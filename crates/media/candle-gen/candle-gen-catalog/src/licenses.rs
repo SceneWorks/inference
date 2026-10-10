@@ -107,9 +107,9 @@ use candle_gen::gen_core::ProviderComponents;
 /// Sorted so a reader can find an id and a future diff stays local; the emitted manifest sorts
 /// independently, so this ordering carries no meaning beyond readability.
 ///
-/// One row per **distinct** id: five Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
-/// `wan2_2_t2v_14b`, `z_image_turbo`) are also generator ids and load the same checkpoints, so they
-/// appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
+/// One row per **distinct** id: fourteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
+/// `qwen_image_2_1`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
+/// they appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
 /// and `ltx_2_3` are trainer-**only** ids with no Candle generator, which is why they appear here
 /// and in no generator list.
 pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -294,6 +294,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "qwen_image",
         components: &["qwen_image"],
+    },
+    // --- qwen-image-2-1 (sc-24109) ------------------------------------------------------------
+    // One repository, one declaration: `Qwen/Qwen-Image-2.1` ships the DiT, the RGBA VAE and the
+    // bundled Qwen3-VL-8B text tower together under the Qwen Research License. No distill LoRA,
+    // no PiD overlay (its 64-channel latent is not the PiD z16 backbone) and no alternate decoder
+    // are loadable through this id, so the row is complete. It is the same component row the MLX
+    // twin's catalog names - one repository, one licence, both backends.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1",
+        components: &["qwen_image_2_1"],
     },
     // --- sana -------------------------------------------------------------------------------
     // Each SANA repository ships its own DC-AE autoencoder, so the VAE rides the DiT row; the
@@ -550,7 +560,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 50);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 51);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -582,9 +592,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            60,
-            "60 distinct Candle provider ids: 55 generators + 7 trainers (5 of them also generator \
-             ids) + 1 captioner + 2 embedders"
+            61,
+            "61 distinct Candle provider ids: 56 generators + 16 trainers (14 of them also \
+             generator ids) + 1 captioner + 2 embedders"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
@@ -739,6 +749,7 @@ mod tests {
                 "ltx_2_3_distilled",
                 "minimax_h3",
                 "mochi_1",
+                "qwen_image_2_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "seedvr2",

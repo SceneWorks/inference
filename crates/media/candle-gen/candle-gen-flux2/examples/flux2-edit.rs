@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewSink, Progress,
-    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource,
 };
 use candle_gen_flux2::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
@@ -37,6 +38,20 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn campaign_contract(args: &[String]) -> Result<Option<(String, String)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency sequential")?;
+    if residency != "sequential" {
+        return Err("flux2_klein_9b_edit campaign residency must be sequential".into());
+    }
+    Ok(Some((source_ref, residency)))
 }
 
 fn save(img: &Image, path: &PathBuf) -> Result<()> {
@@ -188,6 +203,25 @@ struct Common {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let dev_variant = matches!(arg(&args, "--variant").as_deref(), Some("dev"));
+    let campaign_contract = campaign_contract(&args)?;
+    if campaign_contract.is_some() && dev_variant {
+        return Err("SC-20686 campaign supports only flux2_klein_9b_edit".into());
+    }
+    let cancel_campaign = args.iter().any(|arg| arg == "--sc20686-cancel");
+    let _campaign_request = if let Some((source_ref, residency)) = &campaign_contract {
+        let event_path = arg(&args, "--sc20686-events")
+            .filter(|path| path != "-")
+            .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
+        let request =
+            candle_gen_flux2::sc20686_observer::request_output(event_path, source_ref, residency)?;
+        Some(if cancel_campaign {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("FLUX2_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set FLUX2_SNAPSHOT)")?;
@@ -396,12 +430,16 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
 /// klein (sc-5487): distilled reference edit (dense). Self-contained — txt2img-generates the reference
 /// and the no-reference baseline when `--reference` is absent.
 fn run_klein(args: &[String], c: &Common) -> Result<()> {
+    let campaign = args.iter().any(|value| value == "--sc20686-campaign");
     let reference = match arg(args, "--reference") {
         Some(path) => {
             println!("[edit] reference={path}");
             load_image(&path)?
         }
         None => {
+            if campaign {
+                return Err("SC-20686 FLUX edit campaign requires --reference <png>".into());
+            }
             let base_prompt =
                 "a photorealistic studio portrait of a young woman with long red hair, \
                                neutral background, soft lighting";
@@ -422,31 +460,59 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
             base
         }
     };
+    let reference2 = match arg(args, "--reference2") {
+        Some(path) => Some(load_image(&path)?),
+        None => None,
+    };
+    let mut references = vec![reference];
+    if let Some(reference2) = reference2 {
+        references.push(reference2);
+    }
     println!(
         "[edit] {}x{} steps={} guidance={} seed={}\n[edit] prompt={:?}",
         c.width, c.height, c.steps, c.guidance, c.seed, c.prompt
     );
 
-    // Ablation baseline FIRST, while no edit model is resident (two 9B models do not co-reside).
-    let noref = txt2img(
-        "flux2_klein_9b",
-        &c.snapshot,
-        None,
-        &c.prompt,
-        c.width,
-        c.height,
-        c.steps,
-        c.seed,
-    )?;
-    save(
-        &noref,
-        &PathBuf::from(format!("{}_noref.png", c.out.display())),
-    )?;
+    // The ordinary smoke keeps its no-reference ablation. A campaign coordinate owns exactly one
+    // observed edit generation and must not include an unobserved txt2img load/render.
+    let noref = if campaign {
+        None
+    } else {
+        let image = txt2img(
+            "flux2_klein_9b",
+            &c.snapshot,
+            None,
+            &c.prompt,
+            c.width,
+            c.height,
+            c.steps,
+            c.seed,
+        )?;
+        save(
+            &image,
+            &PathBuf::from(format!("{}_noref.png", c.out.display())),
+        )?;
+        Some(image)
+    };
 
-    let model = Flux2Edit::load(&Flux2EditPaths {
+    let paths = Flux2EditPaths {
         root: PathBuf::from(&c.snapshot),
         adapters: Vec::new(),
-    })?;
+    };
+    let model = if campaign {
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&c.snapshot)))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        Flux2Edit::load_klein_with_memory_spec(
+            &paths,
+            &spec,
+            GenerationMemory {
+                stage_residency: true,
+                ..GenerationMemory::default()
+            },
+        )?
+    } else {
+        Flux2Edit::load(&paths)?
+    };
     let req = Flux2EditRequest {
         prompt: c.prompt.clone(),
         negative: String::new(),
@@ -468,15 +534,29 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
     };
     let mut prog = step_progress("edit");
     let t0 = std::time::Instant::now();
-    let edited = model.generate(&req, std::slice::from_ref(&reference), &mut prog)?;
-    println!("\n[edit] edit done in {:.1}s", t0.elapsed().as_secs_f32());
+    let result = model.generate(&req, &references, &mut prog);
+    if campaign && args.iter().any(|value| value == "--sc20686-cancel") {
+        return match result {
+            Err(candle_gen::CandleError::Canceled) => Ok(()),
+            Ok(_) => Err("SC-20686 cancellation arm completed instead of cancelling".into()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    let edited = result?;
     save(&edited, &c.out)?;
+    if campaign {
+        return Ok(());
+    }
+    println!("\n[edit] edit done in {:.1}s", t0.elapsed().as_secs_f32());
     println!("[edit] wrote {}", c.out.display());
 
-    let diff = mean_abs_diff(&edited, &noref);
+    let diff = mean_abs_diff(
+        &edited,
+        noref.as_ref().expect("ordinary smoke has ablation"),
+    );
     println!("[edit] ablation: mean|edit − noref| = {diff:.2} (decisive when >> 0)");
 
-    cancel_contract("edit", &model, &req, std::slice::from_ref(&reference));
+    cancel_contract("edit", &model, &req, &references);
     Ok(())
 }
 

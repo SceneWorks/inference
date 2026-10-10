@@ -36,7 +36,7 @@
 //!
 //! # Trainers share their generator's row
 //!
-//! All fifteen registered MLX trainer ids are also generator ids, and
+//! All seventeen registered MLX trainer ids are also generator ids, and
 //! [`ProviderComponents::provider_id`] is unique across the table — duplicates are rejected by
 //! [`gen_core::license_table_conformance_errors`] because
 //! they are not byte-stable under the manifest's stable sort. One row therefore serves both
@@ -83,7 +83,7 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 60 rows over 70 registered ids: the fifteen trainer ids reuse their generator's row, and ten ids
+/// 61 rows over 71 registered ids: the seventeen trainer ids reuse their generator's row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -404,6 +404,15 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "nvidia_pid_students",
             "wan2_1_t2v_14b_diffusers",
         ],
+    },
+    // --- qwen-image-2-1 (sc-24108) ------------------------------------------------------------
+    // One repository, one declaration: `Qwen/Qwen-Image-2.1` ships the DiT, the RGBA VAE and the
+    // bundled Qwen3-VL-8B text tower together under the Qwen Research License. No distill LoRA,
+    // no PiD overlay (its 64-channel latent is not the PiD z16 backbone) and no alternate decoder
+    // are loadable through this id, so the row is complete.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1",
+        components: &["qwen_image_2_1"],
     },
     // --- sana --------------------------------------------------------------------------------
     // The DC-AE tensors load from each SANA repository's own `vae/`, so the repository row covers
@@ -886,8 +895,9 @@ mod tests {
             .map(|(id, _)| id.to_string())
             .collect();
 
-        assert_eq!(registered.len(), 70, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 60);
+        // sc-24108: `qwen_image_2_1` registers with its own complete row (71 / 61).
+        assert_eq!(registered.len(), 71, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 61);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -954,8 +964,9 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            21,
-            "the complete ids are the mapped ids minus the pinned-incomplete ones"
+            22,
+            "the complete ids are the mapped ids minus the pinned-incomplete ones \
+             (qwen_image_2_1 joined the complete set in sc-24108)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -970,7 +981,7 @@ mod tests {
         }
     }
 
-    /// One row per id, and the sixteen trainer registrations reuse their generator's row rather than
+    /// One row per id, and the seventeen trainer registrations reuse their generator's row rather than
     /// duplicating it — `provider_id` is unique across the table, so they have to.
     #[test]
     fn trainer_ids_reuse_their_generator_row() {
@@ -984,7 +995,7 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(trainers.len(), 16);
+        assert_eq!(trainers.len(), 17);
         for id in &trainers {
             assert!(
                 generators.contains(id),
@@ -1131,7 +1142,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 60);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 61);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

@@ -184,6 +184,7 @@ name = "candle-audio"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "candle-nn",
  "libc",
  "sceneworks-gen-core",
  "sha2",
@@ -222,8 +223,11 @@ dependencies = [
  "candle-audio-moss-tts",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
+ "candle-audio-sheetsage2",
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
+ "candle-audio-yue",
+ "candle-audio-yue2",
  "candle-llm",
  "tempfile",
 ]
@@ -363,6 +367,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-sheetsage2"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-audio-yue2",
+ "candle-nn",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "candle-audio-stable-audio-3"
 version = "0.0.0"
 dependencies = [
@@ -396,9 +413,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-yue"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-llm",
+ "candle-nn",
+ "regex",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-audio-yue2"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-llm",
+ "candle-nn",
+ "candle-quant-kernels",
+ "fancy-regex 0.17.0",
+ "regex",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -441,6 +489,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "candle-quant-kernels",
  "float8",
  "fs2",
  "half",
@@ -530,6 +579,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
+ "candle-gen-qwen-image-2-1",
  "candle-gen-sam3",
  "candle-gen-sana",
  "candle-gen-scail2",
@@ -629,6 +679,7 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -718,6 +769,7 @@ dependencies = [
  "candle-gen",
  "candle-gen-flux2",
  "candle-gen-pid",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -841,6 +893,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-llm",
+ "candle-nn",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "candle-gen-sam3"
 version = "0.0.0"
 dependencies = [
@@ -939,6 +1008,7 @@ name = "candle-gen-sensenova"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -974,7 +1044,9 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -1012,12 +1084,17 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
+ "candle-llm",
  "candle-nn",
+ "candle-quant-kernels",
  "core-llm",
  "core-llm-testkit",
+ "half",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1049,6 +1126,16 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-quant-kernels"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "float8",
+ "half",
 ]
 
 [[package]]
@@ -1190,6 +1277,7 @@ version = "0.0.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -1202,6 +1290,7 @@ version = "0.0.0"
 dependencies = [
  "core-llm",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2203,12 +2292,15 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memmap2",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "safetensors 0.4.5",
  "sceneworks-gen-core",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
@@ -2286,6 +2378,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
+ "mlx-gen-qwen-image-2-1",
  "mlx-gen-sam2",
  "mlx-gen-sam3",
  "mlx-gen-sana",
@@ -2466,6 +2559,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-flux2",
  "mlx-gen-pid",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -2562,6 +2656,21 @@ dependencies = [
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-qwen-image-2-1"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-z-image",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2711,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2727,9 +2836,13 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "half",
+ "libc",
  "memmap2",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -2738,15 +2851,17 @@ dependencies = [
 name = "mlx-llm-server"
 version = "0.0.0"
 dependencies = [
+ "core-llm-testkit",
  "mlx-llm",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3042,7 +3157,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3065,7 +3180,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "bindgen",
  "cc",
@@ -3321,6 +3436,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "tempfile",
 ]
 
 [[package]]

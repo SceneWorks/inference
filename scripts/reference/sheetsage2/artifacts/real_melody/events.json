@@ -1,0 +1,3154 @@
+{
+  "schema_version": "v1",
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "events": [
+    {
+      "subbeat": 0,
+      "tokens_by_field": {
+        "timestamp": [
+          518
+        ],
+        "rhythm": [
+          30531,
+          30709
+        ],
+        "structure": [
+          30968
+        ],
+        "key": [
+          30988
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 0.01,
+        "rhythm": {
+          "meter": [
+            3,
+            4
+          ],
+          "eighth_position": 0
+        },
+        "structure": "verse",
+        "key": "C:major",
+        "chord": "N"
+      },
+      "time": 0.01,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 0,
+      "global_subbeat": 0
+    },
+    {
+      "subbeat": 4,
+      "tokens_by_field": {
+        "timestamp": [
+          591
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 0.74,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 0.74,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 4,
+      "global_subbeat": 4
+    },
+    {
+      "subbeat": 8,
+      "tokens_by_field": {
+        "timestamp": [
+          667
+        ],
+        "rhythm": [
+          30713
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 1.5,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 1.94
+          }
+        ]
+      },
+      "time": 1.5,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 8,
+      "global_subbeat": 8
+    },
+    {
+      "subbeat": 10,
+      "tokens_by_field": {
+        "melody": [
+          31474,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 2.38
+          }
+        ]
+      },
+      "time": 1.94,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 10,
+      "global_subbeat": 10
+    },
+    {
+      "subbeat": 12,
+      "tokens_by_field": {
+        "timestamp": [
+          755
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31470,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 2.38,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 72,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 3.14
+          }
+        ]
+      },
+      "time": 2.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 12,
+      "global_subbeat": 12
+    },
+    {
+      "subbeat": 16,
+      "tokens_by_field": {
+        "timestamp": [
+          831
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 3.14,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 3.89
+          }
+        ]
+      },
+      "time": 3.14,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 16,
+      "global_subbeat": 16
+    },
+    {
+      "subbeat": 20,
+      "tokens_by_field": {
+        "timestamp": [
+          906
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 3.89,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 4.62
+          }
+        ]
+      },
+      "time": 3.89,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 20,
+      "global_subbeat": 20
+    },
+    {
+      "subbeat": 24,
+      "tokens_by_field": {
+        "timestamp": [
+          979
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31659
+        ]
+      },
+      "values": {
+        "timestamp": 4.62,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 5,
+            "duration_steps": 8,
+            "end_time": 6.15
+          }
+        ]
+      },
+      "time": 4.62,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 24,
+      "global_subbeat": 24
+    },
+    {
+      "subbeat": 28,
+      "tokens_by_field": {
+        "timestamp": [
+          1055
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 5.38,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 5.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 28,
+      "global_subbeat": 28
+    },
+    {
+      "subbeat": 32,
+      "tokens_by_field": {
+        "timestamp": [
+          1132
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31486,
+          31656
+        ]
+      },
+      "values": {
+        "timestamp": 6.15,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 2,
+            "duration_steps": 3,
+            "end_time": 6.7125
+          }
+        ]
+      },
+      "time": 6.15,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 32,
+      "global_subbeat": 32
+    },
+    {
+      "subbeat": 35,
+      "tokens_by_field": {
+        "melody": [
+          31484
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 0,
+            "duration_steps": 1,
+            "end_time": 6.9
+          }
+        ]
+      },
+      "time": 6.7125,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 35,
+      "global_subbeat": 35
+    },
+    {
+      "subbeat": 36,
+      "tokens_by_field": {
+        "timestamp": [
+          1207
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 6.9,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 7.66
+          }
+        ]
+      },
+      "time": 6.9,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 36,
+      "global_subbeat": 36
+    },
+    {
+      "subbeat": 40,
+      "tokens_by_field": {
+        "timestamp": [
+          1283
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 7.66,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 8.38
+          }
+        ]
+      },
+      "time": 7.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 40,
+      "global_subbeat": 40
+    },
+    {
+      "subbeat": 44,
+      "tokens_by_field": {
+        "timestamp": [
+          1355
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31476,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 8.38,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 78,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 9.18
+          }
+        ]
+      },
+      "time": 8.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 44,
+      "global_subbeat": 44
+    },
+    {
+      "subbeat": 48,
+      "tokens_by_field": {
+        "timestamp": [
+          1435
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31159
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 9.18,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj7/5",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 9.94
+          }
+        ]
+      },
+      "time": 9.18,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 48,
+      "global_subbeat": 48
+    },
+    {
+      "subbeat": 52,
+      "tokens_by_field": {
+        "timestamp": [
+          1511
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 9.94,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 9.94,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 52,
+      "global_subbeat": 52
+    },
+    {
+      "subbeat": 56,
+      "tokens_by_field": {
+        "timestamp": [
+          1595
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 10.78,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 11.18
+          }
+        ]
+      },
+      "time": 10.78,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 56,
+      "global_subbeat": 56
+    },
+    {
+      "subbeat": 58,
+      "tokens_by_field": {
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 11.58
+          }
+        ]
+      },
+      "time": 11.18,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 58,
+      "global_subbeat": 58
+    },
+    {
+      "subbeat": 60,
+      "tokens_by_field": {
+        "timestamp": [
+          1675
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31486,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 11.58,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 12.66
+          }
+        ]
+      },
+      "time": 11.58,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 60,
+      "global_subbeat": 60
+    },
+    {
+      "subbeat": 64,
+      "tokens_by_field": {
+        "timestamp": [
+          1743
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 12.26,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 12.26,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 64,
+      "global_subbeat": 64
+    },
+    {
+      "subbeat": 66,
+      "tokens_by_field": {
+        "melody": [
+          31484,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 13.06
+          }
+        ]
+      },
+      "time": 12.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 66,
+      "global_subbeat": 66
+    },
+    {
+      "subbeat": 68,
+      "tokens_by_field": {
+        "timestamp": [
+          1823
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 13.06,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 13.86
+          }
+        ]
+      },
+      "time": 13.06,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 68,
+      "global_subbeat": 68
+    },
+    {
+      "subbeat": 72,
+      "tokens_by_field": {
+        "timestamp": [
+          1903
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31160
+        ],
+        "melody": [
+          31481,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 13.86,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj7/7",
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 15.06
+          }
+        ]
+      },
+      "time": 13.86,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 72,
+      "global_subbeat": 72
+    },
+    {
+      "subbeat": 76,
+      "tokens_by_field": {
+        "timestamp": [
+          1983
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 14.66,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 14.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 76,
+      "global_subbeat": 76
+    },
+    {
+      "subbeat": 80,
+      "tokens_by_field": {
+        "timestamp": [
+          2063
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31479,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 15.46,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 81,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 15.860000000000001
+          }
+        ]
+      },
+      "time": 15.46,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 80,
+      "global_subbeat": 80
+    },
+    {
+      "subbeat": 82,
+      "tokens_by_field": {
+        "melody": [
+          31481,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 16.26
+          }
+        ]
+      },
+      "time": 15.860000000000001,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 82,
+      "global_subbeat": 82
+    },
+    {
+      "subbeat": 84,
+      "tokens_by_field": {
+        "timestamp": [
+          2143
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 16.26,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 17.02
+          }
+        ]
+      },
+      "time": 16.26,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 84,
+      "global_subbeat": 84
+    },
+    {
+      "subbeat": 88,
+      "tokens_by_field": {
+        "timestamp": [
+          2219
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 17.02,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 17.82
+          }
+        ]
+      },
+      "time": 17.02,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 88,
+      "global_subbeat": 88
+    },
+    {
+      "subbeat": 92,
+      "tokens_by_field": {
+        "timestamp": [
+          2299
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 17.82,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 18.66
+          }
+        ]
+      },
+      "time": 17.82,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 92,
+      "global_subbeat": 92
+    },
+    {
+      "subbeat": 96,
+      "tokens_by_field": {
+        "timestamp": [
+          2383
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 18.66,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 19.5
+          }
+        ]
+      },
+      "time": 18.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 96,
+      "global_subbeat": 96
+    },
+    {
+      "subbeat": 100,
+      "tokens_by_field": {
+        "timestamp": [
+          2467
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31470,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 19.5,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 72,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 20.38
+          }
+        ]
+      },
+      "time": 19.5,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 100,
+      "global_subbeat": 100
+    },
+    {
+      "subbeat": 104,
+      "tokens_by_field": {
+        "timestamp": [
+          2555
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 20.38,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 20.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 104,
+      "global_subbeat": 104
+    },
+    {
+      "subbeat": 108,
+      "tokens_by_field": {
+        "timestamp": [
+          2643
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 21.26,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 21.68
+          }
+        ]
+      },
+      "time": 21.26,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 108,
+      "global_subbeat": 108
+    },
+    {
+      "subbeat": 110,
+      "tokens_by_field": {
+        "melody": [
+          31474,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 22.1
+          }
+        ]
+      },
+      "time": 21.68,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 110,
+      "global_subbeat": 110
+    },
+    {
+      "subbeat": 112,
+      "tokens_by_field": {
+        "timestamp": [
+          2727
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31470,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 22.1,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 72,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 22.86
+          }
+        ]
+      },
+      "time": 22.1,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 112,
+      "global_subbeat": 112
+    },
+    {
+      "subbeat": 116,
+      "tokens_by_field": {
+        "timestamp": [
+          2803
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 22.86,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 23.58
+          }
+        ]
+      },
+      "time": 22.86,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 116,
+      "global_subbeat": 116
+    },
+    {
+      "subbeat": 120,
+      "tokens_by_field": {
+        "timestamp": [
+          2875
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 23.58,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 24.42
+          }
+        ]
+      },
+      "time": 23.58,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 120,
+      "global_subbeat": 120
+    },
+    {
+      "subbeat": 124,
+      "tokens_by_field": {
+        "timestamp": [
+          2959
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31482,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 24.42,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 25.560000000000002
+          }
+        ]
+      },
+      "time": 24.42,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 124,
+      "global_subbeat": 124
+    },
+    {
+      "subbeat": 128,
+      "tokens_by_field": {
+        "timestamp": [
+          3031
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 25.14,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 25.14,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 128,
+      "global_subbeat": 128
+    },
+    {
+      "subbeat": 132,
+      "tokens_by_field": {
+        "timestamp": [
+          3115
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31486,
+          31656
+        ]
+      },
+      "values": {
+        "timestamp": 25.98,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 2,
+            "duration_steps": 3,
+            "end_time": 26.580000000000002
+          }
+        ]
+      },
+      "time": 25.98,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 132,
+      "global_subbeat": 132
+    },
+    {
+      "subbeat": 135,
+      "tokens_by_field": {
+        "melody": [
+          31484
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 0,
+            "duration_steps": 1,
+            "end_time": 26.78
+          }
+        ]
+      },
+      "time": 26.580000000000002,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 135,
+      "global_subbeat": 135
+    },
+    {
+      "subbeat": 136,
+      "tokens_by_field": {
+        "timestamp": [
+          3195
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 26.78,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 27.58
+          }
+        ]
+      },
+      "time": 26.78,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 136,
+      "global_subbeat": 136
+    },
+    {
+      "subbeat": 140,
+      "tokens_by_field": {
+        "timestamp": [
+          3275
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 27.58,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 28.3
+          }
+        ]
+      },
+      "time": 27.58,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 140,
+      "global_subbeat": 140
+    },
+    {
+      "subbeat": 144,
+      "tokens_by_field": {
+        "timestamp": [
+          3347
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31476,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 28.3,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 78,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 29.06
+          }
+        ]
+      },
+      "time": 28.3,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 144,
+      "global_subbeat": 144
+    },
+    {
+      "subbeat": 148,
+      "tokens_by_field": {
+        "timestamp": [
+          3423
+        ],
+        "rhythm": [
+          30711
+        ],
+        "chord": [
+          31159
+        ],
+        "melody": [
+          31477,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 29.06,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "chord": "C:maj7/5",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 30.259999999999998
+          }
+        ]
+      },
+      "time": 29.06,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 148,
+      "global_subbeat": 148
+    },
+    {
+      "subbeat": 152,
+      "tokens_by_field": {
+        "timestamp": [
+          3503
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 29.86,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 29.86,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 152,
+      "global_subbeat": 152
+    },
+    {
+      "subbeat": 156,
+      "tokens_by_field": {
+        "timestamp": [
+          3583
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31159
+        ],
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 30.66,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj7/5",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 31.060000000000002
+          }
+        ]
+      },
+      "time": 30.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 156,
+      "global_subbeat": 156
+    },
+    {
+      "subbeat": 158,
+      "tokens_by_field": {
+        "melody": [
+          31477,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 31.46
+          }
+        ]
+      },
+      "time": 31.060000000000002,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 158,
+      "global_subbeat": 158
+    },
+    {
+      "subbeat": 160,
+      "tokens_by_field": {
+        "timestamp": [
+          3663
+        ],
+        "rhythm": [
+          30711
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31486,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 31.46,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 32.620000000000005
+          }
+        ]
+      },
+      "time": 31.46,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 160,
+      "global_subbeat": 160
+    },
+    {
+      "subbeat": 164,
+      "tokens_by_field": {
+        "timestamp": [
+          3739
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 32.22,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 32.22,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 164,
+      "global_subbeat": 164
+    },
+    {
+      "subbeat": 166,
+      "tokens_by_field": {
+        "melody": [
+          31484,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 33.02
+          }
+        ]
+      },
+      "time": 32.620000000000005,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 166,
+      "global_subbeat": 166
+    },
+    {
+      "subbeat": 168,
+      "tokens_by_field": {
+        "timestamp": [
+          3819
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 33.02,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 33.82
+          }
+        ]
+      },
+      "time": 33.02,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 168,
+      "global_subbeat": 168
+    },
+    {
+      "subbeat": 172,
+      "tokens_by_field": {
+        "timestamp": [
+          3899
+        ],
+        "rhythm": [
+          30711
+        ],
+        "chord": [
+          31160
+        ],
+        "melody": [
+          31481,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 33.82,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "chord": "C:maj7/7",
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 35.019999999999996
+          }
+        ]
+      },
+      "time": 33.82,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 172,
+      "global_subbeat": 172
+    },
+    {
+      "subbeat": 176,
+      "tokens_by_field": {
+        "timestamp": [
+          3979
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 34.62,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 34.62,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 176,
+      "global_subbeat": 176
+    },
+    {
+      "subbeat": 180,
+      "tokens_by_field": {
+        "timestamp": [
+          4059
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31160
+        ],
+        "melody": [
+          31479,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 35.42,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj7/7",
+        "melody": [
+          {
+            "pitch": 81,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 35.84
+          }
+        ]
+      },
+      "time": 35.42,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 180,
+      "global_subbeat": 180
+    },
+    {
+      "subbeat": 182,
+      "tokens_by_field": {
+        "melody": [
+          31481,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 36.26
+          }
+        ]
+      },
+      "time": 35.84,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 182,
+      "global_subbeat": 182
+    },
+    {
+      "subbeat": 184,
+      "tokens_by_field": {
+        "timestamp": [
+          4143
+        ],
+        "rhythm": [
+          30711
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 36.26,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 37.06
+          }
+        ]
+      },
+      "time": 36.26,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 184,
+      "global_subbeat": 184
+    },
+    {
+      "subbeat": 188,
+      "tokens_by_field": {
+        "timestamp": [
+          4223
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 37.06,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 37.9
+          }
+        ]
+      },
+      "time": 37.06,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 188,
+      "global_subbeat": 188
+    },
+    {
+      "subbeat": 192,
+      "tokens_by_field": {
+        "timestamp": [
+          4307
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 37.9,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 38.74
+          }
+        ]
+      },
+      "time": 37.9,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 192,
+      "global_subbeat": 192
+    },
+    {
+      "subbeat": 196,
+      "tokens_by_field": {
+        "timestamp": [
+          4391
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31474,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 38.74,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 39.5
+          }
+        ]
+      },
+      "time": 38.74,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 196,
+      "global_subbeat": 196
+    },
+    {
+      "subbeat": 200,
+      "tokens_by_field": {
+        "timestamp": [
+          4467
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31470,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 39.5,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 72,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 40.599999999999994
+          }
+        ]
+      },
+      "time": 39.5,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 200,
+      "global_subbeat": 200
+    },
+    {
+      "subbeat": 204,
+      "tokens_by_field": {
+        "timestamp": [
+          4539
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ]
+      },
+      "values": {
+        "timestamp": 40.22,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj"
+      },
+      "time": 40.22,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 204,
+      "global_subbeat": 204
+    },
+    {
+      "subbeat": 208,
+      "tokens_by_field": {
+        "timestamp": [
+          4615
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 40.98,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 40.98,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 208,
+      "global_subbeat": 208
+    },
+    {
+      "subbeat": 212,
+      "tokens_by_field": {
+        "timestamp": [
+          4691
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31486,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 41.74,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 42.16
+          }
+        ]
+      },
+      "time": 41.74,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 212,
+      "global_subbeat": 212
+    },
+    {
+      "subbeat": 214,
+      "tokens_by_field": {
+        "melody": [
+          31486,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 42.58
+          }
+        ]
+      },
+      "time": 42.16,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 214,
+      "global_subbeat": 214
+    },
+    {
+      "subbeat": 216,
+      "tokens_by_field": {
+        "timestamp": [
+          4775
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31486,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 42.58,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 43.3
+          }
+        ]
+      },
+      "time": 42.58,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 216,
+      "global_subbeat": 216
+    },
+    {
+      "subbeat": 220,
+      "tokens_by_field": {
+        "timestamp": [
+          4847
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31487,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 43.3,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 44.02
+          }
+        ]
+      },
+      "time": 43.3,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 220,
+      "global_subbeat": 220
+    },
+    {
+      "subbeat": 224,
+      "tokens_by_field": {
+        "timestamp": [
+          4919
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31489,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 44.02,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 91,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 44.66
+          }
+        ]
+      },
+      "time": 44.02,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 224,
+      "global_subbeat": 224
+    },
+    {
+      "subbeat": 228,
+      "tokens_by_field": {
+        "timestamp": [
+          4983
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31489,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 44.66,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 91,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 45.760000000000005
+          }
+        ]
+      },
+      "time": 44.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 228,
+      "global_subbeat": 228
+    },
+    {
+      "subbeat": 232,
+      "tokens_by_field": {
+        "timestamp": [
+          5055
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 45.38,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 45.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 232,
+      "global_subbeat": 232
+    },
+    {
+      "subbeat": 236,
+      "tokens_by_field": {
+        "timestamp": [
+          5131
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31487,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 46.14,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 46.519999999999996
+          }
+        ]
+      },
+      "time": 46.14,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 236,
+      "global_subbeat": 236
+    },
+    {
+      "subbeat": 238,
+      "tokens_by_field": {
+        "melody": [
+          31486,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 46.9
+          }
+        ]
+      },
+      "time": 46.519999999999996,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 238,
+      "global_subbeat": 238
+    },
+    {
+      "subbeat": 240,
+      "tokens_by_field": {
+        "timestamp": [
+          5207
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31484,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 46.9,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 47.54
+          }
+        ]
+      },
+      "time": 46.9,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 240,
+      "global_subbeat": 240
+    },
+    {
+      "subbeat": 244,
+      "tokens_by_field": {
+        "timestamp": [
+          5271
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31486,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 47.54,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 48.18
+          }
+        ]
+      },
+      "time": 47.54,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 244,
+      "global_subbeat": 244
+    },
+    {
+      "subbeat": 248,
+      "tokens_by_field": {
+        "timestamp": [
+          5335
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31487,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 48.18,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 48.5
+          }
+        ]
+      },
+      "time": 48.18,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 248,
+      "global_subbeat": 248
+    },
+    {
+      "subbeat": 250,
+      "tokens_by_field": {
+        "melody": [
+          31487,
+          31657
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 49.14
+          }
+        ]
+      },
+      "time": 48.5,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 250,
+      "global_subbeat": 250
+    },
+    {
+      "subbeat": 252,
+      "tokens_by_field": {
+        "timestamp": [
+          5399
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ]
+      },
+      "values": {
+        "timestamp": 48.82,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj"
+      },
+      "time": 48.82,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 252,
+      "global_subbeat": 252
+    },
+    {
+      "subbeat": 254,
+      "tokens_by_field": {
+        "melody": [
+          31487,
+          31657
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 49.78
+          }
+        ]
+      },
+      "time": 49.14,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 254,
+      "global_subbeat": 254
+    },
+    {
+      "subbeat": 256,
+      "tokens_by_field": {
+        "timestamp": [
+          5463
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 49.46,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 49.46,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 256,
+      "global_subbeat": 256
+    },
+    {
+      "subbeat": 260,
+      "tokens_by_field": {
+        "timestamp": [
+          5527
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31487
+        ]
+      },
+      "values": {
+        "timestamp": 50.1,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 0,
+            "duration_steps": 1,
+            "end_time": 50.260000000000005
+          }
+        ]
+      },
+      "time": 50.1,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 260,
+      "global_subbeat": 260
+    },
+    {
+      "subbeat": 262,
+      "tokens_by_field": {
+        "melody": [
+          31487,
+          31657
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 89,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 51.06
+          }
+        ]
+      },
+      "time": 50.42,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 262,
+      "global_subbeat": 262
+    },
+    {
+      "subbeat": 264,
+      "tokens_by_field": {
+        "timestamp": [
+          5591
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ]
+      },
+      "values": {
+        "timestamp": 50.74,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj"
+      },
+      "time": 50.74,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 264,
+      "global_subbeat": 264
+    },
+    {
+      "subbeat": 266,
+      "tokens_by_field": {
+        "melody": [
+          31486,
+          31658
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 88,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 52.02
+          }
+        ]
+      },
+      "time": 51.06,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 266,
+      "global_subbeat": 266
+    },
+    {
+      "subbeat": 268,
+      "tokens_by_field": {
+        "timestamp": [
+          5655
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 51.38,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 51.38,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 268,
+      "global_subbeat": 268
+    },
+    {
+      "subbeat": 272,
+      "tokens_by_field": {
+        "timestamp": [
+          5719
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31484,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 52.02,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 52.66
+          }
+        ]
+      },
+      "time": 52.02,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 272,
+      "global_subbeat": 272
+    },
+    {
+      "subbeat": 276,
+      "tokens_by_field": {
+        "timestamp": [
+          5783
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31484,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 52.66,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 86,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 52.98
+          }
+        ]
+      },
+      "time": 52.66,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 276,
+      "global_subbeat": 276
+    },
+    {
+      "subbeat": 278,
+      "tokens_by_field": {
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 53.62
+          }
+        ]
+      },
+      "time": 52.98,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 278,
+      "global_subbeat": 278
+    },
+    {
+      "subbeat": 280,
+      "tokens_by_field": {
+        "timestamp": [
+          5847
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 53.3,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 53.3,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 280,
+      "global_subbeat": 280
+    },
+    {
+      "subbeat": 284,
+      "tokens_by_field": {
+        "timestamp": [
+          5911
+        ],
+        "rhythm": [
+          30713
+        ],
+        "chord": [
+          31160
+        ],
+        "melody": [
+          31481,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 53.94,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "chord": "C:maj7/7",
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 54.9
+          }
+        ]
+      },
+      "time": 53.94,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 284,
+      "global_subbeat": 284
+    },
+    {
+      "subbeat": 288,
+      "tokens_by_field": {
+        "timestamp": [
+          5975
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31160
+        ]
+      },
+      "values": {
+        "timestamp": 54.58,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj7/7"
+      },
+      "time": 54.58,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 288,
+      "global_subbeat": 288
+    },
+    {
+      "subbeat": 292,
+      "tokens_by_field": {
+        "timestamp": [
+          6039
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 55.22,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 55.22,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 292,
+      "global_subbeat": 292
+    },
+    {
+      "subbeat": 296,
+      "tokens_by_field": {
+        "timestamp": [
+          6103
+        ],
+        "rhythm": [
+          30713
+        ],
+        "melody": [
+          31479,
+          31655
+        ]
+      },
+      "values": {
+        "timestamp": 55.86,
+        "rhythm": {
+          "eighth_position": 4
+        },
+        "melody": [
+          {
+            "pitch": 81,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 56.18
+          }
+        ]
+      },
+      "time": 55.86,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 296,
+      "global_subbeat": 296
+    },
+    {
+      "subbeat": 298,
+      "tokens_by_field": {
+        "melody": [
+          31481,
+          31655
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 83,
+            "track": 0,
+            "duration_bin": 1,
+            "duration_steps": 2,
+            "end_time": 56.5
+          }
+        ]
+      },
+      "time": 56.18,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 298,
+      "global_subbeat": 298
+    },
+    {
+      "subbeat": 300,
+      "tokens_by_field": {
+        "timestamp": [
+          6167
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ],
+        "melody": [
+          31482,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 56.5,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj",
+        "melody": [
+          {
+            "pitch": 84,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 57.14
+          }
+        ]
+      },
+      "time": 56.5,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 300,
+      "global_subbeat": 300
+    },
+    {
+      "subbeat": 304,
+      "tokens_by_field": {
+        "timestamp": [
+          6231
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31474,
+          31658
+        ]
+      },
+      "values": {
+        "timestamp": 57.14,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 76,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 58.1
+          }
+        ]
+      },
+      "time": 57.14,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 304,
+      "global_subbeat": 304
+    },
+    {
+      "subbeat": 308,
+      "tokens_by_field": {
+        "timestamp": [
+          6295
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 57.78,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 57.78,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 308,
+      "global_subbeat": 308
+    },
+    {
+      "subbeat": 310,
+      "tokens_by_field": {
+        "melody": [
+          31476,
+          31658
+        ]
+      },
+      "values": {
+        "melody": [
+          {
+            "pitch": 78,
+            "track": 0,
+            "duration_bin": 4,
+            "duration_steps": 6,
+            "end_time": 59.06
+          }
+        ]
+      },
+      "time": 58.1,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 310,
+      "global_subbeat": 310
+    },
+    {
+      "subbeat": 312,
+      "tokens_by_field": {
+        "timestamp": [
+          6359
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31041
+        ]
+      },
+      "values": {
+        "timestamp": 58.42,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "C:maj"
+      },
+      "time": 58.42,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 312,
+      "global_subbeat": 312
+    },
+    {
+      "subbeat": 316,
+      "tokens_by_field": {
+        "timestamp": [
+          6423
+        ],
+        "rhythm": [
+          30711
+        ],
+        "melody": [
+          31477,
+          31657
+        ]
+      },
+      "values": {
+        "timestamp": 59.06,
+        "rhythm": {
+          "eighth_position": 2
+        },
+        "melody": [
+          {
+            "pitch": 79,
+            "track": 0,
+            "duration_bin": 3,
+            "duration_steps": 4,
+            "end_time": 59.7
+          }
+        ]
+      },
+      "time": 59.06,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 316,
+      "global_subbeat": 316
+    },
+    {
+      "subbeat": 320,
+      "tokens_by_field": {
+        "timestamp": [
+          6487
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 59.7,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 59.7,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 320,
+      "global_subbeat": 320
+    }
+  ],
+  "has_eos": true
+}

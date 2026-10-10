@@ -208,6 +208,14 @@ impl BerniniPlanner {
             .require("mask_tokens")?
             .take_axis(Array::from_slice(&[0i32], &[1]), 1)?;
 
+        // Materialize at load, before the backbone `quantize`: left lazy, the first planner forward's
+        // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+        // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`). The Wan-side UMT5, VAE
+        // and experts materialize inside their `mlx_gen_wan` constructors.
+        for weights in [&qw, &cw, &vw, &mw] {
+            weights.materialize_accessed()?;
+        }
+
         // sc-5146 conservative quant policy: quantize the Qwen2.5-VL **LLM** linears — the planner
         // footprint that matters (~7B params, ~14GB bf16; all dims divisible by the group-64 quant
         // size). Everything else on the planner side stays DENSE *where quant is unsafe or not worth

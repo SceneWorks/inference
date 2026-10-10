@@ -467,7 +467,12 @@ fn spec_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
 fn load_eva(path: &Path) -> Result<EvaVisionTransformer> {
     let mut w = Weights::from_file(path)?;
     w.cast_all(Dtype::Float32)?;
-    EvaVisionTransformer::from_weights(&w, "", EvaConfig::default())
+    let eva = EvaVisionTransformer::from_weights(&w, "", EvaConfig::default())?;
+    // Materialize at load (after the f32 cast): left lazy, the first identity encode's command
+    // buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245;
+    // see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(eva)
 }
 
 /// Registered loader for the `pulid_flux` target. Every identity sub-model path is **required** and
@@ -530,6 +535,9 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // PuLID encoder + CA weights, cast f32 (conditioning path).
     let mut pulid = Weights::from_file(encoder_path)?;
     pulid.cast_all(Dtype::Float32)?;
+    // Materialize at load, as `load_eva` does (sc-24245). The whole map is the IDFormer + the CA
+    // modules, all read per generate, so it is materialized entire.
+    pulid.materialize()?;
     identity_inventory.ensure_unchanged()?;
 
     // EVA-CLIP tower (f32).
@@ -537,13 +545,14 @@ pub fn load_pulid_flux(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     identity_inventory.ensure_unchanged()?;
 
     // Native face stack.
-    let face = FaceAnalysis::load(
-        &Weights::from_file(face_dir.join("scrfd_10g.safetensors"))?,
-        &Weights::from_file(face_dir.join("arcface_iresnet100.safetensors"))?,
-    )?
-    .with_parser(&Weights::from_file(
-        face_dir.join("bisenet_parsing.safetensors"),
-    )?)?;
+    let scrfd = Weights::from_file(face_dir.join("scrfd_10g.safetensors"))?;
+    let arcface = Weights::from_file(face_dir.join("arcface_iresnet100.safetensors"))?;
+    let parser = Weights::from_file(face_dir.join("bisenet_parsing.safetensors"))?;
+    let face = FaceAnalysis::load(&scrfd, &arcface)?.with_parser(&parser)?;
+    // Materialize at load, as `load_eva` does (sc-24245).
+    for weights in [&scrfd, &arcface, &parser] {
+        weights.materialize_accessed()?;
+    }
     identity_inventory.ensure_unchanged()?;
 
     Ok(Box::new(PulidFlux::new_loaded(

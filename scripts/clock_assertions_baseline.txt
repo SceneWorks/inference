@@ -2,7 +2,7 @@
 # A RATCHET, not a zero-gate: --check-baseline fails only when a count RISES or a new
 # flagged file appears. See that script's header for why zero is not the target and
 # why the total is a triage inbox size rather than a defect count.
-# 261 assertion(s) across 66 file(s); 2631 .rs file(s) scanned.
+# 279 assertion(s) across 67 file(s); 2912 .rs file(s) scanned.
 crates/audio/candle-audio-acestep/src/model.rs: 5
 crates/audio/candle-audio-acestep/src/text.rs: 2
 crates/audio/candle-audio-acestep/tests/conformance.rs: 1
@@ -36,6 +36,7 @@ crates/contracts/gen-core/src/generator.rs: 9
 crates/contracts/gen-core/src/ltx_checkpoint.rs: 9
 crates/contracts/gen-core/src/transcribe.rs: 1
 crates/llm/mlx-llm/server/src/main.rs: 8
+crates/llm/mlx-llm/src/campaign.rs: 4
 crates/media/candle-gen/candle-gen-joycaption/src/lib.rs: 2
 crates/media/candle-gen/candle-gen-krea/tests/nvfp4_krea_dit_gpu.rs: 1
 crates/media/candle-gen/candle-gen-ltx/src/duration_head.rs: 6
@@ -68,4 +69,4 @@ crates/media/mlx-gen/mlx-gen-minimax-h3/tests/duration_sweep_real.rs: 9
 crates/media/mlx-gen/mlx-gen-minimax-h3/tests/first_light.rs: 1
 crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs: 3
 crates/media/mlx-gen/src/diagnostics.rs: 1
-crates/media/mlx-gen/src/memory_probe.rs: 18
+crates/media/mlx-gen/src/memory_probe.rs: 32

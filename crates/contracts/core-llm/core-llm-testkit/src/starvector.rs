@@ -274,6 +274,9 @@ fn expected_fixture_output(fixture: &StarVectorFixture) -> StarVectorOutput {
         generated_tokens: fixture.fragments.len() as u32,
         generated_bytes: fixture.expected_svg.len(),
         finish_reason: StarVectorFinishReason::CompleteRoot,
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+            core_llm::KvCompressionPolicy::Off,
+        )),
     }
 }
 
@@ -307,7 +310,13 @@ mod tests {
                 supports_video: false,
                 supports_audio: false,
                 supports_thinking: false,
+                supports_reasoning_effort: false,
+                reasoning_efforts: Vec::new(),
+                model_sampling_defaults: None,
+                supports_preserve_thinking: false,
                 supports_tools: false,
+                mtp: None,
+                speculative: Vec::new(),
                 supported_constraints: Vec::new(),
             },
         };
@@ -376,7 +385,11 @@ mod tests {
                 thinking: None,
                 tool_calls: Vec::new(),
                 usage,
+                mtp: None,
+                timings: None,
+                decode: None,
                 finish_reason: Some(core_llm::FinishReason::Stop),
+                kv_cache: None,
             })
         }
     }

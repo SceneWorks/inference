@@ -28,6 +28,13 @@ pub trait TextLlm {
         None
     }
 
+    /// What the load produced: the requested weight format, the projection kinds the loaded
+    /// model actually holds (sc-24139) and every requested optional accelerator the load did not
+    /// attach (sc-24444). `None` (the default) when the provider does not report it.
+    fn load_report(&self) -> Option<crate::report::LoadReport> {
+        None
+    }
+
     /// Cheap, pre-inference validation of a request against this provider's capabilities. Must
     /// reject (not silently ignore) anything outside the declared surface.
     fn validate(&self, req: &TextLlmRequest) -> Result<()>;
@@ -44,5 +51,21 @@ pub trait TextLlm {
     /// Convenience: generate without observing the stream (collect the final output only).
     fn complete(&self, req: &TextLlmRequest) -> Result<TextLlmOutput> {
         self.generate(req, &mut |_| {})
+    }
+
+    /// Generate several independent requests (sc-20681), streaming `(request index, event)`
+    /// through `on_event` and returning one result per request, in request order. A backend with
+    /// continuous batching decodes the requests it can batch together (each keeping its own
+    /// cancellation, KV-cache policy and report); the default — and any request a backend cannot
+    /// batch — runs one after another through [`Self::generate`], so every provider supports it.
+    fn generate_batch(
+        &self,
+        reqs: &[TextLlmRequest],
+        on_event: &mut dyn FnMut(usize, StreamEvent),
+    ) -> Vec<Result<TextLlmOutput>> {
+        reqs.iter()
+            .enumerate()
+            .map(|(i, req)| self.generate(req, &mut |event| on_event(i, event)))
+            .collect()
     }
 }

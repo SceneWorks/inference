@@ -21,8 +21,8 @@
 //! - [`qwen3`] — the stateless Qwen3 text encoder (post-final-norm hidden states),
 //! - [`dit`] — the Wan-audio DiT (adaLN blocks, dim-wide q/k RMSNorm, interleaved 1-D RoPE),
 //! - [`sampler`] — the flow-matching σ schedule (shift 5.0, `extra_one_step`) + Euler update,
-//! - [`vae`] — the continuous DAC decoder (weight-norm resolution, Snake, odd-stride
-//!   `output_padding`, final tanh),
+//! - [`vae`] — the continuous DAC VAE decode path (`post_quant_conv`, the shared
+//!   `candle_audio::neural_codec::DacDecoder`, final tanh),
 //! - [`pipeline`] / [`model`] — the assembled synthesis pipeline and the
 //!   [`gen_core::Generator`] adapter registered under **`moss_sfx_v2`**,
 //! - [`prepare`] — the audio-lane snapshot-preparation accommodation (a validated

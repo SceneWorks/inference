@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod qwen35;
+
 /// A temp fixture path that owns its `TempDir` guard (sc-17755).
 ///
 /// Derefs (and `AsRef`s) to `Path`, so call sites read exactly as they did when these helpers

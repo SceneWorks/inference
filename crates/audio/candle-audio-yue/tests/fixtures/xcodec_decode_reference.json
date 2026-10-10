@@ -1,0 +1,29 @@
+{
+  "story": "sc-19377",
+  "producer": "scripts/reference/yue_xcodec_reference.py",
+  "yue_revision": "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d",
+  "yue_clone_head": "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d",
+  "xcodec_mini_infer_revision": "fe781a67815ab47b4a3a5fce1e8d0a692da7e4e5",
+  "checkpoint": "xcodec_mini_infer/final_ckpt/ckpt_00360000.pth [codec_model]",
+  "torch": "2.14.0",
+  "device": "cpu",
+  "dtype": "float32",
+  "clip": "synthetic stdlib chord + vibrato lead, 1 s @ 16 kHz (synth_clip)",
+  "target_bandwidth_kbps": 4.0,
+  "frames": 25,
+  "tensors": {
+    "codes": [
+      8,
+      25
+    ],
+    "embed": [
+      1024,
+      25
+    ],
+    "wave": [
+      8000
+    ]
+  },
+  "wave_abs_max": 0.5138595104217529,
+  "sha256": "769964d6e7955fa140361d0a2edea889a2c1da8d0a95cd9f07961cdcfa2ee2a8"
+}

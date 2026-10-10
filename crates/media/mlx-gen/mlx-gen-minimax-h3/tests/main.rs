@@ -88,6 +88,9 @@ mod ref2va_checkpoint;
 #[path = "ref2va_conditioning.rs"]
 mod ref2va_conditioning;
 
+#[path = "ref2va_reference_partition_real.rs"]
+mod ref2va_reference_partition_real;
+
 #[path = "sequence_cost_real.rs"]
 mod sequence_cost_real;
 

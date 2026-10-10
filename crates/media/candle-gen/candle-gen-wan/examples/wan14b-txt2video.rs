@@ -12,16 +12,16 @@
 //!
 //! With `--comfyui-high <file> --comfyui-low <file>` it instead loads those two in-place ComfyUI Wan2.2
 //! experts (native-Wan keys, companion scaled-fp8) via
-//! [`candle_gen_wan::wan14b::load_from_comfyui_experts`], sourcing the UMT5 TE / VAE / tokenizer from
-//! `--snapshot` (a resident Wan tier dir). The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
+//! [`candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload`], sourcing the UMT5 TE / VAE /
+//! tokenizer from `--snapshot`. The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
 //! (`umt5_xxl_fp8_e4m3fn_scaled`) and/or `--comfyui-vae <file>` (`wan_2.1_vae.safetensors`) reads those
 //! components in place too (sc-10909); whichever is omitted falls back to `--snapshot`.
 
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert, Progress,
-    WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert,
+    OffloadPolicy, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -32,11 +32,46 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn campaign_contract(args: &[String]) -> Result<Option<(String, String, OffloadPolicy)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency sequential")?;
+    if residency != "sequential" {
+        return Err("wan2_2_t2v_14b campaign residency must be sequential".into());
+    }
+    Ok(Some((source_ref, residency, OffloadPolicy::Sequential)))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("WAN14B_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set WAN14B_SNAPSHOT)")?;
+    // Campaign observation is armed before loading but activated only by the producer after the
+    // registry has resolved the real snapshot and request geometry.  This keeps caller flags from
+    // becoming evidence and ensures the scope covers generation and release.
+    let campaign_contract = campaign_contract(&args)?;
+    let _campaign_request = if let Some((source_ref, residency, _)) = &campaign_contract {
+        {
+            let event_path = arg(&args, "--sc20686-events")
+                .filter(|path| path != "-")
+                .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
+            let request = candle_gen_wan::sc20686_observer::request_output(
+                event_path, source_ref, residency,
+            )?;
+            Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+                request.arm_cancellation()
+            } else {
+                request.arm()
+            })
+        }
+    } else {
+        None
+    };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a fluffy cat walking across a sunny garden, gentle camera pan, cinematic, highly detailed"
             .into()
@@ -88,6 +123,10 @@ fn main() -> Result<()> {
     // sc-10671: `--comfyui-high/--comfyui-low` read the two ComfyUI experts in place (scaled-fp8 dequant
     // + native→diffusers remap), sourcing TE/VAE/tokenizer from `--snapshot`; else the registry loads
     // the whole snapshot.
+    let offload = campaign_contract
+        .as_ref()
+        .map(|(_, _, policy)| *policy)
+        .unwrap_or_default();
     let gen = match (arg(&args, "--comfyui-high"), arg(&args, "--comfyui-low")) {
         (Some(high), Some(low)) => {
             // `load_from_comfyui_experts` takes no adapters, so `--lora-high/--lora-low` would be
@@ -107,18 +146,20 @@ fn main() -> Result<()> {
                 "[smoke] comfyui experts: high={high} low={low} (in place, scaled-fp8→bf16)\n\
                  [smoke] comfyui te={te_file:?} vae={vae_file:?} (in place when Some, else snapshot)"
             );
-            candle_gen_wan::wan14b::load_from_comfyui_experts(
+            candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload(
                 PathBuf::from(&high),
                 PathBuf::from(&low),
                 te_file,
                 vae_file,
                 PathBuf::from(&snapshot),
                 false,
+                offload,
             )?
         }
         _ => {
-            let spec =
-                LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
+            let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)))
+                .with_adapters(adapters)
+                .with_offload_policy(offload);
             candle_gen_wan::provider_registry()?.load("wan2_2_t2v_14b", &spec)?
         }
     };
@@ -154,7 +195,17 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t0 = std::time::Instant::now();
-    let output = gen.generate(&req, &mut on_progress)?;
+    let output = match gen.generate(&req, &mut on_progress) {
+        Ok(output) => output,
+        Err(_error)
+            if args.iter().any(|arg| arg == "--sc20686-cancel")
+                && candle_gen_wan::sc20686_observer::campaign_cancelled() =>
+        {
+            println!("[smoke] expected SC-20686 campaign cancellation");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let secs = t0.elapsed().as_secs_f32();
     let (frames, fps) = match output {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),

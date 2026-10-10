@@ -57,6 +57,21 @@ impl KvCache {
         self.seq_len
     }
 
+    /// Drop every cached position, keeping one empty slot per layer.
+    pub(crate) fn clear(&mut self) {
+        self.layers.iter_mut().for_each(|slot| *slot = None);
+        self.seq_len = 0;
+    }
+
+    /// The bytes the cached keys and values hold.
+    pub(crate) fn live_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.elem_count() + v.elem_count()) * k.dtype().size_in_bytes())
+            .sum()
+    }
+
     /// Persisting append (`update_cache=True`): concat the new K/V onto layer `i` and store it back.
     fn append(&mut self, i: usize, k: Tensor, v: Tensor) -> CResult<(Tensor, Tensor)> {
         let merged = match self.layers[i].take() {
@@ -412,7 +427,14 @@ impl Qwen3Backbone {
     pub fn embed(&self, ids: &[i32]) -> CResult<Tensor> {
         let s = ids.len();
         let idx: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        let idx = Tensor::from_vec(idx, (s,), &self.device)?;
+        self.embed_ids(&Tensor::from_vec(idx, (s,), &self.device)?)
+    }
+
+    /// [`embed`](Self::embed) of ids already on the device: a `u32` tensor of any shape holding one
+    /// sequence's `S` ids (flattened) → `[1, S, hidden]`.
+    pub(crate) fn embed_ids(&self, ids: &Tensor) -> CResult<Tensor> {
+        let idx = ids.flatten_all()?;
+        let s = idx.dim(0)?;
         // Gather at the store dtype, THEN widen the `[s, hidden]` rows — under a bf16 store this is
         // the whole embedding path's dtype boundary, and it is exact (bf16 → f32 widening loses
         // nothing). Widening the table first would allocate the full 2.5 GB f32 copy for the same
@@ -451,6 +473,11 @@ impl Qwen3Backbone {
             n += gen.mlp_gen.merge_distill_lora(lora, &mlp)?;
         }
         Ok(n)
+    }
+
+    /// The device the backbone's tensors live on.
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// A fresh empty cache (one slot per decoder layer).

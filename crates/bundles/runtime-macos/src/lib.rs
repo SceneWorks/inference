@@ -2,6 +2,16 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+/// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
+/// (sc-22988): e.g. `candle_audio_yue2`'s run verification, saved-plan restore, cover preparation
+/// and decode-budget helpers, and `candle_audio_sheetsage2`'s recording → score transcription,
+/// review artifact and cover sequencing (sc-23002; noncommercial, CC BY-NC 4.0 on the owner basis
+/// recorded 2026-09-27; transcription runs on the CPU or CUDA, never Metal). Exactly the audio
+/// catalog's provider set.
+#[cfg(feature = "audio")]
+pub mod audio_providers {
+    pub use candle_audio_catalog::providers::*;
+}
 #[cfg(feature = "perf-bench")]
 pub use mlx_gen_catalog::benchmark_toggle_capabilities;
 #[cfg(feature = "media")]
@@ -27,6 +37,47 @@ pub fn conservative_video_decode_memory_profile(
     frames: u32,
 ) -> Option<VideoDecodeMemoryProfile> {
     mlx_gen_catalog::conservative_video_decode_memory_profile(provider_id, width, height, frames)
+}
+
+#[cfg(feature = "media")]
+/// Resolve the decode working set a provider's automatic planner selects with `free_bytes` free at
+/// decode time, and the decision (sc-20686, epic E8); `None` for a provider without a
+/// budget-planned decode (use [`conservative_video_decode_memory_profile`]).
+pub fn budgeted_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<(VideoDecodeMemoryProfile, &'static str)> {
+    mlx_gen_catalog::budgeted_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        free_bytes,
+    )
+}
+
+#[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE encode profile (sc-20686, epic E8): the conditioning
+/// encode working set, composed like the decode profile (the phases never overlap).
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    mlx_gen_catalog::conservative_video_encode_memory_profile(
+        provider_id,
+        mode,
+        width,
+        height,
+        frames,
+        reference_count,
+    )
 }
 
 #[cfg(feature = "media")]
@@ -124,6 +175,19 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139).
+/// MLX has no CUDA device features: `Quantize::Nvfp4` and `LoadSpec::cuda_graphs` are unavailable,
+/// each with a reason naming this backend, so a product disables those controls with it.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    core_llm::BackendCapabilities::without_cuda("mlx", "metal")
+}
+
+/// Whether an NVFP4 load of the snapshot at `spec.source` can succeed (sc-24139): never on MLX —
+/// the same refusal, naming this backend, as [`text_backend_capabilities`] gives for the host.
+pub fn text_nvfp4_support(_spec: &core_llm::LoadSpec) -> core_llm::FeatureSupport {
+    text_backend_capabilities().nvfp4
+}
+
 /// Build the complete validated macOS runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]
@@ -153,6 +217,83 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// SceneWorks reaches SheetSage2 transcription only through this bundle (sc-23002): the crate is
+    /// re-exported beside `candle_audio_yue2`, the whole recording → transcription → review → cover
+    /// path is public with the signatures a consumer calls, the cover closure is authorized for
+    /// noncommercial use only, and the audio catalog publishes the closure's licence rows under the
+    /// crate-API provider id `sheetsage2`.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_bundle_reaches_sheetsage2_transcription_and_publishes_its_licence_rows() {
+        use super::audio_providers::candle_audio_sheetsage2 as ss2;
+        use super::audio_providers::candle_audio_yue2 as yue2;
+        use ss2::candle_core::Device;
+        use yue2::license::{authorize_closure, IntendedUse};
+
+        // The public path, as typed function items: a signature change fails to compile here.
+        let _resolve: fn(
+            yue2::Closure,
+            &yue2::SnapshotDirs,
+        ) -> Result<yue2::VerifiedClosure, yue2::AssetError> = yue2::snapshot::resolve_closure;
+        let _load: fn(
+            &yue2::VerifiedClosure,
+            &Device,
+        ) -> Result<ss2::provider::Transcriber, ss2::Error> = ss2::provider::Transcriber::load;
+        let _unload: fn(ss2::provider::Transcriber) -> ss2::provider::UnloadReceipt =
+            ss2::provider::Transcriber::unload;
+        let _save: fn(
+            &ss2::review::Transcription,
+            &std::path::Path,
+            &ss2::tokenizer::Tokenizer,
+        ) -> Result<String, ss2::Error> = ss2::review::Transcription::save;
+        let _open: fn(&std::path::Path) -> Result<ss2::review::ReviewArtifact, ss2::Error> =
+            ss2::review::ReviewArtifact::open;
+        let _replay: fn(
+            &ss2::review::ReviewArtifact,
+        ) -> Result<ss2::review::ReplayReport, ss2::Error> = ss2::review::ReviewArtifact::replay;
+        let _plan: fn(
+            &ss2::review::ReviewArtifact,
+            &ss2::cover::CoverOptions,
+        ) -> Result<ss2::cover::CoverPlan, ss2::Error> = ss2::cover::plan_cover;
+        type LoadEngine = fn() -> Result<ss2::cover::EngineCover, ss2::Error>;
+        type RunCover = fn(
+            Option<ss2::provider::Transcriber>,
+            &ss2::cover::CoverPlan,
+            LoadEngine,
+            &std::path::Path,
+            &dyn Fn() -> bool,
+        ) -> Result<ss2::cover::CoverOutcome, ss2::Error>;
+        let _run: RunCover = ss2::cover::run_cover;
+        ss2::provider::check_device(&Device::Cpu).expect("the CPU is a transcription device");
+
+        // Noncommercial only: the owner basis covers the port, never commercial use or
+        // redistribution of the weights.
+        authorize_closure(
+            yue2::Closure::Cover,
+            IntendedUse::NoncommercialExperimentation,
+        )
+        .expect("recording -> transcription -> cover is a supported noncommercial path");
+        for refused in [IntendedUse::CommercialUse, IntendedUse::Redistribution] {
+            assert!(authorize_closure(yue2::Closure::Cover, refused).is_err());
+        }
+
+        // The catalog publishes the cover closure's rows and the `sheetsage2` mapping.
+        let rows = candle_audio_catalog::component_licenses();
+        for row in ss2::provider::COMPONENT_LICENSES {
+            assert!(rows.contains(row), "{} is not published", row.component);
+        }
+        let mapping = candle_audio_catalog::provider_components();
+        let published = mapping
+            .iter()
+            .find(|p| p.provider_id == ss2::provider::TRANSCRIBER_ID)
+            .expect("the sheetsage2 mapping is published");
+        assert_eq!(
+            published.components,
+            ["yue2_sheetsage2", "yue2_mert_v2_fullsong"]
+        );
+        assert!(candle_audio_catalog::CRATE_API_PROVIDERS.contains(&ss2::provider::TRANSCRIBER_ID));
+    }
+
     /// Epic SC-22657 (E1 + E2), story SC-22662: the registry-wide acceptance skeleton for the MLX
     /// bundle. Every memory-contract surface this platform registers — every provider, at every
     /// tier and materialization selector — must publish an honest byte decomposition *and* declare
@@ -270,7 +411,8 @@ mod tests {
         // over SAME-L, both domains, 380 s) + the three pre-trained -base siblings
         // stable_audio_3_{small_music,small_sfx,medium}_base (sc-14546 — rectified_flow,
         // Euler/50/7.0 defaults), and moss_ttsd_v05
-        // (multi-speaker dialogue TTS, sc-13518), plus the
+        // (multi-speaker dialogue TTS, sc-13518), the six yue_* lyrics2song variants (sc-19382), the noncommercial yue2 song generator
+        // (sc-22994), plus the
         // voice-cloning identity embedder
         // chatterbox_ve (sc-12844); later stories extend in catalog order. The lane carries the
         // composed candle preparer (sc-12835/sc-12836) while the main preparer registry stays
@@ -297,7 +439,14 @@ mod tests {
                     "chatterbox_tts",
                     "mmaudio_small_16k",
                     "mmaudio_large_44k",
-                    "moss_ttsd_v05"
+                    "moss_ttsd_v05",
+                    "yue_en_cot",
+                    "yue_en_icl",
+                    "yue_zh_cot",
+                    "yue_zh_icl",
+                    "yue_jp_kr_cot",
+                    "yue_jp_kr_icl",
+                    "yue2"
                 ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
@@ -409,6 +558,13 @@ mod tests {
                 "mmaudio_small_16k",
                 "mmaudio_large_44k",
                 "moss_ttsd_v05",
+                "yue_en_cot",
+                "yue_en_icl",
+                "yue_zh_cot",
+                "yue_zh_icl",
+                "yue_jp_kr_cot",
+                "yue_jp_kr_icl",
+                "yue2",
                 "dummy-audio"
             ]
         );

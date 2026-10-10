@@ -653,6 +653,32 @@ pub enum Quant {
     Nvfp4,
 }
 
+/// YuE2's AR execution mode, separate from the loaded weight tier. Experimental FP8 replaces
+/// only AR projections during generation and restores their BF16 originals before acoustic work;
+/// it is not a whole-model [`Quant`] tier. Other providers must refuse a non-native mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Yue2ArMode {
+    /// Run AR with the loaded weight tier's ordinary projection kernels.
+    #[default]
+    Native,
+    /// Run only the AR projections in experimental E4M3 on CUDA sm_89+ over BF16 weights.
+    ExperimentalFp8,
+}
+
+/// YuE2's stage compute policy, distinct from its quantized weight tier and from the shared
+/// [`Precision`] provider-default sentinel. Legacy preserves already queued loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Yue2ComputePolicy {
+    #[default]
+    Legacy,
+    /// Explicitly allow the provider's mixed stage dtypes (BF16 MoT, FP32 VAE on a GPU).
+    Auto,
+    /// Run the MoT and both VAE variants in BF16; unsupported on the CPU.
+    Bf16,
+    /// Run the MoT and both VAE variants in FP32.
+    Fp32,
+}
+
 impl Quant {
     /// Element bit-width of the tier. For [`Q4`](Self::Q4)/[`Q8`](Self::Q8) this is the width passed to
     /// the MLX affine quantizer. [`Nvfp4`](Self::Nvfp4) reports `4` (its E2M1 elements are 4-bit) but is
@@ -805,6 +831,10 @@ pub struct LoadSpec {
     prepared_encoder_receipt: Option<crate::encoder_contract::PreparedEncoderLoadReceipt>,
     pub quantize: Option<Quant>,
     pub precision: Precision,
+    /// YuE2-only AR execution mode; every other provider refuses a non-native value.
+    pub yue2_ar_mode: Yue2ArMode,
+    /// YuE2-only stage compute policy; other providers refuse a non-legacy value.
+    pub yue2_compute_policy: Yue2ComputePolicy,
     /// Auxiliary control-branch weights overlaid onto the base model at load time — a ControlNet
     /// checkpoint applied on top of `weights` (e.g. Z-Image's Fun-Controlnet-Union safetensors).
     /// `None` for the plain base model; a control-variant loader requires it. A load-time model
@@ -969,6 +999,8 @@ impl LoadSpec {
             prepared_encoder_receipt: None,
             quantize: None,
             precision: Precision::Bf16,
+            yue2_ar_mode: Yue2ArMode::Native,
+            yue2_compute_policy: Yue2ComputePolicy::Legacy,
             control: None,
             extra_controls: Vec::new(),
             ip_adapter: None,
@@ -1664,6 +1696,18 @@ impl LoadSpec {
     /// Builder-style quantization override.
     pub fn with_quant(mut self, quant: Quant) -> Self {
         self.quantize = Some(quant);
+        self
+    }
+
+    /// Select YuE2's AR execution mode independently of its weight tier.
+    pub fn with_yue2_ar_mode(mut self, mode: Yue2ArMode) -> Self {
+        self.yue2_ar_mode = mode;
+        self
+    }
+
+    /// Select YuE2's stage compute policy independently of the weight tier.
+    pub fn with_yue2_compute_policy(mut self, policy: Yue2ComputePolicy) -> Self {
+        self.yue2_compute_policy = policy;
         self
     }
 

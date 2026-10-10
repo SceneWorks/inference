@@ -44,6 +44,7 @@ fn train_lora(tmp: &Path) -> PathBuf {
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         });
     }
     let mut trainer = mlx_gen_kolors::provider_registry()

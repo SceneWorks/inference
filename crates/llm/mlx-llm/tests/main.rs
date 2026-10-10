@@ -38,6 +38,9 @@ mod continuous;
 #[path = "contract_roundtrip.rs"]
 mod contract_roundtrip;
 
+#[path = "draft_model.rs"]
+mod draft_model;
+
 #[path = "gemma4_decoder.rs"]
 mod gemma4_decoder;
 
@@ -59,8 +62,17 @@ mod gguf_tokenizer;
 #[path = "joycaption.rs"]
 mod joycaption;
 
+#[path = "load_admission_probe.rs"]
+mod load_admission_probe;
+
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
+
+#[path = "moe_routing.rs"]
+mod moe_routing;
+
+#[path = "native_composition.rs"]
+mod native_composition;
 
 #[path = "paged.rs"]
 mod paged;
@@ -71,6 +83,12 @@ mod prefix;
 #[path = "prepare_snapshot.rs"]
 mod prepare_snapshot;
 
+#[path = "prism.rs"]
+mod prism;
+
+#[path = "quantized_compute_dtype.rs"]
+mod quantized_compute_dtype;
+
 #[path = "qwen35.rs"]
 mod qwen35;
 
@@ -79,6 +97,9 @@ mod qwen35_tools;
 
 #[path = "qwen35_vision.rs"]
 mod qwen35_vision;
+
+#[path = "qwen38_bonsai.rs"]
+mod qwen38_bonsai;
 
 #[path = "qwen3vl.rs"]
 mod qwen3vl;
@@ -94,6 +115,9 @@ mod snapshot_hf;
 
 #[path = "speculative.rs"]
 mod speculative;
+
+#[path = "speculative_bench.rs"]
+mod speculative_bench;
 
 #[path = "stop_strings.rs"]
 mod stop_strings;

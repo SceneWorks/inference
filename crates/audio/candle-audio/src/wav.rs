@@ -12,8 +12,10 @@ use gen_core::AudioTrack;
 use crate::{AudioError, Result};
 
 /// Encode a track as a complete 16-bit PCM WAV byte stream. Samples are clamped to
-/// `[-1, 1]` then scaled to `i16` (the standard float→PCM convention); `track.samples`
-/// is channel-interleaved, matching the [`AudioTrack`] contract.
+/// `[-1, 1]`, scaled by `i16::MAX` and **rounded to nearest** (half away from zero) — the
+/// convention torchaudio / soundfile `PCM_16` writers use; a truncating cast would bias every
+/// sample toward zero by up to one LSB and zero out sub-LSB signal. `track.samples` is
+/// channel-interleaved, matching the [`AudioTrack`] contract.
 pub fn encode_wav_pcm16(track: &AudioTrack) -> Result<Vec<u8>> {
     if track.channels == 0 || track.sample_rate == 0 {
         return Err(AudioError::Msg(format!(
@@ -62,7 +64,7 @@ pub fn encode_wav_pcm16(track: &AudioTrack) -> Result<Vec<u8>> {
     out.extend_from_slice(&data_len.to_le_bytes());
     for &s in &track.samples {
         let clamped = s.clamp(-1.0, 1.0);
-        out.extend_from_slice(&((clamped * i16::MAX as f32) as i16).to_le_bytes());
+        out.extend_from_slice(&((clamped * i16::MAX as f32).round() as i16).to_le_bytes());
     }
     Ok(out)
 }
@@ -122,6 +124,31 @@ mod tests {
         assert_eq!(pcm[1], i16::MAX);
         assert_eq!(pcm[2], -i16::MAX); // symmetric scale, clamped at -1.0
         assert_eq!(pcm[3], i16::MAX); // out-of-range input clamps, never wraps
+    }
+
+    /// Samples round to the nearest PCM step rather than truncating toward zero: ±0.4 LSB → 0,
+    /// ±0.6 LSB → ±1, ±2.6 LSB → ±3, and values just inside ±1.0 reach
+    /// ±`i16::MAX` instead of stopping one step short.
+    #[test]
+    fn samples_round_to_the_nearest_pcm_step() {
+        let lsb = 1.0 / i16::MAX as f32;
+        let near_full = 1.0 - 0.4 * lsb;
+        let samples = vec![
+            0.4 * lsb,
+            -0.4 * lsb,
+            0.6 * lsb,
+            -0.6 * lsb,
+            2.6 * lsb,
+            -2.6 * lsb,
+            near_full,
+            -near_full,
+        ];
+        let bytes = encode_wav_pcm16(&track(samples, 8_000, 1)).unwrap();
+        let pcm: Vec<i16> = bytes[44..]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(pcm, vec![0, 0, 1, -1, 3, -3, i16::MAX, -i16::MAX]);
     }
 
     #[test]

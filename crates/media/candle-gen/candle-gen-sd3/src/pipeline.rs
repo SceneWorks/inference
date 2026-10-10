@@ -904,7 +904,10 @@ fn denoise_latents(
 /// `/scaling_factor + shift_factor` un-scale inside `decode`; the `[-1, 1]` output maps to `[0, 255]`
 /// u8.
 fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-    let decoded = vae.decode(latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    // (1, 3, H, W) in [-1, 1]
+    let decoded =
+        candle_gen::bounded_kl_decode(&crate::vae::VAE_DECODER, latents, |l| vae.decode(l))?
+            .to_dtype(DType::F32)?;
     let scaled = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?;
     let img = candle_gen::round_rgb8(&scaled)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;

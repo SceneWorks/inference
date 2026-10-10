@@ -1100,12 +1100,23 @@ impl MiniMaxH3 {
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
         // and each reference is put on its own resolution here.
+        //
+        // The image short edge is the request's effective one (sc-23402). It sizes the reference and
+        // its latent rows only. Range-checked AT THE READ rather than trusting `validate`: unlike
+        // the MLX port, `generate_impl` does not route through `Generator::validate`, so a caller
+        // that skips validation would otherwise reach `normalize_reference_image`, which accepts any
+        // positive edge and would silently encode an 8192 reference.
+        let reference_short_edge = reference_short_edge_for(req)?;
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {
             normalized.push(match r {
-                Ref2VaReference::Image(img) => Ref2VaReference::Image(
-                    crate::reference::normalize_reference_image(img, SPATIAL_STRIDE as i32)?,
-                ),
+                Ref2VaReference::Image(img) => {
+                    Ref2VaReference::Image(crate::reference::normalize_reference_image(
+                        img,
+                        SPATIAL_STRIDE as i32,
+                        reference_short_edge,
+                    )?)
+                }
                 Ref2VaReference::Video(v) => Ref2VaReference::Video(VideoReference {
                     frames: crate::reference::normalize_reference_clip(
                         &v.frames,
@@ -1689,6 +1700,23 @@ pub(crate) fn request_references(req: &GenerationRequest) -> Result<Option<Ref2V
     Ref2VaReferences::new(refs).map(Some)
 }
 
+/// The request's effective reference-image short edge, **range-checked at the read** (sc-23402).
+///
+/// [`MiniMaxH3::generate_ref2va`] reads the knob through here rather than calling
+/// [`candle_gen::gen_core::effective_reference_image_short_edge`] directly, because
+/// [`MiniMaxH3::generate_impl`] does not route through [`Generator::validate`] the way the MLX port
+/// does. Without this, the 1024..=2048 range would hold only for a caller that validated first, and
+/// [`crate::reference::normalize_reference_image`] admits any positive edge — so an unvalidated 8192
+/// would be encoded rather than refused.
+///
+/// The refusal is [`candle_gen::gen_core::validate_reference_image_short_edge`]'s own, so the message
+/// a `generate`-path caller sees is identical to the one `validate` produces.
+fn reference_short_edge_for(req: &GenerationRequest) -> Result<i32> {
+    candle_gen::gen_core::validate_reference_image_short_edge(MODEL_ID, req)
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
+    Ok(candle_gen::gen_core::effective_reference_image_short_edge(req) as i32)
+}
+
 impl Generator for MiniMaxH3 {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -1721,6 +1749,11 @@ impl Generator for MiniMaxH3 {
         // sc-19571 — the conditioning-strength refusal runs at the request boundary, not deep
         // inside a render that has already mapped the text encoder.
         reject_keyframe_strength(&req.keyframes())?;
+
+        // sc-23402 — the reference-image short edge, refused here for the same reason: this is the
+        // only gate that runs before any weight is read. Unconditional rather than ref2va-only, so
+        // a value typed onto a request carrying no image reference is still caught.
+        candle_gen::gen_core::validate_reference_image_short_edge(MODEL_ID, req)?;
 
         // **The area budget runs HERE, not only inside `generate`** (sc-17152).
         //
@@ -4012,6 +4045,80 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("conditioning strength is not supported"), "{e}");
+    }
+
+    /// The candle twin of MLX's `validate_refuses_a_reference_image_short_edge_outside_1024_to_2048`.
+    ///
+    /// Without it, deleting the `validate_reference_image_short_edge` call from this port's
+    /// `validate` reds nothing — the gen-core unit test covers the helper, not the call site, and the
+    /// call site is the only thing that runs before the 53 GB text encoder maps.
+    #[test]
+    fn validate_refuses_a_reference_image_short_edge_outside_1024_to_2048() {
+        let model = validator();
+        let with = |edge: u32| GenerationRequest {
+            reference_image_short_edge: Some(edge),
+            ..request(576, 320)
+        };
+
+        for bad in [1023u32, 2049] {
+            let e = model.validate(&with(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains("reference_image_short_edge")
+                    && e.contains(&bad.to_string())
+                    && e.contains("1024..=2048"),
+                "{bad}: {e}"
+            );
+        }
+        model.validate(&with(1024)).expect("1024 is admitted");
+        model.validate(&with(2048)).expect("2048 is admitted");
+        model
+            .validate(&request(576, 320))
+            .expect("an absent knob is vacuous");
+    }
+
+    /// The `generate` path enforces the range **itself**, not by trusting a prior `validate`.
+    ///
+    /// `generate_impl` does not call `Generator::validate` (the MLX port does), and
+    /// `normalize_reference_image` accepts any positive edge — so the read
+    /// `generate_ref2va` goes through is the gate, and this drives that read directly: no weights,
+    /// no device.
+    #[test]
+    fn the_generate_path_read_refuses_an_out_of_range_reference_short_edge() {
+        let with = |edge: u32| GenerationRequest {
+            reference_image_short_edge: Some(edge),
+            ..request(576, 320)
+        };
+
+        let e = reference_short_edge_for(&with(8192))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("reference_image_short_edge")
+                && e.contains("8192")
+                && e.contains("1024..=2048"),
+            "{e}"
+        );
+        assert!(reference_short_edge_for(&with(1023)).is_err());
+        assert!(reference_short_edge_for(&with(2049)).is_err());
+
+        // ...and it still resolves the admitted values, including the absent default.
+        assert_eq!(reference_short_edge_for(&with(1024)).unwrap(), 1024);
+        assert_eq!(reference_short_edge_for(&with(2048)).unwrap(), 2048);
+        assert_eq!(reference_short_edge_for(&request(576, 320)).unwrap(), 2048);
+
+        // The render path must READ through the checked helper. Without this, reverting
+        // `generate_ref2va` to `effective_reference_image_short_edge(req)` would leave every
+        // assertion above green while an unvalidated edge flowed straight into
+        // `normalize_reference_image` — the defect this test exists for.
+        let body = body_of(&production_source(), "fn generate_ref2va(");
+        assert!(
+            body.contains("reference_short_edge_for(req)?"),
+            "generate_ref2va must resolve the short edge through the range-checked helper"
+        );
+        assert!(
+            !body.contains("effective_reference_image_short_edge"),
+            "generate_ref2va must NOT read the knob directly, bypassing the range check"
+        );
     }
 
     /// The step bound is a real gate, not a comment: every step is a full 33 B forward.

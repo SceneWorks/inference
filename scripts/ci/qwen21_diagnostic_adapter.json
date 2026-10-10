@@ -1,0 +1,45 @@
+{
+  "purpose": "DIAGNOSTIC_ONLY",
+  "acceptanceEvidence": false,
+  "repository": "SceneWorks/inference",
+  "releaseId": 402708057,
+  "trainingProvenance": {
+    "trainingSourceMain": "b3ec3f0b8ee6880dc55e6433a35dc60116709752",
+    "trainingRun": 37214050997,
+    "trainingJob": 111470848550,
+    "trainingRunConclusion": "failure retained; training complete and finite, learned/cross-mode render assertions failed",
+    "steps": 120,
+    "datasetSha256": "0d4927eedfcf33eb609278089c02c58f729a87f65d78170b0d7076f3a352073c",
+    "trainingCaption": "zxq edit: invert each RGB colour channel of image 1 independently, then quantize each channel to the four numeric levels 0, 85, 170, 255; preserve the shapes and keep the result in colour"
+  },
+  "adapters": [
+    {
+      "name": "cuda_lokr",
+      "origin": "CUDA",
+      "kind": "lokr",
+      "assetId": 608607182,
+      "assetName": "cuda_edit_lokr.safetensors",
+      "size": 6759392,
+      "file": "qwen21_cuda_lokr.safetensors",
+      "sha256": "201bffa58dc8a1b61ec6399845109ebc3741220f9942f6caa0bfdc85695abf96"
+    },
+    {
+      "name": "mlx_corrected_edit_lokr",
+      "kind": "lokr",
+      "assetId": 610282099,
+      "assetName": "qwen21_edit_lokr_120step_c233129e.safetensors",
+      "size": 6759417,
+      "sha256": "c233129e9a64e384850331c9804b5b496d5208c08fe34aca4c680920fddb03d7",
+      "file": "qwen21_diagnostic_edit_lokr.safetensors"
+    },
+    {
+      "name": "training_receipt",
+      "kind": "diagnostic_training_receipt",
+      "assetId": 610282097,
+      "assetName": "qwen21_edit_lokr_120step_c233129e_training.json",
+      "size": 50361,
+      "sha256": "fa5b6234870f6ac0784f893067524407178ee9ee1678c50bc6bd6713d008e333",
+      "file": "training-receipt.json"
+    }
+  ]
+}

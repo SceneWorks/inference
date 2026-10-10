@@ -34,6 +34,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Module, VarBuilder};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::vae_tiling::{tiled_conv2d_3x3_nchw, GlobalGroupNorm};
+use candle_gen::{budgeted_conv2d, BudgetedConv2d};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
 
@@ -46,8 +47,8 @@ const NORM_EPS: f64 = 1e-6;
 /// Upstream's `output_scale_factor` for every VAE resnet.
 const OUTPUT_SCALE_FACTOR: f64 = 1.0;
 
-fn conv3x3(in_c: usize, out_c: usize, vs: VarBuilder) -> Result<nn::Conv2d> {
-    Ok(nn::conv2d(
+fn conv3x3(in_c: usize, out_c: usize, vs: VarBuilder) -> Result<BudgetedConv2d> {
+    Ok(budgeted_conv2d(
         in_c,
         out_c,
         3,
@@ -59,8 +60,8 @@ fn conv3x3(in_c: usize, out_c: usize, vs: VarBuilder) -> Result<nn::Conv2d> {
     )?)
 }
 
-fn conv1x1(in_c: usize, out_c: usize, vs: VarBuilder) -> Result<nn::Conv2d> {
-    Ok(nn::conv2d(in_c, out_c, 1, Default::default(), vs)?)
+fn conv1x1(in_c: usize, out_c: usize, vs: VarBuilder) -> Result<BudgetedConv2d> {
+    Ok(budgeted_conv2d(in_c, out_c, 1, Default::default(), vs)?)
 }
 
 /// A `GroupNorm` kept alongside its raw affine parameters, so the same layer can be evaluated
@@ -97,10 +98,10 @@ impl Norm {
 /// [`OUTPUT_SCALE_FACTOR`].
 struct VaeResnetBlock {
     norm1: Norm,
-    conv1: nn::Conv2d,
+    conv1: BudgetedConv2d,
     norm2: Norm,
-    conv2: nn::Conv2d,
-    shortcut: Option<nn::Conv2d>,
+    conv2: BudgetedConv2d,
+    shortcut: Option<BudgetedConv2d>,
 }
 
 impl VaeResnetBlock {
@@ -170,7 +171,7 @@ impl VaeResnetBlock {
 /// Upstream's `UpDecoderBlock2D`: a run of resnets and an optional nearest-2× + 3×3 upsampler.
 struct UpBlock {
     resnets: Vec<VaeResnetBlock>,
-    upsampler: Option<nn::Conv2d>,
+    upsampler: Option<BudgetedConv2d>,
 }
 
 impl UpBlock {
@@ -253,12 +254,12 @@ impl UpBlock {
 /// The SDXL VAE decode path: `post_quant_conv` → `conv_in` → mid block → `up_blocks` →
 /// `conv_norm_out` → silu → `conv_out`.
 pub struct SdxlVaeDecoder {
-    post_quant_conv: Option<nn::Conv2d>,
-    conv_in: nn::Conv2d,
+    post_quant_conv: Option<BudgetedConv2d>,
+    conv_in: BudgetedConv2d,
     mid_block: UNetMidBlock2D,
     up_blocks: Vec<UpBlock>,
     norm_out: Norm,
-    conv_out: nn::Conv2d,
+    conv_out: BudgetedConv2d,
 }
 
 impl SdxlVaeDecoder {

@@ -265,7 +265,9 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
 fn decode_preview(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
     // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
     let latents = latents.squeeze(2)?;
-    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let decoded =
+        candle_gen::bounded_kl_decode(&crate::common::VAE_DECODER, &latents, |l| vae.decode(l))?
+            .to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
     let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
         .i(0)?
         .to_device(&Device::Cpu)?;
@@ -313,6 +315,7 @@ pub fn trainer_descriptor() -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -361,6 +364,7 @@ impl Trainer for ZImageTrainer {
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA
         // adapter the caller did not ask for (F-006/F-055).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_flow_match_request(req, LABEL).map_err(Into::into)
     }
 
@@ -882,6 +886,7 @@ mod tests {
             caption: "x".into(),
             control_image_path: None,
             model_options: Default::default(),
+            reference_image_paths: Vec::new(),
         };
         let base = TrainingRequest {
             items: vec![item.clone()],

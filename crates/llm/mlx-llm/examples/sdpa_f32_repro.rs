@@ -1,4 +1,16 @@
+//! **Superseded (sc-20676):** this repro reads results with `as_slice`, which returns the raw
+//! buffer and ignores strides. MLX's fused full attention kernel returns a transposed view
+//! (strides `[L·H·D, D, H·D, 1]`), so every "wrong" fused-SDPA `q_len > 8` multi-head cell below
+//! is a readback artifact, not a kernel bug; read stride-aware and the kernel matches the host
+//! reference in f32/bf16/f16 (`fused_full_kernel_matches_host_across_dtypes`).
+//!
 //! Standalone repro for **sc-7430**: localize the wrong-numbers bug on the pinned pmetal mlx-rs fork.
+//!
+//! **Resolved by sc-24442:** there was no kernel bug. MLX's fused full attention kernel (`q_len > 8`,
+//! head dims 64/80/128) writes its `[B, H, L, D]` output as a permuted-dense view over `[B, L, H, D]`
+//! storage, and this repro originally read results with a stride-blind `as_slice` — so it reported
+//! the output transposed ("O(1)-wrong", correct only at one head). [`read_f32`] now reads in logical
+//! order and every cell matches the f64 reference.
 //!
 //! The story's hypothesis was that BOTH MLX's fused `scaled_dot_product_attention` AND a raw **4-D
 //! batched `matmul`** return wrong **f32** results at multi-head / `seq >= 16` / `head_dim >= 64`
@@ -58,7 +70,10 @@ fn to_dtype(data: &[f32], shape: &[i32], dt: Dtype) -> (Array, Vec<f32>) {
 
 /// Read an MLX array back as f32 regardless of stored dtype (forces evaluation).
 fn read_f32(a: &Array) -> Vec<f32> {
+    // The reshape copies a non-row-contiguous result into logical order (sc-24442).
     a.as_dtype(Dtype::Float32)
+        .unwrap()
+        .reshape(&[-1])
         .unwrap()
         .as_slice::<f32>()
         .to_vec()

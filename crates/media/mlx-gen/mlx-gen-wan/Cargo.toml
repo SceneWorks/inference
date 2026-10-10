@@ -39,3 +39,8 @@ sceneworks-gen-core-testkit = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+# SC-20686: the campaign entrypoint's route load settings are unit-tested against the product's.
+[[example]]
+name = "sc20686_wan"
+test = true

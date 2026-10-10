@@ -4,17 +4,21 @@
 //! wrapper: this module accepts only the published 1B image-to-SVG shape and records the native
 //! preprocessing and weight-tree facts needed by the Candle model implementation.
 
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::{Device, Tensor};
 use serde_json::Value;
 
-use crate::decode::stream::default_seed;
+use crate::decode::{
+    generate_step_from_prefill, DecodeRecord, FinishReason as DecodeFinish, GenerationConfig,
+    RequestSpan, StreamEvent as DecodeEvent,
+};
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
 use crate::models::StarVectorModel;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
 /// The only snapshot family this provider admits.
@@ -35,6 +39,12 @@ pub const VOCAB_SIZE: usize = 49_156;
 const SVG_PROMPT: &str = "<svg";
 /// StarCoderBase's `<|endoftext|>` id. It terminates generation and is never decoded as source.
 const EOS_TOKEN_ID: i32 = 0;
+const MAX_CONTEXT_TOKENS: usize = 8_192;
+// The loaded snapshot tokenizer must still encode the fixed decoder prompt as two IDs; `load`
+// checks that before the descriptor is trusted by request validation.
+const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+const MAX_NEW_TOKENS: u32 =
+    (MAX_CONTEXT_TOKENS - (IMAGE_TOKEN_COUNT + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// Join the half-precision vision adapter output to the decoder's dense embedding stream.
 ///
@@ -45,12 +55,26 @@ fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result
     Ok(Tensor::cat(&[&vision, text], 1)?)
 }
 
-/// Sample one vocabulary row, preserving the provider's single-image shape contract.
+/// The contract's sampling knobs as the sampler's.
+fn sampling_params(sampling: &core_llm::Sampling) -> SamplingParams {
+    SamplingParams {
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        presence_penalty: sampling.presence_penalty,
+        repetition_penalty: sampling.repetition_penalty,
+        repetition_context: sampling.repetition_context,
+    }
+}
+
+/// Sample one vocabulary row, preserving the provider's single-image shape contract — the
+/// selection rule the shared decode engine applies to every row it draws a token from.
+#[cfg(test)]
 fn next_token_id(
     logits: &Tensor,
     history: &[i32],
     sampling: &core_llm::Sampling,
-    rng: &mut SplitMix64,
+    rng: &mut crate::primitives::sampler::SplitMix64,
 ) -> Result<i32> {
     let dims = logits.dims();
     let vocabulary = dims.last().copied().unwrap_or(0);
@@ -64,19 +88,7 @@ fn next_token_id(
             "starvector token selection requires one nonempty vocabulary row; got {dims:?}"
         )));
     }
-    sample(
-        logits,
-        history,
-        &SamplingParams {
-            temperature: sampling.temperature,
-            top_p: sampling.top_p,
-            top_k: sampling.top_k,
-            repetition_penalty: sampling.repetition_penalty,
-            repetition_context: sampling.repetition_context,
-        },
-        rng,
-        None,
-    )
+    crate::primitives::sampler::sample(logits, history, &sampling_params(sampling), rng, None)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -86,26 +98,16 @@ enum DecodedSvgToken {
     Source(String),
 }
 
-/// Decode one sampled continuation token against the complete generated-token history.
-///
-/// The prompt is intentionally absent from `generated_ids`: it is seeded into the bounded source
-/// exactly once by the provider. Re-decoding the growing continuation is required for byte-level
-/// BPE fragments, while `skip_special_tokens = true` prevents genuine tokenizer controls from
-/// becoming SVG source. Non-special added vocabulary remains ordinary model output and therefore
-/// still reaches the fail-closed SVG boundary.
+/// Decode one sampled continuation token with bounded tokenizer state.
 fn decode_generated_svg_token(
-    tokenizer: &core_llm::Tokenizer,
-    generated_ids: &mut Vec<u32>,
-    detok: &mut core_llm::IncrementalDetok,
+    detok: &mut core_llm::TokenizerDecodeStream,
     id: i32,
 ) -> core_llm::Result<DecodedSvgToken> {
     if id == EOS_TOKEN_ID {
         return Ok(DecodedSvgToken::Eos);
     }
-    generated_ids.push(id as u32);
-    let decoded = tokenizer.decode(generated_ids, true)?;
-    Ok(match detok.push(&decoded) {
-        Some(delta) => DecodedSvgToken::Source(delta.to_owned()),
+    Ok(match detok.step(id as u32)? {
+        Some(delta) => DecodedSvgToken::Source(delta),
         None => DecodedSvgToken::Hidden,
     })
 }
@@ -244,7 +246,8 @@ impl StarVectorConfig {
     }
 }
 
-/// Read and validate `config.json` only.  This deliberately never opens a safetensors shard.
+/// Read and validate `config.json` only. This accepts either a snapshot directory or a direct
+/// config path and deliberately never opens a safetensors shard.
 pub fn read_config(dir: impl AsRef<Path>) -> Result<StarVectorConfig> {
     let source = dir.as_ref();
     let path = if source.is_dir() {
@@ -258,9 +261,13 @@ pub fn read_config(dir: impl AsRef<Path>) -> Result<StarVectorConfig> {
     StarVectorConfig::from_json(&value)
 }
 
-/// Weightless registry probe for the exact 1B snapshot.
+/// Weightless registry probe for the exact 1B snapshot directory.
 pub fn can_load_path(dir: impl AsRef<Path>) -> bool {
-    read_config(dir).is_ok()
+    can_load_path_with(dir.as_ref(), |path| read_config(path).is_ok())
+}
+
+fn can_load_path_with(dir: &Path, read_config: impl FnOnce(&Path) -> bool) -> bool {
+    dir.is_dir() && read_config(dir)
 }
 
 /// StarVector's published image processor: pad RGB to a white square, bicubic-resize to 224, and
@@ -360,14 +367,35 @@ pub struct CandleStarVectorProvider {
     descriptor: core_llm::TextLlmDescriptor,
     svg: core_llm::StarVectorDescriptor,
     processor: StarVectorImageProcessor,
+    /// The device the weights were loaded on; request pixels go here (sc-24134).
+    device: Device,
     tokenizer: core_llm::Tokenizer,
     prompt: Vec<i32>,
     model: Mutex<StarVectorModel>,
+    /// The speculative option a request that leaves it unset runs with — this backend's row of
+    /// the defaults table ([`core_llm::defaults`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
 }
+/// The load's NVFP4 refusal (sc-24139): NVFP4 is not served for StarVector-1B (the Llama
+/// provider serves it for the qwen3_5 hybrid and the llama family, sc-24135 / sc-24140), and
+/// NVFP4 is a capability a provider must refuse rather than silently load another
+/// representation. [`crate::backend::nvfp4_support`] answers a product's per-snapshot question
+/// with the same gate.
+pub(crate) fn nvfp4_gate(spec: &core_llm::LoadSpec) -> core_llm::Result<()> {
+    if spec.quantize == Some(core_llm::Quantize::Nvfp4) {
+        return Err(core_llm::Error::Unsupported(
+            "nvfp4: NVFP4 projections are not served for StarVector-1B".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CandleStarVectorProvider {
     pub fn load(spec: &core_llm::LoadSpec) -> core_llm::Result<Self> {
+        nvfp4_gate(spec)?;
         read_config(&spec.source).map_err(to_core)?;
-        let device = crate::device::select_device().map_err(to_core)?;
+        let device = crate::device::select_eager_device().map_err(to_core)?;
         let weights = Weights::from_dir(&spec.source, &device).map_err(to_core)?;
         for key in REQUIRED_WEIGHT_KEYS {
             if !weights.contains(key) {
@@ -378,18 +406,23 @@ impl CandleStarVectorProvider {
         }
         let tokenizer =
             core_llm::Tokenizer::from_file(Path::new(&spec.source).join("tokenizer.json"))?;
-        let prompt = tokenizer
+        let prompt: Vec<i32> = tokenizer
             .encode(SVG_PROMPT, false)?
             .into_iter()
             .map(|id| id as i32)
             .collect();
+        let descriptor = descriptor();
+        let svg = svg_descriptor();
+        validate_loaded_context_cap(&descriptor, &svg, prompt.len())?;
         Ok(Self {
-            descriptor: descriptor(),
-            svg: svg_descriptor(),
+            descriptor,
+            svg,
             processor: StarVectorImageProcessor::default(),
             tokenizer,
             prompt,
             model: Mutex::new(StarVectorModel::from_weights(&weights).map_err(to_core)?),
+            speculative_default: crate::device::decode_defaults(&device).speculative,
+            device,
         })
     }
 }
@@ -399,17 +432,43 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
         family: "starvector-1b".into(),
         backend: "candle".into(),
         capabilities: core_llm::TextLlmCapabilities {
-            max_context_tokens: 8192,
-            max_new_tokens: 4096,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            max_new_tokens: MAX_NEW_TOKENS,
             supports_system_prompt: false,
             supports_vision: true,
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
+            speculative: Vec::new(),
             supported_constraints: vec![],
         },
     }
+}
+
+fn validate_loaded_context_cap(
+    descriptor: &core_llm::TextLlmDescriptor,
+    starvector: &core_llm::StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> core_llm::Result<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| {
+            core_llm::Error::InvalidRequest("StarVector-1B image prefix does not fit usize".into())
+        })?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| {
+            core_llm::Error::InvalidRequest("StarVector-1B prefill token count overflow".into())
+        })?;
+    core_llm::validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
 }
 pub fn svg_descriptor() -> core_llm::StarVectorDescriptor {
     core_llm::StarVectorDescriptor {
@@ -457,34 +516,83 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
         if req.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
         };
-        let svg = core_llm::StarVectorRequest::new(
-            req.clone(),
-            1_000_000,
-            std::time::Duration::from_secs(120),
-        );
-        let out = core_llm::StarVectorProvider::generate_svg(self, &svg, &mut |_| {})?;
-        let finish = match out.finish_reason {
-            core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
-            core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
-            _ => core_llm::FinishReason::Stop,
-        };
-        let usage = core_llm::Usage {
-            prompt_tokens: (257 + self.prompt.len()) as u32,
-            generated_tokens: out.generated_tokens,
-        };
-        events(core_llm::StreamEvent::Done {
-            finish_reason: finish,
-            usage,
-        });
-        Ok(core_llm::TextLlmOutput {
-            text: out.svg.unwrap_or_default(),
-            thinking: None,
-            tool_calls: vec![],
-            usage,
-            finish_reason: Some(finish),
-        })
+        svg_text_output(
+            req,
+            (IMAGE_TOKEN_COUNT + self.prompt.len()) as u32,
+            self.speculative_default,
+            events,
+            |svg| self.generate_svg_recorded(svg, &mut |_| {}),
+        )
     }
 }
+/// The text contract's answer for one SVG generation: `decode` runs the bounded SVG request built
+/// from `req`, and its output becomes the text, usage and finish reason (`Done` emitted on
+/// `events`) — and its measured record (sc-24139) the report, carrying the captioner reasons with
+/// the request's option resolved against the provider's `speculative_default` (E2, E5, E8).
+fn svg_text_output(
+    req: &core_llm::TextLlmRequest,
+    prompt_tokens: u32,
+    speculative_default: core_llm::Speculative,
+    events: &mut dyn FnMut(core_llm::StreamEvent),
+    decode: impl FnOnce(
+        &core_llm::StarVectorRequest,
+    ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)>,
+) -> core_llm::Result<core_llm::TextLlmOutput> {
+    let svg = core_llm::StarVectorRequest::new(
+        req.clone(),
+        1_000_000,
+        std::time::Duration::from_secs(120),
+    );
+    let (out, record) = decode(&svg)?;
+    let finish = match out.finish_reason {
+        core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
+        core_llm::StarVectorFinishReason::TokenLimit => core_llm::FinishReason::Length,
+        _ => core_llm::FinishReason::Stop,
+    };
+    let usage = core_llm::Usage {
+        prompt_tokens,
+        generated_tokens: out.generated_tokens,
+    };
+    events(core_llm::StreamEvent::Done {
+        finish_reason: finish,
+        usage,
+    });
+    Ok(core_llm::TextLlmOutput {
+        timings: None,
+        text: out.svg.unwrap_or_default(),
+        thinking: None,
+        tool_calls: vec![],
+        usage,
+        mtp: None,
+        // The continuation decodes through the shared engine (sc-24138), so it reports its
+        // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
+        // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
+        // StarVector advertises no proposer and has no prefix cache: both are named, in the
+        // words MLX's StarVector uses (E2, E8).
+        decode: record.map(|record| svg_report(&record, req, speculative_default)),
+        finish_reason: Some(finish),
+        // The StarVector wrapper has no compressed-KV table family: the dense KV-cache report for
+        // the request's policy (sc-20683).
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(
+            req.kv_compression,
+        )),
+    })
+}
+/// An SVG continuation's measured report (sc-24139): the engine record with the CUDA-graph
+/// switch off (no graph runner wraps this decoder), and — StarVector advertising no proposer and
+/// having no prefix cache — the request's speculative fallback and the prefix-cache reason named
+/// in the words MLX's StarVector uses (E2, E8). The request's option is resolved against the
+/// provider's per-backend `default` (E5), so a table default of `auto` is named too.
+fn svg_report(
+    record: &DecodeRecord,
+    req: &core_llm::TextLlmRequest,
+    default: core_llm::Speculative,
+) -> core_llm::DecodeReport {
+    record
+        .report(false)
+        .with_captioner_reasons(req.speculative_or(default))
+}
+
 impl core_llm::StarVectorProvider for CandleStarVectorProvider {
     fn starvector_descriptor(&self) -> &core_llm::StarVectorDescriptor {
         &self.svg
@@ -494,7 +602,20 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
         req: &core_llm::StarVectorRequest,
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::StarVectorOutput> {
-        self.validate_svg(req)?;
+        self.generate_svg_recorded(req, events)
+            .map(|(output, _)| output)
+    }
+}
+impl CandleStarVectorProvider {
+    /// [`StarVectorProvider::generate_svg`](core_llm::StarVectorProvider::generate_svg) plus the
+    /// measured decode record of the continuation (sc-24139) — `None` when the bounded stream
+    /// stopped on the seeded prompt, before any decode step.
+    fn generate_svg_recorded(
+        &self,
+        req: &core_llm::StarVectorRequest,
+        events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
+    ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)> {
+        core_llm::StarVectorProvider::validate_svg(self, req)?;
         if req.text_request.cancel.is_cancelled() {
             return Err(core_llm::Error::Canceled);
         }
@@ -518,71 +639,144 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 &image.pixels,
                 image.width as usize,
                 image.height as usize,
-                &crate::device::select_device().map_err(to_core)?,
+                &self.device,
             )
             .map_err(to_core)?;
-        let mut model = self
+        // The decoder is stateless (the request's K/V live in its own step cache); the lock only
+        // serializes generations, bounding the device memory the provider holds to one request.
+        let model = self
             .model
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        model.reset();
         let result = (|| {
             let vision = model.image_embeddings(&pixels).map_err(to_core)?;
             let ids = input_ids(&self.prompt, pixels.device())
                 .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-            let text = model.decoder.embeddings(&ids).map_err(to_core)?;
+            let decoder = &model.decoder;
+            let text = decoder.embeddings(&ids).map_err(to_core)?;
             let initial = concatenate_conditioning_embeddings(&vision, &text).map_err(to_core)?;
-            let mut logits = model.decoder.forward_embeds(&initial, 0).map_err(to_core)?;
+            // The conditioning prefill goes into the shared step cache (growing backing: the
+            // provider has no admission surface to price a whole-budget preallocation), then the
+            // continuation decodes through the step seam (sc-24138).
+            let mut cache = decoder.new_step_cache();
+            // The whole request from the conditioning prefill on (the engine's own span starts
+            // after it).
+            let span = RequestSpan::begin();
+            let logits = decoder
+                .forward_embeds(&initial, &mut cache)
+                .map_err(to_core)?;
             let mut stream = core_llm::StarVectorBoundedStream::new(req);
             match seed_svg_prompt(&mut stream, events)? {
                 core_llm::StarVectorStreamStatus::Continue => {}
                 core_llm::StarVectorStreamStatus::Stop(_) => {
-                    return Ok(emit_done(stream.output()?, events));
+                    return Ok((emit_done(stream.output()?, events), None));
                 }
             }
-            let mut history = self.prompt.clone();
-            let mut rng = SplitMix64::new(req.text_request.seed.unwrap_or_else(default_seed));
-            let mut generated_ids = Vec::new();
-            let mut detok = core_llm::IncrementalDetok::new();
-            for index in 0..req.text_request.max_new_tokens {
-                if req.text_request.cancel.is_cancelled() {
-                    break;
+            let config = GenerationConfig {
+                max_new_tokens: req.text_request.max_new_tokens as usize,
+                sampling: sampling_params(&req.text_request.sampling),
+                seed: req.text_request.seed,
+                stop_tokens: vec![EOS_TOKEN_ID],
+            };
+            let mut detok = self.tokenizer.decode_stream(true);
+            let stopped = Cell::new(false);
+            let failure = RefCell::new(None);
+            let (generated, record) = {
+                let mut on_token = |event: DecodeEvent| {
+                    let DecodeEvent::Token { id, step } = event else {
+                        return;
+                    };
+                    if stopped.get() {
+                        return;
+                    }
+                    let pushed = decode_generated_svg_token(&mut detok, id).and_then(|decoded| {
+                        push_decoded_svg_token(
+                            &mut stream,
+                            decoded,
+                            started.elapsed(),
+                            step as u32 + 1,
+                            events,
+                        )
+                    });
+                    match pushed {
+                        Ok(core_llm::StarVectorStreamStatus::Continue) => {}
+                        Ok(core_llm::StarVectorStreamStatus::Stop(_)) => stopped.set(true),
+                        Err(error) => {
+                            *failure.borrow_mut() = Some(error);
+                            stopped.set(true);
+                        }
+                    }
+                };
+                generate_step_from_prefill(
+                    decoder,
+                    &mut cache,
+                    logits,
+                    &self.prompt,
+                    &config,
+                    &req.text_request.cancel,
+                    &mut on_token,
+                    Some(&|| stopped.get()),
+                )
+                .map_err(to_core)?
+            };
+            if let Some(error) = failure.into_inner() {
+                return Err(error);
+            }
+            // The end-of-text token ends the stream the way the pre-seam loop did: flush the
+            // detokenizer's held bytes as source at the token's index, then mark the EOS.
+            if generated.finish_reason == DecodeFinish::StopToken && !stopped.get() {
+                let index = generated.tokens.len() as u32;
+                let mut ended = false;
+                if let Some(delta) = detok.finish()? {
+                    let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                    if matches!(
+                        status,
+                        core_llm::StarVectorStreamStatus::Continue
+                            | core_llm::StarVectorStreamStatus::Stop(
+                                core_llm::StarVectorFinishReason::CompleteRoot
+                            )
+                    ) {
+                        events(core_llm::StarVectorStreamEvent::Source { text: delta, index });
+                    }
+                    ended = matches!(status, core_llm::StarVectorStreamStatus::Stop(_));
                 }
-                let id = next_token_id(&logits, &history, &req.text_request.sampling, &mut rng)
-                    .map_err(to_core)?;
-                history.push(id);
-                let decoded = decode_generated_svg_token(
-                    &self.tokenizer,
-                    &mut generated_ids,
-                    &mut detok,
-                    id,
-                )?;
-                let status = push_decoded_svg_token(
-                    &mut stream,
-                    decoded,
-                    started.elapsed(),
-                    index + 1,
-                    events,
-                )?;
-                if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
-                    break;
+                if !ended {
+                    push_decoded_svg_token(
+                        &mut stream,
+                        DecodedSvgToken::Eos,
+                        started.elapsed(),
+                        index + 1,
+                        events,
+                    )?;
                 }
-                let next = input_ids(&[id], pixels.device())
-                    .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
-                let embed = model.decoder.embeddings(&next).map_err(to_core)?;
-                logits = model
-                    .decoder
-                    .forward_embeds(&embed, 257 + self.prompt.len() + index as usize)
-                    .map_err(to_core)?;
+            }
+            if stream.output().is_err() {
+                if let Some(delta) = detok.finish()? {
+                    let status = stream.push_decoded_suffix(&delta, started.elapsed())?;
+                    if matches!(
+                        status,
+                        core_llm::StarVectorStreamStatus::Continue
+                            | core_llm::StarVectorStreamStatus::Stop(
+                                core_llm::StarVectorFinishReason::CompleteRoot
+                            )
+                    ) {
+                        events(core_llm::StarVectorStreamEvent::Source {
+                            text: delta,
+                            index: stream.generated_tokens(),
+                        });
+                    }
+                }
             }
             if stream.output().is_err() {
                 // Convert a loop boundary (token budget or mid-stream cancellation) into the
                 // bounded stream's existing typed terminal reason without publishing partial SVG.
                 let _ = stream.push("", started.elapsed())?;
             }
-            Ok(emit_done(stream.output()?, events))
+            Ok((
+                emit_done(stream.output()?, events),
+                Some(record.with_request_span(&span)),
+            ))
         })();
-        model.reset();
         result
     }
 }
@@ -606,10 +800,73 @@ fn to_core(error: Error) -> core_llm::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2/E8 (sc-24432 feature-end review): the captioner advertises no proposer, so an `auto` or
+    /// explicit speculative request decodes plainly with the reason named — the same words MLX's
+    /// StarVector reports — and its prefix cache's `none` is named too; `off` names no fallback.
+    #[test]
+    fn the_report_names_the_speculative_fallback_and_the_prefix_cache() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let record = crate::decode::DecodeRecord::plain(
+            crate::decode::DecodePath::StepModel,
+            3,
+            2,
+            Default::default(),
+        );
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative: Some(speculative),
+            ..Default::default()
+        };
+        for mode in [
+            Speculative::Auto,
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
+        ] {
+            let report = svg_report(&record, &request(mode), Speculative::Off);
+            assert_eq!(
+                report.fallbacks,
+                core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{mode:?}"
+            );
+            assert_eq!(report.fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        }
+        // E5: an unset option takes the provider's per-backend default — a table `auto` is named
+        // as the same no-proposer fallback — and an explicit `off` still overrides the default.
+        let unset = core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            ..Default::default()
+        };
+        assert_eq!(
+            svg_report(&record, &unset, Speculative::Auto).fallbacks,
+            core_llm::no_proposer_fallback(Speculative::Auto, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(svg_report(&record, &unset, Speculative::Off)
+            .fallbacks
+            .is_empty());
+        assert!(
+            svg_report(&record, &request(Speculative::Off), Speculative::Auto)
+                .fallbacks
+                .is_empty()
+        );
+        let off = svg_report(&record, &request(Speculative::Off), Speculative::Off);
+        assert!(off.fallbacks.is_empty());
+        assert_eq!(off.prefix_cache.path, "none");
+        assert_eq!(
+            off.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+        );
+    }
+    use crate::primitives::SplitMix64;
     use candle_core::DType;
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
     use core_llm_testkit::{starvector_conformance, StarVectorProfile};
     use serde_json::json;
+    use std::cell::Cell;
 
     fn exact_config() -> Value {
         json!({
@@ -626,6 +883,35 @@ mod tests {
         })
     }
 
+    /// sc-20683: every SVG text output reports the dense KV cache with the shared reason for its
+    /// policy.
+    #[test]
+    fn svg_text_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let req = core_llm::TextLlmRequest {
+                messages: vec![core_llm::Message::user("x")],
+                kv_compression: policy,
+                max_new_tokens: 64,
+                ..Default::default()
+            };
+            let output = svg_text_output(&req, 0, core_llm::Speculative::Off, &mut |_| {}, |svg| {
+                let mut stream = StarVectorBoundedStream::new(svg);
+                for fragment in core_llm_testkit::deterministic_svg_fixture().fragments {
+                    stream.push(fragment, std::time::Duration::ZERO)?;
+                }
+                Ok((stream.output()?, None))
+            })
+            .unwrap();
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
+    }
+
     #[test]
     fn admits_only_the_exact_1b_snapshot_geometry() {
         assert_eq!(
@@ -640,6 +926,19 @@ mod tests {
         malformed = exact_config();
         malformed["starcoder_model_name"] = json!("bigcode/starcoder2-3b");
         assert!(StarVectorConfig::from_json(&malformed).is_err());
+    }
+
+    #[test]
+    fn descriptor_reserves_the_exact_image_and_svg_prefill() {
+        let text = descriptor();
+        assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(text.capabilities.max_new_tokens, 7_933);
+        core_llm::validate_advertised_generated_token_cap(
+            text.capabilities.max_new_tokens,
+            text.capabilities.max_context_tokens,
+            IMAGE_TOKEN_COUNT + SVG_PROMPT_TOKEN_COUNT,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -807,34 +1106,91 @@ mod tests {
     #[test]
     fn continuation_decode_skips_special_controls_but_not_added_source_vocabulary() {
         let tokenizer = source_tokenizer();
-        let mut ids = Vec::new();
-        let mut detok = core_llm::IncrementalDetok::new();
+        let mut detok = tokenizer.decode_stream(true);
 
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 5).unwrap(),
+            decode_generated_svg_token(&mut detok, 5).unwrap(),
             DecodedSvgToken::Hidden
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 1).unwrap(),
+            decode_generated_svg_token(&mut detok, 1).unwrap(),
             DecodedSvgToken::Source(">".into())
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 2).unwrap(),
+            decode_generated_svg_token(&mut detok, 2).unwrap(),
             DecodedSvgToken::Source("</svg>".into())
         );
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, 0).unwrap(),
+            decode_generated_svg_token(&mut detok, 0).unwrap(),
             DecodedSvgToken::Eos
         );
-        assert_eq!(ids, [5, 1, 2], "EOS must not enter decoded source history");
-
-        let mut added_ids = Vec::new();
-        let mut added_detok = core_llm::IncrementalDetok::new();
+        let mut added_detok = tokenizer.decode_stream(true);
         assert_eq!(
-            decode_generated_svg_token(&tokenizer, &mut added_ids, &mut added_detok, 6).unwrap(),
+            decode_generated_svg_token(&mut added_detok, 6).unwrap(),
             DecodedSvgToken::Source("<svg-start>".into()),
             "non-special added vocabulary is model output, not a control to silently trim"
         );
+    }
+
+    #[test]
+    fn continuation_decode_matches_full_decode_for_a_long_sequence() {
+        let tokenizer = source_tokenizer();
+        let ids: Vec<u32> = [1, 2].into_iter().cycle().take(4_096).collect();
+        let expected = tokenizer.decode(&ids, true).unwrap();
+        let mut detok = tokenizer.decode_stream(true);
+        let mut actual = String::new();
+        for id in ids {
+            if let DecodedSvgToken::Source(delta) =
+                decode_generated_svg_token(&mut detok, id as i32).unwrap()
+            {
+                actual.push_str(&delta);
+            }
+        }
+        if let Some(delta) = detok.finish().unwrap() {
+            actual.push_str(&delta);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 14_336);
+    }
+
+    #[test]
+    fn continuation_decode_resolves_split_utf8_and_drops_an_incomplete_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vocab.json"),
+            r#"{"<|endoftext|>":0,"Ã":1,"©":2}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("merges.txt"), "#version: 0.2\n").unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"0":{"content":"<|endoftext|>","lstrip":false,"normalized":false,"rstrip":false,"single_word":false,"special":true}}}"#,
+        )
+        .unwrap();
+        let tokenizer = core_llm::Tokenizer::from_hf_byte_level_bpe(
+            dir.path().join("vocab.json"),
+            dir.path().join("merges.txt"),
+            dir.path().join("tokenizer_config.json"),
+        )
+        .unwrap();
+
+        let mut complete = tokenizer.decode_stream(true);
+        assert_eq!(
+            decode_generated_svg_token(&mut complete, 1).unwrap(),
+            DecodedSvgToken::Hidden
+        );
+        assert_eq!(
+            decode_generated_svg_token(&mut complete, 2).unwrap(),
+            DecodedSvgToken::Source("é".into())
+        );
+        assert_eq!(complete.finish().unwrap(), None);
+
+        let mut incomplete = tokenizer.decode_stream(true);
+        assert_eq!(
+            decode_generated_svg_token(&mut incomplete, 1).unwrap(),
+            DecodedSvgToken::Hidden
+        );
+        assert_eq!(incomplete.finish().unwrap(), None);
     }
 
     #[test]
@@ -846,8 +1202,7 @@ mod tests {
         }
         .request();
         let tokenizer = source_tokenizer();
-        let mut ids = Vec::new();
-        let mut detok = core_llm::IncrementalDetok::new();
+        let mut detok = tokenizer.decode_stream(true);
         let mut stream = StarVectorBoundedStream::new(&request);
         let mut events = Vec::new();
         assert_eq!(
@@ -856,7 +1211,7 @@ mod tests {
         );
 
         for (index, id) in [5, 1, 2].into_iter().enumerate() {
-            let decoded = decode_generated_svg_token(&tokenizer, &mut ids, &mut detok, id).unwrap();
+            let decoded = decode_generated_svg_token(&mut detok, id).unwrap();
             if matches!(
                 push_decoded_svg_token(
                     &mut stream,
@@ -1057,5 +1412,190 @@ mod tests {
         std::fs::write(root.path().join("config.json"), wrong.to_string()).unwrap();
         assert!(!can_load_path(root.path()));
         assert!(crate::text_registry().unwrap().find(PROVIDER_ID).is_some());
+    }
+
+    #[test]
+    fn model_probe_rejects_file_sources_before_reading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), exact_config().to_string()).unwrap();
+        assert!(
+            read_config(file.path()).is_ok(),
+            "direct config parsing remains supported"
+        );
+
+        let read_attempted = Cell::new(false);
+        let result = can_load_path_with(file.path(), |_| {
+            read_attempted.set(true);
+            true
+        });
+
+        assert!(!result);
+        assert!(!read_attempted.get(), "file payload must not be read");
+        assert!(!can_load_path(file.path()));
+    }
+
+    /// sc-24139 / E2, E5, E8 (sc-24432), through the seam the provider's `generate` answers with
+    /// ([`svg_text_output`] — a real generation needs the exact published 1B geometry, so the
+    /// bounded SVG decode is the fixture stream here): the measured record becomes
+    /// `TextLlmOutput::decode`, carrying the captioner reasons — the speculative fallback for
+    /// `auto` and an explicit proposer, none for `off`, the prefix cache's `none` named — with an
+    /// unset option resolved against the provider's default; a stream that stopped before any
+    /// decode step reports no record. `Done` and the usage carry the decode's counts.
+    #[test]
+    fn generate_reports_the_decode_record_with_the_captioner_reasons() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative,
+            max_new_tokens: 64,
+            ..Default::default()
+        };
+        let run = |req: &core_llm::TextLlmRequest, default, decoded: bool| {
+            let mut done = Vec::new();
+            let out = svg_text_output(
+                req,
+                IMAGE_TOKEN_COUNT as u32 + 2,
+                default,
+                &mut |event| {
+                    if let core_llm::StreamEvent::Done { usage, .. } = event {
+                        done.push(usage);
+                    }
+                },
+                |svg| {
+                    let mut stream = StarVectorBoundedStream::new(svg);
+                    for fragment in core_llm_testkit::deterministic_svg_fixture().fragments {
+                        stream.push(fragment, std::time::Duration::ZERO)?;
+                    }
+                    let record = crate::decode::DecodeRecord::plain(
+                        crate::decode::DecodePath::StepModel,
+                        3,
+                        2,
+                        Default::default(),
+                    );
+                    Ok((stream.output()?, decoded.then_some(record)))
+                },
+            )
+            .unwrap();
+            assert_eq!(done, vec![out.usage]);
+            assert_eq!(out.usage.prompt_tokens, IMAGE_TOKEN_COUNT as u32 + 2);
+            assert!(out.usage.generated_tokens > 0);
+            assert!(out.text.starts_with("<svg"), "{}", out.text);
+            out.decode
+        };
+        let named = |mode| {
+            core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 2);
+        for (speculative, default, fallbacks) in [
+            (
+                Some(Speculative::Auto),
+                Speculative::Off,
+                named(Speculative::Auto),
+            ),
+            (Some(lookup), Speculative::Off, named(lookup)),
+            (Some(Speculative::Off), Speculative::Off, Vec::new()),
+            (None, Speculative::Auto, named(Speculative::Auto)),
+            (Some(Speculative::Off), Speculative::Auto, Vec::new()),
+            (None, Speculative::Off, Vec::new()),
+        ] {
+            let case = format!("{speculative:?} over default {default:?}");
+            let report = run(&request(speculative), default, true).expect(&case);
+            assert_eq!(report.path, "step_model", "{case}");
+            assert_eq!(report.fallbacks, fallbacks, "{case}");
+            assert_eq!(report.prefix_cache.path, "none", "{case}");
+            assert_eq!(
+                report.prefix_cache.reason.as_deref(),
+                Some(core_llm::CAPTIONER_NO_PREFIX_CACHE),
+                "{case}"
+            );
+        }
+        assert!(run(&request(Some(Speculative::Auto)), Speculative::Off, false).is_none());
+    }
+
+    /// sc-24139: NVFP4 is refused at load by name (never a silent dense load), before the
+    /// snapshot is read, by the gate the per-snapshot probe asks.
+    #[test]
+    fn an_nvfp4_load_is_refused_by_name_before_reading_the_snapshot() {
+        let spec = core_llm::LoadSpec {
+            quantize: Some(core_llm::Quantize::Nvfp4),
+            ..core_llm::LoadSpec::dense("/no/such/starvector-1b")
+        };
+        match CandleStarVectorProvider::load(&spec) {
+            Err(core_llm::Error::Unsupported(message)) => {
+                assert!(message.starts_with("nvfp4: "), "{message}");
+                assert!(message.contains("StarVector-1B"), "{message}");
+            }
+            Err(other) => panic!("expected the NVFP4 refusal, got {other:?}"),
+            Ok(_) => panic!("an NVFP4 StarVector-1B load succeeded"),
+        }
+        assert!(nvfp4_gate(&core_llm::LoadSpec::dense("/no/such/starvector-1b")).is_ok());
+    }
+
+    /// sc-24134: the provider selects its device once, at load — on the legacy stream, since it
+    /// never captures (sc-24446, `select_eager_device`) — and a request's pixels go to that
+    /// device. A `select_device()` per request would build a second device — on the own
+    /// stream a second CUDA stream (and cuBLAS / cuRAND handles) that candle's per-op check,
+    /// which compares the GPU ordinal only, cannot tell from the model's (see the CUDA test).
+    #[test]
+    fn the_provider_selects_its_device_once_at_load() {
+        let source = include_str!("starvector.rs");
+        let production = &source[..source.find("mod tests {").expect("the test module")];
+        // `CandleStarVectorProvider::load` is followed by the free `descriptor()` function.
+        let load = production
+            .find("pub fn load(")
+            .expect("the provider's load");
+        let load_end = production
+            .find("pub fn descriptor()")
+            .expect("descriptor()");
+        let calls: Vec<usize> = production
+            .match_indices("select_eager_device(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "one device selection: {calls:?}");
+        assert!(
+            (load..load_end).contains(&calls[0]),
+            "the device is selected in `load`, not per request"
+        );
+    }
+
+    /// The load-time device and a request's pixels are one device on one stream; a second
+    /// `select_device()` (what a per-request selection did) shares the GPU ordinal — so candle's
+    /// per-op check accepts mixing them — but is a different device, and on the own stream a
+    /// different CUDA stream.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn request_pixels_share_the_load_time_device_and_stream() {
+        use candle_core::Device;
+        // The graph runner on at load: the own stream, where a second device is a second stream.
+        let _guard = crate::decode::graph::cuda_graphs_policy_guard(Some(true));
+        let Ok(model_device @ Device::Cuda(_)) = crate::device::select_device() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let stream = |d: &Device| match d {
+            Device::Cuda(c) => (
+                c.cuda_stream().cu_stream() as usize,
+                c.cuda_stream().context().ordinal(),
+            ),
+            _ => unreachable!(),
+        };
+        let pixels = StarVectorImageProcessor::default()
+            .preprocess(&[10u8, 20, 30, 40, 50, 60], 2, 1, &model_device)
+            .unwrap();
+        assert!(pixels.device().same_device(&model_device));
+        assert_eq!(stream(pixels.device()), stream(&model_device));
+
+        // Same GPU ordinal (all candle's per-op check compares), yet another device and stream.
+        let second = crate::device::select_device().unwrap();
+        assert!(!second.same_device(&model_device));
+        if !cfg!(feature = "flash-attn") {
+            assert_ne!(
+                stream(&second).0,
+                stream(&model_device).0,
+                "a second own stream"
+            );
+        }
     }
 }

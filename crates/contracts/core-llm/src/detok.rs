@@ -14,8 +14,9 @@
 //! - **2-byte char**: the placeholder is *longer* than the finished char — characters are dropped,
 //!   or the next delta panics.
 //!
-//! [`IncrementalDetok`] is the one shared fix (the sites in `mlx-llm` and `candle-llm` all drive
-//! it): feed it each full re-decode with [`push`](IncrementalDetok::push) and it returns the newly
+//! [`IncrementalDetok`] is the shared guard for engines that receive full re-decodes. Engines using
+//! the tokenizer's bounded stateful decode stream enforce the same stable-suffix rule there. Feed
+//! this guard each full re-decode with [`push`](IncrementalDetok::push) and it returns the newly
 //! *stable* suffix — it holds back a trailing U+FFFD run (a possibly-incomplete character) until a
 //! later decode resolves it, and only ever advances its shown-prefix marker to a char boundary of
 //! stable text. A U+FFFD that turns out to be permanent (genuinely invalid bytes mid-stream) is

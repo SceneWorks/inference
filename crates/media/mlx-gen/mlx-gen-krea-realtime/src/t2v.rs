@@ -339,6 +339,14 @@ pub fn decode_latents_to_video(
     tiling: Option<&TilingConfig>,
     cancel: &CancelFlag,
 ) -> Result<GenerationOutput> {
+    // The AR denoise is done: its freed activations and superseded KV staging sit in MLX's buffer
+    // cache, sized for DiT shapes the VAE never requests. Return them before the decode builds its
+    // own working set so the two phases' buffers never coexist in the process footprint (see
+    // `encode_prompt`). Live arrays — the DiT, the latents — are untouched. Measured (08ed6939f):
+    // SC-20684 W2 run 36798794462 aborted t2v-q8.paired at the 64 GiB child footprint cap with a
+    // ~33 GiB active peak (the rest MLX's buffer cache); with these phase-boundary releases the
+    // Krea six-cell phase completed (W2 C run 36866378379, exit 0).
+    mlx_gen::memory_probe::clear_cache();
     // `decode_to_frames` reshapes `[C,F,H,W]` → `[1,C,F,H,W]`, decodes (single-pass or tiled), and
     // returns `[F_out, H_out, W_out, 3]` uint8; `frames_to_images` splits it into one `Image`/frame.
     let frames_u8 = decode_to_frames(vae, latents, tiling, Some(cancel))?;
@@ -598,8 +606,10 @@ pub fn generate_i2v_from_components(
     let width = (params.latent_width * SPATIAL_STRIDE) as u32;
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the reference still → clean context latent.
-    let reference_latents = encode_reference_image(vae, reference_image, width, height)?;
-    mlx_rs::transforms::eval([&reference_latents])?;
+    // The encoder's buffers must not persist into generation (sc-20686).
+    let reference_latents = materialize_and_release_phase(|| {
+        encode_reference_image(vae, reference_image, width, height)
+    })?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -653,8 +663,11 @@ pub fn generate_v2v_from_components(
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the source clip → clean source latent (deterministic eps from the seed).
     let key = random::key(params.seed)?;
-    let source_latents = encode_source_clip(vae, cfg, source_frames, width, height, &key)?;
-    mlx_rs::transforms::eval([&source_latents])?;
+    // The encoder's buffers (and the full-resolution source clip) must not persist into
+    // generation: W2 run 36832899832 carried 43 GB of cached encode buffers into v2v generation.
+    let source_latents = materialize_and_release_phase(|| {
+        encode_source_clip(vae, cfg, source_frames, width, height, &key)
+    })?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -697,14 +710,32 @@ fn encode_prompt(
     te_quant: Option<WanQuant>,
 ) -> Result<Array> {
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len)?;
-    let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
-    let enc = match te_quant {
-        Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
-        None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
-    };
-    let context = enc.encode(&tokenizer, prompt)?;
-    mlx_rs::transforms::eval([&context])?;
-    Ok(context)
+    materialize_and_release_phase(|| {
+        let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
+        let enc = match te_quant {
+            Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
+            None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
+        };
+        enc.encode(&tokenizer, prompt)
+    })
+}
+
+/// Run one staged component phase whose weights live only inside `phase`, materialize its output,
+/// then return the phase's freed buffers from MLX's allocator cache.
+///
+/// Dropping a component's Rust handles is not enough: MLX recycles every freed Metal buffer into a
+/// process-wide cache, reuses one only for a near-identical size, and trims that cache only once
+/// active + cached memory nears 0.95 x the device working set (~91 GiB on a 128 GiB Mac). The
+/// UMT5's Q8 packs and staging fit no DiT/VAE shape, so without the clear they would stay in the
+/// process footprint for the whole render (the SC-20684 child-cap overrun). The output is evaluated
+/// *after* `phase` returned, so the lazy graph is the last owner of the component's weights and
+/// they are freed by that evaluation, before the clear.
+#[doc(hidden)]
+pub fn materialize_and_release_phase(phase: impl FnOnce() -> Result<Array>) -> Result<Array> {
+    let output = phase()?;
+    mlx_rs::transforms::eval([&output])?;
+    mlx_gen::memory_probe::clear_cache();
+    Ok(output)
 }
 
 /// Open the snapshot's transformer weights: a single-file `dit.safetensors` (the converted MLX layout)
@@ -1260,6 +1291,55 @@ mod tests {
         assert!(
             transformer < body.find("ProviderVae::from_weights(").expect("vae build"),
             "the VAE build must follow the transformer load"
+        );
+    }
+
+    /// SC-20684: the product's UMT5 is loaded and run only inside the release phase, so its
+    /// weights are freed and MLX's cache of them is cleared before the DiT load. The helper's
+    /// behaviour (active falls, cache cleared) is measured in `tests/t2v_pipeline.rs`.
+    #[test]
+    fn encode_prompt_builds_the_text_encoder_inside_the_release_phase() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("fn encode_prompt(")
+            .expect("encode_prompt")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let phase = body
+            .find("materialize_and_release_phase(||")
+            .expect("encode_prompt must run the UMT5 inside the release phase");
+        for component in [
+            "Weights::from_file(",
+            "Umt5Encoder::from_weights",
+            ".encode(",
+        ] {
+            let at = body.find(component).expect(component);
+            assert!(phase < at, "{component} must be owned by the release phase");
+        }
+    }
+
+    /// SC-20684: the decode returns the denoise's cached buffers at its START, before the VAE builds
+    /// its working set — a clear after the decode would let both phases' buffers coexist in the
+    /// process footprint. Behaviour is measured in `tests/t2v_pipeline.rs`; the position is pinned here.
+    #[test]
+    fn decode_latents_to_video_clears_the_denoise_cache_before_decoding() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("pub fn decode_latents_to_video(")
+            .expect("decode_latents_to_video")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let clear = body
+            .find("mlx_gen::memory_probe::clear_cache();")
+            .expect("decode_latents_to_video must clear MLX's cache");
+        let decode = body.find("decode_to_frames(").expect("VAE decode");
+        assert!(
+            clear < decode,
+            "the cache clear must precede the VAE decode"
         );
     }
 

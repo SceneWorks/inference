@@ -180,6 +180,38 @@ class MagePrimaryEditOracleTests(unittest.TestCase):
                     document, "a" * 40, "b" * 40, expected
                 )
 
+    def test_stale_manifest_header_error_names_each_stale_field(self) -> None:
+        # sc-24380: a seed produced before a reference-environment bump must say which pin moved.
+        document = self.manifest()
+        pinned = self.module.REFERENCE_PACKAGES["transformers"]
+        document["referenceEnvironment"]["transformers"] = "0.0.stale"
+        document["device"] = "mps"
+        with self.assertRaises(self.module.InvalidOracle) as raised:
+            self.module._validate_manifest_header(
+                document, "a" * 40, "b" * 40, {self.module.EDIT_FILE}
+            )
+        message = str(raised.exception)
+        self.assertIn(
+            f"referenceEnvironment.transformers: manifest '0.0.stale' != pinned {pinned!r}",
+            message,
+        )
+        self.assertIn("device: manifest 'mps' != expected 'cpu'", message)
+        self.assertNotIn("referenceEnvironment.torch", message)
+        self.assertNotIn("snapshotRevision", message)
+
+    def test_manifest_header_rejects_null_extra_package_and_unhashable_names(self) -> None:
+        expected = {self.module.EDIT_FILE}
+        extra_null = self.manifest()
+        extra_null["referenceEnvironment"]["extra"] = None
+        with self.assertRaises(self.module.InvalidOracle) as raised:
+            self.module._validate_manifest_header(extra_null, "a" * 40, "b" * 40, expected)
+        self.assertIn("referenceEnvironment.extra: manifest None != pinned None", str(raised.exception))
+        for name in (["x"], {"a": 1}):
+            unhashable = self.manifest()
+            unhashable["files"][0]["name"] = name
+            with self.assertRaises(self.module.InvalidOracle):
+                self.module._validate_manifest_header(unhashable, "a" * 40, "b" * 40, expected)
+
     def test_reference_metadata_population_and_values_are_exact(self) -> None:
         metadata = {
             "prompt": self.module.PROMPT,

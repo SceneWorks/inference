@@ -59,20 +59,46 @@ fn silu(x: &Array) -> Result<Array> {
     mlx_gen::nn::silu(x)
 }
 
-/// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). The
-/// `keep_f32` flag casts the loaded weight/bias to f32 (the `_keep_in_fp32_modules` /
-/// `_skip_layerwise_casting_patterns` set — patch/condition embedders, the output proj); the
-/// attn/FFN Linears load as stored (bf16 in production) and matmul against a `compute_dtype`-cast
-/// activation.
-fn load_linear(w: &Weights, prefix: &str, keep_f32: bool) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.clone();
-    let bias = w.require(&format!("{prefix}.bias"))?.clone();
-    let (weight, bias) = if keep_f32 {
-        (f32c(&weight)?, f32c(&bias)?)
-    } else {
-        (weight, bias)
-    };
+/// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). `dtype`
+/// is the precision it is held in: f32 for the `_keep_in_fp32_modules` /
+/// `_skip_layerwise_casting_patterns` set (patch/condition embedders, the output proj), else the
+/// model's `compute_dtype` for the attn/FFN/VACE projections, which matmul against a
+/// `compute_dtype`-cast activation. Casting at load (as diffusers' `torch_dtype` does) rather than
+/// holding the stored dtype matters for a mixed checkpoint: Wan2.1-VACE-1.3B stores its main blocks
+/// F32 beside BF16 VACE blocks, which ran its main-block GEMMs in F32 at twice the weight memory.
+fn load_linear(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
+    let weight = load_as(w, &format!("{prefix}.weight"), dtype)?;
+    let bias = load_as(w, &format!("{prefix}.bias"), dtype)?;
     Ok(AdaptableLinear::dense(weight, Some(bias)))
+}
+
+/// Whether [`WanVaceTransformer::from_weights`] holds diffusers tensor `name` in f32 — the reference's
+/// `_keep_in_fp32_modules` / layerwise-casting-skip set: the patch/condition embedders, the output
+/// projection, and every modulation table and affine `norm2` — rather than at the compute dtype. The
+/// load-time resident pricing uses this to price each tensor at the width the loader holds it in.
+pub(crate) fn vace_tensor_kept_f32(name: &str) -> bool {
+    let top = name.split('.').next().unwrap_or_default();
+    matches!(
+        top,
+        "patch_embedding"
+            | "vace_patch_embedding"
+            | "condition_embedder"
+            | "proj_out"
+            | "scale_shift_table"
+    ) || name.ends_with(".scale_shift_table")
+        || name.contains(".norm2.")
+}
+
+/// One stored tensor held at `dtype`. A cast is evaluated here, so the held parameter does not keep
+/// its stored-dtype source alive through a lazy graph (the cast's whole point is the smaller copy).
+fn load_as(w: &Weights, key: &str, dtype: Dtype) -> Result<Array> {
+    let stored = w.require(key)?;
+    if stored.dtype() == dtype {
+        return Ok(stored.clone());
+    }
+    let cast = stored.as_dtype(dtype)?;
+    cast.eval()?;
+    Ok(cast)
 }
 
 /// Flatten a diffusers Conv3d patch-embedding weight `[dim, in, pt, ph, pw]` → an equivalent Linear
@@ -86,6 +112,10 @@ fn load_patch_embedding(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
     let bias = f32c(w.require(&format!("{prefix}.bias"))?)?;
     Ok(AdaptableLinear::dense(weight, Some(bias)))
 }
+
+/// SC-20686 operation names for MLX Wan-VACE's recomputed text cross-attention K/V (Metal lane).
+pub(crate) const SC20686_VACE_TEXT_KV_CREATE: &str = "WanVace::attn2(recomputed-text-kv)";
+pub(crate) const SC20686_VACE_TEXT_KV_READ: &str = "WanVace::attn2(sdpa)";
 
 /// A Wan attention module (`attn1` self-attn or `attn2` cross-attn): `to_q/to_k/to_v/to_out.0` +
 /// qk-RMSNorm `norm_q/norm_k`. Matmuls run in `compute_dtype`; the residual the caller maintains is
@@ -104,15 +134,17 @@ struct Attn {
 }
 
 impl Attn {
-    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig, dtype: Dtype) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: load_linear(w, &format!("{prefix}.to_q"), false)?,
-            k: load_linear(w, &format!("{prefix}.to_k"), false)?,
-            v: load_linear(w, &format!("{prefix}.to_v"), false)?,
-            o: load_linear(w, &format!("{prefix}.to_out.0"), false)?,
-            norm_q: w.require(&format!("{prefix}.norm_q.weight"))?.clone(),
-            norm_k: w.require(&format!("{prefix}.norm_k.weight"))?.clone(),
+            q: load_linear(w, &format!("{prefix}.to_q"), dtype)?,
+            k: load_linear(w, &format!("{prefix}.to_k"), dtype)?,
+            v: load_linear(w, &format!("{prefix}.to_v"), dtype)?,
+            o: load_linear(w, &format!("{prefix}.to_out.0"), dtype)?,
+            // The qk-RMSNorm weights are cast with the projections (they are not in the
+            // reference's `_keep_in_fp32_modules`).
+            norm_q: load_as(w, &format!("{prefix}.norm_q.weight"), dtype)?,
+            norm_k: load_as(w, &format!("{prefix}.norm_k.weight"), dtype)?,
             num_heads: cfg.base.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -168,7 +200,25 @@ impl Attn {
             .forward(&ctx)?
             .reshape(&[b, -1, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // SC-20686 Metal lane: MLX Wan-VACE recomputes this text K/V on every call (every block,
+        // every CFG branch, every denoise step) — there is no persistent cross-K/V cache to promote.
+        // Campaign mode records that recomputed transient; ordinary renders skip this entirely.
+        let sc20686 = if mlx_gen::sc20686::active() {
+            let dense = mlx_gen::sc20686::record_recomputed_kv(
+                &k,
+                &v,
+                k.shape()[2] as u64,
+                SC20686_VACE_TEXT_KV_CREATE,
+            )?;
+            mlx_gen::sc20686::begin_read(
+                dense.map(mlx_gen::sc20686::ReadTarget::Recomputed),
+                &[&q, &k, &v],
+            )?
+        } else {
+            None
+        };
         let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        mlx_gen::sc20686::finish_read(sc20686, &out, SC20686_VACE_TEXT_KV_READ, true)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
@@ -181,6 +231,22 @@ impl Attn {
         self.v.quantize(bits, group)?;
         self.o.quantize(bits, group)?;
         Ok(())
+    }
+
+    /// Collect the four projections' quantized packs (the sc-5360 eval-to-free pass).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        for linear in [&self.q, &self.k, &self.v, &self.o] {
+            push_linear_quant_arrays(linear, out);
+        }
+    }
+}
+
+/// A quantized linear's packs (`wq`/`scales`/`biases` and any bias); a dense linear contributes
+/// nothing.
+fn push_linear_quant_arrays<'a>(linear: &'a AdaptableLinear, out: &mut Vec<&'a Array>) {
+    if let Some((wq, scales, biases, bias, _, _)) = linear.quantized_params() {
+        out.extend([wq, scales, biases]);
+        out.extend(bias);
     }
 }
 
@@ -202,19 +268,19 @@ struct CoreBlock {
 }
 
 impl CoreBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig, dtype: Dtype) -> Result<Self> {
         let dim = cfg.base.dim as i32;
         Ok(Self {
             mod_table: f32c(
                 &w.require(&format!("{prefix}.scale_shift_table"))?
                     .reshape(&[1, 1, 6, dim])?,
             )?,
-            self_attn: Attn::load(w, &format!("{prefix}.attn1"), cfg)?,
-            cross_attn: Attn::load(w, &format!("{prefix}.attn2"), cfg)?,
+            self_attn: Attn::load(w, &format!("{prefix}.attn1"), cfg, dtype)?,
+            cross_attn: Attn::load(w, &format!("{prefix}.attn2"), cfg, dtype)?,
             norm2_w: f32c(w.require(&format!("{prefix}.norm2.weight"))?)?,
             norm2_b: f32c(w.require(&format!("{prefix}.norm2.bias"))?)?,
-            ffn_fc1: load_linear(w, &format!("{prefix}.ffn.net.0.proj"), false)?,
-            ffn_fc2: load_linear(w, &format!("{prefix}.ffn.net.2"), false)?,
+            ffn_fc1: load_linear(w, &format!("{prefix}.ffn.net.0.proj"), dtype)?,
+            ffn_fc2: load_linear(w, &format!("{prefix}.ffn.net.2"), dtype)?,
             eps: cfg.base.eps as f32,
         })
     }
@@ -227,6 +293,14 @@ impl CoreBlock {
         self.ffn_fc1.quantize(bits, group)?;
         self.ffn_fc2.quantize(bits, group)?;
         Ok(())
+    }
+
+    /// Collect this block's quantized packs (the sc-5360 eval-to-free pass).
+    fn push_quant_arrays<'a>(&'a self, out: &mut Vec<&'a Array>) {
+        self.self_attn.push_quant_arrays(out);
+        self.cross_attn.push_quant_arrays(out);
+        push_linear_quant_arrays(&self.ffn_fc1, out);
+        push_linear_quant_arrays(&self.ffn_fc2, out);
     }
 
     /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 1, 6, dim]` (f32, the time modulation). `context`:
@@ -281,16 +355,22 @@ struct VaceBlock {
 }
 
 impl VaceBlock {
-    fn load(w: &Weights, prefix: &str, has_proj_in: bool, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        has_proj_in: bool,
+        cfg: &WanVaceConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
         let proj_in = if has_proj_in {
-            Some(load_linear(w, &format!("{prefix}.proj_in"), false)?)
+            Some(load_linear(w, &format!("{prefix}.proj_in"), dtype)?)
         } else {
             None
         };
         Ok(Self {
             proj_in,
-            core: CoreBlock::load(w, prefix, cfg)?,
-            proj_out: load_linear(w, &format!("{prefix}.proj_out"), false)?,
+            core: CoreBlock::load(w, prefix, cfg, dtype)?,
+            proj_out: load_linear(w, &format!("{prefix}.proj_out"), dtype)?,
         })
     }
 
@@ -380,7 +460,12 @@ impl WanVaceTransformer {
         let dim = cfg.base.dim as i32;
         let mut blocks = Vec::with_capacity(cfg.base.num_layers);
         for i in 0..cfg.base.num_layers {
-            blocks.push(CoreBlock::load(w, &format!("blocks.{i}"), cfg)?);
+            blocks.push(CoreBlock::load(
+                w,
+                &format!("blocks.{i}"),
+                cfg,
+                compute_dtype,
+            )?);
         }
         let mut vace_blocks = Vec::with_capacity(cfg.vace_layers.len());
         for j in 0..cfg.vace_layers.len() {
@@ -389,29 +474,51 @@ impl WanVaceTransformer {
                 &format!("vace_blocks.{j}"),
                 j == 0,
                 cfg,
+                compute_dtype,
             )?);
         }
         let half = cfg.base.freq_dim / 2;
         let inv: Vec<f32> = (0..half)
             .map(|j| (10000.0_f64.powf(-(j as f64) / half as f64)) as f32)
             .collect();
-        Ok(Self {
+        let dit = Self {
             patch_embedding: load_patch_embedding(w, "patch_embedding")?,
             vace_patch_embedding: load_patch_embedding(w, "vace_patch_embedding")?,
-            time_embedding_0: load_linear(w, "condition_embedder.time_embedder.linear_1", true)?,
-            time_embedding_1: load_linear(w, "condition_embedder.time_embedder.linear_2", true)?,
-            time_projection: load_linear(w, "condition_embedder.time_proj", true)?,
-            text_embedding_0: load_linear(w, "condition_embedder.text_embedder.linear_1", true)?,
-            text_embedding_1: load_linear(w, "condition_embedder.text_embedder.linear_2", true)?,
+            time_embedding_0: load_linear(
+                w,
+                "condition_embedder.time_embedder.linear_1",
+                Dtype::Float32,
+            )?,
+            time_embedding_1: load_linear(
+                w,
+                "condition_embedder.time_embedder.linear_2",
+                Dtype::Float32,
+            )?,
+            time_projection: load_linear(w, "condition_embedder.time_proj", Dtype::Float32)?,
+            text_embedding_0: load_linear(
+                w,
+                "condition_embedder.text_embedder.linear_1",
+                Dtype::Float32,
+            )?,
+            text_embedding_1: load_linear(
+                w,
+                "condition_embedder.text_embedder.linear_2",
+                Dtype::Float32,
+            )?,
             blocks,
             vace_blocks,
             head_modulation: f32c(&w.require("scale_shift_table")?.reshape(&[1, 2, dim])?)?,
-            head: load_linear(w, "proj_out", true)?,
+            head: load_linear(w, "proj_out", Dtype::Float32)?,
             rope: RopeTable::new(cfg.head_dim()),
             inv_freq: Array::from_slice(&inv, &[half as i32]),
             cfg: cfg.clone(),
             compute_dtype,
-        })
+        };
+        // Materialize at load, before any `quantize`: left lazy, the first forward's command buffers
+        // wait on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(dit)
     }
 
     /// Quantize the DiT's `_quantize_predicate` surface to Q4/Q8 in place (sc-3440): every base block
@@ -427,7 +534,35 @@ impl WanVaceTransformer {
         for vb in &mut self.vace_blocks {
             vb.quantize(bits, group)?;
         }
+        // sc-5360 / SC-20686: force-materialize the quantized packs now, as the base Wan
+        // transformer does, so the dense bf16 sources free at load instead of at the first denoise
+        // step. Left lazy (D run 37023146895), VACE-Fun's first step evaluated both experts' worth of
+        // packing beside the dense expert and its freed bf16 pooled: 45 GiB at 512x512x17.
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        for vb in &self.vace_blocks {
+            vb.core.push_quant_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
         Ok(())
+    }
+
+    /// Every quantized pack this transformer retains (tests: the load-time quantization is
+    /// materialized, not left lazy).
+    #[cfg(test)]
+    fn quantized_packs(&self) -> Vec<&Array> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        for block in &self.blocks {
+            block.push_quant_arrays(&mut arrays);
+        }
+        for vb in &self.vace_blocks {
+            vb.core.push_quant_arrays(&mut arrays);
+        }
+        arrays
     }
 
     /// Patchify grid `(f, h, w)` for a latent `[C, F, H, W]`.
@@ -502,6 +637,34 @@ impl WanVaceTransformer {
         let cache = self.build_vace_cache(latent, control)?;
         let context_emb = self.text_embed(context)?;
         self.forward_vace_cached(latent, t, &cache, &context_emb, scales)
+    }
+
+    /// SC-20686 Metal lane: bind the live recomputed-text-K/V geometry (every main + VACE block
+    /// projects the full context per forward) and open the first denoise-step window. Each CFG
+    /// branch projects its own unpadded context (`[L, dim]`), so the bound `skv` is the longest
+    /// branch's token count. No-op unless a campaign is armed.
+    fn sc20686_bind(&self, cache: &VaceStepCache, contexts: &[&Array]) {
+        if !mlx_gen::sc20686::active() {
+            return;
+        }
+        let head = &self.blocks[0].cross_attn;
+        mlx_gen::sc20686::bind_geometry(
+            mlx_gen::sc20686::KvGeometry {
+                layers: (self.blocks.len() + self.vace_blocks.len()) as u32,
+                heads: head.num_heads as u32,
+                head_dimension: head.head_dim as u32,
+                sq: cache.l as u64,
+                skv: contexts
+                    .iter()
+                    .map(|context| context.shape()[context.ndim() - 2] as u64)
+                    .max()
+                    .unwrap_or(0),
+            },
+            Some(self.compute_dtype),
+            "none",
+            "none",
+        );
+        mlx_gen::sc20686::mark_denoise();
     }
 
     /// Build the step-invariant [`VaceStepCache`] for a fixed latent shape + control latent. The grid
@@ -891,6 +1054,7 @@ pub fn denoise_vace(
     // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
     // latent (shared by every step AND both CFG branches) and the projected text contexts (constant
     // per branch). The old loop rebuilt all of these inside each of the 2 forwards per step.
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cache = transformer.build_vace_cache(init_noise, control)?;
     let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
     let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
@@ -900,6 +1064,13 @@ pub fn denoise_vace(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
+    transformer.sc20686_bind(
+        &cache,
+        &[
+            &ctx_cond_emb,
+            ctx_uncond_emb.as_ref().unwrap_or(&ctx_cond_emb),
+        ],
+    );
 
     // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
     // sequential B=1 forwards, while `crate::pipeline::denoise` batches them into one B=2 forward
@@ -1021,6 +1192,7 @@ pub(crate) fn denoise_vace_range(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<()> {
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cache = transformer.build_vace_cache(latents, control)?;
     let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
     let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
@@ -1030,6 +1202,13 @@ pub(crate) fn denoise_vace_range(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
+    transformer.sc20686_bind(
+        &cache,
+        &[
+            &ctx_cond_emb,
+            ctx_uncond_emb.as_ref().unwrap_or(&ctx_cond_emb),
+        ],
+    );
 
     for i in range {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
@@ -1094,6 +1273,172 @@ mod tests {
             "vace_in_channels": 96
         }));
         (weights, config)
+    }
+
+    fn tiny_inputs(weights: &Weights) -> (Array, Array, Array) {
+        let latent = weights
+            .require("in.hidden_states")
+            .unwrap()
+            .reshape(&[16, 4, 8, 8])
+            .unwrap();
+        let control = weights
+            .require("in.control_hidden_states")
+            .unwrap()
+            .reshape(&[96, 4, 8, 8])
+            .unwrap();
+        // The trimmed `[L, text_dim]` T5 embedding the product's encoder returns.
+        let raw = weights
+            .require("in.encoder_hidden_states")
+            .unwrap()
+            .reshape(&[-1, 32])
+            .unwrap();
+        (latent, control, raw)
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        mlx_rs::ops::abs(mlx_rs::ops::subtract(f32c(a).unwrap(), f32c(b).unwrap()).unwrap())
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    const QUANT_CHILD: &str = "WAN_VACE_QUANT_MATERIALIZE_CHILD";
+
+    /// D run 37023146895 (VACE-Fun 512x512x17 measured 45 GiB): a load-time quantize materializes
+    /// every pack and frees the dense sources then, instead of leaving them for the first denoise
+    /// step. Evaluating the packs afterwards allocates nothing. MLX's counters are process-wide, so
+    /// it runs alone in a child process. Sized: the tiny golden fixture (dim 64), < 64 MiB.
+    #[test]
+    fn load_time_quantize_materializes_every_pack() {
+        if std::env::var_os(QUANT_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vace::tests::load_time_quantize_materializes_every_pack",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(QUANT_CHILD, "1")
+                .output()
+                .expect("spawn the isolated quantize child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated quantize child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (weights, config) = tiny_vace_fixture();
+        let mut dit = WanVaceTransformer::from_weights(&weights, &config, Dtype::Bfloat16).unwrap();
+        drop(weights);
+        dit.quantize(4, None).unwrap();
+        let packs = dit.quantized_packs();
+        assert!(!packs.is_empty(), "the fixture quantizes some projection");
+        let before = mlx_rs::memory::get_active_memory();
+        mlx_rs::transforms::eval(packs).unwrap();
+        assert_eq!(
+            mlx_rs::memory::get_active_memory(),
+            before,
+            "a quantize left packs to evaluate at the first forward"
+        );
+    }
+
+    /// SC-20686: the VACE text context is built exactly as the reference builds it — diffusers
+    /// `WanVACEPipeline._get_t5_prompt_embeds` trims each prompt's T5 output to its token count and
+    /// zero-pads it to `max_sequence_length` (512), and the transformer attends over all 512 with no
+    /// mask. The product's padded context drives the forward bit-identically to that reference, and
+    /// the pre-fix unpadded context does not.
+    #[test]
+    fn vace_text_context_is_the_reference_zero_padded_context() {
+        let (weights, config) = tiny_vace_fixture();
+        let dit = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
+        let (latent, control, raw) = tiny_inputs(&weights);
+        let prompt = mlx_rs::ops::indexing::IndexOp::index(&raw, ..5);
+        assert_eq!(config.base.text_len, 512);
+        let reference =
+            concatenate_axis(&[&prompt, &Array::zeros::<f32>(&[512 - 5, 32]).unwrap()], 0)
+                .unwrap()
+                .reshape(&[1, 512, 32])
+                .unwrap();
+        let ours = crate::model_vace::vace_text_context(&prompt, &config.base).unwrap();
+        assert_eq!(ours.shape(), &[512, 32]);
+        let scales = [1.0, 0.5];
+        let forward = |context: &Array| {
+            dit.forward_vace(&latent, &control, 500.0, context, &scales)
+                .unwrap()
+        };
+        let expected = forward(&reference);
+        assert_eq!(
+            max_abs_diff(&forward(&ours.reshape(&[1, 512, 32]).unwrap()), &expected),
+            0.0
+        );
+        let unpadded = forward(&prompt.reshape(&[1, 5, 32]).unwrap());
+        assert!(
+            max_abs_diff(&unpadded, &expected) > 1e-4,
+            "zero padding must reach the cross-attention (projected pads are not zeros)"
+        );
+    }
+
+    /// SC-20686: Wan2.1-VACE-1.3B ships its main blocks F32 beside BF16 VACE blocks. The attn/FFN/VACE
+    /// projections and qk-RMSNorm weights load at the model's compute dtype (diffusers casts every
+    /// module outside `_keep_in_fp32_modules` with `torch_dtype`), while the reference's f32 set —
+    /// embedders, modulation tables, the affine `norm2`, the output projection — stays f32. A bf16
+    /// forward then tracks the all-f32 reference within bf16 tolerance.
+    #[test]
+    fn mixed_checkpoint_projections_load_at_the_compute_dtype() {
+        let (f32_weights, config) = tiny_vace_fixture();
+        let mut mixed = tiny_vace_fixture().0;
+        mixed
+            .cast_matching(Dtype::Bfloat16, |key| key.starts_with("vace_blocks."))
+            .unwrap();
+        let dit = WanVaceTransformer::from_weights(&mixed, &config, Dtype::Bfloat16).unwrap();
+        for block in dit
+            .blocks
+            .iter()
+            .chain(dit.vace_blocks.iter().map(|vb| &vb.core))
+        {
+            for attn in [&block.self_attn, &block.cross_attn] {
+                for linear in [&attn.q, &attn.k, &attn.v, &attn.o] {
+                    assert_eq!(linear.weight_dtype(), Some(Dtype::Bfloat16));
+                }
+                assert_eq!(attn.norm_q.dtype(), Dtype::Bfloat16);
+                assert_eq!(attn.norm_k.dtype(), Dtype::Bfloat16);
+            }
+            assert_eq!(block.ffn_fc1.weight_dtype(), Some(Dtype::Bfloat16));
+            assert_eq!(block.ffn_fc2.weight_dtype(), Some(Dtype::Bfloat16));
+            assert_eq!(block.mod_table.dtype(), Dtype::Float32);
+            assert_eq!(block.norm2_w.dtype(), Dtype::Float32);
+        }
+        assert_eq!(dit.text_embedding_0.weight_dtype(), Some(Dtype::Float32));
+        assert_eq!(dit.head.weight_dtype(), Some(Dtype::Float32));
+        assert_eq!(dit.head_modulation.dtype(), Dtype::Float32);
+
+        let reference =
+            WanVaceTransformer::from_weights(&f32_weights, &config, Dtype::Float32).unwrap();
+        let (latent, control, raw) = tiny_inputs(&f32_weights);
+        let context = crate::model_vace::vace_text_context(&raw, &config.base)
+            .unwrap()
+            .reshape(&[1, 512, 32])
+            .unwrap();
+        let scales = [1.0, 0.5];
+        let ours = dit
+            .forward_vace(&latent, &control, 500.0, &context, &scales)
+            .unwrap();
+        let expected = reference
+            .forward_vace(&latent, &control, 500.0, &context, &scales)
+            .unwrap();
+        let scale = mlx_rs::ops::abs(&expected)
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let error = max_abs_diff(&ours, &expected);
+        assert!(
+            error <= 0.05 * scale.max(1.0),
+            "bf16 forward drifted: {error} (scale {scale})"
+        );
     }
 
     #[test]

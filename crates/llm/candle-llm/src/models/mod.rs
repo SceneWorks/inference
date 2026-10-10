@@ -5,7 +5,7 @@
 //! dimension later. The only mutable state in a forward pass is the KV cache, threaded in as
 //! `&mut dyn KvCache`.
 
-pub(crate) mod deepstack;
+pub mod deepstack;
 pub mod gemma4_mm;
 pub mod llama;
 pub mod qwen35;
@@ -26,13 +26,29 @@ pub use gemma4_mm::{
 };
 pub use llama::{shard_plan, CausalLm, RopeTables};
 pub mod starvector;
-pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
+pub use qwen35::{
+    Qwen35Cache, Qwen35Config, Qwen35Model, Qwen35Mtp, Qwen35MtpCache, Qwen35PrefixState,
+};
 pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput};
 pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
 };
 pub use starcoder2::{StarCoder2, StarCoder2Config};
-pub use starvector::{StarVectorAdapter, StarVectorClip, StarVectorDecoder, StarVectorModel};
+pub use starvector::{
+    StarVectorAdapter, StarVectorClip, StarVectorDecoder, StarVectorDecoderGeometry,
+    StarVectorModel,
+};
+
+/// Split a decoder-layer checkpoint key `{root}.layers.{i}.{suffix}` into its root, layer index
+/// and suffix (`model.layers.3.mlp.up_proj.weight` → `("model", 3, "mlp.up_proj.weight")`), or
+/// `None` for a key outside a `layers.{i}` block (embeddings, the head, final norms, a vision
+/// tower's `blocks.{i}`). The loaders' projection rules ([`llama::quantizes_layer_tensor`],
+/// [`qwen35::quantizes_tensor`]) and load admission read keys through this one split (sc-24140).
+pub(crate) fn split_layer_key(key: &str) -> Option<(&str, usize, &str)> {
+    let (root, rest) = key.split_once(".layers.")?;
+    let (index, suffix) = rest.split_once('.')?;
+    Some((root, index.parse().ok()?, suffix))
+}
 
 /// The backend-neutral multimodal seam over a loaded decoder. Both Qwen-VL backbones — the Qwen3.6
 /// hybrid linear/full-attention decoder ([`Qwen35Model`]) and the generic Qwen3-VL causal decoder

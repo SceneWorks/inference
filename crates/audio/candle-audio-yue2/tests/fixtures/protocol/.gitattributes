@@ -1,0 +1,5 @@
+# Byte-exact upstream outputs: plan_manifest.json pins every plan file's SHA-256, and the synthetic
+# rank table is hashed into the fixtures' provenance. No eol rewrite, no diffs of the binaries.
+plans/** -text
+plans/**/*.npy -text -diff
+synthetic.tiktoken -text

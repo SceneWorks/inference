@@ -1,0 +1,465 @@
+name: YuE2 targeted stage-precision proof
+
+# Dispatch only. The fixture stage transfers the immutable pinned CPU reference on a hosted runner;
+# the accelerator stages each run ONE ignored real-weight integration test. No old tier
+# quality, terminal acceptance, profile, or FP8 campaign is selected by this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        type: choice
+        required: true
+        options: [fixture, cuda, metal, cuda-diagnostic]
+        description: "fixture = CPU reference; cuda/metal = precision test; cuda-diagnostic = read-only context evidence"
+      cuda_scheduling_mode:
+        type: choice
+        required: false
+        default: shared-host
+        options: [shared-host, shared-gpu1, owner-gpu0, owner-gpu0-mac-anchor, gpu0-with-reviewed-gpu1]
+        description: shared-gpu1 serializes YuE2 on physical GPU1 while observing external workloads; legacy shared-host remains strict
+      expected_engine_sha:
+        type: string
+        required: true
+        description: "Exact 40-hex inference commit built and measured by this dispatch"
+      expected_control_sha:
+        type: string
+        required: true
+        description: "Exact 40-hex workflow/controller commit dispatched (may differ from engine source)"
+      reference_run_id:
+        type: string
+        required: false
+        default: ""
+        description: "Successful fixture-stage run ID at the same exact engine SHA (cuda/metal)"
+      reference_source:
+        type: choice
+        required: false
+        default: direct
+        options: [direct, relay]
+        description: "fixture only: direct immutable M3 artifact, or exact reviewed M4 CPU relay when M3 expires"
+      expected_app_sha:
+        type: string
+        required: false
+        default: ""
+        description: "Optional caller-provided app SHA for provenance; engine test does not verify app admission"
+      diagnostic_pid:
+        type: string
+        required: false
+        default: ""
+        description: "Exact Windows PID, or 0 for selected-device read-only telemetry, on cuda-diagnostic only"
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: "Reviewed owner-window diagnostic run; empty keeps the CUDA mixed-context refusal"
+
+permissions:
+  contents: read
+  actions: read
+
+# Hosted CPU fixture transfers do not hold the shared accelerator lock. Every accelerator
+# Metal shares the app's exact nax-macos-2 group; other accelerators default to the existing
+# Windows physical group. Shared GPU1 YuE2 jobs have their own serialized group;
+# in-job selected-device admission and the external inventory watch remain mandatory.
+# Only the explicitly approved receipt-bound
+# CUDA route uses the fixed provisional GPU0 group; the controller authenticates
+# the selected Windows holder or the exact Mac-active/pending scheduler barrier.
+concurrency:
+  group: ${{ inputs.stage == 'fixture' && format('inference-yue2-precision-fixture-{0}', github.run_id) || inputs.stage == 'metal' && 'yue2-app-precision-nax-macos-2' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'shared-gpu1' && 'inference-yue2-owner-gpu1' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'owner-gpu0-mac-anchor' && inputs.idle_cuda_context_run_id == '37145909196' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || inputs.stage == 'cuda-diagnostic' && inputs.cuda_scheduling_mode == 'gpu0-with-reviewed-gpu1' && inputs.idle_cuda_context_run_id == '' && inputs.expected_engine_sha == '190e20e7c6b5bac006194c729baabd22c0c44a5d' && 'inference-yue2-owner-gpu0' || 'inference-real-weights-physical-host' }}
+  queue: max
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+
+jobs:
+  cuda_diagnostic:
+    if: inputs.stage == 'cuda-diagnostic'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 10
+    env:
+      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+    defaults:
+      run:
+        working-directory: control
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Verify exact control and measured source before read-only probe
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
+          if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
+          if ($env:DIAGNOSTIC_PID -notmatch '^(0|[1-9][0-9]*)$') { throw 'diagnostic_pid must be 0 or a positive decimal PID' }
+          if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
+          if ((git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
+          if (git status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
+          if (git -C ../engine status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
+          if ('${{ inputs.cuda_scheduling_mode }}' -eq 'gpu0-with-reviewed-gpu1') {
+            if ($env:RUNNER_NAME -cne 'cuda-windows-2' -or '${{ inputs.idle_cuda_context_run_id }}' -ne '') { throw 'reviewed GPU1 diagnostic requires the other Windows listener and empty receipt' }
+            $jobs = gh api "repos/SceneWorks/inference/actions/runs/$env:GITHUB_RUN_ID/attempts/1/jobs?per_page=100" | ConvertFrom-Json
+            $selected = @($jobs.jobs | Where-Object { $_.name -eq 'cuda_diagnostic' -and $_.status -eq 'in_progress' })
+            if ($jobs.total_count -ne $jobs.jobs.Count -or $selected.Count -ne 1 -or $selected[0].runner_name -cne 'cuda-windows-2' -or $selected[0].runner_id -ne 2619 -or $selected[0].run_id -ne [int64]$env:GITHUB_RUN_ID -or $selected[0].head_sha -cne $env:EXPECTED_CONTROL_SHA) { throw 'reviewed GPU1 diagnostic runner/job identity differs' }
+            $foreignRun = gh api 'repos/SceneWorks/inference/actions/runs/37203890421' | ConvertFrom-Json
+            $foreignJob = gh api 'repos/SceneWorks/inference/actions/jobs/111441010524' | ConvertFrom-Json
+            $foreignJobs = gh api 'repos/SceneWorks/inference/actions/runs/37203890421/attempts/1/jobs?per_page=100' | ConvertFrom-Json
+            if ($foreignRun.id -ne 37203890421 -or $foreignRun.head_sha -cne 'e13f235d5d371b301e4a04f209e8ad621b1fda9f' -or $foreignRun.run_attempt -ne 1 -or $foreignRun.created_at -cne '2026-10-04T12:57:12Z' -or $foreignRun.status -cne 'in_progress' -or $foreignRun.path -cne '.github/workflows/real-weights.yml') { throw 'reviewed GPU1 run identity differs' }
+            if ($foreignJob.id -ne 111441010524 -or $foreignJob.run_id -ne 37203890421 -or $foreignJob.head_sha -cne $foreignRun.head_sha -or $foreignJob.name -cne 'Decode-speedups benchmark campaign (Candle/CUDA)' -or $foreignJob.status -cne 'in_progress' -or $foreignJob.runner_name -cne 'cuda-windows' -or $foreignJob.runner_id -ne 2313 -or $foreignJob.started_at -cne '2026-10-04T12:57:29Z') { throw 'reviewed GPU1 job/runner/start differs' }
+            if ($foreignJobs.total_count -ne 55 -or $foreignJobs.jobs.Count -ne 55 -or @($foreignJobs.jobs | Where-Object { $_.id -eq 111441010524 -and $_.status -eq 'in_progress' }).Count -ne 1 -or @($foreignJobs.jobs | Where-Object { $_.id -ne 111441010524 -and ($_.status -cne 'completed' -or $_.conclusion -cne 'skipped') }).Count -ne 0) { throw 'reviewed GPU1 job set differs' }
+            $foreignGroup = gh api 'repos/SceneWorks/inference/actions/concurrency_groups/inference-real-weights-physical-host' | ConvertFrom-Json
+            if ($foreignGroup.group_name -cne 'inference-real-weights-physical-host' -or $foreignGroup.total_count -ne $foreignGroup.group_members.Count -or @($foreignGroup.group_members | Where-Object { $_.status -eq 'in_progress' }).Count -ne 1 -or @($foreignGroup.group_members | Where-Object { $_.status -eq 'in_progress' -and $_.run_id -eq 37203890421 -and $null -eq $_.job_id }).Count -ne 1) { throw 'reviewed GPU1 group reservation differs' }
+            $reviewedSources = @{
+              '.github/workflows/real-weights.yml' = '6d586177edd06a208d0bc72ed86e16eb207e2bf82b2c259ff7217a1d8a21f757'
+              'scripts/ci/real-weights/candle-decode-speedups-bench/run-every-matrix-row.cmd' = '157eb7ad92dcb1330e9dcbf8194ead42a262baf2723a3ab0b0f21a15b8a64756'
+              'scripts/release/speculative_bench_campaign.py' = '97b188879d5d8c5049b6490d146d6e6e670c278beb483fc4ab357019442c9b01'
+            }
+            foreach ($path in $reviewedSources.Keys) {
+              $source = gh api "repos/SceneWorks/inference/contents/${path}?ref=e13f235d5d371b301e4a04f209e8ad621b1fda9f" | ConvertFrom-Json
+              if ($source.path -cne $path -or $source.encoding -cne 'base64') { throw 'reviewed GPU1 source metadata differs' }
+              $bytes = [Convert]::FromBase64String($source.content)
+              $hash = [Security.Cryptography.SHA256]::Create()
+              try { $digest = ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() } finally { $hash.Dispose() }
+              if ($digest -cne $reviewedSources[$path]) { throw 'reviewed GPU1 source bytes differ' }
+            }
+          }
+      - name: Collect bounded read-only context and adapter evidence
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "yue2-cuda-diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path $out) { throw 'run-owned diagnostic directory already exists' }
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_CUDA_DIAGNOSTIC_OUT=$out"
+          & .\scripts\ci\yue2_cuda_context_diagnostic.ps1 -TargetPid ([int]$env:DIAGNOSTIC_PID) -OutputDirectory $out -EngineSha $env:EXPECTED_ENGINE_SHA -ControlSha $env:EXPECTED_CONTROL_SHA -SelectedGpuIndex 1
+          if (-not (Test-Path (Join-Path $out 'manifest.json'))) { throw 'diagnostic manifest was not produced' }
+      - name: Upload raw read-only CUDA diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_CUDA_DIAGNOSTIC_OUT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  reference:
+    if: inputs.stage == 'fixture'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Verify exact source and transfer only the pinned CPU reference
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_SOURCE: ${{ inputs.reference_source }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_ENGINE_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROL_SHA"
+          test "$(git -C ../control rev-parse HEAD)" = "$EXPECTED_CONTROL_SHA"
+          test -z "$(git -C ../control status --porcelain --untracked-files=normal)"
+          git diff --exit-code && git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          source_dir="$RUNNER_TEMP/yue2-precision-reference-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$source_dir"
+          case "$REFERENCE_SOURCE" in
+            direct) source_run=36748416547; source_artifact=11116254689 ;;
+            relay) source_run=37138394196; source_artifact=11279267367 ;;
+            *) echo 'unreviewed reference source' >&2; exit 1 ;;
+          esac
+          gh api "repos/SceneWorks/inference/actions/runs/$source_run" > "$source_dir/run.json"
+          gh api "repos/SceneWorks/inference/actions/artifacts/$source_artifact" > "$source_dir/artifact.json"
+          gh api "repos/SceneWorks/inference/actions/artifacts/$source_artifact/zip" > "$source_dir/source-artifact.zip"
+          out="$RUNNER_TEMP/yue2-precision-reference-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 ../control/scripts/ci/yue2_precision_reference_transfer.py \
+            --source-zip "$source_dir/source-artifact.zip" --source-mode "$REFERENCE_SOURCE" \
+            --run-json "$source_dir/run.json" --artifact-json "$source_dir/artifact.json" \
+            --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" \
+            --transfer-run-id "$GITHUB_RUN_ID" --transfer-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$out"
+          test "$(sha256sum "$out/vae_real_reference.safetensors" | cut -d' ' -f1)" = c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b72d4
+          echo "YUE2_REF_OUT=$out" >> "$GITHUB_ENV"
+      - name: Upload pinned reference and provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-reference
+          path: ${{ env.YUE2_REF_OUT }}
+          if-no-files-found: error
+          retention-days: 3
+
+  cuda:
+    if: inputs.stage == 'cuda'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: engine
+    env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
+      YUE2_CUDA_SCHEDULING_MODE: ${{ inputs.cuda_scheduling_mode }}
+      YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - name: Record CUDA job start for bounded owned-test deadline
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000000
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_PRECISION_JOB_STARTED_UTC_NS=$stamp"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-e538120368ac279cc42176c44f9d88fa5af9c9b4-37145909196-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
+      - name: Verify exact engine source and fixture run selector
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
+        run: |
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
+          if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
+          if ($env:REFERENCE_RUN_ID -notmatch '^[0-9]+$') { throw 'reference_run_id must name a fixture run' }
+          if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git -C ../control rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
+          if ((git rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
+          if (git -C ../control status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
+          if (git status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
+          if (-not (Test-Path $env:YUE2_HF_HUB)) { throw 'YuE2 pinned hub is unavailable' }
+          foreach ($repo in @('YuE2-3B', 'YuE2-Vae', 'YuE2-Vae-legacy')) {
+            $revision = switch ($repo) { 'YuE2-3B' { '1a96eca688d6ae5d7f0feb88573fec89920fcd19' } 'YuE2-Vae' { '95535e72a97bc0f09b8ada125d26b4009428c0e8' } default { 'b54118f0fc462f08999d1ec07e88817f4ee3f770' } }
+            if (-not (Test-Path (Join-Path $env:YUE2_HF_HUB "models--m-a-p--$repo\snapshots\$revision"))) { throw "missing pinned $repo snapshot" }
+          }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\yue2-precision-proof" | Out-Null
+          $listening = Join-Path (Split-Path $env:YUE2_HF_HUB -Parent) "yue2-precision-listening\$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path $listening) { throw 'run-scoped listening path already exists' }
+          New-Item -ItemType Directory -Force (Split-Path $listening -Parent) | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_PRECISION_WORK_DIR=$listening"
+          nvidia-smi --query-gpu=index,name,compute_cap,driver_version,memory.total,memory.used,memory.free --format=csv | Out-File -Encoding utf8 "$env:RUNNER_TEMP\yue2-precision-proof\hardware-before.csv"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-precision-reference
+          run-id: ${{ inputs.reference_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-precision-reference
+      - name: Install reviewed Python 3.12
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Resolve pinned interpreter and verify reference
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" --control-sha "${{ inputs.expected_control_sha }}" --run-id "${{ inputs.reference_run_id }}" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select checked Git Bash before pinned Rust
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Build the two tiny CUDA smoke tests and YuE2 precision integration test
+        shell: cmd
+        run: |
+          set "RUSTC_WRAPPER="
+          call "%VCVARS%" || exit /b 1
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --test precision_real_weights --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target precision --build-json "%RUNNER_TEMP%\yue2-precision-proof\build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\binary.txt" || exit /b 1
+          cargo test --locked --release -p candle-quant-kernels --features cuda --lib --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\quant-build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\quant-build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\quant-build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target quant --build-json "%RUNNER_TEMP%\yue2-precision-proof\quant-build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\quant-binary.txt" || exit /b 1
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib --no-run --message-format=json > "%RUNNER_TEMP%\yue2-precision-proof\vae-build.jsonl" 2> "%RUNNER_TEMP%\yue2-precision-proof\vae-build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-precision-proof\vae-build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py resolve-binary --target vae --build-json "%RUNNER_TEMP%\yue2-precision-proof\vae-build.jsonl" --output "%RUNNER_TEMP%\yue2-precision-proof\vae-binary.txt" || exit /b 1
+      - name: Run two exact CUDA smokes then the unchanged precision test with external sampling
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $binary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\binary.txt" -Raw).Trim()
+          $quantBinary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\quant-binary.txt" -Raw).Trim()
+          $vaeBinary = (Get-Content "$env:RUNNER_TEMP\yue2-precision-proof\vae-binary.txt" -Raw).Trim()
+          $proofArgs = @('run', '--backend', 'cuda', '--binary', $binary, '--quant-smoke-binary', $quantBinary, '--vae-smoke-binary', $vaeBinary, '--reference', "$env:RUNNER_TEMP\yue2-precision-reference", '--evidence', "$env:RUNNER_TEMP\yue2-precision-proof", '--work-dir', $env:YUE2_PRECISION_WORK_DIR, '--engine-sha', $env:EXPECTED_ENGINE_SHA, '--control-sha', $env:EXPECTED_CONTROL_SHA, '--cuda-scheduling-mode', $env:YUE2_CUDA_SCHEDULING_MODE)
+          if ($env:EXPECTED_APP_SHA) { $proofArgs += @('--app-sha', $env:EXPECTED_APP_SHA) }
+          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_precision_proof.py @proofArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload raw CUDA proof and failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-cuda-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yue2-precision-proof
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal CC BY-NC 4.0 listening only. Upload generated WAVs, never weights or caches.
+      - name: Upload CUDA listening WAVs only
+        if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-listening-cuda-cc-by-nc-internal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav
+          if-no-files-found: warn
+          retention-days: 30
+
+  metal:
+    if: inputs.stage == 'metal'
+    runs-on: [self-hosted, macOS, ARM64, rw-audio]
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Verify exact engine source, runner, and fixture selector
+        shell: bash
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_NAME" = nax-macos-2
+          [[ "$EXPECTED_ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REFERENCE_RUN_ID" =~ ^[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_ENGINE_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROL_SHA"
+          test "$(git -C ../control rev-parse HEAD)" = "$EXPECTED_CONTROL_SHA"
+          test -z "$(git -C ../control status --porcelain --untracked-files=normal)"
+          git diff --exit-code && git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+          test -d "$hub"
+          test -d "$hub/models--m-a-p--YuE2-3B/snapshots/1a96eca688d6ae5d7f0feb88573fec89920fcd19"
+          test -d "$hub/models--m-a-p--YuE2-Vae/snapshots/95535e72a97bc0f09b8ada125d26b4009428c0e8"
+          test -d "$hub/models--m-a-p--YuE2-Vae-legacy/snapshots/b54118f0fc462f08999d1ec07e88817f4ee3f770"
+          echo "YUE2_HF_HUB=$hub" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/yue2-precision-proof"
+          listening="/Volumes/Models/yue2-precision-listening/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$listening"
+          test -d /Volumes/Models
+          mkdir -p "$(dirname "$listening")"
+          echo "YUE2_PRECISION_WORK_DIR=$listening" >> "$GITHUB_ENV"
+          sw_vers > "$RUNNER_TEMP/yue2-precision-proof/hardware-before.txt"
+          sysctl hw.memsize >> "$RUNNER_TEMP/yue2-precision-proof/hardware-before.txt"
+          system_profiler SPDisplaysDataType >> "$RUNNER_TEMP/yue2-precision-proof/hardware-before.txt"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-precision-reference
+          run-id: ${{ inputs.reference_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-precision-reference
+      - name: Verify exact pinned reference on Metal runner
+        shell: bash
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
+        run: python3.12 ../control/scripts/ci/yue2_precision_proof.py verify-reference --directory "$RUNNER_TEMP/yue2-precision-reference" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA" --run-id "$REFERENCE_RUN_ID"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Build only the YuE2 precision integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release -p candle-audio-yue2 --features metal --test precision_real_weights --no-run --message-format=json > "$RUNNER_TEMP/yue2-precision-proof/build.jsonl" 2> "$RUNNER_TEMP/yue2-precision-proof/build.log"
+          python3.12 ../control/scripts/ci/yue2_precision_proof.py resolve-binary --build-json "$RUNNER_TEMP/yue2-precision-proof/build.jsonl" --output "$RUNNER_TEMP/yue2-precision-proof/binary.txt"
+      - name: Run exactly one Metal precision test with external sampling
+        shell: bash
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXPECTED_APP_SHA: ${{ inputs.expected_app_sha }}
+        run: |
+          set -euo pipefail
+          binary="$(cat "$RUNNER_TEMP/yue2-precision-proof/binary.txt")"
+          proof_args=(run --backend metal --binary "$binary" --reference "$RUNNER_TEMP/yue2-precision-reference" --evidence "$RUNNER_TEMP/yue2-precision-proof" --work-dir "$YUE2_PRECISION_WORK_DIR" --engine-sha "$EXPECTED_ENGINE_SHA" --control-sha "$EXPECTED_CONTROL_SHA")
+          if [[ -n "$EXPECTED_APP_SHA" ]]; then proof_args+=(--app-sha "$EXPECTED_APP_SHA"); fi
+          python3.12 ../control/scripts/ci/yue2_precision_proof.py "${proof_args[@]}"
+      - name: Upload raw Metal proof and failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-metal-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yue2-precision-proof
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal CC BY-NC 4.0 listening only. Upload generated WAVs, never weights or caches.
+      - name: Upload Metal listening WAVs only
+        if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-listening-metal-cc-by-nc-internal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav
+          if-no-files-found: warn
+          retention-days: 30

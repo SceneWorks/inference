@@ -792,4 +792,39 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, crate::CandleError::Canceled));
     }
+
+    /// The mid-block self-attention of every candle image VAE at the 2048² render cap
+    /// (sc-24114): a ×8 KL decoder attends over `256² = 65,536` latent tokens, so its
+    /// single-head scores tensor is `65,536² ≈ 4.29e9` elements — past `i32::MAX`, which
+    /// candle's CUDA softmax kernel indexes with (`row · ncols + col` as an `int`). Every one
+    /// of those sites already routes through `sdpa_budgeted_flat` / `sdpa_budgeted_bhsd` at
+    /// [`ATTN_SCORES_BUDGET`]; this pins that the shipped budget chunks them and that the ×16
+    /// Qwen-Image 2.1 mid block (16,384 tokens, 2.7e8) stays a single pass. SANA's DC-AE runs
+    /// softmax-free linear attention and never forms an `[N, N]` matrix.
+    #[test]
+    fn every_image_vae_mid_block_chunks_at_2048_under_the_shipped_budget() {
+        // (VAE, spatial scale) → latent tokens at 2048².
+        let vaes: [(&str, usize); 6] = [
+            ("sdxl AutoencoderKL (kolors/pulid/instantid)", 8),
+            ("flux AutoencoderKL (diffusers + native)", 8),
+            ("flux2 (lens, ideogram)", 8),
+            ("chroma", 8),
+            ("qwen-image Wan z16 (krea, anima)", 8),
+            ("qwen-image-2-1", 16),
+        ];
+        for (label, scale) in vaes {
+            let tokens = (2048 / scale) * (2048 / scale);
+            let scores = (tokens * tokens) as u64;
+            let block = query_block(tokens, tokens, ATTN_SCORES_BUDGET);
+            if scale == 8 {
+                assert_eq!(tokens, 65_536);
+                assert!(scores > i32::MAX as u64, "{label}: {scores}");
+                assert!(block < tokens, "{label}: must chunk, block {block}");
+                assert!((block * tokens) as u64 <= i32::MAX as u64, "{label}");
+            } else {
+                assert!(scores <= i32::MAX as u64, "{label}: {scores}");
+                assert_eq!(block, tokens, "{label}: stays a single pass");
+            }
+        }
+    }
 }

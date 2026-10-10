@@ -457,6 +457,39 @@
       ]
     },
     {
+      "id": "qwen-research",
+      "spdx_id": "LicenseRef-Qwen-Research-License",
+      "name": "Qwen Research License Agreement",
+      "text_url": "https://huggingface.co/Qwen/Qwen-Image-2.1/raw/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "registration_required",
+          "contact": "model-business@notice.qwencloud.com"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "qwen-research"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you use the Materials or any outputs or results therefrom to create, train, fine-tune, or improve an AI model that is distributed or made available, you shall prominently display \"Built with Qwen\" or \"Improved using Qwen\" in the related product documentation."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You shall not use \"Qwen\" as the primary name or identifier of any derivative works or products; reasonable descriptive use (e.g., \"fine-tuned from Qwen Image\") is permitted."
+        }
+      ]
+    },
+    {
       "id": "stability-ai-community",
       "spdx_id": "LicenseRef-Stability-AI-Community",
       "name": "Stability AI Community License Agreement",
@@ -484,6 +517,32 @@
         {
           "term": "acceptable_use_policy",
           "url": "https://stability.ai/use-policy"
+        }
+      ]
+    },
+    {
+      "id": "tongyi-qianwen",
+      "spdx_id": "LicenseRef-Tongyi-Qianwen-License-Agreement",
+      "name": "Tongyi Qianwen License Agreement",
+      "text_url": "https://huggingface.co/Qwen/Qwen-7B/raw/ef3c5c9c57b252f3149c1408daf4d649ec8b6c85/LICENSE",
+      "terms": [
+        {
+          "term": "downstream_license_copy",
+          "family": "tongyi-qianwen"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you are commercially using the Materials, and your product or service has more than 100 million monthly active users, You shall request a license from Us. You cannot exercise your rights under this Agreement without our express authorization."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You can not use the Materials or any output therefrom to improve any other large language model (excluding Tongyi Qianwen or derivative works thereof)."
         }
       ]
     }
@@ -785,6 +844,132 @@
       "family": "apache-2-0",
       "attribution": "Whisper © OpenAI — licensed under Apache-2.0",
       "retrieved": "2026-08-02"
+    },
+    {
+      "component": "xcodec_mini_infer",
+      "source_url": "https://huggingface.co/m-a-p/xcodec_mini_infer",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue2_3b",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-3B",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-3B — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-3B — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_mert_v2_fullsong",
+      "source_url": "https://huggingface.co/m-a-p/MERT-v2-FullSong",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MERT-v2-FullSong — MERT2 by Multimodal Art Projection, https://huggingface.co/m-a-p/MERT-v2-FullSong — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_qwen_tiktoken",
+      "source_url": "https://huggingface.co/Qwen/Qwen-7B",
+      "gated": false,
+      "declared": "tongyi-qianwen-license-agreement",
+      "family": "tongyi-qianwen",
+      "attribution": "Tongyi Qianwen is licensed under the Tongyi Qianwen LICENSE AGREEMENT, Copyright (c) Alibaba Cloud. All Rights Reserved.",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_sheetsage2",
+      "source_url": "https://huggingface.co/m-a-p/SheetSage2",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "SheetSage2 by Multimodal Art Projection, https://huggingface.co/m-a-p/SheetSage2 (adapts MERT-v2-FullSong) — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_vae",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-Vae",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-Vae — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-Vae — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_vae_legacy",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-Vae-legacy",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-Vae-legacy — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-Vae-legacy — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue_s1_7b_anneal_en_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-en-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_en_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-en-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_jp_kr_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-jp-kr-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_jp_kr_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-jp-kr-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_zh_cot",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-zh-cot",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s1_7b_anneal_zh_icl",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-zh-icl",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
+    },
+    {
+      "component": "yue_s2_1b_general",
+      "source_url": "https://huggingface.co/m-a-p/YuE-s2-1B-general",
+      "gated": false,
+      "declared": "apache-2.0",
+      "family": "apache-2-0",
+      "attribution": "YuE © Multimodal Art Projection (M-A-P) and HKUST — licensed under Apache-2.0",
+      "retrieved": "2026-09-24"
     }
   ],
   "providers": [
@@ -974,6 +1159,21 @@
       "terms": [
         {
           "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "sheetsage2",
+      "components": [
+        "yue2_mert_v2_fullsong",
+        "yue2_sheetsage2"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "non_commercial_weights"
         }
       ]
     },
@@ -1254,6 +1454,158 @@
       "provider_id": "whisper_base",
       "components": [
         "whisper_base"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue2",
+      "components": [
+        "yue2_3b",
+        "yue2_qwen_tiktoken",
+        "yue2_vae",
+        "yue2_vae_legacy"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you are commercially using the Materials, and your product or service has more than 100 million monthly active users, You shall request a license from Us. You cannot exercise your rights under this Agreement without our express authorization."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You can not use the Materials or any output therefrom to improve any other large language model (excluding Tongyi Qianwen or derivative works thereof)."
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "tongyi-qianwen"
+        },
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_en_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_en_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_en_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_en_icl",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_jp_kr_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_jp_kr_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_jp_kr_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_jp_kr_icl",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_zh_cot",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_zh_cot",
+        "yue_s2_1b_general"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue_zh_icl",
+      "components": [
+        "xcodec_mini_infer",
+        "yue_s1_7b_anneal_zh_icl",
+        "yue_s2_1b_general"
       ],
       "terms": [
         {

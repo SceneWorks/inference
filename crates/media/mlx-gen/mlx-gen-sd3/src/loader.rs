@@ -99,18 +99,28 @@ pub const T5_MAX_LENGTH: usize = 256;
 /// T5 pad token id — `<pad>` (0).
 pub const T5_PAD_ID: i32 = 0;
 
+// Every loader below materializes what it built before returning, and before the callers' load-time
+// `quantize` (sc-24245). MLX runs a safetensors `Load` on its CPU stream; left lazy, the first
+// forward's Metal command buffers wait on the disk read — past the GPU watchdog on a cold page cache
+// (`kIOGPUCommandBufferCallbackErrorTimeout`, then `SubmissionsIgnored`). See
+// `mlx_gen_qwen_image::loader::load_transformer_with`.
+
 /// Load CLIP-L (`text_encoder`) at f32 — the SD3 CLIP-L config (768-wide, with a 768 text projection).
 fn load_clip_l(file: &Path) -> Result<ClipTextEncoder> {
     let mut w = Weights::from_file(file)?;
     w.cast_all(Dtype::Float32)?;
-    ClipTextEncoder::from_weights(&w, "text_model", &sd3_clip_l_config())
+    let encoder = ClipTextEncoder::from_weights(&w, "text_model", &sd3_clip_l_config())?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load CLIP-G / OpenCLIP-bigG (`text_encoder_2`) at f32 — 1280-wide with the 1280 pooled projection.
 fn load_clip_g(file: &Path) -> Result<ClipTextEncoder> {
     let mut w = Weights::from_file(file)?;
     w.cast_all(Dtype::Float32)?;
-    ClipTextEncoder::from_weights(&w, "text_model", &sd3_clip_g_config())
+    let encoder = ClipTextEncoder::from_weights(&w, "text_model", &sd3_clip_g_config())?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the three text encoders. CLIP-L + CLIP-G via the SDXL encoder at the `text_model` prefix; the
@@ -123,6 +133,7 @@ pub fn load_text_encoders(root: &Path) -> Result<Sd3TextEncoders> {
     let clip_g = load_clip_g(&artifacts.clip_g)?;
     let t5_w = load_t5_weights(&artifacts.t5_shards)?;
     let t5 = mlx_gen_flux::T5TextEncoder::from_weights(&t5_w, "")?;
+    t5_w.materialize_accessed()?;
     Ok(Sd3TextEncoders { clip_l, clip_g, t5 })
 }
 
@@ -169,7 +180,32 @@ pub fn load_t5_tokenizer(root: &Path) -> Result<TextTokenizer> {
 
 /// Load the MMDiT transformer from `transformer/` (sharded; auto dense-vs-prequantized per Linear).
 pub fn load_transformer(root: &Path, arch: &Sd3Arch) -> Result<Sd3Transformer> {
-    Sd3Transformer::from_dir(&root.join("transformer"), arch)
+    load_transformer_with(root, arch, false)
+}
+
+/// [`load_transformer`], materialized at load. `streamed` (the load arms the block stream and evicts
+/// the resident blocks) leaves the `transformer_blocks.*` bodies lazy: the stream reads each block
+/// itself, and reading them here would defeat bounded residency.
+pub(crate) fn load_transformer_with(
+    root: &Path,
+    arch: &Sd3Arch,
+    streamed: bool,
+) -> Result<Sd3Transformer> {
+    let w = Weights::from_dir(root.join("transformer"))?;
+    let transformer = Sd3Transformer::from_weights(&w, arch)?;
+    if streamed {
+        let resident: Vec<(String, mlx_rs::Array)> = w
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with("transformer_blocks."))
+            .collect();
+        let mut named: Vec<(&str, &mlx_rs::Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        w.materialize_accessed()?;
+    }
+    Ok(transformer)
 }
 
 /// Load the 16-channel VAE (decoder + encoder) from `vae/` via the E4 reuse path.

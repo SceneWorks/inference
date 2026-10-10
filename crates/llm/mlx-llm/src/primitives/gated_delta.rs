@@ -24,12 +24,14 @@
 //! normalisation, and in/out projections (the full layer) build on this in the layer story (sc-7628).
 //! GQA is handled by repeating each of the `Hk` key/query heads to the `Hv` value heads.
 
+use mlx_rs::fast::MetalKernel;
 use mlx_rs::nn::{silu, softplus};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, exp, multiply, subtract, sum_axis};
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Dtype, Stream};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::primitives::stream_is_gpu;
 
 /// The per-step gate `g = exp(−exp(A_log) · softplus(a + dt_bias))` (a faithful port of
 /// `mlx_lm.models.gated_delta.compute_g`). `a` is `[B, T, Hv]` (the gating projection), `A_log` and
@@ -45,17 +47,41 @@ pub fn compute_g(a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
     Ok(g.as_dtype(a.dtype())?)
 }
 
-/// Run the gated delta recurrence over a `[B, T, ·]` chunk, a faithful port of the
-/// `mlx_lm.models.gated_delta` ops path.
+/// Run the gated delta recurrence over a `[B, T, ·]` chunk — the entry point every Qwen35-family
+/// linear layer reaches (sc-24443).
 ///
 /// Shapes: `q`, `k` are `[B, T, Hk, Dk]`; `v` is `[B, T, Hv, Dv]`; `g` (the per-step gate from
 /// [`compute_g`]) and `beta` are `[B, T, Hv]`; `state` (the carried recurrent state, or `None` to
-/// start from zeros) is `[B, Hv, Dv, Dk]`. Returns the per-step output `y` `[B, T, Hv, Dv]` and the
-/// final `state` `[B, Hv, Dv, Dk]` — feed `state` back in for the next chunk / decode step (T = 1).
+/// start from zeros) is `[B, Hv, Dv, Dk]`. Returns the per-step output `y` `[B, T, Hv, Dv]` (in
+/// `q`'s dtype) and the final `state` `[B, Hv, Dv, Dk]` (in the carried state's dtype, or `q`'s
+/// when starting from zeros) — feed `state` back in for the next chunk / decode step.
 ///
-/// GQA: when `Hv > Hk` each key/query head is repeated `Hv / Hk` times so it pairs with the value
-/// heads (`Hv` must be a multiple of `Hk`). The math runs in the inputs' dtype, matching the ops
-/// reference (the layer story can lift accumulation to f32 to match the GPU kernel where it matters).
+/// GQA: when `Hv > Hk` each key/query head pairs with `Hv / Hk` value heads (`Hv` must be a
+/// multiple of `Hk`).
+///
+/// Dispatch (every route matches [`gated_delta_recurrence_ops`] — see the tests' error budgets;
+/// the kernel and chunked routes accumulate in f32 whatever the input dtype, the op route in the
+/// inputs' dtype, which Qwen35 makes f32):
+/// - **GPU, any `T`** — decode (`T = 1`), speculative verify (`T = M`) and prefill: the fused
+///   Metal recurrence ([`gated_delta_kernel`]), one dispatch per [`KERNEL_MAX_STEPS`] tokens with
+///   the state in registers. It is measured faster than the chunkwise form on Metal at every
+///   length (release, Qwen3.6-27B linear-layer dims `Hk = 16, Hv = 48, Dk = Dv = 128`: 1.7 ms vs
+///   2.7 ms at 512 tokens, 7.3 ms vs 11.3 ms at 2048, against 40 / 161 ms for the op loop) and it
+///   is exact f32, whereas MLX runs f32 GEMMs as TF32 on NAX GPUs (M5+), which puts the
+///   chunkwise form ~2e-3 off the reference there.
+///   With the kernel switched off ([`GDN_KERNEL`](crate::switches::GDN_KERNEL)) a GPU stream runs
+///   the op-by-op reference (the pre-sc-24443 path), not the chunkwise form, whose TF32 GEMMs are
+///   not exact there.
+/// - **CPU stream, `T ≥ `[`CHUNKED_PREFILL_MIN_TOKENS`]** — the chunkwise-parallel form
+///   ([`gated_delta_chunked`]; a custom Metal kernel cannot run off the GPU, and the CPU GEMMs are
+///   exact f32), unless the MLX defaults-table row turns it off (`gdn_chunked_prefill`).
+/// - **CPU stream, shorter `T`** — the op-by-op reference.
+///
+/// The recurrent state layout is unchanged by every path: `[B, Hv, Dv, Dk]`, the value-major form
+/// `y = S · q` reads. This entry point returns the **final** state only; a forward that must be
+/// able to roll back to any of its tokens (a speculative verify step feeding the DeltaNet
+/// checkpoint ring, sc-24435) takes [`gated_delta_recurrence_checkpointed`] instead, so decode and
+/// prefill never pay for per-token states.
 pub fn gated_delta_recurrence(
     q: &Array,
     k: &Array,
@@ -64,6 +90,661 @@ pub fn gated_delta_recurrence(
     beta: &Array,
     state: Option<&Array>,
 ) -> Result<(Array, Array)> {
+    use super::fused::{note_fused, note_reference, REASON_CPU_STREAM, REASON_DISABLED};
+    #[cfg(test)]
+    if FORCE_OPS_REFERENCE.with(|f| f.get()) {
+        note_reference(super::fused::REASON_FORCED_REFERENCE);
+        return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+    }
+    let t = q.shape()[1];
+    // Resolve the stream once: the device check and the kernel dispatch must see the same one
+    // (the task-local stream when set, which need not be on the process default device).
+    let stream = Stream::task_local_or_default();
+    // Each route counts in the request's fused-primitive report (E3): the fused Metal kernel, or
+    // — off the GPU — the chunkwise or op-by-op reference forms.
+    let (y, next) = if stream_is_gpu(&stream) {
+        if !crate::switches::GDN_KERNEL.enabled() {
+            note_reference(REASON_DISABLED);
+            return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+        }
+        note_fused();
+        let (y, next, _) = kernel_segmented(q, k, v, g, beta, state, &stream, false)?;
+        (y, next)
+    } else if core_llm::defaults::MLX.gdn_chunked_prefill && t >= CHUNKED_PREFILL_MIN_TOKENS {
+        note_reference(REASON_CPU_STREAM);
+        gated_delta_chunked(q, k, v, g, beta, state)?
+    } else {
+        note_reference(REASON_CPU_STREAM);
+        return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+    };
+    let state_dtype = state.map_or(q.dtype(), Array::dtype);
+    Ok((cast_to(y, q.dtype())?, cast_to(next, state_dtype)?))
+}
+
+/// [`gated_delta_recurrence`] that also returns the state **after every token**: `(y, final_state,
+/// states)` with `states` `[B, T, Hv, Dv, Dk]` (row `t` is the state a step starting right after
+/// token `t` is seeded with; row `T - 1` equals `final_state`). The per-token rows are the
+/// DeltaNet checkpoint ring's input (sc-24435): a partially accepted speculative verify step
+/// restores the row of its last kept token instead of replaying a forward.
+///
+/// Dispatch: on a GPU stream the fused kernel's checkpoint variant (the same per-step arithmetic
+/// as [`gated_delta_kernel`], plus one state-row write per token); off the GPU the op-by-op
+/// reference, collecting its per-step states. Meant for verify widths (a handful of tokens) —
+/// `states` holds `T` full recurrent states. Dtypes follow [`gated_delta_recurrence`]: `y` in
+/// `q`'s dtype, both state outputs in the carried state's (or `q`'s from zeros).
+pub fn gated_delta_recurrence_checkpointed(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array, Array)> {
+    let stream = Stream::task_local_or_default();
+    #[cfg(test)]
+    let force_ops = FORCE_OPS_REFERENCE.with(|f| f.get());
+    #[cfg(not(test))]
+    let force_ops = false;
+    let gpu = stream_is_gpu(&stream);
+    let (y, next, states) = if !force_ops && gpu && crate::switches::GDN_KERNEL.enabled() {
+        super::fused::note_fused();
+        let (y, next, states) = kernel_segmented(q, k, v, g, beta, state, &stream, true)?;
+        (
+            y,
+            next,
+            states.expect("the checkpoint kernel returns per-token states"),
+        )
+    } else {
+        super::fused::note_reference(if force_ops {
+            super::fused::REASON_FORCED_REFERENCE
+        } else if !gpu {
+            super::fused::REASON_CPU_STREAM
+        } else {
+            super::fused::REASON_DISABLED
+        });
+        let (y, next, states) = ops_recurrence(q, k, v, g, beta, state, true)?;
+        (y, next, states.expect("collected per-token states"))
+    };
+    let state_dtype = state.map_or(q.dtype(), Array::dtype);
+    Ok((
+        cast_to(y, q.dtype())?,
+        cast_to(next, state_dtype)?,
+        cast_to(states, state_dtype)?,
+    ))
+}
+
+/// The most tokens one [`gated_delta_kernel`] dispatch runs: a longer sequence is split into
+/// dispatches carrying the state, so no single command stays on the GPU long enough to approach
+/// the Metal watchdog (a dispatch is ~15 ms at Qwen3.6-27B dims) however long the prompt is.
+pub const KERNEL_MAX_STEPS: i32 = 4096;
+
+/// [`gated_delta_kernel`] (or, with `checkpoint`, its per-token-state variant) over `T` in
+/// dispatches of at most [`KERNEL_MAX_STEPS`] tokens. Returns `(y, final_state, states)`, `states`
+/// `Some` exactly when `checkpoint`.
+#[allow(clippy::too_many_arguments)]
+fn kernel_segmented(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+    stream: &Stream,
+    checkpoint: bool,
+) -> Result<(Array, Array, Option<Array>)> {
+    let t = q.shape()[1];
+    if t <= KERNEL_MAX_STEPS {
+        return kernel_on(q, k, v, g, beta, state, stream, checkpoint);
+    }
+    let mut state = state.cloned();
+    let mut ys = Vec::new();
+    let mut all_states = Vec::new();
+    let mut start = 0;
+    while start < t {
+        let end = (start + KERNEL_MAX_STEPS).min(t);
+        let part = |x: &Array| slice_axis(x, 1, start, end);
+        let (y, next, states) = kernel_on(
+            &part(q)?,
+            &part(k)?,
+            &part(v)?,
+            &part(g)?,
+            &part(beta)?,
+            state.as_ref(),
+            stream,
+            checkpoint,
+        )?;
+        ys.push(y);
+        all_states.extend(states);
+        state = Some(next);
+        start = end;
+    }
+    let refs: Vec<&Array> = ys.iter().collect();
+    let states = if checkpoint {
+        let refs: Vec<&Array> = all_states.iter().collect();
+        Some(concatenate_axis(&refs, 1)?)
+    } else {
+        None
+    };
+    Ok((
+        concatenate_axis(&refs, 1)?,
+        state.expect("t > 0 ran a segment"),
+        states,
+    ))
+}
+
+/// The shortest sequence [`gated_delta_recurrence`] runs chunkwise on a CPU stream (one full
+/// chunk); shorter ones take the op-by-op reference.
+pub const CHUNKED_PREFILL_MIN_TOKENS: i32 = GDN_CHUNK;
+
+/// Tokens per chunk of the chunkwise-parallel form (the flash-linear-attention default).
+const GDN_CHUNK: i32 = 64;
+
+/// Chunks whose intra-chunk work is batched into one graph before the carried state and outputs
+/// are evaluated: bounds the prefill's transient to `GDN_SEGMENT_CHUNKS · GDN_CHUNK` tokens'
+/// `[C, C]` matrices however long the prompt is (the role `EVAL_CHUNK` plays in the ops path).
+const GDN_SEGMENT_CHUNKS: i32 = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch routing [`gated_delta_recurrence`] to the op-by-op reference on this thread,
+    /// so a model-level test can compare the production dispatch against the reference path.
+    static FORCE_OPS_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with [`gated_delta_recurrence`] forced onto the op-by-op reference (this thread only).
+#[cfg(test)]
+pub(crate) fn with_ops_reference<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_OPS_REFERENCE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_OPS_REFERENCE.with(|c| c.replace(true)));
+    f()
+}
+
+/// Which recurrence implementation ran — recorded (test builds only) at each implementation's
+/// entry, so a test can assert the route [`gated_delta_recurrence`] took, not just its numbers.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// One fused Metal kernel dispatch (a long run records one per segment).
+    Kernel,
+    /// One dispatch of the fused kernel's per-token-state (checkpoint) variant.
+    CheckpointKernel,
+    /// One call of the chunkwise-parallel form.
+    Chunked,
+    /// One call of the op-by-op reference.
+    Ops,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTES: std::cell::RefCell<Option<Vec<Route>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record(route: Route) {
+    ROUTES.with(|r| {
+        if let Some(routes) = r.borrow_mut().as_mut() {
+            routes.push(route);
+        }
+    });
+}
+
+/// Run `f`, returning every [`Route`] a recurrence implementation recorded on this thread.
+#[cfg(test)]
+pub(crate) fn recording_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<Route>) {
+    let previous = ROUTES.with(|r| r.replace(Some(Vec::new())));
+    let out = f();
+    let routes = ROUTES.with(|r| r.replace(previous)).unwrap_or_default();
+    (out, routes)
+}
+
+fn cast_to(x: Array, dtype: Dtype) -> Result<Array> {
+    Ok(if x.dtype() == dtype {
+        x
+    } else {
+        x.as_dtype(dtype)?
+    })
+}
+
+/// The fused recurrence body. One SIMD group (32 lanes) owns one `(batch, value head, value row)`
+/// state row `S[dv, :]`, `ceil(Dk/32)` elements per lane kept in registers across all `T` steps;
+/// each step decays it, reads `S·k` / `S·q` with a `simd_sum`, and writes the delta. GQA maps a
+/// value head to its key head by index (no repeated q/k). Inputs of any float dtype are read as
+/// f32; `y` and `state_out` are f32. Same per-step operation order as
+/// [`gated_delta_recurrence_ops`] (the reductions differ only in summation order).
+const GDN_KERNEL_SOURCE: &str = r#"
+    const uint n = thread_position_in_grid.z;
+    const uint b_idx = n / Hv;
+    const uint hv_idx = n % Hv;
+    const uint hk_idx = hv_idx / (Hv / Hk);
+    constexpr int n_per_t = (Dk + 31) / 32;
+    const int lane = thread_position_in_threadgroup.x;
+    const uint dv_idx = thread_position_in_grid.y;
+    const int steps = t_len;
+
+    auto q_ = q + (b_idx * steps * Hk + hk_idx) * Dk;
+    auto k_ = k + (b_idx * steps * Hk + hk_idx) * Dk;
+    auto v_ = v + (b_idx * steps * Hv + hv_idx) * Dv;
+    auto y_ = y + (b_idx * steps * Hv + hv_idx) * Dv;
+    auto g_ = g + b_idx * steps * Hv + hv_idx;
+    auto beta_ = beta + b_idx * steps * Hv + hv_idx;
+    auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+    // @checkpoint-init
+
+    float st[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+        const int s = n_per_t * lane + i;
+        st[i] = s < Dk ? static_cast<float>(i_state[s]) : 0.0f;
+    }
+    for (int t = 0; t < steps; ++t) {
+        const float decay = static_cast<float>(g_[0]);
+        float kv_mem = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+            const int s = n_per_t * lane + i;
+            if (s < Dk) {
+                st[i] = st[i] * decay;
+                kv_mem += st[i] * static_cast<float>(k_[s]);
+            }
+        }
+        kv_mem = simd_sum(kv_mem);
+        const float delta =
+            (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[0]);
+        float out = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+            const int s = n_per_t * lane + i;
+            if (s < Dk) {
+                st[i] = st[i] + static_cast<float>(k_[s]) * delta;
+                out += st[i] * static_cast<float>(q_[s]);
+            }
+        }
+        out = simd_sum(out);
+        if (thread_index_in_simdgroup == 0) {
+            y_[dv_idx] = out;
+        }
+        // @checkpoint-step
+        q_ += Hk * Dk;
+        k_ += Hk * Dk;
+        v_ += Hv * Dv;
+        y_ += Hv * Dv;
+        g_ += Hv;
+        beta_ += Hv;
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+        const int s = n_per_t * lane + i;
+        if (s < Dk) {
+            o_state[s] = st[i];
+        }
+    }
+"#;
+
+/// The checkpoint variant's extra lines: `states` `[B, T, Hv, Dv, Dk]` receives each lane's slice of
+/// the state row after every step — the same registers the final `state_out` write reads, so row
+/// `T - 1` is bit-identical to `state_out`.
+const GDN_CHECKPOINT_INIT: &str =
+    "    auto c_state = states + ((b_idx * steps * Hv + hv_idx) * Dv + dv_idx) * Dk;";
+const GDN_CHECKPOINT_STEP: &str = r#"        for (int i = 0; i < n_per_t; ++i) {
+            const int s = n_per_t * lane + i;
+            if (s < Dk) {
+                c_state[s] = st[i];
+            }
+        }
+        c_state += Hv * Dv * Dk;"#;
+
+/// [`GDN_KERNEL_SOURCE`] with the per-token state writes spliced in (built once).
+fn checkpoint_kernel_source() -> &'static str {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let (init, step) = ("    // @checkpoint-init", "        // @checkpoint-step");
+        assert!(
+            GDN_KERNEL_SOURCE.matches(init).count() == 1
+                && GDN_KERNEL_SOURCE.matches(step).count() == 1,
+            "the gated-delta kernel source lost a checkpoint splice marker"
+        );
+        GDN_KERNEL_SOURCE
+            .replace(init, GDN_CHECKPOINT_INIT)
+            .replace(step, GDN_CHECKPOINT_STEP)
+    })
+}
+
+/// The gated delta recurrence as one fused Metal kernel (decode `T = 1`, verify `T = M`, or any
+/// `T`): the whole `T`-step loop runs on the GPU with the state in registers. Shapes as
+/// [`gated_delta_recurrence`]; inputs may be f32/bf16/f16 and are accumulated in f32; returns
+/// `(y [B,T,Hv,Dv], state [B,Hv,Dv,Dk])`, **both f32**. Dispatches on the task-local default
+/// stream (else the default device's), which must be a GPU stream.
+pub fn gated_delta_kernel(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let (y, next, _) = kernel_on(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        &Stream::task_local_or_default(),
+        false,
+    )?;
+    Ok((y, next))
+}
+
+/// [`gated_delta_kernel`] dispatched on `stream` (a GPU stream). With `checkpoint` it runs the
+/// variant that also writes every token's state, returned as `Some([B, T, Hv, Dv, Dk])` (f32).
+#[allow(clippy::too_many_arguments)]
+fn kernel_on(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+    stream: &Stream,
+    checkpoint: bool,
+) -> Result<(Array, Array, Option<Array>)> {
+    #[cfg(test)]
+    record(if checkpoint {
+        Route::CheckpointKernel
+    } else {
+        Route::Kernel
+    });
+    let qs = q.shape();
+    let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+    let vs = v.shape();
+    let (hv, dv) = (vs[2], vs[3]);
+    let state = match state {
+        Some(s) => s.clone(),
+        None => zeros_state(b, hv, dv, dk, Dtype::Float32)?,
+    };
+    let steps = Array::from_int(t);
+    let kernel = if checkpoint {
+        MetalKernel::new(
+            "sceneworks_gated_delta_step_checkpoint",
+            &["q", "k", "v", "g", "beta", "state_in", "t_len"],
+            &["y", "state_out", "states"],
+            checkpoint_kernel_source(),
+        )?
+    } else {
+        MetalKernel::new(
+            "sceneworks_gated_delta_step",
+            &["q", "k", "v", "g", "beta", "state_in", "t_len"],
+            &["y", "state_out"],
+            GDN_KERNEL_SOURCE,
+        )?
+    };
+    // Four value rows per threadgroup when they divide `Dv` (the grid is exact either way).
+    let rows = if dv % 4 == 0 {
+        4
+    } else if dv % 2 == 0 {
+        2
+    } else {
+        1
+    };
+    let mut dispatch = kernel
+        .apply()
+        .inputs([q, k, v, g, beta, &state, &steps])
+        .output_shape([b, t, hv, dv], Dtype::Float32)
+        .output_shape([b, hv, dv, dk], Dtype::Float32);
+    if checkpoint {
+        dispatch = dispatch.output_shape([b, t, hv, dv, dk], Dtype::Float32);
+    }
+    let mut out = dispatch
+        .template_arg("Dk", dk)
+        .template_arg("Dv", dv)
+        .template_arg("Hk", hk)
+        .template_arg("Hv", hv)
+        .grid(32, dv, b * hv)
+        .thread_group(32, rows, 1)
+        .run_device(stream)?;
+    let states = if checkpoint {
+        Some(out.pop().expect("three checkpoint-kernel outputs"))
+    } else {
+        None
+    };
+    let next = out.pop().expect("two kernel outputs");
+    let y = out.pop().expect("two kernel outputs");
+    Ok((y, next, states))
+}
+
+/// The gated delta recurrence in its **chunkwise-parallel** form (the WY / flash-linear-attention
+/// `chunk_gated_delta_rule` formulation), for prefill. Shapes as [`gated_delta_recurrence`];
+/// inputs of any float dtype are computed in f32 and `(y, state)` are returned **f32**.
+///
+/// Within a chunk of `C` tokens starting from state `S₀`, with `Γᵢ = ∏_{j≤i} gⱼ` (a cumulative
+/// sum of `ln g`), the per-token deltas `δᵢ = βᵢ(vᵢ − gᵢSᵢ₋₁kᵢ)` solve the unit-lower-triangular
+/// system `(I + A) Δ = V_β − (K_β Γ) S₀ᵀ` with `Aᵢⱼ = βᵢ (Γᵢ/Γⱼ) kᵢ·kⱼ` (`i > j`), so with
+/// `T = (I + A)⁻¹`, `U = T V_β` and `W = T (K_β Γ)` (all chunks at once):
+///
+/// ```text
+///   Δ    = U − W S₀ᵀ
+///   Y    = (Q Γ) S₀ᵀ + ((Q Kᵀ) ⊙ Γᵢ/Γⱼ, j ≤ i) Δ
+///   S_C  = Γ_C S₀ + Δᵀ (K Γ_C/Γ)
+/// ```
+///
+/// Only the `S₀ → S_C` hand-off is sequential (one step per chunk, not per token). `T` is built
+/// by block doubling — `T₂ₛ = Tₛ − Tₛ Eₛ Tₛ`, `Eₛ` the part of `A` inside the `2s`-diagonal
+/// blocks but outside the `s`-diagonal ones — which is exact block forward substitution. Every
+/// exponent is `≤ 0` (`g ∈ (0, 1]`), so nothing overflows; a gate that underflowed to 0 is
+/// clamped to the smallest normal f32 before its log.
+pub fn gated_delta_chunked(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    #[cfg(test)]
+    record(Route::Chunked);
+    let f32 = Dtype::Float32;
+    let c = GDN_CHUNK;
+    let qs = q.shape();
+    let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+    let vs = v.shape();
+    let (hv, dv) = (vs[2], vs[3]);
+    let (q, k) = if hv != hk {
+        let r = hv / hk;
+        (repeat_heads(q, r)?, repeat_heads(k, r)?)
+    } else {
+        (q.clone(), k.clone())
+    };
+
+    // Pad T to whole chunks with inert steps (g = 1, β = 0, k = q = v = 0 leave the state as is),
+    // then lay every tensor out per head and chunk: [B, Hv, nC, C, ·].
+    let n_chunks = (t + c - 1) / c;
+    let pad = n_chunks * c - t;
+    let heads_first = |x: &Array, fill: f32, d: i32| -> Result<Array> {
+        let x = x.as_dtype(f32)?;
+        let x = if pad > 0 {
+            let mut shape = x.shape().to_vec();
+            shape[1] = pad;
+            let filler = mlx_rs::ops::full::<f32>(&shape, Array::from_f32(fill))?;
+            concatenate_axis(&[&x, &filler], 1)?
+        } else {
+            x
+        };
+        if d == 0 {
+            // [B, Tp, Hv] → [B, Hv, nC, C]
+            Ok(x.transpose_axes(&[0, 2, 1])?
+                .reshape(&[b, hv, n_chunks, c])?)
+        } else {
+            // [B, Tp, Hv, D] → [B, Hv, nC, C, D]
+            Ok(x.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, hv, n_chunks, c, d])?)
+        }
+    };
+    let q = heads_first(&q, 0.0, dk)?;
+    let k = heads_first(&k, 0.0, dk)?;
+    let v = heads_first(v, 0.0, dv)?;
+    let g = heads_first(g, 1.0, 0)?;
+    let beta = heads_first(beta, 0.0, 0)?;
+
+    let masks = ChunkMasks::new(c)?;
+    let mut state = match state {
+        Some(s) => s.as_dtype(f32)?,
+        None => zeros_state(b, hv, dv, dk, f32)?,
+    };
+    let mut ys: Vec<Array> = Vec::with_capacity(n_chunks as usize);
+    let mut seg_start = 0;
+    while seg_start < n_chunks {
+        let n = GDN_SEGMENT_CHUNKS.min(n_chunks - seg_start);
+        let seg = |x: &Array| -> Result<Array> { slice_axis(x, 2, seg_start, seg_start + n) };
+        let (qc, kc, vc, gc, bc) = (seg(&q)?, seg(&k)?, seg(&v)?, seg(&g)?, seg(&beta)?);
+
+        // Intra-chunk work, batched over the segment's chunks: [B, Hv, n, C, ·].
+        let log_g = mlx_rs::ops::log(&mlx_rs::ops::maximum(
+            &gc,
+            Array::from_f32(f32::MIN_POSITIVE),
+        )?)?;
+        let cum = log_g.cumsum(-1, None, None)?; // ln Γᵢ           [B,Hv,n,C]
+        let gamma = exp(&cum)?; // Γᵢ                              [B,Hv,n,C]
+        let diff = subtract(&cum.expand_dims(-1)?, &cum.expand_dims(-2)?)?; // ln Γᵢ − ln Γⱼ
+        let decay = multiply(
+            &exp(&mlx_rs::ops::minimum(&diff, Array::from_f32(0.0))?)?,
+            &masks.lower,
+        )?; // Γᵢ/Γⱼ for j ≤ i, else 0                            [B,Hv,n,C,C]
+        let k_t = kc.swap_axes(-1, -2)?;
+        let kb = multiply(&kc, &bc.expand_dims(-1)?)?; // β k
+        let a = multiply(
+            &multiply(&mlx_rs::ops::matmul(&kb, &k_t)?, &decay)?,
+            &masks.strict,
+        )?; // Aᵢⱼ, i > j
+        let tinv = unit_lower_inverse(&a, &masks)?; // (I + A)⁻¹
+        let w = mlx_rs::ops::matmul(&tinv, &multiply(&kb, &gamma.expand_dims(-1)?)?)?; // [..,C,Dk]
+        let u = mlx_rs::ops::matmul(&tinv, &multiply(&vc, &bc.expand_dims(-1)?)?)?; // [..,C,Dv]
+        let q_gamma = multiply(&qc, &gamma.expand_dims(-1)?)?; // Q Γ
+        let qk = multiply(&mlx_rs::ops::matmul(&qc, &k_t)?, &decay)?; // causal (Q Kᵀ) ⊙ Γᵢ/Γⱼ
+        let last = slice_axis(&cum, -1, c - 1, c)?; // ln Γ_C          [B,Hv,n,1]
+        let k_tail = multiply(&kc, &exp(&subtract(&last, &cum)?)?.expand_dims(-1)?)?; // K Γ_C/Γ
+        let chunk_decay = exp(&last)?; // Γ_C                          [B,Hv,n,1]
+
+        // The sequential hand-off, one step per chunk.
+        for i in 0..n {
+            let pick = |x: &Array| -> Result<Array> {
+                Ok(slice_axis(x, 2, i, i + 1)?.squeeze_axes(&[2])?)
+            };
+            let s_t = state.swap_axes(-1, -2)?; // S₀ᵀ [B,Hv,Dk,Dv]
+            let delta = subtract(&pick(&u)?, &mlx_rs::ops::matmul(&pick(&w)?, &s_t)?)?; // [B,Hv,C,Dv]
+            let y = add(
+                &mlx_rs::ops::matmul(&pick(&q_gamma)?, &s_t)?,
+                &mlx_rs::ops::matmul(&pick(&qk)?, &delta)?,
+            )?; // [B,Hv,C,Dv]
+            let carried = multiply(&state, &pick(&chunk_decay)?.expand_dims(-1)?)?; // Γ_C S₀
+            state = add(
+                &carried,
+                &mlx_rs::ops::matmul(&delta.swap_axes(-1, -2)?, &pick(&k_tail)?)?,
+            )?; // + Δᵀ (K Γ_C/Γ)
+            ys.push(y);
+        }
+        seg_start += n;
+        if seg_start < n_chunks {
+            // Materialize this segment's outputs and the carried state so its [C, C] transients
+            // free before the next segment is built.
+            eval(ys.iter().chain(std::iter::once(&state)))?;
+        }
+    }
+    let refs: Vec<&Array> = ys.iter().collect();
+    let y = concatenate_axis(&refs, 2)?; // [B,Hv,Tp,Dv]
+    let y = slice_axis(&y, 2, 0, t)?.transpose_axes(&[0, 2, 1, 3])?; // [B,T,Hv,Dv]
+    Ok((y, state))
+}
+
+/// Constant `[C, C]` masks of the chunkwise form, plus the block-doubling bands.
+struct ChunkMasks {
+    /// `1` where `j ≤ i`.
+    lower: Array,
+    /// `1` where `j < i`.
+    strict: Array,
+    /// The identity.
+    eye: Array,
+    /// For each doubling level `s` (1, 2, 4, …, C/2): `1` where `i, j` share a `2s` block but
+    /// not an `s` block.
+    bands: Vec<Array>,
+}
+
+impl ChunkMasks {
+    fn new(c: i32) -> Result<Self> {
+        let n = c as usize;
+        let build = |f: &dyn Fn(usize, usize) -> bool| -> Array {
+            let data: Vec<f32> = (0..n * n)
+                .map(|x| if f(x / n, x % n) { 1.0 } else { 0.0 })
+                .collect();
+            Array::from_slice(&data, &[c, c])
+        };
+        let mut bands = Vec::new();
+        let mut s = 1usize;
+        while s < n {
+            bands.push(build(&|i, j| i / (2 * s) == j / (2 * s) && i / s != j / s));
+            s *= 2;
+        }
+        Ok(Self {
+            lower: build(&|i, j| j <= i),
+            strict: build(&|i, j| j < i),
+            eye: build(&|i, j| i == j),
+            bands,
+        })
+    }
+}
+
+/// `(I + A)⁻¹` for strictly-lower-triangular `A` `[…, C, C]` by block doubling:
+/// `T₁ = I`, `T₂ₛ = Tₛ − Tₛ (A ⊙ bandₛ) Tₛ` — exact, since `bandₛ` holds exactly the one
+/// off-diagonal block each `2s` block adds and `Eₛ Tₛ Eₛ = 0`.
+fn unit_lower_inverse(a: &Array, masks: &ChunkMasks) -> Result<Array> {
+    let mut inv = broadcast_to(&masks.eye, a.shape())?;
+    for band in &masks.bands {
+        let e = multiply(a, band)?;
+        let correction = mlx_rs::ops::matmul(&mlx_rs::ops::matmul(&inv, &e)?, &inv)?;
+        inv = subtract(&inv, &correction)?;
+    }
+    Ok(inv)
+}
+
+/// `x[.., start..end, ..]` along `axis` (negative counts from the end).
+fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    let arr = Array::from_slice(&idx, &[idx.len() as i32]);
+    Ok(x.take_axis(&arr, axis)?)
+}
+
+/// The op-by-op gated delta recurrence — a faithful port of the `mlx_lm.models.gated_delta` ops
+/// path (`gated_delta_ops` / `_gated_delta_step_ops`), one graph node group per token. It is the
+/// **numeric reference** the fused kernel and the chunked form are tested against, and the path
+/// [`gated_delta_recurrence`] takes off the GPU. Shapes as [`gated_delta_recurrence`]; the math runs
+/// in the inputs' dtype.
+pub fn gated_delta_recurrence_ops(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let (y, next, _) = ops_recurrence(q, k, v, g, beta, state, false)?;
+    Ok((y, next))
+}
+
+/// [`gated_delta_recurrence_ops`], optionally also returning every step's state stacked
+/// `[B, T, Hv, Dv, Dk]` (`collect`).
+#[allow(clippy::too_many_arguments)]
+fn ops_recurrence(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+    collect: bool,
+) -> Result<(Array, Array, Option<Array>)> {
+    #[cfg(test)]
+    record(Route::Ops);
     let qs = q.shape();
     let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
     let vs = v.shape();
@@ -94,6 +775,7 @@ pub fn gated_delta_recurrence(
     // graphs — and the per-step sync cost `sc-7469` warned against — are unchanged.
     const EVAL_CHUNK: i32 = 256;
     let mut ys: Vec<Array> = Vec::with_capacity(t as usize);
+    let mut states: Vec<Array> = Vec::new();
     let mut flushed = 0usize;
     for ti in 0..t {
         let qt = slice_time(&q, ti)?; // [B,Hv,Dk]
@@ -103,6 +785,9 @@ pub fn gated_delta_recurrence(
         let bt = slice_time(beta, ti)?; // [B,Hv]
         let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, b, hv, dk, dv)?;
         state = next;
+        if collect {
+            states.push(state.expand_dims(1)?); // [B,1,Hv,Dv,Dk]
+        }
         ys.push(y.expand_dims(1)?); // [B,1,Hv,Dv]
         if (ti + 1) % EVAL_CHUNK == 0 {
             // Force this chunk's outputs + the carried state (which transitively pins every step's
@@ -113,7 +798,13 @@ pub fn gated_delta_recurrence(
     }
     let refs: Vec<&Array> = ys.iter().collect();
     let y = concatenate_axis(&refs, 1)?; // [B,T,Hv,Dv]
-    Ok((y, state))
+    let states = if collect {
+        let refs: Vec<&Array> = states.iter().collect();
+        Some(concatenate_axis(&refs, 1)?) // [B,T,Hv,Dv,Dk]
+    } else {
+        None
+    };
+    Ok((y, state, states))
 }
 
 /// Causal depthwise short convolution over `[B, S, C]` with per-channel kernel `weight` `[C, K]`
@@ -126,6 +817,53 @@ pub fn causal_depthwise_conv(
     weight: &Array,
     conv_state: &Array,
 ) -> Result<(Array, Array)> {
+    let (out, trace) = causal_depthwise_conv_traced(x, weight, conv_state)?;
+    Ok((out, trace.tail_after(trace.tokens() - 1)?))
+}
+
+/// The conv input of one forward — `[conv_state ‖ x]`, `[B, S+K-1, C]` — from which the conv tail
+/// **after any token** of the forward is a slice: the state after token `ti` (0-based) is rows
+/// `ti+1 .. ti+K` ([`tail_after`](Self::tail_after)). [`causal_depthwise_conv_traced`] returns it so
+/// the DeltaNet checkpoint ring (sc-24435) can restore any token's conv state without recomputing
+/// the conv.
+#[derive(Clone, Debug)]
+pub struct ConvTrace {
+    cat: Array,
+    tokens: i32,
+    tail: i32,
+}
+
+impl ConvTrace {
+    /// Tokens `S` of the forward this trace belongs to.
+    pub fn tokens(&self) -> i32 {
+        self.tokens
+    }
+
+    /// Rows of one conv tail (`K - 1`).
+    pub fn tail_len(&self) -> i32 {
+        self.tail
+    }
+
+    /// The conv tail after token `ti` (0-based) of this forward — the `[B, K-1, C]` state a step
+    /// starting right after that token is seeded with. `ti` outside `0..tokens()` is an error.
+    pub fn tail_after(&self, ti: i32) -> Result<Array> {
+        if ti < 0 || ti >= self.tokens {
+            return Err(Error::Msg(format!(
+                "ConvTrace: token {ti} outside a {}-token forward",
+                self.tokens
+            )));
+        }
+        slice_seq(&self.cat, ti + 1, ti + 1 + self.tail)
+    }
+}
+
+/// [`causal_depthwise_conv`] returning the [`ConvTrace`] (the conv input) instead of only the final
+/// tail, so the caller can take the tail after **every** token.
+pub fn causal_depthwise_conv_traced(
+    x: &Array,
+    weight: &Array,
+    conv_state: &Array,
+) -> Result<(Array, ConvTrace)> {
     let xs = x.shape();
     let (s, c) = (xs[1], xs[2]);
     let kk = weight.shape()[1]; // kernel size K (weight is [C, K])
@@ -143,8 +881,14 @@ pub fn causal_depthwise_conv(
         });
     }
     let out = silu(acc.expect("conv kernel size must be >= 1"))?; // [B,S,C]
-    let new_state = slice_seq(&cat, s, s + kk - 1)?; // last K-1 of conv_in → [B,K-1,C]
-    Ok((out, new_state))
+    Ok((
+        out,
+        ConvTrace {
+            cat,
+            tokens: s,
+            tail: kk - 1,
+        },
+    ))
 }
 
 /// Gated RMSNorm (`Qwen3NextRMSNormGated`): `rms_norm(x, weight, eps) · silu(gate)`. Applied to the
@@ -159,6 +903,26 @@ pub fn rms_norm_gated(x: &Array, weight: &Array, gate: &Array, eps: f32) -> Resu
 /// delta-rule `ssm_state` `[B, Hv, Dv, Dk]`, both **fixed size** in sequence length (unlike the
 /// growing KV cache). A hybrid decoder keeps one of these per linear layer alongside a
 /// [`KvCache`](super::KvCache) per full-attention layer (the decoder assembles the mixed list).
+///
+/// ## The checkpoint ring (sc-24435)
+/// A recurrence cannot be inverted, so rolling the layer back after a rejected speculative draft
+/// needs the state *as it was* at the kept position. [`arm_checkpoints`](Self::arm_checkpoints)
+/// opens a **checkpoint window** at the current position: it keeps the live state there, and
+/// every forward until the window closes keeps the state after each of its tokens — a multi-token
+/// forward runs [`gated_delta_recurrence_checkpointed`] and keeps its `[B, T, Hv, Dv, Dk]` output
+/// as produced (no copy), a single-token forward keeps its final state (which *is* its per-token
+/// state), and each keeps its conv input ([`ConvTrace`]). [`rollback_to`](Self::rollback_to) any
+/// position from the window start to the current one selects that state: no replay forward, no
+/// copy of the cache. The window spans any number of forwards (a verify step is one; a draft
+/// model's autoregressive proposal is several) and closes on a rollback,
+/// [`close_checkpoints`](Self::close_checkpoints), [`update`](Self::update) or
+/// [`reset`](Self::reset); the next forward after that drops what it kept. A window records at
+/// most the `max_tokens` it was armed with: a forward that would take it past that is refused
+/// ([`Error::CheckpointWindowFull`]) before it runs. Holding a window of `N` tokens costs `N + 1`
+/// recurrent states and about `N + 2K` conv rows per layer on top of the live state — what
+/// request admission prices for the speculative width, whose `width + 1` tokens are the cap the
+/// speculative engine arms. Forwards outside a window (prefill, plain decode) take the
+/// final-state-only [`gated_delta_recurrence`] and pay nothing.
 #[derive(Clone, Debug, Default)]
 pub struct DeltaNetCache {
     /// The short-conv history (previous `K-1` tokens), or `None` before the first step.
@@ -166,6 +930,45 @@ pub struct DeltaNetCache {
     /// The delta-rule recurrent state, or `None` before the first step.
     pub ssm_state: Option<Array>,
     offset: i32,
+    /// The open or last-closed checkpoint window.
+    window: Option<CheckpointWindow>,
+    /// The position the next forward outside a checkpoint window captures its state at
+    /// ([`capture_at`](DeltaNetCache::capture_at)), if any.
+    capture: Option<i32>,
+    /// `(position, conv_state, ssm_state)` the last forward captured.
+    captured: Option<(i32, Array, Array)>,
+}
+
+/// A checkpoint window: the state at `start` and the per-token states of every forward since.
+#[derive(Clone, Debug)]
+struct CheckpointWindow {
+    /// The position the window was opened at.
+    start: i32,
+    /// The most tokens the window records; a forward past it is refused.
+    max_tokens: i32,
+    /// The live `(conv_state, ssm_state)` at `start` (`None` on a cache that has not run).
+    at_start: Option<(Array, Array)>,
+    /// The forwards recorded since `start`, in order and contiguous.
+    chunks: Vec<Checkpoints>,
+    /// Whether forwards are still being recorded.
+    open: bool,
+}
+
+/// One recorded forward's per-token states: positions `base + 1 ..= base + T`.
+#[derive(Clone, Debug)]
+struct Checkpoints {
+    /// The position the forward started at.
+    base: i32,
+    /// `[B, T, Hv, Dv, Dk]` — row `t` is the state after position `base + t + 1`.
+    ssm: Array,
+    /// The forward's conv input.
+    conv: ConvTrace,
+}
+
+impl Checkpoints {
+    fn end(&self) -> i32 {
+        self.base + self.conv.tokens()
+    }
 }
 
 impl DeltaNetCache {
@@ -180,10 +983,264 @@ impl DeltaNetCache {
     }
 
     /// Store the post-step `(conv_state, ssm_state)` and advance the position by `step` tokens.
+    /// The positions stepped over are not restorable (any checkpoint window is dropped).
     pub fn update(&mut self, conv_state: Array, ssm_state: Array, step: i32) {
         self.conv_state = Some(conv_state);
         self.ssm_state = Some(ssm_state);
         self.offset += step;
+        self.window = None;
+    }
+
+    /// Open a checkpoint window at the current position (dropping any previous one): the state
+    /// here and after every token of each forward until the window closes stays restorable by
+    /// [`rollback_to`](Self::rollback_to). The window records at most `max_tokens` tokens: a
+    /// forward that would record more is [`Error::CheckpointWindowFull`] and leaves the cache
+    /// untouched.
+    pub fn arm_checkpoints(&mut self, max_tokens: i32) {
+        self.window = Some(CheckpointWindow {
+            start: self.offset,
+            max_tokens,
+            at_start: self.live_state().map(|(c, s)| (c.clone(), s.clone())),
+            chunks: Vec::new(),
+            open: true,
+        });
+    }
+
+    /// Drop the checkpoint window, open or closed, keeping only the live state: the cache can
+    /// then return to no earlier position. What a cross-turn prefix-cache entry holds (sc-24437)
+    /// — its state exists only at its own position, and it is charged exactly the live state.
+    pub fn discard_checkpoints(&mut self) {
+        self.window = None;
+    }
+
+    /// Stop recording: later forwards run the final-state-only recurrence and drop the window.
+    /// Its positions stay restorable until then.
+    pub fn close_checkpoints(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.open = false;
+        }
+    }
+
+    /// Run the recurrence over the `T` tokens of one forward from the live state and advance the
+    /// position by `T`. `conv` is this forward's conv trace (its last tail becomes the live conv
+    /// state); `q`, `k`, `v`, `g`, `beta` are shaped as for [`gated_delta_recurrence`]. Returns
+    /// `y` `[B, T, Hv, Dv]`.
+    ///
+    /// Inside an open checkpoint window the forward's per-token states are kept (a multi-token
+    /// forward runs [`gated_delta_recurrence_checkpointed`]); otherwise it runs the
+    /// final-state-only [`gated_delta_recurrence`] and drops any closed window, whose positions it
+    /// has moved past. A forward that would take an open window past the `max_tokens` it was armed
+    /// with is [`Error::CheckpointWindowFull`], refused before anything runs: the cache is
+    /// untouched.
+    pub fn advance(
+        &mut self,
+        conv: ConvTrace,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+    ) -> Result<Array> {
+        let t = q.shape()[1];
+        if conv.tokens() != t {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::advance: conv trace covers {} tokens, recurrence {t}",
+                conv.tokens()
+            )));
+        }
+        let recording = match self.window.as_ref() {
+            Some(w) if w.open => {
+                let recorded = self.checkpointed_tokens();
+                if recorded + t > w.max_tokens {
+                    return Err(Error::CheckpointWindowFull {
+                        recorded,
+                        requested: t,
+                        max_tokens: w.max_tokens,
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        if !recording {
+            // Released before the new graph is built. A live state restored from the window is a
+            // lazy row gather that keeps it alive until evaluated — the hybrid cache schedules that
+            // evaluation when it rolls back, so the window does not linger into this forward.
+            self.window = None;
+        }
+        let conv_state = conv.tail_after(t - 1)?;
+        let offset = self.offset;
+        self.captured = None;
+        let capture = self
+            .capture
+            .take()
+            .filter(|&p| !recording && p > offset && p < offset + t);
+        let (y, ssm_state) = if let Some(p) = capture {
+            // A boundary inside a prefill (sc-24446): run the recurrence up to it, keep the state
+            // there, continue from it — the arithmetic of two forwards split at `p`.
+            let b = p - offset;
+            let head = |x: &Array| slice_axis(x, 1, 0, b);
+            let tail = |x: &Array| slice_axis(x, 1, b, t);
+            let (y_head, at) = gated_delta_recurrence(
+                &head(q)?,
+                &head(k)?,
+                &head(v)?,
+                &head(g)?,
+                &head(beta)?,
+                self.ssm_state.as_ref(),
+            )?;
+            let (y_tail, last) = gated_delta_recurrence(
+                &tail(q)?,
+                &tail(k)?,
+                &tail(v)?,
+                &tail(g)?,
+                &tail(beta)?,
+                Some(&at),
+            )?;
+            self.captured = Some((p, conv.tail_after(b - 1)?, at));
+            (concatenate_axis(&[&y_head, &y_tail], 1)?, last)
+        } else if recording && t > 1 {
+            let (y, last, states) =
+                gated_delta_recurrence_checkpointed(q, k, v, g, beta, self.ssm_state.as_ref())?;
+            self.record(conv, states);
+            (y, last)
+        } else {
+            let (y, last) = gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref())?;
+            if recording {
+                // One token: its final state is its per-token state — kept, not recomputed.
+                self.record(conv, last.expand_dims(1)?);
+            }
+            (y, last)
+        };
+        self.conv_state = Some(conv_state);
+        self.ssm_state = Some(ssm_state);
+        self.offset += t;
+        Ok(y)
+    }
+
+    /// Ask the next forward to capture the state after `position` — a boundary strictly inside
+    /// that forward, which runs outside a checkpoint window (a prefill) — so the prefix cache can
+    /// snapshot the layer there without splitting the prefill into two forwards (sc-24446).
+    pub fn capture_at(&mut self, position: i32) {
+        self.capture = Some(position);
+    }
+
+    /// Drop a pending [`capture_at`](Self::capture_at) the last forward did not consume (it
+    /// failed before reaching this layer): a later forward must never capture a stale boundary.
+    pub fn clear_capture(&mut self) {
+        self.capture = None;
+    }
+
+    /// This layer as it was after `position`, from the state the last forward captured there
+    /// ([`capture_at`](Self::capture_at)) — no checkpoint window, no pending capture — or `None`
+    /// when it captured none there.
+    pub fn at_captured(&self, position: i32) -> Option<DeltaNetCache> {
+        let (p, conv, ssm) = self.captured.as_ref()?;
+        (*p == position).then(|| DeltaNetCache {
+            conv_state: Some(conv.clone()),
+            ssm_state: Some(ssm.clone()),
+            offset: position,
+            ..DeltaNetCache::default()
+        })
+    }
+
+    fn record(&mut self, conv: ConvTrace, ssm: Array) {
+        let base = self.offset;
+        if let Some(w) = self.window.as_mut() {
+            w.chunks.push(Checkpoints { base, ssm, conv });
+        }
+    }
+
+    /// The positions [`rollback_to`](Self::rollback_to) can return to besides zero (a reset) and
+    /// the current one (a no-op): the checkpoint window's, from its start up to the current
+    /// position (empty without a window).
+    pub fn restorable(&self) -> std::ops::Range<i32> {
+        match &self.window {
+            Some(w) => w.start.min(self.offset)..self.offset,
+            None => self.offset..self.offset,
+        }
+    }
+
+    /// Whether [`rollback_to`](Self::rollback_to)`(n)` would succeed.
+    pub fn can_rollback_to(&self, n: i32) -> bool {
+        n == 0 || n == self.offset || self.restorable().contains(&n)
+    }
+
+    /// Roll back so the next step continues from position `n`: `n == offset()` is a no-op, `n == 0`
+    /// a [`reset`](Self::reset), and any position of the checkpoint window selects the state kept
+    /// there as the live state — lazily, without a forward (the caller evaluates it;
+    /// [`live_state`](Self::live_state)). The window closes and keeps only the positions up to
+    /// `n`. Anything else is [`Error::Unsupported`] and leaves the cache untouched.
+    pub fn rollback_to(&mut self, n: i32) -> Result<()> {
+        if n == self.offset {
+            self.close_checkpoints();
+            return Ok(());
+        }
+        if n == 0 {
+            self.reset();
+            return Ok(());
+        }
+        if !self.restorable().contains(&n) {
+            let held = self.restorable();
+            return Err(Error::Unsupported(format!(
+                "DeltaNetCache: cannot roll back to position {n} from {}: the checkpoint window \
+                 holds positions {}..{}",
+                self.offset, held.start, held.end
+            )));
+        }
+        let w = self
+            .window
+            .as_mut()
+            .expect("a non-empty restorable range has a window");
+        w.open = false;
+        w.chunks.retain(|c| c.base < n);
+        let (conv_state, ssm_state) = match w.chunks.last() {
+            None => w
+                .at_start
+                .clone()
+                .expect("a window opened past position 0 kept the live state"),
+            Some(c) => {
+                let ti = n - c.base - 1;
+                let row = c.ssm.take_axis(Array::from_slice(&[ti], &[1]), 1)?; // [B,1,Hv,Dv,Dk]
+                let mut shape = row.shape().to_vec();
+                shape.remove(1);
+                (c.conv.tail_after(ti)?, row.reshape(&shape)?)
+            }
+        };
+        debug_assert!(w.chunks.last().is_none_or(|c| c.end() >= n));
+        self.conv_state = Some(conv_state);
+        self.ssm_state = Some(ssm_state);
+        self.offset = n;
+        Ok(())
+    }
+
+    /// The live `(conv_state, ssm_state)`, when the layer has run.
+    pub fn live_state(&self) -> Option<(&Array, &Array)> {
+        self.conv_state.as_ref().zip(self.ssm_state.as_ref())
+    }
+
+    /// Bytes this layer holds: the live state plus the checkpoint window (its start state, and
+    /// every recorded forward's per-token states and conv input) — the resident footprint
+    /// admission prices. A buffer shared by two of them (a single-token forward's final state is
+    /// both live and its checkpoint) is counted twice, so this never under-reports.
+    pub fn resident_bytes(&self) -> usize {
+        let pair = |(c, s): (&Array, &Array)| c.nbytes() + s.nbytes();
+        let live = self.live_state().map_or(0, pair);
+        let window = self.window.as_ref().map_or(0, |w| {
+            w.at_start.as_ref().map_or(0, |(c, s)| pair((c, s)))
+                + w.chunks
+                    .iter()
+                    .map(|c| c.ssm.nbytes() + c.conv.cat.nbytes())
+                    .sum::<usize>()
+        });
+        live + window
+    }
+
+    /// Tokens recorded in the checkpoint window (`0` without one).
+    pub fn checkpointed_tokens(&self) -> i32 {
+        self.window
+            .as_ref()
+            .map_or(0, |w| w.chunks.iter().map(|c| c.conv.tokens()).sum::<i32>())
     }
 
     /// Drop all state, returning the cache to its freshly-constructed condition.
@@ -191,6 +1248,9 @@ impl DeltaNetCache {
         self.conv_state = None;
         self.ssm_state = None;
         self.offset = 0;
+        self.window = None;
+        self.capture = None;
+        self.captured = None;
     }
 }
 
@@ -459,13 +1519,678 @@ mod tests {
         assert!(cache.conv_state.is_none());
     }
 
-    /// A long prefill must not exhaust the Metal allocator. The recurrence builds the whole `t`-step
-    /// graph before a single eval, eagerly allocating per-step index buffers; without periodic flushing
-    /// a sequence past ~100k steps trips the allocator's resource limit and the next gather fails with a
-    /// spurious "expected a non-empty mlx_array". `t = 130_000` clears that limit (~5 buffers/step >
-    /// 499_000) and must now complete because the recurrence flushes every `EVAL_CHUNK` steps. Marked
-    /// `ignore` only for runtime (the loop is long), not flakiness — it is the direct regression guard
-    /// for the high-res-image vision crash.
+    /// Deterministic uniform `[-1, 1)` values (a 64-bit LCG), so the parity fixtures need no RNG state.
+    fn lcg(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Model-shaped recurrence inputs: L2-normalized q (scaled by `1/√Dk`) and k, gates from
+    /// [`compute_g`], `β = sigmoid(b)`, plus a non-zero carried state — all rounded through `dtype`
+    /// so the f32 reference sees exactly the values the path under test reads.
+    struct Inputs {
+        q: Array,
+        k: Array,
+        v: Array,
+        g: Array,
+        beta: Array,
+        state: Array,
+    }
+
+    fn inputs(dims: [i32; 6], dtype: Dtype, seed: u64) -> Inputs {
+        let [b, t, hk, hv, dk, dv] = dims;
+        let n = |shape: &[i32]| shape.iter().product::<i32>() as usize;
+        let arr = |shape: &[i32], s: u64| Array::from_slice(&lcg(n(shape), seed ^ s), shape);
+        let l2 = |x: Array| -> Array {
+            let norm =
+                mlx_rs::ops::sqrt(sum_axis(multiply(&x, &x).unwrap(), -1, true).unwrap() + 1e-6f32)
+                    .unwrap();
+            mlx_rs::ops::divide(&x, &norm).unwrap()
+        };
+        let round = |x: Array| x.as_dtype(dtype).unwrap();
+        let q = l2(arr(&[b, t, hk, dk], 1)) * (dk as f32).powf(-0.5);
+        let k = l2(arr(&[b, t, hk, dk], 2));
+        let a = arr(&[b, t, hv], 4) * 3.0f32;
+        let a_log = arr(&[hv], 5);
+        let dt_bias = arr(&[hv], 6);
+        Inputs {
+            q: round(q),
+            k: round(k),
+            v: round(arr(&[b, t, hv, dv], 3)),
+            g: round(compute_g(&a, &a_log, &dt_bias).unwrap()),
+            beta: round(sigmoid(&(arr(&[b, t, hv], 7) * 2.0f32)).unwrap()),
+            state: arr(&[b, hv, dv, dk], 8) * 0.5f32,
+        }
+    }
+
+    /// Host copy in logical (row-major) order. `as_slice` reads raw memory, and an elementwise op
+    /// keeps a permuted input's layout (the chunked `y` is a transposed view), so materialize with
+    /// one (no view offset) and walk the strides.
+    fn host32(x: &Array) -> Vec<f32> {
+        let x = add(x.as_dtype(Dtype::Float32).unwrap(), Array::from_f32(0.0)).unwrap();
+        x.eval().unwrap();
+        let (shape, strides) = (x.shape().to_vec(), x.strides().to_vec());
+        let data = x.as_slice::<f32>();
+        let mut out = Vec::with_capacity(x.size());
+        let mut idx = vec![0i32; shape.len()];
+        for _ in 0..x.size() {
+            let at: usize = idx
+                .iter()
+                .zip(&strides)
+                .map(|(&i, &s)| i as usize * s)
+                .sum();
+            out.push(data[at]);
+            for d in (0..shape.len()).rev() {
+                idx[d] += 1;
+                if idx[d] < shape[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        out
+    }
+
+    /// `(max |a − r| / max |r|, max |a − r|)` — scale-relative and absolute error against the
+    /// reference `r` (never a cosine: that is scale-invariant).
+    fn errors(a: &Array, r: &Array) -> (f32, f32) {
+        let (a, r) = (host32(a), host32(r));
+        assert_eq!(a.len(), r.len());
+        assert!(a.iter().all(|x| x.is_finite()), "non-finite output");
+        let abs = max_abs_diff(&a, &r);
+        let scale = r.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        (abs / scale, abs)
+    }
+
+    /// The f32 op-by-op reference on the (already dtype-rounded) inputs.
+    fn reference(x: &Inputs, carry: bool) -> (Array, Array) {
+        let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+        let state = carry.then(|| f(&x.state));
+        gated_delta_recurrence_ops(
+            &f(&x.q),
+            &f(&x.k),
+            &f(&x.v),
+            &f(&x.g),
+            &f(&x.beta),
+            state.as_ref(),
+        )
+        .unwrap()
+    }
+
+    type Path =
+        fn(&Array, &Array, &Array, &Array, &Array, Option<&Array>) -> Result<(Array, Array)>;
+
+    /// Run `path` against the f32 reference over `(label, dims)` × {f32, bf16, f16} × {zero, carried
+    /// state}, asserting `y` and the final state within `rel` (scale-relative) and `abs`.
+    fn assert_matches_reference(
+        path: Path,
+        name: &str,
+        cases: &[(&str, [i32; 6])],
+        rel: f32,
+        abs: f32,
+    ) {
+        for &(label, dims) in cases {
+            for dtype in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float16] {
+                for carry in [false, true] {
+                    let x = inputs(dims, dtype, dims.iter().product::<i32>() as u64);
+                    let state = carry.then_some(&x.state);
+                    let (y, s) = path(&x.q, &x.k, &x.v, &x.g, &x.beta, state).unwrap();
+                    let (y_ref, s_ref) = reference(&x, carry);
+                    assert_eq!(y.shape(), y_ref.shape());
+                    assert_eq!(s.shape(), s_ref.shape());
+                    let (y_rel, y_abs) = errors(&y, &y_ref);
+                    let (s_rel, s_abs) = errors(&s, &s_ref);
+                    eprintln!(
+                        "{name} {label} {dims:?} {dtype:?} carry={carry}: y rel {y_rel:.2e} abs \
+                         {y_abs:.2e} | state rel {s_rel:.2e} abs {s_abs:.2e}"
+                    );
+                    assert!(
+                        y_rel <= rel && y_abs <= abs && s_rel <= rel && s_abs <= abs,
+                        "{name} {label} {dtype:?} carry={carry}: y rel {y_rel} abs {y_abs}, \
+                         state rel {s_rel} abs {s_abs} (budget rel {rel} abs {abs})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC (sc-24443): the fused Metal recurrence matches the op-by-op reference within 1e-5
+    /// scale-relative at decode (`T = 1`), verify width (`T = 4`) and prefill (`T = 512`) shapes —
+    /// GQA ×2 at the Qwen3.6 head dims, a batch of two, and tiny non-multiple-of-32 head dims —
+    /// on f32, bf16 and f16 inputs (accumulated in f32), from a zero and from a carried state.
+    #[test]
+    fn metal_kernel_matches_ops_reference() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            assert_matches_reference(
+                gated_delta_kernel,
+                "kernel",
+                &[
+                    ("decode", [1, 1, 2, 4, 128, 128]),
+                    ("verify", [1, 4, 2, 4, 128, 128]),
+                    ("prefill", [1, 512, 2, 4, 128, 128]),
+                    ("prefill", [1, 2048, 2, 4, 128, 128]),
+                    ("batch2", [2, 5, 1, 2, 64, 32]),
+                    ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+                ],
+                1e-5,
+                1e-5,
+            )
+        });
+    }
+
+    /// AC (sc-24443): the chunkwise prefill matches the per-token reference's outputs and final
+    /// state at 512 and 2048 tokens (plus a batch of two at a length that is not a whole number of
+    /// chunks), on f32, bf16 and f16 inputs, from a zero and from a carried state. Run on the CPU
+    /// stream — the route [`gated_delta_recurrence`] gives it, where GEMMs are exact f32 (MLX's
+    /// GPU GEMMs are TF32 on NAX hardware, a ~2e-3 floor for any matmul formulation).
+    #[test]
+    fn chunked_prefill_matches_ops_reference() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            assert_matches_reference(
+                gated_delta_chunked,
+                "chunked",
+                &[
+                    ("512", [1, 512, 2, 4, 128, 128]),
+                    ("2048", [1, 2048, 2, 4, 128, 128]),
+                    ("ragged", [2, 300, 1, 2, 64, 32]),
+                ],
+                2e-5,
+                2e-5,
+            )
+        });
+    }
+
+    /// The dispatcher's contract: every route agrees with the reference — the GPU kernel at any
+    /// length (split into dispatches past [`KERNEL_MAX_STEPS`]), and on a CPU stream (where a Metal
+    /// kernel cannot run) the chunked form from [`CHUNKED_PREFILL_MIN_TOKENS`] and the op loop
+    /// below it — each length takes exactly that route, and output dtypes follow the inputs (y in
+    /// `q`'s dtype, state in the carried state's).
+    #[test]
+    fn dispatch_routes_by_device_and_length_and_keeps_dtypes() {
+        let check = |t: i32, dims: [i32; 4], route: &[Route]| {
+            let [hk, hv, dk, dv] = dims;
+            let x = inputs([1, t, hk, hv, dk, dv], Dtype::Float32, t as u64);
+            let tally = crate::primitives::fused::fused_tally();
+            let ((y, s), routes) = recording_routes(|| {
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+            });
+            assert_eq!(routes, route, "t={t}");
+            // E3: the request's fused-primitive report counts the route that ran — the kernel as
+            // `fused`, the chunked and op forms as `reference` named for the CPU stream.
+            let ran = crate::primitives::fused::fused_tally().since(&tally);
+            if route[0] == Route::Kernel {
+                assert_eq!(
+                    (ran.fused, ran.reference, ran.label()),
+                    (1, 0, "fused"),
+                    "t={t}"
+                );
+            } else {
+                assert_eq!(
+                    (ran.fused, ran.reference, ran.reference_reason),
+                    (0, 1, Some(crate::primitives::fused::REASON_CPU_STREAM)),
+                    "t={t}"
+                );
+            }
+            let (y_ref, s_ref) = reference(&x, true);
+            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "t={t}: y {ey:?} state {es:?}");
+        };
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            for t in [1, 4, 200] {
+                check(t, [2, 4, 32, 16], &[Route::Kernel]);
+            }
+            check(
+                KERNEL_MAX_STEPS + 37,
+                [1, 2, 32, 8],
+                &[Route::Kernel, Route::Kernel],
+            );
+        });
+        mlx_rs::with_new_default_stream(Stream::cpu(), || {
+            for t in [3, CHUNKED_PREFILL_MIN_TOKENS - 1] {
+                check(t, [2, 4, 32, 16], &[Route::Ops]);
+            }
+            for t in [CHUNKED_PREFILL_MIN_TOKENS, 150] {
+                check(t, [2, 4, 32, 16], &[Route::Chunked]);
+            }
+        });
+
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 3, 2, 4, 32, 16], Dtype::Bfloat16, 9);
+            let (y, s) = gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
+            assert_eq!((y.dtype(), s.dtype()), (Dtype::Bfloat16, Dtype::Bfloat16));
+            let (_, s) =
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+            assert_eq!(s.dtype(), Dtype::Float32);
+        });
+    }
+
+    /// sc-24446 (E5): with the GDN kernel switched off (`MLX_LLM_GDN_KERNEL`; here its
+    /// thread-scoped layer) a GPU stream runs the op-by-op reference for both entry points, at
+    /// the length the kernel would otherwise take, and matches the kernel's result.
+    #[test]
+    fn the_gdn_kernel_switch_off_runs_the_reference_on_the_gpu() {
+        use crate::switches::GDN_KERNEL;
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 80, 2, 4, 32, 16], Dtype::Float32, 41);
+            let run = || gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state));
+            let ((y_on, s_on), on) = recording_routes(|| run().unwrap());
+            assert_eq!(on, [Route::Kernel]);
+            let start = crate::primitives::fused::fused_tally();
+            let ((y_off, s_off), off) =
+                GDN_KERNEL.scoped(false, || recording_routes(|| run().unwrap()));
+            assert_eq!(
+                off,
+                [Route::Ops],
+                "the switch is off: the reference, not chunked"
+            );
+            // E3: the request's fused-primitive report names the switch as the reason.
+            let ran = crate::primitives::fused::fused_tally().since(&start);
+            assert_eq!(
+                (ran.fused, ran.reference, ran.reference_reason),
+                (0, 1, Some(crate::primitives::fused::REASON_DISABLED))
+            );
+            let (ey, es) = (errors(&y_off, &y_on), errors(&s_off, &s_on));
+            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "y {ey:?} state {es:?}");
+
+            let checkpointed =
+                || gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, None);
+            let (_, on) = recording_routes(|| checkpointed().unwrap());
+            assert_eq!(on, [Route::CheckpointKernel]);
+            let start = crate::primitives::fused::fused_tally();
+            let (_, off) =
+                GDN_KERNEL.scoped(false, || recording_routes(|| checkpointed().unwrap()));
+            assert!(
+                !off.contains(&Route::CheckpointKernel) && !off.is_empty(),
+                "the switch is off: {off:?}"
+            );
+            let ran = crate::primitives::fused::fused_tally().since(&start);
+            assert_eq!(
+                (ran.fused, ran.reference, ran.reference_reason),
+                (0, 1, Some(crate::primitives::fused::REASON_DISABLED))
+            );
+        });
+    }
+
+    /// The route follows the innermost task-local stream ops are issued on: a GPU scope nested in a
+    /// CPU scope runs the kernel on that GPU stream, and once it returns the enclosing CPU scope
+    /// takes the ops route again (`dispatch_routes_by_device_and_length_and_keeps_dtypes` covers a
+    /// CPU scope under the GPU default). Both scopes are task-local — never the process-global
+    /// default device: switching that races every parallel test in this binary (the sc-24439
+    /// greedy-parity flake), and a global CPU default under a task-local GPU stream has
+    /// livelocked MLX's stream threads, so that combination is not tested at all.
+    #[test]
+    fn kernel_runs_on_the_task_local_gpu_stream_inside_a_cpu_scope() {
+        crate::primitives::kv_cache::testing::on_cpu(|| {
+            mlx_rs::with_new_default_stream(Stream::gpu(), || {
+                let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 21);
+                let ((y, s), routes) = recording_routes(|| {
+                    gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+                });
+                assert_eq!(routes, [Route::Kernel]);
+                let (y_ref, s_ref) = reference(&x, true);
+                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "y {ey:?} state {es:?}");
+                // The public kernel entry point dispatches on the same task-local stream.
+                let (y, s) =
+                    gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "kernel y {ey:?} state {es:?}");
+            });
+            let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 22);
+            let (_, routes) = recording_routes(|| {
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+            });
+            assert_eq!(routes, [Route::Ops], "the enclosing CPU scope is restored");
+        });
+    }
+
+    /// Row `t` of the sequence axis of `x` `[B, T, ...]`, the axis dropped.
+    fn row(x: &Array, t: i32) -> Array {
+        slice_time(x, t).unwrap()
+    }
+
+    /// AC (sc-24435): the fused kernel's checkpoint variant writes every token's state, each
+    /// within 1e-5 scale-relative (and absolute) of the op-by-op reference's per-step state, with
+    /// `y` and the final state matching the reference as the plain kernel's do and the last row
+    /// equal to the final state bit for bit — at verify widths up to `1 + 8` (GQA ×2 at the
+    /// Qwen3.6 head dims), a batch of two and tiny head dims, on f32/bf16/f16 inputs from a zero
+    /// and from a carried state. Every call takes exactly the checkpoint-kernel route.
+    #[test]
+    fn checkpoint_kernel_per_token_states_match_ops_reference() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            for (label, dims) in [
+                ("verify2", [1, 2, 2, 4, 128, 128]),
+                ("verify5", [1, 5, 2, 4, 128, 128]),
+                ("verify9", [1, 9, 2, 4, 128, 128]),
+                ("batch2", [2, 4, 1, 2, 64, 32]),
+                ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+            ] {
+                let [b, t, _, hv, dk, dv] = dims;
+                for dtype in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float16] {
+                    for carry in [false, true] {
+                        let x = inputs(dims, dtype, 0x24435 ^ dims.iter().product::<i32>() as u64);
+                        let state = carry.then_some(&x.state);
+                        let stream = Stream::task_local_or_default();
+                        let ((y, last, states), routes) = recording_routes(|| {
+                            kernel_on(&x.q, &x.k, &x.v, &x.g, &x.beta, state, &stream, true)
+                                .unwrap()
+                        });
+                        assert_eq!(routes, [Route::CheckpointKernel], "{label}");
+                        let states = states.expect("the checkpoint variant returns states");
+                        assert_eq!(states.shape(), &[b, t, hv, dv, dk], "{label}");
+                        let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+                        let carried = carry.then(|| f(&x.state));
+                        let (y_ref, last_ref, states_ref) = ops_recurrence(
+                            &f(&x.q),
+                            &f(&x.k),
+                            &f(&x.v),
+                            &f(&x.g),
+                            &f(&x.beta),
+                            carried.as_ref(),
+                            true,
+                        )
+                        .unwrap();
+                        let states_ref = states_ref.unwrap();
+                        let mut checks = vec![
+                            ("y".to_string(), y.clone(), y_ref),
+                            ("final".to_string(), last.clone(), last_ref),
+                        ];
+                        for ti in 0..t {
+                            checks.push((
+                                format!("state[{ti}]"),
+                                row(&states, ti),
+                                row(&states_ref, ti),
+                            ));
+                        }
+                        for (what, got, want) in &checks {
+                            let (rel, abs) = errors(got, want);
+                            assert!(
+                                rel <= 1e-5 && abs <= 1e-5,
+                                "{label} {dtype:?} carry={carry} {what}: rel {rel} abs {abs}"
+                            );
+                        }
+                        assert_eq!(
+                            host32(&row(&states, t - 1)),
+                            host32(&last),
+                            "{label} {dtype:?} carry={carry}: the last row is the final state"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// The checkpointed entry point's dispatch: the checkpoint kernel on a GPU stream, the op
+    /// loop (collecting its per-step states) on a CPU stream — whose row `t` is exactly the final
+    /// state of the reference over the first `t + 1` tokens — with `y` in `q`'s dtype and both
+    /// state outputs in the carried state's.
+    #[test]
+    fn checkpointed_recurrence_routes_by_device_and_keeps_dtypes() {
+        let x = inputs([1, 5, 2, 4, 32, 16], Dtype::Bfloat16, 51);
+        let carried = x.state.as_dtype(Dtype::Float32).unwrap();
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let ((y, last, states), routes) = recording_routes(|| {
+                gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&carried))
+                    .unwrap()
+            });
+            assert_eq!(routes, [Route::CheckpointKernel]);
+            assert_eq!(
+                (y.dtype(), last.dtype(), states.dtype()),
+                (Dtype::Bfloat16, Dtype::Float32, Dtype::Float32)
+            );
+            let (_, _, states) =
+                gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
+            assert_eq!(states.dtype(), Dtype::Bfloat16, "zero start: q's dtype");
+        });
+        mlx_rs::with_new_default_stream(Stream::cpu(), || {
+            let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+            let (q, k, v, g, beta) = (f(&x.q), f(&x.k), f(&x.v), f(&x.g), f(&x.beta));
+            let ((_, last, states), routes) = recording_routes(|| {
+                gated_delta_recurrence_checkpointed(&q, &k, &v, &g, &beta, Some(&carried)).unwrap()
+            });
+            assert_eq!(routes, [Route::Ops]);
+            assert_eq!(host32(&row(&states, 4)), host32(&last));
+            for t in 1..=5 {
+                let head = |a: &Array| slice_axis(a, 1, 0, t).unwrap();
+                let (_, prefix) = gated_delta_recurrence_ops(
+                    &head(&q),
+                    &head(&k),
+                    &head(&v),
+                    &head(&g),
+                    &head(&beta),
+                    Some(&carried),
+                )
+                .unwrap();
+                assert_eq!(
+                    host32(&row(&states, t - 1)),
+                    host32(&prefix),
+                    "row {}",
+                    t - 1
+                );
+            }
+        });
+    }
+
+    /// A sequence of `n` tokens to feed a [`DeltaNetCache`] piecewise: recurrence inputs plus the
+    /// conv input `[1, n, C]` and a `[C, K]` conv kernel (C = 6, K = 4).
+    struct FeedSeq {
+        x: Inputs,
+        conv_in: Array,
+        conv_w: Array,
+    }
+
+    impl FeedSeq {
+        fn new(n: i32) -> Self {
+            Self {
+                x: inputs([1, n, 2, 4, 32, 16], Dtype::Float32, 0x2443_5000 + n as u64),
+                conv_in: Array::from_slice(&lcg(n as usize * 6, 77), &[1, n, 6]),
+                conv_w: Array::from_slice(&lcg(24, 78), &[6, 4]),
+            }
+        }
+
+        /// Feed tokens `a..b` to `cache` as one forward.
+        fn feed(&self, cache: &mut DeltaNetCache, a: i32, b: i32) {
+            self.try_feed(cache, a, b).unwrap();
+        }
+
+        /// [`feed`](Self::feed), returning the forward's error.
+        fn try_feed(&self, cache: &mut DeltaNetCache, a: i32, b: i32) -> Result<()> {
+            let part = |x: &Array| slice_axis(x, 1, a, b).unwrap();
+            let seed = cache
+                .conv_state
+                .clone()
+                .unwrap_or_else(|| Array::from_slice(&[0.0f32; 18], &[1, 3, 6]));
+            let (_, trace) =
+                causal_depthwise_conv_traced(&part(&self.conv_in), &self.conv_w, &seed).unwrap();
+            let y = cache.advance(
+                trace,
+                &part(&self.x.q),
+                &part(&self.x.k),
+                &part(&self.x.v),
+                &part(&self.x.g),
+                &part(&self.x.beta),
+            )?;
+            y.eval().unwrap();
+            Ok(())
+        }
+
+        /// A cache that saw tokens `0..p` as one forward, then `p..n` one at a time — no window.
+        fn reference(&self, p: i32, n: i32) -> DeltaNetCache {
+            let mut cache = DeltaNetCache::new();
+            self.feed(&mut cache, 0, p);
+            for i in p..n {
+                self.feed(&mut cache, i, i + 1);
+            }
+            cache
+        }
+    }
+
+    fn live(cache: &DeltaNetCache) -> (Vec<f32>, Vec<f32>) {
+        let (conv, ssm) = cache.live_state().expect("the cache has run");
+        (host32(conv), host32(ssm))
+    }
+
+    /// sc-24435 (and the draft-model proposer's use of the seam): one checkpoint window spans
+    /// several forwards — a multi-token verify-shaped forward and then single-token draft-shaped
+    /// ones — and the cache rolls back to **each** position of the window, from its start to the
+    /// current one, restoring exactly the conv and recurrent state of a cache that never saw the
+    /// later tokens and continuing from it identically. Successive rollbacks walk back within the
+    /// window; a position outside it is refused (typed) with the cache untouched; the multi-token
+    /// forward takes the checkpoint kernel while prefill and single-token forwards keep the plain
+    /// one; and the window's memory is released by the next forward outside it.
+    #[test]
+    fn a_checkpoint_window_spans_forwards_and_rolls_back_to_each_position() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let (p, n) = (5, 11);
+            let s = FeedSeq::new(n + 1);
+            let mut cache = DeltaNetCache::new();
+            let ((), routes) = recording_routes(|| {
+                s.feed(&mut cache, 0, p);
+                // One token of slack past what the window records, so only the close below keeps
+                // a later forward out of it.
+                cache.arm_checkpoints(n - p + 1);
+                s.feed(&mut cache, p, p + 3);
+                for i in p + 3..n {
+                    s.feed(&mut cache, i, i + 1);
+                }
+            });
+            assert_eq!(
+                routes,
+                [
+                    Route::Kernel,
+                    Route::CheckpointKernel,
+                    Route::Kernel,
+                    Route::Kernel,
+                    Route::Kernel
+                ]
+            );
+            assert_eq!(cache.offset(), n);
+            assert_eq!(cache.restorable(), p..n);
+            assert_eq!(cache.checkpointed_tokens(), n - p);
+            let windowed = cache.resident_bytes();
+
+            // Keeping every position (a full acceptance) closes the window too: the next forward
+            // records nothing and releases it.
+            let mut kept = cache.clone();
+            kept.rollback_to(n).unwrap();
+            s.feed(&mut kept, n, n + 1);
+            assert_eq!(
+                kept.checkpointed_tokens(),
+                0,
+                "a kept window stopped recording"
+            );
+            assert!(kept.restorable().is_empty());
+
+            for j in p..=n {
+                let mut rolled = cache.clone();
+                rolled.rollback_to(j).unwrap();
+                assert_eq!(rolled.offset(), j);
+                let mut reference = s.reference(p, j);
+                assert_eq!(live(&rolled), live(&reference), "restored state at {j}");
+                // Continuing from the restored state is continuing from the reference.
+                s.feed(&mut rolled, j, j + 1);
+                s.feed(&mut reference, j, j + 1);
+                assert_eq!(live(&rolled), live(&reference), "one token past {j}");
+            }
+
+            // Walking back within the window, one rollback after another.
+            let mut walked = cache.clone();
+            for j in [n - 2, p + 1, p] {
+                walked.rollback_to(j).unwrap();
+                assert_eq!(
+                    live(&walked),
+                    live(&s.reference(p, j)),
+                    "walked back to {j}"
+                );
+                assert_eq!(walked.restorable(), p..j);
+            }
+
+            // Outside the window: refused, typed, untouched.
+            let before = live(&cache);
+            let err = cache.rollback_to(p - 1).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{err}");
+            assert_eq!((cache.offset(), live(&cache)), (n, before));
+
+            // A rollback closes the window; the next forward runs outside it and drops it.
+            cache.rollback_to(n - 1).unwrap();
+            let ((), routes) = recording_routes(|| s.feed(&mut cache, n - 1, n + 1));
+            assert_eq!(routes, [Route::Kernel], "a closed window records nothing");
+            assert_eq!(cache.restorable(), n + 1..n + 1);
+            assert_eq!(cache.checkpointed_tokens(), 0);
+            assert!(cache.resident_bytes() < windowed);
+            assert_eq!(live(&cache), live(&s.reference(p, n + 1)));
+
+            // `rollback_to(0)` is a reset, the current position a no-op.
+            let mut reset = cache.clone();
+            reset.rollback_to(reset.offset()).unwrap();
+            assert_eq!(reset.offset(), n + 1);
+            reset.rollback_to(0).unwrap();
+            assert_eq!(reset.offset(), 0);
+            assert!(reset.live_state().is_none());
+        });
+    }
+
+    /// sc-24435: a checkpoint window records at most the tokens it was armed for. A forward that
+    /// would take it past that — one forward too wide, or one single-token forward too many — is
+    /// refused (typed) before it runs: offset, live state and the window are untouched, and the
+    /// window still rolls back to its start.
+    #[test]
+    fn a_checkpoint_window_refuses_a_forward_past_its_cap() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let p = 4;
+            let s = FeedSeq::new(p + 3);
+            let mut cache = DeltaNetCache::new();
+            s.feed(&mut cache, 0, p);
+            cache.arm_checkpoints(2);
+            let before = live(&cache);
+            let err = s.try_feed(&mut cache, p, p + 3).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::CheckpointWindowFull {
+                        recorded: 0,
+                        requested: 3,
+                        max_tokens: 2
+                    }
+                ),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), live(&cache)), (p, before));
+            assert_eq!(cache.checkpointed_tokens(), 0);
+
+            s.feed(&mut cache, p, p + 1);
+            s.feed(&mut cache, p + 1, p + 2);
+            let full = live(&cache);
+            let err = s.try_feed(&mut cache, p + 2, p + 3).unwrap_err();
+            assert!(
+                matches!(err, Error::CheckpointWindowFull { recorded: 2, .. }),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), live(&cache)), (p + 2, full));
+            assert_eq!(cache.restorable(), p..p + 2);
+            cache.rollback_to(p).unwrap();
+            assert_eq!(live(&cache), live(&s.reference(p, p)));
+        });
+    }
+
+    /// A long prefill must not exhaust the Metal allocator. The op-by-op path builds the whole
+    /// `t`-step graph before a single eval, eagerly allocating per-step index buffers; without
+    /// periodic flushing a sequence past ~100k steps trips the allocator's resource limit and the
+    /// next gather fails with a spurious "expected a non-empty mlx_array". `t = 130_000` clears that
+    /// limit (~5 buffers/step > 499_000) and must complete because the op path flushes every
+    /// `EVAL_CHUNK` steps; the production dispatch (the fused kernel, split every
+    /// [`KERNEL_MAX_STEPS`] tokens) must complete too and agree with it. Marked `ignore` only for
+    /// runtime (the loop is long), not flakiness — it is the direct regression guard for the
+    /// high-res-image vision crash.
     #[test]
     #[ignore = "slow: 130k-step recurrence; guards the long-prefill Metal buffer-limit regression"]
     fn long_prefill_does_not_exhaust_buffer_limit() {
@@ -475,11 +2200,13 @@ mod tests {
         let v = Array::from_slice(&vec![0.03f32; t as usize], &[1, t, 1, 1]);
         let g = Array::from_slice(&vec![0.9f32; t as usize], &[1, t, 1]);
         let beta = Array::from_slice(&vec![0.5f32; t as usize], &[1, t, 1]);
-        let (y, state) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None)
+        let (y, state) = gated_delta_recurrence_ops(&q, &k, &v, &g, &beta, None)
             .expect("long recurrence must not exhaust the Metal allocator");
         assert_eq!(y.shape(), &[1, t, 1, 1]);
         assert_eq!(state.shape(), &[1, 1, 1, 1]);
         // Force a final materialization so a deferred allocator failure can't hide behind laziness.
         eval([&y, &state]).unwrap();
+        let (y_fast, state_fast) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+        assert!(errors(&y_fast, &y).0 < 1e-5 && errors(&state_fast, &state).0 < 1e-5);
     }
 }

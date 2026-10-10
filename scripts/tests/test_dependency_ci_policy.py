@@ -13,7 +13,7 @@ import yaml
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 DENY = WORKFLOW.parents[2] / "deny.toml"
 METAL_CLIPPY = (
-    "cargo clippy --locked -p candle-llm -p 'candle-gen*' -p 'candle-audio*' "
+    "cargo clippy --locked -p candle-llm -p candle-quant-kernels -p 'candle-gen*' -p 'candle-audio*' "
     "--all-targets --features metal -- -D warnings"
 )
 GOVERNANCE = "python3 scripts/ci/check_advisory_policy.py"

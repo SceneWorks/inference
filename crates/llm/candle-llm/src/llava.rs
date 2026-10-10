@@ -30,17 +30,19 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
-use crate::decode::stream::default_seed;
-use crate::decode::{CancelFlag, FinishReason};
-use crate::device::select_device;
+use crate::decode::{
+    generate_step_from_prefill, CancelFlag, DecodeRecord, FinishReason, GenerationConfig,
+    RequestSpan, StreamEvent,
+};
+use crate::device::select_eager_device;
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
 use crate::primitives::projection::QuantSpec;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::sampler::SamplingParams;
+use crate::primitives::{input_ids, AttnFormulation, Weights};
 
 /// The registry id of the LLaVA provider.
 pub const PROVIDER_ID: &str = "candle-llava";
@@ -240,6 +242,10 @@ pub struct LlavaGeneration {
     pub tokens: Vec<i32>,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+    /// The measured decode record (sc-24139): the engine's record of the caption decode, with the
+    /// host-side counters and the fused / CUDA-graph / NVFP4 tallies of the whole request from
+    /// the spliced prefill on — what [`LlavaProvider`] reports on `TextLlmOutput::decode`.
+    pub record: DecodeRecord,
 }
 
 /// A loaded LLaVA VLM: vision tower, projector, language decoder, and image preprocessor.
@@ -307,6 +313,14 @@ impl LlavaModel {
         &self.language
     }
 
+    /// Select how the language decoder attends on its reference paths and growing step cache —
+    /// the caption loop's backing ([`CausalLm::set_attn_formulation`]): [`AttnFormulation::Gqa`]
+    /// by default, [`AttnFormulation::Expanded`] for the pre-migration arithmetic (a labelled
+    /// comparison, e.g. against goldens captured before sc-24138).
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.language.set_attn_formulation(formulation);
+    }
+
     /// The device the model is loaded on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -333,6 +347,11 @@ impl LlavaModel {
 
     /// Generate a caption from a tokenized prompt (containing a single `image_token_id`) and the
     /// projected image features. Emits each token through `on_token(id, step)`.
+    ///
+    /// The spliced embeddings are prefilled into the decoder's shared step cache and the caption
+    /// decodes through the step seam — the engine's token-at-a-time loop (sc-24138) — on the
+    /// cache's growing backing: this provider has no admission surface to price a preallocation of
+    /// the whole (unbounded) caption budget. Same sampler, stop tokens and cancellation as before.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -352,6 +371,8 @@ impl LlavaModel {
             return Err(Error::Canceled);
         }
 
+        // The whole request from the spliced prefill on: the engine measures only its own loop.
+        let span = RequestSpan::begin();
         // Splice the image rows (in the decoder's dtype) into the token embeddings, then decode.
         let expanded = expand_image_tokens(
             prompt_ids,
@@ -363,43 +384,53 @@ impl LlavaModel {
         let feat = image_features.to_dtype(self.language.compute_dtype())?;
         let spliced = splice_image_features(&embeds, &expanded, &feat, self.cfg.image_token_id)?;
 
-        let mut cache = self.language.new_cache();
-        let mut rng = SplitMix64::new(seed.unwrap_or_else(default_seed));
-        let mut history = expanded.clone();
-        let mut generated: Vec<i32> = Vec::new();
-        let prompt_len = expanded.len() as i32;
-        let mut logits = self
+        let mut cache = self.language.new_step_cache();
+        let logits = self
             .language
-            .decode_logits_from_embeds(&spliced, &mut cache, 0)?;
-        let mut finish = FinishReason::MaxTokens;
-
-        for step in 0..max_new_tokens {
-            if cancel.is_cancelled() {
-                finish = FinishReason::Cancelled;
-                break;
-            }
-            let next = sample(&logits, &history, params, &mut rng, None)?;
-            if stop_tokens.contains(&next) {
-                finish = FinishReason::StopToken;
-                break;
-            }
-            on_token(next, step);
-            generated.push(next);
-            history.push(next);
-            if step + 1 == max_new_tokens {
-                break;
-            }
-            let tok = input_ids(&[next], &self.device)?;
-            logits = self
-                .language
-                .decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
-        }
-
+            .step_prefill_from_embeds(&spliced, &mut cache)?;
+        let config = GenerationConfig {
+            max_new_tokens,
+            sampling: *params,
+            seed,
+            stop_tokens: stop_tokens.to_vec(),
+        };
+        let (out, record) = generate_step_from_prefill(
+            &self.language,
+            &mut cache,
+            logits,
+            &expanded,
+            &config,
+            cancel,
+            &mut |event| {
+                if let StreamEvent::Token { id, step } = event {
+                    on_token(id, step);
+                }
+            },
+            None,
+        )?;
         Ok(LlavaGeneration {
-            tokens: generated,
-            finish_reason: finish,
+            tokens: out.tokens,
+            finish_reason: out.finish_reason,
+            record: record.with_request_span(&span),
         })
     }
+}
+
+/// The weight format a LLaVA load quantizes its language decoder to, or the typed refusal. The
+/// load runs it first, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot
+/// NVFP4 question with it (sc-24139): the Llama provider serves NVFP4 (the qwen3_5 hybrid,
+/// sc-24135, and the llama family, sc-24140), but LLaVA — whose provider owns the vision-tower
+/// load — does not, so it is refused here by name.
+pub(crate) fn requested_quantization(spec: &LoadSpec) -> CoreResult<Option<QuantSpec>> {
+    spec.quantize
+        .map(|q| match q {
+            Quantize::Q4 => Ok(QuantSpec::q4()),
+            Quantize::Q8 => Ok(QuantSpec::q8()),
+            Quantize::Nvfp4 => Err(CoreError::Unsupported(
+                "nvfp4: NVFP4 projections are not served for LLaVA".into(),
+            )),
+        })
+        .transpose()
 }
 
 /// LLaVA served as a multimodal [`core_llm::TextLlm`] provider.
@@ -409,6 +440,10 @@ pub struct LlavaProvider {
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
+    /// The speculative option a request that leaves it unset runs with — this backend's row of
+    /// the defaults table ([`core_llm::defaults`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
 }
 
 impl LlavaProvider {
@@ -416,12 +451,9 @@ impl LlavaProvider {
     /// `spec.quantize` (or the snapshot's persisted `quantization` block) quantizes the language
     /// decoder's projections; the vision tower and projector stay dense.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let requested = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
+        let requested = requested_quantization(spec)?;
         let dir = Path::new(&spec.source);
-        let device = select_device().map_err(to_core)?;
+        let device = select_eager_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         // `eos_token_ids` always returns a non-empty model-specific set or the Llama-3 fallback.
@@ -432,6 +464,7 @@ impl LlavaProvider {
             tokenizer,
             template: load_chat_template(dir),
             stop_tokens,
+            speculative_default: crate::device::decode_defaults(&device).speculative,
         })
     }
 
@@ -582,15 +615,57 @@ impl TextLlm for LlavaProvider {
             finish_reason: finish,
             usage,
         });
-        Ok(TextLlmOutput {
+        // The caption decodes through the shared engine (sc-24138), so it reports its path like
+        // every engine request. The CUDA-graph switch is not wired into this provider (no graph
+        // runner wraps its decoder), so the report says the switch was off here.
+        Ok(caption_output(
             text,
-            thinking: None,
-            // No tool calling on the vision path (its chat template renders captions, not tools).
-            tool_calls: Vec::new(),
             usage,
-            finish_reason: Some(finish),
-        })
+            // A captioner advertises no proposer and has no prefix cache: both are named, in the
+            // words MLX's JoyCaption uses (E2, E8).
+            Some(caption_report(&gen.record, req, self.speculative_default)),
+            finish,
+            req.kv_compression,
+        ))
     }
+}
+
+/// The output of one caption. No tool calling on the vision path (its chat template renders
+/// captions, not tools), and — the LLaVA wrapper having no compressed-KV table family — the dense
+/// KV-cache report for the request's `policy` (sc-20683).
+fn caption_output(
+    text: String,
+    usage: Usage,
+    decode: Option<core_llm::DecodeReport>,
+    finish: CoreFinish,
+    policy: core_llm::KvCompressionPolicy,
+) -> TextLlmOutput {
+    TextLlmOutput {
+        timings: None,
+        text,
+        thinking: None,
+        tool_calls: Vec::new(),
+        usage,
+        mtp: None,
+        decode,
+        finish_reason: Some(finish),
+        kv_cache: Some(core_llm::KvCacheReport::without_table_family(policy)),
+    }
+}
+
+/// A caption's measured report (sc-24139): the engine record with the CUDA-graph switch off (no
+/// graph runner wraps this decoder), and — the captioner advertising no proposer and having no
+/// prefix cache — the request's speculative fallback and the prefix-cache reason named in the
+/// words MLX's JoyCaption uses (E2, E8). The request's option is resolved against the provider's
+/// per-backend `default` (E5), so a table default of `auto` is named too.
+fn caption_report(
+    record: &DecodeRecord,
+    req: &TextLlmRequest,
+    default: core_llm::Speculative,
+) -> core_llm::DecodeReport {
+    record
+        .report(false)
+        .with_captioner_reasons(req.speculative_or(default))
 }
 
 /// The LLaVA provider descriptor (constructible without weights; used for catalog composition).
@@ -609,8 +684,14 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Text+vision captioner; no audio path at all.
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
+            mtp: None,
+            speculative: Vec::new(),
             supported_constraints: Vec::new(),
         },
     }
@@ -630,6 +711,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }
@@ -671,20 +753,22 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 }
 
 /// Weightless model-first probe (story 7406): can the `candle-llava` vision provider serve the
-/// snapshot at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
+/// snapshot directory at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
 /// signature — a nested `text_config` (the language decoder) plus a `vision_config` (the SigLIP
 /// tower) — which [`LlavaConfig::from_json`] requires. Never opens a safetensors shard.
 pub fn can_load(spec: &LoadSpec) -> bool {
-    let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() {
-        dir.join("config.json")
-    } else {
-        dir.to_path_buf()
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    can_load_with(Path::new(&spec.source), |path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    })
+}
+
+fn can_load_with(source: &Path, read_config: impl FnOnce(&Path) -> Option<Value>) -> bool {
+    if !source.is_dir() {
         return false;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+    }
+    let Some(v) = read_config(&source.join("config.json")) else {
         return false;
     };
     // LLaVA = a SigLIP/CLIP vision tower + a `text_config` decoder. Decline Qwen3.6 (`qwen3_5`): its
@@ -700,7 +784,259 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 mod tests {
     use super::*;
 
+    /// E2/E8 (sc-24432 feature-end review): the captioner advertises no proposer, so an `auto` or
+    /// explicit speculative request decodes plainly with the reason named — the same words MLX's
+    /// JoyCaption reports — and its prefix cache's `none` is named too; `off` names no fallback.
+    #[test]
+    fn the_report_names_the_speculative_fallback_and_the_prefix_cache() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let record = crate::decode::DecodeRecord::plain(
+            crate::decode::DecodePath::StepModel,
+            3,
+            2,
+            Default::default(),
+        );
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative: Some(speculative),
+            ..Default::default()
+        };
+        for mode in [
+            Speculative::Auto,
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
+        ] {
+            let report = caption_report(&record, &request(mode), Speculative::Off);
+            assert_eq!(
+                report.fallbacks,
+                core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{mode:?}"
+            );
+            assert_eq!(report.fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        }
+        // E5: an unset option takes the provider's per-backend default — a table `auto` is named
+        // as the same no-proposer fallback — and an explicit `off` still overrides the default.
+        let unset = core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            ..Default::default()
+        };
+        assert_eq!(
+            caption_report(&record, &unset, Speculative::Auto).fallbacks,
+            core_llm::no_proposer_fallback(Speculative::Auto, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(caption_report(&record, &unset, Speculative::Off)
+            .fallbacks
+            .is_empty());
+        assert!(
+            caption_report(&record, &request(Speculative::Off), Speculative::Auto)
+                .fallbacks
+                .is_empty()
+        );
+        let off = caption_report(&record, &request(Speculative::Off), Speculative::Off);
+        assert!(off.fallbacks.is_empty());
+        assert_eq!(off.prefix_cache.path, "none");
+        assert_eq!(
+            off.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+        );
+    }
+    /// A tiny LLaVA snapshot (an 8 × 8 SigLIP tower of 4 patches, a 2-layer Llama of vocab 32,
+    /// seeded random weights, a `t0..t31` word-level tokenizer and no chat template — the Llama 3
+    /// fallback renders the prompt) that [`LlavaProvider::load`] loads on the CPU.
+    fn tiny_llava_snapshot() -> tempfile::TempDir {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let (v_hidden, v_inter, l_hidden, l_inter, vocab) = (16, 32, 32, 64, 32usize);
+        let (q_dim, kv_dim) = (l_hidden, 2 * (l_hidden / 4));
+        let dir = tempfile::Builder::new()
+            .prefix("candle-llava-fixture-")
+            .tempdir()
+            .unwrap();
+        let config = serde_json::json!({
+            "architectures": ["LlavaForConditionalGeneration"], "model_type": "llava",
+            "image_token_index": 7, "vision_feature_layer": -1,
+            "vision_feature_select_strategy": "full", "projector_hidden_act": "gelu",
+            "vision_config": {
+                "image_size": 8, "patch_size": 4, "num_channels": 3, "hidden_size": v_hidden,
+                "intermediate_size": v_inter, "num_hidden_layers": 1, "num_attention_heads": 2,
+                "layer_norm_eps": 1e-6
+            },
+            "text_config": {
+                "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "hidden_size": l_hidden, "intermediate_size": l_inter, "num_hidden_layers": 2,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "vocab_size": vocab,
+                "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "tie_word_embeddings": false
+            }
+        });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        let tokenizer = format!(
+            r#"{{ "version": "1.0", "added_tokens": [], "normalizer": null,
+                 "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                 "decoder": null,
+                 "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+            entries.join(", ")
+        );
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer).unwrap();
+        let mut rng = SplitMix64::new(0x11a7_a5ee);
+        let mut weights = std::collections::HashMap::new();
+        let mut put = |key: String, dims: &[usize], ones: bool| {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    if ones {
+                        1.0
+                    } else {
+                        (rng.next_f32() - 0.5) * 0.4
+                    }
+                })
+                .collect();
+            let tensor = Tensor::from_vec(data, dims.to_vec(), &Device::Cpu).unwrap();
+            weights.insert(key, tensor);
+        };
+        let vp = |s: &str| format!("vision_tower.vision_model.{s}");
+        put(
+            vp("embeddings.patch_embedding.weight"),
+            &[v_hidden, 3, 4, 4],
+            false,
+        );
+        put(vp("embeddings.patch_embedding.bias"), &[v_hidden], false);
+        put(
+            vp("embeddings.position_embedding.weight"),
+            &[4, v_hidden],
+            false,
+        );
+        let layer = |s: &str| vp(&format!("encoder.layers.0.{s}"));
+        for norm in ["layer_norm1", "layer_norm2"] {
+            put(layer(&format!("{norm}.weight")), &[v_hidden], true);
+            put(layer(&format!("{norm}.bias")), &[v_hidden], false);
+        }
+        for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            put(
+                layer(&format!("self_attn.{proj}.weight")),
+                &[v_hidden, v_hidden],
+                false,
+            );
+            put(layer(&format!("self_attn.{proj}.bias")), &[v_hidden], false);
+        }
+        put(layer("mlp.fc1.weight"), &[v_inter, v_hidden], false);
+        put(layer("mlp.fc1.bias"), &[v_inter], false);
+        put(layer("mlp.fc2.weight"), &[v_hidden, v_inter], false);
+        put(layer("mlp.fc2.bias"), &[v_hidden], false);
+        put(vp("post_layernorm.weight"), &[v_hidden], true);
+        put(vp("post_layernorm.bias"), &[v_hidden], false);
+        for (i, (out, input)) in [(l_hidden, v_hidden), (l_hidden, l_hidden)]
+            .iter()
+            .enumerate()
+        {
+            let key = |leaf: &str| format!("multi_modal_projector.linear_{}.{leaf}", i + 1);
+            put(key("weight"), &[*out, *input], false);
+            put(key("bias"), &[*out], false);
+        }
+        let lm = |s: &str| format!("language_model.{s}");
+        put(lm("model.embed_tokens.weight"), &[vocab, l_hidden], false);
+        put(lm("model.norm.weight"), &[l_hidden], true);
+        put(lm("lm_head.weight"), &[vocab, l_hidden], false);
+        for i in 0..2 {
+            let p = |s: &str| lm(&format!("model.layers.{i}.{s}"));
+            put(p("input_layernorm.weight"), &[l_hidden], true);
+            put(p("post_attention_layernorm.weight"), &[l_hidden], true);
+            put(p("self_attn.q_proj.weight"), &[q_dim, l_hidden], false);
+            put(p("self_attn.k_proj.weight"), &[kv_dim, l_hidden], false);
+            put(p("self_attn.v_proj.weight"), &[kv_dim, l_hidden], false);
+            put(p("self_attn.o_proj.weight"), &[l_hidden, q_dim], false);
+            put(p("mlp.gate_proj.weight"), &[l_inter, l_hidden], false);
+            put(p("mlp.up_proj.weight"), &[l_inter, l_hidden], false);
+            put(p("mlp.down_proj.weight"), &[l_hidden, l_inter], false);
+        }
+        candle_core::safetensors::save(&weights, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// E2/E5/E8 (sc-24432), through the provider's own `generate`: a caption's report carries the
+    /// captioner reasons — the speculative fallback for `auto` and an explicit proposer, none for
+    /// `off`, and the prefix cache's `none` named in every case — and an unset option resolves
+    /// against the provider's per-backend default, which an explicit `off` still overrides.
+    #[test]
+    fn generate_reports_the_captioner_reasons() {
+        use core_llm::{ImageRef, Speculative, SpeculativeProposer};
+        let dir = tiny_llava_snapshot();
+        let mut provider =
+            LlavaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
+        let pixels: Vec<u8> = (0..8 * 8 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let image = ImageRef::new(8, 8, pixels).unwrap();
+        let request = |speculative: Option<Speculative>| TextLlmRequest {
+            messages: vec![Message {
+                content: vec![Content::Image(image.clone()), Content::text("t3 t5")],
+                ..Message::user("")
+            }],
+            speculative,
+            max_new_tokens: 3,
+            sampling: Sampling::greedy(),
+            ..Default::default()
+        };
+        let report = |provider: &LlavaProvider, speculative| {
+            let out = provider
+                .generate(&request(speculative), &mut |_| {})
+                .unwrap();
+            assert_eq!(out.usage.generated_tokens, 3);
+            let report = out.decode.expect("the caption reports its decode");
+            assert_eq!(report.path, "step_model");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+            assert_eq!(report.prefix_cache.path, "none");
+            assert_eq!(
+                report.prefix_cache.reason.as_deref(),
+                Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+            );
+            report.fallbacks
+        };
+        let named = |mode| {
+            core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 2);
+        for mode in [Speculative::Auto, lookup] {
+            let fallbacks = report(&provider, Some(mode));
+            assert_eq!(fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(fallbacks, named(mode), "{mode:?}");
+        }
+        assert!(report(&provider, Some(Speculative::Off)).is_empty());
+        // E5: the provider's default reaches an unset request (and only an unset one).
+        provider.speculative_default = Speculative::Auto;
+        assert_eq!(report(&provider, None), named(Speculative::Auto));
+        assert!(report(&provider, Some(Speculative::Off)).is_empty());
+        provider.speculative_default = Speculative::Off;
+        assert!(report(&provider, None).is_empty());
+    }
+
+    use std::cell::Cell;
+
     const IMG: i32 = 128077;
+
+    /// sc-20683: every caption reports the dense KV cache with the shared reason for its policy.
+    #[test]
+    fn caption_output_reports_the_dense_kv_cache_for_the_policy() {
+        use core_llm::{
+            KvCacheFallbackReason as Reason, KvCacheReport, KvCompressionPolicy as Policy,
+        };
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let output = caption_output(
+                String::new(),
+                Usage::default(),
+                None,
+                CoreFinish::Stop,
+                policy,
+            );
+            assert_eq!(output.kv_cache, Some(KvCacheReport::dense(reason, None)));
+        }
+    }
 
     #[test]
     fn expand_replaces_image_token() {
@@ -771,5 +1107,30 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.id, PROVIDER_ID);
         assert!(d.capabilities.supports_vision);
+    }
+
+    #[test]
+    fn model_probe_rejects_file_sources_before_reading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::json!({
+                "text_config": {"model_type": "llama"},
+                "vision_config": {"model_type": "clip_vision_model"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let read_attempted = Cell::new(false);
+        let result = can_load_with(file.path(), |_| {
+            read_attempted.set(true);
+            Some(Value::Null)
+        });
+
+        assert!(!result);
+        assert!(!read_attempted.get(), "file payload must not be read");
+        assert!(!can_load(&LoadSpec::dense(
+            file.path().display().to_string()
+        )));
     }
 }

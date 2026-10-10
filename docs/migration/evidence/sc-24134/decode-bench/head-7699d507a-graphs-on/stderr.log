@@ -1,0 +1,4 @@
+[decode_bench] reference          15.01 tok/s  prefill 0.698s  fused {"switch":"on","fused":69888,"reference":0,"reference_reason":null,"path":"fused"}  nvfp4 {"switch":"on","gemv":0,"cublaslt":0,"cublaslt_reason":null,"path":"none"}
+[decode_bench] step_model         14.71 tok/s  prefill 1.142s  graphs {"switch":"on","replayed":0,"eager":256,"captured":0,"fallback_reason":"deltanet_state_unstable","path":"eager"}
+[decode_bench] mtp K=3            18.30 tok/s  accept 0.640  fwd/tok 0.535  syncs/verify 1.00  graphs {"switch":"on","replayed":0,"eager":137,"captured":0,"fallback_reason":"deltanet_state_unstable","path":"eager"}
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24134-evidence\decode-bench\head-7699d507a-graphs-on\decode_bench.json

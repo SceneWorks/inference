@@ -90,6 +90,36 @@ pub const MAX_TOTAL_REFERENCES: usize = 12;
 /// references and the generated canvas which share the one canvas rule. This is the concrete form
 /// of "references do not bind the generated geometry": a 2048-short-edge image reference conditions
 /// a 768-short-edge render.
+///
+/// **Upstream's own value, not a SceneWorks choice** (sc-23402). The reference implementation
+/// declares it as a pipeline config default —
+/// `diffusers/src/diffusers/modular_pipelines/minimax_h3/before_encoder.py:220`,
+/// `ConfigSpec("reference_image_short_edge", 2048)` in `MiniMaxH3Ref2VASetupStep.expected_configs`
+/// — and applies it at `:490-492`:
+///
+/// ```text
+/// scale = components.config.reference_image_short_edge / min(width, height)
+/// target_height = max(multiple, round(height * scale / multiple) * multiple)
+/// target_width  = max(multiple, round(width  * scale / multiple) * multiple)
+/// ```
+///
+/// which is exactly [`normalize_reference_image`] below, including the unconditional (upscaling)
+/// scale and the `max(multiple, …)` floor. The "high detail, upscaling included, no area cap"
+/// rationale is upstream's own comment at `:462-464`. `ModelTC/Minimax-H3-Turbo`'s
+/// `minimax_h3_ref2va_pipeline.py:35` re-declares the same `REFERENCE_SHORT_EDGE = 2048` when it
+/// offers *alternative* resize policies (`match`, `max`) beside the stock one, which it names
+/// `diffusers` and describes as forcing a 2048-pixel short edge — so 2048 with upscaling is the
+/// released checkpoint's rule, and the cheaper policies are an opt-in deviation from it. This crate
+/// implements the stock rule only.
+///
+/// # This is the DEFAULT, not the only admitted value (sc-23402)
+///
+/// A request may lower it through
+/// [`GenerationRequest::reference_image_short_edge`](mlx_gen::gen_core::GenerationRequest::reference_image_short_edge),
+/// admitted over
+/// [`REFERENCE_IMAGE_SHORT_EDGE_MIN`](mlx_gen::gen_core::REFERENCE_IMAGE_SHORT_EDGE_MIN)`..=`[`REFERENCE_IMAGE_SHORT_EDGE_MAX`](mlx_gen::gen_core::REFERENCE_IMAGE_SHORT_EDGE_MAX)
+/// — 1024..=2048 inclusive — and defaulting to this constant when the request omits it. See
+/// [`normalize_reference_image`] for what the value buys.
 pub const REFERENCE_IMAGE_SHORT_EDGE: i32 = 2048;
 
 /// The rate the **conditioner** reads a video reference at — every `24 / 2 = 12`th frame of the
@@ -188,14 +218,26 @@ pub fn sample_video_condition_frames(
     Ok((indices, block_timestamps))
 }
 
-/// Resize an **image** reference onto its own [`REFERENCE_IMAGE_SHORT_EDGE`], on the stride-32
-/// lattice.
+/// Resize an **image** reference onto `short_edge`, on the stride-32 lattice.
 ///
 /// **No area cap and upscaling included** — an image reference is encoded at high detail, unlike a
 /// video reference and the generated canvas which share the one canvas rule. This is the concrete
 /// mechanism behind "references do not bind the generated geometry": the returned size depends only
-/// on the image, never on the request's canvas.
-pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<Image> {
+/// on the image and `short_edge`, never on the request's canvas.
+///
+/// `short_edge` is the request's effective
+/// [`reference_image_short_edge`](mlx_gen::gen_core::GenerationRequest::reference_image_short_edge)
+/// — [`REFERENCE_IMAGE_SHORT_EDGE`] unless the caller lowered it. It buys **reference token count**,
+/// which is roughly quadratic in it: the same 576×320 plate normalizes to 3680×2048 at 2048 and
+/// 1856×1024 at 1024, one quarter the area and therefore about a quarter of the reference tokens the
+/// conditioner and the reference-latent rows carry. It does **not** change the rendered clip's size.
+/// The caller passes an already-validated value; a non-positive one is refused here as a defect
+/// rather than silently producing a degenerate plate.
+pub fn normalize_reference_image(
+    image: &Image,
+    canvas_multiple: i32,
+    short_edge: i32,
+) -> Result<Image> {
     if image.width == 0 || image.height == 0 {
         return Err(Error::Msg(
             "minimax-h3 ref2va: cannot normalize a zero-extent reference image".into(),
@@ -206,8 +248,13 @@ pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<
             "minimax-h3 ref2va: canvas multiple must be positive, got {canvas_multiple}"
         )));
     }
+    if short_edge <= 0 {
+        return Err(Error::Msg(format!(
+            "minimax-h3 ref2va: reference_image_short_edge must be positive, got {short_edge}"
+        )));
+    }
     let (w, h) = (f64::from(image.width), f64::from(image.height));
-    let scale = f64::from(REFERENCE_IMAGE_SHORT_EDGE) / w.min(h);
+    let scale = f64::from(short_edge) / w.min(h);
     let m = f64::from(canvas_multiple);
     let round_to =
         |v: f64| (crate::keyframe::round_half_to_even(v * scale / m) * m).max(m) as i32 as u32;
@@ -646,6 +693,53 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    /// sc-23402 — the requested short edge really drives the normalized geometry, and 1024 costs
+    /// about a quarter the reference tokens 2048 does.
+    ///
+    /// The 576x320 plate is asserted at its **scaled dimensions** rather than against the constant,
+    /// so a caller-supplied value that was ignored, clamped back to the default, or applied to the
+    /// wrong edge all red here. This is the MLX twin of the candle port's test of the same name.
+    #[test]
+    fn the_requested_short_edge_scales_the_reference_and_quarters_its_token_count() {
+        let stride = crate::pipeline::SPATIAL_STRIDE as i32;
+        let plate = image(576, 320);
+
+        let at_2048 = normalize_reference_image(&plate, stride, 2048).unwrap();
+        let at_1024 = normalize_reference_image(&plate, stride, 1024).unwrap();
+
+        assert_eq!((at_2048.width, at_2048.height), (3680, 2048));
+        assert_eq!((at_1024.width, at_1024.height), (1856, 1024));
+        for edge in [at_2048.width, at_2048.height, at_1024.width, at_1024.height] {
+            assert_eq!(
+                edge % crate::pipeline::SPATIAL_STRIDE,
+                0,
+                "off the 32 lattice"
+            );
+        }
+
+        let area = |i: &Image| u64::from(i.width) * u64::from(i.height);
+        let ratio = area(&at_2048) as f64 / area(&at_1024) as f64;
+        assert!(
+            (3.9..=4.1).contains(&ratio),
+            "halving the short edge must quarter the reference token count, got {ratio}x"
+        );
+
+        // The default is upstream's 2048 — the same geometry, reached without naming a value.
+        let default_edge = mlx_gen::gen_core::effective_reference_image_short_edge(
+            &mlx_gen::gen_core::GenerationRequest::default(),
+        ) as i32;
+        assert_eq!(default_edge, REFERENCE_IMAGE_SHORT_EDGE);
+        let at_default = normalize_reference_image(&plate, stride, default_edge).unwrap();
+        assert_eq!(
+            (at_default.width, at_default.height),
+            (at_2048.width, at_2048.height)
+        );
+
+        assert!(normalize_reference_image(&image(0, 8), stride, 2048).is_err());
+        assert!(normalize_reference_image(&plate, 0, 2048).is_err());
+        assert!(normalize_reference_image(&plate, stride, 0).is_err());
     }
 
     fn track() -> AudioTrack {

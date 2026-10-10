@@ -13,6 +13,134 @@ use candle_nn::{Linear, Module};
 
 use crate::error::Result;
 
+/// The input width `in` of an MLX affine **8-bit** triple in the layout
+/// [`QuantizedLinear::from_mlx_affine_q8`] accepts — a `U32` code matrix `[out, in / 4]` (four
+/// 8-bit codes per word) beside `[out, in / group_size]` scales and biases — or `None` for any
+/// other layout, which it refuses (a 4-bit pack, eight codes per word, among them). Load admission
+/// prices the Q8_0 repack by this same test (sc-24140), so it prices no copy for a triple the
+/// loader refuses.
+pub(crate) fn mlx_affine_q8_in_dim(
+    weight_is_u32: bool,
+    weight: (usize, usize),
+    scales: (usize, usize),
+    biases: (usize, usize),
+    group_size: usize,
+) -> Option<usize> {
+    mlx_affine_in_dim(8, weight_is_u32, weight, scales, biases, group_size)
+}
+
+/// [`mlx_affine_q8_in_dim`] for a `bits`-wide MLX affine triple (4 or 8: `32 / bits` codes per
+/// `U32` word) — the layouts [`QuantizedLinear::from_mlx_affine`] accepts. `None` for any other.
+pub(crate) fn mlx_affine_in_dim(
+    bits: usize,
+    weight_is_u32: bool,
+    weight: (usize, usize),
+    scales: (usize, usize),
+    biases: (usize, usize),
+    group_size: usize,
+) -> Option<usize> {
+    let (out_dim, packed_cols) = weight;
+    let in_dim = scales.1.checked_mul(group_size)?;
+    (matches!(bits, 4 | 8)
+        && weight_is_u32
+        && group_size != 0
+        && scales.0 == out_dim
+        && biases == scales
+        && packed_cols.checked_mul(32 / bits) == Some(in_dim))
+    .then_some(in_dim)
+}
+
+/// The GGML block types a prepared snapshot persists (sc-19375). Their block byte sizes are
+/// pairwise distinct — Q4_0 18 B / 32 weights, Q8_0 34 B / 32, Q4_K 144 B / 256 — which is what
+/// makes a stored block tensor self-describing.
+const STORED_GGML: [GgmlDType; 3] = [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType::Q4K];
+
+/// The GGML block type and logical `(rows, cols)` of a **stored GGML block tensor** — a prepared
+/// Q4 / Q8 snapshot's on-disk projection form (sc-19375): a `U8` tensor `[rows, blocks_per_row,
+/// block_bytes]` holding the raw GGML blocks of a `[rows, cols]` weight, row-major (GGML blocks run
+/// along the input dimension, so each row is `blocks_per_row` whole blocks). A stacked weight (the
+/// qwen3_5 MoE experts, `[experts, rows, cols]`) is stored `[experts, rows, blocks_per_row,
+/// block_bytes]`, and its `rows` here count every expert's. The block type is the one of
+/// [`STORED_GGML`] whose block size is `block_bytes`. `None` for any other tensor. The loader,
+/// load admission, the weight reader and the NVFP4 gate classify a tensor by this one rule, from
+/// its dtype and shape alone.
+pub(crate) fn ggml_block_storage(
+    is_u8: bool,
+    shape: &[usize],
+) -> Option<(GgmlDType, usize, usize)> {
+    let [lead @ .., rows, blocks, block_bytes] = shape else {
+        return None;
+    };
+    if !is_u8 {
+        return None;
+    }
+    let dtype = STORED_GGML
+        .into_iter()
+        .find(|d| d.type_size() == *block_bytes)?;
+    let rows = lead.iter().try_fold(*rows, |n, &d| n.checked_mul(d))?;
+    Some((dtype, rows, blocks.checked_mul(dtype.block_size())?))
+}
+
+/// Whether `t` is a stored GGML block tensor ([`ggml_block_storage`]).
+pub(crate) fn is_ggml_block_tensor(t: &Tensor) -> bool {
+    ggml_block_storage(t.dtype() == DType::U8, t.dims()).is_some()
+}
+
+/// Serialize a 2-D [`QTensor`] of a persisted block type (Q4_0 / Q8_0 / Q4_K) into its stored
+/// GGML block tensor on the CPU: a `U8` `[rows, blocks_per_row, block_bytes]` tensor of the raw
+/// GGML blocks, row-major, which [`from_ggml_block_tensor`] reads back. GGML quantizes each block
+/// on its own, so the blocks of any row slice are byte-for-byte those of quantizing that slice
+/// alone — which is what lets a loader carve fused parts and stacked experts out of one stored
+/// tensor.
+pub fn to_ggml_block_tensor(qt: &QTensor) -> Result<Tensor> {
+    let dtype = qt.dtype();
+    let (rows, cols) = qt.shape().dims2()?;
+    if !STORED_GGML.contains(&dtype) || !cols.is_multiple_of(dtype.block_size()) {
+        return Err(crate::error::Error::Unsupported(format!(
+            "ggml block storage: cannot persist a {dtype:?} [{rows}, {cols}] tensor"
+        )));
+    }
+    let bytes = qt.data()?.into_owned();
+    let blocks = cols / dtype.block_size();
+    Ok(Tensor::from_vec(
+        bytes,
+        (rows, blocks, dtype.type_size()),
+        &Device::Cpu,
+    )?)
+}
+
+/// Rebuild the [`QTensor`] a rank-3 stored GGML block tensor holds, directly on `device`: the
+/// blocks are used exactly as stored — never dequantized and re-quantized. A stacked (rank-4)
+/// tensor is sliced to one expert first.
+pub fn from_ggml_block_tensor(stored: &Tensor, device: &Device) -> Result<QTensor> {
+    let storage = ggml_block_storage(stored.dtype() == DType::U8, stored.dims());
+    let (Some((dtype, rows, cols)), 3) = (storage, stored.rank()) else {
+        return Err(crate::error::Error::Config(format!(
+            "ggml block storage: {:?} {:?} is not a rank-3 stored GGML block tensor",
+            stored.dtype(),
+            stored.shape()
+        )));
+    };
+    let bytes = stored
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<u8>()?;
+    // candle reinterprets the byte slice as a block slice (2-byte aligned `f16` fields), so hand
+    // it u64-backed storage rather than rely on the byte vector's allocation alignment.
+    let mut words = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: `words` owns `words.len() * 8 >= bytes.len()` initialized bytes, and u8 has no
+    // alignment requirement; the byte view does not outlive `words`.
+    let aligned =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes.len()) };
+    aligned.copy_from_slice(&bytes);
+    Ok(candle_core::quantized::ggml_file::qtensor_from_ggml(
+        dtype,
+        aligned,
+        vec![rows, cols],
+        device,
+    )?)
+}
+
 /// A linear projection whose weight is stored GGML block-quantized.
 pub struct QuantizedLinear {
     inner: QuantizedWeight,
@@ -29,10 +157,31 @@ enum QuantizedWeight {
 }
 
 impl QuantizedLinear {
+    /// Wrap a tensor which was already stored in a GGUF quantized representation. This preserves
+    /// the compact resident payload and lets [`QMatMul`] dispatch the matching CPU/CUDA kernel;
+    /// loading a Q8 projector must not materialize a second dense copy of the matrix.
+    pub fn from_qtensor(weight: QTensor, bias: Option<Tensor>) -> Result<Self> {
+        Ok(Self {
+            inner: QuantizedWeight::Matmul(QMatMul::from_qtensor(weight)?),
+            bias,
+        })
+    }
+
     /// Quantize a dense `[out, in]` weight (the input dim must be a multiple of `dtype`'s block
     /// size). `bias`, if present, is added after the matmul.
+    ///
+    /// `weight` may be a view — an expert sliced out of a stacked qwen3_5 MoE tensor, or one part
+    /// of a fused Phi-3 `qkv_proj` / `gate_up_proj`. Candle's quantizer reads its source's storage
+    /// from the start, ignoring the view's offset and extent, so the f32 source it is handed is
+    /// always compacted first: a cast to f32 builds a fresh tensor, but an f32 weight (every
+    /// weight on a host device, whose compute dtype is f32) would otherwise be passed through as
+    /// the view itself and quantize the wrong rows — or trip candle's size check (sc-24140).
     pub fn quantize(weight: &Tensor, dtype: GgmlDType, bias: Option<Tensor>) -> Result<Self> {
-        let qt = QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?;
+        let source = match weight.dtype() {
+            DType::F32 => weight.force_contiguous()?,
+            _ => weight.to_dtype(DType::F32)?,
+        };
+        let qt = QTensor::quantize(&source, dtype)?;
         Ok(Self {
             inner: QuantizedWeight::Matmul(QMatMul::from_qtensor(qt)?),
             bias,
@@ -50,25 +199,39 @@ impl QuantizedLinear {
         group_size: usize,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_mlx_affine(weight, scales, biases, bias, group_size, 8, device)
+    }
+
+    /// [`from_mlx_affine_q8`](Self::from_mlx_affine_q8) for a `bits`-wide triple (4 or 8; `32 /
+    /// bits` little-endian codes per `U32` word, MLX's `quantize` layout): the exact affine grid
+    /// `scale · code + bias`, re-packed to the resident Q8_0 form.
+    pub fn from_mlx_affine(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bias: Option<Tensor>,
+        group_size: usize,
+        bits: usize,
+        device: &Device,
+    ) -> Result<Self> {
         let (out_dim, packed_cols) = weight.dims2()?;
-        let (scale_rows, scale_cols) = scales.dims2()?;
-        let in_dim = scale_cols.checked_mul(group_size).ok_or_else(|| {
-            crate::error::Error::Config("MLX affine Q8 input width overflow".into())
-        })?;
-        if weight.dtype() != DType::U32
-            || group_size == 0
-            || scale_rows != out_dim
-            || biases.dims2()? != (scale_rows, scale_cols)
-            || packed_cols.checked_mul(4) != Some(in_dim)
-        {
+        let (_, scale_cols) = scales.dims2()?;
+        let Some(in_dim) = mlx_affine_in_dim(
+            bits,
+            weight.dtype() == DType::U32,
+            (out_dim, packed_cols),
+            scales.dims2()?,
+            biases.dims2()?,
+            group_size,
+        ) else {
             return Err(crate::error::Error::Config(format!(
-                "invalid MLX affine Q8 triple: weight {:?} {:?}, scales {:?}, biases {:?}, group {group_size}",
+                "invalid MLX affine Q{bits} triple: weight {:?} {:?}, scales {:?}, biases {:?}, group {group_size}",
                 weight.dtype(),
                 weight.shape(),
                 scales.shape(),
                 biases.shape()
             )));
-        }
+        };
 
         let cpu = Device::Cpu;
         let words = weight.to_device(&cpu)?.flatten_all()?.to_vec1::<u32>()?;
@@ -82,14 +245,16 @@ impl QuantizedLinear {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        let per_word = 32 / bits;
+        let mask = (1u32 << bits) - 1;
         let mut grid = vec![0f32; out_dim * in_dim];
         for row in 0..out_dim {
             let word_row = row * packed_cols;
             let group_row = row * scale_cols;
             let value_row = row * in_dim;
             for col in 0..in_dim {
-                let word = words[word_row + col / 4];
-                let code = ((word >> (8 * (col % 4))) & 0xff) as f32;
+                let word = words[word_row + col / per_word];
+                let code = ((word >> (bits * (col % per_word))) & mask) as f32;
                 let group = group_row + col / group_size;
                 grid[value_row + col] = scales[group] * code + biases[group];
             }
@@ -100,6 +265,68 @@ impl QuantizedLinear {
             inner: QuantizedWeight::Dequant(std::sync::Arc::new(qt)),
             bias,
         })
+    }
+
+    /// Resident bytes of the weight as stored (the GGML block payload, or the dense tensor
+    /// `QMatMul` expanded a float-typed GGUF matrix into) plus the bias — the load telemetry's
+    /// per-projection footprint (sc-24135).
+    pub fn resident_bytes(&self) -> usize {
+        let dense = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
+        let weight = match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.storage_size_in_bytes()
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => dense(t),
+        };
+        weight + self.bias.as_ref().map_or(0, dense)
+    }
+
+    /// The logical `(out, in)` weight shape.
+    pub fn dims(&self) -> (usize, usize) {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.shape().dims2().unwrap_or((0, 0))
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => {
+                t.dims2().unwrap_or((0, 0))
+            }
+        }
+    }
+
+    /// Logical weight elements (`out · in`).
+    pub fn weight_elems(&self) -> usize {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.shape().elem_count()
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.elem_count(),
+        }
+    }
+
+    /// The resident GGML block tensor and how this projection's forward uses it, for an MoE bank's
+    /// indexed expert table (sc-24440): `(weight, dequant)` — `dequant` for the MLX-affine Q8
+    /// tier, whose forward dequantizes the weight to the activation dtype; otherwise the forward
+    /// is `QMatMul`'s. `None` for a float-typed GGUF matrix (no blocks) or a projection with a bias
+    /// (the indexed kernels add none).
+    pub fn indexed_source(&self) -> Option<(std::sync::Arc<QTensor>, bool)> {
+        if self.bias.is_some() {
+            return None;
+        }
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) => Some((q.clone(), false)),
+            QuantizedWeight::Dequant(q) => Some((q.clone(), true)),
+            QuantizedWeight::Matmul(_) => None,
+        }
+    }
+
+    /// The GGML block dtype the weight is stored in, when it is block-quantized.
+    pub fn ggml_dtype(&self) -> Option<GgmlDType> {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                Some(q.dtype())
+            }
+            QuantizedWeight::Matmul(_) => None,
+        }
     }
 
     /// Forward pass: `x @ dequant(weight)ᵀ (+ bias)`. The quantized matmul runs in f32; the result is
@@ -157,6 +384,39 @@ mod tests {
         }
     }
 
+    /// sc-19375: a stored block is used exactly as stored. The hand-built Q8_0 blocks are **not**
+    /// what candle's quantizer would write for their values (`d = 1.0` over codes no wider than
+    /// ±10, where a requantize picks `d = 10 / 127` and rescales every code), so a loader that
+    /// dequantized and re-quantized — which round-trips a canonical block to identical bytes —
+    /// changes these bytes and fails here.
+    #[test]
+    fn stored_blocks_rebuild_byte_exact_even_when_non_canonical() {
+        let one = half::f16::from_f32(1.0).to_le_bytes();
+        let mut bytes = Vec::new();
+        for row in 0..2i32 {
+            for block in 0..2i32 {
+                bytes.extend_from_slice(&one);
+                bytes.extend((0..32i32).map(|i| (((i + row + block) % 21) - 10) as i8 as u8));
+            }
+        }
+        let stored = Tensor::from_vec(bytes.clone(), (2, 2, 34), &Device::Cpu).unwrap();
+        assert_eq!(
+            ggml_block_storage(true, stored.dims()),
+            Some((GgmlDType::Q8_0, 2, 64))
+        );
+        let qt = from_ggml_block_tensor(&stored, &Device::Cpu).unwrap();
+        assert_eq!(qt.dtype(), GgmlDType::Q8_0);
+        assert_eq!(qt.shape().dims(), &[2, 64]);
+        assert_eq!(qt.data().unwrap().as_ref(), bytes.as_slice());
+        // The blocks really are non-canonical: requantizing their values rewrites them.
+        let requantized = QTensor::quantize(&qt.dequantize(&Device::Cpu).unwrap(), GgmlDType::Q8_0)
+            .unwrap()
+            .data()
+            .unwrap()
+            .into_owned();
+        assert_ne!(requantized, bytes);
+    }
+
     #[test]
     fn mlx_affine_q8_reconstructs_lsb_bytes_bias_and_input_groups() {
         let dev = Device::Cpu;
@@ -206,5 +466,158 @@ mod tests {
 
         let y = packed.forward(&x).unwrap();
         assert_eq!(y.dims(), &[2, out]);
+    }
+
+    /// sc-24444: a 4-bit MLX affine triple (eight little-endian nibbles per word — a published
+    /// companion MTP head's layout) reconstructs its exact affine grid before the Q8_0 repack, and
+    /// the 8-bit reading of the same words is refused by geometry.
+    #[test]
+    fn mlx_affine_q4_reconstructs_lsb_nibbles_bias_and_input_groups() {
+        let dev = Device::Cpu;
+        let (out, inn, group) = (2usize, 64usize, 32usize);
+        let codes: Vec<u8> = (0..out * inn)
+            .map(|i| [0, 15, 1, 14, 7, 8, 3, 12][i % 8] ^ ((i / 8) % 2) as u8)
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|chunk| {
+                chunk.iter().enumerate().fold(0u32, |word, (index, code)| {
+                    word | ((*code as u32) << (index * 4))
+                })
+            })
+            .collect();
+        let scale_values = vec![0.1f32, 0.05, 0.02, 0.08];
+        let bias_values = vec![-0.75f32, 0.25, -0.1, 0.4];
+        let weight = Tensor::from_vec(words, (out, inn / 8), &dev).unwrap();
+        let scales = Tensor::from_vec(scale_values.clone(), (out, inn / group), &dev).unwrap();
+        let biases = Tensor::from_vec(bias_values.clone(), (out, inn / group), &dev).unwrap();
+
+        let packed =
+            QuantizedLinear::from_mlx_affine(&weight, &scales, &biases, None, group, 4, &dev)
+                .unwrap();
+        let resident = match &packed.inner {
+            QuantizedWeight::Dequant(weight) => weight.dequantize(&dev).unwrap(),
+            QuantizedWeight::Matmul(_) => panic!("MLX affine Q4 must use the packed-source path"),
+        };
+        let got = resident.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (index, (actual, &code)) in got.iter().zip(&codes).enumerate() {
+            let (row, col) = (index / inn, index % inn);
+            let g = row * (inn / group) + col / group;
+            let expected = scale_values[g] * f32::from(code) + bias_values[g];
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "index {index}: {actual} vs affine source {expected}"
+            );
+        }
+        assert!(
+            QuantizedLinear::from_mlx_affine_q8(&weight, &scales, &biases, None, group, &dev)
+                .is_err()
+        );
+    }
+}
+
+/// sc-24446: a CUDA quantize-on-load leaves no garbage in the quantized storage's row padding.
+/// candle's MMQ kernels (any quantized matmul over more than 8 rows) load `MMQ_ITER_K` = 256
+/// elements of every row, so a row narrower than that — the stage-2 synthetic fixture's 32/64,
+/// a real 5504-wide `down_proj`'s ragged last tile — reads blocks out of the padding after the
+/// last row. Their quants meet zero activations, but each block's f16 scale is still multiplied
+/// in: an inf/NaN there made the YuE stage-2 test's logits NaN, intermittently, as whatever the
+/// pool last held there changed.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+    use candle_core::cuda_backend::cudarc;
+
+    /// The quantizer's storage is `data` plus 512 elements' worth of blocks of padding.
+    fn padded_bytes(dtype: GgmlDType, elems: usize) -> (usize, usize) {
+        let data = elems / dtype.block_size() * dtype.type_size();
+        (data, data + 512 / dtype.block_size() * dtype.type_size())
+    }
+
+    fn uniform(seed: u64, len: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// Fill the device's free pool with all-ones bytes (an f16 `0xFFFF` is a NaN) in exactly the
+    /// size the quantizer is about to allocate, then free it, so its allocation is handed poisoned
+    /// memory rather than fresh (zeroed) pages.
+    fn poison_pool(dev: &candle_core::CudaDevice, bytes: usize) {
+        let poison = vec![0xFFu8; bytes];
+        let slices: Vec<_> = (0..256)
+            .map(|_| dev.clone_htod(&poison).expect("poison buffer"))
+            .collect();
+        drop(slices);
+    }
+
+    #[test]
+    fn quantize_on_load_zeroes_the_padding_mmq_reads() {
+        let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!("new_cuda_for_test opens a CUDA device")
+        };
+        // 64 output rows of 32 inputs (one Q8_0 / Q4_0 block per row), 16 activation rows: the
+        // MMQ path, whose tile reads 7 blocks past the end of the last weight row.
+        let (out, inn, rows) = (64usize, 32usize, 16usize);
+        for (seed, dtype) in [(1u64, GgmlDType::Q8_0), (2, GgmlDType::Q4_0)] {
+            let w_host =
+                Tensor::from_vec(uniform(seed, out * inn), (out, inn), &Device::Cpu).unwrap();
+            let x_host =
+                Tensor::from_vec(uniform(seed + 10, rows * inn), (rows, inn), &Device::Cpu)
+                    .unwrap();
+            let w = w_host.to_device(&dev).unwrap();
+            let (data, padded) = padded_bytes(dtype, out * inn);
+            // `quantize` compacts an f32 weight first (one `out·in·4`-byte copy), then allocates
+            // the padded storage: poison both sizes.
+            poison_pool(cuda, out * inn * 4);
+            poison_pool(cuda, padded);
+            let q = QuantizedLinear::quantize(&w, dtype, None).unwrap();
+
+            // The padding itself is zero.
+            let QuantizedWeight::Matmul(QMatMul::QTensor(qt)) = &q.inner else {
+                panic!("{dtype:?} quantizes to a GGML block tensor");
+            };
+            assert_eq!(qt.storage_size_in_bytes(), data);
+            let base = qt.device_ptr().unwrap() as u64;
+            let mut tail = vec![0xAAu8; padded - data];
+            cuda.cuda_stream().context().bind_to_thread().unwrap();
+            // SAFETY: `[base, base + padded)` is the live allocation `qt` owns; the legacy-stream
+            // device orders this synchronous copy after the quantizer's upload.
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut tail, base + data as u64) }
+                .unwrap();
+            assert!(
+                tail.iter().all(|&b| b == 0),
+                "{dtype:?}: {} non-zero padding bytes",
+                tail.iter().filter(|&&b| b != 0).count()
+            );
+
+            // And the MMQ forward over it is finite and matches the dequantized weight's matmul.
+            let y = q
+                .forward(&x_host.to_device(&dev).unwrap())
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let deq = qt.dequantize(&Device::Cpu).unwrap();
+            let want = x_host
+                .matmul(&deq.t().unwrap())
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for (r, (got, want)) in y.iter().zip(&want).enumerate() {
+                for (c, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(g.is_finite(), "{dtype:?}: output [{r}, {c}] is {g}");
+                    assert!((g - w).abs() < 0.05, "{dtype:?}: [{r}, {c}] {g} vs {w}");
+                }
+            }
+        }
     }
 }

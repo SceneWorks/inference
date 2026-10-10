@@ -2992,11 +2992,10 @@ mod weights_free_behavior_tests {
 
     #[test]
     fn raw_and_edit_catalog_surfaces_are_exact_and_only_publish_request_scoped_staging() {
-        let registry = register_memory_contract_surfaces(register_providers(
-            gen_core::ProviderRegistryBuilder::new(),
-        ))
-        .build()
-        .unwrap();
+        let registry = register_providers(gen_core::ProviderRegistryBuilder::new());
+        #[cfg(not(feature = "cuda"))]
+        let registry = register_memory_contract_surfaces(registry);
+        let registry = registry.build().unwrap();
         assert_eq!(registry.memory_strategy_registrations().len(), 5);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         assert_eq!(surfaces.len(), 2 * 16 + 3 * 12);
@@ -3192,6 +3191,23 @@ mod weights_free_behavior_tests {
         context.use_pid = true;
         context.has_phases = true;
         assert!(validate_krea_memory_route(KREA_2_RAW_ID, &context).is_err());
+    }
+
+    #[test]
+    fn dense_turbo_fixture_publishes_bf16_production_calibration() {
+        let snapshot = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()));
+        let contract = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            contract.calibration.unwrap().fingerprint,
+            "krea-2-turbo-bf16-cuda-phase-curves-v1"
+        );
     }
 
     #[test]
@@ -4158,7 +4174,7 @@ mod explicit_registry_tests {
                 .expect("Krea Turbo must register its CUDA memory-strategy contract");
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
-                "krea-turbo-cuda-phase-curves-v1"
+                "krea-2-turbo-bf16-cuda-phase-curves-v1"
             );
             assert_eq!(contract.strategies.len(), 5);
             assert!(contract.strategies.iter().all(|capability| matches!(

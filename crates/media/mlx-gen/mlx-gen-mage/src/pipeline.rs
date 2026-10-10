@@ -594,9 +594,9 @@ pub(crate) fn load_text_component(
         ));
     }
     let mut text = if multimodal {
-        crate::text_encoder::load_multimodal_dir(&dirs.text_encoder)?
+        crate::text_encoder::load::load_multimodal_dir_with(&dirs.text_encoder, stream_lm)?
     } else {
-        crate::text_encoder::load_dir(&dirs.text_encoder)?
+        crate::text_encoder::load::load_dir_with(&dirs.text_encoder, stream_lm)?
     };
     if let Some(bits) = bits {
         text.quantize(bits)?;
@@ -629,7 +629,11 @@ pub(crate) fn load_heavy_components(
             "mage_flow: deferred DiT residency requires a dense bf16 snapshot or a prepacked matching tier; load-time block quantization is not streamable".into(),
         ));
     }
-    let mut transformer = MageTransformer::load(&dirs.transformer)?;
+    let mut transformer = if stream_transformer {
+        MageTransformer::load_streamed(&dirs.transformer)?
+    } else {
+        MageTransformer::load(&dirs.transformer)?
+    };
     if stream_transformer {
         transformer = transformer.with_block_stream(
             mlx_gen::WeightsSource::Dir(dirs.transformer.clone()),
@@ -718,7 +722,11 @@ impl MageFlowPipeline {
         }
 
         let multimodal = matches!(part, crate::vae::VaePart::Both);
-        let mut transformer = MageTransformer::load(&dirs.transformer)?;
+        let mut transformer = if stream_transformer {
+            MageTransformer::load_streamed(&dirs.transformer)?
+        } else {
+            MageTransformer::load(&dirs.transformer)?
+        };
         if stream_transformer {
             transformer = transformer.with_block_stream(
                 mlx_gen::WeightsSource::Dir(dirs.transformer.clone()),

@@ -11,6 +11,7 @@ Latent shape: [B, 128, H/16, W/16] — no patch packing, no BN normalization.
 
 import math
 import os
+import pickle
 from functools import lru_cache
 
 import torch
@@ -524,7 +525,10 @@ def _load_state_dict(ckpt_path: str):
         ckpt_path = os.path.join(ckpt_path, "checkpoint-state_dict.pt")
     elif os.path.isdir(ckpt_path):
         ckpt_path = os.path.join(ckpt_path, "checkpoint", "mp_rank_00_model_states.pt")
-    state = torch.load(ckpt_path, map_location="cpu")
+    try:
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{ckpt_path}: unsupported checkpoint object; provide tensor-only weights") from exc
     if "module" in state:
         return state["module"]
     if "state_dict" in state:

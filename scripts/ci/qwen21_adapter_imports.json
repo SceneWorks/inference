@@ -1,0 +1,36 @@
+{
+  "repository": "SceneWorks/inference",
+  "releaseId": 402708057,
+  "adapters": [
+    {
+      "name": "cuda_lora",
+      "origin": "CUDA",
+      "kind": "lora",
+      "assetId": 608607183,
+      "assetName": "cuda_t2i_lora.safetensors",
+      "size": 167851080,
+      "file": "qwen21_cuda_lora.safetensors",
+      "sha256": "75ed9d433ab1357e4b439a049e3997d0dc9271e3950cca605ad72c8d3acff689"
+    },
+    {
+      "name": "cuda_lokr",
+      "origin": "CUDA",
+      "kind": "lokr",
+      "assetId": 608607182,
+      "assetName": "cuda_edit_lokr.safetensors",
+      "size": 6759392,
+      "file": "qwen21_cuda_lokr.safetensors",
+      "sha256": "201bffa58dc8a1b61ec6399845109ebc3741220f9942f6caa0bfdc85695abf96"
+    },
+    {
+      "name": "mlx_t2i_1000_steps",
+      "origin": "MLX run 37127726908",
+      "kind": "lora",
+      "assetId": 609618892,
+      "assetName": "qwen21_t2i_lora.safetensors",
+      "size": 167849666,
+      "file": "qwen21_t2i_lora.safetensors",
+      "sha256": "165ef06aa4374084f5efec26756e1f01c1e41a8c0cec6f5057892d41e33ee8e0"
+    }
+  ]
+}

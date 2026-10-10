@@ -177,6 +177,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // The one trainer with a full base fine-tune path today (sc-14056 / epic 14034): it trains
         // every DiT weight and writes a full checkpoint rather than an adapter.
         supports_full_finetune: true,
+        max_reference_images: 0,
     }
 }
 
@@ -345,6 +346,7 @@ impl Trainer for MageFlowTrainer {
         // anyway so the capability claim and the acceptance stay one fact (and the conformance
         // suite's validate-honesty check exercises the same seam for every family).
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         // `lora_target_modules` only scopes the LoRA/LoKr adapter; a full base fine-tune trains every
         // DiT weight, so the target-resolution guard below does not apply to it.

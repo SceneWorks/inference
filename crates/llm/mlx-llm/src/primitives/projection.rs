@@ -4,10 +4,11 @@
 //! is a load-time choice with no decoder changes: a dense `[out, in]` weight either stays dense
 //! (`matmul(x, wᵀ)`) or is quantized to Q4/Q8 ([`QuantizedLinear`]).
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
 use crate::primitives::nn::linear;
+use crate::primitives::prism::PrismLinear;
 use crate::primitives::quant::QuantizedLinear;
 
 /// Group-wise affine quantization parameters.
@@ -50,6 +51,8 @@ pub enum Projection {
     },
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
+    /// Prism ternary affine weight with a folded Hadamard activation rotation.
+    Prism(PrismLinear),
 }
 
 impl Projection {
@@ -77,17 +80,26 @@ impl Projection {
     }
 
     /// Load from **already-quantized** parts stored in a snapshot (the packed `weight`, per-group
-    /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant. No
-    /// quantization happens here; the parts are used as-is.
-    pub fn from_quantized(weight: Array, scales: Array, biases: Array, spec: QuantSpec) -> Self {
-        Projection::Quantized(QuantizedLinear {
+    /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant and of
+    /// mlx-community checkpoints. No quantization happens here: the packed weight is used as-is and
+    /// the affine parameters are held in the model's `compute` dtype
+    /// ([`QuantizedLinear::from_stored`]).
+    pub fn from_quantized(
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        spec: QuantSpec,
+        compute: Dtype,
+    ) -> Result<Self> {
+        Ok(Projection::Quantized(QuantizedLinear::from_stored(
             weight,
             scales,
             biases,
-            group_size: spec.group_size,
-            bits: spec.bits,
-            bias: None,
-        })
+            spec.group_size,
+            spec.bits,
+            None,
+            compute,
+        )?))
     }
 
     /// `x @ weightᵀ (+ bias)`.
@@ -95,12 +107,42 @@ impl Projection {
         match self {
             Projection::Dense { weight, bias } => linear(x, weight, bias.as_ref()),
             Projection::Quantized(q) => q.forward(x),
+            Projection::Prism(p) => p.forward(x),
         }
     }
 
     /// Whether this projection is quantized.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Projection::Quantized(_))
+        matches!(self, Projection::Quantized(_) | Projection::Prism(_))
+    }
+
+    /// Elements a forward materializes when its activations are **wider** than this projection's
+    /// stored dtype (sc-24446): MLX promotes a BF16 weight to the activation dtype for a dense
+    /// matmul (a full copy of the weight), and a quantized matmul's BF16 scales and biases. A
+    /// Prism projection rotates its input in its own dtype and promotes nothing here.
+    pub fn promoted_elements(&self) -> u64 {
+        let n = |a: &Array| a.size() as u64;
+        let bias = |b: &Option<Array>| b.as_ref().map_or(0, n);
+        match self {
+            Projection::Dense { weight, bias: b } => n(weight) + bias(b),
+            Projection::Quantized(q) => n(&q.scales) + n(&q.biases) + bias(&q.bias),
+            Projection::Prism(_) => 0,
+        }
+    }
+
+    /// The arrays this projection holds, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        match self {
+            Projection::Dense { weight, bias } => {
+                out.push(weight.clone());
+                out.extend(bias.iter().cloned());
+            }
+            Projection::Quantized(q) => {
+                out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()]);
+                out.extend(q.bias.iter().cloned());
+            }
+            Projection::Prism(p) => p.push_arrays(out),
+        }
     }
 }
 
@@ -166,5 +208,13 @@ impl KvProjection {
     /// Whether either half is quantized.
     pub fn is_quantized(&self) -> bool {
         self.k.is_quantized() || self.v.as_ref().is_some_and(Projection::is_quantized)
+    }
+
+    /// The arrays both halves hold, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        self.k.push_arrays(out);
+        if let Some(v) = &self.v {
+            v.push_arrays(out);
+        }
     }
 }

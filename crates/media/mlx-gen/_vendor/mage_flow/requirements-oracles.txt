@@ -968,9 +968,9 @@ tqdm==4.69.1 \
     # via
     #   huggingface-hub
     #   transformers
-transformers==5.5.0 \
-    --hash=sha256:821a9ff0961abbb29eb1eb686d78df1c85929fdf213a3fe49dc6bd94f9efa944 \
-    --hash=sha256:c8db656cf51c600cd8c75f06b20ef85c72e8b8ff9abc880c5d3e8bc70e0ddcbd
+transformers==5.10.4 \
+    --hash=sha256:8c5b99b141b53619435a76629b0284f04d27ff46d788b463fc0ecb23b8ff130e \
+    --hash=sha256:de37741509e64ccb88f7f5708beaf5b1914df447f5fe659f9c0fd95950413168
     # via -r crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.in
 typer==0.27.0 \
     --hash=sha256:629bd12ea5d13a17148125d9a264f949eb171fb3f120f9b04d85873cab054fa5 \

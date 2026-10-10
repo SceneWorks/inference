@@ -1,0 +1,802 @@
+//! The step-seam cache every softmax-attention decoder shares (epic sc-24128, story sc-24138).
+//!
+//! [`StepKvCache`] is the [`DecodeCache`] the llama family ([`CausalLm`]), StarCoder2 and the
+//! StarVector-1B GPTBigCode decoder hand the step seam. It is one type with three backings, so no
+//! decoder keeps a private cache of its own (E0):
+//!
+//! * **static** — one preallocated [`StaticKvCache`] per layer, sized once for the request's bound
+//!   ([`StepKvCache::preallocated`]): written in place, rolled back by moving the offset, buffer
+//!   addresses stable for the cache's life. The fast path's default (story sc-24132's template,
+//!   generalized to per-layer shapes: Gemma 4's layer types disagree on head count and width, and
+//!   DeepSeek-V2's materialized MLA caches keys and values of different widths).
+//! * **growing** — the [`ContiguousKvCache`] concat, the reference oracle's arithmetic kept
+//!   selectable through the seam (E2) and the backing the multimodal providers decode on.
+//! * **paged** — a [`PagedKvCache`] over a shared block pool. Kept behind the seam rather than
+//!   replaced: it is what the continuous-batching / prefix-sharing paths are built on (ragged
+//!   batches over one pool, copy-on-write prefix blocks), which a per-request preallocation cannot
+//!   express.
+//!
+//! The cache also carries the RoPE **position delta** (M-RoPE's `mrope_delta`): a decoder adds it
+//! to [`DecodeCache::len`] to position the tokens a step feeds after a multimodal prefill.
+//!
+//! [`CausalLm`]: crate::models::CausalLm
+
+use candle_core::{DType, Device, Tensor};
+
+use crate::error::{Error, Result};
+use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
+use crate::primitives::device_positions::DevicePositions;
+use crate::primitives::kv_cache::{
+    ContiguousKvCache, IndexedKv, KvCache, KvCacheKind, StaticKvCache,
+};
+use crate::primitives::paged_kv_cache::PagedKvCache;
+
+/// One layer's cached key/value geometry.
+#[derive(Clone, Debug)]
+pub struct LayerKvShape {
+    /// Cached K/V heads (the un-expanded GQA count; the full head count for MLA).
+    pub kv_heads: usize,
+    /// Key head width.
+    pub key_dim: usize,
+    /// Value head width (differs from `key_dim` only for MLA).
+    pub value_dim: usize,
+    /// The device the layer (and so its cache) lives on — per layer for a pipeline-sharded model.
+    pub device: Device,
+}
+
+/// A decoder's per-layer KV geometry: what a preallocation allocates and what admission prices.
+/// `None` marks a layer that caches nothing (a Gemma 4 `num_kv_shared_layers` tail layer, which
+/// attends its donor's keys).
+#[derive(Clone, Debug)]
+pub struct KvLayout {
+    /// One entry per decoder layer.
+    pub layers: Vec<Option<LayerKvShape>>,
+    /// The cached tensors' dtype (the decoder's compute dtype).
+    pub dtype: DType,
+}
+
+impl KvLayout {
+    /// K + V bytes one sequence position costs across every caching layer.
+    pub fn bytes_per_position(&self) -> usize {
+        self.layers.iter().flatten().fold(0usize, |acc, l| {
+            acc.saturating_add(
+                l.kv_heads
+                    .saturating_mul(l.key_dim.saturating_add(l.value_dim))
+                    .saturating_mul(self.dtype.size_in_bytes()),
+            )
+        })
+    }
+
+    /// Bytes [`StepKvCache::preallocated`] allocates for `capacity` positions (batch 1). Saturating.
+    pub fn static_bytes(&self, capacity: usize) -> usize {
+        self.layers.iter().flatten().fold(0usize, |acc, l| {
+            acc.saturating_add(StaticKvCache::buffer_bytes_with_value_dim(
+                1,
+                1,
+                l.kv_heads,
+                l.key_dim,
+                l.value_dim,
+                capacity,
+                self.dtype,
+            ))
+        })
+    }
+
+    /// The `(kv_heads, max(key_dim, value_dim))` of the layer whose K/V are widest per position —
+    /// the largest `kv_heads × max(key_dim, value_dim)` — the scalar pair an admission geometry
+    /// carries so `layers × kv_heads × head_dim × 2` covers every layer, whatever its type.
+    ///
+    /// The pair is taken from **one** layer rather than maxing the head count and the head width
+    /// independently: Gemma 4's sliding layers are many narrow heads and its full layers few wide
+    /// ones (e.g. 8×256 vs `k_eq_v` 1×512), and the independent maxima (8×512) would price twice
+    /// what any layer holds. `(0, 0)` when no layer caches anything.
+    pub fn widest_layer(&self) -> (usize, usize) {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|l| (l.kv_heads, l.key_dim.max(l.value_dim)))
+            .fold((0, 0), |widest, layer| {
+                if layer.0.saturating_mul(layer.1) > widest.0.saturating_mul(widest.1) {
+                    layer
+                } else {
+                    widest
+                }
+            })
+    }
+}
+
+enum Backing {
+    Growing(ContiguousKvCache),
+    Static(Vec<Option<StaticKvCache>>),
+    Paged(PagedKvCache),
+}
+
+/// The shared step-seam cache (see the module docs).
+pub struct StepKvCache {
+    backing: Backing,
+    rope_delta: i32,
+    bytes_per_position: usize,
+    /// The device-staged step positions of a static backing built
+    /// [`with_device_positions`](Self::with_device_positions) (sc-24441); `None` otherwise.
+    positions: Option<DevicePositions>,
+}
+
+impl std::fmt::Debug for StepKvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backing = match &self.backing {
+            Backing::Growing(_) => "growing",
+            Backing::Static(_) => "static",
+            Backing::Paged(_) => "paged",
+        };
+        f.debug_struct("StepKvCache")
+            .field("backing", &backing)
+            .field("len", &KvCache::offset(self))
+            .field("rope_delta", &self.rope_delta)
+            .field("device_positions", &self.positions.is_some())
+            .finish()
+    }
+}
+
+impl StepKvCache {
+    /// An empty cache on the growing ([`ContiguousKvCache`]) backing.
+    pub fn growing(layout: &KvLayout) -> Self {
+        Self {
+            backing: Backing::Growing(ContiguousKvCache::new(layout.layers.len())),
+            rope_delta: 0,
+            bytes_per_position: layout.bytes_per_position(),
+            positions: None,
+        }
+    }
+
+    /// An empty cache whose caching layers are each one preallocated [`StaticKvCache`] of
+    /// `capacity` positions on the layer's own device — [`KvLayout::static_bytes`] of memory,
+    /// allocated here, once. `capacity == 0` is [`Error::Msg`].
+    pub fn preallocated(layout: &KvLayout, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::Msg(
+                "a static KV cache needs a capacity of at least one position".into(),
+            ));
+        }
+        let layers = layout
+            .layers
+            .iter()
+            .map(|l| {
+                l.as_ref()
+                    .map(|l| {
+                        StaticKvCache::with_value_dim(
+                            1,
+                            1,
+                            l.kv_heads,
+                            l.key_dim,
+                            l.value_dim,
+                            capacity,
+                            layout.dtype,
+                            &l.device,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            backing: Backing::Static(layers),
+            rope_delta: 0,
+            bytes_per_position: layout.bytes_per_position(),
+            positions: None,
+        })
+    }
+
+    /// This static cache staging its step positions on the device (sc-24441): the decoder writes
+    /// K/V through [`KvCache::update_indexed`] at the staged start and attends with the
+    /// length-aware decode attention, so a step reads no host-side position and the cache backs a
+    /// CUDA-graph replay ([`DecodeCache::graph_support`] `Ok`). The buffers live on the first
+    /// caching layer's device (the decoder refuses the path for a pipeline-sharded stack). A
+    /// growing or paged backing is [`Error::Msg`].
+    pub fn with_device_positions(mut self) -> Result<Self> {
+        let Backing::Static(layers) = &self.backing else {
+            return Err(Error::Msg(
+                "StepKvCache: device positions need the static (preallocated) backing".into(),
+            ));
+        };
+        let device = layers
+            .iter()
+            .flatten()
+            .next()
+            .map(|l| l.views(0).map(|(k, _)| k.device().clone()))
+            .transpose()?
+            .ok_or_else(|| Error::Msg("StepKvCache: no caching layer".into()))?;
+        self.positions = Some(DevicePositions::new(&device)?);
+        Ok(self)
+    }
+
+    /// The staged device positions, when this cache keeps them.
+    pub fn device_positions(&self) -> Option<&DevicePositions> {
+        self.positions.as_ref()
+    }
+
+    /// An existing paged cache behind the seam (see the module docs for why it is kept).
+    pub fn paged(cache: PagedKvCache, layout: &KvLayout) -> Self {
+        Self {
+            backing: Backing::Paged(cache),
+            rope_delta: 0,
+            bytes_per_position: layout.bytes_per_position(),
+            positions: None,
+        }
+    }
+
+    /// The RoPE position delta the next step's tokens are shifted by (M-RoPE's `mrope_delta`;
+    /// `0` for a text prompt).
+    pub fn rope_delta(&self) -> i32 {
+        self.rope_delta
+    }
+
+    /// Set the RoPE position delta (after a multimodal M-RoPE prefill).
+    pub fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
+    }
+
+    /// Positions a static backing can hold (`None` for the growing and paged backings).
+    pub fn kv_capacity(&self) -> Option<usize> {
+        match &self.backing {
+            Backing::Static(layers) => layers.iter().flatten().map(|l| l.capacity()).next(),
+            _ => None,
+        }
+    }
+
+    /// The storage addresses of `layer`'s static `(keys, values)` buffers — the identity the
+    /// pointer-stability gate and the CUDA-graph runner rely on. `None` for a non-static backing or
+    /// a layer that caches nothing.
+    pub fn storage_addresses(&self, layer: usize) -> Option<Result<(usize, usize)>> {
+        match &self.backing {
+            Backing::Static(layers) => layers
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(|l| l.storage_addresses(0)),
+            _ => None,
+        }
+    }
+
+    /// The paged backing, when that is what this cache runs on.
+    pub fn as_paged(&self) -> Option<&PagedKvCache> {
+        match &self.backing {
+            Backing::Paged(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// `layer`'s cached `(keys, values)` over the live positions `[1, heads, len, dim]` — views of
+    /// the cache's own storage (copy them to keep them past the next write) — or `None` for a
+    /// layer that caches nothing (or has not been written). What the cross-turn prefix cache
+    /// snapshots (sc-24437); a paged backing is [`Error::Unsupported`] (its blocks are shared
+    /// through the pool's own copy-on-write, not snapshotted).
+    pub fn layer_kv(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
+        match &self.backing {
+            Backing::Static(layers) => layers
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(|l| l.views(0))
+                .transpose(),
+            Backing::Growing(c) => Ok(c.peek(layer).cloned()),
+            Backing::Paged(_) => Err(Error::Unsupported(
+                "StepKvCache: a paged backing is not snapshotted by the prefix cache".into(),
+            )),
+        }
+    }
+
+    fn first_static(layers: &[Option<StaticKvCache>]) -> Option<&StaticKvCache> {
+        layers.iter().flatten().next()
+    }
+}
+
+impl KvCache for StepKvCache {
+    fn update(&mut self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<(Tensor, Tensor)> {
+        match &mut self.backing {
+            Backing::Growing(c) => c.update(layer, keys, values),
+            Backing::Paged(c) => c.update(layer, keys, values),
+            Backing::Static(layers) => layers
+                .get_mut(layer)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    Error::Msg(format!(
+                        "StepKvCache: layer {layer} has no static KV slot (it caches nothing)"
+                    ))
+                })?
+                .update(0, keys, values),
+        }
+    }
+
+    fn offset(&self) -> i32 {
+        match &self.backing {
+            Backing::Growing(c) => c.offset(),
+            Backing::Paged(c) => c.offset(),
+            Backing::Static(layers) => Self::first_static(layers).map_or(0, |l| l.offset()),
+        }
+    }
+
+    fn batch_size(&self) -> i32 {
+        match &self.backing {
+            Backing::Growing(c) => c.batch_size(),
+            Backing::Paged(c) => c.batch_size(),
+            Backing::Static(layers) => Self::first_static(layers).map_or(0, |l| l.batch_size()),
+        }
+    }
+
+    fn num_layers(&self) -> usize {
+        match &self.backing {
+            Backing::Growing(c) => c.num_layers(),
+            Backing::Paged(c) => c.num_layers(),
+            Backing::Static(layers) => layers.len(),
+        }
+    }
+
+    fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        match &mut self.backing {
+            Backing::Growing(c) => c.retain_sequences(keep),
+            Backing::Paged(c) => c.retain_sequences(keep),
+            Backing::Static(_) => Err(Error::Unsupported(
+                "StepKvCache: a static backing does not compact its batch".into(),
+            )),
+        }
+    }
+
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        match &mut self.backing {
+            Backing::Growing(c) => c.truncate(len),
+            Backing::Paged(c) => c.truncate(len),
+            Backing::Static(layers) => {
+                for l in layers.iter_mut().flatten() {
+                    l.truncate(len)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match &mut self.backing {
+            Backing::Growing(c) => c.reset(),
+            Backing::Paged(c) => c.reset(),
+            Backing::Static(layers) => layers.iter_mut().flatten().for_each(|l| l.reset()),
+        }
+        self.rope_delta = 0;
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    /// The write at the device-staged step start (static backing with device positions only).
+    fn update_indexed(
+        &mut self,
+        layer: usize,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<Option<IndexedKv>> {
+        let (Backing::Static(layers), Some(positions)) = (&mut self.backing, &self.positions)
+        else {
+            return Ok(None);
+        };
+        let start = positions.start()?;
+        let slot = layers
+            .get_mut(layer)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "StepKvCache: layer {layer} has no static KV slot (it caches nothing)"
+                ))
+            })?;
+        let (keys, values) = slot.update_at(0, keys, values, &start)?;
+        Ok(Some(IndexedKv {
+            keys,
+            values,
+            start,
+        }))
+    }
+}
+
+impl DecodeCache for StepKvCache {
+    fn len(&self) -> i32 {
+        KvCache::offset(self)
+    }
+
+    /// Exact for every backing: the growing cache narrows, the paged cache releases whole blocks
+    /// (copy-on-write for a shared boundary block), the static cache moves its offset.
+    fn rollback_to(&mut self, n: i32) -> Result<()> {
+        let len = DecodeCache::len(self);
+        if n < 0 || n > len {
+            return Err(Error::Msg(format!(
+                "StepKvCache: cannot roll back to {n} from {len} positions"
+            )));
+        }
+        self.truncate(n)
+    }
+
+    fn reset(&mut self) {
+        KvCache::reset(self)
+    }
+
+    fn memory(&self) -> CacheMemory {
+        let live_bytes = match &self.backing {
+            Backing::Growing(c) => {
+                (0..c.num_layers())
+                    .filter_map(|l| c.peek(l))
+                    .fold(0usize, |acc, (k, v)| {
+                        acc.saturating_add(tensor_bytes(k))
+                            .saturating_add(tensor_bytes(v))
+                    })
+            }
+            Backing::Static(layers) => layers
+                .iter()
+                .flatten()
+                .fold(0usize, |acc, l| acc.saturating_add(l.bytes())),
+            // The pool is shared; this sequence's share is the token slots it has reserved.
+            Backing::Paged(c) => c.reserved_tokens().saturating_mul(self.bytes_per_position),
+        };
+        CacheMemory {
+            live_bytes,
+            checkpoint_bytes: 0,
+        }
+    }
+
+    fn kv_kind(&self) -> KvCacheKind {
+        match self.backing {
+            Backing::Static(_) => KvCacheKind::Static,
+            Backing::Growing(_) | Backing::Paged(_) => KvCacheKind::Growing,
+        }
+    }
+
+    /// A CUDA-graph backing (stories sc-24134, sc-24441) exactly when it is the static backing
+    /// with device positions: stable buffers, written at the device-staged start and attended up
+    /// to it, with [`stage_positions`](DecodeCache::stage_positions) /
+    /// [`replay_advance`](DecodeCache::replay_advance) doing a replayed step's host side. Declared
+    /// otherwise so the runner refuses before any capture: the growing backing reallocates its K/V
+    /// as it grows (`growing_kv`), the paged backing reserves blocks as it grows (`paged_kv`), and
+    /// a static backing without device positions is written at its Rust-side offset
+    /// (`positions_host_scalar`).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        match (&self.backing, &self.positions) {
+            (Backing::Growing(_), _) => Err("growing_kv"),
+            (Backing::Paged(_), _) => Err("paged_kv"),
+            (Backing::Static(_), None) => Err("positions_host_scalar"),
+            (Backing::Static(_), Some(_)) => Ok(()),
+        }
+    }
+
+    /// The cache's own address folded with every static layer's K/V buffer addresses and the
+    /// staged [`DevicePositions`] buffers — everything a captured step reads or writes — so a
+    /// fresh cache moved into this one's place (a restored prefix) never replays a graph recorded
+    /// against the old buffers (sc-24441). Stable across steps and rollbacks: the static buffers
+    /// are written in place.
+    fn graph_identity(&self) -> usize {
+        use crate::primitives::decode_cache::fold_graph_identity;
+        let mut id = self as *const Self as usize;
+        if let Backing::Static(layers) = &self.backing {
+            id = fold_graph_identity(
+                id,
+                layers
+                    .iter()
+                    .flatten()
+                    .filter_map(|l| l.storage_addresses(0).ok()),
+            );
+        }
+        if let Some(Ok(positions)) = self.positions.as_ref().map(DevicePositions::addresses) {
+            id = fold_graph_identity(id, [positions]);
+        }
+        id
+    }
+
+    /// Stage the next step's start and RoPE positions (length + delta) on the device.
+    fn stage_positions(&mut self) -> Result<()> {
+        match &self.positions {
+            Some(p) => p.stage(DecodeCache::len(self), self.rope_delta, None),
+            None => Ok(()),
+        }
+    }
+
+    /// A replayed step's host side: the capacity check and every static layer's length.
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        match (&mut self.backing, &self.positions) {
+            (Backing::Static(layers), Some(_)) => {
+                for l in layers.iter().flatten() {
+                    if l.offset() as usize + n > l.capacity() {
+                        return Err(Error::KvCapacityExceeded {
+                            requested: l.offset() as usize + n,
+                            capacity: l.capacity(),
+                        });
+                    }
+                }
+                for l in layers.iter_mut().flatten() {
+                    l.advance(n)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::Unsupported(
+                "StepKvCache::replay_advance: only a static cache with device positions backs a \
+                 graph replay"
+                    .into(),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> KvLayout {
+        let shape = |kv_heads, key_dim, value_dim| {
+            Some(LayerKvShape {
+                kv_heads,
+                key_dim,
+                value_dim,
+                device: Device::Cpu,
+            })
+        };
+        // A uniform layer, a wider (Gemma 4 full-attention-like) layer, an MLA-like layer with a
+        // narrower value, and a KV-shared tail layer that caches nothing.
+        KvLayout {
+            layers: vec![shape(2, 4, 4), shape(1, 8, 8), shape(3, 6, 4), None],
+            dtype: DType::F32,
+        }
+    }
+
+    fn step(h: usize, s: usize, d: usize, phase: f32) -> Tensor {
+        Tensor::arange(0f32, (h * s * d) as f32, &Device::Cpu)
+            .unwrap()
+            .affine(1.0, phase as f64)
+            .unwrap()
+            .reshape((1, h, s, d))
+            .unwrap()
+    }
+
+    fn feed(cache: &mut StepKvCache, s: usize, phase: f32) -> Vec<(Tensor, Tensor)> {
+        [(0usize, 2usize, 4usize, 4usize), (1, 1, 8, 8), (2, 3, 6, 4)]
+            .iter()
+            .map(|&(layer, h, dk, dv)| {
+                cache
+                    .update(layer, &step(h, s, dk, phase), &step(h, s, dv, phase + 0.5))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn layout_prices_every_caching_layer_and_skips_the_shared_tail() {
+        let l = layout();
+        assert_eq!(l.bytes_per_position(), (2 * 8 + 16 + 3 * 10) * 4);
+        assert_eq!(l.static_bytes(5), 5 * l.bytes_per_position());
+        // The widest single layer: the MLA-like 3 × max(6, 4) = 18 beats 2 × 4 and 1 × 8.
+        assert_eq!(l.widest_layer(), (3, 6));
+        let cache = StepKvCache::preallocated(&l, 5).unwrap();
+        assert_eq!(cache.memory().live_bytes, l.static_bytes(5));
+        assert_eq!(cache.kv_capacity(), Some(5));
+        assert_eq!(cache.kv_kind(), KvCacheKind::Static);
+        assert!(
+            cache.storage_addresses(3).is_none(),
+            "the tail caches nothing"
+        );
+        assert!(StepKvCache::preallocated(&l, 0).is_err());
+    }
+
+    /// The admission pair is one layer's `(kv_heads, head width)`, never the head count of one
+    /// layer type crossed with the width of another: on a Gemma 4 12B-style stack (sliding 8×256,
+    /// full `k_eq_v` 1×512) the independent maxima (8×512) would price twice what any layer holds.
+    #[test]
+    fn widest_layer_is_one_layers_geometry() {
+        let shape = |kv_heads, dim| {
+            Some(LayerKvShape {
+                kv_heads,
+                key_dim: dim,
+                value_dim: dim,
+                device: Device::Cpu,
+            })
+        };
+        let layout = |layers| KvLayout {
+            layers,
+            dtype: DType::BF16,
+        };
+        // Sliding layers win: 8 × 256 = 2048 against the full layers' 1 × 512.
+        let gemma4_12b = layout(vec![shape(8, 256), shape(8, 256), shape(1, 512), None]);
+        let (h, d) = gemma4_12b.widest_layer();
+        assert_eq!((h, d), (8, 256));
+        // The scalar geometry prices every caching layer at the widest one — no more.
+        let caching = gemma4_12b.layers.iter().flatten().count();
+        assert_eq!(
+            caching * h * d * 2 * 2,
+            3 * 2048 * 2 * 2,
+            "no inflation past the widest layer"
+        );
+        assert!(caching * h * d * 2 * 2 >= gemma4_12b.bytes_per_position());
+        // Full layers win when their product is larger: 4 × 512 = 2048 > 8 × 128 = 1024.
+        let full_wider = layout(vec![shape(8, 128), shape(4, 512), shape(8, 128)]);
+        assert_eq!(full_wider.widest_layer(), (4, 512));
+        assert!(3 * 4 * 512 * 2 * 2 >= full_wider.bytes_per_position());
+        assert_eq!(layout(vec![None, None]).widest_layer(), (0, 0));
+    }
+
+    /// The three backings hold the same K/V through writes and rollbacks; the static one never
+    /// moves its buffers.
+    #[test]
+    fn backings_agree_through_writes_and_rollback() {
+        let l = layout();
+        let mut fixed = StepKvCache::preallocated(&l, 16).unwrap();
+        let mut growing = StepKvCache::growing(&l);
+        let addresses = fixed.storage_addresses(0).unwrap().unwrap();
+        for (s, phase) in [(4usize, 0.0f32), (1, 10.0), (3, 20.0)] {
+            let a = feed(&mut fixed, s, phase);
+            let b = feed(&mut growing, s, phase);
+            for ((ak, av), (bk, bv)) in a.iter().zip(&b) {
+                assert_eq!(host(ak), host(bk));
+                assert_eq!(host(av), host(bv));
+            }
+        }
+        assert_eq!(DecodeCache::len(&fixed), 8);
+        assert_eq!(DecodeCache::len(&growing), 8);
+        fixed.rollback_to(5).unwrap();
+        growing.rollback_to(5).unwrap();
+        assert!(fixed.rollback_to(6).is_err(), "past the end");
+        let a = feed(&mut fixed, 2, 30.0);
+        let b = feed(&mut growing, 2, 30.0);
+        for ((ak, _), (bk, _)) in a.iter().zip(&b) {
+            assert_eq!(ak.dims()[2], 7);
+            assert_eq!(host(ak), host(bk));
+        }
+        assert_eq!(fixed.storage_addresses(0).unwrap().unwrap(), addresses);
+        assert_eq!(growing.kv_kind(), KvCacheKind::Growing);
+        assert!(growing.memory().live_bytes > 0);
+        assert!(fixed
+            .update(3, &step(1, 1, 4, 0.0), &step(1, 1, 4, 0.0))
+            .is_err());
+        growing.set_rope_delta(-3);
+        DecodeCache::reset(&mut growing);
+        assert_eq!(DecodeCache::len(&growing), 0);
+        assert_eq!(growing.rope_delta(), 0);
+    }
+
+    /// sc-24441: a static cache with device positions writes each step at the start it staged
+    /// on the device (the same rows the host-offset write lands), hands back the whole buffers,
+    /// declares itself a graph backing, and a replay's host side advances every layer — refusing
+    /// past the capacity. Other backings have no indexed write and cannot replay.
+    #[test]
+    fn device_positions_write_at_the_staged_start_and_replay_advances() {
+        let l = layout();
+        let mut staged = StepKvCache::preallocated(&l, 16)
+            .unwrap()
+            .with_device_positions()
+            .unwrap();
+        let mut plain = StepKvCache::preallocated(&l, 16).unwrap();
+        assert_eq!(staged.graph_support(), Ok(()));
+        assert_eq!(plain.graph_support(), Err("positions_host_scalar"));
+        let shapes = [(0usize, 2usize, 4usize, 4usize), (1, 1, 8, 8), (2, 3, 6, 4)];
+        for (s, phase) in [(4usize, 0.0f32), (1, 10.0), (3, 20.0)] {
+            staged.stage_positions().unwrap();
+            for &(layer, h, dk, dv) in &shapes {
+                let (k, v) = (step(h, s, dk, phase), step(h, s, dv, phase + 0.5));
+                let kv = staged.update_indexed(layer, &k, &v).unwrap().unwrap();
+                let (pk, pv) = plain.update(layer, &k, &v).unwrap();
+                assert_eq!(kv.keys.dim(2).unwrap(), 16, "the whole buffer");
+                let len = pk.dim(2).unwrap();
+                assert_eq!(host(&kv.keys.narrow(2, 0, len).unwrap()), host(&pk));
+                assert_eq!(host(&kv.values.narrow(2, 0, len).unwrap()), host(&pv));
+                assert_eq!(
+                    kv.start.to_vec1::<u32>().unwrap(),
+                    vec![(len - s) as u32],
+                    "written at the staged start"
+                );
+            }
+        }
+        assert_eq!(DecodeCache::len(&staged), 8);
+        staged.replay_advance(3).unwrap();
+        assert_eq!(DecodeCache::len(&staged), 11);
+        assert!(matches!(
+            staged.replay_advance(6),
+            Err(Error::KvCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            DecodeCache::len(&staged),
+            11,
+            "refused before any layer moved"
+        );
+        assert!(plain.replay_advance(1).is_err());
+        let mut growing = StepKvCache::growing(&l);
+        assert!(growing
+            .update_indexed(0, &step(2, 1, 4, 0.0), &step(2, 1, 4, 0.0))
+            .unwrap()
+            .is_none());
+        assert!(StepKvCache::growing(&l).with_device_positions().is_err());
+    }
+
+    /// sc-24441: the graph identity follows the buffers a captured step touches — stable across
+    /// steps and rollbacks, but a fresh static cache moved into the same place (fresh K/V) or
+    /// fresh position buffers read as a different identity, so the runner never replays a graph
+    /// into freed buffers.
+    #[test]
+    fn graph_identity_follows_the_kv_and_position_buffers() {
+        let l = layout();
+        let mut cache = StepKvCache::preallocated(&l, 16).unwrap();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        feed(&mut cache, 1, 1.0);
+        cache.rollback_to(2).unwrap();
+        assert_eq!(identity, cache.graph_identity(), "stable");
+        // A fresh cache in the same place: only its static K/V buffers differ.
+        cache = StepKvCache::preallocated(&l, 16).unwrap();
+        assert_ne!(identity, cache.graph_identity(), "fresh K/V buffers");
+
+        let mut cache = StepKvCache::preallocated(&l, 16)
+            .unwrap()
+            .with_device_positions()
+            .unwrap();
+        let identity = cache.graph_identity();
+        // The same K/V buffers with fresh position buffers.
+        cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
+        assert_ne!(identity, cache.graph_identity(), "fresh position buffers");
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        use crate::decode::prefix::PrefixSnapshot;
+        let fresh = || {
+            StepKvCache::preallocated(&l, 16)
+                .unwrap()
+                .with_device_positions()
+                .unwrap()
+        };
+        let mut cache = fresh();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        let entry = cache.snapshot(3).unwrap();
+        let mut restored = fresh();
+        restored.restore(&entry, 3).unwrap();
+        cache = restored;
+        assert_eq!(DecodeCache::len(&cache), 3);
+        assert_ne!(
+            identity,
+            cache.graph_identity(),
+            "a restored cache in its place"
+        );
+    }
+
+    /// The paged backing sits behind the same seam: exact rollback, memory as reserved slots.
+    #[test]
+    fn paged_backing_rolls_back_exactly() {
+        let uniform = KvLayout {
+            layers: vec![
+                Some(LayerKvShape {
+                    kv_heads: 2,
+                    key_dim: 4,
+                    value_dim: 4,
+                    device: Device::Cpu,
+                });
+                2
+            ],
+            dtype: DType::F32,
+        };
+        let mut paged = StepKvCache::paged(PagedKvCache::new(2, 4), &uniform);
+        let mut growing = StepKvCache::growing(&uniform);
+        for cache in [&mut paged, &mut growing] {
+            for layer in 0..2 {
+                cache
+                    .update(layer, &step(2, 6, 4, 0.0), &step(2, 6, 4, 1.0))
+                    .unwrap();
+            }
+            cache.rollback_to(3).unwrap();
+        }
+        assert!(paged.as_paged().is_some());
+        assert_eq!(DecodeCache::len(&paged), 3);
+        let (pk, _) = paged
+            .update(0, &step(2, 1, 4, 9.0), &step(2, 1, 4, 9.0))
+            .unwrap();
+        let (gk, _) = growing
+            .update(0, &step(2, 1, 4, 9.0), &step(2, 1, 4, 9.0))
+            .unwrap();
+        assert_eq!(host(&pk), host(&gk));
+        assert_eq!(paged.kv_kind(), KvCacheKind::Growing);
+        assert_eq!(
+            paged.memory().live_bytes,
+            paged.as_paged().unwrap().reserved_tokens() * uniform.bytes_per_position()
+        );
+    }
+}

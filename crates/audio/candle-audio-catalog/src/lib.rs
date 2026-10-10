@@ -52,15 +52,35 @@ pub mod providers {
     pub use candle_audio_moss_tts;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
+    /// SheetSage2 + MERT-v2-FullSong recording → score transcription (sc-23002): the first half of
+    /// the noncommercial recording → transcription → cover path. Reached through this crate's API,
+    /// not the registry (see [`CRATE_API_PROVIDERS`](crate::CRATE_API_PROVIDERS)). CC BY-NC 4.0 on
+    /// the owner basis recorded 2026-09-27; noncommercial only.
+    pub use candle_audio_sheetsage2;
     pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
+    pub use candle_audio_yue;
+    pub use candle_audio_yue2;
 }
+
+/// Providers whose weight-licence rows this catalog publishes but which are **not** registry
+/// providers: a consumer reaches them through their crate's own API, re-exported from [`providers`]
+/// and from each runtime bundle's `audio_providers`.
+///
+/// `sheetsage2` (sc-23002) is SheetSage2 + MERT-v2-FullSong transcription
+/// ([`candle_audio_sheetsage2::provider::Transcriber`]). Its output is a persisted, replayable
+/// score review artifact (ABC, MIDI, events, warnings) that feeds a YuE2 cover, not the text a
+/// [`gen_core::Transcriber`] returns, so it is not registered as one. Its rows are published all the
+/// same, so the release manifest discloses every artifact a shipped crate loads.
+pub const CRATE_API_PROVIDERS: &[&str] = &[candle_audio_sheetsage2::provider::TRANSCRIBER_ID];
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, Stable Audio 3
 /// small-music — sc-14543 and small-sfx — sc-14544, MOSS-TTS-Realtime
 /// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
-/// and 44.1 kHz — sc-13441), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
+/// and 44.1 kHz — sc-13441, MOSS-TTSD dialogue — sc-13518, the six YuE lyrics2song variants —
+/// sc-19382, and the noncommercial YuE2 song generator `yue2` — sc-22994), then the voice-cloning
+/// identity embedder (Chatterbox `ve`, sc-12844),
 /// then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
@@ -75,6 +95,8 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_chatterbox::register_providers(registry);
     let registry = candle_audio_mmaudio::register_providers(registry);
     let registry = candle_audio_moss_tts::register_providers(registry);
+    let registry = candle_audio_yue::register_providers(registry);
+    let registry = candle_audio_yue2::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -137,6 +159,12 @@ pub fn component_licenses() -> Vec<gen_core::ComponentLicense> {
     rows.extend_from_slice(candle_audio_chatterbox::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_mmaudio::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_moss_tts::COMPONENT_LICENSES);
+    rows.extend_from_slice(candle_audio_yue::COMPONENT_LICENSES);
+    // The generation closure; the cover closure's rows arrive with the transcriber that loads them.
+    rows.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENT_LICENSES);
+    // The cover closure (SheetSage2 + MERT-v2-FullSong), loaded by the crate-API transcriber
+    // `sheetsage2` (sc-23002; see `CRATE_API_PROVIDERS`).
+    rows.extend_from_slice(candle_audio_sheetsage2::provider::COMPONENT_LICENSES);
     // Deliberately empty: `chatterbox_ve` loads the row `candle-audio-chatterbox` already owns.
     rows.extend_from_slice(candle_audio_chatterbox_ve::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_openvoice::COMPONENT_LICENSES);
@@ -157,6 +185,9 @@ pub fn provider_components() -> Vec<gen_core::ProviderComponents> {
     providers.extend_from_slice(candle_audio_chatterbox::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_mmaudio::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_moss_tts::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_yue::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_sheetsage2::provider::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_chatterbox_ve::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_openvoice::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_whisper::PROVIDER_COMPONENTS);
@@ -253,6 +284,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
         || candle_audio_clap::prepare::can_prepare(spec)
+        || candle_audio_yue2::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
@@ -277,6 +309,9 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_whisper::prepare::prepare(spec)
     } else if candle_audio_clap::prepare::can_prepare(spec) {
         candle_audio_clap::prepare::prepare(spec)
+    } else if candle_audio_yue2::prepare::can_prepare(spec) {
+        // YuE2's q8 / q4 tiers are derived locally from the verified original (sc-22995).
+        candle_audio_yue2::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -308,6 +343,142 @@ mod tests {
     /// (**moss_sfx_v2**). Later stories extend this exact assertion, in catalog order.
     /// The generators-only / candle-backend / audio-modality sweeps are asserted here too so
     /// a provider that would fail bundle validation is caught in its own family first.
+    /// sc-19382: the segmented-song / reference-window controls fail closed on every shipped
+    /// generator that does not read them — only YuE advertises them (the window on ICL only).
+    /// sc-19378 adds `output_limiter` (YuE's clamp / rescale), YuE-only as well. sc-22994 adds
+    /// `song` / `artifacts`, which only YuE2 reads.
+    #[test]
+    fn segmented_song_controls_reach_only_the_models_that_read_them() {
+        use super::gen_core::{
+            AudioArtifacts, AudioParams, Error, GenerationRequest, OutputLimiter, SongParams,
+            TimeRegion,
+        };
+        let registry = super::provider_registry().unwrap();
+        let fields: [(&str, AudioParams); 10] = [
+            (
+                "segments",
+                AudioParams {
+                    segments: Some(2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_new_tokens_per_segment",
+                AudioParams {
+                    max_new_tokens_per_segment: Some(100),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repetition_penalty",
+                AudioParams {
+                    repetition_penalty: Some(1.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "reference_region",
+                AudioParams {
+                    reference_region: Some(TimeRegion {
+                        start_secs: 0.0,
+                        end_secs: Some(10.0),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            // sc-19378: both limiter values reach YuE and only YuE.
+            (
+                "output_limiter",
+                AudioParams {
+                    output_limiter: Some(OutputLimiter::Clamp),
+                    ..Default::default()
+                },
+            ),
+            (
+                "output_limiter",
+                AudioParams {
+                    output_limiter: Some(OutputLimiter::Rescale),
+                    ..Default::default()
+                },
+            ),
+            // sc-22994: the symbolic-song controls and the artifact record reach YuE2 and only
+            // YuE2.
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "artifacts",
+                AudioParams {
+                    artifacts: Some(AudioArtifacts::default()),
+                    ..Default::default()
+                },
+            ),
+            // sc-22988: plan-only and cover reach YuE2 and only YuE2.
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams {
+                        plan_only: true,
+                        ..Default::default()
+                    }),
+                    artifacts: Some(AudioArtifacts::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams {
+                        cover: Some(super::gen_core::SongCover {
+                            mode: super::gen_core::SongCoverMode::Melody,
+                            score: String::new(),
+                            keep: None,
+                            translated_from: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for r in registry.generators() {
+            let d = (r.descriptor)();
+            let request = |audio: AudioParams| GenerationRequest {
+                prompt: "a song".into(),
+                audio: Some(audio),
+                ..Default::default()
+            };
+            // The baseline passes, so a refusal below is the field's own gate.
+            d.capabilities
+                .validate_request_audio(d.id, &request(AudioParams::default()))
+                .unwrap_or_else(|e| panic!("{}: baseline refused: {e}", d.id));
+            for (field, audio) in &fields {
+                let reads = if matches!(*field, "song" | "artifacts") {
+                    d.id == "yue2"
+                } else {
+                    d.id.starts_with("yue_")
+                        && (*field != "reference_region" || d.id.ends_with("_icl"))
+                };
+                let got = d
+                    .capabilities
+                    .validate_request_audio(d.id, &request(audio.clone()));
+                if reads {
+                    assert!(got.is_ok(), "{}: {field} must be accepted: {got:?}", d.id);
+                } else {
+                    assert!(
+                        matches!(got, Err(Error::Unsupported(_))),
+                        "{}: {field} must be refused, got {got:?}",
+                        d.id
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn complete_catalog_has_stable_conforming_surface() {
         let registry = super::provider_registry().unwrap();
@@ -332,7 +503,14 @@ mod tests {
                 "chatterbox_tts",
                 "mmaudio_small_16k",
                 "mmaudio_large_44k",
-                "moss_ttsd_v05"
+                "moss_ttsd_v05",
+                "yue_en_cot",
+                "yue_en_icl",
+                "yue_zh_cot",
+                "yue_zh_icl",
+                "yue_jp_kr_cot",
+                "yue_jp_kr_icl",
+                "yue2"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -445,9 +623,21 @@ mod tests {
                 "provider '{id}' ships without a recorded model-weight licence"
             );
         }
+        // A mapping without a registered provider is either a crate-API provider — published
+        // deliberately, and never also registered — or a mistake.
+        for id in super::CRATE_API_PROVIDERS {
+            assert!(
+                mapped.contains(*id),
+                "crate-API provider '{id}' has no weight-licence mapping"
+            );
+            assert!(
+                !registered.contains(*id),
+                "crate-API provider '{id}' is also a registered provider"
+            );
+        }
         for id in &mapped {
             assert!(
-                registered.contains(id),
+                registered.contains(id) || super::CRATE_API_PROVIDERS.contains(&id.as_str()),
                 "weight-licence mapping '{id}' has no registered provider"
             );
         }
@@ -502,6 +692,16 @@ mod tests {
             "notice_file_required",
         ];
         const MIT_ONLY: [&str; 1] = ["attribution_required"];
+        // YuE2's generation closure (sc-22994): CC BY-NC 4.0 weights (non-commercial, attribution)
+        // plus the Tongyi Qianwen tokenizer terms (two deployer obligations, notice, licence copy).
+        const YUE2: [&str; 6] = [
+            "attribution_required",
+            "deployer_obligation",
+            "deployer_obligation",
+            "downstream_license_copy",
+            "non_commercial_weights",
+            "notice_file_required",
+        ];
         // Two acceptable-use policies (Gemma's and Stability's) and two licence-copy duties stay
         // TWO elements each: a distributor of a Stable Audio 3 render hands over two documents, not
         // one, and a union that deduped them would show a user one obligation where the catalog
@@ -631,6 +831,81 @@ mod tests {
                 MMAUDIO.to_vec(),
             ),
             ("moss_ttsd_v05", vec!["moss_ttsd_v05"], APACHE.to_vec()),
+            // YuE (sc-19382): each variant loads its own stage-1 checkpoint plus the shared stage-2
+            // and xcodec snapshots — one row per artifact, all Apache-2.0.
+            (
+                "yue_en_cot",
+                vec![
+                    "yue_s1_7b_anneal_en_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_en_icl",
+                vec![
+                    "yue_s1_7b_anneal_en_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_zh_cot",
+                vec![
+                    "yue_s1_7b_anneal_zh_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_zh_icl",
+                vec![
+                    "yue_s1_7b_anneal_zh_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_jp_kr_cot",
+                vec![
+                    "yue_s1_7b_anneal_jp_kr_cot",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            (
+                "yue_jp_kr_icl",
+                vec![
+                    "yue_s1_7b_anneal_jp_kr_icl",
+                    "yue_s2_1b_general",
+                    "xcodec_mini_infer",
+                ],
+                APACHE.to_vec(),
+            ),
+            // YuE2 (sc-22994): the generation closure — the CC BY-NC 4.0 MoT and decoders plus the
+            // Tongyi Qianwen `qwen.tiktoken` — never the cover closure.
+            (
+                "yue2",
+                vec![
+                    "yue2_3b",
+                    "yue2_qwen_tiktoken",
+                    "yue2_vae",
+                    "yue2_vae_legacy",
+                ],
+                YUE2.to_vec(),
+            ),
+            // sc-23002: the cover closure, loaded by the crate-API transcriber — CC BY-NC 4.0
+            // weights only (noncommercial, attribution); none of the tokenizer's terms.
+            (
+                "sheetsage2",
+                vec!["yue2_sheetsage2", "yue2_mert_v2_fullsong"],
+                vec!["attribution_required", "non_commercial_weights"],
+            ),
             // The same artifact row the generator points at — one checkpoint, one row, two
             // providers.
             ("chatterbox_ve", vec!["chatterbox"], MIT_ONLY.to_vec()),
@@ -653,8 +928,6 @@ mod tests {
             })
             .collect();
         assert_eq!(ordered, expected);
-        assert_eq!(providers.len(), 18);
-        assert_eq!(components.len(), 33);
     }
 
     /// **The migration proof: no provider lost a term it previously carried (sc-16663).**
@@ -1251,6 +1524,19 @@ mod tests {
         .unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&mt, mt.join("out"));
         assert!((regs[0].can_prepare)(&spec));
+        // ...a YuE2-3B snapshot dir is accepted and routed to the YuE2 tier preparer (sc-22995),
+        // which refuses a tier YuE2 does not have by name (the LLM preparer would not)...
+        let y2_tmp = tempfile::tempdir().unwrap();
+        let y2 = y2_tmp.path().to_path_buf();
+        std::fs::write(y2.join("config.json"), r#"{"model_type": "yue2"}"#).unwrap();
+        let spec = super::core_llm::PrepareSpec::quantized(
+            &y2,
+            y2.join("out"),
+            super::core_llm::Quantize::Nvfp4,
+        );
+        assert!((regs[0].can_prepare)(&spec));
+        let err = (regs[0].prepare)(&spec).unwrap_err().to_string();
+        assert!(err.contains("not a YuE2 tier"), "{err}");
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty_tmp = tempfile::tempdir().unwrap();
         let empty = empty_tmp.path().to_path_buf();

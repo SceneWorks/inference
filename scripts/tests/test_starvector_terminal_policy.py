@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,8 +20,16 @@ MODELS = ROOT / "release/real-weight-models.toml"
 CORPUS = ROOT / "release/starvector-terminal-corpus-v1.json"
 SCHEMA = ROOT / "release/starvector-terminal-receipt-v1.schema.json"
 V2_SCHEMA = ROOT / "release/starvector-terminal-receipt-v2.schema.json"
+V2_OUTCOME_SCHEMA = ROOT / "release/starvector-terminal-receipt-v2-outcome-parity.schema.json"
 HARNESS = ROOT / "scripts/release/starvector_terminal_evidence.mjs"
 PREFLIGHT_ASSEMBLER = ROOT / "scripts/release/starvector_terminal_preflight.mjs"
+
+
+def job_bounds(workflow: str, name: str) -> tuple[int, int]:
+    start = workflow.index(f"  {name}:")
+    following = re.search(r"(?m)^  [a-zA-Z0-9_-]+:\s*$", workflow[start + 1 :])
+    end = len(workflow) if following is None else start + 1 + following.start()
+    return start, end
 
 
 def terminal_workflow_errors(workflow: str) -> list[str]:
@@ -26,8 +37,7 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     errors = []
     if "starvector-terminal" not in workflow.split("options:", 1)[1].split("sceneworks_revision:", 1)[0]:
         errors.append("dispatcher profile missing")
-    start = workflow.find("  starvector-terminal-mlx:")
-    end = workflow.find("\n  starvector-terminal-candle:", start)
+    start, end = job_bounds(workflow, "starvector-terminal-mlx")
     mlx = workflow[start:end]
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
@@ -49,6 +59,13 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"MLX terminal command missing {name}")
     if mlx.count("--exact --ignored --nocapture") != 2:
         errors.append("MLX terminal command missing exact filters")
+    for acquisition in (
+        "ensure_model_snapshot.py",
+        "real-weights-huggingface-hub-macos-arm64-py312.txt",
+        "-m pip install",
+    ):
+        if acquisition in mlx:
+            errors.append(f"MLX terminal lane may not acquire snapshots or Hub packages: {acquisition}")
     for artifact in (
         "inventory/starvector-1b-inventory.json",
         "inventory/starvector-8b-inventory.json",
@@ -59,8 +76,7 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     ):
         if artifact not in mlx:
             errors.append(f"MLX terminal provenance missing {artifact}")
-    candle_start = workflow.find("  starvector-terminal-candle:")
-    candle_end = workflow.find("\n  mlx-llm:", candle_start)
+    candle_start, candle_end = job_bounds(workflow, "starvector-terminal-candle")
     candle = workflow[candle_start:candle_end]
     if "needs: starvector-terminal-mlx" not in candle:
         errors.append("Candle lane no longer serializes after MLX")
@@ -83,6 +99,13 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"Candle terminal command missing {name}")
     if candle.count("--exact --ignored --nocapture") != 2:
         errors.append("Candle terminal command missing exact filters")
+    for acquisition in (
+        "ensure_model_snapshot.py",
+        "real-weights-huggingface-hub-windows-x64-py312.txt",
+        "-m pip install",
+    ):
+        if acquisition in candle:
+            errors.append(f"Candle terminal lane may not acquire snapshots or Hub packages: {acquisition}")
     for artifact in (
         "candle-cuda-starvector-1b.log",
         "candle-cuda-starvector-8b.log",
@@ -129,16 +152,15 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
                 self.assertEqual(len(model["expected_files"]), file_count)
 
     def test_terminal_workflow_is_serial_dispatch_only_and_exact_name_selected(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(terminal_workflow_errors(workflow), [])
         self.assertNotIn("inputs.profile == 'starvector-terminal'", workflow[workflow.index("  mlx-llm:"):])
         self.assertNotIn("inputs.profile == 'starvector-terminal'", workflow[workflow.index("  candle-llm:"):])
 
     def test_terminal_workflow_policy_detects_dispatch_serial_and_exact_command_mutations(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        mlx_start = workflow.index("  starvector-terminal-mlx:")
-        candle_start = workflow.index("  starvector-terminal-candle:")
-        candle_end = workflow.index("\n  mlx-llm:", candle_start)
+        workflow = real_weights_inline_text()
+        mlx_start, _ = job_bounds(workflow, "starvector-terminal-mlx")
+        candle_start, candle_end = job_bounds(workflow, "starvector-terminal-candle")
 
         def mutate(start: int, end: int, old: str) -> str:
             return workflow[:start] + workflow[start:end].replace(old, "MUTATED", 1) + workflow[end:]
@@ -148,6 +170,9 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             (mutate(mlx_start, candle_start, "--exact --ignored --nocapture"), "MLX terminal command missing exact filters"),
             (mutate(mlx_start, candle_start, "inputs.profile == 'starvector-terminal'"), "MLX terminal lane is not dispatch-only"),
             (mutate(candle_start, candle_end, ' --workflow-run-attempt "%GITHUB_RUN_ATTEMPT%"'), "workflow-run-attempt"),
+            (mutate(mlx_start, candle_start, "verify_model_snapshot.py"), "MLX terminal command missing"),
+            (workflow[:mlx_start] + workflow[mlx_start:candle_start] + "\n          python3.12 scripts/release/ensure_model_snapshot.py\n" + workflow[candle_start:], "MLX terminal lane may not acquire snapshots"),
+            (workflow[:candle_start] + workflow[candle_start:candle_end] + "\n          %REVIEWED_PYTHON% -m pip install huggingface-hub\n" + workflow[candle_end:], "Candle terminal lane may not acquire snapshots"),
         )
         for mutated, expected in cases:
             with self.subTest(expected=expected):
@@ -233,6 +258,10 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         self.assertEqual(len(corpus["upstream_image_quality_cases"]["sources"]), 4)
 
     def test_v2_schema_adds_closed_failed_campaign_lineage_without_mutating_v1(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(V2_SCHEMA.read_bytes()).hexdigest(),
+            "9971014cde19faf49f2ac7a091d9057851ecb83537de05cb390be56f4302c71d",
+        )
         schema = json.loads(V2_SCHEMA.read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
         self.assertIn("campaign_lineage", schema["required"])
@@ -269,6 +298,7 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             schema["$defs"]["source_artifact"]["properties"]["digest"]["pattern"],
             "^sha256:[0-9a-f]{64}$",
         )
+
         self.assertEqual(
             set(schema["$defs"]["source_artifact"]["required"]),
             {
@@ -300,8 +330,26 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         )
         self.assertEqual(schema["$defs"]["artifact_manifest"]["properties"]["entries"]["maxItems"], 100000)
 
+    def test_v2_outcome_parity_profile_is_separate_from_archived_v2_schema(self) -> None:
+        schema = json.loads(V2_OUTCOME_SCHEMA.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        parity = schema["$defs"]["upstream_parity"]
+        self.assertEqual(parity["properties"]["contract_version"]["const"], 2)
+        cases = parity["properties"]["cases"]["items"]
+        self.assertIn("native_outcome", cases["properties"])
+        self.assertIn("native_rejection_code", cases["properties"])
+
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+        valid = subprocess.run(
+            ["node", str(HARNESS), "validate-plan", "--corpus", str(CORPUS)],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertRegex(valid.stdout, r"^corpus_sha256=[0-9a-f]{64}\s*$")
         corpus["upstream_image_quality_cases"]["sources"][0]["row_count"] = 29
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mutated.json"

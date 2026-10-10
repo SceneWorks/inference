@@ -1,0 +1,239 @@
+{
+  "baseline_bench_source": null,
+  "binary": {
+    "path": "C:\\inf-target\\sc-24138-target-cuda\\release\\deps\\decode_bench-0edd4549a2920e26.exe",
+    "sha256": "c911f8e8fc5a715c82a9aa460065f84fc33fa9617578e33bb71ef27dc449b27c"
+  },
+  "command": [
+    "C:\\inf-target\\sc-24138-target-cuda\\release\\deps\\decode_bench-0edd4549a2920e26.exe",
+    "decode_bench",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "elapsed_seconds": 33.595268199977,
+  "gpu": {
+    "co_tenants_at_start": [
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 3152,
+        "process_name": "[Insufficient Permissions]",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 3144,
+        "process_name": "[Insufficient Permissions]",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 13568,
+        "process_name": "C:\\Windows\\System32\\ShellHost.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 13744,
+        "process_name": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe\\WindowsTerminal.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 14260,
+        "process_name": "C:\\Windows\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\CrossDeviceResume.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 13464,
+        "process_name": "C:\\Windows\\explorer.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 17768,
+        "process_name": "C:\\Windows\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartMenuExperienceHost.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 17744,
+        "process_name": "C:\\Windows\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\SearchHost.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 19688,
+        "process_name": "C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\153.0.4234.48\\msedgewebview2.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 21384,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\PowerToys\\WinUI3Apps\\PowerToys.QuickAccess.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 20904,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\PowerToys\\WinUI3Apps\\PowerToys.AdvancedPaste.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 23108,
+        "process_name": "C:\\Program Files\\WindowsApps\\Microsoft.CommandPalette_0.10.11181.0_x64__8wekyb3d8bbwe\\Microsoft.CmdPal.UI.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 21220,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\PowerToys\\PowerToys.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 24248,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\PowerToys\\WinUI3Apps\\PowerToys.Peek.UI.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 25536,
+        "process_name": "C:\\Windows\\SystemApps\\ShellExperienceHost_cw5n1h2txyewy\\ShellExperienceHost.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 4104,
+        "process_name": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 31244,
+        "process_name": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 13872,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\AnthropicClaude\\app-2.7032.0\\claude.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 6364,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\AnthropicClaude\\app-2.7032.0\\claude.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 10584,
+        "process_name": "[Insufficient Permissions]",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 26552,
+        "process_name": "[Insufficient Permissions]",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      },
+      {
+        "gpu_uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe",
+        "pid": 3100,
+        "process_name": "C:\\Users\\Michael\\AppData\\Local\\PowerToys\\PowerToys.FancyZones.exe",
+        "used_bytes": null,
+        "used_memory_unavailable_reason": "driver did not expose per-process memory"
+      }
+    ],
+    "hardware_unavailable_reason": null,
+    "index": 1,
+    "selected": {
+      "driver_version": "596.36",
+      "free_bytes": 101243158528,
+      "index": 1,
+      "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "total_bytes": 102641958912,
+      "used_bytes": 929038336,
+      "uuid": "GPU-e4b79931-7be6-f216-460a-f5405cfafffe"
+    }
+  },
+  "host": {
+    "physical_memory": {
+      "available_bytes": 510044889088,
+      "total_bytes": 549057683456,
+      "unavailable_reason": null
+    },
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.4"
+  },
+  "label": "RTX Pro 6000 / sm_120",
+  "model": {
+    "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "key": "qwen3-8b",
+    "manifest": "D:\\repos\\inference\\.claude\\worktrees\\sc-24138\\release\\real-weight-models.toml",
+    "manifest_sha256": "80fcd34a530bb4e9d12cc738ef61f2a599a60d8dec94f4f5c181063972bd3552",
+    "repository": "Qwen/Qwen3-8B",
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  "process_memory": {
+    "gpu": {
+      "available": false,
+      "peak_bytes": null,
+      "sample_count": 0,
+      "unavailable_reasons": [
+        "per-process GPU memory unavailable (WDDM or unsupported driver)",
+        "process not reported by nvidia-smi"
+      ]
+    },
+    "rss": {
+      "available": true,
+      "first_sample_bytes": 2777088,
+      "peak_bytes": 4307034112,
+      "sample_count": 104
+    },
+    "sample_interval_seconds": 0.25,
+    "scope": "sampled process working set / per-process GPU memory over the whole run"
+  },
+  "run_kind": "head",
+  "run_name": "head-c5cfe30a3-gqa-ref",
+  "schema_version": 2,
+  "snapshot": {
+    "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "path": "E:\\huggingface\\hub\\models--Qwen--Qwen3-8B\\snapshots\\b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  "source": {
+    "checkout": "D:\\repos\\inference\\.claude\\worktrees\\sc-24138",
+    "clean_tree": true,
+    "dirty_paths": [],
+    "head_sha": "c5cfe30a3baa3ae52883ce07909dbef163b26d8f"
+  },
+  "started_unix_seconds": 1790197539.7139695,
+  "suite": "decode_bench",
+  "suite_document": "decode_bench.json",
+  "suite_document_sha256": "c12a5b7a02cc68a60dd5c3d7277d4de8a968c6b66d4f174ea4c147f8f2dbcd7b"
+}

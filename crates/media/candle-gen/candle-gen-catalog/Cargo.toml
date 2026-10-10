@@ -29,6 +29,7 @@ candle-gen-mochi = { path = "../candle-gen-mochi" }
 candle-gen-pid = { path = "../candle-gen-pid" }
 candle-gen-pulid = { path = "../candle-gen-pulid" }
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+candle-gen-qwen-image-2-1 = { path = "../candle-gen-qwen-image-2-1" }
 candle-gen-sam3 = { path = "../candle-gen-sam3" }
 candle-gen-sana = { path = "../candle-gen-sana" }
 candle-gen-scail2 = { path = "../candle-gen-scail2" }
@@ -70,6 +71,7 @@ metal = [
     "candle-gen-pid/metal",
     "candle-gen-pulid/metal",
     "candle-gen-qwen-image/metal",
+    "candle-gen-qwen-image-2-1/metal",
     "candle-gen-sam3/metal",
     "candle-gen-sana/metal",
     "candle-gen-scail2/metal",
@@ -105,6 +107,7 @@ cuda = [
     "candle-gen-pid/cuda",
     "candle-gen-pulid/cuda",
     "candle-gen-qwen-image/cuda",
+    "candle-gen-qwen-image-2-1/cuda",
     "candle-gen-sam3/cuda",
     "candle-gen-sana/cuda",
     "candle-gen-scail2/cuda",

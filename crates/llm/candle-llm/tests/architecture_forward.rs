@@ -14,8 +14,9 @@
 //! into the uniform architectures fails here.
 //!
 //! Assertions are **exact** — not a tolerance. These are the same kernels running the same graph on
-//! the same device, so anything other than bit-equality is a real change in what the decoder
-//! computes.
+//! the same device and platform configuration. Windows x86_64 MSVC with the CUDA feature uses
+//! its own historical CPU baseline: cross-platform CPU kernels can differ by one ULP. Within each
+//! recorded configuration, anything other than bit-equality is a regression.
 //!
 //! Regenerate (only ever against a known-good tree, and say so in the commit):
 //!
@@ -29,8 +30,11 @@ use candle_core::{DType, Device, Tensor};
 use serde_json::{json, Map, Value};
 
 use candle_llm::config::ModelConfig;
+use candle_llm::decode::{StepModel, StepRequest};
 use candle_llm::models::CausalLm;
-use candle_llm::primitives::{input_ids, SplitMix64, TokenRng, Weights};
+use candle_llm::primitives::{
+    input_ids, AttnFormulation, DecodeCache, SplitMix64, TokenRng, Weights,
+};
 
 const HIDDEN: usize = 32;
 const VOCAB: usize = 48;
@@ -45,9 +49,80 @@ const INTER: usize = 64;
 const PROMPT: [i32; 5] = [1, 2, 3, 4, 5];
 const DECODE_STEPS: [i32; 2] = [6, 7];
 
+// The Windows baseline was measured at the historical source, not regenerated from this PR.
+// Rust 1.96.0 is pinned in the repository; provenance records compiler/dependencies and both repeats.
+fn golden_file(os: &str, arch: &str, target_env: &str, cuda: bool) -> &'static str {
+    match (os, arch, target_env, cuda) {
+        ("windows", "x86_64", "msvc", true) => "forward_candle_x86_64-pc-windows-msvc_cuda.json",
+        _ => "forward_candle.json",
+    }
+}
+
 fn golden_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../testdata/architectures/forward_candle.json")
+        .join("../testdata/architectures")
+        .join(golden_file(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            if cfg!(target_env = "msvc") {
+                "msvc"
+            } else {
+                "other"
+            },
+            cfg!(feature = "cuda"),
+        ))
+}
+
+fn assert_forward_equal(name: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{name}: logit count");
+    if let Some((i, (g, w))) = got
+        .iter()
+        .zip(want)
+        .enumerate()
+        .find(|(_, (g, w))| g.to_bits() != w.to_bits())
+    {
+        panic!("{name}: forward output moved at index {i}: got {g} ({:#x}), the base branch produced {w} ({:#x}). The shared decoder or config changed this architecture's numerics.", g.to_bits(), w.to_bits());
+    }
+}
+
+#[test]
+fn windows_golden_selection_is_limited_to_the_measured_configuration() {
+    assert_eq!(
+        golden_file("windows", "x86_64", "msvc", true),
+        "forward_candle_x86_64-pc-windows-msvc_cuda.json"
+    );
+    for (os, arch, env, cuda) in [
+        ("windows", "x86_64", "msvc", false),
+        ("windows", "aarch64", "msvc", true),
+        ("windows", "x86_64", "gnu", true),
+        ("linux", "x86_64", "gnu", true),
+        ("macos", "aarch64", "other", false),
+    ] {
+        assert_eq!(golden_file(os, arch, env, cuda), "forward_candle.json");
+    }
+}
+
+#[test]
+fn windows_golden_rejects_a_single_changed_bit_in_every_architecture() {
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../testdata/architectures/forward_candle_x86_64-pc-windows-msvc_cuda.json"
+    ))
+    .unwrap();
+    for case in cases() {
+        let want: Vec<f32> = golden[case.name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        assert_eq!(want.len(), VOCAB * (1 + DECODE_STEPS.len()));
+        assert_forward_equal(case.name, &want, &want);
+        let mut mutated = want.clone();
+        mutated[1] = f32::from_bits(mutated[1].to_bits() ^ 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_forward_equal(case.name, &mutated, &want)).is_err()
+        );
+    }
 }
 
 /// Small deterministic `[out, in]` weight. Identical draw sequence on both branches, so the built
@@ -501,8 +576,14 @@ fn run_forward(case: &Case) -> Vec<f32> {
         case.name
     );
     let weights = Weights::from_map(case.weights.clone(), Device::Cpu);
-    let model = CausalLm::from_weights(&weights, "", cfg)
+    let mut model = CausalLm::from_weights(&weights, "", cfg)
         .unwrap_or_else(|e| panic!("{}: model must build: {e}", case.name));
+    // The goldens are the `repeat_kv`-expanded attention arithmetic the decoder ran when they were
+    // captured. sc-24138 made the un-expanded `Gqa` formulation the default (the static cache's
+    // arithmetic, a last-bit change at attention-GEMM knife-edges), so this suite selects the
+    // arithmetic its goldens were measured with; everything else in the decoder loop is still held
+    // to them bit for bit.
+    model.set_attn_formulation(AttnFormulation::Expanded);
 
     let mut cache = model.new_cache();
     let mut out = Vec::new();
@@ -704,6 +785,8 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
     let cases = cases();
 
     if std::env::var("SC18769_WRITE_FORWARD_GOLDEN").is_ok() {
+        assert_eq!(golden_path().file_name().unwrap(), "forward_candle.json",
+            "the qualified Windows golden must be captured from the historical baseline with provenance");
         let mut doc = Map::new();
         doc.insert(
             "_note".into(),
@@ -738,23 +821,7 @@ fn every_architecture_forward_is_bit_identical_to_the_base_branch() {
             .map(|x| x.as_f64().unwrap() as f32)
             .collect();
         let got = run_forward(case);
-        assert_eq!(got.len(), want.len(), "{}: logit count", case.name);
-        // Exact, not approximate: same kernels, same graph, same device.
-        if let Some((i, (g, w))) = got
-            .iter()
-            .zip(&want)
-            .enumerate()
-            .find(|(_, (g, w))| g.to_bits() != w.to_bits())
-        {
-            panic!(
-                "{name}: forward output moved at index {i}: got {g} ({got_bits:#x}), the base \
-                 branch produced {w} ({want_bits:#x}). The shared decoder or config changed this \
-                 architecture's numerics.",
-                name = case.name,
-                got_bits = g.to_bits(),
-                want_bits = w.to_bits(),
-            );
-        }
+        assert_forward_equal(case.name, &got, &want);
     }
 }
 
@@ -779,4 +846,61 @@ fn forward_goldens_cover_every_generic_architecture() {
         covered, expected,
         "the forward suite must cover exactly the generic-decoder architectures"
     );
+}
+
+/// sc-24441: every generic-decoder architecture decodes on the device-positions step path — RoPE
+/// tables from device positions, K/V written at a device-held index, the length-aware decode
+/// attention with each architecture's own soft-cap, rotary layout (partial, interleaved) and
+/// key/value widths (MLA) — to f32 rounding of the host path it replaces, through a prefill,
+/// decodes, a 4-token verify and a rollback into it. Mixture-of-Experts stacks run the same path
+/// eagerly (their graph refusal is the router, not the positions).
+#[test]
+fn every_architecture_steps_identically_on_device_positions() {
+    for case in cases() {
+        let build = |on: bool| {
+            let cfg = ModelConfig::from_json(&case.config).unwrap();
+            let weights = Weights::from_map(case.weights.clone(), Device::Cpu);
+            let mut model = CausalLm::from_weights(&weights, "", cfg).unwrap();
+            model.set_device_positions(on);
+            model
+        };
+        let (host_model, dev_model) = (build(false), build(true));
+        assert_eq!(
+            dev_model.device_positions_support(),
+            Ok(()),
+            "{}",
+            case.name
+        );
+        let mut hc = host_model.new_cache_for(24, 3).unwrap();
+        let mut dc = dev_model.new_cache_for(24, 3).unwrap();
+        assert!(dc.device_positions().is_some(), "{}", case.name);
+        let steps: [(&[i32], bool); 4] = [
+            (&PROMPT, false),
+            (&[6], false),
+            (&[7, 8, 9, 10], true),
+            (&[11], false),
+        ];
+        for (n, (tokens, all)) in steps.iter().enumerate() {
+            let req = if *all {
+                StepRequest::all(tokens)
+            } else {
+                StepRequest::last(tokens)
+            };
+            let h = host(&host_model.forward_step(&mut hc, req).unwrap().logits);
+            let d = host(&dev_model.forward_step(&mut dc, req).unwrap().logits);
+            let scale = h.iter().fold(1f32, |m, x| m.max(x.abs()));
+            for (i, (x, y)) in d.iter().zip(&h).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-4 * scale,
+                    "{} step {n} [{i}]: device positions {x} vs host {y}",
+                    case.name
+                );
+            }
+            if *all {
+                let back = DecodeCache::len(&hc) - 1;
+                hc.rollback_to(back).unwrap();
+                dc.rollback_to(back).unwrap();
+            }
+        }
+    }
 }

@@ -308,6 +308,10 @@ fn load_heavy(
     let encoder = needs_encoder
         .then(|| DcAeEncoder::from_weights(&vae_w, dcfg.clone()))
         .transpose()?;
+    // Materialize at load (sc-24245): MLX runs a safetensors `Load` on its CPU stream; left lazy, the
+    // first forward's Metal command buffers wait on the disk read — past the GPU watchdog on a cold
+    // page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    vae_w.materialize_accessed()?;
     // The stream carries the SAME config the trunk was built with, so a windowed block cannot be
     // built under a different config than its resident twin — the silent "present but wrong" class
     // SANA-Sprint's `qk_norm` gate would otherwise expose (see `crate::block_stream`).
@@ -321,13 +325,17 @@ fn load_heavy(
             trunk
         }
     };
+    // The trunk is materialized in full even when the stream is armed: an armed load keeps its
+    // resident `blocks`, and every forward runs them while rung 4 is `TRANSFORMER_WINDOW_WITHHELD`.
+    let build_trunk = |cfg: &SanaTransformerConfig| -> Result<SanaTransformer> {
+        let trunk = SanaTransformer::from_weights(&trunk_w, cfg.clone())?;
+        trunk_w.materialize_accessed()?;
+        Ok(trunk)
+    };
     if sprint {
         let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
         let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
-        let trunk = with_stream(
-            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
-            &trunk_cfg,
-        );
+        let trunk = with_stream(build_trunk(&trunk_cfg)?, &trunk_cfg);
         Ok(match encoder {
             Some(encoder) => {
                 SanaHeavy::new_sprint(trunk, encoder, decoder, dcfg, guidance_embeds_scale)
@@ -338,10 +346,7 @@ fn load_heavy(
         })
     } else {
         let trunk_cfg = SanaTransformerConfig::sana_1600m();
-        let trunk = with_stream(
-            SanaTransformer::from_weights(&trunk_w, trunk_cfg.clone())?,
-            &trunk_cfg,
-        );
+        let trunk = with_stream(build_trunk(&trunk_cfg)?, &trunk_cfg);
         Ok(match encoder {
             Some(encoder) => SanaHeavy::new(trunk, encoder, decoder, dcfg),
             None => SanaHeavy::new_text_to_image(trunk, decoder, dcfg),

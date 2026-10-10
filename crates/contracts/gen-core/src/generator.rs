@@ -9,7 +9,7 @@
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
 use crate::hdr::HdrColorSpace;
-use crate::media::{AudioChunk, AudioTrack, Image};
+use crate::media::{AudioChunk, AudioTrack, Image, RgbaImage};
 use crate::runtime::{
     CancelFlag, HdrFrameSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
 };
@@ -184,6 +184,29 @@ pub trait Generator {
         Ok(out)
     }
 
+    /// **Generate and report** (sc-22988): the render's [`GenerationReport`] — its output, the
+    /// reproducibility record it published ([`AudioParams::artifacts`]) and its non-fatal
+    /// warnings (e.g. a truncated autoregressive phase).
+    ///
+    /// Additive for the reason [`generate_streaming`](Self::generate_streaming) is: a dedicated
+    /// default-implemented method instead of new fields on [`GenerationOutput`] / [`AudioTrack`],
+    /// whose literals and exhaustive matches span the workspace and its consumers. The default
+    /// wraps [`generate`](Self::generate) in [`GenerationReport::from_output`] (no record, no
+    /// warnings), so every provider can be driven through it and is byte-for-byte unaffected.
+    ///
+    /// A provider that publishes records or reports warnings overrides this as its primary
+    /// implementation and derives [`generate`](Self::generate) from it. That is the only way to
+    /// receive an artifacts-only render ([`SongParams::plan_only`], `output: None`), which
+    /// [`generate`](Self::generate) refuses.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationReport> {
+        self.generate(req, on_progress)
+            .map(GenerationReport::from_output)
+    }
+
     /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
     /// (path **B**) of the stateless [`Conditioning::ConversationHistory`] carrier (path **A**). A
     /// context-aware conversational TTS model (e.g. MOSS-TTS-Realtime, a voice-agent foundation model)
@@ -288,12 +311,53 @@ pub trait ConversationSession {
 #[derive(Clone, Debug)]
 pub enum GenerationOutput {
     Images(Vec<Image>),
+    /// Four-channel images with a **straight (un-premultiplied) alpha** channel (sc-24111) — the
+    /// output of a request whose [`GenerationRequest::output_channels`] is
+    /// [`OutputChannels::Rgba`], on a provider whose
+    /// [`Capabilities::supports_alpha_output`] is `true`.
+    ///
+    /// A **separate variant**, not an `Option<Vec<u8>>` alpha plane on [`Images`](Self::Images),
+    /// for the reason [`RgbaImage`] is a separate type: an RGB-only consumer must not be able to
+    /// receive transparency by accident and silently drop it (a subject extracted onto a
+    /// transparent background, flattened to whatever the decoder painted behind the alpha, is a
+    /// wrong image the caller has no way to detect). Adding a variant makes every consumer's
+    /// `match` name the case explicitly, which is the point.
+    ///
+    /// **Never produced unless asked for.** `OutputChannels::Rgb` is the `Default`, and the shared
+    /// request floor refuses an RGBA request against a provider that does not advertise the
+    /// capability, so no existing consumer can be handed this variant by an existing request.
+    ImagesRgba(Vec<RgbaImage>),
     Video {
         frames: Vec<Image>,
         fps: u32,
         audio: Option<AudioTrack>,
     },
     Audio(AudioTrack),
+}
+
+/// How many channels an image generation emits ([`GenerationRequest::output_channels`],
+/// sc-24111).
+///
+/// [`Rgb`](Self::Rgb) is the `Default` and the historical behaviour, byte-for-byte: a provider
+/// whose decoder is natively four-channel (Qwen-Image 2.1) composites its alpha over white and
+/// emits [`GenerationOutput::Images`], exactly as it did before this field existed.
+///
+/// This is an **output-surface** selector, not a render mode. On Qwen-Image 2.1 — the only family
+/// that reads it today — it changes nothing about conditioning, denoise or decode: upstream has no
+/// transparency flag at all, always decodes four channels, and always returns a PIL `RGBA` image.
+/// *Whether* a render is actually transparent is decided by the **prompt** (see the provider
+/// crates' `UPSTREAM.md`). All this field decides is whether the caller receives the alpha the
+/// decoder produced or a white composite of it — which is why `Rgba` on an ordinary opaque prompt
+/// is legal and simply yields `A = 255` everywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OutputChannels {
+    /// 8-bit RGB ([`GenerationOutput::Images`]) — the default, and what every provider emitted
+    /// before sc-24111.
+    #[default]
+    Rgb,
+    /// 8-bit RGBA with straight alpha ([`GenerationOutput::ImagesRgba`]). Gated by
+    /// [`Capabilities::supports_alpha_output`].
+    Rgba,
 }
 
 /// The HDR opt-in block ([`GenerationRequest::hdr`], sc-18790).
@@ -426,6 +490,27 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_generated_keyframes`]: an engine that does not advertise it
     /// refuses a positive value on the shared floor.
     pub num_generated_keyframes: Option<u32>,
+    /// The **short edge an image reference is encoded at**, in pixels (sc-23402). Admitted range
+    /// [`REFERENCE_IMAGE_SHORT_EDGE_MIN`]`..=`[`REFERENCE_IMAGE_SHORT_EDGE_MAX`] inclusive; `None`
+    /// ⇒ [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`], which is upstream's own
+    /// `reference_image_short_edge` pipeline default.
+    ///
+    /// This sizes the **reference**, never the render: a reference is encoded at its own resolution
+    /// and does not bind the generated geometry, so lowering it trades reference *token count*
+    /// (roughly quadratic in the short edge) against how much detail the conditioner and the
+    /// reference-latent rows carry. It is not an output-resolution control.
+    ///
+    /// An out-of-range value is **refused** before any weight is read, naming the field, the value
+    /// and the range — never clamped, because a silently clamped reference changes the token budget
+    /// the caller believes it measured. Read the effective value with
+    /// [`effective_reference_image_short_edge`]; the consumer records that in the attempt's recipe,
+    /// exactly as it records [`steps`](Self::steps) / [`guidance`](Self::guidance).
+    ///
+    /// **Read on exactly one path: MiniMax-H3's `reference_to_video` (`ref2va`) task; ignored
+    /// everywhere else** — every other model, and MiniMax-H3's own `t2va` / `fl2va` tasks, are
+    /// inert to it (the range refusal above still applies there, so a typo is reported rather than
+    /// silently dropped).
+    pub reference_image_short_edge: Option<u32>,
     /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
     /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
     /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
@@ -604,6 +689,24 @@ pub struct GenerationRequest {
     /// `Some` here as [`Error::Unsupported`] at the contract boundary rather than silently
     /// rendering SDR and leaving the caller to discover it from the pixels.
     pub hdr: Option<HdrRequest>,
+
+    // --- Alpha / transparency (sc-24111; consumed by Qwen-Image 2.1 today) ---
+    /// Whether this generation's images come back as RGB or as RGBA with a straight alpha channel.
+    ///
+    /// **[`OutputChannels::Rgb`] is the `Default`** and is byte-for-byte the pre-sc-24111 render on
+    /// every provider, including the ones whose decoder is natively four-channel.
+    ///
+    /// Gated by [`Capabilities::supports_alpha_output`]: a provider that does not advertise an
+    /// alpha output refuses [`OutputChannels::Rgba`] here, on the shared floor, as
+    /// [`Error::Unsupported`] — it never silently returns RGB. The distinction matters because the
+    /// two are not interchangeable images: flattening a transparent subject over white is a
+    /// different picture from the one the caller asked for, and an RGB reply to an RGBA request
+    /// carries nothing that says so.
+    ///
+    /// Setting this to [`OutputChannels::Rgba`] does **not** make a render transparent. On
+    /// Qwen-Image 2.1 transparency is prompt-driven (upstream ships no flag); this field only
+    /// decides whether the decoder's alpha reaches the caller or is composited over white first.
+    pub output_channels: OutputChannels,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -766,6 +869,232 @@ pub struct AudioParams {
     /// [`AudioParams`]. `prompt` still carries any single-voice / global text; a model that reads the
     /// script renders it in preference to `prompt`.
     pub script: Option<Vec<SpeechSegment>>,
+    /// How many **lyric segments** to render (segment-by-segment autoregressive song models, e.g.
+    /// YuE — sc-19382). `None` ⇒ the model default. A model that renders the whole text in one pass
+    /// ignores it; one that reads it documents how it resolves a count larger than the lyrics hold.
+    pub segments: Option<u32>,
+    /// Per-segment autoregressive **token budget** (segment-by-segment song models, sc-19382).
+    /// `None` ⇒ the model default. Must be `>= 1` where read.
+    pub max_new_tokens_per_segment: Option<u32>,
+    /// Autoregressive **repetition penalty** (token-sampled audio models, sc-19382). `None` ⇒ the
+    /// model default. Must be finite and `> 0` where read.
+    pub repetition_penalty: Option<f32>,
+    /// The span of the [`Conditioning::ReferenceAudio`] clip a model conditions on (in-context
+    /// audio prompting, e.g. YuE ICL — sc-19382), in seconds. `None` ⇒ the model default window.
+    pub reference_region: Option<TimeRegion>,
+    /// How the rendered output is kept inside full scale (song models whose reference writes its
+    /// output through a limiter, e.g. YuE's `save_audio` — sc-19378). `None` ⇒ the model default
+    /// (YuE: [`OutputLimiter::Clamp`], the reference default).
+    pub output_limiter: Option<OutputLimiter>,
+    /// **Symbolic-plan song controls** (sc-22994 — YuE2): the planning mode, an externally supplied
+    /// score, an exact saved plan, cached-latent decoding, the decoder and per-phase token sampling.
+    /// `None` ⇒ every model default. Gated by [`Capabilities::supports_symbolic_song`]: a model
+    /// that does not plan a score refuses it as the typed [`Error::Unsupported`] instead of
+    /// rendering from a plan the caller never asked for.
+    pub song: Option<SongParams>,
+    /// **Persist the render's reproducibility record** (sc-22994): the model writes its complete
+    /// artifact set (score / plan / tokens / latents / effective settings / identities / timings /
+    /// integrity records) into [`AudioArtifacts::dir`], publishing it only once the render
+    /// succeeds. Gated by [`Capabilities::supports_audio_artifacts`]: a model that keeps no record
+    /// refuses it rather than returning audio with nothing written where the caller looks.
+    pub artifacts: Option<AudioArtifacts>,
+}
+
+/// Symbolic-plan song controls ([`AudioParams::song`], sc-22994 — YuE2). Every field is optional
+/// so the block stays additively extensible; each model documents how it resolves defaults and
+/// refuses combinations it cannot honour in its own `validate`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SongParams {
+    /// How the model plans the score before rendering. `None` ⇒ the model default.
+    pub planning: Option<SongPlanning>,
+    /// An externally supplied score (YuE2: ABC notation) used as the plan instead of sampling one.
+    /// Requires a planning mode that has a score.
+    pub score: Option<String>,
+    /// Restore an exact saved plan instead of planning — its token ids are reused as saved, never
+    /// re-tokenized.
+    pub plan: Option<SavedPlan>,
+    /// Decode the verified cached latents of this completed run directory instead of generating.
+    pub cached_latents: Option<std::path::PathBuf>,
+    /// Which published decoder renders the latents. `None` ⇒ the model default.
+    pub decoder: Option<SongDecoder>,
+    /// Token sampling of the score-planning phase. `None` fields ⇒ the model defaults.
+    pub score_sampling: Option<TokenSampling>,
+    /// Token sampling of the semantic-token phase. `None` fields ⇒ the model defaults.
+    pub semantic_sampling: Option<TokenSampling>,
+    /// **Plan only** (sc-22988): plan the score and publish the exact plan as an artifacts-only
+    /// record (kind `plan`) into [`AudioParams::artifacts`], rendering no audio. Requires
+    /// `artifacts` (a plan that is never published is lost — the shared floor refuses the pair
+    /// otherwise) and is gated by [`Capabilities::supports_song_plan_only`]. Its result is
+    /// [`GenerationReport::artifacts`] with [`GenerationReport::output`] `None`, read through
+    /// [`Generator::generate_with_report`]; [`Generator::generate`] has no audio to return and
+    /// refuses.
+    pub plan_only: bool,
+    /// **Zero-shot cover** (sc-22988): plan from a reviewed score instead of sampling one. The
+    /// target style is the request `prompt`; the sung lyrics are [`AudioParams::lyrics`]. Gated
+    /// by [`Capabilities::supports_song_cover`]. The cover fixes the planning mode and the score
+    /// itself, so a model refuses it together with [`Self::planning`], [`Self::score`],
+    /// [`Self::plan`] or [`Self::cached_latents`].
+    pub cover: Option<SongCover>,
+}
+
+/// A zero-shot cover from a reviewed score ([`SongParams::cover`], sc-22988 — YuE2). Symbolic
+/// only: the melody travels as the score; no source audio reaches the generator. Transcribing a
+/// recording into such a score is a separate step outside this contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SongCover {
+    /// Melody-only (harmony removed, accompaniment free) or the full score with its harmony.
+    pub mode: SongCoverMode,
+    /// The reviewed score (YuE2: the native two-voice ABC dialect).
+    pub score: String,
+    /// Which melodies a melody-only cover keeps. `None` ⇒ both.
+    pub keep: Option<SongCoverVoice>,
+    /// When [`AudioParams::lyrics`] is a translation: the source lyrics it translates,
+    /// section-aligned. `None` ⇒ the lyrics are the source lyrics.
+    pub translated_from: Option<String>,
+}
+
+/// How much of a [`SongCover`] score is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongCoverMode {
+    /// The melody only: every chord symbol removed, so the accompaniment is free.
+    Melody,
+    /// The full score with its supplied harmony.
+    Full,
+}
+
+/// Which melodies a melody-only [`SongCover`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongCoverVoice {
+    /// Both melodies.
+    Both,
+    /// The vocal melody only (the instrumental voice becomes rests on the same grid).
+    Vocal,
+    /// The instrumental melody only (the vocal voice becomes rests on the same grid).
+    Instrumental,
+}
+
+/// The complete result of one generation (sc-22988), returned by
+/// [`Generator::generate_with_report`]: the rendered output, the reproducibility record the render
+/// published, and the non-fatal conditions the caller must see.
+///
+/// [`Generator::generate`] returns only [`Self::output`]; a caller that must know a render was
+/// truncated, or that reads an artifacts-only render (a plan with no audio), calls
+/// [`Generator::generate_with_report`] instead.
+#[derive(Clone, Debug)]
+pub struct GenerationReport {
+    /// What was rendered. `None` only for an artifacts-only request ([`SongParams::plan_only`]),
+    /// whose result is [`Self::artifacts`].
+    pub output: Option<GenerationOutput>,
+    /// The record published into [`AudioParams::artifacts`], when the request asked for one.
+    pub artifacts: Option<ArtifactRecord>,
+    /// Non-fatal conditions of this render (a truncated phase, a cover-check warning), in the
+    /// order they were found. Empty when there is nothing to report.
+    pub warnings: Vec<GenerationWarning>,
+}
+
+impl GenerationReport {
+    /// A report carrying only `output`: what [`Generator::generate_with_report`] returns for a
+    /// provider that keeps no record and reports no warnings.
+    pub fn from_output(output: GenerationOutput) -> Self {
+        Self {
+            output: Some(output),
+            artifacts: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// A published reproducibility record ([`GenerationReport::artifacts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    /// The published directory.
+    pub dir: std::path::PathBuf,
+    /// The record's kind (YuE2: `song`, `plan` or `cached_decode`).
+    pub kind: String,
+    /// The record's identity (lower-case hex), as the record's own index states it.
+    pub identity: String,
+}
+
+/// A non-fatal condition of a render ([`GenerationReport::warnings`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationWarning {
+    /// A stable, machine-readable code (e.g. `semantic_truncated`).
+    pub code: String,
+    /// A human-readable detail.
+    pub message: String,
+}
+
+/// The planning mode of a symbolic-plan song model ([`SongParams::planning`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongPlanning {
+    /// Plan melody and harmony.
+    Full,
+    /// Plan the melody only.
+    Melody,
+    /// No symbolic plan.
+    Off,
+}
+
+/// Which published decoder a symbolic-plan song model decodes with ([`SongParams::decoder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongDecoder {
+    /// The listening decoder (YuE2: `m-a-p/YuE2-Vae`).
+    Standard,
+    /// The evaluation decoder (YuE2: `m-a-p/YuE2-Vae-legacy`).
+    Legacy,
+}
+
+/// A saved symbolic plan to restore ([`SongParams::plan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedPlan {
+    /// The plan directory.
+    pub dir: std::path::PathBuf,
+    /// The plan identity recorded when it was saved (lower-case hex), kept outside the plan
+    /// directory; when present, a plan whose identity differs is refused.
+    pub identity: Option<String>,
+}
+
+/// One autoregressive phase's token-sampling overrides ([`SongParams::score_sampling`] /
+/// [`SongParams::semantic_sampling`]). `None` ⇒ the model's default for that field; the model
+/// validates the resolved set as a whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TokenSampling {
+    /// Softmax temperature (`0` = greedy).
+    pub temperature: Option<f64>,
+    /// Nucleus mass.
+    pub top_p: Option<f64>,
+    /// Top-k.
+    pub top_k: Option<u32>,
+    /// Windowed repetition penalty.
+    pub repetition_penalty: Option<f64>,
+    /// Repetition-penalty window, in tokens.
+    pub penalty_window: Option<u32>,
+    /// Output tokens before the end token may be sampled.
+    pub min_tokens: Option<u32>,
+    /// Maximum output tokens.
+    pub max_tokens: Option<u32>,
+}
+
+/// Where a model publishes a render's reproducibility record ([`AudioParams::artifacts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioArtifacts {
+    /// The run directory. A fresh render requires it to be absent or empty; nothing appears there
+    /// until the render has completed.
+    pub dir: std::path::PathBuf,
+    /// Reuse a completed record, or the verified completed stages of an interrupted one, whose
+    /// recorded identities match this request exactly; a mismatched or corrupt record is refused,
+    /// never overwritten.
+    pub resume: bool,
+}
+
+/// The output limiter a model applies before returning audio ([`AudioParams::output_limiter`],
+/// sc-19378). Gated by [`Capabilities::supports_output_limiter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLimiter {
+    /// Hard-clamp every sample to the model's limit (YuE: `±0.99`) — the reference default.
+    Clamp,
+    /// Scale the whole track by `min(limit / peak, 1)` so nothing clips (YuE's `--rescale`).
+    Rescale,
 }
 
 /// One segment of a multi-speaker dialogue [`script`](AudioParams::script) (sc-12848) — the text a
@@ -921,6 +1250,7 @@ impl Default for GenerationRequest {
             video_mode: None,
             trim_first_frames: None,
             num_generated_keyframes: None,
+            reference_image_short_edge: None,
             temporal_upsample_rounds: None,
             auto_duration: None,
             motion_bucket_id: None,
@@ -943,6 +1273,9 @@ impl Default for GenerationRequest {
             preview: PreviewSink::default(),
             // SDR. The one default that must never drift — see `GenerationRequest::hdr`.
             hdr: None,
+            // RGB. Like `hdr`, a default that must never drift: an unasked-for alpha channel
+            // reaching a consumer that indexes RGB triples is a corrupted image, not a bonus.
+            output_channels: OutputChannels::Rgb,
         }
     }
 }
@@ -1077,22 +1410,45 @@ impl Scail2AnimationConditioningRef<'_> {
 
 impl GenerationRequest {
     /// Number of image-conditioning inputs represented by this request for memory-evidence
-    /// geometry. Multi-image carriers contribute their flattened image count; control/depth/mask
-    /// carriers each contribute one. A keyframe is a distinct image input even though its placement
-    /// is temporal; clips remain represented by the frame axis.
+    /// geometry. Multi-image carriers contribute their flattened image count; reference (opaque
+    /// **or** transparent), control/depth/mask carriers each contribute one. A keyframe is a
+    /// distinct image input even though its placement is temporal; clips remain represented by the
+    /// frame axis.
     pub fn image_reference_count(&self) -> u32 {
         self.conditioning.iter().fold(0_u32, |count, conditioning| {
+            // **This match is deliberately wildcard-free** (sc-24111), for the same reason
+            // `first_nonfinite_float` is: the `_ => 0` this replaces is exactly how
+            // `ReferenceRgba` came to be priced at zero. A carrier scored zero here is admitted at
+            // one `reference_count` and then refused at execution by both providers' request
+            // scopes — see `memory_reference_count` below, whose whole contract is that admission
+            // and execution agree carrier for carrier. A new variant now breaks the build here
+            // until someone classifies it.
             let increment = match conditioning {
+                // One image reference each. `ReferenceRgba` is an ordinary reference that kept its
+                // alpha, so it is priced identically to `Reference` — same fit, same token cost.
                 Conditioning::Reference { .. }
+                | Conditioning::ReferenceRgba { .. }
                 | Conditioning::Keyframe { .. }
                 | Conditioning::Control { .. }
                 | Conditioning::Depth { .. }
                 | Conditioning::Mask { .. } => 1,
+                // Multi-image carriers contribute their flattened image count.
                 Conditioning::MultiReference { images } => {
                     u32::try_from(images.len()).unwrap_or(u32::MAX)
                 }
                 Conditioning::ReduxRefs { refs } => u32::try_from(refs.len()).unwrap_or(u32::MAX),
-                _ => 0,
+                // Carriers that are **not** still-image references: audio and video payloads, the
+                // clip carriers (represented by the frame axis, not the image count), and the
+                // tensor-free conversation history. Named rather than wildcarded.
+                Conditioning::ReferenceAudio { .. }
+                | Conditioning::ReferenceVideo { .. }
+                | Conditioning::AudioEdit { .. }
+                | Conditioning::AudioEditRegions { .. }
+                | Conditioning::VoiceEmbedding { .. }
+                | Conditioning::VideoClip { .. }
+                | Conditioning::ControlClip { .. }
+                | Conditioning::VideoSync { .. }
+                | Conditioning::ConversationHistory { .. } => 0,
             };
             count.saturating_add(increment)
         })
@@ -1167,6 +1523,9 @@ impl GenerationRequest {
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
+            // sc-23402: an integer pixel extent, range-checked by
+            // `validate_reference_image_short_edge` rather than by the float floor.
+            reference_image_short_edge: _,
             temporal_upsample_rounds: _,
             // sc-18778: the auto-duration range's floats are validated at construction
             // (`AutoDurationRange::new` refuses non-finite / inverted / non-positive bounds), so
@@ -1191,6 +1550,8 @@ impl GenerationRequest {
             // float-bearing HDR knob (a diffuse-white signal or roll-off rate on the request,
             // say) must join the floor, and this named-not-`..` binding forces that decision.
             hdr: _,
+            // An enum with two unit variants — no float to check (sc-24111).
+            output_channels: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -1252,13 +1613,89 @@ impl GenerationRequest {
             // The script carries no floats (text + opaque labels); named (no `..`) so a future
             // float-bearing per-segment control fails to compile here until it is classified.
             script: _,
+            // Integer counts (sc-19382): no floats to classify.
+            segments: _,
+            max_new_tokens_per_segment: _,
+            // A unit enum (sc-19378): no floats to classify.
+            output_limiter: _,
+            // A directory and a flag (sc-22994): no floats to classify.
+            artifacts: _,
             target_duration,
             bpm,
+            repetition_penalty,
+            reference_region,
+            song,
         }) = audio
         {
-            let audio_floats: [(&'static str, Option<f32>); 2] = [
+            // Symbolic-song token sampling (sc-22994): its three `f64` fields go through the same
+            // non-finite check. Destructured without `..` so a new float-bearing field fails to
+            // compile here until it is classified.
+            if let Some(SongParams {
+                planning: _,
+                score: _,
+                plan: _,
+                cached_latents: _,
+                decoder: _,
+                // A flag and a text-only cover block (sc-22988): no floats to classify.
+                plan_only: _,
+                cover: _,
+                score_sampling,
+                semantic_sampling,
+            }) = song
+            {
+                for (phase, sampling) in
+                    [("score", score_sampling), ("semantic", semantic_sampling)]
+                {
+                    if let Some(TokenSampling {
+                        temperature,
+                        top_p,
+                        repetition_penalty,
+                        top_k: _,
+                        penalty_window: _,
+                        min_tokens: _,
+                        max_tokens: _,
+                    }) = sampling
+                    {
+                        for (field, v) in [
+                            ("temperature", temperature),
+                            ("top_p", top_p),
+                            ("repetition_penalty", repetition_penalty),
+                        ] {
+                            if let Some(x) = v {
+                                if !x.is_finite() {
+                                    let name = match (phase, field) {
+                                        ("score", "temperature") => {
+                                            "audio.song.score_sampling.temperature"
+                                        }
+                                        ("score", "top_p") => "audio.song.score_sampling.top_p",
+                                        ("score", _) => {
+                                            "audio.song.score_sampling.repetition_penalty"
+                                        }
+                                        (_, "temperature") => {
+                                            "audio.song.semantic_sampling.temperature"
+                                        }
+                                        (_, "top_p") => "audio.song.semantic_sampling.top_p",
+                                        _ => "audio.song.semantic_sampling.repetition_penalty",
+                                    };
+                                    return Some((name, *x as f32));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let audio_floats: [(&'static str, Option<f32>); 5] = [
                 ("audio.target_duration", *target_duration),
                 ("audio.bpm", *bpm),
+                ("audio.repetition_penalty", *repetition_penalty),
+                (
+                    "audio.reference_region.start_secs",
+                    reference_region.map(|r| r.start_secs),
+                ),
+                (
+                    "audio.reference_region.end_secs",
+                    reference_region.and_then(|r| r.end_secs),
+                ),
             ];
             for (name, v) in audio_floats {
                 if let Some(x) = v {
@@ -1293,6 +1730,14 @@ impl GenerationRequest {
                     if let Some(s) = strength {
                         if !s.is_finite() {
                             return Some(("conditioning.reference.strength", *s));
+                        }
+                    }
+                }
+                // The RGBA sibling of `Reference` (sc-24111): same strength field, same math.
+                Conditioning::ReferenceRgba { strength, .. } => {
+                    if let Some(s) = strength {
+                        if !s.is_finite() {
+                            return Some(("conditioning.reference_rgba.strength", *s));
                         }
                     }
                 }
@@ -1634,17 +2079,96 @@ impl GenerationRequest {
     }
 }
 
+/// The last value [`default_seed`] handed out in this process — the seam that makes two
+/// back-to-back calls distinct even when they share a clock tick (sc-24114).
+static LAST_DEFAULT_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Seed when a [`GenerationRequest`] omits one: nanos since the epoch (any nonzero value works —
 /// this only sets which sample is drawn; a caller wanting reproducibility passes `req.seed`).
 /// Shared by every generator (F-006).
+///
+/// **Never returns the same value twice in one process.** The clock alone does not guarantee
+/// that: `SystemTime::now()` is coarser than a nanosecond on every platform this runs on, so two
+/// unseeded requests resolved back to back could draw the identical seed and render the identical
+/// sample. Each call therefore returns `max(now, last + 1)` through a compare-and-swap, which is
+/// strictly increasing across calls and threads and lands back on the clock as soon as it moves
+/// past the last value handed out.
 pub fn default_seed() -> u64 {
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
         // "pick one", so the default must never itself be 0 (F-089).
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let mut last = LAST_DEFAULT_SEED.load(Ordering::Relaxed);
+    loop {
+        let candidate = now.max(last.wrapping_add(1)).max(1);
+        match LAST_DEFAULT_SEED.compare_exchange_weak(
+            last,
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return candidate,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
+/// Smallest admitted [`GenerationRequest::reference_image_short_edge`] (sc-23402).
+///
+/// The floor is a judgement, not a checkpoint constant: below roughly 1024 the reference stops
+/// carrying the subject detail the conditioner and the reference-latent rows are there to supply,
+/// and the saving is already ~4× the token count of the default.
+pub const REFERENCE_IMAGE_SHORT_EDGE_MIN: u32 = 1024;
+
+/// Largest admitted [`GenerationRequest::reference_image_short_edge`], equal to
+/// [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`] (sc-23402).
+///
+/// The knob only ever goes **downward** from upstream's default: upstream's value is the released
+/// checkpoint's own rule (see `mlx_gen_minimax_h3::reference::REFERENCE_IMAGE_SHORT_EDGE` for the
+/// citation), so admitting more than it would be inventing a regime nothing was conditioned on.
+pub const REFERENCE_IMAGE_SHORT_EDGE_MAX: u32 = 2048;
+
+/// [`GenerationRequest::reference_image_short_edge`] when the request omits one — upstream's own
+/// `reference_image_short_edge` pipeline default (sc-23402).
+pub const REFERENCE_IMAGE_SHORT_EDGE_DEFAULT: u32 = 2048;
+
+/// The **effective** reference-image short edge for one request: the requested value, or
+/// [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`] when it omits one (sc-23402).
+///
+/// One resolver, shared by the engine that applies the value and by the consumer that records it in
+/// the attempt's recipe, so the recorded number cannot drift from the rendered one. It resolves
+/// *without* range-checking — [`validate_reference_image_short_edge`] is the refusal, and it runs
+/// before any weight is read.
+pub fn effective_reference_image_short_edge(req: &GenerationRequest) -> u32 {
+    req.reference_image_short_edge
+        .unwrap_or(REFERENCE_IMAGE_SHORT_EDGE_DEFAULT)
+}
+
+/// Refuse an out-of-range [`GenerationRequest::reference_image_short_edge`] (sc-23402).
+///
+/// **Fail closed, never clamp.** The value changes the reference token count, which is the whole
+/// reason a caller sets it; a silently clamped request would report one budget and render another.
+/// The message names the field, the value and the admitted range so the caller can tell a typo from
+/// an unsupported control.
+///
+/// `id` is the model's descriptor id, as everywhere else on the request floor. A request that omits
+/// the field validates vacuously, so this is inert for every caller that has not opted in.
+pub fn validate_reference_image_short_edge(id: &str, req: &GenerationRequest) -> Result<()> {
+    if let Some(edge) = req.reference_image_short_edge {
+        if !(REFERENCE_IMAGE_SHORT_EDGE_MIN..=REFERENCE_IMAGE_SHORT_EDGE_MAX).contains(&edge) {
+            return Err(Error::Msg(format!(
+                "{id}: reference_image_short_edge must be in \
+                 {REFERENCE_IMAGE_SHORT_EDGE_MIN}..={REFERENCE_IMAGE_SHORT_EDGE_MAX}, got {edge} \
+                 (it sizes the REFERENCE, not the render — it is refused rather than clamped \
+                 because clamping would change the reference token budget silently)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
@@ -1664,6 +2188,30 @@ pub fn default_seed() -> u64 {
 pub enum Conditioning {
     /// img2img / IP-Adapter / identity reference.
     Reference { image: Image, strength: Option<f32> },
+    /// A reference image that **carries its own alpha channel** — a transparent layer being
+    /// edited, or a previously extracted subject being re-composed (sc-24111). The RGBA sibling of
+    /// [`Reference`](Self::Reference), with the same ordering semantics: it takes its place in the
+    /// request's ordered `conditioning` list and may be freely interleaved with RGB
+    /// [`Reference`](Self::Reference) / [`MultiReference`](Self::MultiReference) entries.
+    ///
+    /// A **distinct variant**, not an alpha field on `Reference`, for the reason
+    /// [`RgbaImage`] is a distinct type: a provider that has never thought about alpha cannot be
+    /// handed a transparent reference and quietly encode whatever colour sits behind `A = 0` as if
+    /// it were content. Default-deny on [`ConditioningKind::ReferenceRgba`] makes that free.
+    ///
+    /// **A transparent reference is not the same request as its flattened self.** The alpha is
+    /// consumed, not decoration: on Qwen-Image 2.1 the VAE encodes all four channels while the
+    /// vision tower reads the reference composited over white, which is exactly how upstream feeds
+    /// it (`img.convert("RGBA")`, `white.paste(img, mask=A)` for the processor copy,
+    /// `image_processor.preprocess(img)` for the VAE copy). Sending the flattened RGB instead
+    /// would hand the VAE white pixels where the layer is transparent.
+    ///
+    /// `strength` mirrors [`Reference`](Self::Reference)'s; a provider with no img2img strength
+    /// (Qwen-Image 2.1) requires it unset or exactly `1.0`.
+    ReferenceRgba {
+        image: RgbaImage,
+        strength: Option<f32>,
+    },
     /// A reference **audio** clip — voice cloning / style reference for audio models
     /// (sc-12834; the audio analogue of [`Conditioning::Reference`]). `strength` mirrors the
     /// per-reference img2img strength: `None` ⇒ the model default. Video→audio (Foley)
@@ -1925,6 +2473,7 @@ impl Conditioning {
     pub fn kind(&self) -> ConditioningKind {
         match self {
             Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::ReferenceRgba { .. } => ConditioningKind::ReferenceRgba,
             Conditioning::ReferenceAudio { .. } => ConditioningKind::ReferenceAudio,
             Conditioning::ReferenceVideo { .. } => ConditioningKind::ReferenceVideo,
             Conditioning::AudioEdit { .. } => ConditioningKind::AudioEdit,
@@ -1969,6 +2518,13 @@ pub enum ControlKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConditioningKind {
     Reference,
+    /// A reference image carrying its own alpha channel ([`Conditioning::ReferenceRgba`],
+    /// sc-24111). A **distinct** kind from [`Reference`](Self::Reference), deliberately: that is
+    /// what makes default-deny free. Every provider that predates transparent references keeps
+    /// advertising `Reference` alone, and [`Capabilities::accepts`] then refuses a transparent
+    /// reference as a typed [`Error::Unsupported`] with no flag and no provider code — rather than
+    /// letting it through to a preprocessor that would flatten or misread the fourth channel.
+    ReferenceRgba,
     /// Voice/style reference audio ([`Conditioning::ReferenceAudio`]).
     ReferenceAudio,
     /// Motion/camera reference video, optionally with its own soundtrack
@@ -2512,6 +3068,22 @@ pub struct Capabilities {
     /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
     /// playback failure the opt-in exists to prevent.
     pub supports_hdr: bool,
+    /// Whether this model can emit **RGBA** images with a straight alpha channel through
+    /// [`GenerationRequest::output_channels`] = [`OutputChannels::Rgba`] (sc-24111).
+    ///
+    /// `Default` is `false`, so every existing provider is unsupported and the shared floor
+    /// rejects an RGBA request against it as [`Error::Unsupported`]. As with
+    /// [`supports_hdr`](Self::supports_hdr), the rejection is the point rather than a nuisance: a
+    /// model that quietly returned RGB would answer "extract this subject onto a transparent
+    /// background" with the subject flattened over whatever its decoder painted, and the caller
+    /// has no channel left to notice it with.
+    ///
+    /// A provider sets this only when **every** generation route behind the descriptor can emit
+    /// the four-channel image — i.e. its decoder is natively RGBA. It is not a request to
+    /// synthesise a matte: there is no separate matting model behind this flag, and a provider
+    /// must never fabricate an alpha channel (a constant `A = 255` widening of an RGB decode) to
+    /// advertise it.
+    pub supports_alpha_output: bool,
     /// Whether [`GenerationRequest::enhance_prompt`] changes the prompt consumed by this provider.
     ///
     /// This is weights-free discoverability for an optional semantic path, not a routing promise:
@@ -2546,6 +3118,55 @@ pub struct Capabilities {
     /// set; a script naming more than `max_speakers` distinct speakers is a range error
     /// ([`Error::Msg`], not a capability gap). `Default` is `None`.
     pub max_speakers: Option<u32>,
+    /// Whether this model renders lyrics **segment by segment** and reads
+    /// [`AudioParams::segments`] and [`AudioParams::max_new_tokens_per_segment`] (sc-19382, YuE).
+    /// `Default` is `false`, and the shared floor then rejects a request carrying either field as
+    /// the typed [`Error::Unsupported`] — a one-pass model would otherwise silently ignore the
+    /// requested segment count or budget.
+    pub supports_segmented_lyrics: bool,
+    /// Whether this model's autoregressive sampler reads [`AudioParams::repetition_penalty`]
+    /// (sc-19382). `Default` is `false`; the shared floor then rejects the field as the typed
+    /// [`Error::Unsupported`] instead of letting a model that never samples with it drop it.
+    pub supports_repetition_penalty: bool,
+    /// Whether this model conditions on a caller-chosen **window** of its
+    /// [`Conditioning::ReferenceAudio`] clip ([`AudioParams::reference_region`], sc-19382 — YuE
+    /// ICL). `Default` is `false`; the shared floor then rejects the field as the typed
+    /// [`Error::Unsupported`], since a model that reads the whole clip (or no reference at all)
+    /// would render from a different span than the caller asked for.
+    pub supports_reference_region: bool,
+    /// Whether this model reads [`AudioParams::output_limiter`] (sc-19378 — YuE's `save_audio`
+    /// clamp vs. rescale). `Default` is `false`; the shared floor then rejects the field as the
+    /// typed [`Error::Unsupported`] instead of letting a model with no such limiter drop it.
+    pub supports_output_limiter: bool,
+    /// Whether this model plans a symbolic score and reads [`AudioParams::song`] (sc-22994 —
+    /// YuE2). `Default` is `false`; the shared floor then rejects the block as the typed
+    /// [`Error::Unsupported`].
+    pub supports_symbolic_song: bool,
+    /// Whether this model publishes a reproducibility record into [`AudioParams::artifacts`]
+    /// (sc-22994). `Default` is `false`; the shared floor then rejects the block as the typed
+    /// [`Error::Unsupported`].
+    pub supports_audio_artifacts: bool,
+    /// Whether this model serves an artifacts-only plan ([`SongParams::plan_only`], sc-22988).
+    /// `Default` is `false`; the shared floor then rejects `plan_only` as the typed
+    /// [`Error::Unsupported`], so a symbolic-song model that cannot stop after planning never
+    /// renders audio the caller did not ask for.
+    pub supports_song_plan_only: bool,
+    /// Whether this model builds a zero-shot cover from a reviewed score ([`SongParams::cover`],
+    /// sc-22988). `Default` is `false`; the shared floor then rejects the cover as the typed
+    /// [`Error::Unsupported`].
+    pub supports_song_cover: bool,
+    /// The per-request [`GenerationMemory`] rungs this model honours **without** a
+    /// [`MemoryProviderContract`] (sc-22988 — the audio lane, which the image memory ladder does
+    /// not cover): [`MemoryStrategy::StagedResidency`] ↔ `stage_residency`,
+    /// [`MemoryStrategy::BoundedDecode`] ↔ `tile_vae_decode` / `decode_tile_edge`,
+    /// [`MemoryStrategy::BoundedAttention`] ↔ `chunk_attention` / `attention_chunk_size`.
+    ///
+    /// Weights-free discoverability for a consumer's admission (each provider documents the units
+    /// of its parameters). `Default` is empty, which says nothing either way — an image provider
+    /// declares its rungs through its [`MemoryProviderContract`] instead — so the shared floor does
+    /// not read it; a provider that lists a rung refuses every [`GenerationMemory`] field outside
+    /// its list in its own `validate` rather than ignoring it.
+    pub request_memory_strategies: &'static [MemoryStrategy],
 
     // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
     //
@@ -2777,7 +3398,19 @@ impl Capabilities {
     ///   `target_duration` within `(0, `[`max_audio_duration_secs`](Self::max_audio_duration_secs)`]`,
     ///   positive `bpm` — sc-12834); and a multi-speaker [`script`](AudioParams::script) only when
     ///   [`supports_multi_speaker`](Self::supports_multi_speaker) is set, within any advertised
-    ///   [`max_speakers`](Self::max_speakers) cap (sc-12848),
+    ///   [`max_speakers`](Self::max_speakers) cap (sc-12848); and `segments` /
+    ///   `max_new_tokens_per_segment` / `repetition_penalty` / `reference_region` only when the
+    ///   matching [`supports_segmented_lyrics`](Self::supports_segmented_lyrics) /
+    ///   [`supports_repetition_penalty`](Self::supports_repetition_penalty) /
+    ///   [`supports_reference_region`](Self::supports_reference_region) flag is set (sc-19382), and
+    ///   `output_limiter` only when [`supports_output_limiter`](Self::supports_output_limiter) is
+    ///   set (sc-19378), and `song` / `artifacts` only when
+    ///   [`supports_symbolic_song`](Self::supports_symbolic_song) /
+    ///   [`supports_audio_artifacts`](Self::supports_audio_artifacts) is set (sc-22994), and
+    ///   `song.plan_only` / `song.cover` only when
+    ///   [`supports_song_plan_only`](Self::supports_song_plan_only) /
+    ///   [`supports_song_cover`](Self::supports_song_cover) is set, `plan_only` also only together
+    ///   with `artifacts` (sc-22988),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -2904,6 +3537,18 @@ impl Capabilities {
         if req.hdr.is_some() && !self.supports_hdr {
             return Err(Error::Unsupported(format!(
                 "{id}: HDR output is not supported by this model"
+            )));
+        }
+        // RGBA opt-in (sc-24111). On the shared floor for the same reason HDR is: a per-provider
+        // check is a check a provider can forget, and a forgotten one returns an opaque RGB image
+        // to a caller who asked for transparency, with nothing in the reply to say the alpha was
+        // dropped. `Rgb` (the `Default`) validates vacuously, so this is inert for every request
+        // that has not opted in.
+        if req.output_channels == OutputChannels::Rgba && !self.supports_alpha_output {
+            return Err(Error::Unsupported(format!(
+                "{id}: RGBA (alpha-channel) output is not supported by this model; it emits RGB \
+                 only. Drop `output_channels: Rgba` from the request, or route to a provider whose \
+                 capabilities advertise `supports_alpha_output`."
             )));
         }
         if let Some(memory) = req.memory {
@@ -3196,6 +3841,71 @@ impl Capabilities {
                         }
                     }
                 }
+            }
+            // Segmented-song / autoregressive / reference-window controls (sc-19382): each is a
+            // capability gap on a model that does not advertise reading it → typed
+            // `Error::Unsupported`, so no provider can silently ignore one.
+            let gated = [
+                (
+                    "audio.segments",
+                    audio.segments.is_some(),
+                    self.supports_segmented_lyrics,
+                ),
+                (
+                    "audio.max_new_tokens_per_segment",
+                    audio.max_new_tokens_per_segment.is_some(),
+                    self.supports_segmented_lyrics,
+                ),
+                (
+                    "audio.repetition_penalty",
+                    audio.repetition_penalty.is_some(),
+                    self.supports_repetition_penalty,
+                ),
+                (
+                    "audio.reference_region",
+                    audio.reference_region.is_some(),
+                    self.supports_reference_region,
+                ),
+                (
+                    "audio.output_limiter",
+                    audio.output_limiter.is_some(),
+                    self.supports_output_limiter,
+                ),
+                (
+                    "audio.song",
+                    audio.song.is_some(),
+                    self.supports_symbolic_song,
+                ),
+                (
+                    "audio.artifacts",
+                    audio.artifacts.is_some(),
+                    self.supports_audio_artifacts,
+                ),
+                (
+                    "audio.song.plan_only",
+                    audio.song.as_ref().is_some_and(|s| s.plan_only),
+                    self.supports_song_plan_only,
+                ),
+                (
+                    "audio.song.cover",
+                    audio.song.as_ref().is_some_and(|s| s.cover.is_some()),
+                    self.supports_song_cover,
+                ),
+            ];
+            for (field, present, supported) in gated {
+                if present && !supported {
+                    return Err(Error::Unsupported(format!(
+                        "{id}: {field} is not supported"
+                    )));
+                }
+            }
+            // An artifacts-only render publishes its result and returns nothing else: without a
+            // record to publish into, the plan would be computed and lost (sc-22988).
+            if audio.song.as_ref().is_some_and(|s| s.plan_only) && audio.artifacts.is_none() {
+                return Err(Error::Msg(format!(
+                    "{id}: audio.song.plan_only requires audio.artifacts (the plan is published \
+                     there; nothing else is returned)"
+                )));
             }
         }
         if check_size
@@ -3515,6 +4225,116 @@ impl Capabilities {
 
 #[cfg(test)]
 mod tests {
+
+    /// `default_seed()` never hands out the same value twice in one process, even when calls land
+    /// in one clock tick, and never hands out the zero sentinel (sc-24114). Back to back the values
+    /// are strictly increasing; across threads they are pairwise distinct.
+    ///
+    /// *Mutation that reds this:* returning the bare clock reading (the pre-sc-24114 body): the
+    /// tight loop below draws duplicates on any platform whose clock is coarser than the loop.
+    #[test]
+    fn default_seed_is_nonzero_and_never_repeats_in_process() {
+        use std::collections::HashSet;
+
+        let burst: Vec<u64> = (0..10_000).map(|_| super::default_seed()).collect();
+        assert!(burst.iter().all(|seed| *seed != 0));
+        assert!(
+            burst.windows(2).all(|pair| pair[1] > pair[0]),
+            "consecutive default seeds must be strictly increasing"
+        );
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..2_000)
+                        .map(|_| super::default_seed())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u64> = burst;
+        for handle in handles {
+            all.extend(handle.join().unwrap());
+        }
+        let distinct: HashSet<u64> = all.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "a default seed was handed out twice"
+        );
+        // Deliberately no wall-clock assertion here (the clock ratchet): that the value lands
+        // back on the clock once it moves past the last seed follows from `max(now, last + 1)`.
+    }
+
+    /// `image_reference_count()` must price a **transparent** reference exactly like an opaque one
+    /// (sc-24111).
+    ///
+    /// This is not cosmetic arithmetic. `memory_reference_count()` delegates here, and both
+    /// providers' request scopes refuse a request whose `memory_reference_count()` differs from
+    /// the admitted `MemoryGeometry::reference_count`. A `ReferenceRgba` scored as zero is
+    /// therefore admitted at `reference_count = 1` and then **refused at execution**
+    /// ("references=0 does not fit admitted … references=1"), or priced with zero reference
+    /// tokens — the exact admission/execution disagreement the doc comment on
+    /// `memory_reference_count` says must be impossible by construction.
+    #[test]
+    fn a_transparent_reference_is_priced_like_an_opaque_one() {
+        fn rgb() -> Image {
+            Image {
+                width: 8,
+                height: 8,
+                pixels: vec![0; 8 * 8 * 3],
+            }
+        }
+        fn rgba() -> RgbaImage {
+            RgbaImage {
+                width: 8,
+                height: 8,
+                pixels: vec![0; 8 * 8 * 4],
+            }
+        }
+
+        let lone = GenerationRequest {
+            conditioning: vec![Conditioning::ReferenceRgba {
+                image: rgba(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            lone.image_reference_count(),
+            1,
+            "a lone transparent reference is one image reference"
+        );
+        assert_eq!(
+            lone.memory_reference_count(),
+            1,
+            "the execution-side count must agree with admission"
+        );
+
+        let mixed = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: rgb(),
+                    strength: None,
+                },
+                Conditioning::ReferenceRgba {
+                    image: rgba(),
+                    strength: None,
+                },
+                Conditioning::MultiReference {
+                    images: vec![rgb()],
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            mixed.image_reference_count(),
+            3,
+            "RGB and RGBA references share one ordered list and are priced alike"
+        );
+        assert_eq!(mixed.memory_reference_count(), 3);
+    }
+
     use super::*;
     use crate::execution_domains::{CfgBatchingDomain, ExecutionValueDomain};
 
@@ -5124,6 +5944,253 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_song_sampling_is_named_by_the_float_floor() {
+        // sc-22994: the symbolic-song sampling floats are classified by the same non-finite floor
+        // as every other request float, and the reported name says which phase and field.
+        type Set = fn(&mut TokenSampling, f64);
+        let fields: [(&str, Set); 3] = [
+            ("temperature", |s, v| s.temperature = Some(v)),
+            ("top_p", |s, v| s.top_p = Some(v)),
+            ("repetition_penalty", |s, v| s.repetition_penalty = Some(v)),
+        ];
+        for semantic in [false, true] {
+            for (field, set) in fields {
+                for bad in [f64::NAN, f64::INFINITY] {
+                    let mut sampling = TokenSampling::default();
+                    set(&mut sampling, bad);
+                    let song = if semantic {
+                        SongParams {
+                            semantic_sampling: Some(sampling),
+                            ..Default::default()
+                        }
+                    } else {
+                        SongParams {
+                            score_sampling: Some(sampling),
+                            ..Default::default()
+                        }
+                    };
+                    let req = GenerationRequest {
+                        audio: Some(AudioParams {
+                            song: Some(song),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    let phase = if semantic { "semantic" } else { "score" };
+                    let (name, _) = req.first_nonfinite_float().expect("non-finite is caught");
+                    assert_eq!(name, format!("audio.song.{phase}_sampling.{field}"));
+                }
+            }
+        }
+        let finite = GenerationRequest {
+            audio: Some(AudioParams {
+                song: Some(SongParams {
+                    score_sampling: Some(TokenSampling {
+                        temperature: Some(0.7),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(finite.first_nonfinite_float(), None);
+    }
+
+    #[test]
+    fn segmented_song_controls_are_refused_unless_advertised() {
+        // sc-19382: each field is a typed capability gap on a model that does not read it, and
+        // passes once its own flag is advertised.
+        type Set = fn(&mut AudioParams);
+        type Flag = fn(&mut Capabilities);
+        let cases: [(&str, Set, Flag); 7] = [
+            (
+                "segments",
+                |a| a.segments = Some(3),
+                |c| c.supports_segmented_lyrics = true,
+            ),
+            (
+                "max_new_tokens_per_segment",
+                |a| a.max_new_tokens_per_segment = Some(100),
+                |c| c.supports_segmented_lyrics = true,
+            ),
+            (
+                "repetition_penalty",
+                |a| a.repetition_penalty = Some(1.1),
+                |c| c.supports_repetition_penalty = true,
+            ),
+            (
+                "reference_region",
+                |a| {
+                    a.reference_region = Some(TimeRegion {
+                        start_secs: 0.0,
+                        end_secs: Some(10.0),
+                    })
+                },
+                |c| c.supports_reference_region = true,
+            ),
+            (
+                "output_limiter",
+                |a| a.output_limiter = Some(OutputLimiter::Rescale),
+                |c| c.supports_output_limiter = true,
+            ),
+            (
+                "song",
+                |a| {
+                    a.song = Some(SongParams {
+                        planning: Some(SongPlanning::Melody),
+                        ..Default::default()
+                    })
+                },
+                |c| c.supports_symbolic_song = true,
+            ),
+            (
+                "artifacts",
+                |a| {
+                    a.artifacts = Some(AudioArtifacts {
+                        dir: "run".into(),
+                        resume: false,
+                    })
+                },
+                |c| c.supports_audio_artifacts = true,
+            ),
+        ];
+        for (name, set, flag) in cases {
+            let mut req = audio_req();
+            set(req.audio.as_mut().unwrap());
+            let mut c = Capabilities {
+                audio_voices: vec!["nova"],
+                audio_languages: vec!["en"],
+                audio_sample_rates: vec![24_000],
+                max_count: 1,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    c.validate_request_audio("tts", &req),
+                    Err(Error::Unsupported(_))
+                ),
+                "{name} must be refused when not advertised"
+            );
+            flag(&mut c);
+            assert!(
+                c.validate_request_audio("tts", &req).is_ok(),
+                "{name} must pass when advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_only_and_cover_are_gated_and_plan_only_needs_artifacts() {
+        // sc-22988: each is a typed capability gap unless its own flag is advertised; a plan-only
+        // request without a record to publish into is a malformed request, not a capability gap.
+        let symbolic = || Capabilities {
+            audio_sample_rates: vec![48_000],
+            max_count: 1,
+            supports_symbolic_song: true,
+            supports_audio_artifacts: true,
+            ..Default::default()
+        };
+        let req = |song: SongParams, artifacts: bool| GenerationRequest {
+            prompt: "a song".into(),
+            audio: Some(AudioParams {
+                song: Some(song),
+                artifacts: artifacts.then(|| AudioArtifacts {
+                    dir: "run".into(),
+                    resume: false,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan_only = SongParams {
+            plan_only: true,
+            ..Default::default()
+        };
+        let cover = SongParams {
+            cover: Some(SongCover {
+                mode: SongCoverMode::Melody,
+                score: "X:1".into(),
+                keep: None,
+                translated_from: None,
+            }),
+            ..Default::default()
+        };
+        let mut caps = symbolic();
+        for (name, song) in [("plan_only", &plan_only), ("cover", &cover)] {
+            let got = caps.validate_request_audio("song", &req(song.clone(), true));
+            assert!(
+                matches!(&got, Err(Error::Unsupported(m)) if m.contains(name)),
+                "{name} must be refused when not advertised: {got:?}"
+            );
+        }
+        caps.supports_song_plan_only = true;
+        caps.supports_song_cover = true;
+        caps.validate_request_audio("song", &req(plan_only.clone(), true))
+            .unwrap();
+        caps.validate_request_audio("song", &req(cover, false))
+            .unwrap();
+        let orphan = caps.validate_request_audio("song", &req(plan_only, false));
+        assert!(
+            matches!(&orphan, Err(Error::Msg(m)) if m.contains("requires audio.artifacts")),
+            "{orphan:?}"
+        );
+    }
+
+    #[test]
+    fn generate_with_report_defaults_to_the_bare_output() {
+        // sc-22988: the additive entry point wraps `generate` for every provider that does not
+        // override it — no record, no warnings, the same output.
+        struct Plain(ModelDescriptor);
+        impl Generator for Plain {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.0
+            }
+            fn validate(&self, _req: &GenerationRequest) -> Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _req: &GenerationRequest,
+                on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<GenerationOutput> {
+                on_progress(Progress::Decoding);
+                Ok(GenerationOutput::Audio(AudioTrack {
+                    samples: vec![0.25, -0.25],
+                    sample_rate: 48_000,
+                    channels: 2,
+                    stems: Vec::new(),
+                }))
+            }
+        }
+        let generator = Plain(ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "plain",
+            family: "test",
+            backend: "candle",
+            modality: Modality::Audio,
+            capabilities: Capabilities {
+                max_count: 1,
+                ..Default::default()
+            },
+        });
+        let mut progress = Vec::new();
+        let report = generator
+            .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))
+            .unwrap();
+        assert_eq!(progress, [Progress::Decoding], "progress is forwarded");
+        assert!(report.artifacts.is_none() && report.warnings.is_empty());
+        match report.output {
+            Some(GenerationOutput::Audio(track)) => assert_eq!(track.samples, [0.25, -0.25]),
+            other => panic!("expected the generated audio, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn conversation_history_gating_is_additive_and_typed() {
         // sc-14150: a ConversationHistory is a capability gap on a non-conversational model, gated by
         // supports_conversation_history (+ the conditioning allowlist); when supported the shape must
@@ -6426,5 +7493,65 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ok.first_nonfinite_float(), None);
+    }
+
+    /// sc-23402 — the reference-image short edge is admitted over 1024..=2048 INCLUSIVE, and an
+    /// out-of-range value is refused rather than clamped.
+    ///
+    /// The two boundary pairs are the whole point: an exclusive upper bound, an off-by-one floor, or
+    /// a `clamp` in place of the refusal each flips exactly one of these four.
+    #[test]
+    fn reference_image_short_edge_admits_1024_through_2048_inclusive_and_refuses_outside() {
+        let with = |edge: Option<u32>| GenerationRequest {
+            reference_image_short_edge: edge,
+            ..Default::default()
+        };
+
+        validate_reference_image_short_edge("m", &with(Some(1024))).expect("1024 is admitted");
+        validate_reference_image_short_edge("m", &with(Some(2048))).expect("2048 is admitted");
+        validate_reference_image_short_edge("m", &with(None)).expect("an absent knob is vacuous");
+
+        for bad in [0, 1, 1023, 2049, u32::MAX] {
+            let message = validate_reference_image_short_edge("m", &with(Some(bad)))
+                .expect_err("out of range is refused, never clamped")
+                .to_string();
+            assert!(
+                message.contains("reference_image_short_edge")
+                    && message.contains(&bad.to_string())
+                    && message.contains("1024..=2048"),
+                "the refusal must name the field, the value and the range, got: {message}"
+            );
+        }
+    }
+
+    /// The effective value is the request's, or upstream's 2048 when absent — the one resolver the
+    /// engine applies and the consumer records, so a recipe cannot drift from the render.
+    #[test]
+    fn effective_reference_image_short_edge_defaults_to_upstreams_2048() {
+        let default_request = GenerationRequest::default();
+        assert_eq!(default_request.reference_image_short_edge, None);
+        assert_eq!(
+            effective_reference_image_short_edge(&default_request),
+            REFERENCE_IMAGE_SHORT_EDGE_DEFAULT
+        );
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, 2048);
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_MAX, 2048);
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_MIN, 1024);
+
+        for asked in [
+            REFERENCE_IMAGE_SHORT_EDGE_MIN,
+            1536,
+            REFERENCE_IMAGE_SHORT_EDGE_MAX,
+        ] {
+            let req = GenerationRequest {
+                reference_image_short_edge: Some(asked),
+                ..Default::default()
+            };
+            assert_eq!(
+                effective_reference_image_short_edge(&req),
+                asked,
+                "the resolver must return the REQUESTED value, not a constant"
+            );
+        }
     }
 }

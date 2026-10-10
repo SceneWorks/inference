@@ -82,19 +82,50 @@ pub struct VideoRef {
 }
 
 impl VideoRef {
-    /// Construct, validating that there is exactly one timestamp per frame and at least one frame.
+    /// Construct a video with complete, finite, non-negative, ordered temporal metadata.
     pub fn new(frames: Vec<ImageRef>, timestamps: Vec<f32>) -> Result<Self, String> {
-        if frames.is_empty() {
+        let video = Self { frames, timestamps };
+        video.validate()?;
+        Ok(video)
+    }
+
+    /// Validate public fields before prompt rendering or visual preprocessing.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.frames.is_empty() {
             return Err("VideoRef: needs at least one frame".to_string());
         }
-        if frames.len() != timestamps.len() {
+        if self.frames.len() != self.timestamps.len() {
             return Err(format!(
                 "VideoRef: {} frames but {} timestamps (need one timestamp per frame)",
-                frames.len(),
-                timestamps.len()
+                self.frames.len(),
+                self.timestamps.len()
             ));
         }
-        Ok(Self { frames, timestamps })
+        if let Some((index, value)) = self
+            .timestamps
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "VideoRef: timestamp {index} must be finite and non-negative, got {value}"
+            ));
+        }
+        if let Some((index, pair)) = self
+            .timestamps
+            .windows(2)
+            .enumerate()
+            .find(|(_, pair)| pair[1] < pair[0])
+        {
+            return Err(format!(
+                "VideoRef: timestamps must preserve sampled-frame order: index {} is {} after {}",
+                index + 1,
+                pair[1],
+                pair[0]
+            ));
+        }
+        Ok(())
     }
 
     /// The number of sampled frames.
@@ -307,6 +338,22 @@ mod tests {
         assert!(VideoRef::new(vec![frame.clone()], vec![0.0, 0.5]).is_err());
         // No frames: err.
         assert!(VideoRef::new(vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn video_rejects_invalid_temporal_metadata() {
+        let frame = ImageRef::new(1, 1, vec![0u8; 3]).unwrap();
+        for timestamps in [vec![0.0, f32::NAN], vec![-0.1, 0.0], vec![0.5, 0.25]] {
+            assert!(
+                VideoRef::new(vec![frame.clone(), frame.clone()], timestamps).is_err(),
+                "invalid timestamps must fail at the contract boundary"
+            );
+        }
+        let invalid_public = VideoRef {
+            frames: vec![frame.clone(), frame],
+            timestamps: vec![0.5, 0.25],
+        };
+        assert!(invalid_public.validate().is_err());
     }
 
     #[test]
