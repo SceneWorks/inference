@@ -13,6 +13,7 @@
 //!   residual streams stay f32 where upstream's do and the PiT pixel stream stays in the compute
 //!   dtype where upstream's does.
 
+use mlx_gen::gen_core::iris;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
@@ -100,9 +101,11 @@ impl RmsNorm {
     }
 }
 
-/// `x · (1 + scale) + shift`.
+/// `x · (1 + scale) + shift`. The `1` is created in `scale`'s dtype — torch's weak Python scalar —
+/// so a bf16 stream stays bf16 (an f32 `Array` scalar would promote it).
 pub fn modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array> {
-    Ok(x.multiply(&scale.add(Array::from_f32(1.0))?)?.add(shift)?)
+    let one = Array::from_f32(1.0).as_dtype(scale.dtype())?;
+    Ok(x.multiply(&scale.add(&one)?)?.add(shift)?)
 }
 
 /// Split the last axis into `n` equal chunks (`tensor.chunk(n, dim=-1)`).
@@ -132,38 +135,14 @@ impl Rope {
     /// `head_dim/4` frequencies, interleaved (x, y) per pair along the last axis, row-major grid,
     /// both axes at one step `scale / (max(h, w) − 1)`.
     pub fn grid_2d(head_dim: usize, height: usize, width: usize, theta: f32, scale: f32) -> Self {
-        let n_pairs = head_dim / 4;
-        let freqs: Vec<f32> = (0..n_pairs)
-            .map(|j| 1.0 / theta.powf((4 * j) as f32 / head_dim as f32))
-            .collect();
-        let step = scale / ((height.max(width) as f32) - 1.0).max(1.0);
-        let mut angles = Vec::with_capacity(height * width * 2 * n_pairs);
-        for r in 0..height {
-            let y = r as f32 * step;
-            for c in 0..width {
-                let x = c as f32 * step;
-                for f in &freqs {
-                    angles.push(x * f);
-                    angles.push(y * f);
-                }
-            }
-        }
-        Self::from_angles(&angles, height * width, 2 * n_pairs)
+        let angles = iris::rope_2d_angles(head_dim, height, width, theta, scale);
+        Self::from_angles(&angles, height * width, 2 * (head_dim / 4))
     }
 
     /// `rope_1d(head_dim, length, theta)`: standard 1-D RoPE over integer positions.
     pub fn line_1d(head_dim: usize, length: usize, theta: f32) -> Self {
-        let pairs = head_dim / 2;
-        let freqs: Vec<f32> = (0..pairs)
-            .map(|j| 1.0 / theta.powf((2 * j) as f32 / head_dim as f32))
-            .collect();
-        let mut angles = Vec::with_capacity(length * pairs);
-        for p in 0..length {
-            for f in &freqs {
-                angles.push(p as f32 * f);
-            }
-        }
-        Self::from_angles(&angles, length, pairs)
+        let angles = iris::rope_1d_angles(head_dim, length, theta);
+        Self::from_angles(&angles, length, head_dim / 2)
     }
 
     /// Rotate `x` `[B, N, H, head_dim]` by complex multiplication over **adjacent** channel pairs
@@ -215,18 +194,8 @@ pub fn attention(
 
 /// `TransformerTextEmbedder`'s key mask: real keys OR the diagonal, additive `[B, 1, T, T]`.
 pub fn key_padding_mask(mask: &[Vec<i32>], tokens: usize) -> Array {
-    let b = mask.len();
-    let mut data = vec![0f32; b * tokens * tokens];
-    for (bi, row) in mask.iter().enumerate() {
-        for i in 0..tokens {
-            for j in 0..tokens {
-                if row[j] == 0 && i != j {
-                    data[(bi * tokens + i) * tokens + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-    Array::from_slice(&data, &[b as i32, 1, tokens as i32, tokens as i32])
+    let data = iris::key_padding_additive(mask, tokens);
+    Array::from_slice(&data, &[mask.len() as i32, 1, tokens as i32, tokens as i32])
 }
 
 /// Concatenate along `axis`.
@@ -243,4 +212,24 @@ pub fn expect_shape(name: &str, a: &Array, want: &[i32]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream's `x * (1 + scale) + shift` keeps a bf16 stream bf16 (the Python `1` is a weak
+    /// scalar); the `1` here must not promote the PiT stream to f32 either.
+    #[test]
+    fn modulate_keeps_a_bf16_stream_in_bf16() {
+        let bf16 = |v: &[f32]| {
+            Array::from_slice(v, &[1, v.len() as i32])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let out = modulate(&bf16(&[1.0, 2.0]), &bf16(&[0.5, 0.5]), &bf16(&[1.0, -1.0])).unwrap();
+        assert_eq!(out.dtype(), Dtype::Bfloat16);
+        let got: Vec<f32> = out.as_dtype(Dtype::Float32).unwrap().as_slice().to_vec();
+        assert_eq!(got, vec![2.5, 0.5]);
+    }
 }

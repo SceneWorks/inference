@@ -876,10 +876,15 @@ mod preview_advertising {
     ///
     /// `iris_3b` (sc-25680) is deferred, **not** a no-go: Iris denoises in pixel space, so the
     /// running solver state already is an RGB image and no latent fit is needed at all. Neither
-    /// backend wires it yet — the MLX twin (sc-25679) advertises `supports_preview: false` too — so
-    /// the preview surface is an epic-level decision (sc-25678), taken once for both backends.
+    /// backend wires it yet — the MLX twin (sc-25679) advertises `supports_preview: false` too.
+    /// S3 (sc-25681) is the story that wires previews for both backends at once.
     const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] =
-        &[("qwen_image_2_1", "sc-24111"), ("iris_3b", "sc-25678")];
+        &[("qwen_image_2_1", "sc-24111"), ("iris_3b", "sc-25681")];
+
+    /// The epics that own the deferred routes above. An epic is a container, not the unit of work
+    /// that wires a preview, so a deferred route that names one of these instead of a story has
+    /// not actually recorded who wires it.
+    const PREVIEW_DEFERRED_ROUTE_EPICS: &[&str] = &["sc-24107", "sc-25678"];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -4089,6 +4094,10 @@ mod preview_advertising {
                 story.starts_with("sc-") && story.len() > 3,
                 "{id} is deferred rather than rejected, so it must name the story that wires it — \
                  got {story:?}"
+            );
+            assert!(
+                !PREVIEW_DEFERRED_ROUTE_EPICS.contains(story),
+                "{id} names {story}, which is an epic, not the story that wires the preview"
             );
         }
 

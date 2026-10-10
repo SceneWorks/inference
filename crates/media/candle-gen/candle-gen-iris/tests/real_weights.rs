@@ -4,8 +4,11 @@
 //!
 //! * `IRIS_WEIGHTS_DIR` — the `speridlabs/iris-3b` snapshot root (generation backbone).
 //! * `IRIS_TEXT_ENCODER_DIR` — the `Qwen/Qwen3-VL-4B-Instruct` snapshot.
-//! * `IRIS_REAL_GOLDEN` — the machine-local upstream reference from
-//!   `crates/media/mlx-gen/tools/dump_iris_realweight.py` (parity tests only; never committed).
+//!
+//! The upstream reference for the parity tests is COMMITTED: the MLX twin's
+//! `tests/fixtures/iris_real_golden_256.safetensors` (~4.4 MB), the compact form
+//! `crates/media/mlx-gen/tools/dump_iris_realweight.py` writes beside its machine-local full golden —
+//! so the CUDA dispatch lane needs no machine-local file and no network at test time.
 //! * `IRIS_OUT` — a directory the provider render writes its PNG into.
 //! * `IRIS_SIZE` (default 1024) / `IRIS_STEPS` (default: the release's 100) — the render geometry.
 //! * `IRIS_VRAM_PROBE=1` — sample device VRAM with `nvidia-smi` across load and generate.
@@ -28,7 +31,7 @@ use candle_gen_iris::{
     denoise, encode, load_backbone, Conditioning, IrisTextEncoder, TextBatch, TextConditioning,
 };
 
-use crate::common::{assert_close, errors, fixture_at, fixtures, host_i32};
+use crate::common::{assert_close, errors, fixture, fixtures, host_i32, Fixture};
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -42,6 +45,34 @@ fn env_u32(name: &str, default: u32) -> u32 {
                 .unwrap_or_else(|_| panic!("{name}={s} is not a number"))
         })
         .unwrap_or(default)
+}
+
+/// The committed real-weight golden with its conditioning re-expanded to the full window: the
+/// compact file keeps only the real (mask = 1) rows, in bf16 — lossless, because the release tower
+/// computes in bf16 and the pad rows are zero (both asserted by the producer) — so zero-padding the
+/// rows back and widening to f32 restores exactly the tensors upstream returned.
+fn real_golden() -> Fixture {
+    let mut golden = fixture("iris_real_golden_256.safetensors");
+    for key in ["cond", "null"] {
+        let mask = host_i32(golden.require(&format!("{key}/mask")));
+        let real = mask.iter().filter(|m| **m == 1).count();
+        assert!(
+            mask[..real].iter().all(|m| *m == 1),
+            "{key}/mask must be a prefix of real rows"
+        );
+        let rows = golden
+            .require(&format!("{key}/embeddings"))
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_eq!(
+            rows.dim(0).unwrap(),
+            real,
+            "{key}: committed rows = real tokens"
+        );
+        let full = rows.pad_with_zeros(0, 0, mask.len() - real).unwrap();
+        golden.tensors.insert(format!("{key}/embeddings"), full);
+    }
+    golden
 }
 
 /// The pinned tokenizer reproduces upstream's separately-tokenized prefix / caption / suffix ids
@@ -88,16 +119,16 @@ fn real_tokenizer_matches_the_pinned_ids() {
     }
 }
 
-/// Real weights vs the upstream CPU reference (`tools/dump_iris_realweight.py`, the MLX twin's
-/// `IRIS_REAL_GOLDEN`) on the build's device: the 12-layer conditioning (prompt and CFG null) and
+/// Real weights vs the upstream CPU reference (`tools/dump_iris_realweight.py`, committed as
+/// [`real_golden`]) on the build's device: the 12-layer conditioning (prompt and CFG null) and
 /// one backbone + pixel-head forward at the release's bf16 policy (or FP32 with
 /// `IRIS_REAL_COMPUTE=fp32`). The bf16 bound is upstream's OWN bf16-autocast distance from its FP32
 /// forward on the same inputs (the MLX twin's measured mean 3.7e-3, max 0.118 of peak).
 #[test]
-#[ignore = "needs the real weights + IRIS_REAL_GOLDEN (tools/dump_iris_realweight.py)"]
+#[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR)"]
 fn real_conditioning_and_forward_match_upstream() {
     let backbone = env_dir("IRIS_WEIGHTS_DIR");
-    let golden = fixture_at(&env_dir("IRIS_REAL_GOLDEN"));
+    let golden = real_golden();
     let config = IrisConfig::from_dir(&backbone).unwrap();
     config.validate_supported().unwrap();
     let device = candle_gen::default_device().unwrap();
@@ -171,10 +202,10 @@ fn real_conditioning_and_forward_match_upstream() {
 /// generate from the oracle's noise — isolating the backbone + pixel head + solver from bf16
 /// rounding. The MLX twin's bounds.
 #[test]
-#[ignore = "needs the real weights + IRIS_REAL_GOLDEN (tools/dump_iris_realweight.py)"]
+#[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR)"]
 fn real_backbone_matches_upstream_in_fp32_on_cpu() {
     let backbone = env_dir("IRIS_WEIGHTS_DIR");
-    let golden = fixture_at(&env_dir("IRIS_REAL_GOLDEN"));
+    let golden = real_golden();
     let config = IrisConfig::from_dir(&backbone).unwrap();
     let cpu = Device::Cpu;
     let dit = load_backbone(&backbone, &config, DType::F32, &cpu).unwrap();
