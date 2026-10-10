@@ -3892,7 +3892,13 @@ mod integration_tests {
                         images.len()
                     )))
                 }
-                GenerationOutput::Video { .. } | GenerationOutput::Audio(_) => {
+                // `ImagesRgba` is unreachable here — this harness never sets
+                // `output_channels: Rgba`, and lens does not advertise `supports_alpha_output`,
+                // so the shared floor would refuse it (sc-24111). Named rather than wildcarded so
+                // a future output variant still breaks this match.
+                GenerationOutput::ImagesRgba(_)
+                | GenerationOutput::Video { .. }
+                | GenerationOutput::Audio(_) => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };

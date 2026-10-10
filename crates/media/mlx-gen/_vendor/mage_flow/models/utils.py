@@ -1,6 +1,6 @@
-import json
 import math
 import os
+import pickle
 
 import torch
 from einops import rearrange
@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 from safetensors.torch import load_file as load_sft
 from torch import Tensor
 
+from ..checkpoint_paths import validate_checkpoint_index
 from .mage_flow import MageFlow, MageFlowParams
 
 
@@ -89,22 +90,10 @@ def correct_model_weight(state_dict):
 
 def load_hf_style_weight(pretrain_path, device):
     index_path = os.path.join(pretrain_path, "diffusion_pytorch_model.safetensors.index.json")
-
-    with open(index_path) as f:
-        index = json.load(f)
-
-    weight_map = index["weight_map"]
-
     sd = {}
-    loaded_shards = set()
-
-    for shard_file in weight_map.values():
-        if shard_file in loaded_shards:
-            continue
-        shard_path = os.path.join(pretrain_path, shard_file)
-        shard_sd = load_file(shard_path, device="cpu")
+    for shard_path in validate_checkpoint_index(index_path):
+        shard_sd = load_file(str(shard_path), device="cpu")
         sd.update(shard_sd)
-        loaded_shards.add(shard_file)
 
     return sd
 
@@ -118,7 +107,12 @@ def load_model_weight(model, pretrain_path, device="cpu"):
             elif os.path.exists(os.path.join(pretrain_path, "diffusion_pytorch_model.safetensors.index.json")):
                 sd = load_hf_style_weight(pretrain_path, device)
             else:
-                sd = torch.load(pretrain_path, map_location="cpu")
+                try:
+                    sd = torch.load(pretrain_path, map_location="cpu", weights_only=True)
+                except pickle.UnpicklingError as exc:
+                    raise ValueError(
+                        f"{pretrain_path}: unsupported checkpoint object; provide tensor-only weights"
+                    ) from exc
 
             sd = correct_model_weight(sd)
             sd = optionally_expand_state_dict(model, sd)

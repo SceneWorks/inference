@@ -1,17 +1,23 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
+import copy
 import functools
+import json
 import ntpath
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import tomllib
 import unittest
 
 import yaml
+
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
+from scripts.ci.real_weights_workflow import script_references as real_weights_script_references
 from pathlib import Path
 
 
@@ -51,6 +57,12 @@ WINDOWS_MAGE_LOCK = (
 )
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
+)
+# sc-19387: the dispatch-only YuE CUDA lane, in its own file because `real-weights.yml` is at
+# GitHub's 500 KB workflow-size limit, and the lock that decodes YuE's upstream ICL reference clip.
+YUE_WORKFLOW = WORKFLOW.with_name("real-weights-yue.yml")
+WINDOWS_YUE_LOCK = (
+    ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
 )
 MACOS_INTERPRETER = "python3.12"
 WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
@@ -206,7 +218,7 @@ def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
 
 
 def chroma_packed_build_script() -> str:
-    workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+    workflow = real_weights_inline_text()
     step = re.search(
         r"(?ms)^      - name: Build and validate packed q4/q8 tiers\n"
         r".*?^        run: \|\n(?P<script>.*?)^      - name:",
@@ -261,6 +273,43 @@ def evaluate_policy(
     if re.search(r"[A-Za-z_]\w*(?:\.\w+)+", rendered):
         raise AssertionError(f"unrecognized workflow context in policy: {rendered}")
     return bool(eval(rendered, {"__builtins__": {}}, {}))
+
+
+def qwen21_primary_concurrency_errors(workflow: dict) -> list[str]:
+    """Exercise the real group expression across both hosts and dispatch boundaries."""
+    concurrency = workflow["concurrency"]
+    errors = []
+    if set(concurrency) != {"group", "cancel-in-progress"}:
+        errors.append("concurrency must retain only group and cancel-in-progress")
+    if concurrency.get("cancel-in-progress") is not False:
+        errors.append("running primary dispatches must never cancel one another")
+    expression = concurrency["group"].removeprefix("${{").removesuffix("}}").strip()
+    profiles = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+    for event in ("workflow_dispatch", "schedule", "push", "pull_request", "workflow_call", "merge_group"):
+        for profile in [*profiles, "", "qwen-image-2-1-lora-mlx-extra"]:
+            for runner in ("rw-starvector", "rw-mage", "nax", "real-weights", "", "rw-starvector-extra"):
+                primary = event == "workflow_dispatch" and profile == "qwen-image-2-1-lora-mlx" and runner == "rw-starvector"
+                expected = "inference-real-weights-qwen21-primary-mac" if primary else "inference-real-weights-physical-host"
+                # Separate runs, revisions and phases on the primary must all share one group.
+                variants = (("1", "a" * 40, "probe"), ("2", "b" * 40, "edit"),
+                            ("3", "c" * 40, "imports"), ("4", "d" * 40, "full"),
+                            ("5", "e" * 40, "diagnostic"), ("6", "f" * 40, "q4-numeric")) if primary else (("1", "a" * 40, "probe"),)
+                for run_id, sha, phase in variants:
+                    values = {"github.event_name": event, "inputs.profile": profile,
+                              "inputs.qwen_image_2_1_lora_runner": runner,
+                              "inputs.qwen_image_2_1_lora_phase": phase,
+                              "github.run_id": run_id, "github.sha": sha}
+                    rendered = expression
+                    for name in sorted(values, key=len, reverse=True):
+                        rendered = rendered.replace(name, repr(values[name]))
+                    rendered = rendered.replace("&&", " and ").replace("||", " or ")
+                    try:
+                        actual = eval(f"({rendered})", {"__builtins__": {}}, {})
+                    except (NameError, SyntaxError, AttributeError) as error:
+                        return [*errors, f"unsupported group expression: {error}"]
+                    if actual != expected:
+                        return [*errors, f"wrong group for {event}/{profile}/{runner}/{phase}/{run_id}: {actual!r}"]
+    return errors
 
 
 def workflow_job_bodies(workflow: str) -> dict[str, list[str]]:
@@ -338,6 +387,37 @@ def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
         source = models.get(f"minimax-h3-mlx-{tier}", {})
         if source.get("revision") != "137ce668c55a20bc0935fd1cf2a3de8448abb7f4":
             errors.append(f"minimax-h3-mlx-{tier}: does not match the provider's built-in revision")
+    return errors
+
+
+GIT_BASH_BIN = "C:\\Program Files\\Git\\bin"
+
+
+def windows_bash_selection_errors(name: str, job: dict) -> list[str]:
+    """On a self-hosted Windows runner a bare `bash` resolves to WSL's
+    `C:\\Windows\\System32\\bash.exe`, which has no distribution there and fails every step
+    (sc-24446: `execvpe(/bin/bash) failed`). Every step that runs bash — `shell: bash`, or
+    `dtolnay/rust-toolchain`, whose steps are `shell: bash` — must come after the step that checks
+    for Git Bash and puts it first on `GITHUB_PATH`."""
+    if "self-hosted" not in job.get("runs-on", []) or "windows" not in [
+        str(label).lower() for label in job.get("runs-on", [])
+    ]:
+        return []
+    selected = False
+    errors = []
+    for step in job.get("steps", []):
+        run = str(step.get("run", ""))
+        if f'"{GIT_BASH_BIN}\\bash.exe"' in run and f'{GIT_BASH_BIN}>>"%GITHUB_PATH%"' in run:
+            selected = True
+            continue
+        runs_bash = step.get("shell") == "bash" or str(step.get("uses", "")).startswith(
+            "dtolnay/rust-toolchain@"
+        )
+        if runs_bash and not selected:
+            errors.append(
+                f"{name}: `{step.get('name') or step.get('uses')}` runs bash before Git Bash is "
+                "selected (a bare `bash` is WSL's on the Windows runners)"
+            )
     return errors
 
 
@@ -483,8 +563,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     ``windows_reviewed_interpreter_exemption_errors`` rather than skipped outright.
     """
     errors: list[str] = []
+    powershell_interpreter = r"$env:REVIEWED_PYTHON"
     interpreter = re.compile(
-        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        rf"({re.escape(WINDOWS_INTERPRETER)}|{re.escape(powershell_interpreter)}|"
         r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
         r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
         re.IGNORECASE,
@@ -574,14 +655,16 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
             looks_like_python_command = bool(
                 re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
             )
-            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+            if looks_like_python_command and not any(
+                reviewed in command for reviewed in (WINDOWS_INTERPRETER, powershell_interpreter)
+            ):
                 errors.append(
                     f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
                     f"{command.strip()!r}"
                 )
             for found in found_interpreters:
                 name = found.group(1)
-                if name != WINDOWS_INTERPRETER:
+                if name not in (WINDOWS_INTERPRETER, powershell_interpreter):
                     errors.append(
                         f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
                         f"{name!r} in {command.strip()!r}"
@@ -696,7 +779,8 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 35 since SC-22261 added the StarVector terminal MLX lane;
+        # 36 since sc-24163 added the `mlx-qwen-image-2-1` job;
+        # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -705,10 +789,11 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 35,
-        # 12 since SC-22261 added the StarVector terminal Candle lane;
+        MACOS_HUB_LOCK: 36,
+        # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
+        # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 12,
+        WINDOWS_HUB_LOCK: 13,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -990,15 +1075,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        # 35 / 12 after SC-22261 added the serialized StarVector terminal pair on top of
-        # sc-18932's `mlx-minimax-h3` and `candle-minimax-h3` materialization lanes. These counts
+        # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
+        # after sc-24114 added `candle-qwen-image-2-1`; 36 macOS after sc-24163 added
+        # `mlx-qwen-image-2-1`.
+        # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 12)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 36)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1007,7 +1094,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_decode_quality_candidates_stay_inside_family_geometry_domains(self) -> None:
-        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow_text = real_weights_inline_text()
         self.assertEqual(decode_quality_candidate_policy_errors(workflow_text), [])
         workflow = yaml.safe_load(workflow_text)
         jobs = workflow["jobs"]
@@ -1087,7 +1174,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(decode_quality_candidate_policy_errors(mutated))
 
     def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_macos_interpreter_errors(workflow), [])
         # The gate is worthless if it inspected nothing, and `count` alone would pass on a file
         # whose installs are all Windows. Pin both: the reviewed interpreter appears on every
@@ -1104,7 +1191,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
 
     def test_real_weight_windows_steps_name_reviewed_cpython_and_fail_fast(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
         windows_python_lines = [
             line
@@ -1209,7 +1296,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         mutated ONE AT A TIME: mutating them together would only prove the set is load-bearing,
         not that any individual member is.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
         bodies = workflow_job_bodies(workflow)
         for job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
@@ -1235,7 +1322,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     )
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         mutations = {
             "bare python3 installer": workflow.replace(
                 f"{MACOS_INTERPRETER} -m pip install", "python3 -m pip install", 1
@@ -1279,7 +1366,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         canonical_macos_install = (
             f"{MACOS_INTERPRETER} -m pip install --disable-pip-version-check "
             "--only-binary=:all: --require-hashes --target \"$PYTHONPATH\" "
@@ -1361,6 +1448,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             {"numpy", "safetensors"},
         )
+        validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_YUE_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            {"cffi", "numpy", "pycparser", "soundfile", "typing-extensions"},
+        )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
         self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
@@ -1439,7 +1532,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         transformer, so the workflow must expose no knob that could reintroduce a divergence,
         and must verify the published artifact declares exactly its tier's width.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         # No dispatch input or env var may select an auxiliary width or T5 geometry.
         for forbidden in (
             "chroma_t5_group_size:",
@@ -1463,7 +1556,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('if "residual_bits" in quantization:', workflow)
 
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
         # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
         # q4 Krea correctness projection and standalone Wan donor plus exact-file materialization.
@@ -1556,11 +1649,13 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("test_sa3_ci_target_coverage.py", workflow[start:run])
         self.assertIn("SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md", workflow[start:run])
 
-    def test_real_weight_workflows_share_one_physical_host_lock(self) -> None:
+    def test_real_weight_workflows_share_lock_except_explicit_qwen_primary_dispatch(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
         for path in (
-            REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
+            YUE_WORKFLOW,
         ):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
@@ -1569,6 +1664,128 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_qwen_primary_group_rejects_broader_or_nonserializing_mutations(self) -> None:
+        workflow = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(qwen21_primary_concurrency_errors(workflow), [])
+        expression = workflow["concurrency"]["group"]
+        mutations = {
+            "event guard omitted": expression.replace("github.event_name == 'workflow_dispatch' &&", ""),
+            "profile guard omitted": expression.replace("inputs.profile == 'qwen-image-2-1-lora-mlx' &&", ""),
+            "runner guard omitted": expression.replace("inputs.qwen_image_2_1_lora_runner == 'rw-starvector' &&", ""),
+            "secondary runner admitted": expression.replace("== 'rw-starvector'", "!= 'nax'"),
+            "all runs share global group": repr("inference-real-weights-physical-host"),
+            "group split per run": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.run_id"),
+            "group split per revision": expression.replace("'inference-real-weights-qwen21-primary-mac'", "github.sha"),
+            "group split per phase": expression.replace("'inference-real-weights-qwen21-primary-mac'", "inputs.qwen_image_2_1_lora_phase"),
+        }
+        for name, group in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(group, expression)
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"]["group"] = group
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
+        for name, changed in {"cancel active": {"cancel-in-progress": True},
+                              "change queue policy": {"queue": "max"}}.items():
+            with self.subTest(mutation=name):
+                mutated = copy.deepcopy(workflow)
+                mutated["concurrency"].update(changed)
+                self.assertTrue(qwen21_primary_concurrency_errors(mutated))
+
+    def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
+        installs = [
+            line.strip()
+            for line in YUE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
+        ]
+        locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
+        # YuE-v1: the hub fetch and the reference-clip decode; YuE2 (sc-22995): the hub fetch.
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK, WINDOWS_HUB_LOCK])
+        for line in installs:
+            with self.subTest(install=line):
+                self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
+                self.assertIn("--only-binary=:all: --require-hashes", line)
+                self.assertTrue(line.endswith("|| exit /b 1"))
+
+    def test_yue2_job_renders_through_the_registered_loader(self) -> None:
+        # sc-23002: the YuE2 job renders through the registry on its production device and replays
+        # the AR parity cases, sampled like the tier measurement, and keeps each summary line.
+        workflow = yaml.safe_load(YUE_WORKFLOW.read_text(encoding="utf-8"))
+        steps = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue2"]["steps"]}
+        build = steps["Build the YuE2 CUDA test binary"]
+        self.assertEqual(build["id"], "build-yue2")
+        self.assertIn(
+            "-p candle-audio-yue2 --features cuda --lib --test engine_real_weights --no-run",
+            build["run"],
+        )
+        render = steps["Render YuE2 through the registered loader and replay the AR parity cases"]
+        self.assertEqual(
+            render["if"], "${{ !cancelled() && steps.build-yue2.outcome == 'success' }}"
+        )
+        run = render["run"]
+        self.assertIn('set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"', run)
+        for command in (
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --test "
+            "engine_real_weights registered_loader_generates_a_song_with_every_artifact "
+            "-- --ignored --exact --nocapture",
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --lib "
+            "parity::real_weight_decodes_match_upstream -- --ignored --exact --nocapture",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(run.count(command), 1)
+        quality = steps["Measure the YuE2 tiers against the F32 reference"]["run"]
+        sampler = [line for line in quality.splitlines() if "nvidia-smi --query-gpu" in line]
+        self.assertEqual(len(sampler), 1)
+        self.assertIn(sampler[0], run)
+        # The summary prefix the steps scrape is the one the harnesses print.
+        evidence = (
+            YUE_WORKFLOW.parents[2] / "crates/audio/candle-audio-yue2/src/evidence.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('pub const SUMMARY_PREFIX: &str = "YUE2_EVIDENCE_SUMMARY ";', evidence)
+        for text in (quality, run):
+            self.assertIn('findstr /C:"YUE2_EVIDENCE_SUMMARY {"', text)
+        self.assertIn('findstr /C:"zh_full semantic:"', run)
+
+    def test_yue2_fp8_route_dispatch_runs_only_the_registered_case(self) -> None:
+        workflow = yaml.safe_load(YUE_WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIn("fp8-route", workflow[True]["workflow_dispatch"]["inputs"]["mode"]["options"])
+        self.assertEqual(
+            workflow["concurrency"]["group"], "inference-real-weights-physical-host"
+        )
+        v1 = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue"]["steps"]}
+        invalid = v1["Refuse YuE2-only mode on YuE-v1"]
+        self.assertEqual(invalid["if"], "inputs.mode == 'fp8-route'")
+        self.assertIn("exit /b 1", invalid["run"])
+
+        steps = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue2"]["steps"]}
+        for name in (
+            "Build the YuE2 CUDA test binary",
+            "Run the YuE2 CUDA lib tests",
+            "Measure the YuE2 tiers against the F32 reference",
+        ):
+            self.assertEqual(steps[name]["if"], "inputs.mode != 'fp8-route'", name)
+        self.assertIn(
+            "steps.build-yue2.outcome == 'success'",
+            steps["Render YuE2 through the registered loader and replay the AR parity cases"]["if"],
+        )
+        build = steps["Build the YuE2 FP8 registered-route test binary"]
+        self.assertEqual(build["id"], "build-yue2-fp8")
+        self.assertEqual(build["if"], "inputs.mode == 'fp8-route'")
+        self.assertIn("--features cuda --lib --no-run", build["run"])
+        route = steps["Prove the registered YuE2 FP8 route on CUDA"]
+        self.assertIn("inputs.mode == 'fp8-route'", route["if"])
+        self.assertIn("steps.build-yue2-fp8.outcome == 'success'", route["if"])
+        self.assertIn('set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"', route["run"])
+        self.assertIn(
+            "--lib provider::tests::registered_fp8_load_publishes_a_mode_bound_run "
+            "-- --ignored --exact --nocapture",
+            route["run"],
+        )
+        self.assertIn('findstr /C:"test result: ok. 1 passed; 0 failed; 0 ignored"', route["run"])
+        self.assertIn("git rev-parse HEAD", route["run"])
+        self.assertIn("nvidia-smi --query-gpu=", route["run"])
+        self.assertIn("exit /b 1", route["run"])
+        self.assertEqual(steps["Keep the YuE2 CUDA evidence"]["with"]["name"], "yue2-cuda-evidence")
 
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
@@ -1626,7 +1843,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("prepare_ltx25_quant_campaign.py promotion", promotion)
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
@@ -1770,6 +1987,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         for fingerprint_input in (
             ".github/workflows/real-weights.yml",
+            "scripts/ci/real-weights/mlx-media/**",
             "crates/media/mlx-gen/_vendor/mage_flow/**",
             "crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg",
             "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt",
@@ -2112,7 +2330,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         model["materialization_expected_files"], flux_materialization_files
                     )
 
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
 
         # Shape, not population. Two `count("--require-materialization-provenance") == 6` pins used
         # to stand here: a second lane for an already-covered model turned them RED for no reason,
@@ -2199,7 +2417,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Over CODE, not prose: `mlx-qwen-image`'s header comment has to name QWEN_IMAGE_SNAPSHOT to
         # explain why the MLX half was renamed off it. Same reason `workflow_code` exists for the
         # wiring gate — a comment can document a variable but can never wire one.
-        workflow = workflow_code(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = workflow_code(real_weights_inline_text())
         self.assertNotIn("residency-ab", workflow)
         self.assertNotIn("QWEN_IMAGE_SNAPSHOT", workflow)
 
@@ -2240,13 +2458,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Every workflow, not just the two that exist today: a lane added in a third file must
         # count as wiring, or this gate would start reporting phantom orphans.
         workflows = "\n".join(
-            path.read_text(encoding="utf-8")
+            real_weights_inline_text()
+            if path == REAL_WEIGHTS_WORKFLOW
+            else path.read_text(encoding="utf-8")
             for path in sorted(WORKFLOW.parent.glob("*.yml"))
         )
         self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
 
     def test_native_decode_seam_real_weight_gates_are_exact_and_golden_free(self) -> None:
-        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow_text = real_weights_inline_text()
         workflow = yaml.safe_load(workflow_text)
         cases = {
             "mlx-media": (
@@ -2406,9 +2626,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_memory_evidence_v1_lane_is_artifact_bound_tolerance_pinned_and_operator_dispatched(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  mlx-memory-evidence-v1:")
-        end = workflow.index("\n  mlx-llm:", start)
+        end = min(
+            workflow.index("\n  qwen38-bonsai-mlx:", start),
+            workflow.index("\n  mlx-llm:", start),
+        )
         job = workflow[start:end]
 
         self.assertIn("memory-evidence-v1", workflow.split("jobs:", 1)[0])
@@ -2429,7 +2652,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("ensure_model_snapshot.py", job)
         self.assertIn("SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance", job)
         self.assertIn("https://github.com/SceneWorks/SceneWorks.git", job)
-        self.assertIn('fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"', job)
+        self.assertIn(
+            "REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}", job
+        )
+        self.assertIn('fetch --depth=1 -- origin "$REQUESTED_SCENEWORKS_REVISION"', job)
         self.assertIn('git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD', job)
         self.assertIn('echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"', job)
         self.assertGreaterEqual(
@@ -2471,7 +2697,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
 
     def test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  candle-scail2-shared:")
         end = workflow.index("\n  candle-media:", start)
         job = workflow[start:end]
@@ -2610,7 +2836,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         NO `verify_residency_ab.py` pin here: no SANA verifier exists, and the adjudicated contract
         (sc-17863) is asserted INSIDE the tests, so the exit code is the verdict.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  mlx-sana-drift-ceiling:")
         end = workflow.index("\n  mlx-memory-evidence-v1:", start)
         job = workflow[start:end]
@@ -2672,7 +2898,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_krea_alternate_decoder_smoke_is_explicit_and_correctness_only(self) -> None:
         """SC-18315 keeps its model smoke distinct from memory/calibration capture."""
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         jobs = workflow_job_bodies(workflow)
         job = "\n".join(jobs["mlx-krea-alternate-decoder"])
         job_header = job.split("steps:", 1)[0]
@@ -2765,7 +2991,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         exactly the outcome whose measured cells someone needs to read, and re-running costs
         hours.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         # Bounded by the job map, not by the NAME OF THE NEXT JOB. The hard-coded
         # `candle-audio-kokoro` anchor this used to carry silently swallowed any job inserted
         # between the two, which is exactly what happened when sc-18932 added `mlx-minimax-h3`
@@ -2796,7 +3022,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # are false greens twice over: `assertIn("krea_s18_rows:", ...)` matches the key inside a
         # `#` comment, and `assertIn("default: ABCDFEZ", ...)` is unanchored, so swapping the two
         # defaults between the rows and seeds inputs still passed. Both were demonstrated.
-        inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
+        inputs = yaml.safe_load(real_weights_inline_text())[True][
             "workflow_dispatch"
         ]["inputs"]
         # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
@@ -2907,7 +3133,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         subsystem form returns nothing at all. A capture that silently matches nothing is worse than
         no capture, because an empty file reads as evidence of absence.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         bounds = {
             "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
             "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
@@ -3053,7 +3279,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         85-minute research sweep ended up inside a 20-minute regression lane. The run-count assertion
         is what makes the next such addition loud instead of silent.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("      - name: Run Krea Realtime real-weight e2e (Q4 tier)")
         step = workflow[
             start : workflow.index("      - name: Run Krea Realtime KV-cache residency", start)
@@ -3068,7 +3294,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
         """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         header = workflow.split("jobs:", 1)[0]
         job_start = workflow.index("  mlx-krea-realtime:")
         job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
@@ -3166,7 +3392,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         on a missing fixture should be wired the moment the fixture exists, and listing it here would
         create a second place to remember to unlist it. The manifest row carries the accounting.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
         # Slice to the NEXT job key at the same indentation, not to the next Qwen job — the last of
         # the three would otherwise swallow the rest of the file and read other lanes' commands.
@@ -3332,7 +3558,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         3. `--exact` after the `--`, one `set -o pipefail` per cargo step, and one run-count
            assertion per selection -- the sc-17250 false-green shape.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         repository = REAL_WEIGHTS_WORKFLOW.parents[2]
         # job -> the (source file, selected names) pairs it draws from. A job may select out of more
         # than ONE test binary: sc-17156 added the VRAM probe, which lives in its own `vram_probe.rs`
@@ -3591,7 +3817,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
 
     def test_minimax_h3_vram_campaign_policy_rejects_unsafe_staging_and_shared_processes(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         manifest = MODEL_MANIFEST.read_text(encoding="utf-8")
         self.assertEqual(minimax_h3_vram_policy_errors(workflow, manifest), [])
 
@@ -3643,6 +3869,87 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_windows_cuda_check_exercises_real_supervisor_without_gpu(self) -> None:
+        job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]
+        steps = job["steps"]
+        named = {step.get("name"): (index, step) for index, step in enumerate(steps)}
+        setup_index, setup = named["Install pinned uv for Windows supervisor smoke"]
+        install_index, install = named["Install reviewed CPython 3.12 for Windows supervisor smoke"]
+        smoke_index, smoke = named["Exercise Windows media supervisor process tree (no GPU)"]
+        compile_index, _ = named["Compile Candle CUDA packages and test binaries (no GPU required)"]
+        self.assertLess(setup_index, install_index)
+        self.assertLess(install_index, smoke_index)
+        self.assertLess(smoke_index, compile_index)
+        self.assertEqual(setup["uses"], WINDOWS_SETUP_ACTION)
+        self.assertEqual(setup["with"], {"version": "0.12.3", "enable-cache": False})
+        self.assertEqual(install["shell"], "cmd")
+        self.assertEqual(
+            install["run"],
+            r"call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd",
+        )
+        self.assertEqual(smoke["shell"], "cmd")
+        self.assertEqual(
+            smoke["run"],
+            r'"%REVIEWED_PYTHON%" -m unittest scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests -v',
+        )
+        self.assertFalse(smoke.get("continue-on-error", False))
+
+    def test_windows_cuda_dispatch_schedules_no_macos_lane(self) -> None:
+        """sc-24164: `lanes: windows-cuda` selects only the Windows CUDA lane set, and every macOS
+        job (including self-hosted `macos-nax`) is gated on the macOS lane it leaves unselected."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(workflow)
+        lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
+        self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        select = next(
+            step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
+        )
+        self.assertEqual(select["env"]["DISPATCH_LANES"], "${{ inputs.lanes }}")
+        run = select["run"]
+        scoped = (
+            'if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
+        )
+        self.assertTrue(run.startswith(scoped), run)
+
+        output = Path(self.enterContext(tempfile.TemporaryDirectory())) / "github-output"
+        subprocess.run(
+            [sys.executable, "scripts/ci/select_lanes.py", "--only", "windows_cuda",
+             "--github-output", str(output)],
+            cwd=WORKFLOW.parents[2],
+            check=True,
+            capture_output=True,
+        )
+        selected = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").split())
+        self.assertEqual({lane for lane, value in selected.items() if value == "true"}, {"windows_cuda"})
+
+        macos_jobs = {
+            name
+            for name, job in parsed["jobs"].items()
+            if "macos" in json.dumps(job.get("runs-on", "")).lower()
+        }
+        self.assertIn("macos-nax", macos_jobs)
+        for name in macos_jobs:
+            with self.subTest(job=name):
+                self.assertIn(
+                    "needs.changes.outputs.macos_metal == 'true'",
+                    parsed["jobs"][name].get("if", ""),
+                    f"{name} could be scheduled by a dispatch that did not select the macOS lane",
+                )
+
+    def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(step for step in job["steps"] if step.get("name") == "Test Candle CUDA packages")
+        command = step["run"].strip().splitlines()[-1]
+        self.assertIn("cargo test --locked --lib --tests", command)
+        self.assertIn("--no-fail-fast", command)
+        self.assertNotIn("||", command)
+        self.assertFalse(step.get("continue-on-error", False))
+        self.assertFalse(job.get("continue-on-error", False))
 
     def test_windows_cuda_jobs_cap_cargo_parallelism_for_shared_host(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
@@ -3719,6 +4026,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow["jobs"]["gate"]["needs"],
             "CI gate must fail when the topology policy in changes fails",
         )
+        checkouts = [
+            step
+            for step in changes["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        self.assertEqual(
+            [(step.get("with") or {}).get("fetch-depth") for step in checkouts],
+            [0],
+            "an annotated tag push names the tag object in `after`; a fetch-depth: 0 checkout "
+            "fetches refs/tags/* so the policy can peel that object to GITHUB_SHA, while a "
+            "shallow tag checkout fetches only the peeled commit and fails every annotated "
+            "runtime-* tag closed",
+        )
 
         triggers = workflow[True]
         self.assertIn("pull_request", triggers)
@@ -3750,6 +4070,531 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("success|skipped)", step["run"])
         self.assertIn("exit 1", step["run"])
         self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
+
+    def assert_qwen38_candle_requires_successful_mlx(self, workflow: dict) -> None:
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assertEqual(
+            candle["if"],
+            "${{ !cancelled() && needs.qwen38-bonsai-mlx.result == 'success' && "
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'qwen38-bonsai' }}",
+        )
+
+    def test_qwen38_candle_skips_after_failed_or_cancelled_mlx(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        for unsafe_condition in (
+            candle["if"].replace("needs.qwen38-bonsai-mlx.result == 'success' && ", ""),
+            candle["if"].replace("== 'success'", "!= 'success'"),
+            candle["if"].replace("needs.qwen38-bonsai-mlx", "needs.qwen38-bonsai-candle"),
+        ):
+            with self.subTest(unsafe_condition=unsafe_condition):
+                mutated = copy.deepcopy(workflow)
+                mutated["jobs"]["qwen38-bonsai-candle"]["if"] = unsafe_condition
+                with self.assertRaises(AssertionError):
+                    self.assert_qwen38_candle_requires_successful_mlx(mutated)
+
+    def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        self.assertIn("qwen38-bonsai", options)
+        for name in ("qwen38_bonsai_preflight_only", "qwen38_bonsai_provision_only"):
+            setting = workflow[True]["workflow_dispatch"]["inputs"][name]
+            self.assertEqual(setting["type"], "boolean")
+            self.assertFalse(setting["default"])
+        jobs = workflow["jobs"]
+        mlx = jobs["qwen38-bonsai-mlx"]
+        cuda = jobs["qwen38-bonsai-candle"]
+        aggregate = jobs["qwen38-bonsai-aggregate"]
+        self.assertNotIn("qwen38-bonsai-candle-cpu", jobs)
+        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle"])
+        self.assertEqual(aggregate["permissions"]["actions"], "read")
+        matrix = json.loads((WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(matrix["cells"]), 16)
+        self.assertFalse(any(cell["device"] == "cpu" for cell in matrix["cells"]))
+        mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
+        cuda_commands = "\n".join(step.get("run", "") for step in cuda["steps"])
+        aggregate_commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
+        for cell in matrix["cells"]:
+            commands = mlx_commands if cell["backend"] == "mlx" else cuda_commands
+            self.assertIn(cell["id"], commands)
+        self.assertEqual((mlx_commands + cuda_commands).count("--preflight "), 16)
+        self.assertNotIn("candle-packed-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("candle-dense-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("--candle-device cpu", mlx_commands + cuda_commands)
+        self.assertIn("--candle-device auto", cuda_commands)
+        for job in (mlx, cuda):
+            steps = job["steps"]
+            phase = next(step for step in steps if step.get("name") == "Validate exclusive qualification phase")
+            provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
+            self.assertIn("--preflight-only", phase["run"])
+            self.assertIn("--provision-only", phase["run"])
+            self.assertLess(steps.index(phase), steps.index(provision))
+            self.assertNotIn("continue-on-error", provision)
+        self.assertIn("check-partition --role mlx", mlx_commands)
+        self.assertIn("check-partition --role cuda", cuda_commands)
+        self.assertIn("--role matrix", aggregate_commands)
+        self.assertIn("qwen38_bonsai_artifacts.py aggregate", aggregate_commands)
+        self.assertFalse(next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"]["merge-multiple"])
+        self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
+
+
+    def qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
+        """Everything `test_qwen_image_2_1_cuda_lane_…` below binds, as a list of findings."""
+        errors: list[str] = []
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        if "qwen-image-2-1" not in options:
+            errors.append("`qwen-image-2-1` is not a dispatchable profile")
+        job = workflow["jobs"].get("candle-qwen-image-2-1")
+        if job is None:
+            return errors + ["no `candle-qwen-image-2-1` job"]
+        if job["if"] != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'":
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        for key, variable in (
+            ("qwen-image-2-1-cuda", "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"),
+            ("qwen-image-2-1-mlx", "CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"),
+        ):
+            model = models[key]
+            expected = (
+                "${{ vars.CANDLE_GEN_MODELS_ROOT }}\\models--"
+                + model["repository"].replace("/", "--")
+                + "\\snapshots\\"
+                + model["revision"]
+            )
+            if job["env"].get(variable) != expected:
+                errors.append(f"{variable} is not the pinned cache path {expected!r}")
+            if model["environment"] != [variable]:
+                errors.append(f"{key} does not declare exactly {variable}")
+            materialize = (
+                f'scripts/release/ensure_model_snapshot.py --model {key} --snapshot "%{variable}%"'
+            )
+            if not any(materialize in step.get("run", "") for step in job["steps"]):
+                errors.append(f"{key} is never materialized")
+
+        steps = {step.get("name"): step for step in job["steps"]}
+        run = steps.get("Run the Qwen-Image 2.1 real-weight renders", {}).get("run", "")
+        selected = re.findall(r"call :run_one (\w+) \|\| set \"QWEN21_FAILED=1\"", run)
+        ignored = re.findall(r"#\[test\]\s*#\[ignore\]\s*fn (\w+)\(", source)
+        if sorted(selected) != sorted(ignored) or len(selected) != len(set(selected)):
+            errors.append(
+                f"the lane selects {sorted(selected)} but the file's ignored tests are {sorted(ignored)}"
+            )
+        for fragment in (
+            "cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda "
+            "--test integration e2e_real_weights::%~1 -- --ignored --exact --nocapture",
+            'findstr /C:"test result: ok. 1 passed" "%log%"',
+            'if not "%QWEN21_FAILED%"=="0" exit /b 1',
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"the render step must carry exactly one {fragment!r}")
+
+        upload = steps.get("Keep the Qwen-Image 2.1 CUDA evidence", {})
+        if upload.get("with", {}).get("name") != "qwen-image-2-1-cuda-evidence":
+            errors.append("the evidence artifact is not `qwen-image-2-1-cuda-evidence`")
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the evidence upload must survive a failed render")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty evidence upload must red")
+        return errors
+
+    def test_qwen_image_2_1_cuda_lane_runs_every_real_weight_test_on_pinned_snapshots(self) -> None:
+        """sc-24114: the dispatch-only Qwen-Image 2.1 CUDA lane runs EVERY `#[ignore]`d test in
+        `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` -- no more, no fewer -- against the two
+        pinned cache paths it materializes, and keeps its evidence even when a render reds.
+
+        Binding the selection to the file's own `#[ignore]` set is what stops a test added there
+        from silently running nowhere, and a rename from turning into "0 passed" + exit 0.
+        """
+        workflow_text = real_weights_inline_text()
+        workflow = yaml.safe_load(workflow_text)
+        source = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(self.qwen_image_2_1_lane_errors(workflow, source), [])
+
+        # The detector has to detect.
+        renamed = source.replace(
+            "fn validation_render_transparency(", "fn validation_render_rgba("
+        )
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, renamed))
+        added = source + "\n#[test]\n#[ignore]\nfn an_unwired_render() {}\n"
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, added))
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'qwen-image-2-1'"}),
+            lambda job: job["env"].update(
+                {"CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "E:\\somewhere\\else"}
+            ),
+            lambda job: job["steps"][-1].pop("if"),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-qwen-image-2-1"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
+
+    def decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
+        """Everything `test_decode_speedups_bench_…` below binds, as a list of findings."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "speculative_bench_campaign",
+            WORKFLOW.parents[2] / "scripts" / "release" / "speculative_bench_campaign.py",
+        )
+        assert spec and spec.loader
+        campaign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(campaign)
+
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "decode-speedups-bench" not in inputs["profile"]["options"]:
+            errors.append("`decode-speedups-bench` is not a dispatchable profile")
+        if inputs.get("decode_bench_matrix", {}).get("type") != "string":
+            errors.append("no string `decode_bench_matrix` input")
+        job = workflow["jobs"].get("candle-decode-speedups-bench")
+        if job is None:
+            return errors + ["no `candle-decode-speedups-bench` job"]
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        if job.get("timeout-minutes", 0) < 480:
+            errors.append(f"timeout {job.get('timeout-minutes')} is under 480 minutes")
+        env = job.get("env", {})
+        for name, value in (
+            ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
+            ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
+            ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
+            ("CUDA_VISIBLE_DEVICES", "1"),
+            # CUDA numbers the cards as nvidia-smi does, so ordinal 1 is the inventory's GPU 1.
+            ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
+            ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
+        ):
+            if env.get(name) != value:
+                errors.append(f"job env {name} is {env.get(name)!r}, expected {value!r}")
+        for name in campaign.SNAPSHOT_ALIASES.values():
+            if name not in env:
+                errors.append(f"snapshot alias variable {name} is not mapped")
+        # The untrusted matrix reaches the job through `env:` only, never a step body or `with:`.
+        steps = job["steps"]
+        if "inputs.decode_bench_matrix" in json.dumps(steps):
+            errors.append("a step interpolates the untrusted matrix input")
+
+        checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+        expected = [
+            {"path": "inference"},
+            {"ref": campaign.PRE_EPIC_SHA, "path": "inference-pre-epic"},
+        ]
+        if [s.get("with") for s in checkouts] != expected:
+            errors.append(f"checkouts are {[s.get('with') for s in checkouts]!r}")
+        if job.get("defaults", {}).get("run", {}).get("working-directory") != "inference":
+            errors.append("steps do not run in the dispatched checkout")
+
+        named = {s.get("name"): s for s in steps}
+        index = {s.get("name"): i for i, s in enumerate(steps)}
+        wrapper = "Disable unstable sccache wrapper for the heavy Candle lane"
+        if "RUSTC_WRAPPER=" not in named.get(wrapper, {}).get("run", ""):
+            errors.append("RUSTC_WRAPPER is not cleared")
+        copy = named.get("Copy the baseline driver into the pre-epic checkout", {}).get("run", "")
+        driver = "crates\\contracts\\core-llm\\core-llm-testkit\\baseline\\speculative_bench_baseline.rs"
+        target = "..\\inference-pre-epic\\crates\\llm\\candle-llm\\tests\\speculative_bench_baseline.rs"
+        if driver not in copy or target not in copy or "|| exit /b 1" not in copy:
+            errors.append(f"the driver is not copied into the pre-epic checkout: {copy!r}")
+        # The runner script builds both checkouts itself, stamping the commit at compile time; a
+        # separate unstamped build would only be rebuilt (or, run as is, refused).
+        for step in steps:
+            if "cargo test" in step.get("run", ""):
+                errors.append(f"{step.get('name')}: builds outside the stamping runner script")
+        plan = named.get(
+            "Validate the matrix and initialize the run-scoped evidence directory", {}
+        ).get("run", "")
+        if "speculative_bench_campaign.py plan --lane cuda " not in plan:
+            errors.append("the matrix is not planned for the cuda lane")
+        if campaign.LANES["cuda"].features != ("cuda",) or campaign.LANES["cuda"].backend != "candle-cuda":
+            errors.append("the runner's cuda lane does not build candle-llm with `cuda`")
+        run_name = "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        if index.get(run_name, -1) < index.get(wrapper, len(steps)):
+            errors.append("the runner builds before RUSTC_WRAPPER is cleared")
+        run = named.get(run_name, {}).get("run", "")
+        for fragment in (
+            'call "%VCVARS%"',
+            '"%REVIEWED_PYTHON%" scripts/release/speculative_bench_campaign.py run ',
+            '--epic-sha "%GITHUB_SHA%"',
+            "--pre-epic-root ..\\inference-pre-epic",
+            '--pre-epic-target-dir "%DECODE_BENCH_PRE_EPIC_TARGET%"',
+            '--output "%DECODE_BENCH_OUT%"',
+        ):
+            if fragment not in run:
+                errors.append(f"the run step lacks {fragment!r}")
+        errors += windows_bash_selection_errors("candle-decode-speedups-bench", job)
+        upload = named.get("Keep the decode-speedups benchmark documents", {})
+        if upload.get("if") != "always()":
+            # A job that hits `timeout-minutes` counts as cancelled: `!cancelled()` dropped every
+            # finished row of run 36891326535 (sc-24446).
+            errors.append("the documents upload must survive a failed row, a cancel and a timeout")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty upload must red")
+        if upload.get("with", {}).get("path") != (
+            "${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}"
+        ):
+            errors.append("the upload is not the run-scoped directory")
+        return errors
+
+    def test_decode_speedups_bench_is_dispatch_only_and_runs_both_checkouts_per_row(self) -> None:
+        """sc-24446: the epic sc-24432 campaign lane — dispatch-only, on the second card, the
+        untrusted matrix only through `env:`, the dispatched ref and the pre-epic revision checked
+        out side by side with the driver copied in, and every document kept."""
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.decode_speedups_bench_errors(workflow), [])
+        header = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/contracts/core-llm/core-llm-testkit/baseline/speculative_bench_baseline.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("worktree add ../inference-pre-epic c1e8f8e02", header)
+
+        def interpolate(job: dict) -> None:
+            job["steps"][-2]["run"] += ' & echo "${{ inputs.decode_bench_matrix }}"'
+
+        def git_bash_index(job: dict) -> int:
+            return next(i for i, s in enumerate(job["steps"]) if s.get("name") == "Select Git Bash")
+
+        def drop_git_bash(job: dict) -> None:
+            job["steps"].pop(git_bash_index(job))
+
+        def select_git_bash_after_the_toolchain(job: dict) -> None:
+            step = job["steps"].pop(git_bash_index(job))
+            job["steps"].insert(git_bash_index_after_toolchain(job), step)
+
+        def git_bash_index_after_toolchain(job: dict) -> int:
+            return 1 + next(
+                i
+                for i, s in enumerate(job["steps"])
+                if str(s.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+            )
+
+        def bare_bash_step_first(job: dict) -> None:
+            job["steps"].insert(2, {"name": "probe", "shell": "bash", "run": "true"})
+
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
+            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job["env"].pop("CUDA_DEVICE_ORDER"),
+            lambda job: job.update({"timeout-minutes": 240}),
+            lambda job: job["steps"][1]["with"].update({"ref": "main"}),
+            lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["steps"][-1].update({"if": "${{ !cancelled() }}"}),
+            interpolate,
+            drop_git_bash,
+            select_git_bash_after_the_toolchain,
+            bare_bash_step_first,
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-decode-speedups-bench"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.decode_speedups_bench_errors(mutated))
+
+
+class WindowsBashSelectionTests(unittest.TestCase):
+    def test_every_self_hosted_windows_job_selects_git_bash_before_running_bash(self) -> None:
+        """sc-24446: the decode-speedups lane's `dtolnay/rust-toolchain` ran WSL's bash. Every
+        self-hosted Windows job in every workflow selects Git Bash before any bash step."""
+        checked = 0
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            text = (
+                real_weights_inline_text()
+                if path == REAL_WEIGHTS_WORKFLOW
+                else path.read_text(encoding="utf-8")
+            )
+            for name, job in (yaml.safe_load(text).get("jobs") or {}).items():
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertEqual(windows_bash_selection_errors(name, job), [])
+                checked += "windows" in str(job.get("runs-on", "")).lower()
+        self.assertGreater(checked, 0)
+
+
+    def mlx_qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
+        """Everything `test_qwen_image_2_1_mlx_lane_…` below binds, as a list of findings."""
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "qwen-image-2-1-lora-mlx" not in inputs["profile"]["options"]:
+            errors.append("`qwen-image-2-1-lora-mlx` is not a dispatchable profile")
+        hook = inputs.get("qwen_image_2_1_third_party_lora")
+        if hook is None or hook.get("default") != "" or hook.get("type") != "string":
+            errors.append(
+                "the third-party adapter hook must be an optional string input defaulting to empty"
+            )
+        job = workflow["jobs"].get("mlx-qwen-image-2-1")
+        if job is None:
+            return errors + ["no `mlx-qwen-image-2-1` job"]
+        # Its OWN profile: dispatching it must not also schedule the CUDA lane.
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-lora-mlx'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        # The Qwen-Image weight-set label (nax-macos-2), never the privileged `real-weights` one.
+        runner = inputs.get("qwen_image_2_1_lora_runner", {})
+        if runner.get("type") != "choice" or runner.get("default") != "rw-mage" or runner.get("options") != ["rw-mage", "rw-starvector"]:
+            errors.append("MLX LoRA runner must be bounded to rw-mage/rw-starvector, default rw-mage")
+        if job["runs-on"] != ["self-hosted", "macOS", "ARM64", "${{ inputs.qwen_image_2_1_lora_runner || 'rw-mage' }}"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        if job["env"].get("QWEN_IMAGE_2_1_THIRD_PARTY_LORA_SPEC") != (
+            "${{ inputs.qwen_image_2_1_third_party_lora }}"
+        ):
+            errors.append("the third-party hook must reach the job through env, not interpolation")
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        steps = {step.get("name"): step for step in job["steps"]}
+        resolve = steps.get("Resolve runner-local snapshot paths", {}).get("run", "")
+        materialize = steps.get("Materialize and verify immutable snapshots", {}).get("run", "")
+        for key, variable in (
+            ("qwen-image-2-1", "MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"),
+            ("qwen-image-2-1-mlx-tiers", "MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"),
+        ):
+            model = models[key]
+            expected = (
+                "${{ vars.MLX_GEN_MODELS_ROOT }}/models--"
+                + model["repository"].replace("/", "--")
+                + "/snapshots/"
+                + model["revision"]
+            )
+            if job["env"].get(variable) != expected:
+                errors.append(f"{variable} is not the pinned cache path {expected!r}")
+            if model["environment"] != [variable]:
+                errors.append(f"{key} does not declare exactly {variable}")
+            if "unwired_reason" in model:
+                errors.append(f"{key} is wired but still carries an unwired_reason")
+            if variable not in resolve.split():
+                errors.append(f"{variable} is not resolved against the runner's home")
+            if (
+                f'scripts/release/ensure_model_snapshot.py --model {key} --snapshot "${variable}"'
+                not in materialize
+            ):
+                errors.append(f"{key} is never materialized")
+
+        run = steps.get("Run the Qwen-Image 2.1 LoRA/LoKr real-weight gates", {}).get("run", "")
+        selected = re.findall(r"run_one (\w+) \|\| failed=1", run)
+        ignored = re.findall(r"#\[test\]\s*#\[ignore\]\s*fn (\w+)\(", source)
+        if sorted(selected) != sorted(ignored) or len(selected) != len(set(selected)):
+            errors.append(
+                f"the lane selects {sorted(selected)} but the file's ignored tests are {sorted(ignored)}"
+            )
+        for fragment in (
+            "cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration",
+            'lora_real_weights::"$name" -- --ignored --exact --nocapture --test-threads 1',
+            'grep -qE "test result: ok\\. 1 passed" "$log"',
+            'if [[ "$failed" != 0 ]]; then',
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"the gate step must carry exactly one {fragment!r}")
+        # The stacking test reads the two adapters the training tests write: order is load-bearing.
+        if selected[:3] != [
+            "t2i_lora_trains_reloads_and_moves_every_tier",
+            "edit_lokr_trains_and_moves_two_reference_edits_every_tier",
+            "stacked_adapters_apply_with_independent_weights",
+        ]:
+            errors.append(f"the training tests must run before the stacking test: {selected!r}")
+
+        upload = steps.get("Keep the Qwen-Image 2.1 MLX evidence", {})
+        if upload.get("with", {}).get("name") != "qwen-image-2-1-mlx-evidence":
+            errors.append("the evidence artifact is not `qwen-image-2-1-mlx-evidence`")
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the evidence upload must survive a failed gate")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty evidence upload must red")
+        return errors
+
+    def test_qwen_image_2_1_mlx_lane_runs_every_lora_real_weight_test_on_pinned_snapshots(
+        self,
+    ) -> None:
+        """sc-24163: the dispatch-only Qwen-Image 2.1 MLX lane runs EVERY `#[ignore]`d test in
+        `mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs` -- no more, no fewer, training before
+        stacking -- against the two pinned hub-cache paths it materializes on the `rw-mage` Mac, and
+        keeps its evidence even when a gate reds.
+        """
+        workflow = yaml.safe_load(real_weights_inline_text())
+        source = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/media/mlx-gen/mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(self.mlx_qwen_image_2_1_lane_errors(workflow, source), [])
+
+        # The detector has to detect.
+        renamed = source.replace(
+            "fn stacked_adapters_apply_with_independent_weights(", "fn stacked_adapters("
+        )
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, renamed))
+        added = source + "\n#[test]\n#[ignore]\nfn an_unwired_gate() {}\n"
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(workflow, added))
+        for field, value in [("options", ["rw-mage", "nax"]), ("default", "nax"), ("type", "string")]:
+            mutated = copy.deepcopy(workflow)
+            mutated[True]["workflow_dispatch"]["inputs"]["qwen_image_2_1_lora_runner"][field] = value
+            self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
+        for mutate in (
+            lambda job: job.update(
+                {"if": "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'"}
+            ),
+            lambda job: job.update({"runs-on": ["self-hosted", "macOS", "ARM64", "real-weights"]}),
+            lambda job: job["env"].update(
+                {"MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "/somewhere/else"}
+            ),
+            lambda job: job["steps"][-1].pop("if"),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["mlx-qwen-image-2-1"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
+
+
+class WorkflowFileSizeTests(unittest.TestCase):
+    # GitHub refuses any workflow file over 512,000 bytes and every run of it then startup-fails
+    # ("Workflow file exceeds the maximum allowed size of 500 KB"). real-weights.yml reached
+    # 509,886 bytes before its larger step bodies moved to scripts/ci/real-weights/. The margin
+    # leaves room for more lanes before the next extraction is due, instead of finding out from a
+    # run that never starts.
+    MAXIMUM_WORKFLOW_BYTES = 450_000
+
+    def test_every_workflow_file_stays_well_under_the_github_size_limit(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                self.assertLess(
+                    path.stat().st_size,
+                    self.MAXIMUM_WORKFLOW_BYTES,
+                    "move large step bodies into checked-in scripts "
+                    "(see scripts/ci/real_weights_workflow.py)",
+                )
+
+    def test_real_weights_externalized_step_bodies_resolve_exactly_once(self) -> None:
+        repository = WORKFLOW.parents[2]
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        references = real_weights_script_references(workflow_text)
+        on_disk = sorted(
+            path.relative_to(repository).as_posix()
+            for path in (repository / "scripts" / "ci" / "real-weights").rglob("*")
+            if path.is_file()
+        )
+        self.assertTrue(references)
+        self.assertEqual(len(references), len(set(references)), "a step body is shared")
+        self.assertEqual(sorted(references), on_disk, "orphaned or missing step body")
+        self.assertEqual(
+            set(yaml.safe_load(real_weights_inline_text())["jobs"]),
+            set(yaml.safe_load(workflow_text)["jobs"]),
+        )
 
 
 if __name__ == "__main__":

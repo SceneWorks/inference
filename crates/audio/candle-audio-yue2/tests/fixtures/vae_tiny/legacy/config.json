@@ -1,0 +1,66 @@
+{
+  "architectures": [
+    "YuE2VAE"
+  ],
+  "audio_channels": 2,
+  "auto_map": {
+    "AutoConfig": "modeling_vae.YuE2VAEConfig",
+    "AutoModel": "modeling_vae.YuE2VAE"
+  },
+  "decode_core_frames": 1024,
+  "decode_halo_frames": 16,
+  "decoder_config": {
+    "c_mults": [
+      1,
+      2,
+      2,
+      3,
+      3,
+      4
+    ],
+    "channels": 3,
+    "final_tanh": false,
+    "latent_dim": 64,
+    "out_channels": 2,
+    "snake_type": "vanilla",
+    "strides": [
+      2,
+      2,
+      4,
+      4,
+      5,
+      6
+    ],
+    "use_filter": false,
+    "use_snake": true
+  },
+  "downsampling_ratio": 1920,
+  "dtype": "float32",
+  "encoder_config": {
+    "c_mults": [
+      1,
+      2,
+      2,
+      3,
+      3,
+      4
+    ],
+    "channels": 3,
+    "in_channels": 2,
+    "latent_dim": 128,
+    "strides": [
+      2,
+      2,
+      4,
+      4,
+      5,
+      6
+    ],
+    "use_snake": true
+  },
+  "latent_dim": 64,
+  "model_type": "yue2_vae",
+  "release_variant": "legacy",
+  "sample_rate": 48000,
+  "transformers_version": "4.57.6"
+}

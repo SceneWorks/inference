@@ -74,7 +74,12 @@ fn llama_quantize_on_load_q8() {
 
     let q8 = LlamaProvider::load(&LoadSpec {
         source: dir.clone(),
+        projector_source: None,
         quantize: Some(Quantize::Q8),
+        cuda_graphs: None,
+        mtp_head_source: None,
+        prefix_cache_bytes: None,
+        draft_source: None,
     })
     .unwrap();
     assert!(q8.is_quantized());
@@ -90,7 +95,12 @@ fn llama_quantize_on_load_q4() {
     let dir = std::env::var("MLX_LLM_TEST_MODEL").expect("set MLX_LLM_TEST_MODEL");
     let q4 = LlamaProvider::load(&LoadSpec {
         source: dir,
+        projector_source: None,
         quantize: Some(Quantize::Q4),
+        cuda_graphs: None,
+        mtp_head_source: None,
+        prefix_cache_bytes: None,
+        draft_source: None,
     })
     .unwrap();
     assert!(q4.is_quantized());

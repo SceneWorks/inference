@@ -33,6 +33,21 @@ profiles = ["llm-macos", "llm-cuda"]
 environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
+# Epic sc-24128 (story sc-24138): the llama-family decode_bench model — the Qwen3 dense
+# architecture the step-seam migration moved onto the shared fast-decode path. Operator-run on the
+# authoritative RTX Pro 6000 host through scripts/release/decode_bench.py, which also pins its
+# config.json sha256; no CI lane dispatches it.
+[[models]]
+key = "qwen3-8b"
+repository = "Qwen/Qwen3-8B"
+revision = "b968826d9c46dd6066d109eabc6255188de91218"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["decode-bench"]
+environment = ["QWEN3_8B_SNAPSHOT"]
+unwired_reason = "operator-run decode_bench (scripts/release/decode_bench.py) for epic sc-24128 on the authoritative RTX Pro 6000 host; deliberately outside CI (sc-24138)"
+expected_files = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json", "model-00001-of-00005.safetensors", "model-00002-of-00005.safetensors", "model-00003-of-00005.safetensors", "model-00004-of-00005.safetensors", "model-00005-of-00005.safetensors"]
+
 # SC-22261 terminal-only native StarVector campaign. These rows intentionally do not ride the
 # scheduled/all LLM sweep: the single campaign must serialize its MLX and authoritative CUDA
 # measurements and bind both implementations to the same immutable SVG-Bench receipt.
@@ -462,6 +477,142 @@ expected_files = [
 ]
 
 [[models]]
+# sc-24108 / sc-24109 — Qwen-Image 2.1, the pinned snapshot the `*-qwen-image-2-1` crates freeze (see their
+# UPSTREAM.md). Public, unmirrored, ~33 GB bf16 (text_encoder 17.5 GB + transformer 14.2 GB +
+# vae 1.35 GB). sc-24163 wires THIS row's MLX variable: the dispatch-only `qwen-image-2-1-lora-mlx` profile's
+# `mlx-qwen-image-2-1` job materializes it under `MLX_GEN_MODELS_ROOT` (the persistent hub cache,
+# on the `rw-mage` Mac) and runs every test in `mlx-gen-qwen-image-2-1/tests/lora_real_weights.rs`
+# (T2I LoRA + two-reference edit LoKr training, with/without renders at bf16/q8/q4, stacking). The
+# operator-run validation renders in `tests/e2e_real_weights.rs` still run on the dev Mac behind
+# an external RSS guard. The candle twin reads the same bytes through `qwen-image-2-1-cuda` below
+# — a separate key because wiring is per variable and each lane's row declares exactly one.
+key = "qwen-image-2-1"
+repository = "Qwen/Qwen-Image-2.1"
+revision = "790c92633540aa0cb11d9abf19eb46d861714758"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1-lora-mlx"]
+environment = ["MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+expected_files = [
+    "LICENSE",
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/tokenizer_config.json",
+    "processor/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-24114 — the SAME pinned Qwen/Qwen-Image-2.1 bytes as `qwen-image-2-1` above, for the candle
+# real-weight lane: the dispatch-only `qwen-image-2-1` profile materializes it on the Windows CUDA
+# runner under `CANDLE_GEN_MODELS_ROOT` (the persistent hub cache, so the ~33 GB is fetched once)
+# and runs every test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` that reads
+# `CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT` (tokenizer prefix, 2048² T2I, reference edit, transparency).
+key = "qwen-image-2-1-cuda"
+repository = "Qwen/Qwen-Image-2.1"
+revision = "790c92633540aa0cb11d9abf19eb46d861714758"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"]
+expected_files = [
+    "LICENSE",
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/tokenizer_config.json",
+    "processor/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors.index.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-24114 — the published Q8/Q4 tiers of Qwen-Image 2.1 (sc-24112's converter output), ~33 GB for
+# both. Each tier directory is a COMPLETE snapshot (packed `model.safetensors` for the DiT and the
+# Qwen3-VL tower, dense `vae/`, `processor/`, `scheduler/`), which the candle loader reads natively;
+# `validation_render_installed_tiers` points one level in (`/q8`, `/q4`). Materialized by the same
+# dispatch-only `qwen-image-2-1` profile, into the same persistent cache.
+key = "qwen-image-2-1-mlx"
+repository = "SceneWorks/qwen-image-2-1-mlx"
+revision = "1691de01c24a070131e0a28bf4c065fd027f4fe9"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/processor/tokenizer.json",
+    "q8/processor/tokenizer_config.json",
+    "q8/processor/chat_template.jinja",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+    "q4/model_index.json",
+    "q4/processor/tokenizer.json",
+    "q4/processor/tokenizer_config.json",
+    "q4/processor/chat_template.jinja",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/transformer/config.json",
+    "q4/transformer/model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
+# sc-24163 — the SAME pinned `SceneWorks/qwen-image-2-1-mlx` bytes as `qwen-image-2-1-mlx` above,
+# for the MLX lane: the dispatch-only `qwen-image-2-1-lora-mlx` profile's `mlx-qwen-image-2-1` job
+# materializes it under `MLX_GEN_MODELS_ROOT` and renders the q8/ and q4/ tiers with and without
+# the trained adapters. A separate key for the same reason `qwen-image-2-1-cuda` is one: wiring is
+# per variable, and the candle row declares exactly `CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT`.
+key = "qwen-image-2-1-mlx-tiers"
+repository = "SceneWorks/qwen-image-2-1-mlx"
+revision = "1691de01c24a070131e0a28bf4c065fd027f4fe9"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1-lora-mlx"]
+environment = ["MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"]
+expected_files = [
+    "q8/model_index.json",
+    "q8/processor/tokenizer.json",
+    "q8/processor/tokenizer_config.json",
+    "q8/processor/chat_template.jinja",
+    "q8/scheduler/scheduler_config.json",
+    "q8/text_encoder/config.json",
+    "q8/text_encoder/model.safetensors",
+    "q8/transformer/config.json",
+    "q8/transformer/model.safetensors",
+    "q8/vae/config.json",
+    "q8/vae/diffusion_pytorch_model.safetensors",
+    "q4/model_index.json",
+    "q4/processor/tokenizer.json",
+    "q4/processor/tokenizer_config.json",
+    "q4/processor/chat_template.jinja",
+    "q4/scheduler/scheduler_config.json",
+    "q4/text_encoder/config.json",
+    "q4/text_encoder/model.safetensors",
+    "q4/transformer/config.json",
+    "q4/transformer/model.safetensors",
+    "q4/vae/config.json",
+    "q4/vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 # SC-18309 N1 needs only the real SDXL VAE to prove that the shared native decode seam is byte-
 # exact to the former direct engine expression. Keep this as an exact two-file projection instead
 # of materializing the 13.5 GB full SDXL matrix on the rw-mage runner.
@@ -625,7 +776,7 @@ expected_files = ["bf16/model.safetensors"]
 # published re-hosts below are what make these three + two tests wirable at all.
 key = "pid-qwenimage"
 repository = "SceneWorks/pid-qwenimage"
-revision = "39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231"
+revision = "4aeb783a9d3037b75275c42d35d84210c89cb044"
 license = "NVIDIA License"
 size_class = "medium"
 profiles = ["media-macos"]
@@ -635,7 +786,7 @@ expected_files = ["pid_qwenimage_2kto4k.safetensors"]
 [[models]]
 key = "pid-flux"
 repository = "SceneWorks/pid-flux"
-revision = "52d9474830ad05ea8dc55edb59a21cb14d1a4615"
+revision = "6d5c1f1049e863f1757f68fd81c6bc850a95609d"
 license = "NVIDIA License"
 size_class = "medium"
 profiles = ["media-macos"]
@@ -2357,4 +2508,333 @@ expected_files = [
   "q4/transformer/diffusion_pytorch_model.safetensors.index.json",
   "q4/transformer_ref/config.json",
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+]
+
+# SC-23935: explicit terminal profile only; not the scheduled LLM sweep.
+
+[[models]]
+key = "bonsai-qwen38-parent"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 55572906808
+repository = "Qwen/Qwen3.8-27B"
+revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+supported_execution_profiles = ["mlx-unified", "candle-dense-cuda"]
+environment = ["BONSAI_QWEN38_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
+admission_language_weight_bytes = 54641395712
+admission_vision_weight_bytes = 921460192
+
+[[models]]
+key = "bonsai-mlx-2bit"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 9514891750
+repository = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+revision = "3f926b415992eaa2ae9dd7b573706494d6bbf787"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+supported_execution_profiles = ["mlx-unified", "candle-packed-cuda"]
+environment = ["BONSAI_MLX_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "hadamard.json", "PACK-RUNTIME.md", "model.safetensors", "LICENSE", "NOTICE.txt", "runtime/LICENSE"]
+admission_language_weight_bytes = 7673714688
+admission_vision_weight_bytes = 921460192
+
+[[models]]
+key = "bonsai-gguf"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_language_load_bounds = { pq2 = 17061529952, ptq1 = 15802009952 }
+admission_mlx_vision_load_bounds = { bf16 = 2868438080, q8 = 2566539200 }
+repository = "prism-ml/Ternary-Bonsai-2-27B-gguf"
+revision = "6ed5e12bf84b7a63069882c91dd9e9218647d17b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+supported_execution_profiles = ["mlx-unified", "candle-packed-cuda"]
+environment = ["BONSAI_GGUF_SNAPSHOT"]
+expected_files = ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "LICENSE", "NOTICE.txt"]
+download_files = [".gitattributes", "LICENSE", "NOTICE.txt", "README.md", "Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf", "assets/bonsai-logo.svg"]
+admission_language_variants = { pq2 = 7206168928, ptq1 = 5946648928 }
+admission_vision_variants = { bf16 = 931145856, q8 = 629246976 }
+
+[[models]]
+key = "bonsai-qwen3vl-baseline"
+# Header-derived native loading upper bound; runtime reserve is added separately.
+admission_mlx_load_upper_bound_bytes = 17542650296
+repository = "Qwen/Qwen3-VL-8B-Instruct"
+revision = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["qwen38-bonsai"]
+environment = ["BONSAI_BASELINE_SNAPSHOT"]
+expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.json", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
+admission_language_weight_bytes = 16381470720
+admission_vision_weight_bytes = 1152776672
+
+# sc-19387 (epic sc-19373) -- YuE-v1 lyrics2song: the four published SceneWorks rehosts the
+# `candle-audio-yue` registered loader reads. Materialized on the Windows CUDA runner under
+# `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml`, which hard-links them into the
+# `YUE_SNAPSHOT_ROOT` layout `tests/registered_loader_real_weights.rs` expects. Each stage-1 row
+# fetches ONLY the tier its case runs (CoT at bf16, ICL at q4) rather than all three (~24 GB per
+# repo); stage 2 carries both of those tiers; xcodec fetches exactly the three checkpoints the
+# SceneWorks manifest provisions for the `xcodec` component.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/model.safetensors",
+    "bf16/tokenizer.json",
+    "q4/config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+]
+
+[[models]]
+key = "yue-xcodec-mini-infer"
+repository = "SceneWorks/xcodec-mini-infer"
+revision = "8ca30a19de500892e23a6ee687fca030053db60d"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "final_ckpt/ckpt_00360000.safetensors", "decoders/decoder_131000.safetensors", "decoders/decoder_151000.safetensors"]
+expected_files = [
+    "final_ckpt/ckpt_00360000.safetensors",
+    "decoders/decoder_131000.safetensors",
+    "decoders/decoder_151000.safetensors",
+]
+
+# sc-19387: the remaining tiers of the same pinned rehosts, fetched only by `real-weights-yue.yml`'s
+# `mode: memory` (every case at q4, q8 and bf16). Same repositories, revisions and snapshot
+# variables as the rows above; each row adds one tier directory to the same hub-cache snapshot.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general-q8"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+]
+
+# sc-22995 (epic sc-22988) -- YuE2 precision tiers: the pinned upstream originals (CC BY-NC 4.0,
+# ungated) the `candle-audio-yue2` quality harness loads on the Windows CUDA runner, materialized
+# under `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml` (`family: yue2`). The
+# runner's copy is a local noncommercial test copy; nothing is rehosted, and the q8/q4 tiers are
+# derived on the runner by `candle_audio_yue2::tier::convert`. Only the pinned closure files are
+# fetched (the repository also carries wheels and example audio the runtime never reads).
+[[models]]
+key = "yue2-3b"
+repository = "m-a-p/YuE2-3B"
+revision = "1a96eca688d6ae5d7f0feb88573fec89920fcd19"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_3B_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
+
+[[models]]
+key = "yue2-vae"
+repository = "m-a-p/YuE2-Vae"
+revision = "95535e72a97bc0f09b8ada125d26b4009428c0e8"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
+
+# The legacy (evaluation) decoder of the same closure (sc-22988 feature review): the CUDA lane
+# materializes both decoders so a standard and a legacy decode of one cached latent run there.
+[[models]]
+key = "yue2-vae-legacy"
+repository = "m-a-p/YuE2-Vae-legacy"
+revision = "b54118f0fc462f08999d1ec07e88817f4ee3f770"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
 ]

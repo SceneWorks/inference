@@ -121,6 +121,20 @@ pub(crate) fn load_transformer_with_stream(
     let w = Weights::from_dir(root.join("transformer"))?;
     crate::convert::validate_transformer(&w, &cfg)?;
     let transformer = Krea2Transformer::from_weights(&w, &cfg)?;
+    // Materialize at load (sc-24245; see mlx_gen_qwen_image::loader::load_transformer_with). A
+    // streamable load reads only the non-block tensors; each window materializes its own blocks.
+    if streamable {
+        let resident: Vec<(String, mlx_rs::Array)> = w
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with("transformer_blocks."))
+            .collect();
+        let mut named: Vec<(&str, &mlx_rs::Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        w.materialize_accessed()?;
+    }
     Ok(if streamable {
         transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")))
     } else {

@@ -1,0 +1,25 @@
+commit 8ea9d21e069421e1247b2e8e974c400135541b82 (clean tree; merged with feature 410e18db2); GPU1 NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 894 MiB, 0 %; release build, CUDA_VISIBLE_DEVICES=1
+
+running 1 test
+test llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate ... [llama] graph runner: 0 replayed / 256 eager, 0 captured, fallback Some("positions_host_scalar")
+[llama] exact row static step seam: first divergence None
+[llama] exact row reference loop, fused off: first divergence None
+[llama] exact row static step seam, fused off: first divergence None
+[llama] exact row graph runner (switch on): first divergence None
+[llama] Qwen3-8B reference: 53 prompt tokens, 256 generated; knife-edge positions (top-2 gap <= 1 bf16 ULP of the top logit): [(17, 0.25, 0.25), (65, 0.0, 0.25), (90, 0.125, 0.125), (132, 0.125, 0.25), (134, 0.125, 0.125), (141, 0.25, 0.25), (148, 0.0, 0.125), (193, 0.25, 0.25), (228, 0.0, 0.25)]
+[llama teacher-forced] M=2: argmax disagreements (position, verify row, reference gap in bf16 ULP): [(132, 1, 0.5), (132, 0, 0.5), (134, 1, 1.0), (134, 0, 1.0)]
+[llama teacher-forced] M=3: argmax disagreements (position, verify row, reference gap in bf16 ULP): [(90, 0, 1.0), (132, 1, 0.5)]
+[llama teacher-forced] M=4: argmax disagreements (position, verify row, reference gap in bf16 ULP): [(65, 3, 0.0), (65, 1, 0.0), (65, 0, 0.0), (132, 3, 0.5), (132, 2, 0.5), (134, 2, 1.0), (134, 1, 1.0), (141, 1, 1.0)]
+[llama teacher-forced] M=5: argmax disagreements (position, verify row, reference gap in bf16 ULP): [(65, 1, 0.0), (65, 0, 0.0), (132, 4, 0.5), (132, 3, 0.5), (132, 2, 0.5), (134, 2, 1.0), (134, 0, 1.0), (141, 2, 1.0)]
+[llama teacher-forced] M=6: argmax disagreements (position, verify row, reference gap in bf16 ULP): [(65, 2, 0.0), (65, 1, 0.0), (90, 5, 1.0), (132, 5, 0.5), (132, 1, 0.5), (134, 2, 1.0), (134, 1, 1.0), (141, 2, 1.0)]
+[llama] ngram K=2: divergence Some(65) acceptance 0.147 proposed 218 syncs/verify Some(1.0) kv static proposer ngram
+[llama] ngram K=3: divergence Some(51) acceptance 0.087 proposed 333 syncs/verify Some(1.0) kv static proposer ngram
+[llama] ngram K=4: divergence Some(132) acceptance 0.076 proposed 421 syncs/verify Some(1.0) kv static proposer ngram
+[llama] free-running ngram K=2: first divergence at 65, reference top-2 gap 0.00 bf16 ULP (a knife-edge; recorded, not gated)
+[llama] free-running ngram K=3: first divergence at 51, reference top-2 gap 2.00 bf16 ULP (not a knife-edge; recorded, not gated)
+[llama] free-running ngram K=4: first divergence at 132, reference top-2 gap 0.50 bf16 ULP (a knife-edge; recorded, not gated)
+[llama] gate holds: exact rows identical over 256 tokens; 30 teacher-forced disagreements, all at <= 1 bf16 ULP knife-edges
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 87.71s
+

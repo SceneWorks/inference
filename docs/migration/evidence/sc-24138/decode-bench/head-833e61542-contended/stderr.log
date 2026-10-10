@@ -1,0 +1,6 @@
+[decode_bench] reference           17.94 tok/s  prefill 0.098s
+[decode_bench] step_model K=0          38.98 tok/s  accept 0.000  fwd/tok 1.000  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=2          20.26 tok/s  accept 0.147  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=3          20.16 tok/s  accept 0.087  fwd/tok 0.887  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=4          22.13 tok/s  accept 0.076  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24138\docs\migration\evidence\sc-24138\decode-bench\head-833e61542\decode_bench.json

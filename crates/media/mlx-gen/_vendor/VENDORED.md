@@ -1,6 +1,6 @@
 # Vendored `mage_flow` — the frozen Mage-Flow parity oracle (sc-14036, epic 14034)
 
-`mage_flow/` is a **verbatim copy** of the reference PyTorch inference implementation from
+`mage_flow/` was imported from the reference PyTorch inference implementation at
 
     https://github.com/microsoft/Mage @ df7f84d9f8fc991d189d929f03cff623b430a4a2
     (2026-07-23T03:15:46Z — "Point tech-report links back to arXiv (2607.19064)")
@@ -8,8 +8,9 @@
 
 It is the ground truth that `tools/dump_mage_flow_golden.py` runs to produce the boundary
 goldens the native Mage-Flow port (`mlx-gen-mage`, `candle-gen-mage`) is gated against. It is
-**read-only**: nothing in this directory is imported by any Rust crate, shipped in any bundle,
-or on any product path — it exists so the oracle survives.
+not imported by any Rust crate or shipped in a product bundle. Local security patches from
+sc-24254 and sc-24255 make checkpoint loads explicit and validate sharded checkpoint paths;
+the upstream commit and tree above remain the provenance baseline.
 
 ## Why it is committed (this crate normally does NOT commit `_vendor/`)
 
@@ -31,14 +32,15 @@ private, model cards pulled) between planning and porting. Every parity test in 
 | path | vendored? | note |
 | --- | --- | --- |
 | `pipeline.py`, `inference.py`, `app.py`, `__init__.py` | yes | verbatim |
-| `models/` (`mage_flow.py`, `utils.py`, `modules/*`) | yes | verbatim — DiT, Mage-VAE, TE, RoPE/blocks, Gaussian-Shading, attention shim |
-| `requirements.txt`, `pyproject.toml`, `README.md` | yes | verbatim — the env pins ARE part of the oracle |
+| `models/` (`mage_flow.py`, `utils.py`, `modules/*`) | yes | upstream DiT, Mage-VAE, TE, RoPE/blocks and attention shim, with local checkpoint and masking API patches |
+| `checkpoint_paths.py` | local | sharded checkpoint containment for MageFlow and the text encoder entry point |
+| `requirements.txt`, `pyproject.toml`, `README.md` | yes | upstream baseline with security dependency updates |
 | `LICENSE` | yes | upstream repo-root MIT, copied in beside the code it licenses |
 | `assets/dog.jpg` | yes | the reference's own edit example (`app.py:161`, `README.md:270`); the edit golden's source image |
 | `assets/*` (20 other files, ~40 MB) | **no** | README gallery/figure images only — no code path reads them. The README's `<img src="assets/…">` links therefore do not resolve locally; they resolve on GitHub. `scripts/check_docs.py` only walks `README.md`, `docs/**`, `release/**`, so this does not break the docs gate. |
 | `mage_vl/` (upstream sibling package) | **no** | out of scope for epic 14034 |
 
-Everything vendored is **byte-for-byte upstream** — no local patches. Verify with:
+Compare the source with the upstream baseline using:
 
 ```sh
 git -C /path/to/Mage checkout df7f84d9f8fc991d189d929f03cff623b430a4a2
@@ -46,39 +48,42 @@ diff -r --exclude=assets --exclude=__pycache__ --exclude=LICENSE \
   /path/to/Mage/mage_flow crates/media/mlx-gen/_vendor/mage_flow
 ```
 
-(`LICENSE` is excluded because it lives at the upstream **repo root**, not inside `mage_flow/`;
-it was copied in beside the code it licenses, so it is the one file that exists only here. The
-`assets` exclude covers the 20 unvendored README images. With those three excludes the diff is
-empty — anything else it prints is a local patch and a bug.)
+(`LICENSE` lives at the upstream repo root, and `assets` excludes the 20 unvendored README images.
+The diff now shows the local sc-24254 and sc-24255 security changes.)
 
-The harness deliberately does **not** edit the vendored source to run off CUDA. It rebinds
+The harness does not edit the vendored source to run off CUDA. It rebinds
 `mage_flow.pipeline.ModelConfig` to a subclass whose `attn_type` defaults to `sdpa`
 (`dump_mage_flow_golden.py::_load_model`) — the reference already supports that value in both
-`_attn_backend.set_attn_backend` and `text_encoder._resolve_hf_attn_impl`. Keep it that way: any
-future adaptation belongs in the harness, not here, so the `diff -r` above stays empty.
+`_attn_backend.set_attn_backend` and `text_encoder._resolve_hf_attn_impl`. The text encoder's
+`create_causal_mask` call was updated for Transformers 5.10.4; the small CPU oracles verify its
+arithmetic against the original committed fixtures. Its packed-text boundaries travel as
+`text_cu_seqlens` rather than `cu_seqlens` (sc-24380): Transformers 5.10 forwards `**kwargs` into
+the Qwen3-VL vision tower, whose `get_vision_cu_seqlens` pops a bare `cu_seqlens` as precomputed
+patch boundaries, which crashed the image-conditioned edit encode.
 
-### SHA-256 of the vendored files
+### SHA-256 of the current vendored files
 
 ```
 275b4dd619de4e16a017b10d0beec72abbbbf14ee8a2fc68f8bdb398e821f623  mage_flow/LICENSE
-3415638dd4674b0a570f7db2b417efa6235a3c7553180652e5c2b5cc1eb13d58  mage_flow/README.md
+c2f185dd426e0e1837944ba3a527471ba103bdefdfd67cd69f3abb8df06b10af  mage_flow/README.md
 0709764f182b55fdec6b8195a4d18640fe0ffef3785d3977d8ebc29905de7489  mage_flow/__init__.py
 ac0597feddf1b6c5aaa2f18cc3ebb3e690dc42232462ac778af45044df41435e  mage_flow/app.py
 164d8dfe707fb854e288ad2eea65c2db87e90af11f689c85502860eeaf3f4794  mage_flow/assets/dog.jpg
+87342853fdffb3ae3a90a109df0d0af89f73bc54a8466a63b196cf5501971e12  mage_flow/checkpoint_paths.py
 0a1e196f784f4daf4b4d1607cade1d066908341e0e444aa29fcea3967a8c1a3f  mage_flow/inference.py
 7e5ba07fdb01f4a5912eaeb3afbe9d4ccc4e391e7de4cdc11865e5aa911ddfd5  mage_flow/models/__init__.py
-59b6e1bee7f95a7fd2fa7bd9e765966832951e2bb184b5ae27283884997b845f  mage_flow/models/mage_flow.py
+b5b2c826d138b2c09302fc74cf6803aa02309a341fd6cf2a695b562684a958b9  mage_flow/models/mage_flow.py
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  mage_flow/models/modules/__init__.py
 7d652eeb2ab39e37554e3d62859c74edeffc8dce70b2c15687060c259647b559  mage_flow/models/modules/_attn_backend.py
 9ffd7c68b6053ad37f6bf0925d8d94dcd72af751448ee0228ec13018fedf54e5  mage_flow/models/modules/mage_latent.py
 4b198343b8929f48a0a14d388502c81f54be17b222f6831303d2da6a91f33a62  mage_flow/models/modules/mage_layers.py
 eed7846d02bee28ebf7a1fb45db7d9f621dd66e702e761848d67bed426c1c4a7  mage_flow/models/modules/mage_text.py
-64f4d7041003e416bc2f4fac5bbf8aabf2e7c798ad106682c34332ba347b0ef9  mage_flow/models/modules/mage_vae.py
-65e490ce35fbe4d4057f115be2ab8731e01ea44b618c10aabac80d51fc38ef81  mage_flow/models/modules/text_encoder.py
-0f242ca7a77e0f85b5985b5299304aa0786737de1ba414c7f8f47b8d664dbca8  mage_flow/models/utils.py
+6b9ac21199e249337f89b9527a8eeec05a8c9164b9631c7c15c3a7590c13ac5a  mage_flow/models/modules/mage_vae.py
+02ed541fd06c782e31b4479768ffde6269ba2314ae79e03643121454c437e608  mage_flow/models/modules/text_encoder.py
+122a32788cd294b5e8e0d38ac231d48213e3a6860756aff2162d1559e9f2ffe1  mage_flow/models/utils.py
 b9fc57018570372dd3404a733e19b918a359188dd9f5ef7817c6b30969fc13db  mage_flow/pipeline.py
-d04bc0c4d884bbca77a79711ed38fbddcf4d8b642b3f2deb1a34b2b01d879f04  mage_flow/pyproject.toml
-ba35ca260f3b1ad62b7550bec4397c6666a5dc0278c2e8f65fb6c31e0dfb3ccc  mage_flow/requirements.txt
+6385399ad9a3fa373bede12915f67e3c345346cf9c3cd1ea1370d94278fa781d  mage_flow/pyproject.toml
+5d5c6fd4eaaa295b12b40e72c02495c0cd162db148d46598a12838dca0dd7f6e  mage_flow/requirements.txt
 ```
 
 ## Pinned reference environment (verbatim from `mage_flow/requirements.txt`)
@@ -91,8 +96,8 @@ torch==2.13.0
 torchvision==0.28.0         # reference-image resize in the edit path
 numpy==2.4.3                # used by the test/benchmark scripts
 diffusers==0.38.0
-transformers==5.5.0
-accelerate==1.13.0          # used by transformers `from_pretrained` loading path
+transformers==5.10.4        # contains named-chat-template path validation
+accelerate==1.13.0          # MageFlow preflights shard indexes before model loading
 safetensors==0.8.0          # diffusers 0.38.0 requires safetensors>=0.8.0
 huggingface_hub>=0.20       # snapshot_download for MageFlowPipeline.from_pretrained("<hf repo id>")
 einops==0.8.2
@@ -110,11 +115,18 @@ the installed torch ABI, so `-r requirements.txt` cannot carry it):
 flash-attn==2.8.3
 ```
 
-Two pins are load-bearing and easy to get wrong:
+Two dependency details are load-bearing:
 
-* **`transformers` must stay `>=5.3.0,<5.6`** (`pyproject.toml`). 5.6 removed the `input_embeds`
-  kwarg of `create_causal_mask` that the vendored TE patch calls
-  (`models/modules/text_encoder.py:255`). On 5.5.0 that call already emits a `FutureWarning`.
+* **`transformers==5.10.4`** contains the path validation added in upstream commit
+  `eaaaf8494dd5386634ae37d1d122212fdc315be5`. The vendored TE patch now calls the
+  `inputs_embeds` masking API used by this pin.
+* **`accelerate==1.13.0`** still joins shard paths from an index without its own containment
+  check. MageFlow validates all shards before its own index load and before the text encoder's
+  `from_pretrained` entry point. Hub snapshot blob symlinks are accepted only within that repo's
+  `blobs/` directory; other escapes and non-regular files are rejected. The vendored MageFlow
+  source does not directly call Accelerate's `load_checkpoint_in_model` or
+  `load_checkpoint_and_dispatch`; this is containment for the exercised MageFlow paths, not a
+  global fix for Accelerate.
 * **The versions stamped in the published weight configs are NOT the runtime pins.**
   `text_encoder/config.json` says `transformers_version: 4.57.0.dev0` and
   `scheduler/scheduler_config.json` says `_diffusers_version: 0.37.0`; those are provenance
@@ -129,7 +141,7 @@ shim routes to `sdpa`); everything else is.
 uv venv --python 3.12 /tmp/mageflow-ref-venv
 uv pip install --python /tmp/mageflow-ref-venv/bin/python \
   torch==2.13.0 torchvision==0.28.0 numpy==2.4.3 \
-  diffusers==0.38.0 transformers==5.5.0 accelerate==1.13.0 safetensors==0.8.0 \
+  diffusers==0.38.0 transformers==5.10.4 accelerate==1.13.0 safetensors==0.8.0 \
   einops==0.8.2 pydantic==2.12.5 pillow==12.3.0 loguru==0.7.3 "huggingface_hub>=0.20"
 # CUDA hosts only, after the above:
 # uv pip install --python /tmp/mageflow-ref-venv/bin/python --no-build-isolation flash-attn==2.8.3

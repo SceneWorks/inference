@@ -221,8 +221,10 @@ fn array_payload(array: &Array) -> Result<(&'static str, Vec<u8>)> {
 /// router (`mlp.gate.weight`), and the shared-expert gate never match and so stay dense — the
 /// engine's quant invariant. Packed Phi-3 / GLM-4 tensors are handled separately (split first, see
 /// [`write_snapshot`]), and keys under a VLM vision tower are excluded entirely
-/// (vision loaders are dense-only).
-pub const PROJECTION_SUFFIXES: [&str; 14] = [
+/// (vision loaders are dense-only). The Qwen3.5/3.8 native MTP head's `mtp.fc` fusion projection
+/// is one too: the Qwen3.5 loader reads it through the same quantizing projection loader as the
+/// body, so a stored-quantized snapshot must carry its `weight`/`scales`/`biases` triple.
+pub const PROJECTION_SUFFIXES: [&str; 15] = [
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
@@ -240,6 +242,8 @@ pub const PROJECTION_SUFFIXES: [&str; 14] = [
     "gate_proj.weight",
     "up_proj.weight",
     "down_proj.weight",
+    // Qwen3.5/3.8 native MTP head: concat(embedding, hidden) → hidden fusion.
+    "mtp.fc.weight",
 ];
 
 /// Packed Phi-3 q‖k‖v attention projection, split into `q/k/v_proj` before quantizing.
@@ -431,7 +435,8 @@ pub fn write_snapshot(
                         expected
                     )));
                 }
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let stem = key
                     .strip_suffix(if key.ends_with(QWEN35_EXPERT_GATE_UP_SUFFIX) {
                         QWEN35_EXPERT_GATE_UP_SUFFIX
@@ -471,7 +476,8 @@ pub fn write_snapshot(
             }
             Some(spec) if is_packed_projection(&key) => {
                 let (q_dim, kv_dim, inter) = split_dims.expect("packed key implies parsed dims");
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let rows = w.shape()[0];
                 let (stem, names, points): (&str, &[&str], Vec<i32>) =
                     if key.ends_with(PACKED_QKV_SUFFIX) {
@@ -507,7 +513,8 @@ pub fn write_snapshot(
                 }
             }
             Some(spec) if is_projection(&key) => {
-                let w = arr.as_dtype(STORE_DTYPE)?;
+                let w = read_then_cast(&arr)?;
+                drop(arr);
                 let base = key.strip_suffix(".weight").unwrap_or(&key);
                 push_quantized(&mut out, base, &w, spec)?;
                 quantized_projections += 1;
@@ -558,6 +565,10 @@ pub fn write_snapshot(
     }
     write_json_string(&out_dir.join("config.json"), &config)?;
 
+    // Every quantized output is already resident (per tensor, above); what can still be lazy is the
+    // pass-through set. Read it here in bounded batches so `save_safetensors` evaluates nothing —
+    // see [`materialize_outputs`].
+    materialize_outputs(&out)?;
     Array::save_safetensors(
         out.iter().map(|(k, v)| (k.as_str(), v)),
         None,
@@ -589,9 +600,57 @@ fn push_quantized(
     spec: QuantSpec,
 ) -> Result<()> {
     let q = QuantizedLinear::quantize(w, spec.group_size, spec.bits, None)?;
+    // Evaluate the packed triple now, while `w` is the only dense transient: the GPU quantize runs
+    // over an already-resident input ([`read_then_cast`]) and the snapshot's dense peak stays one
+    // tensor instead of the whole model accumulating as a lazy graph for the save to evaluate.
+    mlx_rs::transforms::eval([&q.weight, &q.scales, &q.biases])?;
     out.push((format!("{base}.weight"), q.weight));
     out.push((format!("{base}.scales"), q.scales));
     out.push((format!("{base}.biases"), q.biases));
+    Ok(())
+}
+
+/// Read a projection's source bytes on the CPU, then cast it to [`STORE_DTYPE`] and evaluate the
+/// cast (sc-24245).
+///
+/// A [`Weights`] tensor is a lazy safetensors `Load`, which MLX runs on its CPU stream. A GPU op
+/// (the bf16 cast, the quantize kernel) over a not-yet-read `Load` makes the Metal command buffer
+/// wait on the disk read; with every projection of a multi-gigabyte model folded into the one eval
+/// `save_safetensors` performs, those waits outlast the GPU watchdog on a slow or cold drive
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`, the JoyCaption Q4 prepare in the sc-24245 campaign).
+/// Reading the pending loads first ([`mlx_rs::transforms::eval_pending_loads`]) leaves every GPU op
+/// with a resident input. The same pattern as `mlx_gen::quant::quantize_map` and
+/// `mlx_gen::weights::Weights::materialize_batch`, which this crate cannot depend on (mlx-gen
+/// depends on mlx-llm).
+fn read_then_cast(arr: &Array) -> Result<Array> {
+    mlx_rs::transforms::eval_pending_loads([arr])?;
+    let w = arr.as_dtype(STORE_DTYPE)?;
+    w.eval()?;
+    Ok(w)
+}
+
+/// Upper bound on the bytes one [`materialize_outputs`] batch evaluates at once — the same bound as
+/// [`Weights::VERIFY_BATCH_BYTES`].
+const OUTPUT_BATCH_BYTES: usize = Weights::VERIFY_BATCH_BYTES;
+
+/// Force every snapshot output resident before `save_safetensors`, in batches of at most
+/// [`OUTPUT_BATCH_BYTES`], each batch's pending `Load`s read on the CPU stream before anything
+/// derived from them is evaluated (sc-24245; mirrors `mlx_gen::weights::Weights::materialize_batch`).
+/// The save therefore evaluates no graph at all, so no Metal command buffer can wait on the disk.
+/// Peak memory is unchanged: `save_safetensors` holds every output resident while it writes anyway.
+fn materialize_outputs(out: &[(String, Array)]) -> Result<()> {
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for end in 0..out.len() {
+        bytes = bytes.saturating_add(out[end].1.nbytes());
+        if bytes >= OUTPUT_BATCH_BYTES || end + 1 == out.len() {
+            let batch = &out[start..=end];
+            mlx_rs::transforms::eval_pending_loads(batch.iter().map(|(_, a)| a))?;
+            mlx_rs::transforms::eval(batch.iter().map(|(_, a)| a))?;
+            start = end + 1;
+            bytes = 0;
+        }
+    }
     Ok(())
 }
 
@@ -601,23 +660,57 @@ fn push_quantized(
 /// The dense tensor set is loaded via [`Weights`] (single file or sharded) and handed to
 /// [`write_snapshot`]; `config.json` is read through (with a `quantization` block added when
 /// quantizing — every other key preserved) and `tokenizer.json` / `tokenizer_config.json` are
-/// copied verbatim when present. With `quantize: None` the weights are written unchanged, so the
-/// snapshot reloads bit-identically to loading the source directly.
+/// copied verbatim when present, as are the other files the loader reads from a snapshot
+/// ([`SNAPSHOT_SIDECARS`]: the generation EOS set, the sidecar chat template, the Gemma 4
+/// processor config). With `quantize: None` the weights are written unchanged, so the snapshot
+/// reloads bit-identically to loading the source directly.
 pub fn write_hf_snapshot(
     source_dir: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
     quantize: Option<QuantSpec>,
 ) -> Result<SnapshotReport> {
-    let source = source_dir.as_ref();
-    let out_dir = out_dir.as_ref();
+    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, false)
+}
 
+/// [`write_hf_snapshot`] without the checkpoint's native MTP head: every `mtp.*` tensor is dropped
+/// and `mtp_num_hidden_layers` (top level and `text_config`) is set to `0`, so the snapshot loads as
+/// the plain decoder on every runtime — including one that refuses the head itself, as the
+/// pre-epic-sc-24432 MLX loader refuses a Qwen3.5-MoE predictor. The decode-speedups benchmark
+/// (sc-24446) measures such a model's `off` rows on both revisions from one such snapshot.
+pub fn write_hf_snapshot_without_native_mtp(
+    source_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<QuantSpec>,
+) -> Result<SnapshotReport> {
+    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, true)
+}
+
+fn write_hf_snapshot_inner(
+    source: &Path,
+    out_dir: &Path,
+    quantize: Option<QuantSpec>,
+    drop_native_mtp: bool,
+) -> Result<SnapshotReport> {
     // config.json is required — it carries the architecture + shapes the loader dispatches on. Read
     // it as a Value so the writer can add the quantization block; all other keys pass through.
     let config_path = source.join("config.json");
     let config_text = std::fs::read_to_string(&config_path)
         .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?;
-    let config: Value = serde_json::from_str(&config_text)
+    let mut config: Value = serde_json::from_str(&config_text)
         .map_err(|e| Error::Config(format!("parse {}: {e}", config_path.display())))?;
+    if drop_native_mtp {
+        fn no_mtp_layers(map: &mut serde_json::Map<String, Value>) {
+            if map.contains_key("mtp_num_hidden_layers") {
+                map.insert("mtp_num_hidden_layers".into(), json!(0));
+            }
+        }
+        if let Value::Object(map) = &mut config {
+            no_mtp_layers(map);
+            if let Some(Value::Object(text)) = map.get_mut("text_config") {
+                no_mtp_layers(text);
+            }
+        }
+    }
 
     // Tokenizer files pass through verbatim (byte-identical) when present.
     let tokenizer = SnapshotTokenizer {
@@ -625,8 +718,37 @@ pub fn write_hf_snapshot(
         tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
     };
 
-    let weights = Weights::from_dir(source)?;
-    write_snapshot(out_dir, weights.into_map(), config, &tokenizer, quantize)
+    let mut tensors = Weights::from_dir(source)?.into_map();
+    if drop_native_mtp {
+        tensors.retain(|key, _| !key.starts_with("mtp."));
+    }
+    let report = write_snapshot(out_dir, tensors, config, &tokenizer, quantize)?;
+    copy_snapshot_sidecars(source, out_dir)?;
+    Ok(report)
+}
+
+/// Snapshot files besides `config.json`, the tokenizer files and the weights that the loader reads
+/// and that change what a loaded model does: `generation_config.json` carries the generation EOS
+/// set ([`crate::provider::eos_token_ids`] — Qwen3.6's `<|im_end|>` lives only there),
+/// `chat_template.jinja` the sidecar template that wins over the tokenizer config's, and
+/// `processor_config.json` the Gemma 4 multimodal front-end's geometry.
+pub const SNAPSHOT_SIDECARS: [&str; 3] = [
+    "generation_config.json",
+    "chat_template.jinja",
+    "processor_config.json",
+];
+
+/// Copy every [`SNAPSHOT_SIDECARS`] file `source` has into `out_dir`, byte for byte, so a written
+/// snapshot generates as its source does.
+pub fn copy_snapshot_sidecars(source: &Path, out_dir: &Path) -> Result<()> {
+    for name in SNAPSHOT_SIDECARS {
+        let from = source.join(name);
+        if from.is_file() {
+            std::fs::copy(&from, out_dir.join(name))
+                .map_err(|e| Error::Msg(format!("copy {}: {e}", from.display())))?;
+        }
+    }
+    Ok(())
 }
 
 /// Write a JSON value to `path`, pretty-printed (the snapshot's `config.json`).
@@ -647,7 +769,7 @@ fn read_to_string_if_exists(path: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
@@ -712,7 +834,7 @@ mod tests {
         (t, config)
     }
 
-    fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
+    pub(crate) fn tiny_qwen35(moe: bool) -> (Vec<(String, Array)>, Value) {
         let (h, vocab, inter, layers) = (64i32, 8i32, 128i32, 4usize);
         let mut rng = SplitMix64::new(if moe { 0x35A3B } else { 0x3527B });
         let mut t = Vec::new();
@@ -792,6 +914,194 @@ mod tests {
         (t, json!({ "model_type": "qwen3_5", "text_config": text }))
     }
 
+    /// [`tiny_qwen35`] with a configured native MTP head — one predictor layer whose FFN follows
+    /// the body (dense, or the sparse-MoE block of the 35B-A3B release) — as the Qwen3.8-27B and
+    /// Qwen3.6-35B-A3B checkpoints ship it.
+    fn tiny_qwen35_mtp(moe: bool) -> (Vec<(String, Array)>, Value) {
+        let (mut t, mut config) = tiny_qwen35(moe);
+        let (h, inter) = (64i32, 128i32);
+        let mut rng = SplitMix64::new(if moe { 0x03A3_B0FC } else { 0x0038_00FC });
+        let p = |s: &str| format!("mtp.layers.0.{s}");
+        t.push(("mtp.fc.weight".into(), randn(&[h, 2 * h], &mut rng)));
+        for norm in ["pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"] {
+            t.push((format!("mtp.{norm}.weight"), randn(&[h], &mut rng)));
+        }
+        t.push((p("input_layernorm.weight"), randn(&[h], &mut rng)));
+        t.push((p("post_attention_layernorm.weight"), randn(&[h], &mut rng)));
+        t.push((p("self_attn.q_proj.weight"), randn(&[128, h], &mut rng)));
+        t.push((p("self_attn.k_proj.weight"), randn(&[64, h], &mut rng)));
+        t.push((p("self_attn.v_proj.weight"), randn(&[64, h], &mut rng)));
+        t.push((p("self_attn.o_proj.weight"), randn(&[h, 64], &mut rng)));
+        t.push((p("self_attn.q_norm.weight"), randn(&[32], &mut rng)));
+        t.push((p("self_attn.k_norm.weight"), randn(&[32], &mut rng)));
+        if moe {
+            t.push((p("mlp.experts.gate_up_proj"), randn(&[2, 128, h], &mut rng)));
+            t.push((p("mlp.experts.down_proj"), randn(&[2, h, 64], &mut rng)));
+            t.push((p("mlp.gate.weight"), randn(&[2, h], &mut rng)));
+            for (name, shape) in [
+                ("gate_proj.weight", vec![64, h]),
+                ("up_proj.weight", vec![64, h]),
+                ("down_proj.weight", vec![h, 64]),
+            ] {
+                t.push((
+                    p(&format!("mlp.shared_expert.{name}")),
+                    randn(&shape, &mut rng),
+                ));
+            }
+            t.push((p("mlp.shared_expert_gate.weight"), randn(&[1, h], &mut rng)));
+        } else {
+            t.push((p("mlp.gate_proj.weight"), randn(&[inter, h], &mut rng)));
+            t.push((p("mlp.up_proj.weight"), randn(&[inter, h], &mut rng)));
+            t.push((p("mlp.down_proj.weight"), randn(&[h, inter], &mut rng)));
+        }
+        let text = config["text_config"].as_object_mut().unwrap();
+        text.insert("mtp_num_hidden_layers".into(), json!(1));
+        text.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        (t, config)
+    }
+
+    /// A Qwen3.5 checkpoint's native MTP head survives a quantized snapshot (sc-24446): its `mtp.fc`
+    /// fusion is stored as a quantized triple — the loader reads it through the quantizing
+    /// projection path, so a dense `mtp.fc` under a `quantization` block fails the load — and the
+    /// stored head drafts exactly what the load-time-quantized head drafts, dense and MoE.
+    #[test]
+    fn qwen35_native_mtp_head_round_trips_through_a_quantized_snapshot() {
+        for moe in [false, true] {
+            let spec = QuantSpec::q4();
+            let dir = unique_dir(&format!("qwen35-mtp-{}", if moe { "moe" } else { "dense" }));
+            let (tensors, config) = tiny_qwen35_mtp(moe);
+            let dense = Weights::from_map(tensors.iter().cloned().collect());
+            let cfg = Qwen35Config::from_json(&config).unwrap();
+            let load_time =
+                Qwen35Model::from_weights_with(&dense, "model.language_model", cfg, Some(spec))
+                    .unwrap();
+            assert!(
+                load_time.has_mtp(),
+                "fixture loads its head at load-time quant"
+            );
+
+            write_snapshot(
+                &dir,
+                tensors,
+                config,
+                &SnapshotTokenizer::default(),
+                Some(spec),
+            )
+            .unwrap();
+            let stored_weights = Weights::from_dir(&dir).unwrap();
+            for part in ["weight", "scales", "biases"] {
+                assert!(
+                    stored_weights.contains(&format!("mtp.fc.{part}")),
+                    "mtp.fc.{part}"
+                );
+            }
+            let stored_json: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            let stored = Qwen35Model::from_weights_with(
+                &stored_weights,
+                "model.language_model",
+                Qwen35Config::from_json(&stored_json).unwrap(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("moe={moe}: the stored snapshot must load: {e}"));
+            assert!(stored.has_mtp(), "moe={moe}: the stored head is built");
+
+            let ids = Array::from_slice(&[1i32, 2], &[1, 2]);
+            let hidden = Array::from_slice(
+                &(0..128)
+                    .map(|i| (i as f32 - 64.0) / 64.0)
+                    .collect::<Vec<_>>(),
+                &[1, 2, 64],
+            );
+            let draft = |model: &Qwen35Model| {
+                let mut cache = model.new_mtp_cache().unwrap();
+                let (_, logits) = model.mtp_step(&ids, &hidden, &mut cache, 0).unwrap();
+                let logits = logits.as_dtype(Dtype::Float32).unwrap();
+                logits.eval().unwrap();
+                logits.as_slice::<f32>().to_vec()
+            };
+            let (expected, actual) = (draft(&load_time), draft(&stored));
+            let max_abs = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-5,
+                "moe={moe}: stored/load-time MTP parity max_abs={max_abs}"
+            );
+        }
+    }
+
+    /// `write_hf_snapshot_without_native_mtp` (sc-24446) writes the plain decoder: no `mtp.*`
+    /// tensor, `mtp_num_hidden_layers: 0`, a model without a head whose body is the full
+    /// snapshot's — dense and MoE.
+    #[test]
+    fn qwen35_snapshot_without_native_mtp_loads_the_plain_decoder() {
+        for moe in [false, true] {
+            let label = if moe { "moe" } else { "dense" };
+            let src = unique_dir(&format!("qwen35-nomtp-src-{label}"));
+            std::fs::create_dir_all(&src).unwrap();
+            let (tensors, config) = tiny_qwen35_mtp(moe);
+            std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+            let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
+            Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
+            let spec = QuantSpec::q4();
+            let (full, plain) = (
+                unique_dir(&format!("qwen35-full-{label}")),
+                unique_dir(&format!("qwen35-nomtp-{label}")),
+            );
+            write_hf_snapshot(&src, &full, Some(spec)).unwrap();
+            write_hf_snapshot_without_native_mtp(&src, &plain, Some(spec)).unwrap();
+
+            let load = |dir: &Path| {
+                let json: Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                let weights = Weights::from_dir(dir).unwrap();
+                let model = Qwen35Model::from_weights_with(
+                    &weights,
+                    "model.language_model",
+                    Qwen35Config::from_json(&json).unwrap(),
+                    None,
+                )
+                .unwrap();
+                (json, weights, model)
+            };
+            let (_, _, with_head) = load(&full);
+            let (json, weights, without) = load(&plain);
+            assert!(
+                with_head.has_mtp(),
+                "moe={moe}: the full snapshot keeps its head"
+            );
+            assert!(!without.has_mtp(), "moe={moe}: the head is gone");
+            assert!(
+                without.mtp_fallback().is_none(),
+                "moe={moe}: absent, not a fallback"
+            );
+            assert_eq!(json["text_config"]["mtp_num_hidden_layers"], 0);
+            assert!(
+                weights.keys().all(|k| !k.starts_with("mtp.")),
+                "moe={moe}: mtp.* dropped"
+            );
+            assert_eq!(
+                json["quantization"]["bits"], 4,
+                "moe={moe}: the body is still q4"
+            );
+
+            let ids = Array::from_slice(&[1i32, 2], &[1, 2]);
+            let logits = |model: &Qwen35Model| {
+                let out = model.forward(&ids, &mut model.new_cache(), 0).unwrap();
+                let out = out.as_dtype(Dtype::Float32).unwrap();
+                out.eval().unwrap();
+                out.as_slice::<f32>().to_vec()
+            };
+            assert_eq!(logits(&with_head), logits(&without), "moe={moe}: same body");
+        }
+    }
+
     fn qwen35_load_error(result: Result<Qwen35Model>, context: &str) -> Error {
         match result {
             Ok(_) => panic!("{context}"),
@@ -817,6 +1127,9 @@ mod tests {
             "model.layers.2.mlp.shared_expert.gate_proj.weight", // Qwen2-MoE singular
             // Qwen3-VL nested decoder
             "model.language_model.layers.0.self_attn.q_proj.weight",
+            // Qwen3.5/3.8 native MTP head fusion and its predictor layer
+            "mtp.fc.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
         ] {
             assert!(is_projection(k), "{k} should be a projection");
         }
@@ -1418,10 +1731,27 @@ mod tests {
         .unwrap();
         std::fs::write(src.join("tokenizer.json"), "{\"tok\":true}").unwrap();
         std::fs::write(src.join("tokenizer_config.json"), "{\"cfg\":true}").unwrap();
+        for name in SNAPSHOT_SIDECARS {
+            std::fs::write(src.join(name), format!("sidecar {name}")).unwrap();
+        }
+        std::fs::write(src.join("README.md"), "not read by the loader").unwrap();
         let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
         Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
 
         let report = write_hf_snapshot(&src, &out, None).unwrap();
+        // Every file the loader reads besides config/tokenizer/weights is copied verbatim
+        // (sc-24446: a snapshot without `generation_config.json` loses the generation EOS set).
+        for name in SNAPSHOT_SIDECARS {
+            assert_eq!(
+                std::fs::read_to_string(out.join(name)).unwrap(),
+                format!("sidecar {name}"),
+                "{name} copied verbatim"
+            );
+        }
+        assert!(
+            !out.join("README.md").exists(),
+            "only loader-read files are copied"
+        );
         assert_eq!(report.quantized, None);
 
         let reloaded = Weights::from_dir(&out).unwrap();
@@ -1467,6 +1797,100 @@ mod tests {
         assert_eq!(cfg.quantization, Some(QuantSpec::q4()));
         let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         assert!(model.is_quantized());
+    }
+
+    fn assert_bit_equal(key: &str, got: &Array, expected: &Array) {
+        assert_eq!(got.shape(), expected.shape(), "{key}: shape");
+        assert_eq!(got.dtype(), expected.dtype(), "{key}: dtype");
+        let same = mlx_rs::ops::eq(got, expected)
+            .and_then(|m| m.all(None))
+            .and_then(|a| a.try_item::<bool>());
+        assert!(matches!(same, Ok(true)), "{key}: values differ ({same:?})");
+    }
+
+    /// sc-24245: the quantize-prepare path reads each projection's source bytes on the CPU and
+    /// evaluates its packed triple before returning, instead of leaving `Load → cast → quantize`
+    /// lazy for `save_safetensors` to evaluate as one GPU graph waiting on the disk.
+    ///
+    /// MUTATION: drop the `eval_pending_loads`/`eval` from `read_then_cast` and the triple `eval`
+    /// from `push_quantized`, and the truncated source makes the outputs unreadable — RED.
+    #[test]
+    fn quantize_prepare_reads_the_source_before_returning() {
+        let src = unique_dir("lazy-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let path = src.join("model.safetensors");
+        let mut rng = SplitMix64::new(0x24245);
+        let dense = randn(&[128, 64], &mut rng);
+        Array::save_safetensors([("m.q_proj.weight", &dense)], None, &path).unwrap();
+        let spec = QuantSpec::q4();
+        let eager = QuantizedLinear::quantize(
+            &dense.as_dtype(STORE_DTYPE).unwrap(),
+            spec.group_size,
+            spec.bits,
+            None,
+        )
+        .unwrap();
+
+        let lazy = Weights::from_file(&path).unwrap().into_map();
+        let mut out = Vec::new();
+        let w = read_then_cast(&lazy["m.q_proj.weight"]).unwrap();
+        push_quantized(&mut out, "m.q_proj", &w, spec).unwrap();
+        drop((w, lazy));
+        // Nothing downstream has evaluated yet: pull the bytes out from under any deferred read.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let got: HashMap<_, _> = out.into_iter().collect();
+        assert_bit_equal("weight", &got["m.q_proj.weight"], &eager.weight);
+        assert_bit_equal("scales", &got["m.q_proj.scales"], &eager.scales);
+        assert_bit_equal("biases", &got["m.q_proj.biases"], &eager.biases);
+    }
+
+    /// The HF prepare leaf end to end over a lazily loaded tiny snapshot: every projection is
+    /// stored as exactly the packed triple a direct bf16 → Q4 quantization produces, and every
+    /// other tensor round-trips unchanged.
+    #[test]
+    fn hf_q4_prepare_matches_direct_quantization_and_passes_the_rest_through() {
+        let src = unique_dir("hfq-direct-src");
+        let out = unique_dir("hfq-direct-out");
+        std::fs::create_dir_all(&src).unwrap();
+        let (tensors, config) = tiny_model();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
+
+        let spec = QuantSpec::q4();
+        let report = write_hf_snapshot(&src, &out, Some(spec)).unwrap();
+        assert_eq!(report.quantized_projections, 14, "2 layers × 7 projections");
+
+        let stored = Weights::from_dir(&out).unwrap().into_map();
+        assert_eq!(stored.len(), report.num_tensors);
+        for (key, dense) in &tensors {
+            if is_projection(key) {
+                let base = key.strip_suffix(".weight").unwrap();
+                let q = QuantizedLinear::quantize(
+                    &dense.as_dtype(STORE_DTYPE).unwrap(),
+                    spec.group_size,
+                    spec.bits,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(q.weight.shape(), &[dense.shape()[0], dense.shape()[1] / 8]);
+                assert_bit_equal(key, &stored[&format!("{base}.weight")], &q.weight);
+                assert_bit_equal(key, &stored[&format!("{base}.scales")], &q.scales);
+                assert_bit_equal(key, &stored[&format!("{base}.biases")], &q.biases);
+            } else {
+                assert_bit_equal(key, &stored[key], dense);
+            }
+        }
     }
 
     /// A complete tiny Phi-3 tensor set (packed `qkv_proj` + `gate_up_proj`) with matching config:

@@ -464,7 +464,9 @@ pub fn save_lokr_with_meta(
         .collect();
     meta.insert("networkType".to_string(), "lokr".to_string());
     meta.insert("rank".to_string(), (rank as i64).to_string());
-    meta.insert("alpha".to_string(), (alpha as i64).to_string());
+    // Lossless (sc-24158): `f32` Display renders an integral alpha as before (`4`) and keeps a
+    // fractional one (`0.5`) — `as i64` truncated it, silently rescaling the reloaded LoKr.
+    meta.insert("alpha".to_string(), alpha.to_string());
     meta.insert("decomposeFactor".to_string(), decompose_factor.to_string());
     Array::save_safetensors(entries, Some(&meta), path)?;
     Ok(())
@@ -632,6 +634,41 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("LoRA param missing"), "got: {err}");
+    }
+
+    /// sc-24158: a fractional LoKr `alpha` survives save → metadata → [`parse_lokr`] (the writer used
+    /// `as i64`, truncating `2.5` to `2` and silently rescaling the reloaded LoKr).
+    ///
+    /// [`parse_lokr`]: crate::adapters::loader::parse_lokr
+    #[test]
+    fn save_lokr_writes_a_fractional_alpha_losslessly() {
+        use crate::adapters::AdaptableLinear;
+        use crate::weights::Weights;
+        struct OneLin(AdaptableLinear);
+        impl AdaptableHost for OneLin {
+            fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+                (path == ["to_q"]).then_some(&mut self.0)
+            }
+            fn adaptable_paths(&self) -> Vec<String> {
+                vec!["to_q".to_string()]
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = OneLin(AdaptableLinear::dense(
+            mlx_rs::random::normal::<f32>(&[8, 8], None, None, None).unwrap(),
+            None,
+        ));
+        let (targets, params) =
+            build_lokr_targets(&mut host, &["to_q".into()], 4, -1, 0).expect("lokr targets");
+        let path = dir.path().join("lokr.safetensors");
+        TrainAdapter::Lokr { targets }
+            .save_with_meta(&params, 2.5, 4.0, -1, "", &[], &path)
+            .expect("save");
+        let w = Weights::from_file(&path).expect("reload");
+        assert_eq!(w.metadata("alpha"), Some("2.5"));
+        assert_eq!(w.metadata("rank"), Some("4"));
+        let file = crate::adapters::loader::parse_lokr(&w).expect("parse");
+        assert_eq!((file.rank, file.alpha), (4.0, 2.5));
     }
 
     /// sc-14057: caller-supplied `__metadata__` entries ride BOTH adapter kinds, and can never

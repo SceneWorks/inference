@@ -58,6 +58,7 @@ fn descriptor_for(variant: Variant) -> TrainerDescriptor {
         supports_lokr: true,
         supports_control: false,
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -147,6 +148,7 @@ impl Trainer for Sd3Trainer {
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
         gen_core::train::validate_control_request(self.descriptor(), req)?;
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         validate_request(req)?;
         let want_bf16 = {
             let dtype = req.config.train_dtype.trim();

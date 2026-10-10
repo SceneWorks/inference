@@ -210,6 +210,9 @@ impl LensTransformer {
             cfg: *cfg,
             dtype,
         };
+        // Materialize the front/back tensors at load (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`); the trunk stays in the block stream.
+        w.materialize_accessed()?;
         // Constructors clone ref-counted handles. Remove every front/back tensor read above before
         // dropping the source view or the retained preamble would have a duplicate owner.
         w.remove_accessed();

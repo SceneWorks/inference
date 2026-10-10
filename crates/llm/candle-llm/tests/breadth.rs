@@ -151,7 +151,12 @@ fn gemma4_provider(quantize: Option<Quantize>) -> Option<LlamaProvider> {
     };
     let spec = LoadSpec {
         source: dir,
+        projector_source: None,
         quantize,
+        cuda_graphs: None,
+        mtp_head_source: None,
+        prefix_cache_bytes: None,
+        draft_source: None,
     };
     Some(LlamaProvider::load(&spec).expect("load gemma 4"))
 }

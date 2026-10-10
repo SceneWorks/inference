@@ -1,0 +1,9 @@
+Qwen RESEARCH LICENSE AGREEMENT (fixture placeholder)
+
+This file is a placeholder that stands in for the upstream `LICENSE` of
+`Qwen/Qwen-Image-2.1` in the miniature parity snapshot. It is not the licence
+text. The real snapshot ships the Qwen Research License Agreement, and a
+converted tier must carry it (Qwen Research License section 3). This file
+exists only so tests can check that the converter's `copy_turnkey_assets`
+step carries a root `LICENSE` into every converted tier and lists it in
+`SHA256SUMS` (sc-24114).

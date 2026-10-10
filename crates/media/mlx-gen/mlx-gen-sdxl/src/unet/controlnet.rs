@@ -314,7 +314,7 @@ impl ControlNet {
         self.mid_transformer.quantize(bits)?;
         self.mid_resnet1.quantize(bits)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
-            proj.quantize(bits, None)?;
+            crate::quant::quantize_linear(proj, bits)?;
         }
         Ok(())
     }

@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.ci.select_lanes import LANES, select_lanes
+from scripts.ci.select_lanes import LANES, only_lanes, select_lanes
 
 
 class SelectLanesTests(unittest.TestCase):
@@ -50,6 +50,16 @@ class SelectLanesTests(unittest.TestCase):
         self.assertTrue(lanes["macos_metal"])
         self.assertTrue(lanes["windows_cuda"])
         self.assertFalse(lanes["contracts"])
+
+    def test_shared_quant_kernels_are_candle_classified(self) -> None:
+        # candle-quant-kernels (sc-24135) serves both candle-gen and candle-llm: every Candle lane,
+        # and never the fail-safe-to-all an unclassified top-level path would take.
+        lanes = select_lanes(["crates/kernels/candle-quant-kernels/src/nvfp4.rs"])
+        selected = {lane for lane, enabled in lanes.items() if enabled}
+        self.assertEqual(
+            selected,
+            {"workspace", "candle_cpu", "macos_metal", "windows_cuda", "real_weights"},
+        )
 
     def test_audio_family_is_candle_classified(self) -> None:
         # The Candle audio lane (sc-12835) runs on every platform: CPU/CUDA natively and macOS
@@ -191,6 +201,15 @@ class SelectLanesTests(unittest.TestCase):
     def test_empty_or_forced_input_selects_everything(self) -> None:
         self.assertTrue(all(select_lanes([]).values()))
         self.assertTrue(all(select_lanes(["README.md"], force_all=True).values()))
+
+    def test_only_selects_exactly_the_named_lanes(self) -> None:
+        lanes = only_lanes(["windows_cuda"])
+        self.assertEqual({lane for lane, enabled in lanes.items() if enabled}, {"windows_cuda"})
+        self.assertFalse(lanes["macos_metal"])
+        self.assertEqual(set(lanes), set(LANES))
+        for bad in ([], ["windows-cuda"], ["windows_cuda", "nope"]):
+            with self.subTest(selection=bad), self.assertRaises(ValueError):
+                only_lanes(bad)
 
 
 if __name__ == "__main__":

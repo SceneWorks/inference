@@ -419,6 +419,23 @@ impl LoraLinear {
         Ok(())
     }
 
+    /// Device bytes the additive inference residuals on this projection hold right now (sc-24163):
+    /// each LoRA's f32 factors, which every forward casts and drops (no cached copy), and each
+    /// structured LoKr's factors plus the compute-dtype copies its forwards have cached
+    /// ([`LokrFactors::device_bytes`]). The trainable adapter is not counted.
+    pub fn frozen_additive_bytes(&self) -> usize {
+        self.additive
+            .iter()
+            .map(|residual| match residual {
+                AdditiveResidual::Lora { a, b, .. } => {
+                    a.elem_count() * a.dtype().size_in_bytes()
+                        + b.elem_count() * b.dtype().size_in_bytes()
+                }
+                AdditiveResidual::LokrStructured { factors, .. } => factors.device_bytes(),
+            })
+            .sum()
+    }
+
     /// Attach a forward-time **additive structured LoKr** inference residual via the shared Kronecker
     /// vec-trick (sc-11103): the full `(alpha/rank)·strength` scale is baked into `factors`, so the
     /// `[out,in]` delta is never formed and the residual is memory-free on a packed base. Valid on any
@@ -974,17 +991,6 @@ pub fn build_lokr_targets(
     })
 }
 
-/// Reconstruct the LoRA weight delta `ΔW = (alpha/rank)·scale·(B·A)` as an `[out, in]` **f32** tensor
-/// — the inference-side **merge** counterpart to [`LoraLinear`]'s training **forward**, which adds the
-/// mathematically-identical residual `scale·(x·Aᵀ)·Bᵀ` with the install `scale = alpha/rank`. `down`
-/// is `A` `[rank, in]`, `up` is `B` `[out, rank]`; `scale` is the caller's per-adapter strength
-/// (`gen_core::AdapterSpec::scale`, `1.0` reconstructs the trained delta verbatim). Computed in f32 so
-/// a candle-trained adapter round-trips through inference exactly.
-///
-/// SDXL merges this into the dense UNet weight (`W += ΔW`) rather than adding it live: the ancestral
-/// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
-/// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
-/// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
 /// Install trainable LoRA factors on an [`AdaptLoraHost`]. The saved factor convention is identical
 /// to [`build_lora_targets`]; only the host projection type differs.
 pub fn build_adapt_lora_targets(
@@ -1094,6 +1100,97 @@ pub fn build_adapt_lokr_targets(
     })
 }
 
+/// Install trainable LoKr residuals on an [`AdaptLoraHost`] with the **PEFT factor surface** — the
+/// exact factors [`build_lokr_targets`] (and the MLX `build_lokr_targets`) train: `w1` zero-init
+/// `[out_a, in_a]`, and `w2` low-ranked to `w2_a [out_b, rank] · w2_b [rank, in_b]` when
+/// `rank < max(out_b, in_b) / 2` (PEFT's `use_w2` rule), a full kaiming-init `w2 [out_b, in_b]`
+/// otherwise. A trainer whose saved LoKr must carry the same keys as its MLX twin (so either
+/// backend's adapter is the other's) uses this; [`build_adapt_lokr_targets`] keeps its historical
+/// always-full `w2` for the trainers already shipping it. The low-rank product is rebuilt inside every
+/// forward ([`AdaptLinear::push_trainable_lokr_low_rank`]), so no update is hidden behind a stale
+/// eager product.
+pub fn build_adapt_lokr_targets_peft(
+    host: &mut dyn AdaptLoraHost,
+    target_suffixes: &[String],
+    rank: u32,
+    alpha: f32,
+    decompose_factor: i32,
+    seed: u64,
+    device: &Device,
+) -> Result<LoraSet> {
+    if rank == 0 {
+        return Err(CandleError::Msg("lokr rank must be >= 1".into()));
+    }
+    let r = rank as usize;
+    let scale = alpha as f64 / r as f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut vars = Vec::new();
+    let mut targets = Vec::new();
+    host.visit_adapt_lora_mut(&mut |path, lin| {
+        if !target_suffixes.is_empty()
+            && !target_suffixes
+                .iter()
+                .any(|suffix| path_matches(path, suffix))
+        {
+            return Ok(());
+        }
+        let (out_f, in_f) = lin.base_shape();
+        let (out_a, out_b) = factorization(out_f, decompose_factor);
+        let (in_a, in_b) = factorization(in_f, decompose_factor);
+        let w1 = zero_var(out_a, in_a, device)?;
+        vars.push(w1.clone());
+        let mut factors: Vec<(&'static str, Var)> = vec![("lokr_w1", w1.clone())];
+        if (r as f32) < (out_b.max(in_b) as f32) / 2.0 {
+            let w2a = kaiming_uniform_var(out_b, r, &mut rng, device)?; // fan_in = r
+            let w2b = kaiming_uniform_var(r, in_b, &mut rng, device)?; // fan_in = in_b
+            vars.push(w2a.clone());
+            vars.push(w2b.clone());
+            lin.push_trainable_lokr_low_rank(
+                w1.as_tensor().clone(),
+                w2a.as_tensor().clone(),
+                w2b.as_tensor().clone(),
+                scale,
+            );
+            factors.push(("lokr_w2_a", w2a));
+            factors.push(("lokr_w2_b", w2b));
+        } else {
+            let w2 = kaiming_uniform_var(out_b, in_b, &mut rng, device)?; // fan_in = in_b
+            vars.push(w2.clone());
+            lin.push_trainable_lokr(w1.as_tensor().clone(), w2.as_tensor().clone(), scale);
+            factors.push(("lokr_w2", w2));
+        }
+        targets.push(AdapterTarget {
+            path: path.to_string(),
+            factors,
+        });
+        Ok(())
+    })?;
+    if targets.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "no LoKr targets matched suffixes {target_suffixes:?} on the host"
+        )));
+    }
+    Ok(LoraSet {
+        kind: AdapterKind::Lokr,
+        rank,
+        alpha,
+        decompose_factor,
+        vars,
+        targets,
+    })
+}
+
+/// Reconstruct the LoRA weight delta `ΔW = (alpha/rank)·scale·(B·A)` as an `[out, in]` **f32** tensor
+/// — the inference-side **merge** counterpart to [`LoraLinear`]'s training **forward**, which adds the
+/// mathematically-identical residual `scale·(x·Aᵀ)·Bᵀ` with the install `scale = alpha/rank`. `down`
+/// is `A` `[rank, in]`, `up` is `B` `[out, rank]`; `scale` is the caller's per-adapter strength
+/// (`gen_core::AdapterSpec::scale`, `1.0` reconstructs the trained delta verbatim). Computed in f32 so
+/// a candle-trained adapter round-trips through inference exactly.
+///
+/// SDXL merges this into the dense UNet weight (`W += ΔW`) rather than adding it live: the ancestral
+/// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
+/// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
+/// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
 pub fn reconstruct_lora_delta(
     down: &Tensor,
     up: &Tensor,
@@ -1250,6 +1347,11 @@ pub fn conv_lora_delta(
 /// **Linear-only**: pass 2-D factors. The conv/tucker LoHa form (lycoris `use_cp`, `hada_t1`/`hada_t2`)
 /// is out of the candle SDXL adapter surface — like third-party LoKr, LoHa merges only into the
 /// attention/proj Linears (the conv surface is LoRA-only), so a conv-shaped LoHa is surfaced as skipped.
+///
+/// **Orientation is checked, not just element count** (sc-24157): every factor must be 2-D with
+/// `w*_a` `[out, r]` and `w*_b` `[r, in]` for `base_shape = (out, in)`. A transposed module
+/// (`[in, r]`·`[r, out]`) has the same `out·in` elements and would otherwise reshape into a
+/// scrambled `[out, in]` delta and merge silently.
 pub fn reconstruct_loha_delta(
     w1_a: &Tensor,
     w1_b: &Tensor,
@@ -1258,10 +1360,24 @@ pub fn reconstruct_loha_delta(
     scale: f32,
     base_shape: (usize, usize),
 ) -> Result<Tensor> {
+    let (out_f, in_f) = base_shape;
+    let oriented = |a: &Tensor, b: &Tensor| {
+        let (a, b) = (a.dims(), b.dims());
+        a.len() == 2 && b.len() == 2 && a[0] == out_f && b[1] == in_f && a[1] == b[0]
+    };
+    if !(oriented(w1_a, w1_b) && oriented(w2_a, w2_b)) {
+        return Err(CandleError::Msg(format!(
+            "loha: factors w1_a {:?} / w1_b {:?} / w2_a {:?} / w2_b {:?} do not reconstruct the \
+             base [out={out_f}, in={in_f}] (expected w*_a [out, r] and w*_b [r, in])",
+            w1_a.dims(),
+            w1_b.dims(),
+            w2_a.dims(),
+            w2_b.dims()
+        )));
+    }
     let f32d = |t: &Tensor| t.to_dtype(DType::F32);
     let m1 = f32d(w1_a)?.matmul(&f32d(w1_b)?)?; // [out, rank]·[rank, in] → [out, in]
     let m2 = f32d(w2_a)?.matmul(&f32d(w2_b)?)?;
-    let (out_f, in_f) = base_shape;
     let delta = (m1 * m2)?.reshape((out_f, in_f))?;
     Ok((delta * scale as f64)?)
 }
@@ -1409,7 +1525,7 @@ pub fn save_lora_peft(
 /// Write a LoKr [`LoraSet`] as `.safetensors`: bare keys `{path}.lokr_w1` + (`lokr_w2` |
 /// `lokr_w2_a`/`lokr_w2_b`), with `networkType`/`rank`/`alpha`/`decomposeFactor` metadata. No key
 /// prefix (the SDXL LoKr loader accepts a `base_model.model.unet.` prefix but bare keys resolve for
-/// every family). Matches the MLX `save_lokr` (integer rank/alpha rendering).
+/// every family). Matches the MLX `save_lokr` (integer rank, lossless alpha).
 pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Path) -> Result<()> {
     if set.kind != AdapterKind::Lokr {
         return Err(CandleError::Msg(
@@ -1420,7 +1536,9 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("networkType".into(), set.kind.network_type().into());
     meta.insert("rank".into(), (set.rank as i64).to_string());
-    meta.insert("alpha".into(), (set.alpha as i64).to_string());
+    // Lossless (sc-24158): `f32` Display renders an integral alpha as before (`4`) and keeps a
+    // fractional one (`0.5`) — `as i64` truncated it, silently rescaling the reloaded LoKr.
+    meta.insert("alpha".into(), set.alpha.to_string());
     meta.insert("decomposeFactor".into(), set.decompose_factor.to_string());
     for (k, v) in extra_meta {
         meta.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1531,6 +1649,127 @@ mod tests {
                 .unwrap()
                 > 0.0
         );
+    }
+
+    /// `build_adapt_lokr_targets_peft` trains PEFT's factor surface — a low-rank `w2_a·w2_b` below
+    /// the `use_w2` threshold, a full `w2` at or above it — with the residual equal to the folded
+    /// LyCORIS delta, every factor reached by the loss, optimizer updates observed without a
+    /// reinstall, and a frozen projection building no graph to the leaves (sc-24160).
+    #[test]
+    fn adapt_lokr_peft_surface_low_rank_and_full_train_and_freeze() {
+        let device = Device::Cpu;
+        // [out=16, in=16]: auto factorization (4, 4) per side, so `use_w2` flips at rank 2.
+        for (rank, want) in [
+            (1u32, vec!["lokr_w1", "lokr_w2_a", "lokr_w2_b"]),
+            (2, vec!["lokr_w1", "lokr_w2"]),
+        ] {
+            let base = Linear::new(Tensor::zeros((16, 16), DType::F32, &device).unwrap(), None);
+            let mut host = OneAdaptHost {
+                lin: AdaptLinear::from_dense(base, 16, 16),
+            };
+            let set = build_adapt_lokr_targets_peft(
+                &mut host,
+                &["to_q".to_string()],
+                rank,
+                rank as f32,
+                -1,
+                7,
+                &device,
+            )
+            .unwrap();
+            let named: Vec<String> = set.named_vars().into_iter().map(|(n, _)| n).collect();
+            let want: Vec<String> = want.iter().map(|s| format!("block.to_q.{s}")).collect();
+            assert_eq!(named, want, "rank {rank}");
+            // Move w1 off its zero init so the residual (and every factor's gradient) is live.
+            set.vars[0]
+                .set(&Tensor::randn(0f32, 0.5, (4, 4), &device).unwrap())
+                .unwrap();
+
+            let x = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
+            let factor = |suffix: &str| {
+                set.named_vars()
+                    .into_iter()
+                    .find(|(n, _)| n.ends_with(&format!(".{suffix}")))
+                    .map(|(_, v)| v.as_tensor().clone())
+            };
+            let (w1, w2, w2a, w2b) = (
+                factor("lokr_w1"),
+                factor("lokr_w2"),
+                factor("lokr_w2_a"),
+                factor("lokr_w2_b"),
+            );
+            // The residual equals the folded LyCORIS delta `x·ΔWᵀ`.
+            let delta = reconstruct_lokr_delta(
+                w1.as_ref(),
+                None,
+                None,
+                w2.as_ref(),
+                w2a.as_ref(),
+                w2b.as_ref(),
+                rank as f32,
+                rank as f32,
+                1.0,
+                (16, 16),
+            )
+            .unwrap();
+            let want_y = x.matmul(&delta.t().unwrap()).unwrap();
+            let got_y = host.lin.forward(&x).unwrap();
+            let diff = (&got_y - &want_y)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff < 1e-5, "rank {rank}: residual vs folded delta {diff}");
+
+            let grads = got_y.sqr().unwrap().mean_all().unwrap().backward().unwrap();
+            for (name, var) in set.named_vars() {
+                assert!(
+                    grads.get(var.as_tensor()).is_some(),
+                    "{name} has no gradient"
+                );
+            }
+            // An optimizer update is observed by the next forward without a reinstall.
+            let mut opt = TrainOptimizer::from_config("adam", set.vars.clone(), 0.05, 0.0).unwrap();
+            opt.step(&grads).unwrap();
+            let moved = host.lin.forward(&x).unwrap();
+            let shift = (&moved - &got_y)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                shift > 0.0,
+                "rank {rank}: the update must reach the forward"
+            );
+
+            // Frozen: same values, no graph to the leaves; thawed: the graph is back.
+            host.lin.set_trainable_frozen(true);
+            let frozen = host.lin.forward(&x).unwrap();
+            assert_eq!(
+                frozen.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                moved.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            let grads = frozen.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+            assert!(set.vars.iter().all(|v| grads.get(v.as_tensor()).is_none()));
+            host.lin.set_trainable_frozen(false);
+            let grads = host
+                .lin
+                .forward(&x)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .backward()
+                .unwrap();
+            assert!(set.vars.iter().all(|v| grads.get(v.as_tensor()).is_some()));
+        }
     }
 
     fn deterministic_lora_weight(out_f: usize, in_f: usize) -> Tensor {
@@ -2557,6 +2796,40 @@ mod tests {
         assert_eq!(got, vec![7.5, 12.0, 0.0, 0.0]);
     }
 
+    /// sc-24157: a transposed LoHa (`[in, r]`·`[r, out]` against an `[out, in]` base) has the right
+    /// element count, so a reshape alone would accept it; the orientation check refuses it. The
+    /// correctly oriented factors over the same base still reconstruct.
+    #[test]
+    fn reconstruct_loha_delta_refuses_a_transposed_module() {
+        let dev = Device::Cpu;
+        let ones = |r, c| Tensor::ones((r, c), DType::F32, &dev).unwrap();
+        // base [out=2, in=3]; factors for [3, 2].
+        let err = reconstruct_loha_delta(
+            &ones(3, 1),
+            &ones(1, 2),
+            &ones(3, 1),
+            &ones(1, 2),
+            1.0,
+            (2, 3),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("do not reconstruct the base [out=2, in=3]"),
+            "got: {err}"
+        );
+        let ok = reconstruct_loha_delta(
+            &ones(2, 1),
+            &ones(1, 3),
+            &ones(2, 1),
+            &ones(1, 3),
+            1.0,
+            (2, 3),
+        )
+        .unwrap();
+        assert_eq!(ok.dims(), &[2, 3]);
+    }
+
     /// sc-5374: a diffusers / PEFT `lora_adapter_metadata` blob with `lora_alpha ≠ r` parses to the
     /// global pair, so the merge can recover the true `(alpha/rank)` scaling (the example from the
     /// story: `lora_alpha = 16`, `r = 8` ⇒ scale 2.0). The pair applies to any module with no override.
@@ -2608,5 +2881,31 @@ mod tests {
             "{not valid json".to_string(),
         )]);
         assert!(LoraAdapterMeta::from_file_metadata(&bad).is_none());
+    }
+
+    /// sc-24158: a fractional LoKr `alpha` survives the save → metadata → reload round trip (the
+    /// writer used `as i64`, truncating `2.5` to `2` and silently rescaling the reloaded LoKr).
+    #[test]
+    fn save_lokr_writes_a_fractional_alpha_losslessly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lokr.safetensors");
+        let set = LoraSet {
+            kind: AdapterKind::Lokr,
+            rank: 4,
+            alpha: 2.5,
+            decompose_factor: -1,
+            vars: Vec::new(),
+            targets: Vec::new(),
+        };
+        save_lokr(&set, &HashMap::new(), &path).unwrap();
+        let meta = gen_core::weightsmeta::safetensors_file_metadata(&path).unwrap();
+        assert_eq!(meta.get("alpha").map(String::as_str), Some("2.5"));
+        assert_eq!(meta.get("rank").map(String::as_str), Some("4"));
+        let (rank, alpha) = parse_lokr_metadata(
+            meta.get("rank").map(String::as_str),
+            meta.get("alpha").map(String::as_str),
+        )
+        .unwrap();
+        assert_eq!((rank, alpha), (4.0, 2.5));
     }
 }

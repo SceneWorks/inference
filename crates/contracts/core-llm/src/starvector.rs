@@ -122,6 +122,63 @@ impl StarVectorDescriptor {
     }
 }
 
+/// Return the largest generated-token budget that fits after a model's exact prefill.
+///
+/// StarVector inserts image embeddings and a fixed decoder prefix before the first sampled token.
+/// Those positions consume the same decoder context as generated tokens, so a provider must derive
+/// its advertised generation bound from the loaded prefill rather than treating context and output
+/// limits as independent numbers.
+pub fn generated_token_budget(max_context_tokens: usize, prefill_tokens: usize) -> Result<u32> {
+    let available = max_context_tokens
+        .checked_sub(prefill_tokens)
+        .ok_or_else(|| {
+            Error::InvalidRequest(format!(
+            "StarVector prefill of {prefill_tokens} tokens exhausts context of {max_context_tokens}"
+        ))
+        })?;
+    u32::try_from(available).map_err(|_| {
+        Error::InvalidRequest(format!(
+            "StarVector available generation budget {available} does not fit u32"
+        ))
+    })
+}
+
+/// Require a request to fit after the exact prefill that the loaded provider will materialize.
+pub fn validate_generated_token_budget(
+    requested_tokens: u32,
+    max_context_tokens: usize,
+    prefill_tokens: usize,
+) -> Result<u32> {
+    let available = generated_token_budget(max_context_tokens, prefill_tokens)?;
+    if requested_tokens > available {
+        return Err(Error::InvalidRequest(format!(
+            "StarVector max_new_tokens {requested_tokens} exceeds context-derived cap {available} \
+             after {prefill_tokens} prefill tokens in context {max_context_tokens}"
+        )));
+    }
+    Ok(available)
+}
+
+/// Verify that a provider's public cap is exactly the capacity left by its loaded prefill.
+///
+/// This is intentionally equality, rather than an upper-bound check: advertising less would
+/// recreate an artificial generation ceiling, while advertising more would let the cache cross
+/// its model context.
+pub fn validate_advertised_generated_token_cap(
+    advertised_tokens: u32,
+    max_context_tokens: usize,
+    prefill_tokens: usize,
+) -> Result<()> {
+    let available = generated_token_budget(max_context_tokens, prefill_tokens)?;
+    if advertised_tokens != available {
+        return Err(Error::InvalidRequest(format!(
+            "StarVector advertised max_new_tokens {advertised_tokens} disagrees with context-derived cap \
+             {available} after {prefill_tokens} prefill tokens in context {max_context_tokens}"
+        )));
+    }
+    Ok(())
+}
+
 /// A request to generate one SVG document. Image and text are independently optional, but a request
 /// needs at least one non-empty conditioning input. This allows image-to-SVG, disclosed
 /// image-plus-text guidance, and future text-to-SVG providers without overloading raster contracts.
@@ -250,6 +307,10 @@ pub struct StarVectorOutput {
     pub generated_bytes: usize,
     /// Typed terminal classification.
     pub finish_reason: StarVectorFinishReason,
+    /// The KV cache the decode ran on (sc-20682): a StarVector decoder has no qualification-table
+    /// family, so always dense with the request's reason
+    /// ([`KvCacheReport::without_table_family`](crate::KvCacheReport::without_table_family)).
+    pub kv_cache: Option<crate::KvCacheReport>,
 }
 
 /// Reusable host-side stop guard for provider decoding loops.
@@ -338,6 +399,43 @@ impl<'a> StarVectorBoundedStream<'a> {
         }
     }
 
+    /// Accept stable text released at final detokenizer flush for an already-counted token.
+    ///
+    /// Stateful tokenizers can retain a split UTF-8 suffix until generation ends. The token that
+    /// produced this text already passed [`push`](Self::push), often with an empty fragment, so the
+    /// suffix must recheck time, cancellation, byte, and root bounds without charging a second
+    /// generated token.
+    pub fn push_decoded_suffix(
+        &mut self,
+        fragment: &str,
+        elapsed: Duration,
+    ) -> Result<StarVectorStreamStatus> {
+        if self.finish_reason.is_some() || self.generated_tokens == 0 {
+            return Err(Error::InvalidRequest(
+                "StarVector final decoded suffix has no pending generated token".into(),
+            ));
+        }
+        if self.request.text_request.cancel.is_cancelled() {
+            return Ok(self.stop(StarVectorFinishReason::Cancelled));
+        }
+        if elapsed >= self.request.max_wall_time {
+            return Ok(self.stop(StarVectorFinishReason::WallTimeLimit));
+        }
+        let next_bytes = self
+            .source
+            .len()
+            .checked_add(fragment.len())
+            .ok_or_else(|| Error::InvalidRequest("StarVector source byte count overflow".into()))?;
+        if next_bytes > self.request.max_svg_bytes {
+            return Ok(self.stop(StarVectorFinishReason::ByteLimit));
+        }
+        self.source.push_str(fragment);
+        match scan_svg_root(&self.source)? {
+            SvgRootState::Incomplete => Ok(StarVectorStreamStatus::Continue),
+            SvgRootState::Complete => Ok(self.stop(StarVectorFinishReason::CompleteRoot)),
+        }
+    }
+
     /// Accepted decoder tokens so far, including hidden tokens passed as empty fragments.
     pub fn generated_tokens(&self) -> u32 {
         self.generated_tokens
@@ -384,6 +482,9 @@ impl<'a> StarVectorBoundedStream<'a> {
             generated_tokens: self.generated_tokens,
             generated_bytes: self.source.len(),
             finish_reason,
+            kv_cache: Some(crate::KvCacheReport::without_table_family(
+                self.request.text_request.kv_compression,
+            )),
         })
     }
 
@@ -581,6 +682,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_budget_reserves_the_entire_loaded_prefill() {
+        assert_eq!(generated_token_budget(8_192, 259).unwrap(), 7_933);
+        assert_eq!(generated_token_budget(16_000, 578).unwrap(), 15_422);
+        assert!(validate_generated_token_budget(7_934, 8_192, 259).is_err());
+        assert!(validate_advertised_generated_token_cap(4_000, 8_192, 259).is_err());
+        assert!(validate_advertised_generated_token_cap(7_933, 8_192, 259).is_ok());
+        assert!(generated_token_budget(259, 260).is_err());
+    }
+
+    #[test]
     fn bounded_stream_stops_at_exact_complete_root_and_preserves_utf8() {
         let req = request(4, 128, TEST_LIMIT);
         let mut stream = StarVectorBoundedStream::new(&req);
@@ -598,6 +709,24 @@ mod tests {
             Some("<svg data-name=\"café\"><path d=\"M0 0\"/></svg>")
         );
         assert_eq!(out.generated_bytes, out.svg.as_ref().unwrap().len());
+    }
+
+    /// sc-20682: the output names the dense KV cache the decode ran on, with the request's reason.
+    #[test]
+    fn bounded_stream_output_reports_the_dense_kv_cache() {
+        use crate::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        for (policy, reason) in [
+            (Policy::Off, Reason::PolicyDisabled),
+            (Policy::Qualified, Reason::UnqualifiedModel),
+        ] {
+            let mut req = request(4, 128, TEST_LIMIT);
+            req.text_request.kv_compression = policy;
+            let mut stream = StarVectorBoundedStream::new(&req);
+            push(&mut stream, "<svg><path d=\"M0 0\"/></svg>", STEP).unwrap();
+            let report = stream.output().unwrap().kv_cache.unwrap();
+            assert_eq!(report.fallback, Some(reason));
+            assert!(!report.ran_compressed());
+        }
     }
 
     #[test]
@@ -623,6 +752,38 @@ mod tests {
             limited.push_static_prefix("<svg").unwrap(),
             StarVectorStreamStatus::Stop(StarVectorFinishReason::ByteLimit)
         );
+        assert_eq!(limited.output().unwrap().svg, None);
+    }
+
+    #[test]
+    fn final_decoded_suffix_reuses_the_pending_token_and_keeps_bounds() {
+        let req = request(1, 32, TEST_LIMIT);
+        let mut stream = StarVectorBoundedStream::new(&req);
+        assert_eq!(
+            stream.push_static_prefix("<svg").unwrap(),
+            StarVectorStreamStatus::Continue
+        );
+        assert_eq!(
+            push(&mut stream, "", STEP).unwrap(),
+            StarVectorStreamStatus::Continue
+        );
+        assert_eq!(
+            stream.push_decoded_suffix("></svg>", STEP).unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot)
+        );
+        let output = stream.output().unwrap();
+        assert_eq!(output.svg.as_deref(), Some("<svg></svg>"));
+        assert_eq!(output.generated_tokens, 1);
+
+        let limited_req = request(1, 8, TEST_LIMIT);
+        let mut limited = StarVectorBoundedStream::new(&limited_req);
+        limited.push_static_prefix("<svg").unwrap();
+        push(&mut limited, "", STEP).unwrap();
+        assert_eq!(
+            limited.push_decoded_suffix("></svg>", STEP).unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::ByteLimit)
+        );
+        assert_eq!(limited.generated_tokens(), 1);
         assert_eq!(limited.output().unwrap().svg, None);
     }
 

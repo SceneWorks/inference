@@ -194,6 +194,7 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // Adapter-only: no full base fine-tune path (sc-14056). The shared
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
+        max_reference_images: 0,
     }
 }
 
@@ -214,20 +215,18 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     };
     let dtype = Dtype::Float32;
     let te_w = Weights::from_dir(root.join("text_encoder"))?;
+    // bf16 frozen encoder (see the struct field) — half the f32 footprint, matches fp16 inference.
+    let chatglm =
+        ChatGlmModel::from_weights(&te_w, ChatGlmConfig::chatglm3_6b(), None, Dtype::Bfloat16)?;
+    // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    te_w.materialize_accessed()?;
     Ok(Box::new(KolorsTrainer {
         descriptor: trainer_descriptor(),
         vae: load_vae(root)?, // SDXL VAE (sdxl-vae-fp16-fix), f32
         unet: load_unet_kolors_dtype(root, dtype)?,
         hooks: KolorsHooks {
             tokenizer: KolorsTokenizer::from_dir(root.join("tokenizer"))?,
-            // bf16 frozen encoder (see the struct field) — half the f32 footprint, matches fp16
-            // inference.
-            chatglm: Some(ChatGlmModel::from_weights(
-                &te_w,
-                ChatGlmConfig::chatglm3_6b(),
-                None,
-                Dtype::Bfloat16,
-            )?),
+            chatglm: Some(chatglm),
             schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
         },
     }))
@@ -251,6 +250,7 @@ impl Trainer for KolorsTrainer {
         // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
         // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
         gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
+        gen_core::train::validate_edit_request(self.descriptor(), req)?;
         if req.items.is_empty() {
             return Err("kolors trainer: dataset is empty".into());
         }

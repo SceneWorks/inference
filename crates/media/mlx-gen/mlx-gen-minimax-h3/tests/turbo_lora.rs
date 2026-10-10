@@ -570,6 +570,62 @@ fn a_file_matching_nothing_names_the_expected_key_space() {
     assert_eq!(dit.adaptable_mut(&segs).unwrap().adapters().len(), 2);
 }
 
+/// **sc-23402 — every adapter file is forced and GPU-verified at its own load boundary.**
+///
+/// `Weights::from_file` leaves an adapter's factors lazy `Load` buffers on the CPU stream, and
+/// their first Metal consumer is the residual inside denoise step 1: the sc-22414 seam, in its
+/// silent shape. A stale all-zero `a`/`b` folds a **zero** residual, so the render comes out at base
+/// strength with no refusal, no degeneracy trip and no unmatched-target error. Adapters are
+/// installed in `MiniMaxH3::load_task_dit` for both denoise paths, `ref2va` included, so this is the
+/// same route every other load sc-23402 verified.
+///
+/// The count is the **return value of** the verification (`verify_adapter_file` returns what it
+/// verified), not a separate tally, and the verification runs before the file is classified,
+/// converted or folded — hence the ComfyUI arm, whose *source* file is what must be verified.
+///
+/// MUTATION: delete `report.verified_source_tensors += verify_adapter_file(&w)?;` from
+/// `apply_minimax_h3_adapters` — every arm below goes to 0 and reds.
+#[test]
+fn every_adapter_file_is_forced_and_gpu_verified_at_its_load_boundary() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let per_file = 2 * adapter_target_paths(&cfg).len();
+    assert_eq!(per_file, 48, "24 modules, an `a`/`b` pair each");
+
+    let one = write_lora(dir.path(), "verify_one.safetensors", &cfg, Some("8"));
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(one.clone(), 1.0)]).expect("install");
+    assert_eq!(
+        report.verified_source_tensors, per_file,
+        "the WHOLE adapter file is the read set, not only the factors that folded"
+    );
+
+    // Summed per spec: the second file is verified at its own boundary rather than skipped because
+    // the first one passed.
+    let two = write_lora(dir.path(), "verify_two.safetensors", &cfg, Some("128"));
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(one, 1.0), spec(two, 1.0)])
+        .expect("install both");
+    assert_eq!(report.verified_source_tensors, 2 * per_file);
+
+    // A file that goes through a key-space conversion is verified as it was READ — the converted
+    // factors are graph nodes over these buffers, so the source is where the cold `Load` is.
+    let (qkv, fc1) = twin_factors(&cfg);
+    let comfy = write_comfyui_twin(
+        dir.path(),
+        "verify_comfy.safetensors",
+        &cfg,
+        FusedQkvSpec::at(24.0, true),
+        &qkv,
+        (&fc1.0, &fc1.1),
+    );
+    let source_tensors = Weights::from_file(&comfy).expect("read back").len();
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(comfy, 1.0)]).expect("install");
+    assert_eq!(report.converted_from_comfyui, 1, "the conversion arm ran");
+    assert_eq!(report.verified_source_tensors, source_tensors);
+}
+
 /// A PEFT `lora_adapter_metadata` blob whose `r` disagrees with the factor shapes is a **hard
 /// error**, exactly like a disagreeing `__metadata__["rank"]` string — never a silent override.
 ///

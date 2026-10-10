@@ -17,7 +17,7 @@ REFERENCE_PACKAGES = {
     "safetensors": "0.8.0",
     "torch": "2.13.0",
     "torchvision": "0.28.0",
-    "transformers": "5.5.0",
+    "transformers": "5.10.4",
     "typing_extensions": "4.15.0",
 }
 # Keep this aligned with real-weights.yml. The self-hosted macOS oracle runner installs this exact

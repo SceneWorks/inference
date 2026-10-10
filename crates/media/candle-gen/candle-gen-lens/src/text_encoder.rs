@@ -45,6 +45,12 @@ use candle_gen::candle_nn::{
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant as shared;
 use candle_gen::CandleError;
+use candle_llm::decode::{
+    generate_with_sampler, FinishReason, GenerationConfig, LogitsScope, SpeculativePrompt,
+    StepModel, StepOutput, StepRequest, StreamEvent, TokenSampler,
+};
+use candle_llm::primitives::sampler::argmax_device;
+use candle_llm::primitives::{tensor_bytes, CacheMemory, DecodeCache, SamplerPath, SamplingParams};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1222,46 +1228,93 @@ impl LensReasonerModel {
         Ok(hidden)
     }
 
-    /// Greedy next-token id from the **last** position of `hidden` `[1, T, hidden]`
-    /// (`argmax(lm_head(norm(h_last)))`, argmax in f32 for a stable tie-break).
-    fn argmax_token(&self, hidden: &Tensor) -> Result<u32> {
+    /// The last position's f32 logits `[1, 1, vocab]` of `hidden` `[1, T, hidden]`
+    /// (`lm_head(norm(h_last))`, widened to f32 for a stable argmax tie-break).
+    fn last_logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let t = hidden.dim(1)?;
         let last = hidden.narrow(1, t - 1, 1)?; // [1, 1, hidden]
         let normed = self.norm.forward(&last)?;
-        let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, 1, vocab]
-        let id = logits.flatten_all()?.argmax(D::Minus1)?.to_vec0::<u32>()?;
-        Ok(id)
+        self.lm_head.forward(&normed)?.to_dtype(DType::F32) // [1, 1, vocab]
     }
 
     /// **Greedy** autoregressive generation (the parity path): prefill `input_ids`, then decode until
     /// the harmony `<|return|>` stop or `max_new_tokens`. Returns the **new** tokens (including the
     /// trailing stop, which [`crate::text::clean_reasoner_output`] strips) — mirroring the vendor
-    /// `out_ids[0, input_len:]`. The mandatory `cancel` flag is checked before prefill and before
-    /// every subsequent decode step.
+    /// `out_ids[0, input_len:]`. At least one token (the prefill's) is always drawn. The mandatory
+    /// `cancel` flag is checked before prefill and, bridged onto the engine's flag, after every
+    /// emitted token (the engine's typed `Cancelled` finish).
+    ///
+    /// The decode is the shared Candle engine's token-at-a-time loop
+    /// ([`candle_llm::decode::generate_with_sampler`], epic sc-24432 E8) over this model
+    /// (`ReasonerStep`), drawing every token through `ReasonerArgmax` — candle-llm's shared
+    /// [`argmax_device`] over the f32 row, the argmax this decode always took — so a rewrite is
+    /// token-identical to the pre-engine loop.
     pub fn generate_greedy(
         &self,
         input_ids: &[u32],
         max_new_tokens: usize,
         cancel: &CancelFlag,
     ) -> candle_gen::Result<Vec<u32>> {
-        check_reasoner_cancel(cancel)?;
-        let mut caches: Vec<KvCache> = (0..self.layers.len()).map(|_| KvCache::default()).collect();
-        let l = input_ids.len();
-        let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &self.device)?;
-        let hidden = self.embed_tokens.forward(&prompt)?;
-        let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
-        let mut next = self.argmax_token(&hidden)?;
+        self.generate_greedy_until(
+            input_ids,
+            max_new_tokens,
+            crate::text::HARMONY_RETURN,
+            cancel,
+            &mut |_| {},
+        )
+    }
 
-        let mut position = l;
-        let mut out = vec![next];
-        while out.len() < max_new_tokens && next != crate::text::HARMONY_RETURN {
-            check_reasoner_cancel(cancel)?;
-            let tok = Tensor::from_vec(vec![next], (1, 1), &self.device)?;
-            let h = self.embed_tokens.forward(&tok)?;
-            let h = self.run_layers(h, &mut caches, position, false)?;
-            position += 1;
-            next = self.argmax_token(&h)?;
-            out.push(next);
+    /// [`generate_greedy`](Self::generate_greedy) stopping at `stop`, handing every engine event to
+    /// `on_event` before the cancel bridge reads `cancel`. The pre-engine loop kept the final stop in
+    /// its list, which the engine does not emit, so a stop-token end appends it. Past the prefill
+    /// check, `cancel` is observed after every emitted token — where the pre-engine loop checked it,
+    /// before every token after the first (a one-token budget never reaches it).
+    fn generate_greedy_until(
+        &self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        stop: u32,
+        cancel: &CancelFlag,
+        on_event: &mut dyn FnMut(&StreamEvent),
+    ) -> candle_gen::Result<Vec<u32>> {
+        check_reasoner_cancel(cancel)?;
+        let prompt: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
+        let generation = GenerationConfig {
+            max_new_tokens: max_new_tokens.max(1),
+            sampling: SamplingParams::default(),
+            seed: None,
+            stop_tokens: vec![stop as i32],
+        };
+        let mut argmax = ReasonerArgmax { last: None };
+        let engine_cancel = candle_llm::decode::CancelFlag::new();
+        let bridged = engine_cancel.clone();
+        let mut bridge = |event: StreamEvent| {
+            on_event(&event);
+            if cancel.is_cancelled() {
+                bridged.cancel();
+            }
+        };
+        let run = generate_with_sampler(
+            &ReasonerStep(self),
+            SpeculativePrompt::Tokens(&prompt),
+            &generation,
+            &engine_cancel,
+            &mut bridge,
+            None,
+            None,
+            &mut argmax,
+        )
+        .map_err(|e| match e {
+            candle_llm::error::Error::Canceled => CandleError::Canceled,
+            candle_llm::error::Error::Candle(e) => CandleError::Candle(e),
+            other => CandleError::Msg(format!("lens reasoner decode: {other}")),
+        })?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(CandleError::Canceled);
+        }
+        let mut out: Vec<u32> = run.output.tokens.iter().map(|&id| id as u32).collect();
+        if run.output.finish_reason == FinishReason::StopToken {
+            out.extend(argmax.last.map(|id| id as u32));
         }
         Ok(out)
     }
@@ -1279,6 +1332,131 @@ impl LensReasonerModel {
         let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, L, vocab]
         let pred = logits.squeeze(0)?.argmax(D::Minus1)?; // [L]
         pred.to_vec1::<u32>()
+    }
+}
+
+/// The reasoner's KV caches for the engine: the per-layer caches plus the positions fed so far (a
+/// sliding layer evicts, so no layer's length is the position). A sliding layer's eviction cannot
+/// be undone, so only the no-op rollback is served — the token-at-a-time loop never asks for more.
+struct ReasonerCache {
+    layers: Vec<KvCache>,
+    len: i32,
+}
+
+impl DecodeCache for ReasonerCache {
+    fn len(&self) -> i32 {
+        self.len
+    }
+
+    fn rollback_to(&mut self, n: i32) -> candle_llm::error::Result<()> {
+        if n == self.len {
+            return Ok(());
+        }
+        Err(candle_llm::error::Error::Msg(format!(
+            "lens reasoner cache: a sliding-window cache cannot roll back to {n} from {}",
+            self.len
+        )))
+    }
+
+    fn reset(&mut self) {
+        for layer in &mut self.layers {
+            *layer = KvCache::default();
+        }
+        self.len = 0;
+    }
+
+    fn memory(&self) -> CacheMemory {
+        let live_bytes = self
+            .layers
+            .iter()
+            .flat_map(|layer| [layer.k.as_ref(), layer.v.as_ref()])
+            .flatten()
+            .fold(0usize, |acc, t| acc.saturating_add(tensor_bytes(t)));
+        CacheMemory {
+            live_bytes,
+            checkpoint_bytes: 0,
+        }
+    }
+}
+
+/// [`LensReasonerModel`] as the engine's [`StepModel`]: a step from an empty cache is the prompt
+/// prefill (the per-layer causal + sliding masks), every later step one decode token at the next
+/// position. It projects the last position only, so a multi-token verify or a hidden-state request is
+/// refused.
+struct ReasonerStep<'a>(&'a LensReasonerModel);
+
+impl StepModel for ReasonerStep<'_> {
+    type Cache = ReasonerCache;
+
+    fn new_cache(&self) -> ReasonerCache {
+        ReasonerCache {
+            layers: (0..self.0.layers.len())
+                .map(|_| KvCache::default())
+                .collect(),
+            len: 0,
+        }
+    }
+
+    fn device(&self) -> &Device {
+        &self.0.device
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.0.lm_head.weight().dim(0).unwrap_or(0)
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut ReasonerCache,
+        request: StepRequest<'_>,
+    ) -> candle_llm::error::Result<StepOutput> {
+        let n = request.tokens.len()?;
+        if request.want_hidden || (n != 1 && request.scope == LogitsScope::All) {
+            return Err(candle_llm::error::Error::Msg(
+                "the Lens reasoner steps return last-position logits only".into(),
+            ));
+        }
+        let ids = request.tokens.ids(&self.0.device)?;
+        let hidden = self.0.embed_tokens.forward(&ids)?;
+        let prefill = cache.len == 0;
+        let hidden = self
+            .0
+            .run_layers(hidden, &mut cache.layers, cache.len as usize, prefill)?;
+        cache.len += n as i32;
+        let logits = self.0.last_logits(&hidden)?; // [1, 1, vocab]
+        let logits = match request.scope {
+            LogitsScope::Last => logits.squeeze(1)?,
+            LogitsScope::All => logits,
+        };
+        Ok(StepOutput {
+            logits,
+            hidden: None,
+        })
+    }
+}
+
+/// The reasoner's draw on the engine's sampler seam: candle-llm's shared [`argmax_device`] over the
+/// flattened f32 logits row, one index read back — exactly the pre-engine loop's draw.
+struct ReasonerArgmax {
+    /// The last token drawn — on a stop-token end, the stop the engine does not emit.
+    last: Option<i32>,
+}
+
+impl TokenSampler for ReasonerArgmax {
+    fn sample(
+        &mut self,
+        logits: &Tensor,
+        _: &[i32],
+        allowed: Option<&[bool]>,
+    ) -> candle_llm::error::Result<(i32, SamplerPath)> {
+        if allowed.is_some() {
+            return Err(candle_llm::error::Error::Msg(
+                "the Lens reasoner draw takes no constraint mask".into(),
+            ));
+        }
+        let id = argmax_device(logits)?;
+        self.last = Some(id);
+        Ok((id, SamplerPath::Device))
     }
 }
 
@@ -1359,6 +1537,204 @@ mod tests {
             matches!(error, candle_gen::CandleError::Canceled),
             "pre-cancel must remain typed and win over the intentionally missing layer file: {error:?}"
         );
+    }
+
+    /// A tiny two-layer reasoner (layer 0 sliding with a window the decode crosses, layer 1 full),
+    /// MXFP4 experts dequantized dense, vocabulary 48.
+    fn tiny_reasoner() -> LensReasonerModel {
+        let dev = Device::Cpu;
+        let mut cfg = Config::gpt_oss_20b();
+        cfg.vocab_size = 48;
+        cfg.hidden_size = 32;
+        cfg.intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 8;
+        cfg.num_local_experts = 2;
+        cfg.num_experts_per_tok = 1;
+        cfg.sliding_window = 4;
+        cfg.max_position_embeddings = 64;
+        let (h, i, e, v) = (32usize, 32usize, 2usize, 48usize);
+        let (q, kv) = (4 * 8, 2 * 8);
+        let mut tensors = std::collections::HashMap::new();
+        let mut seed = 100u64;
+        let mut put = |key: String, shape: &[usize], scale: f32| {
+            seed += 1;
+            let n = shape.iter().product::<usize>();
+            let data: Vec<f32> = prng(n, seed).into_iter().map(|x| x * scale).collect();
+            tensors.insert(key, Tensor::from_vec(data, shape, &dev).unwrap());
+        };
+        put("model.embed_tokens.weight".into(), &[v, h], 1.0);
+        put("model.norm.weight".into(), &[h], 1.0);
+        put("lm_head.weight".into(), &[v, h], 1.0);
+        let mut bytes = Vec::new();
+        for layer in 0..2 {
+            let p = format!("model.layers.{layer}");
+            for (name, out, inp) in [("q", q, h), ("k", kv, h), ("v", kv, h), ("o", h, q)] {
+                put(
+                    format!("{p}.self_attn.{name}_proj.weight"),
+                    &[out, inp],
+                    0.3,
+                );
+                put(format!("{p}.self_attn.{name}_proj.bias"), &[out], 0.1);
+            }
+            put(format!("{p}.self_attn.sinks"), &[4], 0.5);
+            put(format!("{p}.input_layernorm.weight"), &[h], 1.0);
+            put(format!("{p}.post_attention_layernorm.weight"), &[h], 1.0);
+            put(format!("{p}.mlp.router.weight"), &[e, h], 1.0);
+            put(format!("{p}.mlp.router.bias"), &[e], 0.1);
+            for (name, rows, contract) in [("gate_up", 2 * i, h), ("down", h, i)] {
+                put(format!("{p}.mlp.experts.{name}_proj_bias"), &[e, rows], 0.1);
+                let groups = contract / 32;
+                bytes.push((
+                    format!("{p}.mlp.experts.{name}_proj"),
+                    (0..e * rows * groups * 16)
+                        .map(|k| ((k * 37 + layer * 11) % 256) as u8)
+                        .collect::<Vec<u8>>(),
+                    (e, rows, groups),
+                ));
+            }
+        }
+        for (key, data, (e, rows, groups)) in bytes {
+            tensors.insert(
+                format!("{key}_blocks"),
+                Tensor::from_vec(data, (e, rows, groups, 16), &dev).unwrap(),
+            );
+            // e8m0 124 = 2^-3 keeps the FP4 grid (|x| <= 6) small.
+            tensors.insert(
+                format!("{key}_scales"),
+                Tensor::from_vec(vec![124u8; e * rows * groups], (e, rows, groups), &dev).unwrap(),
+            );
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+        LensReasonerModel::new(&cfg, vb, None).unwrap()
+    }
+
+    /// The pre-engine greedy loop and its argmax helper, verbatim but for its stop (the
+    /// `HARMONY_RETURN` constant, a parameter here so a tiny vocabulary can end on a stop token):
+    /// the E1/E8 oracle.
+    fn reference_greedy(
+        m: &LensReasonerModel,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        stop: u32,
+        cancel: &CancelFlag,
+    ) -> candle_gen::Result<Vec<u32>> {
+        let argmax_token = |hidden: &Tensor| -> Result<u32> {
+            let t = hidden.dim(1)?;
+            let last = hidden.narrow(1, t - 1, 1)?; // [1, 1, hidden]
+            let normed = m.norm.forward(&last)?;
+            let logits = m.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, 1, vocab]
+            let id = logits.flatten_all()?.argmax(D::Minus1)?.to_vec0::<u32>()?;
+            Ok(id)
+        };
+        check_reasoner_cancel(cancel)?;
+        let mut caches: Vec<KvCache> = (0..m.layers.len()).map(|_| KvCache::default()).collect();
+        let l = input_ids.len();
+        let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &m.device)?;
+        let hidden = m.embed_tokens.forward(&prompt)?;
+        let hidden = m.run_layers(hidden, &mut caches, 0, true)?;
+        let mut next = argmax_token(&hidden)?;
+
+        let mut position = l;
+        let mut out = vec![next];
+        while out.len() < max_new_tokens && next != stop {
+            check_reasoner_cancel(cancel)?;
+            let tok = Tensor::from_vec(vec![next], (1, 1), &m.device)?;
+            let h = m.embed_tokens.forward(&tok)?;
+            let h = m.run_layers(h, &mut caches, position, false)?;
+            position += 1;
+            next = argmax_token(&h)?;
+            out.push(next);
+        }
+        Ok(out)
+    }
+
+    /// E8 (sc-24446): the reasoner decode runs on the shared engine and is token-identical to the
+    /// pre-engine loop — across a stop-token end (a stop the run itself emits), a budget end, the
+    /// zero budget (the prefill's token is still drawn) and the public `HARMONY_RETURN` entry —
+    /// and a cancel stays typed where the pre-engine loop checked it: before the prefill and
+    /// before every token after the first.
+    #[test]
+    fn reasoner_engine_decode_matches_the_pre_engine_loop() {
+        let m = tiny_reasoner();
+        let none = CancelFlag::new();
+        let (mut stop_ends, mut budget_ends) = (0, 0);
+        for prompt in [
+            &[3u32, 17, 42, 8, 30, 11, 5][..],
+            &[9u32][..],
+            &[1u32, 2, 3, 4, 5, 6, 7, 8, 9][..],
+        ] {
+            let free = reference_greedy(&m, prompt, 24, u32::MAX, &none).unwrap();
+            for (max, stop) in [
+                (24, u32::MAX),
+                (24, free[3]),
+                (24, free[0]),
+                (0, u32::MAX),
+                (1, u32::MAX),
+            ] {
+                let want = reference_greedy(&m, prompt, max, stop, &none).unwrap();
+                let got = m
+                    .generate_greedy_until(prompt, max, stop, &none, &mut |_| {})
+                    .unwrap();
+                assert_eq!(got, want, "prompt {prompt:?} max {max} stop {stop}");
+                if want.last() == Some(&stop) {
+                    stop_ends += 1;
+                } else {
+                    budget_ends += 1;
+                }
+            }
+            assert_eq!(
+                m.generate_greedy(prompt, 12, &none).unwrap(),
+                reference_greedy(&m, prompt, 12, crate::text::HARMONY_RETURN, &none).unwrap()
+            );
+        }
+        assert!(
+            stop_ends > 0 && budget_ends > 0,
+            "stop {stop_ends}, budget {budget_ends}"
+        );
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let prompt = [3u32, 17, 42];
+        for max in [0, 1, 4] {
+            assert!(matches!(
+                reference_greedy(&m, &prompt, max, u32::MAX, &cancel),
+                Err(CandleError::Canceled)
+            ));
+            assert!(matches!(
+                m.generate_greedy_until(&prompt, max, u32::MAX, &cancel, &mut |_| {}),
+                Err(CandleError::Canceled)
+            ));
+        }
+    }
+
+    /// Past the prefill check, a cancel set mid-decode is bridged onto the engine's flag: the
+    /// engine finishes `Cancelled` right after the token it was emitting and the decode returns the
+    /// typed [`CandleError::Canceled`]; a one-token budget (the pre-engine loop never reached its
+    /// in-loop check) still returns its token.
+    #[test]
+    fn a_mid_run_cancel_ends_the_decode_typed() {
+        let m = tiny_reasoner();
+        let prompt = [3u32, 17, 42, 8];
+        for (max, cancel_after) in [(16, 2usize), (1, 0)] {
+            let cancel = CancelFlag::new();
+            let mut emitted = 0;
+            let run = m.generate_greedy_until(&prompt, max, u32::MAX, &cancel, &mut |event| {
+                if let StreamEvent::Token { step, .. } = event {
+                    emitted = step + 1;
+                    if *step == cancel_after {
+                        cancel.cancel();
+                    }
+                }
+            });
+            if max == 1 {
+                assert_eq!(run.unwrap().len(), 1, "a one-token budget never checks");
+            } else {
+                assert!(matches!(run, Err(CandleError::Canceled)), "{run:?}");
+                assert_eq!(emitted, cancel_after + 1, "cancelled after that token");
+            }
+        }
     }
 
     #[test]

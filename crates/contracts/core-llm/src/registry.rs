@@ -143,7 +143,15 @@ impl TextLlmRegistry {
 
     /// Select and load a provider from the model snapshot with no additional capability needs.
     pub fn load_for_model(&self, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
-        self.load_for_model_with(spec, &ModelRequirements::default())
+        (self.select_for_model(spec)?.load)(spec)
+    }
+
+    /// The registration [`load_for_model`](Self::load_for_model) would load `spec` with, chosen by
+    /// the same weightless selection and without loading anything (sc-24139). A backend answers
+    /// per-snapshot questions — for example whether an NVFP4 load of this snapshot can pass its
+    /// gates — for exactly the provider a load would reach.
+    pub fn select_for_model(&self, spec: &LoadSpec) -> Result<&TextLlmRegistration> {
+        select(self.registrations(), spec, &ModelRequirements::default())
     }
 
     /// Select and load a provider from the model snapshot with explicit capability requirements.
@@ -425,7 +433,13 @@ mod tests {
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
+            speculative: Vec::new(),
             supported_constraints: constraints.iter().map(Constraint::kind).collect(),
         }
     }
@@ -512,6 +526,7 @@ mod tests {
                 generated_tokens: 1,
                 generated_bytes: "<svg/>".len(),
                 finish_reason: StarVectorFinishReason::CompleteRoot,
+                kv_cache: None,
             };
             on_event(StarVectorStreamEvent::Done {
                 finish_reason: output.finish_reason,
@@ -768,6 +783,45 @@ mod tests {
         registry
             .load_for_model(&LoadSpec::dense("/no/such/snapshot"))
             .unwrap();
+    }
+
+    /// sc-24139: `select_for_model` names the registration `load_for_model` would load — the same
+    /// selection, tie-break included — without loading, and fails as the load would.
+    #[test]
+    fn select_for_model_is_the_load_for_model_selection() {
+        let spec = LoadSpec::dense("/no/such/snapshot");
+        // Both accept the snapshot and no vision is required: the tie-break prefers the text
+        // provider although the vision one registered first.
+        let both = TextLlmRegistryBuilder::new()
+            .register(reg(vision_desc, yes))
+            .register(reg(text_desc, yes))
+            .build()
+            .unwrap();
+        assert_eq!(
+            (both.select_for_model(&spec).unwrap().descriptor)().id,
+            "text"
+        );
+        let only_vision = TextLlmRegistryBuilder::new()
+            .register(reg(vision_desc, yes))
+            .register(reg(text_desc, no))
+            .build()
+            .unwrap();
+        assert_eq!(
+            (only_vision.select_for_model(&spec).unwrap().descriptor)().id,
+            "vision"
+        );
+        let none = TextLlmRegistryBuilder::new()
+            .register(reg(text_desc, no))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            none.select_for_model(&spec),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            none.load_for_model(&spec).err(),
+            Some(Error::Unsupported(_))
+        ));
     }
 
     #[test]

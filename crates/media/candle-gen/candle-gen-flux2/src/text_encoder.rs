@@ -18,7 +18,13 @@ use candle_gen::candle_nn::{
     ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::Quant;
-use candle_llm::primitives::{sample, ContiguousKvCache, KvCache, SamplingParams, SplitMix64};
+use candle_llm::decode::{
+    generate_speculative_with, FinishReason, GenerationConfig, LogitsScope, NoProposer,
+    SpeculativePrompt, StepModel, StepOutput, StepRequest,
+};
+use candle_llm::primitives::{
+    tensor_bytes, CacheMemory, ContiguousKvCache, DecodeCache, KvCache, SamplingParams,
+};
 
 use crate::config::Flux2Config;
 use crate::quant::{rms_norm_to, QEmbedding, QLinear};
@@ -507,6 +513,16 @@ impl Flux2PromptEncoder {
         lm_head.forward(&final_norm.forward(&last)?)
     }
 
+    /// Autoregressive caption-upsampling generation from already-built prompt embeds
+    /// `[1, prompt_len, hidden]`. Returns the generated ids with `eos_token` excluded; stops at
+    /// `eos_token` or `sampling.max_new_tokens`. `cancel` is checked before the prefill and before
+    /// every draw, returning [`CandleError::Canceled`](candle_gen::CandleError::Canceled).
+    ///
+    /// The decode is the shared Candle engine's token-at-a-time loop
+    /// ([`generate_speculative_with`] with [`NoProposer`], epic sc-24432 E8) over this tower
+    /// (`CaptionStep`), drawing every token through the shared sampler from the pipeline's seed —
+    /// the same draw the pre-engine loop made (temperature only: no top-k, no top-p, no penalty),
+    /// so a seeded caption is token-identical.
     pub fn generate_from_embeds(
         &self,
         prompt_embeds: &Tensor,
@@ -521,33 +537,167 @@ impl Flux2PromptEncoder {
             )));
         }
         candle_gen::check_cancel(cancel)?;
-        let mut cache = ContiguousKvCache::new(self.layers.len());
-        let mut rng = SplitMix64::new(sampling.seed);
-        let params = SamplingParams {
-            temperature: sampling.temperature,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            repetition_context: 0,
-        };
-        let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
-        let mut generated = Vec::new();
-        for step in 0..sampling.max_new_tokens {
-            candle_gen::check_cancel(cancel)?;
-            let next = sample(&logits, &[], &params, &mut rng, None)
-                .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
-            if next == eos_token {
-                break;
-            }
-            generated.push(next);
-            if step + 1 == sampling.max_new_tokens {
-                break;
-            }
-            let ids = Tensor::from_vec(vec![next as u32], (1, 1), prompt_embeds.device())?;
-            let embeds = self.embed(&ids)?;
-            logits = self.decode_logits_from_embeds(&embeds, &mut cache, prompt_len + step)?;
+        let mut cache = CaptionCache(ContiguousKvCache::new(self.layers.len()));
+        let logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache.0, 0)?;
+        if sampling.max_new_tokens == 0 {
+            return Ok(Vec::new());
         }
-        Ok(generated)
+        // The pre-engine loop checked before its first draw, after the prefill.
+        candle_gen::check_cancel(cancel)?;
+        let generation = GenerationConfig {
+            max_new_tokens: sampling.max_new_tokens,
+            sampling: SamplingParams {
+                temperature: sampling.temperature,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                repetition_context: 0,
+                presence_penalty: 0.0,
+            },
+            seed: Some(sampling.seed),
+            stop_tokens: vec![eos_token],
+        };
+        let decode_cancel = candle_llm::decode::CancelFlag::new();
+        let step = CaptionStep {
+            encoder: self,
+            vocab: logits.dim(D::Minus1)?,
+            cancel,
+            decode_cancel: &decode_cancel,
+        };
+        // The engine's history is the penalty window: the caption draw reads none, and the prompt
+        // exists only as embeds here, so it is the prompt's length in placeholder ids.
+        let history = vec![0; prompt_len];
+        let run = generate_speculative_with(
+            &step,
+            &mut NoProposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden: None,
+                history: &history,
+                position_delta: 0,
+                warm_proposer: false,
+            },
+            &generation,
+            0,
+            &decode_cancel,
+            &mut |_| {},
+            None,
+            None,
+            None,
+        )
+        .map_err(from_llm_decode)?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        Ok(run.output.tokens)
+    }
+}
+
+/// The caption tower's growing K/V cache as the engine's [`DecodeCache`]: its length is the
+/// cached positions, and a rollback truncates them.
+struct CaptionCache(ContiguousKvCache);
+
+impl DecodeCache for CaptionCache {
+    fn len(&self) -> i32 {
+        self.0.offset()
+    }
+
+    fn rollback_to(&mut self, n: i32) -> candle_llm::error::Result<()> {
+        let len = self.len();
+        if n < 0 || n > len {
+            return Err(candle_llm::error::Error::Msg(format!(
+                "flux2 caption cache: cannot roll back to {n} from {len} positions"
+            )));
+        }
+        self.0.truncate(n)
+    }
+
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+
+    fn memory(&self) -> CacheMemory {
+        let live_bytes = (0..self.0.num_layers())
+            .filter_map(|layer| self.0.peek(layer))
+            .fold(0usize, |acc, (k, v)| {
+                acc.saturating_add(tensor_bytes(k))
+                    .saturating_add(tensor_bytes(v))
+            });
+        CacheMemory {
+            live_bytes,
+            checkpoint_bytes: 0,
+        }
+    }
+}
+
+/// The caption-upsampling tower as the engine's [`StepModel`]: each step embeds its ids and runs
+/// them at the cache's next position. It serves the token-at-a-time loop only (the tower projects
+/// the last position), so a multi-token verify or a hidden-state request is refused. After every
+/// forward the pipeline's cancel flag is carried onto the engine's, so the engine's post-forward
+/// check stands where the pre-engine loop checked: before the draw.
+struct CaptionStep<'a> {
+    encoder: &'a Flux2PromptEncoder,
+    vocab: usize,
+    cancel: &'a candle_gen::gen_core::CancelFlag,
+    decode_cancel: &'a candle_llm::decode::CancelFlag,
+}
+
+impl StepModel for CaptionStep<'_> {
+    type Cache = CaptionCache;
+
+    fn new_cache(&self) -> CaptionCache {
+        CaptionCache(ContiguousKvCache::new(self.encoder.layers.len()))
+    }
+
+    fn device(&self) -> &Device {
+        self.encoder.device()
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn forward_step(
+        &self,
+        cache: &mut CaptionCache,
+        request: StepRequest<'_>,
+    ) -> candle_llm::error::Result<StepOutput> {
+        let n = request.tokens.len()?;
+        if request.want_hidden || (n != 1 && request.scope == LogitsScope::All) {
+            return Err(candle_llm::error::Error::Msg(
+                "the FLUX.2 caption tower steps one token and returns its logits only".into(),
+            ));
+        }
+        let ids = request.tokens.ids(self.device())?;
+        let embeds = self.encoder.embed(&ids)?;
+        let offset = cache.0.offset() as usize;
+        let logits = self
+            .encoder
+            .decode_logits_from_embeds(&embeds, &mut cache.0, offset)?;
+        if self.cancel.is_cancelled() {
+            self.decode_cancel.cancel();
+        }
+        let logits = match request.scope {
+            LogitsScope::Last => logits,
+            LogitsScope::All => logits.unsqueeze(1)?,
+        };
+        Ok(StepOutput {
+            logits,
+            hidden: None,
+        })
+    }
+}
+
+/// Keep a cancellation observed by the shared decode loop typed as
+/// [`CandleError::Canceled`](candle_gen::CandleError::Canceled) and a tower's tensor error as the
+/// [`CandleError::Candle`](candle_gen::CandleError::Candle) it was; any other engine error is named
+/// as the caption decode's.
+fn from_llm_decode(e: candle_llm::error::Error) -> candle_gen::CandleError {
+    match e {
+        candle_llm::error::Error::Canceled => candle_gen::CandleError::Canceled,
+        candle_llm::error::Error::Candle(e) => candle_gen::CandleError::Candle(e),
+        other => candle_gen::CandleError::Msg(format!("flux2 caption-upsample decode: {other}")),
     }
 }
 
@@ -659,6 +809,156 @@ mod tests {
             encoder.generate_from_embeds(&embeds, -1, sampling, &cancel),
             Err(candle_gen::CandleError::Canceled)
         ));
+        Ok(())
+    }
+
+    /// The pre-engine caption-upsampling loop, verbatim: the oracle the engine port must reproduce
+    /// token for token (E1/E8).
+    fn reference_caption_tokens(
+        encoder: &Flux2PromptEncoder,
+        prompt_embeds: &Tensor,
+        eos_token: i32,
+        sampling: UpsampleSampling,
+    ) -> Vec<i32> {
+        use candle_llm::primitives::{sample, SplitMix64};
+        let (_, prompt_len, _) = prompt_embeds.dims3().unwrap();
+        let mut cache = ContiguousKvCache::new(encoder.layers.len());
+        let mut rng = SplitMix64::new(sampling.seed);
+        let params = SamplingParams {
+            temperature: sampling.temperature,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+            presence_penalty: 0.0,
+        };
+        let mut logits = encoder
+            .decode_logits_from_embeds(prompt_embeds, &mut cache, 0)
+            .unwrap();
+        let mut generated = Vec::new();
+        for step in 0..sampling.max_new_tokens {
+            let next = sample(&logits, &[], &params, &mut rng, None).unwrap();
+            if next == eos_token {
+                break;
+            }
+            generated.push(next);
+            if step + 1 == sampling.max_new_tokens {
+                break;
+            }
+            let ids = Tensor::from_vec(vec![next as u32], (1, 1), prompt_embeds.device()).unwrap();
+            let embeds = encoder.embed(&ids).unwrap();
+            logits = encoder
+                .decode_logits_from_embeds(&embeds, &mut cache, prompt_len + step)
+                .unwrap();
+        }
+        generated
+    }
+
+    /// E8 (sc-24446): the caption decode runs on the shared engine and is token-identical to the
+    /// pre-engine loop — greedy and seeded temperature draws over several seeds, with both an eos
+    /// end (an eos taken from the run's own budget-end tokens) and a budget end.
+    #[test]
+    fn caption_engine_decode_matches_the_pre_engine_loop() -> Result<()> {
+        let mut cfg = crate::config::Flux2Config::dev();
+        cfg.te_hidden_size = 8;
+        cfg.te_intermediate_size = 16;
+        cfg.te_n_layers = 2;
+        cfg.te_n_heads = 2;
+        cfg.te_n_kv_heads = 1;
+        cfg.te_head_dim = 4;
+        cfg.te_vocab_size = 16;
+        cfg.te_out_layers = [0, 1, 2];
+        cfg.max_sequence_length = 64;
+        let vars = candle_gen::candle_nn::VarMap::new();
+        let encoder = Flux2PromptEncoder::new(
+            &cfg,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu),
+        )?;
+        let embeds = Tensor::from_vec(
+            (0..40)
+                .map(|v| ((v as f32) * 0.37).sin())
+                .collect::<Vec<_>>(),
+            (1, 5, 8),
+            &Device::Cpu,
+        )?;
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let (mut eos_ends, mut budget_ends) = (0, 0);
+        for temperature in [0.0, 0.7, 1.0, 1.6] {
+            for seed in 0..5u64 {
+                let sampling = UpsampleSampling {
+                    temperature,
+                    max_new_tokens: 20,
+                    seed,
+                };
+                let free = reference_caption_tokens(&encoder, &embeds, -1, sampling);
+                // No eos, then an eos the run emits mid-way (its third token).
+                for eos in [-1, free[2]] {
+                    let want = reference_caption_tokens(&encoder, &embeds, eos, sampling);
+                    let got = encoder
+                        .generate_from_embeds(&embeds, eos, sampling, &cancel)
+                        .unwrap();
+                    assert_eq!(got, want, "t {temperature} seed {seed} eos {eos}");
+                    if want.len() < sampling.max_new_tokens {
+                        eos_ends += 1;
+                    } else {
+                        budget_ends += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            eos_ends > 0 && budget_ends > 0,
+            "eos {eos_ends}, budget {budget_ends}"
+        );
+        // Past the pre-draw check, a cancel is observed after every decode forward — before the
+        // draw it feeds, where the pre-engine loop checked — and stays typed; a one-token budget
+        // runs no decode forward, so it never sees it.
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        cancel.cancel();
+        let decode = |max_new_tokens: usize| {
+            let mut cache = CaptionCache(ContiguousKvCache::new(encoder.layers.len()));
+            let logits = encoder
+                .decode_logits_from_embeds(&embeds, &mut cache.0, 0)
+                .unwrap();
+            let decode_cancel = candle_llm::decode::CancelFlag::new();
+            let step = CaptionStep {
+                encoder: &encoder,
+                vocab: 16,
+                cancel: &cancel,
+                decode_cancel: &decode_cancel,
+            };
+            let generation = GenerationConfig {
+                max_new_tokens,
+                sampling: SamplingParams::default(),
+                seed: Some(0),
+                stop_tokens: Vec::new(),
+            };
+            generate_speculative_with(
+                &step,
+                &mut NoProposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &[0; 5],
+                    position_delta: 0,
+                    warm_proposer: false,
+                },
+                &generation,
+                0,
+                &decode_cancel,
+                &mut |_| {},
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .output
+        };
+        assert_eq!(decode(1).finish_reason, FinishReason::MaxTokens);
+        let cancelled = decode(3);
+        assert_eq!(cancelled.finish_reason, FinishReason::Cancelled);
+        assert_eq!(cancelled.tokens.len(), 1);
         Ok(())
     }
 

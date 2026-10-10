@@ -1,0 +1,11 @@
+=== AT3 parity 8B start Thu 09/24/2026 10:38:01.37
+PARITY8_EXIT=0
+=== AT4 8B start Thu 09/24/2026 10:39:35.28
+AT4_8B_EXIT=0
+=== load_residency 8B bf16 start Thu 09/24/2026 10:40:06.06
+LR8_BF16_EXIT=0
+=== load_residency 8B q8 start Thu 09/24/2026 10:40:16.91
+LR8_Q8_EXIT=0
+=== load_residency 8B nvfp4 start Thu 09/24/2026 10:41:10.51
+LR8_NVFP4_EXIT=0
+=== GPU1 done Thu 09/24/2026 10:41:23.32

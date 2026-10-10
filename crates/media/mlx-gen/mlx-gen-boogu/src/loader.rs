@@ -34,11 +34,17 @@ fn prepare_text_weights(mut w: Weights) -> Result<Weights> {
 /// `model.language_model.*`; the visual tower + `lm_head` are loaded but unused for text-to-image.
 pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<BooguTextEncoder> {
     let w = prepare_text_weights(Weights::from_dir(root.as_ref().join("mllm"))?)?;
-    BooguTextEncoder::from_weights(
+    let encoder = BooguTextEncoder::from_weights(
         &w,
         "model.language_model",
         &BooguTextEncoderConfig::qwen3_vl_8b(),
-    )
+    )?;
+    // Materialize at load (after the casts, before any `quantize`) — only the text tower this
+    // reads: left lazy, the first forward's command buffers wait on the safetensors reads — past the
+    // GPU watchdog on a cold page cache (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the Qwen3-VL **vision tower** from a snapshot's `mllm/` dir (`model.visual.*` keys) — the
@@ -63,12 +69,15 @@ pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
         let t = w.require(&k)?.as_dtype(mlx_rs::Dtype::Float32)?;
         w.insert(k, t);
     }
-    VisionTower::from_weights(
+    let tower = VisionTower::from_weights(
         &w,
         VisionConfig::qwen3_vl(),
         "model.visual",
         crate::convert::QUANT_GROUP_SIZE,
-    )
+    )?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(tower)
 }
 
 /// Load the DiT from a snapshot's `transformer/` dir: parse the config, load the (identity-keyed)
@@ -78,7 +87,10 @@ pub fn load_transformer(root: impl AsRef<Path>) -> Result<BooguTransformer> {
     let cfg = BooguConfig::from_snapshot(root)?;
     let w = Weights::from_dir(root.join("transformer"))?;
     crate::convert::validate_transformer(&w, &cfg)?;
-    BooguTransformer::from_weights(&w, &cfg)
+    let dit = BooguTransformer::from_weights(&w, &cfg)?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(dit)
 }
 
 /// Load the VAE from a snapshot's `vae/` dir. Boogu ships the **FLUX.1 16-channel `AutoencoderKL`**
@@ -91,11 +103,14 @@ pub fn load_vae(root: impl AsRef<Path>) -> Result<Vae> {
     let mut w = Weights::from_dir(root.as_ref().join("vae"))?;
     remap_vae_decoder(&mut w)?;
     remap_vae_encoder(&mut w)?;
-    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
+    let vae = Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
         &w,
         "encoder",
         &VaeEncoderConfig::default_z_image(),
-    )
+    )?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 // F-086: the diffusers→NHWC decoder/encoder key remaps were line-for-line copies of the FLUX.1

@@ -1,0 +1,70 @@
+time	global_subbeat	fields
+0.0	0	timestamp=0.0; rhythm=meter:(4, 4),eighth_position:0; structure=verse; key=C:major; chord=C:maj; melody=[pitch=64:track=1:dur_bin=3:dur_steps=4]
+0.59	4	timestamp=0.59; rhythm=eighth_position:2; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+1.19	8	timestamp=1.19; rhythm=eighth_position:4; melody=[pitch=72:track=1:dur_bin=5:dur_steps=8]
+1.79	12	timestamp=1.79; rhythm=eighth_position:6
+2.39	16	timestamp=2.39; rhythm=eighth_position:0; chord=A:min; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+2.99	20	timestamp=2.99; rhythm=eighth_position:2; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+3.59	24	timestamp=3.59; rhythm=eighth_position:4; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+4.19	28	timestamp=4.19; rhythm=eighth_position:6; melody=[pitch=64:track=1:dur_bin=3:dur_steps=4]
+4.79	32	timestamp=4.79; rhythm=eighth_position:0; chord=F:maj; melody=[pitch=65:track=1:dur_bin=5:dur_steps=8]
+5.39	36	timestamp=5.39; rhythm=eighth_position:2
+5.99	40	timestamp=5.99; rhythm=eighth_position:4; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+6.59	44	timestamp=6.59; rhythm=eighth_position:6; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+7.19	48	timestamp=7.19; rhythm=eighth_position:0; chord=G:maj; melody=[pitch=71:track=1:dur_bin=3:dur_steps=4]
+7.79	52	timestamp=7.79; rhythm=eighth_position:2; melody=[pitch=67:track=1:dur_bin=1:dur_steps=2]
+8.09	54	melody=[pitch=69:track=1:dur_bin=1:dur_steps=2]
+8.39	56	timestamp=8.39; rhythm=eighth_position:4; melody=[pitch=71:track=1:dur_bin=5:dur_steps=8]
+8.99	60	timestamp=8.99; rhythm=eighth_position:6
+9.59	64	timestamp=9.59; rhythm=eighth_position:0; chord=C:maj; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+10.19	68	timestamp=10.19; rhythm=eighth_position:2; melody=[pitch=71:track=1:dur_bin=1:dur_steps=2]
+10.489999999999998	70	melody=[pitch=72:track=1:dur_bin=1:dur_steps=2]
+10.79	72	timestamp=10.79; rhythm=eighth_position:4; melody=[pitch=76:track=1:dur_bin=5:dur_steps=8]
+11.43	76	timestamp=11.43; rhythm=eighth_position:6
+12.03	80	timestamp=12.03; rhythm=eighth_position:0; chord=A:min; melody=[pitch=76:track=1:dur_bin=3:dur_steps=4]
+12.59	84	timestamp=12.59; rhythm=eighth_position:2; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+13.19	88	timestamp=13.19; rhythm=eighth_position:4; melody=[pitch=69:track=1:dur_bin=5:dur_steps=8]
+13.79	92	timestamp=13.79; rhythm=eighth_position:6
+14.39	96	timestamp=14.39; rhythm=eighth_position:0; chord=D:min; melody=[pitch=65:track=1:dur_bin=3:dur_steps=4]
+14.99	100	timestamp=14.99; rhythm=eighth_position:2; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+15.59	104	timestamp=15.59; rhythm=eighth_position:4; melody=[pitch=74:track=1:dur_bin=3:dur_steps=4]
+16.23	108	timestamp=16.23; rhythm=eighth_position:6; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+16.83	112	timestamp=16.83; rhythm=eighth_position:0; chord=G:maj; melody=[pitch=71:track=1:dur_bin=5:dur_steps=8]
+17.39	116	timestamp=17.39; rhythm=eighth_position:2
+17.99	120	timestamp=17.99; rhythm=eighth_position:4; melody=[pitch=67:track=1:dur_bin=5:dur_steps=8]
+18.63	124	timestamp=18.63; rhythm=eighth_position:6
+19.23	128	timestamp=19.23; rhythm=eighth_position:0; chord=C:maj; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+19.83	132	timestamp=19.83; rhythm=eighth_position:2; melody=[pitch=64:track=1:dur_bin=3:dur_steps=4]
+20.39	136	timestamp=20.39; rhythm=eighth_position:4; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+20.99	140	timestamp=20.99; rhythm=eighth_position:6; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+21.63	144	timestamp=21.63; rhythm=eighth_position:0; chord=E:min; melody=[pitch=71:track=1:dur_bin=5:dur_steps=8]
+22.23	148	timestamp=22.23; rhythm=eighth_position:2
+22.83	152	timestamp=22.83; rhythm=eighth_position:4; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+23.43	156	timestamp=23.43; rhythm=eighth_position:6; melody=[pitch=64:track=1:dur_bin=3:dur_steps=4]
+24.07	160	timestamp=24.07; rhythm=eighth_position:0; chord=F:maj; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+24.63	164	timestamp=24.63; rhythm=eighth_position:2; melody=[pitch=72:track=1:dur_bin=1:dur_steps=2]
+24.91	166	melody=[pitch=69:track=1:dur_bin=1:dur_steps=2]
+25.19	168	timestamp=25.19; rhythm=eighth_position:4; melody=[pitch=65:track=1:dur_bin=5:dur_steps=8]
+25.79	172	timestamp=25.79; rhythm=eighth_position:6
+26.43	176	timestamp=26.43; rhythm=eighth_position:0; chord=G:maj; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+26.99	180	timestamp=26.99; rhythm=eighth_position:2; melody=[pitch=71:track=1:dur_bin=3:dur_steps=4]
+27.63	184	timestamp=27.63; rhythm=eighth_position:4; melody=[pitch=74:track=1:dur_bin=5:dur_steps=8]
+28.23	188	timestamp=28.23; rhythm=eighth_position:6
+28.87	192	timestamp=28.87; rhythm=eighth_position:0; chord=F:maj; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+29.43	196	timestamp=29.43; rhythm=eighth_position:2; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+29.99	200	timestamp=29.99; rhythm=eighth_position:4; melody=[pitch=65:track=1:dur_bin=3:dur_steps=4]
+30.59	204	timestamp=30.59; rhythm=eighth_position:6; melody=[pitch=69:track=1:dur_bin=3:dur_steps=4]
+31.23	208	timestamp=31.23; rhythm=eighth_position:0; chord=G:maj; melody=[pitch=74:track=1:dur_bin=3:dur_steps=4]
+31.83	212	timestamp=31.83; rhythm=eighth_position:2; melody=[pitch=71:track=1:dur_bin=3:dur_steps=4]
+32.43	216	timestamp=32.43; rhythm=eighth_position:4; melody=[pitch=67:track=1:dur_bin=5:dur_steps=8]
+33.03	220	timestamp=33.03; rhythm=eighth_position:6
+33.63	224	timestamp=33.63; rhythm=eighth_position:0; chord=C:maj; melody=[pitch=64:track=1:dur_bin=3:dur_steps=4]
+34.15	228	timestamp=34.15; rhythm=eighth_position:2; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+34.79	232	timestamp=34.79; rhythm=eighth_position:4; melody=[pitch=72:track=1:dur_bin=3:dur_steps=4]
+35.39	236	timestamp=35.39; rhythm=eighth_position:6; melody=[pitch=71:track=1:dur_bin=3:dur_steps=4]
+36.03	240	timestamp=36.03; rhythm=eighth_position:0; chord=C:maj; melody=[pitch=72:track=1:dur_bin=7:dur_steps=16]
+36.59	244	timestamp=36.59; rhythm=eighth_position:2
+37.23	248	timestamp=37.23; rhythm=eighth_position:4
+37.83	252	timestamp=37.83; rhythm=eighth_position:6
+38.47	256	timestamp=38.47; rhythm=eighth_position:0; chord=C:maj; melody=[pitch=67:track=1:dur_bin=3:dur_steps=4]
+39.07	260	timestamp=39.07; rhythm=eighth_position:2

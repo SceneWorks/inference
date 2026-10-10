@@ -1,0 +1,2 @@
+BINARY="$(cat "$QWEN_BONSAI_OUTPUT_DIR/binary.txt")"
+python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id functional-mlx-bonsai-mlx --model-key bonsai-mlx-2bit --model-revision 3f926b415992eaa2ae9dd7b573706494d6bbf787 --snapshot "$BONSAI_MLX_SNAPSHOT" --model-path "$BONSAI_MLX_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_FORMAT_CASES" --preflight "$QWEN_BONSAI_OUTPUT_DIR/functional-mlx-bonsai-mlx-preflight.json" --output "$QWEN_BONSAI_OUTPUT_DIR/functional-mlx-bonsai-mlx"

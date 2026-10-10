@@ -1,0 +1,3 @@
+if not exist "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" mkdir "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-1b-inventory.json" || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-8b-inventory.json" || exit /b 1

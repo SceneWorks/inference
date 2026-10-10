@@ -119,8 +119,8 @@ impl TimestepEmbedding {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.linear1.quantize(bits, None)?;
-        self.linear2.quantize(bits, None)?;
+        crate::quant::quantize_linear(&mut self.linear1, bits)?;
+        crate::quant::quantize_linear(&mut self.linear2, bits)?;
         Ok(())
     }
 

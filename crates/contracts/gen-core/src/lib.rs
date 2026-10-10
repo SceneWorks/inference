@@ -45,6 +45,7 @@ pub mod memory_strategy;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
+pub mod safetensors_shards;
 pub mod sampling;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
@@ -130,13 +131,18 @@ pub use execution_domains::{
 pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
-    AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
-    ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
-    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
-    PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
-    StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+    default_seed, effective_component_quant, effective_reference_image_short_edge,
+    reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
+    ArtifactRecord, AudioArtifacts, AudioEditMode, AudioEditRef, AudioParams, Capabilities,
+    ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
+    ConversationRole, ConversationSession, ConversationTurn, GenerationMemory, GenerationOutput,
+    GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning, Generator, HdrRequest,
+    KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter, PhaseAdapter,
+    PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover, SongCoverMode,
+    SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
+    StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
+    REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
+    REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
 pub use hdr::{
     exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
@@ -151,10 +157,12 @@ pub use latent::{
     LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
     SpatialCompression, DECODER_OPTIONS, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE,
     LTX_VIDEO_LATENT_SPACE, MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE,
-    QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN, QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD,
-    SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-    SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID, WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
-    WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION, WAN_Z48_STD,
+    QWEN_IMAGE_2_1_Z64_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_MEAN, QWEN_IMAGE_2_1_Z64_NORMALIZATION,
+    QWEN_IMAGE_2_1_Z64_STD, QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN,
+    QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD, SANA_LATENT_SPACE, SD3_LATENT_SPACE,
+    SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID,
+    WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN,
+    WAN_Z48_NORMALIZATION, WAN_Z48_STD,
 };
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
@@ -163,15 +171,16 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image, RgbaImage};
 pub use memory_phases::{
     DecoderTilingRealization, DecoderWorkspaceFacts, ImagePipelineArchitecture, MemoryPhaseFacts,
     StagedWeightSchedule, StreamedWeightFacts,
 };
 pub use memory_strategy::{
-    adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
-    default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
-    standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
+    adapter_stack_identity, adapter_stack_resident_bytes, adapter_stack_upcast_resident_bytes,
+    default_memory_strategy_safety_check, default_registered_memory_strategy_safety_check,
+    standard_memory_behavior_context, standard_memory_strategy_safety_check,
+    validate_calibration_fingerprint, AdapterResidencyMode, LokrKroneckerDims,
     MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
     MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
     MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
@@ -189,8 +198,8 @@ pub use memory_strategy::{
     MemoryStrategyEngagementExclusion, MemoryStrategyParameters, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryStructuralResidentEvidence,
     MemoryStructuralResidentRequestIdentity, MemoryWarmRunSemantics, MemoryWindowMaterialization,
-    ResidentRequestMemory, TransformerComponent, MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI,
-    MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
+    ResidentRequestMemory, TransformerComponent, UpcastLoraCopy, MEMORY_CALIBRATION_ABI,
+    MEMORY_DECODE_QUALITY_ABI, MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
     MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
 pub use registry::{
@@ -220,9 +229,10 @@ pub use runtime::{
     HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape,
     LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome,
-    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
-    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
-    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, Yue2ArMode,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
+    VAE_COMPONENT,
 };
 pub use sd3_encoder_artifacts::{
     resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,

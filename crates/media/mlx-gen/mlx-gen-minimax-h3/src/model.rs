@@ -33,9 +33,10 @@ use std::path::{Path, PathBuf};
 use mlx_rs::Dtype;
 
 use mlx_gen::gen_core::{
-    reject_unknown_components, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
-    GenerationRequest, Generator, KeyframeRef, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, StepSupport, WeightsSource,
+    effective_reference_image_short_edge, reject_unknown_components,
+    validate_reference_image_short_edge, Capabilities, Conditioning, ConditioningKind,
+    GenerationOutput, GenerationRequest, Generator, KeyframeRef, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, StepSupport, WeightsSource,
 };
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::Weights;
@@ -469,6 +470,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     // validating constructor, so the render path cannot reach a reference list that skipped this.
     let references = request_references(req)?;
     MiniMaxH3Task::resolve(!req.keyframes().is_empty(), references.is_some())?;
+
+    // sc-23402 — the reference-image short edge, refused here for the same reason every gate above
+    // is: `validate` is the only thing that runs before the 53 GB text encoder maps. The check is
+    // unconditional rather than ref2va-only, so a value typed onto a request that carries no image
+    // reference is still caught rather than silently inert.
+    validate_reference_image_short_edge(MODEL_ID, req)?;
 
     // sc-19571 — the conditioning-strength refusal runs at the request boundary, not 20 minutes
     // into a render, for the same reason every other gate above does.
@@ -1109,6 +1116,10 @@ impl MiniMaxH3 {
             VISION_PREFIX,
             VISION_GROUP_SIZE,
         )?;
+        // sc-23402: the tower's 351 source tensors are the read set of `w` at this point — force
+        // and GPU-verify them (sc-22414) before the first tower kernel touches them cold. Peak
+        // -neutral: the tower is resident for the whole `run_vision` either way.
+        w.materialize_accessed()?;
         let grounded = crate::text_encoder::run_vision(&vision, keyframes)?;
         // Force the tower's output BEFORE dropping it, and drop its tensors out of `w` too — the
         // same discipline `encode_prompt` documents. Under lazy evaluation `grounded` is a graph
@@ -1409,12 +1420,22 @@ impl MiniMaxH3 {
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
         // and each reference is put on its own resolution here.
+        //
+        // The image short edge is the request's effective one (sc-23402) — validated in
+        // `validate_request` before any weight was read, so this resolve cannot admit a value the
+        // gate refused. It sizes the reference and its latent rows only; the canvas above is
+        // untouched by it.
+        let reference_short_edge = effective_reference_image_short_edge(req) as i32;
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {
             normalized.push(match r {
-                Ref2VaReference::Image(img) => Ref2VaReference::Image(
-                    crate::reference::normalize_reference_image(img, SPATIAL_STRIDE as i32)?,
-                ),
+                Ref2VaReference::Image(img) => {
+                    Ref2VaReference::Image(crate::reference::normalize_reference_image(
+                        img,
+                        SPATIAL_STRIDE as i32,
+                        reference_short_edge,
+                    )?)
+                }
                 Ref2VaReference::Video(v) => Ref2VaReference::Video(VideoReference {
                     frames: crate::reference::normalize_reference_clip(
                         &v.frames,
@@ -1615,11 +1636,14 @@ impl MiniMaxH3 {
             &read("metadata.json")?,
         )?;
         let mut w = Weights::from_dir(self.root.join("audio_vae"))?;
-        crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
+        let encoder = crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
             &mut w,
             &cfg,
             Dtype::Float32,
-        )
+        )?;
+        // sc-23402: force + GPU-verify the read set (sc-22414) before the first encode.
+        w.materialize_accessed()?;
+        Ok(encoder)
     }
 
     /// The `ref2va` presentation: the vision tower over every **visual** reference, spliced into
@@ -1682,6 +1706,10 @@ impl MiniMaxH3 {
             VISION_PREFIX,
             VISION_GROUP_SIZE,
         )?;
+        // sc-23402: same as `encode_prompt_grounded` — the tower is the FIRST big load of a
+        // `ref2va` request and the packed token table the second; both are verified at their
+        // load boundary now, the table in `MiniMaxH3TextEncoder::from_weights`.
+        w.materialize_accessed()?;
         let grounded = crate::text_encoder::run_vision(&vision, &sources)?;
         let mut forced: Vec<&mlx_rs::Array> = grounded.embeds.iter().collect();
         forced.extend(grounded.deepstack.iter().flatten());
@@ -1785,6 +1813,8 @@ impl MiniMaxH3 {
         )?;
         let mut w = Weights::from_dir(self.root.join("audio_vae"))?;
         let vae = MiniMaxH3AudioVae::from_weights(&mut w, &cfg, Dtype::Float32)?;
+        // sc-23402: force + GPU-verify the read set (sc-22414) before the decode consumes it.
+        w.materialize_accessed()?;
         let track = vae.decode_audio_track(latents)?;
         release((vae, w));
         Ok(track)
@@ -2762,6 +2792,41 @@ mod tests {
             },
         )
         .expect("the documented 768p turbo shift must validate");
+    }
+
+    /// sc-23402 — `validate` is wired to the reference-image short-edge gate, so an out-of-range
+    /// value is refused **here**, before the 53 GB text encoder maps.
+    ///
+    /// Deleting the call in `validate_request` leaves the contract-level test in `gen-core` green
+    /// and reds only this one; that is the point of asserting it through THIS entry point.
+    #[test]
+    fn validate_refuses_a_reference_image_short_edge_outside_1024_to_2048() {
+        let caps = descriptor().capabilities;
+        let with = |edge: u32| GenerationRequest {
+            frames: Some(124),
+            reference_image_short_edge: Some(edge),
+            ..request(576, 320)
+        };
+
+        for bad in [1023u32, 2049] {
+            let e = validate_request(&caps, &with(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains("reference_image_short_edge")
+                    && e.contains(&bad.to_string())
+                    && e.contains("1024..=2048"),
+                "{bad}: {e}"
+            );
+        }
+        validate_request(&caps, &with(1024)).expect("1024 is admitted");
+        validate_request(&caps, &with(2048)).expect("2048 is admitted");
+        validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(124),
+                ..request(576, 320)
+            },
+        )
+        .expect("an absent knob is vacuous");
     }
 
     /// `frames` is exact and `duration` is aligned — the split, pinned in both directions.

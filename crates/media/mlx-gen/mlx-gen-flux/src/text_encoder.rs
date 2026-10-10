@@ -395,6 +395,10 @@ impl T5BlockStream {
         }
         let prefix = join(&self.prefix, &format!("encoder.block.{index}"));
         let block = T5Block::from_weights(view, &prefix, self.group_size)?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
+        // watchdog on a cold page cache (sc-24245).
+        view.materialize_accessed()?;
         // The shared drain: `Array` is refcounted and the constructor cloned out of the view, so
         // draining exactly the accessed keys is what lets the window's drop release them.
         //

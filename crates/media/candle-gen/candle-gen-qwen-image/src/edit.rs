@@ -47,7 +47,7 @@ use crate::vl_tokenizer::{
 };
 
 /// The transformer runs bf16 (native dtype); the VL encoder + VAE run f32.
-const DIT_DTYPE: DType = DType::BF16;
+pub(crate) const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
 
 pub(crate) const EDIT_2511_BASE_ROUTE: &str = "qwen_image_edit_2511";

@@ -36,7 +36,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
 use crate::config::{WanModelConfig, WanVaceConfig};
-use crate::model::{dit_resident_bytes, is_wan_curated, moe_denoise_resident_bytes};
+use crate::model::{is_wan_curated, moe_denoise_resident_bytes};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, crossing_index, decode_to_frames, frames_to_images,
     latent_shape, preflight_denoise_memory_guard, preprocess_i2v_image, reject_off_grid,
@@ -184,6 +184,13 @@ fn vace_prep(
         cfg_disabled,
         load_quant,
     )?;
+    // Each CFG branch's context is zero-padded to `text_len` (512) exactly as the reference
+    // (diffusers `WanVACEPipeline` / original Wan) and base Wan build it; the transformer then
+    // attends over all of it unmasked. Changes product numerics vs. the pre-SC-20686 unpadded path.
+    let context = vace_text_context(&context, base)?;
+    let context_null = context_null
+        .map(|null| vace_text_context(&null, base))
+        .transpose()?;
 
     // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
     let control = {
@@ -386,6 +393,12 @@ impl WanVace {
     }
 }
 
+/// One prompt's VACE text context: its trimmed T5 embedding zero-padded to `text_len`, built by the
+/// same seam as base Wan's ([`crate::pad_text_context`]).
+pub fn vace_text_context(t5_embed: &Array, base: &WanModelConfig) -> Result<Array> {
+    crate::pad_text_context(t5_embed, base.text_len)
+}
+
 /// Resolve the `"wan_vace"` configuration from the snapshot directory.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
@@ -452,7 +465,16 @@ impl Generator for WanVace {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -515,7 +537,7 @@ impl WanVace {
         // here.
         preflight_denoise_memory_guard(
             self.descriptor.id,
-            dit_resident_bytes(&[vace_transformer_weights_path(&self.root)], self.quantize),
+            vace_dit_resident_bytes(&vace_transformer_weights_path(&self.root), self.quantize),
             vace_denoise_tokens(&self.config, req)?,
             base.dim,
             false,
@@ -573,7 +595,7 @@ impl WanVace {
 
 /// Resolve where the VACE transformer weights live (diffusers layout) — the consolidated
 /// `model.safetensors` when present, else the sharded `transformer/` dir. Shared by the loader and
-/// the sc-12459 preflight's [`dit_resident_bytes`] so the two can't disagree on precedence; a
+/// the sc-12459 preflight's [`crate::model::dit_resident_bytes`] so the two can't disagree on precedence; a
 /// missing snapshot resolves to the (absent) single-file path, which sizes to 0 bytes at preflight
 /// (the guard under-counts rather than spuriously firing) and errors loudly at the actual load.
 fn vace_transformer_weights_path(root: &std::path::Path) -> PathBuf {
@@ -586,6 +608,30 @@ fn vace_transformer_weights_path(root: &std::path::Path) -> PathBuf {
         return shard_dir;
     }
     single
+}
+
+/// The VACE DiT's resident weight bytes at the precisions the loader holds them in (SC-20686): the
+/// reference's f32 set at 4 bytes per element, every other float tensor at the bf16 compute dtype —
+/// not the stored width, which for the mixed Wan2.1-VACE-1.3B checkpoint (F32 main blocks) is ~1.6×
+/// what the load keeps resident — then the load-time quantization ratio on the cast surface. A
+/// missing or unreadable snapshot prices 0, like [`crate::model::dit_resident_bytes`] (the load then errors loudly).
+pub(crate) fn vace_dit_resident_bytes(path: &std::path::Path, quant: Option<Quant>) -> u64 {
+    let Ok(headers) = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path) else {
+        return 0;
+    };
+    let ratio = crate::model::quant_resident_ratio(quant);
+    headers
+        .iter()
+        .map(|header| {
+            if !header.is_float() {
+                header.data_bytes
+            } else if crate::vace::vace_tensor_kept_f32(&header.name) {
+                header.materialized_bytes(4).unwrap_or(header.data_bytes)
+            } else {
+                (header.materialized_bytes(2).unwrap_or(header.data_bytes) as f64 * ratio) as u64
+            }
+        })
+        .sum()
 }
 
 /// Load the VACE transformer weights (diffusers layout) — a consolidated `model.safetensors` or a
@@ -677,7 +723,12 @@ impl WanVaceFun {
         let mut transformer =
             WanVaceTransformer::from_weights(&weights, &self.config, Dtype::Bfloat16)?;
         if let Some(q) = self.quantize {
+            // SC-20686: the dense map goes first so the materializing quantize frees each bf16
+            // source as its pack evaluates, then the freed dense buffers leave MLX's pool before
+            // the denoise (else they stay in the process footprint beside the packed expert).
+            drop(weights);
             transformer.quantize(q.bits(), None)?;
+            mlx_gen::memory_probe::clear_cache();
         }
         Ok((transformer, applied))
     }
@@ -843,7 +894,16 @@ impl Generator for WanVaceFun {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
         self.i2v_memory.as_ref().map(|p| &p.contract)
@@ -898,12 +958,12 @@ impl WanVaceFun {
         // forward's working set ~20-30% above this estimate (partially offset by the 0.85
         // headroom) — see the fuller note at the single-expert call site
         // (`WanVace::generate_impl`). Recalibration is hardware-gated and not attempted here.
-        let high_bytes = dit_resident_bytes(
-            &[vace_fun_expert_weights_path(&self.root, MoeExpert::High)],
+        let high_bytes = vace_dit_resident_bytes(
+            &vace_fun_expert_weights_path(&self.root, MoeExpert::High),
             self.quantize,
         );
-        let low_bytes = dit_resident_bytes(
-            &[vace_fun_expert_weights_path(&self.root, MoeExpert::Low)],
+        let low_bytes = vace_dit_resident_bytes(
+            &vace_fun_expert_weights_path(&self.root, MoeExpert::Low),
             self.quantize,
         );
         preflight_denoise_memory_guard(
@@ -1040,7 +1100,7 @@ fn vace_fun_expert_names(expert: MoeExpert) -> (&'static str, &'static str, &'st
 }
 
 /// Resolve where one VACE-Fun expert's weights live — consolidated file first, else the shard dir.
-/// Shared by the loader and the sc-12459 preflight's [`dit_resident_bytes`] (same missing-snapshot
+/// Shared by the loader and the sc-12459 preflight's [`crate::model::dit_resident_bytes`] (same missing-snapshot
 /// contract as [`vace_transformer_weights_path`]: resolves to the absent file → 0 preflight bytes,
 /// loud error at the actual load).
 fn vace_fun_expert_weights_path(root: &std::path::Path, expert: MoeExpert) -> PathBuf {
@@ -1148,9 +1208,117 @@ mlx_gen::register_generators! {
     pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
 }
 
+/// SC-20686 estimate-plus-reserve admission: the [`crate::model::DenoiseFacts`] the two VACE
+/// routes' generate-time fit gates price for `req` (single expert, or the MoE residency of the
+/// dual-expert VACE-Fun), from the load spec, the snapshot headers and the request alone.
+pub(crate) fn vace_denoise_facts(
+    route: &str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<crate::model::DenoiseFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(Error::Msg(format!(
+            "{route}: expected a model directory for the admission estimate"
+        )));
+    };
+    let (config, resident_bytes) = match route {
+        MODEL_ID_VACE => (
+            WanVaceConfig::from_model_dir(root)?,
+            vace_dit_resident_bytes(&vace_transformer_weights_path(root), spec.quantize),
+        ),
+        MODEL_ID_VACE_FUN => (
+            WanVaceConfig::vace_fun_from_model_dir(root)?,
+            moe_denoise_resident_bytes(
+                spec.offload_policy,
+                req.sampler.as_deref(),
+                vace_dit_resident_bytes(
+                    &vace_fun_expert_weights_path(root, MoeExpert::Low),
+                    spec.quantize,
+                ),
+                vace_dit_resident_bytes(
+                    &vace_fun_expert_weights_path(root, MoeExpert::High),
+                    spec.quantize,
+                ),
+            ),
+        ),
+        other => {
+            return Err(Error::Msg(format!(
+                "{other}: not a VACE route for the admission estimate"
+            )))
+        }
+    };
+    let base = &config.base;
+    let frames = req.control_clip().map(|c| c.frames.len()).unwrap_or(1);
+    // A load-time quantization (the product's forced Q4 on VACE-Fun) builds each expert dense
+    // first; its bf16 surface is live beside the packs while they materialize.
+    let load_transient_bytes = if spec.quantize.is_none() {
+        0
+    } else if route == MODEL_ID_VACE {
+        vace_dit_resident_bytes(&vace_transformer_weights_path(root), None)
+    } else {
+        [MoeExpert::Low, MoeExpert::High]
+            .into_iter()
+            .map(|expert| {
+                vace_dit_resident_bytes(&vace_fun_expert_weights_path(root, expert), None)
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    Ok(crate::model::DenoiseFacts {
+        resident_bytes,
+        load_transient_bytes,
+        tokens: vace_denoise_tokens(&config, req)?,
+        dim: base.dim,
+        // VACE CFG runs cond/uncond as two sequential B=1 forwards (vace.rs F-073).
+        cfg_batched: false,
+        width: align_dim(req.width, base.patch_size.2, VAE_S),
+        height: align_dim(req.height, base.patch_size.1, VAE_S),
+        frames: u32::try_from(frames)
+            .map_err(|_| Error::Msg(format!("{route}: frame count overflows")))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SC-20686: VACE residency is priced at the precisions the loader holds — a mixed checkpoint's
+    /// F32 projections at the bf16 compute width, the reference's f32 set at 4 bytes — not the
+    /// stored width (which over-priced Wan2.1-VACE-1.3B's F32 main blocks 2x).
+    #[test]
+    fn vace_residency_is_priced_at_the_load_dtypes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let f32_16 = Array::from_slice(&[0.5f32; 16], &[4, 4]);
+        let f32_4 = Array::from_slice(&[0.5f32; 4], &[4]);
+        let bf16_16 = f32_16.as_dtype(mlx_rs::Dtype::Bfloat16).unwrap();
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.attn2.to_k.weight", &f32_16), // stored F32, held bf16: 32 B
+                ("blocks.0.norm2.weight", &f32_4),       // kept f32: 16 B
+                ("blocks.0.scale_shift_table", &f32_4),  // kept f32: 16 B
+                ("condition_embedder.text_embedder.linear_1.weight", &bf16_16), // kept f32: 64 B
+                ("vace_blocks.0.proj_out.weight", &bf16_16), // held bf16: 32 B
+                ("proj_out.weight", &f32_16),            // the output head, kept f32: 64 B
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(
+            vace_dit_resident_bytes(&path, None),
+            32 + 16 + 16 + 64 + 32 + 64
+        );
+        // Load-time Q4 shrinks only the cast surface.
+        assert_eq!(
+            vace_dit_resident_bytes(&path, Some(Quant::Q4)),
+            (32.0 * 0.30) as u64 + 16 + 16 + 64 + (32.0 * 0.30) as u64 + 64
+        );
+        assert_eq!(
+            vace_dit_resident_bytes(&dir.path().join("missing"), None),
+            0
+        );
+    }
     use crate::vace::weighted_control_scale;
     use mlx_gen::{Conditioning, OffloadPolicy, ReplacementMode};
 

@@ -15,6 +15,7 @@ use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::error::{Error, Result};
 use crate::message::Message;
+use crate::request::ReasoningEffort;
 use crate::tool::ToolSpec;
 
 /// Options for a chat-template render. Extensible carrier for the standard chat-template kwargs
@@ -27,10 +28,21 @@ pub struct RenderOptions<'a> {
     /// `is defined` test is false), `Some(true)`/`Some(false)` request reasoning on/off. Maps from
     /// [`TextLlmRequest::enable_thinking_kwarg`](crate::TextLlmRequest::enable_thinking_kwarg).
     pub enable_thinking: Option<bool>,
+    /// The `reasoning_effort` chat-template kwarg. `None` omits it, preserving the template's
+    /// default. Values are typed because Qwen3.8 explicitly rejects any spelling outside
+    /// `xhigh`, `medium`, and `low`.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The `preserve_thinking` chat-template kwarg. `None` omits it, preserving the template's
+    /// default; Qwen3.8 defaults to retaining reasoning from assistant history.
+    pub preserve_thinking: Option<bool>,
     /// Tools / functions offered to the model. Threaded into the template's `tools` context
     /// (matching `transformers` `tools=`); empty ⇒ the context is omitted, so a template's `if tools`
     /// test is false and the render is byte-identical to a no-tools render.
     pub tools: &'a [ToolSpec],
+    /// The `date_string` chat-template kwarg. `None` omits it, so a template that dates its prompt
+    /// (Llama 3.2's `Today Date:` header) falls back to `strftime_now` — the current date, as in
+    /// `transformers`. `Some` fixes the date, making the render independent of the wall clock.
+    pub date_string: Option<&'a str>,
 }
 
 impl<'a> RenderOptions<'a> {
@@ -39,7 +51,10 @@ impl<'a> RenderOptions<'a> {
         Self {
             add_generation_prompt: true,
             enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
             tools: &[],
+            date_string: None,
         }
     }
 
@@ -49,9 +64,27 @@ impl<'a> RenderOptions<'a> {
         self
     }
 
+    /// Set the typed `reasoning_effort` kwarg (builder style).
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Set the `preserve_thinking` kwarg (builder style).
+    pub fn with_preserve_thinking(mut self, preserve_thinking: Option<bool>) -> Self {
+        self.preserve_thinking = preserve_thinking;
+        self
+    }
+
     /// Set the offered `tools` (builder style).
     pub fn with_tools(mut self, tools: &'a [ToolSpec]) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Set the `date_string` kwarg (builder style).
+    pub fn with_date_string(mut self, date_string: Option<&'a str>) -> Self {
+        self.date_string = date_string;
         self
     }
 }
@@ -197,7 +230,10 @@ impl ChatTemplate for JinjaChatTemplate {
             &RenderOptions {
                 add_generation_prompt,
                 enable_thinking: None,
+                reasoning_effort: None,
+                preserve_thinking: None,
                 tools: &[],
+                date_string: None,
             },
         )
     }
@@ -250,6 +286,15 @@ impl ChatTemplate for JinjaChatTemplate {
         ctx.insert("eos_token", Value::from(self.eos_token.clone()));
         if let Some(enable_thinking) = opts.enable_thinking {
             ctx.insert("enable_thinking", Value::from(enable_thinking));
+        }
+        if let Some(reasoning_effort) = opts.reasoning_effort {
+            ctx.insert("reasoning_effort", Value::from(reasoning_effort.as_str()));
+        }
+        if let Some(preserve_thinking) = opts.preserve_thinking {
+            ctx.insert("preserve_thinking", Value::from(preserve_thinking));
+        }
+        if let Some(date_string) = opts.date_string {
+            ctx.insert("date_string", Value::from(date_string));
         }
         // Offered tools in the OpenAI function shape the template renders (`tool | tojson`). Inserted
         // only when non-empty, so a template's `if tools` test is false on a no-tools render (the
@@ -315,9 +360,35 @@ fn extract_token(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+#[cfg(any(test, feature = "test-clock"))]
+thread_local! {
+    static CLOCK_OVERRIDE: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `strftime_now` reading `unix_seconds` as "now" on this thread, so a
+/// test can prove a render does (or does not) depend on the wall clock. Behind the `test-clock`
+/// feature; production builds have no clock override.
+#[cfg(any(test, feature = "test-clock"))]
+#[doc(hidden)]
+pub fn with_template_clock<R>(unix_seconds: i64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLOCK_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CLOCK_OVERRIDE.with(|c| c.replace(Some(unix_seconds))));
+    f()
+}
+
 /// `strftime_now(fmt)`: format the current UTC date. Supports the specifiers HF templates use
 /// (`%Y %y %m %d %e %b %B %%`).
 fn strftime_now(fmt: String) -> std::result::Result<Value, minijinja::Error> {
+    #[cfg(any(test, feature = "test-clock"))]
+    if let Some(secs) = CLOCK_OVERRIDE.with(|c| c.get()) {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+        return Ok(Value::from(format_date(&fmt, y, m, d)));
+    }
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -547,6 +618,129 @@ mod tests {
         assert_eq!(
             out,
             "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+        );
+    }
+
+    const QWEN38_FROZEN_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../docs/reference/qwen38/chat_template.jinja"
+    ));
+
+    #[test]
+    fn qwen38_frozen_template_matches_reasoning_and_tool_controls() {
+        let t = JinjaChatTemplate::with_tokens(QWEN38_FROZEN_TEMPLATE, "", "<|im_end|>");
+        let messages = [Message::user("What is 2+2?")];
+
+        let default = t
+            .render_with(&messages, &RenderOptions::generation())
+            .unwrap();
+        assert!(
+            default.contains("Reasoning effort is set to xhigh."),
+            "{default}"
+        );
+        assert!(
+            default.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{default}"
+        );
+
+        let explicit_xhigh = t
+            .render_with(
+                &messages,
+                &RenderOptions::generation()
+                    .with_enable_thinking(Some(true))
+                    .with_reasoning_effort(Some(ReasoningEffort::XHigh)),
+            )
+            .unwrap();
+        assert_eq!(explicit_xhigh, default);
+
+        let medium = t
+            .render_with(
+                &messages,
+                &RenderOptions::generation().with_reasoning_effort(Some(ReasoningEffort::Medium)),
+            )
+            .unwrap();
+        assert!(!medium.contains("Reasoning effort is set to"), "{medium}");
+        assert!(
+            medium.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{medium}"
+        );
+
+        let low = t
+            .render_with(
+                &messages,
+                &RenderOptions::generation().with_reasoning_effort(Some(ReasoningEffort::Low)),
+            )
+            .unwrap();
+        assert!(low.contains("Reasoning effort is set to low."), "{low}");
+
+        let disabled = t
+            .render_with(
+                &messages,
+                &RenderOptions::generation().with_enable_thinking(Some(false)),
+            )
+            .unwrap();
+        assert!(
+            !disabled.contains("Reasoning effort is set to"),
+            "{disabled}"
+        );
+        assert!(
+            disabled.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{disabled}"
+        );
+
+        let tools = [weather_tool()];
+        let with_tools = t
+            .render_with(
+                &[Message::user("weather in Paris?")],
+                &RenderOptions::generation()
+                    .with_reasoning_effort(Some(ReasoningEffort::Low))
+                    .with_tools(&tools),
+            )
+            .unwrap();
+        assert!(with_tools.contains("# Tools\n\n"), "{with_tools}");
+        assert!(
+            with_tools.contains("Reasoning effort is set to low."),
+            "{with_tools}"
+        );
+        assert!(
+            with_tools.contains("\"name\":\"get_weather\""),
+            "{with_tools}"
+        );
+        assert!(
+            with_tools.contains("<function=example_function_name>"),
+            "{with_tools}"
+        );
+    }
+
+    #[test]
+    fn qwen38_frozen_template_honors_preserve_thinking() {
+        let t = JinjaChatTemplate::new(QWEN38_FROZEN_TEMPLATE);
+        let messages = [
+            Message::user("What is 2+2?"),
+            Message::assistant("Four.").with_thinking("Add two and two."),
+            Message::user("And 3+3?"),
+        ];
+
+        let default = t.render(&messages, false).unwrap();
+        assert!(default.contains("Add two and two."), "{default}");
+        let explicit_preserve = t
+            .render_with(
+                &messages,
+                &RenderOptions::default().with_preserve_thinking(Some(true)),
+            )
+            .unwrap();
+        assert_eq!(explicit_preserve, default);
+
+        let stripped = t
+            .render_with(
+                &messages,
+                &RenderOptions::default().with_preserve_thinking(Some(false)),
+            )
+            .unwrap();
+        assert!(!stripped.contains("Add two and two."), "{stripped}");
+        assert!(
+            stripped.contains("<|im_start|>assistant\nFour.<|im_end|>"),
+            "{stripped}"
         );
     }
 
@@ -1046,6 +1240,28 @@ mod tests {
             .as_secs() as i64;
         let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
         assert_eq!(out, format!("Today: {}", format_date("%d %b %Y", y, m, d)));
+    }
+
+    /// A `date_string` kwarg fixes a dated template's header; omitting it falls back to the
+    /// (here mocked) wall clock, exactly as `transformers` does.
+    #[test]
+    fn date_string_kwarg_pins_a_dated_template_against_the_clock() {
+        let t = JinjaChatTemplate::new(
+            "{%- if not date_string is defined %}{%- set date_string = strftime_now('%d %b %Y') %}\
+             {%- endif %}Today Date: {{ date_string }}",
+        );
+        let msgs = [Message::user("x")];
+        let render = |opts: &RenderOptions<'_>, secs| {
+            with_template_clock(secs, || t.render_with(&msgs, opts).unwrap())
+        };
+        // 2026-10-03 and 2026-10-04 (UTC midnight).
+        let (day_one, day_two) = (20_729 * 86_400, 20_730 * 86_400);
+        let clock = RenderOptions::generation();
+        assert_eq!(render(&clock, day_one), "Today Date: 03 Oct 2026");
+        assert_eq!(render(&clock, day_two), "Today Date: 04 Oct 2026");
+        let pinned = RenderOptions::generation().with_date_string(Some("26 Jul 2024"));
+        assert_eq!(render(&pinned, day_one), "Today Date: 26 Jul 2024");
+        assert_eq!(render(&pinned, day_two), "Today Date: 26 Jul 2024");
     }
 
     #[test]

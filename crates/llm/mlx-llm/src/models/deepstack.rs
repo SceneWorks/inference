@@ -33,8 +33,9 @@ pub(crate) fn splice_image_features(
 /// `<|image_pad|>` and/or video `<|video_pad|>`) with the next feature row, in sequence order. This is
 /// the multimodal splice for a mixed image+video prompt — the visual features (image features then
 /// the video's per-frame merged rows, concatenated in the same order the placeholders appear) line up
-/// one-to-one with the visual positions. Reduces to [`splice_image_features`] for a single token.
-pub(crate) fn splice_vision_features(
+/// one-to-one with the visual positions. Reduces to the crate-private `splice_image_features`
+/// for a single token.
+pub fn splice_vision_features(
     embeds: &Array,
     input_ids: &[i32],
     vision_features: &Array,
@@ -88,7 +89,7 @@ pub(crate) fn splice_vision_features(
 /// the cursor by `max(grid_t, h/merge, w/merge)`. Qwen3-VL emits one video-token run **per frame**
 /// (timestamp-separated), so each `[t, h, w]` video grid expands to `t × [1, h, w]` per-frame blocks.
 /// Image grids are consumed one run per `image_grid_thw` entry (always `gt = 1`).
-pub(crate) fn mrope_positions_mm(
+pub fn mrope_positions_mm(
     input_ids: &[i32],
     image_grid_thw: &[[i32; 3]],
     image_token_id: i32,
@@ -191,11 +192,7 @@ where
     Ok(h)
 }
 
-pub(crate) fn add_visual_features(
-    h: &Array,
-    visual_pos_mask: &[bool],
-    visual: &Array,
-) -> Result<Array> {
+pub fn add_visual_features(h: &Array, visual_pos_mask: &[bool], visual: &Array) -> Result<Array> {
     let sh = h.shape();
     let (b, s, hidden) = (sh[0], sh[1], sh[2]);
     if b != 1 {

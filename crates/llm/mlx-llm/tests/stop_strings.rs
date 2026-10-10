@@ -1,4 +1,6 @@
-//! Real-weights test for request `stop` strings (story 7349, `#[ignore]` — needs a model on disk).
+//! Real-weights test for request `stop` strings (story 7349, `#[ignore]` — needs a model on disk),
+//! and a fixture test of the engine's pipelining behind a stop string that holds the first
+//! tokens back (sc-24446).
 //!
 //! Point `MLX_LLM_TEST_MODEL` at a Hugging Face Llama/Qwen snapshot directory and run:
 //!
@@ -121,5 +123,73 @@ fn honors_request_stop_strings_on_real_model() {
     assert_eq!(
         unmatched.text, baseline.text,
         "an unmatched stop string must leave the output identical to the baseline"
+    );
+}
+
+/// sc-24446 (pipelined TTFT behind held tokens): when the stop matcher holds the first tokens
+/// back — here a stop string that begins with the run's first token and completes on its second,
+/// so nothing is ever delivered — the engine keeps its look-ahead out of the way until the first
+/// delivery: the run stops on token 1 with no discarded look-ahead. When token 0 is delivered,
+/// the loop pipelines from step 2 and a stop on token 2 discards the look-ahead behind it.
+#[test]
+fn a_held_back_first_token_keeps_the_look_ahead_out_of_the_way() {
+    use core_llm::Speculative;
+    use mlx_llm::switches::PIPELINING;
+
+    let root = crate::common::Fixture::new("mlx-llm-held-first-token-", None);
+    let fixture = core_llm_testkit::write_draft_model_fixture(&root).unwrap();
+    let provider = load_textllm(
+        PROVIDER_ID,
+        &LoadSpec::dense(fixture.target.to_string_lossy()),
+    )
+    .unwrap();
+    let req = |stop: Vec<String>| TextLlmRequest {
+        messages: vec![Message::user("Count the apples and the pears.")],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 12,
+        seed: Some(0),
+        speculative: Some(Speculative::Off),
+        stop,
+        ..Default::default()
+    };
+    let run = |stop: Vec<String>| {
+        let mut pieces = Vec::new();
+        let out = PIPELINING.scoped(true, || {
+            provider
+                .generate(&req(stop), &mut |ev| {
+                    if let CoreEvent::Token { text, .. } = ev {
+                        pieces.push(text);
+                    }
+                })
+                .unwrap()
+        });
+        (pieces, out)
+    };
+    let (pieces, _) = run(vec![]);
+    assert!(pieces.len() >= 3, "{pieces:?}");
+    let discarded = |out: &core_llm::TextLlmOutput| out.decode.as_ref().unwrap().discarded_forwards;
+
+    // Tokens 0 and 1 are the stop string: token 0 is held as its prefix, token 1 completes it.
+    let (held, out) = run(vec![format!("{}{}", pieces[0], pieces[1])]);
+    assert!(held.is_empty(), "nothing is delivered: {held:?}");
+    assert_eq!(out.finish_reason, Some(CoreFinish::Stop));
+    assert_eq!(out.usage.generated_tokens, 2);
+    assert_eq!(
+        discarded(&out),
+        0,
+        "no look-ahead is enqueued before the first delivery"
+    );
+
+    // Token 0 is delivered; tokens 1 and 2 are the stop string.
+    let stop = format!("{}{}", pieces[1], pieces[2]);
+    assert!(!stop.starts_with(pieces[0].as_str()), "{stop:?}");
+    let (delivered, out) = run(vec![stop]);
+    assert_eq!(delivered, [pieces[0].clone()]);
+    assert_eq!(out.finish_reason, Some(CoreFinish::Stop));
+    assert_eq!(out.usage.generated_tokens, 3);
+    assert_eq!(
+        discarded(&out),
+        1,
+        "pipelined from step 2: token 2's look-ahead is discarded"
     );
 }

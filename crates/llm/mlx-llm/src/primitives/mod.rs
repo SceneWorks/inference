@@ -13,12 +13,21 @@
 //! though the first decoders run batch-1. The [`KvCache`] trait is the seam the P4 paged cache
 //! (story 7169) slots in behind without touching decoders.
 
+pub mod activation;
 pub mod attention;
 pub mod coherence;
+pub mod fused;
 pub mod gated_delta;
 pub mod kv_cache;
+pub mod kv_candidates;
+pub mod moe;
 pub mod nn;
+pub mod packed_attention;
+pub mod packed_group_affine_kv;
+pub mod packed_metal;
 pub mod paged_kv_cache;
+pub mod paged_packed_kv;
+pub mod prism;
 pub mod projection;
 pub mod quant;
 pub mod rope;
@@ -28,16 +37,62 @@ pub mod weights;
 pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_mask, AttnMask};
 pub use coherence::verify_gpu_view;
 pub use gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv, compute_g, gated_delta_chunked, gated_delta_kernel,
+    gated_delta_recurrence, gated_delta_recurrence_ops, rms_norm_gated, DeltaNetCache,
+    CHUNKED_PREFILL_MIN_TOKENS, KERNEL_MAX_STEPS,
 };
-pub use kv_cache::{ContiguousKvCache, KvCache};
+pub use kv_cache::{
+    CacheRoute, CompressedCacheStorage, ContiguousKvCache, KvCache, PackedAttentionMask,
+    PackedCacheEvidence, PackedKernelPathEvidence,
+};
+pub use moe::{GateUp, MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
 pub use nn::{
-    conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
-    soft_cap,
+    contiguous, conv2d, dtype_bytes, embed, input_ids, input_ids_batch, layer_norm, linear,
+    rms_norm, rms_norm_unscaled, soft_cap,
+};
+pub use packed_group_affine_kv::{
+    group_affine_kernel_fp32_parity_errors, group_affine_kernel_fp32_parity_errors_at,
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
+    DenseTransitionAdmission, OpaqueCompiledKernel, PackedCacheRequest, PackedCodeBits,
+    PackedDispatchTelemetry, PackedGroupAffineKvCache, RepresentationMetadata,
+    RetainedPackedKernel, PACKED_METAL_QUANT_GROUP_SIZE,
+};
+pub use packed_metal::{
+    mlx_nax_available, packed_kernel_path_valid, packed_kv_split_count, packed_metal_identity,
+    packed_nax_head_dimension_supported, packed_query_dtype_name, packed_tiled_min_query_tokens,
+    packed_tiled_split_count, PackedAttentionArgs, PackedKernelDescriptor, PackedKernelPath,
+    PackedKernelSelection, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+    PackedMetalTuningProfile, PackedNaxSelection, PagedPackedAttentionArgs, PagedSequenceExtent,
+    PACKED_METAL_B4_IDENTITY, PACKED_METAL_B8_IDENTITY, PACKED_METAL_DEFAULT_IDENTITY,
+    PACKED_NAX_KERNEL, PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW,
+    PACKED_SELECTION_CONSERVATIVE, PACKED_SELECTION_F32_QUERY, PACKED_SELECTION_HEAD_DIMENSION,
+    PACKED_SELECTION_NAX, PACKED_SELECTION_NAX_UNAVAILABLE, PACKED_TILED_KERNEL,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
+pub use paged_packed_kv::{
+    paged_packed_identity, token_digest, PackedPagePool, PagedCacheIdentity, PagedCacheRequest,
+    PagedCacheSelection, PagedCacheSnapshot, PagedFallbackReason, PagedModelKey,
+    PagedPackedKvCache, PagedPoolStorage, PAGED_PACKED_LAYOUT_VERSION,
+};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
-pub use weights::Weights;
+pub use weights::{Materialized, Weights};
+
+/// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run. Every fused
+/// kernel resolves [`Stream::task_local_or_default`](mlx_rs::Stream::task_local_or_default) once,
+/// gates on this, and dispatches on that same stream: the task-local stream need not be on the
+/// process default device.
+pub(crate) fn stream_is_gpu(stream: &mlx_rs::Stream) -> bool {
+    // SAFETY: `dev` is created and freed here; `stream` outlives both calls.
+    unsafe {
+        let mut dev = mlx_sys::mlx_device_new();
+        let mut ty: mlx_sys::mlx_device_type = mlx_sys::mlx_device_type__MLX_CPU;
+        let ok = mlx_sys::mlx_stream_get_device(&mut dev, stream.as_ptr()) == 0
+            && mlx_sys::mlx_device_get_type(&mut ty, dev) == 0;
+        mlx_sys::mlx_device_free(dev);
+        ok && ty == mlx_sys::mlx_device_type__MLX_GPU
+    }
+}

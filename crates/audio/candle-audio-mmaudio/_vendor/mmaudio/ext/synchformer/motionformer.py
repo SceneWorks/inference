@@ -1,4 +1,5 @@
 import logging
+import pickle
 from pathlib import Path
 
 import einops
@@ -60,7 +61,12 @@ class MotionFormer(VisionTransformer):
 
         if self.ckpt_path is not None:
             check_if_file_exists_else_download(self.ckpt_path, FILE2URL)
-            ckpt = torch.load(self.ckpt_path, map_location='cpu')
+            try:
+                ckpt = torch.load(self.ckpt_path, map_location='cpu', weights_only=True)
+            except pickle.UnpicklingError as exc:
+                raise ValueError(
+                    f'{self.ckpt_path}: unsupported checkpoint object; provide tensor-only weights'
+                ) from exc
             mformer_ckpt2cfg = {
                 'ssv2_motionformer_224_16x4.pyth': 'motionformer_224_16x4.yaml',
                 'ssv2_joint_224_16x4.pyth': 'joint_224_16x4.yaml',

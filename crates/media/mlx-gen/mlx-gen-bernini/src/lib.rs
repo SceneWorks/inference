@@ -103,6 +103,26 @@ pub fn conservative_video_decode_memory_profile(
     mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
 }
 
+/// The provider-owned conservative VAE **encode** working set (sc-20686, epic E8), or `None` when
+/// the request encodes nothing. Bernini: each reference still, and each source clip (at most the output length), encoded one at a time. The encode and decode phases never overlap.
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    let encode_frames = mlx_gen_wan::conditioning_encode_frames(mode, frames, reference_count)?;
+    mlx_gen_wan::conservative_video_encode_memory_profile_for_vae(
+        VAE_TILING,
+        width,
+        height,
+        encode_frames,
+    )
+}
+
 /// Add all MLX Bernini providers to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,

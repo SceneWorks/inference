@@ -7,6 +7,8 @@
 //! reverse (making this `pub` in the library) would put test scaffolding in the shipped surface and
 //! force `tempfile` out of `[dev-dependencies]`. One file, both contexts, nothing to keep in step.
 
+pub mod footprint;
+
 use std::path::{Path, PathBuf};
 
 /// A temp fixture path that owns its `TempDir` guard.
@@ -143,4 +145,34 @@ fn fixtures_with_the_same_prefix_do_not_collide() {
         Fixture::new("mlx-llm-fixture-guard-", None),
     );
     assert_ne!(a.to_path_buf(), b.to_path_buf());
+}
+
+/// Write a loadable snapshot into `dir`: `config.json`, one `model.safetensors` of `weights`, and a
+/// word-level `tokenizer.json` (`t0` … `t{vocab-1}`), so a fixture can be loaded through the
+/// production `LlamaProvider::load` path.
+#[allow(dead_code)] // the integration suites use it; the unit suites do not
+pub fn write_snapshot(
+    dir: &Path,
+    config: &serde_json::Value,
+    weights: &std::collections::HashMap<String, mlx_rs::Array>,
+    vocab: usize,
+) {
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    mlx_rs::Array::save_safetensors(
+        weights.iter().map(|(k, v)| (k.as_str(), v)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+    let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+    std::fs::write(
+        dir.join("tokenizer.json"),
+        format!(
+            r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null, "decoder": null,
+            "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+            entries.join(", ")
+        ),
+    )
+    .unwrap();
 }

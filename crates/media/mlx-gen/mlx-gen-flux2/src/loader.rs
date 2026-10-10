@@ -14,6 +14,7 @@ use std::path::Path;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{LoadSpec, Result, WeightsSource};
+use mlx_rs::Array;
 
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
@@ -291,7 +292,10 @@ fn weights_from_source(source: &WeightsSource) -> Result<Weights> {
 /// construction.
 pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
     let w = Weights::from_dir(root.join("vae"))?;
-    Flux2Vae::from_weights(&w)
+    let vae = Flux2Vae::from_weights(&w)?;
+    // Materialize at load (sc-24245; see mlx_gen_qwen_image::loader::load_transformer_with).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 /// Load the MMDiT transformer for `cfg`, applying the diffusers→internal renames (the fork's
@@ -299,7 +303,16 @@ pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
 /// → `time_guidance_embed.linear_{1,2}`, and each double block's Sequential
 /// `transformer_blocks.{i}.attn.to_out.0` → `to_out`. Everything else matches 1:1. The renames are
 /// arch-general (klein and dev are the same `Flux2Transformer2DModel`); only `cfg` differs.
-fn load_transformer_with(root: &Path, cfg: &Flux2Config) -> Result<Flux2Transformer> {
+///
+/// Materializes what it built before returning (sc-24245; see
+/// `mlx_gen_qwen_image::loader::load_transformer_with`). `streamed` (the caller will arm and
+/// finalize the Klein block stream) reads only the non-block tensors: the evicted block bodies are
+/// re-read per window by [`crate::block_stream::Flux2BlockStream`].
+pub(crate) fn load_transformer_with(
+    root: &Path,
+    cfg: &Flux2Config,
+    streamed: bool,
+) -> Result<Flux2Transformer> {
     let dir = root.join("transformer");
     let quant = read_component_quant(&dir)?;
     let mut w = Weights::from_dir(dir)?;
@@ -322,18 +335,34 @@ fn load_transformer_with(root: &Path, cfg: &Flux2Config) -> Result<Flux2Transfor
     for i in 0..cfg.num_double_layers {
         alias_transformer_double_block(&mut w, i);
     }
-    Flux2Transformer::from_weights_quant(&w, cfg, quant)
+    let transformer = Flux2Transformer::from_weights_quant(&w, cfg, quant)?;
+    if streamed {
+        let resident: Vec<(String, Array)> = w
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| {
+                !key.starts_with("transformer_blocks.")
+                    && !key.starts_with("single_transformer_blocks.")
+            })
+            .collect();
+        let mut named: Vec<(&str, &Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        w.materialize_accessed()?;
+    }
+    Ok(transformer)
 }
 
 /// Load the FLUX.2-klein MMDiT transformer.
 pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
-    load_transformer_with(root, &Flux2Config::klein_9b())
+    load_transformer_with(root, &Flux2Config::klein_9b(), false)
 }
 
 /// Load the FLUX.2-dev MMDiT transformer (sc-5916): the same parametric module tree as klein at the
 /// dev dims (48 single blocks / 48 heads / joint 15360), via `Flux2Config::dev()`.
 pub fn load_transformer_dev(root: &Path) -> Result<Flux2Transformer> {
-    load_transformer_with(root, &Flux2Config::dev())
+    load_transformer_with(root, &Flux2Config::dev(), false)
 }
 
 /// Load the FLUX.2-dev base MMDiT **plus** the Fun-Controlnet-Union control branch (sc-2292) from
@@ -367,6 +396,8 @@ pub fn load_control_transformer_dev(
         }
     }
     let branch = Flux2ControlBranch::from_weights(&control_weights, "", &cfg)?;
+    // Materialize at load, before `load_dev_control`'s quantize (sc-24245).
+    control_weights.materialize_accessed()?;
     Ok(Flux2ControlTransformer::new(base, branch))
 }
 

@@ -114,6 +114,9 @@ impl Default for Flux2EditRequest {
 pub struct Flux2Edit {
     pipe: Pipeline,
     variant: Flux2Variant,
+    /// Directory-backed snapshot identity retained so an armed campaign can inventory the exact
+    /// product weights it just loaded. Ordinary edits never read this through the observer.
+    campaign_snapshot_root: PathBuf,
     te: Option<Flux2PromptEncoder>,
     upsampler: Option<CaptionUpsampler>,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
@@ -390,6 +393,7 @@ impl Flux2Edit {
         Ok(Self {
             pipe,
             variant,
+            campaign_snapshot_root: paths.root.clone(),
             te,
             upsampler,
             tokenizer,
@@ -514,6 +518,21 @@ impl Flux2Edit {
             ));
         }
         validate_request(req, self.variant)?;
+
+        // This is inert unless the product CLI armed an output request. The route, snapshot,
+        // variant and request facts all come from the loaded provider, not campaign arguments.
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.campaign_snapshot_root,
+            &req.cancel,
+            crate::sc20686_observer::PRODUCT_ROUTE_ID,
+            req.width,
+            req.height,
+            &req.prompt,
+            req.guidance,
+            u32::try_from(references.len())
+                .map_err(|_| CandleError::Msg("flux2 edit: reference count overflow".into()))?,
+        )
+        .map_err(|error| CandleError::Msg(format!("flux2 edit: arm SC-20686 campaign: {error}")))?;
 
         if self.memory.stage_residency && req.use_pid {
             return Err(CandleError::Msg(
@@ -641,6 +660,28 @@ impl Flux2Edit {
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
+        let (_, reference_sq, _) = ref_tokens.dims3()?;
+        let (latent_height, latent_width) = pipeline::latent_dims(req.width, req.height);
+        let layer_count = u32::try_from(cfg.num_double_layers)
+            .map_err(|_| CandleError::Msg("flux2 edit: transformer layer count overflow".into()))?;
+        crate::sc20686_observer::bind_edit_geometry(
+            layer_count,
+            u32::try_from(ref_tokens.dim(0)?)
+                .map_err(|_| CandleError::Msg("flux2 edit: batch overflow".into()))?,
+            u32::try_from(cfg.num_heads)
+                .map_err(|_| CandleError::Msg("flux2 edit: head count overflow".into()))?,
+            u32::try_from(cfg.head_dim)
+                .map_err(|_| CandleError::Msg("flux2 edit: head dimension overflow".into()))?,
+            u64::try_from(target_seq)
+                .map_err(|_| CandleError::Msg("flux2 edit: target sequence overflow".into()))?,
+            u64::try_from(reference_sq)
+                .map_err(|_| CandleError::Msg("flux2 edit: reference sequence overflow".into()))?,
+            u32::try_from(latent_height)
+                .map_err(|_| CandleError::Msg("flux2 edit: latent height overflow".into()))?,
+            u32::try_from(latent_width)
+                .map_err(|_| CandleError::Msg("flux2 edit: latent width overflow".into()))?,
+            format!("{:?}", ref_tokens.dtype()),
+        );
         // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
         // tail below unpacks against. The sampler's running latent is the TARGET token grid alone —
         // `ref_tokens` is concatenated and sliced back off inside the predict closure — so the hook
@@ -735,7 +776,16 @@ impl Flux2Edit {
                     None => Ok(v),
                 }
             },
-        )?;
+        );
+        let latents = match latents {
+            Ok(latents) => latents,
+            Err(error) => {
+                if matches!(error, CandleError::Canceled) {
+                    crate::sc20686_observer::observe_cancelled();
+                }
+                return Err(error);
+            }
+        };
 
         on_progress(Progress::Decoding);
         let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
@@ -762,7 +812,9 @@ impl Flux2Edit {
             )?,
             None => vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
         };
-        to_image(&decoded)
+        let image = to_image(&decoded)?;
+        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
+        Ok(image)
     }
 
     /// Run the transformer on the joint `[target, refs]` image stream and keep the leading

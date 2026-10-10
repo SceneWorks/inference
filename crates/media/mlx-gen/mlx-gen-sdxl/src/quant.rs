@@ -29,6 +29,22 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+/// Load-time Q4/Q8 of one SDXL-family Linear, evaluated **one projection at a time** (sc-24245, the
+/// `mlx_gen::quant::quantize_map` precedent): read the dense source first, then force the packed
+/// result. A GPU `quantize` over a not-yet-read safetensors `Load` makes the Metal command buffer
+/// wait on the disk read — past the GPU watchdog on a cold page cache — and the fused-LDM route
+/// builds its components straight from lazy file arrays. Forcing the packed triple right away bounds
+/// the dense transient to one projection. An already-packed base is left untouched (never read), as
+/// [`AdaptableLinear::quantize`] leaves it, so a streamed pre-packed trunk stays lazy.
+pub(crate) fn quantize_linear(linear: &mut AdaptableLinear, bits: i32) -> Result<()> {
+    if linear.quantized_params().is_some() {
+        return Ok(());
+    }
+    linear.materialize_weights()?;
+    linear.quantize(bits, None)?;
+    linear.materialize_weights()
+}
+
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
 pub(crate) const GROUP_SIZE: i32 = 64;
 

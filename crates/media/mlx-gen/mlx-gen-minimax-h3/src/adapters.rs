@@ -196,6 +196,32 @@ pub struct MiniMaxH3LoraReport {
     pub trainer_ranks: Vec<usize>,
     /// Distinct per-target alphas observed across trainer adapters, sorted for stable receipts.
     pub trainer_alphas: Vec<f32>,
+    /// Source tensors forced and GPU-view-verified at the load boundary (sc-23402 / sc-22414),
+    /// summed over every spec — the whole of each adapter file, since every tensor in it is a
+    /// candidate factor. The number is the **return value of** `verify_adapter_file`, so a build
+    /// that drops the verification reports zero here rather than an unchanged tally.
+    pub verified_source_tensors: usize,
+}
+
+/// Force and GPU-view-verify (sc-22414) **every** tensor of one adapter file, returning how many
+/// were verified.
+///
+/// `Weights::from_file` leaves each tensor a lazy `Load` on the CPU stream, and for an adapter that
+/// is the whole read set: an `a`/`b` pair (or a LoKr factor) is first consumed inside
+/// `mlx_gen::adapters::AdaptableLinear`'s residual — a Metal kernel in denoise step 1. That is
+/// precisely the sc-22414 seam, in the one shape of it with **no** symptom: a stale all-zero `a`/`b`
+/// yields a zero residual, so the render comes out at base strength with no refusal, no degeneracy
+/// trip and no unmatched-target error. Adapters are installed in `MiniMaxH3::load_task_dit` for
+/// **both** denoise paths, `ref2va` included, so this is on the same route as every other cold load
+/// sc-23402 verified.
+///
+/// [`mlx_gen::weights::Weights::materialize`] is the same evaluate-then-`verify_gpu_view` primitive
+/// the other groups use, batched at 512 MiB. A converted file ([`convert_comfyui_key_space`],
+/// [`convert_minimax_h3_trainer_key_space`]) is covered transitively: its factors are graph nodes
+/// over these verified buffers, not fresh `Load`s.
+fn verify_adapter_file(w: &Weights) -> Result<usize> {
+    w.materialize()?;
+    Ok(w.len())
 }
 
 /// Every module path a MiniMax-H3 adapter can address, at `cfg`'s geometry: `num_layers` transformer
@@ -840,6 +866,12 @@ fn apply_one_lora(
 /// `lokr_*` keys) then goes to the shared LyCORIS seam, and everything else goes to the diffusers
 /// LoRA path above. This also keeps the turbo files off `wmeta::parse_rank_alpha` — they carry an
 /// `alpha` string and no `networkType`, so classifying them as LoKr would fold them 128× too strong.
+///
+/// # Every file is GPU-verified at its load boundary (sc-23402)
+///
+/// Each spec is forced and checked against the sc-22414 stale-view defect by
+/// `verify_adapter_file` the moment it is read, before classification or folding, and the count
+/// lands in [`MiniMaxH3LoraReport::verified_source_tensors`].
 pub fn apply_minimax_h3_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -848,6 +880,10 @@ pub fn apply_minimax_h3_adapters(
     for spec in specs {
         let before = report.applied;
         let w = Weights::from_file(&spec.path)?;
+        // sc-23402: the load boundary. Force and GPU-verify the whole file here, before anything
+        // classifies, converts or folds it — see [`verify_adapter_file`] for why a stale adapter
+        // read is the silent one.
+        report.verified_source_tensors += verify_adapter_file(&w)?;
         let trainer = classify_minimax_h3_trainer_namespace(
             w.keys(),
             w.metadata("ss_network_module"),

@@ -5,10 +5,10 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, tr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { artifactByteSizesFromFiles, buildArtifactManifest, campaignLineageSha256, currentArtifactReferences, hostilePayload, MAX_RECEIPT_BYTES, pairedBootstrapLowerBound, validatePlan, validateReceipt } from "../release/starvector_terminal_evidence.mjs";
+import { artifactByteSizesFromFiles, buildArtifactManifest, campaignLineageSha256, currentArtifactReferences, hostilePayload, LIMIT_BEHAVIOR_PROFILE_SHA256, MAX_RECEIPT_BYTES, OUTCOME_PARITY_PROFILE_SHA256, pairedBootstrapLowerBound, validatePlan, validateReceipt, validateReceiptProfile } from "../release/starvector_terminal_evidence.mjs";
 
 const corpus = JSON.parse(readFileSync("release/starvector-terminal-corpus-v1.json", "utf8"));
-const INFERENCE = "1".repeat(40), SCENEWORKS = "2".repeat(40), EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
+const INFERENCE = "1".repeat(40), PREFLIGHT_INFERENCE = "3".repeat(40), SCENEWORKS = "2".repeat(40), EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}` : JSON.stringify(value);
 const source = (index) => [["starvector/svg-stack-simple","1d2a96a17cc0c4c1f337b7631adc8c5885bc72ea"],["starvector/svg-icons-simple","e1918a27ba6649e856e5db0710d8a6c7046762c1"],["starvector/svg-emoji-simple","fa75b3617872ae57e6f3cb450aee65dbccbd69e0"],["starvector/svg-fonts-simple","453c739ea13ad2685127f721c333f14d99485299"]][Math.floor(index / 30)];
 const prompts = ["geometric badge","isometric folder","rounded calendar","minimal rocket","layered landscape","abstract flower"];
@@ -56,9 +56,44 @@ function v2Receipt(predecessorCount=0) {
   value.campaign_lineage={kind:predecessorCount===0?"clean":"failed_campaign_supersession",current_campaign_id:value.campaign_run_id,current_workflow:{campaign_id:value.campaign_run_id,inference_revision:value.inference_revision,sceneworks_revision:value.sceneworks_revision,repository:value.execution.repository,path:".github/workflows/starvector-terminal.yml",run_id:value.execution.workflow_run_id,run_attempt:value.execution.workflow_run_attempt,head_sha:value.execution.head_sha},failed_predecessors:predecessors,supersession_records:[]};
   rebuildEdges(value);value.producer.campaign_lineage_sha256=campaignLineageSha256(value.campaign_lineage);value.artifact_manifest=buildManifest(value);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;return value;
 }
+function outcomeParityReceipt() {
+  const value = v2Receipt();
+  for (const run of value.runs) {
+    run.deterministic_parity.contract_version = 2;
+    run.deterministic_parity.cases = run.deterministic_parity.cases.map((record, index) => index === 0 ? {
+      case_index: record.case_index, seed: record.seed, input_png_sha256: record.input_png_sha256,
+      native_outcome: "rejected", upstream_outcome: "rejected",
+      native_provider_transcript_sha256: d(`${run.backend}-${run.tier}-native-transcript-${index}`),
+      native_preview_png_sha256: null, upstream_svg_sha256: null, upstream_preview_png_sha256: null, rendered_ssim: null,
+      native_rejection_stage: "sanitizer", native_rejection_code: "malformed_svg",
+      native_rejection_reason: "provider SVG is malformed: tag not closed",
+      native_raw_svg_sha256: d(`${run.backend}-${run.tier}-native-raw-${index}`),
+      upstream_rejection_stage: "sanitizer", upstream_rejection_code: "malformed_svg",
+      upstream_rejection_reason: "provider SVG is malformed: tag not closed",
+      upstream_raw_svg_sha256: d(`${run.tier}-upstream-raw-${index}`),
+      upstream_sanitizer_stdout_sha256: d(`${run.tier}-sanitizer-stdout-${index}`),
+      upstream_sanitizer_stderr_sha256: d(`${run.tier}-sanitizer-stderr-${index}`),
+    } : {
+      case_index: record.case_index, seed: record.seed, input_png_sha256: record.input_png_sha256,
+      native_outcome: "accepted", upstream_outcome: "accepted",
+      native_provider_transcript_sha256: d(`${run.backend}-${run.tier}-native-transcript-${index}`),
+      native_preview_png_sha256: record.native_preview_png_sha256,
+      upstream_svg_sha256: record.upstream_svg_sha256,
+      upstream_preview_png_sha256: record.upstream_preview_png_sha256,
+      rendered_ssim: record.rendered_ssim,
+    });
+  }
+  return resealV2(value);
+}
+function limitBehaviorReceipt() {
+  const value = outcomeParityReceipt();
+  for (const run of value.runs) run.limits = { completion: true, token: true, byte: true, wall_time: true, queued_cancellation: true, in_flight_cancellation: true };
+  return resealV2(value);
+}
 function resealLineage(value) { value.producer.campaign_lineage_sha256=campaignLineageSha256(value.campaign_lineage); }
 function resealManifest(value) { value.artifact_manifest.aggregate_sha256=h(stable({campaign_run_id:value.artifact_manifest.campaign_run_id,entries:value.artifact_manifest.entries}));value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256; }
 function resealV2(value) { resealLineage(value);value.artifact_manifest=buildManifest(value);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;return value; }
+function resealV2WithPreflight(value, expectedPreflightRevision) { resealLineage(value);value.artifact_manifest=buildArtifactManifest(value,corpus,fixtureByteSize,expectedPreflightRevision);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;return value; }
 function addHistoricalOwnedInputs(value, kind) {
   const predecessor=value.campaign_lineage.failed_predecessors[0],artifact=predecessor.source_artifacts[0];
   const cases=kind==="hostile"?value.hostile_sanitizer.cases:value.prompt_composition.cases;
@@ -143,7 +178,8 @@ test("V2 uses measured current artifact sizes with complete immutable overlap an
     for(const entry of currentArtifactReferences(value,corpus)) {
       const hostileMatch=entry.path.match(/^hostile\/(\d+)\/input$/),promptMatch=entry.path.match(/^prompt\/(\d+)\/prompt_sha256$/);
       const bytes=hostileMatch?hostilePayload(Number(hostileMatch[1])):promptMatch?promptPayload(Number(promptMatch[1])):`realistic current artifact ${entry.path}\n${"data ".repeat(29)}`;
-      const file=join(directory,...entry.path.split("/"));mkdirSync(join(file,".."),{recursive:true});writeFileSync(file,bytes);sizes.set(entry.path,statSync(file).size);
+      const physicalPath=(hostileMatch||promptMatch||process.platform!=="win32")?entry.path:entry.path.replaceAll(":","__colon__");
+      const file=join(directory,...physicalPath.split("/"));mkdirSync(join(file,".."),{recursive:true});writeFileSync(file,bytes);sizes.set(entry.path,statSync(file).size);
     }
     value.artifact_manifest=buildManifest(value,sizes);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;
     assert(value.artifact_manifest.entries.filter(entry=>!entry.path.startsWith("lineage/")&&!entry.path.startsWith("quarantine/")).every(entry=>entry.byte_size>1));
@@ -193,6 +229,57 @@ test("V2 requires genuine frozen upstream parity and the four-source case mappin
     value=>{value.runs[0].deterministic_parity.cases[0].rendered_ssim=.994;},
     value=>{value.runs[0].deterministic_parity.cases[0].second_preview_png_sha256=d("native-repeat");},
   ]) {const value=v2Receipt();mutate(value);assert.throws(()=>validate(value),/upstream|parity.*keys differ/);}
+});
+test("V2 outcome parity accepts matched typed rejections without counting them as image conversion",()=>{
+  const value=outcomeParityReceipt();
+  validate(value);
+  assert.equal(value.runs[0].image_quality.cases.filter((record)=>record.accepted).length,120);
+  assert.equal(value.runs[0].deterministic_parity.cases.filter((record)=>record.native_outcome==="rejected").length,1);
+});
+test("V2 outcome parity rejects decision, normalized reason, artifact, and accepted SSIM mutations",()=>{
+  for(const mutate of [
+    value=>{value.runs[0].deterministic_parity.cases[0].native_outcome="accepted";},
+    value=>{value.runs[0].deterministic_parity.cases[0].native_rejection_code="svg_policy";},
+    value=>{value.runs[0].deterministic_parity.cases[0].native_rejection_reason="generic infrastructure error";},
+    value=>{value.runs[0].deterministic_parity.cases[0].native_raw_svg_sha256=null;},
+    value=>{value.runs[0].deterministic_parity.cases[1].rendered_ssim=.994;},
+  ]){const value=outcomeParityReceipt();mutate(value);assert.throws(()=>validate(value),/outcome parity|typed SVG|SHA-256|keys differ/);}
+});
+test("selected outcome-parity profile rejects missing contract version, legacy V2, and wrong schema hash",()=>{
+  const profile="release/starvector-terminal-receipt-v2-outcome-parity.schema.json";
+  const current=outcomeParityReceipt();
+  assert.equal(validateReceiptProfile(current,profile,OUTCOME_PARITY_PROFILE_SHA256),OUTCOME_PARITY_PROFILE_SHA256);
+  const missing=structuredClone(current);delete missing.runs[0].deterministic_parity.contract_version;
+  assert.throws(()=>validateReceiptProfile(missing,profile,OUTCOME_PARITY_PROFILE_SHA256),/requires receipt V2 and parity contract version 2/);
+  assert.throws(()=>validateReceiptProfile(v2Receipt(),profile,OUTCOME_PARITY_PROFILE_SHA256),/requires receipt V2 and parity contract version 2/);
+  assert.throws(()=>validateReceiptProfile(current,profile,"0".repeat(64)),/profile hash/);
+});
+test("versioned limit-behavior profile accepts only the six executable product behaviors",()=>{
+  const profile="release/starvector-terminal-receipt-v2-outcome-parity-limit-behaviors.schema.json";
+  const current=limitBehaviorReceipt();
+  assert.equal(validateReceiptProfile(current,profile,LIMIT_BEHAVIOR_PROFILE_SHA256),LIMIT_BEHAVIOR_PROFILE_SHA256);
+  validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256);
+  assert.throws(()=>validateReceiptProfile(outcomeParityReceipt(),profile,LIMIT_BEHAVIOR_PROFILE_SHA256),/selected profile limits/);
+  assert.throws(()=>validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,OUTCOME_PARITY_PROFILE_SHA256),/limits.*keys differ/);
+  assert.throws(()=>validateReceiptProfile(current,"release/starvector-terminal-receipt-v2-outcome-parity.schema.json",LIMIT_BEHAVIOR_PROFILE_SHA256),/digest mismatch/);
+});
+test("only the new profile accepts an explicitly verified historical preflight revision",()=>{
+  const current=limitBehaviorReceipt();current.inference_preflight.head_sha=PREFLIGHT_INFERENCE;resealV2WithPreflight(current,PREFLIGHT_INFERENCE);
+  validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256,PREFLIGHT_INFERENCE);
+  assert.throws(()=>validateReceipt(current,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,LIMIT_BEHAVIOR_PROFILE_SHA256),/preflight invalid/);
+  const historical=outcomeParityReceipt();historical.inference_preflight.head_sha=PREFLIGHT_INFERENCE;resealV2WithPreflight(historical,PREFLIGHT_INFERENCE);
+  assert.throws(()=>validateReceipt(historical,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,fixtureByteSize,OUTCOME_PARITY_PROFILE_SHA256,PREFLIGHT_INFERENCE),/historical receipt profiles require preflight and inference revisions to match/);
+  assert.throws(()=>validateReceipt(receipt(),validatePlan(corpus),INFERENCE,SCENEWORKS,corpus,undefined,LIMIT_BEHAVIOR_PROFILE_SHA256,PREFLIGHT_INFERENCE),/limit-behavior profile requires receipt V2/);
+});
+test("production validator CLI selects outcome parity before legacy V2 evidence recovery",()=>{
+  const directory=mkdtempSync(join(tmpdir(),"starvector-profile-cli-"));
+  try {
+    const receiptPath=join(directory,"receipt.json"),base=["scripts/release/starvector_terminal_evidence.mjs","validate-receipt","--corpus","release/starvector-terminal-corpus-v1.json","--receipt",receiptPath,"--inference-revision",INFERENCE,"--sceneworks-revision",SCENEWORKS,"--profile-schema","release/starvector-terminal-receipt-v2-outcome-parity.schema.json","--profile-sha256",OUTCOME_PARITY_PROFILE_SHA256];
+    for(const [value,error] of [[v2Receipt(),/requires receipt V2 and parity contract version 2/],[(()=>{const value=outcomeParityReceipt();delete value.runs[0].deterministic_parity.contract_version;return value;})(),/requires receipt V2 and parity contract version 2/]]) {
+      writeFileSync(receiptPath,JSON.stringify(value));const result=spawnSync(process.execPath,base,{encoding:"utf8"});assert.notEqual(result.status,0);assert.match(result.stderr,error);
+    }
+    writeFileSync(receiptPath,JSON.stringify(outcomeParityReceipt()));const wrong=structuredClone(base);wrong[wrong.length-1]="0".repeat(64);const result=spawnSync(process.execPath,wrong,{encoding:"utf8"});assert.notEqual(result.status,0);assert.match(result.stderr,/profile hash/);
+  } finally {rmSync(directory,{recursive:true,force:true});}
 });
 test("V2 applies the 120-second p95 requirement only to 1B while V1 remains historical",()=>{
   const value=v2Receipt();for(const run of value.runs.filter(run=>run.tier==="8b")) for(const record of run.image_quality.cases)record.latency_seconds=121;

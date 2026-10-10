@@ -2,7 +2,42 @@
 
 use crate::constraint::{Constraint, ConstraintKind};
 use crate::error::{Error, Result};
-use crate::request::TextLlmRequest;
+use crate::request::{ReasoningEffort, Sampling, TextLlmRequest};
+
+/// Limits advertised by a loaded model with an in-checkpoint multi-token predictor (MTP).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtpCapabilities {
+    /// Maximum draft-token count the native provider supports per verification pass.
+    pub max_draft_tokens: u32,
+    /// Upstream-recommended draft-token count used by [`MtpMode::Auto`](crate::MtpMode::Auto).
+    pub recommended_draft_tokens: u32,
+}
+
+/// One speculative proposer a loaded model can run, and its depth limits (epic sc-24432 E4).
+/// Advertised in [`TextLlmCapabilities::speculative`]; read through
+/// [`TextLlmCapabilities::proposer`], which also answers for a provider that still advertises MTP
+/// only through the legacy [`TextLlmCapabilities::mtp`] field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProposerCapabilities {
+    /// The proposal source.
+    pub proposer: crate::SpeculativeProposer,
+    /// The largest depth (draft tokens per verification pass) the backend runs for this proposer —
+    /// a finite, backend-true bound, never `u32::MAX` (epic sc-24432 E4). A request above it is
+    /// clamped to it by [`resolve_speculative`](crate::resolve_speculative), and the clamp is named
+    /// in [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) (sc-24438).
+    pub max_depth: u32,
+    /// The depth [`Speculative::Auto`](crate::Speculative::Auto) runs.
+    pub recommended_depth: u32,
+}
+
+/// Upstream-recommended sampling presets for a model whose thinking and non-thinking modes use
+/// different distributions. These are discovery metadata: a client may initialize controls from
+/// the applicable preset, then sends an ordinary explicit [`Sampling`] request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelSamplingDefaults {
+    pub thinking: Sampling,
+    pub non_thinking: Sampling,
+}
 
 /// What a provider supports. Used both for honest advertisement and to validate requests up front.
 #[derive(Clone, Debug, Default)]
@@ -32,10 +67,34 @@ pub struct TextLlmCapabilities {
     /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
     /// [`ThinkingMode::Enabled`](crate::request::ThinkingMode::Enabled) request is rejected.
     pub supports_thinking: bool,
+    /// Whether the model supports Qwen's `reasoning_effort` chat-template kwarg. This is separate
+    /// from [`supports_thinking`](Self::supports_thinking): a generic thinking template can honor
+    /// `enable_thinking` without recognizing Qwen's effort levels.
+    pub supports_reasoning_effort: bool,
+    /// Reasoning efforts a UI should offer for this loaded model. This is an advertised selection
+    /// surface, not the parser's compatibility set: a provider may accept a legacy effort as an
+    /// alias while omitting it here when the model does not implement that effort distinctly.
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// Model-card sampling recommendations, when the loaded artifact publishes them. Providers do
+    /// not silently replace an explicit request with these values.
+    pub model_sampling_defaults: Option<ModelSamplingDefaults>,
+    /// Whether the model supports Qwen's `preserve_thinking` chat-template kwarg. This is separate
+    /// from [`supports_thinking`](Self::supports_thinking): generic thinking history handling must
+    /// not be advertised as Qwen-compatible preservation control.
+    pub supports_preserve_thinking: bool,
     /// Whether the model supports tool / function calling — i.e. its chat template renders a `tools`
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
+    /// Native in-checkpoint MTP support and limits — the legacy advertisement, still read for
+    /// MTP when [`speculative`](Self::speculative) carries no MTP entry. `None` there too means an
+    /// explicit MTP request is rejected.
+    pub mtp: Option<MtpCapabilities>,
+    /// The speculative proposers this loaded model runs and their depth limits (epic sc-24432
+    /// E4). Empty = none beyond a legacy [`mtp`](Self::mtp) advertisement. Query one proposer with
+    /// [`proposer`](Self::proposer), all of them with
+    /// [`speculative_proposers`](Self::speculative_proposers).
+    pub speculative: Vec<ProposerCapabilities>,
     /// The output constraint KINDS this provider can enforce (empty = none).
     ///
     /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
@@ -48,6 +107,54 @@ impl TextLlmCapabilities {
     /// Whether a given constraint is supported, compared by [`ConstraintKind`].
     pub fn supports_constraint(&self, c: &Constraint) -> bool {
         self.supported_constraints.contains(&c.kind())
+    }
+
+    /// What this model advertises for `proposer`: its [`speculative`](Self::speculative) entry,
+    /// else — for MTP only — the legacy [`mtp`](Self::mtp) advertisement.
+    pub fn proposer(&self, proposer: crate::SpeculativeProposer) -> Option<ProposerCapabilities> {
+        let legacy_mtp = match (proposer, self.mtp) {
+            (crate::SpeculativeProposer::Mtp, Some(mtp)) => Some(ProposerCapabilities {
+                proposer,
+                max_depth: mtp.max_draft_tokens,
+                recommended_depth: mtp.recommended_draft_tokens,
+            }),
+            _ => None,
+        };
+        self.speculative
+            .iter()
+            .find(|c| c.proposer == proposer)
+            .copied()
+            .or(legacy_mtp)
+    }
+
+    /// Advertise an in-checkpoint MTP head at `max_depth` drafts per verify step, running
+    /// `recommended_depth` (clamped into `1..=max_depth`) under
+    /// [`Speculative::Auto`](crate::Speculative::Auto) — on the per-proposer
+    /// [`speculative`](Self::speculative) list **and** the legacy [`mtp`](Self::mtp) field, so the
+    /// two advertisements always agree (sc-24438, E4). Replaces any earlier MTP advertisement.
+    pub fn advertise_mtp(&mut self, max_depth: u32, recommended_depth: u32) {
+        let max_depth = max_depth.max(1);
+        let recommended_depth = recommended_depth.clamp(1, max_depth);
+        self.mtp = Some(MtpCapabilities {
+            max_draft_tokens: max_depth,
+            recommended_draft_tokens: recommended_depth,
+        });
+        self.speculative
+            .retain(|c| c.proposer != crate::SpeculativeProposer::Mtp);
+        self.speculative.push(ProposerCapabilities {
+            proposer: crate::SpeculativeProposer::Mtp,
+            max_depth,
+            recommended_depth,
+        });
+    }
+
+    /// Every advertised proposer (the legacy MTP advertisement included), in
+    /// [`SpeculativeProposer::ALL`](crate::SpeculativeProposer::ALL) order.
+    pub fn speculative_proposers(&self) -> Vec<ProposerCapabilities> {
+        crate::SpeculativeProposer::ALL
+            .into_iter()
+            .filter_map(|p| self.proposer(p))
+            .collect()
     }
 
     /// Validate a request against these capabilities. Providers call this from
@@ -103,11 +210,46 @@ impl TextLlmCapabilities {
             )));
         }
 
+        if req.reasoning_effort.is_some() && !self.supports_reasoning_effort {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support the reasoning_effort template control"
+            )));
+        }
+
+        if req.preserve_thinking.is_some() && !self.supports_preserve_thinking {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support the preserve_thinking template control"
+            )));
+        }
+
+        if req.thinking == crate::request::ThinkingMode::Disabled && req.reasoning_effort.is_some()
+        {
+            return reject("reasoning_effort cannot be set when thinking is disabled".to_string());
+        }
+
         // Offered tools the provider cannot render/parse are rejected, not silently dropped.
         if !self.supports_tools && !req.tools.is_empty() {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support tool (function) calling"
             )));
+        }
+
+        if req.speculative.is_some() && req.mtp.is_some_and(|m| m != crate::MtpMode::Off) {
+            return reject(
+                "set either `speculative` or the legacy `mtp`, not both (legacy `mtp` maps onto \
+                 `speculative`)"
+                    .into(),
+            );
+        }
+        // An explicit proposer must ask for at least one draft — a malformed request. Nothing
+        // else about speculation is refused (epic sc-24432 E2: explicit fallback, never failure):
+        // a proposer the model does not advertise runs plain and `resolve_speculative` names why,
+        // and a depth above the advertised maximum is clamped and the clamp named (sc-24438).
+        // `auto` and `off` never refuse.
+        if let crate::Speculative::Proposer { proposer, depth } = req.speculative_mode() {
+            if depth == 0 {
+                return reject(format!("speculative `{proposer}` depth must be >= 1"));
+            }
         }
 
         if let Some(c) = &req.constraint {
@@ -149,4 +291,255 @@ pub struct TextLlmDescriptor {
     pub backend: String,
     /// Declared capabilities.
     pub capabilities: TextLlmCapabilities,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Message, MtpMode, ReasoningEffort, ThinkingMode};
+
+    fn request() -> TextLlmRequest {
+        TextLlmRequest::new(vec![Message::user("hello")], 8)
+    }
+
+    #[test]
+    fn qwen_template_controls_are_not_implied_by_generic_thinking() {
+        let generic_thinking = TextLlmCapabilities {
+            supports_thinking: true,
+            ..Default::default()
+        };
+        let mut effort = request();
+        effort.reasoning_effort = Some(ReasoningEffort::Low);
+        let err = generic_thinking
+            .validate_request("test", &effort)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("reasoning_effort"));
+
+        let mut preserve = request();
+        preserve.preserve_thinking = Some(false);
+        let err = generic_thinking
+            .validate_request("test", &preserve)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("preserve_thinking"));
+    }
+
+    #[test]
+    fn qwen_thinking_controls_validate_when_explicitly_advertised() {
+        let qwen = TextLlmCapabilities {
+            supports_thinking: true,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec![
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low,
+            ],
+            model_sampling_defaults: None,
+            supports_preserve_thinking: true,
+            ..Default::default()
+        };
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        req.preserve_thinking = Some(true);
+        qwen.validate_request("qwen38", &req).unwrap();
+        assert_eq!(
+            qwen.reasoning_efforts,
+            [
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Low
+            ]
+        );
+    }
+
+    /// E2: an explicit legacy `mtp: enabled` on a model without a head is admitted — it decodes
+    /// plainly with the reason named by the resolver — while a zero draft count stays malformed.
+    #[test]
+    fn explicit_mtp_without_a_head_is_admitted_and_a_zero_draft_count_is_refused() {
+        let mut req = request();
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+        TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap();
+        let resolved =
+            crate::resolve_speculative(req.speculative_mode(), &TextLlmCapabilities::default());
+        assert_eq!(resolved.plan, crate::SpeculativePlan::Off);
+        assert_eq!(
+            resolved.fallback.as_deref(),
+            Some(
+                "speculative: `mtp` is not available for this model (this model does not \
+                 advertise it; decoded without a proposer)"
+            )
+        );
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 0 });
+        assert!(matches!(
+            TextLlmCapabilities::default().validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+
+        let caps = TextLlmCapabilities {
+            mtp: Some(MtpCapabilities {
+                max_draft_tokens: 4,
+                recommended_draft_tokens: 3,
+            }),
+            ..Default::default()
+        };
+        caps.validate_request("test", &req).unwrap();
+
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 0 });
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        // sc-24438: a depth above the advertised maximum is admitted — the resolver clamps it and
+        // names the clamp in the report — rather than refused.
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 5 });
+        caps.validate_request("test", &req).unwrap();
+    }
+
+    /// sc-24438 (E4): one call advertises MTP on both the per-proposer list and the legacy field,
+    /// with the same finite numbers, and replaces an earlier advertisement.
+    #[test]
+    fn advertising_mtp_keeps_the_legacy_field_and_the_proposer_list_in_agreement() {
+        use crate::SpeculativeProposer;
+        let mut caps = TextLlmCapabilities::default();
+        caps.advertise_mtp(7, 3);
+        let legacy = caps.mtp.unwrap();
+        let listed = caps
+            .speculative
+            .iter()
+            .find(|c| c.proposer == SpeculativeProposer::Mtp)
+            .copied()
+            .unwrap();
+        assert_eq!(legacy.max_draft_tokens, listed.max_depth);
+        assert_eq!(legacy.recommended_draft_tokens, listed.recommended_depth);
+        assert_eq!((listed.max_depth, listed.recommended_depth), (7, 3));
+        assert_eq!(caps.proposer(SpeculativeProposer::Mtp), Some(listed));
+
+        // Re-advertising replaces (one MTP entry), and the recommendation never exceeds the max.
+        caps.advertise_mtp(2, 3);
+        assert_eq!(
+            caps.speculative
+                .iter()
+                .filter(|c| c.proposer == SpeculativeProposer::Mtp)
+                .count(),
+            1
+        );
+        let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
+        assert_eq!((mtp.max_depth, mtp.recommended_depth), (2, 2));
+        assert_eq!(
+            caps.mtp,
+            Some(MtpCapabilities {
+                max_draft_tokens: 2,
+                recommended_draft_tokens: 2
+            })
+        );
+    }
+
+    /// sc-24433: an explicit proposer is read against the per-proposer advertisement (legacy MTP
+    /// included), `auto` never refuses, and the new option and the legacy field cannot both be
+    /// set. (Since sc-24438 a too-deep request is clamped by the resolver, not refused; since the
+    /// sc-24432 feature-end review an un-advertised proposer is admitted and runs plain, named.)
+    #[test]
+    fn explicit_proposers_are_checked_per_proposer_and_the_two_fields_cannot_both_be_set() {
+        use crate::{Speculative, SpeculativeProposer};
+        let lookup = ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 8,
+            recommended_depth: 4,
+        };
+        let caps = TextLlmCapabilities {
+            speculative: vec![lookup],
+            mtp: Some(MtpCapabilities {
+                max_draft_tokens: 5,
+                recommended_draft_tokens: 3,
+            }),
+            ..Default::default()
+        };
+        let mtp = ProposerCapabilities {
+            proposer: SpeculativeProposer::Mtp,
+            max_depth: 5,
+            recommended_depth: 3,
+        };
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::PromptLookup),
+            Some(lookup)
+        );
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::Mtp),
+            Some(mtp),
+            "legacy mirror"
+        );
+        assert_eq!(caps.proposer(SpeculativeProposer::DraftModel), None);
+        assert_eq!(caps.speculative_proposers(), vec![mtp, lookup]);
+
+        let mut req = request();
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4));
+        caps.validate_request("test", &req).unwrap();
+        // Above the advertised max: admitted, the resolver clamps it by name (sc-24438).
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 9));
+        caps.validate_request("test", &req).unwrap();
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 0));
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        // Not advertised: admitted (E2), and the resolver runs it plain with the reason named.
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
+        caps.validate_request("test", &req).unwrap();
+        let resolved = crate::resolve_speculative(req.speculative_mode(), &caps);
+        assert_eq!(resolved.plan, crate::SpeculativePlan::Off);
+        assert!(
+            resolved
+                .fallback
+                .as_deref()
+                .is_some_and(|why| why.starts_with("speculative: `draft_model` is not available")),
+            "{resolved:?}"
+        );
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 0));
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::Mtp, 5));
+        caps.validate_request("test", &req).unwrap();
+        req.speculative = Some(Speculative::Auto);
+        TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap();
+
+        req.mtp = Some(MtpMode::Auto);
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        req.speculative = None;
+        caps.validate_request("test", &req).unwrap();
+    }
+
+    #[test]
+    fn auto_mtp_is_a_safe_fallback_without_capability() {
+        let mut req = request();
+        req.mtp = Some(MtpMode::Auto);
+        TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap();
+    }
+
+    #[test]
+    fn reasoning_effort_is_rejected_when_thinking_is_disabled() {
+        let caps = TextLlmCapabilities {
+            supports_thinking: true,
+            supports_reasoning_effort: true,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            ..Default::default()
+        };
+        let mut req = request();
+        req.thinking = ThinkingMode::Disabled;
+        req.reasoning_effort = Some(ReasoningEffort::Medium);
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)));
+        assert!(err.to_string().contains("thinking is disabled"));
+    }
 }

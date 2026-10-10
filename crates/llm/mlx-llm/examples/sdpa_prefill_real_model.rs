@@ -1,10 +1,14 @@
+//! **Superseded (sc-20676):** the "numerically broken" fused prefill kernel was a strided-output
+//! readback artifact in the sc-7430 repro (`as_slice` ignores strides); the kernel is correct and
+//! `sdpa` now runs head dims 64/80/128 prefill through it in 2048-row blocks.
+//!
 //! sc-7430 real-model context demo: shows that generation stays FLUENT on prompts over 8 tokens
 //! even though the fused-SDPA prefill kernel (q_len > 8, multi-head, head_dim ∈ {64,128}) is
 //! numerically broken on the pinned pmetal fork — which is exactly why the bug went unnoticed and
 //! why short-prompt smoke tests passed.
 //!
 //! Point `MLX_LLM_TEST_MODEL` at a HF snapshot (config.json + tokenizer.json + *.safetensors), e.g.
-//! SmolLM2-135M (hidden 576 / 9 heads / head_dim 64 — in the broken envelope), and run:
+//! SmolLM2-135M (hidden 576 / 9 heads / head_dim 64 — the sc-7430 "broken envelope"), and run:
 //!   MLX_LLM_TEST_MODEL=/path/to/smollm2-135m cargo run --release --example sdpa_prefill_real_model
 //!
 //! The numerical bug itself is proven by `examples/sdpa_f32_repro.rs` (mlx-rs only) and the
@@ -12,6 +16,10 @@
 //! prefill changing the greedy continuation on some >8-token prompts) was confirmed with a temporary
 //! fused-vs-eager toggle in `sdpa` (see sc-7430); generations here look fine because the corruption
 //! stays fluent and the last-position argmax is usually robust.
+//!
+//! **sc-24442:** the kernel was never broken — sc-7430's evidence was a stride-blind `as_slice`
+//! readback of the full kernel's permuted output (see `examples/sdpa_f32_repro.rs`). `sdpa` now
+//! runs this prefill as one fused call; this demo remains a real-model fluency smoke.
 
 use core_llm::Tokenizer;
 use mlx_llm::config::ModelConfig;

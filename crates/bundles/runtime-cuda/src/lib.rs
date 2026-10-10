@@ -2,6 +2,16 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+/// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
+/// (sc-22988): e.g. `candle_audio_yue2`'s run verification, saved-plan restore, cover preparation
+/// and decode-budget helpers, and `candle_audio_sheetsage2`'s recording → score transcription,
+/// review artifact and cover sequencing (sc-23002; noncommercial, CC BY-NC 4.0 on the owner basis
+/// recorded 2026-09-27; transcription runs on the CPU or CUDA, never Metal). Exactly the audio
+/// catalog's provider set.
+#[cfg(feature = "audio")]
+pub mod audio_providers {
+    pub use candle_audio_catalog::providers::*;
+}
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 #[cfg(feature = "media")]
@@ -98,6 +108,27 @@ fn audio_lane() -> runtime_catalog::AudioLane {
     }
 }
 
+/// What this bundle's LLM backend can serve on this host before any model is loaded (sc-24139):
+/// the load device, its CUDA compute capability, and whether `Quantize::Nvfp4` and
+/// `LoadSpec::cuda_graphs` are available — each unavailable feature with the refusal a load would
+/// return. A product reads this to offer, or disable with the reason, those controls.
+pub fn text_backend_capabilities() -> core_llm::BackendCapabilities {
+    candle_llm::backend_capabilities()
+}
+
+/// Whether an NVFP4 load of the snapshot at `spec.source` can pass every gate this bundle's load
+/// runs before reading a weight (sc-24139): the provider this bundle's text registry would load it
+/// with, that provider's own NVFP4 gate, then the device gate. A product asks before it downloads
+/// weight shards or registers a snapshot as NVFP4. Reads only `config.json` (or a GGUF header).
+pub fn text_nvfp4_support(spec: &core_llm::LoadSpec) -> core_llm::FeatureSupport {
+    match candle_llm::cuda_text_registry() {
+        Ok(registry) => candle_llm::nvfp4_support(&registry, spec),
+        Err(error) => core_llm::FeatureSupport::unavailable(format!(
+            "nvfp4: the CUDA text registry did not compose: {error}"
+        )),
+    }
+}
+
 /// Build the complete validated CUDA runtime composition.
 pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
     #[cfg(feature = "audio")]
@@ -127,6 +158,83 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// SceneWorks reaches SheetSage2 transcription only through this bundle (sc-23002): the crate is
+    /// re-exported beside `candle_audio_yue2`, the whole recording → transcription → review → cover
+    /// path is public with the signatures a consumer calls, the cover closure is authorized for
+    /// noncommercial use only, and the audio catalog publishes the closure's licence rows under the
+    /// crate-API provider id `sheetsage2`.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_bundle_reaches_sheetsage2_transcription_and_publishes_its_licence_rows() {
+        use super::audio_providers::candle_audio_sheetsage2 as ss2;
+        use super::audio_providers::candle_audio_yue2 as yue2;
+        use ss2::candle_core::Device;
+        use yue2::license::{authorize_closure, IntendedUse};
+
+        // The public path, as typed function items: a signature change fails to compile here.
+        let _resolve: fn(
+            yue2::Closure,
+            &yue2::SnapshotDirs,
+        ) -> Result<yue2::VerifiedClosure, yue2::AssetError> = yue2::snapshot::resolve_closure;
+        let _load: fn(
+            &yue2::VerifiedClosure,
+            &Device,
+        ) -> Result<ss2::provider::Transcriber, ss2::Error> = ss2::provider::Transcriber::load;
+        let _unload: fn(ss2::provider::Transcriber) -> ss2::provider::UnloadReceipt =
+            ss2::provider::Transcriber::unload;
+        let _save: fn(
+            &ss2::review::Transcription,
+            &std::path::Path,
+            &ss2::tokenizer::Tokenizer,
+        ) -> Result<String, ss2::Error> = ss2::review::Transcription::save;
+        let _open: fn(&std::path::Path) -> Result<ss2::review::ReviewArtifact, ss2::Error> =
+            ss2::review::ReviewArtifact::open;
+        let _replay: fn(
+            &ss2::review::ReviewArtifact,
+        ) -> Result<ss2::review::ReplayReport, ss2::Error> = ss2::review::ReviewArtifact::replay;
+        let _plan: fn(
+            &ss2::review::ReviewArtifact,
+            &ss2::cover::CoverOptions,
+        ) -> Result<ss2::cover::CoverPlan, ss2::Error> = ss2::cover::plan_cover;
+        type LoadEngine = fn() -> Result<ss2::cover::EngineCover, ss2::Error>;
+        type RunCover = fn(
+            Option<ss2::provider::Transcriber>,
+            &ss2::cover::CoverPlan,
+            LoadEngine,
+            &std::path::Path,
+            &dyn Fn() -> bool,
+        ) -> Result<ss2::cover::CoverOutcome, ss2::Error>;
+        let _run: RunCover = ss2::cover::run_cover;
+        ss2::provider::check_device(&Device::Cpu).expect("the CPU is a transcription device");
+
+        // Noncommercial only: the owner basis covers the port, never commercial use or
+        // redistribution of the weights.
+        authorize_closure(
+            yue2::Closure::Cover,
+            IntendedUse::NoncommercialExperimentation,
+        )
+        .expect("recording -> transcription -> cover is a supported noncommercial path");
+        for refused in [IntendedUse::CommercialUse, IntendedUse::Redistribution] {
+            assert!(authorize_closure(yue2::Closure::Cover, refused).is_err());
+        }
+
+        // The catalog publishes the cover closure's rows and the `sheetsage2` mapping.
+        let rows = candle_audio_catalog::component_licenses();
+        for row in ss2::provider::COMPONENT_LICENSES {
+            assert!(rows.contains(row), "{} is not published", row.component);
+        }
+        let mapping = candle_audio_catalog::provider_components();
+        let published = mapping
+            .iter()
+            .find(|p| p.provider_id == ss2::provider::TRANSCRIBER_ID)
+            .expect("the sheetsage2 mapping is published");
+        assert_eq!(
+            published.components,
+            ["yue2_sheetsage2", "yue2_mert_v2_fullsong"]
+        );
+        assert!(candle_audio_catalog::CRATE_API_PROVIDERS.contains(&ss2::provider::TRANSCRIBER_ID));
+    }
+
     /// AC (sc-22661 / epic SC-22657 E1+E2): every generator registered in the CUDA bundle publishes
     /// a contract surface whose byte decomposition is honest and whose architecture axes are not
     /// fabricated.
@@ -211,7 +319,8 @@ mod tests {
         // differential DiT over SAME-L, both domains, 380 s) + the three pre-trained -base
         // siblings stable_audio_3_{small_music,small_sfx,medium}_base (sc-14546 —
         // rectified_flow, Euler/50/7.0 defaults), and moss_ttsd_v05
-        // (multi-speaker dialogue TTS, sc-13518), plus the
+        // (multi-speaker dialogue TTS, sc-13518), the six yue_* lyrics2song variants (sc-19382), the noncommercial yue2 song generator
+        // (sc-22994), plus the
         // voice-cloning identity embedder chatterbox_ve (sc-12844); later stories extend these exact
         // assertions in catalog order. The lane carries its own composed candle preparer
         // (sc-12835/sc-12836).
@@ -237,7 +346,14 @@ mod tests {
                     "chatterbox_tts",
                     "mmaudio_small_16k",
                     "mmaudio_large_44k",
-                    "moss_ttsd_v05"
+                    "moss_ttsd_v05",
+                    "yue_en_cot",
+                    "yue_en_icl",
+                    "yue_zh_cot",
+                    "yue_zh_icl",
+                    "yue_jp_kr_cot",
+                    "yue_jp_kr_icl",
+                    "yue2"
                 ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
@@ -345,6 +461,13 @@ mod tests {
                 "mmaudio_small_16k",
                 "mmaudio_large_44k",
                 "moss_ttsd_v05",
+                "yue_en_cot",
+                "yue_en_icl",
+                "yue_zh_cot",
+                "yue_zh_icl",
+                "yue_jp_kr_cot",
+                "yue_jp_kr_icl",
+                "yue2",
                 "dummy-audio"
             ]
         );

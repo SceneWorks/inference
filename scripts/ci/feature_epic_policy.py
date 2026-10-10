@@ -44,6 +44,7 @@ PROTECTED_PREFIXES = ("feature/", "sync/")
 PULL_REQUEST_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 FeatureBranchResolver = Callable[[int], str]
 CommitParentResolver = Callable[[str], tuple[str, str]]
+CommitPeeler = Callable[[str], str]
 
 
 class PolicyError(ValueError):
@@ -189,6 +190,69 @@ def resolve_local_merge_parents(
         _commit_sha(parents[0], "checked-out merge base parent"),
         _commit_sha(parents[1], "checked-out merge head parent"),
     )
+
+
+def resolve_local_commit(
+    obj: str,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> str:
+    """Peel a checked-out object to the commit it names (``git rev-parse <obj>^{commit}``).
+
+    A commit peels to itself; an annotated tag object peels to the commit it tags.
+    """
+
+    obj = _commit_sha(obj, "object to peel")
+    command = ["git", "rev-parse", "--verify", "--quiet", f"{obj}^{{commit}}"]
+    try:
+        result = runner(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PolicyError(f"could not peel {obj} to a commit in the checkout: {error}") from error
+    if result.returncode != 0:
+        raise PolicyError(
+            f"could not peel {obj} to a commit in the checkout: the object is absent or names "
+            "no commit (a fetch-depth: 0 checkout fetches refs/tags/*, which carries a pushed "
+            "annotated tag object)"
+        )
+    return _commit_sha((result.stdout or "").strip(), f"commit peeled from {obj}")
+
+
+def _active_tag_revision(
+    active_sha: str | None,
+    after: str,
+    commit_peeler: CommitPeeler | None,
+) -> None:
+    """Bind a tag push's ``after`` to GITHUB_SHA.
+
+    A lightweight tag's ``after`` is the commit itself. An annotated tag's ``after`` is the tag
+    object, while GITHUB_SHA is the commit that tag peels to. A tag object's name is the hash of
+    its content, which names exactly one commit, so peeling ``after`` locally keeps the same
+    guarantee as the plain equality: the checked-out revision is the one the pushed ref names.
+    """
+
+    if active_sha is None:
+        raise PolicyError("GITHUB_SHA is required for this event")
+    active_sha = _commit_sha(active_sha, "GITHUB_SHA")
+    if active_sha == after:
+        return
+    if commit_peeler is None:
+        raise PolicyError(
+            f"tag push after {after} differs from GITHUB_SHA {active_sha} and no local commit "
+            "peeler was provided to prove which commit it names"
+        )
+    peeled = _commit_sha(commit_peeler(after), f"commit peeled from {after}")
+    if peeled != active_sha:
+        raise PolicyError(
+            "GITHUB_SHA must equal the commit that tag push after names so policy checks the "
+            f"active revision; after {after} peels to {peeled}, found {active_sha}"
+        )
 
 
 def _active_pull_request_revision(
@@ -450,14 +514,21 @@ def _validate_merge_group(
     return f"merge queue ref targets {base_branch!r}"
 
 
-def _validate_push(payload: Mapping[str, Any], active_sha: str | None) -> str:
+def _validate_push(
+    payload: Mapping[str, Any],
+    active_sha: str | None,
+    commit_peeler: CommitPeeler | None,
+) -> str:
     ref = _nested_string(payload, "ref")
     after = _commit_sha(_nested_string(payload, "after"), "after")
+    if ref.startswith("refs/tags/") and len(ref) > len("refs/tags/"):
+        # An annotated tag's `after` is the tag object, not GITHUB_SHA (runs 35812806857,
+        # 35796817963), so a tag push binds through the commit that object peels to.
+        _active_tag_revision(active_sha, after, commit_peeler)
+        return "tag push is outside pull-request topology"
     _active_revision(active_sha, after, "after")
     if ref == "refs/heads/main":
         return "main push is outside pull-request topology"
-    if ref.startswith("refs/tags/") and len(ref) > len("refs/tags/"):
-        return "tag push is outside pull-request topology"
     raise PolicyError(
         f"branch push {ref!r} is not an allowed CI event; feature trains merge "
         "through pull requests"
@@ -472,6 +543,7 @@ def validate_event(
     active_sha: str | None = None,
     feature_resolver: FeatureBranchResolver | None = None,
     commit_parent_resolver: CommitParentResolver | None = None,
+    commit_peeler: CommitPeeler | None = None,
 ) -> str:
     """Validate a GitHub event and return a human-readable acceptance reason."""
 
@@ -490,7 +562,7 @@ def validate_event(
     if event_name == "merge_group":
         return _validate_merge_group(payload, active_sha, feature_resolver)
     if event_name == "push":
-        return _validate_push(payload, active_sha)
+        return _validate_push(payload, active_sha, commit_peeler)
     if event_name == "workflow_dispatch":
         return "operator dispatch is outside pull-request topology"
     raise PolicyError(f"unsupported GitHub event {event_name!r}")
@@ -538,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
             active_sha=args.active_sha,
             feature_resolver=resolve_remote_feature_branch,
             commit_parent_resolver=resolve_local_merge_parents,
+            commit_peeler=resolve_local_commit,
         )
     except (OSError, json.JSONDecodeError, PolicyError) as error:
         print(f"::error title=Feature epic branch policy::{error}")

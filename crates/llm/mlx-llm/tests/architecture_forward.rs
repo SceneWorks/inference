@@ -701,3 +701,23 @@ fn assert_case_coverage(cases: &[Case]) {
         "the forward suite must cover exactly the generic-decoder architectures"
     );
 }
+
+/// sc-24446: every architecture the shared decoder serves loads through the production provider
+/// path — built lazily, then materialized group by group — with every source tensor it read
+/// consumed by one of the model's arrays: an unconsumed source is a load error
+/// (`LlamaProvider::load` refuses it), so this suite pins each architecture's `param_groups`
+/// enumeration (q/k norms, sandwich norms, biases, MLA, MoE banks).
+///
+/// MUTATION: drop the q/k norms from `LlamaLayer::arrays` and the Qwen3 / Qwen3-VL cases go RED.
+#[test]
+fn every_architecture_loads_through_the_provider_with_every_source_consumed() {
+    use core_llm::TextLlm;
+    for case in cases() {
+        let dir = crate::common::Fixture::new("mlx-llm-arch-load-", None);
+        crate::common::write_snapshot(&dir, &case.config, &case.weights, VOCAB as usize);
+        let provider =
+            mlx_llm::LlamaProvider::load(&core_llm::LoadSpec::dense(dir.to_str().unwrap()))
+                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        assert_eq!(provider.descriptor().family, case.family, "{}", case.name);
+    }
+}

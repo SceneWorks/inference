@@ -1,6 +1,6 @@
 # Vendored `mmaudio` — the frozen MMAudio torch-parity oracle (sc-17285)
 
-`mmaudio/` is a **verbatim copy** of the reference PyTorch implementation from
+`mmaudio/` is the reference PyTorch implementation from
 
     https://github.com/hkchengrex/MMAudio @ 974010a026c731054592d8f777218bd9d85a6c24
     (2026-02-23T00:09:17-06:00 — "mobile friendly")
@@ -8,7 +8,7 @@
 
 It is the ground truth that `scripts/reference/mmaudio_reference.py` runs to produce the five
 committed torch-parity fixtures under `../tests/fixtures/`, which the native candle MMAudio port is
-gated against. It is **read-only**: nothing in this directory is imported by any Rust crate, shipped
+gated against. It is **oracle-only**: nothing in this directory is imported by any Rust crate, shipped
 in any bundle, or on any product path — it exists so the oracle survives.
 
 ## Why it is committed
@@ -32,14 +32,16 @@ strictly worse than committing it. It is also 364 KB across 102 files, so the co
 
 | path | vendored? | note |
 | --- | --- | --- |
-| `mmaudio/**` | yes | the entire package, verbatim — 102 files, incl. the nested BigVGAN/Synchformer licences and the `bigvgan_vocoder.yml` / `divided_224_16x4.yaml` configs the loaders read |
+| `mmaudio/**` | yes | the entire 102-file package, with three tensor-only checkpoint-loading patches; incl. the nested BigVGAN/Synchformer licences and the `bigvgan_vocoder.yml` / `divided_224_16x4.yaml` configs the loaders read |
 | `LICENSE` | yes | upstream repo-root MIT, copied in as `mmaudio/LICENSE` beside the code it licenses |
 | `config/`, `training/`, `docs/`, `demo.py`, `train.py`, `batch_eval.py`, … | **no** | repository-level entry points and training configs; the producer builds the models directly and reads none of them |
 
 The whole package is taken rather than the reachable subset deliberately: an import-driven subset
 has to be re-derived every time upstream moves an import, and getting it wrong fails as a confusing
-`ModuleNotFoundError` inside a half-loaded reference. Everything vendored is **byte-for-byte
-upstream** — no local patches. Verify with:
+`ModuleNotFoundError` inside a half-loaded reference. The only local changes are
+`ext/bigvgan/utils.py`, `ext/bigvgan_v2/utils.py`, and `ext/synchformer/motionformer.py`: their
+checkpoint readers require `weights_only=True` and reject unsupported checkpoint objects.
+Verify against upstream with:
 
 ```sh
 git -C /path/to/MMAudio checkout 974010a026c731054592d8f777218bd9d85a6c24
@@ -48,15 +50,15 @@ diff -r --exclude=__pycache__ --exclude=LICENSE \
 ```
 
 (`LICENSE` is excluded because it lives at the upstream **repo root**, not inside `mmaudio/`; it was
-copied in beside the code it licenses, so it is the one file that exists only here. With that single
-exclude the diff is empty — anything else it prints is a local patch and a bug.)
+copied in beside the code it licenses. The diff must contain only the three checkpoint-loading
+patches above.)
 
 The harness deliberately does **not** edit the vendored source to run offline. Two hub lookups are
-rebound from `scripts/reference/mmaudio_reference.py` instead, so the `diff -r` above stays empty:
+rebound from `scripts/reference/mmaudio_reference.py` instead, leaving the model code unchanged:
 
 * `FeaturesUtils.__init__` would build the CLIP tower via
   `create_model_from_pretrained('hf-hub:apple/DFN5B-CLIP-ViT-H-14-384')`. That literal is a
-  historical upstream alias and remains untouched here so this tree stays byte-for-byte vendored;
+  historical upstream alias and remains untouched here;
   the canonical repository is `apple/DFN5B-CLIP-ViT-H-14-378`. MMAudio nevertheless feeds 384px,
   and patch 14 with stride 14 produces the same 27×27 grid at native 378px and at 384px. The harness
   constructs `FeaturesUtils(enable_conditions=False)` and attaches a tower built from the explicit
@@ -76,9 +78,18 @@ harness, not here.
 
 The fixtures record the reference's *mathematics*, so they are generated in **float32 on the CPU**,
 not the reference's own bfloat16/CUDA default. `mmaudio_parity_metadata.json` records the exact
-package versions of the run that produced them, and `scripts/tests/test_mmaudio_reference.py`
-re-digests this tree on every ordinary-CI run: edit anything under `mmaudio/` and the committed
-fixtures are reported as stale until they are regenerated.
+package versions and original tree digest of the run that produced them. The three safe-loading
+patches do not relabel those original real-weight outputs as newly generated.
+`scripts/reference/mmaudio_reference.py` accepts only the exact original-producer/current-patched
+tree digest pair; every other tree edit makes the fixtures stale. In a scratch CPU run, the
+synthetic clip and sync frames and fixed latent reproduced their recorded SHA-256 digests, the
+latent matched the committed tensor byte for byte, and a representative tensor-only checkpoint
+loaded with the same names, shapes, and values under both implicit and explicit weights-only
+loading in the pinned torch 2.13.0 producer environment. An unsupported object was rejected by
+both forms. The original pinned default was already weights-only, and the three patches change
+only the load argument and the resulting error message, not the numerical or generator path. These
+checks do not replace a full real-weight oracle run, which needs the pinned snapshots and is outside this
+CPU-only remediation. After a full `dump`, the producer digest will record the patched tree directly.
 
 Regeneration, and the licence position of the fixtures themselves, are documented in
 `scripts/reference/mmaudio_reference.py` and `../NOTICE`.
@@ -125,7 +136,7 @@ f4dd9c548d5a166525573c8f84e73e8a53858af40e2baeffc8999a7295dff8b5  mmaudio/ext/bi
 9a2fbb788a9d584a2a0766e4bb790c8368911143472d257952581455313cf2c6  mmaudio/ext/bigvgan/incl_licenses/LICENSE_4
 b6234401b9831a86505fbeecad803a0b2fe17b06997f614d5325c6d0e1a6fa7f  mmaudio/ext/bigvgan/incl_licenses/LICENSE_5
 d91bdc68d8ab6e023be9d8356e59e6556f2250832ac737e2d01d0c8b9eabf0b2  mmaudio/ext/bigvgan/models.py
-23c12cd2a92babe447f9b74a1f24e68d9a341855ebcbbefdab95120d6dda96db  mmaudio/ext/bigvgan/utils.py
+1b2cab6e038b5e21a0f8153ac381228390596f4199ea69db03f9c2721f2a2b9f  mmaudio/ext/bigvgan/utils.py
 5c7f573db5f807a9adc2a755c4901e203ea067f73c7a20fa6b703da7e77d7b35  mmaudio/ext/bigvgan_v2/LICENSE
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  mmaudio/ext/bigvgan_v2/__init__.py
 ff2562e116399bca730929aeb07e029a61321660a4f07c3db0b8f9853c70470f  mmaudio/ext/bigvgan_v2/activations.py
@@ -150,7 +161,7 @@ b6234401b9831a86505fbeecad803a0b2fe17b06997f614d5325c6d0e1a6fa7f  mmaudio/ext/bi
 3fb4aef5b76dc0ccb1f57499d75c2fe039df5c9793778ede172f5ac7a4045681  mmaudio/ext/bigvgan_v2/incl_licenses/LICENSE_6
 8f36ba0c214d4f487ffd7ee0b8528da9b67b459bef2d115de9cd001316589f46  mmaudio/ext/bigvgan_v2/incl_licenses/LICENSE_7
 ff474afe15f36bab44711fc45c1a77314a4b9d8c96fa2d333f3fefe719fd76f9  mmaudio/ext/bigvgan_v2/incl_licenses/LICENSE_8
-cfd3d2e280120d48f5c87f3d81c1d8cee070da1f8f219c752abb88066b7be120  mmaudio/ext/bigvgan_v2/utils.py
+b3e4086a5ef9461f845f0303e024b8b258ea9048d34f62ac341f975e7a6aef4a  mmaudio/ext/bigvgan_v2/utils.py
 892a64fee5ff50488fec6336f25d8614ff6d77c70e82d192bce93cdd8aba1d90  mmaudio/ext/mel_converter.py
 66d2bc397b8d85ec77700dcbcdc62fd9079c4c595e513dc1817b83169147efca  mmaudio/ext/rotary_embeddings.py
 89de5456a4fbc3cd0c1d6a2af6e7a8b7ade38764bc0c5835fbcbad6472e7714f  mmaudio/ext/stft_converter.py
@@ -158,7 +169,7 @@ c9328a125ac22561f7e322ba860613a6d9890a97436d8bdfc4f3804361c6b259  mmaudio/ext/st
 768c302e92c9c1b9c829b73f83101edbe312ca6ed3abc2e8cc9d2eb3e4b185b2  mmaudio/ext/synchformer/LICENSE
 3e0a5e12b4e51fd8ba3f7e180e88a8c995f3fc99136a43621747f2cca04f8e62  mmaudio/ext/synchformer/__init__.py
 80461bd19c1f7bc1213445eba48aa69554e4b0230c57d3acc80625d2e2519dce  mmaudio/ext/synchformer/divided_224_16x4.yaml
-e7c5cb68dff0f95ae4343f29705044266895ac9f2ae25f79720d2a15a677e132  mmaudio/ext/synchformer/motionformer.py
+9ceb61c765a7024eec462dfe50cb0d3c12157bce9b871c1a09ca4a198c939a4a  mmaudio/ext/synchformer/motionformer.py
 d0a162d9e1ee4e215631dae93afa997867004d80b57472e6195aca6a0e6aa370  mmaudio/ext/synchformer/synchformer.py
 7f5aa03e995ee57bd29c42968b9f8863fc098af56c9bf5b4ff71803d8ce21266  mmaudio/ext/synchformer/utils.py
 eff9225dd341572bc7089a0c127c48d2f80bcf88cfe56f442d71057f0be0988b  mmaudio/ext/synchformer/video_model_builder.py

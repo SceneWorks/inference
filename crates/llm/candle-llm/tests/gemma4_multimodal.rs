@@ -561,7 +561,12 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
     for quantize in [None, Some(Quantize::Q4), Some(Quantize::Q8)] {
         let spec = LoadSpec {
             source: src.clone(),
+            projector_source: None,
             quantize,
+            cuda_graphs: None,
+            mtp_head_source: None,
+            prefix_cache_bytes: None,
+            draft_source: None,
         };
         let p = LlamaProvider::load(&spec)
             .unwrap_or_else(|e| panic!("load gemma4 (quantize={quantize:?}): {e}"));
@@ -642,6 +647,99 @@ fn audio_conditioning_changes_the_provider_output() {
         clip(rising),
         "generation is deterministic"
     );
+}
+
+/// sc-24437: the cross-turn prefix cache keys on token ids, and two clips (or images) sit behind
+/// the same placeholder ids — so a multimodal prompt neither reads nor feeds the cache, and the
+/// report names why. A second clip on the same provider therefore decodes exactly what it decodes
+/// on a fresh one, however much of its prompt the first clip's matched token for token.
+#[test]
+fn a_multimodal_prompt_never_reuses_another_clips_prefix() {
+    let fx = write_snapshot(true, true);
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    let req = |v: Vec<f32>| {
+        request(vec![
+            Content::Audio(AudioRef::new(AUDIO_RATE, v).unwrap()),
+            Content::text("t1"),
+        ])
+    };
+    let rising = req((0..8).map(|i| i as f32 / 8.0).collect());
+    let falling = req((0..8).map(|i| 1.0 - i as f32 / 8.0).collect());
+    let report = |p: &LlamaProvider, r: &TextLlmRequest| {
+        p.generate(r, &mut |_| {})
+            .expect("generate")
+            .decode
+            .expect("a decode report")
+    };
+    for r in [&rising, &falling] {
+        let rep = report(&p, r);
+        assert_eq!(rep.prefix_hit_tokens, 0);
+        assert_eq!(rep.prefix_cache.path, "bypassed");
+        let reason = rep.prefix_cache.reason.unwrap();
+        assert!(
+            reason.starts_with("a multimodal prompt is never cached"),
+            "{reason}"
+        );
+    }
+    let fresh = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert_eq!(generate(&p, &falling), generate(&fresh, &falling));
+    assert_ne!(generate(&p, &rising), generate(&p, &falling));
+}
+
+/// sc-24138: a Gemma 4 request — the soft-token splice and plain text alike — decodes through
+/// the unified engine over the step seam on the **static** KV cache by default, and the record
+/// says so (`step_model`, `static`, no proposer). The reference `Decode` loop stays selectable as
+/// the oracle and, attending in the same formulation, produces the same tokens on CPU f32 (where
+/// the two loops are bit-identical; a CUDA device's bf16 GEMMs over the two caches' layouts may
+/// round differently in the last bit, so there only the paths are compared).
+#[test]
+fn gemma4_decodes_through_the_engine_and_the_reference_stays_selectable() {
+    use candle_llm::decode::DecodePath;
+    use candle_llm::primitives::KvCacheKind;
+
+    let fx = write_snapshot(true, true);
+    let mut p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert_eq!(p.decode_path(), DecodePath::StepModel, "the default");
+    let rising: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
+    let requests = [
+        request(vec![
+            Content::Audio(AudioRef::new(AUDIO_RATE, rising).unwrap()),
+            Content::text("t1"),
+        ]),
+        request(vec![Content::text("t1 t2")]),
+    ];
+    let mut engine = Vec::new();
+    for (i, req) in requests.iter().enumerate() {
+        engine.push(generate(&p, req));
+        let record = p.last_decode_record().expect("record");
+        assert_eq!(
+            record.path,
+            DecodePath::StepModel,
+            "request {i}: the engine ran"
+        );
+        assert_eq!(
+            record.kv_cache,
+            KvCacheKind::Static,
+            "request {i}: on the static cache"
+        );
+        assert_eq!(record.proposer, core_llm::ProposerKind::None, "request {i}");
+    }
+    p.set_decode_path(DecodePath::Reference)
+        .expect("the reference loop is selectable");
+    let cpu = !candle_llm::device::select_device().unwrap().is_cuda();
+    for (i, (req, want)) in requests.iter().zip(&engine).enumerate() {
+        let got = generate(&p, req);
+        if cpu {
+            assert_eq!(&got, want, "request {i}: the same tokens");
+        }
+        let record = p.last_decode_record().expect("record");
+        assert_eq!(
+            record.path,
+            DecodePath::Reference,
+            "request {i}: the oracle ran"
+        );
+        assert_eq!(record.kv_cache, KvCacheKind::Growing, "request {i}");
+    }
 }
 
 /// A clip at the wrong sample rate is refused rather than silently reinterpreted.
@@ -819,4 +917,64 @@ fn the_nested_decoder_layout_loads() {
         "the fixture must use the nested layout this test is about"
     );
     CausalLm::from_weights(&weights, "", cfg).expect("the nested decoder must load");
+}
+
+/// sc-24436 E2: a Gemma 4 prompt's soft-token expansion is known only after the request is routed,
+/// so a draft whose context window holds the unexpanded prompt but not the expanded one is
+/// checked again once the expansion is known: the request runs `auto` (prompt lookup on this
+/// family) with the draft's context window named, never the draft past its window.
+#[test]
+fn a_draft_outrun_by_the_soft_token_expansion_falls_back_by_name() {
+    use core_llm::{ProposerKind, Speculative, SpeculativeProposer};
+
+    let fx = write_snapshot(true, true);
+    let dir: &std::path::Path = fx.as_ref();
+    let rising: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
+    let mut req = request(vec![
+        Content::Audio(AudioRef::new(AUDIO_RATE, rising).unwrap()),
+        Content::text("t1"),
+    ]);
+    let expanded = prompt_tokens(&LlamaProvider::load(&spec_of(&fx)).expect("load"), &req);
+    let unexpanded = prompt_tokens(
+        &LlamaProvider::load(&spec_of(&fx)).expect("load"),
+        &request(vec![Content::text("t1")]),
+    );
+    assert!(unexpanded < expanded, "{unexpanded} vs {expanded}");
+    // The same checkpoint as its own draft, its window one position short of the expanded
+    // request's reach (the prompt, the budget and a depth-2 step's 3 positions).
+    let depth = 2u32;
+    let window = expanded + req.max_new_tokens + depth + 1 - 1;
+    let draft = common::Fixture::new("candle-llm-gemma4-draft-", None);
+    let draft_dir: &std::path::Path = draft.as_ref();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), draft_dir.join(entry.file_name())).unwrap();
+    }
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(draft_dir.join("config.json")).unwrap()).unwrap();
+    config["text_config"]["max_position_embeddings"] = serde_json::json!(window);
+    std::fs::write(draft_dir.join("config.json"), config.to_string()).unwrap();
+    let p = LlamaProvider::load(&spec_of(&fx).with_draft(draft_dir.to_str().unwrap())).unwrap();
+    assert!(p.load_report().unwrap().draft.unwrap().is_resident());
+
+    req.speculative = Some(Speculative::proposer(
+        SpeculativeProposer::DraftModel,
+        depth,
+    ));
+    let out = p.generate(&req, &mut |_| {}).expect("generate");
+    let report = out.decode.expect("report");
+    assert_ne!(report.proposer, ProposerKind::DraftModel, "{report:?}");
+    assert!(
+        report
+            .fallbacks
+            .iter()
+            .any(|f| f.contains("exceeds the draft model's context window")),
+        "{:?}",
+        report.fallbacks
+    );
+    // A text request of the same budget fits the draft's window and runs it.
+    let mut text = request(vec![Content::text("t1")]);
+    text.speculative = req.speculative;
+    let report = p.generate(&text, &mut |_| {}).unwrap().decode.unwrap();
+    assert_eq!(report.proposer, ProposerKind::DraftModel, "{report:?}");
 }

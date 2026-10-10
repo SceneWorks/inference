@@ -727,6 +727,23 @@ pub const QWEN_IMAGE_2512_FUN_CONTROLNET_UNION: ComponentLicense = ComponentLice
     retrieved: "2026-08-02",
 };
 
+/// `Qwen/Qwen-Image-2.1` (sc-24108) — the unified T2I/edit/RGBA checkpoint: DiT, RGBA VAE and the
+/// bundled Qwen3-VL-8B text tower ship in one repository under one declaration. The card's
+/// `license_name` is `qwen-research` and the governing text is the `LICENSE` beside the weights
+/// (see [`super::families::QWEN_RESEARCH`]). The attribution is the §3(c) notice verbatim.
+pub const QWEN_IMAGE_2_1: ComponentLicense = ComponentLicense {
+    component: "qwen_image_2_1",
+    source_url: "https://huggingface.co/Qwen/Qwen-Image-2.1",
+    gated: false,
+    declared: "qwen-research",
+    family: "qwen-research",
+    attribution: Some(
+        "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou \
+         Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.",
+    ),
+    retrieved: "2026-09-22",
+};
+
 /// `Qwen/Qwen-Image-Edit`.
 pub const QWEN_IMAGE_EDIT: ComponentLicense = ComponentLicense {
     component: "qwen_image_edit",
@@ -1223,6 +1240,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     QWEN_IMAGE,
     QWEN_IMAGE_2512,
     QWEN_IMAGE_2512_FUN_CONTROLNET_UNION,
+    QWEN_IMAGE_2_1,
     QWEN_IMAGE_EDIT,
     QWEN_IMAGE_EDIT_2511_LIGHTNING,
     QWEN_IMAGE_LIGHTNING,
@@ -1270,7 +1288,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 73);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 74);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1654,9 +1672,11 @@ mod tests {
     fn provenance_fields_are_re_readable() {
         // Every row must name the date of an evidence pass that actually happened. The original
         // sweep is 2026-08-02; sc-17147 added the MiniMax-H3 pair after reading that repository's
-        // own LICENSE, so its date is the second entry. A row carrying any other date is a row
-        // whose provenance nobody can re-read.
-        const EVIDENCE_PACK_DATES: &[&str] = &["2026-08-02", "2026-08-12"];
+        // own LICENSE, so its date is the second entry; sc-24108 read the Qwen Research License
+        // beside `Qwen/Qwen-Image-2.1` on 2026-09-22
+        // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`). A row carrying any other
+        // date is a row whose provenance nobody can re-read.
+        const EVIDENCE_PACK_DATES: &[&str] = &["2026-08-02", "2026-08-12", "2026-09-22"];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(
                 EVIDENCE_PACK_DATES.contains(&row.retrieved),

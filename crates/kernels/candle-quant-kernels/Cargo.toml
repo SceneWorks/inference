@@ -1,0 +1,30 @@
+[package]
+name = "candle-quant-kernels"
+version = "0.0.0"
+edition = "2021"
+description = "Shared low-precision Candle compute kernels for SceneWorks inference — the NVFP4 codec, the cuBLASLt fp8/int8/NVFP4 GEMM wrapper and its fused activation quantizer — consumed by both candle-gen (media) and candle-llm (LLM)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "cuda", "nvfp4", "quantization", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Same workspace candle pin as candle-gen / candle-llm, so the whole stack resolves ONE candle build.
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# bf16 output buffers for the raw cuBLASLt calls (cuda-only); same version candle-core resolves.
+half = { version = "2", optional = true }
+# fp8 E4M3 storage type for the cuBLASLt 8-bit GEMM wrapper (sc-9299, cuda-only): naming
+# `float8::F8E4M3` is required to clone candle's `CudaStorageSlice::F8E4M3` device buffer for the
+# raw cublasLt call. Same version candle-core resolves, so cargo unifies to ONE `float8` build.
+float8 = { version = "0.7", optional = true }
+
+[features]
+# CPU by default: the codec, capability floors and quant helpers are pure host/candle code.
+default = []
+# NVIDIA CUDA backend. All device code (the cuBLASLt handle, the nvrtc fused quantizer, the
+# FP4 compute leg of `Nvfp4Linear`) is gated behind `#[cfg(feature = "cuda")]`.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8", "dep:half"]
+# Apple Metal backend: nothing here is Metal-specific, but the Metal Clippy lane passes
+# `--features metal` to every Candle package, so the feature exists and forwards to candle.
+metal = ["candle-core/metal", "candle-nn/metal"]

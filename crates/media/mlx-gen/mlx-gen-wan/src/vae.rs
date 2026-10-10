@@ -29,7 +29,7 @@ use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
 use crate::vae_common::{
     contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
-    FeatCache,
+    DeadStageBuffers, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -192,10 +192,13 @@ impl ResidualBlock {
     }
 
     /// Encode path (chunked, with `feat_cache`).
+    ///
+    /// The encoder is always single-pass, so the block releases its dead buffers mid-block.
     fn forward_cached(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
         let h = self.shortcut(x)?;
         let y = silu(&rms_norm_channels(x, &self.norm1)?)?;
         let y = cached_conv(&self.conv1, &y, cache)?;
+        DeadStageBuffers::Release.materialize_with_cache(&y, cache)?;
         let y = silu(&rms_norm_channels(&y, &self.norm2)?)?;
         let y = cached_conv(&self.conv2, &y, cache)?;
         Ok(add(&y, &h)?)
@@ -418,7 +421,7 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        self.forward_upsample_tail(&self.forward_middle(x)?)
+        self.forward_upsample_tail(&self.forward_middle(x)?, DeadStageBuffers::Release)
     }
 
     /// The **globally-scoped** half: `conv1` → the three middle blocks, all at latent resolution
@@ -444,13 +447,19 @@ impl Decoder3d {
     /// `RMS → SiLU → conv` head. Every op here is a convolution, a nearest upsample, or the
     /// per-position channel-L2 norm, so evaluating it on a crop is exact up to the convolution
     /// padding at the crop boundary — which is what the trapezoidal overlap blend absorbs.
-    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+    ///
+    /// With [`DeadStageBuffers::Release`] every residual block and resample is materialized and its
+    /// freed buffers released; with [`DeadStageBuffers::Keep`] the tail stays one lazy graph.
+    fn forward_upsample_tail(&self, middle: &Array, dead: DeadStageBuffers) -> Result<Array> {
         let mut x = middle.clone();
         for layer in &self.upsamples {
             x = match layer {
                 UpLayer::Res(r) => r.forward(&x)?,
                 UpLayer::Up(u) => u.forward(&x)?,
             };
+            if dead.releases() {
+                dead.materialize(&x)?;
+            }
         }
         let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
         self.head_conv.forward(&x, None)
@@ -511,19 +520,29 @@ impl Encoder3d {
         })
     }
 
+    /// Chunk forward. Every block boundary materializes (with the carried conv-cache slots) and
+    /// releases its dead buffers (sc-20686): the encode is single-pass per chunk.
     fn forward(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
+        let dead = DeadStageBuffers::Release;
         let mut x = cached_conv(&self.conv1, x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         for layer in &self.downsamples {
             x = match layer {
                 DownLayer::Res(r) => r.forward_cached(&x, cache)?,
                 DownLayer::Down(d) => d.forward(&x, cache)?,
             };
+            dead.materialize_with_cache(&x, cache)?;
         }
         x = self.middle.0.forward_cached(&x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         x = self.middle.1.forward(&x)?;
+        dead.materialize_with_cache(&x, cache)?;
         x = self.middle.2.forward_cached(&x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
-        cached_conv(&self.head_conv, &x, cache)
+        let out = cached_conv(&self.head_conv, &x, cache)?;
+        dead.materialize_with_cache(&out, cache)?;
+        Ok(out)
     }
 }
 
@@ -716,21 +735,33 @@ impl WanVae {
             None
         };
 
-        Ok(Self {
+        let vae = Self {
             conv2: CausalConv3d::from_weights(w, "conv2", 1)?,
             decoder: Decoder3d::from_weights(w)?,
             encoder,
             mean,
             inv_std,
-        })
+        };
+        // Materialize at load: left lazy, the first encode/decode's command buffers wait on the
+        // safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(vae)
     }
 
     /// Decode a normalized latent `[B, z, T, H, W]` → video `[B, 3, 4·T, 8·H, 8·W]` in `[-1, 1]`.
     pub fn decode(&self, z: &Array) -> Result<Array> {
-        let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
-        let x = self.conv2.forward(&denorm, None)?;
-        let out = self.decoder.forward(&x)?;
-        contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)
+        // The intermediates are scoped to this block so they are dropped before the release below
+        // rather than freed into the cache after it (sc-20686).
+        let out = {
+            let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+            let x = self.conv2.forward(&denorm, None)?;
+            let out = self.decoder.forward(&x)?;
+            contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?
+        };
+        // Single pass: the head's freed buffers leave the cache with the output (sc-20686).
+        DeadStageBuffers::Release.materialize(&out)?;
+        Ok(out)
     }
 
     /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`): split the latent
@@ -774,16 +805,22 @@ impl WanVae {
         if !cfg.needs_tiling(Self::VAE_TILING, f, h, w) {
             return self.decode(z);
         }
-        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent.
-        let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
-        let middle = self
-            .decoder
-            .forward_middle(&self.conv2.forward(&denorm, None)?)?;
+        // Denormalize + conv2 + the attention-bearing middle blocks, once on the full latent,
+        // materialized with their intermediates released before the first tile (sc-20686).
+        let middle = {
+            let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+            self.decoder
+                .forward_middle(&self.conv2.forward(&denorm, None)?)?
+        };
+        DeadStageBuffers::Release.materialize(&middle)?;
         let plan = cfg.plan(Self::VAE_TILING, f, h, w);
 
-        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp.
+        // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp,
+        // released at every block like the single pass, and the pool released after every tile.
         tile_decode_accumulate(&middle, &plan, [2, 3, 4], cancel, |tile| {
-            let dec = self.decoder.forward_upsample_tail(tile)?;
+            let dec = self
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Release)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
     }
@@ -809,10 +846,12 @@ impl WanVae {
                 slice_t(video, 1 + 4 * (i - 1), 1 + 4 * i)
             }?;
             let chunk_out = encoder.forward(&chunk, &mut cache)?;
-            out = Some(match out {
+            let joined = match out.take() {
                 None => chunk_out,
                 Some(o) => concatenate_axis(&[&o, &chunk_out], 2)?,
-            });
+            };
+            DeadStageBuffers::Release.materialize_with_cache(&joined, &cache)?;
+            out = Some(joined);
         }
         let out = out.ok_or_else(|| Error::Msg("wan vae: encode produced no chunks".into()))?;
         let parts = split(&post_conv1.forward(&out, None)?, 2, 1)?; // [mean, logvar]
@@ -828,8 +867,13 @@ impl WanVae {
     /// `[B, z, T_lat, H/8, W/8]` via chunked causal encoding (`DiagonalGaussianDistribution.mode()` =
     /// the Gaussian mean). Requires encoder weights.
     pub fn encode(&self, video: &Array) -> Result<Array> {
-        let (mean, _logvar) = self.encode_moments(video)?;
-        self.normalize_latent(&mean)
+        let latent = {
+            let (mean, _logvar) = self.encode_moments(video)?;
+            self.normalize_latent(&mean)?
+        };
+        // The encoder's intermediates are dropped before this release (sc-20686).
+        DeadStageBuffers::Release.materialize(&latent)?;
+        Ok(latent)
     }
 
     /// Encode + **sample** the Gaussian (`DiagonalGaussianDistribution.sample()`): `mean +
@@ -838,8 +882,13 @@ impl WanVae {
     /// (the reference draws it from the request seed). Bernini's `get_vae_features` uses this for
     /// **video** source conditioning; images use [`Self::encode`] (`.mode()`).
     pub fn encode_sample(&self, video: &Array, eps: &Array) -> Result<Array> {
-        let (mean, logvar) = self.encode_moments(video)?;
-        self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)
+        let latent = {
+            let (mean, logvar) = self.encode_moments(video)?;
+            self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)?
+        };
+        // The encoder's intermediates are dropped before this release (sc-20686).
+        DeadStageBuffers::Release.materialize(&latent)?;
+        Ok(latent)
     }
 }
 
@@ -886,5 +935,423 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() <= 1e-3 * w.abs().max(1.0), "got {g} want {w}");
         }
+    }
+
+    /// A z16 decoder with the production topology at base width `dim` (96 in production), seeded
+    /// random f32 weights (production z16 decodes f32), each materialized as it is made.
+    fn synthetic_decoder(dim: i32) -> WanVae {
+        let key = mlx_rs::random::key(20686).unwrap();
+        let mut tensors = std::collections::HashMap::new();
+        let mut put = |name: String, shape: &[i32]| {
+            let value = mlx_rs::random::normal::<f32>(shape, None, Some(0.2), Some(&key)).unwrap();
+            mlx_rs::transforms::eval([&value]).unwrap();
+            tensors.insert(name, value);
+        };
+        fn conv(put: &mut dyn FnMut(String, &[i32]), p: &str, o: i32, i: i32, kt: i32, k: i32) {
+            put(format!("{p}.weight"), &[o, kt, k, k, i]);
+            put(format!("{p}.bias"), &[o]);
+        }
+        fn res(put: &mut dyn FnMut(String, &[i32]), p: &str, i: i32, o: i32) {
+            put(format!("{p}.residual.0.gamma"), &[i]);
+            conv(put, &format!("{p}.residual.2"), o, i, 3, 3);
+            put(format!("{p}.residual.3.gamma"), &[o]);
+            conv(put, &format!("{p}.residual.6"), o, o, 3, 3);
+            if i != o {
+                conv(put, &format!("{p}.shortcut"), o, i, 1, 1);
+            }
+        }
+        let top = dim * DIM_MULT[3];
+        conv(&mut put, "conv2", 16, 16, 1, 1);
+        conv(&mut put, "decoder.conv1", top, 16, 3, 3);
+        res(&mut put, "decoder.middle.0", top, top);
+        res(&mut put, "decoder.middle.2", top, top);
+        put("decoder.middle.1.norm.gamma".into(), &[top]);
+        put(
+            "decoder.middle.1.to_qkv.weight".into(),
+            &[3 * top, 1, 1, top],
+        );
+        put("decoder.middle.1.to_qkv.bias".into(), &[3 * top]);
+        put("decoder.middle.1.proj.weight".into(), &[top, 1, 1, top]);
+        put("decoder.middle.1.proj.bias".into(), &[top]);
+        let mut input = top;
+        let mut index = 0;
+        for stage in 0..DIM_MULT.len() {
+            let output = dim * DIM_MULT[DIM_MULT.len() - 1 - stage];
+            for block in 0..=NUM_RES_BLOCKS {
+                let block_input = if block == 0 { input } else { output };
+                res(
+                    &mut put,
+                    &format!("decoder.upsamples.{index}"),
+                    block_input,
+                    output,
+                );
+                index += 1;
+            }
+            input = output;
+            if let Some(&temporal) = TEMPORAL_UPSAMPLE.get(stage) {
+                let p = format!("decoder.upsamples.{index}");
+                if temporal {
+                    conv(
+                        &mut put,
+                        &format!("{p}.time_conv"),
+                        2 * output,
+                        output,
+                        3,
+                        1,
+                    );
+                }
+                put(
+                    format!("{p}.resample.1.weight"),
+                    &[output / 2, 3, 3, output],
+                );
+                put(format!("{p}.resample.1.bias"), &[output / 2]);
+                input = output / 2;
+                index += 1;
+            }
+        }
+        put("decoder.head.0.gamma".into(), &[dim]);
+        conv(&mut put, "decoder.head.2", 3, dim, 3, 3);
+        WanVae::from_weights(&Weights::from_map(tensors)).unwrap()
+    }
+
+    fn block_releases() -> usize {
+        crate::vae_common::BLOCK_RELEASES.with(std::cell::Cell::get)
+    }
+
+    fn eval(x: &Array) {
+        mlx_rs::transforms::eval([x]).unwrap();
+    }
+
+    /// The same decode with the tail run in `dead` mode (denormalize → conv2 → middle → tail →
+    /// clamp), evaluated.
+    fn decode_with(vae: &WanVae, latent: &Array, dead: DeadStageBuffers) -> Array {
+        let denorm = add(divide(latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let out = vae.decoder.forward_upsample_tail(&middle, dead).unwrap();
+        let out = contiguous(&minimum(maximum(&out, scalar(-1.0)).unwrap(), scalar(1.0)).unwrap())
+            .unwrap();
+        eval(&out);
+        out
+    }
+
+    /// sc-20686: a single-pass decode materializes and releases after every residual block and
+    /// resample plus once with the output, without changing a single output value; a tiled decode
+    /// releases its middle once, every tile's tail at every block and every tile's pool, again
+    /// without changing a value (the D-run regression: a tiled decode that kept its pool and ran
+    /// each tail as one lazy graph outgrew its planned budget). Sized: dim 8, latent [1,16,2,8,8] →
+    /// a few MiB.
+    #[test]
+    fn single_pass_and_tiled_decodes_release_every_block() {
+        let vae = synthetic_decoder(8);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+
+        let before = block_releases();
+        let released = vae.decode(&latent).unwrap();
+        assert_eq!(block_releases() - before, vae.decoder.upsamples.len() + 1);
+
+        let kept = decode_with(&vae, &latent, DeadStageBuffers::Keep);
+        assert_eq!(released.shape(), kept.shape());
+        assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
+
+        let cfg = TilingConfig::spatial_only(32, 16);
+        let sh = latent.shape();
+        let plan = cfg.plan(WanVae::VAE_TILING, sh[2], sh[3], sh[4]);
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        assert!(tiles > 1, "the fixture must actually tile");
+        let before = block_releases();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).unwrap();
+        eval(&tiled);
+        assert_eq!(tiled.shape(), released.shape());
+        assert_eq!(
+            block_releases() - before,
+            1 + tiles * (vae.decoder.upsamples.len() + 1),
+            "the middle, every tail block of every tile, and every tile's pool are released"
+        );
+        // The releases change no value: the same tiles with the pool kept and the tail lazy.
+        let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let kept = mlx_gen::vae_tiling::tiled_decode(&middle, &plan, [2, 3, 4], None, |tile| {
+            let dec = vae
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+            Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+        })
+        .unwrap();
+        eval(&kept);
+        assert_eq!(tiled.as_slice::<f32>(), kept.as_slice::<f32>());
+    }
+
+    const TILED_CHILD: &str = "WAN_Z16_TILED_DECODE_CHILD";
+
+    /// sc-20686 (the D-run regression): a tiled decode's live + cache peak stays at or below the
+    /// same tiles decoded with the pool kept and each tail one lazy graph, and it leaves MLX's cache
+    /// empty. MLX's counters are process-wide, so the measurement runs alone in a child process.
+    /// Sized: dim 16 f32 weights (< 8 MiB), latent [1,16,3,16,16] in 4 spatial tiles; < 256 MiB.
+    #[test]
+    fn tiled_decode_releases_its_pool_and_bounds_its_peak() {
+        if std::env::var_os(TILED_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::tiled_decode_releases_its_pool_and_bounds_its_peak",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(TILED_CHILD, "1")
+                .output()
+                .expect("spawn the isolated tiled-decode child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated tiled-decode child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use mlx_rs::memory::{
+            clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
+        };
+        const MIB: usize = 1 << 20;
+        let vae = synthetic_decoder(16);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 3, 16, 16], None, None, None).unwrap();
+        eval(&latent);
+        let cfg = TilingConfig::spatial_only(80, 16);
+        let plan = cfg.plan(WanVae::VAE_TILING, 3, 16, 16);
+        assert!(
+            plan.h.len() * plan.w.len() > 1,
+            "the fixture must actually tile"
+        );
+
+        // Control: the same tiles with every tail one lazy graph and the pool kept.
+        clear_cache();
+        reset_peak_memory();
+        let base = get_active_memory();
+        let kept = {
+            let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+            let middle = vae
+                .decoder
+                .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+                .unwrap();
+            mlx_gen::vae_tiling::tiled_decode(&middle, &plan, [2, 3, 4], None, |tile| {
+                let dec = vae
+                    .decoder
+                    .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
+                Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
+            })
+            .unwrap()
+        };
+        eval(&kept);
+        let kept_peak = get_peak_memory() - base;
+        drop(kept);
+
+        clear_cache();
+        reset_peak_memory();
+        let base = get_active_memory();
+        let tiled = vae.decode_tiled(&latent, &cfg, None).unwrap();
+        eval(&tiled);
+        let tiled_peak = get_peak_memory() - base;
+        let cached = get_cache_memory();
+        assert!(
+            tiled_peak <= kept_peak,
+            "the releasing tiled decode peaked at {tiled_peak} B, above the kept pool's {kept_peak} B"
+        );
+        assert!(
+            cached < MIB,
+            "a tiled decode must leave the cache empty: {cached} B"
+        );
+    }
+
+    const CACHE_CHILD: &str = "WAN_Z16_DECODE_CACHE_CHILD";
+
+    /// sc-20686: right after a single-pass decode MLX's allocator cache is empty, both of what the
+    /// decode freed and of what was cached before it, while the same decode with the pool kept
+    /// leaves its garbage cached. MLX's counters are process-wide and this binary runs tests on
+    /// parallel threads, so the measurement runs alone in a child process of this test binary.
+    /// Sized: dim 16 f32 weights (< 8 MiB), latent [1,16,2,8,8], a 16 MiB seeded scratch; total
+    /// well under 128 MiB.
+    #[test]
+    fn single_pass_decode_leaves_mlx_cache_empty() {
+        if std::env::var_os(CACHE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::single_pass_decode_leaves_mlx_cache_empty",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CACHE_CHILD, "1")
+                .output()
+                .expect("spawn the isolated decode-cache child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated decode-cache child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use mlx_rs::memory::{clear_cache, get_cache_memory};
+        const MIB: usize = 1 << 20;
+        let vae = synthetic_decoder(16);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+        eval(&latent);
+
+        clear_cache();
+        drop(decode_with(&vae, &latent, DeadStageBuffers::Keep));
+        let kept = get_cache_memory();
+        assert!(
+            kept >= 4 * MIB,
+            "the control decode must leave garbage: {kept} B"
+        );
+
+        {
+            let scratch = mlx_rs::ops::zeros::<f32>(&[(4 * MIB) as i32]).unwrap();
+            eval(&scratch);
+        }
+        assert!(get_cache_memory() >= kept + 16 * MIB);
+        let out = vae.decode(&latent).unwrap();
+        eval(&out);
+        let released = get_cache_memory();
+        assert!(
+            released < MIB && released * 16 < kept,
+            "a single-pass decode must leave the cache empty: {released} B (kept pool {kept} B)"
+        );
+    }
+
+    /// Measurement harness (sc-20686), not a gate: the production-width z16 decoder (dim 96, f32,
+    /// synthetic weights) single-pass decode's live and live + cache peaks per output voxel. Sized:
+    /// ~0.3 GB of weights + the decode, ~0.6 GB at the default latent `2,8,8` (32,768 voxels);
+    /// total < 1 GB. Override the latent with `WAN_DECODE_HARNESS_LATENT=t,h,w` (sizes scale with
+    /// the voxel count). Run alone: `cargo test -p mlx-gen-wan --lib
+    /// vae::tests::decode_footprint_harness -- --ignored --exact --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore = "measurement harness; production-width weights; run alone on request"]
+    fn decode_footprint_harness() {
+        let [t, h, w] = std::env::var("WAN_DECODE_HARNESS_LATENT").map_or([2, 8, 8], |raw| {
+            let dims: Vec<i32> = raw.split(',').map(|v| v.trim().parse().unwrap()).collect();
+            [dims[0], dims[1], dims[2]]
+        });
+        let vae = synthetic_decoder(96);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, t, h, w], None, None, None).unwrap();
+        eval(&latent);
+        mlx_rs::memory::clear_cache();
+        let base = mlx_rs::memory::get_active_memory() as u64;
+        mlx_rs::memory::reset_peak_memory();
+        let probe =
+            mlx_gen::memory_probe::AllocatorProbe::start(std::time::Duration::from_millis(1));
+        let out = vae.decode(&latent).unwrap();
+        eval(&out);
+        let report = probe.finish();
+        let live = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(base);
+        let footprint = report
+            .sampled_footprint_peak_bytes
+            .max(live + base)
+            .saturating_sub(base);
+        let shape = out.shape();
+        let voxels = f64::from(shape[2] * shape[3] * shape[4]);
+        eprintln!(
+            "z16 f32 single-pass latent {t},{h},{w}: {voxels} voxels; live {:.0} B/voxel, \
+             live+cache {:.0} B/voxel",
+            live as f64 / voxels,
+            footprint as f64 / voxels
+        );
+    }
+
+    /// sc-20686: the chunked encode releases at every encoder block boundary (mid-block too) and
+    /// per chunk, plus once with the normalized latent. Sized: width 8, clip [1,3,5,64,64].
+    #[test]
+    fn encode_releases_every_block_of_every_chunk() {
+        let vae = crate::encode_footprint_harness::synthetic_z16(8);
+        let (_, encoder) = vae.encoder.as_ref().unwrap();
+        let layers: usize = encoder
+            .downsamples
+            .iter()
+            .map(|layer| match layer {
+                DownLayer::Res(_) => 2,
+                DownLayer::Down(_) => 1,
+            })
+            .sum();
+        // conv1 + layers + middle (2 + 1 + 2) + head + the joined chunk output.
+        let per_chunk = 1 + layers + 5 + 1 + 1;
+        let clip =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, 5, 64, 64], None).unwrap();
+        let before = block_releases();
+        let latent = vae.encode(&clip).unwrap();
+        assert_eq!(latent.shape(), &[1, 16, 2, 8, 8]);
+        assert_eq!(block_releases() - before, 2 * per_chunk + 1);
+        let eps = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+        let before = block_releases();
+        vae.encode_sample(&clip, &eps).unwrap();
+        assert_eq!(block_releases() - before, 2 * per_chunk + 1);
+    }
+
+    const ENCODE_CACHE_CHILD: &str = "WAN_Z16_ENCODE_CACHE_CHILD";
+
+    /// sc-20686: right after an encode MLX's allocator cache is empty (W2 run 36832899832 carried
+    /// 43 GB of cached encode buffers into Krea v2v generation). Isolated child (MLX's counters are
+    /// process-wide). Sized: width 16 f32, clip [1,3,5,64,64], 16 MiB seeded scratch.
+    #[test]
+    fn encode_leaves_mlx_cache_empty() {
+        if std::env::var_os(ENCODE_CACHE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::encode_leaves_mlx_cache_empty",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ENCODE_CACHE_CHILD, "1")
+                .output()
+                .expect("spawn the isolated encode-cache child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated encode-cache child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let vae = crate::encode_footprint_harness::synthetic_z16(16);
+        let clip =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, 5, 64, 64], None).unwrap();
+        eval(&clip);
+        {
+            let scratch = mlx_rs::ops::zeros::<f32>(&[(4 * MIB) as i32]).unwrap();
+            eval(&scratch);
+        }
+        assert!(mlx_rs::memory::get_cache_memory() >= 16 * MIB);
+        let latent = vae.encode(&clip).unwrap();
+        eval(&latent);
+        let left = mlx_rs::memory::get_cache_memory();
+        assert!(
+            left < 64 * 1024,
+            "an encode must leave the cache empty: {left} B"
+        );
+
+        // A carried conv-cache slot is a lazy slice of a block's full output; materializing a
+        // boundary must evaluate it so that output (64 MiB here) is not kept alive by the slot.
+        let mut cache = FeatCache::new(1);
+        {
+            let block_output = mlx_rs::ops::zeros::<f32>(&[1, 1, 16, 1024, 1024]).unwrap();
+            eval(&block_output);
+            cache.slots[0] = Some(last_t(&block_output, 1).unwrap());
+        }
+        let held = mlx_rs::memory::get_active_memory();
+        let boundary = mlx_rs::ops::zeros::<f32>(&[4]).unwrap();
+        DeadStageBuffers::Keep
+            .materialize_with_cache(&boundary, &cache)
+            .unwrap();
+        let after = mlx_rs::memory::get_active_memory();
+        assert!(
+            after + 32 * MIB < held,
+            "the slot must stop holding its source: {held} -> {after} live bytes"
+        );
     }
 }

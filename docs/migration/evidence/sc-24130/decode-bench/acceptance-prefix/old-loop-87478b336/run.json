@@ -1,0 +1,84 @@
+{
+  "baseline_bench_source": null,
+  "binary": {
+    "path": "D:\\repos\\inference\\.claude\\worktrees\\sc-24130-target-cuda\\release\\deps\\decode_bench-a589f4c981fe54a8.exe",
+    "sha256": "bbbdb9a0655b7b9841e89cb41ab302c381b86dd224ec5e4536e593d0cd0a8c99"
+  },
+  "command": [
+    "D:\\repos\\inference\\.claude\\worktrees\\sc-24130-target-cuda\\release\\deps\\decode_bench-a589f4c981fe54a8.exe",
+    "decode_bench",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "elapsed_seconds": 83.88645160000306,
+  "gpu": {
+    "co_tenants_at_start": [],
+    "hardware_unavailable_reason": null,
+    "index": 0,
+    "selected": {
+      "driver_version": "596.36",
+      "free_bytes": 102171148288,
+      "index": 0,
+      "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "total_bytes": 102641958912,
+      "used_bytes": 0,
+      "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+    }
+  },
+  "host": {
+    "physical_memory": {
+      "available_bytes": 516376547328,
+      "total_bytes": 549057683456,
+      "unavailable_reason": null
+    },
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.4"
+  },
+  "label": "RTX Pro 6000 / sm_120",
+  "model": {
+    "config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "key": "bonsai-qwen38-parent",
+    "manifest": "D:\\repos\\inference\\.claude\\worktrees\\sc-24130\\release\\real-weight-models.toml",
+    "manifest_sha256": "6b70991a127a63192d99c01cea598db93a346d650b7d4ef31851478a1eaee0a5",
+    "repository": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "process_memory": {
+    "gpu": {
+      "available": false,
+      "peak_bytes": null,
+      "sample_count": 0,
+      "unavailable_reasons": [
+        "per-process GPU memory unavailable (WDDM or unsupported driver)",
+        "process not reported by nvidia-smi"
+      ]
+    },
+    "rss": {
+      "available": true,
+      "first_sample_bytes": 2691072,
+      "peak_bytes": 4318089216,
+      "sample_count": 263
+    },
+    "sample_interval_seconds": 0.25,
+    "scope": "sampled process working set / per-process GPU memory over the whole run"
+  },
+  "run_kind": "head",
+  "run_name": "old-loop-87478b336",
+  "schema_version": 2,
+  "snapshot": {
+    "config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "path": "E:\\huggingface\\hub\\models--Qwen--Qwen3.8-27B\\snapshots\\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "source": {
+    "checkout": "D:\\repos\\inference\\.claude\\worktrees\\sc-24130-oldloop",
+    "clean_tree": true,
+    "dirty_paths": [],
+    "head_sha": "87478b336daf1fc87f91bda88f78b5ccc3c5638f"
+  },
+  "started_unix_seconds": 1790188510.808651,
+  "suite": "decode_bench",
+  "suite_document": "decode_bench.json",
+  "suite_document_sha256": "cf4163694d62a9aaaf248edecebec754268d977b86246ed58a36af61bfdc1572"
+}

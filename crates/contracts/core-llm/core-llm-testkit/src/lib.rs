@@ -28,7 +28,35 @@ use core_llm::{
 };
 use std::path::PathBuf;
 
+pub mod comparison;
+pub mod defaults;
+pub mod draft_model;
+pub mod kv_compression;
+pub mod speculative;
+pub use kv_compression::{
+    check_kv_policy_conformance, kv_policy_cases, kv_policy_conformance, KvBackendDecision,
+    KvCaseDecoder, KvPolicyCase, KvPolicyDecision, KvReader,
+};
 pub mod starvector;
+pub use defaults::check_speculative_default;
+pub use draft_model::{
+    check_draft_model_qwen3vl_multimodal, check_draft_model_refused, check_draft_model_resident,
+    check_draft_model_short_context, check_draft_model_stop_token, check_draft_model_targets,
+    draft_model_parity_cases, draft_model_prompts, qwen3vl_image_prompts,
+    write_draft_model_fixture, write_qwen3vl_draft_fixture, DraftLoader, DraftModelFixture,
+    Qwen3VlDraftFixture, DRAFT_FIXTURE_VOCAB,
+};
+pub use speculative::{
+    advertised_parity_cases, bench_build_stamp, bench_config, bench_env, bench_load_spec,
+    bench_request, bench_thinking, check_speculative_bench_on_fixture,
+    check_speculative_greedy_parity, git_provenance, parse_bench_format, parse_bench_sampling,
+    reconcile_git_provenance, run_speculative_bench, run_speculative_bench_from_env, sampling_json,
+    speculative_prompt_set, BenchConfig, BenchDocument, BenchPrompt, BenchProvenance, BenchRow,
+    BenchSample, BenchStats, BenchSwitches, BenchThinking, ParityCase, ParityRow, PromptClass,
+    BENCH_ALLOW_SHA_OVERRIDE_ENV, BENCH_BUILD_GIT_DIRTY_ENV, BENCH_BUILD_GIT_SHA_ENV,
+    BENCH_DEFAULT_NEW_TOKENS, BENCH_DEFAULT_REPEATS, BENCH_ENV, BENCH_GIT_SHA_ENV, BENCH_SCHEMA,
+    BENCH_SWITCHES, BENCH_WARMUP_PROMPT,
+};
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,
     check_starvector_streaming, check_starvector_validate, deterministic_svg_fixture,
@@ -70,6 +98,7 @@ impl TextLlmProfile {
                 temperature: 1.0,
                 top_p: 1.0,
                 top_k: 0,
+                presence_penalty: 0.0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },

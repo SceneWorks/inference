@@ -26,6 +26,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 from transformers.utils import ModelOutput
 
+from ...checkpoint_paths import preflight_model_source
 from ._attn_backend import flash_attn_varlen_func
 
 
@@ -77,6 +78,15 @@ class CustomQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
     OUTPUT_MODE_EMBEDDING = "embedding"
     OUTPUT_MODE_LOGITS = "logits"
     OUTPUT_MODE_HIDDEN = "hidden"
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        source = preflight_model_source(
+            pretrained_model_name_or_path,
+            revision=kwargs.get("revision"),
+            subfolder=kwargs.get("subfolder", ""),
+        )
+        return super().from_pretrained(source, *model_args, **kwargs)
 
     def __init__(self, config):
         super().__init__(config)
@@ -251,12 +261,11 @@ def model_forward(
     else:
         text_position_ids = position_ids[0]
 
-    if kwargs.get("cu_seqlens") is None:
+    if kwargs.get("text_cu_seqlens") is None:
         attention_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -319,7 +328,7 @@ def forward(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    cu_seqlens = kwargs.get("cu_seqlens", None)
+    cu_seqlens = kwargs.get("text_cu_seqlens", None)
 
     if cu_seqlens is None:
         attention_interface: Callable = eager_attention_forward
@@ -437,6 +446,9 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.tokenizer_max_length = tokenizer_max_length
+        # Transformers may delegate sharded loads to Accelerate, whose pinned loader
+        # joins index-controlled shard names without validating their destinations.
+        version = preflight_model_source(version)
         self.tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(version)
         self.tokenizer.padding_side = "right"
 
@@ -516,7 +528,9 @@ class TextEncoder(nn.Module):
         with torch.no_grad():
             forward_kwargs = {
                 "input_ids": input_ids_packed,
-                "cu_seqlens": cu_seqlens,
+                # Transformers 5.10 treats a bare `cu_seqlens` kwarg as precomputed vision
+                # patch boundaries (`get_vision_cu_seqlens`), so the text packing uses its own key.
+                "text_cu_seqlens": cu_seqlens,
                 "position_ids": position_ids_packed,
                 "output_hidden_states": False,
                 "max_seqlen": None,
@@ -704,4 +718,3 @@ class TextEncoder(nn.Module):
             # FAIL-CLOSED: block on any screening error.
             return FilterVerdict(
                 True, ["policy"], f"edit filter error (blocked): {type(exc).__name__}: {exc}", "")
-

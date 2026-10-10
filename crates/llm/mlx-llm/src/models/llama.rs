@@ -45,23 +45,28 @@
 //! Attention is scaled by a literal `1.0` (not `head_dim^-0.5`) — the learned q/k norms absorb it —
 //! and the norms multiply by the stored weight directly, *not* Gemma-2's `(1 + weight)` fold.
 
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, multiply, sigmoid, split_sections, zeros_dtype,
-};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
-use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
-use crate::primitives::kv_cache::KvCache;
-use crate::primitives::nn::{
-    embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
+use crate::primitives::activation::{gelu_precision, ActivationRole, GeluPrecision};
+use crate::primitives::attention::{
+    sdpa_capped, sliding_causal_mask, AttnMask, SDPA_EVAL_GROUP_QLEN,
 };
+use crate::primitives::kv_cache::{KvCache, PackedAttentionMask, PackedCacheEvidence};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
+use crate::primitives::nn::{embed, gelu_tanh, rms_norm, rms_norm_unscaled, silu, soft_cap};
+use crate::primitives::paged_packed_kv::paged_attention_batch;
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
-use crate::primitives::quant::QuantizedLinear;
+use crate::primitives::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{ContiguousKvCache, PagedKvCache, Weights};
+use crate::primitives::{
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedCacheRequest,
+    PagedCacheSelection, PagedKvCache, PagedPackedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
+};
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -83,13 +88,51 @@ enum Stack {
     Sequential(Box<crate::residency::SequentialStack>),
 }
 
+/// Token embeddings may arrive dense (the engine-native snapshot invariant) or already packed by
+/// an MLX community checkpoint. Packed rows stay packed at rest and are dequantized only after the
+/// requested token ids have been gathered.
+#[derive(Debug)]
+enum TokenEmbedding {
+    Dense(Array),
+    Quantized(QuantizedEmbedding),
+}
+
+impl TokenEmbedding {
+    fn forward(&self, input_ids: &Array) -> Result<Array> {
+        match self {
+            Self::Dense(weight) => embed(weight, input_ids),
+            Self::Quantized(weight) => weight.forward(input_ids),
+        }
+    }
+
+    /// The arrays the embedding holds, for load-time materialization (sc-24446).
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        match self {
+            Self::Dense(weight) => out.push(weight.clone()),
+            Self::Quantized(q) => {
+                out.extend([q.weight.clone(), q.scales.clone(), q.biases.clone()])
+            }
+        }
+    }
+
+    fn tied_projection(&self) -> Projection {
+        match self {
+            Self::Dense(weight) => Projection::Dense {
+                weight: weight.clone(),
+                bias: None,
+            },
+            Self::Quantized(weight) => Projection::Quantized(weight.tied_linear()),
+        }
+    }
+}
+
 /// A loaded causal decoder.
 #[derive(Debug)]
 pub struct CausalLm {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     stack: Stack,
     norm: Array,
-    lm_head: Array,
+    lm_head: Projection,
     /// The model-level RoPE for a uniform architecture; Gemma 4's `sliding_attention` schedule.
     rope: Rope,
     /// Gemma 4's `full_attention` schedule — a different head dim *and* a different frequency
@@ -98,6 +141,12 @@ pub struct CausalLm {
     full_rope: Option<Rope>,
     cfg: ModelConfig,
     quantized: bool,
+    /// The load-time quantization the projections were built with (`None` for none): its bits
+    /// and group size shape the K/V as much as the config does.
+    load_quant: Option<QuantSpec>,
+    /// The identity of the weight files this decoder was loaded from ([`Self::with_weights_identity`];
+    /// empty when the caller named none).
+    weights_identity: String,
     /// Gemma scales token embeddings by √hidden; `None` ⇒ no scaling.
     embed_scale: Option<f32>,
     /// Gemma-2 final-logit soft-cap; `None` ⇒ no cap.
@@ -198,7 +247,66 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        let model = Self::build(w, prefix, cfg, quant, None)?;
+        // The caller-owned-map load boundary: every source verified resident (sc-22414), then
+        // every derived array evaluated (sc-24446), so no forward reads a weight or builds one
+        // inside its command stream (sc-24245).
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
+    }
+
+    /// [`CausalLm::from_weights_with`] without evaluating anything: every array is a lazy graph
+    /// over `w`'s sources, for the provider to materialize group by group with
+    /// [`Weights::materialize_groups`], releasing each group's consumed sources (sc-24446).
+    pub fn build_lazy(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         Self::build(w, prefix, cfg, quant, None)
+    }
+
+    /// Whether a forward's activations are wider than its weights: a Gemma GeGLU whose role the
+    /// activation-dtype policy keeps on the `f32` path ([`crate::primitives::activation`]) — its
+    /// residual stream, every later projection's input and the final hidden state are `f32`
+    /// (sc-24446). An LLM decoder's GeGLU and every SwiGLU decoder keep BF16 throughout.
+    pub fn activations_promote(&self) -> bool {
+        self.cfg.architecture.is_gemma()
+            && gelu_precision(self.cfg.activation_role) == GeluPrecision::F32
+    }
+
+    /// When [`CausalLm::activations_promote`]: the LM head's elements, and the most elements any
+    /// one decoder projection promotes ([`Projection::promoted_elements`]) — what a forward
+    /// materializes as `f32` copies of BF16 weights, priced by request admission. `None`
+    /// otherwise.
+    pub fn promoted_weight_elements(&self) -> Option<(u64, u64)> {
+        if !self.activations_promote() {
+            return None;
+        }
+        let mut largest = 0u64;
+        if let Stack::Resident(layers) = &self.stack {
+            for layer in layers {
+                layer.for_each_projection(&mut |p| largest = largest.max(p.promoted_elements()));
+            }
+        }
+        Some((self.lm_head.promoted_elements(), largest))
+    }
+
+    /// The model's resident arrays in build order, grouped as load admission prices them
+    /// (sc-24446): the arrays outside the layer stack, then one group per resident layer (a
+    /// streamed stack holds none).
+    pub fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut outside = Vec::new();
+        self.embed_tokens.push_arrays(&mut outside);
+        outside.push(self.norm.clone());
+        self.lm_head.push_arrays(&mut outside);
+        let mut groups = vec![outside];
+        if let Stack::Resident(layers) = &self.stack {
+            groups.extend(layers.iter().map(LlamaLayer::arrays));
+        }
+        groups
     }
 
     /// The one constructor. `stream_source` selects the layer stack's shape: `None` builds every
@@ -279,12 +387,55 @@ impl CausalLm {
             }
         };
 
-        let embed_tokens = req_bf16(p("embed_tokens.weight"))?;
+        let embed_key = p("embed_tokens.weight");
+        let embed_base = embed_key
+            .strip_suffix(".weight")
+            .expect("embedding weight key has the required suffix");
+        let embed_scales_key = format!("{embed_base}.scales");
+        let embed_tokens = if w.contains(&embed_scales_key) {
+            let spec = cfg.quantization.ok_or_else(|| {
+                Error::Config(format!(
+                    "snapshot stores quantized tensor `{embed_scales_key}` but config.json has no `quantization` block"
+                ))
+            })?;
+            TokenEmbedding::Quantized(QuantizedEmbedding::from_quantized(
+                w.require(&embed_key)?.clone(),
+                w.require(&embed_scales_key)?.clone(),
+                w.require(&format!("{embed_base}.biases"))?.clone(),
+                spec.group_size,
+                spec.bits,
+                COMPUTE_DTYPE,
+            )?)
+        } else {
+            TokenEmbedding::Dense(req_bf16(embed_key)?)
+        };
         let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
+            embed_tokens.tied_projection()
         } else {
-            req_bf16(head_key)?
+            let head_base = head_key
+                .strip_suffix(".weight")
+                .expect("LM head key has the required suffix");
+            let head_scales_key = format!("{head_base}.scales");
+            if w.contains(&head_scales_key) {
+                let spec = cfg.quantization.ok_or_else(|| {
+                    Error::Config(format!(
+                        "snapshot stores quantized tensor `{head_scales_key}` but config.json has no `quantization` block"
+                    ))
+                })?;
+                Projection::from_quantized(
+                    w.require(&head_key)?.clone(),
+                    w.require(&head_scales_key)?.clone(),
+                    w.require(&format!("{head_base}.biases"))?.clone(),
+                    spec,
+                    COMPUTE_DTYPE,
+                )?
+            } else {
+                Projection::Dense {
+                    weight: req_bf16(head_key)?,
+                    bias: None,
+                }
+            }
         };
 
         let plan = LayerPlan::new(&cfg, decoder_root.clone());
@@ -312,13 +463,13 @@ impl CausalLm {
             ),
             None => (cfg.build_rope(), None),
         };
-        // Every tensor this constructor read is a freshly loaded buffer whose GPU view can lag the
-        // CPU's (sc-22414): force them resident in bounded batches and hold until the GPU reads the
-        // same bytes, *before* any forward builds a graph over them. Under `Stack::Resident` that is
-        // the whole checkpoint; under `Stack::Sequential` it is the resident set (embeddings, final
-        // norm, LM head) — the streamed layers are verified per pass in
+        // Nothing is evaluated here. Every tensor this constructor read is a freshly loaded buffer
+        // whose GPU view can lag the CPU's (sc-22414); the callers force them resident and verified
+        // *before* any forward builds a graph over them — `from_weights_with` /
+        // `from_file_sequential` up front, the provider group by group
+        // (`Weights::materialize_groups`). Under `Stack::Sequential` that is the resident set
+        // (embeddings, final norm, LM head) — the streamed layers are verified per pass in
         // `crate::residency::SequentialStack::run_layer`.
-        w.verify_accessed_gpu_view()?;
         let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,
@@ -328,6 +479,8 @@ impl CausalLm {
             rope,
             full_rope,
             quantized,
+            load_quant: quant,
+            weights_identity: String::new(),
             embed_scale: gemma.then(|| (cfg.hidden_size as f32).sqrt()),
             final_softcap: cfg.final_logit_softcap,
             cfg,
@@ -355,7 +508,10 @@ impl CausalLm {
         // This view supplies only the non-layer weights (embeddings, final norm, LM head). It is
         // dropped on return; every layer read happens later, against a view the stream reopens.
         let w = Weights::from_file(path)?;
-        Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))
+        let model = Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))?;
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
     }
 
     /// The resident layer stack, or a typed refusal when this model streams its layers.
@@ -413,9 +569,50 @@ impl CausalLm {
         PagedKvCache::new(self.cfg.num_layers, block_size)
     }
 
+    /// A single-sequence paged cache under the compressed-KV policy (sc-20680; crate-internal since
+    /// the sc-20688 review, so no external caller can arm per-sequence paged compression): with the
+    /// qualified opt-in, a request the qualification table admits runs on K8V8 pages of
+    /// `request.packed_pool` read in place by the fused paged reader; every other request runs the
+    /// established dense [`PagedKvCache`] on `request.dense_pool`, with its reason in
+    /// [`PagedCacheSelection::report`].
+    pub(crate) fn select_paged_cache(&self, request: PagedCacheRequest<'_>) -> PagedCacheSelection {
+        crate::kv_policy::select_paged_cache(self, request)
+    }
+
+    /// The engine's cached-decode compute dtype (bf16): activations, logits and the K/V cache.
+    pub const COMPUTE_DTYPE: Dtype = COMPUTE_DTYPE;
+
     /// The engine's cached-decode compute dtype (bf16).
     pub const fn compute_dtype(&self) -> Dtype {
-        COMPUTE_DTYPE
+        Self::COMPUTE_DTYPE
+    }
+
+    /// Name the weight files this decoder was loaded from (for example each file's name, size
+    /// and modification time), so its [`Self::cache_fingerprint`] changes when they are replaced.
+    pub fn with_weights_identity(mut self, identity: impl Into<String>) -> Self {
+        self.weights_identity = identity.into();
+        self
+    }
+
+    /// SHA-256 (hex) of everything in the loaded decoder that shapes its K/V (sc-20681): the whole
+    /// parsed config (geometry, vocabulary, RoPE theta and scaling, attention variants, a
+    /// pre-quantized checkpoint's quantization spec), the cached K/V dtype, the load-time
+    /// quantization (its bits and group size, so Q4 and Q8 loads of the same weights differ) and
+    /// the weights' identity ([`Self::with_weights_identity`], so replaced weights at the same
+    /// path differ; sc-20688 review). Paged prefix stores and snapshots key on it next to the
+    /// caller's model name, so decoders named alike but configured or weighted differently never
+    /// share pages.
+    pub fn cache_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let described = format!(
+            "{:?}|kv={:?}|quantized={}|load_quant={:?}|weights={}",
+            self.cfg,
+            Self::COMPUTE_DTYPE,
+            self.quantized,
+            self.load_quant,
+            self.weights_identity
+        );
+        format!("{:x}", Sha256::digest(described.as_bytes()))
     }
 
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
@@ -471,7 +668,10 @@ impl CausalLm {
 
     /// Embed token ids `[batch, seq]` → `[batch, seq, hidden]` (bf16). Gemma scales by √hidden.
     pub fn embed(&self, input_ids: &Array) -> Result<Array> {
-        let e = embed(&self.embed_tokens, input_ids)?;
+        let e = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
         match self.embed_scale {
             Some(s) => Ok(multiply(&e, &Array::from_f32(s).as_dtype(e.dtype())?)?),
             None => Ok(e),
@@ -709,6 +909,23 @@ impl CausalLm {
         caches: &mut [&mut PagedKvCache],
         positions: &[i32],
     ) -> Result<Array> {
+        let mut caches = caches
+            .iter_mut()
+            .map(|cache| &mut **cache as &mut dyn KvCache)
+            .collect::<Vec<_>>();
+        self.decode_logits_per_seq_dyn(input_ids, &mut caches, positions)
+    }
+
+    /// [`CausalLm::decode_logits_per_seq`] over any per-sequence caches (sc-20681): a batch may mix
+    /// dense paged sequences with paged compressed ones. The compressed sequences of one page pool
+    /// attend through one fused paged dispatch per layer (a page table and per-sequence lengths,
+    /// no padding mask); every other sequence attends on its own as before.
+    pub fn decode_logits_per_seq_dyn(
+        &self,
+        input_ids: &Array,
+        caches: &mut [&mut dyn KvCache],
+        positions: &[i32],
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         if caches.len() != b as usize {
@@ -881,8 +1098,17 @@ impl CausalLm {
         let mut shared = SharedKv::default();
         match &self.stack {
             Stack::Resident(layers) => {
+                let checkpoint_prefill = input_embeds.shape()[1] > SDPA_EVAL_GROUP_QLEN;
                 for (i, layer) in layers.iter().enumerate() {
                     h = layer.forward(&h, ropes, mask, cache, i, &mut shared)?;
+                    if checkpoint_prefill {
+                        // The sequential stack already evaluates its carry per layer. Do the
+                        // same for a long resident prefill: evaluating h also materializes this
+                        // layer's K/V ancestors (residency.rs), then the previous layer's graph
+                        // can be released before the next one is constructed. Decode and short
+                        // prefills keep the existing lazy execution path.
+                        h.eval()?;
+                    }
                     if let Some(sink) = collect.as_deref_mut() {
                         sink.push(h.clone());
                     }
@@ -918,7 +1144,7 @@ impl CausalLm {
     /// Final RMSNorm + `lm_head` (+ Gemma-2 logit soft-cap) over hidden states `[batch, n, hidden]`.
     fn project_logits(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps)?;
-        let logits = linear(&normed, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&normed)?;
         match self.final_softcap {
             // Soft-cap in f32 for precision (the cap denominator matters near the extremes).
             Some(c) => soft_cap(&logits.as_dtype(Dtype::Float32)?, c),
@@ -929,11 +1155,63 @@ impl CausalLm {
 
 impl crate::decode::Decode for CausalLm {
     fn make_cache(&self) -> Box<dyn KvCache> {
-        Box::new(self.new_cache())
+        // Every decoder now crosses the experimental cache factory before its first mutation.
+        // The explicit override remains off by default, so this returns the identical established
+        // contiguous cache while preserving a single, testable future selection seam.
+        select_decoder_cache(PackedCacheRequest::disabled(self.cfg.num_layers)).into_cache()
     }
 
     fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> Result<Array> {
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl CausalLm {
+    /// Explicit opt-in construction for the retained packed reader.  Normal `Decode::make_cache`
+    /// remains unchanged; callers must provide a reader that was compiled for this model's
+    /// identity and pass the real batch/query geometry discovered at the model boundary.
+    pub fn make_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> Box<dyn KvCache> {
+        self.select_cache_with_packed_reader(handle, batch, query_length, has_mask)
+            .into_cache()
+    }
+
+    /// Preflight-preserving variant for sealed harnesses. The caller can record the exact route or
+    /// fallback reason before taking ownership of the decoder cache.
+    pub fn select_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> DecoderCacheSelection {
+        select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: handle.cache_identity().to_owned(),
+                layers: self.cfg.num_layers,
+                batch,
+                kv_heads: self.cfg.num_kv_heads as usize,
+                head_dimension: self.cfg.head_dim as usize,
+                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: handle.code_bits(),
+                query_length,
+                has_mask,
+            },
+            handle,
+        )
+    }
+
+    /// Immutable compressed-domain evidence at the public model/cache boundary. A sealed model
+    /// receipt can call this without downcasting to the experimental storage implementation.
+    pub fn packed_cache_evidence(&self, cache: &dyn KvCache) -> Option<PackedCacheEvidence> {
+        cache.packed_evidence()
     }
 }
 
@@ -1027,6 +1305,76 @@ pub(crate) struct LlamaLayer {
 }
 
 impl LlamaLayer {
+    /// Every projection of the layer (attention and FFN; a sparse-MoE block's shared expert).
+    fn for_each_projection(&self, f: &mut dyn FnMut(&Projection)) {
+        match &self.attn {
+            Attention::Gqa(a) => {
+                f(&a.q);
+                if let Some(kv) = &a.kv {
+                    f(kv.key());
+                    if let Some(v) = kv.value() {
+                        f(v);
+                    }
+                }
+                f(&a.o);
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    f(p);
+                }
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    f(p);
+                }
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    f(p);
+                }
+            }
+            Ffn::Moe(m) => m.for_each_shared_projection(f),
+        }
+    }
+
+    /// Every array the layer holds, for load-time materialization (sc-24446).
+    pub(crate) fn arrays(&self) -> Vec<Array> {
+        let mut out = vec![self.input_ln.clone(), self.post_ln.clone()];
+        out.extend(self.pre_ff_ln.iter().cloned());
+        out.extend(self.post_ff_ln.iter().cloned());
+        out.extend(self.layer_scalar.iter().cloned());
+        match &self.attn {
+            Attention::Gqa(a) => {
+                a.q.push_arrays(&mut out);
+                if let Some(kv) = &a.kv {
+                    kv.push_arrays(&mut out);
+                }
+                a.o.push_arrays(&mut out);
+                out.extend(a.q_norm.iter().cloned());
+                out.extend(a.k_norm.iter().cloned());
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    p.push_arrays(&mut out);
+                }
+                out.extend(a.q_a_layernorm.iter().cloned());
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    p.push_arrays(&mut out);
+                }
+                out.push(a.kv_a_layernorm.clone());
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    p.push_arrays(&mut out);
+                }
+            }
+            Ffn::Moe(m) => m.push_arrays(&mut out),
+        }
+        out
+    }
+
     pub(crate) fn forward(
         &self,
         x: &Array,
@@ -1048,7 +1396,7 @@ impl LlamaLayer {
         &self,
         x: &Array,
         ropes: &RopeTables,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let (cos, sin) = ropes.get(self.rope_slot);
@@ -1120,7 +1468,7 @@ impl Attention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         match self {
@@ -1286,6 +1634,37 @@ impl LlamaAttention {
         let (k_all, v_all) = match &self.kv {
             Some(kv) => {
                 let (k, v) = self.project_kv(kv, x, cos, sin)?;
+                // The packed route is an explicit opt-in on the cache. It is attempted before
+                // `update`, so an accepted result cannot accidentally materialize full K/V and
+                // then fall through to dense SDPA. Shared-K/V and score-softcap layers stay on
+                // the established path because the retained reader cannot preserve those extra
+                // semantics without a dense shared tensor.
+                if self.softcap.is_none() {
+                    let packed_mask = match mask {
+                        AttnMask::Causal => PackedAttentionMask::Causal,
+                        AttnMask::SlidingCausal { window } => {
+                            PackedAttentionMask::SlidingWindow(window as usize)
+                        }
+                        AttnMask::None => PackedAttentionMask::None,
+                        AttnMask::Additive(_) => PackedAttentionMask::Additive,
+                    };
+                    if let Some(out) = cache.try_packed_attention(
+                        layer_idx,
+                        &q,
+                        &k,
+                        &v,
+                        packed_mask,
+                        self.scale,
+                        self.stores_kv,
+                    )? {
+                        return self.output(&out);
+                    }
+                } else if let Some(softcap) = self.softcap {
+                    let reason = format!(
+                        "attention score softcap c={softcap} requires tanh before softmax; the packed reader implements uncapped scaled dot-product attention"
+                    );
+                    cache.prepare_dense_fallback("score-softcap", &reason)?;
+                }
                 let both = cache.update(layer_idx, &k, &v)?;
                 if self.stores_kv {
                     shared.set(self.kind, both.clone());
@@ -1313,7 +1692,7 @@ impl LlamaAttention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        caches: &mut [&mut PagedKvCache],
+        caches: &mut [&mut dyn KvCache],
         layer_idx: usize,
     ) -> Result<Array> {
         let q = self.project_q(x, cos, sin)?;
@@ -1325,15 +1704,88 @@ impl LlamaAttention {
             )
         })?;
         let (k, v) = self.project_kv(kv, x, cos, sin)?;
-        let mut outs = Vec::with_capacity(caches.len());
+        let mut outs: Vec<Option<Array>> = (0..caches.len()).map(|_| None).collect();
+        let packed_mask = match self.sliding_window {
+            Some(window) => PackedAttentionMask::SlidingWindow(window.max(0) as usize),
+            None => PackedAttentionMask::Causal,
+        };
+        // The paged compressed sequences of one pool attend in one fused dispatch (sc-20681).
+        if self.softcap.is_none() && !self.stores_kv {
+            let mut group = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, cache)| {
+                    cache
+                        .as_any_mut()
+                        .downcast_mut::<PagedPackedKvCache>()
+                        .map(|cache| (i, cache))
+                })
+                .collect::<Vec<_>>();
+            if group.len() > 1 {
+                let rows = group.iter().map(|(i, _)| *i as i32).collect::<Vec<_>>();
+                let rows = Array::from_slice(&rows, &[rows.len() as i32]);
+                let (qg, kg, vg) = (
+                    q.take_axis(&rows, 0)?,
+                    k.take_axis(&rows, 0)?,
+                    v.take_axis(&rows, 0)?,
+                );
+                let batched = {
+                    let mut members = group
+                        .iter_mut()
+                        .map(|(_, cache)| &mut **cache)
+                        .collect::<Vec<_>>();
+                    paged_attention_batch(
+                        &mut members,
+                        layer_idx,
+                        &qg,
+                        &kg,
+                        &vg,
+                        packed_mask,
+                        self.scale,
+                    )?
+                };
+                if let Some(out) = batched {
+                    for (j, (i, _)) in group.iter().enumerate() {
+                        outs[*i] = Some(row_axis0(&out, j as i32)?);
+                    }
+                }
+            }
+        }
         for (i, cache) in caches.iter_mut().enumerate() {
-            let i = i as i32;
-            let (qi, ki, vi) = (row_axis0(&q, i)?, row_axis0(&k, i)?, row_axis0(&v, i)?);
+            if outs[i].is_some() {
+                continue;
+            }
+            let row = i as i32;
+            let (qi, ki, vi) = (
+                row_axis0(&q, row)?,
+                row_axis0(&k, row)?,
+                row_axis0(&v, row)?,
+            );
+            if self.softcap.is_none() {
+                if let Some(out) = cache.try_packed_attention(
+                    layer_idx,
+                    &qi,
+                    &ki,
+                    &vi,
+                    packed_mask,
+                    self.scale,
+                    self.stores_kv,
+                )? {
+                    outs[i] = Some(out);
+                    continue;
+                }
+            } else if let Some(softcap) = self.softcap {
+                let reason = format!(
+                    "attention score softcap c={softcap} requires tanh before softmax; the packed \
+                     reader implements uncapped scaled dot-product attention"
+                );
+                cache.prepare_dense_fallback("score-softcap", &reason)?;
+            }
             let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?;
             let mut buf = None;
             let mask =
                 self.windowed(AttnMask::Causal, qi.shape()[2], k_all.shape()[2], &mut buf)?;
-            outs.push(sdpa_capped(
+            outs[i] = Some(sdpa_capped(
                 &qi,
                 &k_all,
                 &v_all,
@@ -1342,6 +1794,10 @@ impl LlamaAttention {
                 mask,
             )?);
         }
+        let outs = outs
+            .into_iter()
+            .map(|out| out.ok_or_else(|| Error::Msg("a sequence produced no attention".into())))
+            .collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Array> = outs.iter().collect();
         let out = concatenate_axis(&refs, 0)?; // [b, heads, s, head_dim]
         self.output(&out)
@@ -1502,11 +1958,12 @@ fn row_axis0(a: &Array, i: i32) -> Result<Array> {
     Ok(a.take_axis(&idx, 0)?)
 }
 
-/// A layer's feed-forward network: a dense gated MLP, or a sparse Mixture-of-Experts bank.
+/// A layer's feed-forward network: a dense gated MLP, or a sparse Mixture-of-Experts bank (the shared
+/// [`SparseMoe`] block — Qwen2-MoE, DeepSeek-V2).
 #[derive(Debug)]
 enum Ffn {
     Dense(LlamaMlp),
-    Moe(MoeMlp),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -1524,109 +1981,19 @@ struct LlamaMlp {
     gate: Projection,
     up: Projection,
     down: Projection,
-    gelu: bool,
+    /// GeGLU (Gemma) for this role — the activation-dtype policy's key; `None` ⇒ SwiGLU.
+    gelu: Option<ActivationRole>,
 }
 
 impl LlamaMlp {
     fn forward(&self, x: &Array) -> Result<Array> {
         let g = self.gate.forward(x)?;
-        let g = if self.gelu { gelu_tanh(&g)? } else { silu(&g)? };
+        let g = match self.gelu {
+            Some(role) => gelu_tanh(&g, role)?,
+            None => silu(&g)?,
+        };
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&g, &up)?)
-    }
-}
-
-/// A sparse Mixture-of-Experts feed-forward (Qwen2-MoE, DeepSeek-V2): a softmax router over `experts`
-/// (top-k per token) plus an always-on `shared` expert. Correctness-first — each expert runs only on
-/// its routed tokens (gathered, then scatter-added back), so active compute scales with
-/// `experts_per_tok`. Top-k selection is done on the host. `n_group`/`topk_group` group-limited
-/// routing (DeepSeek-V2-236B / V3) is not modelled — V2-Lite uses plain greedy top-k.
-#[derive(Debug)]
-struct MoeMlp {
-    /// Router weight `[num_experts, hidden]`.
-    router: Array,
-    experts: Vec<LlamaMlp>,
-    shared: LlamaMlp,
-    /// Shared-expert sigmoid gate `[1, hidden]` (Qwen2-MoE); `None` ⇒ added ungated (DeepSeek-V2).
-    shared_gate: Option<Array>,
-    experts_per_tok: usize,
-    norm_topk_prob: bool,
-    /// Multiplier on the (un-normalized) routed weights — DeepSeek's `routed_scaling_factor`; `1.0`
-    /// for Qwen2-MoE. Ignored when `norm_topk_prob` (the weights are renormalized instead).
-    routed_scaling_factor: f32,
-}
-
-impl MoeMlp {
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s, h) = (sh[0], sh[1], sh[2]);
-        let t = b * s;
-        let dtype = x.dtype();
-        let xf = x.reshape(&[t, h])?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax on the host, for a stable top-k).
-        let logits = linear(&xf, &self.router, None)?; // [t, num_experts]
-        let logits = to_f32_host(&logits)?; // row-major [t * num_experts]
-
-        // Invert the per-token top-k into per-expert (token, weight) lists.
-        let mut routed: Vec<Vec<(i32, f32)>> = vec![Vec::new(); num_experts];
-        for ti in 0..t as usize {
-            let row = &logits[ti * num_experts..(ti + 1) * num_experts];
-            let m = row.iter().copied().fold(f32::MIN, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let top = &idx[..k];
-            // Renormalize the top-k weights to sum to 1, or apply the routed scaling factor.
-            let (denom, post_scale) = if self.norm_topk_prob {
-                (
-                    top.iter()
-                        .map(|&e| probs[e])
-                        .sum::<f32>()
-                        .max(f32::MIN_POSITIVE),
-                    1.0,
-                )
-            } else {
-                (1.0, self.routed_scaling_factor)
-            };
-            for &e in top {
-                routed[e].push((ti as i32, probs[e] / denom * post_scale));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = zeros_dtype(&[t, h], dtype)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len() as i32;
-            let idx_i: Vec<i32> = toks.iter().map(|&(ti, _)| ti).collect();
-            let idx_u: Vec<u32> = toks.iter().map(|&(ti, _)| ti as u32).collect();
-            let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
-            let idx = Array::from_slice(&idx_i, &[n]);
-            let idx_u = Array::from_slice(&idx_u, &[n]);
-            let wts = Array::from_slice(&wts, &[n, 1]).as_dtype(dtype)?;
-            let xe = xf.take_axis(&idx, 0)?; // [n, h]
-            let ye = multiply(&self.experts[e].forward(&xe)?, &wts)?.reshape(&[n, 1, h])?;
-            out = mlx_rs::ops::indexing::scatter_add_single(&out, &idx_u, &ye, 0)?;
-        }
-
-        // Always-on shared expert: Qwen2 gates it by sigmoid(x · shared_gateᵀ); DeepSeek adds it
-        // ungated.
-        let shared = self.shared.forward(&xf)?;
-        let shared = match &self.shared_gate {
-            Some(g) => {
-                let sg = sigmoid(&linear(&xf, g, None)?)?; // [t, 1]
-                multiply(&shared, &sg)?
-            }
-            None => shared,
-        };
-        Ok(add(&out, &shared)?.reshape(&[b, s, h])?)
     }
 }
 
@@ -1742,14 +2109,15 @@ impl LayerPlan {
                          `quantization` block"
                     ))
                 })?;
-                Ok(Projection::Quantized(QuantizedLinear {
-                    weight: w.require(key)?.clone(),
-                    scales: w.require(&scales_key)?.clone(),
-                    biases: w.require(&format!("{base}.biases"))?.clone(),
-                    group_size: spec.group_size,
-                    bits: spec.bits,
+                Ok(Projection::Quantized(QuantizedLinear::from_stored(
+                    w.require(key)?.clone(),
+                    w.require(&scales_key)?.clone(),
+                    w.require(&format!("{base}.biases"))?.clone(),
+                    spec.group_size,
+                    spec.bits,
                     bias,
-                }))
+                    COMPUTE_DTYPE,
+                )?))
             } else {
                 Projection::load_with_bias(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, bias, quant)
             }
@@ -1873,15 +2241,14 @@ impl LayerPlan {
         // `first_k_dense_replace` layers dense even though the model is MoE. Gemma uses GeGLU.
         let moe_layer = cfg.moe.filter(|m| i >= m.first_k_dense_replace);
         let ffn = if let Some(moe) = moe_layer {
-            let mut experts = Vec::with_capacity(moe.num_experts);
+            // The routed experts are stored per expert; stack each projection across the bank so
+            // the shared block dispatches them with a gathered matmul.
+            let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
             for e in 0..moe.num_experts {
                 let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
-                experts.push(LlamaMlp {
-                    gate: proj(ep("gate_proj.weight"))?,
-                    up: proj(ep("up_proj.weight"))?,
-                    down: proj(ep("down_proj.weight"))?,
-                    gelu: false,
-                });
+                gate.push(proj(ep("gate_proj.weight"))?);
+                up.push(proj(ep("up_proj.weight"))?);
+                down.push(proj(ep("down_proj.weight"))?);
             }
             // Shared-expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
             // (plural, ungated); Qwen2-MoE has a single `mlp.shared_expert` gated by a sigmoid.
@@ -1891,24 +2258,27 @@ impl LayerPlan {
                 "mlp.shared_expert"
             };
             let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-            Ffn::Moe(MoeMlp {
-                router: req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
-                experts,
-                shared: LlamaMlp {
+            Ffn::Moe(SparseMoe::new(
+                req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                SwitchLinear::stack(gate)?,
+                SwitchLinear::stack(up)?,
+                SwitchLinear::stack(down)?,
+                SwiGlu {
                     gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
                     up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
                     down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
-                    gelu: false,
                 },
-                shared_gate: if w.contains(&shared_gate_key) {
+                if w.contains(&shared_gate_key) {
                     Some(req_bf16(shared_gate_key)?) // [1, hidden]
                 } else {
                     None
                 },
-                experts_per_tok: moe.num_experts_per_tok,
-                norm_topk_prob: moe.norm_topk_prob,
-                routed_scaling_factor: moe.routed_scaling_factor,
-            })
+                MoeRouting {
+                    experts_per_tok: moe.num_experts_per_tok,
+                    norm_topk_prob: moe.norm_topk_prob,
+                    routed_scaling_factor: moe.routed_scaling_factor,
+                },
+            )?)
         } else {
             // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
             let (gate, up) = {
@@ -1931,7 +2301,7 @@ impl LayerPlan {
                 gate,
                 up,
                 down: proj(lp("mlp.down_proj.weight"))?,
-                gelu: gemma,
+                gelu: gemma.then_some(cfg.activation_role),
             })
         };
 
@@ -1986,6 +2356,171 @@ impl LayerPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24442 AC2: every `CausalLm` fixture emits the same greedy tokens under the new `sdpa`
+    /// routing as under the pre-sc-24442 one (8-row tiles for multi-head power-of-2 head dims, one
+    /// call otherwise), compared in-process — Llama and Qwen3 (q/k-norm) wiring × every head dim
+    /// class (vector-only 96/256, full-kernel 64/80/128, unserved 8/32/72/512) × MHA / GQA 4 / GQA 8
+    /// × prompts inside one vector tile, across tiles, and across many tiles.
+    #[test]
+    fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
+        use crate::primitives::attention::route_override::{
+            assert_greedy_matches_pre_sc24442, GreedyComparison,
+        };
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        const HIDDEN: i32 = 32;
+        const VOCAB: i32 = 48;
+        const INTER: i32 = 64;
+        let mut seen = GreedyComparison::default();
+        for (family, qk_norm) in [("llama", false), ("qwen3", true)] {
+            for hd in [8, 32, 64, 72, 80, 96, 128, 256, 512] {
+                for (nh, nkv) in [(4, 4), (4, 1), (8, 1)] {
+                    let mut rng = SplitMix64::new(0x2444_2000 + (hd * 16 + nh + nkv) as u64);
+                    let mut randn = |shape: &[i32]| {
+                        let n: i32 = shape.iter().product();
+                        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+                        Array::from_slice(&data, shape)
+                    };
+                    let ones = |d: i32| Array::ones::<f32>(&[d]).unwrap();
+                    let mut m = HashMap::new();
+                    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    m.insert("model.norm.weight".into(), ones(HIDDEN));
+                    m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    for i in 0..2 {
+                        let p = |s: &str| format!("model.layers.{i}.{s}");
+                        m.insert(p("input_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("self_attn.q_proj.weight"), randn(&[nh * hd, HIDDEN]));
+                        m.insert(p("self_attn.k_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.v_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, nh * hd]));
+                        if qk_norm {
+                            m.insert(p("self_attn.q_norm.weight"), randn(&[hd]));
+                            m.insert(p("self_attn.k_norm.weight"), randn(&[hd]));
+                        }
+                        m.insert(p("mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
+                    }
+                    let arch = if qk_norm {
+                        "Qwen3ForCausalLM"
+                    } else {
+                        "LlamaForCausalLM"
+                    };
+                    let cfg = ModelConfig::from_json(&json!({
+                        "architectures": [arch], "model_type": family,
+                        "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
+                        "num_attention_heads": nh, "num_key_value_heads": nkv, "head_dim": hd,
+                        "vocab_size": VOCAB, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                        "tie_word_embeddings": false
+                    }))
+                    .unwrap();
+                    let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+                    for prompt_len in [5, 20, 70] {
+                        let prompt: Vec<i32> =
+                            (0..prompt_len).map(|i| (i * 7 + 3) % VOCAB).collect();
+                        seen += assert_greedy_matches_pre_sc24442(
+                            &format!("{family} hd {hd} {nh}/{nkv} prompt {prompt_len}"),
+                            &prompt,
+                            6,
+                            || model.new_cache(),
+                            |ids, cache, offset| model.decode_logits(ids, cache, offset).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.differing_calls > 0,
+            "no fixture exercised a routing change"
+        );
+        assert!(
+            seen.compared_steps > seen.tie_steps,
+            "most greedy steps must be decisive enough to compare: {seen:?}"
+        );
+    }
+
+    /// sc-24446 parity gate for the Gemma decoders' GeGLU in the activation dtype: Gemma 2 on a
+    /// random BF16 fixture (soft-capped attention and logits, sandwich norms, `1 + w`) and Gemma 4
+    /// on the decoder-golden fixture (sliding / full alternation, layer scalars, k = v), each held
+    /// to the gate's logit budget and greedy-margin rule against its own `f32` path
+    /// ([`crate::primitives::activation::parity`]).
+    #[test]
+    fn gemma_geglu_activation_dtype_parity() {
+        use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
+        use serde_json::json;
+        // Gemma 2.
+        let (v, h, inter, layers, heads, kv, hd) = (64, 64, 128, 2, 4, 2, 16);
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![v, h]),
+            ("model.norm.weight".into(), vec![h]),
+        ];
+        for i in 0..layers {
+            let l = |s: &str| format!("model.layers.{i}.{s}");
+            for (key, shape) in [
+                ("input_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("pre_feedforward_layernorm.weight", vec![h]),
+                ("post_feedforward_layernorm.weight", vec![h]),
+                ("self_attn.q_proj.weight", vec![heads * hd, h]),
+                ("self_attn.k_proj.weight", vec![kv * hd, h]),
+                ("self_attn.v_proj.weight", vec![kv * hd, h]),
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("mlp.gate_proj.weight", vec![inter, h]),
+                ("mlp.up_proj.weight", vec![inter, h]),
+                ("mlp.down_proj.weight", vec![h, inter]),
+            ] {
+                shapes.push((l(key), shape));
+            }
+        }
+        let cfg = ModelConfig::from_json(&json!({
+            "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2",
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "vocab_size": v, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": hd, "sliding_window": 4096,
+            "max_position_embeddings": 8192
+        }))
+        .unwrap();
+        let gemma2 = CausalLm::from_weights(
+            &Weights::from_map(random_bf16(&shapes, 0x2444_6603)),
+            "",
+            cfg,
+        )
+        .unwrap();
+        let report = assert_geglu_parity("gemma2", &gemma2, &[3, 17, 5, 40, 9], 16);
+        eprintln!("gemma2 GeGLU parity: {report:?}");
+
+        // Gemma 4, on the decoder-golden fixture.
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| -> Vec<f32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let mut map = std::collections::HashMap::new();
+        for (key, entry) in g["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = floats(&entry["shape"]).iter().map(|&x| x as i32).collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let cfg = ModelConfig::from_json(&g["config"]).unwrap();
+        let gemma4 = CausalLm::from_weights(&Weights::from_map(map), "", cfg).unwrap();
+        let prompt: Vec<i32> = floats(&g["prompt"]).iter().map(|&x| x as i32).collect();
+        let report = assert_geglu_parity("gemma4", &gemma4, &prompt, 16);
+        eprintln!("gemma4 GeGLU parity: {report:?}");
+    }
 
     #[test]
     fn join_handles_empty_prefix() {

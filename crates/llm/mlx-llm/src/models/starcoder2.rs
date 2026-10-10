@@ -57,6 +57,8 @@ pub struct StarCoder2 {
     layers: Vec<StarCoder2Layer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
+    /// Standard RoPE over the full head, built once at load (device-resident schedule).
+    rope: Rope,
     cfg: StarCoder2Config,
 }
 
@@ -89,6 +91,7 @@ impl StarCoder2 {
             layers,
             final_norm_weight: w.require(&key("model.norm.weight"))?.clone(),
             final_norm_bias: w.require(&key("model.norm.bias"))?.clone(),
+            rope: Rope::standard(cfg.head_dim(), cfg.rope_theta),
             cfg,
         };
         w.verify_accessed_gpu_view()?;
@@ -108,8 +111,7 @@ impl StarCoder2 {
         offset: i32,
     ) -> Result<Array> {
         let sequence = embeds.shape()[1];
-        let rope = Rope::standard(self.cfg.head_dim(), self.cfg.rope_theta);
-        let (cos, sin) = rope.cos_sin(sequence, offset, embeds.dtype())?;
+        let (cos, sin) = self.rope.cos_sin(sequence, offset, embeds.dtype())?;
         let mut hidden = embeds.clone();
         for (index, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, cache, index)?;
@@ -193,11 +195,10 @@ impl StarCoder2Layer {
             Some(&self.post_attn_norm_bias),
             self.eps,
         )?;
-        let mlp = gelu_tanh(&linear(
-            &normed,
-            &self.mlp_fc_weight,
-            Some(&self.mlp_fc_bias),
-        )?)?;
+        let mlp = gelu_tanh(
+            &linear(&normed, &self.mlp_fc_weight, Some(&self.mlp_fc_bias))?,
+            crate::primitives::activation::ActivationRole::LlmDecode,
+        )?;
         let mlp = linear(&mlp, &self.mlp_proj_weight, Some(&self.mlp_proj_bias))?;
         Ok(add(&hidden, &mlp)?)
     }
@@ -372,6 +373,62 @@ mod tests {
             &[4],
         );
         StarCoder2::from_weights(&Weights::from_map(map), prefix, cfg).unwrap()
+    }
+
+    /// sc-24446 parity gate: StarVector-8B's StarCoder2 decoder switches its tanh-GELU MLP to the
+    /// activation dtype; on a random BF16 fixture its logits stay within the gate's budget of the
+    /// `f32` path and its greedy tokens agree ([`crate::primitives::activation::parity`]).
+    #[test]
+    fn geglu_activation_dtype_parity() {
+        use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
+        let (v, h, inter, layers, heads, kv_heads) = (64, 64, 128, 2, 4, 2);
+        let kv = kv_heads * (h / heads);
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("p.model.embed_tokens.weight".into(), vec![v, h]),
+            ("p.model.norm.weight".into(), vec![h]),
+            ("p.model.norm.bias".into(), vec![h]),
+        ];
+        for i in 0..layers {
+            let l = |s: &str| format!("p.model.layers.{i}.{s}");
+            for (key, shape) in [
+                ("input_layernorm.weight", vec![h]),
+                ("input_layernorm.bias", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.bias", vec![h]),
+                ("self_attn.q_proj.weight", vec![h, h]),
+                ("self_attn.q_proj.bias", vec![h]),
+                ("self_attn.k_proj.weight", vec![kv, h]),
+                ("self_attn.k_proj.bias", vec![kv]),
+                ("self_attn.v_proj.weight", vec![kv, h]),
+                ("self_attn.v_proj.bias", vec![kv]),
+                ("self_attn.o_proj.weight", vec![h, h]),
+                ("self_attn.o_proj.bias", vec![h]),
+                ("mlp.c_fc.weight", vec![inter, h]),
+                ("mlp.c_fc.bias", vec![inter]),
+                ("mlp.c_proj.weight", vec![h, inter]),
+                ("mlp.c_proj.bias", vec![h]),
+            ] {
+                shapes.push((l(key), shape));
+            }
+        }
+        let cfg = StarCoder2Config {
+            vocab_size: v,
+            hidden_size: h,
+            intermediate_size: inter,
+            layers: layers as usize,
+            heads,
+            kv_heads,
+            rope_theta: 10_000.0,
+            layer_norm_eps: 1e-5,
+        };
+        let model = StarCoder2::from_weights(
+            &Weights::from_map(random_bf16(&shapes, 0x2444_6602)),
+            "p",
+            cfg,
+        )
+        .unwrap();
+        let report = assert_geglu_parity("starcoder2", &model, &[3, 17, 5, 40, 9], 16);
+        eprintln!("starcoder2 GeGLU parity: {report:?}");
     }
 
     #[test]

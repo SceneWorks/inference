@@ -509,6 +509,28 @@ impl Gemma4Mm {
         };
         let model = Self { cfg, vision, audio };
         w.verify_accessed_gpu_view()?;
+        // The derived arrays (the position table's row / column splits, any BF16 cast) exist
+        // before a request needs them, not inside its forward (sc-24446).
+        let mut arrays = Vec::new();
+        if let Some(v) = &model.vision {
+            arrays.extend([
+                &v.patch_ln1_w,
+                &v.patch_ln1_b,
+                &v.patch_dense_w,
+                &v.patch_dense_b,
+                &v.patch_ln2_w,
+                &v.patch_ln2_b,
+                &v.pos_row,
+                &v.pos_col,
+                &v.pos_norm_w,
+                &v.pos_norm_b,
+                &v.proj_w,
+            ]);
+        }
+        if let Some(a) = &model.audio {
+            arrays.push(&a.proj_w);
+        }
+        mlx_rs::transforms::eval(arrays)?;
         Ok(model)
     }
 }

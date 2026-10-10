@@ -6,6 +6,31 @@
 
 use thiserror::Error;
 
+/// Exact, backend-neutral evidence for request admission that failed before native allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestResourceExhausted {
+    /// Actual prompt tokens after template rendering and visual expansion.
+    pub prompt_tokens: usize,
+    /// Requested generation budget.
+    pub max_new_tokens: u32,
+    /// Provider-advertised architectural context limit.
+    pub max_context_tokens: usize,
+    /// Checked native workspace estimate for this request.
+    pub required_bytes: u64,
+    /// Fresh observed capacity after applying the operational cap.
+    pub available_bytes: u64,
+}
+
+impl std::fmt::Display for RequestResourceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "request requires an estimated {} bytes of native workspace but only {} bytes are available; reduce prompt/media length or max_new_tokens",
+            self.required_bytes, self.available_bytes
+        )
+    }
+}
+
 /// Errors surfaced across the contract.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -21,6 +46,10 @@ pub enum Error {
     /// The request was invalid for this provider (out-of-bounds knob, unsupported field, …).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    /// An architecturally valid request exceeded the measured preallocation memory budget.
+    #[error("invalid request: {0}")]
+    RequestResourceExhausted(RequestResourceExhausted),
 
     /// A requested capability is genuinely unsupported (keep typed; do not stringify).
     #[error("unsupported: {0}")]

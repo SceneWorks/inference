@@ -21,3 +21,7 @@ name = "core_llm_testkit"
 core-llm = { path = ".." }
 # Build the JSON-Schema for the tool-calling check's sample tool (`ToolSpec::parameters`). Tensor-free.
 serde_json = "1"
+
+[dev-dependencies]
+# Self-removing roots for the benchmark document's write test (sc-24433).
+tempfile = { workspace = true }

@@ -2,6 +2,7 @@
 #   LICENSE is in incl_licenses directory.
 
 import os
+import pickle
 
 import torch
 from torch.nn.utils import weight_norm
@@ -26,6 +27,9 @@ def get_padding(kernel_size, dilation=1):
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)
     print(f"Loading '{filepath}'")
-    checkpoint_dict = torch.load(filepath, map_location=device)
+    try:
+        checkpoint_dict = torch.load(filepath, map_location=device, weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{filepath}: unsupported checkpoint object; provide tensor-only weights") from exc
     print("Complete.")
     return checkpoint_dict
