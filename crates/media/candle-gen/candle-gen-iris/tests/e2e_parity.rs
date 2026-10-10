@@ -1,13 +1,14 @@
 //! End to end vs upstream `iris3b.sampling.generate` on the miniature snapshot: tokenize the prompt
-//! and the empty negative through the template → Qwen3-VL (bf16, as released) → FP32 backbone →
-//! FlowDPM-Solver++ with CFG → clamp, from the same injected noise. The MLX twin's `e2e_parity`
-//! fixture and bound.
+//! and the empty negative through the template → Qwen3-VL → FP32 backbone → FlowDPM-Solver++ with
+//! CFG → clamp, from the same injected noise. The MLX twin's `e2e_parity` fixture and bound.
 //!
-//! Tolerance: the backbone and solver run FP32 on Candle CPU (true f32, like the oracle); the text
-//! tower is bf16 on both sides and differs by bf16 ulps there (see `text_parity`), which flows
+//! Tolerance: the backbone and solver run FP32 on Candle CPU (true f32, like the oracle). The
+//! oracle runs the text tower in bf16 (the release's `text_encoder.dtype`), but the Candle CPU
+//! backend has no half-precision GEMM, so here the tower runs f32 (`tower_dtype`); the conditioning
+//! distance is therefore upstream's own bf16-vs-fp32 envelope (see `text_parity`), and it flows
 //! through every CFG-amplified network evaluation. Bound 6e-2 on the [−1, 1] image (upstream's own
-//! bf16-vs-fp32 tower moves this image by max |Δ| 4.0e-2). The FP32
-//! backbone and solver alone are held to 1e-4 / 1e-5 by `dit_parity` / `solver_parity`.
+//! bf16-vs-fp32 tower moves this image by max |Δ| 4.0e-2). The FP32 backbone and solver alone are
+//! held to 1e-4 / 1e-5 by `dit_parity` / `solver_parity`.
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::iris::GenerationParams;

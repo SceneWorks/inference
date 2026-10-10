@@ -21,8 +21,7 @@ use std::time::Instant;
 use mlx_gen::gen_core::iris::restoration::{plan_request, restore_detailed, TileGeometry};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, Transform, TransformRequest,
-    WeightsSource,
+    Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, TransformRequest, WeightsSource,
 };
 use mlx_gen_iris::IrisRestorer;
 
@@ -142,7 +141,10 @@ fn real_restoration_matches_upstream() {
         &req.cancel,
         &mut |p| {
             if let Progress::Step { current, total } = p {
-                eprintln!("tile {current}/{total} at {:.1}s", t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "tile {current}/{total} at {:.1}s",
+                    t0.elapsed().as_secs_f64()
+                );
                 ticks.push(current);
             }
         },
@@ -180,8 +182,8 @@ fn real_restoration_matches_upstream() {
 #[test]
 #[ignore = "needs the upscaler export (IRIS_UPSCALER_DIR)"]
 fn real_small_restoration_matches_upstream() {
-    let golden = Weights::from_file(fixtures().join("iris_restoration_real_small.safetensors"))
-        .unwrap();
+    let golden =
+        Weights::from_file(fixtures().join("iris_restoration_real_small.safetensors")).unwrap();
     let registry = mlx_gen_iris::provider_registry().unwrap();
     let t0 = Instant::now();
     let restorer = registry.load_transform("iris_3b_restore", &spec()).unwrap();
@@ -195,7 +197,9 @@ fn real_small_restoration_matches_upstream() {
     let t0 = Instant::now();
     let mut steps = 0;
     let image = restorer
-        .apply(&req, &mut |p| steps += matches!(p, Progress::Step { .. }) as u32)
+        .apply(&req, &mut |p| {
+            steps += matches!(p, Progress::Step { .. }) as u32
+        })
         .unwrap();
     eprintln!(
         "restore 64x48 -> {}x{}: {:.1}s, {steps} tiles",

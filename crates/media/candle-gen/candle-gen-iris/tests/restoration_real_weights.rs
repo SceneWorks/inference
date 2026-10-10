@@ -20,8 +20,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_gen::gen_core::{
-    Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, Transform, TransformRequest,
-    WeightsSource,
+    Image, InputSizing, LoadSpec, Precision, Progress, TargetSize, TransformRequest, WeightsSource,
 };
 use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
 
@@ -162,7 +161,10 @@ fn real_small_restoration_matches_upstream() {
          {own_psnr:.1} dB)"
     );
     let bound = if fp32() { 0.5 } else { 1.5 * own_mean };
-    assert!(mean <= bound, "mean RGB8 distance {mean:.3} exceeds {bound:.3}");
+    assert!(
+        mean <= bound,
+        "mean RGB8 distance {mean:.3} exceeds {bound:.3}"
+    );
 }
 
 /// Release-scale timing render: the small reference input nearest-upsampled 8x to 512x384, then the
