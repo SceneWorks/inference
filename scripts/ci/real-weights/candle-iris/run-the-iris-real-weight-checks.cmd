@@ -18,4 +18,3 @@ cargo test --locked --release -p candle-gen-iris --features cuda --test integrat
 type "%log%"
 findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test - a rename would make this step vacuously green & exit /b 1)
 exit /b 0
-
