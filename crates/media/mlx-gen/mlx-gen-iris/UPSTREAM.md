@@ -240,5 +240,5 @@ the committed upstream reference of the small case (RGB8 only), so the CUDA job 
 
 | Case | Upstream bf16 vs fp32 (the bound's basis) | MLX bf16 vs upstream fp32 | Candle CUDA bf16 vs upstream fp32 |
 | --- | --- | --- | --- |
-| 512×384 → 2048×1536 (6 tiles), machine-local golden | max 68, mean 0.521, PSNR 47.7 dB | max 60, mean 0.423, PSNR 49.0 dB (restore 10.8 s, peak footprint 11.7 GB) | — (no Python oracle on the runner; release-scale render report-only) |
-| 64×48 → 256×192 (enlarged, 2 tiles), committed | max 23, mean 0.522, PSNR 48.1 dB | max 19, mean 0.459, PSNR 48.7 dB | recorded by the `candle-iris` job |
+| 512×384 → 2048×1536 (6 tiles), machine-local golden | max 68, mean 0.521, PSNR 47.7 dB | max 60, mean 0.423, PSNR 49.0 dB (restore 10.8 s, peak footprint 11.7 GB) | — (no Python oracle on the runner): release-scale render 512×384 → 2048×1536, 6 tiles in 2.6 s, VRAM peak 10.1 GB |
+| 64×48 → 256×192 (enlarged, 2 tiles), committed | max 23, mean 0.522, PSNR 48.1 dB | max 19, mean 0.459, PSNR 48.7 dB | max 23, mean 0.701, PSNR 46.0 dB (bound 0.783; restore 1.0 s, VRAM peak 10.1 GB; run 38085270480) |
