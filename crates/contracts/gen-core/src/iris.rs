@@ -15,6 +15,8 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod train;
+
 /// GitHub `speridlabs/iris-3b` commit the port mirrors (model, pipeline, text conditioning, solver).
 pub const UPSTREAM_CODE_REVISION: &str = "a8d15239dea469aba042cfa56ca3bb4e450d5ebc";
 /// Hugging Face `speridlabs/iris-3b` revision (weights + `config.yaml` for every task).

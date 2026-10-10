@@ -29,6 +29,7 @@ pub mod nn;
 pub mod pipeline;
 pub mod solver;
 pub mod text_encoder;
+pub mod train;
 
 pub use dit::{IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{
@@ -43,7 +44,9 @@ pub use text_encoder::{IrisTextEncoder, TextConditioning};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry.register_generator(model::REGISTRATION)
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_trainer(train::REGISTRATION)
 }
 
 /// Build the complete explicit MLX Iris provider catalog.

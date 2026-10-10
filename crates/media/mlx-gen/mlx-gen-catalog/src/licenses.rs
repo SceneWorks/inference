@@ -36,7 +36,7 @@
 //!
 //! # Trainers share their generator's row
 //!
-//! All seventeen registered MLX trainer ids are also generator ids, and
+//! All eighteen registered MLX trainer ids are also generator ids, and
 //! [`ProviderComponents::provider_id`] is unique across the table — duplicates are rejected by
 //! [`gen_core::license_table_conformance_errors`] because
 //! they are not byte-stable under the manifest's stable sort. One row therefore serves both
@@ -83,7 +83,7 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 62 rows over 72 registered ids: the seventeen trainer ids reuse their generator's row, and ten ids
+/// 62 rows over 72 registered ids: the eighteen trainer ids reuse their generator's row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -989,7 +989,7 @@ mod tests {
         }
     }
 
-    /// One row per id, and the seventeen trainer registrations reuse their generator's row rather than
+    /// One row per id, and the eighteen trainer registrations reuse their generator's row rather than
     /// duplicating it — `provider_id` is unique across the table, so they have to.
     #[test]
     fn trainer_ids_reuse_their_generator_row() {
@@ -1003,7 +1003,8 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(trainers.len(), 17);
+        // sc-25685 adds the `iris_3b` trainer (it reuses the iris_3b generator row).
+        assert_eq!(trainers.len(), 18);
         for id in &trainers {
             assert!(
                 generators.contains(id),

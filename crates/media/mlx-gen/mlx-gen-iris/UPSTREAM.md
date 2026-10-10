@@ -63,6 +63,47 @@ and is held to the same fixtures.
 | Output `clamp(−1, 1)` → `[0, 255]` (torchvision `save_image(normalize, value_range=(−1,1))`) | `generate`, `sample.py` | `pipeline.rs` `to_image` | `pipeline.rs` `to_image` (nearest-even rounding) | ported (`round(255·(x+1)/2)`) |
 | Noise `torch.randn` on the generator device | `generate` | seeded MLX normal (repo convention) | launch-portable CPU `StdRng` (`candle_gen::seed`) — not bit-reproducible with torch or MLX; parity uses injected noise | **not bit-reproducible** with torch RNG; parity is measured with injected noise |
 
+## Generation training coverage table (sc-25685)
+
+The backend-neutral half (request surface, plan, positional randomness, schedule, data walk and
+preprocessing, Muon routing, random-init law, artifact schemas, checkpoint layout) is
+`gen_core::iris::train`; the MLX half is `src/train/`. Oracle: `../tools/dump_iris_train.py`
+(frozen `train/*.py`, `flow/*.py`, `seeding.py` sha256-pinned; Dion `microsoft/dion@58d38adb`, the
+commit upstream's `pyproject.toml` pins). The release ships no downstream training loop; generation
+training follows `train/trainer.py`. Upstream trains no adapters: LoRA/LoKr are the standard PEFT /
+LyCORIS parameterizations over the frozen upstream Linears, under the same objective and loop.
+
+| Upstream behaviour | Source | MLX (`src/train`, `gen_core::iris::train`) | Candle | Status |
+| --- | --- | --- | --- | --- |
+| Rectified-flow loss: `x_t = (1−σ)x0 + σε`, target `ε − x0`, per-sample MSE then mean; v- or x-prediction (`v̂ = (x_t − x̂0)/max(σ, x_pred_sigma_min)`) | `flow/transport.py` | `model::flow_loss` | S8 | ported; `loss_v`/`loss_x` fixtures 3e-7 |
+| 1000-point shifted training grid, integer-truncated model time; `shift_law` none/sd3/flux | `flow/schedule.py` | `TrainSchedule`, `resolution_shift` | S8 | ported (f64, exact values pinned) |
+| Logit-normal / uniform timestep index sampling | `flow/timesteps.py` | `TimestepSampler` (from `TrainingConfig::timestep_type`) | S8 | ported law; draws from the host positional RNG (not torch's stream) |
+| Positional seeding `mix_seed(seed, rank, epoch, position)` for dropout/timesteps/noise; caption choice `mix_seed(seed, epoch, idx)` | `seeding.py`, `trainer.py`, `datasets.py` | `mix_seed` (values pinned), `batch_seed`, `caption_seed`, `HostRng` | S8 (same host draws ⇒ same samples) | ported; RNG stream is SplitMix64/Box–Muller, identical on both backends |
+| CFG caption dropout → the `null("")` states AND mask per dropped row | `trainer.py` | `Run::batch` | S8 | ported; mutation-tested |
+| Frozen Qwen3-VL conditioning, encoded on the fly | `trainer.py` | `text_conditioning: on_the_fly` (default) or the bit-identical `cached` memo | S8 | ported; on-the-fly == cached bit for bit |
+| `on_caption_overflow` warn / error / silent | `text/qwen3_vl.py` | `TextSource::encode` (option `on_caption_overflow`) | S8 | ported |
+| Fixed-square data policy: shortest-side PIL bicubic resize, center crop, `[−1, 1]` | `data/datasets.py` | `preprocess_image` (PIL-exact `resize_bicubic_u8`) | S8 | ported (bucket/area policies: S11) |
+| Single-device ranged walk (`chunks = min(640, n)`, tail beyond `chunks·⌊n/chunks⌋` unassigned, last partial batch kept) | `data/samplers.py` | `DataWalk` | S8 | ported (note: 641–1279 items cover only 640) |
+| `caption_field` / `caption_fields` (uniform among present fields) | `data/datasets.py` | `select_caption`, item `model_options.captions` | S8 | ported |
+| Gradient accumulation (`loss / grad_accum`; windows counted globally across epochs, accelerate) | `trainer.py` + accelerate | `Window` | S8 | ported; oracle-checked |
+| `clip_grad_norm_(0.5)` | `trainer.py` | `optim::clip_grads` | S8 | ported |
+| EMA `p_ema = d·p_ema + (1−d)·p`, updated from the **pre-step** weights | `train/ema.py`, `trainer.py` | `optim::ema_update` in `Window::update` | S8 | ported; mutation-tested |
+| AdamW (betas, eps 1e-8, decoupled wd, bias correction) | `train/optim.py` | `IrisOptimizer` (`Slot::Adam`) | S8 | ported; rel ≤ 1e-2 (near-zero-gradient elements: f32 noise × m/√v) |
+| Hybrid Muon: hidden matrices orthogonalized (bf16 quintic Newton–Schulz, Nesterov μ = 0.95, `rms_norm` lr adjust, fused QKV / shared adaLN cores split per row block with per-block lr scales), AdamW for embeddings/heads/vectors/boundary matrices | `train/optim.py` + Dion `Muon` | `IrisOptimizer` (`Slot::Muon`), `full_param_route` | S8 | ported; rel ≤ 3e-2 (bf16 NS rounding); low-rank adaLN-core updates bounded by per-block norms (see `train_parity`) |
+| Parameters that get no gradient (the discarded text tail of a final dual block under `keep`) are skipped | torch `grad is None` | `ParamRoute::Frozen` | S8 | ported |
+| `LambdaLR` constant / cosine, warmup ramping from **0** | `train/lr.py` | `lr_factor` | S8 | ported (linear: refused) |
+| `scale_lr` auto_lr none/sqrt/linear | `train/optim.py` | `scale_lr` | S8 | ported |
+| Mixed precision bf16 autocast over f32 masters / `no` | accelerate | `TrainingConfig::train_dtype` bf16 / f32 (fp16 refused) | S8 | ported (the provider's autocast policy, traced casts) |
+| Random init (`initialize_weights`: xavier patch embed, N(0,.02) timestep MLP, zero head, adaLN-zero, kaiming Linear, ones norms, N(0,1) text positions) | `models/dit.py` | `init_kind`, `random_init` | S8 | ported law (MLX RNG) |
+| Weights-only start (`load_from`) | `trainer.py` | `init: weights` / `load_from` | S8 | ported |
+| Checkpoint: model + EMA + optimizer + scheduler + step + epoch + data position + RNG, atomic temp+rename, `latest` | `train/ckpt.py` | `CheckpointState`, `publish_checkpoint` | S8 | ported; cancel+resume bit-exact (full/Muon, LoRA/accum) |
+| Retention `keep_last_checkpoints` + `milestone_steps` | `train/ckpt.py` | `prune_checkpoints` | S8 | ported |
+| `resume_data_policy` exact / new_phase, `override_lr_on_resume` | `trainer.py` | `check_resume`, `Run::prepare` | S8 | ported |
+| `nan_loss_tolerance` (drop the window, abort past the tolerance) | `trainer.py` | `Run::execute` | S8 | ported |
+| Validation samples from the training state (seeded, 100 steps, CFG 3 at the stage size) | `trainer.py` `_render_validation` | `TrainingProgress::Sample` (steps / cfg / prompts from the request, `preview_weights` raw or EMA) | S8 | ported (upstream renders raw; EMA selectable) |
+| Export: `config.yaml` (model/text_encoder/flow) + `model.safetensors` (EMA, else raw; fp32 or bf16) | `scripts/export_checkpoint.py` | `Run::export`, `export_config_yaml` | S8 | ported; loads in the provider |
+| `activation_checkpointing`, REPA/iREPA, bucket/area shapes, stage presets, frozen-grid holdout validation, distributed training, fp16 | `trainer.py` etc. | refused (typed) | — | S11 |
+
 ## Precision
 
 Upstream samples on CUDA under `torch.autocast(bfloat16)` over FP32 parameters (and in plain FP32 on
