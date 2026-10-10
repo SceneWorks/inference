@@ -159,4 +159,6 @@ upstream FP32 CPU as the reference. Upstream's OWN bf16-autocast distance on tha
 max 4.6e-2 / pearson 0.99999. Native MLX bf16 (Apple GPU): model input exact; full-res mean 2.5e-3 /
 max 0.31 (fur edges) / pearson 0.99999; pooled mean 2.3e-3 / max 4.2e-2; from the `image`-crate JPEG
 decode (not PIL) pooled mean 3.3e-3 / max 7.0e-2. Bounds: pearson ≥ 0.9995, mean ≤ 1e-2, pooled max
-≤ 0.15. The Candle/CUDA job (`iris` profile) checks the same pooled reference.
+≤ 0.15. The Candle/CUDA job (`iris` profile) checks the same pooled reference: bf16 on `cuda:0`
+(`image`-crate decode) measured pooled mean 2.8e-3 / max 0.11 / pearson 0.99999, 0.4 s estimate,
+8.4 GB VRAM peak (run 38076560406).
