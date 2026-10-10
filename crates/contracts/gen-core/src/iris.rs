@@ -15,8 +15,8 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
-pub mod train;
 mod tables;
+pub mod train;
 pub use tables::{
     key_padding_additive, pixel_sincos_table, rope_1d_angles, rope_2d_angles, timestep_freqs,
     TIMESTEP_FREQUENCY_DIM,
