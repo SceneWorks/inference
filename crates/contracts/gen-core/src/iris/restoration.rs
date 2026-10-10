@@ -17,20 +17,16 @@
 //! The backend owns only `velocity(tile) -> v`; tile iteration, cancellation between tiles and
 //! per-tile progress are here.
 
-use std::path::{Path, PathBuf};
-
-use super::{yaml, IrisConfig, BACKBONE_CONFIG_FILE, BACKBONE_WEIGHTS_FILE, UPSTREAM_WEIGHTS_REPO};
+pub use super::downstream::{EmptyPrompt, EMPTY_PROMPT_FILE};
+use super::downstream::{TaskExport, TaskSettings};
+use super::{IrisConfig, IrisTask};
 use crate::media::Image;
-use crate::runtime::{CancelFlag, LoadSpec, Progress, WeightsSource};
+use crate::runtime::{CancelFlag, LoadSpec, Progress};
 use crate::transform::{InputBudget, InputSizing, TargetSize, TransformRequest};
 use crate::{Error, Result};
 
 /// Registry id of the Iris-3B restoration transform.
 pub const MODEL_ID: &str = "iris_3b_restore";
-/// The export's `task.name` (`scripts/export_downstream.py`).
-pub const TASK_NAME: &str = "restoration";
-/// `empty_prompt.safetensors`: `embeddings` `[1, T, L, D]` F32 and `mask` `[1, T]` BOOL.
-pub const EMPTY_PROMPT_FILE: &str = "empty_prompt.safetensors";
 /// `Restorer.__call__(scale=4.0)` — the release default.
 pub const DEFAULT_SCALE: f64 = 4.0;
 /// `fit_budget(short_side=512, long_side=1024)` — `scripts/upscale.py`'s default input budget.
@@ -61,38 +57,19 @@ pub struct RestorationSettings {
 }
 
 impl RestorationSettings {
-    /// Parse the `task` section of `config.yaml` text, refusing every other task's export by name:
-    /// a file with no `task` section is the **generation** backbone, `task.name: depth` the depth
-    /// export — both are typed refusals, never a restoration attempt (`load_export`'s check).
-    pub fn parse(text: &str, model_id: &str) -> Result<Self> {
-        let root = yaml::parse(text)?;
-        let Some(task) = root.get("task") else {
-            return Err(Error::Unsupported(format!(
-                "{model_id}: this config.yaml has no `task` section — it is the Iris-3B generation \
-                 backbone, not the restoration export (stage the `upscaler/` folder of \
-                 {UPSTREAM_WEIGHTS_REPO})"
-            )));
+    /// Read `sigma` / `tile` from the export's `task` section (task identity is already checked by
+    /// [`TaskExport`]: a generation checkpoint or a depth export never reaches this).
+    pub fn from_task(task: &TaskSettings, model_id: &str) -> Result<Self> {
+        let get = |key: &str| {
+            task.get(key)
+                .ok_or_else(|| Error::Msg(format!("{model_id}: config.yaml task.{key} is missing")))
         };
-        let name = task
-            .get("name")
-            .ok_or_else(|| Error::Msg(format!("{model_id}: config.yaml task.name is missing")))?
-            .as_str("task.name")?;
-        if name != TASK_NAME {
-            return Err(Error::Unsupported(format!(
-                "{model_id}: this export holds a {name:?} task, not {TASK_NAME:?} — stage the \
-                 `upscaler/` folder of {UPSTREAM_WEIGHTS_REPO}"
-            )));
-        }
-        let sigma = task
-            .get("sigma")
-            .ok_or_else(|| Error::Msg(format!("{model_id}: config.yaml task.sigma is missing")))?
-            .as_f64("task.sigma")?;
-        let tile = task
-            .get("tile")
-            .ok_or_else(|| Error::Msg(format!("{model_id}: config.yaml task.tile is missing")))?
-            .as_usize("task.tile")?;
-        let tile = u32::try_from(tile)
-            .map_err(|_| Error::Msg(format!("{model_id}: task.tile {tile} is out of range")))?;
+        let sigma: f64 = get("sigma")?
+            .parse()
+            .map_err(|_| Error::Msg(format!("{model_id}: task.sigma is not a number")))?;
+        let tile: u32 = get("tile")?
+            .parse()
+            .map_err(|_| Error::Msg(format!("{model_id}: task.tile is not a positive integer")))?;
         Ok(Self { sigma, tile })
     }
 
@@ -136,141 +113,46 @@ impl RestorationSettings {
     }
 }
 
-/// The resolved, existence- and identity-checked resources of the restoration task.
+/// The resolved, identity-checked resources of the restoration task: the shared downstream export
+/// closure ([`TaskExport`], the `upscaler/` folder) plus its validated `task` settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RestorationResources {
-    /// The export directory (`config.yaml` + `model.safetensors` + `empty_prompt.safetensors`).
-    pub dir: PathBuf,
-    pub config: IrisConfig,
+    pub export: TaskExport,
     pub settings: RestorationSettings,
 }
 
 impl RestorationResources {
     /// Resolve the restoration task from a load spec: `spec.weights` is the `upscaler/` export
-    /// directory. The task runs **without** the text encoder (E4), so a `text_encoder` component —
-    /// or any other — is refused, as is a generation/depth export staged in its place.
+    /// directory. The task runs **without** the text encoder (E4), so any component — or a
+    /// generation / depth export staged in its place — is a typed refusal ([`TaskExport`]).
     pub fn from_spec(spec: &LoadSpec, model_id: &str) -> Result<Self> {
-        if spec.components.contains_key(super::TEXT_ENCODER_COMPONENT) {
-            return Err(Error::Unsupported(format!(
-                "{model_id}: restoration runs on the shipped empty-prompt states and never loads \
-                 the text encoder — drop the '{}' component",
-                super::TEXT_ENCODER_COMPONENT
-            )));
-        }
-        crate::control::reject_unknown_components(spec, &[], model_id)?;
-        let dir = match &spec.weights {
-            WeightsSource::Dir(dir) => dir.clone(),
-            WeightsSource::File(file) => {
-                return Err(Error::Msg(format!(
-                    "{model_id}: the restoration resource must be the export directory holding \
-                     {BACKBONE_CONFIG_FILE} + {BACKBONE_WEIGHTS_FILE} + {EMPTY_PROMPT_FILE} (the \
-                     `upscaler/` folder of {UPSTREAM_WEIGHTS_REPO}), not the single file {}",
-                    file.display()
-                )))
-            }
-        };
-        Self::from_dir(&dir, model_id)
+        Self::checked(
+            TaskExport::from_spec(spec, IrisTask::Restoration, model_id)?,
+            model_id,
+        )
     }
 
-    /// Read and check one export directory.
-    pub fn from_dir(dir: &Path, model_id: &str) -> Result<Self> {
-        if !dir.is_dir() {
-            return Err(Error::Msg(format!(
-                "{model_id}: the restoration export directory {} does not exist",
-                dir.display()
-            )));
-        }
-        let config_path = dir.join(BACKBONE_CONFIG_FILE);
-        let text = std::fs::read_to_string(&config_path).map_err(|e| {
-            Error::Msg(format!(
-                "{model_id}: the restoration export is incomplete — read {}: {e}",
-                config_path.display()
-            ))
-        })?;
-        // Task identity first: a generation or depth export is named as such, not reported as a
-        // missing empty prompt.
-        let settings = RestorationSettings::parse(&text, model_id)?;
-        let config = IrisConfig::parse(&text)
-            .map_err(|e| Error::Msg(format!("iris: {}: {e}", config_path.display())))?;
-        config.validate_supported()?;
-        settings.validate(&config, model_id)?;
-        for name in [BACKBONE_WEIGHTS_FILE, EMPTY_PROMPT_FILE] {
-            let path = dir.join(name);
-            if !path.is_file() {
-                return Err(Error::Msg(format!(
-                    "{model_id}: the restoration export is incomplete — {} is missing",
-                    path.display()
-                )));
-            }
-        }
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            config,
-            settings,
-        })
+    /// [`Self::from_spec`] on a directory.
+    pub fn from_dir(dir: &std::path::Path, model_id: &str) -> Result<Self> {
+        Self::checked(
+            TaskExport::from_dir(dir, IrisTask::Restoration, model_id)?,
+            model_id,
+        )
+    }
+
+    fn checked(export: TaskExport, model_id: &str) -> Result<Self> {
+        let settings = RestorationSettings::from_task(&export.settings, model_id)?;
+        settings.validate(&export.config, model_id)?;
+        Ok(Self { export, settings })
+    }
+
+    pub fn config(&self) -> &IrisConfig {
+        &self.export.config
     }
 
     /// Read the shipped empty-prompt states.
     pub fn empty_prompt(&self) -> Result<EmptyPrompt> {
-        EmptyPrompt::read(&self.dir.join(EMPTY_PROMPT_FILE), &self.config)
-    }
-}
-
-/// The shipped empty-prompt conditioning (`embeddings` `[1, T, L, D]` F32, `mask` `[1, T]`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct EmptyPrompt {
-    /// Row-major `[1, T, L, D]`.
-    pub embeddings: Vec<f32>,
-    pub shape: [usize; 4],
-    /// `T` 0/1 flags.
-    pub mask: Vec<i32>,
-}
-
-impl EmptyPrompt {
-    /// Read and shape-check `empty_prompt.safetensors` against the backbone (`T = model.text_len`,
-    /// `L = model.text_lap_num_layers`, `D = model.text_dim`).
-    pub fn read(path: &Path, config: &IrisConfig) -> Result<Self> {
-        use safetensors::{Dtype, SafeTensors};
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::Msg(format!("iris: read {}: {e}", path.display())))?;
-        let st = SafeTensors::deserialize(&bytes)
-            .map_err(|e| Error::Msg(format!("iris: {}: {e}", path.display())))?;
-        let get = |name: &str| {
-            st.tensor(name)
-                .map_err(|_| Error::MissingTensor(format!("{name} (in {})", path.display())))
-        };
-        let emb = get("embeddings")?;
-        let mask = get("mask")?;
-        let m = &config.model;
-        let want = [1, m.text_len, m.text_lap_num_layers, m.text_dim];
-        if emb.dtype() != Dtype::F32 || emb.shape() != want {
-            return Err(Error::Msg(format!(
-                "iris: {}: embeddings must be F32 {want:?}, got {:?} {:?}",
-                path.display(),
-                emb.dtype(),
-                emb.shape()
-            )));
-        }
-        if mask.dtype() != Dtype::BOOL || mask.shape() != [1, m.text_len] {
-            return Err(Error::Msg(format!(
-                "iris: {}: mask must be BOOL [1, {}], got {:?} {:?}",
-                path.display(),
-                m.text_len,
-                mask.dtype(),
-                mask.shape()
-            )));
-        }
-        let embeddings = emb
-            .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        let mask = mask.data().iter().map(|&b| i32::from(b != 0)).collect();
-        Ok(Self {
-            embeddings,
-            shape: want,
-            mask,
-        })
+        self.export.empty_prompt()
     }
 }
 
@@ -1122,6 +1004,7 @@ pub fn restore_detailed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::WeightsSource;
 
     fn opts(scale: f64, input_sizing: InputSizing) -> RestorationOptions {
         RestorationOptions {
@@ -1294,20 +1177,29 @@ mod tests {
 
     #[test]
     fn wrong_task_exports_are_refused() {
-        let generation = "model:\n  block: single_stream\n";
-        let err = RestorationSettings::parse(generation, MODEL_ID).unwrap_err();
+        let export = |config: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.yaml"), config).unwrap();
+            std::fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+            std::fs::write(dir.path().join(EMPTY_PROMPT_FILE), b"").unwrap();
+            RestorationResources::from_dir(dir.path(), MODEL_ID)
+        };
+        let err = export("model:\n  block: single_stream\n").unwrap_err();
         assert!(
             matches!(&err, Error::Unsupported(m) if m.contains("generation")),
             "{err}"
         );
-        let depth = "model:\n  block: single_stream\ntask:\n  name: depth\n";
-        let err = RestorationSettings::parse(depth, MODEL_ID).unwrap_err();
+        let err = export("model:\n  block: single_stream\ntask:\n  name: depth\n").unwrap_err();
         assert!(
-            matches!(&err, Error::Unsupported(m) if m.contains("\"depth\"")),
+            matches!(&err, Error::Unsupported(m) if m.contains("'depth'")),
             "{err}"
         );
         let ok = "task:\n  name: restoration\n  sigma: 0.5\n  tile: 1024\n";
-        let s = RestorationSettings::parse(ok, MODEL_ID).unwrap();
+        let task = super::super::downstream::parse_task_settings(ok)
+            .unwrap()
+            .unwrap();
+        let s = RestorationSettings::from_task(&task, MODEL_ID).unwrap();
+        assert_eq!(export(ok).unwrap().settings, s);
         assert_eq!(
             s,
             RestorationSettings {

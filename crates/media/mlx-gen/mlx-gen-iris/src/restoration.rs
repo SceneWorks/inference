@@ -102,13 +102,17 @@ impl IrisRestorer {
         refuse_unsupported_spec(spec)?;
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
         let prompt = resources.empty_prompt()?;
-        let dit = load_backbone(&resources.dir, &resources.config, compute_dtype(spec))?;
+        let dit = load_backbone(
+            &resources.export.dir,
+            &resources.export.config,
+            compute_dtype(spec),
+        )?;
         let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
         let states = Array::from_slice(&prompt.embeddings, &shape);
         eval([&states])?;
         Ok(Self {
             descriptor: descriptor(),
-            config: resources.config,
+            config: resources.export.config,
             settings: resources.settings,
             dit,
             states,

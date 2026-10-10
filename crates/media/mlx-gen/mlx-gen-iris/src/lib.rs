@@ -15,6 +15,11 @@
 //! [`load_backbone`] never touch the text encoder, so the depth and restoration tasks reuse them
 //! with their own (encoder-free) conditioning.
 //!
+//! The monocular-depth task ([`depth`], [`depth::DEPTH_MODEL_ID`] = `iris_3b_depth`, sc-25682) is a
+//! provider-specific API (like the catalog's other depth estimator), not a registry generator: it
+//! returns a float32 relative-log-depth map, not an image. [`depth::load`] resolves only the
+//! `depth/` export and returns a `gen_core::iris::depth::IrisDepthEstimator`.
+//!
 //! ## Frozen upstream
 //!
 //! See `UPSTREAM.md` (revisions, resource layout, the generation coverage table, fixtures and
@@ -23,6 +28,7 @@
 //!
 //! [`gen_core::iris`]: mlx_gen::gen_core::iris
 
+pub mod depth;
 pub mod dit;
 pub mod model;
 pub mod nn;

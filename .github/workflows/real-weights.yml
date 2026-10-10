@@ -4928,12 +4928,14 @@ jobs:
   #
   # WHAT IT PROVISIONS. Two pinned snapshots through `ensure_model_snapshot.py` INTO the runner's
   # persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`), fetched once and only verified after:
-  #   * `iris-3b-cuda`               speridlabs/iris-3b @ 74454433…  generation backbone (~12 GB) +
-  #                                  the `upscaler/` restoration export (~12 GB, sc-25683)
+  #   * `iris-3b-cuda`               speridlabs/iris-3b @ 74454433…  generation backbone + the
+  #                                  `depth/` (sc-25682) and `upscaler/` (sc-25683) exports, ~12 GB each
   #   * `qwen3-vl-4b-instruct-cuda`  Qwen/Qwen3-VL-4B-Instruct @ ebb281ec…             (~9 GB)
   #
   # WHAT IT RUNS. The pinned-tokenizer check and ONE production-path render through the catalog
-  # (`iris_3b` at the release defaults: 1024², 100 steps, CFG 3), each `--exact` with a run-count
+  # (`iris_3b` at the release defaults: 1024², 100 steps, CFG 3) plus ONE depth estimate
+  # (`iris_3b_depth`, sc-25682) of the repo photo at the default max side, checked against the
+  # committed upstream FP32 reference — each `--exact` with a run-count
   # assertion, writing the PNG + log + a report-only `nvidia-smi` VRAM line into the evidence
   # artifact. sc-25683 adds the restoration transform (`iris_3b_restore`): the 64x48 → 256x192
   # parity case against the committed upstream reference (two 1024-px tiles) and one release-scale

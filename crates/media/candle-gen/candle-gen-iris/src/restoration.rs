@@ -100,15 +100,15 @@ impl IrisRestorer {
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
         let prompt = resources.empty_prompt()?;
         let dit = load_backbone(
-            &resources.dir,
-            &resources.config,
+            &resources.export.dir,
+            &resources.export.config,
             compute_dtype(spec),
             device,
         )?;
         let states = Tensor::from_vec(prompt.embeddings, prompt.shape.to_vec(), device)?;
         Ok(Self {
             descriptor: descriptor(),
-            config: resources.config,
+            config: resources.export.config,
             settings: resources.settings,
             dit,
             states,

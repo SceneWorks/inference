@@ -15,6 +15,8 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod depth;
+pub mod downstream;
 pub mod restoration;
 
 /// GitHub `speridlabs/iris-3b` commit the port mirrors (model, pipeline, text conditioning, solver).
@@ -30,6 +32,8 @@ pub const TEXT_ENCODER_REVISION: &str = "ebb281ec70b05090aa6165b016eac8ec08e71b1
 
 /// Registry id of the Iris-3B text-to-image route (the SceneWorks worker's `payload.model`).
 pub const GENERATION_MODEL_ID: &str = "iris_3b";
+/// Model id of the Iris-3B monocular-depth task (the `depth/` export; see [`depth`]).
+pub const DEPTH_MODEL_ID: &str = "iris_3b_depth";
 /// Descriptor family shared by every Iris task and backend.
 pub const FAMILY: &str = "iris";
 

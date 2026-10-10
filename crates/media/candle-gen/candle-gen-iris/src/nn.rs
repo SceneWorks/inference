@@ -95,6 +95,8 @@ pub fn split_at(x: &Tensor, axis: usize, at: usize) -> Result<(Tensor, Tensor)> 
 /// recorded and a leftover (or missing) key is a load error naming it.
 pub struct Checkpoint {
     vb: VarBuilder<'static>,
+    /// Key prefix of this view (`""` for the whole file); `keys` are stored without it.
+    prefix: String,
     keys: BTreeSet<String>,
     used: RefCell<BTreeSet<String>>,
 }
@@ -102,10 +104,20 @@ pub struct Checkpoint {
 impl Checkpoint {
     /// mmap `file` onto `device` (tensors are read one at a time at f32, then cast by the caller).
     pub fn open(file: &Path, device: &Device) -> Result<Self> {
-        let keys = safetensors_keys(file)?;
+        Self::open_prefixed(file, device, "")
+    }
+
+    /// The view of `file` under `prefix` (e.g. the depth export's `pixel.` backbone): keys are
+    /// taken and reported without the prefix, and keys outside it are not part of this view.
+    pub fn open_prefixed(file: &Path, device: &Device, prefix: &str) -> Result<Self> {
+        let keys = safetensors_keys(file)?
+            .into_iter()
+            .filter_map(|k| k.strip_prefix(prefix).map(str::to_owned))
+            .collect();
         let vb = candle_gen::mmap_var_builder(&[file.to_path_buf()], DType::F32, device)?;
         Ok(Self {
             vb,
+            prefix: prefix.to_owned(),
             keys,
             used: RefCell::new(BTreeSet::new()),
         })
@@ -120,7 +132,7 @@ impl Checkpoint {
             )));
         }
         self.used.borrow_mut().insert(key.to_owned());
-        Ok(self.vb.get_unchecked(key)?)
+        Ok(self.vb.get_unchecked(&format!("{}{key}", self.prefix))?)
     }
 
     /// Keys the checkpoint carries that no module consumed, sorted.
@@ -234,6 +246,12 @@ impl Linear {
 
     pub fn weight(&self) -> &Tensor {
         &self.weight
+    }
+
+    /// A linear layer from an already-shaped `[out, in]` weight (and optional `[out]` bias), stored
+    /// as given — e.g. the depth task's 1×1-conv reducer, whose `[1, C, 1, 1]` kernel is reshaped.
+    pub fn from_parts(weight: Tensor, bias: Option<Tensor>) -> Self {
+        Self { weight, bias }
     }
 }
 
