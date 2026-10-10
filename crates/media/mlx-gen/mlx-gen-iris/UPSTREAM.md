@@ -232,3 +232,13 @@ end-to-end references (`../tools/dump_iris_restoration.py`).
 | `fit_budget` PIL Lanczos bytes (7 shapes) | sha256-exact | exact | shared |
 | End to end FP32, 7 cases (enlarge → resize back, multi-tile, 1×, 2.5×, single tile, portrait 3×, budgeted): fused tiles / colour-fixed float | 1e-4 of peak | ≤ 2.2e-5 / ≤ 7.2e-6 | ≤ 2.1e-5 / ≤ 6.9e-6 |
 | Same, RGB8 | ≤ 1 level | ≤ 1 (at most 6 of 61 440 values differ) | ≤ 1 |
+
+Real weights (`tests/restoration_real_weights.rs`, `../tools/dump_iris_restoration_realweight.py`):
+the native bf16 path is held to 1.5× upstream's **own** bf16-autocast-vs-FP32 mean RGB8 distance on
+the same input (FP32: 0.5 level mean). `tests/fixtures/iris_restoration_real_small.safetensors` is
+the committed upstream reference of the small case (RGB8 only), so the CUDA job checks parity too.
+
+| Case | Upstream bf16 vs fp32 (the bound's basis) | MLX bf16 vs upstream fp32 | Candle CUDA bf16 vs upstream fp32 |
+| --- | --- | --- | --- |
+| 512×384 → 2048×1536 (6 tiles), machine-local golden | max 68, mean 0.521, PSNR 47.7 dB | max 60, mean 0.423, PSNR 49.0 dB (restore 10.8 s, peak footprint 11.7 GB) | — (no Python oracle on the runner; release-scale render report-only) |
+| 64×48 → 256×192 (enlarged, 2 tiles), committed | max 23, mean 0.522, PSNR 48.1 dB | max 19, mean 0.459, PSNR 48.7 dB | recorded by the `candle-iris` job |
