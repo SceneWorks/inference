@@ -15,6 +15,12 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+mod tables;
+pub use tables::{
+    key_padding_additive, pixel_sincos_table, rope_1d_angles, rope_2d_angles, timestep_freqs,
+    TIMESTEP_FREQUENCY_DIM,
+};
+
 /// GitHub `speridlabs/iris-3b` commit the port mirrors (model, pipeline, text conditioning, solver).
 pub const UPSTREAM_CODE_REVISION: &str = "a8d15239dea469aba042cfa56ca3bb4e450d5ebc";
 /// Hugging Face `speridlabs/iris-3b` revision (weights + `config.yaml` for every task).
