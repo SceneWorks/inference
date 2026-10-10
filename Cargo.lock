@@ -2415,6 +2415,7 @@ dependencies = [
  "mlx-gen-flux2",
  "mlx-gen-ideogram",
  "mlx-gen-instantid",
+ "mlx-gen-iris",
  "mlx-gen-joycaption",
  "mlx-gen-kolors",
  "mlx-gen-krea",
@@ -2545,6 +2546,19 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-iris"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
 ]
 

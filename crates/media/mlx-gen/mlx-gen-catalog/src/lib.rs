@@ -30,6 +30,7 @@ pub mod providers {
     pub use mlx_gen_flux2 as flux2;
     pub use mlx_gen_ideogram as ideogram;
     pub use mlx_gen_instantid as instantid;
+    pub use mlx_gen_iris as iris;
     pub use mlx_gen_joycaption as joycaption;
     pub use mlx_gen_kolors as kolors;
     pub use mlx_gen_krea as krea;
@@ -96,6 +97,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_flux::register_providers(registry);
     let registry = mlx_gen_flux2::register_providers(registry);
     let registry = mlx_gen_ideogram::register_providers(registry);
+    let registry = mlx_gen_iris::register_providers(registry);
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
     let registry = mlx_gen_krea::register_providers(registry);
@@ -862,6 +864,8 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
+                "iris" => None,
                 // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
                 // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
                 // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
@@ -1840,6 +1844,7 @@ mod tests {
                 "flux2_dev_control",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "iris_3b",
                 "kolors",
                 "krea_2_turbo",
                 "krea_2_raw",
@@ -1933,8 +1938,9 @@ mod tests {
             .chain(&text_embedders)
             .collect();
         // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
-        assert_eq!(distinct.len(), 71);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 61);
+        // sc-25679 adds `iris_3b` (a generator with its own complete row): 72 / 62.
+        assert_eq!(distinct.len(), 72);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 62);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

@@ -531,6 +531,18 @@ pub const IP_ADAPTER: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// `speridlabs/iris-3b` — the Iris-3B pixel-space DiT backbones (generation at the root, `depth/`,
+/// `upscaler/`). The model card and the code repository both declare Apache-2.0.
+pub const IRIS_3B: ComponentLicense = ComponentLicense {
+    component: "iris_3b",
+    source_url: "https://huggingface.co/speridlabs/iris-3b",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Iris-3B \u{a9} Speridlabs — licensed under Apache-2.0"),
+    retrieved: "2026-10-10",
+};
+
 /// `Kwai-Kolors/Kolors-IP-Adapter-Plus`. Unlike its `Kolors-ControlNet-Pose` sibling, which declares
 /// nothing at all, this repository declares `apache-2.0` — so the absence next door is one
 /// repository's omission and not a Kwai-Kolors-wide policy. Its bundled CLIP-ViT-L/14-336 image
@@ -676,6 +688,18 @@ pub const QWEN3_VL_32B_INSTRUCT: ComponentLicense = ComponentLicense {
     family: "apache-2-0",
     attribution: Some("Qwen3-VL-32B-Instruct \u{a9} Alibaba Cloud — licensed under Apache-2.0"),
     retrieved: "2026-08-12",
+};
+
+/// `Qwen/Qwen3-VL-4B-Instruct` — the frozen text encoder Iris-3B's generation task conditions on
+/// (loaded from the upstream repository itself, pinned by revision).
+pub const QWEN3_VL_4B_INSTRUCT: ComponentLicense = ComponentLicense {
+    component: "qwen3_vl_4b_instruct",
+    source_url: "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("Qwen3-VL-4B-Instruct \u{a9} Alibaba Cloud — licensed under Apache-2.0"),
+    retrieved: "2026-10-10",
 };
 
 /// `guozinan/PuLID` → `pulid_flux_v0.9.1.safetensors`.
@@ -1227,6 +1251,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     IDEOGRAM_4_TURBOTIME_LORA,
     INSTANTID,
     IP_ADAPTER,
+    IRIS_3B,
     KOLORS_IP_ADAPTER_PLUS,
     KREA_2_RAW,
     KREA_2_TURBO,
@@ -1237,6 +1262,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     NVIDIA_PID_STUDENTS,
     PULID,
     QWEN3_VL_32B_INSTRUCT,
+    QWEN3_VL_4B_INSTRUCT,
     QWEN_IMAGE,
     QWEN_IMAGE_2512,
     QWEN_IMAGE_2512_FUN_CONTROLNET_UNION,
@@ -1288,7 +1314,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 74);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 76);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1674,9 +1700,12 @@ mod tests {
         // sweep is 2026-08-02; sc-17147 added the MiniMax-H3 pair after reading that repository's
         // own LICENSE, so its date is the second entry; sc-24108 read the Qwen Research License
         // beside `Qwen/Qwen-Image-2.1` on 2026-09-22
-        // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`). A row carrying any other
-        // date is a row whose provenance nobody can re-read.
-        const EVIDENCE_PACK_DATES: &[&str] = &["2026-08-02", "2026-08-12", "2026-09-22"];
+        // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`); sc-25679 read the
+        // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
+        // (`docs/licensing/sc-25679-iris-licence-evidence.md`). A row carrying any other date is a
+        // row whose provenance nobody can re-read.
+        const EVIDENCE_PACK_DATES: &[&str] =
+            &["2026-08-02", "2026-08-12", "2026-09-22", "2026-10-10"];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(
                 EVIDENCE_PACK_DATES.contains(&row.retrieved),
