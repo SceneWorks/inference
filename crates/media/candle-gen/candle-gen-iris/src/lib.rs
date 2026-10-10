@@ -33,6 +33,7 @@
 //!
 //! [`gen_core::iris`]: candle_gen::gen_core::iris
 
+pub mod adapters;
 pub mod depth;
 pub mod dit;
 pub mod model;
@@ -47,8 +48,12 @@ pub use candle_gen::gen_core::iris::{
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };
 pub use dit::{IrisDiT, TextBatch};
-pub use model::{compute_dtype, descriptor, load, load_backbone, Iris3b, MODEL_ID};
-pub use pipeline::{denoise, encode, noise, to_image, Conditioning};
+pub use model::{
+    compute_dtype, descriptor, load, load_backbone, load_backbone_with_adapters, Iris3b, MODEL_ID,
+};
+pub use pipeline::{
+    denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
+};
 pub use restoration::IrisRestorer;
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 

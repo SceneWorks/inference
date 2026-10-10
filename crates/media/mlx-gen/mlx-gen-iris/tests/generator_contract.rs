@@ -3,7 +3,7 @@
 //! the SceneWorks worker reaches through `mlx-gen-catalog`): validate honesty, progress (`Step
 //! 1..=N` then exactly one `Decoding`), typed cancellation (pre-tripped and mid-run, never a partial
 //! image), seeded determinism, the CFG-off render, both residency policies, typed errors for
-//! missing/incomplete task resources and for controls the route does not honour.
+//! missing/incomplete task resources (the control surface itself is `controls_contract`).
 
 use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use mlx_gen::gen_core::{Error as CoreError, Progress};
@@ -51,6 +51,20 @@ fn request() -> GenerationRequest {
         seed: Some(42),
         ..Default::default()
     }
+}
+
+/// The load gate on the catalog's production path: with the declared `text_encoder` component
+/// removed, `load` fails naming it; an unrecognized component key is refused. The miniature spec
+/// otherwise loads, so neither half can pass on an unrelated load error.
+#[test]
+fn missing_or_unknown_component_fails_at_load() {
+    let registry = mlx_gen_iris::provider_registry().unwrap();
+    gen_core_testkit::check_component_load_gate(
+        |spec| registry.load(ID, spec),
+        &spec(OffloadPolicy::Resident),
+        mlx_gen_iris::model::descriptor().required_components,
+    )
+    .expect("Iris load must gate on every declared required component");
 }
 
 #[test]
@@ -132,34 +146,6 @@ fn mid_run_cancel_is_typed_and_returns_no_image() {
         result.err()
     );
     assert_eq!(seen, 2, "no step after the flag trips");
-}
-
-#[test]
-fn controls_the_route_does_not_honour_are_refused() {
-    let g = load(OffloadPolicy::Resident);
-    let mut req = request();
-    req.sampler = Some("euler".into());
-    assert!(matches!(g.validate(&req), Err(CoreError::Unsupported(_))));
-    let mut req = request();
-    req.scheduler_shift = Some(3.0);
-    assert!(
-        matches!(g.validate(&req), Err(CoreError::Unsupported(m)) if m.contains("scheduler_shift"))
-    );
-    let mut req = request();
-    req.true_cfg = Some(4.0);
-    assert!(g.validate(&req).is_err());
-    let mut req = request();
-    req.width = 40; // not a multiple of the 16-px patch
-    assert!(g.validate(&req).is_err());
-    // CFG off: the negative prompt would never be evaluated.
-    let mut req = request();
-    req.guidance = Some(1.0);
-    req.negative_prompt = Some("blurry".into());
-    assert!(
-        matches!(g.validate(&req), Err(CoreError::Unsupported(m)) if m.contains("negative_prompt"))
-    );
-    req.negative_prompt = Some(String::new());
-    g.validate(&req).unwrap();
 }
 
 #[test]

@@ -57,7 +57,7 @@ and is held to the same fixtures.
 | Chat template prefix/suffix (system "Describe the image…", user turn, assistant marker) | `text/qwen3_vl.py` `_PROMPT_PREFIX`/`_PROMPT_SUFFIX` | `text_encoder.rs` `PROMPT_PREFIX`/`PROMPT_SUFFIX` | `text_encoder.rs` (same `gen_core::iris` constants) | ported verbatim; prefix, caption, suffix tokenized **separately** (`add_special_tokens=False`) |
 | 300-token conditioning window, caption truncated to `max_length - len(suffix)`, suffix always kept | `_run`, `caption_budget` | `assemble_window` | `assemble_window` (shared) | ported; overflow golden |
 | Right padding with `pad_token_id` (fallback `eos`), mask = 1 over caption + suffix | `_run` | `assemble_window` | same (runs only the real tokens) | ported; the tower is causal and the pads trail, so real rows never see a pad and pad rows are zeroed by the mask — the port runs only the real tokens and writes zeros (the pad id cannot affect the output) |
-| `on_caption_overflow` (`warn`/`error`/`silent`) | `TextEncoderConfig` | — | — (same release default) | release default `warn` (truncate) honoured; the knob is not exposed |
+| `on_caption_overflow` (`warn`/`error`/`silent`) | `TextEncoderConfig`, `_tokenize_captions` (also `--set text_encoder.on_caption_overflow=…`) | config value, overridden per request by `GenerationRequest::caption_overflow`; `gen_core::iris::apply_caption_overflow_policy` in `IrisTextEncoder::encode_with_policy` | same (`text_encoder.rs`) | ported (sc-25681): `warn` truncates, logs and returns a `caption_truncated` `GenerationWarning` (`generate_with_report`); `silent` truncates quietly; `error` refuses the request before the tower runs. Applies to the negative prompt too (upstream's `null()` shares `_tokenize_captions`). Any other config value is refused at load. Upstream rate-limits its log line to once per 100 calls — a logging cadence, not behaviour; the port reports every truncation |
 | 12 post-block hidden states `[2,5,…,35]` (1-based), sliced to the window, pad rows zeroed | `_run`, `hidden_layers` | `IrisTextEncoder::encode` | `IrisTextEncoder::encode_window` | ported; index law asserted by the oracle |
 | Qwen3-VL language tower (GQA 32/8×128, q/k RMSNorm, SwiGLU, θ = 5e6; interleaved mRoPE collapses to 1-D for text) | transformers `Qwen3VLTextModel` | the shared generic decoder `mlx_llm::CausalLm` (`qwen3_vl` architecture, HF-ordered hidden states) | the shared generic decoder `candle_llm::CausalLm` (`qwen3_vl`, HF-ordered hidden states); bf16 on CUDA, f32 on the Candle CPU lane (no CPU half GEMM) | reused; bf16, the release's `text_encoder.dtype` |
 | CFG null = the negative prompt run through the **same** template (empty ⇒ training dropout null) | `null()` | `encode` of the negative prompt | `pipeline::encode` | ported (the on-disk null cache is a pure memo, not behaviour) |
@@ -70,12 +70,68 @@ and is held to the same fixtures.
 | Timestep re-fusion `silu(t_emb + s)` | `IrisDiT.forward` | `dit.rs` | `dit.rs` | ported |
 | PiT pixel head: per-pixel Linear(3→16) + full-resolution 2D sincos, 4 post-modulation blocks (pixel-wise adaLN, patch compaction 256·16→1280, 10-head RoPE attention over the patch grid, GELU MLP), RMSNorm + Linear(16→3), `fold` | `blocks/pit.py`, `PixelEmbedder`, `FinalLayer` | `dit.rs` | `dit.rs` (`gelu_erf`) | ported |
 | Flow schedule: `σ = 1 − linspace(1, 0.001, N+1)`, shift `s·σ/(1+(s−1)σ)` with `flow.shift` = 4, model time `1000·t` | `flow/schedule.py`, `FlowDPMSolver.time_grid` | `solver.rs` `time_grid` (f64) | `gen_core::iris::time_grid` (shared, f64) | ported |
-| FlowDPM-Solver++ order 2 multistep, lower-order warm-up and final (terminal step = exact x0 projection), v-prediction `x0 = x − t·v` | `flow/solver.py` | `solver.rs` | `solver.rs` (shared plan; FP32 state) | ported; FP32 integration state |
-| CFG on the raw model output, `uncond + s·(cond − uncond)`, gated strictly inside `cfg_interval` (0, 1) | `_model_out` | `solver.rs` | `solver.rs` `cfg_combine` | ported; interval fixed at the release default |
-| `steps` (default 100), `cfg_scale` (default 3.0), `negative_prompt` (default ""), `seed`, `width`/`height` (default 1024², multiples of 16) | `scripts/sample.py`, `SampleConfig` | `GenerationRequest` `steps`/`guidance`/`negative_prompt`/`seed`/`width`/`height` | same `GenerationRequest` fields (`model.rs`) | honoured |
-| `order` (1..), `shift` override, `cfg_interval`, `prediction="x"`, `--set` config overrides | `scripts/sample.py` | — | — (same refusals, `reject_unhonored_generation_controls`) | not exposed in S1 (fixed at release values; S3 widens the surface) — never accepted-and-ignored |
+| FlowDPM-Solver++ multistep, lower-order warm-up and final (terminal step = exact x0 projection) | `flow/solver.py` | `solver.rs` | `solver.rs` (shared plan; FP32 state) | ported; FP32 integration state |
+| `prediction`: `v` (`x0 = x − t·out`) or `x` (`x0 = out`) — a checkpoint property | `FlowConfig.prediction`, `_pred_x0` | `config.yaml` `flow.prediction` → `gen_core::iris::Prediction` → `solver::sample` | same | ported (sc-25681); any other value is refused at load (upstream raises) |
+| CFG on the raw model output, `uncond + s·(cond − uncond)`, gated strictly inside `cfg_interval` | `_model_out` | `solver.rs` `cfg_combine`, `GenerationParams::cfg_at` | same | ported |
 | Output `clamp(−1, 1)` → `[0, 255]` (torchvision `save_image(normalize, value_range=(−1,1))`) | `generate`, `sample.py` | `pipeline.rs` `to_image` | `pipeline.rs` `to_image` (nearest-even rounding) | ported (`round(255·(x+1)/2)`) |
 | Noise `torch.randn` on the generator device | `generate` | seeded MLX normal (repo convention) | launch-portable CPU `StdRng` (`candle_gen::seed`) — not bit-reproducible with torch or MLX; parity uses injected noise | **not bit-reproducible** with torch RNG; parity is measured with injected noise |
+
+### Generation control surface (sc-25681)
+
+Every public argument of `iris3b.sampling.generate` / `scripts/sample.py`, its request field, and the
+native computation it changes. "Test" names the fixture case (`tests/controls_parity.rs`, both
+backends, against `iris_controls_golden.safetensors`) and the provider-level check
+(`tests/controls_contract.rs::every_advertised_control_changes_the_render`, both backends).
+
+| Upstream control (default) | Request field | MLX | Candle | Test | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `prompts: list[str]` | `prompt`, or `prompt_batch` (non-empty ⇒ `prompt` empty) | `pipeline::encode` per prompt → one batched `denoise` (`[B, …]` text states, per-row masks, null expanded over the batch in `cat([uncond, cond])`) | same | `batch` | `prompt_batch.len() × count ≤ 8` images; image `k = c·B + j` draws noise from seed `k` (MLX `seed + k`, Candle `image_seed(seed, k)`), so a batched image equals its single render up to batched-GEMM rounding (`a_prompt_batch_renders_one_image_per_prompt_per_count`, FP32 ≤ 1 code value) |
+| `height` / `width` (1024²) | `height` / `width` (multiples of 16, 16..=2048) | noise geometry, patch grid, 2-D RoPE grid, PiT sincos table | same | `portrait` (12×8) vs `base` (8×12) | aspect ratio is the pair; no separate aspect control upstream |
+| `steps` (100) | `steps` | `dpm_solver_plan(steps, …)` | same | every case (5 steps) | |
+| `order` (2) | `sampler`: `dpmpp_2m` = order 2 (default), `euler` = order 1 | `GenerationParams::order` → plan | same | `order1` | order 1 is the first-order DPM-Solver++ update `x ← (t/s)·x + ((s−t)/s)·x0` on every step — exactly the flow Euler (= DDIM) step (`gen_core::iris` `the_order_one_plan_is_the_euler_step`). Upstream runs the 2M update for every `order ≥ 2`, so 3+ is not a distinct solver and has no name; any other sampler name is refused |
+| `cfg_scale` (3.0) | `guidance` | `cfg_combine`; `1.0` skips the unconditional branch and its encode | same | `negative` (4.0), `cfg_off` (1.0) | |
+| `cfg_interval` ((0, 1)) | `cfg_interval: Option<(f32, f32)>` | `GenerationParams::cfg_at` | same | `interval` (0.3, 0.8) | `0 ≤ lo < hi ≤ 1` (model time `t` ∈ (0, 1)); an interval holding none of the plan's evaluation times while guidance ≠ 1 is refused (the guidance would be accepted and never run), and any interval at guidance 1.0 is refused (CFG is off, so the interval would do nothing) |
+| `shift` (checkpoint `flow.shift`) | `scheduler_shift` | `time_grid(steps, shift)` | same | `shift2` | `> 0`; default is the checkpoint's own `flow.shift` |
+| `negative_prompt` ("") | `negative_prompt` | encoded through the same template as the unconditional | same | `negative` | refused at guidance 1.0 (never evaluated) |
+| `generator` seed | `seed` | MLX seeded normal | `candle_gen::seed` CPU `StdRng` | `every_advertised_control_changes_the_render` | not bit-compatible with `torch.randn` (parity runs on injected noise) |
+| `noise` | — | — | — | — | test-only injection (`denoise` takes the noise tensor) |
+| `num_train_timesteps`, `prediction` | — (checkpoint `flow.*`) | read from `config.yaml` | same | `prediction_x` | checkpoint properties, not request controls |
+| `--set KEY=VALUE` config overrides | — | the inference-relevant keys are the rows above (`sample.*` → request fields; `flow.shift` → `scheduler_shift`; `text_encoder.on_caption_overflow` → `caption_overflow`); architecture keys are the checkpoint's and are validated, never overridden | same | — | an override of an architecture key would mis-load the checkpoint upstream too |
+| `flow.shift_law` (`none`/`sd3`/`flux`) | — | accepted, inert at inference | same | `gen_core::iris` `unsupported_switches_are_typed_refusals` | `scripts/sample.py` samples with `flow.shift` verbatim whatever the law — the law only resolves the *training* stage shift (`RectifiedFlow`). Unknown laws are refused (upstream's `resolution_shift` raises) |
+| `sample:` section of a checkpoint config | — | ignored | same | — | upstream's `inference_config` keeps only `model`/`text_encoder`/`flow` (`INFERENCE_SECTIONS`); `SampleConfig` defaults always apply |
+
+Refused by name (`gen_core::iris::reject_unhonored_generation_controls` and the shared floor): every
+other request field — `true_cfg`, `timestep_to_start_cfg`, `guidance_method` and the APG knobs,
+`scheduler` names, `strength`, conditioning inputs, video/audio fields, PiD, phases.
+
+### Adapters (sc-25681)
+
+Upstream Iris-3B ships no adapter code; LoRA/LoKr use the repository's adapter conventions, keyed by
+the upstream `IrisDiT` module path (the checkpoint key stem, e.g. `blocks.3.attn_proj`,
+`y_embedder.refiner.proj`, `pixel_blocks.0.fc1`).
+
+| Concern | MLX (`src/adapters.rs`) | Candle (`src/adapters.rs`) |
+| --- | --- | --- |
+| Application | forward-time residual on the projection (`mlx_gen::adapters::AdaptableLinear`, `apply_adapters_strict`), base never mutated; LoKr via the structured Kronecker product `w1·X·w2ᵀ` | `W += δ` folded into the f32 weight at the safetensors-key level before the compute-dtype cast (`candle_gen::train::merge` convention); LoKr `δ = scale·(alpha/rank)·kron(w1, w2)` |
+| Formats | PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` / bare; `lora_A/B`, `lora_down/up`; per-target `.alpha` or `lora_adapter_metadata`), kohya `lora_unet_…`, PEFT-stamped LoKr (`networkType=lokr`), LyCORIS-layout LoKr/LoHa factors — key layouts only: every one of them must also carry the identity stamps below | same set |
+| Identity | `gen_core::iris::check_adapter_identity`: `family=iris` and `irisTask=<task>` **required**, `baseModel` must match when present — the task backbones share one architecture, so only the stamp tells a depth adapter from a generation one. Required for **every** format: a file exported by a third-party trainer (kohya, LyCORIS) carries neither stamp and is refused until it is re-stamped; unstamped third-party files are not supported | same |
+| Strictness | a target that resolves to no projection, a file that lands nothing, a diff-patch (`.diff`/`.diff_b`) file, per-pass scales / MoE expert → typed error | same, plus a delta whose shape differs from its projection |
+| Provenance | `Generator::adapter_apply_reports()` — one `AdapterApplyReport { adapter_path, applied, skipped }` per file, from the most recent backbone load | same |
+
+Fixtures: `iris_lora.safetensors` / `iris_lokr.safetensors` (four targets: text adapter, a dual-stream
+block, a single-stream block, the pixel head) and `iris_lora_depth_task.safetensors` (refused);
+`iris_adapter_golden.safetensors` holds upstream's merged-weight forwards and the expected deltas.
+
+### Live step preview (sc-25681)
+
+Iris denoises in pixel space, so the preview needs no latent→RGB fit: each solver step emits the
+step's predicted clean image `x0` (`FlowDPMSolver._pred_x0`, CFG-combined) of the batch's first row,
+average-pooled over each patch cell (the backbone's own token grid — 64×64 for a 1024² render) and
+decoded with the exact pixel map `(x + 1)/2` (`pipeline::preview_image`, both backends, unit-tested
+for exactness). The last frame is the output (the terminal update is the exact x0 projection).
+Upstream has no preview; nothing in its semantics makes `x0` misleading — it is the same estimate
+the solver integrates. Both descriptors advertise `supports_preview: true`; an inert sink costs one
+branch per step.
 
 ## Depth coverage table (source → native, sc-25682)
 
@@ -132,6 +188,12 @@ which is also the snapshot the generator-contract test loads through the catalog
 | Solver trajectory, 7 steps, CFG, shift (`solver_parity`) | f32 | 1e-5 | 8.8e-8 | 0 (bit-identical) | identical f32 coefficients |
 | 100-step default grid | f64 | 1e-15 abs | exact | exact | f64 on both sides |
 | End to end, 6 steps, CFG 3 (`e2e_parity`) | bf16 tower + FP32 backbone | 6e-2 | 3.1e-2 | 4.0e-2 (f32 tower, see `text_parity`) | tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 4.0e-2) |
+| Every generation control, 9 cases (`controls_parity`, `tools/dump_iris_controls.py`) | bf16 tower + FP32 backbone (MLX); f32 tower + FP32 backbone vs the oracle's **fp32-tower** render (Candle) | 6e-2 (MLX) / 2e-4 (Candle) | 8.4e-3–4.5e-2 | 1.1e-5–5.8e-5 | MLX: tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 1.7e-2–7.3e-2 across the cases); every control's golden sits ≥ 0.15 from `base`, so an ignored control fails |
+| LoRA / LoKr / both on the backbone (`adapter_parity`) | FP32 | 2e-3 (MLX) / 1e-4 forward, 1e-6 delta (Candle) | 2.5e-5 / 8.8e-4 / 8.6e-4 | forwards 2.4e-5 / 3.3e-5; deltas ≤ 1.5e-8 | MLX's shared LoKr path reconstructs its factors in bf16 (PARITY-BF16); each adapter moves the output by 0.11–0.44 |
+
+The oracle renders the fp32-tower references with a **separate** null-embedding cache directory:
+upstream memoizes `null("")` on disk keyed by repo, window and layers but not by dtype, so a shared
+directory hands an fp32 tower the bf16 null.
 
 `tests/fixtures/iris_tokenizer_ids.json` pins the real Qwen3-VL tokenizer's prefix / suffix / caption
 ids for a prompt battery; the ignored real-weight test checks the loaded tokenizer against it.

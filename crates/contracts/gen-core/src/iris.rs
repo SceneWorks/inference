@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::generator::GenerationRequest;
+use std::collections::HashMap;
+
+use crate::generator::{CaptionOverflowPolicy, GenerationRequest};
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
@@ -51,8 +53,18 @@ pub const BACKBONE_WEIGHTS_FILE: &str = "model.safetensors";
 
 /// Release sampling defaults (`SampleConfig` / `scripts/sample.py`).
 pub const DEFAULT_STEPS: u32 = 100;
-/// DPM-Solver++ order (`sample.order`). Not a request knob in this release surface.
+/// DPM-Solver++ order (`sample.order`); selected per request through the sampler name
+/// ([`SOLVER_ORDER_2_SAMPLER`] / [`SOLVER_ORDER_1_SAMPLER`]).
 pub const DEFAULT_SOLVER_ORDER: usize = 2;
+/// The sampler name that selects upstream's default `order = 2` multistep DPM-Solver++ (2M, with the
+/// lower-order warm-up and final step).
+pub const SOLVER_ORDER_2_SAMPLER: &str = "dpmpp_2m";
+/// The sampler name that selects upstream's `order = 1`: every step is the first-order
+/// DPM-Solver++ update `x ← (t/s)·x + ((s − t)/s)·x0`, which on the rectified-flow schedule is
+/// exactly the deterministic Euler (= DDIM) step — the repo's canonical name for it.
+pub const SOLVER_ORDER_1_SAMPLER: &str = "euler";
+/// Every sampler name the generation route advertises, default first.
+pub const SAMPLERS: [&str; 2] = [SOLVER_ORDER_2_SAMPLER, SOLVER_ORDER_1_SAMPLER];
 /// Classifier-free guidance scale (`sample.cfg_scale`).
 pub const DEFAULT_CFG_SCALE: f32 = 3.0;
 /// CFG gate: guidance applies at model-evaluation times strictly inside this interval.
@@ -384,7 +396,7 @@ impl IrisConfig {
     /// and depth is read from the file.
     pub fn validate_supported(&self) -> Result<()> {
         let m = &self.model;
-        let checks: [(&str, bool, String); 25] = [
+        let checks: [(&str, bool, String); 27] = [
             ("model.block", m.block == "single_stream", m.block.clone()),
             (
                 // `dual_depth: 0` renames the shared modulation core (`adaln_shared`); the native
@@ -457,14 +469,28 @@ impl IrisConfig {
                 m.pixel.abs_pos_embed.to_string(),
             ),
             (
+                // `v` (velocity) and `x` (clean image) are both implemented by the solver.
                 "flow.prediction",
-                self.flow.prediction == "v",
+                Prediction::from_name(&self.flow.prediction).is_some(),
                 self.flow.prediction.clone(),
             ),
             (
+                // A training-only key: `scripts/sample.py` samples with `flow.shift` verbatim whatever
+                // the law (the resolved stage shift lives only in the trainer). The value must still
+                // be one upstream knows (`resolution_shift` raises on anything else).
                 "flow.shift_law",
-                self.flow.shift_law == "none",
+                matches!(self.flow.shift_law.as_str(), "none" | "sd3" | "flux"),
                 self.flow.shift_law.clone(),
+            ),
+            (
+                "flow.shift",
+                self.flow.shift.is_finite() && self.flow.shift > 0.0,
+                self.flow.shift.to_string(),
+            ),
+            (
+                "flow.num_train_timesteps",
+                self.flow.num_train_timesteps > 0,
+                self.flow.num_train_timesteps.to_string(),
             ),
             (
                 "text_encoder.name",
@@ -484,11 +510,9 @@ impl IrisConfig {
                 self.text_encoder.max_length.to_string(),
             ),
             (
+                // Upstream's constructor accepts exactly warn | error | silent.
                 "text_encoder.on_caption_overflow",
-                matches!(
-                    self.text_encoder.on_caption_overflow.as_str(),
-                    "warn" | "silent"
-                ),
+                CaptionOverflowPolicy::from_name(&self.text_encoder.on_caption_overflow).is_some(),
                 self.text_encoder.on_caption_overflow.clone(),
             ),
             (
@@ -532,6 +556,47 @@ impl IrisConfig {
     /// `model.text_len` is the window the DiT reads; the encoder must produce at least that many.
     pub fn conditioning_window(&self) -> usize {
         self.text_encoder.max_length.min(self.model.text_len)
+    }
+
+    /// The checkpoint's prediction target (`flow.prediction`), validated.
+    pub fn prediction(&self) -> Result<Prediction> {
+        Prediction::from_name(&self.flow.prediction).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "iris: flow.prediction = {} is not v or x",
+                self.flow.prediction
+            ))
+        })
+    }
+
+    /// The checkpoint's configured caption-overflow policy (`text_encoder.on_caption_overflow`).
+    pub fn caption_overflow(&self) -> Result<CaptionOverflowPolicy> {
+        CaptionOverflowPolicy::from_name(&self.text_encoder.on_caption_overflow).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "iris: text_encoder.on_caption_overflow = {} is not warn, error or silent",
+                self.text_encoder.on_caption_overflow
+            ))
+        })
+    }
+}
+
+/// What the network's raw output is (`flow.prediction`, a checkpoint property): the velocity
+/// (`x0 = x − t·out`) or the clean image itself (`x0 = out`). Upstream's `FlowDPMSolver._pred_x0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prediction {
+    /// `prediction: v` (the release).
+    Velocity,
+    /// `prediction: x`.
+    Clean,
+}
+
+impl Prediction {
+    /// Parse upstream's spelling (`v` / `x`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "v" => Some(Self::Velocity),
+            "x" => Some(Self::Clean),
+            _ => None,
+        }
     }
 }
 
@@ -815,6 +880,34 @@ pub fn assemble_window(
     })
 }
 
+/// Apply the caption-overflow policy to one assembled window (upstream
+/// `Qwen3VLTextEncoder._tokenize_captions`): `Error` refuses an overflowing caption, `Warn` returns
+/// the warning for the caller to log/report, `Silent` truncates without a word. A caption that fit
+/// its budget is `Ok(None)` under every policy.
+pub fn apply_caption_overflow_policy(
+    window: &TextWindow,
+    max_length: usize,
+    suffix_len: usize,
+    policy: CaptionOverflowPolicy,
+) -> Result<Option<String>> {
+    if window.truncated_tokens == 0 {
+        return Ok(None);
+    }
+    match policy {
+        CaptionOverflowPolicy::Warn => Ok(caption_overflow_warning(window, max_length, suffix_len)),
+        CaptionOverflowPolicy::Silent => Ok(None),
+        CaptionOverflowPolicy::Error => {
+            let budget = max_length.saturating_sub(suffix_len);
+            Err(Error::Msg(format!(
+                "iris: caption tokenizes to {} tokens but only {budget} fit \
+                 (text_encoder.max_length={max_length} minus {suffix_len} chat-template tokens); \
+                 shorten the caption, or use caption_overflow = warn to truncate it",
+                budget + window.truncated_tokens
+            )))
+        }
+    }
+}
+
 /// The `on_caption_overflow: warn` message for one window (upstream logs every truncation under
 /// the release policy), or `None` when the caption fit its budget.
 pub fn caption_overflow_warning(
@@ -913,8 +1006,10 @@ pub fn dpm_solver_plan(steps: usize, order: usize, shift: f64) -> Result<Vec<Dpm
         return Err(Error::Msg("iris: steps must be >= 1".into()));
     }
     if !(1..=2).contains(&order) {
+        // Upstream runs the second-order update for every `step_order > 1`, so an order ≥ 3 is the
+        // order-2 computation under another number, and order 0 indexes past its history.
         return Err(Error::Unsupported(format!(
-            "iris: DPM-Solver++ order {order} is not implemented (upstream implements 1 and 2)"
+            "iris: DPM-Solver++ order {order} is not a distinct upstream solver (1 and 2 are)"
         )));
     }
     let grid = time_grid(steps, shift);
@@ -956,45 +1051,135 @@ pub fn cfg_active(cfg_scale: f32, s: f64, interval: (f64, f64)) -> bool {
 // Generation control surface
 // ---------------------------------------------------------------------------------------------
 
-/// The resolved generation controls of one request (release defaults filled in).
+/// The resolved generation controls of one request (release defaults filled in) — every upstream
+/// `generate(...)` argument, mapped from the request:
+///
+/// | upstream | request field | default |
+/// | --- | --- | --- |
+/// | `prompts` | `prompt` or `prompt_batch` | — |
+/// | `height` / `width` | `height` / `width` | — |
+/// | `steps` | `steps` | 100 |
+/// | `order` | `sampler` (`dpmpp_2m` = 2, `euler` = 1) | 2 |
+/// | `cfg_scale` | `guidance` | 3.0 |
+/// | `cfg_interval` | `cfg_interval` | (0, 1) |
+/// | `shift` | `scheduler_shift` | the checkpoint's `flow.shift` |
+/// | `negative_prompt` | `negative_prompt` | `""` |
+/// | `generator` seed | `seed` | the caller's default seed |
+/// | `prediction`, `num_train_timesteps` | — (checkpoint `flow.*`) | — |
+/// | `text_encoder.on_caption_overflow` | `caption_overflow` | the checkpoint's policy |
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationParams {
+    /// The prompts rendered together as one batch (`[prompt]` for an ordinary request).
+    pub prompts: Vec<String>,
     pub steps: usize,
+    /// DPM-Solver++ order (1 or 2).
+    pub order: usize,
     pub cfg_scale: f32,
+    /// CFG runs at model times strictly inside this interval.
+    pub cfg_interval: (f64, f64),
+    /// The flow shift the time grid is remapped by.
+    pub shift: f64,
     /// The CFG unconditional prompt — `""` (the training dropout null) unless a negative prompt is
     /// given. Encoded with the same template as the positive prompt.
     pub negative_prompt: String,
     pub seed: u64,
     pub width: u32,
     pub height: u32,
+    /// The checkpoint's prediction target.
+    pub prediction: Prediction,
+    /// The caption-overflow policy in force for this request.
+    pub caption_overflow: CaptionOverflowPolicy,
 }
 
 impl GenerationParams {
-    /// Resolve the request's controls. `default_seed` supplies the seed when none is given.
-    pub fn resolve(req: &GenerationRequest, default_seed: u64) -> Self {
-        Self {
+    /// Resolve the request's controls against the checkpoint `config`. `default_seed` supplies the
+    /// seed when none is given. Every value the native solver cannot honour is a typed error naming
+    /// the field — never clamped, never ignored.
+    pub fn resolve(
+        req: &GenerationRequest,
+        default_seed: u64,
+        config: &IrisConfig,
+    ) -> Result<Self> {
+        let order = match req.sampler.as_deref() {
+            None => DEFAULT_SOLVER_ORDER,
+            Some(SOLVER_ORDER_2_SAMPLER) => 2,
+            Some(SOLVER_ORDER_1_SAMPLER) => 1,
+            Some(other) => {
+                return Err(Error::Unsupported(format!(
+                "iris: sampler {other:?} is not an Iris-3B solver (use {SOLVER_ORDER_2_SAMPLER} \
+                     for DPM-Solver++ order 2 or {SOLVER_ORDER_1_SAMPLER} for order 1)"
+            )))
+            }
+        };
+        let shift = match req.scheduler_shift {
+            None => config.flow.shift,
+            Some(v) if v.is_finite() && v > 0.0 => v as f64,
+            Some(v) => {
+                return Err(Error::Msg(format!(
+                    "iris: scheduler_shift {v} must be a finite value > 0 (the flow shift \
+                     `s·σ/(1 + (s − 1)·σ)`)"
+                )))
+            }
+        };
+        let cfg_interval = match req.cfg_interval {
+            None => DEFAULT_CFG_INTERVAL,
+            Some((lo, hi)) if (0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi) && lo < hi => {
+                (lo as f64, hi as f64)
+            }
+            Some((lo, hi)) => {
+                return Err(Error::Msg(format!(
+                    "iris: cfg_interval ({lo}, {hi}) must satisfy 0 <= lo < hi <= 1 (model time t \
+                     runs from 1 = noise to 0 = clean)"
+                )))
+            }
+        };
+        let prompts = if req.prompt_batch.is_empty() {
+            vec![req.prompt.clone()]
+        } else {
+            req.prompt_batch.clone()
+        };
+        Ok(Self {
+            prompts,
             steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
+            order,
             cfg_scale: req.guidance.unwrap_or(DEFAULT_CFG_SCALE),
+            cfg_interval,
+            shift,
             negative_prompt: req.negative_prompt.clone().unwrap_or_default(),
             seed: req.seed.unwrap_or(default_seed),
             width: req.width,
             height: req.height,
-        }
+            prediction: config.prediction()?,
+            caption_overflow: match req.caption_overflow {
+                Some(policy) => policy,
+                None => config.caption_overflow()?,
+            },
+        })
     }
 
     /// Whether the run needs the unconditional branch at all (`cfg_scale != 1`).
     pub fn uses_cfg(&self) -> bool {
         self.cfg_scale != 1.0
     }
+
+    /// The solver plan these controls select.
+    pub fn plan(&self) -> Result<Vec<DpmStep>> {
+        dpm_solver_plan(self.steps, self.order, self.shift)
+    }
+
+    /// Whether guidance runs at `step` (the interval gate of `FlowDPMSolver._model_out`).
+    pub fn cfg_at(&self, step: &DpmStep) -> bool {
+        cfg_active(self.cfg_scale, step.s, self.cfg_interval)
+    }
 }
 
 /// Refuse every request field the Iris generation route does not honour, by name. The shared
 /// `Capabilities::validate_request` floor already polices size, count, steps, negative prompt,
-/// guidance/true_cfg support, sampler/scheduler/guidance-method membership and conditioning kinds;
-/// this covers the remaining per-request knobs, so none is ever accepted and ignored.
+/// guidance/true_cfg support, sampler/scheduler/guidance-method membership, conditioning kinds,
+/// `cfg_interval` / `prompt_batch` / `caption_overflow` support; this covers the remaining
+/// per-request knobs, so none is ever accepted and ignored.
 pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequest) -> Result<()> {
-    let set: [(&str, bool); 25] = [
-        ("scheduler_shift", req.scheduler_shift.is_some()),
+    let set: [(&str, bool); 24] = [
         ("timestep_to_start_cfg", req.timestep_to_start_cfg.is_some()),
         ("guidance_eta", req.guidance_eta.is_some()),
         ("guidance_momentum", req.guidance_momentum.is_some()),
@@ -1045,6 +1230,124 @@ pub fn reject_unhonored_generation_controls(model_id: &str, req: &GenerationRequ
             "{model_id}: `negative_prompt` has no effect at guidance 1.0 (classifier-free guidance \
              is off); raise guidance or drop the negative prompt"
         )));
+    }
+    Ok(())
+}
+
+/// The full request validation of the generation route against its checkpoint `config`: the
+/// per-field refusals of [`reject_unhonored_generation_controls`], then every resolved value
+/// ([`GenerationParams::resolve`]) and the combinations that would accept a control and do nothing
+/// with it — a `cfg_interval` or `guidance` whose guidance never runs on the resolved step plan.
+pub fn validate_generation_request(
+    model_id: &str,
+    req: &GenerationRequest,
+    config: &IrisConfig,
+) -> Result<GenerationParams> {
+    reject_unhonored_generation_controls(model_id, req)?;
+    let params =
+        GenerationParams::resolve(req, 0, config).map_err(|e| prefix_error(model_id, e))?;
+    // At guidance 1.0 no step evaluates the unconditional branch, so an interval would be
+    // accepted and silently dropped (the same reasoning as the `negative_prompt` refusal).
+    if req.cfg_interval.is_some() && !params.uses_cfg() {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: `cfg_interval` has no effect at guidance 1.0 (classifier-free guidance is \
+             off); raise guidance or drop the interval"
+        )));
+    }
+    let plan = params.plan().map_err(|e| prefix_error(model_id, e))?;
+    if params.uses_cfg() && !plan.iter().any(|step| params.cfg_at(step)) {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: cfg_interval ({}, {}) contains none of the {} solver evaluation times, so \
+             guidance {} (and any negative prompt) would never apply; widen the interval or set \
+             guidance 1.0",
+            params.cfg_interval.0,
+            params.cfg_interval.1,
+            plan.len(),
+            params.cfg_scale
+        )));
+    }
+    Ok(params)
+}
+
+fn prefix_error(model_id: &str, e: Error) -> Error {
+    match e {
+        Error::Unsupported(m) => Error::Unsupported(format!("{model_id}: {m}")),
+        Error::Msg(m) => Error::Msg(format!("{model_id}: {m}")),
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adapter identity
+// ---------------------------------------------------------------------------------------------
+
+/// Adapter `__metadata__` key naming the model family (the repo-wide provenance stamp).
+pub const ADAPTER_FAMILY_KEY: &str = "family";
+/// Adapter `__metadata__` key naming the base model id the adapter was trained on.
+pub const ADAPTER_BASE_MODEL_KEY: &str = "baseModel";
+/// Adapter `__metadata__` key naming the Iris **task** the adapter was trained for
+/// ([`IrisTask::name`]). The three task backbones share one architecture, so tensor names and shapes
+/// cannot tell a depth adapter from a generation one — this stamp is the only witness.
+pub const ADAPTER_TASK_KEY: &str = "irisTask";
+
+/// The provenance an Iris trainer stamps into an adapter it writes (family, base model, task), so
+/// [`check_adapter_identity`] accepts it on exactly that task's route.
+pub fn adapter_provenance(task: IrisTask, base_model: &str) -> [(&'static str, String); 3] {
+    [
+        (ADAPTER_FAMILY_KEY, FAMILY.to_owned()),
+        (ADAPTER_BASE_MODEL_KEY, base_model.to_owned()),
+        (ADAPTER_TASK_KEY, task.name().to_owned()),
+    ]
+}
+
+/// Refuse an adapter that is not an Iris adapter for `task` on `base_model`, from its safetensors
+/// `__metadata__`: the family and task stamps are **required** (an unstamped file cannot be told
+/// apart from another task's adapter, so it is refused rather than guessed), and a base-model stamp,
+/// when present, must name `base_model`. `path` only labels the error.
+pub fn check_adapter_identity(
+    meta: &HashMap<String, String>,
+    task: IrisTask,
+    base_model: &str,
+    path: &Path,
+) -> Result<()> {
+    let label = path.display();
+    match meta.get(ADAPTER_FAMILY_KEY).map(String::as_str) {
+        Some(FAMILY) => {}
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "{base_model}: adapter {label} was trained for the {other:?} family, not {FAMILY:?}"
+            )))
+        }
+        None => {
+            return Err(Error::Unsupported(format!(
+            "{base_model}: adapter {label} carries no `{ADAPTER_FAMILY_KEY}` metadata stamp; an \
+                 Iris adapter must declare `{ADAPTER_FAMILY_KEY}={FAMILY}` and \
+                 `{ADAPTER_TASK_KEY}=<task>` (the task backbones share one architecture, so an \
+                 unstamped file cannot be matched to a task)"
+        )))
+        }
+    }
+    match meta.get(ADAPTER_TASK_KEY).map(String::as_str) {
+        Some(t) if t == task.name() => {}
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "{base_model}: adapter {label} was trained for the Iris {other:?} task, not {:?}",
+                task.name()
+            )))
+        }
+        None => {
+            return Err(Error::Unsupported(format!(
+                "{base_model}: adapter {label} carries no `{ADAPTER_TASK_KEY}` metadata stamp; an Iris \
+                 adapter must declare which task backbone it was trained on"
+            )))
+        }
+    }
+    if let Some(other) = meta.get(ADAPTER_BASE_MODEL_KEY) {
+        if other != base_model {
+            return Err(Error::Unsupported(format!(
+                "{base_model}: adapter {label} was trained on base model {other:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -1153,12 +1456,31 @@ flow:
             .validate_supported()
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(m) if m.contains("model.rope_aspect")));
-        let text = RELEASE_CONFIG.replace("prediction: v", "prediction: x");
+        let text = RELEASE_CONFIG.replace("prediction: v", "prediction: eps");
         let err = IrisConfig::parse(&text)
             .unwrap()
             .validate_supported()
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(m) if m.contains("flow.prediction")));
+        let text = RELEASE_CONFIG.replace("shift_law: none", "shift_law: linear");
+        let err = IrisConfig::parse(&text)
+            .unwrap()
+            .validate_supported()
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(m) if m.contains("flow.shift_law")));
+        // Every value upstream itself accepts is supported.
+        for (from, to) in [
+            ("prediction: v", "prediction: x"),
+            ("shift_law: none", "shift_law: sd3"),
+            ("shift_law: none", "shift_law: flux"),
+            ("on_caption_overflow: warn", "on_caption_overflow: error"),
+            ("on_caption_overflow: warn", "on_caption_overflow: silent"),
+        ] {
+            IrisConfig::parse(&RELEASE_CONFIG.replace(from, to))
+                .unwrap()
+                .validate_supported()
+                .unwrap();
+        }
         for (from, to, key) in [
             ("dtype: bfloat16", "dtype: float16", "text_encoder.dtype"),
             (
@@ -1243,21 +1565,185 @@ flow:
         let ok = GenerationRequest::default();
         reject_unhonored_generation_controls("iris_3b", &ok).unwrap();
         let req = GenerationRequest {
-            scheduler_shift: Some(2.0),
+            timestep_to_start_cfg: Some(2),
             ..Default::default()
         };
         let err = reject_unhonored_generation_controls("iris_3b", &req).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(m) if m.contains("scheduler_shift")));
+        assert!(matches!(err, Error::Unsupported(m) if m.contains("timestep_to_start_cfg")));
+    }
+
+    fn release() -> IrisConfig {
+        IrisConfig::parse(RELEASE_CONFIG).unwrap()
     }
 
     #[test]
     fn params_take_the_release_defaults() {
-        let p = GenerationParams::resolve(&GenerationRequest::default(), 7);
+        let p = GenerationParams::resolve(&GenerationRequest::default(), 7, &release()).unwrap();
         assert_eq!(p.steps, 100);
+        assert_eq!(p.order, 2);
         assert_eq!(p.cfg_scale, 3.0);
+        assert_eq!(p.cfg_interval, (0.0, 1.0));
+        assert_eq!(p.shift, 4.0);
         assert_eq!(p.negative_prompt, "");
         assert_eq!(p.seed, 7);
+        assert_eq!(p.prompts, [""]);
+        assert_eq!(p.prediction, Prediction::Velocity);
+        assert_eq!(p.caption_overflow, CaptionOverflowPolicy::Warn);
         assert!(p.uses_cfg());
+    }
+
+    #[test]
+    fn every_control_maps_onto_its_upstream_argument() {
+        let req = GenerationRequest {
+            prompt_batch: vec!["a".into(), "b".into()],
+            sampler: Some("euler".into()),
+            scheduler_shift: Some(2.5),
+            cfg_interval: Some((0.25, 0.75)),
+            caption_overflow: Some(CaptionOverflowPolicy::Error),
+            ..Default::default()
+        };
+        let p = GenerationParams::resolve(&req, 0, &release()).unwrap();
+        assert_eq!(p.prompts, ["a", "b"]);
+        assert_eq!(p.order, 1);
+        assert_eq!(p.shift, 2.5);
+        assert_eq!(p.cfg_interval, (0.25, 0.75));
+        assert_eq!(p.caption_overflow, CaptionOverflowPolicy::Error);
+        // The checkpoint's own shift and policy are the defaults.
+        let cfg = IrisConfig::parse(
+            &RELEASE_CONFIG
+                .replace("shift: 4.0", "shift: 3.0")
+                .replace("on_caption_overflow: warn", "on_caption_overflow: silent")
+                .replace("prediction: v", "prediction: x"),
+        )
+        .unwrap();
+        cfg.validate_supported().unwrap();
+        let p = GenerationParams::resolve(&GenerationRequest::default(), 0, &cfg).unwrap();
+        assert_eq!(p.shift, 3.0);
+        assert_eq!(p.caption_overflow, CaptionOverflowPolicy::Silent);
+        assert_eq!(p.prediction, Prediction::Clean);
+    }
+
+    #[test]
+    fn invalid_control_values_are_typed_errors() {
+        let cfg = release();
+        for (req, needle) in [
+            (
+                GenerationRequest {
+                    sampler: Some("heun".into()),
+                    ..Default::default()
+                },
+                "heun",
+            ),
+            (
+                GenerationRequest {
+                    scheduler_shift: Some(0.0),
+                    ..Default::default()
+                },
+                "scheduler_shift",
+            ),
+            (
+                GenerationRequest {
+                    cfg_interval: Some((-0.5, 0.5)),
+                    ..Default::default()
+                },
+                "cfg_interval",
+            ),
+            (
+                // Guidance on, but the interval holds no evaluation time of a 4-step plan.
+                GenerationRequest {
+                    steps: Some(4),
+                    cfg_interval: Some((0.9999, 1.0)),
+                    ..Default::default()
+                },
+                "never apply",
+            ),
+        ] {
+            let err = validate_generation_request("iris_3b", &req, &cfg).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        // Any interval with guidance off is refused: no step runs the unconditional branch, so
+        // the interval would be accepted and do nothing.
+        let off = GenerationRequest {
+            steps: Some(4),
+            guidance: Some(1.0),
+            cfg_interval: Some((0.25, 0.75)),
+            ..Default::default()
+        };
+        let err = validate_generation_request("iris_3b", &off, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)) && err.to_string().contains("`cfg_interval`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_order_one_plan_is_the_euler_step() {
+        let plan = dpm_solver_plan(6, 1, 4.0).unwrap();
+        for step in &plan {
+            let DpmUpdate::First { cx, c0 } = step.update else {
+                panic!("order 1 is first-order everywhere");
+            };
+            // x ← (t/s)·x + ((s − t)/s)·x0, the Euler/DDIM step of the flow ODE.
+            assert!((cx as f64 - step.t / step.s).abs() < 1e-6);
+            assert!((-c0 as f64 - (step.s - step.t) / step.s).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn caption_overflow_policies_follow_upstream() {
+        let w = assemble_window(&[1, 2], &[10, 11, 12, 13, 14], &[8, 9], 5).unwrap();
+        assert!(
+            apply_caption_overflow_policy(&w, 5, 2, CaptionOverflowPolicy::Warn)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            apply_caption_overflow_policy(&w, 5, 2, CaptionOverflowPolicy::Silent).unwrap(),
+            None
+        );
+        let err =
+            apply_caption_overflow_policy(&w, 5, 2, CaptionOverflowPolicy::Error).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tokenizes to 5 tokens but only 3 fit"),
+            "{err}"
+        );
+        let fits = assemble_window(&[1, 2], &[10], &[8, 9], 5).unwrap();
+        apply_caption_overflow_policy(&fits, 5, 2, CaptionOverflowPolicy::Error).unwrap();
+        let text = RELEASE_CONFIG.replace("on_caption_overflow: warn", "on_caption_overflow: drop");
+        let err = IrisConfig::parse(&text)
+            .unwrap()
+            .validate_supported()
+            .unwrap_err();
+        assert!(err.to_string().contains("on_caption_overflow"), "{err}");
+    }
+
+    #[test]
+    fn adapter_identity_requires_the_family_and_task_stamps() {
+        let path = Path::new("a.safetensors");
+        let stamped: HashMap<String, String> = adapter_provenance(IrisTask::Generation, "iris_3b")
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        check_adapter_identity(&stamped, IrisTask::Generation, "iris_3b", path).unwrap();
+        let err = check_adapter_identity(&stamped, IrisTask::Depth, "iris_3b", path).unwrap_err();
+        assert!(err.to_string().contains("generation"), "{err}");
+        let err =
+            check_adapter_identity(&stamped, IrisTask::Generation, "iris_3b_x", path).unwrap_err();
+        assert!(err.to_string().contains("base model"), "{err}");
+        let mut other = stamped.clone();
+        other.insert(ADAPTER_FAMILY_KEY.into(), "qwen-image".into());
+        assert!(check_adapter_identity(&other, IrisTask::Generation, "iris_3b", path).is_err());
+        for key in [ADAPTER_FAMILY_KEY, ADAPTER_TASK_KEY] {
+            let mut missing = stamped.clone();
+            missing.remove(key);
+            let err = check_adapter_identity(&missing, IrisTask::Generation, "iris_3b", path)
+                .unwrap_err();
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+        let mut no_base = stamped;
+        no_base.remove(ADAPTER_BASE_MODEL_KEY);
+        check_adapter_identity(&no_base, IrisTask::Generation, "iris_3b", path).unwrap();
     }
 
     #[test]

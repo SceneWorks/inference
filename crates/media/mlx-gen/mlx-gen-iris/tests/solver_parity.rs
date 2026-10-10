@@ -5,7 +5,7 @@
 //! Tolerance: FP32 integration state on both sides with identical f32 coefficients; 1e-5 of peak
 //! covers MLX vs torch elementwise rounding. The 100-step default grid is compared in f64.
 
-use mlx_gen::gen_core::iris::{dpm_solver_plan, time_grid};
+use mlx_gen::gen_core::iris::{dpm_solver_plan, time_grid, Prediction};
 use mlx_gen::CancelFlag;
 use mlx_gen_iris::solver::{cfg_combine, sample};
 use mlx_rs::ops::{stack_axis, tanh};
@@ -53,13 +53,14 @@ fn multistep_trajectory_matches_upstream() {
     let final_x = sample(
         z,
         &plan,
+        Prediction::Velocity,
         &CancelFlag::new(),
         |x, step| {
             let t = step.model_time(1000);
             let out = cfg_combine(&analytic(x, t, uncond), &analytic(x, t, cond), scale)?;
             Ok(out)
         },
-        |i| seen.push(i),
+        |i, _| seen.push(i),
     )
     .unwrap();
     // re-run recording each state
@@ -68,12 +69,13 @@ fn multistep_trajectory_matches_upstream() {
         x = sample(
             z,
             &plan[..n],
+            Prediction::Velocity,
             &CancelFlag::new(),
             |x, step| {
                 let t = step.model_time(1000);
                 cfg_combine(&analytic(x, t, uncond), &analytic(x, t, cond), scale)
             },
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         states.push(x.clone());
@@ -94,12 +96,13 @@ fn cancellation_returns_the_typed_error_not_a_partial_state() {
     let result = sample(
         golden.require("z").unwrap(),
         &plan,
+        Prediction::Velocity,
         &cancel,
         |x, step| {
             calls += 1;
             Ok(analytic(x, step.model_time(1000), 0.0))
         },
-        |i| {
+        |i, _| {
             if i == 2 {
                 cancel.cancel();
             }
@@ -107,4 +110,61 @@ fn cancellation_returns_the_typed_error_not_a_partial_state() {
     );
     assert!(matches!(result, Err(mlx_gen::Error::Canceled)));
     assert_eq!(calls, 2, "no network evaluation after the flag trips");
+}
+
+/// sc-25681: `on_step(i, x0)` hands out step `i`'s predicted clean image (the preview source) under
+/// both readings of the network output — `v` (`x0 = x − s·out`) and `x` (`x0 = out`) — and the two
+/// readings integrate to different trajectories.
+#[test]
+fn the_step_callback_receives_each_steps_predicted_clean_image() {
+    let golden = fixture("iris_solver_golden.safetensors");
+    let z = golden.require("z").unwrap();
+    let plan = dpm_solver_plan(7, 2, 4.0).unwrap();
+    let (cond, uncond, scale) = (0.7f32, -0.4f32, 2.5f32);
+    let model =
+        |x: &Array, t: f32| cfg_combine(&analytic(x, t, uncond), &analytic(x, t, cond), scale);
+    let mut finals = Vec::new();
+    for prediction in [Prediction::Velocity, Prediction::Clean] {
+        let mut x0s = Vec::new();
+        let mut states = vec![z.clone()];
+        for n in 1..=plan.len() {
+            let x = sample(
+                z,
+                &plan[..n],
+                prediction,
+                &CancelFlag::new(),
+                |x, step| model(x, step.model_time(1000)),
+                |i, x0| {
+                    if i == n {
+                        x0s.push(x0.clone())
+                    }
+                },
+            )
+            .unwrap();
+            states.push(x);
+        }
+        for (i, step) in plan.iter().enumerate() {
+            let out = model(&states[i], step.model_time(1000)).unwrap();
+            let want = match prediction {
+                Prediction::Velocity => states[i]
+                    .subtract(out.multiply(Array::from_f32(step.s_f32())).unwrap())
+                    .unwrap(),
+                Prediction::Clean => out,
+            };
+            assert_close(&format!("{prediction:?} x0[{i}]"), &x0s[i], &want, 1e-6);
+        }
+        // The terminal update is the exact x0 projection: the last x0 IS the result.
+        assert_close(
+            "terminal x0",
+            states.last().unwrap(),
+            x0s.last().unwrap(),
+            0.0,
+        );
+        finals.push(states.pop().unwrap());
+    }
+    let (moved, _, _) = crate::common::errors(&finals[0], &finals[1]);
+    assert!(
+        moved > 0.1,
+        "the prediction reading must change the trajectory ({moved})"
+    );
 }
