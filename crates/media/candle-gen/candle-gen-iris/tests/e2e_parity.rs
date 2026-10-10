@@ -12,7 +12,7 @@
 
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::iris::GenerationParams;
-use candle_gen::gen_core::{CancelFlag, GenerationRequest};
+use candle_gen::gen_core::{CancelFlag, GenerationRequest, PreviewSink};
 use candle_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 
 use crate::common::{assert_close, cpu, fixture, tiny_backbone, tiny_config, tiny_text_encoder};
@@ -32,8 +32,8 @@ fn generate_matches_upstream_from_injected_noise() {
         seed: Some(0),
         ..Default::default()
     };
-    let params = GenerationParams::resolve(&req, 0);
-    let conditioning = encode(&te, &req.prompt, &params).unwrap();
+    let params = GenerationParams::resolve(&req, 0, &config).unwrap();
+    let conditioning = encode(&te, &params).unwrap();
     assert!(
         conditioning.uncond.is_some(),
         "CFG > 1 encodes the empty-negative null"
@@ -47,6 +47,7 @@ fn generate_matches_upstream_from_injected_noise() {
         &params,
         &CancelFlag::new(),
         |i| steps.push(i),
+        &PreviewSink::default(),
     )
     .unwrap();
     assert_eq!(steps, (1..=params.steps).collect::<Vec<_>>());
