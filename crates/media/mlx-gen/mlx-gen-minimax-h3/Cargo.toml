@@ -60,3 +60,7 @@ sha2 = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+# Benchmark-only synchronized attention timing. Disabled in ordinary builds.
+[features]
+veda-s0-profile = []

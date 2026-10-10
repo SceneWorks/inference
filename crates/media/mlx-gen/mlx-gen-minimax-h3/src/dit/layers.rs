@@ -31,6 +31,53 @@ use crate::dit::config::MiniMaxH3DitConfig;
 use crate::dit::rope::{MmRope, MmRopeTables};
 use crate::layout::split_gate_value;
 
+/// Benchmark-only, thread-local timing scope. Synchronization changes lazy graph residency;
+/// its caller must compare profiled and unprofiled whole-forward timing.
+#[cfg(feature = "veda-s0-profile")]
+pub mod s0_profile {
+    use mlx_gen::Result;
+    use mlx_rs::Array;
+    use std::{cell::Cell, time::Instant};
+    thread_local! {
+        static STATE: Cell<(bool, f64, usize)> = const { Cell::new((false, 0.0, 0)) };
+    }
+    pub struct Scope;
+    impl Scope {
+        pub fn new(enabled: bool) -> Self {
+            STATE.with(|s| s.set((enabled, 0.0, 0)));
+            Self
+        }
+        pub fn finish(self) -> (f64, usize) {
+            STATE.with(|s| {
+                let (_, seconds, calls) = s.replace((false, 0.0, 0));
+                (seconds, calls)
+            })
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            STATE.with(|s| s.set((false, 0.0, 0)));
+        }
+    }
+    pub(super) fn start(q: &Array, k: &Array, v: &Array) -> Result<Option<Instant>> {
+        if !STATE.with(|s| s.get().0) {
+            return Ok(None);
+        }
+        mlx_rs::transforms::eval([q, k, v])?;
+        Ok(Some(Instant::now()))
+    }
+    pub(super) fn stop(start: Option<Instant>, output: &Array) -> Result<()> {
+        if let Some(start) = start {
+            mlx_rs::transforms::eval([output])?;
+            STATE.with(|s| {
+                let (enabled, seconds, calls) = s.get();
+                s.set((enabled, seconds + start.elapsed().as_secs_f64(), calls + 1));
+            });
+        }
+        Ok(())
+    }
+}
+
 /// **The rung-3 reachability probe** (sc-18661): what the last [`DitAttention::forward_bounded`] in
 /// this process actually executed.
 ///
@@ -340,7 +387,11 @@ impl DitAttention {
         // than from local arithmetic — a probe that re-derived the boundaries could agree with itself
         // while the kernel did something else.
         record_planned_attention(bounded, b, h, seq);
+        #[cfg(feature = "veda-s0-profile")]
+        let s0_started = s0_profile::start(&qh, &kh, &vh)?;
         let out = sdpa_bounded_bhsd(&qh, &kh, &vh, scale, None, bounded)?;
+        #[cfg(feature = "veda-s0-profile")]
+        s0_profile::stop(s0_started, &out)?;
 
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
