@@ -9,17 +9,25 @@
 //! half-precision GEMM, so here the tower runs f32 (`tower_dtype`) — the measured distance (max
 //! |Δ| 2.0e-2–2.5e-2 of peak) is therefore upstream's own bf16-vs-fp32 envelope on this snapshot
 //! (2.2 %). The bound is the MLX twin's 4e-2 of peak; a structural error (wrong layer, template,
-//! RoPE or mask) is O(peak). Ids and masks are exact.
+//! RoPE or mask) is O(peak). Ids and masks are exact. `windows_masks_and_layer_states_match_upstream`
+//! runs on the build's device, so on the CUDA lane the tower runs the release's bf16 on the real
+//! kernels against the same fixture and bound.
 
 use candle_gen_iris::text_encoder::caption_overflow_warning;
 use candle_gen_iris::IrisTextEncoder;
 
+use candle_gen::candle_core::Device;
+
 use crate::common::{
-    assert_close, cpu, fixture, host_f32, host_i32, tiny_config, tiny_text_encoder,
+    assert_close, cpu, device, fixture, host_f32, host_i32, tiny_config, tiny_text_encoder,
 };
 
 fn encoder() -> IrisTextEncoder {
-    IrisTextEncoder::load(&tiny_text_encoder(), &tiny_config().text_encoder, &cpu())
+    encoder_on(&cpu())
+}
+
+fn encoder_on(device: &Device) -> IrisTextEncoder {
+    IrisTextEncoder::load(&tiny_text_encoder(), &tiny_config().text_encoder, device)
         .expect("tiny Qwen3-VL snapshot loads")
 }
 
@@ -42,7 +50,8 @@ fn template_pieces_tokenize_like_upstream() {
 
 #[test]
 fn windows_masks_and_layer_states_match_upstream() {
-    let te = encoder();
+    // The build's device: on the CUDA lane the tower runs the release's bf16 on the real kernels.
+    let te = encoder_on(&device());
     let golden = fixture("iris_text_golden.safetensors");
     for (name, prompt) in PROMPTS {
         let window = te.window(prompt).unwrap();

@@ -35,6 +35,13 @@ pub fn cpu() -> Device {
     Device::Cpu
 }
 
+/// The build's device — `cuda:0` under `--features cuda`, else CPU. The tests that use it compare
+/// the device's own kernels (bf16 GEMM / attention on CUDA) to the committed fixtures; the CUDA
+/// dispatch lane runs them by name.
+pub fn device() -> Device {
+    candle_gen::default_device().expect("the build's device")
+}
+
 /// A committed fixture: its tensors (on CPU) and its header metadata.
 pub struct Fixture {
     pub tensors: HashMap<String, Tensor>,
