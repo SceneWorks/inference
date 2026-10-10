@@ -540,17 +540,31 @@ expected_files = [
 # sc-25680 — Iris-3B's generation backbone (the repo root: `config.yaml` + FP32 `model.safetensors`,
 # ~12 GB) for the candle real-weight lane: the dispatch-only `iris` profile's `candle-iris` job
 # materializes it on the Windows CUDA runner under `CANDLE_GEN_MODELS_ROOT` and runs
-# `candle-gen-iris/tests/real_weights.rs`. Only the generation task is fetched — `depth/` and
-# `upscaler/` are later stories' backbones.
+# `candle-gen-iris/tests/real_weights.rs`. sc-25682 adds the monocular-depth task's `depth/` export
+# (`config.yaml` + FP32 `model.safetensors` ~12 GB + `empty_prompt.safetensors`), read by
+# `candle-gen-iris/tests/depth_real_weights.rs` from the same snapshot root. `upscaler/` is a later
+# story's backbone.
 key = "iris-3b-cuda"
 repository = "speridlabs/iris-3b"
 revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
 license = "Apache-2.0"
-size_class = "large"
+size_class = "very-large"
 profiles = ["iris"]
 environment = ["IRIS_WEIGHTS_DIR"]
-download_files = ["config.yaml", "model.safetensors"]
-expected_files = ["config.yaml", "model.safetensors"]
+download_files = [
+    "config.yaml",
+    "model.safetensors",
+    "depth/config.yaml",
+    "depth/model.safetensors",
+    "depth/empty_prompt.safetensors",
+]
+expected_files = [
+    "config.yaml",
+    "model.safetensors",
+    "depth/config.yaml",
+    "depth/model.safetensors",
+    "depth/empty_prompt.safetensors",
+]
 
 [[models]]
 # sc-25680 — the Qwen/Qwen3-VL-4B-Instruct text encoder Iris-3B's generation task conditions on

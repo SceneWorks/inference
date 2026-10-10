@@ -275,6 +275,8 @@ struct TextAdapter {
 pub struct IrisDiT {
     cfg: ModelConfig,
     compute: Dtype,
+    /// Channels of `x` (`model.in_channels`, plus the depth task's extra zero channel).
+    input_channels: usize,
     s_embedder: Linear,
     t_mlp0: Linear,
     t_mlp2: Linear,
@@ -302,6 +304,18 @@ impl IrisDiT {
     /// Build from the backbone's `model.safetensors` (upstream key names) at `compute` dtype.
     /// Every source key must be consumed; a leftover or missing key is a load error.
     pub fn from_weights(w: &Weights, cfg: &ModelConfig, compute: Dtype) -> Result<Self> {
+        Self::from_weights_widened(w, cfg, compute, cfg.in_channels)
+    }
+
+    /// [`Self::from_weights`] for a backbone whose input projections were widened to
+    /// `input_channels` (`iris3b/downstream/depth.py` `_widen`: the depth task concatenates a zero
+    /// channel after RGB). The output stays `model.in_channels` wide.
+    pub fn from_weights_widened(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        input_channels: usize,
+    ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
@@ -433,6 +447,7 @@ impl IrisDiT {
         let dit = Self {
             cfg: cfg.clone(),
             compute,
+            input_channels,
             s_embedder: l.linear("s_embedder.proj", true)?,
             t_mlp0: l.linear("t_embedder.mlp.0", true)?,
             t_mlp2: l.linear("t_embedder.mlp.2", true)?,
@@ -461,7 +476,12 @@ impl IrisDiT {
         crate::nn::expect_shape(
             "s_embedder.proj.weight",
             &dit.s_embedder.arrays()[0].clone(),
-            &[cfg.hidden_size as i32, p * p * cfg.in_channels as i32],
+            &[cfg.hidden_size as i32, p * p * input_channels as i32],
+        )?;
+        crate::nn::expect_shape(
+            "pixel_embedder.proj.weight",
+            &dit.pixel_proj.arrays()[0].clone(),
+            &[cfg.pixel.hidden_size as i32, input_channels as i32],
         )?;
         Ok(dit)
     }
@@ -671,6 +691,12 @@ impl IrisDiT {
         let sh = x.shape();
         let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
         let p = cfg.patch_size as i32;
+        if c as usize != self.input_channels {
+            return Err(Error::Msg(format!(
+                "iris: input has {c} channels, the backbone embeds {}",
+                self.input_channels
+            )));
+        }
         if h % p != 0 || w % p != 0 {
             return Err(Error::Msg(format!(
                 "iris: input {h}x{w} is not divisible by patch_size {p}"
@@ -771,11 +797,12 @@ impl IrisDiT {
         let out = self
             .final_linear
             .forward(&self.final_norm.forward(&pixels)?)?;
-        // fold: [B·L, p·p, C] → [B, C, H, W]
+        // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
+        let c_out = cfg.in_channels as i32;
         Ok(out
-            .reshape(&[b, hp, wp, p, p, c])?
+            .reshape(&[b, hp, wp, p, p, c_out])?
             .transpose_axes(&[0, 5, 1, 3, 2, 4])?
-            .reshape(&[b, c, h, w])?
+            .reshape(&[b, c_out, h, w])?
             .as_dtype(Dtype::Float32)?)
     }
 
