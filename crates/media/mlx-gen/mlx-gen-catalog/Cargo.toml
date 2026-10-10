@@ -18,6 +18,7 @@ mlx-gen-depth = { path = "../mlx-gen-depth" }
 mlx-gen-face = { path = "../mlx-gen-face" }
 mlx-gen-ideogram = { path = "../mlx-gen-ideogram" }
 mlx-gen-instantid = { path = "../mlx-gen-instantid" }
+mlx-gen-iris = { path = "../mlx-gen-iris" }
 mlx-gen-joycaption = { path = "../mlx-gen-joycaption" }
 mlx-gen-kolors = { path = "../mlx-gen-kolors" }
 mlx-gen-krea = { path = "../mlx-gen-krea" }

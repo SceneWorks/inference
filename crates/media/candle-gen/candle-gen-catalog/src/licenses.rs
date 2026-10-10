@@ -820,6 +820,9 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
+            // Iris-3B (sc-25679) is MLX-first; its Candle twin is epic sc-25678's S2.
+            "iris_3b",
+            "qwen3_vl_4b_instruct",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

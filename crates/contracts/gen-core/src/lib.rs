@@ -34,6 +34,7 @@ pub mod guidance;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
+pub mod iris;
 pub mod json_constraint;
 pub mod latent;
 pub mod license;

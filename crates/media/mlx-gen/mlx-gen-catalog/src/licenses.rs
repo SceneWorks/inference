@@ -83,7 +83,7 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 61 rows over 71 registered ids: the seventeen trainer ids reuse their generator's row, and ten ids
+/// 62 rows over 72 registered ids: the seventeen trainer ids reuse their generator's row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -227,6 +227,13 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "ideogram_4_turbotime_lora",
             "nvidia_pid_students",
         ],
+    },
+    // --- iris --------------------------------------------------------------------------------
+    // The generation task loads the repo-root backbone and the upstream Qwen3-VL-4B-Instruct
+    // repository (pinned revision) as its text encoder; both are rowed, because both are loaded.
+    ProviderComponents {
+        provider_id: "iris_3b",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
     },
     // --- kolors ------------------------------------------------------------------------------
     // The shortest row relative to what the id loads: the `Kwai-Kolors/Kolors-diffusers` repository
@@ -896,8 +903,9 @@ mod tests {
             .collect();
 
         // sc-24108: `qwen_image_2_1` registers with its own complete row (71 / 61).
-        assert_eq!(registered.len(), 71, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 61);
+        // sc-25679: `iris_3b` registers with its own complete row (72 / 62).
+        assert_eq!(registered.len(), 72, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 62);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -964,9 +972,9 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            22,
+            23,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
-             (qwen_image_2_1 joined the complete set in sc-24108)"
+             (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1142,7 +1150,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 61);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 62);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

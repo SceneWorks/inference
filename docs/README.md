@@ -46,6 +46,9 @@ clause for every term assigned to a licence family.
 - **[Qwen Research License evidence (sc-24108)](licensing/sc-24108-qwen-research-licence-evidence.md)** —
   the primary-source read behind the `qwen-research` family and the `qwen_image_2_1` component row
   (Qwen-Image 2.1). **Draft, unsigned.**
+- **[Iris-3B licence evidence (sc-25679)](licensing/sc-25679-iris-licence-evidence.md)** — the
+  primary-source read behind the `iris_3b` and `qwen3_vl_4b_instruct` component rows (Iris-3B,
+  Apache-2.0). **Draft, unsigned.**
 - **[Tongyi Qianwen License evidence (sc-22989)](licensing/sc-22989-tongyi-qianwen-licence-evidence.md)** —
   the primary-source read behind the `tongyi-qianwen` family and YuE2's `yue2_qwen_tiktoken`
   component row (`qwen.tiktoken` is byte-identical to Qwen-7B's). **Draft, unsigned.**
