@@ -4945,7 +4945,10 @@ jobs:
   # 1024-px tiles) plus one release-scale 512x384 → 2048x1536 render (six tiles); and the generation
   # trainer (sc-25686): one bounded LoRA run (four bf16 AdamW steps at 256², batch 1, the repo
   # photo's crops) → export → load through `load_backbone_with_adapters` → render beside the base,
-  # the adapted render checked against the trainer's own preview. Each runs
+  # the adapted render checked against the trainer's own preview; and the depth trainer (sc-25687):
+  # one bounded FULL fine-tune of the `depth/` export (four bf16 AdamW steps at 128², batch 1, the
+  # repo photo with a synthetic depth ramp) → `depth/` export → the standalone estimator, whose
+  # prediction must move toward the target. Each runs
   # `--exact` with a run-count assertion, writing the PNG + logs + a report-only `nvidia-smi` VRAM
   # line into the evidence artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
   # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.

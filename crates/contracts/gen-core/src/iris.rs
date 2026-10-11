@@ -171,6 +171,7 @@ impl GenerationResources {
     /// the backend when it resolves the shard index.
     pub fn check(&self, model_id: &str) -> Result<()> {
         require_dir(&self.backbone_dir, model_id, "generation backbone")?;
+        downstream::refuse_task_export(&self.backbone_dir, model_id)?;
         for name in [BACKBONE_CONFIG_FILE, BACKBONE_WEIGHTS_FILE] {
             require_file(
                 &self.backbone_dir.join(name),

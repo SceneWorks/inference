@@ -134,6 +134,56 @@ pub fn load_depth_export(export: TaskExport, compute: DType, device: &Device) ->
     })
 }
 
+/// The pieces of one `IrisDepth.forward` — the loaded estimator's, or a training step's (built from
+/// the trainable `Var` tensors, `crate::train::depth`), so training and inference share one graph.
+pub struct DepthParts<'a> {
+    /// The widened backbone.
+    pub dit: &'a IrisDiT,
+    /// The 1×1 conv as a `[1, C]` linear layer, in the compute dtype.
+    pub reducer: &'a Linear,
+    /// `[1, T, L, D]` f32 empty-prompt states (on the model's device) and their `[T]` mask.
+    pub embeddings: &'a Tensor,
+    pub mask: &'a [i32],
+    pub num_train_timesteps: usize,
+}
+
+/// `IrisDepth.forward` over `parts`: RGB ‖ zero channel, one backbone forward at model time
+/// `num_train_timesteps` on the empty prompt, the 1×1 reducer. `[B, 3, H, W]` (any device) →
+/// `[B, 1, H, W]` f32 on the model's device.
+pub fn depth_forward(parts: &DepthParts, rgb: &Tensor) -> Result<Tensor> {
+    let (b, _, h, w) = rgb.dims4()?;
+    let device = parts.dit.device();
+    let rgb = rgb.to_device(device)?.to_dtype(DType::F32)?;
+    let zero = Tensor::zeros((b, DEPTH_EXTRA_INPUT_CHANNELS, h, w), DType::F32, device)?;
+    let x = Tensor::cat(&[&rgb, &zero], 1)?;
+    let t_model = parts.num_train_timesteps as f32;
+    let t = Tensor::full(t_model, b, device)?;
+    let (_, tl, l, d) = parts.embeddings.dims4()?;
+    let states = parts.embeddings.broadcast_as((b, tl, l, d))?.contiguous()?;
+    let mask = vec![parts.mask.to_vec(); b];
+    let out = parts.dit.forward(
+        &x,
+        &t,
+        &TextBatch {
+            states: &states,
+            mask: &mask,
+        },
+    )?;
+    // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
+    // runs in the compute dtype like every other projection.
+    let c = out.dim(1)?;
+    let pixels = out
+        .permute((0, 2, 3, 1))?
+        .contiguous()?
+        .reshape((b * h * w, c))?;
+    let reduced = parts.reducer.forward(&pixels)?;
+    Ok(reduced
+        .reshape((b, h, w, 1))?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?
+        .to_dtype(DType::F32)?)
+}
+
 impl IrisDepth {
     pub fn export(&self) -> &TaskExport {
         &self.export
@@ -150,37 +200,16 @@ impl IrisDepth {
     /// `IrisDepth.forward`: `[B, 3, H, W]` RGB in `[-1, 1]` (H and W on the patch grid, any device)
     /// → `[B, 1, H, W]` relative log depth (f32, on the model's device).
     pub fn forward(&self, rgb: &Tensor) -> Result<Tensor> {
-        let (b, _, h, w) = rgb.dims4()?;
-        let device = self.device();
-        let rgb = rgb.to_device(device)?.to_dtype(DType::F32)?;
-        let zero = Tensor::zeros((b, DEPTH_EXTRA_INPUT_CHANNELS, h, w), DType::F32, device)?;
-        let x = Tensor::cat(&[&rgb, &zero], 1)?;
-        let t_model = self.export.config.flow.num_train_timesteps as f32;
-        let t = Tensor::full(t_model, b, device)?;
-        let (_, tl, l, d) = self.embeddings.dims4()?;
-        let states = self.embeddings.broadcast_as((b, tl, l, d))?.contiguous()?;
-        let mask = vec![self.mask.clone(); b];
-        let out = self.dit.forward(
-            &x,
-            &t,
-            &TextBatch {
-                states: &states,
-                mask: &mask,
+        depth_forward(
+            &DepthParts {
+                dit: &self.dit,
+                reducer: &self.reducer,
+                embeddings: &self.embeddings,
+                mask: &self.mask,
+                num_train_timesteps: self.export.config.flow.num_train_timesteps,
             },
-        )?;
-        // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so
-        // it runs in the compute dtype like every other projection.
-        let c = out.dim(1)?;
-        let pixels = out
-            .permute((0, 2, 3, 1))?
-            .contiguous()?
-            .reshape((b * h * w, c))?;
-        let reduced = self.reducer.forward(&pixels)?;
-        Ok(reduced
-            .reshape((b, h, w, 1))?
-            .permute((0, 3, 1, 2))?
-            .contiguous()?
-            .to_dtype(DType::F32)?)
+            rgb,
+        )
     }
 
     /// One `[3, h, w]` host input → the `h × w` host prediction.

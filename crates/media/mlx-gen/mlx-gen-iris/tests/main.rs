@@ -28,6 +28,15 @@ mod depth_parity;
 #[path = "depth_real_weights.rs"]
 mod depth_real_weights;
 
+#[path = "depth_train_lifecycle.rs"]
+mod depth_train_lifecycle;
+
+#[path = "depth_train_parity.rs"]
+mod depth_train_parity;
+
+#[path = "depth_train_real_weights.rs"]
+mod depth_train_real_weights;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
