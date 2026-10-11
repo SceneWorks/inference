@@ -11,7 +11,8 @@
 //!   second-order degradation of the repository photo's crops → the `upscaler/` export → loaded by
 //!   `iris_3b_restore` (no training-only component) → a ×4 restoration of a small image, beside the
 //!   base export's: the paper's FULL fine-tune (`recipe_training_config`) and HYPIR's LoRA arm
-//!   (rank 8, merged). Writes the PNGs, losses and per-step timings into `IRIS_OUT/<case>`.
+//!   (rank 8, merged). Writes the PNGs, losses and per-step timings into `IRIS_OUT/<case>` (the export itself stays in
+//!   a temp dir).
 //!
 //! Inputs: `IRIS_UPSCALER_DIR`, the pinned snapshot directories `IRIS_LPIPS_VGG16_DIR`,
 //! `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (`gen_core::iris::restoration_train`'s
@@ -250,10 +251,13 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
         "[[IRIS_RESTORE_TRAIN]] {case}: full_finetune={} rank={} lr={:e} weight_decay={}",
         config.full_finetune, config.rank, config.learning_rate, config.weight_decay
     );
+    // The export (12 GB f32) and checkpoints live in a temp dir dropped with the test; only the
+    // PNGs and logs go to the evidence directory.
+    let work = tempfile::tempdir().unwrap();
     let req = TrainingRequest {
         items,
         config,
-        output_dir: out.join("restore-train"),
+        output_dir: work.path().join("restore-train"),
         file_name: "restorer.safetensors".into(),
         trigger_words: Vec::new(),
         cancel: CancelFlag::default(),
@@ -304,6 +308,7 @@ fn train_export_and_restore(case: &str, mut config: TrainingConfig) {
         moved > 0,
         "{case}: the trained export restores exactly as the base did"
     );
+    drop(work);
 }
 
 /// HYPIR's LoRA arm (rank 8, the merged adapter) at the recipe's lr 1e-5 / weight decay 0.01.
