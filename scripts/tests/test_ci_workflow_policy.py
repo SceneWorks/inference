@@ -782,6 +782,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     expected_lock_counts = {
         # 36 since sc-24163 added the `mlx-qwen-image-2-1` job;
         # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
+        # 37 since sc-25687 added the dispatch-only `mlx-iris-depth-train` job;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -790,7 +791,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 36,
+        MACOS_HUB_LOCK: 37,
         # 14 since sc-25680 added the `candle-iris` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
@@ -1081,12 +1082,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
         # after sc-24114 added `candle-qwen-image-2-1`; 36 macOS after sc-24163 added
-        # `mlx-qwen-image-2-1`.
+        # `mlx-qwen-image-2-1`; 37 macOS after sc-25687 added `mlx-iris-depth-train`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 36)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 37)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 14)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)

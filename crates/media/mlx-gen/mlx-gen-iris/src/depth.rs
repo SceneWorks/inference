@@ -158,6 +158,62 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
     })
 }
 
+/// The pieces of one `IrisDepth.forward` — the loaded estimator's, or a training step's (built from
+/// the traced trainable tensors, `crate::train::depth`), so training and inference share one graph.
+pub struct DepthParts<'a> {
+    /// The widened backbone.
+    pub dit: &'a IrisDiT,
+    /// `[1, C]` (the 1×1 conv kernel) and `[1]`, in the compute dtype.
+    pub reducer_weight: &'a Array,
+    pub reducer_bias: &'a Array,
+    /// `[1, T, L, D]` f32 empty-prompt states and their `[T]` mask.
+    pub embeddings: &'a Array,
+    pub mask: &'a [i32],
+    pub num_train_timesteps: usize,
+}
+
+/// `IrisDepth.forward` over `parts`: RGB ‖ zero channel, one backbone forward at model time
+/// `num_train_timesteps` on the empty prompt, the 1×1 reducer. `[B, 3, H, W]` → `[B, 1, H, W]` f32.
+pub fn depth_forward(parts: &DepthParts, rgb: &Array) -> Result<Array> {
+    let sh = rgb.shape();
+    let (b, h, w) = (sh[0], sh[2], sh[3]);
+    let x = concatenate_axis(
+        &[
+            &rgb.as_dtype(Dtype::Float32)?,
+            &zeros::<f32>(&[b, DEPTH_EXTRA_INPUT_CHANNELS as i32, h, w])?,
+        ],
+        1,
+    )?;
+    let t_model = parts.num_train_timesteps as f32;
+    let t = Array::from_slice(&vec![t_model; b as usize], &[b]);
+    let e = parts.embeddings.shape();
+    let states = mlx_rs::ops::broadcast_to(parts.embeddings, &[b, e[1], e[2], e[3]])?;
+    let mask = vec![parts.mask.to_vec(); b as usize];
+    let out = parts.dit.forward(
+        &x,
+        &t,
+        &TextBatch {
+            states: &states,
+            mask: &mask,
+        },
+    )?;
+    // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
+    // runs in the compute dtype like every other projection.
+    let c = out.shape()[1];
+    let pixels = out
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[-1, c])?
+        .as_dtype(parts.dit.compute_dtype())?;
+    let reduced = addmm(
+        parts.reducer_bias,
+        &pixels,
+        parts.reducer_weight.t(),
+        1.0,
+        1.0,
+    )?;
+    Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
+}
+
 impl IrisDepth {
     pub fn export(&self) -> &TaskExport {
         &self.export
@@ -170,43 +226,17 @@ impl IrisDepth {
     /// `IrisDepth.forward`: `[B, 3, H, W]` RGB in `[-1, 1]` (f32, H and W on the patch grid) →
     /// `[B, 1, H, W]` relative log depth (f32).
     pub fn forward(&self, rgb: &Array) -> Result<Array> {
-        let sh = rgb.shape();
-        let (b, h, w) = (sh[0], sh[2], sh[3]);
-        let x = concatenate_axis(
-            &[
-                &rgb.as_dtype(Dtype::Float32)?,
-                &zeros::<f32>(&[b, DEPTH_EXTRA_INPUT_CHANNELS as i32, h, w])?,
-            ],
-            1,
-        )?;
-        let t_model = self.export.config.flow.num_train_timesteps as f32;
-        let t = Array::from_slice(&vec![t_model; b as usize], &[b]);
-        let e = self.embeddings.shape();
-        let states = mlx_rs::ops::broadcast_to(&self.embeddings, &[b, e[1], e[2], e[3]])?;
-        let mask = vec![self.mask.clone(); b as usize];
-        let out = self.dit.forward(
-            &x,
-            &t,
-            &TextBatch {
-                states: &states,
-                mask: &mask,
+        depth_forward(
+            &DepthParts {
+                dit: &self.dit,
+                reducer_weight: &self.reducer_weight,
+                reducer_bias: &self.reducer_bias,
+                embeddings: &self.embeddings,
+                mask: &self.mask,
+                num_train_timesteps: self.export.config.flow.num_train_timesteps,
             },
-        )?;
-        // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so
-        // it runs in the compute dtype like every other projection.
-        let c = out.shape()[1];
-        let pixels = out
-            .transpose_axes(&[0, 2, 3, 1])?
-            .reshape(&[-1, c])?
-            .as_dtype(self.compute_dtype())?;
-        let reduced = addmm(
-            &self.reducer_bias,
-            &pixels,
-            self.reducer_weight.t(),
-            1.0,
-            1.0,
-        )?;
-        Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
+            rgb,
+        )
     }
 
     fn estimate_impl(

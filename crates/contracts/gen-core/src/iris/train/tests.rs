@@ -572,6 +572,7 @@ fn checkpoints_publish_atomically_and_prune() {
         data_identity: "d".into(),
         dataset_fingerprint: "f".into(),
         base_identity: "b".into(),
+        task: IrisTask::Generation,
     };
     for step in [1u64, 2, 3, 4] {
         let staging = checkpoint_staging_dir(root.path(), step);
@@ -624,6 +625,7 @@ fn resume_checks_state_and_data_identity() {
         data_identity: plan.data_identity(),
         dataset_fingerprint: "ds".into(),
         base_identity: "base".into(),
+        task: IrisTask::Generation,
     };
     check_resume(&saved, &plan, "ds", "base").unwrap();
     assert!(check_resume(&saved, &plan, "other", "base").is_err());

@@ -217,6 +217,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "iris_3b",
         components: &["iris_3b", "qwen3_vl_4b_instruct"],
     },
+    // The depth trainer (sc-25687) trains the repository's `depth/` export, or the repo-root
+    // backbone as its parent — whose empty-prompt conditioning may be encoded once by the Qwen3-VL
+    // text encoder — so both are rowed. It is not a generator id, hence its own row.
+    ProviderComponents {
+        provider_id: "iris_3b_depth",
+        components: &["iris_3b", "qwen3_vl_4b_instruct"],
+    },
     // The restoration transform (sc-25683) loads only the same repository's `upscaler/` export —
     // never the text encoder — so its one component is the repository row.
     ProviderComponents {
@@ -574,7 +581,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 53);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 54);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -606,10 +613,10 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            63,
-            "63 distinct Candle provider ids: 57 generators + 17 trainers (15 of them also \
-             generator ids — iris_3b joined in sc-25686) + 1 captioner + 2 embedders + 1 transform \
-             (iris_3b_restore, sc-25683)"
+            64,
+            "64 distinct Candle provider ids: 57 generators + 18 trainers (15 of them also \
+             generator ids — iris_3b joined in sc-25686; iris_3b_depth, sc-25687, is not) + 1 \
+             captioner + 2 embedders + 1 transform (iris_3b_restore, sc-25683)"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
@@ -761,6 +768,7 @@ mod tests {
                 "chroma1_flash",
                 "chroma1_hd",
                 "iris_3b",
+                "iris_3b_depth",
                 "iris_3b_restore",
                 "ltx_2_3",
                 "ltx_2_3_distilled",

@@ -267,6 +267,59 @@ decode (not PIL) pooled mean 3.3e-3 / max 7.0e-2. Bounds: pearson ≥ 0.9995, me
 (`image`-crate decode) measured pooled mean 2.8e-3 / max 0.11 / pearson 0.99999, 0.4 s estimate,
 8.4 GB VRAM peak (run 38076560406).
 
+## Depth training coverage table (`iris_3b_depth` trainer, sc-25687)
+
+The frozen release has **no downstream training loop**: the model and export are upstream code
+(`src/iris3b/downstream/depth.py` `IrisDepth`, `scripts/export_downstream.py depth` — whose `depth()`
+asserts a "direct-regression (stage 0)" checkpoint carrying its own `conditioning`), the recipe is the
+paper (arXiv 2610.09450v1 §5.2 "Recipe." / "Data.", Eq. 5). Nothing below is a verbatim port of a
+training script; each row names its source, and where the paper is silent the choice is a documented
+assumption **and** a `model_options.iris` option (never a hidden constant). Contract:
+`gen_core::iris::train::depth` (plan, items, paired transforms, normalization, Eq. 5 host reference,
+export layout, resume identity); tensors: `mlx_gen_iris::train::depth` / `candle_gen_iris::train::depth`.
+
+| Choice | Source | MLX | Candle | Status |
+| --- | --- | --- | --- | --- |
+| Model = widened projections + zero 4th channel + 1×1 reducer + empty prompt, one forward at `t = flow.num_train_timesteps` | `IrisDepth.__init__` / `.forward` | `depth::depth_forward` (shared with the estimator) | same | ported — training and inference share one graph |
+| Full fine-tune (no adapters) | §5.2 "We fully fine-tune with AdamW" | trainer refuses `full_finetune = false` | same | ported |
+| Target: relative log depth, per image, 2nd/98th percentiles of the **valid** GT → −1 / +1 | §5.2 "normalized per image by the 2nd and 98th percentiles of the valid ground truth"; `depth.py` docstring "mapped to -1 (near) and +1 (far)" | `normalize_log_depth` (numpy `linear` percentile) | same | ported; `low_percentile` / `high_percentile` options. **Assumption:** normalized over the training crop's valid pixels (after the paired resize / crop); the paper says only "per image" |
+| Target clamp to [−1, 1] | paper silent (Marigold clips; the stated map does not) | off | same | **assumption**, option `clip_target` |
+| Loss Eq. 5: `1/|M| Σ_{p∈M} |d̂−d| + 5‖∇d̂−∇d‖₁` | §5.2 Eq. 5 | `train::depth::depth_loss` | same | ported; `gradient_weight` option (default 5) |
+| ∇ = forward differences in x and y; a pair counts when both pixels are valid | paper silent (∇ undefined) | fixed | same | **assumption** (documented; the conventional masked gradient-matching term) |
+| `|M|` over the micro-batch | Eq. 5 has one `M` | `valid_pixels` | same | literal reading; option `loss_reduction: per_image` |
+| Invalid / beyond-far-plane pixels masked | §5.2 "masked from the loss" | per-item `mask_path`, `min_depth`, `max_depth` (+ finite, `d > 0`) | same | ported |
+| No-valid-depth / degenerate examples | paper silent | `invalid_examples: reject` (default, refuses naming the item) / `skip`; a crop-emptied row is masked out | same | explicit policy, tested |
+| AdamW β (0.9, 0.999), wd 0.01, LR 3e-5 constant, no warmup, clip 1.0, global batch 32, 10K steps | §5.2 | β + clip are the depth defaults; `apply_paper_recipe` sets the shared fields | same | ported (Muon also honoured when asked) |
+| Raw weights evaluated (no EMA) | §5.2 "evaluate the raw weights" | `ema_enabled` default false, `export_weights: raw` | same | ported; EMA optional |
+| Random horizontal flips | §5.2 "with random horizontal flips" | `hflip_prob` 0.5, paired over RGB / depth / mask | same | ported (½ = **assumption**, the conventional flip) |
+| Training sizes 480×640 / 352×1216 (native), 9:1 per batch | §5.2 "Data." | one training size per run (`depth_size`); `resize: cover` (bicubic RGB, nearest depth + mask) or `none`; `crop: center` / `random` | same | resolution and mixing are dataset/job choices (SceneWorks); crop/resize **assumption** + options |
+| Parent init: widened columns | paper silent | zeros (the channel is always 0: no forward effect, no gradient) | same | **assumption**, tested |
+| Parent init: reducer | paper silent; `nn.Conv2d` default in `IrisDepth.__init__` | `reducer_init: torch_default` (U(±1/√C)), or `channel_mean` | same | upstream-construction default + option |
+| Parent empty prompt | export carries `payload["conditioning"]` | `empty_prompt` component file, or encode `""` once with `text_encoder` | same | ported; a `depth/` export uses its own |
+| Export | `export_downstream.py depth` | `<out>/<stem>/{config.yaml (model/text_encoder/flow + task: depth), model.safetensors (FP32 `pixel.*` + `depth_reducer.*`), empty_prompt.safetensors}` + `irisTask=depth` / `irisArtifact=full_model` / `irisBaseIdentity` stamps | same | ported; runs in `depth::load` unchanged; generation / restoration loaders refuse it |
+| Lifecycle (cancel, checkpoints, resume incl. optimizer/scheduler/EMA/RNG/data position, new phase, retention, previews) | generation trainer contract (sc-25685) | shared `gen_core::iris::train` machinery; `state.json` `task = depth` | same | ported |
+
+Fixtures: `iris_depth_train_golden.safetensors` from `../tools/dump_iris_depth_train.py` (upstream
+`IrisDepth` on `tiny-depth`, torch FP32 CPU, the paper's normalization + Eq. 5, one
+`clip_grad_norm_(1.0)` + `torch.optim.AdamW(β=(0.9, 0.999), wd=0.01)` step at lr 1e-3). Measured
+(`tests/depth_train_parity.rs`, FP32 CPU): normalized targets 1.2e-7; prediction 2.0e-5 of peak; loss
+2.5215921 vs 2.5215914; per-tensor gradient norms ≤ 1e-3 rel; selected gradients ≤ 9e-5 of peak (MLX)
+/ ≤ 8.8e-5 (Candle); the AdamW update matches to ≤ 3e-8 on every well-conditioned element (elements
+whose gradient is at rounding level may flip `sign(g)` in Adam's first step, bounded by 2·lr);
+post-step loss 2.3403609 vs 2.3403635. MLX ↔ Candle parity is transitive through this one reference.
+Hand-derived Eq. 5 values and finite-difference subgradients: `gen_core` unit tests. Candle's `abs`
+backward is +1 at exactly 0 (torch: 0) — reachable only at an exactly-zero valid error.
+
+Real weights (`tests/depth_train_real_weights.rs`, ignored, both backends): the `depth/` export
+(~3B parameters) fully fine-tuned for 4 bf16 AdamW steps (lr 3e-5, wd 0.01, clip 1) at 128², batch 1,
+on the repo photo with a synthetic depth ramp, then the export is loaded by the estimator unchanged.
+Candle/CUDA (RTX PRO 6000, run 38133787177): losses 0.818 → 0.411 → 0.227 → 0.343, 2.7 s/step,
+train + checkpoint + export 230 s, VRAM peak 64.6 GB; estimator mean |pred − target| 0.662 (release)
+→ 0.112 (trained). MLX on nax-macos-2 (dispatch-only `iris-depth-train-mlx` profile: 128 GB RAM,
+`memory_pressure` 94% = 120 GB free at start, 80 GB phys_footprint guard; run 38136750391): losses
+0.830 → 0.355 → 0.325 → 0.219, 1.1 s/step, train + checkpoint + export 14.1 s, peak phys_footprint
+59.0 GB, 19 s test wall; estimator mean |pred − target| 0.660 (release) → 0.083 (trained).
+
 ## Restoration (`iris_3b_restore`, sc-25683)
 
 Source: `src/iris3b/downstream/restoration.py`, `src/iris3b/downstream/__init__.py`,

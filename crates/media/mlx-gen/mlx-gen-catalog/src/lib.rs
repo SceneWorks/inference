@@ -1910,6 +1910,7 @@ mod tests {
                 "anima_aesthetic",
                 "anima_turbo",
                 "iris_3b",
+                "iris_3b_depth",
                 "kolors",
                 "krea_2_raw",
                 "lens",
@@ -1934,8 +1935,8 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
-        // this is where a surface change and a mapping change meet. All eighteen trainer ids are
-        // also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
+        // this is where a surface change and a mapping change meet. All trainer ids but
+        // `iris_3b_depth` (sc-25687) are also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
         // distinct ids.
         //
         // Registration is never conditioned on the mapping — 60 < 70 because ten ids load nothing
@@ -1952,8 +1953,10 @@ mod tests {
         // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
         // sc-25679 adds `iris_3b` (a generator with its own complete row): 72 / 62.
         // sc-25683 adds `iris_3b_restore` (a transform with its own complete row): 73 / 63.
-        assert_eq!(distinct.len(), 73);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 63);
+        // sc-25687 adds the `iris_3b_depth` trainer (not a generator id; its own complete row):
+        // 74 / 64.
+        assert_eq!(distinct.len(), 74);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 64);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface
