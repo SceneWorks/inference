@@ -315,9 +315,10 @@ Real weights (`tests/depth_train_real_weights.rs`, ignored, both backends): the 
 on the repo photo with a synthetic depth ramp, then the export is loaded by the estimator unchanged.
 Candle/CUDA (RTX PRO 6000, run 38133787177): losses 0.818 → 0.411 → 0.227 → 0.343, 2.7 s/step,
 train + checkpoint + export 230 s, VRAM peak 64.6 GB; estimator mean |pred − target| 0.662 (release)
-→ 0.112 (trained). MLX runs on nax-macos-2 through the dispatch-only `iris-depth-train-mlx` profile
-(machine check + 80 GB phys_footprint guard); its first dispatch (38133785314) skipped on the
-memory check (128 GB RAM, 30 GB active + wired + compressor in use > the 20 GB limit).
+→ 0.112 (trained). MLX on nax-macos-2 (dispatch-only `iris-depth-train-mlx` profile: 128 GB RAM,
+`memory_pressure` 94% = 120 GB free at start, 80 GB phys_footprint guard; run 38136750391): losses
+0.830 → 0.355 → 0.325 → 0.219, 1.1 s/step, train + checkpoint + export 14.1 s, peak phys_footprint
+59.0 GB, 19 s test wall; estimator mean |pred − target| 0.660 (release) → 0.083 (trained).
 
 ## Restoration (`iris_3b_restore`, sc-25683)
 
