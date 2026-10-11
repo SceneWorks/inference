@@ -1,4 +1,6 @@
 mkdir -p "$IRIS_OUT"
+# Build with readable diagnostics first; the JSON pass below only resolves the cached binary.
+cargo test --locked --release -p mlx-gen-iris --test integration --no-run
 bin=$(cargo test --locked --release -p mlx-gen-iris --test integration --no-run --message-format=json \
   | python3.12 -c 'import json,sys
 for line in sys.stdin:

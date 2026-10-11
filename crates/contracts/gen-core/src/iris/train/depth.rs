@@ -22,6 +22,7 @@
 //! | --- | --- | --- | --- |
 //! | model: widened input projections, zero 4th channel, 1×1 reducer, empty prompt, one forward at `t = num_train_timesteps` | `IrisDepth.forward` | — | — |
 //! | target: per-image relative log depth, 2nd/98th percentiles of the **valid** GT mapped to −1 / +1 | paper §5.2 + `depth.py` docstring | 2 / 98 | `low_percentile`, `high_percentile` |
+//! | normalization scope: the training crop's valid pixels (after the paired resize / crop) | paper says only "per image" | **assumption** | — |
 //! | target clamp to [−1, 1] | paper silent (Marigold clips; the stated map does not) | off | `clip_target` |
 //! | loss `1/|M| Σ_{p∈M} |d̂−d| + 5‖∇d̂−∇d‖₁` (Eq. 5) | paper §5.2 | weight 5 | `gradient_weight` |
 //! | ∇: forward differences in x and y, a pair counted when both pixels are valid | paper silent (∇ undefined) | — (documented) | — |
