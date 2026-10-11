@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(fp8(0x7e), 448.0);
         assert_eq!(fp8(1), 2.0f32.powi(-9));
         assert!(fp8(0x7f).is_nan());
-        assert_eq!(bf16(1.00390625), 0x3f80);
+        assert_eq!(bf16(f32::from_bits(0x3f80_8000)), 0x3f80);
     }
     #[test]
     fn tile_order_padding_global_and_budget() {
