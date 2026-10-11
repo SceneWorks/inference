@@ -1103,9 +1103,10 @@ const REFUSED: &[u8] = b"refused: ";
 ///
 /// **Frame sizes.** A frame's length prefix is never trusted for allocation: a frame is refused
 /// ([`DistError::Desync`]) when it exceeds the bound the receiver knows locally (a hello: 4 KiB; an
-/// all-reduce contribution: exactly the coordinator's own; an all-gather contribution: at most the
-/// coordinator's own — every caller gathers `torch.chunk` row shards, and shard 0, which the
-/// coordinator holds, is the largest; a barrier: the tag), and every payload is read incrementally,
+/// all-reduce or all-gather contribution: at most the coordinator's own — every caller reduces or
+/// gathers whole tensors or `torch.chunk` row shards, and shard 0, which the coordinator holds, is
+/// the largest; an all-reduce answer: exactly the caller's own length; a barrier: the tag), every
+/// all-reduce contribution must match its group's length, and every payload is read incrementally,
 /// so memory grows only with the bytes that actually arrive (a lying prefix on an answer whose size
 /// the receiver cannot know — a gather result, a broadcast — ends in the bounded wait).
 ///
@@ -1471,8 +1472,8 @@ impl TcpCollective {
     }
 
     /// One exchange. A peer sends `mine` and receives its answer (at most `answer_max` bytes). The
-    /// coordinator receives every member's payload (at most `member_max(rank)` bytes), validates it
-    /// against its own with `check(mine, theirs)` (an `Err` names what the member sent → a
+    /// coordinator receives every member's payload (at most `member_max(rank)` bytes), validates
+    /// each with `check(rank, payloads)` (an `Err` names what the member sent → a
     /// [`DistError::Desync`]), then answers every rank with `answer(rank, payloads)`.
     #[allow(clippy::too_many_arguments)]
     fn coordinate(
@@ -1482,7 +1483,7 @@ impl TcpCollective {
         op: &str,
         member_max: impl Fn(usize) -> usize,
         answer_max: usize,
-        check: impl Fn(&[u8], &[u8]) -> std::result::Result<(), String>,
+        check: impl Fn(usize, &[Vec<u8>]) -> std::result::Result<(), String>,
         answer: impl Fn(usize, &[Vec<u8>]) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
         let seq = self.next_seq();
@@ -1497,16 +1498,17 @@ impl TcpCollective {
         let mut payloads = vec![mine];
         for r in 1..self.world.world_size {
             let s = self.peers[r].as_mut().expect("connected");
-            let p = recv_frame(s, kind, seq, r, op, member_max(r))?;
-            check(&payloads[0], &p).map_err(|got| {
+            payloads.push(recv_frame(s, kind, seq, r, op, member_max(r))?);
+        }
+        for r in 1..self.world.world_size {
+            check(r, &payloads).map_err(|got| {
                 DistError::Desync {
                     rank: r,
-                    expected: format!("{op} #{seq} matching rank 0"),
+                    expected: format!("{op} #{seq} matching its group"),
                     got,
                 }
                 .into_error()
             })?;
-            payloads.push(p);
         }
         for r in 1..self.world.world_size {
             let out = answer(r, &payloads);
@@ -1517,22 +1519,33 @@ impl TcpCollective {
     }
 }
 
-/// The coordinator's check of an all-reduce contribution: `header` op / precision bytes and the
-/// payload length must equal its own.
-fn same_reduce(header: usize) -> impl Fn(&[u8], &[u8]) -> std::result::Result<(), String> {
-    move |mine, theirs| {
-        if theirs.len() != mine.len() {
+/// The coordinator's check of an all-reduce contribution: its `header` op / precision bytes must
+/// equal rank 0's, and its length the first member's of its own reduction group (sub-group
+/// reductions — hybrid sharding's replicate groups — reduce row shards of different lengths per
+/// group; `groups = None` is the whole world).
+fn same_reduce(
+    header: usize,
+    groups: Option<Partition>,
+) -> impl Fn(usize, &[Vec<u8>]) -> std::result::Result<(), String> {
+    move |r, payloads| {
+        let theirs = &payloads[r];
+        let lead = groups
+            .as_ref()
+            .and_then(|g| g.members(r).first().copied())
+            .unwrap_or(0);
+        let want = &payloads[lead];
+        if theirs.len() != want.len() || theirs.len() < header {
             return Err(format!(
-                "{} bytes of values (rank 0 has {})",
+                "{} bytes of values (rank {lead} of its group has {})",
                 theirs.len().saturating_sub(header),
-                mine.len() - header
+                want.len().saturating_sub(header)
             ));
         }
-        if theirs[..header] != mine[..header] {
+        if theirs[..header] != payloads[0][..header] {
             return Err(format!(
                 "op/precision bytes {:?} (rank 0 has {:?})",
                 &theirs[..header],
-                &mine[..header]
+                &payloads[0][..header]
             ));
         }
         Ok(())
@@ -1587,7 +1600,7 @@ impl Collective for TcpCollective {
             "all_reduce",
             |_| len,
             4 * data.len(),
-            same_reduce(2),
+            same_reduce(2, Some(groups.clone())),
             move |rank, payloads| {
                 let members = parts.members(rank);
                 let vals: Vec<Vec<f32>> = members
@@ -1625,7 +1638,8 @@ impl Collective for TcpCollective {
             "all_gather",
             |_| bound,
             usize::MAX,
-            |_, theirs| {
+            |r, payloads: &[Vec<u8>]| {
+                let theirs = &payloads[r];
                 if theirs.len() % 4 == 0 {
                     Ok(())
                 } else {
@@ -1677,8 +1691,9 @@ impl Collective for TcpCollective {
             "broadcast",
             |r| if r == root { usize::MAX } else { 8 },
             usize::MAX,
-            |mine, theirs| {
-                if theirs.get(..8) == Some(&mine[..8]) {
+            |r, payloads: &[Vec<u8>]| {
+                let theirs = &payloads[r];
+                if theirs.get(..8) == Some(&payloads[0][..8]) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -1702,8 +1717,9 @@ impl Collective for TcpCollective {
             &op,
             |_| len,
             0,
-            |mine, theirs| {
-                if mine == theirs {
+            |r, payloads: &[Vec<u8>]| {
+                let theirs = &payloads[r];
+                if *theirs == payloads[0] {
                     Ok(())
                 } else {
                     Err(format!("barrier {:?}", String::from_utf8_lossy(theirs)))
@@ -1724,7 +1740,7 @@ impl Collective for TcpCollective {
             "all_reduce_f64",
             |_| len,
             8 * data.len(),
-            same_reduce(1),
+            same_reduce(1, None),
             |_, payloads| {
                 let vals: Vec<Vec<f64>> = payloads.iter().map(|p| bytes_f64(&p[1..])).collect();
                 let mut acc = vals[0].clone();
@@ -2200,5 +2216,29 @@ mod tests {
             format!("{:?}", DistToken("x".into())),
             "DistToken(<redacted>)"
         );
+    }
+
+    /// Hybrid sharding's replicate-group reduction: each group reduces its own row shard, so the
+    /// groups' lengths differ (shard 0's rows are the longest) — valid, only a mismatch WITHIN a
+    /// group is a desync.
+    #[test]
+    fn sub_group_reductions_may_differ_in_length_across_groups() {
+        let port = free_port();
+        let handles: Vec<_> = (0..4)
+            .map(|r| {
+                std::thread::spawn(move || {
+                    let mut c = TcpCollective::connect(&world(r, 4, port)).unwrap();
+                    let groups = Partition(vec![0, 1, 0, 1]);
+                    let mut v = vec![r as f32; if r % 2 == 0 { 3 } else { 2 }];
+                    c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &groups)
+                        .map(|_| v)
+                })
+            })
+            .collect();
+        let out: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(out[0].as_ref().unwrap(), &vec![2.0; 3]);
+        assert_eq!(out[1].as_ref().unwrap(), &vec![4.0; 2]);
+        assert_eq!(out[2].as_ref().unwrap(), &vec![2.0; 3]);
+        assert_eq!(out[3].as_ref().unwrap(), &vec![4.0; 2]);
     }
 }
