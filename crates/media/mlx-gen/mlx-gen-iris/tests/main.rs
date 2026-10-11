@@ -28,6 +28,9 @@ mod curricula_lifecycle;
 #[path = "curricula_parity.rs"]
 mod curricula_parity;
 
+#[path = "curricula_real_weights.rs"]
+mod curricula_real_weights;
+
 #[path = "depth_parity.rs"]
 mod depth_parity;
 
