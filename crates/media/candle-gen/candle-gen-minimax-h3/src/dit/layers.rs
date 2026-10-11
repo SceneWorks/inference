@@ -459,6 +459,8 @@ impl DitAttention {
         }
         let (b, seq) = (s[0], s[1]);
         let (h, d) = (self.heads, self.head_dim);
+        #[cfg(feature = "veda-s0-profile")]
+        let s0_started = super::s0_profile::start(x.device())?;
 
         // The published checkpoint ships `to_q`/`to_k`/`to_v` already split, so this applies NO
         // fused-QKV transform. See `crate::dit::qkv` for which transform produced them and why
@@ -480,13 +482,24 @@ impl DitAttention {
         let kh = k.transpose(1, 2)?.contiguous()?;
         let vh = v.transpose(1, 2)?.contiguous()?;
         let scale = 1.0 / (d as f64).sqrt();
+        #[cfg(feature = "veda-s0-profile")]
+        super::s0_profile::stop(s0_started, x.device(), 0)?;
+        #[cfg(feature = "veda-s0-profile")]
+        let s0_started = super::s0_profile::start(x.device())?;
         let out = sdpa(&qh, &kh, &vh, scale)?;
+        #[cfg(feature = "veda-s0-profile")]
+        super::s0_profile::stop(s0_started, x.device(), 1)?;
+        #[cfg(feature = "veda-s0-profile")]
+        let s0_started = super::s0_profile::start(x.device())?;
 
         let out = out
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, seq, h * d))?;
-        self.to_out.forward(&out)
+        let out = self.to_out.forward(&out)?;
+        #[cfg(feature = "veda-s0-profile")]
+        super::s0_profile::stop(s0_started, x.device(), 2)?;
+        Ok(out)
     }
 }
 

@@ -44,6 +44,8 @@ serde_json = { workspace = true }
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
+# S0 measurement only: default builds contain no timers or synchronizations.
+veda-s0-profile = []
 
 [dev-dependencies]
 # RAII fixture roots for the real-weight helpers (sc-17791). A `TempDir` guard removes the tree on

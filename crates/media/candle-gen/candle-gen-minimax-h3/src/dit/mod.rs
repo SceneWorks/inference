@@ -66,6 +66,8 @@ pub mod positions;
 pub mod qkv;
 pub mod refiner;
 pub mod rope;
+#[cfg(feature = "veda-s0-profile")]
+pub mod s0_profile;
 
 pub use adaln::{release_device_memory, AdaLnCache, AdaLnResidency, ScheduleKey, TimestepSchedule};
 pub use block::{AdaLnModulation, AdaLnProjection, DitBlock};

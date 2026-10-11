@@ -451,7 +451,11 @@ impl DitBlock {
             &modulation.shift_mlp,
             &idx,
         )?;
+        #[cfg(feature = "veda-s0-profile")]
+        let s0_started = super::s0_profile::start(x.device())?;
         let ff = self.ff.forward(&normed)?;
+        #[cfg(feature = "veda-s0-profile")]
+        super::s0_profile::stop(s0_started, x.device(), 3)?;
         let gate = gate_rows(&modulation.gate_mlp, &idx, rows, x.dtype())?;
         Ok(x.add(&gate.broadcast_mul(&ff)?)?)
     }

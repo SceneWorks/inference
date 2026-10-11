@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
+        options: [veda-s0-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4464,6 +4464,50 @@ jobs:
       - name: Run mmaudio standalone component and torch-parity conformance
         shell: cmd
         run: call scripts\ci\real-weights\candle-mmaudio\run-mmaudio-standalone-component-and-torch-parity-conformanc.cmd
+
+  veda-s0-cuda:
+    name: Veda S0 bounded random gather and real DiT profiling (CUDA only)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-s0-cuda'
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+    # The owned build/benchmark has a hard one-hour deadline; reserve setup and artifact time.
+    timeout-minutes: 75
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target-veda-s0-cuda
+      CARGO_BUILD_JOBS: "4"
+      S0_OUTPUT_DIR: ${{ github.workspace }}/../veda-s0-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+      S0_Q4_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Require existing admitted CUDA listener
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_NAME -notin @('cuda-windows', 'cuda-windows-2')) {
+            throw "Unexpected CUDA listener $env:RUNNER_NAME"
+          }
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-minimax-h3\install-reviewed-cpython-3-12.cmd
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+      - name: Claim idle physical GPU, build exact source, and collect bounded S0 evidence
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\release\veda_s0_cuda.py'
+      - name: Preserve CUDA S0 evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-s0-cuda-${{ github.sha }}
+          path: ${{ env.S0_OUTPUT_DIR }}/
+          if-no-files-found: error
 
   # sc-18932 — the candle half of the MiniMax-H3 wiring. Same defect as `mlx-minimax-h3` above:
   # `candle-gen-minimax-h3/tests/real_weights.rs` (sc-17154) reads `MINIMAX_H3_SNAPSHOT` and no
