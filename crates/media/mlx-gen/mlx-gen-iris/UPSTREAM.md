@@ -310,6 +310,15 @@ post-step loss 2.3403609 vs 2.3403635. MLX ↔ Candle parity is transitive throu
 Hand-derived Eq. 5 values and finite-difference subgradients: `gen_core` unit tests. Candle's `abs`
 backward is +1 at exactly 0 (torch: 0) — reachable only at an exactly-zero valid error.
 
+Real weights (`tests/depth_train_real_weights.rs`, ignored, both backends): the `depth/` export
+(~3B parameters) fully fine-tuned for 4 bf16 AdamW steps (lr 3e-5, wd 0.01, clip 1) at 128², batch 1,
+on the repo photo with a synthetic depth ramp, then the export is loaded by the estimator unchanged.
+Candle/CUDA (RTX PRO 6000, run 38133787177): losses 0.818 → 0.411 → 0.227 → 0.343, 2.7 s/step,
+train + checkpoint + export 230 s, VRAM peak 64.6 GB; estimator mean |pred − target| 0.662 (release)
+→ 0.112 (trained). MLX runs on nax-macos-2 through the dispatch-only `iris-depth-train-mlx` profile
+(machine check + 80 GB phys_footprint guard); its first dispatch (38133785314) skipped on the
+memory check (128 GB RAM, 30 GB active + wired + compressor in use > the 20 GB limit).
+
 ## Restoration (`iris_3b_restore`, sc-25683)
 
 Source: `src/iris3b/downstream/restoration.py`, `src/iris3b/downstream/__init__.py`,
