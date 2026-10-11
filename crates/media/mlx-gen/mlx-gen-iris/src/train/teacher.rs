@@ -48,12 +48,21 @@ impl Teacher {
     /// checking every tensor's presence and shape.
     pub fn load(path: &Path, arch: TeacherArch) -> Result<Self> {
         let file = teacher_file(path);
-        let mut src = Weights::from_file(&file).map_err(|e| {
+        let src = Weights::from_file(&file).map_err(|e| {
             Error::Msg(format!(
                 "iris training: load the REPA teacher {}: {e}",
                 file.display()
             ))
         })?;
+        Self::from_weights(src, arch)
+    }
+
+    /// Build from tensors already in memory (hub or Hugging Face names).
+    pub fn from_tensors(arch: TeacherArch, tensors: HashMap<String, Array>) -> Result<Self> {
+        Self::from_weights(Weights::from_map(tensors), arch)
+    }
+
+    fn from_weights(mut src: Weights, arch: TeacherArch) -> Result<Self> {
         let keys: Vec<String> = src.keys().map(str::to_string).collect();
         let naming = TeacherNaming::detect(keys.iter().map(String::as_str))?;
         let mut w = HashMap::new();

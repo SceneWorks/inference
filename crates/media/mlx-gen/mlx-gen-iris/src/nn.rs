@@ -178,6 +178,7 @@ pub fn chunk_last(x: &Array, n: i32) -> Result<Vec<Array>> {
 }
 
 /// Rotation tables `(cos, sin)`, `[n, pairs]` f32, for `apply_rope`.
+#[derive(Clone)]
 pub struct Rope {
     pub cos: Array,
     pub sin: Array,

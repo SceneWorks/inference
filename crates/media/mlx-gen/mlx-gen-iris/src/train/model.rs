@@ -550,7 +550,7 @@ struct TrainHooks<'a> {
     captured: Option<Array>,
 }
 
-impl ForwardHooks for TrainHooks<'_> {
+impl<'a> ForwardHooks for TrainHooks<'a> {
     fn trunk_block(
         &mut self,
         dit: &IrisDiT,
@@ -572,23 +572,19 @@ impl ForwardHooks for TrainHooks<'_> {
                 core_txt.cloned().unwrap_or_else(|| core_img.clone()),
             ];
             inputs.extend(keys.iter().map(|k| self.p[k].clone()));
-            let model = self.model;
-            let cfg = &model.cfg;
-            let mut region = checkpoint(|xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+            // The recompute runs during the backward, after this forward returned: it owns its
+            // context and borrows only the model (alive for the whole value-and-grad call).
+            let model: &'a TrainModel = self.model;
+            let ctx = ctx.clone();
+            let mut region = checkpoint(move |xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
                 let (w, adapted) = model
                     .region_source(&prefix, &keys, &xs[4..])
                     .map_err(to_exc)?;
-                let blk = IrisDiT::load_trunk_block(&w, cfg, model.compute, i, adapted.as_ref())
-                    .map_err(to_exc)?;
-                let (so, yo) = dit
-                    .run_external_trunk_block(
-                        &blk,
-                        ctx,
-                        &xs[0],
-                        &xs[1],
-                        &xs[2],
-                        has_txt.then(|| &xs[3]),
-                    )
+                let blk =
+                    IrisDiT::load_trunk_block(&w, &model.cfg, model.compute, i, adapted.as_ref())
+                        .map_err(to_exc)?;
+                let (so, yo) = blk
+                    .run(&ctx, &xs[0], &xs[1], &xs[2], has_txt.then(|| &xs[3]))
                     .map_err(to_exc)?;
                 Ok(vec![so, yo])
             });
@@ -619,17 +615,15 @@ impl ForwardHooks for TrainHooks<'_> {
         let keys = region_keys(self.p, &prefix);
         let mut inputs = vec![pixels.clone(), s_cond.clone()];
         inputs.extend(keys.iter().map(|k| self.p[k].clone()));
-        let model = self.model;
-        let cfg = &model.cfg;
-        let mut region = checkpoint(|xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+        let model: &'a TrainModel = self.model;
+        let ctx = ctx.clone();
+        let mut region = checkpoint(move |xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
             let (w, adapted) = model
                 .region_source(&prefix, &keys, &xs[2..])
                 .map_err(to_exc)?;
-            let blk = IrisDiT::load_pixel_block(&w, cfg, model.compute, i, adapted.as_ref())
+            let blk = IrisDiT::load_pixel_block(&w, &model.cfg, model.compute, i, adapted.as_ref())
                 .map_err(to_exc)?;
-            Ok(vec![dit
-                .run_external_pixel_block(&blk, ctx, &xs[0], &xs[1])
-                .map_err(to_exc)?])
+            Ok(vec![blk.run(&ctx, &xs[0], &xs[1]).map_err(to_exc)?])
         });
         Ok(region(&inputs)?.pop().expect("one output"))
     }

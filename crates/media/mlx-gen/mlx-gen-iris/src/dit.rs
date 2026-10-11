@@ -788,6 +788,7 @@ impl IrisDiT {
             .map(|core| core.forward(&cond))
             .transpose()?;
         let ctx = TrunkCtx {
+            compute: self.compute,
             rope_img,
             rope_txt,
             heads: cfg.num_heads as i32,
@@ -823,6 +824,7 @@ impl IrisDiT {
             square,
         );
         let pctx = PixelCtx {
+            compute: self.compute,
             rope_pix,
             batch: b,
             n_patches,
@@ -844,7 +846,7 @@ impl IrisDiT {
 
     #[allow(clippy::too_many_arguments)]
     fn dual(
-        &self,
+        compute: Dtype,
         blk: &DualBlock,
         x: &Array,
         y: &Array,
@@ -868,7 +870,7 @@ impl IrisDiT {
         let q = cat(&[&qy, &qx], 1)?;
         let k = cat(&[&ky, &kx], 1)?;
         let v = cat(&[&vy, &vx], 1)?;
-        let out = attention(&q, &k, &v, self.compute, None)?;
+        let out = attention(&q, &k, &v, compute, None)?;
         let n_txt = y.shape()[1];
         let mut halves = out.split_axis(&[n_txt], 1)?;
         let out_x = halves.swap_remove(1);
@@ -892,7 +894,7 @@ impl IrisDiT {
 
     #[allow(clippy::too_many_arguments)]
     fn single(
-        &self,
+        compute: Dtype,
         blk: &SingleBlock,
         x: &Array,
         y: &Array,
@@ -915,7 +917,7 @@ impl IrisDiT {
         let (kx, ky) = (ks.swap_remove(1), ks.swap_remove(0));
         let q = cat(&[&rope_txt.apply(&qy)?, &rope_img.apply(&qx)?], 1)?;
         let k = cat(&[&rope_txt.apply(&ky)?, &rope_img.apply(&kx)?], 1)?;
-        let mut attn = attention(&q, &k, &v, self.compute, None)?;
+        let mut attn = attention(&q, &k, &v, compute, None)?;
         let (mut h, mut tokens) = (h, tokens);
         if !blk.text_out {
             attn = attn.split_axis(&[n_txt], 1)?.swap_remove(1);
@@ -939,7 +941,7 @@ impl IrisDiT {
     }
 
     fn pit(
-        &self,
+        compute: Dtype,
         blk: &PitBlock,
         x: &Array,
         cond: &Array,
@@ -959,7 +961,7 @@ impl IrisDiT {
             &compact.reshape(&[batch, n_patches, -1])?,
             Some(rope),
             None,
-            self.compute,
+            compute,
         )?;
         let expanded = blk
             .expand
@@ -979,7 +981,9 @@ impl IrisDiT {
 
 /// What a trunk block reads besides its own weights in one forward: the image / text RoPE tables
 /// and the head counts.
+#[derive(Clone)]
 pub struct TrunkCtx {
+    compute: Dtype,
     rope_img: Rope,
     rope_txt: Rope,
     heads: i32,
@@ -987,7 +991,9 @@ pub struct TrunkCtx {
 }
 
 /// What a PiT block reads besides its own weights in one forward.
+#[derive(Clone)]
 pub struct PixelCtx {
+    compute: Dtype,
     rope_pix: Rope,
     batch: i32,
     n_patches: i32,
@@ -1055,7 +1061,7 @@ impl IrisDiT {
         core_img: &Array,
         core_txt: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        self.trunk_block_with(&self.blocks[i], ctx, s, y, core_img, core_txt)
+        Self::trunk_block_with(&self.blocks[i], ctx, s, y, core_img, core_txt)
     }
 
     /// Run an externally built trunk block on `(s, y)` (same graph as [`Self::run_trunk_block`]).
@@ -1068,11 +1074,10 @@ impl IrisDiT {
         core_img: &Array,
         core_txt: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        self.trunk_block_with(&block.0, ctx, s, y, core_img, core_txt)
+        Self::trunk_block_with(&block.0, ctx, s, y, core_img, core_txt)
     }
 
     fn trunk_block_with(
-        &self,
         block: &Block,
         ctx: &TrunkCtx,
         s: &Array,
@@ -1081,7 +1086,8 @@ impl IrisDiT {
         core_txt: Option<&Array>,
     ) -> Result<(Array, Array)> {
         match block {
-            Block::Dual(blk) => self.dual(
+            Block::Dual(blk) => Self::dual(
+                ctx.compute,
                 blk,
                 s,
                 y,
@@ -1094,7 +1100,8 @@ impl IrisDiT {
                 ctx.heads,
                 ctx.kv_heads,
             ),
-            Block::Single(blk) => self.single(
+            Block::Single(blk) => Self::single(
+                ctx.compute,
                 blk,
                 s,
                 y,
@@ -1115,7 +1122,8 @@ impl IrisDiT {
         pixels: &Array,
         s_cond: &Array,
     ) -> Result<Array> {
-        self.pit(
+        Self::pit(
+            ctx.compute,
             &self.pixel_blocks[i],
             pixels,
             s_cond,
@@ -1133,7 +1141,8 @@ impl IrisDiT {
         pixels: &Array,
         s_cond: &Array,
     ) -> Result<Array> {
-        self.pit(
+        Self::pit(
+            ctx.compute,
             &block.0,
             pixels,
             s_cond,
@@ -1181,5 +1190,35 @@ impl IrisDiT {
             adapted,
         };
         Ok(PixelBlock(Self::load_pit(&l, cfg, i, cfg.norm_eps as f32)?))
+    }
+}
+
+impl TrunkBlock {
+    /// Run this block on `(s, y)` under `ctx` (owns nothing of a backbone: a checkpointed region's
+    /// recompute runs it after the forward that built `ctx` returned).
+    pub fn run(
+        &self,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        IrisDiT::trunk_block_with(&self.0, ctx, s, y, core_img, core_txt)
+    }
+}
+
+impl PixelBlock {
+    /// Run this PiT block under `ctx`.
+    pub fn run(&self, ctx: &PixelCtx, pixels: &Array, s_cond: &Array) -> Result<Array> {
+        IrisDiT::pit(
+            ctx.compute,
+            &self.0,
+            pixels,
+            s_cond,
+            &ctx.rope_pix,
+            ctx.batch,
+            ctx.n_patches,
+        )
     }
 }
