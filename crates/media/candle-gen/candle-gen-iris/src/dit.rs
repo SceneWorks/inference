@@ -453,6 +453,12 @@ impl IrisDiT {
                 unused[0]
             )));
         }
+        let stray = w.unconsumed_residuals();
+        if !stray.is_empty() {
+            return Err(Error::Msg(format!(
+                "iris: adapter target(s) {stray:?} are not projections of this backbone's graph"
+            )));
+        }
         let p = cfg.patch_size;
         crate::nn::expect_shape(
             "s_embedder.proj.weight",
