@@ -17,9 +17,11 @@ use crate::generator::{CaptionOverflowPolicy, GenerationRequest};
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod degradation;
 pub mod depth;
 pub mod downstream;
 pub mod restoration;
+pub mod restoration_train;
 mod tables;
 pub mod train;
 pub use tables::{

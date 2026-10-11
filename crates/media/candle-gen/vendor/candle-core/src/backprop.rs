@@ -412,13 +412,24 @@ impl Tensor {
                         }
                         let (_n, _c, h, w) = arg.dims4()?;
                         // For computing the max-pool gradient, we compute a mask where a 1 means
-                        // that the element is the maximum, then we apply this mask to the
-                        // upsampled gradient (taking into account that multiple max may exist so
-                        // we scale the gradient for this case).
-                        let node_upsampled = node.upsample_nearest2d(h, w)?;
-                        let mask = arg.eq(&node_upsampled)?.to_dtype(arg.dtype())?;
-                        let avg = mask.avg_pool2d_with_stride(*kernel_size, *stride)?;
-                        let grad_arg = ((grad * avg)?.upsample_nearest2d(h, w)? * mask)?;
+                        // that the element is the maximum of its window, then route each window's
+                        // gradient to its maxima, split evenly when there are several. Only the
+                        // region the windows cover receives gradient (a trailing row / column a
+                        // floor-division pool drops gets zero), and the per-window maximum count is
+                        // `avg(mask) · kh · kw` (the former `grad · avg` scaled a unique maximum's
+                        // gradient by 1 / (kh · kw), and mismatched odd sizes).
+                        let (kh, kw) = *kernel_size;
+                        let (oh, ow) = (node.dim(2)?, node.dim(3)?);
+                        let (hc, wc) = (oh * kh, ow * kw);
+                        let arg_c = arg.narrow(2, 0, hc)?.narrow(3, 0, wc)?;
+                        let node_upsampled = node.upsample_nearest2d(hc, wc)?;
+                        let mask = arg_c.eq(&node_upsampled)?.to_dtype(arg.dtype())?;
+                        let count =
+                            (mask.avg_pool2d_with_stride(*kernel_size, *stride)? * (kh * kw) as f64)?;
+                        let grad_c = ((grad / count)?.upsample_nearest2d(hc, wc)? * mask)?;
+                        let grad_arg = grad_c
+                            .pad_with_zeros(2, 0, h - hc)?
+                            .pad_with_zeros(3, 0, w - wc)?;
                         let sum_grad = grads.or_insert(arg)?;
                         *sum_grad = sum_grad.add(&grad_arg)?;
                     }

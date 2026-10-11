@@ -11,6 +11,9 @@ call :run_one real_small_restoration_matches_upstream restoration_real_weights::
 call :run_one real_release_scale_restoration_renders restoration_real_weights::real_release_scale_restoration_renders --ignored || set "IRIS_FAILED=1"
 call :run_one real_lora_trains_exports_and_renders train_real_weights::real_lora_trains_exports_and_renders --ignored || set "IRIS_FAILED=1"
 call :run_one real_depth_full_finetune_trains_exports_and_estimates depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates --ignored || set "IRIS_FAILED=1"
+call :run_one real_lpips_and_critic_trunk_match_the_reference restoration_train_real_weights::real_lpips_and_critic_trunk_match_the_reference --ignored || set "IRIS_FAILED=1"
+call :run_one real_restoration_trains_exports_and_restores restoration_train_real_weights::real_restoration_trains_exports_and_restores --ignored || set "IRIS_FAILED=1"
+call :run_one real_restoration_full_finetune_trains_exports_and_restores restoration_train_real_weights::real_restoration_full_finetune_trains_exports_and_restores --ignored || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1
 exit /b 0
 

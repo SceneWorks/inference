@@ -62,6 +62,7 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_trainer(train::REGISTRATION)
         .register_trainer(train::depth::REGISTRATION)
+        .register_trainer(train::restore::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
 }
 
@@ -101,7 +102,7 @@ mod tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(trainers, ["iris_3b", "iris_3b_depth"]);
+        assert_eq!(trainers, ["iris_3b", "iris_3b_depth", "iris_3b_restore"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

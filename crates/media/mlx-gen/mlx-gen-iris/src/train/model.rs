@@ -117,7 +117,7 @@ fn to_exc(e: impl std::fmt::Display) -> Exception {
     Exception::custom(e.to_string())
 }
 
-fn fnv(key: &str) -> u64 {
+pub(crate) fn fnv(key: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.bytes() {
         h ^= b as u64;

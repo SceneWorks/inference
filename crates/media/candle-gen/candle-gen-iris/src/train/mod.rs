@@ -25,9 +25,12 @@
 //!
 //! [`gen_core::iris::train`]: candle_gen::gen_core::iris::train
 
+pub mod critic;
 pub mod depth;
+pub mod lpips;
 pub mod model;
 pub mod optim;
+pub mod restore;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

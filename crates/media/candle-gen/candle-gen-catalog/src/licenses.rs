@@ -614,9 +614,10 @@ mod tests {
         assert_eq!(
             registered.len(),
             64,
-            "64 distinct Candle provider ids: 57 generators + 18 trainers (15 of them also \
-             generator ids — iris_3b joined in sc-25686; iris_3b_depth, sc-25687, is not) + 1 \
-             captioner + 2 embedders + 1 transform (iris_3b_restore, sc-25683)"
+            "64 distinct Candle provider ids: 57 generators + 19 trainers (15 of them also \
+             generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
+             transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
+             1 transform (iris_3b_restore, sc-25683)"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();

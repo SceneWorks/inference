@@ -37,7 +37,8 @@
 //! # Trainers share their generator's row
 //!
 //! Every registered MLX trainer id but `iris_3b_depth` (sc-25687, which has its own row) is also a
-//! generator id, and
+//! generator id or — for `iris_3b_restore` (sc-25688) — the restoration transform's id, whose row
+//! it reuses, and
 //! [`ProviderComponents::provider_id`] is unique across the table — duplicates are rejected by
 //! [`gen_core::license_table_conformance_errors`] because
 //! they are not byte-stable under the manifest's stable sort. One row therefore serves both
@@ -84,7 +85,8 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 62 rows over 72 registered ids: the eighteen trainer ids reuse their generator's row, and ten ids
+/// 62 rows over 72 registered ids: the trainer ids reuse their generator's (or, for
+/// `iris_3b_restore`, transform's) row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -1014,7 +1016,8 @@ mod tests {
     }
 
     /// One row per id, and every trainer registration but `iris_3b_depth` (its own row) reuses its
-    /// generator's row rather than duplicating it — `provider_id` is unique across the table, so they have to.
+    /// generator's (or, for `iris_3b_restore`, the transform's) row rather than duplicating it —
+    /// `provider_id` is unique across the table, so they have to.
     #[test]
     fn trainer_ids_reuse_their_generator_row() {
         let registry = crate::provider_registry().unwrap();
@@ -1028,12 +1031,21 @@ mod tests {
             .collect();
 
         // sc-25685 adds the `iris_3b` trainer (it reuses the iris_3b generator row); sc-25687 adds
-        // `iris_3b_depth`, a trainer whose id is no generator id and so carries its own row.
-        assert_eq!(trainers.len(), 19);
+        // `iris_3b_depth`, a trainer whose id is no generator id and so carries its own row;
+        // sc-25688 adds the `iris_3b_restore` trainer, which reuses the iris_3b_restore TRANSFORM
+        // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
+        // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
+        // export).
+        assert_eq!(trainers.len(), 20);
+        let transforms: BTreeSet<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
         for id in trainers.iter().filter(|id| id.as_str() != "iris_3b_depth") {
             assert!(
-                generators.contains(id),
-                "trainer {id} is not also a generator id, so it needs its own mapping row"
+                generators.contains(id) || transforms.contains(id),
+                "trainer {id} is neither a generator nor a transform id, so it needs its own \
+                 mapping row"
             );
         }
 

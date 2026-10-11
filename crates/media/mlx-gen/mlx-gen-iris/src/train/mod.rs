@@ -18,9 +18,12 @@
 //! `keep_last_checkpoints` plus milestones. The run ends by exporting a full model directory or an
 //! adapter file (schemas in `gen_core::iris::train`).
 
+pub mod critic;
 pub mod depth;
+pub mod lpips;
 pub mod model;
 pub mod optim;
+pub mod restore;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

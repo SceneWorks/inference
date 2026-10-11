@@ -5910,6 +5910,7 @@ mod tests {
                 "anima_base",
                 "iris_3b",
                 "iris_3b_depth",
+                "iris_3b_restore",
                 "kolors",
                 "krea_2_raw",
                 "krea_2_control",
@@ -5942,7 +5943,8 @@ mod tests {
         // reuses that row; sc-25680 adds `iris_3b`, a generator with its own complete row; sc-25683
         // adds the `iris_3b_restore` transform with its own complete row: 63 / 53; the sc-25686
         // `iris_3b` trainer reuses the generator's row and adds no id; the sc-25687 `iris_3b_depth`
-        // trainer is a new id with its own complete row: 64 / 54).
+        // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
+        // trainer reuses the transform's id and row and adds no id).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in

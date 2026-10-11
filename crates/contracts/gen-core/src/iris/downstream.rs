@@ -190,9 +190,9 @@ impl TaskExport {
 }
 
 /// Refuse a downstream task export staged where a **generation** backbone belongs: a
-/// `config.yaml` with a `task` section (`depth/`, `upscaler/`, or a native depth-training export) is
-/// a typed [`Error::Unsupported`] naming the task. A directory without a readable `config.yaml`
-/// passes (the caller's own existence checks name what is missing).
+/// `config.yaml` with a `task` section (`depth/`, `upscaler/`, or a native depth- or
+/// restoration-training export) is a typed [`Error::Unsupported`] naming the task and its provider.
+/// A directory without a readable `config.yaml` passes (the caller's own existence checks name what is missing).
 pub fn refuse_task_export(dir: &Path, model_id: &str) -> Result<()> {
     let Ok(text) = std::fs::read_to_string(dir.join(BACKBONE_CONFIG_FILE)) else {
         return Ok(());
@@ -200,10 +200,14 @@ pub fn refuse_task_export(dir: &Path, model_id: &str) -> Result<()> {
     match parse_task_settings(&text) {
         Ok(Some(settings)) => Err(Error::Unsupported(format!(
             "{model_id}: {} is the '{}' task export (its {BACKBONE_CONFIG_FILE} has a `task` \
-             section), not a generation backbone — load it with the {} task's provider",
+             section), not a generation backbone — load it with {}",
             dir.display(),
             settings.name,
-            settings.name
+            match settings.name.as_str() {
+                "restoration" => super::restoration::MODEL_ID,
+                "depth" => super::DEPTH_MODEL_ID,
+                _ => "the matching task's provider",
+            }
         ))),
         _ => Ok(()),
     }
@@ -395,6 +399,30 @@ mod tests {
         assert_eq!(s.get("tile"), Some("1024"));
         assert_eq!(parse_task_settings("model:\n  depth: 2\n").unwrap(), None);
         assert!(parse_task_settings("task:\n  sigma: 0.5\n").is_err());
+    }
+
+    /// A task export staged as a generation backbone is refused and names the provider that
+    /// loads it — both exports a native trainer writes (depth, sc-25687; restoration, sc-25688).
+    #[test]
+    fn a_task_export_is_refused_as_a_generation_backbone_naming_its_provider() {
+        for (task, provider) in [
+            ("depth", super::super::DEPTH_MODEL_ID),
+            ("restoration", super::super::restoration::MODEL_ID),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            export(
+                dir.path(),
+                &format!("model:\n  patch_size: 16\ntask:\n  name: {task}\n"),
+            );
+            let err = refuse_task_export(dir.path(), "iris_3b").unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{task}: {err}");
+            let text = err.to_string();
+            assert!(text.contains(&format!("'{task}' task export")), "{text}");
+            assert!(text.contains(&format!("load it with {provider}")), "{text}");
+        }
+        let generation = tempfile::tempdir().unwrap();
+        export(generation.path(), "model:\n  patch_size: 16\n");
+        refuse_task_export(generation.path(), "iris_3b").unwrap();
     }
 
     #[test]

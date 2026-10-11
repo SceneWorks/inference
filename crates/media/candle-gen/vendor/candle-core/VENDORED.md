@@ -64,6 +64,11 @@ evidence.
    backward `match`, the `tracked` set and the `needs_grad` closure above it (delimited by
    `// sc-25686` comments) are the whole change. See *Untracked operands get no gradient* below.
 5. `VENDORED.md` — this file.
+6. `src/backprop.rs` `Op::MaxPool2D` arm + `tests/grad_tests.rs` `max_pool2d_grad` — one local fix,
+   not upstream (sc-25688; upstream `main` still has the defect as of 2026-10): the max-pool
+   backward routes each window's gradient to its maximum (split evenly over ties) and gives the
+   rows / columns a floor-division pool drops zero gradient. See *Max-pool backward routes the
+   window gradient* below.
 
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
@@ -103,6 +108,39 @@ root's is consumed as before). `candle-gen-iris`'s
 `train_parity::backward_stores_gradients_only_for_trainable_tensors` pins it (full, LoRA, LoKr), and
 upstream's `grad_tests` / `custom_op_tests` / `conv_tests` / `matmul_tests` / `tensor_tests` pass on
 this copy.
+
+## Max-pool backward routes the window gradient
+
+Upstream's `MaxPool2D` backward builds the "is the window maximum" mask, then multiplies the
+upsampled gradient by `avg_pool(mask)` — the **fraction** of the window that is maximal. A unique
+maximum therefore received `grad / (kh · kw)` (a quarter of the true gradient for the 2×2 pools VGG
+uses), a tie received `grad · ties / (kh · kw)` instead of `grad / ties`, and on an odd input
+(`h` or `w` not a multiple of the kernel) the nearest-upsampled `[oh, ow]` gradient was stretched over
+the whole `[h, w]` input, misaligning every window. The patch divides by the per-window maximum count
+(`avg_pool(mask) · kh · kw`), computes the mask and the routed gradient over the covered
+`[oh·kh, ow·kw]` region only, and zero-pads the dropped trailing rows / columns — the
+`torch.nn.functional.max_pool2d` gradient (which, on ties, picks one index; an even split is the
+same total). Only the pool's own gradient changes; its forward is upstream's.
+
+**Who it changes.** Every backward through a candle `max_pool2d`:
+
+* the latent-LPIPS auxiliary loss (`candle-gen/src/train/latent_lpips.rs` `Op::MaxPool`, built by
+  `candle-gen-perceptual`), whose gradient now reaches the trainer at the true scale — the trainers
+  that declare a latent-LPIPS family are `candle-gen-sdxl` and `candle-gen-kolors` (SDXL),
+  `candle-gen-sd3` (SD3) and `candle-gen-z-image` (Flux); `mage`, `anima`, `krea`, `ltx`,
+  `qwen-image-2-1`, `lens` and `wan` declare none (`latent_lpips: None`, the loss is refused) and
+  run no max-pool backward;
+* the Iris restoration trainer's LPIPS-VGG (`candle-gen-iris/src/train/lpips.rs`), whose gradient is
+  pinned against torch in `restoration_train_parity`.
+
+In E-LatentLPIPS the first three VGG pools are identities and only the fourth is a real 2×2
+max-pool, so before the fix the gradient reaching the latent through the taps behind it was a
+quarter of its true value (and misaligned when that layer's spatial size was odd); the shallower
+taps were unaffected. A run that weights `latent_lpips_loss` now trains that part of the term at the
+strength the weight states. The Iris LPIPS-VGG has five real pools (the last unused), so the fix
+matters there for every tap past the first. `tests/grad_tests.rs::max_pool2d_grad` pins
+a unique maximum, a tie and an odd trailing row / column on CPU, CUDA and Metal; upstream's
+`grad_tests` / `pool_tests` / `conv_tests` / `tensor_tests` pass on this copy.
 
 ## Eager behaviour is unchanged outside the guard
 

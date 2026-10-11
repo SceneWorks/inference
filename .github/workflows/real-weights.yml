@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4997,10 +4997,13 @@ jobs:
   # 1024-px tiles) plus one release-scale 512x384 → 2048x1536 render (six tiles); and the generation
   # trainer (sc-25686): one bounded LoRA run (four bf16 AdamW steps at 256², batch 1, the repo
   # photo's crops) → export → load through `load_backbone_with_adapters` → render beside the base,
-  # the adapted render checked against the trainer's own preview; and the depth trainer (sc-25687):
+  # the adapted render checked against the trainer's own preview; the depth trainer (sc-25687):
   # one bounded FULL fine-tune of the `depth/` export (four bf16 AdamW steps at 128², batch 1, the
   # repo photo with a synthetic depth ramp) → `depth/` export → the standalone estimator, whose
-  # prediction must move toward the target. Each runs
+  # prediction must move toward the target; and the restoration trainer (sc-25688): the pinned
+  # LPIPS-VGG and OpenCLIP ConvNeXt-XXL critic trunk against the committed upstream reference, then
+  # bounded full-recipe runs (pixel + LPIPS + adversarial, 256² crop, two steps; LoRA on the
+  # `upscaler/` export, and the paper's FULL fine-tune) → the export → `iris_3b_restore` ×4. Each runs
   # `--exact` with a run-count assertion, writing the PNG + logs + a report-only `nvidia-smi` VRAM
   # line into the evidence artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
   # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.
@@ -5014,6 +5017,10 @@ jobs:
       IRIS_WEIGHTS_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3
       IRIS_TEXT_ENCODER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen3-VL-4B-Instruct\snapshots\ebb281ec70b05090aa6165b016eac8ec08e71b17
       IRIS_UPSCALER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3\upscaler
+      # sc-25688: the restoration trainer's training-only resources (critic trunk, LPIPS).
+      IRIS_CRITIC_TRUNK_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup\snapshots\9f3e8ee3f383c672388d9178afe70af9e63ac9df
+      IRIS_LPIPS_VGG16_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--timm--vgg16.tv_in1k\snapshots\b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
+      IRIS_LPIPS_LIN_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--vivym--lpips\snapshots\270571f1fb2a2c4c5f920cec96cd87838c345982
       IRIS_SIZE: "1024"
       IRIS_STEPS: "100"
       IRIS_VRAM_PROBE: "1"
@@ -5423,5 +5430,67 @@ jobs:
         with:
           name: qwen-image-2-1-mlx-evidence
           path: ${{ runner.temp }}/qwen-image-2-1-mlx-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25688 — the MLX restoration trainer on real weights. DISPATCH-ONLY (`iris-restore-mlx`
+  # profile; never `all`, never the schedule; nothing is gated on its numbers). `rw-chroma` stores no
+  # bytes and is registered on both Macs, so the first step checks the host and SKIPS (with the reason
+  # in the log) unless it is nax-macos-2 with >= 128 GB of unified memory and no heavy memory pressure.
+  # It materializes the `upscaler/` export and the three pinned training-only resources (OpenCLIP
+  # ConvNeXt-XXL critic trunk, timm VGG16, LPIPS v0.1 heads) into the runner's hub, then runs, each
+  # under an external phys_footprint guard: the pinned LPIPS-VGG and critic trunk against the
+  # committed upstream reference (cap 40 GB, 30 min), and two bounded full-recipe training runs
+  # (pixel + LPIPS + adversarial, AdamW weight decay 0.01, 256² crop, batch 1, two steps) → the
+  # export → `iris_3b_restore` ×4 beside the base export: HYPIR's LoRA arm (cap 40 GB, 30 min) and the
+  # paper's FULL fine-tune of the 3B generator (cap 100 GB, 60 min; it starts only when
+  # `memory_pressure` reports >= 120 GB free right before it, else it is skipped with the measured
+  # numbers). The restored PNGs, losses, timings and the guard's peaks go in the evidence artifact.
+  # The test binary builds into a run-scoped CARGO_TARGET_DIR with unstripped proc-macros
+  # (rust-lang/rust#157750).
+  mlx-iris-restore-train:
+    name: MLX Iris-3B restoration training real weights
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-restore-mlx'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 180
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      IRIS_WEIGHTS_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--speridlabs--iris-3b/snapshots/7445443349bc9abe3c96f01ff793e2098ca012b3
+      IRIS_CRITIC_TRUNK_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup/snapshots/9f3e8ee3f383c672388d9178afe70af9e63ac9df
+      IRIS_LPIPS_VGG16_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--timm--vgg16.tv_in1k/snapshots/b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
+      IRIS_LPIPS_LIN_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--vivym--lpips/snapshots/270571f1fb2a2c4c5f920cec96cd87838c345982
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check the host (nax-macos-2, >= 128 GB, memory pressure)
+        run: source scripts/ci/real-weights/mlx-iris-restore-train/check-the-host.sh
+      - name: Resolve runner-local snapshot paths
+        if: env.IRIS_RESTORE_SKIP == '0'
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT IRIS_WEIGHTS_DIR IRIS_CRITIC_TRUNK_DIR IRIS_LPIPS_VGG16_DIR IRIS_LPIPS_LIN_DIR
+      - name: Report runner disk headroom
+        if: env.IRIS_RESTORE_SKIP == '0'
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT IRIS_WEIGHTS_DIR IRIS_CRITIC_TRUNK_DIR IRIS_LPIPS_VGG16_DIR IRIS_LPIPS_LIN_DIR
+      - name: Toolchain versions
+        if: env.IRIS_RESTORE_SKIP == '0'
+        run: rustc --version && cargo --version
+      - name: Build the Iris MLX test binary
+        if: env.IRIS_RESTORE_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-iris-restore-train/build-the-test-binary.sh
+      - name: Materialize and verify immutable snapshots
+        if: env.IRIS_RESTORE_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-iris-restore-train/materialize-and-verify-immutable-snapshots.sh
+      - name: Run the guarded real-weight checks
+        if: env.IRIS_RESTORE_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-iris-restore-train/run-the-guarded-checks.sh
+      - name: Keep the Iris MLX restoration-training evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iris-restore-mlx-evidence
+          path: ${{ runner.temp }}/iris-restore-mlx-evidence
           if-no-files-found: error
           retention-days: 30
