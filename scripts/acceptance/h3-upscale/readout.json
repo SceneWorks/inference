@@ -1,0 +1,1878 @@
+{
+  "story": "sc-25328",
+  "date_utc": "2026-10-10",
+  "gate": "COMPLETE",
+  "decision": "NO-GO",
+  "decision_reason": "The corrected experiment does not meet E11: neither the other-model generated clip nor live-action clip shows useful faithful improvement over bicubic, and both exhibit material preservation regressions. H3 offers at most one modest/borderline improvement. The required two of three useful cases and preservation floor are unmet.",
+  "production": "S2-S9 unstarted pending plan revision; no product capability or pin change",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-e4b79931-7be6-f216-460a-f5405cfafffe, 97887 MiB, 596.36",
+  "build": {
+    "native": "Candle/CUDA12.9",
+    "toolset": "MSVC14.44.35207, cl19.44.35227",
+    "reference": "Torch2.10.0+cu130, GPU serial reference only",
+    "memory": "200ms sampled process RSS and assigned-device used memory; not exact allocation maxima",
+    "warmth": "One serial bounded campaign with installed OS/cache assets, no controlled cold/warm distribution"
+  },
+  "pins": {
+    "upsampler": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+    "comfy": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+    "h3": "6818f6c32d12b210915e44ad56a4228c2608f160",
+    "seedvr2": "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
+  },
+  "assets": [
+    {
+      "repo": "sandpies/ComfyUI-H3-Video-Upsampler",
+      "rev": "9337fe00d0753d249aba6181b81d3b6a62bccb52",
+      "filename": "lora/h3upscale_v2_x2.safetensors",
+      "hash": "ff671fa94e377fd277319a89c366a67f49b97ae6528c8ac3b0c5e0a3b254c56c"
+    },
+    {
+      "repo": "LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "rev": "3f941d5d182014dd5c0a5e16330420ee2d4aa0c6",
+      "filename": "minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+      "hash": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6"
+    }
+  ],
+  "authorization": "User confirmed written LoRA authorization via online form for requested use; user-provided evidence, not an independently audited permissive public grant. No weights/source media redistributed.",
+  "settings": {
+    "frames": 39,
+    "input": [
+      512,
+      288
+    ],
+    "output": [
+      1024,
+      576
+    ],
+    "fps": 24,
+    "seed": 444,
+    "denoise": 0.1,
+    "sigma": 0.5714285969734192,
+    "updates": 1,
+    "lora_strength": 1.0,
+    "refiner_targets_applied": 312,
+    "tier": "unaccelerated Ref2VA BF16 / learned FP16",
+    "caption": "h3upscale, increase resolution and restore fine details while preserving the original content and visual style.",
+    "noise_fixture_sha256": "33e5c0f440335c880c310a64a50817f11225aebe84a663019c6690dc9a43d398",
+    "vae_dtype": "fp32",
+    "decode_stitch": "pinned Comfy already-blended full-width neighbour strips; experimental-only"
+  },
+  "numerical_scope": "Independent actual pinned real VAE source/raw, source-normalized and guide-normalized captures derived directly from each fixed RGB input, then actual full learned-network reference using that independent source; tiny layout/schedule/control fixtures. No full real-weight RefDiT equivalence claim.",
+  "visual_review": {
+    "reviewers": "Implementation agent and independent epic coordinator",
+    "frames": [
+      0,
+      19,
+      38
+    ],
+    "all39_decoded_metrics": true,
+    "metrics_caveat": "descriptive deviations from bicubic; no high-resolution truth, no automatic quality score",
+    "useful_cases": "At most one modest/borderline H3 case; zero established useful non-H3 cases",
+    "candidate": "corrected F32 candidate only"
+  },
+  "final_binary_confirmation": {
+    "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+    "method": "Runtime Rust frozen before final release build; every corrected native execution used this exact final rebuilt executable. Retained binary hash equals all nine run receipts.",
+    "executions": 9,
+    "native_rust_source_sha256": {
+      "crates\\media\\candle-gen\\candle-gen-minimax-h3\\examples\\h3_upscale_prototype.rs": "96ff350b88fbdedd5c6d6800593847255054d425db1a8e82aa74a062e9c0dfa1",
+      "crates\\media\\candle-gen\\candle-gen-minimax-h3\\src\\upscale_prototype.rs": "d5e1641986b3d6d5ef3c3bd2d1c23fca4b8b5371fbb4ec19a8f76ef4dcb52f68"
+    }
+  },
+  "cases": [
+    {
+      "kind": "h3",
+      "source_provenance": {
+        "kind": "h3",
+        "source": "https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/6818f6c32d12b210915e44ad56a4228c2608f160/assets",
+        "provenance": "Official H3 video demo"
+      },
+      "original_sha256": "d66903241362e224085cc93f7a5e70fba6ab378d0ac6ff6af83acf2559849a42",
+      "normalization": {
+        "start_seconds": 0,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "828af4b619ccfba5f79b30acdca470dec6af26c85d0b29ea042ff03d876183aa",
+      "bicubic_sha256": "61bb4a93d924e8ed6efeb4da7f80717bfc407ce18d8b523cc67f6e4fb31dc832",
+      "original_dimensions_fps": "1344x768@24",
+      "findings": {
+        "useful_detail": "Modest/borderline sharpening of arch, ship silhouette and console edges",
+        "preservation": "Composition and silhouette broadly retained across frames 0/19/38; small console glyph/light patterns and ship surfaces are redrawn. Guided and unguided look broadly similar; learned-only enlargement explains much of the limited sharpening. This does not establish a second useful case.",
+        "seedvr2": "Cleaner edges and better small-detail retention than H3 refinement; no claim of original high-resolution ground truth"
+      },
+      "reused_baselines": {
+        "source.mp4": "828af4b619ccfba5f79b30acdca470dec6af26c85d0b29ea042ff03d876183aa",
+        "bicubic.mp4": "61bb4a93d924e8ed6efeb4da7f80717bfc407ce18d8b523cc67f6e4fb31dc832",
+        "source.rgb": "02d323a7ac6f9078013903fe6a648dc6f825b3e28144f61a4fdfbcb09c0044ab",
+        "seedvr2.mp4": "54c7958842f4a482af70f10d8c0d65a3fd4b61e3af7dc4ff3a7fd88fdaa9dfe9"
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 154.53200000000652,
+          "peak": {
+            "host_rss_bytes": 5920718848,
+            "device_used_mib": 73255,
+            "samples": 564
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.3891708
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 21.39928
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.7560819
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 36.75361
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 51.0480043
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.7544217
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.0001652
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "291db10780b69e7843960743dff3dfaa28f7234f5d4fe04102c157519e77e0b4",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "h3/guided.mp4",
+          "rgb_sha256": "467f6cc86457e842314d0a7ab51cca507a75190eba382df8419d1741acb4ba48",
+          "intermediates_sha256": "edc4d8ad7b31a2efa4b4660bceef563da83757b868daaf2d7f8d6ae57c1fb93c",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 90.03099999995902,
+          "peak": {
+            "host_rss_bytes": 5781385216,
+            "device_used_mib": 72935,
+            "samples": 334
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.3760769
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.15e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6071203
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 21.9685795
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 24.7253437
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 4.9530278
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 16.9843783
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "23de004e9167d52da0f01e0ffac0e9cef5b076ccd0f68eca92cb073356a93738",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "h3/unguided.mp4",
+          "rgb_sha256": "d30f7b4ec8537f547fe4190a56c9e1646f901c25f363e9c27059cf15cbb0fdc2",
+          "intermediates_sha256": "422f6e191ad2d01df09d3967ef25934125b02c1af740134be13f5beb310d3064",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 38.65700000000652,
+          "peak": {
+            "host_rss_bytes": 5363359744,
+            "device_used_mib": 18629,
+            "samples": 144
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.507249
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 8.5e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.622198
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.1536481
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "4e2570a91319c7d1ea38cba91bb4b5899a5a5cf84d0265b8cb5e9f7258c6b423",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "h3/latent-only.mp4",
+          "rgb_sha256": "0ef6d9bf19573e2e6ffe028cc650fa363d9fd831668cb1c495ee7123d8327664",
+          "intermediates_sha256": "422f6e191ad2d01df09d3967ef25934125b02c1af740134be13f5beb310d3064",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 82.01600000000326,
+        "peak": {
+          "host_rss_bytes": 7131844608,
+          "device_used_mib": 58691,
+          "samples": 306
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 3.4842431,
+          "video_seconds": 78.1869318
+        },
+        "result_sha256": "54c7958842f4a482af70f10d8c0d65a3fd4b61e3af7dc4ff3a7fd88fdaa9dfe9",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "h3/seedvr2.mp4",
+        "reused": "unchanged normalized input and binary/output hashes; original measured timing retained, no new Seed run"
+      },
+      "real_vae_parity": {
+        "case": "h3",
+        "pass": true,
+        "captures": {
+          "source.raw": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.000301361083984375,
+            "max_relative": 2.7251467051682753e-05,
+            "rms": 4.532792445388623e-06,
+            "pass": true
+          },
+          "source.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.0002669095993041992,
+            "max_relative": 5.3284860531220785e-05,
+            "rms": 3.499832700981642e-06,
+            "pass": true
+          },
+          "guide.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.002047330141067505,
+            "max_relative": 0.00043001460235620733,
+            "rms": 1.6811629393487237e-05,
+            "pass": true
+          }
+        },
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "comfy_commit": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+        "upsampler_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "vae_revision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+        "reference": "Unmodified pinned real Comfy VAE, published F32 learned weights and pixel/latent normalization buffers, cuDNN/SDPA without autocast or TF32; native captures are comparison-only",
+        "torch": "2.10.0+cu130",
+        "reference_seconds": 16.48399999999674,
+        "published_tensor_count": 703,
+        "weight_sha256": {
+          "diffusion_pytorch_model-00001-of-00003.safetensors": "72f4c6be84ac0674f27398cde991dd9d719762f3952c4921aa66b2ce542f6374",
+          "diffusion_pytorch_model-00002-of-00003.safetensors": "2e05e8bc23fa4071043e17fd242be8acd0685e781a43987432b2eae925be4198",
+          "diffusion_pytorch_model-00003-of-00003.safetensors": "c05d6ac4b1a33de372799d708531da6320f6a3ce6d1ce6d895e770988e004a39"
+        },
+        "source_sha256": {
+          "comfy\\ldm\\minimax\\vae.py": "8a889ea28fc24b13edfbdea9e85b8a0762b2e7e079bbe34db026c6e6d4f5a556",
+          "comfy\\ops.py": "bf063b4a1b6517e017e3e73e8948caa494177025d71366ae712aaca73f6b9dff",
+          "comfy\\quant_ops.py": "37f0054dfbd8430524ac2c73dafd25b8ad4eabc490a2b7490eeebde8dffbc749",
+          "comfy\\rmsnorm.py": "e8dfbebe9272587038f504538f72fe7e82261307f2c7fbd6f0b05cce28172fdd",
+          "comfy\\ldm\\modules\\attention.py": "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498",
+          "upscale_guide.py": "6ce377cdf9099270049421f38932164bbb469150cbbc75a47bfc4ccc3c4ae139"
+        },
+        "rgb_sha256": "02d323a7ac6f9078013903fe6a648dc6f825b3e28144f61a4fdfbcb09c0044ab",
+        "native_sha256": "edc4d8ad7b31a2efa4b4660bceef563da83757b868daaf2d7f8d6ae57c1fb93c",
+        "reference_sha256": "e1b1c5a88bbefed936702079aff82e15821827ee92995cc415070e9e427ef32a",
+        "script_sha256": "6c73defe8044bbcaaca4384424afbfda1d9087dfed0f4abbd751e01abc0ad4e4",
+        "dependencies": {
+          "comfy-kitchen": "0.2.37",
+          "comfy-aimdo": "0.5.5"
+        },
+        "reference_manifest_sha256": "7c674cc52042945455a030cf46bfda8749e75fe6e8e92054a2d09e079ebcdc3e",
+        "comparison_script_sha256": "446094c0249607d70d35aabc48f5a9241215e4b367beb29696af19951396fe9b",
+        "native_capture_mutations_rejected": {
+          "source.raw": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 11.058526039123535,
+              "max_relative": 0.9999999137611802,
+              "rms": 0.02715124562382698,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "12eb65746de0c317f823fbe90c1e5ce675fba693783e96db1a2b4bfa2d9e344a"
+          },
+          "source.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 5.0091071128845215,
+              "max_relative": 0.999999904805966,
+              "rms": 0.012298520654439926,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "11aa0531cc27328417c1784d1b1175ff633dc99655f5441fbecb1e4b63bf5f62"
+          },
+          "guide.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 4.7610697746276855,
+              "max_relative": 0.9999996995399957,
+              "rms": 0.01168954186141491,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "0dfc3c1e7be36ef0289c3d2a40635eeed7e5b8db9de8000ae02b66ec47f01d64"
+          }
+        }
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.009765625,
+        "max_relative": 0.0018782870022539444,
+        "rms": 0.0010363421170040965,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "reference_dtype": "fp16",
+        "upstream_source_sha256": "f144c83b3f4c438bf33daa0b24ed237ecbd4d2c578250e0e9d3b6b2ce68387f1",
+        "weights_sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6",
+        "native_intermediates_sha256": "edc4d8ad7b31a2efa4b4660bceef563da83757b868daaf2d7f8d6ae57c1fb93c",
+        "expected_sha256": "9a6335501254f88f95c9e5294208dae6de8cd9fa2f5e489687856e40f3104d4d",
+        "script_sha256": "b996299ca4d6c7023bcea749c51907be56f0c247b72060f451a7ff36e894bdad",
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights",
+        "independent_source_reference_sha256": "e1b1c5a88bbefed936702079aff82e15821827ee92995cc415070e9e427ef32a",
+        "reference_input": "independent pinned real VAE export from fixed RGB; native latents are comparison-only"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 2.589176893234253,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 7.992422103881836,
+          "frame_mae_begin_middle_tail": [
+            8.42280387878418,
+            7.754780292510986,
+            8.092582702636719
+          ],
+          "adjacent_frame_change_mean": 2.8622186183929443,
+          "temporal_change_departure_mean": 2.668691635131836,
+          "temporal_change_departure_max": 3.233593463897705,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 8.36217212677002,
+          "frame_mae_begin_middle_tail": [
+            8.640377044677734,
+            8.190007209777832,
+            8.50743293762207
+          ],
+          "adjacent_frame_change_mean": 2.7905821800231934,
+          "temporal_change_departure_mean": 2.666858673095703,
+          "temporal_change_departure_max": 3.20587158203125,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 6.662355899810791,
+          "frame_mae_begin_middle_tail": [
+            7.214873313903809,
+            6.483706951141357,
+            6.737875461578369
+          ],
+          "adjacent_frame_change_mean": 2.7852683067321777,
+          "temporal_change_departure_mean": 2.4808456897735596,
+          "temporal_change_departure_max": 3.124199867248535,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 8.48863697052002,
+          "frame_mae_begin_middle_tail": [
+            6.2199273109436035,
+            9.226237297058105,
+            8.761632919311523
+          ],
+          "adjacent_frame_change_mean": 2.706526279449463,
+          "temporal_change_departure_mean": 3.594377279281616,
+          "temporal_change_departure_max": 5.055352210998535,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "h3/review-begin-middle-tail.png": "e6a8ebeda16317c1a769aac7eeb48d058e032f4e80be319377c3affc6b6c16af",
+        "h3/review-full-frame0.png": "eb115fea2588c0e6494b636f429c1bee77a6d6088d26169c64aa40200af2e0fe",
+        "h3/review-full-frame19.png": "b1d5c7408f206f6e336325e26add4d28339e69d949ebcdf1fe4c446f18ee595f",
+        "h3/review-full-frame38.png": "42b3dba651edd1c705f5339aae8bb132758d9f0256bc4d7c3cceb06a7a5abe67"
+      }
+    },
+    {
+      "kind": "other-model",
+      "source_provenance": {
+        "kind": "other-model",
+        "url": "https://cloud.video.taobao.com/vod/4szTT1B0LqXvJzmuEURfGRA-nllnqN_G2AT0ZWkQXoQ.mp4",
+        "sha256": "e5c3b31ea6388f52aecccf09836bc816f892013e991045d4ac655c03f47aed9f",
+        "provenance": "Official Wan2.2 T2V model-card Video Demo",
+        "reference": "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/blob/c8c270b13ee05bfa474194ac9fb07a5868a97cea/README.md",
+        "rights": "Model repository Apache-2.0; separate demo-media grant unstated; private prototype input only"
+      },
+      "original_sha256": "e5c3b31ea6388f52aecccf09836bc816f892013e991045d4ac655c03f47aed9f",
+      "normalization": {
+        "start_seconds": 59.1,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "275969ff4747a68e2430b5894fe78b94caf3acd83f80d7382bb5eac7fed3eaf6",
+      "bicubic_sha256": "65198b38d752e08fdcf493601ef84a95496e909e8b26cb861c50133f2cb7aa30",
+      "original_dimensions_fps": "1280x720@30",
+      "findings": {
+        "useful_detail": "No useful faithful improvement",
+        "preservation": "Watermark becomes gibberish at beginning/middle/tail; floor, light beams and crowd develop woven texture and smear; robot face/surfaces lose source detail while pose remains broadly aligned. Latent-only already loses watermark/robot detail and smears textures; guided and unguided retain similar damage. This identifies a recipe limitation after validated source/guide stages, separate from the superseded VAE precision/stitch defect.",
+        "seedvr2": "Retains more legible watermark and robot/scene outlines; some texture changes remain"
+      },
+      "reused_baselines": {
+        "source.mp4": "275969ff4747a68e2430b5894fe78b94caf3acd83f80d7382bb5eac7fed3eaf6",
+        "bicubic.mp4": "65198b38d752e08fdcf493601ef84a95496e909e8b26cb861c50133f2cb7aa30",
+        "source.rgb": "f81d859d0aee81b486787f6ef760fc3e4b89ca259bf8308a1cdad5867ac77e0b",
+        "seedvr2.mp4": "df75fbe5cdebdb35d5ba7ed879ac5035fa6ea53d50ef4820708e0881c07b0302"
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 115.07799999997951,
+          "peak": {
+            "host_rss_bytes": 5920907264,
+            "device_used_mib": 73255,
+            "samples": 426
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.72835
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 21.6447751
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.7172554
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 22.0832163
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 25.7630411
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.7560549
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 16.9819714
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "d90d44d7493ac5cd36e693e4e03d7825d5395123b8af2e7e4964dc6d56cd41f8",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "other-model/guided.mp4",
+          "rgb_sha256": "1343cacbd7541c569978e893eef5ddf5421b0ca81ff93ff81b18ff237ff1ba26",
+          "intermediates_sha256": "93c647aa6bbf38c747fd82c8625d24c5abd0771a5802e056337f4a89a334e1e5",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 90.81300000002375,
+          "peak": {
+            "host_rss_bytes": 5780979712,
+            "device_used_mib": 72935,
+            "samples": 335
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.6171667
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 7.1e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6263511
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 21.8580783
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 25.284595
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 4.953285
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.055143
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "3eda2457c0c90bd9ad015463350a5e0dfda5ae26ef980f1e879f1715cc77e619",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "other-model/unguided.mp4",
+          "rgb_sha256": "aed68bf482d64d114992902b617dd1eae33dbbae5145001989b1aa3c017f9917",
+          "intermediates_sha256": "0e944359fd671816fadc153f293376c629bdbc43d0170e4b5c5e8b2390db5b1f",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 38.73399999999674,
+          "peak": {
+            "host_rss_bytes": 5482065920,
+            "device_used_mib": 18629,
+            "samples": 144
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.5534361
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 9.9e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.628467
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.1673897
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "0db904fc22ba9d88b5cd160021027827ab22b90119548489df12d58b2aa9a348",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "other-model/latent-only.mp4",
+          "rgb_sha256": "f12b1fe79e94b1a22fcc86c41d8c2af17fae59c1760930c73477b7d9207e749f",
+          "intermediates_sha256": "0e944359fd671816fadc153f293376c629bdbc43d0170e4b5c5e8b2390db5b1f",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 83.73399999999674,
+        "peak": {
+          "host_rss_bytes": 7131369472,
+          "device_used_mib": 58691,
+          "samples": 307
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 2.9308473,
+          "video_seconds": 80.4998352
+        },
+        "result_sha256": "df75fbe5cdebdb35d5ba7ed879ac5035fa6ea53d50ef4820708e0881c07b0302",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "other-model/seedvr2.mp4",
+        "reused": "unchanged normalized input and binary/output hashes; original measured timing retained, no new Seed run"
+      },
+      "real_vae_parity": {
+        "case": "other-model",
+        "pass": true,
+        "captures": {
+          "source.raw": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.0003261566162109375,
+            "max_relative": 3.624961100563628e-05,
+            "rms": 4.396049007482361e-06,
+            "pass": true
+          },
+          "source.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.00020062923431396484,
+            "max_relative": 4.284184328978111e-05,
+            "rms": 3.377866050868761e-06,
+            "pass": true
+          },
+          "guide.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.006636977195739746,
+            "max_relative": 0.0015397210133380355,
+            "rms": 2.845655762939714e-05,
+            "pass": true
+          }
+        },
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "comfy_commit": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+        "upsampler_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "vae_revision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+        "reference": "Unmodified pinned real Comfy VAE, published F32 learned weights and pixel/latent normalization buffers, cuDNN/SDPA without autocast or TF32; native captures are comparison-only",
+        "torch": "2.10.0+cu130",
+        "reference_seconds": 16.48499999998603,
+        "published_tensor_count": 703,
+        "weight_sha256": {
+          "diffusion_pytorch_model-00001-of-00003.safetensors": "72f4c6be84ac0674f27398cde991dd9d719762f3952c4921aa66b2ce542f6374",
+          "diffusion_pytorch_model-00002-of-00003.safetensors": "2e05e8bc23fa4071043e17fd242be8acd0685e781a43987432b2eae925be4198",
+          "diffusion_pytorch_model-00003-of-00003.safetensors": "c05d6ac4b1a33de372799d708531da6320f6a3ce6d1ce6d895e770988e004a39"
+        },
+        "source_sha256": {
+          "comfy\\ldm\\minimax\\vae.py": "8a889ea28fc24b13edfbdea9e85b8a0762b2e7e079bbe34db026c6e6d4f5a556",
+          "comfy\\ops.py": "bf063b4a1b6517e017e3e73e8948caa494177025d71366ae712aaca73f6b9dff",
+          "comfy\\quant_ops.py": "37f0054dfbd8430524ac2c73dafd25b8ad4eabc490a2b7490eeebde8dffbc749",
+          "comfy\\rmsnorm.py": "e8dfbebe9272587038f504538f72fe7e82261307f2c7fbd6f0b05cce28172fdd",
+          "comfy\\ldm\\modules\\attention.py": "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498",
+          "upscale_guide.py": "6ce377cdf9099270049421f38932164bbb469150cbbc75a47bfc4ccc3c4ae139"
+        },
+        "rgb_sha256": "f81d859d0aee81b486787f6ef760fc3e4b89ca259bf8308a1cdad5867ac77e0b",
+        "native_sha256": "93c647aa6bbf38c747fd82c8625d24c5abd0771a5802e056337f4a89a334e1e5",
+        "reference_sha256": "d06ecb400cccb0bfbaf8ed932cb39a4ac9262cb14a0f4864c1f0430bc23bb6d6",
+        "script_sha256": "6c73defe8044bbcaaca4384424afbfda1d9087dfed0f4abbd751e01abc0ad4e4",
+        "dependencies": {
+          "comfy-kitchen": "0.2.37",
+          "comfy-aimdo": "0.5.5"
+        },
+        "reference_manifest_sha256": "6167c0efcba5974daff880d9c2b42a84f125cc773992bc6d2fdd6263c028871a",
+        "comparison_script_sha256": "446094c0249607d70d35aabc48f5a9241215e4b367beb29696af19951396fe9b",
+        "native_capture_mutations_rejected": {
+          "source.raw": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 8.997523307800293,
+              "max_relative": 1.000000317979044,
+              "rms": 0.022091006860136986,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "4e3306a84e1da7c454525a66b764c1b052950be2c6649168a69e8d4701f27622"
+          },
+          "source.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 4.683022499084473,
+              "max_relative": 1.000000407290251,
+              "rms": 0.01149790734052658,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "e98d53ed6e9c0e9131e99b6e667015f637fd07fd76bf1582e7d20c4c1502dcc3"
+          },
+          "guide.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 4.310508728027344,
+              "max_relative": 1.0000005531103775,
+              "rms": 0.010583336465060711,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "3fec2cd32e679f9713b2e87ec218360b2d1e39d4092cb7b8b5cad6690153bf63"
+          }
+        }
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.0133056640625,
+        "max_relative": 0.002606159143075746,
+        "rms": 0.001237745163962245,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "reference_dtype": "fp16",
+        "upstream_source_sha256": "f144c83b3f4c438bf33daa0b24ed237ecbd4d2c578250e0e9d3b6b2ce68387f1",
+        "weights_sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6",
+        "native_intermediates_sha256": "93c647aa6bbf38c747fd82c8625d24c5abd0771a5802e056337f4a89a334e1e5",
+        "expected_sha256": "ac846818dbfdb75558262a8aa9ff34e457df8db3a7e1eeafbef88268def37a9b",
+        "script_sha256": "b996299ca4d6c7023bcea749c51907be56f0c247b72060f451a7ff36e894bdad",
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights",
+        "independent_source_reference_sha256": "d06ecb400cccb0bfbaf8ed932cb39a4ac9262cb14a0f4864c1f0430bc23bb6d6",
+        "reference_input": "independent pinned real VAE export from fixed RGB; native latents are comparison-only"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 32.188133239746094,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 17.003694534301758,
+          "frame_mae_begin_middle_tail": [
+            11.526930809020996,
+            19.21241569519043,
+            17.400373458862305
+          ],
+          "adjacent_frame_change_mean": 26.578197479248047,
+          "temporal_change_departure_mean": 21.297012329101562,
+          "temporal_change_departure_max": 29.58564567565918,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 18.016862869262695,
+          "frame_mae_begin_middle_tail": [
+            12.475775718688965,
+            20.20962142944336,
+            19.042760848999023
+          ],
+          "adjacent_frame_change_mean": 25.556228637695312,
+          "temporal_change_departure_mean": 22.41807746887207,
+          "temporal_change_departure_max": 30.492847442626953,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 14.265131950378418,
+          "frame_mae_begin_middle_tail": [
+            7.850502967834473,
+            17.12448501586914,
+            12.730280876159668
+          ],
+          "adjacent_frame_change_mean": 26.493261337280273,
+          "temporal_change_departure_mean": 18.412431716918945,
+          "temporal_change_departure_max": 25.92835807800293,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 28.53559112548828,
+          "frame_mae_begin_middle_tail": [
+            4.853270530700684,
+            34.34651565551758,
+            32.3670654296875
+          ],
+          "adjacent_frame_change_mean": 27.855112075805664,
+          "temporal_change_departure_mean": 35.52947998046875,
+          "temporal_change_departure_max": 49.32517623901367,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "other-model/review-begin-middle-tail.png": "ef314f7061ac7d48b53a0600d71b9bdae8deb3240f03f36d2f2624c61f9ce8ce",
+        "other-model/review-full-frame0.png": "4772a06d8d6fe129ecbaeb9948dab5f9588aeec64e75d7a30d93aa51f51ffcec",
+        "other-model/review-full-frame19.png": "2b2dccaeb05e3bc9059aa1c4d11074f5b21367912c8097864b1f4c3b8bc2f81b",
+        "other-model/review-full-frame38.png": "f165608580aa871fdb286bc3734bd6435fab77329ee16d9657fa7e188eca2b9f"
+      }
+    },
+    {
+      "kind": "live-action",
+      "source_provenance": {
+        "kind": "live-action",
+        "url": "https://upload.wikimedia.org/wikipedia/commons/7/7e/Birds_at_a_dock.webm",
+        "sha256": "031f4f3903c5f16e8a628be3bc16d3b3a52a6bc33407916b4bac8dd14665e140",
+        "provenance": "Birds taking flight at a dock in San Francisco, May 28 2011",
+        "author": "Editor",
+        "reference": "https://commons.wikimedia.org/wiki/File:Birds_at_a_dock.webm",
+        "license": "CC-BY-3.0",
+        "license_url": "https://creativecommons.org/licenses/by/3.0/",
+        "changes": "Any normalized experiment crops/resamples/resizes must be recorded separately"
+      },
+      "original_sha256": "031f4f3903c5f16e8a628be3bc16d3b3a52a6bc33407916b4bac8dd14665e140",
+      "normalization": {
+        "start_seconds": 1,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "3d1b8e98262c6f44870e0c1eace6fcec22a3afd1b3e6de6da306e81cd89fc8f5",
+      "bicubic_sha256": "a60d26a60d9ea3317981f26b7f6deba76dca5eca9127a9b8f612ccbd3f5bf2fa",
+      "original_dimensions_fps": "1920x1080 approximately30fps (33/34ms source PTS)",
+      "findings": {
+        "useful_detail": "No useful faithful improvement",
+        "preservation": "Moving birds collapse into angular ghost trails/double outlines, water/masts/boats gain woven or line texture, and standing birds soften/redraw across frames 0/19/38. Unguided and latent-only controls show related outline and texture damage; guided refinement does not restore faithful motion/detail.",
+        "seedvr2": "Preserves bird outlines and marina structure more clearly; texture changes remain"
+      },
+      "reused_baselines": {
+        "source.mp4": "3d1b8e98262c6f44870e0c1eace6fcec22a3afd1b3e6de6da306e81cd89fc8f5",
+        "bicubic.mp4": "a60d26a60d9ea3317981f26b7f6deba76dca5eca9127a9b8f612ccbd3f5bf2fa",
+        "source.rgb": "5b9ac312f7da94a8f07bfda6188d28c5b2bd36edbfc3d7a2944f3cb3732ea8f7",
+        "seedvr2.mp4": "d9473503ce4c6325ee4d77d840834f6a3d52a433109b66d0fbfa1a89412b3abd"
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 116.92200000002049,
+          "peak": {
+            "host_rss_bytes": 6078570496,
+            "device_used_mib": 73243,
+            "samples": 433
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.7567712
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 21.6638157
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6911231
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 22.531734
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 26.8967449
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.7747065
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.1967776
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "973aa3e337e5ffb3df5705a66ae768c7785c62b17fae4bc4f9f8d136da4ddc5a",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "live-action/guided.mp4",
+          "rgb_sha256": "a63a4e21bced88138564d143b89bdb8f08bae2053ac3689c888a46f68e2d2bb6",
+          "intermediates_sha256": "690856d117085dcd27233e0fb6de0d44462131823d9f57119cbd796dac6750cf",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 90.90599999995902,
+          "peak": {
+            "host_rss_bytes": 5779787776,
+            "device_used_mib": 72919,
+            "samples": 336
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.5636482
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 8.3e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6168684
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 21.6465565
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 25.4789218
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 5.0422219
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 17.1455121
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "359d9f99286208f77c02d0fd01c9242bfacbd1127a54b472fb513d182d87f269",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "live-action/unguided.mp4",
+          "rgb_sha256": "b2e4573e2fbe59eeebf12fc8f4fb74a5bb10c4f6b5264c076f8c53577676c0dc",
+          "intermediates_sha256": "49c15896f12568f74b65108ddac57516fe3039125b23f537a961ef024a828c9d",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 39.75,
+          "peak": {
+            "host_rss_bytes": 5309632512,
+            "device_used_mib": 18613,
+            "samples": 144
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "vae_dtype": "fp32",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.6505206
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.86e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6701276
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 18.0181783
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "0d74a871967842fb40c6b4da504ed5b022048e852247c01a50711596aae1ed47",
+          "executable_sha256": "0def16b388b1be41f5693c2672657288368c39fc451df564bfbae35eef0067e3",
+          "artifact": "live-action/latent-only.mp4",
+          "rgb_sha256": "f6d231182311c7c193d0c0edea7b3a0d89a117d6dbed97883082f60ed1b892cf",
+          "intermediates_sha256": "49c15896f12568f74b65108ddac57516fe3039125b23f537a961ef024a828c9d",
+          "geometry_timing_audio": "39 frames at 1024x576 and 24 fps; all PTS i/24 within 1/12288 s; source AAC timing and decoded soundtrack unchanged"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 83.5,
+        "peak": {
+          "host_rss_bytes": 7131770880,
+          "device_used_mib": 58531,
+          "samples": 313
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 3.1834961,
+          "video_seconds": 80.0067884
+        },
+        "result_sha256": "d9473503ce4c6325ee4d77d840834f6a3d52a433109b66d0fbfa1a89412b3abd",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "live-action/seedvr2.mp4",
+        "reused": "unchanged normalized input and binary/output hashes; original measured timing retained, no new Seed run"
+      },
+      "real_vae_parity": {
+        "case": "live-action",
+        "pass": true,
+        "captures": {
+          "source.raw": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.0003281235694885254,
+            "max_relative": 3.9896309310918775e-05,
+            "rms": 4.303286914364435e-06,
+            "pass": true
+          },
+          "source.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.00034902989864349365,
+            "max_relative": 6.967181555750493e-05,
+            "rms": 3.3150224680866813e-06,
+            "pass": true
+          },
+          "guide.normalized": {
+            "shape": [
+              1,
+              24,
+              12,
+              18,
+              32
+            ],
+            "max_abs": 0.005399823188781738,
+            "max_relative": 0.0010655227447952471,
+            "rms": 2.9282648029038683e-05,
+            "pass": true
+          }
+        },
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "comfy_commit": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+        "upsampler_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "vae_revision": "6818f6c32d12b210915e44ad56a4228c2608f160",
+        "reference": "Unmodified pinned real Comfy VAE, published F32 learned weights and pixel/latent normalization buffers, cuDNN/SDPA without autocast or TF32; native captures are comparison-only",
+        "torch": "2.10.0+cu130",
+        "reference_seconds": 16.65600000001723,
+        "published_tensor_count": 703,
+        "weight_sha256": {
+          "diffusion_pytorch_model-00001-of-00003.safetensors": "72f4c6be84ac0674f27398cde991dd9d719762f3952c4921aa66b2ce542f6374",
+          "diffusion_pytorch_model-00002-of-00003.safetensors": "2e05e8bc23fa4071043e17fd242be8acd0685e781a43987432b2eae925be4198",
+          "diffusion_pytorch_model-00003-of-00003.safetensors": "c05d6ac4b1a33de372799d708531da6320f6a3ce6d1ce6d895e770988e004a39"
+        },
+        "source_sha256": {
+          "comfy\\ldm\\minimax\\vae.py": "8a889ea28fc24b13edfbdea9e85b8a0762b2e7e079bbe34db026c6e6d4f5a556",
+          "comfy\\ops.py": "bf063b4a1b6517e017e3e73e8948caa494177025d71366ae712aaca73f6b9dff",
+          "comfy\\quant_ops.py": "37f0054dfbd8430524ac2c73dafd25b8ad4eabc490a2b7490eeebde8dffbc749",
+          "comfy\\rmsnorm.py": "e8dfbebe9272587038f504538f72fe7e82261307f2c7fbd6f0b05cce28172fdd",
+          "comfy\\ldm\\modules\\attention.py": "bc0a142275a9b1ebacd42d75d674ac6ce74e1c6bbdedeb8fc52706599d4ad498",
+          "upscale_guide.py": "6ce377cdf9099270049421f38932164bbb469150cbbc75a47bfc4ccc3c4ae139"
+        },
+        "rgb_sha256": "5b9ac312f7da94a8f07bfda6188d28c5b2bd36edbfc3d7a2944f3cb3732ea8f7",
+        "native_sha256": "690856d117085dcd27233e0fb6de0d44462131823d9f57119cbd796dac6750cf",
+        "reference_sha256": "3107097ba19f2a2d9f47a8005bad8cef648474358899084f5b2689cde827829b",
+        "script_sha256": "6c73defe8044bbcaaca4384424afbfda1d9087dfed0f4abbd751e01abc0ad4e4",
+        "dependencies": {
+          "comfy-kitchen": "0.2.37",
+          "comfy-aimdo": "0.5.5"
+        },
+        "reference_manifest_sha256": "5d08ef63846ed40dd3dc27338f2f908b5cecd45e88beb47c1f5197381004307f",
+        "comparison_script_sha256": "446094c0249607d70d35aabc48f5a9241215e4b367beb29696af19951396fe9b",
+        "native_capture_mutations_rejected": {
+          "source.raw": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 8.224411010742188,
+              "max_relative": 1.0000002319131513,
+              "rms": 0.020192835479974747,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "511711ab1d80a6dce3b08483f4d532f81d1edc4036d2f3cbf7785da690c94c05"
+          },
+          "source.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 5.00963020324707,
+              "max_relative": 1.0000003807365576,
+              "rms": 0.012299804948270321,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "ea507dc2ac58e7aa2ac8a5d4a69a9500389c089c43e095ae169b28cf48954240"
+          },
+          "guide.normalized": {
+            "rejected": true,
+            "reason": "numerical absolute/relative limits violated; RGB and reference hashes valid; native checksum is computed from current values, not checked against an expected native checksum",
+            "errors": {
+              "shape": [
+                1,
+                24,
+                12,
+                18,
+                32
+              ],
+              "max_abs": 5.067773342132568,
+              "max_relative": 1.0000008468291237,
+              "rms": 0.012442593462765217,
+              "pass": false
+            },
+            "changed_tensor_payload_sha256": "053806802cb1e378ace4f7f9bca6cb1e3963412493c23cfd81ede04fb1dd8eac"
+          }
+        }
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.009033203125,
+        "max_relative": 0.0019048599670510708,
+        "rms": 0.001094565261155367,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "reference_dtype": "fp16",
+        "upstream_source_sha256": "f144c83b3f4c438bf33daa0b24ed237ecbd4d2c578250e0e9d3b6b2ce68387f1",
+        "weights_sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6",
+        "native_intermediates_sha256": "690856d117085dcd27233e0fb6de0d44462131823d9f57119cbd796dac6750cf",
+        "expected_sha256": "9eef2421838d9afddea772f9c996d29ca443ad36e045aaf97a34fdd2d1429ed2",
+        "script_sha256": "b996299ca4d6c7023bcea749c51907be56f0c247b72060f451a7ff36e894bdad",
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights",
+        "independent_source_reference_sha256": "3107097ba19f2a2d9f47a8005bad8cef648474358899084f5b2689cde827829b",
+        "reference_input": "independent pinned real VAE export from fixed RGB; native latents are comparison-only"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 4.7288079261779785,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 14.0861177444458,
+          "frame_mae_begin_middle_tail": [
+            14.968941688537598,
+            13.85835075378418,
+            14.15791130065918
+          ],
+          "adjacent_frame_change_mean": 2.7548980712890625,
+          "temporal_change_departure_mean": 5.827239990234375,
+          "temporal_change_departure_max": 7.7752227783203125,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 14.59239673614502,
+          "frame_mae_begin_middle_tail": [
+            15.503901481628418,
+            14.358038902282715,
+            14.635893821716309
+          ],
+          "adjacent_frame_change_mean": 2.6440842151641846,
+          "temporal_change_departure_mean": 5.775554656982422,
+          "temporal_change_departure_max": 7.737277030944824,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 10.615409851074219,
+          "frame_mae_begin_middle_tail": [
+            10.933294296264648,
+            10.460625648498535,
+            10.514752388000488
+          ],
+          "adjacent_frame_change_mean": 2.8320693969726562,
+          "temporal_change_departure_mean": 5.52876615524292,
+          "temporal_change_departure_max": 7.097683429718018,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 10.51870059967041,
+          "frame_mae_begin_middle_tail": [
+            8.680634498596191,
+            10.6407470703125,
+            11.284473419189453
+          ],
+          "adjacent_frame_change_mean": 4.298194885253906,
+          "temporal_change_departure_mean": 6.9341959953308105,
+          "temporal_change_departure_max": 8.547538757324219,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "live-action/review-begin-middle-tail.png": "82410a90eb795726cccb9072950be1fcf554fa3fa7aa4b46e765de25e458b1fe",
+        "live-action/review-full-frame0.png": "7224655b789a07c1f3f07ca8c5c2d4a4b95d2dcbbcd7e929da9fa77883b160a1",
+        "live-action/review-full-frame19.png": "fa0f42221c56646927ac8a58655187c546b2dd01244007ce7027b2f418e4aafc",
+        "live-action/review-full-frame38.png": "f46035a294a4081a3eb43cdf1364a7f4cfdf44e472c417499b0cffa94fc6a275"
+      }
+    }
+  ],
+  "local_platform_limits": {
+    "broad_discovery": {
+      "os": "Windows",
+      "python": "3.14.4",
+      "count": 1445,
+      "failures": 38,
+      "errors": 31,
+      "skipped": 64,
+      "result": "FAILED; not a successful Linux workflow equivalent",
+      "log_sha256": "41c91353df847a94c516b5720245b38f7a9d1a3d9e9b6b0ef3286146cd7fd5db",
+      "failure_groups": "Unchanged KV proof/noise-floor, Mage/LTX fixture paths/promotion, POSIX process supervision and campaign/tooling tests; full case list and tracebacks retained in external log."
+    },
+    "native_windows_workflow": {
+      "python": "3.12.10 exact workflow pin",
+      "tests": 4,
+      "result": "PASS",
+      "log": "windows-supervisor-pinned31210.log"
+    },
+    "extra_interpreter_probe": {
+      "python": "3.12.11",
+      "tests": 4,
+      "failures": 1,
+      "failure": "test_child_cap_aborts_and_reaps: WaitForSingleObject returned258; no version-causation claim",
+      "log": "windows-supervisor-tests.log"
+    },
+    "baseline_blob_proof": {
+      "scripts/media_campaign_windows.py": {
+        "base": "1cea81ed161ac5fcf2257edf3a90f10cbf3c0308",
+        "current": "1cea81ed161ac5fcf2257edf3a90f10cbf3c0308"
+      },
+      "scripts/media_campaign_supervisor.py": {
+        "base": "c570f68444d024ac3175d9b982a5532aa16a0b82",
+        "current": "c570f68444d024ac3175d9b982a5532aa16a0b82"
+      },
+      "scripts/tests/test_media_campaign_supervisor.py": {
+        "base": "48bfd8d7bd4892e9e7abf612a66a920bdf793631",
+        "current": "48bfd8d7bd4892e9e7abf612a66a920bdf793631"
+      }
+    },
+    "unrelated_source_proof": "git diff BASE -- scripts/tests scripts/ci/real-weights is empty; no S1 source imports by these unrelated modules",
+    "scope": "No unrelated tooling changes; S1 acceptance tests passed separately. Linux/macOS CI execution remains remote platform verification."
+  },
+  "local_validation": {
+    "workflow": ".github/workflows/ci.yml",
+    "generation": {
+      "command": "cargo test --locked --lib --tests -j 1 -p 'candle-gen*'",
+      "initial": {
+        "groups": 57,
+        "passed": 3794,
+        "failed": 1,
+        "ignored": 228
+      },
+      "remaining": {
+        "groups": 11,
+        "passed": 619,
+        "failed": 0,
+        "ignored": 35
+      },
+      "exact_retest": {
+        "original_result": "FAILED on unchanged POSIX /tmp fixture: Windows os error 3 (path missing)",
+        "test": "tests::load_reports_missing_single_file_source",
+        "resolved_fixture": "C:/tmp/sdxl.safetensors",
+        "parent_initially_absent": true,
+        "file_absent": true,
+        "preparation": "Created only empty C:/tmp; ran the exact failed test once in the original compiled CPU binary; removed only that newly created empty directory nonrecursively",
+        "retest": "PASS 1/1",
+        "source": "crates/media/candle-gen/candle-gen-sdxl/src/lib.rs",
+        "base_blob": "5759dbad1d536307f1c51d5f671fe9d0e008b1e7",
+        "current_blob": "5759dbad1d536307f1c51d5f671fe9d0e008b1e7",
+        "source_changes": false,
+        "log_sha256": "48c2470cafb10c7fa88405da896ddeeb413c7d742881dc1897ff231316923d75"
+      },
+      "unique_passed": 4414,
+      "ignored": 263,
+      "result": "COMPLETE; all selected runnable targets pass after reversible fixture-parent setup; original failure retained",
+      "continuation": "Exact wildcard --no-run --message-format=json graph; only SDXL unrun integration plus SeedVR2, SenseNova, SVD, Wan, Z-Image binaries executed, using Cargo artifact receipts and RUST_TEST_THREADS=1"
+    },
+    "cpu": {
+      "commands": [
+        "cargo clippy --locked -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cpu --features candle-audio/testkit --all-targets -- -D warnings",
+        "cargo doc --locked --no-deps -p core-llm -p core-llm-testkit -p sceneworks-gen-core -p sceneworks-gen-core-testkit -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cpu -p runtime-catalog",
+        "cargo test --locked --lib -j 1 -p candle-llm -p candle-quant-kernels -p \"candle-audio*\" -p runtime-cpu",
+        "cargo test --locked -j 1 -p candle-llm --test conformance",
+        "cargo test --locked -j 1 -p candle-audio-stable-audio-3 --test provider --test dtype_policy --test variant_quality --test conformance --test sampler_oracle --test same_oracle --test primitive_oracle --test listening_stimuli --test reference_audio --test reference_window --test audio_edit --test adapters -- --nocapture",
+        "cargo test --locked --no-default-features --lib -p runtime-cpu",
+        "cargo test --locked --no-default-features --features audio --lib -p runtime-cpu",
+        "cargo test --locked --no-default-features --features media --lib -p runtime-cpu"
+      ],
+      "result": "PASS exit 0",
+      "test_summary": {
+        "groups": 41,
+        "passed": 1591,
+        "failed": 0,
+        "ignored": 77
+      }
+    },
+    "cuda": {
+      "commands": [
+        "cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda --no-run",
+        "cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact",
+        "cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda -- -D warnings",
+        "cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda"
+      ],
+      "result": "PASS exit 0; compile-only wildcard, named catalog test, all-target lint and docs; no broad GPU runtime"
+    },
+    "scope": "Exact locally available CPU/Windows CUDA PR workflow checks; Linux/macOS native CI execution is not asserted",
+    "logs": {
+      "full-cpu-gen.log": "ac961d30c97399fa9d4cc2c955716d1b85fb5d18f12962c191872470ad87ce5d",
+      "cpu-gen-remaining.log": "ce9f1d032f4dc1f0066764457b3e573cdf408a9be986472cf11a6e402c30782a",
+      "cpu-gen-remaining.json": "373851cf583bb43263a47cb672ce52837c3c7f18544cc58008a5dbe44b90b7fd",
+      "cpu-gen-artifacts.jsonl": "837a396d2a3cbf31c5db68e87c25df7f94b5309c426ebff726f88c13c37b4887",
+      "sdxl-platform-retest.log": "48c2470cafb10c7fa88405da896ddeeb413c7d742881dc1897ff231316923d75",
+      "full-cpu-gates.log": "d6e49912cfa6d8b7e0159a32d6a8d1668c27b27f6d7072e33064fde403ab6871",
+      "full-cuda-gates.log": "5132689ea74eab2999f44398c7eddd5d7f3b86d2a796ca6165ecb3b384fe0cc6"
+    },
+    "review_fix": {
+      "affected_checks": [
+        {
+          "command": [
+            "E:/Comfy/ComfyUI/.venv/Scripts/python.exe",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "scripts/acceptance/h3-upscale",
+            "-p",
+            "test_*.py",
+            "-v"
+          ],
+          "exit_code": 0,
+          "log": "fix-gate-0.log",
+          "log_sha256": "cc14af1c18fc7633e19f26c11610f249fde39d92391b802a09b3a88d96a46cca"
+        },
+        {
+          "command": [
+            "cargo",
+            "fmt",
+            "-p",
+            "candle-gen-minimax-h3",
+            "--check"
+          ],
+          "exit_code": 0,
+          "log": "fix-gate-1.log",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "command": [
+            "E:/Comfy/ComfyUI/.venv/Scripts/python.exe",
+            "scripts/check-workspace.py"
+          ],
+          "exit_code": 0,
+          "log": "fix-gate-2.log",
+          "log_sha256": "e630eab379f681d673913a663a2fb601206320b81bb05725c17335cb57d991ff"
+        },
+        {
+          "command": [
+            "E:/Comfy/ComfyUI/.venv/Scripts/python.exe",
+            "scripts/check_clock_assertions.py",
+            "--check-baseline"
+          ],
+          "exit_code": 0,
+          "log": "fix-gate-3.log",
+          "log_sha256": "51d0bd149535ee0d5e23805826ff0c495652f3398e89b6a7dd11c30845d9f021"
+        },
+        {
+          "command": [
+            "git",
+            "diff",
+            "--check"
+          ],
+          "exit_code": 0,
+          "log": "fix-gate-4.log",
+          "log_sha256": "c89def0aa8a7f0904fe24973e58413217f01b0cdc97d0f8ccc8738b2bd38ac54"
+        }
+      ],
+      "completed_affected_rust_checks": [
+        {
+          "command": "cargo test --locked -p candle-gen-minimax-h3",
+          "result": "376 unit + 205 integration passed; 20 hardware ignored",
+          "log": "evidence-f32-cpu-final.log",
+          "log_sha256": "731e6bd2490e7fe2738b9509369a63b795f0558d133b39bf45090bb9e19c2472"
+        },
+        {
+          "command": "2022 vcvars64: cargo test --locked -p candle-gen-minimax-h3 --features cuda --no-run; cargo clippy --locked -p candle-gen-minimax-h3 --all-targets --features cuda -- -D warnings; RUSTDOCFLAGS=-D warnings cargo doc --locked -p candle-gen-minimax-h3 --features cuda --no-deps",
+          "result": "all passed after final runtime source change",
+          "log": "evidence-f32-cuda-gates.log",
+          "log_sha256": "cfa29d030997d94bf6c62314e2b0dc6d7decbfcba8c81334ff34aa0832ece48e"
+        },
+        {
+          "command": "2022 vcvars64: cargo build --release --locked -p candle-gen-minimax-h3 --features cuda --example h3_upscale_prototype",
+          "result": "final binary used by all nine native runs",
+          "log": "evidence-f32-build-final.log",
+          "log_sha256": "8f14270a5fec8ae79261bed3eedbaf3b020d6729c324dbe7ea8b9ec5fede5c78"
+        }
+      ],
+      "tooling_tests": 8,
+      "cpu_tests": 581,
+      "hardware_ignored": 20,
+      "real_capture_mutations": {
+        "rejected": 9,
+        "reason": "Actual value perturbations violate numerical bounds with unchanged valid independent RGB/reference hashes; native checksum is freshly computed, never validated against an expected-native hash. Receipts include numeric errors and changed tensor payload SHA. Shared native-as-reference false-green is explicitly demonstrated and rejected by independent expected tensors in a unit test."
+      },
+      "comparison_commands": {
+        "vae": "compare_real_vae.py --reference-root evidence-vae-reference-f32 --evidence-root evidence-f32-final --out evidence-f32-final/vae-parity (CPU compare, all three cases)",
+        "learned": "compare_real_upscaler.py --upstream pinned/tiled_upsampler.py --weights immutable learned checkpoint --intermediates evidence-f32-final/<case>/guided.intermediates.safetensors --source-reference evidence-vae-reference-f32/<case>.safetensors --device cuda --out evidence-f32-final/<case>/real-upscaler-parity.json"
+      },
+      "limits": {
+        "max_abs": 0.08,
+        "max_relative": 0.015,
+        "rule": "AND; predeclared unchanged"
+      },
+      "broad_checks": "Earlier first-push evidence preserved for unchanged surfaces, including explicit platform limitations; affected checks only repeated in ordinary review fix."
+    }
+  },
+  "candidate": "published F32 VAE + pinned already-blended decode / Ref2VA BF16 / learned FP16",
+  "candidate_history": {
+    "superseded_commit": "a340a16086030530dde1ccdd3270438fdf978eee",
+    "superseded_portable_readout_sha256": "307cabeb1bb8e854cc8bb920c4fae88c7289f1f7ec9cc22a31992738221deeb4",
+    "superseded_report_sha256": "5f71ad049577f6252806af41127a5ca4e3b34b06367fee412ad6ae18aaedcae8",
+    "earlier_quality_decision": "NO-GO; historical only, invalidated as current candidate when actual source/guide parity failed",
+    "bf16_actual_source_guide_failures": {
+      "h3": {
+        "source.raw": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.783203125,
+          "max_relative": 0.07120028409090909,
+          "rms": 0.014600167982280254,
+          "pass": false
+        },
+        "source.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.7116556167602539,
+          "max_relative": 0.1418136930387526,
+          "rms": 0.011019028723239899,
+          "pass": false
+        },
+        "guide.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 1.1263220310211182,
+          "max_relative": 0.23651197409778354,
+          "rms": 0.035271067172288895,
+          "pass": false
+        }
+      },
+      "other-model": {
+        "source.raw": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 1.0,
+          "max_relative": 0.1103448275862069,
+          "rms": 0.014272799715399742,
+          "pass": false
+        },
+        "source.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.7272591590881348,
+          "max_relative": 0.15491263664410954,
+          "rms": 0.010880405083298683,
+          "pass": false
+        },
+        "guide.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 1.080995798110962,
+          "max_relative": 0.24915163073623955,
+          "rms": 0.03504152223467827,
+          "pass": false
+        }
+      },
+      "live-action": {
+        "source.raw": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.9140625,
+          "max_relative": 0.11164122137404581,
+          "rms": 0.013172087259590626,
+          "pass": false
+        },
+        "source.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.6436048746109009,
+          "max_relative": 0.1289545890210193,
+          "rms": 0.009969387203454971,
+          "pass": false
+        },
+        "guide.normalized": {
+          "shape": [
+            1,
+            24,
+            12,
+            18,
+            32
+          ],
+          "max_abs": 0.8358052968978882,
+          "max_relative": 0.16531979677334105,
+          "rms": 0.032646290957927704,
+          "pass": false
+        }
+      }
+    },
+    "first_divergence": {
+      "reference_sha256": "82a1308ed62090adb39ed01894366c2aae0a797605fc5009fa0d9f3624d51434",
+      "original_tail_native_sha256": "fa4940c02068719d99603a4fd87dee4d1afa09f9624631265b25b3893782c555",
+      "blended_tail_native_sha256": "9768249f7ead67b3c2fc4ab98c3dd07631fd8ae6fe8d70e37fe754e2c0e197a0",
+      "captures": {
+        "source.decoded.rgb": {
+          "original_tail_max_abs": 0.22071337699890137,
+          "blended_tail_max_abs": 7.870793342590332e-05,
+          "blended_tail_rms": 1.1222277862543706e-06
+        },
+        "guide.pixels.rgb": {
+          "original_tail_max_abs": 0.1726609468460083,
+          "blended_tail_max_abs": 6.127357482910156e-05,
+          "blended_tail_rms": 9.289577178606123e-07
+        },
+        "guide.normalized": {
+          "original_tail_max_abs": 0.619807779788971,
+          "blended_tail_max_abs": 0.002047330141067505,
+          "blended_tail_rms": 1.6811629393487237e-05
+        }
+      }
+    },
+    "recovery": "Kept unchanged bounds .08/.015; corrected experimental VAE to published F32 and pinned decode-neighbour semantics, re-ran only affected native candidates; source/audio/bicubic/Seed reused with verified hashes"
+  },
+  "reference_exporter": {
+    "executed_script_sha256": "6c73defe8044bbcaaca4384424afbfda1d9087dfed0f4abbd751e01abc0ad4e4",
+    "note": "Exact executed exporter archived; mandatory source/guide calculations unchanged in current diagnostic-capable harness. Actual Comfy source unmodified; all published703 F32 tensors strictly consumed after lossless names/QKV/gate mapping.",
+    "tolerances": {
+      "max_abs": 0.08,
+      "max_relative": 0.015
+    },
+    "declared_before_measurement_sha256": "426c6cac7ab843ae8383293b58b2271392404e0e339143c7320678ca70d851fe"
+  }
+}

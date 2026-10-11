@@ -1874,6 +1874,57 @@ fn the_conversion_leaves_no_comfyui_module_behind() {
     );
 }
 
+/// The published upscale LoRA uses ComfyUI's refiner container, not the
+/// diffusers spelling used by the existing turbo fixtures. All twelve leaves
+/// must install; accepting only the trunk would discard trained conditioning.
+#[test]
+fn upscale_comfy_refiner_container_reaches_all_twelve_native_leaves() {
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().unwrap();
+    let canonical = write_lora(dir.path(), "canonical.safetensors", &cfg, Some("8"));
+    let af = candle_gen::train::merge::read_adapter(&canonical).unwrap();
+    let arrays: Vec<_> = af
+        .tensors
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("token_refiner.refiner_blocks."))
+        .map(|(key, value)| {
+            (
+                format!(
+                    "diffusion_model.{}",
+                    key.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+                        .replace("attn.to_out.0", "attn.out_proj")
+                ),
+                value,
+            )
+        })
+        .collect();
+    let path = dir.path().join("upscale-refiner.safetensors");
+    write_safetensors(
+        &path,
+        &arrays,
+        &[("target_format", "ComfyUI generic LoRA"), ("alpha", "8")],
+    );
+    let mut dit = tiny_dit(&cfg);
+    let report = apply_minimax_h3_adapters(&mut dit, &[spec(path, 1.0)]).unwrap();
+    assert_eq!(report.applied, 12);
+    assert_eq!(dit.adapted_module_count(), 12);
+    assert!(report.unmatched_paths.is_empty());
+    let raw = candle_gen::train::merge::read_adapter(&canonical).unwrap();
+    let expected: HashMap<_, _> = raw
+        .tensors
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("token_refiner."))
+        .collect();
+    let native = convert_comfyui_key_space(&arrays.into_iter().collect(), &HashMap::new()).unwrap();
+    for (key, value) in expected {
+        assert_eq!(
+            rel_max_abs(native.get(&key.replace(".default", "")).unwrap(), &value),
+            0.,
+            "{key}"
+        );
+    }
+}
+
 /// **Block-diagonality is measured on the BYTES, not inferred from the shape.**
 ///
 /// A shared-`A` fused LoRA whose rank happens to divide by three has exactly the shape a

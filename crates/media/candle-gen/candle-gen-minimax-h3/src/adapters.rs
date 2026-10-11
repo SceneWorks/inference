@@ -364,15 +364,18 @@ pub fn resolve_target_alpha(in_band: Option<f32>, blob_alpha: Option<f32>, file_
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
 
 /// The ComfyUI container prefix for the 50-block stack. Its diffusers spelling is
-/// `transformer_blocks.`; the token refiner keeps its name in both.
+/// `transformer_blocks.`; the refiner's `blocks.` becomes `refiner_blocks.`.
 const COMFY_BLOCK_CONTAINER: &str = "blocks.";
 
 /// Map a ComfyUI *container* path onto the diffusers one, leaving an already-diffusers path alone.
 ///
 /// The order matters: `token_refiner.refiner_blocks.` and `transformer_blocks.` both *contain*
-/// `blocks.`, so they are matched first and returned unchanged. Only a bare leading `blocks.` — the
-/// ComfyUI spelling of the trunk — is rewritten.
+/// `blocks.`, so replacing that substring globally would corrupt canonical
+/// names. Rewrite only the leading Comfy refiner or trunk container.
 fn normalize_comfy_container(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("token_refiner.blocks.") {
+        return format!("token_refiner.refiner_blocks.{rest}");
+    }
     if path.starts_with("transformer_blocks.") || path.starts_with("token_refiner.") {
         return path.to_string();
     }
