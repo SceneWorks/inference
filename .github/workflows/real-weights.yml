@@ -4956,6 +4956,9 @@ jobs:
           IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
           IRIS_OUT: ${{ runner.temp }}/iris-depth-train-evidence
           TMPDIR: ${{ runner.temp }}
+          # Own target dir (as `mlx-chroma-auxiliary`): the shared `../cargo-target` on this box
+          # failed with `can't find crate for mlx_rs` (E0463) on runs 38134929461 / 38135310701.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-iris-depth-train
         run: source scripts/ci/real-weights/mlx-iris-depth-train/run-the-guarded-depth-full-fine-tune.sh
       - name: Remove the materialized export
         if: always()
