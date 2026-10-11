@@ -13,10 +13,10 @@ use candle_gen::gen_core::iris::train::{
     OptimizerPlan, Prediction, TimestepSampler, TrainSchedule,
 };
 use candle_gen_iris::train::model::{
-    flow_loss, AdapterKind, AdapterTarget, StepBatch, TrainModel, Trainable,
+    flow_loss, loss_and_grads, AdapterKind, AdapterTarget, StepBatch, TrainModel, Trainable,
 };
 use candle_gen_iris::train::optim::{
-    detached_copy, newton_schulz, snapshot, IrisOptimizer, Params, Tensors,
+    clip_grads, detached_copy, newton_schulz, snapshot, IrisOptimizer, Params, Tensors,
 };
 use candle_gen_iris::train::Window;
 
@@ -389,9 +389,68 @@ fn adapter_model(
     (model, params, init, owner)
 }
 
+/// AdamW's first step moves an element by `lr · g / (|g| + ε)` (bias-corrected `m̂ = g`,
+/// `√v̂ = |g|`), whose sensitivity `∂u/∂g = ε / (|g| + ε)²` is unbounded as `|g| → ε`: an element
+/// whose window-1 gradient is f32 cancellation residue (`|g|` ~ 1e-8 against a ~1e-3 RMS) lands
+/// anywhere in `(−1, 1)·lr` on either side, and one such element moves its tensor's rel L2 by up
+/// to `2 · (1 − decay) · lr / ‖Δema‖` ≈ 0.18 — GEMM/reduction order, not the port.
+///
+/// Measured (sc-25686, `lora_adamw`): inverting the oracle's step-1 update for every element with
+/// `|g| < 2e-6` gives `|g_torch − g_candle| ≤ 1.05e-7` on both aarch64 macOS and x86_64 Linux
+/// (AVX2/FMA); the elements that cross 1e-3 of their tensor's update norm are exactly those with
+/// `|g| < 1e-7`. `q_proj_x.lora_A[114]` (torch `g` = 4.2e-8, Candle 3.5e-8 on macOS / 1.4e-8 on
+/// x86_64) alone took that tensor's unmasked Δema rel L2 to 2.7e-3 / 2.0e-2 — the CI failure.
+///
+/// Excluding `|g| < ADAM_NOISE_FLOOR = 1e-6` bounds a kept element's step-1 noise at
+/// `ε · 1.05e-7 / (1e-6 + ε)² ≈ 1e-3` of its unit step. The kept elements then agree to ≤ 4.7e-4
+/// rel L2 on both platforms, so the AdamW adapter bound is 2e-3 (LoKr's, ~5x headroom) rather
+/// than the MLX twin's unmasked 2e-2. The excluded set (56 of 12 780 LoRA and 36 of 4 030 LoKr
+/// elements) is asserted small — under 2% overall, under 25% of any tensor — so a zeroed or
+/// vanishing gradient cannot hide behind it.
+const ADAM_NOISE_FLOOR: f32 = 1e-6;
+
+/// The kept elements of every factor, concatenated, must agree tighter than any one tensor: the
+/// decoupled weight decay is `lr · wd · θ` ≈ 1e-3 of an AdamW step, so dropping it moves every
+/// tensor by ~1e-3 rel L2 — inside the per-tensor bound — but the whole update by 1.0e-3 against
+/// a measured ≤ 8.8e-5 (macOS and x86_64) for the correct port. 3e-4 sits ~3x from each.
+const ADAM_AGGREGATE_TOL: f32 = 3e-4;
+
+/// The window-1 (clipped) gradient the first optimizer step sees, keyed like `params`.
+fn first_window_grads(model: &TrainModel, params: &Params, g: &Fixture) -> Tensors {
+    let obj = objective(Prediction::Velocity);
+    let mut acc: Option<Tensors> = None;
+    for i in 0..2 {
+        let (_, gr) = loss_and_grads(model, params, &batch(g, i), &obj, 0.5).unwrap();
+        acc = Some(match acc {
+            None => gr,
+            Some(mut a) => {
+                for (k, v) in gr {
+                    let s = a[&k].add(&v).unwrap();
+                    a.insert(k, s);
+                }
+                a
+            }
+        });
+    }
+    clip_grads(acc.unwrap(), 0.5).unwrap().1
+}
+
 fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
     let g = fixture(GOLDEN);
     let (model, params, init, owner) = adapter_model(&g, kind_name);
+    // AdamW only: Muon's Newton–Schulz has no per-element `ε` conditioning.
+    let keep: Option<HashMap<String, Vec<bool>>> = (opt_kind == OptimizerKind::AdamW).then(|| {
+        first_window_grads(&model, &params, &g)
+            .into_iter()
+            .map(|(k, t)| {
+                let m = host_f32(&t)
+                    .iter()
+                    .map(|x| x.abs() >= ADAM_NOISE_FLOOR)
+                    .collect();
+                (k, m)
+            })
+            .collect()
+    });
     let mut opt = IrisOptimizer::new(&plan(opt_kind), &params, |k, nd| {
         adapter_param_route(&owner[k], nd, opt_kind)
     })
@@ -410,26 +469,69 @@ fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
         &host_f32(g.require(&format!("{tag}.grad_norms"))),
         1e-5,
     );
+    let (mut dropped, mut total) = (0usize, 0usize);
+    // Every kept element of every factor, concatenated: (Δθ got, Δθ want, Δema got, Δema want).
+    let mut all: [Vec<f32>; 4] = Default::default();
     for (k, p) in &params {
         let start = &init[k];
+        let mask = |v: Vec<f32>| -> Vec<f32> {
+            match keep.as_ref() {
+                None => v,
+                Some(keep) => v
+                    .into_iter()
+                    .zip(&keep[k])
+                    .filter(|(_, &m)| m)
+                    .map(|(x, _)| x)
+                    .collect(),
+            }
+        };
+        let n = start.elem_count();
+        let kept = keep
+            .as_ref()
+            .map_or(n, |m| m[k].iter().filter(|&&b| b).count());
+        // A tensor whose update is mostly noise-floor elements is a broken gradient, not noise.
+        assert!(
+            kept * 4 >= n * 3,
+            "{tag} {k}: {} of {n} elements at the noise floor",
+            n - kept
+        );
+        dropped += n - kept;
+        total += n;
+        let got_d = mask(delta(p.as_tensor(), start));
+        let want_d = mask(delta(g.require(&format!("{tag}.final.{k}")), start));
+        let got_e = mask(delta(&ema[k], start));
+        let want_e = mask(delta(g.require(&format!("{tag}.ema.{k}")), start));
+        assert_update(&format!("{tag} Δ{k}"), &got_d, &want_d, tol);
+        assert_update(&format!("{tag} Δema {k}"), &got_e, &want_e, tol);
+        for (acc, v) in all.iter_mut().zip([got_d, want_d, got_e, want_e]) {
+            acc.extend(v);
+        }
+    }
+    if keep.is_some() {
+        let [got_d, want_d, got_e, want_e] = &all;
         assert_update(
-            &format!("{tag} Δ{k}"),
-            &delta(p.as_tensor(), start),
-            &delta(g.require(&format!("{tag}.final.{k}")), start),
-            tol,
+            &format!("{tag} Δ (all kept)"),
+            got_d,
+            want_d,
+            ADAM_AGGREGATE_TOL,
         );
         assert_update(
-            &format!("{tag} Δema {k}"),
-            &delta(&ema[k], start),
-            &delta(g.require(&format!("{tag}.ema.{k}")), start),
-            tol,
+            &format!("{tag} Δema (all kept)"),
+            got_e,
+            want_e,
+            ADAM_AGGREGATE_TOL,
         );
     }
+    eprintln!("{tag}: {dropped} of {total} elements below the AdamW noise floor");
+    assert!(
+        dropped * 50 <= total,
+        "{tag}: {dropped} of {total} elements at the noise floor"
+    );
 }
 
 #[test]
 fn lora_adamw_matches_oracle() {
-    adapter_case("lora", OptimizerKind::AdamW, 2e-2);
+    adapter_case("lora", OptimizerKind::AdamW, 2e-3);
 }
 
 #[test]
