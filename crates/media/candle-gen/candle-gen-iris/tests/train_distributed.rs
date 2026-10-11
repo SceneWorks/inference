@@ -222,19 +222,27 @@ fn spawn(mut j: Json, result: &Path) -> Child {
         .expect("spawn a rank process")
 }
 
-/// Wait for `child` at most until `deadline`, killing it (only this PID) on overrun.
-fn wait_bounded(child: &mut Child, deadline: Instant) -> bool {
+/// Reap `child`, killing it (only this PID) if it is still running at `deadline` — a hung rank
+/// then writes no result, and reading that result fails the test.
+fn reap_or_kill(child: &mut Child, deadline: Instant) {
     loop {
         if child.try_wait().unwrap().is_some() {
-            return true;
+            return;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return false;
+            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn read_result(path: &Path, rank: usize) -> Json {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!("rank {rank} wrote no result (it crashed, or hung and was killed): {e}")
+    });
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// Launch every job as a rank process and collect their results.
@@ -248,12 +256,13 @@ fn launch(jobs: Vec<Json>, scratch: &Path) -> Vec<Json> {
         .zip(&results)
         .map(|(j, r)| spawn(j, r))
         .collect();
-    for (r, c) in children.iter_mut().enumerate() {
-        assert!(wait_bounded(c, deadline), "rank {r} did not finish in time");
+    for c in children.iter_mut() {
+        reap_or_kill(c, deadline);
     }
     results
         .iter()
-        .map(|p| serde_json::from_slice(&std::fs::read(p).expect("rank result")).unwrap())
+        .enumerate()
+        .map(|(r, p)| read_result(p, r))
         .collect()
 }
 
@@ -633,24 +642,20 @@ fn lost_rank_case(field: &str) {
         .zip(&results)
         .map(|(j, r)| spawn(j, r))
         .collect();
-    assert!(
-        wait_bounded(&mut kids[0], deadline),
-        "the surviving rank hung instead of failing"
-    );
+    // A survivor that hung instead of failing is killed at the deadline and writes no result.
+    reap_or_kill(&mut kids[0], deadline);
     // The stalled rank is ours to stop; the exited one is already gone.
     let _ = kids[1].kill();
     let _ = kids[1].wait();
-    let r: Json = serde_json::from_slice(&std::fs::read(&results[0]).unwrap()).unwrap();
+    let r = read_result(&results[0], 0);
     eprintln!("survivor ({field}): {r}");
     let typed = r["dist"].as_str().unwrap_or_else(|| panic!("untyped failure: {r}"));
     assert!(typed.starts_with("RankLost"), "{typed}");
     if field == "stall_at" {
-        assert!(typed.contains("transport timeout"), "{typed}");
+        // The bound that ended the wait is the configured transport timeout (clock-free reading:
+        // the typed detail names it).
+        assert!(typed.contains("within the 5s transport timeout"), "{typed}");
     }
-    assert!(
-        r["secs"].as_f64().unwrap() < 100.0,
-        "failure surfaced within the bound"
-    );
 }
 
 #[test]
