@@ -4,8 +4,10 @@
 //! trained adapter renders here what its training previews rendered. Never merged into the base
 //! weight: under the release's bf16 compute a merge rounds every delta below the base's bf16 ulp
 //! away. A LoRA is held as its f32 factors (`Aᵀ`, `Bᵀ · scale · alpha/rank` — [`lora_residual`]); a
-//! LoKr / LoHa as its reconstructed delta, the real Kronecker product
-//! `δ = scale · (alpha/rank) · kron(w1, w2)` (low-rank `_a`/`_b` factors expanded first).
+//! LoKr as its Kronecker factors applied structurally, `w1 · X · w2ᵀ` with `scale · alpha/rank`
+//! baked into `w2` ([`lokr_residual`] — the delta `kron(w1, w2)` is never formed); a LoHa as its
+//! exact low-rank factorisation when that is smaller than its delta, else the delta
+//! ([`crate::nn::Residual`] documents the costs).
 //!
 //! Upstream Iris-3B ships no adapter code, so the surface is the repo's, the same one the MLX twin
 //! installs: PEFT/diffusers LoRA (`transformer.` / `diffusion_model.` prefixes or bare, `lora_A/B`
@@ -30,10 +32,11 @@ use candle_gen::gen_core::weightsmeta::{
     COMMON_LORA_PREFIXES, KOHYA_PREFIX, LOKR_SUFFIXES,
 };
 use candle_gen::gen_core::{AdapterApplyReport, AdapterKind, AdapterSpec};
+use candle_gen::quant::LokrFactors;
 use candle_gen::train::lora::{parse_lokr_metadata, reconstruct_lokr_delta, LoraAdapterMeta};
 use candle_gen::train::merge::{
     has_diff_patch_keys, parse_loha_thirdparty, parse_lokr_thirdparty, read_adapter, read_scalar,
-    AdapterFile,
+    AdapterFile, ThirdPartyLoha,
 };
 use candle_gen::{CandleError as Error, Result};
 
@@ -83,6 +86,89 @@ pub fn lora_residual(
     Ok(Residual::Lora {
         a: down.to_dtype(DType::F32)?.t()?,
         b: (up.to_dtype(DType::F32)?.t()? * eff)?,
+    })
+}
+
+/// A LoKr's residual from its factors (full `w1`/`w2` or low-rank `_a`/`_b` legs), scaled by
+/// `(alpha/rank) · scale`: the structured Kronecker product ([`Residual::Kron`]) when the factors
+/// decompose the `[out, in]` projection, else the reconstructed delta. The one builder the
+/// provider's loader and the trainer's forward share, so a trained file renders exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn lokr_residual(
+    w1: Option<&Tensor>,
+    w1_a: Option<&Tensor>,
+    w1_b: Option<&Tensor>,
+    w2: Option<&Tensor>,
+    w2_a: Option<&Tensor>,
+    w2_b: Option<&Tensor>,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+    shape: (usize, usize),
+) -> Result<Residual> {
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() || !scale.is_finite() {
+        return Err(Error::Msg(format!(
+            "iris: LoKr scale is invalid (rank = {rank}, alpha = {alpha}, scale = {scale})"
+        )));
+    }
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    match LokrFactors::build(eff, shape, w1, w1_a, w1_b, w2, None, w2_a, w2_b)? {
+        Some(f) => Ok(Residual::Kron(f)),
+        None => reconstruct_lokr_delta(w1, w1_a, w1_b, w2, w2_a, w2_b, alpha, rank, scale, shape)
+            .map(Residual::Delta),
+    }
+}
+
+/// A LyCORIS LoHa's residual, `s · (A₁B₁) ⊙ (A₂B₂)` with `A₍ᵢ₎` `[out, rᵢ]`, `B₍ᵢ₎` `[rᵢ, in]`.
+/// The Hadamard product of two low-rank products is exactly rank `r₁r₂`: with the row-wise Kronecker
+/// `U[o, (p, q)] = A₁[o, p]·A₂[o, q]` and `V[(p, q), i] = B₁[p, i]·B₂[q, i]`, `δ = s · U · V`. When
+/// `r₁r₂·(in + out) < in·out` that factorisation is smaller than the delta (and so is its GEMM work)
+/// and is installed as [`Residual::LowRank`]; otherwise the dense delta is cheaper and installed.
+pub(crate) fn loha_residual(
+    g: &ThirdPartyLoha,
+    shape: (usize, usize),
+    user_scale: f32,
+) -> Result<Residual> {
+    let (out_f, in_f) = shape;
+    let factors = match (&g.w1_a, &g.w1_b, &g.w2_a, &g.w2_b) {
+        (Some(a1), Some(b1), Some(a2), Some(b2)) => [a1, b1, a2, b2].map(|t| t.dims().to_vec()),
+        _ => return g.delta(shape, user_scale).map(Residual::Delta),
+    };
+    let rank_of = |a: &[usize], b: &[usize]| {
+        (a.len() == 2 && b.len() == 2 && a[0] == out_f && b[1] == in_f && a[1] == b[0])
+            .then_some(a[1])
+    };
+    let (Some(r1), Some(r2)) = (
+        rank_of(&factors[0], &factors[1]),
+        rank_of(&factors[2], &factors[3]),
+    ) else {
+        // Misoriented factors: the dense reconstruction reports them by shape.
+        return g.delta(shape, user_scale).map(Residual::Delta);
+    };
+    let k = r1 * r2;
+    if k * (in_f + out_f) >= in_f * out_f {
+        return g.delta(shape, user_scale).map(Residual::Delta);
+    }
+    let f32d = |t: &Option<Tensor>| -> Result<Tensor> {
+        Ok(t.as_ref().expect("checked above").to_dtype(DType::F32)?)
+    };
+    let (a1, b1, a2, b2) = (
+        f32d(&g.w1_a)?,
+        f32d(&g.w1_b)?,
+        f32d(&g.w2_a)?,
+        f32d(&g.w2_b)?,
+    );
+    let u = a1
+        .reshape((out_f, r1, 1))?
+        .broadcast_mul(&a2.reshape((out_f, 1, r2))?)?
+        .reshape((out_f, k))?;
+    let v = b1
+        .reshape((r1, 1, in_f))?
+        .broadcast_mul(&b2.reshape((1, r2, in_f))?)?
+        .reshape((k, in_f))?;
+    Ok(Residual::LowRank {
+        a: v.t()?.contiguous()?,
+        b: (u.t()? * g.scale(user_scale) as f64)?.contiguous()?,
     })
 }
 
@@ -173,15 +259,8 @@ impl FileMerge<'_> {
         };
         let shape = self.projections.shapes[&path];
         let residual = residual(shape)?;
-        let dims = match &residual {
-            Residual::Lora { a, b } => vec![b.dim(1)?, a.dim(0)?],
-            Residual::Delta(d) => d.dims().to_vec(),
-        };
-        let inner_ok = match &residual {
-            Residual::Lora { a, b } => a.dim(1)? == b.dim(0)?,
-            Residual::Delta(_) => true,
-        };
-        if dims != [shape.0, shape.1] || !inner_ok {
+        let (dims, inner_ok) = residual.shape()?;
+        if dims != shape || !inner_ok {
             return Err(Error::Msg(format!(
                 "iris: adapter target {raw} reconstructs a {dims:?} delta for the {shape:?} \
                  projection {path} — the adapter was trained on a different architecture"
@@ -271,7 +350,7 @@ fn merge_stamped_lokr(merge: &mut FileMerge, af: &AdapterFile, scale: f32) -> Re
     }
     for (stem, f) in groups {
         merge.fold(stem, |shape| {
-            reconstruct_lokr_delta(
+            lokr_residual(
                 f.get("lokr_w1"),
                 f.get("lokr_w1_a"),
                 f.get("lokr_w1_b"),
@@ -283,7 +362,6 @@ fn merge_stamped_lokr(merge: &mut FileMerge, af: &AdapterFile, scale: f32) -> Re
                 scale,
                 shape,
             )
-            .map(Residual::Delta)
         })?;
     }
     Ok(())
@@ -333,15 +411,14 @@ pub fn merge_adapters(
             merge_stamped_lokr(&mut merge, &af, spec.scale)?;
         } else if keys_contain_lokr(keys()) {
             for (raw, g) in parse_lokr_thirdparty(&af)? {
-                merge.fold(&raw, |shape| {
-                    g.delta(shape, spec.scale).map(Residual::Delta)
+                merge.fold(&raw, |shape| match g.structured(shape, spec.scale)? {
+                    Some(f) => Ok(Residual::Kron(f)),
+                    None => g.delta(shape, spec.scale).map(Residual::Delta),
                 })?;
             }
         } else if keys_contain_loha(keys()) {
             for (raw, g) in parse_loha_thirdparty(&af)? {
-                merge.fold(&raw, |shape| {
-                    g.delta(shape, spec.scale).map(Residual::Delta)
-                })?;
+                merge.fold(&raw, |shape| loha_residual(&g, shape, spec.scale))?;
             }
         } else if spec.kind == AdapterKind::Lokr {
             return Err(Error::Msg(format!(

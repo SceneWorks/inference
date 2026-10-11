@@ -5,9 +5,9 @@
 //! backbone. FP32 on the Candle CPU backend (upstream's fp32 CPU path); Muon's Newton–Schulz is
 //! bf16 on both sides. Every tolerance is printed beside its measured value.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor, Var};
+use candle_gen::candle_core::{DType, Tensor, TensorId, Var};
 use candle_gen::gen_core::iris::train::{
     adapter_param_route, full_param_route, FlowObjective, MuonAdjustLr, OptimizerKind,
     OptimizerPlan, Prediction, TimestepSampler, TrainSchedule,
@@ -15,7 +15,9 @@ use candle_gen::gen_core::iris::train::{
 use candle_gen_iris::train::model::{
     flow_loss, AdapterKind, AdapterTarget, StepBatch, TrainModel, Trainable,
 };
-use candle_gen_iris::train::optim::{detached_copy, newton_schulz, IrisOptimizer, Params, Tensors};
+use candle_gen_iris::train::optim::{
+    detached_copy, newton_schulz, snapshot, IrisOptimizer, Params, Tensors,
+};
 use candle_gen_iris::train::Window;
 
 use crate::common::{
@@ -315,8 +317,17 @@ fn full_training_muon_matches_upstream() {
     full_case(OptimizerKind::Muon, "muon", 5e-2);
 }
 
-fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
-    let g = fixture(GOLDEN);
+/// The adapter run on the miniature backbone: the model, its factor `Var`s at the oracle's
+/// initial values (and those values), and each factor key's owning target path.
+fn adapter_model(
+    g: &Fixture,
+    kind_name: &str,
+) -> (
+    TrainModel,
+    Params,
+    BTreeMap<String, Tensor>,
+    HashMap<String, String>,
+) {
     let targets: Vec<String> = g.meta("targets").split(',').map(str::to_string).collect();
     let base = base_f32();
     let kind = if kind_name == "lora" {
@@ -375,6 +386,12 @@ fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
             base,
         },
     };
+    (model, params, init, owner)
+}
+
+fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
+    let g = fixture(GOLDEN);
+    let (model, params, init, owner) = adapter_model(&g, kind_name);
     let mut opt = IrisOptimizer::new(&plan(opt_kind), &params, |k, nd| {
         adapter_param_route(&owner[k], nd, opt_kind)
     })
@@ -428,4 +445,38 @@ fn lokr_adamw_matches_oracle() {
 #[test]
 fn lokr_muon_matches_oracle() {
     adapter_case("lokr", OptimizerKind::Muon, 6e-2);
+}
+
+/// The step's `GradStore` holds a gradient for every trainable `Var` and for nothing else: the
+/// frozen base weights (and the step's data) of an adapter run, which sit as matmul / binary-op
+/// operands of the tracked graph, get no gradient computed or stored (the vendored candle-core
+/// patch, sc-25686) — upstream candle stored a full `[in, out]` weight gradient per frozen Linear.
+fn assert_store_is_exactly_the_trainables(
+    tag: &str,
+    model: &TrainModel,
+    params: &Params,
+    g: &Fixture,
+) {
+    let dit = model.dit(&snapshot(params)).unwrap();
+    let loss = flow_loss(&dit, &batch(g, 0), &objective(Prediction::Velocity)).unwrap();
+    let store = loss.backward().unwrap();
+    let vars: HashSet<TensorId> = params.values().map(|v| v.as_tensor().id()).collect();
+    let stored: HashSet<TensorId> = store.get_ids().copied().collect();
+    let extra = stored.difference(&vars).count();
+    assert_eq!(
+        extra, 0,
+        "{tag}: {extra} gradient(s) stored for non-trainable tensors"
+    );
+    assert_eq!(stored, vars, "{tag}: every trainable tensor has a gradient");
+}
+
+#[test]
+fn backward_stores_gradients_only_for_trainable_tensors() {
+    let g = fixture(GOLDEN);
+    for kind_name in ["lora", "lokr"] {
+        let (model, params, _, _) = adapter_model(&g, kind_name);
+        assert_store_is_exactly_the_trainables(kind_name, &model, &params, &g);
+    }
+    let (model, params) = full_model();
+    assert_store_is_exactly_the_trainables("full", &model, &params, &g);
 }

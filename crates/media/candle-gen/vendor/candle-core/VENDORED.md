@@ -58,7 +58,12 @@ evidence.
    `quantize_imatrix_onto`, `quantize_onto`) allocate their `MATRIX_ROW_PADDING` tail with
    `alloc_zeros` instead of `unsafe alloc`, as `load_quantized` and `QCudaStorage::zeros` already
    do. See *Quantized padding is zeroed* below.
-4. `VENDORED.md` — this file.
+4. `src/backprop.rs` — one local patch, not upstream (sc-25686; upstream `main` still has the
+   behaviour as of 2026-10): `Tensor::backward` computes and stores a gradient only for an operand
+   that is itself in `sorted_nodes` (i.e. leads to a `Var`). Every `if needs_grad(..)` guard in the
+   backward `match`, the `tracked` set and the `needs_grad` closure above it (delimited by
+   `// sc-25686` comments) are the whole change. See *Untracked operands get no gradient* below.
+5. `VENDORED.md` — this file.
 
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
@@ -78,6 +83,26 @@ unchanged code path). llama.cpp zeroes the same padding for the same reason. Wit
 the term is an exact `0`, so zeroing it changes no finite result. candle-llm's
 `primitives::quant::cuda_tests::quantize_on_load_zeroes_the_padding_mmq_reads` pins it on the CUDA
 lane.
+
+## Untracked operands get no gradient
+
+Upstream's backward walks only the nodes that lead to a `Var`, but inside a multi-input op's arm it
+computes and accumulates a gradient for **every** floating operand. A frozen (non-`Var`) weight
+used as a matmul rhs — every base projection of an adapter run — therefore costs a full
+weight-gradient GEMM (`lhsᵀ · grad`, `[in, out]`) plus a `zeros_like` accumulator, and since that
+operand is never a node of the walk its entry is never consumed: it stays in the `GradStore` until
+the store drops (sc-25686: the Iris LoRA step peaked at 45 GB on CUDA against MLX's ~15 GB; the
+Qwen-Image 2.1 trainer's `DEAD_WEIGHT_GRAD_COPIES` prices the same retention). The patch guards each
+operand of the multi-input arms (`Binary` add/sub/mul/div/min/max, `WhereCond`, the convolutions,
+`SliceScatter0`, `Scatter`/`ScatterAdd`/`IndexAdd`, `Matmul`, `Cat`, and the `CustomOp2`/`CustomOp3`
+results) with membership in the walked set; single-input arms are reached only through a walked node
+whose one operand is walked, so they need none. A tracked tensor's gradient is unchanged — the same
+ops accumulated in the same order — so this changes no trained result; it only stops computing and
+storing gradients nobody reads. A `GradStore` from `backward()` now holds `Var` gradients only (the
+root's is consumed as before). `candle-gen-iris`'s
+`train_parity::backward_stores_gradients_only_for_trainable_tensors` pins it (full, LoRA, LoKr), and
+upstream's `grad_tests` / `custom_op_tests` / `conv_tests` / `matmul_tests` / `tensor_tests` pass on
+this copy.
 
 ## Eager behaviour is unchanged outside the guard
 
@@ -145,7 +170,9 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
 1. Re-copy `candle-core/` from the new revision over this directory (keep this file).
 2. Re-apply `cabbc301` and `f53ed3bf` unless the new revision contains them (upstream main after
    2026-06-24 does), and the zeroed quantized padding (`src/quantized/cuda.rs`) unless the new
-   revision zeroes it itself — only then can this vendor and its `[patch]` be dropped.
+   revision zeroes it itself, and the untracked-operand backward guards (`src/backprop.rs`) unless
+   the new revision skips untracked operands itself — only then can this vendor and its `[patch]` be
+   dropped.
 3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
 4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
    `VENDORED_PACKAGES`), re-vendor `candle-kernels` (its own `VENDORED.md`), regenerate the lock,

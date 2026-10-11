@@ -8,7 +8,7 @@
 //! [`Checkpoint`], cast to the compute dtype exactly as the provider casts a loaded checkpoint, the
 //! casts on the autograd tape), or from the frozen base with each target's adapter installed as the
 //! provider installs an exported adapter file: a forward-time [`Residual`] built by the same
-//! [`lora_residual`] / [`reconstruct_lokr_delta`] the provider's loader calls. Training and inference
+//! [`lora_residual`] / [`lokr_residual`] the provider's loader calls. Training and inference
 //! therefore cannot disagree about the graph, and a preview renders what the exported artifact
 //! renders through `load_backbone_with_adapters`.
 //!
@@ -23,11 +23,11 @@ use candle_gen::gen_core::iris::train::{
     backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, HostRng, InitKind, Prediction,
 };
 use candle_gen::gen_core::iris::ModelConfig;
-use candle_gen::train::lora::{factorization, reconstruct_lokr_delta};
+use candle_gen::train::lora::factorization;
 use candle_gen::{CandleError as Error, Result};
 
 use super::optim::{mul_s, Params, Tensors};
-use crate::adapters::lora_residual;
+use crate::adapters::{lokr_residual, lora_residual};
 use crate::dit::{IrisDiT, TextBatch};
 use crate::nn::{Checkpoint, Residual};
 
@@ -135,9 +135,9 @@ pub fn provider_dtype(key: &str, a: &Tensor, compute: DType) -> Result<Tensor> {
 }
 
 /// One target's residual exactly as the provider's loader installs the exported file: a LoRA via
-/// [`lora_residual`] (`Aᵀ`, `Bᵀ · alpha/rank`, f32), a LoKr as the `[out, in]` delta of
-/// [`reconstruct_lokr_delta`] (cast to the compute dtype at install). Every op is on the autograd
-/// tape, so gradients reach the f32 factors.
+/// [`lora_residual`] (`Aᵀ`, `Bᵀ · alpha/rank`, f32), a LoKr via [`lokr_residual`] (the structured
+/// Kronecker factors, `w2` scaled by `alpha/rank`, f32 — never an `[out, in]` delta). Every op is on
+/// the autograd tape, so gradients reach the f32 factors.
 pub fn provider_residual(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> Result<Residual> {
     let get = |name: &str| p.get(&format!("{}.{name}", t.path));
     let need = |name: &str| -> Result<&Tensor> {
@@ -152,7 +152,7 @@ pub fn provider_residual(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> R
             rank as f32,
             1.0,
         ),
-        AdapterKind::Lokr { rank, alpha, .. } => Ok(Residual::Delta(reconstruct_lokr_delta(
+        AdapterKind::Lokr { rank, alpha, .. } => lokr_residual(
             get("lokr_w1"),
             None,
             None,
@@ -163,7 +163,7 @@ pub fn provider_residual(kind: AdapterKind, t: &AdapterTarget, p: &Tensors) -> R
             rank as f32,
             1.0,
             (t.out_f, t.in_f),
-        )?)),
+        ),
     }
 }
 

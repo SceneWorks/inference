@@ -23,6 +23,7 @@ use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::iris;
+use candle_gen::quant::LokrFactors;
 use candle_gen::{CandleError as Error, Result};
 
 /// The dtype two operands meet at: themselves when they agree, f32 otherwise (the only two dtypes
@@ -311,45 +312,86 @@ impl Loader<'_> {
 /// A forward-time adapter residual on one projection (sc-25686): `y = base(x) + r(x)`, the residual
 /// narrowed to the projection's output dtype — never merged into the (bf16) base weight, so a delta
 /// below the base's bf16 ulp still reaches the forward and its gradient, and the trainer's forward
-/// is the provider's. The MLX twin's `AdaptableLinear` residuals, op for op: a LoRA runs
-/// `(x · Aᵀ) · (Bᵀ · s)` with f32 factors (the compute-dtype input promoted to f32, as MLX promotes
-/// a bf16 × f32 product); a LoKr / LoHa runs its reconstructed `[out, in]` delta in the compute
-/// dtype (`x · δᵀ`).
+/// is the provider's. The MLX twin's `AdaptableLinear` residuals:
+///
+/// * a LoRA runs `(x · Aᵀ) · (Bᵀ · s)` with f32 factors (the compute-dtype input promoted to f32, as
+///   MLX promotes a bf16 × f32 product);
+/// * a LoKr runs the structured Kronecker product `Y = w1 · X · w2ᵀ` over `X = reshape(x, [.., c, d])`
+///   ([`LokrFactors`], the MLX twin's `LokrStructured`) — two GEMMs over the small factor shapes,
+///   never an `[out, in]` delta, so it costs a LoRA's memory, not a second base weight;
+/// * a LyCORIS LoHa `s · (A₁B₁) ⊙ (A₂B₂)` (ranks `r₁`, `r₂`) runs as its exact rank-`r₁r₂`
+///   (Khatri–Rao) factorisation `(x · V) · U` when that is smaller than the delta,
+///   `r₁r₂·(in + out) < in·out` ([`Residual::LowRank`]); above that rank the factorisation costs more
+///   than the dense delta in both memory and GEMM work, so the `[out, in]` delta is held in the compute
+///   dtype and run as `x · δᵀ` ([`Residual::Delta`], one extra base-sized weight and GEMM per adapted
+///   projection — the MLX twin materialises every LoHa this way). A LoKr whose factors do not
+///   decompose its projection's `[out, in]` falls back to the same dense delta.
 #[derive(Clone, Debug)]
 pub enum Residual {
     /// `a = Aᵀ` `[in, rank]`, `b = Bᵀ · (alpha/rank) · scale` `[rank, out]`, both f32.
     Lora { a: Tensor, b: Tensor },
+    /// The structured LoKr: the Kronecker factors with the full scale baked into `w2`, f32.
+    Kron(LokrFactors),
+    /// A LoHa's exact low-rank factorisation: `a = V` `[in, r₁r₂]`, `b = U · scale` `[r₁r₂, out]`
+    /// (f32 as built; held in the compute dtype once installed).
+    LowRank { a: Tensor, b: Tensor },
     /// The `[out, in]` delta (f32 as reconstructed; held in the compute dtype once installed).
     Delta(Tensor),
 }
 
 impl Residual {
-    /// The f32 `[out, in]` weight delta this residual adds (`b`ᵀ`·a`ᵀ for a LoRA).
+    /// The f32 `[out, in]` weight delta this residual adds — the merged view (the forward never
+    /// forms it for a LoRA, a structured LoKr or a factored LoHa).
     pub fn delta(&self) -> Result<Tensor> {
         Ok(match self {
-            Residual::Lora { a, b } => b
+            Residual::Lora { a, b } | Residual::LowRank { a, b } => b
                 .to_dtype(DType::F32)?
                 .t()?
                 .matmul(&a.to_dtype(DType::F32)?.t()?)?,
+            Residual::Kron(f) => f.dense_delta()?,
             Residual::Delta(d) => d.to_dtype(DType::F32)?,
         })
     }
 
-    /// The residual as the forward holds it: LoRA factors f32 on `device`; a delta in `compute`.
+    /// The `[out, in]` shape this residual adapts, and whether its inner dimensions agree.
+    pub fn shape(&self) -> Result<((usize, usize), bool)> {
+        Ok(match self {
+            Residual::Lora { a, b } | Residual::LowRank { a, b } => {
+                ((b.dim(1)?, a.dim(0)?), a.dim(1)? == b.dim(0)?)
+            }
+            Residual::Kron(f) => (f.shape(), true),
+            Residual::Delta(d) => (d.dims2()?, true),
+        })
+    }
+
+    /// The residual as the forward holds it: LoRA and LoKr factors f32 on `device` (a LoKr's GEMMs
+    /// cast them to the activation dtype); a LoHa factorisation or a delta in `compute`.
     fn prepare(self, compute: DType, device: &Device) -> Result<Self> {
         Ok(match self {
             Residual::Lora { a, b } => Residual::Lora {
                 a: to(&a.to_device(device)?, DType::F32)?,
                 b: to(&b.to_device(device)?, DType::F32)?,
             },
+            Residual::Kron(f) => Residual::Kron(f.to_device(device)?),
+            Residual::LowRank { a, b } => Residual::LowRank {
+                a: to(&a.to_device(device)?, compute)?,
+                b: to(&b.to_device(device)?, compute)?,
+            },
             Residual::Delta(d) => Residual::Delta(to(&d.to_device(device)?, compute)?),
         })
     }
 
-    /// `r(x)` for a flattened `[rows, in]` input in the compute dtype.
+    /// `r(x)` for a flattened `[rows, in]` input in the compute dtype. A half-precision GEMM on the
+    /// Candle CPU backend runs as one does elsewhere — f32 accumulation, each product rounded once.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gemm = gemm_dtype(x);
         Ok(match self {
             Residual::Lora { a, b } => to(x, DType::F32)?.matmul(a)?.matmul(b)?,
+            Residual::Kron(f) => to(&f.residual(&to(x, gemm)?)?, x.dtype())?,
+            Residual::LowRank { a, b } => {
+                let h = to(&to(x, gemm)?.matmul(&to(a, gemm)?)?, a.dtype())?;
+                to(&to(&h, gemm)?.matmul(&to(b, gemm)?)?, b.dtype())?
+            }
             Residual::Delta(d) => {
                 let gemm = gemm_dtype(d);
                 let y = to(x, gemm)?.matmul(&to(d, gemm)?.t()?)?;
@@ -609,6 +651,128 @@ mod tests {
             .unwrap();
         let r = repeat_kv(k, 2).unwrap().flatten_all().unwrap();
         assert_eq!(r.to_vec1::<f32>().unwrap(), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Deterministic, non-symmetric values in `[-1, 1)`.
+    fn values(shape: (usize, usize), seed: u32) -> Tensor {
+        let n = shape.0 * shape.1;
+        let data: Vec<f32> = (0..n as u32)
+            .map(|i| (((i * 7919 + seed * 104_729) % 1000) as f32) / 500.0 - 1.0)
+            .collect();
+        Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+    }
+
+    /// The largest absolute difference between `r(x)` (installed at f32) and `x · δᵀ`.
+    fn residual_error(r: &Residual, delta: &Tensor, rows: usize) -> f32 {
+        let (_, in_f) = delta.dims2().unwrap();
+        let x = values((rows, in_f), 11);
+        let got = r
+            .clone()
+            .prepare(DType::F32, &Device::Cpu)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let want = x.matmul(&delta.t().unwrap()).unwrap();
+        (got - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn lokr_runs_the_structured_kronecker_product() {
+        use candle_gen::train::lora::reconstruct_lokr_delta;
+        // w1 [2, 3] ⊗ w2_a·w2_b [4, 5] → [8, 15].
+        let (w1, w2_a, w2_b) = (values((2, 3), 1), values((4, 2), 2), values((2, 5), 3));
+        let lokr = |shape| {
+            crate::adapters::lokr_residual(
+                Some(&w1),
+                None,
+                None,
+                None,
+                Some(&w2_a),
+                Some(&w2_b),
+                4.0,
+                2.0,
+                0.5,
+                shape,
+            )
+            .unwrap()
+        };
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2_a),
+            Some(&w2_b),
+            4.0,
+            2.0,
+            0.5,
+            (8, 15),
+        )
+        .unwrap();
+        let r = lokr((8, 15));
+        assert!(matches!(r, Residual::Kron(_)), "{r:?}");
+        assert_eq!(r.shape().unwrap(), ((8, 15), true));
+        let merged = max_diff(&r.delta().unwrap(), &delta);
+        assert!(
+            merged < 1e-6,
+            "merged view off the Kronecker delta by {merged}"
+        );
+        let err = residual_error(&r, &delta, 6);
+        assert!(err < 1e-5, "structured residual off x·δᵀ by {err}");
+        // Factors that do not decompose the projection fall back to the reconstructed delta.
+        let r = lokr((4, 30));
+        assert!(matches!(r, Residual::Delta(_)), "{r:?}");
+    }
+
+    #[test]
+    fn loha_runs_its_low_rank_factorisation_below_the_break_even_rank() {
+        use candle_gen::train::merge::ThirdPartyLoha;
+        let loha = |rank: usize, out: usize, inp: usize| ThirdPartyLoha {
+            w1_a: Some(values((out, rank), 4)),
+            w1_b: Some(values((rank, inp), 5)),
+            w2_a: Some(values((out, rank), 6)),
+            w2_b: Some(values((rank, inp), 7)),
+            alpha: Some(3.0),
+        };
+        // r² = 4: 4·(24 + 16) = 160 < 24·16 = 384 → factorised.
+        let g = loha(2, 24, 16);
+        let r = crate::adapters::loha_residual(&g, (24, 16), 0.75).unwrap();
+        assert!(matches!(r, Residual::LowRank { .. }), "{r:?}");
+        assert_eq!(r.shape().unwrap(), ((24, 16), true));
+        let delta = g.delta((24, 16), 0.75).unwrap();
+        let merged = max_diff(&r.delta().unwrap(), &delta);
+        assert!(
+            merged < 1e-5,
+            "merged view off the Hadamard delta by {merged}"
+        );
+        let err = residual_error(&r, &delta, 5);
+        assert!(err < 1e-4, "factorised residual off x·δᵀ by {err}");
+        // r² = 16: 16·(24 + 16) = 640 ≥ 384 → the dense delta is cheaper.
+        let g = loha(4, 24, 16);
+        let r = crate::adapters::loha_residual(&g, (24, 16), 0.75).unwrap();
+        assert!(matches!(r, Residual::Delta(_)), "{r:?}");
     }
 
     #[test]
