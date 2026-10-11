@@ -4475,18 +4475,23 @@ jobs:
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
-      CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target-veda-s0-cuda
       CARGO_BUILD_JOBS: "4"
-      S0_OUTPUT_DIR: ${{ github.workspace }}/../veda-s0-cuda-${{ github.run_id }}-${{ github.run_attempt }}
       S0_Q4_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Require existing admitted CUDA listener
-        shell: pwsh
+      - name: Prepare normalized evidence paths and require admitted CUDA listener
+        shell: cmd
         run: |
-          if ($env:RUNNER_NAME -notin @('cuda-windows', 'cuda-windows-2')) {
-            throw "Unexpected CUDA listener $env:RUNNER_NAME"
-          }
+          for %%I in ("%RUNNER_TEMP%\veda-s0-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "S0_OUTPUT_DIR=%%~fI"
+          for %%I in ("%RUNNER_TEMP%\veda-s0-cuda-target-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "CARGO_TARGET_DIR=%%~fI"
+          mkdir "%S0_OUTPUT_DIR%" || exit /b 1
+          echo S0_OUTPUT_DIR=%S0_OUTPUT_DIR%>>"%GITHUB_ENV%"
+          echo CARGO_TARGET_DIR=%CARGO_TARGET_DIR%>>"%GITHUB_ENV%"
+          >"%S0_OUTPUT_DIR%\preflight.json" echo {"instrument":"veda_s0_cuda","complete":false,"status":"tooling_not_yet_checked","runner":"%RUNNER_NAME%","host":"%COMPUTERNAME%","source_commit":"%GITHUB_SHA%","gpu_started":false,"benchmark_started":false}
+          if not "%RUNNER_NAME%"=="cuda-windows" if not "%RUNNER_NAME%"=="cuda-windows-2" (
+            echo Unexpected CUDA listener %RUNNER_NAME%
+            exit /b 1
+          )
       - name: Install pinned uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
@@ -4495,6 +4500,11 @@ jobs:
       - name: Install reviewed CPython 3.12
         shell: cmd
         run: call scripts\ci\real-weights\candle-minimax-h3\install-reviewed-cpython-3-12.cmd
+      - name: Select existing Git Bash for toolchain action
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: 1.96.0
