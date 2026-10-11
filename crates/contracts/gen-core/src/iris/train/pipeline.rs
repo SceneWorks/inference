@@ -330,7 +330,8 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..9 {
             let (w, h) = if i % 2 == 0 { (32, 16) } else { (16, 32) };
-            let mut it = TrainingItem::captioned(write_png(d.path(), &format!("{i}.png"), w, h), "c".into());
+            let mut it =
+                TrainingItem::captioned(write_png(d.path(), &format!("{i}.png"), w, h), "c".into());
             if i == 8 {
                 it.model_options
                     .insert(ITEM_SPLIT_KEY.into(), json!("holdout"));
@@ -339,7 +340,10 @@ mod tests {
         }
         let policy = ShapePolicy::build("bucket", 512, 16, "shared21-512", 32, 4.0).unwrap();
         let mut p = DataPipeline::new(&items, policy, 2, 0, 1).unwrap();
-        assert_eq!((p.train.len(), p.holdout.clone(), p.epoch_batches()), (8, vec![8], 4));
+        assert_eq!(
+            (p.train.len(), p.holdout.clone(), p.epoch_batches()),
+            (8, vec![8], 4)
+        );
         p.begin_epoch(1, None).unwrap();
         let all = p.batches();
         assert_eq!(all.len(), 4);

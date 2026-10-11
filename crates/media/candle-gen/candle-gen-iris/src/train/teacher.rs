@@ -100,15 +100,15 @@ impl Teacher {
         let xc = x.broadcast_sub(&mean)?;
         let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
         let y = xc.broadcast_div(&(var + TEACHER_LN_EPS)?.sqrt()?)?;
-        Ok(y
-            .broadcast_mul(self.get(&format!("{prefix}.weight")))?
+        Ok(y.broadcast_mul(self.get(&format!("{prefix}.weight")))?
             .broadcast_add(self.get(&format!("{prefix}.bias")))?)
     }
 
     fn linear(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        Ok(x
-            .broadcast_matmul(&self.get(&format!("{prefix}.weight")).t()?)?
-            .broadcast_add(self.get(&format!("{prefix}.bias")))?)
+        Ok(
+            x.broadcast_matmul(&self.get(&format!("{prefix}.weight")).t()?)?
+                .broadcast_add(self.get(&format!("{prefix}.bias")))?,
+        )
     }
 
     /// `_teacher_tokens(images, grid)`: `[B, 3, H, W]` clean images in `[−1, 1]` → `[B, gh·gw, D]`
@@ -133,11 +133,16 @@ impl Teacher {
             .permute((0, 2, 4, 1, 3, 5))?
             .contiguous()?
             .reshape((b, gh * gw, 3 * p * p))?;
-        let pw = self.get("patch_embed.proj.weight").reshape((d, 3 * p * p))?;
+        let pw = self
+            .get("patch_embed.proj.weight")
+            .reshape((d, 3 * p * p))?;
         let mut t = patches
             .broadcast_matmul(&pw.t()?)?
             .broadcast_add(self.get("patch_embed.proj.bias"))?;
-        let cls = self.get("cls_token").broadcast_as((b, 1, d))?.contiguous()?;
+        let cls = self
+            .get("cls_token")
+            .broadcast_as((b, 1, d))?
+            .contiguous()?;
         t = Tensor::cat(&[&cls, &t], 1)?;
         t = t.broadcast_add(&self.pos_embed(grid, &device)?)?;
         if a.num_register_tokens > 0 {

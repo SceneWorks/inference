@@ -51,10 +51,10 @@ use gen_core::iris::train::{
     check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, draw_batch,
     export_config_yaml, file_stem, full_model_metadata, full_param_route, latest_checkpoint,
     linear_paths_from_keys, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
-    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng,
-    InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy,
-    TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA,
-    CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
+    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng, InitMode,
+    IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy, TextConditioningMode,
+    TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE,
+    CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
 };
 use gen_core::iris::{IrisConfig, TextEncoderConfig, FAMILY, TEXT_ENCODER_COMPONENT};
 use gen_core::train::{
@@ -205,7 +205,11 @@ impl IrisTrainer {
     }
 
     /// The plan, at the contract level (typed distributed refusals stay typed).
-    fn plan(&self, req: &TrainingRequest, linear_paths: &[String]) -> gen_core::Result<IrisTrainPlan> {
+    fn plan(
+        &self,
+        req: &TrainingRequest,
+        linear_paths: &[String],
+    ) -> gen_core::Result<IrisTrainPlan> {
         IrisTrainPlan::resolve(req, &self.config, &self.flow_defaults, linear_paths)
     }
 
@@ -1185,7 +1189,8 @@ impl Run {
             return Ok(f.clone());
         }
         let full = self.gather_forward()?;
-        let keep = !self.plan.dist.sharding.shards_params() || !self.plan.dist.reshard_after_forward;
+        let keep =
+            !self.plan.dist.sharding.shards_params() || !self.plan.dist.reshard_after_forward;
         if keep {
             self.full = Some(full.clone());
         }
@@ -1569,7 +1574,14 @@ impl Run {
         })
     }
 
-    fn log_step(&mut self, flow: f64, repa: Option<f64>, norm: f64, lr: f64, epoch: u32) -> Result<()> {
+    fn log_step(
+        &mut self,
+        flow: f64,
+        repa: Option<f64>,
+        norm: f64,
+        lr: f64,
+        epoch: u32,
+    ) -> Result<()> {
         self.log_window.push(flow);
         let every = self.plan.log_every.max(1) as u64;
         if !self.topo.is_main() || !self.step.is_multiple_of(every) {
@@ -1605,7 +1617,8 @@ impl Run {
         for (k, g) in grads {
             let name = block_group(k);
             let v = to_host(g)?;
-            *groups.entry(name).or_insert(0.0) += v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+            *groups.entry(name).or_insert(0.0) +=
+                v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
         }
         let mut rec = serde_json::Map::new();
         rec.insert("kind".into(), json!("grad_norms"));
@@ -1656,7 +1669,10 @@ impl Run {
             }
             let shape4 = [b as i32, 3, hh as i32, ww as i32];
             let sig: Vec<f32> = t_idx.iter().map(|&t| self.schedule.sigmas[t]).collect();
-            let tim: Vec<f32> = t_idx.iter().map(|&t| self.schedule.model_times[t]).collect();
+            let tim: Vec<f32> = t_idx
+                .iter()
+                .map(|&t| self.schedule.model_times[t])
+                .collect();
             let batch = StepBatch {
                 x0: Array::from_slice(&pixels, &shape4),
                 noise: Array::from_slice(&noise, &shape4),
@@ -1677,7 +1693,12 @@ impl Run {
         {
             self.full = None;
         }
-        let mut flat: Vec<f64> = sums.sums.iter().chain(sums.counts.iter()).copied().collect();
+        let mut flat: Vec<f64> = sums
+            .sums
+            .iter()
+            .chain(sums.counts.iter())
+            .copied()
+            .collect();
         if self.world() > 1 {
             self.topo.reduce_scalars(&mut flat, ReduceOp::Sum)?;
         }
@@ -1746,9 +1767,8 @@ impl Run {
         let io = self.plan.dist.checkpoint_io;
         let world = self.plan.dist.world.clone();
         let mkdir = |p: &Path| {
-            std::fs::create_dir_all(p).map_err(|e| {
-                Error::Msg(format!("iris checkpoint: create {}: {e}", p.display()))
-            })
+            std::fs::create_dir_all(p)
+                .map_err(|e| Error::Msg(format!("iris checkpoint: create {}: {e}", p.display())))
         };
         if io == gen_core::iris::train::dist::CheckpointIo::Dcp {
             let staging = self.ckpt_root.join(format!(
@@ -1779,7 +1799,10 @@ impl Run {
                 // Zero-row shards (more shards than rows) have nothing to write.
                 list.retain(|(_, a)| a.size() > 0);
                 list.sort_by(|a, c| a.0.cmp(&c.0));
-                let path = staging.join(format!("shard_{:05}.safetensors", self.plan.dist.shard_index()));
+                let path = staging.join(format!(
+                    "shard_{:05}.safetensors",
+                    self.plan.dist.shard_index()
+                ));
                 save_safetensors_atomic(&path, &list, &Default::default())?;
             }
             self.topo.coll.barrier("dcp shards")?;
@@ -2014,7 +2037,13 @@ fn block_group(key: &str) -> String {
     let mut parts = key.split('.');
     let head = parts.next().unwrap_or(key);
     match head {
-        "blocks" => format!("blocks.{:02}", parts.next().and_then(|i| i.parse::<usize>().ok()).unwrap_or(0)),
+        "blocks" => format!(
+            "blocks.{:02}",
+            parts
+                .next()
+                .and_then(|i| i.parse::<usize>().ok())
+                .unwrap_or(0)
+        ),
         "pixel_blocks" => format!("pixel_blocks.{}", parts.next().unwrap_or("0")),
         other => other.to_string(),
     }
@@ -2288,4 +2317,3 @@ fn render_preview(
         seed,
     )
 }
-

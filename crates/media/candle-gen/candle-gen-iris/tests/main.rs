@@ -22,6 +22,9 @@ mod controls_contract;
 #[path = "controls_parity.rs"]
 mod controls_parity;
 
+#[path = "curricula_lifecycle.rs"]
+mod curricula_lifecycle;
+
 #[path = "curricula_parity.rs"]
 mod curricula_parity;
 

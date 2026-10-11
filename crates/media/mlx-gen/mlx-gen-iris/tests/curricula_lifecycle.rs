@@ -14,9 +14,7 @@ use mlx_gen::gen_core::iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, HostRng, OPTIONS_KEY,
 };
 use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
-use mlx_gen::gen_core::{
-    LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingRequest,
-};
+use mlx_gen::gen_core::{LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingRequest};
 use mlx_gen::{LoadSpec, WeightsSource};
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value as Json};
@@ -59,8 +57,10 @@ fn trainer_with(teacher: Option<&Path>) -> Box<dyn Trainer> {
         WeightsSource::Dir(tiny_text_encoder()),
     );
     if let Some(t) = teacher {
-        spec.components
-            .insert(TEACHER_COMPONENT.into(), WeightsSource::Dir(t.to_path_buf()));
+        spec.components.insert(
+            TEACHER_COMPONENT.into(),
+            WeightsSource::Dir(t.to_path_buf()),
+        );
     }
     mlx_gen_iris::provider_registry()
         .unwrap()
@@ -163,7 +163,13 @@ fn tiny_preset(id: &str, resolution: usize) -> TrainingConfig {
     cfg.learning_rate = 1e-3;
     cfg.train_dtype = "f32".into();
     let o = opts(&mut cfg);
-    for k in ["architecture", "text_encoder", "dist", "expected_global_batch", "perf"] {
+    for k in [
+        "architecture",
+        "text_encoder",
+        "dist",
+        "expected_global_batch",
+        "perf",
+    ] {
         o.remove(k);
     }
     o.insert("log_every".into(), json!(1));
@@ -200,7 +206,10 @@ fn latest(out: &Path) -> PathBuf {
 
 #[test]
 fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase() {
-    cpu_process("curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase", stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body);
+    cpu_process(
+        "curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase",
+        stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body,
+    );
 }
 
 fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
@@ -218,7 +227,11 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
         let o = opts(&mut s1);
         assert_eq!(o["stage"], json!("stage1_256"));
         let repa = o.get_mut("repa").unwrap().as_object_mut().unwrap();
-        assert_eq!(repa["weight"], json!(0.5), "the preset carries stage 1's REPA");
+        assert_eq!(
+            repa["weight"],
+            json!(0.5),
+            "the preset carries stage 1's REPA"
+        );
         repa.insert("teacher".into(), json!("dinov2_vits14"));
         repa.insert("teacher_dim".into(), json!(384));
         repa.insert("teacher_image_size".into(), json!(56));
@@ -235,7 +248,8 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
     assert!(ck1.join("repa_projector.safetensors").is_file());
     let m1 = metrics(&out1);
     assert!(
-        m1.iter().any(|r| r["kind"] == "step" && r.get("loss/repa_raw").is_some()),
+        m1.iter()
+            .any(|r| r["kind"] == "step" && r.get("loss/repa_raw").is_some()),
         "REPA losses are logged: {m1:?}"
     );
 
@@ -256,7 +270,10 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
     opts(&mut s2).insert("resume_from".into(), json!(ck1));
     let out2 = out.path().join("s2");
     let mut t = trainer_with(None);
-    assert_eq!(train(t.as_mut(), &request(&items, s2.clone(), &out2)).unwrap(), 4);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, s2.clone(), &out2)).unwrap(),
+        4
+    );
     let st2 = read_checkpoint_state(&latest(&out2)).unwrap();
     assert_eq!(
         (st2.stage.as_deref(), st2.parent_stage.as_deref()),
@@ -275,14 +292,23 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
     let e = trainer_with(None)
         .validate(&request(&items, s3.clone(), &out.path().join("s3")))
         .err()
-        .or_else(|| train(trainer_with(None).as_mut(), &request(&items, s3, &out.path().join("s3"))).err())
+        .or_else(|| {
+            train(
+                trainer_with(None).as_mut(),
+                &request(&items, s3, &out.path().join("s3")),
+            )
+            .err()
+        })
         .expect("stage 3 refuses a stage 1 parent");
     assert!(e.to_string().contains("stage"), "{e}");
 }
 
 #[test]
 fn area_shape_batches_train_per_shape_and_resume_exactly() {
-    cpu_process("curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly", area_shape_batches_train_per_shape_and_resume_exactly_body);
+    cpu_process(
+        "curricula_lifecycle::area_shape_batches_train_per_shape_and_resume_exactly",
+        area_shape_batches_train_per_shape_and_resume_exactly_body,
+    );
 }
 
 fn area_shape_batches_train_per_shape_and_resume_exactly_body() {
@@ -304,7 +330,10 @@ fn area_shape_batches_train_per_shape_and_resume_exactly_body() {
         .clone(),
     );
     let mut t = trainer_with(None);
-    assert_eq!(train(t.as_mut(), &request(&items, cfg.clone(), a.path())).unwrap(), 4);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg.clone(), a.path())).unwrap(),
+        4
+    );
     // Interrupted at 2, then resumed (the shape batcher's regroup history replays).
     let req = request(&items, cfg.clone(), b.path());
     let flag = req.cancel.clone();
@@ -318,18 +347,27 @@ fn area_shape_batches_train_per_shape_and_resume_exactly_body() {
             .unwrap()
     });
     cfg.resume = true;
-    assert_eq!(train(t.as_mut(), &request(&items, cfg, b.path())).unwrap(), 4);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg, b.path())).unwrap(),
+        4
+    );
     let (sa, sb) = (
         read_checkpoint_state(&latest(a.path())).unwrap(),
         read_checkpoint_state(&latest(b.path())).unwrap(),
     );
     assert_eq!(sa, sb, "the resumed area run equals the uninterrupted one");
-    assert!(sa.data_position.unwrap().to_string().contains("shape"), "a shape-batch cursor");
+    assert!(
+        sa.data_position.unwrap().to_string().contains("shape"),
+        "a shape-batch cursor"
+    );
 }
 
 #[test]
 fn activation_checkpointing_leaves_the_run_unchanged() {
-    cpu_process("curricula_lifecycle::activation_checkpointing_leaves_the_run_unchanged", activation_checkpointing_leaves_the_run_unchanged_body);
+    cpu_process(
+        "curricula_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+        activation_checkpointing_leaves_the_run_unchanged_body,
+    );
 }
 
 fn activation_checkpointing_leaves_the_run_unchanged_body() {
@@ -372,7 +410,10 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
 
 #[test]
 fn holdout_validation_writes_the_banded_metrics() {
-    cpu_process("curricula_lifecycle::holdout_validation_writes_the_banded_metrics", holdout_validation_writes_the_banded_metrics_body);
+    cpu_process(
+        "curricula_lifecycle::holdout_validation_writes_the_banded_metrics",
+        holdout_validation_writes_the_banded_metrics_body,
+    );
 }
 
 fn holdout_validation_writes_the_banded_metrics_body() {
@@ -387,7 +428,13 @@ fn holdout_validation_writes_the_banded_metrics_body() {
     let m = metrics(out.path());
     let vals: Vec<&Json> = m.iter().filter(|r| r["kind"] == "validation").collect();
     assert_eq!(vals.len(), 2, "one validation per step: {m:?}");
-    for k in ["val/loss", "val/loss_t0", "val/loss_t1", "val/loss_t2", "val/loss_t3"] {
+    for k in [
+        "val/loss",
+        "val/loss_t0",
+        "val/loss_t1",
+        "val/loss_t2",
+        "val/loss_t3",
+    ] {
         assert!(vals[0][k].is_number(), "{k}: {:?}", vals[0]);
     }
     // The holdout item never trains: the frozen grid's single sample sits in band 0 (k = 0 → t
@@ -399,7 +446,10 @@ fn holdout_validation_writes_the_banded_metrics_body() {
 
 #[test]
 fn fp16_trains_with_the_dynamic_loss_scaler() {
-    cpu_process("curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler", fp16_trains_with_the_dynamic_loss_scaler_body);
+    cpu_process(
+        "curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler",
+        fp16_trains_with_the_dynamic_loss_scaler_body,
+    );
 }
 
 fn fp16_trains_with_the_dynamic_loss_scaler_body() {
@@ -409,10 +459,14 @@ fn fp16_trains_with_the_dynamic_loss_scaler_body() {
     cfg.train_dtype = "fp16".into();
     opts(&mut cfg).insert("log_every".into(), json!(1));
     let mut t = trainer_with(None);
-    assert_eq!(train(t.as_mut(), &request(&items, cfg, out.path())).unwrap(), 2);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg, out.path())).unwrap(),
+        2
+    );
     let m = metrics(out.path());
     assert!(
-        m.iter().any(|r| r["kind"] == "step" && r.get("loss_scale").is_some()),
+        m.iter()
+            .any(|r| r["kind"] == "step" && r.get("loss_scale").is_some()),
         "{m:?}"
     );
     let st = read_checkpoint_state(&latest(out.path())).unwrap();
@@ -421,7 +475,10 @@ fn fp16_trains_with_the_dynamic_loss_scaler_body() {
 
 #[test]
 fn resume_optimizer_core_starts_a_new_projector_cold() {
-    cpu_process("curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold", resume_optimizer_core_starts_a_new_projector_cold_body);
+    cpu_process(
+        "curricula_lifecycle::resume_optimizer_core_starts_a_new_projector_cold",
+        resume_optimizer_core_starts_a_new_projector_cold_body,
+    );
 }
 
 fn resume_optimizer_core_starts_a_new_projector_cold_body() {
@@ -446,7 +503,10 @@ fn resume_optimizer_core_starts_a_new_projector_cold_body() {
         .expect_err("a full optimizer resume refuses the new projector");
     assert!(e.to_string().contains("projector"), "{e}");
     opts(&mut cfg).insert("resume_optimizer".into(), json!("core"));
-    assert_eq!(train(t.as_mut(), &request(&items, cfg, out.path())).unwrap(), 4);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg, out.path())).unwrap(),
+        4
+    );
     let st = read_checkpoint_state(&latest(out.path())).unwrap();
     assert!(st.repa_projector.is_some());
 }

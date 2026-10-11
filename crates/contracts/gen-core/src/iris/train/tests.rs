@@ -549,8 +549,10 @@ fn plan_honours_options_and_refuses_what_it_cannot_honour() {
     assert_eq!(resolve(c).unwrap().mixed_precision, MixedPrecision::Fp16);
     let mut c = base_cfg();
     c.gradient_checkpointing = true;
-    c.model_options
-        .insert(OPTIONS_KEY.into(), json!({"activation_checkpointing": "none"}));
+    c.model_options.insert(
+        OPTIONS_KEY.into(),
+        json!({"activation_checkpointing": "none"}),
+    );
     assert!(resolve(c).is_err(), "toggle on + policy none contradict");
     let mut c = base_cfg();
     c.resolution = 18;

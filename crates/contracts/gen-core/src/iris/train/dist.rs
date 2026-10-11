@@ -679,9 +679,11 @@ pub fn parse_dist(
         None | Some(JsonValue::Null) => "auto".to_string(),
         Some(JsonValue::String(v)) if matches!(v.as_str(), "auto" | "true" | "false") => v.clone(),
         Some(JsonValue::Bool(b)) => b.to_string(),
-        Some(v) => return Err(Error::Msg(format!(
+        Some(v) => {
+            return Err(Error::Msg(format!(
             "iris training: dist.ddp.find_unused_parameters must be auto, true or false, got {v}"
-        ))),
+        )))
+        }
     };
     let ddp = DdpKnobs {
         find_unused_parameters: fup,
@@ -1078,7 +1080,10 @@ fn stream_lost(s: &TcpStream, peer: usize, op: &str, e: std::io::Error) -> Error
         return io_lost(
             peer,
             op,
-            format!("no answer within the {}s transport timeout", bound.as_secs()),
+            format!(
+                "no answer within the {}s transport timeout",
+                bound.as_secs()
+            ),
         );
     }
     io_lost(peer, op, e)

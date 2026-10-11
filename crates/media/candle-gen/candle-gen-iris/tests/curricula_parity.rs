@@ -73,7 +73,10 @@ fn step_batch(x0: Tensor, noise: Tensor, t_idx: &[i32], y: Tensor, mask: &[i32])
     let sched = TrainSchedule::new(1000, 4.0);
     let b = t_idx.len();
     let sig: Vec<f32> = t_idx.iter().map(|&t| sched.sigmas[t as usize]).collect();
-    let tm: Vec<f32> = t_idx.iter().map(|&t| sched.model_times[t as usize]).collect();
+    let tm: Vec<f32> = t_idx
+        .iter()
+        .map(|&t| sched.model_times[t as usize])
+        .collect();
     let t_len = mask.len() / b;
     StepBatch {
         x0: f32t(&x0),
@@ -125,7 +128,10 @@ fn full_model(rope_aspect: &str) -> TrainModel {
 }
 
 fn json_pair(v: &Json) -> (usize, usize) {
-    (v[0].as_u64().unwrap() as usize, v[1].as_u64().unwrap() as usize)
+    (
+        v[0].as_u64().unwrap() as usize,
+        v[1].as_u64().unwrap() as usize,
+    )
 }
 
 fn grads_under(model: &TrainModel, params: &Params, ac: AcPolicy) -> Tensors {
@@ -417,7 +423,11 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
     let teacher = Teacher::load(std::path::Path::new(&dir), arch, &device).unwrap();
     let img = f32t(g.require("image")).to_device(&device).unwrap();
     for (name, grid) in [("g16", (16, 16)), ("g4_match", (4, 4))] {
-        let got = teacher.tokens(&img, grid).unwrap().to_device(&cpu()).unwrap();
+        let got = teacher
+            .tokens(&img, grid)
+            .unwrap()
+            .to_device(&cpu())
+            .unwrap();
         assert_close(
             &format!("release teacher {name}"),
             &got,

@@ -30,8 +30,8 @@ use candle_gen::gen_core::iris::train::{
 };
 use candle_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
 use candle_gen::gen_core::{
-    LoadSpec, LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress,
-    TrainingRequest, WeightsSource,
+    LoadSpec, LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 use serde_json::{json, Value as Json};
 
@@ -434,7 +434,6 @@ fn the_mlx_transports_are_typed_refusals_on_candle() {
     );
 }
 
-
 fn export(out: &Path) -> PathBuf {
     out.join("dist").join("model.safetensors")
 }
@@ -504,7 +503,10 @@ fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
             );
             let d = max_diff(&export(ddp.path()), &export(bf16.path()));
             eprintln!("fsdp full param_dtype=bf16 vs ddp: max |Δ| = {d:.3e}");
-            assert!(d > 0.0 && d < 1e-2, "param_dtype=bf16 rounds the forward copy: {d}");
+            assert!(
+                d > 0.0 && d < 1e-2,
+                "param_dtype=bf16 rounds the forward copy: {d}"
+            );
         }
     }
 }
@@ -533,7 +535,6 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
 }
 
-
 #[test]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let (data, scratch) = (tmp(), tmp());
@@ -545,14 +546,25 @@ fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let cut = tmp();
     let world = tcp_world(2, 1);
     let jobs = (0..2)
-        .map(|r| job(data.path(), cut.path(), r, world.clone(), dist.clone(), 4, Some(2)))
+        .map(|r| {
+            job(
+                data.path(),
+                cut.path(),
+                r,
+                world.clone(),
+                dist.clone(),
+                4,
+                Some(2),
+            )
+        })
         .collect();
     for r in launch(jobs, scratch.path()) {
         assert_eq!(r["steps"], 2, "{r}");
     }
     let at2 = latest(cut.path());
     assert!(
-        at2.join("shard_00000.safetensors").is_file() && at2.join("shard_00001.safetensors").is_file(),
+        at2.join("shard_00000.safetensors").is_file()
+            && at2.join("shard_00001.safetensors").is_file(),
         "dcp writes one file per shard"
     );
     // Reshard: the 2-shard checkpoint resumes in one process (copied so the mesh run stays clean).
@@ -564,7 +576,15 @@ fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let world = tcp_world(2, 1);
     let jobs = (0..2)
         .map(|r| {
-            let mut j = job(data.path(), cut.path(), r, world.clone(), dist.clone(), 4, None);
+            let mut j = job(
+                data.path(),
+                cut.path(),
+                r,
+                world.clone(),
+                dist.clone(),
+                4,
+                None,
+            );
             j["resume"] = json!(true);
             j
         })
@@ -649,7 +669,9 @@ fn lost_rank_case(field: &str) {
     let _ = kids[1].wait();
     let r = read_result(&results[0], 0);
     eprintln!("survivor ({field}): {r}");
-    let typed = r["dist"].as_str().unwrap_or_else(|| panic!("untyped failure: {r}"));
+    let typed = r["dist"]
+        .as_str()
+        .unwrap_or_else(|| panic!("untyped failure: {r}"));
     assert!(typed.starts_with("RankLost"), "{typed}");
     if field == "stall_at" {
         // The bound that ended the wait is the configured transport timeout (clock-free reading:

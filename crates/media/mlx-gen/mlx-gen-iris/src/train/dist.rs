@@ -335,9 +335,9 @@ impl Topology {
             let mut bucket: Vec<(Rc<str>, Vec<i32>, usize)> = Vec::new();
             let mut buf: Vec<f32> = Vec::new();
             let flush = |bucket: &mut Vec<(Rc<str>, Vec<i32>, usize)>,
-                             buf: &mut Vec<f32>,
-                             out: &mut Params,
-                             coll: &mut Box<dyn Collective>|
+                         buf: &mut Vec<f32>,
+                         out: &mut Params,
+                         coll: &mut Box<dyn Collective>|
              -> Result<()> {
                 if bucket.is_empty() {
                     return Ok(());
@@ -421,6 +421,9 @@ impl TakeRows for Array {
         if self.ndim() == 0 {
             return Ok(self.clone());
         }
-        Ok(self.index_device((r.start as i32)..(r.end as i32), mlx_rs::Stream::task_local_or_default()))
+        Ok(self.index_device(
+            (r.start as i32)..(r.end as i32),
+            mlx_rs::Stream::task_local_or_default(),
+        ))
     }
 }

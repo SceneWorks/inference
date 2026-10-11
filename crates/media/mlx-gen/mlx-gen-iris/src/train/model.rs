@@ -32,9 +32,7 @@ use super::optim::Params;
 use crate::dit::{ForwardHooks, IrisDiT, PixelCtx, TextBatch, TrunkCtx};
 use crate::nn::AdaptedLinears;
 use gen_core::iris::train::ac::AcPolicy;
-use gen_core::iris::train::repa::{
-    bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX,
-};
+use gen_core::iris::train::repa::{bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX};
 use mlx_rs::nn::silu;
 use mlx_rs::ops::{matmul, sqrt, sum_axes};
 use mlx_rs::transforms::checkpoint;
@@ -643,8 +641,14 @@ pub fn resize_token_grid(
 ) -> Result<Array> {
     let sh = tokens.shape();
     let (b, c) = (sh[0], sh[2]);
-    let mh = Array::from_slice(&bilinear_matrix(src.0, dst.0), &[dst.0 as i32, src.0 as i32]);
-    let mw = Array::from_slice(&bilinear_matrix(src.1, dst.1), &[dst.1 as i32, src.1 as i32]);
+    let mh = Array::from_slice(
+        &bilinear_matrix(src.0, dst.0),
+        &[dst.0 as i32, src.0 as i32],
+    );
+    let mw = Array::from_slice(
+        &bilinear_matrix(src.1, dst.1),
+        &[dst.1 as i32, src.1 as i32],
+    );
     let x = tokens
         .transpose_axes(&[0, 2, 1])?
         .reshape(&[b, c, src.0 as i32, src.1 as i32])?;
@@ -655,7 +659,12 @@ pub fn resize_token_grid(
 
 /// The projector (`REPALoss._project`) in fp32: the 3-layer SiLU MLP, or iREPA's 3×3 conv on the
 /// student grid.
-fn project(plan: &RepaPlan, p: &HashMap<Rc<str>, Array>, x: &Array, grid: (usize, usize)) -> Result<Array> {
+fn project(
+    plan: &RepaPlan,
+    p: &HashMap<Rc<str>, Array>,
+    x: &Array,
+    grid: (usize, usize),
+) -> Result<Array> {
     let get = |leaf: &str| -> Result<&Array> {
         let k = format!("{PROJECTOR_PREFIX}{leaf}");
         p.get(k.as_str())
@@ -817,11 +826,7 @@ pub fn loss_and_grads_ext(
     for chunk in refs.chunks(256) {
         eval(chunk.iter().copied())?;
     }
-    Ok((
-        flow.item::<f32>(),
-        rl.map(|r| r.item::<f32>()),
-        grads,
-    ))
+    Ok((flow.item::<f32>(), rl.map(|r| r.item::<f32>()), grads))
 }
 
 /// PyTorch-default init of the REPA projector (`U(±1/√fan_in)` weights and biases), from MLX's RNG

@@ -23,8 +23,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::silu;
-use mlx_rs::ops::{concatenate_axis, matmul, mean_axes, sqrt, var_axes};
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::ops::{concatenate_axis, matmul, mean_axes, sqrt, var_axes};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype, Stream};
 
@@ -214,7 +214,11 @@ impl Teacher {
         let qkv = lin(&h, "attn.qkv")?
             .reshape(&[b, n, 3, heads, hd])?
             .transpose_axes(&[2, 0, 3, 1, 4])?;
-        let (q, k, v) = (qkv.index_device(0, cur()), qkv.index_device(1, cur()), qkv.index_device(2, cur()));
+        let (q, k, v) = (
+            qkv.index_device(0, cur()),
+            qkv.index_device(1, cur()),
+            qkv.index_device(2, cur()),
+        );
         let attn = scaled_dot_product_attention(&q, &k, &v, (hd as f32).powf(-0.5), None, None)?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, n, heads * hd])?;

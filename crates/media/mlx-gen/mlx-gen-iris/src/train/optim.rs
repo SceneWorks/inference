@@ -285,7 +285,8 @@ impl IrisOptimizer {
                         None => orthogonalize(&u.as_dtype(Dtype::Bfloat16)?, *split, adjust)?,
                         Some(sh) => {
                             let whole = sh.gather(&k, &u)?;
-                            let o = orthogonalize(&whole.as_dtype(Dtype::Bfloat16)?, *split, adjust)?;
+                            let o =
+                                orthogonalize(&whole.as_dtype(Dtype::Bfloat16)?, *split, adjust)?;
                             sh.own_rows(&k, &o)?
                         }
                     };

@@ -17,9 +17,7 @@ use mlx_gen::gen_core::iris::train::repa::{
 use mlx_gen::gen_core::iris::train::shapes::{
     preprocess_to_shape, RangedSampler, ShapeBatchSampler, ShapePolicy,
 };
-use mlx_gen::gen_core::iris::train::{
-    FlowObjective, Prediction, TimestepSampler, TrainSchedule,
-};
+use mlx_gen::gen_core::iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
 use mlx_gen::weights::Weights;
 use mlx_gen_iris::train::model::{
     flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch, TrainExtras, TrainModel,
@@ -30,7 +28,9 @@ use mlx_gen_iris::train::teacher::{spatial_normalize, Teacher};
 use mlx_rs::{Array, Dtype};
 use serde_json::Value as Json;
 
-use crate::common::{assert_close, fixture, host_f32, host_i32, on_cpu, tiny_backbone, tiny_config};
+use crate::common::{
+    assert_close, fixture, host_f32, host_i32, on_cpu, tiny_backbone, tiny_config,
+};
 
 const GOLDEN: &str = "iris_curricula_golden.safetensors";
 const TRAIN: &str = "iris_train_golden.safetensors";
@@ -71,7 +71,10 @@ fn step_batch(x0: Array, noise: Array, t_idx: &[i32], y: Array, mask: &[i32]) ->
     let sched = TrainSchedule::new(1000, 4.0);
     let b = t_idx.len();
     let sig: Vec<f32> = t_idx.iter().map(|&t| sched.sigmas[t as usize]).collect();
-    let tm: Vec<f32> = t_idx.iter().map(|&t| sched.model_times[t as usize]).collect();
+    let tm: Vec<f32> = t_idx
+        .iter()
+        .map(|&t| sched.model_times[t as usize])
+        .collect();
     let t_len = mask.len() / b;
     StepBatch {
         x0,
@@ -158,14 +161,25 @@ fn shape_policies_and_the_covering_resize_match_upstream() {
         .map(|&v| v as u8)
         .collect();
     let img = preprocess_to_shape(&rgb, 47, 31, &small).unwrap();
-    assert_eq!(json_pair(&meta(&g, "shape.target")), (img.height, img.width));
+    assert_eq!(
+        json_pair(&meta(&g, "shape.target")),
+        (img.height, img.width)
+    );
     let got = Array::from_slice(&img.chw, &[3, img.height as i32, img.width as i32]);
     // PIL's fixed-point bicubic is reproduced exactly; the [−1, 1] map is the same f32 ops.
-    assert_close("covering resize + crop", &got, g.require("shape.chw").unwrap(), 1e-6);
+    assert_close(
+        "covering resize + crop",
+        &got,
+        g.require("shape.chw").unwrap(),
+        1e-6,
+    );
 }
 
 fn json_pair(v: &Json) -> (usize, usize) {
-    (v[0].as_u64().unwrap() as usize, v[1].as_u64().unwrap() as usize)
+    (
+        v[0].as_u64().unwrap() as usize,
+        v[1].as_u64().unwrap() as usize,
+    )
 }
 
 fn json_ranges(v: &Json) -> Vec<(usize, usize)> {
@@ -184,7 +198,11 @@ fn ranged_walk_and_shape_batches_match_upstream() {
         .unwrap()
         .resume_state(3, 4, None, None)
         .unwrap();
-    assert_eq!(state, meta(&g, "ranged.640.w2.state"), "the resume state, key for key");
+    assert_eq!(
+        state,
+        meta(&g, "ranged.640.w2.state"),
+        "the resume state, key for key"
+    );
     let w4 = meta(&g, "ranged.640.w2_to_w4");
     for r in 0..4 {
         let mut s = RangedSampler::new(640, r, 4).unwrap();
@@ -206,8 +224,13 @@ fn ranged_walk_and_shape_batches_match_upstream() {
     let mut sb3 = ShapeBatchSampler::new(RangedSampler::new(30, 0, 1).unwrap(), 3, true).unwrap();
     sb3.set_epoch(1);
     sb3.load_resume_state(&sstate, &keys).unwrap();
-    let want: Vec<Vec<usize>> = serde_json::from_value(meta(&g, "shape_batches.regroup_b3")).unwrap();
-    assert_eq!(sb3.batches(&keys), want, "a micro-batch change regroups the suffix");
+    let want: Vec<Vec<usize>> =
+        serde_json::from_value(meta(&g, "shape_batches.regroup_b3")).unwrap();
+    assert_eq!(
+        sb3.batches(&keys),
+        want,
+        "a micro-batch change regroups the suffix"
+    );
 }
 
 fn grads_under(model: &TrainModel, params: &Params, ac: AcPolicy) -> Params {
@@ -342,7 +365,10 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
             let plan = RepaPlan {
                 weight,
                 variant,
-                spatial_norm_gamma: m.get("spatial_norm_gamma").and_then(Json::as_f64).unwrap_or(1.0),
+                spatial_norm_gamma: m
+                    .get("spatial_norm_gamma")
+                    .and_then(Json::as_f64)
+                    .unwrap_or(1.0),
                 teacher: tiny_arch(0),
                 teacher_dim: 32,
                 proj_hidden_dim: 24,
@@ -363,7 +389,8 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
                 assert_close(
                     &format!("{case} spatial normalization"),
                     &n,
-                    g.require(&format!("repa.{case}.teacher_normalized")).unwrap(),
+                    g.require(&format!("repa.{case}.teacher_normalized"))
+                        .unwrap(),
                     1e-4,
                 );
                 n

@@ -53,10 +53,10 @@ use candle_gen::gen_core::iris::train::{
     check_resume, checkpoint_root, checkpoint_staging_dir, dataset_fingerprint, draw_batch,
     export_config_yaml, file_stem, full_model_metadata, full_param_route, latest_checkpoint,
     linear_paths_from_keys, prune_checkpoints, publish_checkpoint, read_checkpoint_state,
-    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng,
-    InitMode, IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy,
-    TextConditioningMode, TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA,
-    CKPT_OPTIMIZER, CKPT_STATE, CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
+    select_caption, AdapterMetadata, ArtifactPlan, CheckpointState, GradScaler, HostRng, InitMode,
+    IrisTrainPlan, MixedPrecision, ParamRoute, Prediction, ResumeDataPolicy, TextConditioningMode,
+    TrainFlowDefaults, TrainSchedule, WeightsSelect, CKPT_EMA, CKPT_OPTIMIZER, CKPT_STATE,
+    CKPT_TRAINABLE, TECHNIQUES, TRAINER_ID,
 };
 use candle_gen::gen_core::iris::{IrisConfig, TextEncoderConfig, FAMILY, TEXT_ENCODER_COMPONENT};
 use candle_gen::gen_core::train::{
@@ -698,7 +698,10 @@ fn block_group(key: &str) -> String {
     match head {
         "blocks" => format!(
             "blocks.{:02}",
-            parts.next().and_then(|i| i.parse::<usize>().ok()).unwrap_or(0)
+            parts
+                .next()
+                .and_then(|i| i.parse::<usize>().ok())
+                .unwrap_or(0)
         ),
         "pixel_blocks" => format!("pixel_blocks.{}", parts.next().unwrap_or("0")),
         other => other.to_string(),
@@ -1045,7 +1048,9 @@ impl Run {
                 .filter(|k| !k.starts_with(PROJECTOR_PREFIX))
                 .collect();
             if payload.trainable.len() != core_keys.len()
-                || core_keys.iter().any(|k| !payload.trainable.contains_key(*k))
+                || core_keys
+                    .iter()
+                    .any(|k| !payload.trainable.contains_key(*k))
             {
                 return Err(Error::Msg(
                     "iris resume: the checkpoint's trainable tensors do not match this run".into(),
@@ -1712,7 +1717,10 @@ impl Run {
             }
             let shape4 = (b, 3, hh, ww);
             let sig: Vec<f32> = t_idx.iter().map(|&t| self.schedule.sigmas[t]).collect();
-            let tim: Vec<f32> = t_idx.iter().map(|&t| self.schedule.model_times[t]).collect();
+            let tim: Vec<f32> = t_idx
+                .iter()
+                .map(|&t| self.schedule.model_times[t])
+                .collect();
             let batch = StepBatch {
                 x0: Tensor::from_vec(pixels, shape4, &device)?,
                 noise: Tensor::from_vec(noise, shape4, &device)?,
@@ -1727,7 +1735,12 @@ impl Run {
             }
         }
         drop(dit);
-        let mut flat: Vec<f64> = sums.sums.iter().chain(sums.counts.iter()).copied().collect();
+        let mut flat: Vec<f64> = sums
+            .sums
+            .iter()
+            .chain(sums.counts.iter())
+            .copied()
+            .collect();
         if self.world() > 1 {
             self.topo.reduce_scalars(&mut flat, ReduceOp::Sum)?;
         }

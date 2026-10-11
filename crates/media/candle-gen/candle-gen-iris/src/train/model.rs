@@ -686,7 +686,8 @@ fn backward_segmented(
                     .iter()
                     .map(|t| Var::from_tensor(&t.detach()))
                     .collect::<candle_gen::candle_core::Result<_>>()?;
-                let o = tracked.run_pixel_block(*i, ctx, vars[0].as_tensor(), vars[1].as_tensor())?;
+                let o =
+                    tracked.run_pixel_block(*i, ctx, vars[0].as_tensor(), vars[1].as_tensor())?;
                 (vec![(o, take(&mut cot, out))], vars)
             }
         };
@@ -747,8 +748,7 @@ fn project(plan: &RepaPlan, p: &Tensors, x: &Tensor, grid: (usize, usize)) -> Re
             .ok_or_else(|| Error::Msg(format!("iris repa: projector tensor {k} missing")))
     };
     let lin = |x: &Tensor, i: usize| -> Result<Tensor> {
-        Ok(x
-            .broadcast_matmul(&get(&format!("{i}.weight"))?.t()?)?
+        Ok(x.broadcast_matmul(&get(&format!("{i}.weight"))?.t()?)?
             .broadcast_add(get(&format!("{i}.bias"))?)?)
     };
     match plan.variant {
@@ -912,7 +912,10 @@ pub fn init_projector(plan: &RepaPlan, seed: u64, device: &Device) -> Result<Par
         let bound = plan.projector_init_bound(&key);
         let n: usize = shape.iter().product();
         let mut rng = HostRng::new(mix_seed(&[seed, fnv(&key)]));
-        out.insert(key.clone(), to_var(uniform(&mut rng, n, bound), &shape, device)?);
+        out.insert(
+            key.clone(),
+            to_var(uniform(&mut rng, n, bound), &shape, device)?,
+        );
     }
     Ok(out)
 }
