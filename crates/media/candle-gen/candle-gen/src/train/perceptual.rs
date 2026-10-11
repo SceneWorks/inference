@@ -839,7 +839,6 @@ mod tests {
         assert!(scalar(&multiscale_grad_loss(&other, &t, 4).unwrap()) > 0.01);
     }
 
-    /// Mutation: flip the sign in any `recover_x0` arm ⇒ red.
     /// sc-2124: the aux gain normalises the ε Jacobian `σ_ve = √((1−ᾱ)/ᾱ)` to `min(σ_ve, 1)` —
     /// exactly `1/σ_ve` at high noise (SDXL's last timestep, σ_ve ≈ 14.6), exactly `1` at low noise —
     /// and is exactly `1` (no change at all) for flow and v-prediction at every noise level.
@@ -882,6 +881,7 @@ mod tests {
         }
     }
 
+    /// Mutation: flip the sign in any `recover_x0` arm ⇒ red.
     #[test]
     fn recover_x0_inverts_each_parameterisation() {
         let x0 = map(7, &[1, 2, 3, 3]);

@@ -596,8 +596,9 @@ impl Default for DepthAnchoringConfig {
     }
 }
 
-/// The default schedule of every **decoded-x0 (pixel-space)** auxiliary loss — depth anchoring,
-/// the identity and face-landmark losses and the three body losses (sc-2124) — once given a
+/// The default schedule of the **decoded-x0 (pixel-space)** auxiliary losses whose upstream window
+/// was `[0, 1]` — depth anchoring, the identity and face-landmark losses and the body-proportion
+/// loss (sc-2124; body shape / normal keep upstream's [`BODY_SURFACE_SCHEDULE`]) — once given a
 /// weight: the low-noise window `[0, 0.5]` the latent losses use ([`LATENT_PERCEPTUAL_SCHEDULE`])
 /// and upstream's every-other-update alternation (`every_n = 2`). Near pure noise the decoded x0
 /// is mush, so an aux-only update there trains the adapter toward the frozen model's reading of
@@ -607,6 +608,17 @@ pub const PIXEL_PERCEPTUAL_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
     weight: 0.0,
     t_min: 0.0,
     t_max: 0.5,
+    every_n: 2,
+};
+
+/// The default schedule of the **body shape and surface-normal** losses (sc-2124): upstream
+/// ai-toolkit-perceptual's `[0.4, 0.8]` window, every-other-update alternation. Unlike the other
+/// decoded-x0 losses (upstream `[0, 1]`, here [`PIXEL_PERCEPTUAL_SCHEDULE`]) this window already
+/// excludes the top of the noise range, so it is kept. Weight `0` ⇒ off.
+pub const BODY_SURFACE_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
+    weight: 0.0,
+    t_min: 0.4,
+    t_max: 0.8,
     every_n: 2,
 };
 
@@ -2544,10 +2556,10 @@ mod tests {
         );
     }
 
-    /// sc-2124: every decoded-x0 (pixel-space) aux loss defaults to the latent losses' low-noise
-    /// window `[0, 0.5]` with every-other-update alternation, so a consumer that sets only a weight
-    /// never trains at pure noise; the latent losses keep their own additive default. Mutation:
-    /// default any of the six to `AuxLossSchedule::OFF` (window `[0, 1]`) ⇒ red.
+    /// sc-2124: the decoded-x0 aux losses whose upstream window was `[0, 1]` (depth, identity,
+    /// landmark, body proportion) default to the latent losses' low-noise window `[0, 0.5]`; body
+    /// shape / normal keep upstream's `[0.4, 0.8]`; all alternate every other update. Mutation:
+    /// default any of them to `AuxLossSchedule::OFF` (window `[0, 1]`) ⇒ red.
     #[test]
     fn pixel_space_aux_losses_default_to_the_low_noise_window() {
         let c = TrainingConfig::default();
@@ -2556,8 +2568,6 @@ mod tests {
             ("identity", c.identity_loss.schedule),
             ("landmark", c.face_landmark_loss.schedule),
             ("proportion", c.body_losses.proportion),
-            ("shape", c.body_losses.shape),
-            ("normal", c.body_losses.normal),
         ];
         for (name, s) in pixel {
             assert_eq!(
@@ -2571,6 +2581,16 @@ mod tests {
             PIXEL_PERCEPTUAL_SCHEDULE.t_max,
             LATENT_PERCEPTUAL_SCHEDULE.t_max
         );
+        for (name, s) in [
+            ("shape", c.body_losses.shape),
+            ("normal", c.body_losses.normal),
+        ] {
+            assert_eq!(
+                (s.weight, s.t_min, s.t_max, s.every_n),
+                (0.0, 0.4, 0.8, 2),
+                "{name}"
+            );
+        }
     }
 
     #[test]

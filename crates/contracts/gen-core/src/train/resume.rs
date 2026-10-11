@@ -431,7 +431,7 @@ mod tests {
         let all = training_config_fingerprint(&on);
         assert!(
             all.ends_with(
-                ";body_shape=0.2/0.0-0.5/2,min_cos=0.2;normal=0.3/0.0-0.5/2,subject=false"
+                ";body_shape=0.2/0.4-0.8/2,min_cos=0.2;normal=0.3/0.4-0.8/2,subject=false"
             ),
             "{all}"
         );

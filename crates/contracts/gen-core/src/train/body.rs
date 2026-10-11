@@ -154,9 +154,9 @@ impl Default for BodyLossesConfig {
         Self {
             proportion: super::PIXEL_PERCEPTUAL_SCHEDULE,
             include_head: false,
-            shape: super::PIXEL_PERCEPTUAL_SCHEDULE,
+            shape: super::BODY_SURFACE_SCHEDULE,
             shape_min_cos: Self::DEFAULT_SHAPE_MIN_COS,
-            normal: super::PIXEL_PERCEPTUAL_SCHEDULE,
+            normal: super::BODY_SURFACE_SCHEDULE,
             normal_restrict_to_subject: false,
             pose_model_dir: None,
             shape_model_dir: None,

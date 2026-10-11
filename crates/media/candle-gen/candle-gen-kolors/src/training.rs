@@ -1142,7 +1142,7 @@ mod tests {
         /// The aux term is the depth loss of THE trainer's x0 estimate times the ε gain
         /// `min(1, √ᾱ/√(1−ᾱ))` (sc-2124): recomputed independently from the model output with the
         /// trainer's parameterisation, it matches the step's aux value at a high-σ timestep (gain
-        /// < 1). Mutations: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red; drop
+        /// < 1), and every adapter gradient is the ungained term's gradient times the gain. Mutations: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red; drop
         /// the gain (`aux_loss` instead of `aux_loss_gained`) ⇒ red.
         #[test]
         fn aux_term_is_the_gained_depth_loss_of_the_recovered_x0() {
@@ -1151,7 +1151,7 @@ mod tests {
             let _ = d.sample(1, &sched);
             let s2 = d.sample(2, &sched).plan(0.5).unwrap().unwrap();
             let t = timestep_at(s2.noise_level());
-            let (l, _) = run(&f, t, Some(&s2));
+            let (l, g) = run(&f, t, Some(&s2));
             let noisy = ddpm_noise(&f.alphas, &f.x0, &f.noise, t).unwrap();
             let eps = f
                 .unet
@@ -1169,18 +1169,37 @@ mod tests {
             let x0 = ((&noisy - (eps * (1.0 - ab).sqrt()).unwrap()).unwrap() / ab.sqrt()).unwrap();
             let gain = (ab.sqrt() / (1.0 - ab).sqrt()).min(1.0) as f32;
             assert!(gain < 0.9, "t={t}: a high-σ step (σ_ve > 1), gain {gain}");
-            let want = s2
-                .aux_loss(&x0)
-                .unwrap()
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap()
-                * gain;
+            let ungained = s2.aux_loss(&x0).unwrap().unwrap();
+            let want = ungained.to_scalar::<f32>().unwrap() * gain;
             let got = l.aux.unwrap();
             assert!(
                 (got - want).abs() <= 1e-5 * want.abs().max(1.0),
                 "{got} vs {want}"
             );
+            // The gradient reaching the adapter is the ungained one scaled by the gain (to f32
+            // accumulation-order noise: 1e-3 of the largest gradient entry across the adapter).
+            let g_ungained = ungained.backward().unwrap();
+            let floats = |g: &GradStore, v: &Var| -> Vec<f32> {
+                grad_bits(g, v).into_iter().map(f32::from_bits).collect()
+            };
+            let scale = f
+                .vars
+                .iter()
+                .flat_map(|v| floats(&g_ungained, v))
+                .fold(0f32, |m, y| m.max(y.abs()))
+                * gain;
+            assert!(scale > 0.0, "no nonzero aux gradient to compare");
+            let mut checked = 0;
+            for (i, v) in f.vars.iter().enumerate() {
+                let (a, b) = (floats(&g, v), floats(&g_ungained, v));
+                assert_eq!(a.len(), b.len(), "var {i}");
+                for (x, y) in a.iter().zip(&b) {
+                    let want = y * gain;
+                    assert!((x - want).abs() <= 1e-3 * scale, "var {i}: {x} vs {want}");
+                    checked += usize::from(want.abs() > 0.1 * scale);
+                }
+            }
+            assert!(checked > 0, "no material aux gradient to compare");
         }
 
         /// (c) Depth off is bit-identical to the pre-epic-2123 step body (reproduced verbatim).
