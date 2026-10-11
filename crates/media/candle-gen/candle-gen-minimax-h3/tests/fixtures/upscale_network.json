@@ -1,0 +1,17 @@
+{
+  "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+  "upstream_file_sha256": "f144c83b3f4c438bf33daa0b24ed237ecbd4d2c578250e0e9d3b6b2ce68387f1",
+  "comfy_commit": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+  "comfy_model_sha256": "15f0395cf0dbe6e5c13fd859ff359eacc7761b4e15f60aa0038853985d0e599b",
+  "comfy_sampling_sha256": "8afdc665272589a567792bb652389df7d4a83f69574c2b7e5b3d533d55592990",
+  "comfy_samplers_sha256": "f2c264ca9d394612f828e3ffe167c856a278a10e1711b269f0ba65dccb66393f",
+  "comfy_vae_sha256": "8a889ea28fc24b13edfbdea9e85b8a0762b2e7e079bbe34db026c6e6d4f5a556",
+  "guide_source_sha256": "6ce377cdf9099270049421f38932164bbb469150cbbc75a47bfc4ccc3c4ae139",
+  "torch": "2.10.0+cu130",
+  "device": "cpu",
+  "dtype": "float32",
+  "max_absolute_tolerance": 3e-05,
+  "max_relative_tolerance": 0.0001,
+  "fixture_sha256": "c87bfe8b30835a12ddd2ba91aa817bcef140890df929e1f82b5acb5d5c9f69e2",
+  "role": "weights-free algorithm reference; not quality or real-weight runtime evidence"
+}

@@ -1,0 +1,1187 @@
+{
+  "story": "sc-25328",
+  "date_utc": "2026-10-10",
+  "gate": "COMPLETE",
+  "decision": "NO-GO",
+  "decision_reason": "No useful faithful improvement demonstrated on two of three including a non-H3 case; material bird/face/text preservation regressions. This is a completed negative quality experiment, not a setup/resource failure.",
+  "production": "S2-S9 unstarted pending plan revision; no product capability or pin change",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-e4b79931-7be6-f216-460a-f5405cfafffe, 97887 MiB, 596.36",
+  "build": {
+    "native": "Candle/CUDA12.9",
+    "toolset": "MSVC14.44.35207, cl19.44.35227",
+    "reference": "Torch2.10.0+cu130, GPU serial reference only",
+    "memory": "200ms sampled process RSS and assigned-device used memory; not exact allocation maxima",
+    "warmth": "One serial bounded campaign with installed OS/cache assets, no controlled cold/warm distribution"
+  },
+  "pins": {
+    "upsampler": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+    "comfy": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+    "h3": "6818f6c32d12b210915e44ad56a4228c2608f160",
+    "seedvr2": "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
+  },
+  "assets": [
+    {
+      "repo": "sandpies/ComfyUI-H3-Video-Upsampler",
+      "rev": "9337fe00d0753d249aba6181b81d3b6a62bccb52",
+      "filename": "lora/h3upscale_v2_x2.safetensors",
+      "hash": "ff671fa94e377fd277319a89c366a67f49b97ae6528c8ac3b0c5e0a3b254c56c"
+    },
+    {
+      "repo": "LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "rev": "3f941d5d182014dd5c0a5e16330420ee2d4aa0c6",
+      "filename": "minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+      "hash": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6"
+    }
+  ],
+  "authorization": "User confirmed written LoRA authorization via online form for requested use; user-provided evidence, not an independently audited permissive public grant. No weights/source media redistributed.",
+  "settings": {
+    "frames": 39,
+    "input": [
+      512,
+      288
+    ],
+    "output": [
+      1024,
+      576
+    ],
+    "fps": 24,
+    "seed": 444,
+    "denoise": 0.1,
+    "sigma": 0.5714285969734192,
+    "updates": 1,
+    "lora_strength": 1.0,
+    "refiner_targets_applied": 312,
+    "tier": "unaccelerated Ref2VA BF16 / learned FP16",
+    "caption": "h3upscale, increase resolution and restore fine details while preserving the original content and visual style.",
+    "noise_fixture_sha256": "33e5c0f440335c880c310a64a50817f11225aebe84a663019c6690dc9a43d398"
+  },
+  "numerical_scope": "Actual full learned network on each captured source latent; independently exported tiny composed VAE/network normalization, convolution/interpolation, actual guide layout/pixels and actual schedule fixtures. Not a full real-weight end-to-end ComfyUI RefDiT clip equivalence assertion.",
+  "visual_review": {
+    "reviewers": "Implementation agent and independent epic coordinator",
+    "frames": [
+      0,
+      19,
+      38
+    ],
+    "all39_decoded_metrics": true,
+    "metrics_caveat": "descriptive deviations from bicubic; no high-resolution truth, no automatic quality score",
+    "useful_cases": "at most one potential H3 case; zero established non-H3 cases"
+  },
+  "final_binary_confirmation": {
+    "exit_code": 0,
+    "wall_seconds": 97.20527470001252,
+    "peak": {
+      "host_rss_bytes": 5987729408,
+      "device_used_mib": 73283,
+      "samples": 359
+    },
+    "executable_sha256": "18177afc59ed6cee12897e12df418af332cafae4b79d698c33f17731900b9211",
+    "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+    "log": "guided.log",
+    "stages": {
+      "status": "native_output_emitted_unreviewed",
+      "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+      "backend": "candle/cuda",
+      "tier": "bf16",
+      "upscaler_dtype": "fp16",
+      "frames": 39,
+      "width": 1024,
+      "height": 576,
+      "denoise": 0.10000000149011612,
+      "sigma": 0.5714285969734192,
+      "guide": true,
+      "seed": 444,
+      "stages": [
+        {
+          "stage": "source_encode",
+          "seconds": 15.8731669
+        },
+        {
+          "stage": "source_guide_decode_resize_encode",
+          "seconds": 13.9659576
+        },
+        {
+          "stage": "learned_upscale",
+          "seconds": 0.6527636
+        },
+        {
+          "stage": "caption_ref2va_conditioner",
+          "seconds": 23.6990595
+        },
+        {
+          "stage": "unaccelerated_ref2va_dit_lora_load",
+          "seconds": 24.9366736
+        },
+        {
+          "stage": "one_euler_refinement_frozen_audio",
+          "seconds": 6.9241854
+        },
+        {
+          "stage": "decode_rgb24",
+          "seconds": 10.697662
+        }
+      ],
+      "internal_audio": "clean_zero_frozen",
+      "delivery_audio": "mux original source soundtrack externally under AAC policy"
+    },
+    "raw_rgb_exactly_equal_to_campaign": true,
+    "result_sha256": "d434003edca393bc200195c22b6408ebe9bb4733af804c5db92218c53114fdd3"
+  },
+  "cases": [
+    {
+      "kind": "h3",
+      "source_provenance": {
+        "kind": "h3",
+        "source": "https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/6818f6c32d12b210915e44ad56a4228c2608f160/assets",
+        "provenance": "Official H3 video demo"
+      },
+      "original_sha256": "d66903241362e224085cc93f7a5e70fba6ab378d0ac6ff6af83acf2559849a42",
+      "normalization": {
+        "start_seconds": 0,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "828af4b619ccfba5f79b30acdca470dec6af26c85d0b29ea042ff03d876183aa",
+      "bicubic_sha256": "61bb4a93d924e8ed6efeb4da7f80717bfc407ce18d8b523cc67f6e4fb31dc832",
+      "original_dimensions_fps": "1344x768@24",
+      "findings": {
+        "useful_detail": "marginal/unproven",
+        "preservation": "Scene/person retained; slightly crisper ship/window edges, but altered console markings and lighting are not established faithful detail. At most one potential positive case.",
+        "seedvr2": "Scene retained with crisper edges and changed console detail; complementary baseline, not proof of universally superior fidelity."
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 103.87163950002287,
+          "peak": {
+            "host_rss_bytes": 5987254272,
+            "device_used_mib": 73244,
+            "samples": 368
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 18.0964098
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 13.7600236
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.666397
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 24.6901858
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 28.0714903
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.7305179
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 11.1344242
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "d434003edca393bc200195c22b6408ebe9bb4733af804c5db92218c53114fdd3",
+          "artifact": "h3/guided.mp4",
+          "intermediates_sha256": "d2ed18b6f186aebe6ce00ce65ba68b79f7a7470c014bef2f35aa25aa55e48e7a",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 84.72367550001945,
+          "peak": {
+            "host_rss_bytes": 5985943552,
+            "device_used_mib": 72931,
+            "samples": 304
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 16.0344935
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.75e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6492564
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 24.1061518
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 27.8128234
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 5.0482373
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 10.6415282
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "fb3cd78f649af58dee56ac8817494d9d661f7cbc0edf2e6468172755655be34d",
+          "artifact": "h3/unguided.mp4",
+          "intermediates_sha256": "ee732de52dae5f82ee303ee57901a22b10efef840688216125f907def3d83c12",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 28.248620599973947,
+          "peak": {
+            "host_rss_bytes": 5759074304,
+            "device_used_mib": 12577,
+            "samples": 102
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 15.8637795
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.6e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6545627
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 11.3265479
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "bb9b138bfe65f9f8c36a2ec58317bfd294291426b796878098913257e637d9e4",
+          "artifact": "h3/latent-only.mp4",
+          "intermediates_sha256": "ee732de52dae5f82ee303ee57901a22b10efef840688216125f907def3d83c12",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 82.01600000000326,
+        "peak": {
+          "host_rss_bytes": 7131844608,
+          "device_used_mib": 58691,
+          "samples": 306
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 3.4842431,
+          "video_seconds": 78.1869318
+        },
+        "result_sha256": "54c7958842f4a482af70f10d8c0d65a3fd4b61e3af7dc4ff3a7fd88fdaa9dfe9",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "h3/seedvr2.mp4"
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.009765625,
+        "max_relative": 0.0018811136192626034,
+        "rms": 0.0011102167190983891,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 2.589176893234253,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 8.058774948120117,
+          "frame_mae_begin_middle_tail": [
+            8.485337257385254,
+            7.891180992126465,
+            8.1404390335083
+          ],
+          "adjacent_frame_change_mean": 2.8693020343780518,
+          "temporal_change_departure_mean": 2.6787467002868652,
+          "temporal_change_departure_max": 3.246212959289551,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 8.432127952575684,
+          "frame_mae_begin_middle_tail": [
+            8.692566871643066,
+            8.30887222290039,
+            8.561264991760254
+          ],
+          "adjacent_frame_change_mean": 2.807738780975342,
+          "temporal_change_departure_mean": 2.6838958263397217,
+          "temporal_change_departure_max": 3.204956531524658,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 6.734188556671143,
+          "frame_mae_begin_middle_tail": [
+            7.277015209197998,
+            6.615701675415039,
+            6.808836936950684
+          ],
+          "adjacent_frame_change_mean": 2.7977981567382812,
+          "temporal_change_departure_mean": 2.4914252758026123,
+          "temporal_change_departure_max": 3.1502504348754883,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 8.48863697052002,
+          "frame_mae_begin_middle_tail": [
+            6.2199273109436035,
+            9.226237297058105,
+            8.761632919311523
+          ],
+          "adjacent_frame_change_mean": 2.706526279449463,
+          "temporal_change_departure_mean": 3.594377279281616,
+          "temporal_change_departure_max": 5.055352210998535,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "h3/review-begin-middle-tail.png": "fcd91befafa1fbada27109e4f0b5b69d3993eade93ea82f911162831cb82345c",
+        "h3/review-full-frame0.png": "b7c3b0bd6bdd0bd9d928687756b7be98c66f08bde664578c69dca8d7081e5dc2",
+        "h3/review-full-frame19.png": "edc511ba16aca17cc7b3a8e7ec188a912eddaf93a62ec5d37261163227fe6bab",
+        "h3/review-full-frame38.png": "8da3f7904256b7e37970b22d0c4189c4d8e48496db92379d8ab634030da5856e"
+      }
+    },
+    {
+      "kind": "other-model",
+      "source_provenance": {
+        "kind": "other-model",
+        "url": "https://cloud.video.taobao.com/vod/4szTT1B0LqXvJzmuEURfGRA-nllnqN_G2AT0ZWkQXoQ.mp4",
+        "sha256": "e5c3b31ea6388f52aecccf09836bc816f892013e991045d4ac655c03f47aed9f",
+        "provenance": "Official Wan2.2 T2V model-card Video Demo",
+        "reference": "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/blob/c8c270b13ee05bfa474194ac9fb07a5868a97cea/README.md",
+        "rights": "Model repository Apache-2.0; separate demo-media grant unstated; private prototype input only"
+      },
+      "original_sha256": "e5c3b31ea6388f52aecccf09836bc816f892013e991045d4ac655c03f47aed9f",
+      "normalization": {
+        "start_seconds": 59.1,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "275969ff4747a68e2430b5894fe78b94caf3acd83f80d7382bb5eac7fed3eaf6",
+      "bicubic_sha256": "65198b38d752e08fdcf493601ef84a95496e909e8b26cb861c50133f2cb7aa30",
+      "original_dimensions_fps": "1280x720@30",
+      "findings": {
+        "useful_detail": "no",
+        "preservation": "The actual test crop shows a nightclub and robot with rapid viewpoint changes. Guided refinement softens/redraws the robot and crowd, changes faces and corrupts the visible Generated by Wan AI watermark; lit floor/beams acquire weave patterns. Regressions visible at frames 0/19/38.",
+        "seedvr2": "Sharper floor/robot outlines on selected frames, with substantial texture/lighting and crowd changes; no universal superiority claim."
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 106.02825879998272,
+          "peak": {
+            "host_rss_bytes": 5987491840,
+            "device_used_mib": 73241,
+            "samples": 379
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 16.0709163
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 14.1178564
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.7282326
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 29.4153762
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 27.5003898
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.7574333
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 10.9748584
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "16111f71c99bfc6e0a4b85c26a2a76acd60cf17b6e1e962775569b2fe06c216f",
+          "artifact": "other-model/guided.mp4",
+          "intermediates_sha256": "de97f3911938f829b5ca35081453cb260e5decab68c70a97b71b582fcaba1b74",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 86.28597880003508,
+          "peak": {
+            "host_rss_bytes": 5985468416,
+            "device_used_mib": 72925,
+            "samples": 305
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 15.9068346
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.4e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6467171
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 26.0094093
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 27.1028668
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 5.0149933
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 11.1625054
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "0245228faf84000ebc99b2baa732f3a6b6521cd9b1ee24d155239cd324e2a1c0",
+          "artifact": "other-model/unguided.mp4",
+          "intermediates_sha256": "865de8e6797aaabf9e9eb81770c04ab05437d31ea06d6c42cf088cee32928a83",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 32.32060910004657,
+          "peak": {
+            "host_rss_bytes": 5892284416,
+            "device_used_mib": 12699,
+            "samples": 114
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 20.0798459
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 1.58e-05
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6776163
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 11.0435948
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "9c7d016f9c467e88950673cec33cbfbc0c94918b0484bd4c81a5209572ff2450",
+          "artifact": "other-model/latent-only.mp4",
+          "intermediates_sha256": "865de8e6797aaabf9e9eb81770c04ab05437d31ea06d6c42cf088cee32928a83",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 83.73399999999674,
+        "peak": {
+          "host_rss_bytes": 7131369472,
+          "device_used_mib": 58691,
+          "samples": 307
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 2.9308473,
+          "video_seconds": 80.4998352
+        },
+        "result_sha256": "df75fbe5cdebdb35d5ba7ed879ac5035fa6ea53d50ef4820708e0881c07b0302",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "other-model/seedvr2.mp4"
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.010986328125,
+        "max_relative": 0.002142041127189642,
+        "rms": 0.0011623637983575463,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 32.188133239746094,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 17.070110321044922,
+          "frame_mae_begin_middle_tail": [
+            11.595312118530273,
+            19.26978874206543,
+            17.44371795654297
+          ],
+          "adjacent_frame_change_mean": 26.572126388549805,
+          "temporal_change_departure_mean": 21.294221878051758,
+          "temporal_change_departure_max": 29.683761596679688,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 18.104496002197266,
+          "frame_mae_begin_middle_tail": [
+            12.521550178527832,
+            20.27915382385254,
+            19.156145095825195
+          ],
+          "adjacent_frame_change_mean": 25.611059188842773,
+          "temporal_change_departure_mean": 22.4445743560791,
+          "temporal_change_departure_max": 30.4898681640625,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 14.368681907653809,
+          "frame_mae_begin_middle_tail": [
+            7.9131083488464355,
+            17.265823364257812,
+            12.85342788696289
+          ],
+          "adjacent_frame_change_mean": 26.488788604736328,
+          "temporal_change_departure_mean": 18.46572494506836,
+          "temporal_change_departure_max": 25.987964630126953,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 28.53559112548828,
+          "frame_mae_begin_middle_tail": [
+            4.853270530700684,
+            34.34651565551758,
+            32.3670654296875
+          ],
+          "adjacent_frame_change_mean": 27.855112075805664,
+          "temporal_change_departure_mean": 35.52947998046875,
+          "temporal_change_departure_max": 49.32517623901367,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "other-model/review-begin-middle-tail.png": "e080b2486bb6e311565476a28447bff100910c94284b8d25c10dc4d62f632cc1",
+        "other-model/review-full-frame0.png": "f9ce37e1ff9cdd71ec4d87c1760fa2eab6409bd95232ec34b549206c48fd4b89",
+        "other-model/review-full-frame19.png": "b829ca2694348d27e54b094f8724be3a471f6e60bbe0450312fd0d7dd09c12cc",
+        "other-model/review-full-frame38.png": "39025e9ed6a8bbb3c2475e4d3703b3d580b048a9524181d48cbbe1ae0a4dd03a"
+      }
+    },
+    {
+      "kind": "live-action",
+      "source_provenance": {
+        "kind": "live-action",
+        "url": "https://upload.wikimedia.org/wikipedia/commons/7/7e/Birds_at_a_dock.webm",
+        "sha256": "031f4f3903c5f16e8a628be3bc16d3b3a52a6bc33407916b4bac8dd14665e140",
+        "provenance": "Birds taking flight at a dock in San Francisco, May 28 2011",
+        "author": "Editor",
+        "reference": "https://commons.wikimedia.org/wiki/File:Birds_at_a_dock.webm",
+        "license": "CC-BY-3.0",
+        "license_url": "https://creativecommons.org/licenses/by/3.0/",
+        "changes": "Any normalized experiment crops/resamples/resizes must be recorded separately"
+      },
+      "original_sha256": "031f4f3903c5f16e8a628be3bc16d3b3a52a6bc33407916b4bac8dd14665e140",
+      "normalization": {
+        "start_seconds": 1,
+        "fps": 24,
+        "width": 512,
+        "height": 288,
+        "frames": 39,
+        "resize": "lanczos",
+        "audio": "source AAC transcode; normalized test fixture only"
+      },
+      "source_fixture_sha256": "3d1b8e98262c6f44870e0c1eace6fcec22a3afd1b3e6de6da306e81cd89fc8f5",
+      "bicubic_sha256": "a60d26a60d9ea3317981f26b7f6deba76dca5eca9127a9b8f612ccbd3f5bf2fa",
+      "original_dimensions_fps": "1920x1080 approximately30fps (33/34ms source PTS)",
+      "findings": {
+        "useful_detail": "no",
+        "preservation": "Source bird outlines and moving wings are smeared/angular in guided output. Waterfront, water, masts and trees acquire line/weave artifacts. Beginning/middle/tail confirm degraded preservation; denoise-zero is less altered but still softens feathers/outlines.",
+        "seedvr2": "Selected frames retain bird outlines and waterfront structure more clearly, with changed surface texture; no ground-truth recovery claim."
+      },
+      "variants": [
+        {
+          "variant": "guided",
+          "exit_code": 0,
+          "wall_seconds": 99.95438910002122,
+          "peak": {
+            "host_rss_bytes": 5987766272,
+            "device_used_mib": 73245,
+            "samples": 362
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": true,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 16.3522336
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 14.0169007
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6623524
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 26.1298693
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 24.7533586
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 6.716166
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 10.8711568
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "7b042abc879e4a19a640a831bd6511e197825765e9facec4990db9e42ddd6efd",
+          "artifact": "live-action/guided.mp4",
+          "intermediates_sha256": "142326940643f856fb467fe25fb65fd9f92df740ac43efce269979da593ba9c8",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "unguided",
+          "exit_code": 0,
+          "wall_seconds": 82.43508900003508,
+          "peak": {
+            "host_rss_bytes": 5986074624,
+            "device_used_mib": 72936,
+            "samples": 303
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.10000000149011612,
+            "sigma": 0.5714285969734192,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 16.0536515
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 5.1e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6501875
+              },
+              {
+                "stage": "caption_ref2va_conditioner",
+                "seconds": 23.7417608
+              },
+              {
+                "stage": "unaccelerated_ref2va_dit_lora_load",
+                "seconds": 25.8923729
+              },
+              {
+                "stage": "one_euler_refinement_frozen_audio",
+                "seconds": 5.0335482
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 10.6589785
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "9528ba3764e778185aa3213ae9a1ebbcf945362621f9dacb7cd70fea2056cb3f",
+          "artifact": "live-action/unguided.mp4",
+          "intermediates_sha256": "4202aa3aae734b65a5510f6e49ba003edc131f32db6289aa3f10040248f4f539",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        },
+        {
+          "variant": "latent-only",
+          "exit_code": 0,
+          "wall_seconds": 27.495603699993808,
+          "peak": {
+            "host_rss_bytes": 5796638720,
+            "device_used_mib": 12515,
+            "samples": 103
+          },
+          "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+          "stages": {
+            "status": "native_output_emitted_unreviewed",
+            "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+            "backend": "candle/cuda",
+            "tier": "bf16",
+            "upscaler_dtype": "fp16",
+            "frames": 39,
+            "width": 1024,
+            "height": 576,
+            "denoise": 0.0,
+            "sigma": null,
+            "guide": false,
+            "seed": 444,
+            "stages": [
+              {
+                "stage": "source_encode",
+                "seconds": 15.7501382
+              },
+              {
+                "stage": "source_guide_decode_resize_encode",
+                "seconds": 5.6e-06
+              },
+              {
+                "stage": "learned_upscale",
+                "seconds": 0.6451358
+              },
+              {
+                "stage": "decode_rgb24",
+                "seconds": 10.7472066
+              }
+            ],
+            "internal_audio": "clean_zero_frozen",
+            "delivery_audio": "mux original source soundtrack externally under AAC policy"
+          },
+          "result_sha256": "e04f5a65b14491b41cb0a68f2c455c5d4b6c025c082cfa1d8700c6c5551cff7e",
+          "artifact": "live-action/latent-only.mp4",
+          "intermediates_sha256": "4202aa3aae734b65a5510f6e49ba003edc131f32db6289aa3f10040248f4f539",
+          "geometry_timing_audio": "39 frames 1024x576@24, PTS i/24 within 1/12288s; source AAC start/duration within 1/sample_rate, every decoded soundtrack hash equals normalized fixture"
+        }
+      ],
+      "seedvr2": {
+        "exit_code": 0,
+        "wall_seconds": 83.5,
+        "peak": {
+          "host_rss_bytes": 7131770880,
+          "device_used_mib": 58531,
+          "samples": 313
+        },
+        "memory_method": "200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
+        "stages": {
+          "backend": "candle/cuda",
+          "model": "SeedVR2 3B",
+          "tier": "BF16",
+          "seed": 444,
+          "frames": 39,
+          "width": 1024,
+          "height": 576,
+          "load_seconds": 3.1834961,
+          "video_seconds": 80.0067884
+        },
+        "result_sha256": "d9473503ce4c6325ee4d77d840834f6a3d52a433109b66d0fbfa1a89412b3abd",
+        "installed_asset_sha256": {
+          "ema_vae_fp16.safetensors": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+          "seedvr2_ema_3b_fp16.safetensors": "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
+        },
+        "executable_sha256": "d12621545ff95064d195d36424c4ef460918e527fa7c7882ca7e3b75c82040f5",
+        "binary_hash_method": "Hashed unchanged owning-crate binary after serial comparator campaign; no intervening rebuild.",
+        "artifact": "live-action/seedvr2.mp4"
+      },
+      "real_upscaler_parity": {
+        "upstream_commit": "36cb612ec3df30094eeb4fec66f1528925ebba73",
+        "torch": "2.10.0+cu130",
+        "reference_device": "cuda",
+        "max_abs": 0.01171875,
+        "max_relative": 0.0024671052631578946,
+        "rms": 0.0011064015561714768,
+        "tolerances": {
+          "max_abs": 0.08,
+          "max_relative": 0.015
+        },
+        "pass": true,
+        "named_deviation": "Candle FP16 Conv3d temporal-tap accumulation and intermediate separable resize rounding versus upstream fused PyTorch Conv3d/trilinear; checked on actual input/weights"
+      },
+      "delivery_metrics": {
+        "bicubic": {
+          "frame_mae_mean": 0.0,
+          "frame_mae_begin_middle_tail": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "adjacent_frame_change_mean": 4.7288079261779785,
+          "temporal_change_departure_mean": 0.0,
+          "temporal_change_departure_max": 0.0,
+          "decoded_source_audio_equal": true
+        },
+        "guided": {
+          "frame_mae_mean": 14.203156471252441,
+          "frame_mae_begin_middle_tail": [
+            15.140947341918945,
+            13.979393005371094,
+            14.235170364379883
+          ],
+          "adjacent_frame_change_mean": 2.7580924034118652,
+          "temporal_change_departure_mean": 5.8304524421691895,
+          "temporal_change_departure_max": 7.83028507232666,
+          "decoded_source_audio_equal": true
+        },
+        "unguided": {
+          "frame_mae_mean": 14.707490921020508,
+          "frame_mae_begin_middle_tail": [
+            15.626509666442871,
+            14.469311714172363,
+            14.746532440185547
+          ],
+          "adjacent_frame_change_mean": 2.6881344318389893,
+          "temporal_change_departure_mean": 5.797913074493408,
+          "temporal_change_departure_max": 7.744662284851074,
+          "decoded_source_audio_equal": true
+        },
+        "latent-only": {
+          "frame_mae_mean": 10.7653169631958,
+          "frame_mae_begin_middle_tail": [
+            11.106230735778809,
+            10.61184310913086,
+            10.673805236816406
+          ],
+          "adjacent_frame_change_mean": 2.844569444656372,
+          "temporal_change_departure_mean": 5.53828239440918,
+          "temporal_change_departure_max": 7.133034706115723,
+          "decoded_source_audio_equal": true
+        },
+        "seedvr2": {
+          "frame_mae_mean": 10.51870059967041,
+          "frame_mae_begin_middle_tail": [
+            8.680634498596191,
+            10.6407470703125,
+            11.284473419189453
+          ],
+          "adjacent_frame_change_mean": 4.298194885253906,
+          "temporal_change_departure_mean": 6.9341959953308105,
+          "temporal_change_departure_max": 8.547538757324219,
+          "decoded_source_audio_equal": true
+        }
+      },
+      "review_artifacts": {
+        "live-action/review-begin-middle-tail.png": "94f76786e000a6c3b4bd3000fe95e2d8e8d51193ee0302fea5f94d855a708c7e",
+        "live-action/review-full-frame0.png": "246f230641f1eb2bd489a0f6f0a6f835599cead0e128b01df4133f1f627652ec",
+        "live-action/review-full-frame19.png": "320088a4b8155399827f922ae8d5fb343f537c63f68bc552c535275762624e7f",
+        "live-action/review-full-frame38.png": "67b8483a647c7fcefaa2f7007f595cb79aeeebebbb88d9959354224c278083f3"
+      }
+    }
+  ],
+  "local_platform_limits": {
+    "broad_discovery": {
+      "os": "Windows",
+      "python": "3.14.4",
+      "count": 1445,
+      "failures": 38,
+      "errors": 31,
+      "skipped": 64,
+      "result": "FAILED; not a successful Linux workflow equivalent",
+      "log_sha256": "41c91353df847a94c516b5720245b38f7a9d1a3d9e9b6b0ef3286146cd7fd5db",
+      "failure_groups": "Unchanged KV proof/noise-floor, Mage/LTX fixture paths/promotion, POSIX process supervision and campaign/tooling tests; full case list and tracebacks retained in external log."
+    },
+    "native_windows_workflow": {
+      "python": "3.12.10 exact workflow pin",
+      "tests": 4,
+      "result": "PASS",
+      "log": "windows-supervisor-pinned31210.log"
+    },
+    "extra_interpreter_probe": {
+      "python": "3.12.11",
+      "tests": 4,
+      "failures": 1,
+      "failure": "test_child_cap_aborts_and_reaps: WaitForSingleObject returned258; no version-causation claim",
+      "log": "windows-supervisor-tests.log"
+    },
+    "baseline_blob_proof": {
+      "scripts/media_campaign_windows.py": {
+        "base": "1cea81ed161ac5fcf2257edf3a90f10cbf3c0308",
+        "current": "1cea81ed161ac5fcf2257edf3a90f10cbf3c0308"
+      },
+      "scripts/media_campaign_supervisor.py": {
+        "base": "c570f68444d024ac3175d9b982a5532aa16a0b82",
+        "current": "c570f68444d024ac3175d9b982a5532aa16a0b82"
+      },
+      "scripts/tests/test_media_campaign_supervisor.py": {
+        "base": "48bfd8d7bd4892e9e7abf612a66a920bdf793631",
+        "current": "48bfd8d7bd4892e9e7abf612a66a920bdf793631"
+      }
+    },
+    "unrelated_source_proof": "git diff BASE -- scripts/tests scripts/ci/real-weights is empty; no S1 source imports by these unrelated modules",
+    "scope": "No unrelated tooling changes; S1 acceptance tests passed separately. Linux/macOS CI execution remains remote platform verification."
+  },
+  "local_validation": {
+    "workflow": ".github/workflows/ci.yml",
+    "generation": {
+      "command": "cargo test --locked --lib --tests -j 1 -p 'candle-gen*'",
+      "initial": {
+        "groups": 57,
+        "passed": 3794,
+        "failed": 1,
+        "ignored": 228
+      },
+      "remaining": {
+        "groups": 11,
+        "passed": 619,
+        "failed": 0,
+        "ignored": 35
+      },
+      "exact_retest": {
+        "original_result": "FAILED on unchanged POSIX /tmp fixture: Windows os error 3 (path missing)",
+        "test": "tests::load_reports_missing_single_file_source",
+        "resolved_fixture": "C:/tmp/sdxl.safetensors",
+        "parent_initially_absent": true,
+        "file_absent": true,
+        "preparation": "Created only empty C:/tmp; ran the exact failed test once in the original compiled CPU binary; removed only that newly created empty directory nonrecursively",
+        "retest": "PASS 1/1",
+        "source": "crates/media/candle-gen/candle-gen-sdxl/src/lib.rs",
+        "base_blob": "5759dbad1d536307f1c51d5f671fe9d0e008b1e7",
+        "current_blob": "5759dbad1d536307f1c51d5f671fe9d0e008b1e7",
+        "source_changes": false,
+        "log_sha256": "48c2470cafb10c7fa88405da896ddeeb413c7d742881dc1897ff231316923d75"
+      },
+      "unique_passed": 4414,
+      "ignored": 263,
+      "result": "COMPLETE; all selected runnable targets pass after reversible fixture-parent setup; original failure retained",
+      "continuation": "Exact wildcard --no-run --message-format=json graph; only SDXL unrun integration plus SeedVR2, SenseNova, SVD, Wan, Z-Image binaries executed, using Cargo artifact receipts and RUST_TEST_THREADS=1"
+    },
+    "cpu": {
+      "commands": [
+        "cargo clippy --locked -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cpu --features candle-audio/testkit --all-targets -- -D warnings",
+        "cargo doc --locked --no-deps -p core-llm -p core-llm-testkit -p sceneworks-gen-core -p sceneworks-gen-core-testkit -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cpu -p runtime-catalog",
+        "cargo test --locked --lib -j 1 -p candle-llm -p candle-quant-kernels -p \"candle-audio*\" -p runtime-cpu",
+        "cargo test --locked -j 1 -p candle-llm --test conformance",
+        "cargo test --locked -j 1 -p candle-audio-stable-audio-3 --test provider --test dtype_policy --test variant_quality --test conformance --test sampler_oracle --test same_oracle --test primitive_oracle --test listening_stimuli --test reference_audio --test reference_window --test audio_edit --test adapters -- --nocapture",
+        "cargo test --locked --no-default-features --lib -p runtime-cpu",
+        "cargo test --locked --no-default-features --features audio --lib -p runtime-cpu",
+        "cargo test --locked --no-default-features --features media --lib -p runtime-cpu"
+      ],
+      "result": "PASS exit 0",
+      "test_summary": {
+        "groups": 41,
+        "passed": 1591,
+        "failed": 0,
+        "ignored": 77
+      }
+    },
+    "cuda": {
+      "commands": [
+        "cargo test --locked --lib --tests -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda --no-run",
+        "cargo test --locked -p candle-gen-catalog --features cuda tests::every_registered_memory_strategy_rejects_cross_route_decode_geometry -- --exact",
+        "cargo clippy --locked --all-targets -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda -- -D warnings",
+        "cargo doc --locked --no-deps -p candle-llm -p candle-quant-kernels -p \"candle-gen*\" -p \"candle-audio*\" -p runtime-cuda --features cuda"
+      ],
+      "result": "PASS exit 0; compile-only wildcard, named catalog test, all-target lint and docs; no broad GPU runtime"
+    },
+    "scope": "Exact locally available CPU/Windows CUDA PR workflow checks; Linux/macOS native CI execution is not asserted",
+    "logs": {
+      "full-cpu-gen.log": "ac961d30c97399fa9d4cc2c955716d1b85fb5d18f12962c191872470ad87ce5d",
+      "cpu-gen-remaining.log": "ce9f1d032f4dc1f0066764457b3e573cdf408a9be986472cf11a6e402c30782a",
+      "cpu-gen-remaining.json": "373851cf583bb43263a47cb672ce52837c3c7f18544cc58008a5dbe44b90b7fd",
+      "cpu-gen-artifacts.jsonl": "837a396d2a3cbf31c5db68e87c25df7f94b5309c426ebff726f88c13c37b4887",
+      "sdxl-platform-retest.log": "48c2470cafb10c7fa88405da896ddeeb413c7d742881dc1897ff231316923d75",
+      "full-cpu-gates.log": "d6e49912cfa6d8b7e0159a32d6a8d1668c27b27f6d7072e33064fde403ab6871",
+      "full-cuda-gates.log": "5132689ea74eab2999f44398c7eddd5d7f3b86d2a796ca6165ecb3b384fe0cc6"
+    }
+  }
+}

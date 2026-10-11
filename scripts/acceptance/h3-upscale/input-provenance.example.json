@@ -1,0 +1,47 @@
+{
+  "assets": [
+    {
+      "repo": "sandpies/ComfyUI-H3-Video-Upsampler",
+      "rev": "9337fe00d0753d249aba6181b81d3b6a62bccb52",
+      "filename": "lora/h3upscale_v2_x2.safetensors",
+      "hash": "ff671fa94e377fd277319a89c366a67f49b97ae6528c8ac3b0c5e0a3b254c56c"
+    },
+    {
+      "repo": "LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "rev": "3f941d5d182014dd5c0a5e16330420ee2d4aa0c6",
+      "filename": "minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+      "hash": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6"
+    }
+  ],
+  "sources": [
+    {
+      "kind": "h3",
+      "path": "inputs/t2va.mp4",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/6818f6c32d12b210915e44ad56a4228c2608f160/assets",
+      "provenance": "Official H3 video demo",
+      "sha256": "d66903241362e224085cc93f7a5e70fba6ab378d0ac6ff6af83acf2559849a42"
+    },
+    {
+      "kind": "other-model",
+      "url": "https://cloud.video.taobao.com/vod/4szTT1B0LqXvJzmuEURfGRA-nllnqN_G2AT0ZWkQXoQ.mp4",
+      "path": "inputs/wan22-official-demo.mp4",
+      "sha256": "e5c3b31ea6388f52aecccf09836bc816f892013e991045d4ac655c03f47aed9f",
+      "provenance": "Official Wan2.2 T2V model-card Video Demo",
+      "reference": "https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B/blob/c8c270b13ee05bfa474194ac9fb07a5868a97cea/README.md",
+      "rights": "Model repository Apache-2.0; separate demo-media grant unstated; private prototype input only"
+    },
+    {
+      "kind": "live-action",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/7/7e/Birds_at_a_dock.webm",
+      "path": "inputs/birds-at-a-dock.webm",
+      "sha256": "031f4f3903c5f16e8a628be3bc16d3b3a52a6bc33407916b4bac8dd14665e140",
+      "provenance": "Birds taking flight at a dock in San Francisco, May 28 2011",
+      "author": "Editor",
+      "reference": "https://commons.wikimedia.org/wiki/File:Birds_at_a_dock.webm",
+      "license": "CC-BY-3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "changes": "Any normalized experiment crops/resamples/resizes must be recorded separately"
+    }
+  ],
+  "authorization_evidence": "User confirmed written h3upscale_v2_x2 authorization obtained via online form on 2026-10-10; user-provided evidence, not an independently audited public grant."
+}

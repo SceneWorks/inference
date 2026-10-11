@@ -135,6 +135,8 @@ pub mod spatial_tiling;
 pub mod tensor;
 pub mod text_encoder;
 pub mod tier;
+/// Offline experiment only; no provider registration or generation capability.
+pub mod upscale_prototype;
 pub mod vae;
 pub mod vae_encoder;
 
