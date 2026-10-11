@@ -42,6 +42,7 @@ def audio_hash(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--cases", nargs="+", choices=("h3", "other-model", "live-action"), default=("h3", "other-model", "live-action"))
     args = parser.parse_args()
     names = ["source", "bicubic", "guided", "unguided", "latent-only", "seedvr2"]
     all_metrics = {
@@ -51,7 +52,7 @@ def main():
         "selected_review_frames": [0, 19, 38],
         "cases": {},
     }
-    for kind in ["h3", "other-model", "live-action"]:
+    for kind in args.cases:
         folder = args.evidence / kind
         videos = {name: decode(folder / f"{name}.mp4") for name in names}
         baseline = videos["bicubic"].astype(np.float32)

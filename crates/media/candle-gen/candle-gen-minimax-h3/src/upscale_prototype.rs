@@ -257,6 +257,134 @@ pub fn source_guide_pixels(
     .clamp(0f32, 1f32)?)
 }
 
+/// Pinned Comfy decoder stitch: neighbours are already blended. The source
+/// encoder and ordinary generation retain their existing original-tail stitch.
+/// A full-width trailing strip is needed at crossed seams, not one original
+/// strip per column (Comfy vae.py at the separately pinned reference revision).
+pub fn stitch_pinned_decode(
+    rows: &crate::spatial_tiling::TilePlan,
+    cols: &crate::spatial_tiling::TilePlan,
+    mut decode: impl FnMut(usize, usize) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let mut previous: Option<Tensor> = None;
+    let mut result = Vec::new();
+    for i in 0..rows.len() {
+        let mut left: Option<Tensor> = None;
+        let mut parts = Vec::new();
+        for j in 0..cols.len() {
+            let mut tile = decode(i, j)?;
+            if let Some(above) = &previous {
+                let above = above.narrow(4, cols.starts[j], cols.lengths[j])?;
+                tile = crate::blocks::blend(&above, &tile, rows.overlaps[i - 1] as i32, 3)?;
+            }
+            if let Some(neighbor) = &left {
+                tile = crate::blocks::blend(neighbor, &tile, cols.overlaps[j - 1] as i32, 4)?;
+            }
+            // Save AFTER both blends, BEFORE trimming. This differs deliberately
+            // from the original-tail stitch shared by the ordinary VAE paths.
+            left = if j + 1 < cols.len() {
+                Some(
+                    tile.narrow(4, tile.dim(4)? - cols.overlaps[j], cols.overlaps[j])?
+                        .contiguous()?,
+                )
+            } else {
+                None
+            };
+            if j + 1 < cols.len() {
+                tile = tile.narrow(4, 0, tile.dim(4)? - cols.overlaps[j])?;
+            }
+            parts.push(tile);
+        }
+        let row = Tensor::cat(&parts, 4)?;
+        previous = if i + 1 < rows.len() {
+            Some(
+                row.narrow(3, row.dim(3)? - rows.overlaps[i], rows.overlaps[i])?
+                    .contiguous()?,
+            )
+        } else {
+            None
+        };
+        result.push(if i + 1 < rows.len() {
+            row.narrow(3, 0, row.dim(3)? - rows.overlaps[i])?
+                .contiguous()?
+        } else {
+            row
+        });
+    }
+    Ok(Tensor::cat(&result, 3)?)
+}
+
+/// Experimental pinned Comfy decode only; ordinary generation is unchanged.
+/// Uses the same temporal plan and tile geometry, with the pinned decoder's
+/// already-blended neighbours rather than the older original-neighbour rule.
+pub fn decode_pinned_vae(vae: &crate::MiniMaxH3VideoVae, latents: &Tensor) -> Result<Tensor> {
+    use crate::spatial_tiling::TilePlan;
+    let z = vae.denormalize(latents)?;
+    let geometry = vae.geometry();
+    let plan = crate::chunking::TemporalPlan::new(geometry, z.dim(2)? as i32)?;
+    let z = if plan.pad_tokens > 0 {
+        let mut parts = vec![z.clone()];
+        let last = z.narrow(2, z.dim(2)? - 1, 1)?;
+        parts.extend((0..plan.pad_tokens).map(|_| last.clone()));
+        Tensor::cat(&parts, 2)?
+    } else {
+        z
+    };
+    let ratio = vae.config().patch_size;
+    let tiling = vae.tiling();
+    let rows = TilePlan::split(
+        z.dim(3)? * ratio,
+        tiling.tile_height,
+        tiling.overlap_height,
+        ratio,
+    )?;
+    let cols = TilePlan::split(
+        z.dim(4)? * ratio,
+        tiling.tile_width,
+        tiling.overlap_width,
+        ratio,
+    )?;
+    let mut parts = Vec::new();
+    let mut overlap: Option<Tensor> = None;
+    for span in &plan.chunks {
+        let clip = z.narrow(2, span.start as usize, span.tokens() as usize)?;
+        let decoded = stitch_pinned_decode(&rows, &cols, |i, j| {
+            let tile = clip
+                .narrow(3, rows.starts[i] / ratio, rows.lengths[i] / ratio)?
+                .narrow(4, cols.starts[j] / ratio, cols.lengths[j] / ratio)?
+                .contiguous()?;
+            vae.decode_clip_untiled(&tile)
+        })?;
+        for split in 0..geometry.split_count() {
+            let (start, end) = plan.split_span(decoded.dim(2)? as i32, split);
+            if start >= end {
+                continue;
+            }
+            let part = decoded.narrow(2, start as usize, (end - start) as usize)?;
+            if split == 0 {
+                parts.push(match overlap.take() {
+                    Some(previous) => {
+                        crate::blocks::blend(&previous, &part, geometry.frame_overlap, 2)?
+                    }
+                    None => part,
+                });
+            } else {
+                overlap = Some(part);
+            }
+        }
+    }
+    if let Some(tail) = overlap {
+        parts.push(tail);
+    }
+    let result = Tensor::cat(&parts, 2)?;
+    if result.dim(2)? != plan.total_frames as usize {
+        return Err(refuse("pinned decode temporal frame count mismatch"));
+    }
+    Ok(result
+        .narrow(2, 0, plan.output_frames as usize)?
+        .contiguous()?)
+}
+
 /// One native Ref2VA pass with frozen clean audio. The target alone receives
 /// the reversed H3 velocity Euler update. Guide and audio are never scattered
 /// back into the output. This does not call the ordinary generation validator.

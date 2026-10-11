@@ -1,46 +1,44 @@
-# sc-25328 bounded prototype readout
+# sc-25328 corrected prototype readout
 
-**Decision: NO-GO (completed experiment).** Successful native execution and numerical checks do not meet E11 quality. Live-action birds and other-model faces/text materially regress; useful faithful improvement is not established on two cases including a non-H3 clip. S2-S9 remain unstarted pending plan revision.
+**Decision: NO-GO (completed corrected experiment).** The corrected experiment does not meet E11: neither the other-model generated clip nor live-action clip shows useful faithful improvement over bicubic, and both exhibit material preservation regressions. H3 offers at most one modest/borderline improvement. The required two of three useful cases and preservation floor are unmet.
 
-All cases are explicitly normalized 39-frame 512x288@24 test fixtures, enlarged to 1024x576. Original media retains separate provenance/hashes in `readout.json`; this experiment does not claim arbitrary source timing support. Source AAC from each normalized fixture is copied to every output, with all 39 picture PTS checked and decoded soundtrack hashes equal.
+This candidate uses published F32 VAE weights and the pinned decoder's already-blended full-width neighbour strips, with Ref2VA BF16 and the learned upscaler FP16. Ordinary generation remains unchanged. The earlier BF16 candidate and its NO-GO are superseded; its original reports, actual parity failures and hashes are retained in the history.
 
-Measured on NVIDIA RTX PRO 6000 Blackwell Max-Q, 97887 MiB total, driver 596.36; one assigned GPU serially. Native Candle/CUDA 12.9 with MSVC 14.44; BF16 VAE/Ref2VA and FP16 learned upscaler. Installed cache/OS state was not controlled into cold/warm trials. Peaks are 200 ms samples of process RSS and device-used memory, not allocation-exact maxima.
+All three fixed fixtures contain 39 frames at 512x288 and 24 fps, enlarged to 1024x576. Original media provenance and normalization remain explicit in readout.json. Source/audio, bicubic and SeedVR2 baselines were reused only after hash verification; this does not claim arbitrary source timing support. All 39 output PTS and decoded source soundtracks pass.
+
+Nine independently derived real source/guide captures and three composed learned-network comparisons pass the unchanged predeclared max-absolute 0.08 AND peak-relative 0.015 limits. Each expected VAE tensor comes directly from fixed RGB through the unmodified pinned Comfy VAE; no native latent is used to produce its source or guide. All nine real capture value mutations are rejected numerically with valid RGB/export hashes and fresh changed-tensor hashes. RGB/export hash changes also fail. Per-case errors, source/weight/reference/native hashes and exact exporter provenance are bound in readout.json. Full real RefDiT parity is outside this claim.
+
+The isolated H3 decoder error was 0.220713 in RGB under original-neighbour seams, falling to 0.000078708 after the experimental stitch correction; guide latent error fell from 0.619808 to 0.002047. The tiny fixture executes actual pinned Comfy spatial methods and rejects the old original-tail stitch.
+
+Measured on RTX PRO 6000 Blackwell Max-Q, 97887 MiB, driver 596.36; Candle/CUDA 12.9 and supported MSVC 14.44. Peaks are process RSS/device-used memory sampled every 200 ms. Cache/temperature state was not controlled into cold/warm distributions.
 
 | Case | Run | Wall seconds | Device MiB | Host RSS bytes |
 |---|---|---:|---:|---:|
-| h3 | guided | 103.87 | 73244 | 5987254272 |
-| h3 | unguided | 84.72 | 72931 | 5985943552 |
-| h3 | latent-only | 28.25 | 12577 | 5759074304 |
-| h3 | SeedVR2 | 82.02 | 58691 | 7131844608 |
-| other-model | guided | 106.03 | 73241 | 5987491840 |
-| other-model | unguided | 86.29 | 72925 | 5985468416 |
-| other-model | latent-only | 32.32 | 12699 | 5892284416 |
-| other-model | SeedVR2 | 83.73 | 58691 | 7131369472 |
-| live-action | guided | 99.95 | 73245 | 5987766272 |
-| live-action | unguided | 82.44 | 72936 | 5986074624 |
-| live-action | latent-only | 27.50 | 12515 | 5796638720 |
-| live-action | SeedVR2 | 83.50 | 58531 | 7131770880 |
+| h3 | guided | 154.53 | 73255 | 5920718848 |
+| h3 | unguided | 90.03 | 72935 | 5781385216 |
+| h3 | latent-only | 38.66 | 18629 | 5363359744 |
+| h3 | SeedVR2 (reused) | 82.02 | 58691 | 7131844608 |
+| other-model | guided | 115.08 | 73255 | 5920907264 |
+| other-model | unguided | 90.81 | 72935 | 5780979712 |
+| other-model | latent-only | 38.73 | 18629 | 5482065920 |
+| other-model | SeedVR2 (reused) | 83.73 | 58691 | 7131369472 |
+| live-action | guided | 116.92 | 73243 | 6078570496 |
+| live-action | unguided | 90.91 | 72919 | 5779787776 |
+| live-action | latent-only | 39.75 | 18613 | 5309632512 |
+| live-action | SeedVR2 (reused) | 83.50 | 58531 | 7131770880 |
 
-Per-stage timings, output/intermediate hashes, actual SeedVR2 weight hashes and reference errors are recorded in `readout.json`. Guided default denoise 0.1 selects sigma 0.5714286, one Euler update, LoRA strength 1 with 312 targets applied. Controls disable the guide or use denoise zero learned-only enlargement. Internal audio is clean-zero/frozen; no generated audio is delivered.
+Guided denoise 0.1 selects shifted sigma 0.5714286, one Euler step and LoRA strength 1 with 312 targets. Controls disable the guide or use denoise zero for learned-only enlargement. Internal audio is frozen clean-zero; delivered audio is the unchanged fixture soundtrack.
 
-**h3: marginal/unproven.** Scene/person retained; slightly crisper ship/window edges, but altered console markings and lighting are not established faithful detail. At most one potential positive case. SeedVR2: Scene retained with crisper edges and changed console detail; complementary baseline, not proof of universally superior fidelity.
+**h3: Modest/borderline sharpening of arch, ship silhouette and console edges.** Composition and silhouette broadly retained across frames 0/19/38; small console glyph/light patterns and ship surfaces are redrawn. Guided and unguided look broadly similar; learned-only enlargement explains much of the limited sharpening. This does not establish a second useful case. SeedVR2: Cleaner edges and better small-detail retention than H3 refinement; no claim of original high-resolution ground truth
 
-**other-model: no.** The actual test crop shows a nightclub and robot with rapid viewpoint changes. Guided refinement softens/redraws the robot and crowd, changes faces and corrupts the visible Generated by Wan AI watermark; lit floor/beams acquire weave patterns. Regressions visible at frames 0/19/38. SeedVR2: Sharper floor/robot outlines on selected frames, with substantial texture/lighting and crowd changes; no universal superiority claim.
+**other-model: No useful faithful improvement.** Watermark becomes gibberish at beginning/middle/tail; floor, light beams and crowd develop woven texture and smear; robot face/surfaces lose source detail while pose remains broadly aligned. Latent-only already loses watermark/robot detail and smears textures; guided and unguided retain similar damage. This identifies a recipe limitation after validated source/guide stages, separate from the superseded VAE precision/stitch defect. SeedVR2: Retains more legible watermark and robot/scene outlines; some texture changes remain
 
-**live-action: no.** Source bird outlines and moving wings are smeared/angular in guided output. Waterfront, water, masts and trees acquire line/weave artifacts. Beginning/middle/tail confirm degraded preservation; denoise-zero is less altered but still softens feathers/outlines. SeedVR2: Selected frames retain bird outlines and waterfront structure more clearly, with changed surface texture; no ground-truth recovery claim.
+**live-action: No useful faithful improvement.** Moving birds collapse into angular ghost trails/double outlines, water/masts/boats gain woven or line texture, and standing birds soften/redraw across frames 0/19/38. Unguided and latent-only controls show related outline and texture damage; guided refinement does not restore faithful motion/detail. SeedVR2: Preserves bird outlines and marina structure more clearly; texture changes remain
 
-Visual review used beginning/middle/tail frames 0/19/38 in six-column source/bicubic/guided/unguided/latent-only/SeedVR2 sheets plus full-size three-column pairs. Both implementation agent and epic coordinator inspected the results. The all 39-frame RGB/change metrics describe departures from bicubic, not quality or high-resolution truth. Live-action guided adjacent-frame RGB change averages 2.758 versus bicubic 4.729 (0..255 units), consistent with the observed smearing; that statistic alone is not a motion quality score.
+Implementation agent and coordinator inspected beginning/middle/tail frames 0/19/38, six-column controls and full-size pairs. Change metrics over all 39 frames describe deviations from bicubic, which is a preservation baseline rather than high-resolution truth. They are not automatic quality scores.
 
-All three real-weight learned-network comparisons pass unchanged max-absolute 0.08 and relative 0.015 tolerances: actual max-absolute errors 0.009765625 (H3), 0.010986328125 (other-model), 0.01171875 (live-action). Named native FP16 temporal-tap/intermediate resize-rounding deviations are documented. Tiny reference fixtures use actual pinned upstream AST definitions for composed VAE/network normalization, Conv3d/interpolation, guide pixels/strided positions/classes/update mask/frozen audio and shifted simple schedule. They reject raw-domain, stretched/full-grid guide and raw-sigma mistakes. This is not a claim of full real-weight end-to-end ComfyUI RefDiT equivalence.
+Affected checks pass: 376 H3 unit + 205 integration tests (20 hardware tests ignored); eight acceptance tooling tests; CUDA compile-only, all-target Clippy and rustdoc with warnings denied; affected-package formatting, workspace checks for 105 members, clock ratchet with 279 existing flags, and diff checks. Earlier broad first-push lane evidence remains recorded for unchanged surfaces, including explicit unrelated Windows/Linux platform limitations. No broad campaign or second adversarial review was repeated.
 
-The corrected normalized boundary is raw posterior -> VAE F32 normalization -> learned FP16 statistics normalization -> network -> reverse learned statistics -> already normalized RefDiT/VAE decode. Initial wrong-domain output had pink grids and was excluded from the quality decision. Strict Comfy refiner container mapping and BF16-to-F32 Euler state conversion were fixed and tested. A final rebuilt executable confirmation rendered the H3 guided clip with its binary hash recorded; raw RGB exactly matches the three-case campaign.
+Viewable current evidence: evidence-f32-final/<case>/{source,bicubic,guided,unguided,latent-only,seedvr2}.mp4, review-begin-middle-tail.png and review-full-frame{0,19,38}.png. Actual VAE parity is in evidence-f32-final/vae-parity; independent fixed-RGB exports and exact executed exporter are in evidence-vae-reference-f32. The final release binary is retained with all nine matching receipt hashes.
 
-Verification: H3 CPU 376 unit + 204 integration tests passed (20 hardware tests ignored); SeedVR2 CPU 43 unit tests passed (10 hardware tests ignored); CUDA all-target Clippy and rustdoc with warnings denied; assigned-GPU tiny BF16 precision fixture passed and removing its cast failed; real silent/early/full soundtrack tests passed; workspace 105-member checks, clock ratchet at 279, pinned whole-workspace formatting via per-package equivalent and git diff checks passed. Windows `cargo fmt --all --check` exceeds Windows argument limit (error 206) in this checkout; the same pinned formatter checked all 105 members.
-
-Viewable evidence is retained outside the repository as `evidence-corrected/<case>/{source,bicubic,guided,unguided,latent-only,seedvr2}.mp4`, `review-begin-middle-tail.png`, `review-full-frame{0,19,38}.png`, and `report.json`. The final executable confirmation is in `evidence-final-binary/`. Portable artifact hashes and provenance are committed here; media and weights are not redistributed.
-
-Pinned recipe/assets and source licenses/notices are documented in README.md, THIRD_PARTY_NOTICES.md and input-provenance.example.json. User-provided written LoRA authorization is retained as such; no independently audited permissive public grant is asserted. No product routing/capability, generation validator, cross-provider dependency, inference pin or measurement gate changes.
-
-Additional platform evidence: the workflow's native Windows supervisor subset passes all four tests on its exact CPython 3.12.10 pin. Broad Linux tooling discovery run on Windows/Python 3.14.4 failed (1445 tests; 38 failures, 31 errors, 64 skips), including unrelated POSIX/process/path assumptions; it is not reported as green Linux execution. An extra 3.12.11 supervisor probe had one cleanup timing failure. The supervisor implementation/tests have exact Git blobs matching the immutable base, and unrelated scripts/tests/CI tooling have no diff. Full logs and `tooling-platform-limits.json` retain the evidence; Linux/macOS lanes require their native CI platforms.
-
-Final broad verification: the exact `candle-gen* --lib --tests -j 1` selection completed with 4414 unique tests passed and 263 hardware tests ignored. Its unchanged SDXL missing-file test originally failed because `/tmp` resolved to an absent `C:/tmp` parent; creating only the empty parent made the exact test pass, then the new empty directory was removed. No SDXL source changed, and original failure/base-blob proof is retained. The 11 unrun generation binaries were executed from Cargo's exact wildcard artifact receipts without repeating completed suites. Full CPU wildcard Clippy/docs, library tests, LLM conformance, all 12 Stable Audio targets and the three runtime profiles passed (1591 runnable tests, 77 ignored). Full CUDA wildcard compile, named catalog test, all-target Clippy and docs passed. Exact commands, counts and log hashes are in `readout.json` and external `local-validation.json`; native Linux/macOS CI remains platform verification.
+S2-S9 remain unstarted pending plan revision. No product route/capability, generation-validator, cross-provider dependency, inference pin or terminal measurement gate changes. Existing notices and user-provided written LoRA authorization are retained; no model weights/source media are redistributed.

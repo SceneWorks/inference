@@ -34,7 +34,8 @@ original sources from these test fixtures. Only source AAC is muxed; frozen
 internal clean-zero audio is never decoded or delivered. Do not use an occupied
 GPU. The UUID maps to ordinal zero inside the native child process.
 
-The learned network runs FP16. VAE and unaccelerated Ref2VA transformer run BF16.
+The learned network runs FP16. The experimental VAE runs published F32 weights;
+the unaccelerated Ref2VA transformer runs BF16.
 The exact latent chain is posterior raw -> VAE normalization -> learned network
 statistics normalization -> network -> reverse network statistics. Its output is
 already normalized VAE/DiT state. Applying VAE normalization after the learned
@@ -108,3 +109,45 @@ Delivery checks: `python -m unittest discover -s scripts/acceptance/h3-upscale
 all39 frame timestamps and decoded soundtrack hashes. The CUDA-only tiny BF16
 refinement fixture is ignored by default and must be invoked explicitly on the
 assigned UUID; it distinguishes a missing BF16-to-F32 Euler boundary cast.
+
+
+The review fix independently exports actual source and guide latents directly
+from each fixed `source.rgb`: use `compare_real_vae.py --comfy-root <clean pinned
+checkout> --upstream-guide <pinned upscale_guide.py> --vae <immutable H3 vae dir>
+--evidence-root <fixture directory> --out <fresh reference directory>
+--export-only`. This imports unmodified Comfy at the additional pin above and
+loads all 703 published F32 tensors strictly; split Q/K/V are interleaved per
+head, and published value/gate halves are reversed for Comfy. Its published F32
+weights, F32 buffers and cuDNN/SDPA run without autocast or TF32. The actual
+Comfy GPL-3.0 reference source remains in the external checkout with its license;
+no Comfy source or model weights are vendored here.
+
+The experimental native caller now keeps the VAE F32 and implements the pinned
+decoder's already-blended full-width neighbor strip. Ordinary generation and
+its original-tail stitch are unchanged. Ref2VA remains BF16 and the learned
+network FP16. `--capture-only true` on the native example stops after saving
+source/guide intermediates, before loading learned or Ref2VA networks. Its
+source and guide tensors can be checked before any refined clip is run.
+
+Run the same reference command with `--reference-root <saved references>` to
+compare existing native captures on CPU. It binds the RGB, reference manifest,
+independent tensors, native tensors, source and weight hashes, refuses changed
+RGB/exports, and rejects one mutation of each real source/raw, normalized source
+and normalized guide capture. Both predeclared limits remain max-absolute 0.08
+AND peak-relative 0.015; they were not loosened for the precision/stitch fix.
+`compare_real_upscaler.py --source-reference <independent VAE safetensors>` also
+checks the learned stage using this independently derived source.
+
+`export_decode_stitch.py --vae-source <pinned Comfy vae.py> --out <fixture>`
+extracts the actual pinned spatial decoder methods on CPU. The committed tiny
+crossed-seam fixture and native test reject the older original-neighbor rule.
+`review.py --cases <case>` permits an early case readout; the default still
+reviews all three completed cases. Earlier candidates and verdicts remain
+historical and are explicitly superseded by the current readout.
+
+Reference environment used Torch 2.10.0+cu130 with the pinned checkout's
+comfy-kitchen 0.2.37 and comfy-aimdo 0.5.5. Keep those reference dependencies
+isolated from product execution and existing installations. Saved real-input
+exports retain the exact executed exporter and its matching SHA256 alongside
+source/weight manifests; the current harness also saves decoded and guide RGB
+for first-divergence diagnosis.

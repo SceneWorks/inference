@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--denoise",
         "--guide",
         "--noise-fixture",
+        "--capture-only",
     ];
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mut seen = std::collections::HashSet::new();
@@ -83,6 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let denoise: f32 = argument("--denoise")?.parse()?;
     let guided: bool = argument("--guide")?.parse()?;
     let sigma = prototype::recipe_sigma(denoise)?;
+    let capture_only: bool = argument("--capture-only")
+        .unwrap_or_else(|_| "false".into())
+        .parse()?;
     // All installed files preflight before a CUDA context or heavyweight load.
     for path in [&source, &upscaler, &lora, &noise_path] {
         if !path.is_file() {
@@ -109,7 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .permute((0, 4, 1, 2, 3))?
     .contiguous()?;
     let mut phase = Instant::now();
-    let mut vae = h3::MiniMaxH3VideoVae::load(&root, &device, DType::BF16)?;
+    // Published VAE weights and the pinned Comfy reference use F32. Keep
+    // this precision choice confined to the offline experiment.
+    let mut vae = h3::MiniMaxH3VideoVae::load(&root, &device, DType::F32)?;
     let source_raw = vae.encode(&pixel_normalize(&pixels)?)?.mean().clone();
     let source_normalized = prototype::normalize_vae_raw(&source_raw)?;
     let mut intermediates = std::collections::HashMap::new();
@@ -126,8 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Source guide is decoded and re-encoded before learned enlargement. It is
     // never the enlarged latent or an ordinary reference video presentation.
     let guide = if guided && sigma.is_some() {
-        let decoded = h3::revert_pixel_normalization(&vae.decode(&source_normalized)?)?;
+        let decoded = h3::revert_pixel_normalization(&prototype::decode_pinned_vae(
+            &vae,
+            &source_normalized,
+        )?)?;
+        intermediates.insert(
+            "source.decoded.rgb",
+            decoded.narrow(2, 0, 39)?.to_device(&Device::Cpu)?,
+        );
         let guide_pixels = prototype::source_guide_pixels(&decoded.narrow(2, 0, 39)?, 576, 1024)?;
+        intermediates.insert("guide.pixels.rgb", guide_pixels.to_device(&Device::Cpu)?);
         Some(
             prototype::normalize_vae_raw(vae.encode(&pixel_normalize(&guide_pixels)?)?.mean())?
                 .to_dtype(DType::F32)?,
@@ -143,6 +157,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     if let Some(guide) = &guide {
         intermediates.insert("guide.normalized", guide.to_device(&Device::Cpu)?);
+    }
+    if capture_only {
+        candle_gen::candle_core::safetensors::save(
+            &intermediates,
+            output.with_extension("intermediates.safetensors"),
+        )?;
+        std::fs::write(
+            output.with_extension("stages.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"status":"source_guide_capture_only", "vae_dtype":"fp32", "stages":stages}),
+            )?,
+        )?;
+        return Ok(());
     }
     drop(vae);
     h3::release_device_memory(&device)?;
@@ -222,8 +249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         enlarged
     };
     phase = Instant::now();
-    vae = h3::MiniMaxH3VideoVae::load_decode_only(&root, &device, DType::BF16)?;
-    let decoded = h3::revert_pixel_normalization(&vae.decode(&result)?)?.narrow(2, 0, 39)?;
+    vae = h3::MiniMaxH3VideoVae::load_decode_only(&root, &device, DType::F32)?;
+    let decoded = h3::revert_pixel_normalization(&prototype::decode_pinned_vae(&vae, &result)?)?
+        .narrow(2, 0, 39)?;
     let images = h3::frames_to_images(&decoded)?;
     let mut file = std::fs::File::create(&output)?;
     for image in images {
@@ -234,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.with_extension("stages.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "status":"native_output_emitted_unreviewed","upstream_commit":prototype::REFERENCE_COMMIT,
-            "backend":"candle/cuda","tier":"bf16","upscaler_dtype":"fp16","frames":39,"width":1024,"height":576,"denoise":denoise,"sigma":sigma,"guide":guided,
+            "backend":"candle/cuda","tier":"bf16","vae_dtype":"fp32","upscaler_dtype":"fp16","frames":39,"width":1024,"height":576,"denoise":denoise,"sigma":sigma,"guide":guided,
             "seed":444,"stages":stages,"internal_audio":"clean_zero_frozen","delivery_audio":"mux original source soundtrack externally under AAC policy"
         }))?,
     )?;

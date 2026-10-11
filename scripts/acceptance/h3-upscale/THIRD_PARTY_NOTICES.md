@@ -37,3 +37,14 @@ Trained by Sandpies with that fork on Alissonerdx's
 [h3upscale-4k](https://huggingface.co/datasets/Alissonerdx/h3upscale-4k)
 dataset, on the MiniMax H3 Ref2VA base. Read both of their terms before
 redistributing or using it commercially.
+
+
+## Independent Comfy numerical reference
+
+The actual unmodified ComfyUI VAE reference at revision
+`7a5dad695fe1cae25efcb2550530fb20ef68da3d` is GPL-3.0 and remains in the
+external reference checkout with its original license. The acceptance exporter
+imports it at runtime; no Comfy implementation or weights are vendored here.
+The tiny decoder fixture is numerical output of its pinned methods. The
+experimental native decoder uses existing Candle primitives to reproduce the
+observed already-blended neighbor semantics; ordinary generation is unchanged.

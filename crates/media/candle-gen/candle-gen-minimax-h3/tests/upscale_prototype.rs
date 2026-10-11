@@ -220,3 +220,44 @@ fn bf16_refinement_retains_f32_scheduler_state() {
     assert_eq!(output.dtype(), DType::F32);
     assert_eq!(output.dims(), enlarged.dims());
 }
+
+#[test]
+fn pinned_decoder_stitch_uses_already_blended_canvas_strips() {
+    use candle_gen_minimax_h3::spatial_tiling::{BoundedStitch, TilePlan};
+    let fixture = candle_gen::candle_core::safetensors::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upscale_decode_stitch.safetensors"),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let rows = TilePlan::split(5, 4, 2, 1).unwrap();
+    let cols = TilePlan::split(8, 4, 2, 1).unwrap();
+    let output =
+        candle_gen_minimax_h3::upscale_prototype::stitch_pinned_decode(&rows, &cols, |i, j| {
+            Ok(fixture[&format!("tile.{i}.{j}")].clone())
+        })
+        .unwrap();
+    compare(&output, &fixture["output"], 1e-6);
+    let mut original =
+        BoundedStitch::new(rows.len(), cols.len(), &rows.overlaps, &cols.overlaps).unwrap();
+    for i in 0..rows.len() {
+        for j in 0..cols.len() {
+            original
+                .push(fixture[&format!("tile.{i}.{j}")].clone())
+                .unwrap();
+        }
+    }
+    let original = original.finish().unwrap();
+    let difference = (&original - &output)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    assert!(
+        difference > 0.1,
+        "original-neighbour mutation must fail pinned decoder parity"
+    );
+}

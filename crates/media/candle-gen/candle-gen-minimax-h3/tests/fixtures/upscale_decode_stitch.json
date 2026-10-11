@@ -1,0 +1,11 @@
+{
+  "comfy_commit": "7a5dad695fe1cae25efcb2550530fb20ef68da3d",
+  "source_sha256": "8a889ea28fc24b13edfbdea9e85b8a0762b2e7e079bbe34db026c6e6d4f5a556",
+  "fixture_sha256": "18ca8ed5d2a4ad6b1bd7dd5a9f435153d6492947377cd2845195ebf38b16957d",
+  "methods": [
+    "split_tiles",
+    "blend",
+    "tiled_decode"
+  ],
+  "purpose": "crossed heavy overlaps distinguish original from already-blended neighbour strips"
+}
