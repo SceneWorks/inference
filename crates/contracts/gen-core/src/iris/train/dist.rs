@@ -1261,8 +1261,8 @@ impl TcpCollective {
                 }
             }
             // Release every peer only once the whole world joined.
-            for r in 1..world.world_size {
-                let s = peers[r].as_mut().expect("joined");
+            for (r, peer) in peers.iter_mut().enumerate().skip(1) {
+                let s = peer.as_mut().expect("joined");
                 send_frame(s, 0, 0, b"ok", r, "rendezvous")?;
             }
         } else {

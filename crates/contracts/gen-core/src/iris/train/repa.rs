@@ -753,6 +753,8 @@ mod tests {
 
     /// Values printed by torch 2.8 `F.interpolate` on ramps (`arange(n)` as a `1 × n` image).
     #[test]
+    // The expected values are torch's printed f32 outputs, kept digit for digit.
+    #[allow(clippy::excessive_precision)]
     fn interpolation_matches_torch_on_ramps() {
         let ramp = |n: usize| (0..n).map(|v| v as f32).collect::<Vec<_>>();
         // size=(1,8), bicubic

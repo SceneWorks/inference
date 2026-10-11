@@ -96,7 +96,7 @@ LyCORIS parameterizations over the frozen upstream Linears, under the same objec
 | CFG caption dropout → the `null("")` states AND mask per dropped row | `trainer.py` | `Run::batch` | `train::Run::batch` | ported; mutation-tested (both) |
 | Frozen Qwen3-VL conditioning, encoded on the fly | `trainer.py` | `text_conditioning: on_the_fly` (default) or the bit-identical `cached` memo | `train::TextSource` (same modes) | ported; on-the-fly == cached bit for bit |
 | `on_caption_overflow` warn / error / silent | `text/qwen3_vl.py` | `TextSource::encode` (option `on_caption_overflow`) | `train::TextSource::encode` | ported |
-| Fixed-square data policy: shortest-side PIL bicubic resize, center crop, `[−1, 1]` | `data/datasets.py` | `preprocess_image` (PIL-exact `resize_bicubic_u8`) | shared contract | ported (bucket/area policies: S11) |
+| Fixed-square data policy: shortest-side PIL bicubic resize, center crop, `[−1, 1]` | `data/datasets.py` | `preprocess_image` (PIL-exact `resize_bicubic_u8`) | shared contract | ported (bucket / area policies: below) |
 | Single-device ranged walk (`chunks = min(640, n)`, tail beyond `chunks·⌊n/chunks⌋` unassigned, last partial batch kept) | `data/samplers.py` | `DataWalk` | shared contract (`unused_tail_warning` on stderr) | ported (note: 641–1279 items cover only 640) |
 | `caption_field` / `caption_fields` (uniform among present fields) | `data/datasets.py` | `select_caption`, item `model_options.captions` | shared contract | ported |
 | Gradient accumulation (`loss / grad_accum`; windows counted globally across epochs, accelerate) | `trainer.py` + accelerate | `Window` | `train::Window` | ported; oracle-checked (both) |
@@ -107,7 +107,7 @@ LyCORIS parameterizations over the frozen upstream Linears, under the same objec
 | Parameters that get no gradient (the discarded text tail of a final dual block under `keep`) are skipped | torch `grad is None` | `ParamRoute::Frozen` | same route (a param the graph never reads gets a zero gradient, then is skipped) | ported |
 | `LambdaLR` constant / cosine, warmup ramping from **0** | `train/lr.py` | `lr_factor` | shared contract | ported (linear: refused) |
 | `scale_lr` auto_lr none/sqrt/linear | `train/optim.py` | `scale_lr` | shared contract | ported |
-| Mixed precision bf16 autocast over f32 masters / `no` | accelerate | `TrainingConfig::train_dtype` bf16 / f32 (fp16 refused) | candle autograd over f32 `Var` masters; the provider's casts on the tape; the fused RMSNorm / softmax kernels (no candle backward) swapped for the same math in composable ops under autograd only (`nn.rs`) | ported (the provider's autocast policy, traced casts) |
+| Mixed precision bf16 autocast over f32 masters / `no` | accelerate | `TrainingConfig::train_dtype` bf16 / f32 / fp16 (fp16: below) | candle autograd over f32 `Var` masters; the provider's casts on the tape; the fused RMSNorm / softmax kernels (no candle backward) swapped for the same math in composable ops under autograd only (`nn.rs`) | ported (the provider's autocast policy, traced casts) |
 | Random init (`initialize_weights`: xavier patch embed, N(0,.02) timestep MLP, zero head, adaLN-zero, kaiming Linear, ones norms, N(0,1) text positions) | `models/dit.py` | `init_kind`, `random_init` | `train::model::random_init` (host `HostRng` keyed `mix_seed(seed, fnv(key))`, device-portable) | ported law (MLX RNG / host RNG) |
 | Weights-only start (`load_from`) | `trainer.py` | `init: weights` / `load_from` | same | ported |
 | Checkpoint: model + EMA + optimizer + scheduler + step + epoch + data position + RNG, atomic temp+rename, `latest` | `train/ckpt.py` | `CheckpointState`, `publish_checkpoint` | same layout key for key (`backend: candle`), staged + `publish_checkpoint` (fsync) | ported; cancel+resume bit-exact (full/Muon, LoRA/accum; Candle also LoKr) |
@@ -116,7 +116,241 @@ LyCORIS parameterizations over the frozen upstream Linears, under the same objec
 | `nan_loss_tolerance` (drop the window, abort past the tolerance) | `trainer.py` | `Run::execute` | `train::Run::execute` | ported |
 | Validation samples from the training state (seeded, 100 steps, CFG 3 at the stage size) | `trainer.py` `_render_validation` | `TrainingProgress::Sample` (steps / cfg / prompts from the request, `preview_weights` raw or EMA) | `train::render_preview_with` (the provider's sampler and forward; an adapter preview == the exported file loaded through `load_backbone_with_adapters`, bit for bit) | ported (upstream renders raw; EMA selectable) |
 | Export: `config.yaml` (model/text_encoder/flow) + `model.safetensors` (EMA, else raw; fp32 or bf16) | `scripts/export_checkpoint.py` | `Run::export`, `export_config_yaml` | `train::Run::export` (atomic + fsync) | ported; loads in the provider — and cross-backend (`train_cross_backend`: Candle-trained LoRA/LoKr/full load in MLX and vice versa, FP32 forwards agree to 1e-4; LoKr 5e-3 — MLX reconstructs a LoKr delta in bf16) |
-| `activation_checkpointing`, REPA/iREPA, bucket/area shapes, stage presets, frozen-grid holdout validation, distributed training, fp16 | `trainer.py` etc. | refused (typed) | — | S11 |
+| Official stages `stage1_256 → stage2_512 → stage3_1024 → sft_1024` | `configs/*.yaml` | `upstream::STAGE_PRESETS` (the YAML vendored verbatim) → `stage_preset_config`: an editable `TrainingConfig` stamped `stage` / `parent_stage`; the run records both in `state.json`, and `check_lineage` refuses a parent from another stage | shared contract | ported (sc-25689); lifecycle chain 256 → 512 on both backends |
+| Shape policies `fixed` / `bucket` (`shared21-512`, `shared21-1024`, closest ratio, first on a tie) / `area` (`shape_align`, `shape_max_ratio`) with the covering resize + center crop | `data/shapes.py`, `data/buckets.py`, `data/datasets.py` | `train::shapes::ShapePolicy`, `preprocess_to_shape` (PIL-exact bicubic) | shared contract | ported; every target and the 31×47 crop exact vs upstream |
+| Ranged walk (640 canonical chunks, world-portable resume state, resharding a cursor to another world) + shape batcher (`drop_last`, per-shape batches, regroup history replayed on a micro-batch change, `limit_batches`) | `data/samplers.py` | `train::shapes::{RangedSampler, ShapeBatchSampler}`, `train::pipeline::DataPipeline` | shared contract | ported; plans and resume states equal upstream's key for key |
+| `rope_aspect` square / isotropic (stage 1 trains square) | `models/dit.py` | `rope_2d_angles_aspect`, the trunk's RoPE grid | same | ported; non-square bucket step under both laws: loss 1e-5, grads 1e-4 vs upstream |
+| REPA / iREPA: frozen DINOv2 teacher (`x_norm_patchtokens`, bicubic input resize, ImageNet norm, interpolated position table; `_reg` variants antialiased), MLP (REPA) / conv (iREPA) projector on block `layer`'s tokens, bilinear token-grid resize to the smaller grid, iREPA spatial normalization, `−cos` loss × `weight` | `train/repa.py` | `train::teacher::Teacher` (hub and Hugging Face naming), `model::repa_loss`; the teacher is the provisioned `repa_teacher` component (`facebook/dinov2-base` @ f9e44c81 = the hub `dinov2_vitb14_pretrain.pth`, checked tensor for tensor), never fetched | `train::teacher::Teacher`, `train::model::repa_loss` | ported; tokens 1e-4, losses 1e-5, projector + backbone grads 1e-4 (three grid relations); the release teacher on real weights 1e-3 (`IRIS_REPA_TEACHER_DIR`). `teacher_source: hf` (DINOv3 through `transformers`) refused typed: the native teacher is the dinov2 hub family |
+| Activation checkpointing `none` / `full` / `selective_layer` (`ac_selective_every`) / `selective_op` | `models/ac.py` | `mlx_rs::transforms::checkpoint` per trunk / PiT block | segmented recompute: the region runs off the tape (`with_composable`, so it computes exactly what the replay computes), boundary `Var`s, reverse surrogate backward | ported; every policy's gradients equal the plain graph's ≤ 1e-6 (upstream's are bit-identical). `selective_op` (torch SAC keeps matmul outputs) recomputes the whole block natively: same gradients, a different memory profile |
+| Holdout validation: items flagged `model_options.split = "holdout"`, the frozen `(noise, t)` grid (`VAL_GRID_SEED`, `VAL_T_STRIDE`), `val_every_steps`, `val_samples`, banded `val/loss_t0..3` | `trainer.py` `_val_loss` | `train::holdout`, `Run::validate_holdout` → `<checkpoints>/metrics.jsonl` | same | ported; grid noise exact, per-sample loss 1e-5 |
+| Metrics (`log_every`, `log_block_grad_norms`, REPA raw / weighted / total, loss scale) | `trainer.py` | `<checkpoints>/metrics.jsonl` (run header, steps, grad groups, validation) | same | ported (upload to a tracker is the product layer's) |
+| fp16 mixed precision with `GradScaler` (65536, ×2 per 2000 clean steps, ×0.5 and skip on overflow) | accelerate | `MixedPrecision::Fp16` + `GradScaler`, checkpointed | CUDA only (candle's CPU backend has no half GEMM: refused typed there) | ported |
+| `resume_optimizer` full / core (a new REPA projector starts cold); `save_every_epochs`; retention | `trainer.py` | `check_resume`, `Run::prepare` | same | ported |
+| Distributed: DDP and FSDP2 (`full`, `grad_op`, `hybrid`, `hybrid_grad_op`), mesh resolution, `param_dtype` (the gathered forward copy rounded), `reduce_dtype` (rank-order reductions, bf16 rounding), `expected_global_batch` = batch × world × accum, `scale_warmup_by_world`, `checkpoint_io` rank0 / per_node / dcp, resharding a checkpoint to another world | `train/parallel.py`, `world.py`, `trainer.py` | `train::dist` (backend-neutral plan, `Collective`, the host `TcpCollective`); MLX transports `mlx_ring` / `mlx_jaccl` / `mlx_mpi` / `mlx_any` (MLX's own collectives on the CPU stream, behind a bounded TCP liveness barrier) | the host TCP transport (no NCCL: the repo had no distributed primitives and Windows has no NCCL); the MLX transports refused typed | ported; see *Curricula and distributed training* below |
+| Invalid meshes, a global-batch mismatch, a split world, a lost / stalled rank, a desynchronized collective | `parallel.py`, `world.py` | typed `DistError` (`InvalidMesh`, `GlobalBatchMismatch`, `SplitWorld`, `RankLost`, `Desync`, `Unsupported`) at `Trainer::train`, every wait bounded by `dist.world.timeout_secs` | same | ported; multi-process tests below |
+
+### Curricula and distributed training (sc-25689)
+
+Oracle: the curricula section of `../tools/dump_iris_train.py` (frozen `train/repa.py`,
+`models/ac.py`, `data/shapes.py`, `data/buckets.py`, `data/samplers.py`, `data/datasets.py`
+sha256-pinned; DINOv2 `facebookresearch/dinov2@7764ea0f`) → `iris_curricula_golden.safetensors`, and
+`iris_repa_teacher_real.safetensors` (the release teacher's tokens). Both backends hold
+`curricula_parity` (MLX CPU stream / Candle CPU, FP32) and `curricula_lifecycle` (the stage chain
+256 → 512 with REPA on a provisioned teacher, `area` batches + exact resume, AC leaving the run
+unchanged, holdout metrics, fp16, `resume_optimizer: core`).
+
+**Distributed semantics.** Every rank holds the same positional draws upstream's do (`mix_seed(seed,
+rank, epoch, position)`) and its slice of the world-portable ranged walk; the per-rank epoch length
+is agreed as the world minimum (upstream's `_agree_batch_count`). DDP all-reduces the window's
+gradients (in `bucket_cap_mb` buckets) to the global mean in `reduce_dtype`; FSDP2 shards every
+trained tensor by rows (`torch.chunk`: the first shards take the rows), reduces within the shard
+group then across replicate groups, clips on the global norm, updates EMA and AdamW shard-wise, and
+orthogonalizes each Muon matrix **whole** (the shards' rows gathered, Newton–Schulz once, each rank
+keeping its rows) — so a sharded step equals the replicated one: AdamW ≤ 1e-6 (the f32 order of the
+per-shard norm sum), Muon bit-identical with the clip out of reach. `param_dtype` rounds the gathered
+forward copy (FSDP2's `MixedPrecisionPolicy`); the f32 shards stay the masters. `checkpoint_io: dcp`
+writes one file per shard (`shard_NNNNN.safetensors`, zero-row tensors omitted) and any world
+reassembles them; `rank0` / `per_node` write the consolidated layout. Transports: the host TCP
+collective (both backends; rank 0 coordinates, every reduction in rank order, every wait bounded) and,
+on MLX, MLX's own `ring` / `jaccl` / `mpi` collectives (CPU stream; the ring backend has no
+sub-group `split`, so hybrid sub-group reductions are world all-gathers reduced per group; a TCP
+liveness barrier precedes each MLX collective because MLX's socket backends block on a vanished
+peer). `mlx_jaccl` is available only when the MLX build links `libjaccl` (source builds; prebuilt
+cells compile a typed-unavailable stub).
+
+**Multi-process evidence (`train_distributed`, both backends, real OS processes on one host):**
+DDP over TCP vs over MLX ring on loopback — bit-identical trainable / EMA / optimizer / export; FSDP
+`full` and `grad_op` (2 ranks) and `hybrid` 2 × 2 (4 ranks) vs DDP of the same world (AdamW ≤ 1e-6,
+Muon exact); `param_dtype: bf16` honored (moves the result by 4.6e-4); a `dcp` checkpoint resumed on
+the same mesh reproduces the uninterrupted run bit for bit and reshards to one process; a rank that
+exits, or stalls, surfaces on the survivor as `RankLost` (the stall naming the transport timeout) and
+nothing hangs; invalid meshes / a global-batch mismatch / an MLX transport on Candle are typed
+refusals. Multi-host MLX (two Macs over ring or JACCL) is supported by the hostfile path but is not
+exercised: the only machine this story may load is nax-macos-2. On candle/CUDA the same tests run
+every rank on `cuda:0` (`iris-curricula-cuda`); the device inventory in that lane records the box's
+GPU count.
+
+**Real weights (dispatch-only):** `iris-curricula-mlx` (`mlx-iris-curricula-train`, nax-macos-2)
+and `iris-curricula-cuda` (`candle-iris-curricula`) run the release teacher against upstream and the
+bounded official curriculum (`curricula_real_weights`: the shipped `stage1_256` with REPA for two
+steps → `stage2_512` as a `new_phase` to step 4, batch 1).
+
+**Upstream config map.** Every leaf of `configs/` (`TrainConfig` and its sections) and the trainer
+CLI, as `gen_core::iris::train::upstream::UPSTREAM_OPTIONS` records it; `translate_upstream` turns a
+config + dotlist overrides into the native request, refusing a refused key that is set away from its
+default, and `check_resources` holds every `resource` key to the provisioned backbone / text encoder.
+*honored* = carried into the request; *mapped* = a framework / performance flag with the named native
+counterpart (never changes the update); *inert* = upstream's trainer never reads it either;
+*resource* = fixed by the provisioned resource (a set value must match); *refused* = typed refusal
+unless at its default.
+
+| Upstream key | Disposition | Native |
+| --- | --- | --- |
+| `name` | honored | iris.run_name (state.json, metrics.jsonl) |
+| `work_dir` | mapped | the request's output_dir (checkpoints under <output_dir>/<stem>.checkpoints) |
+| `wandb_project` | honored | iris.tracking.project (metrics.jsonl header) |
+| `report_to` | mapped | metrics are written to <checkpoints>/metrics.jsonl; uploading them to wandb / tensorboard is the product layer's (inference links no network client) |
+| `tags` | honored | iris.tracking.tags (metrics.jsonl header) |
+| `model.block` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.dual_depth` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.final_block_text` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.hidden_size` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.depth` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.num_heads` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.num_kv_heads` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.gated_attention` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.sandwich_norm` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.patch_size` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.in_channels` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.mlp_ratio` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.qkv_bias` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.qk_norm` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.norm_eps` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.attn_backend` | mapped | sdpa \| torch_flash \| torch_cudnn \| fa3 \| fa4 select a torch attention kernel; natively MLX's fused SDPA / Candle's SDPA compute the same attention |
+| `model.modulation` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.modulation_rank` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.timestep_max_period` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.adaln_zero_init` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.rope_theta` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.rope_scale` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.rope_aspect` | honored | iris.rope_aspect (square \| isotropic; the trained and exported image RoPE law — stage 1 trains square) |
+| `model.rope_frame_pairs` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.rope_frame_theta` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_rope` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_rope_theta` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_abs_pos_embed` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_dim` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_len` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_adapter` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_lap_num_layers` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_lap_num_heads` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.text_lap_mlp_ratio` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.repa_layer` | honored | iris.repa.layer |
+| `model.pixel.enabled` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.depth` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.hidden_size` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.attn_hidden_size` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.num_heads` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.mlp_ratio` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.modulation` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `model.pixel.abs_pos_embed` | resource | the trained architecture is the backbone resource's config.yaml (random init reads it); a set value must equal it — provision a backbone config with that architecture to train one |
+| `flow.num_train_timesteps` | resource | the 1000-point grid of the backbone's flow section |
+| `flow.shift` | honored | iris.flow_shift |
+| `flow.timestep_sampler` | honored | TrainingConfig::timestep_type |
+| `flow.logit_mean` | honored | iris.logit_mean |
+| `flow.logit_std` | honored | iris.logit_std |
+| `flow.prediction` | honored | iris.prediction |
+| `flow.x_pred_sigma_min` | honored | iris.x_pred_sigma_min |
+| `flow.shift_law` | honored | iris.shift_law |
+| `flow.shift_base_tokens` | honored | iris.shift_base_tokens |
+| `text_encoder.name` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.pretrained` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.dim` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.max_length` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.dtype` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.attn_implementation` | mapped | a Hugging Face attention backend switch; the shared native decoder runs the same attention |
+| `text_encoder.hidden_layers` | resource | the frozen conditioning is the text-encoder resource and the backbone's text_encoder section; a set value must equal it |
+| `text_encoder.null_embed_dir` | mapped | the on-disk null-embedding memo; natively the null is encoded once per run in memory (bit-identical: the encoder is frozen and deterministic) |
+| `text_encoder.compile` | mapped | torch.compile of the frozen decoder; natively the decoder runs eagerly (same math) |
+| `text_encoder.on_caption_overflow` | honored | iris.on_caption_overflow |
+| `repa.weight` | honored | iris.repa.weight |
+| `repa.variant` | honored | iris.repa.variant |
+| `repa.spatial_norm_gamma` | honored | iris.repa.spatial_norm_gamma |
+| `repa.teacher_source` | honored | iris.repa.teacher_source (hub: the native DINOv2 teacher; hf / DINOv3: refused, see TeacherArch) |
+| `repa.teacher_hub` | honored | iris.repa.teacher_hub (facebookresearch/dinov2 only) |
+| `repa.teacher` | honored | iris.repa.teacher (dinov2_vit{s,b,l,g}14[_reg]) |
+| `repa.teacher_weights` | honored | iris.repa.teacher_weights: the teacher resource directory (LoadSpec component repa_teacher); never downloaded |
+| `repa.teacher_dim` | honored | iris.repa.teacher_dim |
+| `repa.proj_hidden_dim` | honored | iris.repa.proj_hidden_dim |
+| `repa.teacher_image_size` | honored | iris.repa.teacher_image_size |
+| `repa.teacher_patch_size` | honored | iris.repa.teacher_patch_size |
+| `repa.teacher_match_student` | honored | iris.repa.teacher_match_student |
+| `data.data_dirs` | refused | native training reads the request's TrainingItems (the product layer resolves WIDS shards into items) |
+| `data.type` | honored | iris.data_type (pixel \| pixel_multiscale; the synthetic smoke datasets are refused) |
+| `data.image_size` | honored | TrainingConfig::resolution |
+| `data.shape_policy` | honored | iris.shape_policy |
+| `data.aspect_ratio_bucket` | honored | iris.aspect_ratio_bucket |
+| `data.shape_align` | honored | iris.shape_align |
+| `data.shape_max_ratio` | honored | iris.shape_max_ratio |
+| `data.caption_field` | honored | iris.caption_field |
+| `data.caption_fields` | honored | iris.caption_fields |
+| `data.val_data_dirs` | refused | the holdout set is the request items flagged model_options.split = "holdout" |
+| `data.num_workers` | mapped | dataloader worker processes; natively the host decodes each batch in process |
+| `train.batch_size` | honored | TrainingConfig::batch_size (per rank) |
+| `train.grad_accum_steps` | honored | TrainingConfig::gradient_accumulation |
+| `train.expected_global_batch` | honored | iris.expected_global_batch |
+| `train.num_epochs` | honored | iris.num_epochs |
+| `train.max_steps` | honored | TrainingConfig::steps (= max_steps × grad_accum micro-steps; 0 = the epoch horizon) |
+| `train.mixed_precision` | honored | TrainingConfig::train_dtype (bf16 \| fp16 \| no) |
+| `train.activation_checkpointing` | honored | iris.activation_checkpointing |
+| `train.ac_selective_every` | honored | iris.ac_selective_every |
+| `train.gradient_clip` | honored | iris.gradient_clip |
+| `train.text_dropout` | honored | iris.text_dropout |
+| `train.seed` | honored | TrainingConfig::seed |
+| `train.optimizer.name` | honored | TrainingConfig::optimizer |
+| `train.optimizer.lr` | honored | TrainingConfig::learning_rate |
+| `train.optimizer.betas` | honored | iris.betas |
+| `train.optimizer.weight_decay` | honored | TrainingConfig::weight_decay |
+| `train.optimizer.muon_momentum` | honored | iris.muon_momentum |
+| `train.optimizer.muon_nesterov` | honored | iris.muon_nesterov |
+| `train.optimizer.muon_adjust_lr` | honored | iris.muon_adjust_lr |
+| `train.optimizer.auto_lr` | honored | iris.auto_lr |
+| `train.optimizer.base_batch_size` | honored | iris.base_batch_size |
+| `train.optimizer.schedule` | honored | TrainingConfig::lr_scheduler |
+| `train.optimizer.warmup_steps` | honored | TrainingConfig::lr_warmup_steps (× grad_accum) |
+| `train.optimizer.scale_warmup_by_world` | honored | iris.scale_warmup_by_world |
+| `train.ema.enabled` | honored | iris.ema_enabled |
+| `train.ema.decay` | honored | iris.ema_decay |
+| `train.dist.strategy` | honored | iris.dist.strategy |
+| `train.dist.sharding` | honored | iris.dist.sharding |
+| `train.dist.mesh.dp_shard` | honored | iris.dist.mesh.dp_shard |
+| `train.dist.mesh.dp_replicate` | honored | iris.dist.mesh.dp_replicate |
+| `train.dist.param_dtype` | honored | iris.dist.param_dtype |
+| `train.dist.reduce_dtype` | honored | iris.dist.reduce_dtype |
+| `train.dist.reshard_after_forward` | honored | iris.dist.reshard_after_forward |
+| `train.dist.checkpoint_io` | honored | iris.dist.checkpoint_io |
+| `train.dist.ddp.find_unused_parameters` | honored | iris.dist.ddp.find_unused_parameters |
+| `train.dist.ddp.gradient_as_bucket_view` | honored | iris.dist.ddp.gradient_as_bucket_view |
+| `train.dist.ddp.batched_grad_copy` | honored | iris.dist.ddp.batched_grad_copy |
+| `train.dist.ddp.skip_all_reduce_unused_params` | honored | iris.dist.ddp.skip_all_reduce_unused_params |
+| `train.dist.ddp.bucket_cap_mb` | honored | iris.dist.ddp.bucket_cap_mb |
+| `train.dist.ddp.forward_sync_buffers` | honored | iris.dist.ddp.forward_sync_buffers |
+| `train.load_from` | honored | iris.load_from (a native checkpoint / exported model dir; a torch .pth is refused — export it with scripts/export_checkpoint.py) |
+| `train.resume_from` | honored | iris.resume_from ("latest" = TrainingConfig::resume) |
+| `train.resume_data_world_size` | refused | migrates torch checkpoints written before data_position was persisted; every native checkpoint records its data position |
+| `train.resume_data_policy` | honored | iris.resume_data_policy |
+| `train.resume_optimizer` | honored | iris.resume_optimizer |
+| `train.override_lr_on_resume` | honored | iris.override_lr_on_resume |
+| `train.save_every_steps` | honored | TrainingConfig::save_every (× grad_accum) |
+| `train.save_every_epochs` | honored | iris.save_every_epochs |
+| `train.keep_last_checkpoints` | honored | iris.keep_last_checkpoints |
+| `train.milestone_steps` | honored | iris.milestone_steps |
+| `train.log_every` | honored | iris.log_every |
+| `train.log_block_grad_norms` | honored | iris.log_block_grad_norms |
+| `train.sample_every_steps` | honored | TrainingConfig::sample_every (× grad_accum) + iris.preview_at_step_one |
+| `train.val_every_steps` | honored | iris.val_every_steps |
+| `train.val_samples` | honored | iris.val_samples |
+| `train.validation_prompts` | honored | TrainingConfig::sample_prompts (≤ 4) or iris.upstream_validation_prompts (the default seven) |
+| `train.nan_loss_tolerance` | honored | iris.nan_loss_tolerance |
+| `train.perf.foreach_ema` | mapped | multi-tensor EMA kernels; the native EMA update is the same elementwise blend |
+| `train.perf.fused_adamw` | mapped | torch's fused AdamW kernel; the native AdamW is the same update |
+| `train.perf.skip_dropped_text` | mapped | dropped rows skip the encoder; natively a dropped row always takes the null states without encoding (identical: the encoder consumes no randomness) |
+| `train.perf.lazy_sync` | honored | iris.perf.lazy_sync (the non-finite guard on the clipped grad norm) |
+| `train.perf.compile` | mapped | torch.compile (numerics within training noise); natively eager |
+| `train.perf.compile_mode` | mapped | torch.compile mode; natively eager |
+| `train.perf.compile_scope` | mapped | torch.compile scope; natively eager |
+| `train.perf.compile_dynamic` | mapped | torch.compile shape dynamism; natively eager |
+| `train.perf.compile_fullgraph` | mapped | torch.compile fullgraph; natively eager |
+| `train.perf.recompile_limit` | mapped | dynamo cache budget; natively eager (no recompilation) |
+| `sample.steps` | inert | scripts/sample.py only; the trainer's previews use 100 steps |
+| `sample.order` | honored | iris.preview_order |
+| `sample.cfg_scale` | inert | scripts/sample.py only; the trainer's previews use CFG 3 |
+| `sample.cfg_interval` | inert | scripts/sample.py only; the trainer's previews use (0, 1) |
+| `sample.negative_prompt` | inert | scripts/sample.py only; the trainer's previews pass none |
+| `cli.--config` | honored | translate_upstream's yaml |
+| `cli.--expected-nodes` | honored | iris.dist.world.expected_nodes |
+| `cli.--prestage` | mapped | fills node-local torch caches (hub teacher, shape-plan keys); natively the teacher is a provisioned resource and shape keys are computed in the run's preparing pass — Trainer::validate is the dry run |
+| `cli.overrides` | honored | translate_upstream's dotlist overrides |
 
 ### Generation control surface (sc-25681)
 
