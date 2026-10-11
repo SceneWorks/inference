@@ -602,21 +602,17 @@ fn read_checkpoint_members(dir: &Path, saved: &CheckpointState) -> Result<CkptPa
         .map(|p| load_tensors(p))
         .collect::<Result<_>>()?;
     let mut merged: HashMap<String, Array> = HashMap::new();
-    for key in parts[0].keys() {
+    let keys: std::collections::BTreeSet<&String> = parts.iter().flat_map(|p| p.keys()).collect();
+    for key in keys {
         if key == "o::__t" {
             merged.insert(key.clone(), parts[0][key].clone());
             continue;
         }
-        let rows: Vec<&Array> = parts
+        // A shard holding zero rows of a tensor (more shards than rows) writes no entry for it;
+        // the reassembled shape is checked against the run's when it is restored.
+        let nonempty: Vec<Array> = parts
             .iter()
-            .map(|p| {
-                p.get(key).ok_or_else(|| {
-                    Error::Msg(format!("iris resume: a dcp shard lacks {key}"))
-                })
-            })
-            .collect::<Result<_>>()?;
-        let nonempty: Vec<Array> = rows
-            .into_iter()
+            .filter_map(|p| p.get(key))
             .filter(|a| a.ndim() == 0 || a.shape()[0] > 0)
             .cloned()
             .collect();
@@ -1163,6 +1159,22 @@ impl Run {
         Ok(())
     }
 
+    /// The gathered (unsharded) parameters at `dist.param_dtype` — FSDP2's
+    /// `MixedPrecisionPolicy(param_dtype)`: the all-gathered copy the forward and backward read is
+    /// rounded to that precision (the f32 shards stay the optimizer's masters; the compute dtype
+    /// stays `mixed_precision`'s).
+    fn gather_forward(&mut self) -> Result<Params> {
+        let full = self.topo.gather_map(&self.params)?;
+        let dtype = match self.plan.dist.param_dtype {
+            gen_core::iris::train::dist::Precision::Fp32 => return Ok(full),
+            gen_core::iris::train::dist::Precision::Bf16 => Dtype::Bfloat16,
+            gen_core::iris::train::dist::Precision::Fp16 => Dtype::Float16,
+        };
+        full.into_iter()
+            .map(|(k, v)| Ok((k, v.as_dtype(dtype)?.as_dtype(Dtype::Float32)?)))
+            .collect()
+    }
+
     /// The full parameters for a forward (gathered from the shard group under sharding; kept for
     /// the window unless `reshard_after_forward`, kept across steps under `grad_op`).
     fn forward_params(&mut self) -> Result<Params> {
@@ -1172,7 +1184,7 @@ impl Run {
         if let Some(f) = &self.full {
             return Ok(f.clone());
         }
-        let full = self.topo.gather_map(&self.params)?;
+        let full = self.gather_forward()?;
         let keep = !self.plan.dist.sharding.shards_params() || !self.plan.dist.reshard_after_forward;
         if keep {
             self.full = Some(full.clone());
@@ -1546,7 +1558,7 @@ impl Run {
         self.full = None;
         if plan.dist.sharded() && !plan.dist.sharding.shards_params() {
             // grad_op: the parameters stay gathered between steps.
-            let full = self.topo.gather_map(&self.params)?;
+            let full = self.gather_forward()?;
             self.full = Some(full);
         }
         Ok(WindowOutcome::Stepped {
@@ -1764,6 +1776,8 @@ impl Run {
                 for (k, v) in self.opt.state_tensors() {
                     list.push((format!("o::{k}"), v));
                 }
+                // Zero-row shards (more shards than rows) have nothing to write.
+                list.retain(|(_, a)| a.size() > 0);
                 list.sort_by(|a, c| a.0.cmp(&c.0));
                 let path = staging.join(format!("shard_{:05}.safetensors", self.plan.dist.shard_index()));
                 save_safetensors_atomic(&path, &list, &Default::default())?;

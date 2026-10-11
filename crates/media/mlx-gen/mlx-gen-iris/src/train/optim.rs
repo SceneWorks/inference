@@ -333,6 +333,9 @@ impl IrisOptimizer {
                 Slot::Frozen => {}
             }
         }
+        // Name order: a sharded checkpoint gathers these collectively, so every rank must visit
+        // them in the same sequence (the slot map's iteration order is per-process).
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 

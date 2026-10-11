@@ -1070,12 +1070,26 @@ fn io_lost(rank: usize, op: &str, e: impl std::fmt::Display) -> Error {
     .into_error()
 }
 
+/// A transport I/O failure as [`DistError::RankLost`], naming an expired bounded wait as such.
+fn stream_lost(s: &TcpStream, peer: usize, op: &str, e: std::io::Error) -> Error {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    if matches!(e.kind(), WouldBlock | TimedOut) {
+        let bound = s.read_timeout().ok().flatten().unwrap_or_default();
+        return io_lost(
+            peer,
+            op,
+            format!("no answer within the {}s transport timeout", bound.as_secs()),
+        );
+    }
+    io_lost(peer, op, e)
+}
+
 fn write_all(s: &mut TcpStream, buf: &[u8], peer: usize, op: &str) -> Result<()> {
-    s.write_all(buf).map_err(|e| io_lost(peer, op, e))
+    s.write_all(buf).map_err(|e| stream_lost(s, peer, op, e))
 }
 
 fn read_exact(s: &mut TcpStream, buf: &mut [u8], peer: usize, op: &str) -> Result<()> {
-    s.read_exact(buf).map_err(|e| io_lost(peer, op, e))
+    s.read_exact(buf).map_err(|e| stream_lost(s, peer, op, e))
 }
 
 fn send_frame(

@@ -30,6 +30,10 @@ use super::optim::Params;
 
 /// An MLX array's f32 values on the host.
 pub fn to_host(a: &Array) -> Result<Vec<f32>> {
+    if a.size() == 0 {
+        // A zero-row shard (more shards than rows) has no host buffer to read.
+        return Ok(Vec::new());
+    }
     let f = a.as_dtype(Dtype::Float32)?;
     eval([&f])?;
     Ok(f.as_slice::<f32>().to_vec())
@@ -288,6 +292,15 @@ impl Topology {
             .coll
             .all_gather(&to_host(shard)?, &self.plan.shard_groups())?;
         let flat: Vec<f32> = parts.into_iter().flatten().collect();
+        let numel: i32 = full.iter().product();
+        if flat.len() != numel as usize {
+            return Err(Error::Msg(format!(
+                "iris distributed: the shards of {key} gather to {} values, its full shape {full:?} \
+                 holds {numel} (local shard {:?})",
+                flat.len(),
+                shard.shape()
+            )));
+        }
         Ok(from_host(&flat, &full))
     }
 
