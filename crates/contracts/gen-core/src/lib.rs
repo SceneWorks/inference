@@ -283,7 +283,7 @@ pub use train::{
     LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
     TrainingRequest, TrainingTechniques, VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE,
-    MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
+    MAX_RESOLUTION_BUCKETS, PIXEL_PERCEPTUAL_SCHEDULE, RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,

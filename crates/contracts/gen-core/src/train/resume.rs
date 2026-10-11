@@ -424,14 +424,14 @@ mod tests {
         let p = training_config_fingerprint(&on);
         assert_eq!(
             p,
-            format!("{base};body_proportion=0.1/0.0-1.0/2,head=false")
+            format!("{base};body_proportion=0.1/0.0-0.5/2,head=false")
         );
         on.body_losses.shape.weight = 0.2;
         on.body_losses.normal.weight = 0.3;
         let all = training_config_fingerprint(&on);
         assert!(
             all.ends_with(
-                ";body_shape=0.2/0.0-1.0/2,min_cos=0.2;normal=0.3/0.0-1.0/2,subject=false"
+                ";body_shape=0.2/0.0-0.5/2,min_cos=0.2;normal=0.3/0.0-0.5/2,subject=false"
             ),
             "{all}"
         );
@@ -456,10 +456,10 @@ mod tests {
         let with = training_config_fingerprint(&on);
         assert_eq!(
             with,
-            format!("{base};identity_loss=0.1/0.0-1.0/2/0.2/dataset_average")
+            format!("{base};identity_loss=0.1/0.0-0.5/2/0.2/dataset_average")
         );
         on.face_landmark_loss.schedule.weight = 0.05;
-        assert!(training_config_fingerprint(&on).ends_with(";face_landmark_loss=0.05/0.0-1.0/2"));
+        assert!(training_config_fingerprint(&on).ends_with(";face_landmark_loss=0.05/0.0-0.5/2"));
         let mut gate = on.clone();
         gate.identity_loss.min_cos = 0.3;
         assert_ne!(

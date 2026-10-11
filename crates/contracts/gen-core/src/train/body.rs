@@ -152,11 +152,11 @@ impl BodyLossesConfig {
 impl Default for BodyLossesConfig {
     fn default() -> Self {
         Self {
-            proportion: AuxLossSchedule::OFF,
+            proportion: super::PIXEL_PERCEPTUAL_SCHEDULE,
             include_head: false,
-            shape: AuxLossSchedule::OFF,
+            shape: super::PIXEL_PERCEPTUAL_SCHEDULE,
             shape_min_cos: Self::DEFAULT_SHAPE_MIN_COS,
-            normal: AuxLossSchedule::OFF,
+            normal: super::PIXEL_PERCEPTUAL_SCHEDULE,
             normal_restrict_to_subject: false,
             pose_model_dir: None,
             shape_model_dir: None,

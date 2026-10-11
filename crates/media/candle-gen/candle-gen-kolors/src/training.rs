@@ -456,9 +456,10 @@ fn kolors_step(
     let aux_term = match aux {
         Some(a) if aux_on => {
             let alpha_bar = schedule.alphas_cumprod[timestep];
-            let x0_hat = Parameterization::Epsilon { alpha_bar }
-                .recover_x0(&noisy_f32, &prediction.to_dtype(DType::F32)?)?;
-            a.aux_loss(&x0_hat)?
+            let param = Parameterization::Epsilon { alpha_bar };
+            let x0_hat = param.recover_x0(&noisy_f32, &prediction.to_dtype(DType::F32)?)?;
+            // sc-2124: undo the ε Jacobian's σ_ve amplification (`Parameterization::aux_gain`).
+            a.aux_loss_gained(&x0_hat, param.aux_gain())?
         }
         _ => None,
     };
@@ -1138,11 +1139,13 @@ mod tests {
             assert_ne!(got, 100, "the remapped level, not the sampled one");
         }
 
-        /// The aux term is the depth loss of THE trainer's x0 estimate: recomputed independently from
-        /// the model output with the trainer's parameterisation, it matches the step's aux bits.
-        /// Mutation: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red.
+        /// The aux term is the depth loss of THE trainer's x0 estimate times the ε gain
+        /// `min(1, √ᾱ/√(1−ᾱ))` (sc-2124): recomputed independently from the model output with the
+        /// trainer's parameterisation, it matches the step's aux value at a high-σ timestep (gain
+        /// < 1). Mutations: recover with `alphas_cumprod[timestep - 1]` in `kolors_step` ⇒ red; drop
+        /// the gain (`aux_loss` instead of `aux_loss_gained`) ⇒ red.
         #[test]
-        fn aux_term_is_the_depth_loss_of_the_recovered_x0() {
+        fn aux_term_is_the_gained_depth_loss_of_the_recovered_x0() {
             let f = fixture();
             let (mut d, sched) = driver(&f);
             let _ = d.sample(1, &sched);
@@ -1164,12 +1167,15 @@ mod tests {
                 .unwrap();
             let ab = f.alphas.alphas_cumprod[t] as f64;
             let x0 = ((&noisy - (eps * (1.0 - ab).sqrt()).unwrap()).unwrap() / ab.sqrt()).unwrap();
+            let gain = (ab.sqrt() / (1.0 - ab).sqrt()).min(1.0) as f32;
+            assert!(gain < 0.9, "t={t}: a high-σ step (σ_ve > 1), gain {gain}");
             let want = s2
                 .aux_loss(&x0)
                 .unwrap()
                 .unwrap()
                 .to_scalar::<f32>()
-                .unwrap();
+                .unwrap()
+                * gain;
             let got = l.aux.unwrap();
             assert!(
                 (got - want).abs() <= 1e-5 * want.abs().max(1.0),
