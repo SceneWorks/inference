@@ -1105,12 +1105,16 @@ mod depth_anchoring_tests {
                 .transpose_axes(&[0, 3, 1, 2])
                 .unwrap();
                 let plan = p.plan(2, 0, h.noise_level(raw)).unwrap();
+                // sc-2124: the ε aux gain `min(1, √ᾱ/√(1−ᾱ))`.
+                let ab = h.alpha_bar(t).unwrap();
+                let gain = (ab.sqrt() / (1.0 - ab).sqrt()).min(1.0);
                 let want = p
                     .aux_loss(&plan, 0, &x0_hat)
                     .unwrap()
                     .unwrap()
                     .weighted
-                    .item::<f32>();
+                    .item::<f32>()
+                    * gain;
                 assert!(
                     (want - aux).abs() <= 1e-5 * want.abs().max(1.0),
                     "{want} vs {aux}"

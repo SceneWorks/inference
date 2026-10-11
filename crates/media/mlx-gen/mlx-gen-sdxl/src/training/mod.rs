@@ -1348,6 +1348,114 @@ mod depth_anchoring_tests {
         assert_eq!(depth, expected);
     }
 
+    /// sc-2124: the ε family's aux term carries the gain `min(1, √ᾱ/√(1−ᾱ)) = min(1, 1/σ_ve)`. On an
+    /// aux-only step at a high-σ timestep (window `[0.6, 0.8]` ⇒ σ_ve > 1) the step's aux value is
+    /// the ungained depth loss of the recovered x0 times the gain, and every adapter gradient is the
+    /// ungained term's gradient times the same gain. Mutation: drop the gain in
+    /// `compute_step_loss_grads` (or make `aux_gain` return `1`) ⇒ red.
+    #[test]
+    fn epsilon_aux_term_and_gradient_carry_the_inverse_sigma_gain() {
+        let h = hooks();
+        let mut unet = tiny_unet(3).unwrap();
+        let mut cfg = cfg();
+        let window = AuxLossSchedule {
+            t_min: 0.6,
+            t_max: 0.8,
+            ..schedule()
+        };
+        cfg.depth_anchoring.schedule = window;
+        let (adapter, params) = adapter(&mut unet, &cfg);
+        let cache = cache_n(1);
+        let d = aux_driver(
+            path_with(window),
+            &cache,
+            &single_bucket(cache.len()),
+            1,
+            &Default::default(),
+        )
+        .unwrap();
+        let plan = d.path().plan(2, 0, 0.5).unwrap();
+        assert!(!plan.diffusion && !plan.aux.is_empty(), "{plan:?}");
+        let t = h.timestep_at(plan.noise_level);
+        let ab = h.alpha_bar(t).unwrap();
+        let gain = (ab.sqrt() / (1.0 - ab).sqrt()).min(1.0);
+        assert!(gain < 0.9, "{t:?}: a high-σ step (σ_ve > 1), gain {gain}");
+        let noise =
+            random::normal::<f32>(&[1, 6, 4, 4], None, None, Some(&random::key(9).unwrap()))
+                .unwrap();
+        let c = &cache[0];
+        let (got, g) = compute_step_loss_grads(
+            &h,
+            &mut unet,
+            &params,
+            &adapter,
+            cfg.alpha,
+            cfg.rank as f32,
+            &c.x0,
+            &c.cond,
+            &c.pooled,
+            &c.time_ids,
+            t,
+            &noise,
+            false,
+            None,
+            Dtype::Float32,
+            None,
+            Some(AuxStep {
+                path: d.path(),
+                plan: &plan,
+                entry: 0,
+            }),
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+
+        // The ungained term, recomputed independently on the same forward.
+        let noisy = h.add_noise(&c.x0, &noise, t).unwrap();
+        let (cond, pooled, ids) = (c.cond.clone(), c.pooled.clone(), c.time_ids.clone());
+        let (unet_ref, adapter_ref, path, plan_ref) = (&mut unet, &adapter, d.path(), &plan);
+        let (alpha, rank) = (cfg.alpha, cfg.rank as f32);
+        let ungained = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter_ref.install_as(unet_ref, &p, alpha, rank, None, Dtype::Float32)?;
+            let eps = unet_ref
+                .forward(&noisy, t.unet_time(), &cond, &pooled, &ids)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let x0 = Parameterization::Epsilon { alpha_bar: ab }
+                .recover_x0(&noisy, &eps)
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .transpose_axes(&[0, 3, 1, 2])?;
+            let term = path
+                .aux_loss(plan_ref, 0, &x0)
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .expect("the plan has an aux loss");
+            Ok(vec![term.weighted])
+        };
+        let (val, g_ref) = keyed_value_and_grad(ungained)(params.clone(), 0).unwrap();
+        eval(g_ref.values()).unwrap();
+        let want = val[0].item::<f32>() * gain;
+        let aux = got.aux.expect("aux-only step");
+        assert!(
+            (aux - want).abs() <= 1e-5 * want.abs().max(1.0),
+            "{aux} vs {want}"
+        );
+        // Gradients: gain × ungained, per tensor to f32 accumulation-order noise (1% relative L1;
+        // an ungained step is off by `(1 − gain)/gain` > 11%).
+        let mut material = 0;
+        for (k, v) in &g_ref {
+            let (mut err, mut norm) = (0f64, 0f64);
+            for (x, y) in g[k].as_slice::<f32>().iter().zip(v.as_slice::<f32>()) {
+                let want = f64::from(y * gain);
+                err += (f64::from(*x) - want).abs();
+                norm += want.abs();
+            }
+            if norm > 0.0 {
+                assert!(err <= 1e-2 * norm, "{k}: relative L1 error {}", err / norm);
+                material += 1;
+            }
+        }
+        assert!(material > 0, "no material aux gradient to compare");
+    }
+
     /// Interleaved alternation through the real step seam (sc-2124): with N = 2 images and
     /// `every_n = 2` no two depth steps run back to back and every image gets a diffusion and a
     /// depth step within 3 epochs, and with gradient accumulation 2 both micro-steps of a window
