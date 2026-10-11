@@ -102,7 +102,8 @@ def claim_device(out: Path):
 
 
 def verify_idle(device: dict, out: Path, phase: str):
-    devices, processes = inventory(out, phase)-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
+    devices, processes = inventory(out, phase)
+    (out / f"{phase}-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
     current = next(d for d in devices if d["uuid"] == device["uuid"])
     if not idle(current, processes):
         raise RuntimeError(f"selected physical device became occupied before {phase}")

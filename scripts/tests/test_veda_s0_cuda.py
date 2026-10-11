@@ -45,6 +45,16 @@ class S0CudaTests(unittest.TestCase):
         self.assertEqual([r[3] for r in rows],["G","C+G","unknown"])
         self.assertFalse(s0.idle(dict(uuid="GPU-test",used_mib=1164,utilization_percent=0),rows))
 
+    def test_phase_admission_recheck_preserves_typed_inventory(self):
+        device = dict(uuid="GPU-test", used_mib=1164, utilization_percent=0)
+        processes = [["GPU-test", "1", "permission-opaque", "G"]]
+        with tempfile.TemporaryDirectory() as out, patch.object(s0, "inventory", return_value=([device], processes)) as inventory:
+            s0.verify_idle(device, Path(out), "random")
+            inventory.assert_called_once_with(Path(out), "random")
+            import json
+            receipt = json.loads((Path(out) / "random-inventory.json").read_text())
+            self.assertEqual(receipt["processes"], processes)
+
     def test_owned_child_preserves_failure_returncode(self):
         job = Mock()
         child = Mock()
