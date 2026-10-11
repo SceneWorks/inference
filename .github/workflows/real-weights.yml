@@ -4929,7 +4929,8 @@ jobs:
   # gate). `rw-chroma` stores nothing and materializes per run into `runner.temp`, so there is no
   # `~/` snapshot to resolve and no headroom report; the 12 GB export is downloaded in its own step,
   # never during training. The machine check routes the run to nax-macos-2 only and skips the
-  # training (with a warning) under 128 GB RAM or with more than 20 GB already in use; the run is
+  # training (with a warning) under 128 GB RAM or under 85 GB free by `memory_pressure` (free % ×
+  # total RAM: the ~65 GB peak measured on CUDA + 20 GB headroom); the run is
   # wrapped in an external phys_footprint guard (SIGTERM at 80 GB or 20 min) that prints the peak.
   mlx-iris-depth-train:
     name: MLX Iris-3B depth full fine-tune (real weights)
