@@ -525,6 +525,12 @@ pub fn miniature_parts(
     let compute = match plan.mixed_precision {
         MixedPrecision::Bf16 => Dtype::Bfloat16,
         MixedPrecision::Fp32 => Dtype::Float32,
+        // Only the generation plan resolves fp16 (sc-25689); this task's plan never does.
+        MixedPrecision::Fp16 => {
+            return Err(Error::Unsupported(
+                "iris training: fp16 mixed precision is the generation trainer's".into(),
+            ))
+        }
     };
     let config = res.export.config();
     let source = load_source(&res.init_weights(plan.init), None)?;
@@ -556,6 +562,12 @@ impl Run {
         let compute = match pre.mixed_precision {
             MixedPrecision::Bf16 => Dtype::Bfloat16,
             MixedPrecision::Fp32 => Dtype::Float32,
+            // Only the generation plan resolves fp16 (sc-25689); this task's plan never does.
+            MixedPrecision::Fp16 => {
+                return Err(Error::Unsupported(
+                    "iris training: fp16 mixed precision is the generation trainer's".into(),
+                ))
+            }
         };
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {

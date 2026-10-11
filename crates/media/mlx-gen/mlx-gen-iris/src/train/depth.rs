@@ -634,6 +634,12 @@ impl Run {
         let compute = match plan.mixed_precision {
             MixedPrecision::Bf16 => Dtype::Bfloat16,
             MixedPrecision::Fp32 => Dtype::Float32,
+            // Only the generation plan resolves fp16 (sc-25689); this task's plan never does.
+            MixedPrecision::Fp16 => {
+                return Err(Error::Unsupported(
+                    "iris training: fp16 mixed precision is the generation trainer's".into(),
+                ))
+            }
         };
         // The dataset pass first (one `Caching` event per item): every example decodes, aligns and
         // is valid (or is skipped under `invalid_examples: skip`) before any weight is read.
@@ -914,6 +920,12 @@ impl Run {
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
             task: IrisTask::Depth,
+            stage: None,
+            parent_stage: None,
+            data_position: None,
+            dist: None,
+            repa_projector: None,
+            grad_scaler: None,
         }
     }
 

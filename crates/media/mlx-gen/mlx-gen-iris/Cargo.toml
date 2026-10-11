@@ -21,8 +21,16 @@ mlx-rs = { workspace = true }
 mlx-llm = { workspace = true }
 # state.json of the durable training checkpoints and the adapter metadata lists (sc-25685).
 serde_json = { workspace = true }
+# MLX's distributed layer (`mlx::core::distributed`: ring / jaccl / mpi) for data-parallel
+# training (sc-25689) — the C bindings mlx-rs does not wrap. Same pin as mlx-rs (workspace).
+mlx-sys = { workspace = true }
 # Header-only image validation in the training dataset pass (decode lives in gen_core::iris::train).
 image = { workspace = true }
+
+[build-dependencies]
+# build.rs links MLX's libjaccl.a (or compiles the JACCL-absent shim for a prebuilt MLX without it)
+# so `mlx::core::distributed::init` links (sc-25689).
+cc = "1"
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }

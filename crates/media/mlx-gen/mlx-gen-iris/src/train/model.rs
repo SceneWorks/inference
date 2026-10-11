@@ -29,8 +29,15 @@ use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
 use super::optim::Params;
-use crate::dit::{IrisDiT, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, PixelCtx, TextBatch, TrunkCtx};
 use crate::nn::AdaptedLinears;
+use gen_core::iris::train::ac::AcPolicy;
+use gen_core::iris::train::repa::{
+    bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX,
+};
+use mlx_rs::nn::silu;
+use mlx_rs::ops::{matmul, sqrt, sum_axes};
+use mlx_rs::transforms::checkpoint;
 
 /// The adapter parameterization.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,8 +200,11 @@ impl TrainModel {
     pub fn dit(&self, trainable: &HashMap<Rc<str>, Array>) -> Result<IrisDiT> {
         match &self.trainable {
             Trainable::Full => {
+                // The REPA projector (sc-25689) trains beside the backbone; it is not a backbone
+                // tensor.
                 let map: HashMap<String, Array> = trainable
                     .iter()
+                    .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 IrisDiT::from_weights(&Weights::from_map(map), &self.cfg, self.compute)
@@ -426,6 +436,411 @@ pub fn adapter_tensors(
             format!("{}.alpha", t.path),
             Array::from_slice(&[kind.alpha()], &[1]),
         ));
+    }
+    Ok(out)
+}
+
+// =============================================================================================
+// sc-25689: activation checkpointing, REPA, per-sample (holdout) loss
+// =============================================================================================
+
+/// What a training forward adds to the inference graph: the REPA objective and the activation
+/// checkpointing policy.
+#[derive(Clone, Debug)]
+pub struct TrainExtras {
+    pub repa: Option<RepaPlan>,
+    pub ac: AcPolicy,
+}
+
+impl Default for TrainExtras {
+    fn default() -> Self {
+        Self {
+            repa: None,
+            ac: AcPolicy::None,
+        }
+    }
+}
+
+/// One micro-batch's REPA targets: the frozen teacher's tokens (spatially normalized under iREPA)
+/// and the student / teacher patch grids.
+pub struct RepaTargets {
+    /// `[B, Nt, Dt]` f32.
+    pub teacher: Array,
+    pub student_grid: (usize, usize),
+    pub teacher_grid: (usize, usize),
+}
+
+/// The trainable keys under `prefix`, sorted (one region's inputs).
+fn region_keys(p: &HashMap<Rc<str>, Array>, prefix: &str) -> Vec<Rc<str>> {
+    let mut keys: Vec<Rc<str>> = p
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+impl TrainModel {
+    /// The weights + adapter install of the block under `prefix`, built from `arrays` (the
+    /// region's trainable inputs under `keys`) exactly as [`TrainModel::dit`] builds the whole
+    /// backbone.
+    fn region_source(
+        &self,
+        prefix: &str,
+        keys: &[Rc<str>],
+        arrays: &[Array],
+    ) -> Result<(Weights, Option<AdaptedLinears>)> {
+        match &self.trainable {
+            Trainable::Full => {
+                let map: HashMap<String, Array> = keys
+                    .iter()
+                    .zip(arrays)
+                    .map(|(k, a)| (k.to_string(), a.clone()))
+                    .collect();
+                Ok((Weights::from_map(map), None))
+            }
+            Trainable::Adapter {
+                kind,
+                targets,
+                base,
+            } => {
+                let factors: HashMap<Rc<str>, Array> = keys
+                    .iter()
+                    .zip(arrays)
+                    .map(|(k, a)| (k.clone(), a.clone()))
+                    .collect();
+                let base_map: HashMap<String, Array> = base
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut linears = BTreeMap::new();
+                let mut adapted = BTreeSet::new();
+                for t in targets.iter().filter(|t| t.path.starts_with(prefix)) {
+                    let w = base.get(&format!("{}.weight", t.path)).ok_or_else(|| {
+                        Error::Msg(format!("iris adapter: base has no {}.weight", t.path))
+                    })?;
+                    let bias = base
+                        .get(&format!("{}.bias", t.path))
+                        .map(|b| b.as_dtype(self.compute))
+                        .transpose()?;
+                    let mut lin = AdaptableLinear::dense(w.as_dtype(self.compute)?, bias);
+                    lin.set_adapters(vec![provider_adapter(self.compute, *kind, t, &factors)?]);
+                    linears.insert(t.path.clone(), lin);
+                    adapted.insert(t.path.clone());
+                }
+                Ok((
+                    Weights::from_map(base_map),
+                    Some(AdaptedLinears::new(linears, adapted)),
+                ))
+            }
+        }
+    }
+}
+
+/// The training forward's hooks: activation-checkpointing regions (MLX's own checkpoint
+/// transform — the region's trainable tensors and activations are its inputs, so the recompute
+/// rebuilds the block from them) and the REPA capture of block `capture` (1-based).
+struct TrainHooks<'a> {
+    model: &'a TrainModel,
+    p: &'a HashMap<Rc<str>, Array>,
+    ac: AcPolicy,
+    capture: Option<usize>,
+    captured: Option<Array>,
+}
+
+impl ForwardHooks for TrainHooks<'_> {
+    fn trunk_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        let (so, yo) = if self.ac.should_checkpoint(i) {
+            let prefix = format!("blocks.{i}.");
+            let keys = region_keys(self.p, &prefix);
+            let has_txt = core_txt.is_some();
+            let mut inputs = vec![
+                s.clone(),
+                y.clone(),
+                core_img.clone(),
+                core_txt.cloned().unwrap_or_else(|| core_img.clone()),
+            ];
+            inputs.extend(keys.iter().map(|k| self.p[k].clone()));
+            let model = self.model;
+            let cfg = &model.cfg;
+            let mut region = checkpoint(|xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+                let (w, adapted) = model
+                    .region_source(&prefix, &keys, &xs[4..])
+                    .map_err(to_exc)?;
+                let blk = IrisDiT::load_trunk_block(&w, cfg, model.compute, i, adapted.as_ref())
+                    .map_err(to_exc)?;
+                let (so, yo) = dit
+                    .run_external_trunk_block(
+                        &blk,
+                        ctx,
+                        &xs[0],
+                        &xs[1],
+                        &xs[2],
+                        has_txt.then(|| &xs[3]),
+                    )
+                    .map_err(to_exc)?;
+                Ok(vec![so, yo])
+            });
+            let mut out = region(&inputs)?;
+            let yo = out.pop().expect("two outputs");
+            (out.pop().expect("two outputs"), yo)
+        } else {
+            dit.run_trunk_block(i, ctx, s, y, core_img, core_txt)?
+        };
+        if self.capture == Some(i + 1) {
+            self.captured = Some(so.clone());
+        }
+        Ok((so, yo))
+    }
+
+    fn pixel_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Array,
+        s_cond: &Array,
+    ) -> Result<Array> {
+        if !self.ac.should_checkpoint(i) {
+            return dit.run_pixel_block(i, ctx, pixels, s_cond);
+        }
+        let prefix = format!("pixel_blocks.{i}.");
+        let keys = region_keys(self.p, &prefix);
+        let mut inputs = vec![pixels.clone(), s_cond.clone()];
+        inputs.extend(keys.iter().map(|k| self.p[k].clone()));
+        let model = self.model;
+        let cfg = &model.cfg;
+        let mut region = checkpoint(|xs: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+            let (w, adapted) = model
+                .region_source(&prefix, &keys, &xs[2..])
+                .map_err(to_exc)?;
+            let blk = IrisDiT::load_pixel_block(&w, cfg, model.compute, i, adapted.as_ref())
+                .map_err(to_exc)?;
+            Ok(vec![dit
+                .run_external_pixel_block(&blk, ctx, &xs[0], &xs[1])
+                .map_err(to_exc)?])
+        });
+        Ok(region(&inputs)?.pop().expect("one output"))
+    }
+}
+
+/// `F.normalize(x, dim=-1)`: `x / max(‖x‖₂, 1e−12)`.
+fn l2_normalize(x: &Array) -> Result<Array> {
+    let n = sqrt(&sum_axes(&x.square()?, &[-1], true)?)?;
+    Ok(x.divide(&maximum(&n, &Array::from_f32(1e-12))?)?)
+}
+
+/// `_resize_token_grid`: bilinearly resample `[B, h·w, C]` tokens onto `dst`.
+pub fn resize_token_grid(
+    tokens: &Array,
+    src: (usize, usize),
+    dst: (usize, usize),
+) -> Result<Array> {
+    let sh = tokens.shape();
+    let (b, c) = (sh[0], sh[2]);
+    let mh = Array::from_slice(&bilinear_matrix(src.0, dst.0), &[dst.0 as i32, src.0 as i32]);
+    let mw = Array::from_slice(&bilinear_matrix(src.1, dst.1), &[dst.1 as i32, src.1 as i32]);
+    let x = tokens
+        .transpose_axes(&[0, 2, 1])?
+        .reshape(&[b, c, src.0 as i32, src.1 as i32])?;
+    let x = matmul(&matmul(&mh, &x)?, &mw.t())?;
+    Ok(x.reshape(&[b, c, (dst.0 * dst.1) as i32])?
+        .transpose_axes(&[0, 2, 1])?)
+}
+
+/// The projector (`REPALoss._project`) in fp32: the 3-layer SiLU MLP, or iREPA's 3×3 conv on the
+/// student grid.
+fn project(plan: &RepaPlan, p: &HashMap<Rc<str>, Array>, x: &Array, grid: (usize, usize)) -> Result<Array> {
+    let get = |leaf: &str| -> Result<&Array> {
+        let k = format!("{PROJECTOR_PREFIX}{leaf}");
+        p.get(k.as_str())
+            .ok_or_else(|| Error::Msg(format!("iris repa: projector tensor {k} missing")))
+    };
+    let lin = |x: &Array, i: usize| -> Result<Array> {
+        Ok(matmul(x, &get(&format!("{i}.weight"))?.t())?.add(get(&format!("{i}.bias"))?)?)
+    };
+    match plan.variant {
+        RepaVariant::Repa => {
+            let h = silu(lin(x, 0)?)?;
+            let h = silu(lin(&h, 2)?)?;
+            lin(&h, 4)
+        }
+        RepaVariant::Irepa => {
+            let sh = x.shape();
+            let (b, d) = (sh[0], sh[2]);
+            let (gh, gw) = (grid.0 as i32, grid.1 as i32);
+            // NHWC input, OHWI weight.
+            let xs = x.reshape(&[b, gh, gw, d])?;
+            let w = get("weight")?.transpose_axes(&[0, 2, 3, 1])?;
+            let y = mlx_rs::ops::conv2d(&xs, &w, (1, 1), (1, 1), (1, 1), 1)?.add(get("bias")?)?;
+            Ok(y.reshape(&[b, gh * gw, -1])?)
+        }
+    }
+}
+
+/// `REPALoss.forward` given the teacher's tokens: `−mean(cos(student, teacher))`.
+pub fn repa_loss(
+    plan: &RepaPlan,
+    p: &HashMap<Rc<str>, Array>,
+    student_tokens: &Array,
+    t: &RepaTargets,
+) -> Result<Array> {
+    let x = student_tokens.as_dtype(Dtype::Float32)?;
+    let mut student = l2_normalize(&project(plan, p, &x, t.student_grid)?)?;
+    let mut teacher = t.teacher.clone();
+    if t.teacher_grid != t.student_grid {
+        let nt = t.teacher_grid.0 * t.teacher_grid.1;
+        let ns = t.student_grid.0 * t.student_grid.1;
+        if nt > ns {
+            teacher = resize_token_grid(&teacher, t.teacher_grid, t.student_grid)?;
+        } else {
+            student = resize_token_grid(&student, t.student_grid, t.teacher_grid)?;
+        }
+    }
+    let teacher = l2_normalize(&teacher)?;
+    let student = l2_normalize(&student)?;
+    let cos = sum_axes(&student.multiply(&teacher)?, &[-1], false)?;
+    Ok(cos.mean(None)?.negative()?)
+}
+
+/// The per-sample rectified-flow loss `[B]` (`reduction="none"`, the holdout grid's form).
+pub fn flow_loss_per_sample(dit: &IrisDiT, b: &StepBatch, obj: &FlowObjective) -> Result<Array> {
+    per_sample_loss(dit, b, obj, &mut crate::dit::NoHooks)
+}
+
+fn per_sample_loss(
+    dit: &IrisDiT,
+    b: &StepBatch,
+    obj: &FlowObjective,
+    hooks: &mut dyn ForwardHooks,
+) -> Result<Array> {
+    let one = Array::from_f32(1.0);
+    let x_t = one
+        .subtract(&b.sigma)?
+        .multiply(&b.x0)?
+        .add(&b.sigma.multiply(&b.noise)?)?;
+    let out = dit.forward_hooked(
+        &x_t,
+        &b.t,
+        &TextBatch {
+            states: &b.states,
+            mask: &b.masks,
+        },
+        hooks,
+    )?;
+    let target = b.noise.subtract(&b.x0)?;
+    let pred = match obj.prediction {
+        Prediction::Velocity => out,
+        Prediction::Clean => {
+            let floor = Array::from_f32(obj.x_pred_sigma_min as f32);
+            x_t.subtract(&out)?.divide(&maximum(&b.sigma, &floor)?)?
+        }
+    };
+    let err = pred.subtract(&target)?.square()?;
+    Ok(mean_axes(&err, &[1, 2, 3], false)?)
+}
+
+/// The training forward of one micro-batch: the flow loss (batch mean) and, under REPA, the
+/// alignment loss — with the activation-checkpointing regions of `extras.ac`.
+pub fn forward_losses(
+    model: &TrainModel,
+    p: &HashMap<Rc<str>, Array>,
+    batch: &StepBatch,
+    obj: &FlowObjective,
+    extras: &TrainExtras,
+    repa: Option<&RepaTargets>,
+) -> Result<(Array, Option<Array>)> {
+    let dit = model.dit(p)?;
+    let mut hooks = TrainHooks {
+        model,
+        p,
+        ac: extras.ac,
+        capture: extras.repa.as_ref().map(|r| r.layer),
+        captured: None,
+    };
+    let flow = per_sample_loss(&dit, batch, obj, &mut hooks)?.mean(None)?;
+    let repa_l = match (&extras.repa, repa) {
+        (Some(plan), Some(t)) => {
+            let feats = hooks.captured.take().ok_or_else(|| {
+                Error::Msg(format!("iris repa: block {} was never reached", plan.layer))
+            })?;
+            Some(repa_loss(plan, p, &feats, t)?)
+        }
+        (Some(_), None) => {
+            return Err(Error::Msg(
+                "iris repa: the micro-batch carries no teacher targets".into(),
+            ))
+        }
+        _ => None,
+    };
+    Ok((flow, repa_l))
+}
+
+/// The losses of one micro-batch and the gradient of `(flow + weight · repa) · grad_scale` over
+/// every trainable tensor (backbone or adapter factors, plus the REPA projector). Returns the
+/// unscaled flow and REPA losses.
+pub fn loss_and_grads_ext(
+    model: &TrainModel,
+    trainable: &Params,
+    batch: &StepBatch,
+    obj: &FlowObjective,
+    extras: &TrainExtras,
+    repa: Option<&RepaTargets>,
+    grad_scale: f32,
+) -> Result<(f32, Option<f32>, Params)> {
+    let loss_fn = |p: HashMap<Rc<str>, Array>, _: i32| -> mlx_rs::error::Result<Vec<Array>> {
+        let (flow, rl) = forward_losses(model, &p, batch, obj, extras, repa).map_err(to_exc)?;
+        let total = match (&rl, &extras.repa) {
+            (Some(r), Some(plan)) => flow.add(&r.multiply(Array::from_f32(plan.weight as f32))?)?,
+            _ => flow.clone(),
+        };
+        let scaled = total.multiply(Array::from_f32(grad_scale))?;
+        let mut out = vec![scaled, flow];
+        if let Some(r) = rl {
+            out.push(r);
+        }
+        Ok(out)
+    };
+    let mut vg = keyed_value_and_grad(loss_fn);
+    let (vals, grads) =
+        vg(trainable.clone(), 0).map_err(|e| Error::Msg(format!("iris train step: {e}")))?;
+    let flow = vals[1].clone();
+    let rl = vals.get(2).cloned();
+    let mut refs: Vec<&Array> = vec![&flow];
+    refs.extend(rl.iter());
+    refs.extend(grads.values());
+    for chunk in refs.chunks(256) {
+        eval(chunk.iter().copied())?;
+    }
+    Ok((
+        flow.item::<f32>(),
+        rl.map(|r| r.item::<f32>()),
+        grads,
+    ))
+}
+
+/// PyTorch-default init of the REPA projector (`U(±1/√fan_in)` weights and biases), from MLX's RNG
+/// keyed on `mix_seed(seed, fnv(key))`.
+pub fn init_projector(plan: &RepaPlan, seed: u64) -> Result<Params> {
+    let mut out = Params::new();
+    for (key, shape) in plan.projector_shapes() {
+        let bound = plan.projector_init_bound(&key) as f32;
+        let dims: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+        let k = random::key(mix_seed(&[seed, fnv(&key)]))?;
+        let a = random::uniform::<_, f32>(-bound, bound, &dims[..], Some(&k))?;
+        eval([&a])?;
+        out.insert(Rc::from(key.as_str()), a);
     }
     Ok(out)
 }

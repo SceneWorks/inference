@@ -366,75 +366,7 @@ impl IrisDiT {
         };
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
-            let p = |name: &str| format!("blocks.{i}.{name}");
-            let text_out = cfg.final_block_text == "keep" || i + 1 < cfg.depth;
-            let bias = |name: &str| -> Result<Modulation> {
-                Ok(Modulation {
-                    bias: l.f32(&p(name))?,
-                })
-            };
-            if i < cfg.dual_depth {
-                let text = if text_out {
-                    Some(DualText {
-                        norm2: l.norm(&p("norm_y2"), eps)?,
-                        proj: l.linear(&p("attn.proj_y"), true)?,
-                        gate: l.linear(&p("attn_gate_y"), false)?,
-                        attn_post_norm: l.norm(&p("attn_post_norm_y"), eps)?,
-                        mlp: SwiGlu::load(&l, &p("mlp_y"))?,
-                        mlp_post_norm: l.norm(&p("mlp_post_norm_y"), eps)?,
-                    })
-                } else {
-                    None
-                };
-                blocks.push(Block::Dual(Box::new(DualBlock {
-                    norm_x1: l.norm(&p("norm_x1"), eps)?,
-                    norm_x2: l.norm(&p("norm_x2"), eps)?,
-                    norm_y1: l.norm(&p("norm_y1"), eps)?,
-                    qkv_x: Qkv::load(
-                        &l,
-                        &p("attn.qkv_x"),
-                        &p("attn.q_proj_x"),
-                        &p("attn.k_proj_x"),
-                        &p("attn.v_proj_x"),
-                        gqa,
-                    )?,
-                    qkv_y: Qkv::load(
-                        &l,
-                        &p("attn.qkv_y"),
-                        &p("attn.q_proj_y"),
-                        &p("attn.k_proj_y"),
-                        &p("attn.v_proj_y"),
-                        gqa,
-                    )?,
-                    q_norm_x: l.norm(&p("attn.q_norm_x"), eps)?,
-                    k_norm_x: l.norm(&p("attn.k_norm_x"), eps)?,
-                    q_norm_y: l.norm(&p("attn.q_norm_y"), eps)?,
-                    k_norm_y: l.norm(&p("attn.k_norm_y"), eps)?,
-                    proj_x: l.linear(&p("attn.proj_x"), true)?,
-                    gate_x: l.linear(&p("attn_gate_x"), false)?,
-                    attn_post_norm_x: l.norm(&p("attn_post_norm_x"), eps)?,
-                    mlp_x: SwiGlu::load(&l, &p("mlp_x"))?,
-                    mlp_post_norm_x: l.norm(&p("mlp_post_norm_x"), eps)?,
-                    text,
-                    mod_img: bias("adaln_img.bias")?,
-                    mod_txt: bias("adaln_txt.bias")?,
-                })));
-            } else {
-                blocks.push(Block::Single(Box::new(SingleBlock {
-                    norm1: l.norm(&p("norm1"), eps)?,
-                    norm2: l.norm(&p("norm2"), eps)?,
-                    qkv: Qkv::load(&l, &p("qkv"), &p("q_proj"), &p("k_proj"), &p("v_proj"), gqa)?,
-                    q_norm: l.norm(&p("q_norm"), eps)?,
-                    k_norm: l.norm(&p("k_norm"), eps)?,
-                    attn_gate: l.linear(&p("attn_gate"), false)?,
-                    attn_proj: l.linear(&p("attn_proj"), true)?,
-                    attn_post_norm: l.norm(&p("attn_post_norm"), eps)?,
-                    mlp: SwiGlu::load(&l, &p("mlp"))?,
-                    mlp_post_norm: l.norm(&p("mlp_post_norm"), eps)?,
-                    modulation: bias("adaln.bias")?,
-                    text_out,
-                })));
-            }
+            blocks.push(Self::load_block(&l, cfg, i, eps, gqa)?);
         }
         let mut layer_blocks = Vec::with_capacity(2);
         for i in 0..2 {
@@ -467,17 +399,7 @@ impl IrisDiT {
 
         let mut pixel_blocks = Vec::with_capacity(cfg.pixel.depth);
         for i in 0..cfg.pixel.depth {
-            let p = |name: &str| format!("pixel_blocks.{i}.{name}");
-            pixel_blocks.push(PitBlock {
-                norm1: l.norm(&p("norm1"), eps)?,
-                norm2: l.norm(&p("norm2"), eps)?,
-                adaln: l.linear(&p("adaln"), true)?,
-                compress: l.linear(&p("compress"), true)?,
-                expand: l.linear(&p("expand"), true)?,
-                attn: SelfAttention::load(&l, &p("attn"), cfg.pixel.num_heads, cfg.qk_norm, eps)?,
-                fc1: l.linear(&p("mlp.fc1"), true)?,
-                fc2: l.linear(&p("mlp.fc2"), true)?,
-            });
+            pixel_blocks.push(Self::load_pit(&l, cfg, i, eps)?);
         }
 
         let dit = Self {
@@ -520,6 +442,95 @@ impl IrisDiT {
             &[cfg.pixel.hidden_size as i32, input_channels as i32],
         )?;
         Ok(dit)
+    }
+
+    /// Load trunk block `i` (`blocks.{i}.*`) from `l` — the backbone build and a checkpointed
+    /// region's recompute (sc-25689) read one definition.
+    fn load_block(l: &Loader, cfg: &ModelConfig, i: usize, eps: f32, gqa: bool) -> Result<Block> {
+        let p = |name: &str| format!("blocks.{i}.{name}");
+        let text_out = cfg.final_block_text == "keep" || i + 1 < cfg.depth;
+        let bias = |name: &str| -> Result<Modulation> {
+            Ok(Modulation {
+                bias: l.f32(&p(name))?,
+            })
+        };
+        if i < cfg.dual_depth {
+            let text = if text_out {
+                Some(DualText {
+                    norm2: l.norm(&p("norm_y2"), eps)?,
+                    proj: l.linear(&p("attn.proj_y"), true)?,
+                    gate: l.linear(&p("attn_gate_y"), false)?,
+                    attn_post_norm: l.norm(&p("attn_post_norm_y"), eps)?,
+                    mlp: SwiGlu::load(l, &p("mlp_y"))?,
+                    mlp_post_norm: l.norm(&p("mlp_post_norm_y"), eps)?,
+                })
+            } else {
+                None
+            };
+            Ok(Block::Dual(Box::new(DualBlock {
+                norm_x1: l.norm(&p("norm_x1"), eps)?,
+                norm_x2: l.norm(&p("norm_x2"), eps)?,
+                norm_y1: l.norm(&p("norm_y1"), eps)?,
+                qkv_x: Qkv::load(
+                    &l,
+                    &p("attn.qkv_x"),
+                    &p("attn.q_proj_x"),
+                    &p("attn.k_proj_x"),
+                    &p("attn.v_proj_x"),
+                    gqa,
+                )?,
+                qkv_y: Qkv::load(
+                    &l,
+                    &p("attn.qkv_y"),
+                    &p("attn.q_proj_y"),
+                    &p("attn.k_proj_y"),
+                    &p("attn.v_proj_y"),
+                    gqa,
+                )?,
+                q_norm_x: l.norm(&p("attn.q_norm_x"), eps)?,
+                k_norm_x: l.norm(&p("attn.k_norm_x"), eps)?,
+                q_norm_y: l.norm(&p("attn.q_norm_y"), eps)?,
+                k_norm_y: l.norm(&p("attn.k_norm_y"), eps)?,
+                proj_x: l.linear(&p("attn.proj_x"), true)?,
+                gate_x: l.linear(&p("attn_gate_x"), false)?,
+                attn_post_norm_x: l.norm(&p("attn_post_norm_x"), eps)?,
+                mlp_x: SwiGlu::load(l, &p("mlp_x"))?,
+                mlp_post_norm_x: l.norm(&p("mlp_post_norm_x"), eps)?,
+                text,
+                mod_img: bias("adaln_img.bias")?,
+                mod_txt: bias("adaln_txt.bias")?,
+            })))
+        } else {
+            Ok(Block::Single(Box::new(SingleBlock {
+                norm1: l.norm(&p("norm1"), eps)?,
+                norm2: l.norm(&p("norm2"), eps)?,
+                qkv: Qkv::load(l, &p("qkv"), &p("q_proj"), &p("k_proj"), &p("v_proj"), gqa)?,
+                q_norm: l.norm(&p("q_norm"), eps)?,
+                k_norm: l.norm(&p("k_norm"), eps)?,
+                attn_gate: l.linear(&p("attn_gate"), false)?,
+                attn_proj: l.linear(&p("attn_proj"), true)?,
+                attn_post_norm: l.norm(&p("attn_post_norm"), eps)?,
+                mlp: SwiGlu::load(l, &p("mlp"))?,
+                mlp_post_norm: l.norm(&p("mlp_post_norm"), eps)?,
+                modulation: bias("adaln.bias")?,
+                text_out,
+            })))
+        }
+    }
+
+    /// Load PiT block `i` (`pixel_blocks.{i}.*`) from `l`.
+    fn load_pit(l: &Loader, cfg: &ModelConfig, i: usize, eps: f32) -> Result<PitBlock> {
+        let p = |name: &str| format!("pixel_blocks.{i}.{name}");
+        Ok(PitBlock {
+            norm1: l.norm(&p("norm1"), eps)?,
+            norm2: l.norm(&p("norm2"), eps)?,
+            adaln: l.linear(&p("adaln"), true)?,
+            compress: l.linear(&p("compress"), true)?,
+            expand: l.linear(&p("expand"), true)?,
+            attn: SelfAttention::load(l, &p("attn"), cfg.pixel.num_heads, cfg.qk_norm, eps)?,
+            fc1: l.linear(&p("mlp.fc1"), true)?,
+            fc2: l.linear(&p("mlp.fc2"), true)?,
+        })
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -702,6 +713,19 @@ impl IrisDiT {
 
     /// Predict the flow velocity `[B, C, H, W]` (f32) for noisy pixels `x` at model time `t` `[B]`.
     pub fn forward(&self, x: &Array, t: &Array, text: &TextBatch) -> Result<Array> {
+        self.forward_hooked(x, t, text, &mut NoHooks)
+    }
+
+    /// [`Self::forward`] with `hooks` around every trunk and pixel block — the training forward's
+    /// seam for activation-checkpointing regions and the REPA feature capture (sc-25689). With
+    /// [`NoHooks`] it is exactly the inference forward.
+    pub fn forward_hooked(
+        &self,
+        x: &Array,
+        t: &Array,
+        text: &TextBatch,
+        hooks: &mut dyn ForwardHooks,
+    ) -> Result<Array> {
         let cfg = &self.cfg;
         let sh = x.shape();
         let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
@@ -746,12 +770,14 @@ impl IrisDiT {
         y = y.add(&pos)?;
 
         let head_dim = cfg.hidden_size / cfg.num_heads;
-        let rope_img = Rope::grid_2d(
+        let square = cfg.rope_aspect == "square";
+        let rope_img = Rope::grid_2d_aspect(
             head_dim,
             hp as usize,
             wp as usize,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
+            square,
         );
         let rope_txt = Rope::line_1d(head_dim, n_txt as usize, cfg.text_rope_theta as f32);
 
@@ -761,25 +787,14 @@ impl IrisDiT {
             .as_ref()
             .map(|core| core.forward(&cond))
             .transpose()?;
-        let heads = cfg.num_heads as i32;
-        let kv_heads = cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32;
-        for block in &self.blocks {
-            (s, y) = match block {
-                Block::Dual(blk) => self.dual(
-                    blk,
-                    &s,
-                    &y,
-                    &core_img,
-                    core_txt.as_ref().expect("dual blocks carry a text core"),
-                    &rope_img,
-                    &rope_txt,
-                    heads,
-                    kv_heads,
-                )?,
-                Block::Single(blk) => self.single(
-                    blk, &s, &y, &core_img, &rope_img, &rope_txt, heads, kv_heads,
-                )?,
-            };
+        let ctx = TrunkCtx {
+            rope_img,
+            rope_txt,
+            heads: cfg.num_heads as i32,
+            kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32,
+        };
+        for i in 0..self.blocks.len() {
+            (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
         }
 
         // timestep re-fused into every patch token
@@ -799,15 +814,21 @@ impl IrisDiT {
             .transpose_axes(&[0, 1, 3, 2, 4, 5])?
             .reshape(&[b * n_patches, p * p, pix])?;
         let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
-        let rope_pix = Rope::grid_2d(
+        let rope_pix = Rope::grid_2d_aspect(
             pix_head,
             hp as usize,
             wp as usize,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
+            square,
         );
-        for block in &self.pixel_blocks {
-            pixels = self.pit(block, &pixels, &s_cond, &rope_pix, b, n_patches)?;
+        let pctx = PixelCtx {
+            rope_pix,
+            batch: b,
+            n_patches,
+        };
+        for i in 0..self.pixel_blocks.len() {
+            pixels = hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)?;
         }
         let out = self
             .final_linear
@@ -949,5 +970,216 @@ impl IrisDiT {
             .fc2
             .forward(&gelu(blk.fc1.forward(&blk.norm2.forward(&x)?)?)?)?;
         Ok(x.add(&modulate(&mlp, &m[3], &m[2])?)?)
+    }
+}
+
+// =============================================================================================
+// Training seams (sc-25689): per-block hooks, externally built blocks
+// =============================================================================================
+
+/// What a trunk block reads besides its own weights in one forward: the image / text RoPE tables
+/// and the head counts.
+pub struct TrunkCtx {
+    rope_img: Rope,
+    rope_txt: Rope,
+    heads: i32,
+    kv_heads: i32,
+}
+
+/// What a PiT block reads besides its own weights in one forward.
+pub struct PixelCtx {
+    rope_pix: Rope,
+    batch: i32,
+    n_patches: i32,
+}
+
+/// A trunk block built outside a loaded backbone (an activation-checkpointing region's
+/// recompute builds one from the region's own input arrays).
+pub struct TrunkBlock(Block);
+
+/// A PiT block built outside a loaded backbone.
+pub struct PixelBlock(PitBlock);
+
+/// Hooks around every block of [`IrisDiT::forward_hooked`]. The defaults run the backbone's own
+/// block, which is the inference forward.
+pub trait ForwardHooks {
+    #[allow(clippy::too_many_arguments)]
+    fn trunk_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        dit.run_trunk_block(i, ctx, s, y, core_img, core_txt)
+    }
+
+    fn pixel_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Array,
+        s_cond: &Array,
+    ) -> Result<Array> {
+        dit.run_pixel_block(i, ctx, pixels, s_cond)
+    }
+}
+
+/// The inference forward's hooks: none.
+pub struct NoHooks;
+
+impl ForwardHooks for NoHooks {}
+
+impl IrisDiT {
+    /// Trunk blocks.
+    pub fn trunk_depth(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// PiT blocks.
+    pub fn pixel_depth(&self) -> usize {
+        self.pixel_blocks.len()
+    }
+
+    /// Run the backbone's own trunk block `i` on `(s, y)`.
+    pub fn run_trunk_block(
+        &self,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        self.trunk_block_with(&self.blocks[i], ctx, s, y, core_img, core_txt)
+    }
+
+    /// Run an externally built trunk block on `(s, y)` (same graph as [`Self::run_trunk_block`]).
+    pub fn run_external_trunk_block(
+        &self,
+        block: &TrunkBlock,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        self.trunk_block_with(&block.0, ctx, s, y, core_img, core_txt)
+    }
+
+    fn trunk_block_with(
+        &self,
+        block: &Block,
+        ctx: &TrunkCtx,
+        s: &Array,
+        y: &Array,
+        core_img: &Array,
+        core_txt: Option<&Array>,
+    ) -> Result<(Array, Array)> {
+        match block {
+            Block::Dual(blk) => self.dual(
+                blk,
+                s,
+                y,
+                core_img,
+                core_txt.ok_or_else(|| {
+                    Error::Msg("iris: a dual-stream block needs the text modulation core".into())
+                })?,
+                &ctx.rope_img,
+                &ctx.rope_txt,
+                ctx.heads,
+                ctx.kv_heads,
+            ),
+            Block::Single(blk) => self.single(
+                blk,
+                s,
+                y,
+                core_img,
+                &ctx.rope_img,
+                &ctx.rope_txt,
+                ctx.heads,
+                ctx.kv_heads,
+            ),
+        }
+    }
+
+    /// Run the backbone's own PiT block `i`.
+    pub fn run_pixel_block(
+        &self,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Array,
+        s_cond: &Array,
+    ) -> Result<Array> {
+        self.pit(
+            &self.pixel_blocks[i],
+            pixels,
+            s_cond,
+            &ctx.rope_pix,
+            ctx.batch,
+            ctx.n_patches,
+        )
+    }
+
+    /// Run an externally built PiT block.
+    pub fn run_external_pixel_block(
+        &self,
+        block: &PixelBlock,
+        ctx: &PixelCtx,
+        pixels: &Array,
+        s_cond: &Array,
+    ) -> Result<Array> {
+        self.pit(
+            &block.0,
+            pixels,
+            s_cond,
+            &ctx.rope_pix,
+            ctx.batch,
+            ctx.n_patches,
+        )
+    }
+
+    /// Build trunk block `i` from `w` exactly as the backbone build does (`adapted` installs the
+    /// adapter residuals of its projections).
+    pub fn load_trunk_block(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        i: usize,
+        adapted: Option<&AdaptedLinears>,
+    ) -> Result<TrunkBlock> {
+        let l = Loader {
+            weights: w,
+            compute,
+            adapted,
+        };
+        let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);
+        Ok(TrunkBlock(Self::load_block(
+            &l,
+            cfg,
+            i,
+            cfg.norm_eps as f32,
+            gqa,
+        )?))
+    }
+
+    /// Build PiT block `i` from `w` exactly as the backbone build does.
+    pub fn load_pixel_block(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        i: usize,
+        adapted: Option<&AdaptedLinears>,
+    ) -> Result<PixelBlock> {
+        let l = Loader {
+            weights: w,
+            compute,
+            adapted,
+        };
+        Ok(PixelBlock(Self::load_pit(&l, cfg, i, cfg.norm_eps as f32)?))
     }
 }

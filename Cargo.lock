@@ -2568,10 +2568,12 @@ dependencies = [
 name = "mlx-gen-iris"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "image",
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",

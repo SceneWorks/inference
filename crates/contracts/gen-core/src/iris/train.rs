@@ -165,7 +165,13 @@ impl HostRng {
 /// `torch.manual_seed(mix_seed(train.seed, rank, epoch, position))` upstream; single device, so
 /// rank is 0.
 pub fn batch_seed(seed: u64, epoch: u32, position: usize) -> u64 {
-    mix_seed(&[seed, 0, epoch as u64, position as u64])
+    batch_seed_rank(seed, 0, epoch, position)
+}
+
+/// [`batch_seed`] of `rank` (`mix_seed(train.seed, rank, epoch, position)`): every rank draws its
+/// own positional stream (sc-25689).
+pub fn batch_seed_rank(seed: u64, rank: usize, epoch: u32, position: usize) -> u64 {
+    mix_seed(&[seed, rank as u64, epoch as u64, position as u64])
 }
 
 /// The caption-choice key of dataset `index` in `epoch` (`_caption_rng`: `mix_seed(seed, epoch,
@@ -3100,6 +3106,7 @@ pub mod ac;
 pub mod depth;
 pub mod dist;
 pub mod holdout;
+pub mod pipeline;
 pub mod repa;
 pub mod shapes;
 pub mod upstream;
