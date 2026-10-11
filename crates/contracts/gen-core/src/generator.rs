@@ -27,6 +27,11 @@ pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
 
+    /// Observed sparse-attention outcome of the most recent request, when adopted.
+    fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
@@ -465,6 +470,8 @@ pub struct GenerationRequest {
     pub fps: Option<u32>,
     pub duration: Option<f32>,
     pub video_mode: Option<String>,
+    /// MiniMax-H3 learned sparse attention; absent/off is the historical dense route.
+    pub veda: Option<crate::VedaRequest>,
     /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
     /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
     /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
@@ -1248,6 +1255,7 @@ impl Default for GenerationRequest {
             fps: None,
             duration: None,
             video_mode: None,
+            veda: None,
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
@@ -1520,6 +1528,7 @@ impl GenerationRequest {
             frames: _,
             fps: _,
             video_mode: _,
+            veda: _,
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
