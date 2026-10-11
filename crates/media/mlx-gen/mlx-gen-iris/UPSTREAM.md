@@ -168,8 +168,10 @@ nothing hangs; invalid meshes / a global-batch mismatch / an MLX transport on Ca
 refusals. Multi-host MLX (two Macs over ring or JACCL) is supported by the hostfile path but is not
 exercised: the only machine this story may load is nax-macos-2. On candle/CUDA a rank trains on
 `cuda:<local_rank>` (upstream's `world.py`), sharing the build's device when that ordinal has no
-GPU; the `iris-curricula-cuda` lane runs the same tests on the Windows box's two RTX PRO 6000
-Blackwell (96 GB) cards, one rank per card, over the host TCP transport (no NCCL on Windows).
+GPU. The `iris-curricula-cuda` lane runs the same tests on the Windows CUDA box (two RTX PRO 6000
+Blackwell, 96 GB each, per `nvidia-smi`), whose runner listener exposes one of them to CUDA
+(`cuda:1` is an invalid ordinal there), so both ranks share that card — over the host TCP transport
+(no NCCL on Windows).
 
 **Real weights (dispatch-only):** `iris-curricula-mlx` (`mlx-iris-curricula-train`, nax-macos-2)
 and `iris-curricula-cuda` (`candle-iris-curricula`) run the release teacher against upstream and the

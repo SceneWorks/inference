@@ -5565,7 +5565,9 @@ jobs:
   # committed upstream tokens; real multi-process training on this box (FSDP full / grad_op vs DDP,
   # a sharded checkpoint resumed exactly and resharded, a rank that exits and a rank that stalls
   # surfacing as typed `RankLost` — each rank a process on `cuda:<local_rank>`, numbered in PCI bus
-  # order as nvidia-smi does, over the host TCP transport, as Windows has no NCCL); the miniature
+  # order as nvidia-smi does, sharing the visible card when the listener exposes only one (it
+  # does: `cuda:1` is an invalid ordinal there), over the host TCP transport, as Windows has no
+  # NCCL); the miniature
   # fp16 + stage-preset lifecycle on the device; and the bounded
   # official curriculum on real weights (`stage1_256` + REPA → `stage2_512` new phase, batch 1, four
   # steps). Logs, per-check VRAM lines and the curriculum's metrics go in the evidence artifact.
