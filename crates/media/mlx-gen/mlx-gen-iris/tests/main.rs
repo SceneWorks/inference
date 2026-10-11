@@ -51,3 +51,9 @@ mod solver_parity;
 
 #[path = "text_parity.rs"]
 mod text_parity;
+
+#[path = "train_lifecycle.rs"]
+mod train_lifecycle;
+
+#[path = "train_parity.rs"]
+mod train_parity;

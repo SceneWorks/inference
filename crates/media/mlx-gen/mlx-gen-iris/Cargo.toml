@@ -19,12 +19,14 @@ mlx-rs = { workspace = true }
 # `mlx-gen-* -> mlx-llm` direction is the documented one (see `mlx-gen-ltx`); the pin lives in the
 # root workspace so cargo unifies ONE mlx-llm across the worker graph.
 mlx-llm = { workspace = true }
+# state.json of the durable training checkpoints and the adapter metadata lists (sc-25685).
+serde_json = { workspace = true }
+# Header-only image validation in the training dataset pass (decode lives in gen_core::iris::train).
+image = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
-image = { workspace = true }
 # The restoration fixture pins upstream's PIL-Lanczos budget resize by the sha256 of its bytes.
 sha2 = { workspace = true }
 

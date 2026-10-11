@@ -309,6 +309,166 @@ fn provider_renders_a_real_image() {
     assert!(mean > 5.0 && mean < 250.0, "degenerate image (mean {mean})");
 }
 
+fn save_png(img: &mlx_gen::Image, path: &std::path::Path) {
+    image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+        .unwrap()
+        .save(path)
+        .unwrap();
+}
+
+/// A bounded real-weight LoRA run (sc-25685): `IRIS_TRAIN_DATA` (a directory of PNGs, one shared
+/// caption) at 256², batch 1, a few AdamW steps through the catalog trainer (bf16 mixed precision,
+/// cached Qwen3-VL conditioning, EMA, a preview from the in-progress EMA weights) → the adapter
+/// artifact → loaded onto the real backbone through the provider's adapter loader → a render beside
+/// the unadapted base render. Writes PNGs into `IRIS_OUT`.
+#[test]
+#[ignore = "needs the real weights (IRIS_WEIGHTS_DIR, IRIS_TEXT_ENCODER_DIR), IRIS_TRAIN_DATA and IRIS_OUT"]
+fn real_lora_trains_exports_and_renders() {
+    use mlx_gen::gen_core::iris::train::{AdapterMetadata, OPTIONS_KEY};
+    use mlx_gen::gen_core::{TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest};
+    use mlx_gen_iris::train::render_preview_with;
+
+    let weights = env_dir("IRIS_WEIGHTS_DIR");
+    let te_dir = env_dir("IRIS_TEXT_ENCODER_DIR");
+    let out = env_dir("IRIS_OUT");
+    let caption = "a red fox curled up asleep in the snow at golden hour";
+    let mut items: Vec<TrainingItem> = std::fs::read_dir(env_dir("IRIS_TRAIN_DATA"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "png"))
+        .map(|p| TrainingItem::captioned(p, caption.into()))
+        .collect();
+    items.sort_by(|a, b| a.image_path.cmp(&b.image_path));
+    assert!(!items.is_empty());
+    let mut config = TrainingConfig {
+        rank: 16,
+        alpha: 16.0,
+        learning_rate: 1e-4,
+        steps: 4,
+        batch_size: 1,
+        resolution: 256,
+        save_every: 2,
+        seed: 3,
+        sample_every: 4,
+        sample_prompts: vec!["a red fox sleeping in fresh snow, golden hour".into()],
+        sample_steps: 20,
+        sample_guidance_scale: 3.0,
+        ..Default::default()
+    };
+    config.model_options.insert(
+        OPTIONS_KEY.into(),
+        serde_json::json!({"text_conditioning": "cached", "ema_decay": 0.5,
+                           "preview_weights": "ema", "export_weights": "ema"}),
+    );
+    let mut spec = LoadSpec::new(WeightsSource::Dir(weights.clone()));
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(te_dir.clone()),
+    );
+    let mut trainer = mlx_gen_iris::provider_registry()
+        .unwrap()
+        .load_trainer("iris_3b", &spec)
+        .unwrap();
+    let req = TrainingRequest {
+        items,
+        config,
+        output_dir: out.join("train"),
+        file_name: "fox_lora.safetensors".into(),
+        trigger_words: Vec::new(),
+        cancel: CancelFlag::default(),
+    };
+    let start = std::time::Instant::now();
+    let mut last = start;
+    let res = trainer
+        .train(&req, &mut |p| match p {
+            TrainingProgress::Training { step, total, loss } => {
+                eprintln!(
+                    "step {step}/{total} loss {loss:.4} ({:.1}s)",
+                    last.elapsed().as_secs_f32()
+                );
+                assert!(loss.is_finite());
+                last = std::time::Instant::now();
+            }
+            TrainingProgress::Sample { step, image, .. } => {
+                save_png(&image, &out.join(format!("train_preview_step{step}.png")));
+                eprintln!("preview at step {step}");
+                last = std::time::Instant::now();
+            }
+            other => eprintln!("{other:?} ({:.1}s)", start.elapsed().as_secs_f32()),
+        })
+        .unwrap();
+    drop(trainer);
+    eprintln!(
+        "train total {:.1}s → {}",
+        start.elapsed().as_secs_f32(),
+        res.adapter_path.display()
+    );
+    assert_eq!(res.steps, 4);
+    mlx_rs::memory::clear_cache();
+
+    let (_, meta) = mlx_rs::Array::load_safetensors_with_metadata(&res.adapter_path).unwrap();
+    let meta = AdapterMetadata::from_map(&meta.into_iter().collect()).unwrap();
+    eprintln!(
+        "adapter: {} targets, rank {}",
+        meta.targets.len(),
+        meta.rank
+    );
+
+    // Render the base and the adapted backbone with the provider's pipeline pieces.
+    let cfg = IrisConfig::from_dir(&weights).unwrap();
+    let te = IrisTextEncoder::load(&te_dir, &cfg.text_encoder).unwrap();
+    let prompt = "a red fox sleeping in fresh snow, golden hour";
+    let (c, u) = (te.encode(prompt).unwrap(), te.encode("").unwrap());
+    drop(te);
+    mlx_rs::memory::clear_cache();
+    let render = |adapters: &[mlx_gen::AdapterSpec]| {
+        let (dit, _) = mlx_gen_iris::load_backbone_with_adapters(
+            &weights,
+            &cfg,
+            Dtype::Bfloat16,
+            adapters,
+            mlx_gen::gen_core::iris::IrisTask::Generation,
+            "iris_3b",
+        )
+        .unwrap();
+        render_preview_with(
+            &dit,
+            20,
+            3.0,
+            cfg.flow.shift,
+            1000,
+            mlx_gen::gen_core::iris::train::Prediction::Velocity,
+            256,
+            (&c.states, &c.mask),
+            Some((&u.states, &u.mask)),
+            3,
+        )
+        .unwrap()
+    };
+    let t = std::time::Instant::now();
+    let before = render(&[]);
+    save_png(&before, &out.join("base_256.png"));
+    mlx_rs::memory::clear_cache();
+    let after = render(&[mlx_gen::AdapterSpec::new(
+        res.adapter_path.clone(),
+        1.0,
+        mlx_gen::AdapterKind::Lora,
+    )]);
+    save_png(&after, &out.join("lora_adapted_256.png"));
+    let diff = before
+        .pixels
+        .iter()
+        .zip(&after.pixels)
+        .map(|(a, b)| (*a as f32 - *b as f32).abs())
+        .sum::<f32>()
+        / before.pixels.len() as f32;
+    eprintln!(
+        "renders {:.1}s; mean |base − adapted| = {diff:.2}",
+        t.elapsed().as_secs_f32()
+    );
+    assert!(diff > 0.0, "the adapter changed nothing");
+}
+
 /// sc-25681: the production path with every non-default upstream control at once — a two-prompt
 /// batch, order 1 (`euler`), shift 3, CFG 4.5 gated to `cfg_interval` (0.05, 0.95), a negative
 /// prompt, a portrait canvas, and the per-step preview sink — one PNG per prompt.

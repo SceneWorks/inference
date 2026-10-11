@@ -37,6 +37,7 @@ pub mod pipeline;
 pub mod restoration;
 pub mod solver;
 pub mod text_encoder;
+pub mod train;
 
 pub use dit::{IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{
@@ -58,6 +59,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_trainer(train::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
 }
 
