@@ -65,7 +65,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_cfg_interval: true,
             supports_prompt_batch: true,
             supports_caption_overflow_policy: true,
-            // LoRA / LoKr (and LyCORIS-layout LoHa) deltas merged into the backbone projections;
+            // LoRA / LoKr (and LyCORIS-layout LoHa) as forward-time residuals on the projections;
             // every file must carry the Iris `family` / `irisTask` stamps.
             supports_lora: true,
             supports_lokr: true,
@@ -130,8 +130,9 @@ pub fn load_backbone(
     .0)
 }
 
-/// [`load_backbone`] with `adapters` merged (in order) into its projections for `task` on
-/// `base_model` (see [`crate::adapters`]); returns one report per adapter file.
+/// [`load_backbone`] with `adapters` installed (in order) as forward-time residuals on its
+/// projections for `task` on `base_model` (see [`crate::adapters`]); returns one report per adapter
+/// file.
 pub fn load_backbone_with_adapters(
     dir: &Path,
     config: &IrisConfig,
@@ -153,7 +154,7 @@ pub fn load_backbone_with_adapters(
             task,
             base_model,
         )?;
-        (checkpoint.with_deltas(merged.deltas)?, merged.reports)
+        (checkpoint.with_residuals(merged.residuals)?, merged.reports)
     };
     let dit = IrisDiT::from_checkpoint(&checkpoint, &config.model, compute, device)?;
     Ok((dit, reports))

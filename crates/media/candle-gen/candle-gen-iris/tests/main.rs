@@ -51,3 +51,15 @@ mod solver_parity;
 
 #[path = "text_parity.rs"]
 mod text_parity;
+
+#[path = "train_cross_backend.rs"]
+mod train_cross_backend;
+
+#[path = "train_lifecycle.rs"]
+mod train_lifecycle;
+
+#[path = "train_parity.rs"]
+mod train_parity;
+
+#[path = "train_real_weights.rs"]
+mod train_real_weights;

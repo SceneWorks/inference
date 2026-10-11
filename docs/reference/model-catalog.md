@@ -121,6 +121,7 @@ LoRA/LoKr fine-tuning is available for a subset of generator families. Load with
 | `anima_base` | ✓ | ✓ |
 | `anima_aesthetic` | ✓ | — |
 | `anima_turbo` | ✓ | — |
+| `iris_3b` (full model or LoRA/LoKr) | ✓ | ✓ |
 | `kolors` | ✓ | ✓ |
 | `krea_2_raw` | ✓ | ✓ |
 | `krea_2_control` | — | ✓ |

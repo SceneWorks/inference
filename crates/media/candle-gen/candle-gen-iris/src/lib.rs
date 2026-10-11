@@ -24,6 +24,15 @@
 //! (`crates/media/mlx-gen/mlx-gen-iris/tests/fixtures/`, produced by `tools/dump_iris_*.py` from the
 //! pinned revisions), so both backends are held to one numeric reference.
 //!
+//! ## Training (sc-25686)
+//!
+//! [`train`] registers the `iris_3b` [`Trainer`](candle_gen::gen_core::train::Trainer): full
+//! training (random or weights init) and LoRA / LoKr adapters over the one backend-neutral contract
+//! `gen_core::iris::train` the MLX trainer reads, with its checkpoint layout, resume semantics,
+//! artifact schemas and metadata stamps. Adapters are forward-time residuals in training **and** in
+//! [`load_backbone_with_adapters`], so a training preview renders exactly what the exported file
+//! renders here; artifacts load across backends (`tests/train_cross_backend.rs`).
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -42,6 +51,7 @@ pub mod pipeline;
 pub mod restoration;
 pub mod solver;
 pub mod text_encoder;
+pub mod train;
 
 pub use candle_gen::gen_core::iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,
@@ -57,13 +67,14 @@ pub use pipeline::{
 pub use restoration::IrisRestorer;
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 
-/// Add the Candle Iris-3B generator and restoration transform to an explicit media registry
-/// builder.
+/// Add the Candle Iris-3B generator, its generation trainer (sc-25686) and the restoration
+/// transform to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_trainer(train::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
 }
 
@@ -105,6 +116,11 @@ mod tests {
             .map(|registration| (registration.descriptor)().id)
             .collect();
         assert_eq!(transforms, ["iris_3b_restore"]);
+        let trainers: Vec<_> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(trainers, ["iris_3b"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

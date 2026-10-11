@@ -9,6 +9,7 @@ call :run_one provider_renders_with_non_default_controls real_weights::provider_
 call :run_one real_depth_matches_the_upstream_reference depth_real_weights::real_depth_matches_the_upstream_reference --ignored || set "IRIS_FAILED=1"
 call :run_one real_small_restoration_matches_upstream restoration_real_weights::real_small_restoration_matches_upstream --ignored || set "IRIS_FAILED=1"
 call :run_one real_release_scale_restoration_renders restoration_real_weights::real_release_scale_restoration_renders --ignored || set "IRIS_FAILED=1"
+call :run_one real_lora_trains_exports_and_renders train_real_weights::real_lora_trains_exports_and_renders --ignored || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1
 exit /b 0
 

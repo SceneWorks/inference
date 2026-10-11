@@ -575,6 +575,27 @@ impl LokrFactors {
         }))
     }
 
+    /// The `[out, in]` projection shape this residual adapts (`out` is the output slice's length
+    /// when one is set).
+    pub fn shape(&self) -> (usize, usize) {
+        let out = self.output_slice.map_or(self.a * self.b, |(_, len)| len);
+        (out, self.c * self.d)
+    }
+
+    /// The f32 `[out, in]` weight delta this residual applies, `kron(w1, w2)` with the scale baked
+    /// into `w2` (the output slice, if any, applied) — a merged **view** for parity checks; the
+    /// forward never forms it.
+    pub fn dense_delta(&self) -> candle_core::Result<Tensor> {
+        let delta = crate::train::lora::kron2d(
+            &self.w1.to_dtype(DType::F32)?,
+            &self.w2.to_dtype(DType::F32)?,
+        )?;
+        match self.output_slice {
+            Some((start, len)) => delta.narrow(0, start, len),
+            None => Ok(delta),
+        }
+    }
+
     /// Move the (CPU-read) factors onto `device` — the base lives on the DiT's device, so the residual
     /// matmul would be a device mismatch otherwise.
     pub fn to_device(&self, device: &Device) -> Result<Self> {

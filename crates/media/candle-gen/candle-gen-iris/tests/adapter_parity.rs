@@ -1,6 +1,6 @@
 //! sc-25681: LoRA and LoKr on the Iris backbone vs upstream (`tools/dump_iris_controls.py`) — the
-//! MLX twin's `adapter_parity` fixtures. Candle folds every adapter into the dense weights
-//! (`W += δ`, f32), so this checks the reconstructed deltas themselves against the oracle's
+//! MLX twin's `adapter_parity` fixtures. Candle installs every adapter as a forward-time residual
+//! (sc-25686), so this checks the reconstructed (merged-view) deltas themselves against the oracle's
 //! `delta/{lora,lokr}/<path>` (the LoKr's being `kron(w1, w2_a·w2_b)`), then upstream's merged-weight
 //! forward on the `iris_dit_golden` inputs.
 //!
@@ -47,11 +47,12 @@ fn lora_and_lokr_deltas_and_forwards_match_upstream() {
             "iris_3b",
         )
         .unwrap();
-        assert_eq!(merged.deltas.len(), targets.len(), "{kind}");
+        let deltas = merged.deltas().unwrap();
+        assert_eq!(deltas.len(), targets.len(), "{kind}");
         for path in &targets {
             assert_close(
                 &format!("delta/{kind}/{path}"),
-                &merged.deltas[&format!("{path}.weight")],
+                &deltas[&format!("{path}.weight")],
                 golden.require(&format!("delta/{kind}/{path}")),
                 1e-6,
             );

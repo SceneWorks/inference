@@ -55,6 +55,7 @@ use std::path::Path;
 use candle_core::{safetensors as cst, DType, Device, Tensor};
 
 use crate::gen_core::weightsmeta as wmeta;
+use crate::quant::LokrFactors;
 use crate::train::lora::{reconstruct_loha_delta, reconstruct_lokr_delta};
 use crate::{CandleError, Result};
 
@@ -444,6 +445,27 @@ impl ThirdPartyLokr {
             base_shape,
         )
     }
+
+    /// This module as the structured Kronecker residual ([`LokrFactors`], `y = w1·X·w2ᵀ`, never the
+    /// `[out, in]` delta) with the same `lycoris scale × user_scale` [`Self::delta`] bakes in, or
+    /// `None` when its factors do not decompose `base_shape` (the caller folds [`Self::delta`]).
+    pub fn structured(
+        &self,
+        base_shape: (usize, usize),
+        user_scale: f32,
+    ) -> Result<Option<LokrFactors>> {
+        LokrFactors::build(
+            self.lycoris_scale() as f64 * user_scale as f64,
+            base_shape,
+            self.w1.as_ref(),
+            self.w1_a.as_ref(),
+            self.w1_b.as_ref(),
+            self.w2.as_ref(),
+            None,
+            self.w2_a.as_ref(),
+            self.w2_b.as_ref(),
+        )
+    }
 }
 
 /// One module's third-party LoHa factors — two low-rank Hadamard pairs + an optional per-module
@@ -472,6 +494,11 @@ impl ThirdPartyLoha {
         }
     }
 
+    /// The fully effective multiplier [`Self::delta`] applies: lycoris `alpha/rank` × `user_scale`.
+    pub fn scale(&self, user_scale: f32) -> f32 {
+        self.lycoris_scale() * user_scale
+    }
+
     /// Reconstruct this module's `[out, in]` Hadamard delta (lycoris scale × `user_scale` baked in).
     /// Errors if a `hada_w1/w2` `a`/`b` leg is missing (a conv-tucker-only module never reaches here —
     /// it resolves to a 4-D base and skips first).
@@ -484,14 +511,7 @@ impl ThirdPartyLoha {
                 ))
             }
         };
-        reconstruct_loha_delta(
-            w1_a,
-            w1_b,
-            w2_a,
-            w2_b,
-            self.lycoris_scale() * user_scale,
-            base_shape,
-        )
+        reconstruct_loha_delta(w1_a, w1_b, w2_a, w2_b, self.scale(user_scale), base_shape)
     }
 }
 

@@ -20,9 +20,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
-use candle_gen::candle_nn::ops::softmax_last_dim;
+use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::iris;
+use candle_gen::quant::LokrFactors;
 use candle_gen::{CandleError as Error, Result};
 
 /// The dtype two operands meet at: themselves when they agree, f32 otherwise (the only two dtypes
@@ -91,17 +92,29 @@ pub fn split_at(x: &Tensor, axis: usize, at: usize) -> Result<(Tensor, Tensor)> 
     Ok((x.narrow(axis, 0, at)?, x.narrow(axis, at, len - at)?))
 }
 
-/// The checkpoint the backbone modules are built from: a `'static` mmap [`VarBuilder`] over the
-/// single `model.safetensors` plus the key list from its header, so every key a module consumes is
-/// recorded and a leftover (or missing) key is a load error naming it.
+/// Where a [`Checkpoint`] reads its tensors from.
+enum Source {
+    /// A `'static` mmap [`VarBuilder`] over one `model.safetensors` (tensors read at f32).
+    Mmap(VarBuilder<'static>),
+    /// In-memory tensors handed out **as stored** (dtype and autograd identity preserved) — the
+    /// training backbone (sc-25686): f32 `Var` masters of a full run, or a frozen base already at
+    /// the provider's load dtypes under an adapter run.
+    Map(HashMap<String, Tensor>),
+}
+
+/// The checkpoint the backbone modules are built from: an mmap over the single
+/// `model.safetensors` (or, for training, an in-memory tensor map) plus its key list, so every key
+/// a module consumes is recorded and a leftover (or missing) key is a load error naming it.
 pub struct Checkpoint {
-    vb: VarBuilder<'static>,
+    source: Source,
+    device: Device,
     /// Key prefix of this view (`""` for the whole file); `keys` are stored without it.
     prefix: String,
     keys: BTreeSet<String>,
     used: RefCell<BTreeSet<String>>,
-    /// f32 adapter deltas folded into their weight as it is read (`W += δ`), keyed by checkpoint key.
-    deltas: HashMap<String, Tensor>,
+    /// Forward-time adapter residuals keyed by projection path (`blocks.3.attn_proj`), handed to the
+    /// [`Loader`] when it builds that projection.
+    residuals: RefCell<BTreeMap<String, Vec<Residual>>>,
 }
 
 impl Checkpoint {
@@ -119,27 +132,47 @@ impl Checkpoint {
             .collect();
         let vb = candle_gen::mmap_var_builder(&[file.to_path_buf()], DType::F32, device)?;
         Ok(Self {
-            vb,
+            source: Source::Mmap(vb),
+            device: device.clone(),
             prefix: prefix.to_owned(),
             keys,
             used: RefCell::new(BTreeSet::new()),
-            deltas: HashMap::new(),
+            residuals: RefCell::new(BTreeMap::new()),
         })
     }
 
-    /// Fold adapter `deltas` (f32 `[out, in]`, keyed by checkpoint key) into their weights as they
-    /// are read. Every key must exist in the checkpoint.
-    pub fn with_deltas(mut self, deltas: HashMap<String, Tensor>) -> Result<Self> {
-        if let Some(key) = deltas.keys().find(|k| !self.keys.contains(*k)) {
+    /// A checkpoint over in-memory `tensors` (upstream key names) on `device`: [`take`](Self::take)
+    /// returns each tensor exactly as stored — no dtype change, the same autograd node — so a
+    /// backbone built from `Var` tensors is differentiable with respect to them.
+    pub fn from_tensors(tensors: HashMap<String, Tensor>, device: &Device) -> Self {
+        Self {
+            keys: tensors.keys().cloned().collect(),
+            source: Source::Map(tensors),
+            device: device.clone(),
+            prefix: String::new(),
+            used: RefCell::new(BTreeSet::new()),
+            residuals: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// Install forward-time adapter `residuals` (keyed by projection path). Every path must be a
+    /// `‹path›.weight` of the checkpoint, and the model build must consume every one
+    /// ([`unconsumed_residuals`](Self::unconsumed_residuals)).
+    pub fn with_residuals(self, residuals: BTreeMap<String, Vec<Residual>>) -> Result<Self> {
+        if let Some(path) = residuals
+            .keys()
+            .find(|p| !self.keys.contains(&format!("{p}.weight")))
+        {
             return Err(Error::Msg(format!(
-                "iris: an adapter delta targets `{key}`, which the backbone checkpoint does not carry"
+                "iris: an adapter targets `{path}`, which the backbone checkpoint does not carry"
             )));
         }
-        self.deltas = deltas;
+        *self.residuals.borrow_mut() = residuals;
         Ok(self)
     }
 
-    /// Read one tensor (as f32, with any adapter delta folded in), recording the key as consumed.
+    /// Read one tensor (as f32 from a file; as stored from a tensor map), recording the key as
+    /// consumed.
     pub fn take(&self, key: &str) -> Result<Tensor> {
         if !self.keys.contains(key) {
             return Err(Error::Msg(format!(
@@ -148,18 +181,28 @@ impl Checkpoint {
             )));
         }
         self.used.borrow_mut().insert(key.to_owned());
-        let tensor = self.vb.get_unchecked(&format!("{}{key}", self.prefix))?;
-        Ok(match self.deltas.get(key) {
-            // The merge in f32, before the caller's cast to the compute dtype (`W += δ`).
-            Some(delta) => (tensor + delta.to_device(self.vb.device())?)?,
-            None => tensor,
+        Ok(match &self.source {
+            Source::Mmap(vb) => vb.get_unchecked(&format!("{}{key}", self.prefix))?,
+            Source::Map(map) => map[key].clone(),
         })
+    }
+
+    /// The residuals installed on projection `path` (handed out once).
+    fn take_residuals(&self, path: &str) -> Vec<Residual> {
+        self.residuals.borrow_mut().remove(path).unwrap_or_default()
     }
 
     /// Keys the checkpoint carries that no module consumed, sorted.
     pub fn unused_keys(&self) -> Vec<String> {
         let used = self.used.borrow();
         self.keys.difference(&used).cloned().collect()
+    }
+
+    /// Adapter targets no module built as a projection — empty after a successful model build (an
+    /// adapter on a 2-D tensor the graph does not read as a Linear is a load error, never a silently
+    /// dropped residual).
+    pub fn unconsumed_residuals(&self) -> Vec<String> {
+        self.residuals.borrow().keys().cloned().collect()
     }
 }
 
@@ -245,7 +288,17 @@ impl Loader<'_> {
         } else {
             None
         };
-        Ok(Linear { weight, bias })
+        let residuals = self
+            .weights
+            .take_residuals(prefix)
+            .into_iter()
+            .map(|r| r.prepare(self.compute, &self.weights.device))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Linear {
+            weight,
+            bias,
+            residuals,
+        })
     }
 
     pub fn norm(&self, prefix: &str, eps: f32) -> Result<RmsNorm> {
@@ -256,10 +309,103 @@ impl Loader<'_> {
     }
 }
 
-/// `nn.Linear` (`[out, in]` weight).
+/// A forward-time adapter residual on one projection (sc-25686): `y = base(x) + r(x)`, the residual
+/// narrowed to the projection's output dtype — never merged into the (bf16) base weight, so a delta
+/// below the base's bf16 ulp still reaches the forward and its gradient, and the trainer's forward
+/// is the provider's. The MLX twin's `AdaptableLinear` residuals:
+///
+/// * a LoRA runs `(x · Aᵀ) · (Bᵀ · s)` with f32 factors (the compute-dtype input promoted to f32, as
+///   MLX promotes a bf16 × f32 product);
+/// * a LoKr runs the structured Kronecker product `Y = w1 · X · w2ᵀ` over `X = reshape(x, [.., c, d])`
+///   ([`LokrFactors`], the MLX twin's `LokrStructured`) — two GEMMs over the small factor shapes,
+///   never an `[out, in]` delta, so it costs a LoRA's memory, not a second base weight;
+/// * a LyCORIS LoHa `s · (A₁B₁) ⊙ (A₂B₂)` (ranks `r₁`, `r₂`) runs as its exact rank-`r₁r₂`
+///   (Khatri–Rao) factorisation `(x · V) · U` when that is smaller than the delta,
+///   `r₁r₂·(in + out) < in·out` ([`Residual::LowRank`]); above that rank the factorisation costs more
+///   than the dense delta in both memory and GEMM work, so the `[out, in]` delta is held in the compute
+///   dtype and run as `x · δᵀ` ([`Residual::Delta`], one extra base-sized weight and GEMM per adapted
+///   projection — the MLX twin materialises every LoHa this way). A LoKr whose factors do not
+///   decompose its projection's `[out, in]` falls back to the same dense delta.
+#[derive(Clone, Debug)]
+pub enum Residual {
+    /// `a = Aᵀ` `[in, rank]`, `b = Bᵀ · (alpha/rank) · scale` `[rank, out]`, both f32.
+    Lora { a: Tensor, b: Tensor },
+    /// The structured LoKr: the Kronecker factors with the full scale baked into `w2`, f32.
+    Kron(LokrFactors),
+    /// A LoHa's exact low-rank factorisation: `a = V` `[in, r₁r₂]`, `b = U · scale` `[r₁r₂, out]`
+    /// (f32 as built; held in the compute dtype once installed).
+    LowRank { a: Tensor, b: Tensor },
+    /// The `[out, in]` delta (f32 as reconstructed; held in the compute dtype once installed).
+    Delta(Tensor),
+}
+
+impl Residual {
+    /// The f32 `[out, in]` weight delta this residual adds — the merged view (the forward never
+    /// forms it for a LoRA, a structured LoKr or a factored LoHa).
+    pub fn delta(&self) -> Result<Tensor> {
+        Ok(match self {
+            Residual::Lora { a, b } | Residual::LowRank { a, b } => b
+                .to_dtype(DType::F32)?
+                .t()?
+                .matmul(&a.to_dtype(DType::F32)?.t()?)?,
+            Residual::Kron(f) => f.dense_delta()?,
+            Residual::Delta(d) => d.to_dtype(DType::F32)?,
+        })
+    }
+
+    /// The `[out, in]` shape this residual adapts, and whether its inner dimensions agree.
+    pub fn shape(&self) -> Result<((usize, usize), bool)> {
+        Ok(match self {
+            Residual::Lora { a, b } | Residual::LowRank { a, b } => {
+                ((b.dim(1)?, a.dim(0)?), a.dim(1)? == b.dim(0)?)
+            }
+            Residual::Kron(f) => (f.shape(), true),
+            Residual::Delta(d) => (d.dims2()?, true),
+        })
+    }
+
+    /// The residual as the forward holds it: LoRA and LoKr factors f32 on `device` (a LoKr's GEMMs
+    /// cast them to the activation dtype); a LoHa factorisation or a delta in `compute`.
+    fn prepare(self, compute: DType, device: &Device) -> Result<Self> {
+        Ok(match self {
+            Residual::Lora { a, b } => Residual::Lora {
+                a: to(&a.to_device(device)?, DType::F32)?,
+                b: to(&b.to_device(device)?, DType::F32)?,
+            },
+            Residual::Kron(f) => Residual::Kron(f.to_device(device)?),
+            Residual::LowRank { a, b } => Residual::LowRank {
+                a: to(&a.to_device(device)?, compute)?,
+                b: to(&b.to_device(device)?, compute)?,
+            },
+            Residual::Delta(d) => Residual::Delta(to(&d.to_device(device)?, compute)?),
+        })
+    }
+
+    /// `r(x)` for a flattened `[rows, in]` input in the compute dtype. A half-precision GEMM on the
+    /// Candle CPU backend runs as one does elsewhere — f32 accumulation, each product rounded once.
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gemm = gemm_dtype(x);
+        Ok(match self {
+            Residual::Lora { a, b } => to(x, DType::F32)?.matmul(a)?.matmul(b)?,
+            Residual::Kron(f) => to(&f.residual(&to(x, gemm)?)?, x.dtype())?,
+            Residual::LowRank { a, b } => {
+                let h = to(&to(x, gemm)?.matmul(&to(a, gemm)?)?, a.dtype())?;
+                to(&to(&h, gemm)?.matmul(&to(b, gemm)?)?, b.dtype())?
+            }
+            Residual::Delta(d) => {
+                let gemm = gemm_dtype(d);
+                let y = to(x, gemm)?.matmul(&to(d, gemm)?.t()?)?;
+                to(&y, d.dtype())?
+            }
+        })
+    }
+}
+
+/// `nn.Linear` (`[out, in]` weight) plus any forward-time adapter residuals.
 pub struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
+    residuals: Vec<Residual>,
 }
 
 impl Linear {
@@ -280,7 +426,10 @@ impl Linear {
         if let Some(b) = &self.bias {
             y = y.broadcast_add(&to(b, gemm)?)?;
         }
-        let y = to(&y, dtype)?;
+        let mut y = to(&y, dtype)?;
+        for r in &self.residuals {
+            y = y.add(&to(&r.forward(&flat)?, dtype)?)?;
+        }
         let mut shape = lead.to_vec();
         shape.push(out_dim);
         Ok(y.reshape(shape)?)
@@ -293,7 +442,11 @@ impl Linear {
     /// A linear layer from an already-shaped `[out, in]` weight (and optional `[out]` bias), stored
     /// as given — e.g. the depth task's 1×1-conv reducer, whose `[1, C, 1, 1]` kernel is reshaped.
     pub fn from_parts(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+        Self {
+            weight,
+            bias,
+            residuals: Vec::new(),
+        }
     }
 }
 
@@ -322,6 +475,15 @@ pub struct RmsNorm {
 impl RmsNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = to(x, DType::F32)?.contiguous()?;
+        if x.track_op() || self.weight.track_op() {
+            // Under autograd (training, sc-25686): candle's fused `rms_norm` is a CustomOp with no
+            // backward, which would silently zero every upstream gradient — the same f32 math in
+            // composable ops instead.
+            let dim = x.dim(D::Minus1)? as f64;
+            let ms = (x.sqr()?.sum_keepdim(D::Minus1)? / dim)?;
+            let rms = (ms + self.eps as f64)?.sqrt()?;
+            return Ok(x.broadcast_div(&rms)?.broadcast_mul(&self.weight)?);
+        }
         Ok(candle_gen::candle_nn::ops::rms_norm(
             &x,
             &self.weight,
@@ -422,13 +584,22 @@ pub fn attention(
     let v = repeat_kv(t(v)?, h / kv)?;
     let mask = mask.map(|m| to(m, kernel)).transpose()?;
     let scale = 1.0 / (d as f64).sqrt();
+    // Under autograd (training) the fused `softmax_last_dim` (no backward) is replaced by the
+    // composable softmax over the same axis.
+    let differentiable = q.track_op() || k.track_op() || v.track_op();
     let out = candle_gen::sdpa_budgeted_bhsd(
         &q,
         &k,
         &v,
         scale,
         mask.as_ref(),
-        softmax_last_dim,
+        |s: &Tensor| {
+            if differentiable {
+                softmax(s, D::Minus1)
+            } else {
+                softmax_last_dim(s)
+            }
+        },
         candle_gen::ATTN_SCORES_BUDGET,
     )?;
     let out = to(&out, compute)?;
@@ -480,6 +651,128 @@ mod tests {
             .unwrap();
         let r = repeat_kv(k, 2).unwrap().flatten_all().unwrap();
         assert_eq!(r.to_vec1::<f32>().unwrap(), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Deterministic, non-symmetric values in `[-1, 1)`.
+    fn values(shape: (usize, usize), seed: u32) -> Tensor {
+        let n = shape.0 * shape.1;
+        let data: Vec<f32> = (0..n as u32)
+            .map(|i| (((i * 7919 + seed * 104_729) % 1000) as f32) / 500.0 - 1.0)
+            .collect();
+        Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+    }
+
+    /// The largest absolute difference between `r(x)` (installed at f32) and `x · δᵀ`.
+    fn residual_error(r: &Residual, delta: &Tensor, rows: usize) -> f32 {
+        let (_, in_f) = delta.dims2().unwrap();
+        let x = values((rows, in_f), 11);
+        let got = r
+            .clone()
+            .prepare(DType::F32, &Device::Cpu)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let want = x.matmul(&delta.t().unwrap()).unwrap();
+        (got - want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn lokr_runs_the_structured_kronecker_product() {
+        use candle_gen::train::lora::reconstruct_lokr_delta;
+        // w1 [2, 3] ⊗ w2_a·w2_b [4, 5] → [8, 15].
+        let (w1, w2_a, w2_b) = (values((2, 3), 1), values((4, 2), 2), values((2, 5), 3));
+        let lokr = |shape| {
+            crate::adapters::lokr_residual(
+                Some(&w1),
+                None,
+                None,
+                None,
+                Some(&w2_a),
+                Some(&w2_b),
+                4.0,
+                2.0,
+                0.5,
+                shape,
+            )
+            .unwrap()
+        };
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2_a),
+            Some(&w2_b),
+            4.0,
+            2.0,
+            0.5,
+            (8, 15),
+        )
+        .unwrap();
+        let r = lokr((8, 15));
+        assert!(matches!(r, Residual::Kron(_)), "{r:?}");
+        assert_eq!(r.shape().unwrap(), ((8, 15), true));
+        let merged = max_diff(&r.delta().unwrap(), &delta);
+        assert!(
+            merged < 1e-6,
+            "merged view off the Kronecker delta by {merged}"
+        );
+        let err = residual_error(&r, &delta, 6);
+        assert!(err < 1e-5, "structured residual off x·δᵀ by {err}");
+        // Factors that do not decompose the projection fall back to the reconstructed delta.
+        let r = lokr((4, 30));
+        assert!(matches!(r, Residual::Delta(_)), "{r:?}");
+    }
+
+    #[test]
+    fn loha_runs_its_low_rank_factorisation_below_the_break_even_rank() {
+        use candle_gen::train::merge::ThirdPartyLoha;
+        let loha = |rank: usize, out: usize, inp: usize| ThirdPartyLoha {
+            w1_a: Some(values((out, rank), 4)),
+            w1_b: Some(values((rank, inp), 5)),
+            w2_a: Some(values((out, rank), 6)),
+            w2_b: Some(values((rank, inp), 7)),
+            alpha: Some(3.0),
+        };
+        // r² = 4: 4·(24 + 16) = 160 < 24·16 = 384 → factorised.
+        let g = loha(2, 24, 16);
+        let r = crate::adapters::loha_residual(&g, (24, 16), 0.75).unwrap();
+        assert!(matches!(r, Residual::LowRank { .. }), "{r:?}");
+        assert_eq!(r.shape().unwrap(), ((24, 16), true));
+        let delta = g.delta((24, 16), 0.75).unwrap();
+        let merged = max_diff(&r.delta().unwrap(), &delta);
+        assert!(
+            merged < 1e-5,
+            "merged view off the Hadamard delta by {merged}"
+        );
+        let err = residual_error(&r, &delta, 5);
+        assert!(err < 1e-4, "factorised residual off x·δᵀ by {err}");
+        // r² = 16: 16·(24 + 16) = 640 ≥ 384 → the dense delta is cheaper.
+        let g = loha(4, 24, 16);
+        let r = crate::adapters::loha_residual(&g, (24, 16), 0.75).unwrap();
+        assert!(matches!(r, Residual::Delta(_)), "{r:?}");
     }
 
     #[test]
