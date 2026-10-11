@@ -395,7 +395,10 @@ pub fn save_safetensors_atomic(
     let list: Vec<(&str, &Tensor)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     safetensors::serialize_to_file(list, Some(meta), &tmp)
         .map_err(|e| Error::Msg(format!("iris: write {}: {e}", tmp.display())))?;
-    std::fs::File::open(&tmp)
+    // Write access: Windows' `FlushFileBuffers` refuses a read-only handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| Error::Msg(format!("iris: sync {}: {e}", tmp.display())))?;
     std::fs::rename(&tmp, path)

@@ -2468,7 +2468,11 @@ pub fn sync_dir_files(dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir).map_err(|e| io("list", dir, e))? {
         let path = entry.map_err(|e| io("list", dir, e))?.path();
         if path.is_file() {
-            std::fs::File::open(&path)
+            // Write access: Windows' `FlushFileBuffers` refuses a read-only handle ("Access is
+            // denied"); POSIX `fsync` accepts either.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| io("sync", &path, e))?;
         }
