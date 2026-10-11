@@ -421,6 +421,6 @@ impl TakeRows for Array {
         if self.ndim() == 0 {
             return Ok(self.clone());
         }
-        Ok(self.index((r.start as i32)..(r.end as i32)))
+        Ok(self.index_device((r.start as i32)..(r.end as i32), mlx_rs::Stream::task_local_or_default()))
     }
 }

@@ -192,6 +192,9 @@ fn rank_entry() {
         return;
     };
     let j: Json = serde_json::from_str(&raw).unwrap();
+    // A rank process is all CPU: the default device too, not only the task-local stream (the
+    // array operators and `index` target the default device).
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let result = run_job(&j);
     std::fs::write(
         j["result"].as_str().unwrap(),

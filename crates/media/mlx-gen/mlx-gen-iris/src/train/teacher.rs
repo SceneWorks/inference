@@ -26,7 +26,14 @@ use mlx_rs::nn::silu;
 use mlx_rs::ops::{concatenate_axis, matmul, mean_axes, sqrt, var_axes};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Dtype, Stream};
+
+/// The caller's stream (`with_new_default_stream`'s, e.g. the CPU stream), else the default
+/// device's: mlx-rs's plain `index` ignores the task-local stream and always targets the default
+/// device.
+fn cur() -> Stream {
+    Stream::task_local_or_default()
+}
 
 /// The loaded teacher: every tensor under its hub name, f32.
 pub struct Teacher {
@@ -149,8 +156,8 @@ impl Teacher {
                 self.get("register_tokens"),
                 &[b, a.num_register_tokens as i32, d],
             )?;
-            let head = t.index((.., ..1, ..));
-            let tail = t.index((.., 1.., ..));
+            let head = t.index_device((.., ..1, ..), cur());
+            let tail = t.index_device((.., 1.., ..), cur());
             t = concatenate_axis(&[&head, &reg, &tail], 1)?;
         }
         for i in 0..a.depth {
@@ -162,7 +169,7 @@ impl Teacher {
             Some(self.get("norm.bias")),
             TEACHER_LN_EPS as f32,
         )?;
-        Ok(t.index((.., (1 + a.num_register_tokens) as i32.., ..)))
+        Ok(t.index_device((.., (1 + a.num_register_tokens) as i32.., ..), cur()))
     }
 
     /// `interpolate_pos_encoding` for a `gh × gw` patch grid → `[1, 1 + gh·gw, D]`.
@@ -174,10 +181,10 @@ impl Teacher {
         let m = self.arch.pos_grid as i32;
         let d = self.arch.embed_dim as i32;
         let (gh, gw) = (grid.0 as i32, grid.1 as i32);
-        let cls = table.index((.., ..1, ..));
+        let cls = table.index_device((.., ..1, ..), cur());
         // [1, M², D] → [D, M, M] → Mh · P · Mwᵀ → [D, gh, gw] → [1, gh·gw, D]
         let patch = table
-            .index((.., 1.., ..))
+            .index_device((.., 1.., ..), cur())
             .reshape(&[m, m, d])?
             .transpose_axes(&[2, 0, 1])?;
         let mh = Array::from_slice(&mh, &[gh, m]);
@@ -207,7 +214,7 @@ impl Teacher {
         let qkv = lin(&h, "attn.qkv")?
             .reshape(&[b, n, 3, heads, hd])?
             .transpose_axes(&[2, 0, 3, 1, 4])?;
-        let (q, k, v) = (qkv.index(0), qkv.index(1), qkv.index(2));
+        let (q, k, v) = (qkv.index_device(0, cur()), qkv.index_device(1, cur()), qkv.index_device(2, cur()));
         let attn = scaled_dot_product_attention(&q, &k, &v, (hd as f32).powf(-0.5), None, None)?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, n, heads * hd])?;
