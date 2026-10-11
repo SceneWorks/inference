@@ -16,6 +16,17 @@ _spec.loader.exec_module(s0)
 
 
 class S0CudaTests(unittest.TestCase):
+    def test_build_launch_uses_repo_batch_without_nested_cmd_quoting(self):
+        argv = s0.build_command()
+        self.assertEqual(argv[:3], ["cmd", "/d", "/c"])
+        self.assertEqual(len(argv), 4)
+        self.assertNotIn('"', subprocess.list2cmdline(argv))
+        script = Path(__file__).resolve().parents[2] / argv[3].replace("\\", "/")
+        lines = script.read_text().splitlines()
+        self.assertEqual(lines[1], 'call "%VCVARS%" || exit /b 1')
+        self.assertTrue(lines[2].startswith("cargo build --locked --release "))
+        self.assertEqual(lines[3], "exit /b %errorlevel%")
+
     def test_expired_inventory_deadline_does_not_launch_driver_probe(self):
         with patch.object(s0.subprocess, "check_output") as probe:
             with self.assertRaisesRegex(TimeoutError, "sampling deadline"):

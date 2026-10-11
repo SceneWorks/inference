@@ -166,6 +166,10 @@ def persist_receipt(out: Path, receipt: dict):
     temporary.replace(out / "receipt.json")
 
 
+def build_command() -> list[str]:
+    return ["cmd", "/d", "/c", r"scripts\ci\real-weights\veda-s0-cuda\build.cmd"]
+
+
 def main() -> int:
     out = Path(os.environ["S0_OUTPUT_DIR"])
     out.mkdir(parents=True, exist_ok=True)
@@ -195,8 +199,7 @@ def main() -> int:
         # It owns descendants on timeout/error and refuses incompatible enclosing CI Jobs.
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from media_campaign_windows import WindowsJob
-        build = ["cmd", "/d", "/s", "/c", 'call "%VCVARS%" && cargo build --locked --release -j4 -p candle-gen-minimax-h3 --features cuda,veda-s0-profile --example veda_s0_cuda']
-        result = execute_owned("build", build, out, deadline, WindowsJob)
+        result = execute_owned("build", build_command(), out, deadline, WindowsJob)
         receipt["results"].append(result)
         receipt["status"] = "build_child_completed"
         persist_receipt(out, receipt)
