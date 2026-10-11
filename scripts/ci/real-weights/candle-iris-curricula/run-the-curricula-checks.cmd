@@ -2,8 +2,8 @@ call "%VCVARS%"
 set "IRIS_FAILED=0"
 rem The release REPA teacher against the committed upstream tokens, on the GPU.
 call :run_one the_release_teacher_matches_upstream_on_real_weights curricula_parity::the_release_teacher_matches_upstream_on_real_weights --ignored || set "IRIS_FAILED=1"
-rem Real multi-rank training on this box: every rank a process on cuda:0 (the device inventory above
-rem records how many GPUs the box has), over the host TCP transport (Windows has no NCCL).
+rem Real multi-rank training on this box: rank r a process on cuda:r (the device inventory above
+rem records the cards), over the host TCP transport (Windows has no NCCL).
 call :run_one fsdp_full_and_grad_op_sharding_reproduce_ddp train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp || set "IRIS_FAILED=1"
 call :run_one a_sharded_checkpoint_resumes_exactly_and_reshards train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards || set "IRIS_FAILED=1"
 call :run_one a_rank_that_exits_mid_run_fails_the_survivor_typed train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed || set "IRIS_FAILED=1"

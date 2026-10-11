@@ -713,6 +713,27 @@ fn mkdir(p: &Path) -> Result<()> {
         .map_err(|e| Error::Msg(format!("iris checkpoint: create {}: {e}", p.display())))
 }
 
+/// The device a rank trains on: upstream's `cuda:<local_rank>` (`world.py`) on a CUDA build when
+/// that GPU exists; a rank whose ordinal has no GPU shares the build's device (several ranks on one
+/// card — same semantics, shared memory and compute).
+fn rank_device(base: &Device, world: &World) -> Device {
+    if world.world_size == 1 || !base.is_cuda() {
+        return base.clone();
+    }
+    match Device::new_cuda(world.local_rank) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "iris training: rank {} has no cuda:{} ({e}); it shares {:?}",
+                world.rank,
+                world.local_rank,
+                base.location()
+            );
+            base.clone()
+        }
+    }
+}
+
 impl Run {
     fn prepare(
         trainer: &IrisTrainer,
@@ -722,8 +743,8 @@ impl Run {
     ) -> Result<Self> {
         on_progress(TrainingProgress::Preparing);
         let mut config = trainer.config.clone();
-        let device = trainer.device.clone();
         let pre = trainer.resolve_plan(req, &[])?;
+        let device = rank_device(&trainer.device, &pre.dist.world);
         config.model.rope_aspect = pre.rope_aspect.clone();
         let compute = match pre.mixed_precision {
             MixedPrecision::Bf16 => DType::BF16,

@@ -166,9 +166,10 @@ the same mesh reproduces the uninterrupted run bit for bit and reshards to one p
 exits, or stalls, surfaces on the survivor as `RankLost` (the stall naming the transport timeout) and
 nothing hangs; invalid meshes / a global-batch mismatch / an MLX transport on Candle are typed
 refusals. Multi-host MLX (two Macs over ring or JACCL) is supported by the hostfile path but is not
-exercised: the only machine this story may load is nax-macos-2. On candle/CUDA the same tests run
-every rank on `cuda:0` (`iris-curricula-cuda`); the device inventory in that lane records the box's
-GPU count.
+exercised: the only machine this story may load is nax-macos-2. On candle/CUDA a rank trains on
+`cuda:<local_rank>` (upstream's `world.py`), sharing the build's device when that ordinal has no
+GPU; the `iris-curricula-cuda` lane runs the same tests on the Windows box's two RTX PRO 6000
+Blackwell (96 GB) cards, one rank per card, over the host TCP transport (no NCCL on Windows).
 
 **Real weights (dispatch-only):** `iris-curricula-mlx` (`mlx-iris-curricula-train`, nax-macos-2)
 and `iris-curricula-cuda` (`candle-iris-curricula`) run the release teacher against upstream and the

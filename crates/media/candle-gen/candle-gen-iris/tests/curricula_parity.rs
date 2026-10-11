@@ -422,6 +422,11 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
     let device = crate::common::device();
     let teacher = Teacher::load(std::path::Path::new(&dir), arch, &device).unwrap();
     let img = f32t(g.require("image")).to_device(&device).unwrap();
+    // Peak-relative. The 4×4 case (a 37² position table resampled to 4², twelve fp32 blocks) is
+    // the sensitive one: measured max |Δ| / peak 4.2e-4 on the CPU (MLX CPU 1.9e-4), 1.2e-3 on
+    // CUDA (mean |Δ| 9.9e-5 there — accumulation order and the device's transcendental kernels,
+    // not a systematic offset), so the device bound is 2e-3.
+    let tol = if device.is_cpu() { 1e-3 } else { 2e-3 };
     for (name, grid) in [("g16", (16, 16)), ("g4_match", (4, 4))] {
         let got = teacher
             .tokens(&img, grid)
@@ -432,7 +437,7 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
             &format!("release teacher {name}"),
             &got,
             &f32t(g.require(&format!("{name}.tokens"))),
-            1e-3,
+            tol,
         );
     }
 }

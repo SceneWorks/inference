@@ -1,9 +1,8 @@
 //! sc-25689 — **real multi-rank** training on one host, the Candle twin of the MLX
 //! `train_distributed`: every scenario launches each rank as its own OS process (this test binary
 //! re-entered through [`rank_entry`]) running the Candle trainer on the miniature snapshot on the
-//! build's device (CPU here; every rank on `cuda:0` on a CUDA build — two ranks sharing one GPU
-//! where the box has one), over the host TCP transport (the Candle trainer's transport: Windows has
-//! no NCCL).
+//! build's device (CPU here; on a CUDA build rank r on `cuda:r`, ranks sharing a card where the box
+//! has fewer), over the host TCP transport (the Candle trainer's transport: Windows has no NCCL).
 //!
 //! * replication — DDP ranks reproduce bit for bit across launches, the MLX transports are typed
 //!   refusals here, and FSDP — whose ranks cannot diverge by construction (every step re-gathers

@@ -5564,8 +5564,9 @@ jobs:
   # share), then runs `--exact` with a run-count assertion: the release teacher against the
   # committed upstream tokens; real multi-process training on this box (FSDP full / grad_op vs DDP,
   # a sharded checkpoint resumed exactly and resharded, a rank that exits and a rank that stalls
-  # surfacing as typed `RankLost` — every rank a process on cuda:0 over the host TCP transport, as
-  # Windows has no NCCL); the miniature fp16 + stage-preset lifecycle on the device; and the bounded
+  # surfacing as typed `RankLost` — each rank a process on `cuda:<local_rank>`, numbered in PCI bus
+  # order as nvidia-smi does, over the host TCP transport, as Windows has no NCCL); the miniature
+  # fp16 + stage-preset lifecycle on the device; and the bounded
   # official curriculum on real weights (`stage1_256` + REPA → `stage2_512` new phase, batch 1, four
   # steps). Logs, per-check VRAM lines and the curriculum's metrics go in the evidence artifact.
   candle-iris-curricula:
@@ -5578,6 +5579,8 @@ jobs:
       IRIS_WEIGHTS_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3
       IRIS_TEXT_ENCODER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen3-VL-4B-Instruct\snapshots\ebb281ec70b05090aa6165b016eac8ec08e71b17
       IRIS_REPA_TEACHER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--facebook--dinov2-base\snapshots\f9e44c814b77203eaa57a6bdbbd535f21ede1415
+      # Rank r trains on cuda:r; number the cards as nvidia-smi does (see `candle-decode-speedups-bench`).
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
       # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
