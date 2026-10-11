@@ -125,12 +125,19 @@ fn run_job(j: &Json) -> Json {
     let out = PathBuf::from(j["out"].as_str().unwrap());
     let mut cfg = config(j["steps"].as_u64().unwrap() as u32);
     cfg.resume = j["resume"].as_bool().unwrap_or(false);
-    if let Some(o) = j["optimizer"].as_str() {
-        cfg.optimizer = o.into();
+    let mut opts = json!({"ema_decay": 0.9, "text_dropout": 0.3});
+    match j["optimizer"].as_str() {
+        // Muon with the clip out of reach: the orthogonalization input is then independent of
+        // how the global norm was summed.
+        Some(UNCLIPPED_MUON) => {
+            cfg.optimizer = "muon".into();
+            opts["gradient_clip"] = json!(1e6);
+        }
+        Some(o) => cfg.optimizer = o.into(),
+        None => {}
     }
     let dist = j["dist"].clone();
     let world_size = dist["world"]["world_size"].as_u64().unwrap_or(1);
-    let mut opts = json!({"ema_decay": 0.9, "text_dropout": 0.3});
     if world_size > 1 {
         opts["dist"] = dist.clone();
         if dist["world"]["num_nodes"].as_u64().unwrap_or(1) > 1 {
@@ -403,13 +410,13 @@ fn export(out: &Path) -> PathBuf {
     out.join("dist").join("model.safetensors")
 }
 
-/// AdamW is elementwise, so a sharded step equals the replicated one up to the f32 rounding of
-/// the global gradient norm (summed per shard): ≤ 1e-6. Muon orthogonalizes in bf16 (Dion's
-/// Newton–Schulz), where that last-ulp norm difference can flip a bf16 rounding of the update:
-/// one bf16 ulp (2^-8 relative) of a ≤ lr-sized step, per step — 4 · 1e-3 · 2^-8 ≈ 1.6e-5, so
-/// 4e-5 bounds it with margin.
+/// A sharded step equals the replicated one up to the f32 rounding of the global gradient norm
+/// (summed per shard, then clipped): AdamW is elementwise, ≤ 1e-6. Muon orthogonalizes in bf16
+/// (Dion's Newton–Schulz), which turns that last-ulp clip difference into bf16-sized update
+/// differences — so Muon is compared with the clip out of reach ([`UNCLIPPED_MUON`]), where the
+/// gathered matrix it orthogonalizes is the replicated one exactly.
 const ADAMW_TOL: f32 = 1e-6;
-const MUON_TOL: f32 = 4e-5;
+const UNCLIPPED_MUON: &str = "muon_unclipped";
 
 fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
     let d = max_diff(&export(ddp), &export(other));
@@ -430,7 +437,7 @@ fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
-    for (optimizer, tol) in [("adamw", ADAMW_TOL), ("muon", MUON_TOL)] {
+    for (optimizer, tol) in [("adamw", ADAMW_TOL), (UNCLIPPED_MUON, ADAMW_TOL)] {
         let ddp = shared_run(
             2,
             json!({"strategy": "ddp"}),

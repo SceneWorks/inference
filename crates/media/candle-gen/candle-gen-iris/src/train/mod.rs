@@ -1060,7 +1060,9 @@ impl Run {
                         var.as_tensor().dims()
                     )));
                 }
-                var.set(&t)?;
+                if t.elem_count() > 0 {
+                    var.set(&t)?;
+                }
                 Ok(())
             };
             for (k, v) in &payload.trainable {

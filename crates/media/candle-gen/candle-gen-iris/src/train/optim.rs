@@ -330,7 +330,11 @@ impl IrisOptimizer {
                     p.sub(&step.to_dtype(DType::F32)?)?
                 }
             };
-            var.set(&new_p)?;
+            if var.elem_count() > 0 {
+                // A zero-row shard (more shards than rows) has nothing to update (and candle hands
+                // its empty input back from the update arithmetic).
+                var.set(&new_p)?;
+            }
         }
         Ok(())
     }
