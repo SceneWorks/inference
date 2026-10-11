@@ -505,6 +505,42 @@ fn binary_grad(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// Local addition (sc-25688, VENDORED.md change 6): the patched `MaxPool2D` backward routes each
+// window's gradient to its maximum (split evenly over ties) and gives the rows / columns a
+// floor-division pool drops zero gradient.
+fn max_pool2d_grad(device: &Device) -> Result<()> {
+    #[rustfmt::skip]
+    let x = Var::from_tensor(&Tensor::new(&[
+        [0.1f32, 0.2, 9.0, 0.3, 50.0],
+        [0.4,    5.0, 0.5, 9.0, 50.0],
+        [7.0,    0.6, 0.7, 0.8, 50.0],
+        [0.9,    1.0, 1.1, 8.0, 50.0],
+        [60.0,  60.0, 60.0, 60.0, 60.0],
+    ], device)?.reshape((1, 1, 5, 5))?)?;
+    let pool = x.as_tensor().max_pool2d(2)?;
+    assert_eq!(
+        pool.flatten_all()?.to_vec1::<f32>()?,
+        [5.0, 9.0, 7.0, 8.0]
+    );
+    // d loss / d pool = [[1, 2], [3, 4]].
+    let w = Tensor::new(&[[1f32, 2.], [3., 4.]], device)?.reshape((1, 1, 2, 2))?;
+    let grads = (pool * w)?.sum_all()?.backward()?;
+    let grad = grads.get(x.as_tensor()).context("no grad for x")?;
+    assert_eq!(
+        grad.reshape((5, 5))?.to_vec2::<f32>()?,
+        [
+            // A unique maximum takes its window's whole gradient (1, 3, 4); the two tied 9s
+            // split theirs (2 / 2 each); the dropped row 4 and column 4 get none.
+            [0., 0., 1., 0., 0.],
+            [0., 1., 0., 1., 0.],
+            [3., 0., 0., 0., 0.],
+            [0., 0., 0., 4., 0.],
+            [0., 0., 0., 0., 0.],
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn test_flip_backprop() -> Result<()> {
     let device = &Device::Cpu;
@@ -560,4 +596,10 @@ test_device!(
     binary_grad_cpu,
     binary_grad_gpu,
     binary_grad_metal
+);
+test_device!(
+    max_pool2d_grad,
+    max_pool2d_grad_cpu,
+    max_pool2d_grad_gpu,
+    max_pool2d_grad_metal
 );

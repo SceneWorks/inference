@@ -3,7 +3,9 @@
 Runs argv[3:] as a child, polls its macOS phys_footprint (proc_pid_rusage RUSAGE_INFO_V4 — includes
 Metal / unified-memory buffers) every 0.25 s, SIGTERMs it when the footprint crosses the cap (GB,
 argv[1]) or the wall clock exceeds argv[2] seconds, and prints the peak. Report-only beyond the kill:
-nothing is gated on the peak.
+nothing is gated on the peak. Caps the job passes: 40 GB for the reference check and the LoRA run,
+100 GB for the paper's full fine-tune of the 3B generator (f32 masters + AdamW moments + grads + EMA
+≈ 60 GB before activations and the frozen critic).
 """
 
 import ctypes

@@ -31,8 +31,13 @@
 //!   regenerates `x̂` with the current generator under no-grad; one **step** is one generator
 //!   window plus one critic window. Gradients are clipped (`max_grad_norm = 1.0`) per network; the EMA
 //!   (decay 0.999) is updated after every generator optimizer step.
-//! * **Optimizers** — AdamW for both networks, `lr = 1e-5`, `betas = (0.9, 0.999)`, torch's default
-//!   `weight_decay = 0.01` and `eps = 1e-8`, constant schedule (paper: "constant LR").
+//! * **Optimizers** — AdamW for both networks. The trainer reads its LR, weight decay, schedule
+//!   and artifact from the **request** (`TrainingConfig`); the published recipe — a **full
+//!   fine-tune** with AdamW at `lr = 1e-5` for generator and critic (paper §5.3), torch's default
+//!   `weight_decay = 0.01` and `eps = 1e-8`, `betas = (0.9, 0.999)`, constant LR — is
+//!   [`recipe_training_config`] / [`apply_recipe`], the documented default a caller starts from.
+//!   A LoRA/LoKr adapter (HYPIR's own arm) is supported when the request asks for it, never
+//!   substituted for the recipe.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -582,6 +587,36 @@ pub const RECIPE_CLIP: f64 = 1.0;
 pub const RECIPE_EMA_DECAY: f64 = 0.999;
 /// `torch.optim.AdamW` eps.
 pub const ADAMW_EPS: f64 = 1e-8;
+/// Paper §5.3: AdamW "at an LR of 10⁻⁵ for both generator and critic".
+pub const RECIPE_LR: f32 = 1e-5;
+/// `torch.optim.AdamW`'s default weight decay (HYPIR's `opt_kwargs` set none) — both networks.
+pub const RECIPE_WEIGHT_DECAY: f32 = 0.01;
+/// Paper §5.3: 1024² crops.
+pub const RECIPE_RESOLUTION: u32 = 1024;
+
+/// Set the shared-config fields of the published restoration recipe (paper §5.3): a **full**
+/// fine-tune, AdamW at [`RECIPE_LR`] with [`RECIPE_WEIGHT_DECAY`] for both the generator and the
+/// critic (the critic inherits both unless `lr_critic` / `critic_weight_decay` override them), a
+/// constant LR with no warmup, 1024² crops. Betas, clipping, EMA and the Eq. 6 weights are the
+/// `iris_restore` option defaults already. The caller still sets steps, cadences, seed and precision.
+pub fn apply_recipe(cfg: &mut TrainingConfig) {
+    cfg.full_finetune = true;
+    cfg.optimizer = "adamw".into();
+    cfg.learning_rate = RECIPE_LR;
+    cfg.weight_decay = RECIPE_WEIGHT_DECAY;
+    cfg.lr_scheduler = LrSchedule::Constant;
+    cfg.lr_warmup_steps = 0;
+    cfg.resolution = RECIPE_RESOLUTION;
+}
+
+/// The restoration trainer's documented default request config: [`TrainingConfig::default`] with
+/// [`apply_recipe`] — the paper's full fine-tune, not the shared default's LoRA r16 / lr 1e-4 /
+/// weight decay 0.
+pub fn recipe_training_config() -> TrainingConfig {
+    let mut cfg = TrainingConfig::default();
+    apply_recipe(&mut cfg);
+    cfg
+}
 
 const OPTION_KEYS: [&str; 26] = [
     "loss_l2",
@@ -1792,6 +1827,98 @@ pub fn phase_of(batch_count: u64, accum: usize) -> (Phase, bool) {
     (phase, (batch_count + 1).is_multiple_of(accum))
 }
 
+/// Count one non-finite accumulation window of `network` ("generator" / "critic") against
+/// `nan_loss_tolerance`: log it, and fail once the count exceeds the tolerance.
+pub fn count_non_finite_window(
+    network: &str,
+    step: u64,
+    nan_count: &mut u32,
+    tolerance: u32,
+) -> Result<()> {
+    *nan_count += 1;
+    eprintln!(
+        "iris restore training: non-finite {network} loss at step {step} ({nan_count}/{tolerance})"
+    );
+    if *nan_count > tolerance {
+        return Err(Error::Msg(format!(
+            "iris restore training: loss was non-finite {nan_count} times; aborting"
+        )));
+    }
+    Ok(())
+}
+
+/// How a closed accumulation window ends.
+#[derive(Debug, PartialEq)]
+pub enum WindowClose<S> {
+    /// Every micro-batch's loss was finite: step the optimizer; `loss` is the window's mean.
+    Step { loss: f64 },
+    /// A micro-batch's loss was non-finite: discard the window's gradients and put back the state
+    /// the window started from (`None` when it recorded none) — counted by
+    /// [`count_non_finite_window`].
+    Skip { restore: Option<S> },
+}
+
+/// One accumulation window's loss bookkeeping: the mean loss, whether any micro-batch was
+/// non-finite, and the state `S` the window started from (the critic's spectral `u`/`v`, which
+/// every train-mode micro-batch advances), so a skipped window leaves no trace.
+#[derive(Debug)]
+pub struct LossWindow<S> {
+    start: Option<S>,
+    bad: bool,
+    sum: f64,
+}
+
+impl<S> Default for LossWindow<S> {
+    fn default() -> Self {
+        Self {
+            start: None,
+            bad: false,
+            sum: 0.0,
+        }
+    }
+}
+
+impl<S> LossWindow<S> {
+    /// Keep the state as of the window's first micro-batch (later calls keep the first).
+    pub fn begin(&mut self, state: impl FnOnce() -> S) {
+        if self.start.is_none() {
+            self.start = Some(state());
+        }
+    }
+
+    /// Record one micro-batch's loss into the window mean (`loss / accum`); `false` (and the
+    /// window is marked bad) when it is non-finite.
+    pub fn record(&mut self, loss: f64, accum: usize) -> bool {
+        if loss.is_finite() {
+            self.sum += loss / accum.max(1) as f64;
+            true
+        } else {
+            self.bad = true;
+            false
+        }
+    }
+
+    /// Close the window and reset for the next. A bad window is counted against
+    /// `nan_loss_tolerance` (an error past it).
+    pub fn close(
+        &mut self,
+        network: &str,
+        step: u64,
+        nan_count: &mut u32,
+        tolerance: u32,
+    ) -> Result<WindowClose<S>> {
+        let done = std::mem::take(self);
+        if done.bad {
+            count_non_finite_window(network, step, nan_count, tolerance)?;
+            Ok(WindowClose::Skip {
+                restore: done.start,
+            })
+        } else {
+            Ok(WindowClose::Step { loss: done.sum })
+        }
+    }
+}
+
 // =============================================================================================
 // Checkpoint state and export identity
 // =============================================================================================
@@ -2113,6 +2240,88 @@ mod tests {
         assert_eq!(c.kernel2.kernel_list.len(), 6);
         assert!(parse_degradation(Some(&json!({"queue_size": 256}))).is_err());
         assert!(parse_degradation(Some(&json!({"resize_back": false}))).is_err());
+    }
+
+    /// The recipe config resolves to the paper's full fine-tune with lr 1e-5 and weight decay 0.01
+    /// on BOTH optimizers (E3: the shared LoRA default is never silently substituted).
+    #[test]
+    fn the_recipe_config_resolves_to_the_papers_full_fine_tune() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(super::super::BACKBONE_CONFIG_FILE),
+            "model:\n  patch_size: 16\ntask:\n  name: restoration\n  sigma: 0.5\n  tile: 1024\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(super::super::BACKBONE_WEIGHTS_FILE), b"").unwrap();
+        std::fs::write(
+            dir.path().join(super::super::downstream::EMPTY_PROMPT_FILE),
+            b"",
+        )
+        .unwrap();
+        let export = RestorationResources::from_dir(dir.path(), TRAINER_ID).unwrap();
+        let req = TrainingRequest {
+            config: recipe_training_config(),
+            items: vec![TrainingItem::captioned(
+                dir.path().join("a.png"),
+                String::new(),
+            )],
+            output_dir: dir.path().join("out"),
+            file_name: "restorer.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: crate::runtime::CancelFlag::default(),
+        };
+        let plan = RestoreTrainPlan::resolve(&req, &export, &[], false).unwrap();
+        assert_eq!(plan.artifact, RestoreArtifact::Full);
+        assert_eq!(plan.image_size, 1024);
+        assert_eq!(plan.schedule, LrShape::Constant);
+        assert_eq!(plan.warmup_steps, 0);
+        for (name, opt) in [("generator", plan.generator), ("critic", plan.critic)] {
+            assert_eq!(opt.lr, f64::from(RECIPE_LR), "{name}");
+            assert_eq!(opt.lr, f64::from(1e-5_f32), "{name}");
+            assert_eq!(opt.weight_decay, f64::from(0.01_f32), "{name}");
+            assert_eq!(opt.betas, RECIPE_BETAS, "{name}");
+        }
+    }
+
+    /// An injected non-finite critic loss skips its window: counted against the tolerance, the
+    /// window's starting state handed back (the spectral `u`/`v` do not advance), the mean of a
+    /// clean window unaffected — and past the tolerance the run fails.
+    #[test]
+    fn a_non_finite_window_is_counted_skipped_and_restores_its_start() {
+        let mut nan_count = 0u32;
+        let mut w: LossWindow<u32> = LossWindow::default();
+        // Clean two-micro-batch window: the mean, no count.
+        w.begin(|| 1);
+        assert!(w.record(2.0, 2));
+        w.begin(|| 99);
+        assert!(w.record(4.0, 2));
+        assert_eq!(
+            w.close("critic", 1, &mut nan_count, 1).unwrap(),
+            WindowClose::Step { loss: 3.0 }
+        );
+        assert_eq!(nan_count, 0);
+        // Injected non-finite loss on the second micro-batch: skip, restore the FIRST state.
+        w.begin(|| 7);
+        assert!(w.record(1.0, 2));
+        w.begin(|| 8);
+        assert!(!w.record(f64::NAN, 2));
+        assert_eq!(
+            w.close("critic", 2, &mut nan_count, 1).unwrap(),
+            WindowClose::Skip { restore: Some(7) }
+        );
+        assert_eq!(nan_count, 1);
+        // The next window starts clean.
+        w.begin(|| 9);
+        assert!(w.record(5.0, 1));
+        assert_eq!(
+            w.close("critic", 3, &mut nan_count, 1).unwrap(),
+            WindowClose::Step { loss: 5.0 }
+        );
+        // A second bad window exceeds tolerance 1.
+        w.begin(|| 10);
+        w.record(f64::INFINITY, 1);
+        assert!(w.close("critic", 4, &mut nan_count, 1).is_err());
+        assert_eq!(nan_count, 2);
     }
 
     #[test]

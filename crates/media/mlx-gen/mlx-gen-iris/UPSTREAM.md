@@ -438,7 +438,7 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
 | Adversarial loss: `multilevel_loss(alpha=0.8)` = BCE-with-logits, target 0.8 (real / generator), 0 (fake), spatial mean per level, summed | `D.py` L62; `cv_losses.py` | `multilevel_loss` (both); `gan_real_label` option | ported (non-saturating BCE with one-sided label smoothing) |
 | Critic loss `mean D_real + mean D_fake`, x̂ regenerated under no-grad | `base.py` L296–304 | `critic_grads` (both) | ported |
 | Alternation: window `(batch_count // accum) % 2` even = G, odd = D; one step = G + D window | `base.py` L327, L346–348 | `restoration_train::phase_of`; `steps` / `save_every` / `sample_every` must be multiples of `2·accum` | ported |
-| Optimizers: AdamW for G and D, lr 1e-5 both, betas (0.9, 0.999), torch defaults eps 1e-8, weight_decay 0.01 | paper; `base.py` L164–176; yaml `lr_G`, `lr_D`, `opt_kwargs` | `IrisOptimizer` (AdamW route) ×2; `lr_critic`, `betas`, `critic_betas`, `critic_weight_decay` options; G weight decay = `TrainingConfig::weight_decay` | ported |
+| Optimizers: AdamW for G and D, lr 1e-5 both, betas (0.9, 0.999), torch defaults eps 1e-8, weight_decay 0.01 | paper §5.3 ("We fully fine-tune with AdamW at an LR of 10⁻⁵ for both generator and critic"); `base.py` L164–176; yaml `lr_G`, `lr_D`, `opt_kwargs` | `IrisOptimizer` (AdamW route) ×2. The values come from the **request** (`TrainingConfig::learning_rate` / `weight_decay`; `lr_critic`, `betas`, `critic_betas`, `critic_weight_decay` options); the recipe values are `restoration_train::recipe_training_config()` / `apply_recipe` (`RECIPE_LR = 1e-5`, `RECIPE_WEIGHT_DECAY = 0.01`, full fine-tune, constant LR), the trainer's documented default | ported |
 | Clip `max_grad_norm = 1.0` per network | `base.py` L288, L307 | `clip_grads` per window; `gradient_clip`, `critic_gradient_clip` | ported |
 | EMA 0.999, updated after each G optimizer step; EMA weights exported | paper ("EMA … decay 0.999 is scored"); `base.py` L343, `ema.py` | `ema_update` after the G step; `export_weights` default `ema` | ported |
 | LR schedule | paper (Iris arm: constant) | constant (default) or cosine; warmup in steps | constant ported; cosine = the shared knob; linear refused |
@@ -446,8 +446,8 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
 | Second-order Real-ESRGAN degradation at 4× incl. USM sharpening of the GT | paper; `batch_transform.py` `__call__`; yaml dataset + batch_transform | `gen_core::iris::degradation` (kernels, sinc via J₁, reflect `filter2D`, area/bilinear/bicubic `F.interpolate`, Gaussian/Poisson (gray) noise, `DiffJPEG(differentiable=False)`, USM, 8-bit round) | ported; per-op parity + end-to-end 8-bit LQ bit-exact on recorded draws |
 | Batch-level resize/mode draws + 256-entry training-pair queue | `batch_transform.py` (`_dequeue_and_enqueue`) | drawn **per item** from `mix_seed(seed, RESTORE1, epoch, item)` | deliberate mapping: the queue only diversifies per-batch draws; per-item draws do that directly and keep each pair a function of `(seed, epoch, item)` (cancel/resume bit-exact) |
 | Aligned degraded/clean pairs | (not in HYPIR) | `TrainingItem::model_options["degraded_image"]`; integer-scale aligned crops, torch-exact bicubic upsample | native addition (story AC); all-or-none per run |
-| Full fine-tune | paper ("full fine-tuning") | `full_finetune: true` | ported |
-| LoRA (`init_lora_weights="gaussian"`, `lora_alpha = rank`) merged into the export | HYPIR's own arm (`sd2.py` `LoraConfig`) | LoRA / LoKr over `blocks.*`, `lora_init` gaussian default, merged (f32) at export | ported; export is always the full `upscaler/` layout |
+| Full fine-tune — **the recipe** | paper §5.3 ("We fully fine-tune …") | `full_finetune: true` (set by `recipe_training_config()`) | ported; the default request |
+| LoRA (`init_lora_weights="gaussian"`, `lora_alpha = rank`) merged into the export — HYPIR's arm, supported but **not** the default | HYPIR's own arm (`sd2.py` `LoraConfig`) | LoRA / LoKr over `blocks.*`, `lora_init` gaussian default, merged (f32) at export | ported; export is always the full `upscaler/` layout |
 | Mixed precision bf16; critic trunk `precision="bf16"` | yaml `mixed_precision: bf16`; `base.py` L151 | `train_dtype`, `critic_dtype` (convs/linears in bf16, LayerNorm/reductions f32) | ported; Candle CPU refuses a bf16 critic (no CPU bf16 GEMM) |
 | Data order (shuffled DataLoader) | `base.py` L188 | `gen_core::iris::train::DataWalk` (the generation trainer's ranged walk) | native (reused machinery, deterministic) |
 | Checkpoints: `accelerator.save_state` + EMA dict, `checkpoints_total_limit` | `base.py` L431–453 | generation-trainer checkpoint machinery + `critic.safetensors` (head + `u`/`v`), `critic_optimizer.safetensors`, `state.json` (`iris-restoration-train-checkpoint-v1`) | ported; resume restores generator, EMA, both optimizers, spectral buffers, data cursor |
@@ -463,7 +463,10 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
   features, generator term + input gradient, the critic step (power iterations, losses, head
   gradients, clip + AdamW), each Eq. 6 term and its gradient — Candle CPU f32 to 1e-4 of peak (the
   64-px LPIPS gradient to 1.5e-2: deep-tap ReLU gates within float noise of zero); MLX on Metal
-  (its CPU-stream GEMM mis-reads transposed operands: run-to-run nondeterministic) to 2e-2 / 2e-3.
+  (the production path; TF32-class f32 accumulation) to 2e-2 / 2e-3. The MLX CPU stream's
+  run-to-run gradient drift seen while writing these was MLX's CPU direct conv writing past its
+  output (a 7x7 depthwise conv on a 2x2 map) — fixed in the mlx-rs fork
+  (`cpu-conv-border-clamp.patch`, upstream ml-explore/mlx af9a5924).
 * `tests/restoration_train_lifecycle.rs` (both, miniature networks): every term contributes to the
   generator update; overfitting two pairs improves PSNR and LPIPS; cancel → resume bit-exact incl.
   critic, spectral buffers and both optimizers; export → `iris_3b_restore` ×2; other tasks refuse.

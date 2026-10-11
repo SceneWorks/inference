@@ -2928,7 +2928,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2969,7 +2969,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3265,7 +3265,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3288,7 +3288,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=fe22998bf73e5e785d7659beb2f24d624b785bda#fe22998bf73e5e785d7659beb2f24d624b785bda"
 dependencies = [
  "bindgen",
  "cc",

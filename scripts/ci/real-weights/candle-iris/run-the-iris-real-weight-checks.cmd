@@ -13,6 +13,7 @@ call :run_one real_lora_trains_exports_and_renders train_real_weights::real_lora
 call :run_one real_depth_full_finetune_trains_exports_and_estimates depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates --ignored || set "IRIS_FAILED=1"
 call :run_one real_lpips_and_critic_trunk_match_the_reference restoration_train_real_weights::real_lpips_and_critic_trunk_match_the_reference --ignored || set "IRIS_FAILED=1"
 call :run_one real_restoration_trains_exports_and_restores restoration_train_real_weights::real_restoration_trains_exports_and_restores --ignored || set "IRIS_FAILED=1"
+call :run_one real_restoration_full_finetune_trains_exports_and_restores restoration_train_real_weights::real_restoration_full_finetune_trains_exports_and_restores --ignored || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1
 exit /b 0
 

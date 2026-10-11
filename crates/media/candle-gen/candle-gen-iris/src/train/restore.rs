@@ -6,7 +6,13 @@
 //! checkpoint, resume, export (the `upscaler/` layout, adapters merged) and positional randomness
 //! are the MLX twin's, key for key.
 //!
+//! Every hyper-parameter comes from the request. The documented default request is
+//! [`recipe_training_config`] — the paper's **full** fine-tune, AdamW at lr 1e-5 with weight decay
+//! 0.01 for generator and critic, constant LR; a LoRA/LoKr adapter (HYPIR's own arm) trains only
+//! when the request asks for one.
+//!
 //! [`gen_core::iris::restoration_train`]: candle_gen::gen_core::iris::restoration_train
+//! [`recipe_training_config`]: candle_gen::gen_core::iris::restoration_train::recipe_training_config
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,8 +22,9 @@ use candle_gen::gen_core::iris::restoration::RestorationResources;
 use candle_gen::gen_core::iris::restoration_train::{
     self as contract, base_identity, check_resume, critic_head_init, export_metadata, phase_of,
     read_checkpoint_state, training_pair, validate_item, write_export_sidecars, ConvNextConfig,
-    Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan, RestoreTrainResources,
-    TrainPair, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER, CRITIC_HEAD_WIDTH, TRAINER_ID,
+    LossWindow, Phase, RestoreArtifact, RestoreCheckpointState, RestoreTrainPlan,
+    RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
+    CRITIC_HEAD_WIDTH, TRAINER_ID,
 };
 use candle_gen::gen_core::iris::train::{
     adapter_param_route, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
@@ -769,7 +776,7 @@ impl Run {
         let mut g_acc = Accum::default();
         let mut d_acc = Accum::default();
         let mut g_sums = [0f64; 4];
-        let mut d_sum = 0f64;
+        let mut d_win: LossWindow<SpectralState> = LossWindow::default();
         let mut window_bad = false;
         let mut boundary = (self.epoch, self.pos);
         let mut cancelled = false;
@@ -808,19 +815,12 @@ impl Run {
                         }
                         if sync {
                             if window_bad {
-                                self.nan_count += 1;
-                                eprintln!(
-                                    "iris restore training: non-finite generator loss at step {} \
-                                     ({}/{})",
-                                    self.step, self.nan_count, plan.nan_loss_tolerance
-                                );
-                                if self.nan_count > plan.nan_loss_tolerance {
-                                    return Err(Error::Msg(format!(
-                                        "iris restore training: loss was non-finite {} times; \
-                                         aborting",
-                                        self.nan_count
-                                    )));
-                                }
+                                contract::count_non_finite_window(
+                                    "generator",
+                                    self.step,
+                                    &mut self.nan_count,
+                                    plan.nan_loss_tolerance,
+                                )?;
                                 g_acc = Accum::default();
                                 window_bad = false;
                             } else if let Some(g) = g_acc.grads.take() {
@@ -843,6 +843,7 @@ impl Run {
                         let dit = self.model.dit(&snapshot_detached(&self.params))?;
                         let xhat = self.frozen.restore(&dit, &batch.lq)?.detach();
                         drop(dit);
+                        d_win.begin(|| self.sn.clone());
                         let (loss, grads, sn) = critic_grads(
                             &self.frozen,
                             &plan,
@@ -853,18 +854,33 @@ impl Run {
                             grad_scale,
                         )?;
                         self.sn = sn;
-                        if loss.is_finite() {
+                        if d_win.record(loss, accum) {
                             d_acc.add(grads)?;
-                            d_sum += loss / accum as f64;
                         }
                         if sync {
-                            if let Some(g) = d_acc.grads.take() {
-                                let lr = self.lr_critic * self.factor();
-                                let (_, g) = clip_grads(g, plan.critic.clip)?;
-                                self.critic_opt.step(&self.head, &g, lr)?;
+                            match d_win.close(
+                                "critic",
+                                self.step,
+                                &mut self.nan_count,
+                                plan.nan_loss_tolerance,
+                            )? {
+                                WindowClose::Step { loss } => {
+                                    if let Some(g) = d_acc.grads.take() {
+                                        let lr = self.lr_critic * self.factor();
+                                        let (_, g) = clip_grads(g, plan.critic.clip)?;
+                                        self.critic_opt.step(&self.head, &g, lr)?;
+                                    }
+                                    self.losses[4] = loss;
+                                }
+                                WindowClose::Skip { restore } => {
+                                    // A skipped window leaves no trace: no critic step, and the
+                                    // spectral u/v go back to where the window started.
+                                    d_acc = Accum::default();
+                                    if let Some(sn) = restore {
+                                        self.sn = sn;
+                                    }
+                                }
                             }
-                            self.losses[4] = d_sum;
-                            d_sum = 0.0;
                             self.sched_step += 1;
                             self.step += 1;
                             boundary = (epoch, pos + 1);

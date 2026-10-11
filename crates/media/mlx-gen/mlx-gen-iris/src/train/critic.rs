@@ -58,8 +58,7 @@ fn gelu(x: &Array) -> Result<Array> {
 }
 
 /// `y = x · Wᵀ + b` with `x` cast to the compute dtype, output f32. Both GEMM operands are made
-/// row-contiguous first: MLX's CPU GEMM mis-reads a transposed narrow operand (measured: a
-/// `[2, 32] · [16, 32]ᵀ` product changed between evaluations of the same graph).
+/// row-contiguous first (one dense `[in, out]` weight read by every call).
 fn linear(x: &Array, w: &Array, b: Option<&Array>, compute: Dtype) -> Result<Array> {
     linear_t(x, &contiguous(&w.t())?, b, compute)
 }
@@ -83,7 +82,7 @@ fn conv(
     groups: i32,
     compute: Dtype,
 ) -> Result<Array> {
-    // Dense input: MLX's CPU conv reads a strided view (the blur's shifted slices) wrongly.
+    // Dense input (the blur's shifted slices are strided views).
     let y = conv2d_general(
         &contiguous(&x.as_dtype(compute)?)?,
         w,

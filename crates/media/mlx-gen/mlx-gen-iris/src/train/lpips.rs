@@ -79,7 +79,7 @@ impl Lpips {
                             &[cout as i32, cin as i32, 3, 3],
                         )?
                         .transpose_axes(&[0, 2, 3, 1])?;
-                        // A dense OHWI copy: MLX's CPU conv reads a strided weight view wrongly.
+                        // A dense OHWI copy of the OIHW checkpoint weight.
                         let w = mlx_gen::array::contiguous(&w)?;
                         let b = take(vgg, &format!("features.{idx}.bias"), &[cout as i32])?;
                         eval([&w, &b])?;

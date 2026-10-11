@@ -1,6 +1,6 @@
 //! The restoration recipe's training-only networks and loss terms on MLX vs HYPIR's own code
 //! (`tools/dump_iris_restoration_train.py` → `iris_restoration_train_golden.safetensors`), FP32 on
-//! the MLX CPU stream (true f32, like the oracle):
+//! the default (Metal) stream — the production path:
 //!
 //! * LPIPS-VGG (formula weights, the real VGG16 / LPIPS-v0.1 architecture): per-sample distances and
 //!   `d mean(LPIPS) / d in0`;
@@ -11,14 +11,16 @@
 //! * the generator loss of `BaseTrainer.optimize_generator` — `mse + 5·LPIPS + 0.5·D(x, for_G)`:
 //!   each term, the total, and each term's input gradient.
 //!
-//! These run on the default (Metal) stream — the production path. The MLX **CPU** stream is not
-//! usable here: its GEMM mis-reads transposed narrow operands, and the matmul VJPs produce exactly
-//! such products, so the same CPU graph returned different gradients from run to run (measured
-//! while writing these tests; the GPU stream is run-to-run identical). Tolerances are relative to
-//! each tensor's peak and cover Metal's reduced-precision f32 GEMM/conv accumulation (TF32-class,
-//! measured ≤ 2.7e-3 of peak on the critic logits, ≤ 1.5e-2 on the smallest
-//! gradient term, whose own peak is ~40× below the total's): [`FWD`] for maps, logits and gradients,
-//! [`SCALAR`] for the reduced losses and the optimizer step.
+//! Tolerances are relative to each tensor's peak and cover Metal's reduced-precision f32 GEMM/conv
+//! accumulation (TF32-class, measured ≤ 2.7e-3 of peak on the critic logits, ≤ 1.5e-2 on the
+//! smallest gradient term, whose own peak is ~40× below the total's): [`FWD`] for maps, logits and
+//! gradients, [`SCALAR`] for the reduced losses and the optimizer step.
+//!
+//! (On the MLX CPU stream these gradients used to change from run to run. The cause was MLX's CPU
+//! direct convolution, not its GEMM: with the ConvNeXt 7x7 depthwise conv (padding 3) on the
+//! trunk's 2x2 last stage, its border loop wrote whole rows past the output buffer, corrupting
+//! whatever the eval had allocated next. Fixed by the mlx-rs fork's `cpu-conv-border-clamp.patch`,
+//! upstream ml-explore/mlx af9a5924; pinned by the fork's `mlx-tests/tests/cpu_conv_padding_overhang.rs`.)
 
 use std::collections::HashMap;
 use std::rc::Rc;

@@ -5439,10 +5439,15 @@ jobs:
   # in the log) unless it is nax-macos-2 with >= 128 GB of unified memory and no heavy memory pressure.
   # It materializes the `upscaler/` export and the three pinned training-only resources (OpenCLIP
   # ConvNeXt-XXL critic trunk, timm VGG16, LPIPS v0.1 heads) into the runner's hub, then runs, each
-  # under an external phys_footprint guard (cap 40 GB, 30 min): the pinned LPIPS-VGG and critic trunk
-  # against the committed upstream reference, and ONE bounded full-recipe training run (pixel + LPIPS
-  # + adversarial; LoRA on the export, 256² crop, two steps) → the merged export → `iris_3b_restore`
-  # ×4, with the restored PNG, timings and the guard's peak in the evidence artifact.
+  # under an external phys_footprint guard: the pinned LPIPS-VGG and critic trunk against the
+  # committed upstream reference (cap 40 GB, 30 min), and two bounded full-recipe training runs
+  # (pixel + LPIPS + adversarial, AdamW weight decay 0.01, 256² crop, batch 1, two steps) → the
+  # export → `iris_3b_restore` ×4 beside the base export: HYPIR's LoRA arm (cap 40 GB, 30 min) and the
+  # paper's FULL fine-tune of the 3B generator (cap 100 GB, 60 min; it starts only when
+  # `memory_pressure` reports >= 120 GB free right before it, else it is skipped with the measured
+  # numbers). The restored PNGs, losses, timings and the guard's peaks go in the evidence artifact.
+  # The test binary builds into a run-scoped CARGO_TARGET_DIR with unstripped proc-macros
+  # (rust-lang/rust#157750).
   mlx-iris-restore-train:
     name: MLX Iris-3B restoration training real weights
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-restore-mlx'
