@@ -348,3 +348,85 @@ the committed upstream reference of the small case (RGB8 only), so the CUDA job 
 | --- | --- | --- | --- |
 | 512×384 → 2048×1536 (6 tiles), machine-local golden | max 68, mean 0.521, PSNR 47.7 dB | max 60, mean 0.423, PSNR 49.0 dB (restore 10.8 s, peak footprint 11.7 GB) | — (no Python oracle on the runner): release-scale render 512×384 → 2048×1536, 6 tiles in 2.6 s, VRAM peak 10.1 GB |
 | 64×48 → 256×192 (enlarged, 2 tiles), committed | max 23, mean 0.522, PSNR 48.1 dB | max 19, mean 0.459, PSNR 48.7 dB | max 23, mean 0.701, PSNR 46.0 dB (bound 0.783; restore 1.0 s, VRAM peak 10.1 GB; run 38085270480) |
+
+## Restoration training (trainer `iris_3b_restore`, sc-25688)
+
+The frozen release ships the restoration export and its inference but **no training loop**. The
+recipe is the paper's (arXiv 2610.09450v1 §5.3, Eq. 6: "follows the one-step recipe of HYPIR"); every
+choice the paper leaves open is traced to HYPIR's reference trainer, `XPixelGroup/HYPIR` @
+`b61d107c6cef38f01a93c7833558869731cfa8c1` (`HYPIR/trainer/base.py`, `HYPIR/model/{D,backbone}.py`,
+`HYPIR/dataset/{realesrgan,batch_transform,utils,diffjpeg}.py`, `HYPIR/utils/degradation.py`,
+`configs/sd2_train.yaml`; sha256-pinned in `../tools/dump_iris_restoration_train.py`). One
+backend-neutral contract (`gen_core::iris::restoration_train` + `gen_core::iris::degradation`), two
+native trainers (`mlx-gen-iris::train::restore`, `candle-gen-iris::train::restore`) with their own
+LPIPS-VGG (`train::lpips`) and critic (`train::critic`).
+
+### Training-only resources (separate from every export; the caller checks the sha256)
+
+| Component | What (reference use) | Pinned source | sha256 |
+| --- | --- | --- | --- |
+| `critic_trunk` | OpenCLIP `convnext_xxlarge` `laion2b_s34b_b82k_augreg_soup` (`backbone.py` L38–39); only `visual.*` read | `laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup` @ `9f3e8ee3f383c672388d9178afe70af9e63ac9df` `open_clip_pytorch_model.bin` | `d571d992…e2f155` |
+| `lpips_vgg16` | `lpips.LPIPS(net="vgg")` trunk (`base.py` L129) = torchvision `vgg16-397923af` | `timm/vgg16.tv_in1k` @ `b8d8aa2dd860af9233c8c67385a8097fd6c35d3f` `model.safetensors` (`features.*` bit-identical to torchvision's, checked) | `57b02691…203fad8` |
+| `lpips_lin` | LPIPS v0.1 VGG heads (`lpips==0.1.4`) | `vivym/lpips` @ `270571f1fb2a2c4c5f920cec96cd87838c345982` `vgg_lpips_linear.safetensors` (bit-identical to `richzhang/PerceptualSimilarity@082bb24` `vgg.pth`, checked) | `0c6387bf…4333ac` |
+
+Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOURCES`.
+
+### Recipe trace (source → native)
+
+| Choice | Source | Native (`gen_core` / MLX / Candle) | Status |
+| --- | --- | --- | --- |
+| One-step generator `x̂ = x_lq − σ·v(x_lq, σ·N, ∅)` on the bicubic-upsampled input, empty-prompt conditioning, no noise | paper §5.3; `restoration.py` `restore_tile`; HYPIR `forward_generator` (one step at `model_t`) | `Frozen::restore` (both) — the transform's exact forward at the export's `task.sigma` (release 0.5 ⇒ t = 500) | ported (HYPIR's SD2 `model_t = 200` is a different backbone's choice; the Iris export's own `sigma` is the identity trained) |
+| Loss `‖x̂−y‖₂² + 5·LPIPS + 0.5·L_adv` | paper Eq. 6; `base.py` L282–284; yaml `lambda_*` | `generator_terms` (both); `loss_l2/lpips/gan` options | ported; every term on (zeroing one is a request, never a default) |
+| Pixel term `F.mse_loss(reduction="mean")` | `base.py` L282 | mean over every element | ported |
+| LPIPS-VGG v0.1, inputs in [−1, 1], `.mean()` | `base.py` L129, L283 | `train::lpips` (both): ScalingLayer, VGG16 taps relu1_2…relu5_3, channel-normalize (`+1e-10`), lin, spatial mean, sum | ported; f32 (not under autocast); norm floored at `sqrt(1e-30)` so an all-zero pixel's gradient is finite (torch gives NaN there) |
+| Critic trunk features | `D.py` L77–81, `backbone.py` `_visual_forward(return_pooled_feats=True)` @ timm 1.0.15 | `ConvNextTrunk::features`: CLIP normalize of `x·0.5+0.5`, stages 0/1/2 maps + pooled `head.norm`→`proj` embedding | ported (timm ≥1.0.20 changed `forward_intermediates` — pinned 1.0.15, HYPIR's) |
+| Critic head `MultiLevelDConv(level=4, in_ch1=[384,768,1536], in_ch2=1024, out_ch=512, down=2)` | `D.py` L8–49, L61 | `head_logits` (both): BlurPool(pad 2)→SN conv3×3 s2→LeakyReLU 0.2→BlurPool(pad 1)→SN conv1×1 s2; SN Linear→LeakyReLU→SN Linear | ported |
+| Spectral norm (`torch.nn.utils.spectral_norm`, 1 power iteration per train-mode forward, none in eval; σ = uᵀWv with u, v constants) | `vision_aided_loss` `spectral_norm` | `power_iteration` + `spectral_weight`; `u`/`v` live in the checkpoint | ported; two iterations per critic micro-batch (`D(y)` then `D(x̂)`), none in generator windows |
+| Adversarial loss: `multilevel_loss(alpha=0.8)` = BCE-with-logits, target 0.8 (real / generator), 0 (fake), spatial mean per level, summed | `D.py` L62; `cv_losses.py` | `multilevel_loss` (both); `gan_real_label` option | ported (non-saturating BCE with one-sided label smoothing) |
+| Critic loss `mean D_real + mean D_fake`, x̂ regenerated under no-grad | `base.py` L296–304 | `critic_grads` (both) | ported |
+| Alternation: window `(batch_count // accum) % 2` even = G, odd = D; one step = G + D window | `base.py` L327, L346–348 | `restoration_train::phase_of`; `steps` / `save_every` / `sample_every` must be multiples of `2·accum` | ported |
+| Optimizers: AdamW for G and D, lr 1e-5 both, betas (0.9, 0.999), torch defaults eps 1e-8, weight_decay 0.01 | paper; `base.py` L164–176; yaml `lr_G`, `lr_D`, `opt_kwargs` | `IrisOptimizer` (AdamW route) ×2; `lr_critic`, `betas`, `critic_betas`, `critic_weight_decay` options; G weight decay = `TrainingConfig::weight_decay` | ported |
+| Clip `max_grad_norm = 1.0` per network | `base.py` L288, L307 | `clip_grads` per window; `gradient_clip`, `critic_gradient_clip` | ported |
+| EMA 0.999, updated after each G optimizer step; EMA weights exported | paper ("EMA … decay 0.999 is scored"); `base.py` L343, `ema.py` | `ema_update` after the G step; `export_weights` default `ema` | ported |
+| LR schedule | paper (Iris arm: constant) | constant (default) or cosine; warmup in steps | constant ported; cosine = the shared knob; linear refused |
+| Crops 1024², horizontal flip | paper; `realesrgan.py` `augment`, `utils.py` `random_crop_arr(min_crop_frac=0.7)` / `center_crop_arr` (PIL BOX halving + BICUBIC) | `training_pair` (`crop`: random / center / none), PIL-exact BOX/BICUBIC (`imageops`) | ported; `resolution` is the crop |
+| Second-order Real-ESRGAN degradation at 4× incl. USM sharpening of the GT | paper; `batch_transform.py` `__call__`; yaml dataset + batch_transform | `gen_core::iris::degradation` (kernels, sinc via J₁, reflect `filter2D`, area/bilinear/bicubic `F.interpolate`, Gaussian/Poisson (gray) noise, `DiffJPEG(differentiable=False)`, USM, 8-bit round) | ported; per-op parity + end-to-end 8-bit LQ bit-exact on recorded draws |
+| Batch-level resize/mode draws + 256-entry training-pair queue | `batch_transform.py` (`_dequeue_and_enqueue`) | drawn **per item** from `mix_seed(seed, RESTORE1, epoch, item)` | deliberate mapping: the queue only diversifies per-batch draws; per-item draws do that directly and keep each pair a function of `(seed, epoch, item)` (cancel/resume bit-exact) |
+| Aligned degraded/clean pairs | (not in HYPIR) | `TrainingItem::model_options["degraded_image"]`; integer-scale aligned crops, torch-exact bicubic upsample | native addition (story AC); all-or-none per run |
+| Full fine-tune | paper ("full fine-tuning") | `full_finetune: true` | ported |
+| LoRA (`init_lora_weights="gaussian"`, `lora_alpha = rank`) merged into the export | HYPIR's own arm (`sd2.py` `LoraConfig`) | LoRA / LoKr over `blocks.*`, `lora_init` gaussian default, merged (f32) at export | ported; export is always the full `upscaler/` layout |
+| Mixed precision bf16; critic trunk `precision="bf16"` | yaml `mixed_precision: bf16`; `base.py` L151 | `train_dtype`, `critic_dtype` (convs/linears in bf16, LayerNorm/reductions f32) | ported; Candle CPU refuses a bf16 critic (no CPU bf16 GEMM) |
+| Data order (shuffled DataLoader) | `base.py` L188 | `gen_core::iris::train::DataWalk` (the generation trainer's ranged walk) | native (reused machinery, deterministic) |
+| Checkpoints: `accelerator.save_state` + EMA dict, `checkpoints_total_limit` | `base.py` L431–453 | generation-trainer checkpoint machinery + `critic.safetensors` (head + `u`/`v`), `critic_optimizer.safetensors`, `state.json` (`iris-restoration-train-checkpoint-v1`) | ported; resume restores generator, EMA, both optimizers, spectral buffers, data cursor |
+| Export | — | `upscaler/` layout: `config.yaml` + `empty_prompt.safetensors` copied verbatim from the base export, `model.safetensors` (FP32, `irisTask=restoration`, `irisArtifact=full_model`) | loads in `iris_3b_restore` with no training-only component; the depth loader and the generation loader (`refuse_downstream_export`) refuse it |
+| Previews | `log_images` | the first item's degraded input restored with `preview_weights` every `sample_every` | native (no prompts — `sample_prompts` refused) |
+
+### Verification
+
+* `gen_core::iris::degradation` parity (`degradation_parity.rs`): HYPIR kernels ≤1e-8, every op on its
+  recorded input ≤2e-5 (JPEG: ≤2 % of elements past 1e-3), the full chain's 8-bit LQ bit-exact on all
+  three scripted chains.
+* `tests/restoration_train_parity.rs` (both): LPIPS (formula weights), miniature ConvNeXt critic
+  features, generator term + input gradient, the critic step (power iterations, losses, head
+  gradients, clip + AdamW), each Eq. 6 term and its gradient — Candle CPU f32 to 1e-4 of peak (the
+  64-px LPIPS gradient to 1.5e-2: deep-tap ReLU gates within float noise of zero); MLX on Metal
+  (its CPU-stream GEMM mis-reads transposed operands: run-to-run nondeterministic) to 2e-2 / 2e-3.
+* `tests/restoration_train_lifecycle.rs` (both, miniature networks): every term contributes to the
+  generator update; overfitting two pairs improves PSNR and LPIPS; cancel → resume bit-exact incl.
+  critic, spectral buffers and both optimizers; export → `iris_3b_restore` ×2; other tasks refuse.
+* Real weights (`tests/restoration_train_real_weights.rs`, `#[ignore]`): pinned LPIPS-VGG and
+  ConvNeXt-XXL against `iris_restoration_train_real.safetensors`
+  (`../tools/dump_iris_restoration_train_realweight.py`; Candle CPU: LPIPS ≤1.3e-8, trunk ≤2.1e-6 of
+  peak), and one bounded train → export → restore run (dispatch-only `iris` CUDA profile,
+  `iris-restore-mlx` macOS profile).
+* Real-weight evidence (2026-10-11), one bounded LoRA run of the full recipe (rank 8, 256² crop, two
+  steps = G, D, G, D, bf16, EMA) → merged `upscaler/` export → `iris_3b_restore` 64×48 → 256×192:
+  CUDA (`iris` profile, run 38137202298): train 58.4 s, VRAM peak 29.3 GB, trunk ≤2.8e-6 / LPIPS
+  ≤1e-6 of peak; MLX on nax-macos-2 (`iris-restore-mlx`, run 38140601912): train 8.1 s, guard peak
+  25.2 GB (cap 40), trunk ≤2.8e-3 of peak (Metal), LPIPS ≤5e-7. The generator loss at the first step
+  (~5e4) is the untrained critic read through spectral norm's random initial `u`/`v` (HYPIR's first
+  generator window runs in eval mode, before any power iteration); it falls to ~5 by the second step.
+  The paper's full fine-tune of the 3B generator needs f32 masters + grads + AdamW m/v + EMA ≈ 5 × 12 GB
+  = 60 GB before activations, the critic and LPIPS — above this lane's 40 GB guard; it is exercised on
+  the miniature (`restoration_train_lifecycle`).
+

@@ -46,6 +46,15 @@ mod restoration_parity;
 #[path = "restoration_real_weights.rs"]
 mod restoration_real_weights;
 
+#[path = "restoration_train_lifecycle.rs"]
+mod restoration_train_lifecycle;
+
+#[path = "restoration_train_parity.rs"]
+mod restoration_train_parity;
+
+#[path = "restoration_train_real_weights.rs"]
+mod restoration_train_real_weights;
+
 #[path = "solver_parity.rs"]
 mod solver_parity;
 

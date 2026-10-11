@@ -5909,6 +5909,7 @@ mod tests {
             [
                 "anima_base",
                 "iris_3b",
+                "iris_3b_restore",
                 "kolors",
                 "krea_2_raw",
                 "krea_2_control",

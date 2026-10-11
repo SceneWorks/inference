@@ -1910,6 +1910,7 @@ mod tests {
                 "anima_aesthetic",
                 "anima_turbo",
                 "iris_3b",
+                "iris_3b_restore",
                 "kolors",
                 "krea_2_raw",
                 "lens",
@@ -1934,8 +1935,8 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
-        // this is where a surface change and a mapping change meet. All eighteen trainer ids are
-        // also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
+        // this is where a surface change and a mapping change meet. Every trainer id is also a
+        // generator id (or, for `iris_3b_restore`, the transform id), which is why 67 generators + 1 captioner + 2 embedders are 70
         // distinct ids.
         //
         // Registration is never conditioned on the mapping — 60 < 70 because ten ids load nothing

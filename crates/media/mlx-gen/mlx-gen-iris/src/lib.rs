@@ -60,6 +60,7 @@ pub fn register_providers(
     registry
         .register_generator(model::REGISTRATION)
         .register_trainer(train::REGISTRATION)
+        .register_trainer(train::restore::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
 }
 
@@ -95,6 +96,11 @@ mod tests {
             .map(|registration| (registration.descriptor)().id)
             .collect();
         assert_eq!(transforms, ["iris_3b_restore"]);
+        let trainers: Vec<_> = registry
+            .trainers()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(trainers, ["iris_3b", "iris_3b_restore"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

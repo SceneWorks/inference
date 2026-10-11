@@ -597,7 +597,11 @@ fn cubic2(x: f32, a: f32) -> f32 {
 /// The non-antialiased bicubic taps of one axis (`HelperInterpCubic::compute_indices_weights`):
 /// source index `scale·(i + 0.5) − 0.5` in f32 with `scale = f32(1 / scale_factor)`,
 /// `guard_index_and_lambda`, Keys `a = −0.75`, replicate-clamped indices.
-fn bicubic_taps(in_size: usize, out_size: usize, coord_scale: f32) -> Vec<([usize; 4], [f32; 4])> {
+pub(crate) fn bicubic_taps(
+    in_size: usize,
+    out_size: usize,
+    coord_scale: f32,
+) -> Vec<([usize; 4], [f32; 4])> {
     const A: f32 = -0.75;
     (0..out_size)
         .map(|i| {

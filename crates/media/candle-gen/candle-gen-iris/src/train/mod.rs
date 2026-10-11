@@ -25,8 +25,11 @@
 //!
 //! [`gen_core::iris::train`]: candle_gen::gen_core::iris::train
 
+pub mod critic;
+pub mod lpips;
 pub mod model;
 pub mod optim;
+pub mod restore;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,6 +136,8 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             )))
         }
     };
+    // A depth / restoration export shares the architecture; only its task identity tells it apart.
+    gen_core::iris::refuse_downstream_export(&backbone_dir, TRAINER_ID)?;
     let config = IrisConfig::from_dir(&backbone_dir)?;
     config.validate_supported()?;
     let flow_defaults = TrainFlowDefaults::from_dir(&backbone_dir)?;

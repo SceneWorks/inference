@@ -17,9 +17,11 @@ use crate::generator::{CaptionOverflowPolicy, GenerationRequest};
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod degradation;
 pub mod depth;
 pub mod downstream;
 pub mod restoration;
+pub mod restoration_train;
 mod tables;
 pub mod train;
 pub use tables::{
@@ -178,6 +180,7 @@ impl GenerationResources {
                 "generation backbone",
             )?;
         }
+        refuse_downstream_export(&self.backbone_dir, model_id)?;
         require_dir(&self.text_encoder_dir, model_id, "text encoder")?;
         for name in TEXT_ENCODER_REQUIRED_FILES {
             require_file(&self.text_encoder_dir.join(name), model_id, "text encoder")?;
@@ -194,6 +197,29 @@ impl GenerationResources {
         }
         Ok(())
     }
+}
+
+/// Refuse a downstream task export (its `config.yaml` carries a `task` section — a depth export,
+/// or a restoration export such as the restoration trainer writes) staged as a generation
+/// backbone: the task backbones share one architecture, so only the identity tells them apart.
+pub fn refuse_downstream_export(dir: &Path, model_id: &str) -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(dir.join(BACKBONE_CONFIG_FILE)) else {
+        return Ok(());
+    };
+    if let Some(task) = downstream::parse_task_settings(&text)? {
+        return Err(Error::Unsupported(format!(
+            "{model_id}: {} is the '{}' task export, not the generation backbone — stage it with \
+             the {} model instead",
+            dir.display(),
+            task.name,
+            match task.name.as_str() {
+                "restoration" => restoration::MODEL_ID,
+                "depth" => DEPTH_MODEL_ID,
+                _ => "matching task",
+            }
+        )));
+    }
+    Ok(())
 }
 
 fn require_dir(dir: &Path, model_id: &str, resource: &str) -> Result<()> {
