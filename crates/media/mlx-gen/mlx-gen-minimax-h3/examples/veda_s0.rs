@@ -278,7 +278,9 @@ fn self_check(o: &Options) -> Result<Value> {
             }
         }
     }
-    let mask = Array::from_slice(&mask, &[1, c.heads, c.seq, c.seq]);
+    // MLX additive masks must promote to the attention output dtype; f32 would
+    // promote BF16 QKV to f32 and is rejected. Zero and -infinity are exact in BF16.
+    let mask = Array::from_slice(&mask, &[1, c.heads, c.seq, c.seq]).as_dtype(q.dtype())?;
     let actual = sparse(&c, o, &p, &q, &k, &v)?;
     let expected = dense(&c, o, &q, &k, &v, Some(&mask))?;
     let error = relative(&actual, &expected)?;
@@ -287,7 +289,7 @@ fn self_check(o: &Options) -> Result<Value> {
         return Err(format!("masked reference mismatch: relative max abs {error}").into());
     }
     Ok(
-        json!({"passed":true,"relative_max_abs":error,"tolerance":0.025,"retained_pair_fraction":p.pairs as f64/(c.heads as f64*c.seq as f64*c.seq as f64),"not_dense":true,"padded_keys":false}),
+        json!({"passed":true,"mask_dtype":"bf16","relative_max_abs":error,"tolerance":0.025,"retained_pair_fraction":p.pairs as f64/(c.heads as f64*c.seq as f64*c.seq as f64),"not_dense":true,"padded_keys":false}),
     )
 }
 fn median(v: &mut [f64]) -> f64 {
