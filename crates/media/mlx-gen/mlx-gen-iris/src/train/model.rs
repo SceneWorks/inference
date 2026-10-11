@@ -630,7 +630,7 @@ impl<'a> ForwardHooks for TrainHooks<'a> {
 /// `F.normalize(x, dim=-1)`: `x / max(‖x‖₂, 1e−12)`.
 fn l2_normalize(x: &Array) -> Result<Array> {
     let n = sqrt(&sum_axes(&x.square()?, &[-1], true)?)?;
-    Ok(x.divide(&maximum(&n, &Array::from_f32(1e-12))?)?)
+    Ok(x.divide(&maximum(&n, Array::from_f32(1e-12))?)?)
 }
 
 /// `_resize_token_grid`: bilinearly resample `[B, h·w, C]` tokens onto `dst`.
@@ -652,7 +652,7 @@ pub fn resize_token_grid(
     let x = tokens
         .transpose_axes(&[0, 2, 1])?
         .reshape(&[b, c, src.0 as i32, src.1 as i32])?;
-    let x = matmul(&matmul(&mh, &x)?, &mw.t())?;
+    let x = matmul(&matmul(&mh, &x)?, mw.t())?;
     Ok(x.reshape(&[b, c, (dst.0 * dst.1) as i32])?
         .transpose_axes(&[0, 2, 1])?)
 }
@@ -671,7 +671,7 @@ fn project(
             .ok_or_else(|| Error::Msg(format!("iris repa: projector tensor {k} missing")))
     };
     let lin = |x: &Array, i: usize| -> Result<Array> {
-        Ok(matmul(x, &get(&format!("{i}.weight"))?.t())?.add(get(&format!("{i}.bias"))?)?)
+        Ok(matmul(x, get(&format!("{i}.weight"))?.t())?.add(get(&format!("{i}.bias"))?)?)
     };
     match plan.variant {
         RepaVariant::Repa => {

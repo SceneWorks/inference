@@ -472,7 +472,7 @@ impl IrisDiT {
                 norm_x2: l.norm(&p("norm_x2"), eps)?,
                 norm_y1: l.norm(&p("norm_y1"), eps)?,
                 qkv_x: Qkv::load(
-                    &l,
+                    l,
                     &p("attn.qkv_x"),
                     &p("attn.q_proj_x"),
                     &p("attn.k_proj_x"),
@@ -480,7 +480,7 @@ impl IrisDiT {
                     gqa,
                 )?,
                 qkv_y: Qkv::load(
-                    &l,
+                    l,
                     &p("attn.qkv_y"),
                     &p("attn.q_proj_y"),
                     &p("attn.k_proj_y"),

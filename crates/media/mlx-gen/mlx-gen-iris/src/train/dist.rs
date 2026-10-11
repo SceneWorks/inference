@@ -275,7 +275,7 @@ impl Topology {
         }
         let r = rows_of(full.shape(), self.plan.dp_shard, self.plan.shard_index());
         let _ = key;
-        Ok(full.take_along_rows(r)?)
+        full.take_along_rows(r)
     }
 
     /// Every rank's shard of `key` gathered back into the full tensor (within the shard group).

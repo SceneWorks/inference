@@ -135,7 +135,7 @@ impl Teacher {
             .add(&one)?
             .divide(Array::from_f32(2.0))?;
         // Mh · x · Mwᵀ over the last two axes.
-        let x = matmul(&matmul(&mh, &x)?, &mw.t())?;
+        let x = matmul(&matmul(&mh, &x)?, mw.t())?;
         let mean = Array::from_slice(&IMAGENET_MEAN, &[1, 3, 1, 1]);
         let std = Array::from_slice(&IMAGENET_STD, &[1, 3, 1, 1]);
         let x = x.subtract(&mean)?.divide(&std)?;
@@ -147,7 +147,7 @@ impl Teacher {
             .transpose_axes(&[0, 2, 4, 1, 3, 5])?
             .reshape(&[b, ghi * gwi, 3 * pi * pi])?;
         let pw = self.get("patch_embed.proj.weight").reshape(&[d, -1])?;
-        let mut t = matmul(&patches, &pw.t())?.add(self.get("patch_embed.proj.bias"))?;
+        let mut t = matmul(&patches, pw.t())?.add(self.get("patch_embed.proj.bias"))?;
         let cls = mlx_rs::ops::broadcast_to(self.get("cls_token"), &[b, 1, d])?;
         t = concatenate_axis(&[&cls, &t], 1)?;
         t = t.add(&self.pos_embed(grid)?)?;
@@ -189,7 +189,7 @@ impl Teacher {
             .transpose_axes(&[2, 0, 1])?;
         let mh = Array::from_slice(&mh, &[gh, m]);
         let mw = Array::from_slice(&mw, &[gw, m]);
-        let r = matmul(&matmul(&mh, &patch)?, &mw.t())?
+        let r = matmul(&matmul(&mh, &patch)?, mw.t())?
             .transpose_axes(&[1, 2, 0])?
             .reshape(&[1, gh * gw, d])?;
         Ok(concatenate_axis(&[&cls, &r], 1)?)
@@ -203,7 +203,7 @@ impl Teacher {
         let heads = a.num_heads as i32;
         let hd = (a.embed_dim / a.num_heads) as i32;
         let lin = |x: &Array, w: &str| -> Result<Array> {
-            Ok(matmul(x, &g(&format!("{w}.weight")).t())?.add(g(&format!("{w}.bias")))?)
+            Ok(matmul(x, g(&format!("{w}.weight")).t())?.add(g(&format!("{w}.bias")))?)
         };
         let h = layer_norm(
             x,
