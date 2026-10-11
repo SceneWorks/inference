@@ -14,33 +14,68 @@ import socket
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 MAX_SECONDS = 3600
 ALLOWED_RUNNERS = {"cuda-windows", "cuda-windows-2"}
+# Reserved display/WDDM baseline, not CUDA work: cap it at 2 GiB on this 96-GiB pool.
+MAX_GRAPHICS_BASELINE_MIB = 2048
 
 
 def command(args: list[str]) -> str:
     return subprocess.check_output(args, text=True, timeout=30).strip()
 
 
-def inventory() -> tuple[list[dict], list[list[str]]]:
+def inventory(out: Path | None = None, label: str = "snapshot") -> tuple[list[dict], list[list[str]]]:
     rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"])
     devices = []
     for row in csv.reader(rows.splitlines()):
         i, uuid, name, driver, total, used, utilization = [v.strip() for v in row]
         devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total), used_mib=int(used), utilization_percent=int(utilization)))
+    xml = command(["nvidia-smi", "-q", "-x"])
+    if out is not None:
+        (out / f"{label}-nvidia-smi.xml").write_text(xml)
+    xml_uuids = {(gpu.findtext("uuid") or "").strip() for gpu in ET.fromstring(xml).findall("gpu")}
+    if xml_uuids != {device["uuid"] for device in devices}:
+        raise RuntimeError("driver XML and CSV GPU identities differ")
+    processes = typed_processes(xml)
+    # Cover permission-opaque processes using driver-supplied type, never executable names.
+    # A PID present in the CSV but absent from the typed snapshot remains unknown/refused.
     rows = command(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"])
-    processes = [[v.strip() for v in row] for row in csv.reader(rows.splitlines()) if row]
+    known = {(p[0], p[1]) for p in processes}
+    for row in csv.reader(rows.splitlines()):
+        if not row:
+            continue
+        row = [v.strip() for v in row]
+        if len(row) != 3:
+            raise RuntimeError("unrecognized GPU process inventory")
+        if (row[0], row[1]) not in known:
+            processes.append(row + ["unknown"])
     return devices, processes
 
 
+def typed_processes(xml: str) -> list[list[str]]:
+    result = []
+    for gpu in ET.fromstring(xml).findall("gpu"):
+        uuid = (gpu.findtext("uuid") or "").strip()
+        if not uuid:
+            raise RuntimeError("driver XML GPU identity missing")
+        for process in gpu.findall("processes/process_info"):
+            pid = (process.findtext("pid") or "").strip()
+            if not pid:
+                raise RuntimeError("driver XML process PID missing")
+            result.append([uuid, pid, process.findtext("process_name") or "unknown", (process.findtext("type") or "unknown").strip()])
+    return result
+
+
 def idle(device: dict, processes: list[list[str]]) -> bool:
-    return device["used_mib"] < 1024 and device["utilization_percent"] < 5 and not any(row[0] == device["uuid"] for row in processes)
+    return (device["used_mib"] < MAX_GRAPHICS_BASELINE_MIB and device["utilization_percent"] < 5
+            and all(len(row) == 4 and row[3] == "G" for row in processes if row[0] == device["uuid"]))
 
 
 def claim_device(out: Path):
     import msvcrt
-    devices, processes = inventory()
+    devices, processes = inventory(out, "admission")
     (out / "admission-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
     # Public is host-global for both listeners, unlike runner.temp/workspaces.
     lock_dir = Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks"
@@ -58,7 +93,7 @@ def claim_device(out: Path):
         except OSError:
             handle.close()
             continue
-        current, current_processes = inventory()
+        current, current_processes = inventory(out, "claimed-device")
         checked = next(d for d in current if d["uuid"] == device["uuid"])
         if idle(checked, current_processes):
             return checked, handle
@@ -67,8 +102,7 @@ def claim_device(out: Path):
 
 
 def verify_idle(device: dict, out: Path, phase: str):
-    devices, processes = inventory()
-    (out / f"{phase}-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
+    devices, processes = inventory(out, phase)-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
     current = next(d for d in devices if d["uuid"] == device["uuid"])
     if not idle(current, processes):
         raise RuntimeError(f"selected physical device became occupied before {phase}")
@@ -95,6 +129,7 @@ def main() -> int:
             raise RuntimeError("checkout identity/cleanliness mismatch")
         device, lock = claim_device(out)
         receipt["device"] = device
+        receipt["graphics_baseline_policy"] = dict(max_baseline_mib=MAX_GRAPHICS_BASELINE_MIB, reserved_baseline_mib=device["used_mib"], admitted_process_type="G", refused_process_types=["C", "C+G", "unknown"], type_authority="nvidia-smi -q -x driver XML; no executable-name inference")
         receipt["device_lock_directory"] = str(Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks")
         os.environ["CUDA_VISIBLE_DEVICES"] = device["uuid"]
         receipt["cuda_visible_devices"] = device["uuid"]
