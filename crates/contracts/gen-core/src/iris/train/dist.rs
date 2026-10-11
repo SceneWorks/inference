@@ -1640,7 +1640,7 @@ impl Collective for TcpCollective {
             usize::MAX,
             |r, payloads: &[Vec<u8>]| {
                 let theirs = &payloads[r];
-                if theirs.len() % 4 == 0 {
+                if theirs.len().is_multiple_of(4) {
                     Ok(())
                 } else {
                     Err(format!("{} bytes (not whole f32 values)", theirs.len()))
