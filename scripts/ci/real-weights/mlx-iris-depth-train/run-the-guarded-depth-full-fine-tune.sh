@@ -11,7 +11,7 @@ test -x "$bin"
 cap_kb=$((80 * 1024 * 1024))
 limit_s=1200
 start=$(date +%s)
-"$bin" depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates \
+TMPDIR="$IRIS_TMPDIR" "$bin" depth_train_real_weights::real_depth_full_finetune_trains_exports_and_estimates \
   --ignored --exact --nocapture --test-threads=1 > "$IRIS_OUT/depth-train.log" 2>&1 &
 pid=$!
 peak=0

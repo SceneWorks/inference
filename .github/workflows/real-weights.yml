@@ -4955,7 +4955,9 @@ jobs:
         env:
           IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
           IRIS_OUT: ${{ runner.temp }}/iris-depth-train-evidence
-          TMPDIR: ${{ runner.temp }}
+          # The test's temp root (the 12 GB export) — applied to the test process only, never to
+          # the build (a build with TMPDIR redirected lost freshly built proc-macros, E0463).
+          IRIS_TMPDIR: ${{ runner.temp }}
           # Own target dir (as `mlx-chroma-auxiliary`): the shared `../cargo-target` on this box
           # failed with `can't find crate for mlx_rs` (E0463) on runs 38134929461 / 38135310701.
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-iris-depth-train
