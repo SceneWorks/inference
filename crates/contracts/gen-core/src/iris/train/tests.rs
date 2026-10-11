@@ -494,13 +494,9 @@ fn plan_honours_options_and_refuses_what_it_cannot_honour() {
 
     for (field, mutate) in [
         (
-            "gradient",
-            Box::new(|c: &mut TrainingConfig| c.gradient_checkpointing = true)
-                as Box<dyn Fn(&mut TrainingConfig)>,
-        ),
-        (
             "loss",
-            Box::new(|c: &mut TrainingConfig| c.loss_type = "mae".into()),
+            Box::new(|c: &mut TrainingConfig| c.loss_type = "mae".into())
+                as Box<dyn Fn(&mut TrainingConfig)>,
         ),
         (
             "lr_scheduler",
@@ -512,7 +508,7 @@ fn plan_honours_options_and_refuses_what_it_cannot_honour() {
         ),
         (
             "train_dtype",
-            Box::new(|c: &mut TrainingConfig| c.train_dtype = "fp16".into()),
+            Box::new(|c: &mut TrainingConfig| c.train_dtype = "fp8".into()),
         ),
         (
             "timestep_type",
@@ -544,6 +540,18 @@ fn plan_honours_options_and_refuses_what_it_cannot_honour() {
             other => panic!("{field}: expected a typed refusal, got {other:?}"),
         }
     }
+    // sc-25689: the shared checkpointing toggle is the `full` policy, fp16 is honored (GradScaler).
+    let mut c = base_cfg();
+    c.gradient_checkpointing = true;
+    assert_eq!(resolve(c).unwrap().ac, ac::AcPolicy::Full);
+    let mut c = base_cfg();
+    c.train_dtype = "fp16".into();
+    assert_eq!(resolve(c).unwrap().mixed_precision, MixedPrecision::Fp16);
+    let mut c = base_cfg();
+    c.gradient_checkpointing = true;
+    c.model_options
+        .insert(OPTIONS_KEY.into(), json!({"activation_checkpointing": "none"}));
+    assert!(resolve(c).is_err(), "toggle on + policy none contradict");
     let mut c = base_cfg();
     c.resolution = 18;
     assert!(resolve(c).is_err(), "resolution must be on the patch grid");
@@ -573,6 +581,12 @@ fn checkpoints_publish_atomically_and_prune() {
         dataset_fingerprint: "f".into(),
         base_identity: "b".into(),
         task: IrisTask::Generation,
+        stage: None,
+        parent_stage: None,
+        data_position: None,
+        dist: None,
+        repa_projector: None,
+        grad_scaler: None,
     };
     for step in [1u64, 2, 3, 4] {
         let staging = checkpoint_staging_dir(root.path(), step);
@@ -626,6 +640,12 @@ fn resume_checks_state_and_data_identity() {
         dataset_fingerprint: "ds".into(),
         base_identity: "base".into(),
         task: IrisTask::Generation,
+        stage: None,
+        parent_stage: None,
+        data_position: None,
+        dist: None,
+        repa_projector: None,
+        grad_scaler: None,
     };
     check_resume(&saved, &plan, "ds", "base").unwrap();
     assert!(check_resume(&saved, &plan, "other", "base").is_err());

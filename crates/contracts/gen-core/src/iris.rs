@@ -25,8 +25,8 @@ pub mod restoration_train;
 mod tables;
 pub mod train;
 pub use tables::{
-    key_padding_additive, pixel_sincos_table, rope_1d_angles, rope_2d_angles, timestep_freqs,
-    TIMESTEP_FREQUENCY_DIM,
+    key_padding_additive, pixel_sincos_table, rope_1d_angles, rope_2d_angles,
+    rope_2d_angles_aspect, timestep_freqs, TIMESTEP_FREQUENCY_DIM,
 };
 
 /// GitHub `speridlabs/iris-3b` commit the port mirrors (model, pipeline, text conditioning, solver).
@@ -437,8 +437,9 @@ impl IrisConfig {
             ("model.qkv_bias", !m.qkv_bias, m.qkv_bias.to_string()),
             ("model.qk_norm", m.qk_norm, m.qk_norm.to_string()),
             (
+                // `square` is stage 1's law (sc-25689 implements both).
                 "model.rope_aspect",
-                m.rope_aspect == "isotropic",
+                matches!(m.rope_aspect.as_str(), "isotropic" | "square"),
                 m.rope_aspect.clone(),
             ),
             (
@@ -638,8 +639,9 @@ impl Section<'_> {
 }
 
 /// A strict reader for the YAML subset OmegaConf writes for these configs: block mappings by
-/// indentation, `key: scalar`, and `- scalar` sequences. Anything else (flow collections, anchors,
-/// multi-line scalars) is an error rather than a guess.
+/// indentation, `key: scalar`, `- scalar` sequences and one-line flow sequences of scalars
+/// (`[a, b]`, `[]` — the upstream stage configs use them). Anything else (flow mappings, nested flow
+/// collections, anchors, multi-line scalars) is an error rather than a guess.
 mod yaml {
     use crate::{Error, Result};
 
@@ -777,7 +779,9 @@ mod yaml {
             }
             *pos += 1;
             let rest = rest.trim();
-            let value = if !rest.is_empty() {
+            let value = if rest.starts_with('[') {
+                parse_flow_list(rest, line.number)?
+            } else if !rest.is_empty() {
                 Value::Scalar(unquote(rest)?)
             } else if *pos < lines.len()
                 && lines[*pos].indent >= indent
@@ -792,6 +796,50 @@ mod yaml {
             entries.push((key, value));
         }
         Ok(Value::Map(entries))
+    }
+
+    /// A one-line flow sequence of scalars: `[a, 'b, c', 3]` (commas inside quotes kept).
+    pub fn parse_flow_list(text: &str, number: usize) -> Result<Value> {
+        let inner = text
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .ok_or_else(|| Error::Msg(format!("yaml line {number}: unterminated flow list")))?;
+        let mut items: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote = None;
+        for c in inner.chars() {
+            match (quote, c) {
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                (Some(q), c) if c == q => {
+                    quote = None;
+                    cur.push(c);
+                }
+                (None, ',') => items.push(std::mem::take(&mut cur)),
+                (None, '[' | ']' | '{' | '}') => {
+                    return Err(Error::Msg(format!(
+                        "yaml line {number}: nested flow collections are not supported"
+                    )))
+                }
+                _ => cur.push(c),
+            }
+        }
+        if !cur.trim().is_empty() || !items.is_empty() {
+            items.push(cur);
+        }
+        if items.iter().any(|i| i.trim().is_empty()) {
+            return Err(Error::Msg(format!(
+                "yaml line {number}: empty flow list item"
+            )));
+        }
+        Ok(Value::List(
+            items
+                .iter()
+                .map(|i| unquote(i).map(Value::Scalar))
+                .collect::<Result<Vec<_>>>()?,
+        ))
     }
 
     fn parse_list(lines: &[Line], pos: &mut usize, indent: usize) -> Result<Value> {
@@ -1454,7 +1502,7 @@ flow:
 
     #[test]
     fn unsupported_switches_are_typed_refusals() {
-        let text = RELEASE_CONFIG.replace("rope_aspect: isotropic", "rope_aspect: square");
+        let text = RELEASE_CONFIG.replace("rope_aspect: isotropic", "rope_aspect: diagonal");
         let err = IrisConfig::parse(&text)
             .unwrap()
             .validate_supported()
