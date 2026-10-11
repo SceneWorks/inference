@@ -158,6 +158,7 @@ impl TaskExport {
         for file in [BACKBONE_WEIGHTS_FILE, EMPTY_PROMPT_FILE] {
             super::require_file(&dir.join(file), model_id, &resource)?;
         }
+        check_weights_task_stamp(&dir.join(BACKBONE_WEIGHTS_FILE), task, model_id)?;
         let config = IrisConfig::parse(&text)
             .map_err(|e| Error::Msg(format!("iris: {}: {e}", config_path.display())))?;
         config.validate_supported()?;
@@ -186,6 +187,78 @@ impl TaskExport {
     pub fn empty_prompt(&self) -> Result<EmptyPrompt> {
         EmptyPrompt::read(&self.empty_prompt_path(), &self.config)
     }
+}
+
+/// Refuse a downstream task export staged where a **generation** backbone belongs: a
+/// `config.yaml` with a `task` section (`depth/`, `upscaler/`, or a native depth- or
+/// restoration-training export) is a typed [`Error::Unsupported`] naming the task and its provider.
+/// A directory without a readable `config.yaml` passes (the caller's own existence checks name what is missing).
+pub fn refuse_task_export(dir: &Path, model_id: &str) -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(dir.join(BACKBONE_CONFIG_FILE)) else {
+        return Ok(());
+    };
+    match parse_task_settings(&text) {
+        Ok(Some(settings)) => Err(Error::Unsupported(format!(
+            "{model_id}: {} is the '{}' task export (its {BACKBONE_CONFIG_FILE} has a `task` \
+             section), not a generation backbone — load it with {}",
+            dir.display(),
+            settings.name,
+            match settings.name.as_str() {
+                "restoration" => super::restoration::MODEL_ID,
+                "depth" => super::DEPTH_MODEL_ID,
+                _ => "the matching task's provider",
+            }
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A trained export stamps its task in the `model.safetensors` metadata (`irisTask`, see
+/// `train::task_model_metadata`); the shipped release exports carry no stamp. A stamp naming another
+/// task is a typed refusal, so a mislabelled directory never loads as this task.
+fn check_weights_task_stamp(path: &Path, task: IrisTask, model_id: &str) -> Result<()> {
+    let Some(stamp) = weights_metadata(path)?.and_then(|m| m.get(super::ADAPTER_TASK_KEY).cloned())
+    else {
+        return Ok(());
+    };
+    if stamp == task.name() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "{model_id}: {} is stamped `{}={stamp}`, not the {} task",
+            path.display(),
+            super::ADAPTER_TASK_KEY,
+            task.name()
+        )))
+    }
+}
+
+/// The `__metadata__` map of a safetensors file, read from its header only (`None` when the file is
+/// too short to hold a header or carries no metadata).
+pub fn weights_metadata(path: &Path) -> Result<Option<std::collections::HashMap<String, String>>> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| Error::Msg(format!("iris: read {}: {e}", path.display()));
+    let mut f = std::fs::File::open(path).map_err(io)?;
+    let mut len = [0u8; 8];
+    if f.read_exact(&mut len).is_err() {
+        return Ok(None);
+    }
+    let n = u64::from_le_bytes(len);
+    if n > 100 << 20 {
+        return Err(Error::Msg(format!(
+            "iris: {} has an implausible {n}-byte safetensors header",
+            path.display()
+        )));
+    }
+    let mut header = vec![0u8; n as usize];
+    f.read_exact(&mut header).map_err(io)?;
+    let v: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| Error::Msg(format!("iris: {} header: {e}", path.display())))?;
+    Ok(v.get("__metadata__").and_then(|m| m.as_object()).map(|m| {
+        m.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+            .collect()
+    }))
 }
 
 /// The empty-prompt conditioning an export ships (`empty_prompt.safetensors`), host-side: the
@@ -255,6 +328,49 @@ impl EmptyPrompt {
             mask,
         })
     }
+
+    /// Write the export layout (`embeddings` F32 `[1, T, L, D]`, `mask` BOOL `[1, T]`) to `path`
+    /// atomically (temp file, fsync, rename) — `scripts/export_downstream.py`'s pair.
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let n: usize = self.shape.iter().product();
+        if self.embeddings.len() != n || self.mask.len() != self.shape[1] {
+            return Err(Error::Msg(format!(
+                "iris: the empty prompt holds {} values / {} mask flags for {:?}",
+                self.embeddings.len(),
+                self.mask.len(),
+                self.shape
+            )));
+        }
+        let emb: Vec<u8> = self
+            .embeddings
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mask: Vec<u8> = self.mask.iter().map(|&m| u8::from(m != 0)).collect();
+        let bad = |e: safetensors::SafeTensorError| Error::Msg(format!("iris: {e}"));
+        let views = [
+            (
+                "embeddings",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    self.shape.to_vec(),
+                    &emb,
+                )
+                .map_err(bad)?,
+            ),
+            (
+                "mask",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::BOOL,
+                    vec![1, self.shape[1]],
+                    &mask,
+                )
+                .map_err(bad)?,
+            ),
+        ];
+        let bytes = safetensors::serialize(views, &None).map_err(bad)?;
+        super::train::atomic_write(path, &bytes)
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +399,30 @@ mod tests {
         assert_eq!(s.get("tile"), Some("1024"));
         assert_eq!(parse_task_settings("model:\n  depth: 2\n").unwrap(), None);
         assert!(parse_task_settings("task:\n  sigma: 0.5\n").is_err());
+    }
+
+    /// A task export staged as a generation backbone is refused and names the provider that
+    /// loads it — both exports a native trainer writes (depth, sc-25687; restoration, sc-25688).
+    #[test]
+    fn a_task_export_is_refused_as_a_generation_backbone_naming_its_provider() {
+        for (task, provider) in [
+            ("depth", super::super::DEPTH_MODEL_ID),
+            ("restoration", super::super::restoration::MODEL_ID),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            export(
+                dir.path(),
+                &format!("model:\n  patch_size: 16\ntask:\n  name: {task}\n"),
+            );
+            let err = refuse_task_export(dir.path(), "iris_3b").unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{task}: {err}");
+            let text = err.to_string();
+            assert!(text.contains(&format!("'{task}' task export")), "{text}");
+            assert!(text.contains(&format!("load it with {provider}")), "{text}");
+        }
+        let generation = tempfile::tempdir().unwrap();
+        export(generation.path(), "model:\n  patch_size: 16\n");
+        refuse_task_export(generation.path(), "iris_3b").unwrap();
     }
 
     #[test]

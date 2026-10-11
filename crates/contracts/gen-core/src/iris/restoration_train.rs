@@ -47,7 +47,7 @@ use super::degradation::{
 use super::restoration::{bicubic_scale_factor, RestorationResources};
 use super::train::{
     mix_seed, select_adapter_targets, HostRng, LrShape, MixedPrecision, ResumeDataPolicy,
-    WeightsSelect, META_ARTIFACT, META_BASE, META_STEPS, META_TASK, META_UPSTREAM, META_WEIGHTS,
+    WeightsSelect,
 };
 use super::{IrisConfig, IrisTask};
 use crate::runtime::{LoadSpec, WeightsSource};
@@ -1956,22 +1956,16 @@ pub fn check_resume(
     Ok(())
 }
 
-/// The `model.safetensors` metadata of a restoration export: `format = "pt"`,
-/// [`META_ARTIFACT`] `= "full_model"`, [`META_TASK`] `= "restoration"`, [`META_WEIGHTS`],
-/// [`META_STEPS`], [`META_BASE`], [`META_UPSTREAM`], plus the recipe revision.
+/// The `model.safetensors` metadata of a restoration export: the shared trained-task stamps
+/// ([`super::train::task_model_metadata`] with `irisTask = restoration`) plus the recipe revision
+/// (`irisRecipe`).
 pub fn export_metadata(
     weights: WeightsSelect,
     steps: u64,
     base_identity: &str,
 ) -> BTreeMap<String, String> {
-    let mut m = BTreeMap::new();
-    m.insert("format".into(), "pt".into());
-    m.insert(META_ARTIFACT.into(), "full_model".into());
-    m.insert(META_TASK.into(), IrisTask::Restoration.name().into());
-    m.insert(META_WEIGHTS.into(), weights.as_str().into());
-    m.insert(META_STEPS.into(), steps.to_string());
-    m.insert(META_BASE.into(), base_identity.into());
-    m.insert(META_UPSTREAM.into(), super::UPSTREAM_CODE_REVISION.into());
+    let mut m =
+        super::train::task_model_metadata(IrisTask::Restoration, weights, steps, base_identity);
     m.insert("irisRecipe".into(), format!("HYPIR@{HYPIR_REVISION}"));
     m
 }

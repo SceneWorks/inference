@@ -346,7 +346,7 @@ pub trait IrisDepthEstimator {
 }
 
 /// numpy `percentile(values, q)` (method `linear`).
-fn percentile(sorted: &[f32], q: f64) -> f32 {
+pub(crate) fn percentile(sorted: &[f32], q: f64) -> f32 {
     let n = sorted.len();
     let index = q / 100.0 * (n - 1) as f64;
     let lo = index.floor() as usize;

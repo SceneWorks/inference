@@ -53,13 +53,15 @@ pub use pipeline::{
 pub use restoration::IrisRestorer;
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 
-/// Add the MLX Iris-3B generator and restoration transform to an explicit media registry builder.
+/// Add the MLX Iris-3B generator, its generation (sc-25685) and depth (sc-25687) trainers and the
+/// restoration transform to an explicit media registry builder.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
         .register_trainer(train::REGISTRATION)
+        .register_trainer(train::depth::REGISTRATION)
         .register_trainer(train::restore::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
 }
@@ -100,7 +102,7 @@ mod tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(trainers, ["iris_3b", "iris_3b_restore"]);
+        assert_eq!(trainers, ["iris_3b", "iris_3b_depth", "iris_3b_restore"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

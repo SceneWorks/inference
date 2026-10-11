@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-restore-mlx]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4923,6 +4923,58 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # sc-25687 — ONE bounded real-weight MLX FULL fine-tune of the Iris-3B `depth/` export (~3B
+  # parameters: 12 GB f32 masters + 24 GB AdamW state + 12 GB f32 grads + the per-step bf16 copy,
+  # ~60 GB). DISPATCH-ONLY (`iris-depth-train-mlx` profile; never `all`, never the schedule, no
+  # gate). `rw-chroma` stores nothing and materializes per run into `runner.temp`, so there is no
+  # `~/` snapshot to resolve and no headroom report; the 12 GB export is downloaded in its own step,
+  # never during training. The machine check routes the run to nax-macos-2 only and skips the
+  # training (with a warning) under 128 GB RAM or under 85 GB free by `memory_pressure` (free % ×
+  # total RAM: the ~65 GB peak measured on CUDA + 20 GB headroom); the run is
+  # wrapped in an external phys_footprint guard (SIGTERM at 80 GB or 20 min) that prints the peak.
+  mlx-iris-depth-train:
+    name: MLX Iris-3B depth full fine-tune (real weights)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-depth-train-mlx'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && python3.12 --version
+      - name: Check the runner and its free memory
+        id: machine
+        run: source scripts/ci/real-weights/mlx-iris-depth-train/check-the-runner-and-its-free-memory.sh
+      - name: Materialize the pinned depth export
+        if: steps.machine.outputs.ok == 'true'
+        env:
+          PYTHONPATH: ${{ runner.temp }}/huggingface-hub
+          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
+        run: source scripts/ci/real-weights/mlx-iris-depth-train/materialize-the-pinned-depth-export.sh
+      - name: Run the guarded depth full fine-tune
+        if: steps.machine.outputs.ok == 'true'
+        env:
+          IRIS_WEIGHTS_DIR: ${{ runner.temp }}/iris-3b-${{ github.run_id }}-${{ github.run_attempt }}
+          IRIS_OUT: ${{ runner.temp }}/iris-depth-train-evidence
+          # The test's temp root (its 12 GB export), applied to the test process only.
+          IRIS_TMPDIR: ${{ runner.temp }}
+          # Own target dir (as `mlx-chroma-auxiliary`), so a stripped artifact never lingers.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-iris-depth-train
+          # Rust 1.96/LLVM 22 can mis-strip macOS proc-macro dylibs into E0463
+          # (rust-lang/rust#157750) — what failed this job's builds; keep the release build
+          # unstripped, as `mlx-qwen-image-2-1` does.
+          CARGO_PROFILE_RELEASE_STRIP: "none"
+        run: source scripts/ci/real-weights/mlx-iris-depth-train/run-the-guarded-depth-full-fine-tune.sh
+      - name: Remove the materialized export
+        if: always()
+        run: rm -rf "$RUNNER_TEMP"/iris-3b-*
+      - name: Upload depth-training evidence
+        if: always() && steps.machine.outputs.ok == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iris-depth-train-mlx-evidence
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/iris-depth-train-evidence
+
   # sc-25680 — Iris-3B real-weight evidence on candle/CUDA. DISPATCH-ONLY (`iris` profile; never
   # `all`, never the schedule): one bounded render, not a sweep.
   #
@@ -4945,10 +4997,13 @@ jobs:
   # 1024-px tiles) plus one release-scale 512x384 → 2048x1536 render (six tiles); and the generation
   # trainer (sc-25686): one bounded LoRA run (four bf16 AdamW steps at 256², batch 1, the repo
   # photo's crops) → export → load through `load_backbone_with_adapters` → render beside the base,
-  # the adapted render checked against the trainer's own preview; and the restoration trainer
-  # (sc-25688): the pinned LPIPS-VGG and OpenCLIP ConvNeXt-XXL critic trunk against the committed
-  # upstream reference, then one bounded full-recipe run (pixel + LPIPS + adversarial; LoRA on the
-  # `upscaler/` export, 256² crop, two steps) → the merged export → `iris_3b_restore` ×4. Each runs
+  # the adapted render checked against the trainer's own preview; the depth trainer (sc-25687):
+  # one bounded FULL fine-tune of the `depth/` export (four bf16 AdamW steps at 128², batch 1, the
+  # repo photo with a synthetic depth ramp) → `depth/` export → the standalone estimator, whose
+  # prediction must move toward the target; and the restoration trainer (sc-25688): the pinned
+  # LPIPS-VGG and OpenCLIP ConvNeXt-XXL critic trunk against the committed upstream reference, then
+  # bounded full-recipe runs (pixel + LPIPS + adversarial, 256² crop, two steps; LoRA on the
+  # `upscaler/` export, and the paper's FULL fine-tune) → the export → `iris_3b_restore` ×4. Each runs
   # `--exact` with a run-count assertion, writing the PNG + logs + a report-only `nvidia-smi` VRAM
   # line into the evidence artifact. No memory/VRAM campaign: the probe reports the one render's peak, nothing is gated
   # on it. Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1` above.

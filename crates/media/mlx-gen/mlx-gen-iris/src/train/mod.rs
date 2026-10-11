@@ -19,6 +19,7 @@
 //! adapter file (schemas in `gen_core::iris::train`).
 
 pub mod critic;
+pub mod depth;
 pub mod lpips;
 pub mod model;
 pub mod optim;
@@ -124,8 +125,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             )))
         }
     };
-    // A depth / restoration export shares the architecture; only its task identity tells it apart.
-    gen_core::iris::refuse_downstream_export(&backbone_dir, TRAINER_ID)?;
+    gen_core::iris::downstream::refuse_task_export(&backbone_dir, TRAINER_ID)?;
     let config = IrisConfig::from_dir(&backbone_dir)?;
     config.validate_supported()?;
     let flow_defaults = TrainFlowDefaults::from_dir(&backbone_dir)?;
@@ -865,6 +865,7 @@ impl Run {
             data_identity: self.plan.data_identity(),
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
+            task: gen_core::iris::IrisTask::Generation,
         }
     }
 

@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
-use super::{IrisConfig, ModelConfig, GENERATION_MODEL_ID};
+use super::{IrisConfig, IrisTask, ModelConfig, GENERATION_MODEL_ID};
 use crate::train::{
     LrSchedule, NetworkType, TrainingConfig, TrainingItem, TrainingRequest, TrainingTechniques,
 };
@@ -2148,10 +2148,21 @@ pub fn full_model_metadata(
     steps: u64,
     base_identity: &str,
 ) -> BTreeMap<String, String> {
+    task_model_metadata(IrisTask::Generation, weights, steps, base_identity)
+}
+
+/// [`full_model_metadata`] of a trained model of any Iris task: the same stamps with
+/// [`META_TASK`] `= task` (the depth export, [`depth`], stamps `depth`).
+pub fn task_model_metadata(
+    task: IrisTask,
+    weights: WeightsSelect,
+    steps: u64,
+    base_identity: &str,
+) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("format".into(), "pt".into());
     m.insert(META_ARTIFACT.into(), "full_model".into());
-    m.insert(META_TASK.into(), super::IrisTask::Generation.name().into());
+    m.insert(META_TASK.into(), task.name().into());
     m.insert(META_WEIGHTS.into(), weights.as_str().into());
     m.insert(META_STEPS.into(), steps.to_string());
     m.insert(META_BASE.into(), base_identity.into());
@@ -2359,14 +2370,32 @@ pub struct CheckpointState {
     pub data_identity: String,
     pub dataset_fingerprint: String,
     pub base_identity: String,
+    /// The task the run trains (`state.json` `task`; the trainer id follows from it).
+    pub task: IrisTask,
+}
+
+/// The trainer id of an Iris task's trainer.
+pub fn trainer_id(task: IrisTask) -> &'static str {
+    match task {
+        IrisTask::Depth => depth::DEPTH_TRAINER_ID,
+        _ => TRAINER_ID,
+    }
+}
+
+/// [`IrisTask::name`] read back.
+pub fn parse_task(name: &str) -> Result<IrisTask> {
+    [IrisTask::Generation, IrisTask::Depth, IrisTask::Restoration]
+        .into_iter()
+        .find(|t| t.name() == name)
+        .ok_or_else(|| Error::Msg(format!("iris: unknown task {name:?}")))
 }
 
 impl CheckpointState {
     pub fn to_json(&self) -> JsonValue {
         json!({
             "format": CHECKPOINT_FORMAT,
-            "trainer": TRAINER_ID,
-            "task": super::IrisTask::Generation.name(),
+            "trainer": trainer_id(self.task),
+            "task": self.task.name(),
             "step": self.step,
             "epoch": self.epoch,
             "batches_consumed": self.batches_consumed,
@@ -2424,6 +2453,7 @@ impl CheckpointState {
             data_identity: s("data_identity")?,
             dataset_fingerprint: s("dataset_fingerprint")?,
             base_identity: s("base_identity")?,
+            task: parse_task(&s("task")?)?,
         })
     }
 }
@@ -2589,6 +2619,12 @@ pub fn check_resume(
     dataset_fingerprint: &str,
     base_identity: &str,
 ) -> Result<()> {
+    if saved.task != IrisTask::Generation {
+        return Err(Error::Msg(format!(
+            "iris resume: the checkpoint belongs to the {} task, not generation",
+            saved.task.name()
+        )));
+    }
     if saved.state_identity != plan.state_identity() {
         return Err(Error::Msg(format!(
             "iris resume: the checkpoint trained a different state ({}) than this run ({}); \
@@ -2621,6 +2657,8 @@ pub fn check_resume(
     }
     Ok(())
 }
+
+pub mod depth;
 
 #[cfg(test)]
 mod tests;
