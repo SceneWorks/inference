@@ -561,6 +561,19 @@ impl IrisDiT {
 
     /// Predict the flow velocity `[B, C, H, W]` (f32) for noisy pixels `x` at model time `t` `[B]`.
     pub fn forward(&self, x: &Tensor, t: &Tensor, text: &TextBatch) -> Result<Tensor> {
+        self.forward_hooked(x, t, text, &mut NoHooks)
+    }
+
+    /// [`Self::forward`] with `hooks` around every trunk and pixel block — the training forward's
+    /// seam for activation-checkpointing regions and the REPA feature capture (sc-25689). With
+    /// [`NoHooks`] it is exactly the inference forward.
+    pub fn forward_hooked(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        text: &TextBatch,
+        hooks: &mut dyn ForwardHooks,
+    ) -> Result<Tensor> {
         let cfg = &self.cfg;
         let (b, c, h, w) = x.dims4()?;
         let p = cfg.patch_size;
@@ -604,12 +617,14 @@ impl IrisDiT {
         let mut y = add(&y, &pos)?;
 
         let head_dim = cfg.hidden_size / cfg.num_heads;
-        let rope_img = Rope::grid_2d(
+        let square = cfg.rope_aspect == "square";
+        let rope_img = Rope::grid_2d_aspect(
             head_dim,
             hp,
             wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
+            square,
             &self.device,
         )?;
         let rope_txt = Rope::line_1d(head_dim, n_txt, cfg.text_rope_theta as f32, &self.device)?;
@@ -620,24 +635,14 @@ impl IrisDiT {
             .as_ref()
             .map(|core| core.forward(&cond))
             .transpose()?;
-        let heads = cfg.num_heads;
-        let kv_heads = cfg.num_kv_heads.unwrap_or(cfg.num_heads);
-        for block in &self.blocks {
-            (s, y) = match block {
-                Block::Dual(blk) => {
-                    let core_txt = core_txt.as_ref().ok_or_else(|| {
-                        Error::Msg(
-                            "iris: a dual-stream block needs the text modulation core".into(),
-                        )
-                    })?;
-                    self.dual(
-                        blk, &s, &y, &core_img, core_txt, &rope_img, &rope_txt, heads, kv_heads,
-                    )?
-                }
-                Block::Single(blk) => self.single(
-                    blk, &s, &y, &core_img, &rope_img, &rope_txt, heads, kv_heads,
-                )?,
-            };
+        let ctx = TrunkCtx {
+            rope_img,
+            rope_txt,
+            heads: cfg.num_heads,
+            kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads),
+        };
+        for i in 0..self.blocks.len() {
+            (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
         }
 
         // timestep re-fused into every patch token
@@ -657,16 +662,22 @@ impl IrisDiT {
             .contiguous()?
             .reshape((b * n_patches, p * p, pix))?;
         let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
-        let rope_pix = Rope::grid_2d(
+        let rope_pix = Rope::grid_2d_aspect(
             pix_head,
             hp,
             wp,
             cfg.rope_theta as f32,
             cfg.rope_scale as f32,
+            square,
             &self.device,
         )?;
-        for block in &self.pixel_blocks {
-            pixels = self.pit(block, &pixels, &s_cond, &rope_pix, b, n_patches)?;
+        let pctx = PixelCtx {
+            rope_pix,
+            batch: b,
+            n_patches,
+        };
+        for i in 0..self.pixel_blocks.len() {
+            pixels = hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)?;
         }
         let out = self
             .final_linear
@@ -814,5 +825,130 @@ impl IrisDiT {
             .fc2
             .forward(&blk.fc1.forward(&blk.norm2.forward(&x)?)?.gelu_erf()?)?;
         add(&x, &modulate(&mlp, &m[3], &m[2])?)
+    }
+}
+
+// =============================================================================================
+// Training seams (sc-25689): per-block hooks
+// =============================================================================================
+
+/// What a trunk block reads besides its own weights in one forward.
+#[derive(Clone)]
+pub struct TrunkCtx {
+    rope_img: Rope,
+    rope_txt: Rope,
+    heads: usize,
+    kv_heads: usize,
+}
+
+/// What a PiT block reads besides its own weights in one forward.
+#[derive(Clone)]
+pub struct PixelCtx {
+    rope_pix: Rope,
+    batch: usize,
+    n_patches: usize,
+}
+
+/// Hooks around every block of [`IrisDiT::forward_hooked`]. The defaults run the backbone's own
+/// block, which is the inference forward.
+pub trait ForwardHooks {
+    #[allow(clippy::too_many_arguments)]
+    fn trunk_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Tensor,
+        y: &Tensor,
+        core_img: &Tensor,
+        core_txt: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        dit.run_trunk_block(i, ctx, s, y, core_img, core_txt)
+    }
+
+    fn pixel_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Tensor,
+        s_cond: &Tensor,
+    ) -> Result<Tensor> {
+        dit.run_pixel_block(i, ctx, pixels, s_cond)
+    }
+}
+
+/// The inference forward's hooks: none.
+pub struct NoHooks;
+
+impl ForwardHooks for NoHooks {}
+
+impl IrisDiT {
+    /// Trunk blocks.
+    pub fn trunk_depth(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// PiT blocks.
+    pub fn pixel_depth(&self) -> usize {
+        self.pixel_blocks.len()
+    }
+
+    /// Run this backbone's trunk block `i` on `(s, y)`.
+    pub fn run_trunk_block(
+        &self,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Tensor,
+        y: &Tensor,
+        core_img: &Tensor,
+        core_txt: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        match &self.blocks[i] {
+            Block::Dual(blk) => {
+                let core_txt = core_txt.ok_or_else(|| {
+                    Error::Msg("iris: a dual-stream block needs the text modulation core".into())
+                })?;
+                self.dual(
+                    blk,
+                    s,
+                    y,
+                    core_img,
+                    core_txt,
+                    &ctx.rope_img,
+                    &ctx.rope_txt,
+                    ctx.heads,
+                    ctx.kv_heads,
+                )
+            }
+            Block::Single(blk) => self.single(
+                blk,
+                s,
+                y,
+                core_img,
+                &ctx.rope_img,
+                &ctx.rope_txt,
+                ctx.heads,
+                ctx.kv_heads,
+            ),
+        }
+    }
+
+    /// Run this backbone's PiT block `i`.
+    pub fn run_pixel_block(
+        &self,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Tensor,
+        s_cond: &Tensor,
+    ) -> Result<Tensor> {
+        self.pit(
+            &self.pixel_blocks[i],
+            pixels,
+            s_cond,
+            &ctx.rope_pix,
+            ctx.batch,
+            ctx.n_patches,
+        )
     }
 }
