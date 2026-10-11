@@ -20,19 +20,27 @@ MAX_SECONDS = 3600
 ALLOWED_RUNNERS = {"cuda-windows", "cuda-windows-2"}
 # Reserved display/WDDM baseline, not CUDA work: cap it at 2 GiB on this 96-GiB pool.
 MAX_GRAPHICS_BASELINE_MIB = 2048
+MAX_BASELINE_UTILIZATION_PERCENT = 5
+BASELINE_SAMPLES = 5
+BASELINE_INTERVAL_SECONDS = 0.5
+MAX_SAMPLING_SECONDS = 5
 
 
-def command(args: list[str]) -> str:
-    return subprocess.check_output(args, text=True, timeout=30).strip()
+def command(args: list[str], deadline: float | None = None) -> str:
+    timeout = 30 if deadline is None else min(30, deadline - time.monotonic())
+    if timeout <= 0:
+        raise TimeoutError("GPU inventory sampling deadline exhausted")
+    return subprocess.check_output(args, text=True, timeout=timeout).strip()
 
 
-def inventory(out: Path | None = None, label: str = "snapshot") -> tuple[list[dict], list[list[str]]]:
-    rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"])
+def inventory(out: Path | None = None, label: str = "snapshot",
+              deadline: float | None = None) -> tuple[list[dict], list[list[str]]]:
+    rows = command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"], deadline)
     devices = []
     for row in csv.reader(rows.splitlines()):
         i, uuid, name, driver, total, used, utilization = [v.strip() for v in row]
         devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total), used_mib=int(used), utilization_percent=int(utilization)))
-    xml = command(["nvidia-smi", "-q", "-x"])
+    xml = command(["nvidia-smi", "-q", "-x"], deadline)
     if out is not None:
         (out / f"{label}-nvidia-smi.xml").write_text(xml)
     xml_uuids = {(gpu.findtext("uuid") or "").strip() for gpu in ET.fromstring(xml).findall("gpu")}
@@ -41,14 +49,19 @@ def inventory(out: Path | None = None, label: str = "snapshot") -> tuple[list[di
     processes = typed_processes(xml)
     # Cover permission-opaque processes using driver-supplied type, never executable names.
     # A PID present in the CSV but absent from the typed snapshot remains unknown/refused.
-    rows = command(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"])
+    rows = command(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader,nounits"], deadline)
     known = {(p[0], p[1]) for p in processes}
+    typed_by_pid = {}
+    for uuid, pid, _, _ in processes:
+        typed_by_pid.setdefault(pid, set()).add(uuid)
     for row in csv.reader(rows.splitlines()):
         if not row:
             continue
         row = [v.strip() for v in row]
         if len(row) != 3:
             raise RuntimeError("unrecognized GPU process inventory")
+        if row[1] in typed_by_pid and row[0] not in typed_by_pid[row[1]]:
+            raise RuntimeError("driver XML and compute-app GPU UUID/PID differ")
         if (row[0], row[1]) not in known:
             processes.append(row + ["unknown"])
     return devices, processes
@@ -69,8 +82,47 @@ def typed_processes(xml: str) -> list[list[str]]:
 
 
 def idle(device: dict, processes: list[list[str]]) -> bool:
-    return (device["used_mib"] < MAX_GRAPHICS_BASELINE_MIB and device["utilization_percent"] < 5
-            and all(len(row) == 4 and row[3] == "G" for row in processes if row[0] == device["uuid"]))
+    return (device["used_mib"] < MAX_GRAPHICS_BASELINE_MIB
+            and device["utilization_percent"] < MAX_BASELINE_UTILIZATION_PERCENT
+            and all(len(row) == 4 and row[3] in {"G", "C+G"} and row[1]
+                    for row in processes if row[0] == device["uuid"]))
+
+
+def process_identities(uuid: str, processes: list[list[str]]) -> list[tuple[str, str, str]]:
+    return sorted((row[0], row[1], row[3]) for row in processes if row[0] == uuid)
+
+
+def sample_baseline(device: dict, out: Path, phase: str,
+                    baseline: dict | None = None) -> tuple[dict, dict]:
+    """Admit one physical UUID only after bounded, stable driver observations."""
+    samples = []
+    started = time.monotonic()
+    try:
+        for index in range(BASELINE_SAMPLES):
+            if index:
+                time.sleep(BASELINE_INTERVAL_SECONDS)
+            devices, processes = inventory(out, f"{phase}-sample-{index + 1}", started + MAX_SAMPLING_SECONDS)
+            matches = [row for row in devices if row["uuid"] == device["uuid"]]
+            sample = dict(sample_number=index + 1, elapsed_seconds=time.monotonic() - started,
+                          devices=devices, processes=processes)
+            samples.append(sample)
+            if len(matches) != 1 or time.monotonic() - started > MAX_SAMPLING_SECONDS:
+                raise RuntimeError(f"physical GPU identity or sampling deadline changed during {phase}")
+            current = matches[0]
+            identities = process_identities(device["uuid"], processes)
+            if not idle(current, processes):
+                raise RuntimeError(f"physical GPU occupied during {phase}")
+            if index == 0 and baseline is None:
+                baseline = dict(uuid=device["uuid"], reserved_baseline_mib=current["used_mib"],
+                                process_identities=identities)
+            if (identities != baseline["process_identities"]
+                    or current["used_mib"] > baseline["reserved_baseline_mib"]
+                    or (index and current["used_mib"] > samples[index - 1]["selected_used_mib"])):
+                raise RuntimeError(f"physical GPU baseline changed during {phase}")
+            sample["selected_used_mib"] = current["used_mib"]
+        return current, baseline
+    finally:
+        (out / f"{phase}-samples.json").write_text(json.dumps(samples, indent=2))
 
 
 def claim_device(out: Path):
@@ -93,20 +145,19 @@ def claim_device(out: Path):
         except OSError:
             handle.close()
             continue
-        current, current_processes = inventory(out, "claimed-device")
-        checked = next(d for d in current if d["uuid"] == device["uuid"])
-        if idle(checked, current_processes):
-            return checked, handle
-        handle.close()
+        try:
+            checked, baseline = sample_baseline(device, out, "claimed-device")
+            return checked, handle, baseline
+        except RuntimeError:
+            handle.close()
+        except Exception:
+            handle.close()
+            raise
     raise RuntimeError("no unclaimed idle physical CUDA device; refusing benchmark")
 
 
-def verify_idle(device: dict, out: Path, phase: str):
-    devices, processes = inventory(out, phase)
-    (out / f"{phase}-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
-    current = next(d for d in devices if d["uuid"] == device["uuid"])
-    if not idle(current, processes):
-        raise RuntimeError(f"selected physical device became occupied before {phase}")
+def verify_idle(device: dict, out: Path, phase: str, baseline: dict):
+    sample_baseline(device, out, phase, baseline)
 
 
 def persist_receipt(out: Path, receipt: dict):
@@ -128,9 +179,13 @@ def main() -> int:
             raise RuntimeError("S0 requires an explicitly admitted existing Windows CUDA listener")
         if receipt["source_commit"] != os.environ["GITHUB_SHA"] or command(["git", "status", "--porcelain"]):
             raise RuntimeError("checkout identity/cleanliness mismatch")
-        device, lock = claim_device(out)
+        device, lock, baseline = claim_device(out)
         receipt["device"] = device
-        receipt["graphics_baseline_policy"] = dict(max_baseline_mib=MAX_GRAPHICS_BASELINE_MIB, reserved_baseline_mib=device["used_mib"], admitted_process_type="G", refused_process_types=["C", "C+G", "unknown"], type_authority="nvidia-smi -q -x driver XML; no executable-name inference")
+        receipt["graphics_baseline_policy"] = dict(max_baseline_mib=MAX_GRAPHICS_BASELINE_MIB,
+            max_utilization_percent=MAX_BASELINE_UTILIZATION_PERCENT, sample_count=BASELINE_SAMPLES,
+            max_sampling_seconds=MAX_SAMPLING_SECONDS, baseline=baseline,
+            admitted_process_types=["G", "C+G"], refused_process_types=["C", "unknown"],
+            type_authority="nvidia-smi -q -x driver XML; no executable-name inference")
         receipt["device_lock_directory"] = str(Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks")
         os.environ["CUDA_VISIBLE_DEVICES"] = device["uuid"]
         receipt["cuda_visible_devices"] = device["uuid"]
@@ -160,7 +215,7 @@ def main() -> int:
                 receipt["status"] = "real_dit_assets_unavailable"
                 receipt["missing_asset"] = os.environ.get("S0_Q4_DIT_DIR", "")
                 return 3
-            verify_idle(device, out, name)
+            verify_idle(device, out, name, baseline)
             result = execute_owned(name, args, out, deadline, WindowsJob)
             receipt["results"].append(result)
             receipt["status"] = f"{name}_child_completed"
