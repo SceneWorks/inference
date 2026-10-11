@@ -32,7 +32,8 @@
 //!   (upstream's checkpoint names).
 //! * Previews follow the shared contract: empty [`TrainingConfig::sample_prompts`] (or
 //!   `sample_every = 0`) renders nothing; at most [`PREVIEW_PROMPT_CAP`] prompts render per cadence;
-//!   no extra render at step 1. Upstream's seven default validation prompts are an explicit opt-in
+//!   no extra render at step 1. Upstream's validation prompts (its seven defaults, or a translated
+//!   config's own list — every one, uncapped, as upstream renders them) are an explicit opt-in
 //!   (`upstream_validation_prompts`).
 //! * [`TrainingConfig::resolution`] is upstream's fixed-square `data.image_size` (shortest-side
 //!   bicubic resize + center crop); it must be a multiple of the backbone's `patch_size` and is
@@ -1275,7 +1276,7 @@ pub struct PreviewPlan {
 /// | `resume_data_policy`, `override_lr_on_resume` | `train.*` | `"exact"`, false |
 /// | `preview_weights` | (raw `core`) | the `export_weights` default (`"raw"` / `"ema"`) |
 /// | `preview_negative_prompt` | `sample.negative_prompt` | `""` |
-/// | `upstream_validation_prompts` | `validation_prompts` default | false (true: render [`DEFAULT_VALIDATION_PROMPTS`] when `sample_prompts` is empty) |
+/// | `upstream_validation_prompts` | `validation_prompts` | false (true: render [`DEFAULT_VALIDATION_PROMPTS`]; a list: render those prompts — uncapped, when `sample_prompts` is empty) |
 /// | `export_weights` | `export_checkpoint.py` (EMA when on) | full model: `"ema"` when EMA is on, else `"raw"`; LoRA / LoKr: `"raw"` |
 ///
 /// The adapter default is `raw` because upstream ships no adapter EMA/export and an EMA at the
@@ -2044,22 +2045,47 @@ impl IrisTrainPlan {
                 )))
             }
         };
-        let upstream_prompts = opts.bool("upstream_validation_prompts", false)?;
+        // `upstream_validation_prompts`: true = upstream's seven defaults, a list = a translated
+        // config's own `validation_prompts` (upstream renders every one: uncapped).
+        let upstream_prompts: Option<Vec<String>> = match opts.get("upstream_validation_prompts") {
+            None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => None,
+            Some(JsonValue::Bool(true)) => Some(
+                DEFAULT_VALIDATION_PROMPTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            Some(JsonValue::Array(a)) => Some(
+                a.iter()
+                    .map(|v| {
+                        v.as_str().map(str::to_string).ok_or_else(|| {
+                            Error::Msg(format!(
+                                "iris training: upstream_validation_prompts entries must be \
+                                 strings, got {v}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            Some(v) => {
+                return Err(Error::Msg(format!(
+                    "iris training: upstream_validation_prompts must be a bool or a list of \
+                     prompts, got {v}"
+                )))
+            }
+        };
         let prompts: Vec<String> = match (cfg.sample_prompts.is_empty(), upstream_prompts) {
-            (true, true) => DEFAULT_VALIDATION_PROMPTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            (true, false) => Vec::new(),
-            (false, false) => cfg
+            (true, Some(list)) => list,
+            (true, None) => Vec::new(),
+            (false, None) => cfg
                 .sample_prompts
                 .iter()
                 .take(PREVIEW_PROMPT_CAP)
                 .cloned()
                 .collect(),
-            (false, true) => {
+            (false, Some(_)) => {
                 return Err(Error::Msg(
-                    "iris training: upstream_validation_prompts renders upstream's default \
+                    "iris training: upstream_validation_prompts renders upstream's validation \
                      prompts in place of sample_prompts — set one or the other"
                         .into(),
                 ))
@@ -2207,6 +2233,31 @@ impl IrisTrainPlan {
         let mut id = format!(
             "image_size={};seed={};caption_field={};caption_fields={:?};\
              text_dropout={};sampler={:?};prediction={};shift={}",
+            self.image_size,
+            self.seed,
+            self.caption_field,
+            self.caption_fields,
+            self.text_dropout,
+            self.flow.sampler,
+            prediction_name(self.flow.prediction),
+            self.flow.shift
+        );
+        if !self.shape.uniform() {
+            id.push_str(&format!(";shape={}", self.shape_policy_id));
+        }
+        id
+    }
+
+    /// The data identity a pre-sc-25689 checkpoint (no `data_position`) recorded, which also
+    /// pinned the micro-batch and accumulation it trained with — rebuilt from this plan with the
+    /// **saved** `batch` / `accum` ([`CheckpointState::legacy_batch`]), so an exact resume of such a
+    /// checkpoint compares like with like (and, as for a current checkpoint, survives a micro-batch
+    /// change: the ranged walk resumes by samples). A non-uniform shape policy did not exist then:
+    /// it stays part of the identity, so such a run never matches a legacy checkpoint.
+    pub fn legacy_data_identity(&self, batch: usize, accum: usize) -> String {
+        let mut id = format!(
+            "image_size={};batch={batch};accum={accum};seed={};caption_field={};\
+             caption_fields={:?};text_dropout={};sampler={:?};prediction={};shift={}",
             self.image_size,
             self.seed,
             self.caption_field,
@@ -2781,6 +2832,21 @@ pub fn parse_task(name: &str) -> Result<IrisTask> {
 }
 
 impl CheckpointState {
+    /// A pre-sc-25689 checkpoint (no `data_position`): the `(batch, accum)` its data identity
+    /// recorded — the micro-batch its `batches_consumed` counts. `None` for a current checkpoint.
+    pub fn legacy_batch(&self) -> Option<(usize, usize)> {
+        if self.data_position.is_some() {
+            return None;
+        }
+        let field = |k: &str| {
+            self.data_identity
+                .split(';')
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        Some((field("batch")?, field("accum")?))
+    }
+
     pub fn to_json(&self) -> JsonValue {
         json!({
             "format": CHECKPOINT_FORMAT,
@@ -3069,6 +3135,27 @@ pub fn check_resume(
                 .into(),
         ));
     }
+    // A projector the resumed run drops (`repa.weight = 0`), under a full optimizer resume: upstream's
+    // replicated load refuses the changed parameter routing (`ckpt.py` `_validate_optimizer_layout`:
+    // the saved `aux` group holds the projector, the live one is empty), while its FSDP2 load forgets
+    // the stale `aux` group (`trainer.py` `_drop_stale_aux_group`) — the official stage-1 → stage-2
+    // continuation. Mirrored per strategy; `resume_optimizer: core` resumes without it either way.
+    if plan.repa.is_none() && saved.repa_projector.is_some() && !plan.resume_optimizer_core {
+        if !plan.dist.sharded() {
+            return Err(Error::Unsupported(
+                "iris resume: the checkpoint carries a REPA projector (and its optimizer state) \
+                 that this run drops (repa.weight = 0); a full optimizer resume of a replicated \
+                 (ddp) run refuses the changed parameter routing, as upstream's \
+                 _validate_optimizer_layout does (ckpt.py). Set resume_optimizer: core to resume \
+                 the backbone's optimizer state without the projector"
+                    .into(),
+            ));
+        }
+        eprintln!(
+            "iris resume: this run trains no REPA projector; dropping the checkpoint's projector \
+             and its optimizer state (upstream's FSDP2 load forgets the stale aux group)"
+        );
+    }
     if saved.state_identity != plan.state_identity() {
         return Err(Error::Msg(format!(
             "iris resume: the checkpoint trained a different state ({}) than this run ({}); \
@@ -3083,12 +3170,16 @@ pub fn check_resume(
         ));
     }
     if plan.resume_data_policy == ResumeDataPolicy::Exact {
-        if saved.data_identity != plan.data_identity() {
+        // A pre-sc-25689 checkpoint recorded its micro-batch / accumulation in the identity.
+        let requested = match saved.legacy_batch() {
+            Some((batch, accum)) => plan.legacy_data_identity(batch, accum),
+            None => plan.data_identity(),
+        };
+        if saved.data_identity != requested {
             return Err(Error::Msg(format!(
-                "iris resume: data shaping differs (saved {}, requested {}); resume_data_policy \
-                 new_phase starts the current dataset fresh",
+                "iris resume: data shaping differs (saved {}, requested {requested}); \
+                 resume_data_policy new_phase starts the current dataset fresh",
                 saved.data_identity,
-                plan.data_identity()
             )));
         }
         if saved.dataset_fingerprint != dataset_fingerprint {

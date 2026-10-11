@@ -163,6 +163,9 @@ fn real_stage_presets_resume_256_to_512_with_repa() {
         .extend([
             ("resume_from".to_string(), json!(ck1)),
             ("activation_checkpointing".to_string(), json!("full")),
+            // single-process stage 2 drops stage 1's projector: `core`, as upstream's replicated
+            // load requires (its FSDP2 cluster load forgets the projector group by itself)
+            ("resume_optimizer".to_string(), json!("core")),
         ]);
     let out2 = work.path().join("stage2");
     let t1 = Instant::now();

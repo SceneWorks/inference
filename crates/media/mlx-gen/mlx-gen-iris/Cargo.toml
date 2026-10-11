@@ -30,7 +30,7 @@ image = { workspace = true }
 [build-dependencies]
 # build.rs links MLX's libjaccl.a (or compiles the JACCL-absent shim for a prebuilt MLX without it)
 # so `mlx::core::distributed::init` links (sc-25689).
-cc = "1"
+cc = { workspace = true }
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }

@@ -549,7 +549,7 @@ repository = "speridlabs/iris-3b"
 revision = "7445443349bc9abe3c96f01ff793e2098ca012b3"
 license = "Apache-2.0"
 size_class = "very-large"
-profiles = ["iris"]
+profiles = ["iris", "iris-curricula-cuda"]
 environment = ["IRIS_WEIGHTS_DIR"]
 download_files = [
     "config.yaml",
@@ -672,13 +672,15 @@ expected_files = ["vgg_lpips_linear.safetensors"]
 # sc-25689 — the frozen REPA teacher of the official stage-1 curriculum (`dinov2_vitb14`, as
 # `transformers`' Dinov2Model safetensors — tensor-for-tensor the hub `dinov2_vitb14_pretrain.pth`,
 # checked by `tools/dump_iris_train.py`). Read by `candle-gen-iris/tests/curricula_real_weights.rs`
-# and the release-teacher parity check in `curricula_parity.rs`.
+# and the release-teacher parity check in `curricula_parity.rs`, on the dispatch-only
+# `iris-curricula-cuda` profile (`candle-iris-curricula`), which also reads the two `-cuda` entries
+# above.
 key = "dinov2-base-cuda"
 repository = "facebook/dinov2-base"
 revision = "f9e44c814b77203eaa57a6bdbbd535f21ede1415"
 license = "Apache-2.0"
 size_class = "small"
-profiles = ["iris"]
+profiles = ["iris-curricula-cuda"]
 environment = ["IRIS_REPA_TEACHER_DIR"]
 download_files = ["config.json", "model.safetensors"]
 expected_files = ["config.json", "model.safetensors"]
@@ -744,7 +746,7 @@ repository = "Qwen/Qwen3-VL-4B-Instruct"
 revision = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 license = "Apache-2.0"
 size_class = "large"
-profiles = ["iris"]
+profiles = ["iris", "iris-curricula-cuda"]
 environment = ["IRIS_TEXT_ENCODER_DIR"]
 download_files = [
     "config.json",

@@ -244,8 +244,8 @@ pub const UPSTREAM_OPTIONS: &[UpstreamOption] = opts![
                                      iris.preview_at_step_one"),
     "train.val_every_steps" => H("iris.val_every_steps"),
     "train.val_samples" => H("iris.val_samples"),
-    "train.validation_prompts" => H("TrainingConfig::sample_prompts (≤ 4) or \
-                                     iris.upstream_validation_prompts (the default seven)"),
+    "train.validation_prompts" => H("iris.upstream_validation_prompts (true: the default seven; \
+                                     a list: the config's own — every prompt, uncapped)"),
     "train.nan_loss_tolerance" => H("iris.nan_loss_tolerance"),
     "train.perf.foreach_ema" => M("multi-tensor EMA kernels; the native EMA update is the same \
                                    elementwise blend"),
@@ -575,9 +575,9 @@ pub fn translate_upstream(
     if !text_encoder.is_empty() {
         put("text_encoder", JsonValue::Object(text_encoder));
     }
-    if explicit.iter().any(|k| k == "model.rope_aspect") {
-        put("rope_aspect", j("model.rope_aspect"));
-    }
+    // Always the merged value: a key left at upstream's default must resolve to upstream's default,
+    // never inherit the provisioned backbone's (a stage-1 export carries `rope_aspect: square`).
+    put("rope_aspect", j("model.rope_aspect"));
     // REPA
     let mut repa = JsonMap::new();
     for k in [
@@ -596,9 +596,7 @@ pub fn translate_upstream(
     ] {
         repa.insert(k.into(), j(&format!("repa.{k}")));
     }
-    if explicit.iter().any(|k| k == "model.repa_layer") {
-        repa.insert("layer".into(), j("model.repa_layer"));
-    }
+    repa.insert("layer".into(), j("model.repa_layer"));
     put("repa", JsonValue::Object(repa));
     // train loop
     put("expected_global_batch", j("train.expected_global_batch"));
@@ -675,34 +673,18 @@ pub fn translate_upstream(
             "recompile_limit": j("train.perf.recompile_limit"),
         }),
     );
-    // previews: upstream renders the raw weights at step 1 and every cadence, the seven default
-    // prompts unless the config names others.
+    // previews: upstream renders the raw weights at step 1 and every cadence, every validation
+    // prompt (the seven defaults unless the config names others) — uncapped, carried through
+    // `upstream_validation_prompts` (true = the defaults, a list = the config's own).
     put("preview_weights", json!("raw"));
     put("preview_at_step_one", json!(true));
     put("preview_order", j("sample.order"));
     let prompts = j("train.validation_prompts");
+    cfg.sample_prompts = Vec::new();
     if is_default("train.validation_prompts") {
-        cfg.sample_prompts = Vec::new();
         put("upstream_validation_prompts", json!(true));
     } else {
-        let list: Vec<String> = prompts
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|v| v.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if list.len() > super::PREVIEW_PROMPT_CAP {
-            return Err(Error::Unsupported(format!(
-                "iris training: train.validation_prompts names {} prompts; the native preview \
-                 cadence renders at most {} custom prompts (the default seven are rendered with \
-                 upstream_validation_prompts)",
-                list.len(),
-                super::PREVIEW_PROMPT_CAP
-            )));
-        }
-        cfg.sample_prompts = list;
+        put("upstream_validation_prompts", prompts);
     }
     // Every carried value is type-checked by `IrisTrainPlan::resolve`.
     cfg.model_options

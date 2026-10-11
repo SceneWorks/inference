@@ -186,6 +186,13 @@ fn bytes_of(path: &Path) -> Vec<(String, Vec<f32>)> {
 
 #[test]
 fn gen_core_trainer_conformance_checks() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::gen_core_trainer_conformance_checks",
+        gen_core_trainer_conformance_checks_body,
+    );
+}
+
+fn gen_core_trainer_conformance_checks_body() {
     use gen_core_testkit::trainer as kit;
     let data = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
@@ -220,6 +227,13 @@ fn gen_core_trainer_conformance_checks() {
 
 #[test]
 fn cancel_and_resume_reproduce_the_uninterrupted_run() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run",
+        cancel_and_resume_reproduce_the_uninterrupted_run_body,
+    );
+}
+
+fn cancel_and_resume_reproduce_the_uninterrupted_run_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -300,6 +314,13 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run() {
 /// `invalid_examples`: `reject` refuses before any step naming the item; `skip` trains on the rest.
 #[test]
 fn invalid_examples_follow_the_policy() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::invalid_examples_follow_the_policy",
+        invalid_examples_follow_the_policy_body,
+    );
+}
+
+fn invalid_examples_follow_the_policy_body() {
     let data = tempfile::tempdir().unwrap();
     let mut items = dataset(data.path());
     items.push(example(data.path(), 3, 16, 16, 3)); // a constant plane: no normalization
@@ -359,6 +380,13 @@ fn target_error(pred: &[f32], item: &TrainingItem) -> f64 {
 /// predicts depth closer to the training targets than the starting export.
 #[test]
 fn overfit_export_and_load_in_the_estimator() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::overfit_export_and_load_in_the_estimator",
+        overfit_export_and_load_in_the_estimator_body,
+    );
+}
+
+fn overfit_export_and_load_in_the_estimator_body() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
     let out = tempfile::tempdir().unwrap();
@@ -462,6 +490,13 @@ fn overfit_export_and_load_in_the_estimator() {
 /// or is encoded once by the text encoder; the run trains and its export loads in the estimator.
 #[test]
 fn parent_init_from_a_file_or_the_text_encoder() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::parent_init_from_a_file_or_the_text_encoder",
+        parent_init_from_a_file_or_the_text_encoder_body,
+    );
+}
+
+fn parent_init_from_a_file_or_the_text_encoder_body() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
     let mut cfg = config();

@@ -713,24 +713,32 @@ fn mkdir(p: &Path) -> Result<()> {
         .map_err(|e| Error::Msg(format!("iris checkpoint: create {}: {e}", p.display())))
 }
 
-/// The device a rank trains on: upstream's `cuda:<local_rank>` (`world.py`) on a CUDA build when
-/// that GPU exists; a rank whose ordinal has no GPU shares the build's device (several ranks on one
-/// card — same semantics, shared memory and compute).
-fn rank_device(base: &Device, world: &World) -> Device {
+/// The device a rank trains on: upstream's `cuda:<local_rank>` (`world.py`) on a CUDA build. A rank
+/// whose ordinal has no GPU is refused ([`DistError::InvalidMesh`]) unless the run opts into
+/// sharing (`dist.world.share_device`): then it shares the build's device (several ranks on one
+/// card — same semantics, shared memory and compute), said on stderr.
+fn rank_device(base: &Device, world: &World) -> std::result::Result<Device, DistError> {
     if world.world_size == 1 || !base.is_cuda() {
-        return base.clone();
+        return Ok(base.clone());
     }
     match Device::new_cuda(world.local_rank) {
-        Ok(d) => d,
-        Err(e) => {
+        Ok(d) => Ok(d),
+        Err(e) if world.share_device => {
             eprintln!(
-                "iris training: rank {} has no cuda:{} ({e}); it shares {:?}",
+                "iris training: rank {} has no cuda:{} ({e}); dist.world.share_device: it shares \
+                 {:?}",
                 world.rank,
                 world.local_rank,
                 base.location()
             );
-            base.clone()
+            Ok(base.clone())
         }
+        Err(e) => Err(DistError::InvalidMesh(format!(
+            "rank {} trains on cuda:{} (its local_rank), which this process cannot open ({e}); \
+             a node needs one GPU per local rank, or set dist.world.share_device = true to run \
+             several ranks on one card",
+            world.rank, world.local_rank
+        ))),
     }
 }
 
@@ -744,7 +752,13 @@ impl Run {
         on_progress(TrainingProgress::Preparing);
         let mut config = trainer.config.clone();
         let pre = trainer.resolve_plan(req, &[])?;
-        let device = rank_device(&trainer.device, &pre.dist.world);
+        let device = match rank_device(&trainer.device, &pre.dist.world) {
+            Ok(d) => d,
+            Err(d) => {
+                *failure.borrow_mut() = Some(d.clone());
+                return Err(d.into_error().into());
+            }
+        };
         config.model.rope_aspect = pre.rope_aspect.clone();
         let compute = match pre.mixed_precision {
             MixedPrecision::Bf16 => DType::BF16,
@@ -1160,7 +1174,17 @@ impl Run {
                 }
                 ResumeDataPolicy::Exact => match &saved.data_position {
                     Some(p) => p.clone(),
-                    None => pipeline.legacy_position(saved.epoch, saved.batches_consumed)?,
+                    None => {
+                        let (batch, _) = saved.legacy_batch().ok_or_else(|| {
+                            Error::Msg(
+                                "iris resume: the checkpoint has neither a data_position nor a \
+                                 legacy batch identity; resume_data_policy new_phase starts the \
+                                 current dataset fresh"
+                                    .into(),
+                            )
+                        })?;
+                        pipeline.legacy_position(saved.epoch, saved.batches_consumed, batch)?
+                    }
                 },
             };
             first_epoch = position

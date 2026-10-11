@@ -249,8 +249,16 @@ impl DataPipeline {
         self.data_position(1, 0, 0, 0)
     }
 
-    /// A legacy (pre-sc-25689, single-rank, uniform) cursor: `batches` consumed in `epoch`.
-    pub fn legacy_position(&mut self, epoch: u32, batches: usize) -> Result<JsonValue> {
+    /// A legacy (pre-sc-25689, single-rank, uniform) cursor: `batches` micro-batches of the
+    /// **saved** `saved_batch` size ([`super::CheckpointState::legacy_batch`]) consumed in `epoch`.
+    /// The cursor records the saved batch size, so the load resumes by samples exactly as a
+    /// current checkpoint does across a micro-batch change.
+    pub fn legacy_position(
+        &mut self,
+        epoch: u32,
+        batches: usize,
+        saved_batch: usize,
+    ) -> Result<JsonValue> {
         if self.world_size != 1 || !self.policy.uniform() {
             return Err(Error::Msg(
                 "iris resume: a checkpoint without a data_position resumes on one rank with the \
@@ -258,14 +266,14 @@ impl DataPipeline {
                     .into(),
             ));
         }
-        let samples = (batches * self.batch_size).min(match &self.walker {
+        let samples = (batches * saved_batch).min(match &self.walker {
             Walker::Ranged(s) => s.covered(),
             Walker::Shape(_) => 0,
         });
         match &mut self.walker {
             Walker::Ranged(s) => {
                 s.set_epoch(epoch);
-                let mut st = s.resume_state(batches, self.batch_size, None, Some(samples))?;
+                let mut st = s.resume_state(batches, saved_batch, None, Some(samples))?;
                 let o = st.as_object_mut().expect("object");
                 o.insert("epoch".into(), json!(epoch));
                 o.insert("batches_consumed".into(), json!(batches));
@@ -366,7 +374,65 @@ mod tests {
         let mut g = DataPipeline::new(&items, f.policy.clone(), 3, 0, 1).unwrap();
         g.begin_epoch(1, Some(&pos)).unwrap();
         assert_eq!(g.batches(), vec![vec![6, 7]]);
-        let legacy = g.legacy_position(1, 2).unwrap();
+        let legacy = g.legacy_position(1, 2, 3).unwrap();
         assert_eq!(legacy["samples_per_rank"], json!(6));
+        // A legacy checkpoint counts micro-batches of ITS batch size: 2 batches of 2 = 4 samples,
+        // resumed by a batch-3 run at sample 4.
+        let legacy = g.legacy_position(1, 2, 2).unwrap();
+        assert_eq!(legacy["samples_per_rank"], json!(4));
+        let mut h = DataPipeline::new(&items, f.policy.clone(), 3, 0, 1).unwrap();
+        h.begin_epoch(1, Some(&legacy)).unwrap();
+        assert_eq!(h.batches(), vec![vec![4, 5, 6], vec![7]]);
+    }
+
+    /// A cursor written by a 2-rank run resumes on 1 and on 4 ranks exactly as upstream's
+    /// `RangedSampler.load_resume_state` re-splits it: every rank's unread tail, in rank order,
+    /// cut into equal contiguous per-rank plans (`_split_ranges`) — no sample dropped or repeated.
+    #[test]
+    fn a_cursor_reshards_to_another_world_like_upstreams_sampler() {
+        let d = tempfile::tempdir().unwrap();
+        let items: Vec<TrainingItem> = (0..8)
+            .map(|i| {
+                TrainingItem::captioned(
+                    write_png(d.path(), &format!("{i}.png"), 16, 16),
+                    "c".into(),
+                )
+            })
+            .collect();
+        let fixed = ShapePolicy::build("fixed", 16, 16, "", 32, 4.0).unwrap();
+        // world 2: rank 0 walks [0, 4), rank 1 [4, 8); each consumed one batch of 2
+        let mut w2: Vec<DataPipeline> = (0..2)
+            .map(|r| DataPipeline::new(&items, fixed.clone(), 2, r, 2).unwrap())
+            .collect();
+        for p in w2.iter_mut() {
+            p.begin_epoch(1, None).unwrap();
+        }
+        assert_eq!(w2[0].batches(), vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(w2[1].batches(), vec![vec![4, 5], vec![6, 7]]);
+        w2[0].begin_epoch(1, None).unwrap();
+        let pos = w2[0].data_position(1, 1, 1, 2).unwrap();
+        // every rank writes the same cursor (equal progress over the shared plan)
+        w2[1].begin_epoch(1, None).unwrap();
+        assert_eq!(w2[1].data_position(1, 1, 1, 2).unwrap(), pos);
+        // upstream: unread = [2, 4) + [6, 8); one rank takes it all, four ranks one sample each
+        let mut w1 = DataPipeline::new(&items, fixed.clone(), 2, 0, 1).unwrap();
+        w1.begin_epoch(1, Some(&pos)).unwrap();
+        assert_eq!(w1.batches(), vec![vec![2, 3], vec![6, 7]]);
+        let w4: Vec<Vec<Vec<usize>>> = (0..4)
+            .map(|r| {
+                let mut p = DataPipeline::new(&items, fixed.clone(), 1, r, 4).unwrap();
+                p.begin_epoch(1, Some(&pos)).unwrap();
+                p.batches()
+            })
+            .collect();
+        assert_eq!(
+            w4,
+            vec![vec![vec![2]], vec![vec![3]], vec![vec![6]], vec![vec![7]]]
+        );
+        // a world that cannot split the remainder evenly is refused, as upstream refuses
+        let mut w3 = DataPipeline::new(&items, fixed, 1, 0, 3);
+        if let Ok(p) = w3.as_mut() {
+            assert!(p.begin_epoch(1, Some(&pos)).is_err());
+        }
     }
 }

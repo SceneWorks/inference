@@ -20,8 +20,8 @@ use mlx_gen::gen_core::iris::train::shapes::{
 use mlx_gen::gen_core::iris::train::{FlowObjective, Prediction, TimestepSampler, TrainSchedule};
 use mlx_gen::weights::Weights;
 use mlx_gen_iris::train::model::{
-    flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch, TrainExtras, TrainModel,
-    Trainable,
+    checkpointed_regions, flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch,
+    TrainExtras, TrainModel, Trainable,
 };
 use mlx_gen_iris::train::optim::Params;
 use mlx_gen_iris::train::teacher::{spatial_normalize, Teacher};
@@ -120,6 +120,13 @@ fn full_model(rope_aspect: &str) -> TrainModel {
 
 #[test]
 fn shape_policies_and_the_covering_resize_match_upstream() {
+    crate::common::cpu_process(
+        "curricula_parity::shape_policies_and_the_covering_resize_match_upstream",
+        shape_policies_and_the_covering_resize_match_upstream_body,
+    );
+}
+
+fn shape_policies_and_the_covering_resize_match_upstream_body() {
     let g = fixture(GOLDEN);
     let native: [(usize, usize); 8] = [
         (1000, 1000),
@@ -188,6 +195,13 @@ fn json_ranges(v: &Json) -> Vec<(usize, usize)> {
 
 #[test]
 fn ranged_walk_and_shape_batches_match_upstream() {
+    crate::common::cpu_process(
+        "curricula_parity::ranged_walk_and_shape_batches_match_upstream",
+        ranged_walk_and_shape_batches_match_upstream_body,
+    );
+}
+
+fn ranged_walk_and_shape_batches_match_upstream_body() {
     let g = fixture(GOLDEN);
     let want = meta(&g, "ranged.1300.w2");
     for r in 0..2 {
@@ -244,6 +258,13 @@ fn grads_under(model: &TrainModel, params: &Params, ac: AcPolicy) -> Params {
 /// the plain graph's — and to upstream's — for the full model.
 #[test]
 fn activation_checkpointing_gradients_equal_the_plain_graph() {
+    crate::common::cpu_process(
+        "curricula_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+        activation_checkpointing_gradients_equal_the_plain_graph_body,
+    );
+}
+
+fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
     on_cpu(|| {
         let g = fixture(GOLDEN);
         let model = full_model("isotropic");
@@ -257,13 +278,26 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
                 1e-4,
             );
         }
+        // `none` enters no checkpointed region; `full` / `selective_op` enter every region (the same
+        // set natively); `selective_layer` with stride 2 a strict, non-empty subset. (Stride 1 is the
+        // `full` region set — not a separate case.)
+        let before = checkpointed_regions();
+        let none_again = grads_under(&model, &params, AcPolicy::None);
+        assert_eq!(
+            checkpointed_regions() - before,
+            0,
+            "none checkpoints no region"
+        );
+        assert_eq!(none_again.len(), none.len());
+        let mut regions = Vec::new();
         for ac in [
             AcPolicy::Full,
             AcPolicy::SelectiveOp,
             AcPolicy::SelectiveLayer { every: 2 },
-            AcPolicy::SelectiveLayer { every: 1 },
         ] {
+            let before = checkpointed_regions();
             let got = grads_under(&model, &params, ac);
+            regions.push(checkpointed_regions() - before);
             assert_eq!(got.len(), none.len());
             let mut worst = 0f32;
             for (k, v) in &none {
@@ -277,11 +311,29 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
             eprintln!("{}: max |Δgrad| vs none = {worst:.3e}", ac.name());
             assert!(worst <= 1e-6, "{}: {worst}", ac.name());
         }
+        eprintln!("checkpointed regions (full, selective_op, selective_layer/2): {regions:?}");
+        // one region per trunk block and per pixel block; stride 2 keeps blocks 0, 2, … of each stack
+        let (trunk, pix) = (model.cfg.depth, model.cfg.pixel.depth);
+        let full = trunk + pix;
+        let strided = trunk.div_ceil(2) + pix.div_ceil(2);
+        assert!(strided > 0 && strided < full);
+        assert_eq!(
+            regions,
+            vec![full, full, strided],
+            "regions entered per policy"
+        );
     });
 }
 
 #[test]
 fn non_square_bucket_steps_match_upstream_under_both_rope_laws() {
+    crate::common::cpu_process(
+        "curricula_parity::non_square_bucket_steps_match_upstream_under_both_rope_laws",
+        non_square_bucket_steps_match_upstream_under_both_rope_laws_body,
+    );
+}
+
+fn non_square_bucket_steps_match_upstream_under_both_rope_laws_body() {
     on_cpu(|| {
         let g = fixture(GOLDEN);
         let get = |k: &str| g.require(&format!("ns.{k}")).unwrap().clone();
@@ -353,6 +405,13 @@ fn tiny_teacher(g: &Weights, name: &str, registers: usize) -> Teacher {
 
 #[test]
 fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
+    crate::common::cpu_process(
+        "curricula_parity::repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream",
+        repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream_body,
+    );
+}
+
+fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream_body() {
     on_cpu(|| {
         let g = fixture(GOLDEN);
         let teacher = tiny_teacher(&g, "teacher", 0);
@@ -462,12 +521,68 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
                     1e-4,
                 );
             }
+            // The REPA capture inside checkpointed regions: the same losses and gradients.
+            if case == "repa_t2" {
+                for ac in [AcPolicy::Full, AcPolicy::SelectiveLayer { every: 2 }] {
+                    let before = checkpointed_regions();
+                    let (f2, r2, g2) = loss_and_grads_ext(
+                        &full_model("isotropic"),
+                        &params,
+                        &batch,
+                        &objective(),
+                        &TrainExtras {
+                            repa: Some(plan.clone()),
+                            ac,
+                        },
+                        Some(&targets),
+                        1.0,
+                    )
+                    .unwrap();
+                    let (trunk, pix) = (tiny_config().model.depth, tiny_config().model.pixel.depth);
+                    let want = match ac {
+                        AcPolicy::Full => trunk + pix,
+                        _ => trunk.div_ceil(2) + pix.div_ceil(2),
+                    };
+                    assert_eq!(
+                        checkpointed_regions() - before,
+                        want,
+                        "{}: regions entered",
+                        ac.name()
+                    );
+                    assert!(
+                        (f2 - flow).abs() <= 1e-6,
+                        "{}: flow {f2} vs {flow}",
+                        ac.name()
+                    );
+                    let (ra, rb) = (r2.unwrap(), repa.unwrap());
+                    assert!((ra - rb).abs() <= 1e-6, "{}: repa {ra} vs {rb}", ac.name());
+                    assert_eq!(g2.len(), grads.len());
+                    let mut worst = 0f32;
+                    for (k, v) in &grads {
+                        let d = host_f32(&g2[k])
+                            .iter()
+                            .zip(host_f32(v))
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0f32, f32::max);
+                        worst = worst.max(d);
+                    }
+                    eprintln!("repa + {}: max |Δgrad| vs none = {worst:.3e}", ac.name());
+                    assert!(worst <= 1e-6, "repa + {}: {worst}", ac.name());
+                }
+            }
         }
     });
 }
 
 #[test]
 fn the_register_teacher_resizes_its_position_table_with_antialias() {
+    crate::common::cpu_process(
+        "curricula_parity::the_register_teacher_resizes_its_position_table_with_antialias",
+        the_register_teacher_resizes_its_position_table_with_antialias_body,
+    );
+}
+
+fn the_register_teacher_resizes_its_position_table_with_antialias_body() {
     on_cpu(|| {
         let g = fixture(GOLDEN);
         let teacher = tiny_teacher(&g, "teacher_reg", 4);
@@ -483,6 +598,13 @@ fn the_register_teacher_resizes_its_position_table_with_antialias() {
 
 #[test]
 fn the_frozen_holdout_grid_matches_upstreams_val_loss() {
+    crate::common::cpu_process(
+        "curricula_parity::the_frozen_holdout_grid_matches_upstreams_val_loss",
+        the_frozen_holdout_grid_matches_upstreams_val_loss_body,
+    );
+}
+
+fn the_frozen_holdout_grid_matches_upstreams_val_loss_body() {
     on_cpu(|| {
         let g = fixture(GOLDEN);
         let get = |k: &str| g.require(&format!("val.{k}")).unwrap().clone();

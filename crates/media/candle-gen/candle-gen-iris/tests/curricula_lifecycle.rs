@@ -259,6 +259,13 @@ fn stage_presets_chain_256_to_512_with_repa_and_a_new_phase_body() {
     opts(&mut s2).insert("resume_from".into(), json!(ck1));
     let out2 = out.path().join("s2");
     let mut t = trainer_with(None);
+    // Single-process (ddp) stage 2 drops stage 1's projector: a full optimizer resume refuses the
+    // changed routing, as upstream's replicated load does; `core` resumes without it (an FSDP2
+    // cluster run drops it as upstream's sharded load does).
+    let e = train(t.as_mut(), &request(&items, s2.clone(), &out2))
+        .expect_err("a full ddp resume refuses the dropped projector");
+    assert!(e.to_string().contains("resume_optimizer: core"), "{e}");
+    opts(&mut s2).insert("resume_optimizer".into(), json!("core"));
     assert_eq!(
         train(t.as_mut(), &request(&items, s2.clone(), &out2)).unwrap(),
         4
@@ -509,4 +516,110 @@ fn resume_optimizer_core_starts_a_new_projector_cold_body() {
     );
     let st = read_checkpoint_state(&latest(out.path())).unwrap();
     assert!(st.repa_projector.is_some());
+}
+
+#[test]
+fn a_pre_curricula_checkpoint_resumes_exactly() {
+    cpu_process(
+        "curricula_lifecycle::a_pre_curricula_checkpoint_resumes_exactly",
+        a_pre_curricula_checkpoint_resumes_exactly_body,
+    );
+}
+
+/// A checkpoint written before sc-25689 (`state.json` without `data_position` / `stage` / `dist` /
+/// `repa_projector`, its data identity carrying `batch=…;accum=…`) resumes **exactly**: the legacy
+/// cursor (the saved micro-batch's `batches_consumed`) continues the walk, and the resumed run
+/// equals the uninterrupted one.
+fn a_pre_curricula_checkpoint_resumes_exactly_body() {
+    let (data, a, b) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let items = dataset(data.path());
+    let mut cfg = base();
+    cfg.steps = 4;
+    cfg.batch_size = 1;
+    cfg.save_every = 1;
+    opts(&mut cfg).insert("ema_decay".into(), json!(0.9));
+    let mut t = trainer_with(None);
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg.clone(), a.path())).unwrap(),
+        4
+    );
+    let req = request(&items, cfg.clone(), b.path());
+    let flag = req.cancel.clone();
+    on_cpu(|| {
+        trainer_with(None)
+            .train(&req, &mut |p| {
+                if let candle_gen::gen_core::TrainingProgress::Training { step: 1, .. } = p {
+                    flag.cancel();
+                }
+            })
+            .unwrap()
+    });
+    // Rewrite the interrupted checkpoint's state.json into the pre-sc-25689 shape.
+    let state_path = latest(b.path()).join("state.json");
+    let mut v: Json = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let o = v.as_object_mut().unwrap();
+    for k in [
+        "data_position",
+        "stage",
+        "parent_stage",
+        "dist",
+        "repa_projector",
+        "grad_scaler",
+    ] {
+        o.remove(k);
+    }
+    let id = o["data_identity"].as_str().unwrap().to_string();
+    assert!(
+        id.starts_with("image_size=") && !id.contains("batch="),
+        "{id}"
+    );
+    let legacy = id.replacen(";seed=", ";batch=1;accum=1;seed=", 1);
+    o.insert("data_identity".into(), json!(legacy));
+    std::fs::write(&state_path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let old = read_checkpoint_state(&latest(b.path())).unwrap();
+    assert!(old.data_position.is_none() && old.legacy_batch() == Some((1, 1)));
+    assert_eq!(old.step, 1);
+
+    cfg.resume = true;
+    assert_eq!(
+        train(t.as_mut(), &request(&items, cfg, b.path())).unwrap(),
+        4
+    );
+    let (la, lb) = (latest(a.path()), latest(b.path()));
+    let (mut sa, mut sb) = (
+        read_checkpoint_state(&la).unwrap(),
+        read_checkpoint_state(&lb).unwrap(),
+    );
+    // The cursors are equivalent, not equal: a resumed walk records its re-split plan (upstream's
+    // `load_resume_state` does the same) — both have walked the whole epoch.
+    let left = |s: &Json| {
+        let covered: u64 = s["ranges_by_rank"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[1].as_u64().unwrap() - r[0].as_u64().unwrap())
+            .sum();
+        covered - s["samples_per_rank"].as_u64().unwrap()
+    };
+    let (pa, pb) = (
+        sa.data_position.take().unwrap(),
+        sb.data_position.take().unwrap(),
+    );
+    assert_eq!((left(&pa), left(&pb)), (0, 0), "{pa} / {pb}");
+    assert_eq!(sa, sb, "the resumed legacy checkpoint continues exactly");
+    for f in [
+        "trainable.safetensors",
+        "ema.safetensors",
+        "optimizer.safetensors",
+    ] {
+        assert_eq!(
+            std::fs::read(la.join(f)).unwrap(),
+            std::fs::read(lb.join(f)).unwrap(),
+            "{f}: the resumed run's state equals the uninterrupted one's"
+        );
+    }
 }

@@ -10,7 +10,8 @@
 //! * `[H, W]` map after the bilinear resize back: 1e-4;
 //! * presentation adapters: `colorize_inferno` vs upstream `colorize` within ≤ 4 RGB levels.
 //!
-//! The bf16 release policy (upstream's CUDA autocast) is held to 5e-2 on the GPU stream.
+//! The bf16 release policy (upstream's CUDA autocast) is held to 5e-2 (every case runs in a
+//! CPU-default child process, sc-25689: no op reaches the GPU).
 
 use mlx_gen::gen_core::iris::depth::{
     colorize_inferno, plan_depth_input, prepare_depth_input, DepthMap, DepthRequest,
@@ -71,6 +72,13 @@ fn map_array(map: &DepthMap) -> Array {
 
 #[test]
 fn depth_matches_upstream_stage_by_stage() {
+    crate::common::cpu_process(
+        "depth_parity::depth_matches_upstream_stage_by_stage",
+        depth_matches_upstream_stage_by_stage_body,
+    );
+}
+
+fn depth_matches_upstream_stage_by_stage_body() {
     on_cpu(|| {
         let golden = fixture("iris_depth_golden.safetensors");
         let spec = {
@@ -161,6 +169,13 @@ fn depth_matches_upstream_stage_by_stage() {
 
 #[test]
 fn bf16_release_policy_tracks_upstream() {
+    crate::common::cpu_process(
+        "depth_parity::bf16_release_policy_tracks_upstream",
+        bf16_release_policy_tracks_upstream_body,
+    );
+}
+
+fn bf16_release_policy_tracks_upstream_body() {
     let golden = fixture("iris_depth_golden.safetensors");
     let export = TaskExport::from_dir(&export_dir(), IrisTask::Depth, DEPTH_MODEL_ID).unwrap();
     let model = load_depth_export(export, Dtype::Bfloat16).unwrap();
@@ -176,6 +191,13 @@ fn bf16_release_policy_tracks_upstream() {
 
 #[test]
 fn the_depth_task_resolves_only_its_own_closure() {
+    crate::common::cpu_process(
+        "depth_parity::the_depth_task_resolves_only_its_own_closure",
+        the_depth_task_resolves_only_its_own_closure_body,
+    );
+}
+
+fn the_depth_task_resolves_only_its_own_closure_body() {
     let refusal = |spec: &LoadSpec| match load(spec) {
         Err(mlx_gen::gen_core::Error::Unsupported(m)) => m,
         Err(other) => panic!("expected a typed refusal, got {other}"),

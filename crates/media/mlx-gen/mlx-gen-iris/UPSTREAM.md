@@ -125,9 +125,9 @@ LyCORIS parameterizations over the frozen upstream Linears, under the same objec
 | Holdout validation: items flagged `model_options.split = "holdout"`, the frozen `(noise, t)` grid (`VAL_GRID_SEED`, `VAL_T_STRIDE`), `val_every_steps`, `val_samples`, banded `val/loss_t0..3` | `trainer.py` `_val_loss` | `train::holdout`, `Run::validate_holdout` → `<checkpoints>/metrics.jsonl` | same | ported; grid noise exact, per-sample loss 1e-5 |
 | Metrics (`log_every`, `log_block_grad_norms`, REPA raw / weighted / total, loss scale) | `trainer.py` | `<checkpoints>/metrics.jsonl` (run header, steps, grad groups, validation) | same | ported (upload to a tracker is the product layer's) |
 | fp16 mixed precision with `GradScaler` (65536, ×2 per 2000 clean steps, ×0.5 and skip on overflow) | accelerate | `MixedPrecision::Fp16` + `GradScaler`, checkpointed | CUDA only (candle's CPU backend has no half GEMM: refused typed there) | ported |
-| `resume_optimizer` full / core (a new REPA projector starts cold); `save_every_epochs`; retention | `trainer.py` | `check_resume`, `Run::prepare` | same | ported |
-| Distributed: DDP and FSDP2 (`full`, `grad_op`, `hybrid`, `hybrid_grad_op`), mesh resolution, `param_dtype` (the gathered forward copy rounded), `reduce_dtype` (rank-order reductions, bf16 rounding), `expected_global_batch` = batch × world × accum, `scale_warmup_by_world`, `checkpoint_io` rank0 / per_node / dcp, resharding a checkpoint to another world | `train/parallel.py`, `world.py`, `trainer.py` | `train::dist` (backend-neutral plan, `Collective`, the host `TcpCollective`); MLX transports `mlx_ring` / `mlx_jaccl` / `mlx_mpi` / `mlx_any` (MLX's own collectives on the CPU stream, behind a bounded TCP liveness barrier) | the host TCP transport (no NCCL: the repo had no distributed primitives and Windows has no NCCL); the MLX transports refused typed | ported; see *Curricula and distributed training* below |
-| Invalid meshes, a global-batch mismatch, a split world, a lost / stalled rank, a desynchronized collective | `parallel.py`, `world.py` | typed `DistError` (`InvalidMesh`, `GlobalBatchMismatch`, `SplitWorld`, `RankLost`, `Desync`, `Unsupported`) at `Trainer::train`, every wait bounded by `dist.world.timeout_secs` | same | ported; multi-process tests below |
+| `resume_optimizer` full / core (a new REPA projector starts cold; a projector the resumed run drops — `repa.weight: 0` — is refused under `full` on a replicated (`ddp`) run, as upstream's `_validate_optimizer_layout` refuses the changed parameter routing (`ckpt.py`), and dropped on an FSDP2 run, as upstream's `_drop_stale_aux_group` forgets it (`trainer.py`); `core` resumes without it either way); `save_every_epochs`; retention; exact resume of a pre-sc-25689 checkpoint (no `data_position`: its identity's saved `batch` / `accum` rebuild the legacy identity and cursor) | `trainer.py`, `train/ckpt.py` | `check_resume`, `Run::prepare` | same | ported |
+| Distributed: DDP and FSDP2 (`full`, `grad_op`, `hybrid`, `hybrid_grad_op`), mesh resolution, `param_dtype` (the gathered forward copy rounded), `reduce_dtype` (rank-order reductions, bf16 rounding), `expected_global_batch` = batch × world × accum, `scale_warmup_by_world`, `checkpoint_io` rank0 / per_node / dcp, resharding a checkpoint to another world | `train/parallel.py`, `world.py`, `trainer.py` | `train::dist` (backend-neutral plan, `Collective`, the host `TcpCollective`); MLX transports `mlx_ring` / `mlx_jaccl` / `mlx_mpi` / `mlx_any` (MLX's own collectives on the CPU stream, behind a bounded TCP liveness barrier, each run on a worker thread waited on for at most the timeout — a rank lost inside an MLX collective is a typed `RankLost`; the blocked worker is abandoned and the process must exit) | the host TCP transport (no NCCL: the repo had no distributed primitives and Windows has no NCCL); the MLX transports refused typed | ported; see *Curricula and distributed training* below |
+| Invalid meshes, a global-batch mismatch, a split world, a lost / stalled rank, a desynchronized collective | `parallel.py`, `world.py` | typed `DistError` (`InvalidMesh`, `GlobalBatchMismatch`, `SplitWorld`, `RankLost`, `Desync`, `Unsupported`) at `Trainer::train`, every wait bounded by `dist.world.timeout_secs` (default 5400 s, upstream's process-group timeout); the TCP rendezvous drops connections that are not a rank of the job (malformed, another protocol, a wrong `SCENEWORKS_DIST_TOKEN` per-job secret, an out-of-range or duplicate rank) and keeps accepting; no frame is allocated from an untrusted length (bounded by what the receiver knows: 4 KiB hellos, exact reduce payloads, gather shards ≤ shard 0), and mismatched member payloads (length, op, precision, barrier tag) are a `Desync` | same | ported; multi-process tests below |
 
 ### Curricula and distributed training (sc-25689)
 
@@ -167,11 +167,14 @@ exits, or stalls, surfaces on the survivor as `RankLost` (the stall naming the t
 nothing hangs; invalid meshes / a global-batch mismatch / an MLX transport on Candle are typed
 refusals. Multi-host MLX (two Macs over ring or JACCL) is supported by the hostfile path but is not
 exercised: the only machine this story may load is nax-macos-2. On candle/CUDA a rank trains on
-`cuda:<local_rank>` (upstream's `world.py`), sharing the build's device when that ordinal has no
-GPU. The `iris-curricula-cuda` lane runs the same tests on the Windows CUDA box (two RTX PRO 6000
-Blackwell, 96 GB each, per `nvidia-smi`), whose runner listener exposes one of them to CUDA
-(`cuda:1` is an invalid ordinal there), so both ranks share that card — over the host TCP transport
-(no NCCL on Windows).
+`cuda:<local_rank>` (upstream's `world.py`); a rank whose ordinal has no GPU is a typed
+`InvalidMesh` refusal unless the run opts into `dist.world.share_device` (several ranks on one
+card — same semantics, shared memory and compute; never a silent fallback). The
+`iris-curricula-cuda` lane runs the same tests on the Windows CUDA box (two RTX PRO 6000 Blackwell,
+96 GB each, per `nvidia-smi`), whose runner listener exposes one of them to CUDA (`cuda:1` is an
+invalid ordinal there): it proves the refusal on one visible card, then runs the multi-rank
+scenarios with `share_device` on — both ranks on that card, over the host TCP transport (no NCCL on
+Windows).
 
 **Real weights (dispatch-only):** `iris-curricula-mlx` (`mlx-iris-curricula-train`, nax-macos-2)
 and `iris-curricula-cuda` (`candle-iris-curricula`) run the release teacher against upstream and the
@@ -333,7 +336,7 @@ unless at its default.
 | `train.sample_every_steps` | honored | TrainingConfig::sample_every (× grad_accum) + iris.preview_at_step_one |
 | `train.val_every_steps` | honored | iris.val_every_steps |
 | `train.val_samples` | honored | iris.val_samples |
-| `train.validation_prompts` | honored | TrainingConfig::sample_prompts (≤ 4) or iris.upstream_validation_prompts (the default seven) |
+| `train.validation_prompts` | honored | iris.upstream_validation_prompts (true: the default seven; a list: the config's own — every prompt, uncapped) |
 | `train.nan_loss_tolerance` | honored | iris.nan_loss_tolerance |
 | `train.perf.foreach_ema` | mapped | multi-tensor EMA kernels; the native EMA update is the same elementwise blend |
 | `train.perf.fused_adamw` | mapped | torch's fused AdamW kernel; the native AdamW is the same update |

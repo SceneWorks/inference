@@ -780,3 +780,225 @@ fn micro_step_fields_convert_to_optimizer_steps() {
         );
     }
 }
+
+/// A tiny backbone whose `model` section carries `extra` (e.g. a stage-1 export's
+/// `rope_aspect: square`) and a trunk deep enough for upstream's default REPA layer.
+fn tiny_config_with(extra: &str) -> IrisConfig {
+    IrisConfig::parse(&format!(
+        "model:\n  dual_depth: 2\n  hidden_size: 64\n  depth: 12\n  num_heads: 4\n  num_kv_heads: 2\n  \
+         patch_size: 4\n  text_dim: 32\n  text_len: 10\n  text_lap_num_heads: 4\n{extra}  pixel:\n    \
+         depth: 2\n    hidden_size: 8\n    attn_hidden_size: 32\n    num_heads: 2\n\
+         text_encoder:\n  dim: 32\n  max_length: 10\n"
+    ))
+    .unwrap()
+}
+
+/// A translated config made runnable on one local process (the stage's world / batch assertions
+/// replaced; nothing else touched).
+fn single_process(mut cfg: TrainingConfig) -> TrainingConfig {
+    let o = cfg
+        .model_options
+        .get_mut(OPTIONS_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    o.insert("dist".into(), json!({}));
+    o.remove("expected_global_batch");
+    cfg
+}
+
+/// A stage-2 run translated from upstream's stage YAML trains upstream's merged `rope_aspect`
+/// (`isotropic`, the default the YAML leaves alone) even when the provisioned backbone is a stage-1
+/// export that carries `rope_aspect: square`.
+#[test]
+fn a_translated_stage_trains_upstreams_rope_aspect_not_the_backbones() {
+    let backbone = tiny_config_with("  rope_aspect: square\n");
+    assert_eq!(backbone.model.rope_aspect, "square");
+    let cfg = single_process(
+        upstream::stage_preset_config("stage2_512", TrainingConfig::default()).unwrap(),
+    );
+    let plan = IrisTrainPlan::resolve(&request(cfg), &backbone, &defaults(), &[]).unwrap();
+    assert_eq!(plan.rope_aspect, "isotropic");
+    // stage 1 names `square` explicitly
+    let cfg = single_process(
+        upstream::stage_preset_config("stage1_256", TrainingConfig::default()).unwrap(),
+    );
+    let backbone = tiny_config_with("");
+    let plan = IrisTrainPlan::resolve(&request(cfg), &backbone, &defaults(), &[]).unwrap();
+    assert_eq!(plan.rope_aspect, "square");
+}
+
+/// Every honored key a translated config leaves at upstream's default resolves to upstream's
+/// merged default — never to the provisioned backbone's value (the default-carryover class). The
+/// backbone here disagrees with upstream on every key it could leak.
+#[test]
+fn translated_defaults_resolve_to_upstreams_merged_values_not_the_backbones() {
+    let leaves = upstream::default_leaves().unwrap();
+    let up = |k: &str| upstream::to_json(&leaves[k]);
+    let backbone = tiny_config_with("  rope_aspect: square\n  repa_layer: 4\n");
+    let flow = TrainFlowDefaults::parse(
+        "flow:\n  shift: 1.5\n  timestep_sampler: uniform\n  logit_mean: 0.7\n  logit_std: 2.5\n  \
+         x_pred_sigma_min: 0.3\n  shift_base_tokens: 999\nmodel:\n  repa_layer: 4\n",
+    )
+    .unwrap();
+    // REPA on (its other keys at upstream's defaults) so the capture layer resolves.
+    let t =
+        upstream::translate_upstream(None, &["repa.weight=0.5".into()], TrainingConfig::default())
+            .unwrap();
+    let plan = IrisTrainPlan::resolve(&request(t.config), &backbone, &flow, &[]).unwrap();
+    assert_eq!(json!(plan.rope_aspect), up("model.rope_aspect"));
+    let repa = plan.repa.as_ref().expect("repa.weight > 0");
+    assert_eq!(json!(repa.layer), up("model.repa_layer"));
+    assert_eq!(json!(repa.variant.as_str()), up("repa.variant"));
+    assert_eq!(
+        json!(repa.spatial_norm_gamma),
+        up("repa.spatial_norm_gamma")
+    );
+    assert_eq!(json!(repa.teacher.entrypoint), up("repa.teacher"));
+    assert_eq!(json!(repa.teacher_dim), up("repa.teacher_dim"));
+    assert_eq!(json!(repa.proj_hidden_dim), up("repa.proj_hidden_dim"));
+    assert_eq!(
+        json!(repa.teacher_image_size),
+        up("repa.teacher_image_size")
+    );
+    assert_eq!(
+        json!(repa.teacher_match_student),
+        up("repa.teacher_match_student")
+    );
+    let f = &plan.flow;
+    assert_eq!(json!(f.base_shift), up("flow.shift"));
+    assert_eq!(json!(f.shift_law), up("flow.shift_law"));
+    assert_eq!(json!(f.shift_base_tokens), up("flow.shift_base_tokens"));
+    assert_eq!(json!(f.x_pred_sigma_min), up("flow.x_pred_sigma_min"));
+    assert_eq!(json!(f.num_train_timesteps), up("flow.num_train_timesteps"));
+    assert_eq!(
+        f.sampler,
+        TimestepSampler::LogitNormal {
+            mean: up("flow.logit_mean").as_f64().unwrap(),
+            std: up("flow.logit_std").as_f64().unwrap(),
+        }
+    );
+    assert_eq!(json!(prediction_name(f.prediction)), up("flow.prediction"));
+    assert_eq!(json!(plan.image_size), up("data.image_size"));
+    assert_eq!(json!(plan.batch_size), up("train.batch_size"));
+    assert_eq!(json!(plan.grad_accum), up("train.grad_accum_steps"));
+    assert_eq!(json!(plan.seed), up("train.seed"));
+    assert_eq!(json!(plan.gradient_clip), up("train.gradient_clip"));
+    assert_eq!(json!(plan.text_dropout), up("train.text_dropout"));
+    assert_eq!(json!(plan.ema), up("train.ema.decay"));
+    assert_eq!(
+        json!(plan.nan_loss_tolerance),
+        up("train.nan_loss_tolerance")
+    );
+    assert_eq!(json!(plan.caption_field), up("data.caption_field"));
+    assert_eq!(
+        json!(plan.on_caption_overflow),
+        up("text_encoder.on_caption_overflow")
+    );
+    assert_eq!(
+        json!(plan.keep_last_checkpoints),
+        up("train.keep_last_checkpoints")
+    );
+    assert_eq!(json!(plan.log_every), up("train.log_every"));
+    assert_eq!(json!(plan.save_every_epochs), up("train.save_every_epochs"));
+    assert_eq!(json!(plan.holdout.samples), up("train.val_samples"));
+    assert_eq!(json!(plan.preview_order), up("sample.order"));
+    assert_eq!(
+        json!(plan.optimizer.kind.as_str()),
+        up("train.optimizer.name")
+    );
+    assert_eq!(
+        plan.preview.prompts,
+        DEFAULT_VALIDATION_PROMPTS.to_vec(),
+        "the default validation prompts"
+    );
+}
+
+/// A translated config's own validation prompts render — every one, as upstream does (no cap).
+#[test]
+fn translated_custom_validation_prompts_are_all_rendered() {
+    let t = upstream::translate_upstream(
+        None,
+        &["train.validation_prompts=[a, b, c, d, e, f]".into()],
+        TrainingConfig::default(),
+    )
+    .unwrap();
+    let plan = IrisTrainPlan::resolve(&request(t.config), &tiny_config_with(""), &defaults(), &[])
+        .unwrap();
+    assert_eq!(plan.preview.prompts, ["a", "b", "c", "d", "e", "f"]);
+    assert!(plan.preview.every > 0);
+}
+
+/// A pre-sc-25689 checkpoint (no `data_position`, `batch=…;accum=…` in its data identity) resumes
+/// exactly — at its saved micro-batch, even when the run's micro-batch changed — and still refuses a
+/// changed data shaping.
+#[test]
+fn a_legacy_checkpoint_resumes_exactly_and_a_dropped_projector_needs_core() {
+    let cfg = tiny_config();
+    let plan = IrisTrainPlan::resolve(&request(base_cfg()), &cfg, &defaults(), &linears()).unwrap();
+    // The identity the pre-sc-25689 trainer wrote for this request at batch 3, accum 1
+    // (`git show feature/sc-25678-iris-3b:…/train.rs` `data_identity`).
+    let legacy_id = format!(
+        "image_size=16;batch=3;accum=1;seed={};caption_field=caption;caption_fields=[];\
+         text_dropout={};sampler={:?};prediction=v;shift={}",
+        plan.seed, plan.text_dropout, plan.flow.sampler, plan.flow.shift
+    );
+    assert_eq!(plan.legacy_data_identity(3, 1), legacy_id);
+    let saved = CheckpointState {
+        step: 2,
+        epoch: 1,
+        batches_consumed: 2,
+        scheduler_step: 2,
+        lr: 1e-4,
+        nan_count: 0,
+        last_loss: 0.1,
+        artifact: "lora".into(),
+        optimizer: "adamw".into(),
+        ema_decay: Some(0.9999),
+        seed: 0,
+        backend: "mlx".into(),
+        state_identity: plan.state_identity(),
+        data_identity: legacy_id,
+        dataset_fingerprint: "ds".into(),
+        base_identity: "base".into(),
+        task: IrisTask::Generation,
+        stage: None,
+        parent_stage: None,
+        data_position: None,
+        dist: None,
+        repa_projector: None,
+        grad_scaler: None,
+    };
+    assert_eq!(saved.legacy_batch(), Some((3, 1)));
+    assert_ne!(
+        plan.batch_size, 3,
+        "the run's micro-batch differs from the saved one"
+    );
+    check_resume(&saved, &plan, "ds", "base").unwrap();
+    let mut shifted = plan.clone();
+    shifted.text_dropout = 0.5;
+    let e = check_resume(&saved, &shifted, "ds", "base").unwrap_err();
+    assert!(e.to_string().contains("new_phase"), "{e}");
+    // a current checkpoint never reads as legacy
+    let mut current = saved.clone();
+    current.data_position = Some(json!({}));
+    assert_eq!(current.legacy_batch(), None);
+
+    // A checkpoint with a REPA projector resumed by a run without REPA: a full optimizer resume
+    // refuses (upstream's routed-layout check), `core` resumes without it.
+    let mut with_projector = saved.clone();
+    with_projector.data_identity = plan.data_identity();
+    with_projector.repa_projector = Some("repa:64:32:384".into());
+    let e = check_resume(&with_projector, &plan, "ds", "base").unwrap_err();
+    assert!(
+        matches!(&e, Error::Unsupported(m) if m.contains("resume_optimizer: core")),
+        "{e}"
+    );
+    let mut core = plan.clone();
+    core.resume_optimizer_core = true;
+    check_resume(&with_projector, &core, "ds", "base").unwrap();
+    // an FSDP2 run forgets the stale projector group, as upstream's sharded load does
+    let mut sharded = plan.clone();
+    sharded.dist.strategy = dist::Strategy::Fsdp2;
+    assert!(sharded.dist.sharded());
+    check_resume(&with_projector, &sharded, "ds", "base").unwrap();
+}

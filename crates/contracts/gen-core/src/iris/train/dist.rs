@@ -331,6 +331,29 @@ pub struct World {
     pub hostfile: Option<String>,
     /// Bound on every transport wait.
     pub timeout: Duration,
+    /// The per-job rendezvous secret ([`DIST_TOKEN_ENV`]): every rank presents it in its hello and
+    /// the coordinator drops a connection whose token differs. `None` = no secret (any peer that
+    /// speaks the protocol and names a free rank joins — only safe on a trusted network).
+    pub token: Option<DistToken>,
+    /// `dist.world.share_device`: an explicit opt-in to run several ranks on one accelerator when
+    /// a rank's own device (`cuda:<local_rank>`) does not exist — same semantics, shared memory
+    /// and compute. Off: such a rank is refused ([`DistError::InvalidMesh`]), never silently
+    /// folded onto another rank's device.
+    pub share_device: bool,
+}
+
+/// The environment variable carrying the per-job rendezvous secret ([`World::token`]). It is read
+/// from the environment (never from the run config, which is persisted) by [`parse_dist`].
+pub const DIST_TOKEN_ENV: &str = "SCENEWORKS_DIST_TOKEN";
+
+/// A rendezvous secret; its `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DistToken(pub String);
+
+impl std::fmt::Debug for DistToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DistToken(<redacted>)")
+    }
 }
 
 impl World {
@@ -349,6 +372,8 @@ impl World {
             transport: "tcp".into(),
             hostfile: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            token: None,
+            share_device: false,
         }
     }
 
@@ -357,9 +382,11 @@ impl World {
     }
 }
 
-/// The default bound on a collective wait (seconds). Upstream's process-group timeout is 5400 s;
-/// natively the bound is per transport wait and configurable (`dist.world.timeout_secs`).
-pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// The default bound on a collective wait (seconds) — upstream's process-group timeout (5400 s),
+/// so rank-0-only work between collectives (previews, consolidated checkpoint / export writes)
+/// never reads as a lost rank where upstream would wait. Natively the bound is per transport wait
+/// and configurable (`dist.world.timeout_secs`).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5400;
 
 const LOOPBACK: [&str; 6] = [
     "localhost",
@@ -791,6 +818,7 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
             "transport",
             "hostfile",
             "timeout_secs",
+            "share_device",
         ],
     )?;
     let u = |k: &str, d: u64| -> Result<u64> { Ok(uint(obj, k, "dist.world")?.unwrap_or(d)) };
@@ -847,6 +875,11 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
         transport,
         hostfile: str_of("hostfile")?,
         timeout: Duration::from_secs(timeout),
+        token: std::env::var(DIST_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(DistToken),
+        share_device: boolean(obj, "share_device", "dist.world")?.unwrap_or(false),
     })
 }
 
@@ -1051,10 +1084,37 @@ const OP_BCAST: u8 = 3;
 const OP_BARRIER: u8 = 4;
 const OP_REDUCE64: u8 = 5;
 
+/// The largest hello (or rendezvous answer) a connection may send before it is admitted.
+const HELLO_MAX: usize = 4096;
+/// The longest the coordinator waits for one accepted connection's hello before dropping it (a
+/// silent connection must not stall the rendezvous of the real ranks).
+const HELLO_WAIT: Duration = Duration::from_secs(10);
+/// The rendezvous answer that admits a rank.
+const ADMITTED: &[u8] = b"ok";
+/// The prefix of the answer that refuses an authenticated rank whose world disagrees.
+const REFUSED: &[u8] = b"refused: ";
+
 /// A host-staged collective over TCP: rank 0 coordinates (every rank holds one connection to it);
-/// each collective is "every rank sends its contribution, the coordinator reduces per group in rank
-/// order and answers every rank". Every socket wait is bounded by the world's timeout; an EOF, an
-/// error or an expired wait is a [`DistError::RankLost`] naming the peer and the operation.
+/// each collective is "every rank sends its contribution, the coordinator validates and reduces per
+/// group in rank order and answers every rank". Every socket wait is bounded by the world's
+/// timeout; an EOF, an error or an expired wait is a [`DistError::RankLost`] naming the peer and
+/// the operation; a frame of the wrong kind, sequence, size, op or precision is a
+/// [`DistError::Desync`].
+///
+/// **Frame sizes.** A frame's length prefix is never trusted for allocation: a frame is refused
+/// ([`DistError::Desync`]) when it exceeds the bound the receiver knows locally (a hello: 4 KiB; an
+/// all-reduce contribution: exactly the coordinator's own; an all-gather contribution: at most the
+/// coordinator's own — every caller gathers `torch.chunk` row shards, and shard 0, which the
+/// coordinator holds, is the largest; a barrier: the tag), and every payload is read incrementally,
+/// so memory grows only with the bytes that actually arrive (a lying prefix on an answer whose size
+/// the receiver cannot know — a gather result, a broadcast — ends in the bounded wait).
+///
+/// **Rendezvous.** The coordinator keeps accepting until every rank joined or the deadline passed;
+/// a connection that sends no hello in time, a malformed hello, the wrong protocol, the wrong
+/// [`World::token`], an out-of-range rank or a rank that already joined is dropped and the
+/// rendezvous continues. An authenticated rank whose world description disagrees is refused (it
+/// fails fast with [`DistError::SplitWorld`]) and, when the world never completes, named in the
+/// coordinator's [`DistError::SplitWorld`].
 #[derive(Debug)]
 pub struct TcpCollective {
     world: World,
@@ -1114,12 +1174,22 @@ fn send_frame(
     s.flush().map_err(|e| io_lost(peer, op, e))
 }
 
-fn recv_frame(s: &mut TcpStream, kind: u8, seq: u64, peer: usize, op: &str) -> Result<Vec<u8>> {
+/// Receive one frame of `kind` / `seq` holding at most `max_len` bytes. The length prefix is
+/// checked against `max_len` before anything is read, and the payload is read incrementally (no
+/// allocation sized by the untrusted prefix).
+fn recv_frame(
+    s: &mut TcpStream,
+    kind: u8,
+    seq: u64,
+    peer: usize,
+    op: &str,
+    max_len: usize,
+) -> Result<Vec<u8>> {
     let mut head = [0u8; 17];
     read_exact(s, &mut head, peer, op)?;
     let got_kind = head[0];
     let got_seq = u64::from_le_bytes(head[1..9].try_into().expect("8"));
-    let len = u64::from_le_bytes(head[9..17].try_into().expect("8")) as usize;
+    let len = u64::from_le_bytes(head[9..17].try_into().expect("8"));
     if got_kind != kind || got_seq != seq {
         return Err(DistError::Desync {
             rank: peer,
@@ -1128,9 +1198,25 @@ fn recv_frame(s: &mut TcpStream, kind: u8, seq: u64, peer: usize, op: &str) -> R
         }
         .into_error());
     }
-    let mut payload = vec![0u8; len];
-    read_exact(s, &mut payload, peer, op)?;
-    Ok(payload)
+    if len > max_len as u64 {
+        return Err(DistError::Desync {
+            rank: peer,
+            expected: format!("{op} #{seq} of at most {max_len} bytes"),
+            got: format!("a {len}-byte frame"),
+        }
+        .into_error());
+    }
+    let mut payload = Vec::new();
+    let read = (&mut *s).take(len).read_to_end(&mut payload);
+    match read {
+        Err(e) => Err(stream_lost(s, peer, op, e)),
+        Ok(n) if (n as u64) < len => Err(io_lost(
+            peer,
+            op,
+            format!("connection closed after {n} of {len} bytes"),
+        )),
+        Ok(_) => Ok(payload),
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -1161,6 +1247,14 @@ fn op_code(op: ReduceOp) -> u8 {
     }
 }
 
+fn op_of(code: u8) -> ReduceOp {
+    match code {
+        1 => ReduceOp::Min,
+        2 => ReduceOp::Max,
+        _ => ReduceOp::Sum,
+    }
+}
+
 fn prec_code(p: Precision) -> u8 {
     match p {
         Precision::Fp32 => 0,
@@ -1169,10 +1263,77 @@ fn prec_code(p: Precision) -> u8 {
     }
 }
 
+fn prec_of(code: u8) -> Precision {
+    match code {
+        1 => Precision::Bf16,
+        2 => Precision::Fp16,
+        _ => Precision::Fp32,
+    }
+}
+
+/// Byte-wise equality whose time does not depend on where the inputs differ.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Why the coordinator did not admit one accepted connection.
+enum Rejection {
+    /// Not (provably) a rank of this job: silent, malformed, another protocol, the wrong token, an
+    /// out-of-range or already-joined rank. Dropped without an answer.
+    Stranger(String),
+    /// An authenticated rank of this job whose world description disagrees: refused (it fails fast)
+    /// and reported if the world never completes.
+    Split(String),
+}
+
+/// The coordinator's check of one accepted connection's hello.
+fn admit(
+    s: &mut TcpStream,
+    world: &World,
+    peers: &[Option<TcpStream>],
+) -> std::result::Result<usize, Rejection> {
+    let stranger = |m: String| Rejection::Stranger(m);
+    let payload = recv_frame(s, 0, 0, usize::MAX, "rendezvous", HELLO_MAX)
+        .map_err(|e| stranger(format!("no valid hello: {e}")))?;
+    let v: JsonValue =
+        serde_json::from_slice(&payload).map_err(|e| stranger(format!("bad hello: {e}")))?;
+    if v["magic"].as_u64() != Some(MAGIC) {
+        return Err(stranger("it speaks another protocol".into()));
+    }
+    let theirs = v["token"].as_str().unwrap_or("");
+    let mine = world.token.as_ref().map(|t| t.0.as_str()).unwrap_or("");
+    if !same_secret(theirs.as_bytes(), mine.as_bytes()) {
+        return Err(stranger(format!(
+            "its rendezvous token ({DIST_TOKEN_ENV}) does not match"
+        )));
+    }
+    let r = match v["rank"].as_u64() {
+        Some(r) if r >= 1 && (r as usize) < world.world_size => r as usize,
+        other => return Err(stranger(format!("out-of-range rank {other:?}"))),
+    };
+    if peers[r].is_some() {
+        return Err(stranger(format!("rank {r} already joined")));
+    }
+    for (k, mine) in [
+        ("world_size", world.world_size),
+        ("local_world_size", world.local_world_size),
+        ("num_nodes", world.num_nodes),
+    ] {
+        if v[k].as_u64() != Some(mine as u64) {
+            return Err(Rejection::Split(format!(
+                "rank {r} declares {k}={} but rank 0 declares {mine}",
+                v[k]
+            )));
+        }
+    }
+    Ok(r)
+}
+
 impl TcpCollective {
     /// Join the job described by `world`: rank 0 listens on `master_addr:master_port` and accepts
-    /// `world_size − 1` peers; every other rank connects (retrying until the timeout). Each peer
-    /// announces its world description and the coordinator refuses a world that disagrees.
+    /// until `world_size − 1` ranks joined (dropping every connection that is not a rank of this
+    /// job — see the type docs); every other rank connects (retrying until the timeout) and
+    /// presents its world description and [`World::token`].
     pub fn connect(world: &World) -> Result<Self> {
         assert_single_world(world).map_err(DistError::into_error)?;
         let deadline = Instant::now() + world.timeout;
@@ -1184,6 +1345,7 @@ impl TcpCollective {
             "local_world_size": world.local_world_size,
             "num_nodes": world.num_nodes,
             "node_rank": world.node_rank,
+            "token": world.token.as_ref().map(|t| t.0.as_str()).unwrap_or(""),
         })
         .to_string();
         if world.world_size == 1 {
@@ -1201,57 +1363,63 @@ impl TcpCollective {
                 .set_nonblocking(true)
                 .map_err(|e| io_lost(0, "rendezvous", e))?;
             let mut joined = 1usize;
+            let mut dropped: Vec<String> = Vec::new();
+            let mut split: Vec<String> = Vec::new();
             while joined < world.world_size {
                 match listener.accept() {
-                    Ok((mut s, _)) => {
-                        s.set_nonblocking(false)
-                            .map_err(|e| io_lost(0, "rendezvous", e))?;
-                        configure(&s, world.timeout)?;
-                        let payload = recv_frame(&mut s, 0, 0, usize::MAX, "rendezvous")?;
-                        let v: JsonValue = serde_json::from_slice(&payload).map_err(|e| {
-                            DistError::SplitWorld(format!("bad hello: {e}")).into_error()
-                        })?;
-                        let r = v["rank"].as_u64().unwrap_or(u64::MAX) as usize;
-                        for (k, mine) in [
-                            ("world_size", world.world_size),
-                            ("local_world_size", world.local_world_size),
-                            ("num_nodes", world.num_nodes),
-                        ] {
-                            if v[k].as_u64() != Some(mine as u64) {
-                                return Err(DistError::SplitWorld(format!(
-                                    "rank {r} declares {k}={} but rank 0 declares {mine}",
-                                    v[k]
-                                ))
-                                .into_error());
+                    Ok((mut s, from)) => {
+                        let ready = s.set_nonblocking(false).is_ok()
+                            && configure(&s, world.timeout.min(HELLO_WAIT)).is_ok();
+                        let verdict = if ready {
+                            admit(&mut s, world, &peers)
+                        } else {
+                            Err(Rejection::Stranger("socket setup failed".into()))
+                        };
+                        match verdict {
+                            Ok(r) => {
+                                configure(&s, world.timeout)?;
+                                peers[r] = Some(s);
+                                joined += 1;
+                            }
+                            Err(Rejection::Stranger(why)) => {
+                                eprintln!(
+                                    "iris distributed: rendezvous dropped a connection from \
+                                     {from}: {why}"
+                                );
+                                dropped.push(format!("{from}: {why}"));
+                            }
+                            Err(Rejection::Split(why)) => {
+                                let mut answer = REFUSED.to_vec();
+                                answer.extend_from_slice(why.as_bytes());
+                                let _ = send_frame(&mut s, 0, 0, &answer, usize::MAX, "rendezvous");
+                                eprintln!("iris distributed: rendezvous refused {from}: {why}");
+                                split.push(why);
                             }
                         }
-                        if v["magic"].as_u64() != Some(MAGIC) {
-                            return Err(DistError::SplitWorld(
-                                "a peer speaks another protocol".into(),
-                            )
-                            .into_error());
-                        }
-                        if r == 0 || r >= world.world_size || peers[r].is_some() {
-                            return Err(DistError::SplitWorld(format!(
-                                "duplicate or out-of-range rank {r} joined"
-                            ))
-                            .into_error());
-                        }
-                        peers[r] = Some(s);
-                        joined += 1;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if Instant::now() > deadline {
+                            if !split.is_empty() {
+                                return Err(DistError::SplitWorld(split.join("; ")).into_error());
+                            }
                             let missing: Vec<usize> = (1..world.world_size)
                                 .filter(|&r| peers[r].is_none())
                                 .collect();
+                            let mut detail = format!(
+                                "ranks {missing:?} never joined within {:?}",
+                                world.timeout
+                            );
+                            if !dropped.is_empty() {
+                                detail.push_str(&format!(
+                                    "; dropped {} connection(s): {}",
+                                    dropped.len(),
+                                    dropped.join("; ")
+                                ));
+                            }
                             return Err(DistError::RankLost {
                                 rank: missing[0],
                                 op: "rendezvous".into(),
-                                detail: format!(
-                                    "ranks {missing:?} never joined within {:?}",
-                                    world.timeout
-                                ),
+                                detail,
                             }
                             .into_error());
                         }
@@ -1263,7 +1431,7 @@ impl TcpCollective {
             // Release every peer only once the whole world joined.
             for (r, peer) in peers.iter_mut().enumerate().skip(1) {
                 let s = peer.as_mut().expect("joined");
-                send_frame(s, 0, 0, b"ok", r, "rendezvous")?;
+                send_frame(s, 0, 0, ADMITTED, r, "rendezvous")?;
             }
         } else {
             let addr = resolve(&world.master_addr, world.master_port)?;
@@ -1280,9 +1448,13 @@ impl TcpCollective {
             };
             configure(&stream, world.timeout)?;
             send_frame(&mut stream, 0, 0, hello.as_bytes(), 0, "rendezvous")?;
-            let ok = recv_frame(&mut stream, 0, 0, 0, "rendezvous")?;
-            if ok != b"ok" {
-                return Err(DistError::SplitWorld("rendezvous refused".into()).into_error());
+            let answer = recv_frame(&mut stream, 0, 0, 0, "rendezvous", HELLO_MAX)?;
+            if answer != ADMITTED {
+                let why = answer
+                    .strip_prefix(REFUSED)
+                    .map(|w| String::from_utf8_lossy(w).into_owned())
+                    .unwrap_or_else(|| "rendezvous refused".into());
+                return Err(DistError::SplitWorld(why).into_error());
             }
             peers[0] = Some(stream);
         }
@@ -1298,13 +1470,19 @@ impl TcpCollective {
         self.seq
     }
 
-    /// Coordinator side of one exchange: gather every rank's payload, compute every rank's answer
-    /// with `answer(rank, payloads)`, send it.
+    /// One exchange. A peer sends `mine` and receives its answer (at most `answer_max` bytes). The
+    /// coordinator receives every member's payload (at most `member_max(rank)` bytes), validates it
+    /// against its own with `check(mine, theirs)` (an `Err` names what the member sent → a
+    /// [`DistError::Desync`]), then answers every rank with `answer(rank, payloads)`.
+    #[allow(clippy::too_many_arguments)]
     fn coordinate(
         &mut self,
         kind: u8,
         mine: Vec<u8>,
         op: &str,
+        member_max: impl Fn(usize) -> usize,
+        answer_max: usize,
+        check: impl Fn(&[u8], &[u8]) -> std::result::Result<(), String>,
         answer: impl Fn(usize, &[Vec<u8>]) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
         let seq = self.next_seq();
@@ -1314,12 +1492,21 @@ impl TcpCollective {
         if self.world.rank != 0 {
             let s = self.peers[0].as_mut().expect("connected");
             send_frame(s, kind, seq, &mine, 0, op)?;
-            return recv_frame(s, kind, seq, 0, op);
+            return recv_frame(s, kind, seq, 0, op, answer_max);
         }
         let mut payloads = vec![mine];
         for r in 1..self.world.world_size {
             let s = self.peers[r].as_mut().expect("connected");
-            payloads.push(recv_frame(s, kind, seq, r, op)?);
+            let p = recv_frame(s, kind, seq, r, op, member_max(r))?;
+            check(&payloads[0], &p).map_err(|got| {
+                DistError::Desync {
+                    rank: r,
+                    expected: format!("{op} #{seq} matching rank 0"),
+                    got,
+                }
+                .into_error()
+            })?;
+            payloads.push(p);
         }
         for r in 1..self.world.world_size {
             let out = answer(r, &payloads);
@@ -1327,6 +1514,28 @@ impl TcpCollective {
             send_frame(s, kind, seq, &out, r, op)?;
         }
         Ok(answer(0, &payloads))
+    }
+}
+
+/// The coordinator's check of an all-reduce contribution: `header` op / precision bytes and the
+/// payload length must equal its own.
+fn same_reduce(header: usize) -> impl Fn(&[u8], &[u8]) -> std::result::Result<(), String> {
+    move |mine, theirs| {
+        if theirs.len() != mine.len() {
+            return Err(format!(
+                "{} bytes of values (rank 0 has {})",
+                theirs.len().saturating_sub(header),
+                mine.len() - header
+            ));
+        }
+        if theirs[..header] != mine[..header] {
+            return Err(format!(
+                "op/precision bytes {:?} (rank 0 has {:?})",
+                &theirs[..header],
+                &mine[..header]
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1370,45 +1579,59 @@ impl Collective for TcpCollective {
     ) -> Result<()> {
         let mut msg = vec![op_code(op), prec_code(precision)];
         msg.extend(f32_bytes(data));
+        let len = msg.len();
         let parts = groups.clone();
-        let out = self.coordinate(OP_REDUCE, msg, "all_reduce", move |rank, payloads| {
-            let members = parts.members(rank);
-            let vals: Vec<Vec<f32>> = members
-                .iter()
-                .map(|&m| bytes_f32(&payloads[m][2..]))
-                .collect();
-            let refs: Vec<&[f32]> = vals.iter().map(Vec::as_slice).collect();
-            let op = match payloads[0][0] {
-                1 => ReduceOp::Min,
-                2 => ReduceOp::Max,
-                _ => ReduceOp::Sum,
-            };
-            let prec = match payloads[0][1] {
-                1 => Precision::Bf16,
-                2 => Precision::Fp16,
-                _ => Precision::Fp32,
-            };
-            f32_bytes(&reduce_in_rank_order(&refs, op, prec))
-        })?;
-        let v = bytes_f32(&out);
-        if v.len() != data.len() {
+        let out = self.coordinate(
+            OP_REDUCE,
+            msg,
+            "all_reduce",
+            |_| len,
+            4 * data.len(),
+            same_reduce(2),
+            move |rank, payloads| {
+                let members = parts.members(rank);
+                let vals: Vec<Vec<f32>> = members
+                    .iter()
+                    .map(|&m| bytes_f32(&payloads[m][2..]))
+                    .collect();
+                let refs: Vec<&[f32]> = vals.iter().map(Vec::as_slice).collect();
+                let op = op_of(payloads[0][0]);
+                let prec = prec_of(payloads[0][1]);
+                f32_bytes(&reduce_in_rank_order(&refs, op, prec))
+            },
+        )?;
+        if out.len() != 4 * data.len() {
             return Err(DistError::Desync {
                 rank: self.world.rank,
                 expected: format!("{} elements", data.len()),
-                got: format!("{} elements", v.len()),
+                got: format!("{} bytes", out.len()),
             }
             .into_error());
         }
-        data.copy_from_slice(&v);
+        data.copy_from_slice(&bytes_f32(&out));
         Ok(())
     }
 
+    /// Contributions are `torch.chunk` row shards of one tensor (every caller's use): none may be
+    /// larger than the coordinator's own (shard 0, the largest) — a larger one is a
+    /// [`DistError::Desync`].
     fn all_gather(&mut self, data: &[f32], groups: &Partition) -> Result<Vec<Vec<f32>>> {
         let parts = groups.clone();
+        let mine = f32_bytes(data);
+        let bound = mine.len();
         let out = self.coordinate(
             OP_GATHER,
-            f32_bytes(data),
+            mine,
             "all_gather",
+            |_| bound,
+            usize::MAX,
+            |_, theirs| {
+                if theirs.len() % 4 == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("{} bytes (not whole f32 values)", theirs.len()))
+                }
+            },
             move |rank, payloads| {
                 let mut buf = Vec::new();
                 for m in parts.members(rank) {
@@ -1418,53 +1641,113 @@ impl Collective for TcpCollective {
                 buf
             },
         )?;
+        let malformed = || {
+            DistError::Desync {
+                rank: 0,
+                expected: "an all_gather answer of length-prefixed f32 runs".into(),
+                got: format!("{} malformed bytes", out.len()),
+            }
+            .into_error()
+        };
         let mut res = Vec::new();
         let mut i = 0;
         while i < out.len() {
-            let n = u64::from_le_bytes(out[i..i + 8].try_into().expect("8")) as usize;
+            let head = out.get(i..i + 8).ok_or_else(malformed)?;
+            let n = u64::from_le_bytes(head.try_into().expect("8")) as usize;
             i += 8;
-            res.push(bytes_f32(&out[i..i + 4 * n]));
-            i += 4 * n;
+            let end = n
+                .checked_mul(4)
+                .and_then(|b| b.checked_add(i))
+                .filter(|&e| e <= out.len())
+                .ok_or_else(malformed)?;
+            res.push(bytes_f32(&out[i..end]));
+            i = end;
         }
         Ok(res)
     }
 
     fn broadcast(&mut self, data: &mut Vec<u8>, root: usize) -> Result<()> {
-        let mine = if self.world.rank == root {
-            data.clone()
-        } else {
-            Vec::new()
-        };
-        let out = self.coordinate(OP_BCAST, mine, "broadcast", move |_, payloads| {
-            payloads[root].clone()
-        })?;
+        let mut mine = (root as u64).to_le_bytes().to_vec();
+        if self.world.rank == root {
+            mine.extend_from_slice(data);
+        }
+        let out = self.coordinate(
+            OP_BCAST,
+            mine,
+            "broadcast",
+            |r| if r == root { usize::MAX } else { 8 },
+            usize::MAX,
+            |mine, theirs| {
+                if theirs.get(..8) == Some(&mine[..8]) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "a broadcast from another root ({:?})",
+                        theirs.get(..8)
+                    ))
+                }
+            },
+            move |_, payloads| payloads[root][8..].to_vec(),
+        )?;
         *data = out;
         Ok(())
     }
 
     fn barrier(&mut self, tag: &str) -> Result<()> {
         let op = format!("barrier {tag}");
-        self.coordinate(OP_BARRIER, tag.as_bytes().to_vec(), &op, |_, _| Vec::new())
-            .map(|_| ())
+        let len = tag.len();
+        self.coordinate(
+            OP_BARRIER,
+            tag.as_bytes().to_vec(),
+            &op,
+            |_| len,
+            0,
+            |mine, theirs| {
+                if mine == theirs {
+                    Ok(())
+                } else {
+                    Err(format!("barrier {:?}", String::from_utf8_lossy(theirs)))
+                }
+            },
+            |_, _| Vec::new(),
+        )
+        .map(|_| ())
     }
 
     fn all_reduce_f64(&mut self, data: &mut [f64], op: ReduceOp) -> Result<()> {
         let mut msg = vec![op_code(op)];
         msg.extend(f64_bytes(data));
-        let out = self.coordinate(OP_REDUCE64, msg, "all_reduce_f64", |_, payloads| {
-            let vals: Vec<Vec<f64>> = payloads.iter().map(|p| bytes_f64(&p[1..])).collect();
-            let mut acc = vals[0].clone();
-            for v in &vals[1..] {
-                for (a, b) in acc.iter_mut().zip(v) {
-                    *a = match payloads[0][0] {
-                        1 => a.min(*b),
-                        2 => a.max(*b),
-                        _ => *a + b,
-                    };
+        let len = msg.len();
+        let out = self.coordinate(
+            OP_REDUCE64,
+            msg,
+            "all_reduce_f64",
+            |_| len,
+            8 * data.len(),
+            same_reduce(1),
+            |_, payloads| {
+                let vals: Vec<Vec<f64>> = payloads.iter().map(|p| bytes_f64(&p[1..])).collect();
+                let mut acc = vals[0].clone();
+                for v in &vals[1..] {
+                    for (a, b) in acc.iter_mut().zip(v) {
+                        *a = match op_of(payloads[0][0]) {
+                            ReduceOp::Min => a.min(*b),
+                            ReduceOp::Max => a.max(*b),
+                            ReduceOp::Sum => *a + b,
+                        };
+                    }
                 }
+                f64_bytes(&acc)
+            },
+        )?;
+        if out.len() != 8 * data.len() {
+            return Err(DistError::Desync {
+                rank: self.world.rank,
+                expected: format!("{} elements", data.len()),
+                got: format!("{} bytes", out.len()),
             }
-            f64_bytes(&acc)
-        })?;
+            .into_error());
+        }
         data.copy_from_slice(&bytes_f64(&out));
         Ok(())
     }
@@ -1488,6 +1771,8 @@ mod tests {
             transport: "tcp".into(),
             hostfile: None,
             timeout: Duration::from_secs(10),
+            token: None,
+            share_device: false,
         }
     }
 
@@ -1598,7 +1883,7 @@ mod tests {
                     let mut g = vec![r as f32];
                     c.all_reduce(&mut g, ReduceOp::Max, Precision::Fp32, &groups)
                         .unwrap();
-                    let gathered = c.all_gather(&vec![r as f32; r + 1], &groups).unwrap();
+                    let gathered = c.all_gather(&vec![r as f32; 3 - r], &groups).unwrap();
                     let mut b = if r == 2 {
                         b"hello".to_vec()
                     } else {
@@ -1619,7 +1904,7 @@ mod tests {
             if r == 1 {
                 assert_eq!(gathered, vec![vec![1.0, 1.0]]);
             } else {
-                assert_eq!(gathered, vec![vec![0.0], vec![2.0, 2.0, 2.0]]);
+                assert_eq!(gathered, vec![vec![0.0, 0.0, 0.0], vec![2.0]]);
             }
             assert_eq!(b, b"hello");
             assert_eq!(f, 0.0);
@@ -1655,6 +1940,265 @@ mod tests {
         let e = TcpCollective::connect(&w).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::RankLost { op, .. }) if op == "rendezvous")
+        );
+    }
+
+    /// A raw connection to a listening coordinator (retrying until it listens).
+    fn dial(port: u16) -> TcpStream {
+        for _ in 0..200 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("coordinator never listened on {port}");
+    }
+
+    fn hello_of(w: &World, rank: usize, token: &str) -> Vec<u8> {
+        json!({"magic": MAGIC, "rank": rank, "world_size": w.world_size,
+               "local_world_size": w.local_world_size, "num_nodes": w.num_nodes,
+               "node_rank": 0, "token": token})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_huge_length_prefix_is_a_typed_refusal_not_an_allocation() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut s = dial(port);
+            let mut head = vec![0u8];
+            head.extend(0u64.to_le_bytes());
+            head.extend(u64::MAX.to_le_bytes()); // 17 bytes claiming 16 EiB
+            s.write_all(&head).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let (mut s, _) = l.accept().unwrap();
+        configure(&s, Duration::from_secs(5)).unwrap();
+        let e = recv_frame(&mut s, 0, 0, 1, "rendezvous", HELLO_MAX).unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::Desync { got, .. }) if got.contains("18446744073709551615-byte")),
+            "{e}"
+        );
+        sender.join().unwrap();
+        // A prefix within the bound but never delivered ends in the bounded wait, having allocated
+        // only what arrived.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut s = dial(port);
+            let mut head = vec![0u8];
+            head.extend(0u64.to_le_bytes());
+            head.extend(1_000u64.to_le_bytes());
+            s.write_all(&head).unwrap();
+            s.write_all(b"partial").unwrap();
+        });
+        let (mut s, _) = l.accept().unwrap();
+        configure(&s, Duration::from_secs(5)).unwrap();
+        sender.join().unwrap();
+        let e = recv_frame(&mut s, 0, 0, 1, "x", HELLO_MAX).unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::RankLost { .. })),
+            "{e}"
+        );
+    }
+
+    /// Rank `r` of `w0`'s world joining after `after` ms, then all-reducing its rank number.
+    fn delayed_rank(w0: &World, r: usize, after: u64) -> std::thread::JoinHandle<Vec<f32>> {
+        let mut w = w0.clone();
+        w.rank = r;
+        w.local_rank = r;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(after));
+            let mut c = TcpCollective::connect(&w).unwrap();
+            let mut v = vec![r as f32];
+            c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(3))
+                .unwrap();
+            v
+        })
+    }
+
+    #[test]
+    fn rendezvous_drops_strangers_and_duplicates_and_keeps_accepting() {
+        let port = free_port();
+        let mut w0 = world(0, 3, port);
+        w0.token = Some(DistToken("s3cret".into()));
+        let w_bad = w0.clone();
+        let strangers = std::thread::spawn(move || {
+            // garbage bytes, a connection that closes without a hello, and a well-formed hello
+            // with the wrong token claiming rank 1 — all before any real rank joins
+            let mut g = dial(port);
+            g.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+            drop(dial(port));
+            let mut t = dial(port);
+            send_frame(&mut t, 0, 0, &hello_of(&w_bad, 1, "guess"), 0, "x").unwrap();
+            let wrong_token_dropped = recv_frame(&mut t, 0, 0, 0, "x", HELLO_MAX).is_err();
+            // then, after the real rank 1 joined, a duplicate rank 1 with the right token
+            std::thread::sleep(Duration::from_millis(600));
+            let mut dup = dial(port);
+            send_frame(&mut dup, 0, 0, &hello_of(&w_bad, 1, "s3cret"), 0, "x").unwrap();
+            let duplicate_dropped = recv_frame(&mut dup, 0, 0, 0, "x", HELLO_MAX).is_err();
+            (g, wrong_token_dropped, duplicate_dropped)
+        });
+        let one = delayed_rank(&w0, 1, 300);
+        let two = delayed_rank(&w0, 2, 1200);
+        let mut c = TcpCollective::connect(&w0).unwrap();
+        let mut v = vec![0.0f32];
+        c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(3))
+            .unwrap();
+        assert_eq!(v, vec![3.0]);
+        assert_eq!(one.join().unwrap(), vec![3.0]);
+        assert_eq!(two.join().unwrap(), vec![3.0]);
+        let (_g, wrong_token_dropped, duplicate_dropped) = strangers.join().unwrap();
+        assert!(
+            wrong_token_dropped,
+            "a wrong-token hello must not be admitted"
+        );
+        assert!(duplicate_dropped, "a duplicate rank must not be admitted");
+    }
+
+    #[test]
+    fn a_wrong_token_never_takes_a_rank() {
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.token = Some(DistToken("right".into()));
+        w0.timeout = Duration::from_secs(3);
+        let mut impostor = w0.clone();
+        impostor.rank = 1;
+        impostor.local_rank = 1;
+        impostor.token = Some(DistToken("wrong".into()));
+        let mut real = impostor.clone();
+        real.token = Some(DistToken("right".into()));
+        let first = std::thread::spawn(move || TcpCollective::connect(&impostor));
+        std::thread::sleep(Duration::from_millis(300));
+        let second = std::thread::spawn(move || TcpCollective::connect(&real));
+        let c0 = TcpCollective::connect(&w0);
+        assert!(
+            c0.is_ok(),
+            "the real rank 1 joins after the impostor was dropped"
+        );
+        assert!(second.join().unwrap().is_ok());
+        let e = first.join().unwrap().unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::RankLost { rank: 0, .. })),
+            "{e}"
+        );
+        // With only an impostor, the world never completes: a bounded RankLost naming the drop.
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.token = Some(DistToken("right".into()));
+        w0.timeout = Duration::from_millis(800);
+        let mut impostor = w0.clone();
+        impostor.rank = 1;
+        impostor.local_rank = 1;
+        impostor.token = None;
+        let t = std::thread::spawn(move || TcpCollective::connect(&impostor));
+        let e = TcpCollective::connect(&w0).unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::RankLost { detail, .. }) if detail.contains("token")),
+            "{e}"
+        );
+        let _ = t.join();
+    }
+
+    #[test]
+    fn mismatched_member_payloads_are_a_desync_on_the_coordinator() {
+        type Case = fn(&mut TcpCollective, usize) -> Result<()>;
+        let cases: [(&str, Case); 5] = [
+            ("longer", |c, r| {
+                let mut v = vec![0.0f32; 1 + r];
+                c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(2))
+            }),
+            ("shorter", |c, r| {
+                let mut v = vec![0.0f32; 2 - r];
+                c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(2))
+            }),
+            ("op", |c, r| {
+                let op = if r == 0 { ReduceOp::Sum } else { ReduceOp::Max };
+                c.all_reduce(&mut [0.0], op, Precision::Fp32, &Partition::whole(2))
+            }),
+            ("precision", |c, r| {
+                let p = if r == 0 {
+                    Precision::Fp32
+                } else {
+                    Precision::Bf16
+                };
+                c.all_reduce(&mut [0.0], ReduceOp::Sum, p, &Partition::whole(2))
+            }),
+            ("f64 shorter", |c, r| {
+                let mut v = vec![0.0f64; 2 - r];
+                c.all_reduce_f64(&mut v, ReduceOp::Sum)
+            }),
+        ];
+        for (name, case) in cases {
+            let port = free_port();
+            let mut w0 = world(0, 2, port);
+            w0.timeout = Duration::from_secs(2);
+            let mut w1 = w0.clone();
+            w1.rank = 1;
+            w1.local_rank = 1;
+            let peer = std::thread::spawn(move || {
+                let mut c = TcpCollective::connect(&w1).unwrap();
+                case(&mut c, 1)
+            });
+            let mut c = TcpCollective::connect(&w0).unwrap();
+            let e = case(&mut c, 0).unwrap_err();
+            assert!(
+                matches!(dist_error(&e), Some(DistError::Desync { rank: 1, .. })),
+                "{name}: {e}"
+            );
+            // the peer's wait is bounded and typed
+            let pe = peer.join().unwrap().unwrap_err();
+            assert!(dist_error(&pe).is_some(), "{name}: {pe}");
+        }
+        // a gather contribution larger than the coordinator's shard 0
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.timeout = Duration::from_secs(2);
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let peer = std::thread::spawn(move || {
+            let mut c = TcpCollective::connect(&w1).unwrap();
+            let _ = c.all_gather(&[1.0, 2.0], &Partition::whole(2));
+        });
+        let mut c = TcpCollective::connect(&w0).unwrap();
+        let e = c.all_gather(&[1.0], &Partition::whole(2)).unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::Desync { rank: 1, .. })),
+            "{e}"
+        );
+        peer.join().unwrap();
+        // barriers with different tags
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.timeout = Duration::from_secs(2);
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let peer = std::thread::spawn(move || {
+            let mut c = TcpCollective::connect(&w1).unwrap();
+            let _ = c.barrier("export");
+        });
+        let mut c = TcpCollective::connect(&w0).unwrap();
+        let e = c.barrier("checkpoint").unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::Desync { .. })),
+            "{e}"
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn the_default_wait_is_upstreams_process_group_timeout() {
+        // torch's process-group timeout in upstream (`train/world.py`): a configured constant,
+        // read as its printed value (no clock is involved)
+        assert_eq!(format!("{:?}", World::single().timeout), "5400s");
+        assert_eq!(
+            format!("{:?}", DistToken("x".into())),
+            "DistToken(<redacted>)"
         );
     }
 }

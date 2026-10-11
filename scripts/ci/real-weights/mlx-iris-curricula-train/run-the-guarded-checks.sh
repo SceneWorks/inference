@@ -6,7 +6,8 @@
 # (~12 GB) + f32 grads (~12 GB) + the per-step bf16 copy (~6 GB) + the frozen teacher + Qwen3-VL
 # conditioning + 256² / 512² activations (stage 2 under full activation checkpointing). It starts
 # only when `memory_pressure` reports >= 120 GB free (free % × total RAM, decimal GB) right before
-# it; otherwise it is skipped with the measured numbers. Its checkpoints (~36 GB each, one kept
+# it; otherwise it is skipped — green, as the restore lane's full fine-tune — with the measured
+# numbers in the log, a warning annotation and `curriculum-admission.txt`. Its checkpoints (~36 GB each, one kept
 # per stage) live under the runner's temp dir and are removed with the test's tempdir.
 bin="$(cat "$RUNNER_TEMP/iris-curricula-test-binary")"
 failed=0
@@ -30,8 +31,8 @@ free_gb=$(( mem_bytes / 1000000000 * ${free_pct:-0} / 100 ))
 echo "curriculum admission: RAM $((mem_bytes / 1000000000)) GB, memory_pressure free ${free_pct:-?}% = ${free_gb} GB (need >= 120 GB)" \
   | tee "$IRIS_OUT/curriculum-admission.txt"
 if [[ -z "$free_pct" || "$free_gb" -lt 120 ]]; then
-  echo "::warning::skipping the curriculum run: ${free_gb} GB free (memory_pressure ${free_pct:-?}%) is under 120 GB"
-  failed=1
+  echo "::warning::skipped (not run, not failed) the curriculum run: ${free_gb} GB free (memory_pressure ${free_pct:-?}%) is under 120 GB" \
+    | tee -a "$IRIS_OUT/curriculum-admission.txt"
 else
   run_guarded 100 5400 curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa
 fi

@@ -400,7 +400,10 @@ fn blur(x: &Array, pad_px: i32, compute: Dtype) -> Result<Array> {
         for (j, b) in BLUR_TAPS.iter().enumerate() {
             let (i, j) = (i as i32, j as i32);
             let term = xp
-                .index((.., i..i + h, j..j + w, ..))
+                .index_device(
+                    (.., i..i + h, j..j + w, ..),
+                    mlx_rs::Stream::task_local_or_default(),
+                )
                 .multiply(Array::from_f32(a * b / 64.0).as_dtype(compute)?)?;
             acc = Some(match acc {
                 None => term,

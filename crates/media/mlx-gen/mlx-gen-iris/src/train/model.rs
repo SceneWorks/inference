@@ -310,7 +310,7 @@ pub fn loss_and_grads(
     for chunk in refs.chunks(256) {
         eval(chunk.iter().copied())?;
     }
-    Ok((loss.item::<f32>(), grads))
+    Ok((super::scalar_f32(&loss)?, grads))
 }
 
 /// Upstream `initialize_weights` for every backbone tensor (f32), drawn from MLX's RNG keyed on
@@ -537,6 +537,22 @@ impl TrainModel {
     }
 }
 
+thread_local! {
+    static CHECKPOINTED_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many activation-checkpointed regions this thread's training forwards entered — a test
+/// probe: a policy's region set is otherwise invisible (the gradient is the plain graph's either
+/// way).
+#[doc(hidden)]
+pub fn checkpointed_regions() -> usize {
+    CHECKPOINTED_REGIONS.with(|c| c.get())
+}
+
+fn note_checkpointed_region() {
+    CHECKPOINTED_REGIONS.with(|c| c.set(c.get() + 1));
+}
+
 /// The training forward's hooks: activation-checkpointing regions (MLX's own checkpoint
 /// transform — the region's trainable tensors and activations are its inputs, so the recompute
 /// rebuilds the block from them) and the REPA capture of block `capture` (1-based).
@@ -560,6 +576,7 @@ impl<'a> ForwardHooks for TrainHooks<'a> {
         core_txt: Option<&Array>,
     ) -> Result<(Array, Array)> {
         let (so, yo) = if self.ac.should_checkpoint(i) {
+            note_checkpointed_region();
             let prefix = format!("blocks.{i}.");
             let keys = region_keys(self.p, &prefix);
             let has_txt = core_txt.is_some();
@@ -609,6 +626,7 @@ impl<'a> ForwardHooks for TrainHooks<'a> {
         if !self.ac.should_checkpoint(i) {
             return dit.run_pixel_block(i, ctx, pixels, s_cond);
         }
+        note_checkpointed_region();
         let prefix = format!("pixel_blocks.{i}.");
         let keys = region_keys(self.p, &prefix);
         let mut inputs = vec![pixels.clone(), s_cond.clone()];
@@ -826,7 +844,8 @@ pub fn loss_and_grads_ext(
     for chunk in refs.chunks(256) {
         eval(chunk.iter().copied())?;
     }
-    Ok((flow.item::<f32>(), rl.map(|r| r.item::<f32>()), grads))
+    let rl = rl.as_ref().map(super::scalar_f32).transpose()?;
+    Ok((super::scalar_f32(&flow)?, rl, grads))
 }
 
 /// PyTorch-default init of the REPA projector (`U(±1/√fan_in)` weights and biases), from MLX's RNG

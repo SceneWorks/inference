@@ -486,6 +486,22 @@ enum Region {
     },
 }
 
+thread_local! {
+    static CHECKPOINTED_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many activation-checkpointed regions this thread's training forwards entered — a test
+/// probe: a policy's region set is otherwise invisible (the gradient is the plain graph's either
+/// way).
+#[doc(hidden)]
+pub fn checkpointed_regions() -> usize {
+    CHECKPOINTED_REGIONS.with(|c| c.get())
+}
+
+fn note_checkpointed_region() {
+    CHECKPOINTED_REGIONS.with(|c| c.set(c.get() + 1));
+}
+
 /// The training forward's hooks. A checkpointed region runs **off the tape** on the detached
 /// backbone (`tape_free`, composable kernels forced so it computes exactly what its recompute
 /// computes) and hands its outputs on as fresh boundary `Var`s; the segmented backward
@@ -511,6 +527,7 @@ impl ForwardHooks for TrainHooks<'_> {
         core_txt: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let (so, yo) = if self.ac.should_checkpoint(i) {
+            note_checkpointed_region();
             let (so, yo) = with_composable(|| {
                 self.tape_free.run_trunk_block(
                     i,
@@ -555,6 +572,7 @@ impl ForwardHooks for TrainHooks<'_> {
         if !self.ac.should_checkpoint(i) {
             return dit.run_pixel_block(i, ctx, pixels, s_cond);
         }
+        note_checkpointed_region();
         let out = with_composable(|| {
             self.tape_free
                 .run_pixel_block(i, ctx, &pixels.detach(), &s_cond.detach())

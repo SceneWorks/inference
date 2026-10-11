@@ -8,14 +8,20 @@
 //! MLX) and read host-visible unified memory. The `ring` backend has neither group `split` nor
 //! `sum_scatter`, so a collective over a sub-group (hybrid sharding's shard / replicate groups) is
 //! the world all-gather of every rank's contribution reduced per group locally — the same values,
-//! more traffic. Liveness: MLX's socket backends block on a vanished peer, so every MLX collective
-//! is preceded by a bounded barrier on a host TCP side channel ([`TcpCollective`], the run's
-//! rendezvous): a lost rank surfaces as a typed [`DistError::RankLost`] within the timeout instead
-//! of a hang.
+//! more traffic. Liveness: MLX's socket backends block on a vanished peer and take no timeout, so
+//! every MLX collective is preceded by a bounded barrier on a host TCP side channel
+//! ([`TcpCollective`], the run's rendezvous) **and** runs on a worker thread the trainer waits on
+//! for at most the world's timeout: a rank lost before the collective fails the barrier, a rank
+//! lost (or stalled) inside it expires the wait — either way a typed [`DistError::RankLost`]
+//! within the timeout instead of a hang. A worker that never returns stays blocked inside MLX: it
+//! is abandoned, the collective is poisoned (every later call fails with the same `RankLost`),
+//! and the process must exit — MLX offers no way to cancel a collective.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use gen_core::iris::train::dist::{
     reduce_in_rank_order, Collective, DistError, DistPlan, Partition, Precision, ReduceOp,
@@ -47,13 +53,116 @@ pub fn from_host(v: &[f32], shape: &[i32]) -> Array {
 /// MLX's distributed group as a [`Collective`].
 pub struct MlxCollective {
     world: World,
-    group: mlx_sys::mlx_distributed_group,
+    group: GroupHandle,
     /// The bounded liveness barrier + small host reductions.
     side: TcpCollective,
+    /// Set once an MLX collective outlived the bounded wait: its worker is still blocked inside
+    /// MLX, so the group can never be used again.
+    poisoned: Option<DistError>,
 }
 
-// SAFETY: the group handle is only used from the trainer's thread.
+/// The MLX group handle, moved to the collective's worker thread.
+#[derive(Clone, Copy)]
+struct GroupHandle(mlx_sys::mlx_distributed_group);
+
+// SAFETY: the handle is an opaque pointer to MLX's group, which MLX's collectives use from the
+// thread that issues them; one collective is in flight at a time (the trainer waits on it).
+unsafe impl Send for GroupHandle {}
+
+// SAFETY: the group handle is only used from the trainer's thread (and the one worker it waits on).
 unsafe impl Send for MlxCollective {}
+
+/// An MLX collective entry point (`mlx_distributed_all_sum` / `_all_gather`).
+type MlxCollectiveFn = unsafe extern "C" fn(
+    *mut mlx_sys::mlx_array,
+    mlx_sys::mlx_array,
+    mlx_sys::mlx_distributed_group,
+    mlx_sys::mlx_stream,
+) -> std::os::raw::c_int;
+
+/// One MLX collective over host values, on the calling thread: the array is built from `data`,
+/// reduced on an explicit CPU stream and read back (no default-device op).
+fn run_collective(
+    group: GroupHandle,
+    data: &[f32],
+    shape: &[i32],
+    f: MlxCollectiveFn,
+) -> std::result::Result<Vec<f32>, String> {
+    let x = from_host(data, shape);
+    // SAFETY: `res` is a fresh array handle owned by the returned `Array`; `x`, the group and the
+    // stream outlive the call.
+    unsafe {
+        let stream = mlx_sys::mlx_default_cpu_stream_new();
+        let mut res = mlx_sys::mlx_array_new();
+        let status = f(&mut res, x.as_ptr(), group.0, stream);
+        if status != 0 {
+            mlx_sys::mlx_stream_free(stream);
+            mlx_sys::mlx_array_free(res);
+            return Err(format!("status {status}"));
+        }
+        let out = Array::from_ptr(res);
+        let r = eval([&out]).map_err(|e| e.to_string());
+        mlx_sys::mlx_stream_free(stream);
+        r?;
+        Ok(out.as_slice::<f32>().to_vec())
+    }
+}
+
+/// Run one MLX collective on a worker thread and wait at most `timeout` for it: MLX's socket
+/// backends block forever on a peer that died or stalled inside the collective. On expiry the
+/// worker is abandoned (still blocked in MLX) and the wait is a [`DistError::RankLost`].
+fn bounded_collective(
+    group: GroupHandle,
+    data: Vec<f32>,
+    shape: Vec<i32>,
+    f: MlxCollectiveFn,
+    timeout: Duration,
+    rank: usize,
+    op: &str,
+) -> std::result::Result<Vec<f32>, DistError> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("iris-mlx-{op}"))
+        .spawn(move || {
+            let _ = tx.send(run_collective(group, &data, &shape, f));
+        });
+    let lost = |detail: String| DistError::RankLost {
+        rank,
+        op: op.to_string(),
+        detail,
+    };
+    if let Err(e) = spawned {
+        return Err(lost(format!("could not start the collective worker: {e}")));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(lost(format!("MLX distributed {op} failed ({e})"))),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(lost(format!(
+            "no answer within the {}s transport timeout: a peer died or stalled inside the MLX \
+             {op} (the blocked collective is abandoned; this process must exit)",
+            timeout.as_secs()
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(lost(format!("the MLX {op} worker panicked")))
+        }
+    }
+}
+
+/// The length header of a padded all-gather row, carried **bit-exactly** in an f32 slot (a
+/// `len as f32` is exact only to 2^24 elements; the gather copies bits).
+pub fn encode_len(len: usize) -> gen_core::Result<f32> {
+    u32::try_from(len).map(f32::from_bits).map_err(|_| {
+        DistError::Unsupported(format!(
+            "an all-gather contribution of {len} elements exceeds the 2^32 the row header carries"
+        ))
+        .into_error()
+    })
+}
+
+/// [`encode_len`] read back.
+pub fn decode_len(slot: f32) -> usize {
+    slot.to_bits() as usize
+}
 
 impl MlxCollective {
     /// Initialize MLX distributed with `backend` (`ring`, `jaccl`, `mpi`, or `any`). `ring` /
@@ -102,62 +211,57 @@ impl MlxCollective {
         }
         Ok(Self {
             world: world.clone(),
-            group,
+            group: GroupHandle(group),
             side,
+            poisoned: None,
         })
     }
 
-    fn live(&mut self, op: &str) -> gen_core::Result<()> {
+    /// The bounded liveness barrier every MLX collective `op` is preceded by (public so a test
+    /// can stand a rank at the barrier and then fail inside the collective).
+    #[doc(hidden)]
+    pub fn liveness_barrier(&mut self, op: &str) -> gen_core::Result<()> {
+        if let Some(e) = &self.poisoned {
+            return Err(e.clone().into_error());
+        }
         self.side.barrier(op)
     }
 
+    /// One MLX collective (after the liveness barrier), bounded by the world's timeout.
     fn mlx_op(
-        &self,
+        &mut self,
         op: &str,
-        x: &Array,
-        f: unsafe extern "C" fn(
-            *mut mlx_sys::mlx_array,
-            mlx_sys::mlx_array,
-            mlx_sys::mlx_distributed_group,
-            mlx_sys::mlx_stream,
-        ) -> std::os::raw::c_int,
-    ) -> gen_core::Result<Array> {
-        // SAFETY: `res` is a fresh array handle owned by the returned `Array`; `x`, the group and
-        // the stream outlive the call.
-        unsafe {
-            let stream = mlx_sys::mlx_default_cpu_stream_new();
-            let mut res = mlx_sys::mlx_array_new();
-            let status = f(&mut res, x.as_ptr(), self.group, stream);
-            mlx_sys::mlx_stream_free(stream);
-            if status != 0 {
-                mlx_sys::mlx_array_free(res);
-                return Err(DistError::RankLost {
-                    rank: self.world.rank,
-                    op: op.to_string(),
-                    detail: format!("MLX distributed {op} failed (status {status})"),
-                }
-                .into_error());
+        data: Vec<f32>,
+        shape: Vec<i32>,
+        f: MlxCollectiveFn,
+    ) -> gen_core::Result<Vec<f32>> {
+        self.liveness_barrier(op)?;
+        let r = bounded_collective(
+            self.group,
+            data,
+            shape,
+            f,
+            self.world.timeout,
+            self.world.rank,
+            op,
+        );
+        r.map_err(|e| {
+            if matches!(&e, DistError::RankLost { detail, .. } if detail.contains("abandoned")) {
+                self.poisoned = Some(e.clone());
             }
-            let out = Array::from_ptr(res);
-            eval([&out]).map_err(|e| {
-                DistError::RankLost {
-                    rank: self.world.rank,
-                    op: op.to_string(),
-                    detail: e.to_string(),
-                }
-                .into_error()
-            })?;
-            Ok(out)
-        }
+            e.into_error()
+        })
     }
 
     /// The world all-gather of equal-length rows (`[world, n]`).
     fn gather_rows(&mut self, data: &[f32]) -> gen_core::Result<Vec<Vec<f32>>> {
-        self.live("all_gather")?;
         let n = data.len();
-        let x = from_host(data, &[1, n as i32]);
-        let g = self.mlx_op("all_gather", &x, mlx_sys::mlx_distributed_all_gather)?;
-        let flat = g.as_slice::<f32>().to_vec();
+        let flat = self.mlx_op(
+            "all_gather",
+            data.to_vec(),
+            vec![1, n as i32],
+            mlx_sys::mlx_distributed_all_gather,
+        )?;
         Ok(flat.chunks(n.max(1)).map(<[f32]>::to_vec).collect())
     }
 }
@@ -176,10 +280,13 @@ impl Collective for MlxCollective {
     ) -> gen_core::Result<()> {
         let whole = groups.0.iter().all(|&g| g == groups.0[0]);
         if whole && op == ReduceOp::Sum && precision == Precision::Fp32 {
-            self.live("all_reduce")?;
-            let x = from_host(data, &[data.len() as i32]);
-            let out = self.mlx_op("all_sum", &x, mlx_sys::mlx_distributed_all_sum)?;
-            data.copy_from_slice(out.as_slice::<f32>());
+            let out = self.mlx_op(
+                "all_reduce",
+                data.to_vec(),
+                vec![data.len() as i32],
+                mlx_sys::mlx_distributed_all_sum,
+            )?;
+            data.copy_from_slice(&out);
             return Ok(());
         }
         // Sub-groups, min/max and rounded precisions: the exact rank-order reduction of the
@@ -196,18 +303,25 @@ impl Collective for MlxCollective {
         let mut len = [data.len() as f64];
         self.side.all_reduce_f64(&mut len, ReduceOp::Max)?;
         let max = len[0] as usize;
-        let mut padded = vec![data.len() as f32];
+        let mut padded = vec![encode_len(data.len())?];
         padded.extend_from_slice(data);
         padded.resize(max + 1, 0.0);
         let rows = self.gather_rows(&padded)?;
-        Ok(groups
+        groups
             .members(self.world.rank)
             .into_iter()
             .map(|m| {
-                let n = rows[m][0] as usize;
-                rows[m][1..=n].to_vec()
+                let n = decode_len(rows[m][0]);
+                rows[m].get(1..=n).map(<[f32]>::to_vec).ok_or_else(|| {
+                    DistError::Desync {
+                        rank: m,
+                        expected: format!("an all_gather row of at most {max} values"),
+                        got: format!("a header of {n}"),
+                    }
+                    .into_error()
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn broadcast(&mut self, data: &mut Vec<u8>, root: usize) -> gen_core::Result<()> {
@@ -425,5 +539,28 @@ impl TakeRows for Array {
             (r.start as i32)..(r.end as i32),
             mlx_rs::Stream::task_local_or_default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gather_row_lengths_survive_past_two_to_the_24() {
+        for len in [
+            0usize,
+            1,
+            7,
+            1 << 24,
+            (1 << 24) + 1,
+            (1 << 31) + 3,
+            u32::MAX as usize,
+        ] {
+            assert_eq!(decode_len(encode_len(len).unwrap()), len, "{len}");
+        }
+        // the old `len as f32` header lost the length past 2^24
+        assert_ne!(((1usize << 24) + 1) as f32 as usize, (1 << 24) + 1);
+        assert!(encode_len(u32::MAX as usize + 1).is_err());
     }
 }

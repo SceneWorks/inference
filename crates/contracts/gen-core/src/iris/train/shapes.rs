@@ -1117,12 +1117,64 @@ pub fn shape_policy_id(
     max_ratio: f64,
     patch: usize,
 ) -> String {
-    format!("{policy}:{image_size}:{bucket}:{align}:{max_ratio}:{patch}")
+    format!(
+        "{policy}:{image_size}:{bucket}:{align}:{}:{patch}",
+        py_float_repr(max_ratio)
+    )
+}
+
+/// Python's `repr(float)` (what an f-string prints): the shortest round-trip digits, always with a
+/// fractional part or an exponent (`4.0`, `2.5`, `1e-05`, `1e+16`, `inf`, `nan`).
+pub fn py_float_repr(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.into();
+    }
+    let a = x.abs();
+    if a != 0.0 && !(1e-4..1e16).contains(&a) {
+        // Rust `{:e}` is `1e-5` / `1.5e16`; Python writes a signed, two-digit exponent.
+        let e = format!("{x:e}");
+        let (mantissa, exp) = e.split_once('e').expect("exponent");
+        let exp: i32 = exp.parse().expect("integer exponent");
+        let sign = if exp < 0 { '-' } else { '+' };
+        return format!("{mantissa}e{sign}{:02}", exp.abs());
+    }
+    let s = format!("{x}");
+    if s.contains('.') {
+        s
+    } else {
+        format!("{s}.0")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shape_policy_ids_print_floats_like_python() {
+        // `builder.shape_policy_id` with the DataConfig defaults (shape_max_ratio: float = 4.0)
+        assert_eq!(
+            shape_policy_id("bucket", 512, "shared21-512", 32, 4.0, 16),
+            "bucket:512:shared21-512:32:4.0:16"
+        );
+        for (x, py) in [
+            (4.0, "4.0"),
+            (2.5, "2.5"),
+            (0.1, "0.1"),
+            (-3.0, "-3.0"),
+            (0.0, "0.0"),
+            (1e-5, "1e-05"),
+            (1.5e16, "1.5e+16"),
+            (1e16, "1e+16"),
+            (123456.0, "123456.0"),
+            (f64::INFINITY, "inf"),
+        ] {
+            assert_eq!(py_float_repr(x), py, "{x}");
+        }
+    }
 
     #[test]
     fn python_round_is_half_to_even() {

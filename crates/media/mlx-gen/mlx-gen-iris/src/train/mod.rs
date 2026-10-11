@@ -73,6 +73,13 @@ use serde_json::{json, Value as JsonValue};
 use crate::dit::{IrisDiT, TextBatch};
 use crate::solver::{cfg_combine, sample};
 use crate::text_encoder::IrisTextEncoder;
+
+/// A scalar's value as f32, converted on the task-local stream first: `Array::item` converts a
+/// non-f32 scalar with an `astype` on the **default device** (the GPU on a Mac), whatever the
+/// task-local stream says.
+pub(crate) fn scalar_f32(a: &Array) -> Result<f32> {
+    Ok(a.as_dtype(Dtype::Float32)?.item::<f32>())
+}
 use dist::{make_collective, to_host, Topology};
 use model::{
     adapter_tensors, flow_loss_per_sample, init_adapter, init_projector, loss_and_grads,
@@ -1090,7 +1097,17 @@ impl Run {
                 }
                 ResumeDataPolicy::Exact => match &saved.data_position {
                     Some(p) => p.clone(),
-                    None => pipeline.legacy_position(saved.epoch, saved.batches_consumed)?,
+                    None => {
+                        let (batch, _) = saved.legacy_batch().ok_or_else(|| {
+                            Error::Msg(
+                                "iris resume: the checkpoint has neither a data_position nor a \
+                                 legacy batch identity; resume_data_policy new_phase starts the \
+                                 current dataset fresh"
+                                    .into(),
+                            )
+                        })?;
+                        pipeline.legacy_position(saved.epoch, saved.batches_consumed, batch)?
+                    }
                 },
             };
             first_epoch = position

@@ -362,8 +362,8 @@ pub fn generator_grads(
     for chunk in refs.chunks(256) {
         eval(chunk.iter().copied())?;
     }
-    let host = |i: usize| vals[i].item::<f32>() as f64;
-    Ok(([host(1), host(2), host(3), host(4)], grads))
+    let host = |i: usize| super::scalar_f32(&vals[i]).map(f64::from);
+    Ok(([host(1)?, host(2)?, host(3)?, host(4)?], grads))
 }
 
 /// One critic micro-batch: two power iterations (`D(y)` then `D(x̂)`), the critic loss and the
@@ -396,7 +396,7 @@ pub fn critic_grads(
     let mut refs: Vec<&Array> = vals.iter().collect();
     refs.extend(grads.values());
     eval(refs)?;
-    Ok((vals[1].item::<f32>() as f64, grads, sn2))
+    Ok((super::scalar_f32(&vals[1])? as f64, grads, sn2))
 }
 
 /// Accumulated gradients of one window.

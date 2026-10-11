@@ -217,6 +217,13 @@ fn spawn(mut j: Json, result: &Path) -> Child {
             "1",
         ])
         .env(CHILD_ENV, j.to_string())
+        .envs(
+            j["env"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())),
+        )
         .spawn()
         .expect("spawn a rank process")
 }
@@ -280,11 +287,16 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// `IRIS_DIST_SHARE_DEVICE=1` (the CUDA lane, whose runner exposes one card): the multi-rank
+/// scenarios opt into `dist.world.share_device` — explicitly several ranks on one card.
+const SHARE_DEVICE_ENV: &str = "IRIS_DIST_SHARE_DEVICE";
+
 fn tcp_world(n: usize, nodes: usize) -> Json {
     json!({
         "world_size": n, "local_world_size": n / nodes, "num_nodes": nodes,
         "master_addr": "127.0.0.1", "master_port": free_port(), "transport": "tcp",
         "timeout_secs": 20,
+        "share_device": std::env::var(SHARE_DEVICE_ENV).as_deref() == Ok("1"),
     })
 }
 
@@ -631,6 +643,69 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(e.path(), dst).unwrap();
         }
     }
+}
+
+/// On a CUDA build, a rank whose `cuda:<local_rank>` does not exist is a typed `InvalidMesh`
+/// refusal — never silently folded onto another rank's card — unless the run opts into
+/// `dist.world.share_device`. Each rank process sees exactly one card (`CUDA_VISIBLE_DEVICES=0`),
+/// so rank 1's `cuda:1` is absent whatever the box holds. (A CPU build has no per-rank device:
+/// nothing to refuse, the case is vacuous there and says so.)
+#[test]
+fn a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in() {
+    if !trainer_device_is_cuda() {
+        eprintln!("CPU build: ranks share the CPU by construction; the refusal is CUDA-only");
+        return;
+    }
+    let (data, scratch, out) = (tmp(), tmp(), tmp());
+    write_dataset(data.path());
+    let one_card = json!({"CUDA_VISIBLE_DEVICES": "0"});
+    for share in [false, true] {
+        let mut world = tcp_world(2, 1);
+        world["share_device"] = json!(share);
+        world["timeout_secs"] = json!(10);
+        let jobs: Vec<Json> = (0..2)
+            .map(|r| {
+                let mut j = job(
+                    data.path(),
+                    out.path().join(format!("{share}")).as_path(),
+                    r,
+                    world.clone(),
+                    json!({"strategy": "ddp"}),
+                    2,
+                    None,
+                );
+                j["env"] = one_card.clone();
+                j
+            })
+            .collect();
+        let r = launch(jobs, scratch.path());
+        eprintln!("share_device={share}: {r:?}");
+        if share {
+            assert_eq!(r[0]["steps"], 2, "{}", r[0]);
+            assert_eq!(r[1]["steps"], 2, "{}", r[1]);
+        } else {
+            let typed = r[1]["dist"]
+                .as_str()
+                .unwrap_or_else(|| panic!("untyped failure: {}", r[1]));
+            assert!(
+                typed.starts_with("InvalidMesh") && typed.contains("share_device"),
+                "{typed}"
+            );
+            // rank 0 waited for a rank that never joined: bounded and typed
+            assert!(
+                r[0]["dist"].as_str().unwrap_or("").starts_with("RankLost"),
+                "{}",
+                r[0]
+            );
+        }
+    }
+}
+
+fn trainer_device_is_cuda() -> bool {
+    cfg!(feature = "cuda")
+        && candle_gen::candle_core::Device::new_cuda(0)
+            .map(|d| d.is_cuda())
+            .unwrap_or(false)
 }
 
 fn lost_rank_case(field: &str) {

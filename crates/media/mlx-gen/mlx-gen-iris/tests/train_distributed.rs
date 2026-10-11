@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use mlx_gen::gen_core::iris::train::dist::{dist_error, DistError};
+use mlx_gen::gen_core::iris::train::dist::{
+    dist_error, parse_dist, Collective, DistError, Partition, Precision, ReduceOp, World,
+};
 use mlx_gen::gen_core::iris::train::{
     checkpoint_root, latest_checkpoint, read_checkpoint_state, OPTIONS_KEY,
 };
@@ -30,6 +32,7 @@ use mlx_gen::gen_core::{
     LrSchedule, Trainer, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
+use mlx_gen_iris::train::dist::MlxCollective;
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value as Json};
 
@@ -184,6 +187,43 @@ fn run_job(j: &Json) -> Json {
     }
 }
 
+/// The child side of a bare MLX-collective probe: every rank joins an `mlx_ring` group; rank 1
+/// passes the liveness barrier of an all-reduce and then `stall`s or `exit`s **inside** the
+/// collective (it never enters MLX's all-sum), while rank 0 runs the all-reduce. Rank 0 reports
+/// the typed failure, how long it took, and what a second collective call returns.
+fn run_probe(j: &Json) -> Json {
+    let world: World = parse_dist(Some(&json!({"world": j["world"]})), false, true)
+        .unwrap()
+        .world;
+    let mut c = on_cpu(|| MlxCollective::init(&world, "ring")).unwrap();
+    if j["probe"] == "gather" {
+        // unequal contributions: the padded ring gather must return each one exactly
+        let mine: Vec<f32> = (0..3 - world.rank)
+            .map(|i| (10 * world.rank + i) as f32)
+            .collect();
+        let got = on_cpu(|| c.all_gather(&mine, &Partition::whole(2))).unwrap();
+        return json!({ "gathered": got });
+    }
+    if world.rank == 1 {
+        c.liveness_barrier("all_reduce").unwrap();
+        match j["probe"].as_str().unwrap() {
+            "exit" => std::process::exit(17),
+            _ => std::thread::sleep(Duration::from_secs(60)),
+        }
+        return json!({});
+    }
+    let mut v = vec![1.0f32; 8];
+    let e = on_cpu(|| c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(2)))
+        .expect_err("a peer lost inside the collective");
+    let again =
+        on_cpu(|| c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(2)))
+            .expect_err("a poisoned collective refuses");
+    json!({
+        "dist": dist_error(&e).map(|d| format!("{d:?}")),
+        "again": dist_error(&again).map(|d| format!("{d:?}")),
+    })
+}
+
 /// The re-entry point of a rank process (a no-op when run as an ordinary test).
 #[test]
 #[ignore = "the rank-process entry of train_distributed (driven by the scenarios)"]
@@ -195,7 +235,11 @@ fn rank_entry() {
     // A rank process is all CPU: the default device too, not only the task-local stream (the
     // array operators and `index` target the default device).
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
-    let result = run_job(&j);
+    let result = if j.get("probe").is_some() {
+        run_probe(&j)
+    } else {
+        run_job(&j)
+    };
     std::fs::write(
         j["result"].as_str().unwrap(),
         serde_json::to_vec(&result).unwrap(),
@@ -662,6 +706,91 @@ fn lost_rank_case(field: &str) {
         // the typed detail names it).
         assert!(typed.contains("within the 5s transport timeout"), "{typed}");
     }
+}
+
+/// A rank lost **inside** an MLX collective (past the side-channel liveness barrier, where MLX's
+/// ring sockets would block forever) fails the survivor with a typed `RankLost` within the world
+/// timeout, and the poisoned collective refuses every later call.
+fn lost_inside_the_collective(mode: &str) {
+    let scratch = tmp();
+    let hostfile = scratch.path().join("hostfile.json");
+    std::fs::write(
+        &hostfile,
+        json!([
+            [format!("127.0.0.1:{}", free_port())],
+            [format!("127.0.0.1:{}", free_port())]
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut world = tcp_world(2, 1);
+    world["transport"] = json!("mlx_ring");
+    world["hostfile"] = json!(hostfile);
+    world["timeout_secs"] = json!(5);
+    let results: Vec<PathBuf> = (0..2)
+        .map(|r| scratch.path().join(format!("probe{r}.json")))
+        .collect();
+    let mut kids: Vec<Child> = (0..2)
+        .map(|r| {
+            let mut w = world.clone();
+            w["rank"] = json!(r);
+            w["local_rank"] = json!(r);
+            spawn(json!({"probe": mode, "world": w}), &results[r])
+        })
+        .collect();
+    reap_or_kill(&mut kids[0], Instant::now() + Duration::from_secs(90));
+    let _ = kids[1].kill();
+    let _ = kids[1].wait();
+    let r = read_result(&results[0], 0);
+    eprintln!("survivor ({mode} inside the collective): {r}");
+    let typed = r["dist"]
+        .as_str()
+        .unwrap_or_else(|| panic!("untyped failure: {r}"));
+    assert!(typed.starts_with("RankLost"), "{typed}");
+    // Bounded by the world timeout (clock-free reading: the typed detail names the bound that
+    // ended the wait; a hang is killed at the 90 s reap and writes no result).
+    assert!(typed.contains("within the 5s transport timeout"), "{typed}");
+    let again = r["again"].as_str().unwrap();
+    assert!(again.starts_with("RankLost"), "{again}");
+}
+
+#[test]
+fn the_mlx_ring_gather_returns_unequal_contributions_exactly() {
+    let scratch = tmp();
+    let hostfile = scratch.path().join("hostfile.json");
+    std::fs::write(
+        &hostfile,
+        json!([
+            [format!("127.0.0.1:{}", free_port())],
+            [format!("127.0.0.1:{}", free_port())]
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut world = tcp_world(2, 1);
+    world["transport"] = json!("mlx_ring");
+    world["hostfile"] = json!(hostfile);
+    let jobs: Vec<Json> = (0..2)
+        .map(|r| {
+            let mut w = world.clone();
+            w["rank"] = json!(r);
+            w["local_rank"] = json!(r);
+            json!({"probe": "gather", "world": w})
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        assert_eq!(r["gathered"], json!([[0.0, 1.0, 2.0], [10.0, 11.0]]), "{r}");
+    }
+}
+
+#[test]
+fn a_rank_that_stalls_inside_an_mlx_collective_fails_the_survivor_typed() {
+    lost_inside_the_collective("stall");
+}
+
+#[test]
+fn a_rank_that_exits_inside_an_mlx_collective_fails_the_survivor_typed() {
+    lost_inside_the_collective("exit");
 }
 
 #[test]

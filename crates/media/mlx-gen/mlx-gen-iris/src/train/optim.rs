@@ -394,7 +394,7 @@ pub fn clip_grads(grads: Params, max_norm: f64) -> Result<(f64, Params)> {
         let axes: Vec<i32> = (0..g.ndim() as i32).collect();
         total = total.add(&sum_axes(&g.square()?, &axes[..], false)?)?;
     }
-    let total = sqrt(&total)?.item::<f32>() as f64;
+    let total = super::scalar_f32(&sqrt(&total)?)? as f64;
     let coef = gen_core::iris::train::clip_coefficient(max_norm, total);
     let c = s(coef);
     let mut out = HashMap::with_capacity(grads.len());

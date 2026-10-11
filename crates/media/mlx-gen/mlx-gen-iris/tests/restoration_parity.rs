@@ -101,6 +101,13 @@ fn meta(g: &Weights, key: &str) -> serde_json::Value {
 
 #[test]
 fn bicubic_upsample_matches_torch_scale_factor() {
+    crate::common::cpu_process(
+        "restoration_parity::bicubic_upsample_matches_torch_scale_factor",
+        bicubic_upsample_matches_torch_scale_factor_body,
+    );
+}
+
+fn bicubic_upsample_matches_torch_scale_factor_body() {
     let g = golden();
     let cases = meta(&g, "bicubic");
     for (name, scale) in cases.as_object().unwrap() {
@@ -114,6 +121,13 @@ fn bicubic_upsample_matches_torch_scale_factor() {
 
 #[test]
 fn antialiased_resize_matches_torch() {
+    crate::common::cpu_process(
+        "restoration_parity::antialiased_resize_matches_torch",
+        antialiased_resize_matches_torch_body,
+    );
+}
+
+fn antialiased_resize_matches_torch_body() {
     let g = golden();
     for name in ["up", "down", "width_only", "down_odd"] {
         let input = planes(g.require(&format!("ops/aa/{name}/in")).unwrap());
@@ -125,6 +139,13 @@ fn antialiased_resize_matches_torch() {
 
 #[test]
 fn fusion_window_and_tile_grid_match_upstream() {
+    crate::common::cpu_process(
+        "restoration_parity::fusion_window_and_tile_grid_match_upstream",
+        fusion_window_and_tile_grid_match_upstream_body,
+    );
+}
+
+fn fusion_window_and_tile_grid_match_upstream_body() {
     let g = golden();
     close(
         "window 32",
@@ -179,6 +200,13 @@ fn fusion_window_and_tile_grid_match_upstream() {
 
 #[test]
 fn wavelet_colour_fix_matches_upstream_at_the_boundary() {
+    crate::common::cpu_process(
+        "restoration_parity::wavelet_colour_fix_matches_upstream_at_the_boundary",
+        wavelet_colour_fix_matches_upstream_at_the_boundary_body,
+    );
+}
+
+fn wavelet_colour_fix_matches_upstream_at_the_boundary_body() {
     let g = golden();
     let content = planes(g.require("ops/wavelet/content").unwrap());
     let reference = planes(g.require("ops/wavelet/reference").unwrap());
@@ -189,6 +217,13 @@ fn wavelet_colour_fix_matches_upstream_at_the_boundary() {
 
 #[test]
 fn fit_budget_is_pil_lanczos_bit_exact() {
+    crate::common::cpu_process(
+        "restoration_parity::fit_budget_is_pil_lanczos_bit_exact",
+        fit_budget_is_pil_lanczos_bit_exact_body,
+    );
+}
+
+fn fit_budget_is_pil_lanczos_bit_exact_body() {
     let g = golden();
     for case in meta(&g, "fit_budget").as_array().unwrap() {
         let size = |k: &str| {
@@ -213,6 +248,13 @@ fn fp32_restorer() -> IrisRestorer {
 
 #[test]
 fn restoration_matches_upstream_end_to_end_in_fp32() {
+    crate::common::cpu_process(
+        "restoration_parity::restoration_matches_upstream_end_to_end_in_fp32",
+        restoration_matches_upstream_end_to_end_in_fp32_body,
+    );
+}
+
+fn restoration_matches_upstream_end_to_end_in_fp32_body() {
     on_cpu(|| {
         let restorer = fp32_restorer();
         let g = golden();
@@ -318,6 +360,13 @@ fn restoration_matches_upstream_end_to_end_in_fp32() {
 
 #[test]
 fn release_geometry_preview_is_backend_free() {
+    crate::common::cpu_process(
+        "restoration_parity::release_geometry_preview_is_backend_free",
+        release_geometry_preview_is_backend_free_body,
+    );
+}
+
+fn release_geometry_preview_is_backend_free_body() {
     // What SceneWorks shows before running: the planner with the release geometry, no weights.
     let req = TransformRequest {
         image: formula_rgb(512, 384),
@@ -330,6 +379,13 @@ fn release_geometry_preview_is_backend_free() {
 
 #[test]
 fn cancel_between_tiles_is_typed_and_yields_no_image() {
+    crate::common::cpu_process(
+        "restoration_parity::cancel_between_tiles_is_typed_and_yields_no_image",
+        cancel_between_tiles_is_typed_and_yields_no_image_body,
+    );
+}
+
+fn cancel_between_tiles_is_typed_and_yields_no_image_body() {
     on_cpu(|| {
         let restorer = fp32_restorer();
         let cancel = CancelFlag::new();
@@ -359,6 +415,13 @@ fn cancel_between_tiles_is_typed_and_yields_no_image() {
 
 #[test]
 fn wrong_task_artifacts_are_refused() {
+    crate::common::cpu_process(
+        "restoration_parity::wrong_task_artifacts_are_refused",
+        wrong_task_artifacts_are_refused_body,
+    );
+}
+
+fn wrong_task_artifacts_are_refused_body() {
     // The generation backbone (no `task` section).
     let err = IrisRestorer::load(&LoadSpec::new(WeightsSource::Dir(tiny_backbone())))
         .err()

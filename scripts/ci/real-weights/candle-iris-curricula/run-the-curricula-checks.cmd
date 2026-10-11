@@ -3,11 +3,17 @@ set "IRIS_FAILED=0"
 rem The release REPA teacher against the committed upstream tokens, on the GPU.
 call :run_one the_release_teacher_matches_upstream_on_real_weights curricula_parity::the_release_teacher_matches_upstream_on_real_weights --ignored || set "IRIS_FAILED=1"
 rem Real multi-rank training on this box: rank r a process on cuda:r (the device inventory above
-rem records the cards), over the host TCP transport (Windows has no NCCL).
+rem records the cards), over the host TCP transport (Windows has no NCCL). The runner listener
+rem exposes one card (cuda:1 is an invalid ordinal), so the scenarios opt explicitly into
+rem dist.world.share_device (several ranks on one card); without the opt-in such a rank is refused
+rem typed, which the first check proves on one visible card.
+call :run_one a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in train_distributed::a_rank_without_its_cuda_device_is_refused_unless_sharing_is_opted_in || set "IRIS_FAILED=1"
+set "IRIS_DIST_SHARE_DEVICE=1"
 call :run_one fsdp_full_and_grad_op_sharding_reproduce_ddp train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp || set "IRIS_FAILED=1"
 call :run_one a_sharded_checkpoint_resumes_exactly_and_reshards train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards || set "IRIS_FAILED=1"
 call :run_one a_rank_that_exits_mid_run_fails_the_survivor_typed train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed || set "IRIS_FAILED=1"
 call :run_one a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout || set "IRIS_FAILED=1"
+set "IRIS_DIST_SHARE_DEVICE="
 rem The miniature curricula lifecycle on the device (fp16 trains here: CUDA has half GEMM).
 call :run_one fp16_trains_with_the_dynamic_loss_scaler curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler || set "IRIS_FAILED=1"
 call :run_one stage_presets_chain_256_to_512_with_repa_and_a_new_phase curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase || set "IRIS_FAILED=1"

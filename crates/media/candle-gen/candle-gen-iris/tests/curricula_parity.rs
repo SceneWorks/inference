@@ -19,8 +19,8 @@ use candle_gen::gen_core::iris::train::{
     FlowObjective, Prediction, TimestepSampler, TrainSchedule,
 };
 use candle_gen_iris::train::model::{
-    flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch, TrainExtras, TrainModel,
-    Trainable,
+    checkpointed_regions, flow_loss_per_sample, loss_and_grads_ext, RepaTargets, StepBatch,
+    TrainExtras, TrainModel, Trainable,
 };
 use candle_gen_iris::train::optim::{Params, Tensors};
 use candle_gen_iris::train::teacher::{spatial_normalize, Teacher};
@@ -157,13 +157,26 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
             1e-4,
         );
     }
+    // `none` enters no checkpointed region; `full` / `selective_op` enter every region (the same
+    // set natively); `selective_layer` with stride 2 a strict, non-empty subset. (Stride 1 is the
+    // `full` region set — not a separate case.)
+    let before = checkpointed_regions();
+    let none_again = grads_under(&model, &params, AcPolicy::None);
+    assert_eq!(
+        checkpointed_regions() - before,
+        0,
+        "none checkpoints no region"
+    );
+    assert_eq!(none_again.len(), none.len());
+    let mut regions = Vec::new();
     for ac in [
         AcPolicy::Full,
         AcPolicy::SelectiveOp,
         AcPolicy::SelectiveLayer { every: 2 },
-        AcPolicy::SelectiveLayer { every: 1 },
     ] {
+        let before = checkpointed_regions();
         let got = grads_under(&model, &params, ac);
+        regions.push(checkpointed_regions() - before);
         assert_eq!(got.len(), none.len());
         let mut worst = 0f32;
         for (k, v) in &none {
@@ -177,6 +190,17 @@ fn activation_checkpointing_gradients_equal_the_plain_graph() {
         eprintln!("{}: max |Δgrad| vs none = {worst:.3e}", ac.name());
         assert!(worst <= 1e-6, "{}: {worst}", ac.name());
     }
+    eprintln!("checkpointed regions (full, selective_op, selective_layer/2): {regions:?}");
+    // one region per trunk block and per pixel block; stride 2 keeps blocks 0, 2, … of each stack
+    let (trunk, pix) = (model.cfg.depth, model.cfg.pixel.depth);
+    let full = trunk + pix;
+    let strided = trunk.div_ceil(2) + pix.div_ceil(2);
+    assert!(strided > 0 && strided < full);
+    assert_eq!(
+        regions,
+        vec![full, full, strided],
+        "regions entered per policy"
+    );
 }
 
 #[test]
@@ -357,6 +381,55 @@ fn repa_and_irepa_teacher_tokens_losses_and_gradients_match_upstream() {
                 &f32t(g.require(&format!("repa.{case}.grad.{n}"))),
                 1e-4,
             );
+        }
+        // The REPA capture inside checkpointed regions: the same losses and gradients.
+        if case == "repa_t2" {
+            for ac in [AcPolicy::Full, AcPolicy::SelectiveLayer { every: 2 }] {
+                let before = checkpointed_regions();
+                let (f2, r2, g2) = loss_and_grads_ext(
+                    &full_model("isotropic"),
+                    &params,
+                    &batch,
+                    &objective(),
+                    &TrainExtras {
+                        repa: Some(plan.clone()),
+                        ac,
+                    },
+                    Some(&targets),
+                    1.0,
+                )
+                .unwrap();
+                let (trunk, pix) = (tiny_config().model.depth, tiny_config().model.pixel.depth);
+                let want = match ac {
+                    AcPolicy::Full => trunk + pix,
+                    _ => trunk.div_ceil(2) + pix.div_ceil(2),
+                };
+                assert_eq!(
+                    checkpointed_regions() - before,
+                    want,
+                    "{}: regions entered",
+                    ac.name()
+                );
+                assert!(
+                    (f2 - flow).abs() <= 1e-6,
+                    "{}: flow {f2} vs {flow}",
+                    ac.name()
+                );
+                let (ra, rb) = (r2.unwrap(), repa.unwrap());
+                assert!((ra - rb).abs() <= 1e-6, "{}: repa {ra} vs {rb}", ac.name());
+                assert_eq!(g2.len(), grads.len());
+                let mut worst = 0f32;
+                for (k, v) in &grads {
+                    let d = host_f32(&g2[k])
+                        .iter()
+                        .zip(host_f32(v))
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    worst = worst.max(d);
+                }
+                eprintln!("repa + {}: max |Δgrad| vs none = {worst:.3e}", ac.name());
+                assert!(worst <= 1e-6, "repa + {}: {worst}", ac.name());
+            }
         }
     }
 }

@@ -333,18 +333,21 @@ pub fn depth_loss(pred: &Array, step: &DepthStep, gradient_weight: f64) -> Resul
     let e = pred.subtract(&step.target)?;
     let v = &step.valid;
     let value = sum_axes(&abs(&e)?.multiply(v)?, &[1, 2, 3], false)?;
+    // Explicit task-local stream: `IndexOp::index` targets the default device (the GPU on a Mac)
+    // whatever the task-local stream says.
+    let st = mlx_rs::Stream::task_local_or_default();
     let dx = e
-        .index((.., .., .., 1..))
-        .subtract(e.index((.., .., .., ..-1)))?;
+        .index_device((.., .., .., 1..), &st)
+        .subtract(e.index_device((.., .., .., ..-1), &st))?;
     let vx = v
-        .index((.., .., .., 1..))
-        .multiply(v.index((.., .., .., ..-1)))?;
+        .index_device((.., .., .., 1..), &st)
+        .multiply(v.index_device((.., .., .., ..-1), &st))?;
     let dy = e
-        .index((.., .., 1.., ..))
-        .subtract(e.index((.., .., ..-1, ..)))?;
+        .index_device((.., .., 1.., ..), &st)
+        .subtract(e.index_device((.., .., ..-1, ..), &st))?;
     let vy = v
-        .index((.., .., 1.., ..))
-        .multiply(v.index((.., .., ..-1, ..)))?;
+        .index_device((.., .., 1.., ..), &st)
+        .multiply(v.index_device((.., .., ..-1, ..), &st))?;
     let grad = sum_axes(&abs(&dx)?.multiply(&vx)?, &[1, 2, 3], false)?.add(&sum_axes(
         &abs(&dy)?.multiply(&vy)?,
         &[1, 2, 3],
@@ -382,7 +385,7 @@ pub fn loss_and_grads(
     for chunk in refs.chunks(256) {
         eval(chunk.iter().copied())?;
     }
-    Ok((l.item::<f32>(), grads))
+    Ok((super::scalar_f32(&l)?, grads))
 }
 
 /// One accumulation window (the generation trainer's `Window` over the depth loss): micro-batches
