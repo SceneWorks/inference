@@ -4961,6 +4961,10 @@ jobs:
           # Own target dir (as `mlx-chroma-auxiliary`): the shared `../cargo-target` on this box
           # failed with `can't find crate for mlx_rs` (E0463) on runs 38134929461 / 38135310701.
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-iris-depth-train
+          # Even a fresh target dir lost a just-built proc-macro (`rustversion`, E0463) on run
+          # 38135652150 — the runner service's sccache wrapper; build without it (as the heavy
+          # Candle lanes do).
+          RUSTC_WRAPPER: ""
         run: source scripts/ci/real-weights/mlx-iris-depth-train/run-the-guarded-depth-full-fine-tune.sh
       - name: Remove the materialized export
         if: always()
