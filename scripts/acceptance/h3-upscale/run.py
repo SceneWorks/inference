@@ -86,7 +86,7 @@ def execute(args, command_args, out_rgb):
             "executable_sha256":sha(Path(command_args[0])),
             "memory_method":"200ms native process RSS and assigned GPU device-used samples; measured sampled peaks, not allocation exact maxima",
             "log":out_rgb.with_suffix(".log").name,
-            "stages":json.loads(out_rgb.with_suffix(".stages.json").read_text()) if out_rgb.with_suffix(".stages.json").exists() else None}
+            "stages":json.loads(out_rgb.with_suffix(".stages.json").read_text(encoding="utf-8")) if out_rgb.with_suffix(".stages.json").exists() else None}
 
 
 def main():

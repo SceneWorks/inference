@@ -108,7 +108,7 @@ def compare_saved_reference(reference_root, evidence_root, out):
     all_pass = True
     for case in ("h3", "other-model", "live-action"):
         metadata_path = reference_root / (case + ".json")
-        metadata = json.loads(metadata_path.read_text())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         reference_path = reference_root / (case + ".safetensors")
         directory = evidence_root / case
         native_path = directory / "guided.intermediates.safetensors"
@@ -143,7 +143,7 @@ def compare_saved_reference(reference_root, evidence_root, out):
                   "reference_manifest_sha256": sha256(metadata_path),
                   "comparison_script_sha256": sha256(Path(__file__)),
                   "native_capture_mutations_rejected": mutations}
-        (out / (case + ".json")).write_text(json.dumps(report, indent=2) + "\n")
+        (out / (case + ".json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps({"case": case, "pass": passed, "captures": comparison}), flush=True)
     return all_pass
 
@@ -164,17 +164,17 @@ def main():
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "GPU-e4b79931-7be6-f216-460a-f5405cfafffe":
         raise ValueError("assign the authorized GPU UUID explicitly")
     actual_pin = subprocess.check_output(
-        ["git", "-C", str(args.comfy_root), "rev-parse", "HEAD"], text=True).strip()
+        ["git", "-C", str(args.comfy_root), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
     if actual_pin != COMFY_PIN:
         raise ValueError("unexpected Comfy reference revision")
-    if subprocess.check_output(["git", "-C", str(args.comfy_root), "status", "--porcelain"], text=True).strip():
+    if subprocess.check_output(["git", "-C", str(args.comfy_root), "status", "--porcelain"], text=True, encoding="utf-8").strip():
         raise ValueError("Comfy reference checkout has changes")
     args.out.mkdir(parents=True, exist_ok=False)
     # Persist the acceptance bounds BEFORE importing/loading/running any model.
     (args.out / "declared-tolerances.json").write_text(json.dumps({
         "captures": CAPTURES, "tolerances": TOLERANCES,
         "basis": "Fixed predeclared backend accumulation bound; both absolute and relative limits required; no case-dependent tolerance",
-    }, indent=2) + "\n")
+    }, indent=2) + "\n", encoding="utf-8")
     sys.path.insert(0, str(args.comfy_root))
     module = importlib.import_module("comfy.ldm.minimax.vae")
     torch.set_num_threads(16)
@@ -212,7 +212,7 @@ def main():
         if tensor.is_meta:
             raise ValueError("unmaterialized reference tensor " + name)
     vae.eval()
-    tree = ast.parse(args.upstream_guide.read_text())
+    tree = ast.parse(args.upstream_guide.read_text(encoding="utf-8"))
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "guide_pixels"]
     if len(nodes) != 1:
         raise ValueError("pinned guide_pixels definition missing")
@@ -268,7 +268,7 @@ def main():
                   "native_sha256": None if args.export_only else sha256(native_path), "reference_sha256": sha256(reference_path),
                   "script_sha256": sha256(Path(__file__)),
                   "dependencies": {name: importlib.metadata.version(name) for name in ("comfy-kitchen", "comfy-aimdo")}}
-        (args.out / (case + ".json")).write_text(json.dumps(report, indent=2) + "\n")
+        (args.out / (case + ".json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps({"case": case, "pass": passed, "captures": comparison}), flush=True)
         del pixels, source, decoded, guide_pixels, guide
     if not all_pass:

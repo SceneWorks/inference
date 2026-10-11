@@ -61,7 +61,7 @@ class CaptureComparisonTests(unittest.TestCase):
                 save_file(self.expected, str(folder / "guided.intermediates.safetensors"))
                 metadata = {"comfy_commit": COMFY_PIN, "tolerances": TOLERANCES,
                             "reference_sha256": sha256(exported), "rgb_sha256": sha256(rgb)}
-                (reference / (case + ".json")).write_text(json.dumps(metadata))
+                (reference / (case + ".json")).write_text(json.dumps(metadata), encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertTrue(compare_saved_reference(reference, evidence, root / "good"))
             rgb = evidence / "h3/source.rgb"; rgb.write_bytes(b"different source RGB")

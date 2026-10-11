@@ -16,7 +16,7 @@ def main():
     parser.add_argument("--gpu-uuid",required=True)
     args=parser.parse_args()
     report_path=args.evidence/"report.json"
-    report=json.loads(report_path.read_text())
+    report=json.loads(report_path.read_text(encoding="utf-8"))
     if len(report["cases"])!=3 or any(len(case["variants"])!=3 or any(v["exit_code"] for v in case["variants"]) for case in report["cases"]):
         raise SystemExit("complete the H3 campaign before starting the serial comparator")
     assets={path.name:runner.sha(path) for path in sorted(args.root.glob("*.safetensors"))}
@@ -30,11 +30,11 @@ def main():
             output=folder/"seedvr2.mp4"
             runner.mux(rgb,folder/"source.mp4",output)
             receipt.update({"result":str(output),"result_sha256":runner.sha(output),"result_probe":runner.probe(output)})
-        report_path.write_text(json.dumps(report,indent=2)+"\n")
+        report_path.write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
         if receipt["exit_code"]:
             raise SystemExit("native SeedVR2 failed; comparator readout remains incomplete")
     report["missing"]=[v for v in report["missing"] if v!="SeedVR2 side-by-side"]
-    report_path.write_text(json.dumps(report,indent=2)+"\n")
+    report_path.write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
 
 
 if __name__=="__main__":

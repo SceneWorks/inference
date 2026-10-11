@@ -40,6 +40,6 @@ def main():
     z = torch.arange(5.).reshape(1, 1, 1, 5, 1).expand(1, 1, 1, 5, 8)
     values["output"] = Fixture().tiled_decode(z)
     save_file(values, str(args.out), metadata={"comfy_commit": PIN, "source_sha256": SOURCE_SHA})
-    args.out.with_suffix(".json").write_text(json.dumps({"comfy_commit": PIN, "source_sha256": SOURCE_SHA, "fixture_sha256": hashlib.sha256(args.out.read_bytes()).hexdigest(), "methods": [n.name for n in methods], "purpose": "crossed heavy overlaps distinguish original from already-blended neighbour strips"}, indent=2) + "\n")
+    args.out.with_suffix(".json").write_text(json.dumps({"comfy_commit": PIN, "source_sha256": SOURCE_SHA, "fixture_sha256": hashlib.sha256(args.out.read_bytes()).hexdigest(), "methods": [n.name for n in methods], "purpose": "crossed heavy overlaps distinguish original from already-blended neighbour strips"}, indent=2) + "\n", encoding="utf-8")
 
 if __name__ == "__main__": main()

@@ -91,7 +91,7 @@ def main():
                 pair.paste(Image.fromarray(videos[name][frame]), (col * 1024, 32))
                 draw.text((col * 1024 + 8, 8), f"{kind} / {name} / frame {frame}", fill="white")
             pair.save(folder / f"review-full-frame{frame}.png")
-    (args.evidence / "delivery-metrics.json").write_text(json.dumps(all_metrics, indent=2) + "\n")
+    (args.evidence / "delivery-metrics.json").write_text(json.dumps(all_metrics, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
