@@ -518,6 +518,14 @@ fn the_frozen_holdout_grid_matches_upstreams_val_loss() {
 #[test]
 #[ignore = "needs the dinov2-base teacher resource (IRIS_REPA_TEACHER_DIR)"]
 fn the_release_teacher_matches_upstream_on_real_weights() {
+    // FP32 parity (the CPU stream's f32 GEMM), in a CPU-default child: no op reaches the GPU.
+    crate::common::cpu_process(
+        "curricula_parity::the_release_teacher_matches_upstream_on_real_weights",
+        release_teacher_body,
+    );
+}
+
+fn release_teacher_body() {
     let Ok(dir) = std::env::var("IRIS_REPA_TEACHER_DIR") else {
         panic!("set IRIS_REPA_TEACHER_DIR to the facebook/dinov2-base snapshot");
     };

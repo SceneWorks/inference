@@ -19,36 +19,11 @@ use mlx_gen::{LoadSpec, WeightsSource};
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value as Json};
 
-use crate::common::{on_cpu, tiny_backbone, tiny_text_encoder};
+// Every case runs in a CPU-default child process (`common::cpu_process`): no op of these runs
+// reaches the GPU.
+use crate::common::{cpu_process, on_cpu, tiny_backbone, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
-const CPU_CHILD_ENV: &str = "IRIS_CURRICULA_CPU_CHILD";
-
-/// Run `body` in a child process of this test binary whose MLX **default device** is the CPU.
-/// `on_cpu` sets only mlx-rs's task-local stream, which the array operators, `index` and a few
-/// other entry points do not consult — they target the default device (the GPU on a Mac). A
-/// process-wide CPU default in a dedicated child keeps every op of these runs off the GPU without
-/// changing the device under the binary's other tests.
-fn cpu_process(test: &str, body: fn()) {
-    if std::env::var(CPU_CHILD_ENV).as_deref() == Ok(test) {
-        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
-        on_cpu(body);
-        std::fs::write(std::env::var(CPU_CHILD_DONE).unwrap(), b"ok").unwrap();
-        return;
-    }
-    let done = tempfile::tempdir().unwrap();
-    let marker = done.path().join("done");
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
-        .env(CPU_CHILD_ENV, test)
-        .env(CPU_CHILD_DONE, &marker)
-        .status()
-        .expect("spawn the CPU child");
-    assert!(status.success(), "{test} failed in its CPU child");
-    assert!(marker.is_file(), "{test}: the CPU child ran no body");
-}
-
-const CPU_CHILD_DONE: &str = "IRIS_CURRICULA_CPU_CHILD_DONE";
 
 fn trainer_with(teacher: Option<&Path>) -> Box<dyn Trainer> {
     let mut spec = LoadSpec::new(WeightsSource::Dir(tiny_backbone()));

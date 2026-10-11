@@ -17,7 +17,12 @@ run_guarded() { # $1 cap GB, $2 wall s, $3 test path
   cat "$log"
   grep -q "test result: ok. 1 passed" "$log" || { echo "::error::$t did not run exactly one passing test"; failed=1; }
 }
-run_guarded 20 900 curricula_parity::the_release_teacher_matches_upstream_on_real_weights
+# The teacher check is an FP32 parity on the CPU device: the test runs its body in a CPU-default
+# child of itself; naming the child here runs that body in the guarded process directly, so the
+# guard measures it (0.41 GB on CPU, measured).
+teacher_test=curricula_parity::the_release_teacher_matches_upstream_on_real_weights
+IRIS_TEST_CPU_CHILD="$teacher_test" IRIS_TEST_CPU_CHILD_DONE="$IRIS_OUT/teacher-child.done" \
+  run_guarded 20 900 "$teacher_test"
 
 mem_bytes="$(sysctl -n hw.memsize)"
 free_pct="$(/usr/bin/memory_pressure -Q 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')"
