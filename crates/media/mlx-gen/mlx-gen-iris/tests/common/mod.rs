@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod metal_guard;
+
 use mlx_gen::gen_core::iris::IrisConfig;
 use mlx_gen::weights::Weights;
 use mlx_rs::{Array, Dtype};
@@ -43,11 +45,13 @@ const CPU_CHILD_DONE: &str = "IRIS_TEST_CPU_CHILD_DONE";
 /// (sc-25689). [`on_cpu`] sets only mlx-rs's task-local stream, which the array operators, `index`
 /// and a few other entry points do not consult — they target the default device (the GPU on a
 /// Mac). A process-wide CPU default in a dedicated child keeps every op of `body` off the GPU
-/// without changing the device under the binary's other tests. `test` is the test's full path in
-/// the integration binary (`module::name`).
+/// without changing the device under the binary's other tests, and [`metal_guard`] makes any Metal
+/// work the child attempts anyway fatal (sc-25690). `test` is the test's full path in the
+/// integration binary (`module::name`).
 pub fn cpu_process(test: &str, body: fn()) {
     if std::env::var(CPU_CHILD_ENV).as_deref() == Ok(test) {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        metal_guard::forbid_metal();
         on_cpu(body);
         std::fs::write(std::env::var(CPU_CHILD_DONE).unwrap(), b"ok").unwrap();
         return;

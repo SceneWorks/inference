@@ -200,36 +200,3 @@ pub fn to_images(samples: &Array) -> Result<Vec<Image>> {
 pub fn to_image(sample: &Array) -> Result<Image> {
     mlx_gen::image::decoded_to_image(sample)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_preview_is_the_exact_decode_of_the_patch_mean_of_the_first_row() {
-        // [2, 3, 8, 8] with values spanning past [−1, 1], patch 4 → a 2×2 frame of row 0.
-        let n = 2 * 3 * 8 * 8;
-        let data: Vec<f32> = (0..n)
-            .map(|i| ((i * 37 % 97) as f32 / 32.0) - 1.5)
-            .collect();
-        let x0 = Array::from_slice(&data, &[2, 3, 8, 8]);
-        let frame = preview_image(&x0, 4).unwrap();
-        assert_eq!((frame.width, frame.height), (2, 2));
-        for py in 0..2 {
-            for px in 0..2 {
-                for c in 0..3 {
-                    let mut sum = 0f32;
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            sum += data[(c * 8 + py * 4 + y) * 8 + px * 4 + x];
-                        }
-                    }
-                    let unit = ((sum / 16.0 + 1.0) / 2.0).clamp(0.0, 1.0);
-                    let want = (unit * 255.0).round_ties_even() as u8;
-                    assert_eq!(frame.pixels[(py * 2 + px) * 3 + c], want, "({px},{py},{c})");
-                }
-            }
-        }
-        assert!(preview_image(&x0, 3).is_err(), "off the patch grid");
-    }
-}

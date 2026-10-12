@@ -11,7 +11,7 @@ use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
 };
 
-use crate::common::{tiny_backbone, tiny_text_encoder};
+use crate::common::{cpu_process, tiny_backbone, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
 
@@ -69,16 +69,37 @@ fn missing_or_unknown_component_fails_at_load() {
 
 #[test]
 fn gen_core_conformance_resident() {
+    cpu_process(
+        "generator_contract::gen_core_conformance_resident",
+        gen_core_conformance_resident_body,
+    );
+}
+
+fn gen_core_conformance_resident_body() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());
 }
 
 #[test]
 fn gen_core_conformance_sequential() {
+    cpu_process(
+        "generator_contract::gen_core_conformance_sequential",
+        gen_core_conformance_sequential_body,
+    );
+}
+
+fn gen_core_conformance_sequential_body() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Sequential), &profile());
 }
 
 #[test]
 fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
+    cpu_process(
+        "generator_contract::progress_is_steps_then_one_decoding_and_output_is_rgb8",
+        progress_is_steps_then_one_decoding_and_output_is_rgb8_body,
+    );
+}
+
+fn progress_is_steps_then_one_decoding_and_output_is_rgb8_body() {
     let g = load(OffloadPolicy::Resident);
     let mut events = Vec::new();
     let out = g
@@ -105,6 +126,13 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
 
 #[test]
 fn count_folds_into_one_bar_with_distinct_seeds() {
+    cpu_process(
+        "generator_contract::count_folds_into_one_bar_with_distinct_seeds",
+        count_folds_into_one_bar_with_distinct_seeds_body,
+    );
+}
+
+fn count_folds_into_one_bar_with_distinct_seeds_body() {
     let g = load(OffloadPolicy::Resident);
     let mut steps = Vec::new();
     let mut req = request();
@@ -126,6 +154,13 @@ fn count_folds_into_one_bar_with_distinct_seeds() {
 
 #[test]
 fn mid_run_cancel_is_typed_and_returns_no_image() {
+    cpu_process(
+        "generator_contract::mid_run_cancel_is_typed_and_returns_no_image",
+        mid_run_cancel_is_typed_and_returns_no_image_body,
+    );
+}
+
+fn mid_run_cancel_is_typed_and_returns_no_image_body() {
     let g = load(OffloadPolicy::Resident);
     let mut req = request();
     req.steps = Some(6);
