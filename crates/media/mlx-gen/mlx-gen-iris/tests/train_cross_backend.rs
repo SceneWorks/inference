@@ -34,19 +34,11 @@ const ARTIFACTS: [(&str, Option<AdapterKind>); 3] = [
     ("full", None),
 ];
 
-/// The cross-backend bound: FP32 summation order only (1e-4 of peak, `dit_parity`'s) — except a
-/// LoKr checked against the forward the **MLX** producer recorded: that recording predates
-/// sc-25690, when the MLX provider reconstructed a LoKr delta in bf16 whatever the compute dtype,
-/// so its bf16 rounding of the delta is the whole difference (measured ~1.2e-3 of peak). Both
-/// providers now build a LoKr residual in the compute dtype (f32 here), so a LoKr checked against
-/// the Candle recording holds the FP32 bound.
-fn tolerance(recorded_by: &str, name: &str) -> f32 {
-    if recorded_by == "mlx" && name == "lokr" {
-        5e-3
-    } else {
-        1e-4
-    }
-}
+/// The cross-backend bound: FP32 summation order only (1e-4 of peak, `dit_parity`'s), for every
+/// artifact and either recording. Both providers build a LoKr residual in the compute dtype (f32
+/// here) since sc-25690, and the MLX recording (`forward.safetensors`) was re-produced on the MLX
+/// CPU device then (the artifacts themselves reproduced byte for byte).
+const TOL: f32 = 1e-4;
 
 fn artifact_path(dir: &Path, name: &str) -> PathBuf {
     if name == "full" {
@@ -135,12 +127,12 @@ fn check_trained_elsewhere(backend: &str) {
                 &format!("{backend}-trained {name} on mlx"),
                 &got,
                 expected,
-                tolerance(backend, name),
+                TOL,
             );
             let (moved, peak, _) = errors(expected, &bare);
             eprintln!("{backend}/{name}: the artifact moves the forward by {moved:.3e}");
             assert!(
-                moved > 10.0 * tolerance(backend, name) * peak.max(1.0),
+                moved > 10.0 * TOL * peak.max(1.0),
                 "{backend}/{name}: the trained artifact barely moves the forward ({moved:.3e})"
             );
         }
