@@ -524,7 +524,9 @@ mod tests {
         let krea_config = mlx_gen_krea::Krea2Config::turbo();
         // The complete set of `LogicalKeyMapping` implementations reachable from the MLX platform.
         let implementations: &[&dyn LogicalKeyMapping] = &[
-            &mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(),
+            &mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(
+                mlx_gen_krea::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            ),
             &mlx_gen_krea::KreaDiffusersKeyMapping::new(&krea_config),
         ];
 
@@ -568,14 +570,18 @@ mod tests {
 
         // And the native mapping really is the remap the provider loads through.
         assert_eq!(
-            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
-                .logical_key("model.diffusion_model.blocks.0.attn.wq.weight")
-                .as_deref(),
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(
+                mlx_gen_krea::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX
+            )
+            .logical_key("model.diffusion_model.blocks.0.attn.wq.weight")
+            .as_deref(),
             Some("transformer_blocks.0.attn.to_q.weight")
         );
         assert_eq!(
-            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config()
-                .logical_key("foreign.weight"),
+            mlx_gen_krea::KreaNativeToDiffusersMapping::without_config(
+                mlx_gen_krea::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX
+            )
+            .logical_key("foreign.weight"),
             None
         );
     }
