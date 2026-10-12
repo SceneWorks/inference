@@ -28,8 +28,19 @@ impl std::str::FromStr for VedaBudget {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let value = text.trim();
-        let budget = if let Some(percent) = value.strip_suffix('%') {
-            Self::SparsityPercent(percent.trim().parse().map_err(|_| {
+        let budget = if let Some(percent) = value.strip_suffix(['%', '％']) {
+            let percent = percent.trim();
+            let mut parts = percent.split('.');
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+            if !digits(parts.next().unwrap_or_default())
+                || parts.next().is_some_and(|s| !digits(s))
+                || parts.next().is_some()
+            {
+                return Err(
+                    "Veda sparsity must be a percentage or positive integer key-tile count".into(),
+                );
+            }
+            Self::SparsityPercent(percent.parse().map_err(|_| {
                 "Veda sparsity must be a percentage or positive integer key-tile count".to_owned()
             })?)
         } else {
@@ -50,7 +61,7 @@ impl std::str::FromStr for VedaBudget {
 }
 
 /// Request controls use the frozen Veda defaults. Providers report what actually executed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VedaRequest {
     pub enabled: bool,
     pub generated: VedaBudget,
@@ -59,17 +70,6 @@ pub struct VedaRequest {
     pub full_attention_layers: Vec<usize>,
     /// Zero-based actual sampling evaluations to run with full attention.
     pub full_attention_steps: Vec<usize>,
-}
-impl Default for VedaRequest {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            generated: Default::default(),
-            reference: Default::default(),
-            full_attention_layers: vec![],
-            full_attention_steps: vec![],
-        }
-    }
 }
 impl VedaRequest {
     /// Validate even disabled controls so malformed persisted settings cannot hide until enabled.
@@ -92,6 +92,65 @@ impl VedaRequest {
         }
         Ok(())
     }
+    /// Frozen node list syntax: zero-based indices and inclusive ranges, with common separators.
+    /// Bounds are checked before expanding a range so malformed input cannot allocate arbitrarily.
+    pub fn parse_indices(text: &str, domain: usize) -> Result<Vec<usize>, String> {
+        let chars: Vec<char> = text.chars().collect();
+        let separator = |c: char| c.is_whitespace() || matches!(c, ',' | ';' | '，' | '；' | '、');
+        let dash = |c: char| matches!(c, '-' | '~' | '–' | '—');
+        let number = |cursor: &mut usize| -> Result<usize, String> {
+            let start = *cursor;
+            while *cursor < chars.len() && chars[*cursor].is_ascii_digit() {
+                *cursor += 1;
+            }
+            if start == *cursor {
+                return Err(
+                    "Veda full attention list requires zero-based indices or ranges".into(),
+                );
+            }
+            chars[start..*cursor]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .map_err(|_| "Veda full attention index exceeds usize".into())
+        };
+        let mut values = std::collections::BTreeSet::new();
+        let mut cursor = 0;
+        while cursor < chars.len() {
+            if separator(chars[cursor]) {
+                cursor += 1;
+                continue;
+            }
+            let first = number(&mut cursor)?;
+            let mut look = cursor;
+            while look < chars.len() && chars[look].is_whitespace() {
+                look += 1;
+            }
+            let last = if look < chars.len() && dash(chars[look]) {
+                cursor = look + 1;
+                while cursor < chars.len() && chars[cursor].is_whitespace() {
+                    cursor += 1;
+                }
+                number(&mut cursor)?
+            } else {
+                first
+            };
+            if cursor < chars.len() && !separator(chars[cursor]) {
+                return Err(
+                    "Veda full attention list requires zero-based indices or ranges".into(),
+                );
+            }
+            if first.max(last) >= domain {
+                return Err(format!(
+                    "Veda full attention zero-based index {} outside 0..{domain}",
+                    first.max(last)
+                ));
+            }
+            values.extend(first.min(last)..=first.max(last));
+        }
+        Ok(values.into_iter().collect())
+    }
+
     pub fn full_attention(&self, layer: usize, step: usize) -> bool {
         !self.enabled
             || self.full_attention_layers.contains(&layer)
@@ -145,6 +204,58 @@ mod tests {
         }
     }
     #[test]
+    fn incompatible_model_is_refused_by_the_shared_request_boundary() {
+        let caps = crate::Capabilities {
+            max_count: 1,
+            max_size: 2048,
+            ..Default::default()
+        };
+        let request = crate::GenerationRequest {
+            veda: Some(VedaRequest {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = caps
+            .validate_request("another_model", &request)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Veda attention requires MiniMax-H3"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn frozen_index_text_is_bounded_and_preserves_zero_based_ranges() {
+        assert_eq!(
+            VedaRequest::parse_indices("0, 1; 49 - 47，2~3；5–6、8—7", 50).unwrap(),
+            [0, 1, 2, 3, 5, 6, 7, 8, 47, 48, 49]
+        );
+        assert_eq!(
+            VedaRequest::parse_indices("", 0).unwrap(),
+            Vec::<usize>::new()
+        );
+        for bad in [
+            "-1",
+            "1.5",
+            "foo",
+            "0-50",
+            "0-18446744073709551615",
+            "1--2",
+            "1-",
+            "1+2",
+        ] {
+            assert!(VedaRequest::parse_indices(bad, 50).is_err(), "{bad}");
+        }
+        assert_eq!(
+            "90％".parse::<VedaBudget>().unwrap(),
+            VedaBudget::SparsityPercent(90.0)
+        );
+    }
+
+    #[test]
     fn malformed_controls_are_refused() {
         for input in [
             "",
@@ -158,6 +269,10 @@ mod tests {
             "-0.01%",
             "4294967296",
             "+1",
+            "1e1%",
+            "+0%",
+            ".5%",
+            "5.%",
         ] {
             assert!(input.parse::<VedaBudget>().is_err(), "{input}");
         }

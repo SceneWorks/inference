@@ -439,6 +439,10 @@ fn reconcile_tier(dit_dir: &Path, requested: Option<mlx_gen::gen_core::Quant>) -
 
 /// Reject a request this model cannot serve, before any weight is read.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    if let Some(veda) = &req.veda {
+        veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
+            .map_err(Error::Msg)?;
+    }
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{MODEL_ID}: prompt must not be empty")));
     }
@@ -1995,6 +1999,49 @@ mlx_gen::register_generators! {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn malformed_veda_controls_fail_at_native_request_boundary() {
+        for enabled in [false, true] {
+            for bad in [
+                mlx_gen::gen_core::VedaBudget::KeyTiles(0),
+                mlx_gen::gen_core::VedaBudget::SparsityPercent(f64::NAN),
+                mlx_gen::gen_core::VedaBudget::SparsityPercent(100.0),
+            ] {
+                let mut request = request(1344, 768);
+                request.veda = Some(mlx_gen::gen_core::VedaRequest {
+                    enabled,
+                    generated: bad,
+                    ..Default::default()
+                });
+                let error = validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("generated: Veda"), "{error}");
+            }
+            for steps in [4, 8, 50] {
+                let mut request = request(1344, 768);
+                request.steps = Some(steps);
+                request.veda = Some(mlx_gen::gen_core::VedaRequest {
+                    enabled,
+                    full_attention_steps: vec![steps as usize],
+                    ..Default::default()
+                });
+                let error = validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("zero-based index"), "{error}");
+                request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
+                request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+                assert!(validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("full_attention_layers"));
+                request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+                validate_request(&descriptor().capabilities, &request).unwrap();
+            }
+        }
+    }
+
     use super::*;
     use mlx_gen::gen_core::CancelFlag;
     use mlx_gen::runtime::{AdapterKind, MoeExpert};

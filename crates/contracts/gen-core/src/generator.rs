@@ -3538,6 +3538,11 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
+            return Err(Error::Unsupported(format!(
+                "{id}: Veda attention requires MiniMax-H3"
+            )));
+        }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
         // one here means the request renders SDR while the caller believes it asked for HDR — a

@@ -314,7 +314,7 @@ impl DitAttention {
         x: &Array,
         rope: Option<(&MmRope, &MmRopeTables)>,
         bounded: BoundedAttention<'_>,
-        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
     ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
@@ -351,7 +351,9 @@ impl DitAttention {
         // while the kernel did something else.
         record_planned_attention(bounded, b, h, seq);
         let out = match veda {
-            Some((runtime, layer)) => runtime.attention(layer, &qh, &kh, &vh, bounded)?,
+            Some((runtime, layer, step)) => {
+                runtime.attention(layer, step, &qh, &kh, &vh, bounded)?
+            }
             None => sdpa_bounded_bhsd(&qh, &kh, &vh, scale, None, bounded)?,
         };
 

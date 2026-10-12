@@ -561,6 +561,7 @@ pub struct MiniMaxH3 {
     /// discipline the rest of this struct keeps. They are read once per render, in
     /// [`MiniMaxH3::load_task_dit`], onto the job-local DiT.
     adapters: Vec<AdapterSpec>,
+    veda_report: crate::veda::ReportSink,
 }
 
 impl MiniMaxH3 {
@@ -630,6 +631,7 @@ impl MiniMaxH3 {
             offload: OFFLOAD_POLICY,
             contract: crate::memory_strategy::contract_for(spec)?,
             adapters: spec.adapters.clone(),
+            veda_report: Default::default(),
         })
     }
 
@@ -877,6 +879,10 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
+            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            ..Default::default()
+        };
         Generator::validate(self, req)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -987,6 +993,9 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            model.prepare_veda(request, self.veda_report.clone());
+        }
         drop(context);
 
         let total = schedule.num_evals() as u32;
@@ -1294,6 +1303,9 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            model.prepare_veda(request, self.veda_report.clone());
+        }
         drop(context);
 
         let total = schedule.num_evals() as u32;
@@ -1718,11 +1730,19 @@ fn reference_short_edge_for(req: &GenerationRequest) -> Result<i32> {
 }
 
 impl Generator for MiniMaxH3 {
+    fn veda_execution_report(&self) -> Option<candle_gen::gen_core::VedaExecutionReport> {
+        Some(self.veda_report.borrow().clone())
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
+        if let Some(veda) = &req.veda {
+            veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
+                .map_err(candle_gen::gen_core::Error::Msg)?;
+        }
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -1970,6 +1990,47 @@ candle_gen::register_generators! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_veda_controls_fail_at_native_request_boundary() {
+        let generator = validator();
+        for enabled in [false, true] {
+            for bad in [
+                candle_gen::gen_core::VedaBudget::KeyTiles(0),
+                candle_gen::gen_core::VedaBudget::SparsityPercent(f64::NAN),
+                candle_gen::gen_core::VedaBudget::SparsityPercent(100.0),
+            ] {
+                let mut request = request(1344, 768);
+                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                    enabled,
+                    generated: bad,
+                    ..Default::default()
+                });
+                let error = generator.validate(&request).unwrap_err().to_string();
+                assert!(error.contains("generated: Veda"), "{error}");
+            }
+            for steps in [4, 8, 50] {
+                let mut request = request(1344, 768);
+                request.steps = Some(steps);
+                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                    enabled,
+                    full_attention_steps: vec![steps as usize],
+                    ..Default::default()
+                });
+                let error = generator.validate(&request).unwrap_err().to_string();
+                assert!(error.contains("zero-based index"), "{error}");
+                request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
+                request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+                assert!(generator
+                    .validate(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("full_attention_layers"));
+                request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+                generator.validate(&request).unwrap();
+            }
+        }
+    }
+
     /// Every component directory a flat (untiered) snapshot must carry — the four
     /// [`MiniMaxH3::load`] ends up requiring when nothing is staged, since an unstaged tier resolves
     /// to `root/transformer` and `root/text_encoder`.

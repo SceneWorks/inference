@@ -439,7 +439,7 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
         bounded: BoundedAttention<'_>,
-        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
     ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
