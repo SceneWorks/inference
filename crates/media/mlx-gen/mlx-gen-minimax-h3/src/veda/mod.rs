@@ -85,13 +85,15 @@ impl VedaRuntime {
             layouts.insert(shape, packed.veda_layout(shape)?);
         }
         // Actual-device check precedes sparse production calls. Failure leaves this request dense.
-        self_test()?;
         {
             let mut r = report.borrow_mut();
             r.predictor = Some(bundle.identity.clone());
             r.plan = Some(plan.name.clone());
             r.exact_plan = plan.grid == grid;
+            r.execution_grid = Some(grid);
+            r.plan_grid = Some(plan.grid);
         }
+        self_test()?;
         Ok(Self {
             bundle,
             plan,
