@@ -1,8 +1,9 @@
 //! sc-25681: every public upstream generation control vs upstream `iris3b.sampling.generate` on the
 //! miniature snapshot (`tools/dump_iris_controls.py`), table-driven over the oracle's case list —
 //! solver order 1, shift 2, CFG interval (0.3, 0.8), a negative prompt, CFG off, a portrait canvas,
-//! a two-prompt batch, and the `prediction: x` checkpoint reading — each from the oracle's injected
-//! noise. Every control's golden is also checked to sit measurably away from the release-controls
+//! a two-prompt batch, the `prediction: x` checkpoint reading, and (sc-25690) a square canvas, a
+//! second (2:1) landscape canvas beside `base`'s 3:2 one, and a changed step count (8 for 5) — each
+//! from the oracle's injected noise. Every control's golden is also checked to sit measurably away from the release-controls
 //! `base` golden, so a native path that accepted a control and ignored it could not pass.
 //!
 //! Tolerance: the `e2e_parity` bound (6e-2 of peak) — the backbone and solver run FP32 on the MLX
@@ -75,7 +76,41 @@ fn every_control_matches_upstream_on_the_miniature_body() {
         let dit = load_backbone(&tiny_backbone(), &base_config, Dtype::Float32).unwrap();
         let golden = fixture("iris_controls_golden.safetensors");
         let cases: Vec<Value> = serde_json::from_str(golden.metadata("cases").unwrap()).unwrap();
-        assert_eq!(cases.len(), 9, "the oracle's case table");
+        let names: Vec<&str> = cases.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "base",
+                "order1",
+                "shift2",
+                "interval",
+                "negative",
+                "cfg_off",
+                "portrait",
+                "batch",
+                "prediction_x",
+                "square",
+                "landscape",
+                "steps"
+            ],
+            "the oracle's case table"
+        );
+        // The canvases the table must span (epic AT2): square, portrait and two landscapes, plus a
+        // step count other than `base`'s — read from the oracle's own case rows, so a regenerated
+        // table that lost one fails here rather than passing on fewer cases.
+        let canvas = |name: &str| {
+            let case = cases.iter().find(|c| c["name"] == name).unwrap();
+            (
+                case["width"].as_u64().unwrap(),
+                case["height"].as_u64().unwrap(),
+                case["steps"].as_u64().unwrap(),
+            )
+        };
+        assert_eq!(canvas("base"), (12, 8, 5));
+        assert_eq!(canvas("square"), (8, 8, 5));
+        assert_eq!(canvas("portrait"), (8, 12, 5));
+        assert_eq!(canvas("landscape"), (16, 8, 5));
+        assert_eq!(canvas("steps"), (12, 8, 8));
         let base_image = golden.require("base/image").unwrap();
         for case in &cases {
             let name = case["name"].as_str().unwrap();
@@ -85,6 +120,15 @@ fn every_control_matches_upstream_on_the_miniature_body() {
             let req = case_request(case, &config);
             mlx_gen::gen_core::iris::validate_generation_request("iris_3b", &req, &config).unwrap();
             let params = GenerationParams::resolve(&req, 0, &config).unwrap();
+            assert_eq!(
+                (
+                    params.width as u64,
+                    params.height as u64,
+                    params.steps as u64
+                ),
+                canvas(name),
+                "{name}: the resolved canvas and step count are the oracle's"
+            );
             let conditioning = encode(&te, &params).unwrap();
             assert_eq!(conditioning.cond.len(), params.prompts.len());
             let mut steps = Vec::new();
