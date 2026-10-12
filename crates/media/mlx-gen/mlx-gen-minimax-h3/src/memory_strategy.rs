@@ -1786,6 +1786,16 @@ pub const MEMORY_BEHAVIOR: mlx_gen::gen_core::MemoryBehaviorRegistration =
         begin_request: registered_begin_request,
     };
 
+/// Request-only sparse estimate; off leaves the dense memory contract byte-for-byte unchanged.
+pub fn veda_workspace_bound(
+    req: mlx_gen::gen_core::veda::workspace::Request<'_>,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
+    mlx_gen::gen_core::veda::workspace::for_video_request(
+        req,
+        mlx_gen::gen_core::veda::workspace::Backend::Mlx,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

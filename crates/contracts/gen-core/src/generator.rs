@@ -90,6 +90,15 @@ pub trait Generator {
         )
     }
 
+    /// Optional problem-bounded sparse residency. Disabled/absent settings return None without
+    /// loading predictors or allocating device state. Worker admission calls this per queued job.
+    fn veda_workspace_bound(
+        &self,
+        _req: crate::veda::workspace::Request<'_>,
+    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
+        Ok(None)
+    }
+
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
     /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
     /// resident baseline.

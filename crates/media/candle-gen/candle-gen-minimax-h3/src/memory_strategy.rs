@@ -1056,6 +1056,16 @@ fn memory_contract_surface_specs() -> Vec<candle_gen::gen_core::MemoryContractSu
     candle_gen::gen_core::candle_memory_contract_surface_specs()
 }
 
+/// Request-only sparse estimate; off leaves the dense memory contract byte-for-byte unchanged.
+pub fn veda_workspace_bound(
+    req: candle_gen::gen_core::veda::workspace::Request<'_>,
+) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>> {
+    candle_gen::gen_core::veda::workspace::for_video_request(
+        req,
+        candle_gen::gen_core::veda::workspace::Backend::Cuda,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

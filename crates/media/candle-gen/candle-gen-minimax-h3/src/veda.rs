@@ -12,10 +12,11 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 pub const COMPONENT: &str = "veda_predictor";
 pub use candle_gen::quant::veda_int8::KERNEL;
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
-const WORKSPACE_ALLOWANCE: u64 = 512 * 1024 * 1024;
+use candle_gen::gen_core::veda::workspace::{self, Backend, LayoutSize, Limits};
 struct Prepared {
     bundle: Bundle,
     plan: Plan,
+    grid: [usize; 3],
     layouts: BTreeMap<TileShape, Layout>,
 }
 pub struct VedaRuntime {
@@ -69,8 +70,31 @@ impl VedaRuntime {
                 );
             }
             report.borrow_mut().predictor_load_attempts += 1;
+            let g = packed.geometry();
+            let grid = [g.num_latent_frames, g.latent_height / 2, g.latent_width / 2];
+            let plan = workspace::frozen_plan(grid)?;
+            let sizes = plan
+                .shapes
+                .iter()
+                .map(|&s| packed.veda_layout(s).map(|l| (s, LayoutSize::from(&l))))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            // Account loading even when checkpoint integrity/decode fails.
+            let initial = workspace::bound(
+                request,
+                Backend::Cuda,
+                &plan,
+                grid,
+                &sizes,
+                layers,
+                heads,
+                dim,
+                1,
+                2,
+                Limits::default(),
+            )?;
+            report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load(path, layers, heads, dim)?;
-            Self::build(bundle, packed, &report)
+            Self::build(bundle, request, packed, &report)
         })();
         let (prepared, failure) = match result {
             Ok(p) => (Some(p), None),
@@ -87,7 +111,12 @@ impl VedaRuntime {
             calls: Default::default(),
         })
     }
-    fn build(bundle: Bundle, packed: &PackedLayout, report: &ReportSink) -> Result<Prepared> {
+    fn build(
+        bundle: Bundle,
+        request: &VedaRequest,
+        packed: &PackedLayout,
+        report: &ReportSink,
+    ) -> Result<Prepared> {
         let g = packed.geometry();
         let grid = [g.num_latent_frames, g.latent_height / 2, g.latent_width / 2];
         let plan = bundle.choose(grid);
@@ -95,14 +124,32 @@ impl VedaRuntime {
         for &shape in &plan.shapes {
             layouts.insert(shape, packed.veda_layout(shape)?);
         }
+        let sizes = layouts
+            .iter()
+            .map(|(&s, l)| (s, LayoutSize::from(l)))
+            .collect();
+        let bound = workspace::bound(
+            request,
+            Backend::Cuda,
+            &plan,
+            grid,
+            &sizes,
+            bundle.layers,
+            bundle.heads,
+            bundle.dim,
+            1,
+            2,
+            Limits::default(),
+        )?;
         let mut r = report.borrow_mut();
         r.predictor = Some(bundle.identity.clone());
         r.plan = Some(plan.name.clone());
         r.exact_plan = plan.grid == grid;
-        r.workspace_bytes = r.workspace_bytes.max(bundle.host_bytes());
+        r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
         Ok(Prepared {
             bundle,
             plan,
+            grid,
             layouts,
         })
     }
@@ -177,6 +224,28 @@ impl VedaRuntime {
         {
             return Err("Veda unsupported device/dtype/layout".into());
         }
+        let sizes = p
+            .layouts
+            .iter()
+            .map(|(&s, l)| (s, LayoutSize::from(l)))
+            .collect();
+        let bound = workspace::bound(
+            &self.request,
+            Backend::Cuda,
+            &p.plan,
+            p.grid,
+            &sizes,
+            p.bundle.layers,
+            heads,
+            dim,
+            batch,
+            2,
+            Limits::default(),
+        )?;
+        {
+            let mut r = self.report.borrow_mut();
+            r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
+        }
         let tested = self
             .tested
             .borrow()
@@ -203,20 +272,9 @@ impl VedaRuntime {
             for h in 0..heads {
                 let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
                 let slots = layout.perm.len();
-                let tiles = layout.valid.len();
-                // Bound copies, pooling, projected features, logits, worst-case mask, kernel scratch,
-                // retained and final outputs BEFORE any gather (even minimum single-head batches).
-                let minimum = 6 * slots as u64 * dim as u64
-                    + 20 * slots as u64 * dim as u64
-                    + (8 * layout.video * 3 * dim
-                        + 8 * layout.video * dim
-                        + 4 * layout.video * layout.video
-                        + 24 * dim * dim) as u64
-                    + (8 * tiles * tiles + 8 * tiles + 4 * (tiles + 1)) as u64;
-                if minimum > WORKSPACE_ALLOWANCE {
-                    return Err(
-                        "Veda minimum head workspace exceeds problem-bounded allowance".into(),
-                    );
+                if let Some(reason) = &bound.chunks[&p.plan.shapes[p.plan.heads[layer][h]]].refusal
+                {
+                    return Err(format!("Veda {reason}").into());
                 }
                 let qt = tile(q, b, h, layout)?;
                 let kt = tile(k, b, h, layout)?;
@@ -259,11 +317,7 @@ impl VedaRuntime {
                     q.device(),
                 )?;
                 outputs.push(out.index_select(&inverse, 1)?.reshape((1, 1, seq, dim))?);
-                high = high.max(
-                    minimum
-                        + 8 * batch as u64 * heads as u64 * seq as u64 * dim as u64
-                        + p.bundle.host_bytes(),
-                );
+                high = bound.total_bytes;
             }
             batches.push(Tensor::cat(&outputs, 1)?);
         }
@@ -595,7 +649,18 @@ mod tests {
     fn runtime(dev: &Device, report: ReportSink) -> VedaRuntime {
         let p = packed(dev);
         VedaRuntime {
-            prepared: Some(VedaRuntime::build(predictor(2, 2, 16), &p, &report).unwrap()),
+            prepared: Some(
+                VedaRuntime::build(
+                    predictor(2, 2, 16),
+                    &VedaRequest {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    &p,
+                    &report,
+                )
+                .unwrap(),
+            ),
             request: VedaRequest {
                 enabled: true,
                 generated: VedaBudget::KeyTiles(1),

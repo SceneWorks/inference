@@ -178,12 +178,20 @@ impl Bundle {
     pub fn load(path: &Path, layers: usize, heads: usize, dim: usize) -> Result<Self> {
         use sha2::{Digest, Sha256};
         // Hash and parse one owned buffer, so a replaced path cannot pass integrity validation.
-        let bytes = std::fs::read(path).map_err(|e| {
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|e| {
             bad(format!(
                 "{}: {e}; repair/install the managed component",
                 path.display()
             ))
         })?;
+        if file.metadata()?.len() != 275_415_648 {
+            return Err(bad(
+                "size mismatch; repair/install the frozen managed component",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(275_415_649);
+        file.take(275_415_649).read_to_end(&mut bytes)?;
         if bytes.len() != 275_415_648 {
             return Err(bad(
                 "size mismatch; repair/install the frozen managed component",
