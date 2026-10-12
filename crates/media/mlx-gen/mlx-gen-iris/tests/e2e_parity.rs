@@ -14,11 +14,16 @@ use mlx_gen::{CancelFlag, GenerationRequest, PreviewSink};
 use mlx_gen_iris::{denoise, encode, load_backbone, IrisTextEncoder};
 use mlx_rs::Dtype;
 
-use crate::common::{assert_close, fixture, on_cpu, tiny_backbone, tiny_config, tiny_text_encoder};
+use crate::common::{
+    assert_close, cpu_process, fixture, tiny_backbone, tiny_config, tiny_text_encoder,
+};
 
 #[test]
 fn generate_matches_upstream_from_injected_noise() {
-    on_cpu(run);
+    cpu_process(
+        "e2e_parity::generate_matches_upstream_from_injected_noise",
+        run,
+    );
 }
 
 fn run() {

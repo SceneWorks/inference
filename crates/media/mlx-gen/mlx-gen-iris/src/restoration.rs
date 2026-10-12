@@ -120,6 +120,11 @@ impl IrisRestorer {
         })
     }
 
+    /// The export's `task` settings (`sigma`, `tile`) the restorer runs with.
+    pub fn settings(&self) -> &RestorationSettings {
+        &self.settings
+    }
+
     /// The export's tile geometry (the release: 1024-px tiles, 16-px patches).
     pub fn geometry(&self) -> TileGeometry {
         self.settings.geometry(&self.config)

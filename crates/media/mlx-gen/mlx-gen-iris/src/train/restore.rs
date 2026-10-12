@@ -28,7 +28,7 @@
 //! adapter (HYPIR's own arm) trains only when the request asks for one.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gen_core::iris::restoration_train::{
@@ -38,6 +38,7 @@ use gen_core::iris::restoration_train::{
     RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
     CRITIC_HEAD_WIDTH, TRAINER_ID,
 };
+use gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
 use gen_core::iris::train::{
     adapter_param_route, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
     latest_checkpoint, linear_paths_from_keys, lr_factor, mix_seed, prune_checkpoints,
@@ -731,6 +732,7 @@ impl Run {
             (None, true) => latest_checkpoint(&ckpt_root),
             (None, false) => None,
         };
+        let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -760,6 +762,10 @@ impl Run {
                 pos = saved.batches_consumed;
             }
         }
+        // sc-25690: the checkpoints under the root that are not this run's lineage move aside
+        // before its first publish (retention and `latest` see only this run's) — once the resume
+        // source was validated, so a refused resume leaves the root as it was.
+        retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         Ok(Self {
             plan,
             model,
@@ -1088,9 +1094,6 @@ impl Run {
     /// Write the `upscaler/`-layout restoration export; returns its `model.safetensors`.
     fn export(&self, req: &TrainingRequest) -> Result<PathBuf> {
         let dir = req.output_dir.join(file_stem(&req.file_name));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::Msg(format!("iris restore export: {}: {e}", dir.display())))?;
-        write_export_sidecars(&self.export, &dir)?;
         let which = self.plan.export_weights;
         let dtype = if self.plan.export_bf16 {
             Dtype::Bfloat16
@@ -1102,13 +1105,17 @@ impl Run {
             .into_iter()
             .map(|(k, v)| Ok((k, v.as_dtype(dtype)?)))
             .collect::<Result<Vec<_>>>()?;
-        let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
-        save_safetensors_atomic(
-            &path,
-            &list,
-            &export_metadata(which, self.step, &self.base_identity),
-        )?;
-        Ok(path)
+        let meta = export_metadata(which, self.step, &self.base_identity);
+        // sc-25690: the sidecars and the merged weights appear together or not at all.
+        publish_export_dir(&dir, |stage: &Path| -> Result<()> {
+            write_export_sidecars(&self.export, stage)?;
+            save_safetensors_atomic(
+                &stage.join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                &list,
+                &meta,
+            )
+        })?;
+        Ok(dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE))
     }
 
     /// Restore the first item's (epoch-1) degraded input with the preview weights.

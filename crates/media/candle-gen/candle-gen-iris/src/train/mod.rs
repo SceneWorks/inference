@@ -45,6 +45,9 @@ use candle_gen::gen_core::iris::train::dist::{
     dist_error, Collective, DistError, Partition, Precision, ReduceOp, World,
 };
 use candle_gen::gen_core::iris::train::holdout::{self as holdout_contract, ValSums};
+use candle_gen::gen_core::iris::train::lineage::{
+    agree_resume, elect_checkpoint_writer, publish_export_dir, retire_foreign_checkpoints,
+};
 use candle_gen::gen_core::iris::train::pipeline::DataPipeline;
 use candle_gen::gen_core::iris::train::repa::{RepaPlan, PROJECTOR_PREFIX, TEACHER_COMPONENT};
 use candle_gen::gen_core::iris::train::shapes::preprocess_file_to_shape;
@@ -388,6 +391,9 @@ impl Collective for Recording {
         let r = self.inner.all_reduce_f64(data, op);
         self.note(r)
     }
+    fn set_cancel_armed(&mut self, armed: bool) -> bool {
+        self.inner.set_cancel_armed(armed)
+    }
 }
 
 // =============================================================================================
@@ -496,6 +502,9 @@ struct Run {
     last_loss: f64,
     first_epoch: u32,
     resume_position: Option<JsonValue>,
+    /// Whether this rank publishes consolidated checkpoints (the elected writer of its storage,
+    /// sc-25690).
+    writes_checkpoints: bool,
     log_window: Vec<f64>,
 }
 
@@ -742,6 +751,12 @@ fn rank_device(base: &Device, world: &World) -> std::result::Result<Device, Dist
     }
 }
 
+/// A boundary of an ended pass and the data position captured when that pass ended.
+struct Settled {
+    boundary: (u32, usize, usize, usize),
+    position: JsonValue,
+}
+
 impl Run {
     fn prepare(
         trainer: &IrisTrainer,
@@ -765,7 +780,7 @@ impl Run {
             MixedPrecision::Fp32 => DType::F32,
             MixedPrecision::Fp16 => DType::F16,
         };
-        let coll = match make_collective(&pre.dist.world) {
+        let coll = match make_collective(&pre.dist.world, &req.cancel) {
             Ok(c) => c,
             Err(e) => {
                 if let Some(d) = dist_error(&e) {
@@ -776,7 +791,7 @@ impl Run {
         };
         let coll: Box<dyn Collective> = Box::new(Recording {
             inner: coll,
-            slot: failure,
+            slot: failure.clone(),
         });
         if pre.dist.world.world_size > 1 {
             eprintln!(
@@ -1074,6 +1089,27 @@ impl Run {
             (None, true) => latest_checkpoint(&ckpt_root),
             (None, false) => None,
         };
+        // sc-25690: every rank resumes from one agreed checkpoint; one writer per storage; the
+        // checkpoints that are not this run's lineage move aside before its first publish.
+        let search_root = match (&plan.resume_from, plan.resume) {
+            (Some(p), _) if !p.join(CKPT_STATE).is_file() => Some(p.clone()),
+            (None, true) => Some(ckpt_root.clone()),
+            _ => None,
+        };
+        let resume_dir = match agree_resume(topo.coll.as_mut(), resume_dir, search_root.as_deref())
+        {
+            Ok(d) => d,
+            Err(e) => {
+                // typed at `Trainer::train`, like every other distributed failure
+                if let Some(d) = dist_error(&e) {
+                    failure.borrow_mut().get_or_insert(d.clone());
+                }
+                return Err(e.into());
+            }
+        };
+        let writes_checkpoints =
+            elect_checkpoint_writer(topo.coll.as_mut(), plan.dist.checkpoint_io, &ckpt_root)?;
+        let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -1193,6 +1229,15 @@ impl Run {
                 .unwrap_or(1) as u32;
             resume_position = Some(position);
         }
+        // sc-25690: the root's checkpoints that are not this run's lineage move aside before its
+        // first publish, and only once the resume source was validated and loaded (a refused
+        // resume leaves the root as it was).
+        if writes_checkpoints {
+            retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
+        }
+        if plan.dist.world.world_size > 1 {
+            topo.coll.barrier("checkpoint lineage")?;
+        }
         let run = Self {
             plan,
             config,
@@ -1224,6 +1269,7 @@ impl Run {
             last_loss,
             first_epoch,
             resume_position,
+            writes_checkpoints,
             log_window: Vec::new(),
         };
         if run.topo.is_main() {
@@ -1430,9 +1476,15 @@ impl Run {
         let mut finished = reached(self.step);
         let mut epoch = self.first_epoch;
         let mut resume = self.resume_position.take();
+        // sc-25690: the data position of a boundary is the walker's state of the pass that set
+        // it. `begin_epoch` resets the walker, so a boundary carried into the next pass (a cancel
+        // before its first step) saves the position captured when its pass ended.
+        let mut walker_epoch = 0u32;
+        let mut settled: Option<Settled> = None;
         while !finished && !cancelled && epoch <= max_epoch {
             let resumed_pass = resume.is_some();
             let skip = self.pipeline.begin_epoch(epoch, resume.take().as_ref())?;
+            walker_epoch = epoch;
             if resumed_pass && self.pipeline.regroups() {
                 let mut v = [self.pipeline.remaining_batches() as f64];
                 self.topo.reduce_scalars(&mut v, ReduceOp::Min)?;
@@ -1445,6 +1497,9 @@ impl Run {
                 self.any(&mut cancel)?;
                 if cancel[0] > 0.0 {
                     cancelled = true;
+                    // The agreement decided: the cancel-save and export that follow wait for the
+                    // writer however long its writes take (bounded by the transport timeout).
+                    self.topo.coll.set_cancel_armed(false);
                     break;
                 }
                 let position = skip + local_step;
@@ -1538,7 +1593,9 @@ impl Run {
                     loss: self.last_loss as f32,
                 });
                 if plan.save_every > 0 && self.step.is_multiple_of(plan.save_every as u64) {
-                    self.save_checkpoint(boundary.expect("stepped"))?;
+                    let b = boundary.expect("stepped");
+                    let position = self.position_at(b, walker_epoch, &settled)?;
+                    self.save_checkpoint(b, position)?;
                     last_saved = Some(self.step);
                     on_progress(TrainingProgress::Checkpoint {
                         step: self.micro_step(),
@@ -1564,12 +1621,20 @@ impl Run {
             if finished || cancelled {
                 break;
             }
+            if let Some(b) = boundary.filter(|b| b.0 == walker_epoch) {
+                let position = self.pipeline.data_position(b.0, b.1, b.2, b.3)?;
+                settled = Some(Settled {
+                    boundary: b,
+                    position,
+                });
+            }
             if plan.save_every_epochs > 0
                 && (epoch.is_multiple_of(plan.save_every_epochs) || Some(epoch) == plan.num_epochs)
                 && last_saved != Some(self.step)
             {
                 if let Some(b) = boundary {
-                    self.save_checkpoint(b)?;
+                    let position = self.position_at(b, walker_epoch, &settled)?;
+                    self.save_checkpoint(b, position)?;
                     last_saved = Some(self.step);
                     on_progress(TrainingProgress::Checkpoint {
                         step: self.micro_step(),
@@ -1583,7 +1648,8 @@ impl Run {
         }
         if last_saved != Some(self.step) && self.step > 0 {
             if let Some(b) = boundary {
-                self.save_checkpoint(b)?;
+                let position = self.position_at(b, walker_epoch, &settled)?;
+                self.save_checkpoint(b, position)?;
                 on_progress(TrainingProgress::Checkpoint {
                     step: self.micro_step(),
                 });
@@ -1812,6 +1878,26 @@ impl Run {
         (self.step * self.plan.grad_accum as u64) as u32
     }
 
+    /// The data position of boundary `b` (sc-25690): read from the walker while it still walks
+    /// `b`'s pass (`walker_epoch`), else the position `settled` when that pass ended.
+    fn position_at(
+        &mut self,
+        b: (u32, usize, usize, usize),
+        walker_epoch: u32,
+        settled: &Option<Settled>,
+    ) -> Result<JsonValue> {
+        if b.0 == walker_epoch {
+            return Ok(self.pipeline.data_position(b.0, b.1, b.2, b.3)?);
+        }
+        match settled {
+            Some(s) if s.boundary == b => Ok(s.position.clone()),
+            _ => Err(Error::Msg(format!(
+                "iris checkpoint: no data position was captured for the boundary {b:?} of an \
+                 ended pass"
+            ))),
+        }
+    }
+
     fn state(&self, position: JsonValue, boundary: (u32, usize)) -> CheckpointState {
         CheckpointState {
             step: self.step,
@@ -1845,8 +1931,27 @@ impl Run {
     }
 
     /// Publish a checkpoint at an optimizer-step boundary, collectively (see the MLX twin).
-    fn save_checkpoint(&mut self, b: (u32, usize, usize, usize)) -> Result<()> {
-        let position = self.pipeline.data_position(b.0, b.1, b.2, b.3)?;
+    fn save_checkpoint(
+        &mut self,
+        b: (u32, usize, usize, usize),
+        position: JsonValue,
+    ) -> Result<()> {
+        // The waits of a checkpoint are for its writer, not a stalled peer: a cancel arriving
+        // while a large checkpoint is written must not end them (sc-25690).
+        let armed = self.topo.coll.set_cancel_armed(false);
+        let r = self.write_checkpoint(b, position);
+        self.topo.coll.set_cancel_armed(armed);
+        r
+    }
+
+    fn write_checkpoint(
+        &mut self,
+        b: (u32, usize, usize, usize),
+        position: JsonValue,
+    ) -> Result<()> {
+        if self.topo.is_main() {
+            gen_core::iris::train::dist::writer_test_delay();
+        }
         let state = self.state(position, (b.0, b.1));
         let io = self.plan.dist.checkpoint_io;
         let world = self.plan.dist.world.clone();
@@ -1923,7 +2028,7 @@ impl Run {
             let full = self.topo.gather_full(&key, &v)?;
             opt_state.push((name, full));
         }
-        if io.writes(&world) {
+        if self.writes_checkpoints {
             mkdir(&self.ckpt_root)?;
             let mut staging = checkpoint_staging_dir(&self.ckpt_root, self.step);
             if io == gen_core::iris::train::dist::CheckpointIo::PerNode {
@@ -1970,6 +2075,14 @@ impl Run {
 
     /// Write the final artifact; the main rank writes, every rank returns the same path.
     fn export(&mut self, req: &TrainingRequest) -> Result<PathBuf> {
+        // As a checkpoint: the export's waits are for its writer (sc-25690).
+        let armed = self.topo.coll.set_cancel_armed(false);
+        let r = self.write_export(req);
+        self.topo.coll.set_cancel_armed(armed);
+        r
+    }
+
+    fn write_export(&mut self, req: &TrainingRequest) -> Result<PathBuf> {
         let which = self.plan.export_weights;
         let tensors = self.selected_full(which)?;
         let path = match &self.model.trainable {
@@ -1983,13 +2096,12 @@ impl Run {
             self.topo.coll.barrier("export")?;
             return Ok(path);
         }
+        gen_core::iris::train::dist::writer_test_delay();
         std::fs::create_dir_all(&req.output_dir)
             .map_err(|e| Error::Msg(format!("iris export: {}: {e}", req.output_dir.display())))?;
         match &self.model.trainable {
             Trainable::Full => {
                 let dir = req.output_dir.join(file_stem(&req.file_name));
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| Error::Msg(format!("iris export: {}: {e}", dir.display())))?;
                 let dtype = if self.plan.export_bf16 {
                     DType::BF16
                 } else {
@@ -1999,16 +2111,20 @@ impl Run {
                 for (k, v) in &tensors {
                     list.push((k.clone(), v.to_dtype(dtype)?));
                 }
-                contract::atomic_write(
-                    &dir.join(gen_core::iris::BACKBONE_CONFIG_FILE),
-                    export_config_yaml(&self.config, &self.plan.flow, self.adaln_zero_init)
-                        .as_bytes(),
-                )?;
-                save_safetensors_atomic(
-                    &path,
-                    &list,
-                    &full_model_metadata(which, self.step, &self.base_identity),
-                )?;
+                let yaml = export_config_yaml(&self.config, &self.plan.flow, self.adaln_zero_init);
+                let meta = full_model_metadata(which, self.step, &self.base_identity);
+                // sc-25690: config + weights appear together or not at all.
+                publish_export_dir(&dir, |stage: &Path| -> Result<()> {
+                    contract::atomic_write(
+                        &stage.join(gen_core::iris::BACKBONE_CONFIG_FILE),
+                        yaml.as_bytes(),
+                    )?;
+                    save_safetensors_atomic(
+                        &stage.join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                        &list,
+                        &meta,
+                    )
+                })?;
             }
             Trainable::Adapter { kind, targets, .. } => {
                 let meta = AdapterMetadata {

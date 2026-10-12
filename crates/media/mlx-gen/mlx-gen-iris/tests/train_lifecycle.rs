@@ -28,7 +28,7 @@ use mlx_gen_iris::{load_backbone_with_adapters, IrisDiT, IrisTextEncoder};
 use mlx_rs::{Array, Dtype};
 use serde_json::json;
 
-use crate::common::{on_cpu, tiny_backbone, tiny_config, tiny_text_encoder};
+use crate::common::{cpu_process, on_cpu, tiny_backbone, tiny_config, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
 
@@ -144,6 +144,13 @@ fn assert_same_files(a: &Path, b: &Path) {
 
 #[test]
 fn gen_core_trainer_conformance() {
+    cpu_process(
+        "train_lifecycle::gen_core_trainer_conformance",
+        gen_core_trainer_conformance_body,
+    );
+}
+
+fn gen_core_trainer_conformance_body() {
     let data = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
@@ -234,6 +241,13 @@ fn resume_case(mut cfg: TrainingConfig, name: &str) {
 
 #[test]
 fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run() {
+    cpu_process(
+        "train_lifecycle::full_muon_cancel_and_resume_reproduce_the_uninterrupted_run",
+        full_muon_cancel_and_resume_reproduce_the_uninterrupted_run_body,
+    );
+}
+
+fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run_body() {
     let mut cfg = config();
     cfg.full_finetune = true;
     cfg.optimizer = "muon".into();
@@ -244,6 +258,13 @@ fn full_muon_cancel_and_resume_reproduce_the_uninterrupted_run() {
 
 #[test]
 fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
+    cpu_process(
+        "train_lifecycle::lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run",
+        lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run_body,
+    );
+}
+
+fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run_body() {
     let mut cfg = config();
     cfg.batch_size = 1;
     cfg.gradient_accumulation = 2;
@@ -293,6 +314,13 @@ fn lora_accumulated_cancel_and_resume_reproduce_the_uninterrupted_run() {
 
 #[test]
 fn resume_identity_retention_and_new_phase() {
+    cpu_process(
+        "train_lifecycle::resume_identity_retention_and_new_phase",
+        resume_identity_retention_and_new_phase_body,
+    );
+}
+
+fn resume_identity_retention_and_new_phase_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -342,6 +370,13 @@ fn resume_identity_retention_and_new_phase() {
 
 #[test]
 fn cached_and_on_the_fly_conditioning_train_identically() {
+    cpu_process(
+        "train_lifecycle::cached_and_on_the_fly_conditioning_train_identically",
+        cached_and_on_the_fly_conditioning_train_identically_body,
+    );
+}
+
+fn cached_and_on_the_fly_conditioning_train_identically_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -483,11 +518,25 @@ fn adapter_round_trip(network: NetworkType, compute: Dtype) {
 
 #[test]
 fn lora_adapter_exports_and_loads_through_the_provider() {
+    cpu_process(
+        "train_lifecycle::lora_adapter_exports_and_loads_through_the_provider",
+        lora_adapter_exports_and_loads_through_the_provider_body,
+    );
+}
+
+fn lora_adapter_exports_and_loads_through_the_provider_body() {
     adapter_round_trip(NetworkType::Lora, Dtype::Float32);
 }
 
 #[test]
 fn lokr_adapter_exports_and_loads_through_the_provider() {
+    cpu_process(
+        "train_lifecycle::lokr_adapter_exports_and_loads_through_the_provider",
+        lokr_adapter_exports_and_loads_through_the_provider_body,
+    );
+}
+
+fn lokr_adapter_exports_and_loads_through_the_provider_body() {
     adapter_round_trip(NetworkType::Lokr, Dtype::Float32);
 }
 
@@ -495,17 +544,38 @@ fn lokr_adapter_exports_and_loads_through_the_provider() {
 /// (a delta merged into the bf16 weight would round away) and match the provider's bf16 install.
 #[test]
 fn bf16_lora_adapter_exports_and_loads_through_the_provider() {
+    cpu_process(
+        "train_lifecycle::bf16_lora_adapter_exports_and_loads_through_the_provider",
+        bf16_lora_adapter_exports_and_loads_through_the_provider_body,
+    );
+}
+
+fn bf16_lora_adapter_exports_and_loads_through_the_provider_body() {
     adapter_round_trip(NetworkType::Lora, Dtype::Bfloat16);
 }
 
 #[test]
 fn bf16_lokr_adapter_exports_and_loads_through_the_provider() {
+    cpu_process(
+        "train_lifecycle::bf16_lokr_adapter_exports_and_loads_through_the_provider",
+        bf16_lokr_adapter_exports_and_loads_through_the_provider_body,
+    );
+}
+
+fn bf16_lokr_adapter_exports_and_loads_through_the_provider_body() {
     adapter_round_trip(NetworkType::Lokr, Dtype::Bfloat16);
 }
 
 /// The shared contract: empty `sample_prompts` disables sampling whatever `sample_every` says.
 #[test]
 fn empty_sample_prompts_render_no_previews() {
+    cpu_process(
+        "train_lifecycle::empty_sample_prompts_render_no_previews",
+        empty_sample_prompts_render_no_previews_body,
+    );
+}
+
+fn empty_sample_prompts_render_no_previews_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -529,6 +599,13 @@ fn empty_sample_prompts_render_no_previews() {
 
 #[test]
 fn exported_full_model_loads_and_generates_in_the_provider() {
+    cpu_process(
+        "train_lifecycle::exported_full_model_loads_and_generates_in_the_provider",
+        exported_full_model_loads_and_generates_in_the_provider_body,
+    );
+}
+
+fn exported_full_model_loads_and_generates_in_the_provider_body() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
     let out = tempfile::tempdir().unwrap();
@@ -612,6 +689,13 @@ fn exported_full_model_loads_and_generates_in_the_provider() {
 
 #[test]
 fn random_init_x_prediction_trains_and_its_export_records_the_objective() {
+    cpu_process(
+        "train_lifecycle::random_init_x_prediction_trains_and_its_export_records_the_objective",
+        random_init_x_prediction_trains_and_its_export_records_the_objective_body,
+    );
+}
+
+fn random_init_x_prediction_trains_and_its_export_records_the_objective_body() {
     let data = tempfile::tempdir().unwrap();
     let items = dataset(data.path());
     let out = tempfile::tempdir().unwrap();
@@ -710,6 +794,13 @@ fn a_trainer_load_without_the_text_encoder_is_refused() {
 /// null, so two datasets differing only in their captions train identically — and at 0 they do not.
 #[test]
 fn caption_dropout_substitutes_the_null_conditioning() {
+    cpu_process(
+        "train_lifecycle::caption_dropout_substitutes_the_null_conditioning",
+        caption_dropout_substitutes_the_null_conditioning_body,
+    );
+}
+
+fn caption_dropout_substitutes_the_null_conditioning_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -738,6 +829,13 @@ fn caption_dropout_substitutes_the_null_conditioning() {
 /// lr 0 and leaves the (zero-decay) weights untouched; without warmup the same step moves them.
 #[test]
 fn warmup_starts_the_schedule_at_zero() {
+    cpu_process(
+        "train_lifecycle::warmup_starts_the_schedule_at_zero",
+        warmup_starts_the_schedule_at_zero_body,
+    );
+}
+
+fn warmup_starts_the_schedule_at_zero_body() {
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
@@ -765,6 +863,13 @@ fn warmup_starts_the_schedule_at_zero() {
 /// seed it reproduces the catalog generator's image exactly.
 #[test]
 fn preview_renderer_matches_the_provider() {
+    cpu_process(
+        "train_lifecycle::preview_renderer_matches_the_provider",
+        preview_renderer_matches_the_provider_body,
+    );
+}
+
+fn preview_renderer_matches_the_provider_body() {
     let cfg = tiny_config();
     let g = mlx_gen_iris::provider_registry()
         .unwrap()

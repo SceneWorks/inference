@@ -2,13 +2,13 @@
 //! folded into the weights (`tools/dump_iris_controls.py`), on the `iris_dit_golden` inputs. The
 //! synthetic adapters target four projections (text adapter, a dual-stream block, a single-stream
 //! block, the pixel head); the LoKr's delta is the Kronecker product of a full `w1` and a low-rank
-//! `w2_a·w2_b`. MLX installs both as forward-time residuals (LoKr through the structured
-//! `w1·X·w2ᵀ`), so the comparison is residual-vs-merged.
+//! `w2_a·w2_b`. MLX installs both as forward-time residuals on the dense projection (the LoKr as
+//! its reconstructed `[out, in]` delta), so the comparison is residual-vs-merged.
 //!
-//! Tolerance: FP32 backbone on the MLX CPU stream (1e-4 for the bare forward, `dit_parity`); the
-//! shared LoKr path reconstructs its factors in bf16 (PARITY-BF16, `mlx_gen::adapters::loader`), so
-//! the adapted forwards are held to 2e-3 of peak — two orders below each adapter's own effect on
-//! the output (asserted).
+//! Tolerance: the bare forward's 1e-4 of peak (`dit_parity`, FP32 on the MLX CPU stream). Under
+//! `Precision::Fp32` the LoKr residual is built in f32 (the host's `lycoris_dtype`, sc-25690);
+//! measured max|Δ| / peak: LoRA 1.9e-5, LoKr 2.5e-5, both 2.6e-5 (with the former bf16 LoKr
+//! reconstruction: LoKr 6.5e-4, both 6.3e-4 — over this bound).
 
 use mlx_gen::gen_core::iris::{IrisTask, ADAPTER_TASK_KEY};
 use mlx_gen::{AdapterKind, AdapterSpec, Error};
@@ -16,10 +16,11 @@ use mlx_gen_iris::{load_backbone_with_adapters, TextBatch};
 use mlx_rs::Dtype;
 
 use crate::common::{
-    assert_close, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone, tiny_config,
+    assert_close, cpu_process, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone,
+    tiny_config,
 };
 
-const TOL: f32 = 2e-3;
+const TOL: f32 = 1e-4;
 
 fn spec(file: &str, kind: AdapterKind, scale: f32) -> AdapterSpec {
     AdapterSpec::new(fixtures().join(file), scale, kind)
@@ -27,6 +28,13 @@ fn spec(file: &str, kind: AdapterKind, scale: f32) -> AdapterSpec {
 
 #[test]
 fn lora_and_lokr_match_upstream_merged_weights() {
+    cpu_process(
+        "adapter_parity::lora_and_lokr_match_upstream_merged_weights",
+        lora_and_lokr_match_upstream_merged_weights_body,
+    );
+}
+
+fn lora_and_lokr_match_upstream_merged_weights_body() {
     on_cpu(|| {
         let config = tiny_config();
         let golden = fixture("iris_adapter_golden.safetensors");
@@ -81,8 +89,72 @@ fn lora_and_lokr_match_upstream_merged_weights() {
     });
 }
 
+/// A backbone whose `config.yaml` declares one pixel block fewer than its checkpoint carries
+/// (`pixel_blocks.1.*` unconsumed) — a config/checkpoint mismatch.
+fn mismatched_backbone() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let config = std::fs::read_to_string(tiny_backbone().join("config.yaml")).unwrap();
+    assert_eq!(config.matches("\n    depth: 2\n").count(), 1);
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        config.replace("\n    depth: 2\n", "\n    depth: 1\n"),
+    )
+    .unwrap();
+    std::fs::copy(
+        tiny_backbone().join("model.safetensors"),
+        dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    dir
+}
+
+/// sc-25690 I8: the checkpoint's unused-key check holds with an adapter attached — the adapter
+/// install must not mark every projection as consumed.
+/// MUTATION: build the install's projection host through tracked `Weights::require` reads — RED.
+#[test]
+fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached() {
+    crate::common::cpu_process(
+        "adapter_parity::a_mismatched_checkpoint_is_refused_with_an_adapter_attached",
+        a_mismatched_checkpoint_is_refused_with_an_adapter_attached_body,
+    );
+}
+
+fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached_body() {
+    let dir = mismatched_backbone();
+    let config = mlx_gen::gen_core::iris::IrisConfig::from_dir(dir.path()).unwrap();
+    assert_eq!(config.model.pixel.depth, 1);
+    let lora = spec("iris_lora.safetensors", AdapterKind::Lora, 0.75);
+    let lokr = spec("iris_lokr.safetensors", AdapterKind::Lokr, 1.0);
+    for specs in [vec![], vec![lora], vec![lokr]] {
+        let err = load_backbone_with_adapters(
+            dir.path(),
+            &config,
+            Dtype::Float32,
+            &specs,
+            IrisTask::Generation,
+            "iris_3b",
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{} adapter(s): the mismatch must be refused", specs.len()));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not consume"),
+            "{} adapter(s): {msg}",
+            specs.len()
+        );
+        assert!(msg.contains("pixel_blocks.1."), "{msg}");
+    }
+}
+
 #[test]
 fn an_adapter_for_another_task_or_family_is_refused() {
+    cpu_process(
+        "adapter_parity::an_adapter_for_another_task_or_family_is_refused",
+        an_adapter_for_another_task_or_family_is_refused_body,
+    );
+}
+
+fn an_adapter_for_another_task_or_family_is_refused_body() {
     let config = tiny_config();
     let load = |file: &str| {
         load_backbone_with_adapters(

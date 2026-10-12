@@ -15,7 +15,8 @@ use mlx_rs::Dtype;
 use serde_json::Value;
 
 use crate::common::{
-    assert_close, errors, fixture, on_cpu, tiny_backbone, tiny_config, tiny_text_encoder,
+    assert_close, cpu_process, errors, fixture, on_cpu, tiny_backbone, tiny_config,
+    tiny_text_encoder,
 };
 
 const TOL: f32 = 6e-2;
@@ -61,6 +62,13 @@ pub fn case_request(case: &Value, config: &IrisConfig) -> GenerationRequest {
 
 #[test]
 fn every_control_matches_upstream_on_the_miniature() {
+    cpu_process(
+        "controls_parity::every_control_matches_upstream_on_the_miniature",
+        every_control_matches_upstream_on_the_miniature_body,
+    );
+}
+
+fn every_control_matches_upstream_on_the_miniature_body() {
     on_cpu(|| {
         let base_config = tiny_config();
         let te = IrisTextEncoder::load(&tiny_text_encoder(), &base_config.text_encoder).unwrap();

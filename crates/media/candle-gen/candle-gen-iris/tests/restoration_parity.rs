@@ -112,7 +112,7 @@ fn restoration_matches_upstream_end_to_end_in_fp32() {
         let out = restore_detailed(
             &req.image,
             &plan,
-            0.5,
+            restorer.settings().sigma,
             &req.cancel,
             &mut |p| steps += matches!(p, Progress::Step { .. }) as usize,
             &mut |tile, th, tw| restorer.velocity(tile, th, tw).map_err(Into::into),
@@ -190,6 +190,45 @@ fn cancel_between_tiles_is_typed_and_yields_no_image() {
         "{err:?}"
     );
     assert_eq!(steps, 2);
+}
+
+/// sc-25690 I11: a cancel that arrives after the last tile — at the post-processing marker — is
+/// honoured by the resize back / colour fix and yields no image, on the enlarge branch with the
+/// colour fix (the longest post-processing) and without either.
+/// MUTATION: drop the post-processing cancel checks in `gen_core::iris::restoration` — RED.
+#[test]
+fn cancel_after_the_last_tile_is_typed_and_yields_no_image() {
+    let restorer = fp32_restorer();
+    for (width, height, color_fix) in [(12u32, 8u32, true), (40, 24, false)] {
+        let cancel = CancelFlag::new();
+        let req = TransformRequest {
+            image: Image {
+                width,
+                height,
+                pixels: vec![100; (width * height * 3) as usize],
+            },
+            target: TargetSize::Scale(4.0),
+            input_sizing: InputSizing::Original,
+            color_fix: Some(color_fix),
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
+        let plan = restorer.plan(&req).unwrap();
+        let mut steps = 0;
+        let err = restorer
+            .apply(&req, &mut |p| match p {
+                Progress::Step { .. } => steps += 1,
+                Progress::Decoding => cancel.cancel(),
+                _ => {}
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, candle_gen::gen_core::Error::Canceled),
+            "{width}x{height} enlarged={} color_fix={color_fix}: {err:?}",
+            plan.enlarged
+        );
+        assert_eq!(steps, plan.forward_count(), "every tile ran first");
+    }
 }
 
 #[test]

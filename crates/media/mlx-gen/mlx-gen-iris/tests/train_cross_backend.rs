@@ -23,8 +23,8 @@ use mlx_rs::{Array, Dtype};
 use serde_json::json;
 
 use crate::common::{
-    assert_close, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone, tiny_config,
-    tiny_text_encoder,
+    assert_close, cpu_process, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone,
+    tiny_config, tiny_text_encoder,
 };
 
 const ID: &str = "iris_3b";
@@ -34,18 +34,11 @@ const ARTIFACTS: [(&str, Option<AdapterKind>); 3] = [
     ("full", None),
 ];
 
-/// The cross-backend bound: FP32 summation order only (1e-4 of peak, `dit_parity`'s) — except a
-/// LoKr, whose `[out, in]` delta the MLX provider reconstructs in **bf16** whatever the compute
-/// dtype (`mlx_gen::adapters::loader::apply_lokr`, PARITY-BF16 sc-2609) while the Candle provider
-/// holds it in the compute dtype; at this FP32 forward that bf16 rounding of the delta is the whole
-/// difference (measured ~1.2e-3 of peak; at the release's bf16 compute both hold a bf16 delta).
-fn tolerance(name: &str) -> f32 {
-    if name == "lokr" {
-        5e-3
-    } else {
-        1e-4
-    }
-}
+/// The cross-backend bound: FP32 summation order only (1e-4 of peak, `dit_parity`'s), for every
+/// artifact and either recording. Both providers build a LoKr residual in the compute dtype (f32
+/// here) since sc-25690, and the MLX recording (`forward.safetensors`) was re-produced on the MLX
+/// CPU device then (the artifacts themselves reproduced byte for byte).
+const TOL: f32 = 1e-4;
 
 fn artifact_path(dir: &Path, name: &str) -> PathBuf {
     if name == "full" {
@@ -134,12 +127,12 @@ fn check_trained_elsewhere(backend: &str) {
                 &format!("{backend}-trained {name} on mlx"),
                 &got,
                 expected,
-                tolerance(name),
+                TOL,
             );
             let (moved, peak, _) = errors(expected, &bare);
             eprintln!("{backend}/{name}: the artifact moves the forward by {moved:.3e}");
             assert!(
-                moved > 10.0 * tolerance(name) * peak.max(1.0),
+                moved > 10.0 * TOL * peak.max(1.0),
                 "{backend}/{name}: the trained artifact barely moves the forward ({moved:.3e})"
             );
         }
@@ -148,12 +141,26 @@ fn check_trained_elsewhere(backend: &str) {
 
 #[test]
 fn candle_trained_artifacts_load_and_match_on_mlx() {
+    cpu_process(
+        "train_cross_backend::candle_trained_artifacts_load_and_match_on_mlx",
+        candle_trained_artifacts_load_and_match_on_mlx_body,
+    );
+}
+
+fn candle_trained_artifacts_load_and_match_on_mlx_body() {
     check_trained_elsewhere("candle");
 }
 
 /// The MLX-produced fixtures still load here (and their recorded forward is this backend's).
 #[test]
 fn mlx_trained_fixtures_match_their_recorded_forward() {
+    cpu_process(
+        "train_cross_backend::mlx_trained_fixtures_match_their_recorded_forward",
+        mlx_trained_fixtures_match_their_recorded_forward_body,
+    );
+}
+
+fn mlx_trained_fixtures_match_their_recorded_forward_body() {
     check_trained_elsewhere("mlx");
 }
 
@@ -164,6 +171,13 @@ fn mlx_trained_fixtures_match_their_recorded_forward() {
 #[test]
 #[ignore = "fixture producer: writes into IRIS_CROSS_BACKEND_OUT"]
 fn produce_cross_backend_fixtures() {
+    cpu_process(
+        "train_cross_backend::produce_cross_backend_fixtures",
+        produce_cross_backend_fixtures_body,
+    );
+}
+
+fn produce_cross_backend_fixtures_body() {
     on_cpu(|| {
         let out =
             PathBuf::from(std::env::var("IRIS_CROSS_BACKEND_OUT").expect("IRIS_CROSS_BACKEND_OUT"));

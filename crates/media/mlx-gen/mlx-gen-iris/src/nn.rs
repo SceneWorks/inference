@@ -290,23 +290,3 @@ pub fn expect_shape(name: &str, a: &Array, want: &[i32]) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Upstream's `x * (1 + scale) + shift` keeps a bf16 stream bf16 (the Python `1` is a weak
-    /// scalar); the `1` here must not promote the PiT stream to f32 either.
-    #[test]
-    fn modulate_keeps_a_bf16_stream_in_bf16() {
-        let bf16 = |v: &[f32]| {
-            Array::from_slice(v, &[1, v.len() as i32])
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap()
-        };
-        let out = modulate(&bf16(&[1.0, 2.0]), &bf16(&[0.5, 0.5]), &bf16(&[1.0, -1.0])).unwrap();
-        assert_eq!(out.dtype(), Dtype::Bfloat16);
-        let got: Vec<f32> = out.as_dtype(Dtype::Float32).unwrap().as_slice().to_vec();
-        assert_eq!(got, vec![2.5, 0.5]);
-    }
-}

@@ -36,7 +36,7 @@ use mlx_gen_iris::train::dist::MlxCollective;
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value as Json};
 
-use crate::common::{on_cpu, tiny_backbone, tiny_text_encoder};
+use crate::common::{cpu_process, on_cpu, tiny_backbone, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
 const CHILD_ENV: &str = "IRIS_DIST_CHILD";
@@ -156,6 +156,12 @@ fn run_job(j: &Json) -> Json {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
+    if let Some(ms) = j["writer_delay_ms"].as_u64() {
+        std::env::set_var(
+            mlx_gen::gen_core::iris::train::dist::WRITER_TEST_DELAY_ENV,
+            ms.to_string(),
+        );
+    }
     let flag = req.cancel.clone();
     let cancel_at = j["cancel_at"].as_u64().map(|v| v as u32);
     let die_at = j["die_at"].as_u64().map(|v| v as u32);
@@ -195,7 +201,10 @@ fn run_probe(j: &Json) -> Json {
     let world: World = parse_dist(Some(&json!({"world": j["world"]})), false, true)
         .unwrap()
         .world;
-    let mut c = on_cpu(|| MlxCollective::init(&world, "ring")).unwrap();
+    let mut c = on_cpu(|| MlxCollective::init(&world, "ring", &Default::default())).unwrap();
+    if j["probe"] == "hybrid" {
+        return hybrid_probe(j, c);
+    }
     if j["probe"] == "gather" {
         // unequal contributions: the padded ring gather must return each one exactly
         let mine: Vec<f32> = (0..3 - world.rank)
@@ -224,6 +233,40 @@ fn run_probe(j: &Json) -> Json {
     })
 }
 
+/// The child side of the MLX-ring hybrid-sharding probe (sc-25690): a `dp_replicate 2 x dp_shard 2`
+/// mesh reduces one gradient of 3 rows (odd: the two shards hold 2 and 1 rows, so the replicate
+/// groups' all-reduce contributions differ in length across groups) through
+/// `Topology::reduce_grads`, plus a direct sub-group all-reduce of unequal-length rows.
+fn hybrid_probe(j: &Json, coll: MlxCollective) -> Json {
+    use mlx_gen_iris::train::dist::{to_host, Topology};
+    let dist = json!({"strategy": "fsdp2", "sharding": "hybrid",
+                      "mesh": {"dp_replicate": 2, "dp_shard": 2}, "world": j["world"]});
+    let plan = parse_dist(Some(&dist), false, true).unwrap();
+    let rank = plan.world.rank;
+    let key: std::rc::Rc<str> = "w".into();
+    let mut topo = Topology {
+        plan,
+        coll: Box::new(coll),
+        shapes: HashMap::from([(key.clone(), vec![3, 2])]),
+    };
+    // rank r's local gradient: (r + 1) * (row + 1) in every column
+    let g: Vec<f32> = (0..3)
+        .flat_map(|row| [((rank + 1) * (row + 1)) as f32; 2])
+        .collect();
+    let grads = HashMap::from([(key.clone(), Array::from_slice(&g, &[3, 2]))]);
+    let rows = on_cpu(|| topo.reduce_grads(grads)).unwrap();
+    let mine = on_cpu(|| to_host(&rows[&key])).unwrap();
+    // a sub-group reduction of rows whose length differs across the groups
+    let groups = Partition(vec![0, 1, 0, 1]);
+    let mut v = vec![rank as f32; if rank.is_multiple_of(2) { 3 } else { 2 }];
+    on_cpu(|| {
+        topo.coll
+            .all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &groups)
+    })
+    .unwrap();
+    json!({"rows": mine, "sub": v})
+}
+
 /// The re-entry point of a rank process (a no-op when run as an ordinary test).
 #[test]
 #[ignore = "the rank-process entry of train_distributed (driven by the scenarios)"]
@@ -235,6 +278,7 @@ fn rank_entry() {
     // A rank process is all CPU: the default device too, not only the task-local stream (the
     // array operators and `index` target the default device).
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::common::metal_guard::forbid_metal();
     let result = if j.get("probe").is_some() {
         run_probe(&j)
     } else {
@@ -425,6 +469,13 @@ fn shared_run(
 /// DDP run, bit for bit — trainable, EMA, optimizer state and export.
 #[test]
 fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit() {
+    cpu_process(
+        "train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit",
+        ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body,
+    );
+}
+
+fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let ddp = json!({"strategy": "ddp"});
@@ -491,6 +542,13 @@ fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
 
 #[test]
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
+    cpu_process(
+        "train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp",
+        fsdp_full_and_grad_op_sharding_reproduce_ddp_body,
+    );
+}
+
+fn fsdp_full_and_grad_op_sharding_reproduce_ddp_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     for (optimizer, tol) in [("adamw", ADAMW_TOL), (UNCLIPPED_MUON, ADAMW_TOL)] {
@@ -541,6 +599,13 @@ fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
 
 #[test]
 fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
+    cpu_process(
+        "train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp",
+        hybrid_sharding_over_four_ranks_reproduces_ddp_body,
+    );
+}
+
+fn hybrid_sharding_over_four_ranks_reproduces_ddp_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let ddp = shared_run(
@@ -563,8 +628,103 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
 }
 
+/// sc-25690: once the collective cancel agreement decided, the cancel-save and the export wait
+/// for their writer however long its writes take: a rank-0 write slower than the cancel grace
+/// still ends in a clean cancel with a checkpoint and an export on every rank (no peer gives up
+/// at the grace, rank 0 sees no lost rank).
+#[test]
+fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
+    let (data, scratch, out) = (tmp(), tmp(), tmp());
+    write_dataset(data.path());
+    let mut world = tcp_world(2, 1);
+    world["cancel_grace_secs"] = json!(1);
+    let jobs = (0..2)
+        .map(|r| {
+            let mut j = job(
+                data.path(),
+                out.path(),
+                r,
+                world.clone(),
+                json!({"strategy": "ddp"}),
+                4,
+                Some(2),
+            );
+            if r == 0 {
+                j["writer_delay_ms"] = json!(2500);
+            }
+            j
+        })
+        .collect();
+    let res = launch(jobs, scratch.path());
+    for r in &res {
+        assert_eq!(r["steps"], 2, "a clean cancel at step 2 on every rank: {r}");
+    }
+    let s = read_checkpoint_state(&latest(out.path())).unwrap();
+    assert_eq!(s.step, 2);
+    assert!(ok(&res[0]).is_file(), "the export was written");
+}
+
+/// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a
+/// storage rank 1 cannot see: one output directory per rank) refuse typed on every rank instead of
+/// resuming at different steps and silently averaging diverged replicas.
+#[test]
+fn ranks_that_see_different_checkpoints_refuse_to_resume() {
+    let (data, scratch) = (tmp(), tmp());
+    write_dataset(data.path());
+    let outs = [tmp(), tmp()];
+    let ddp = json!({"strategy": "ddp"});
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                Some(2),
+            )
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        assert_eq!(r["steps"], 2, "{r}");
+    }
+    assert!(latest_checkpoint(&checkpoint_root(outs[0].path(), NAME)).is_some());
+    assert!(latest_checkpoint(&checkpoint_root(outs[1].path(), NAME)).is_none());
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            let mut j = job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                None,
+            );
+            j["resume"] = json!(true);
+            j
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        let typed = r["dist"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an untyped outcome: {r}"));
+        assert!(typed.starts_with("SplitWorld"), "{typed}");
+    }
+}
+
 #[test]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
+    cpu_process(
+        "train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards",
+        a_sharded_checkpoint_resumes_exactly_and_reshards_body,
+    );
+}
+
+fn a_sharded_checkpoint_resumes_exactly_and_reshards_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let dist = json!({"strategy": "fsdp2", "sharding": "full", "checkpoint_io": "dcp"});
@@ -783,6 +943,47 @@ fn the_mlx_ring_gather_returns_unequal_contributions_exactly() {
     }
 }
 
+/// Hybrid sharding over MLX's `ring` backend (sc-25690): the replicate-group all-reduce of row
+/// shards of different lengths (an odd row count over two shards) goes through the padded gather
+/// (MLX's ring all-gather needs equal rows) and reduces exactly.
+#[test]
+fn hybrid_sharding_over_the_mlx_ring_reduces_odd_row_shards() {
+    let scratch = tmp();
+    let hostfile = scratch.path().join("hostfile.json");
+    let hosts: Vec<Json> = (0..4)
+        .map(|_| json!([format!("127.0.0.1:{}", free_port())]))
+        .collect();
+    std::fs::write(&hostfile, Json::Array(hosts).to_string()).unwrap();
+    let mut world = tcp_world(4, 1);
+    world["transport"] = json!("mlx_ring");
+    world["hostfile"] = json!(hostfile);
+    let jobs: Vec<Json> = (0..4)
+        .map(|r| {
+            let mut w = world.clone();
+            w["rank"] = json!(r);
+            w["local_rank"] = json!(r);
+            json!({"probe": "hybrid", "world": w})
+        })
+        .collect();
+    let res = launch(jobs, scratch.path());
+    for (r, out) in res.iter().enumerate() {
+        // global mean = (1 + 2 + 3 + 4) / 4 * (row + 1) = 2.5 * (row + 1); shard 0 = rows 0..2,
+        // shard 1 = row 2 (shard index = rank % dp_shard)
+        let want = if r % 2 == 0 {
+            json!([2.5, 2.5, 5.0, 5.0])
+        } else {
+            json!([7.5, 7.5])
+        };
+        assert_eq!(out["rows"], want, "rank {r}: {out}");
+        let sub = if r % 2 == 0 {
+            json!([2.0, 2.0, 2.0])
+        } else {
+            json!([4.0, 4.0])
+        };
+        assert_eq!(out["sub"], sub, "rank {r}: {out}");
+    }
+}
+
 #[test]
 fn a_rank_that_stalls_inside_an_mlx_collective_fails_the_survivor_typed() {
     lost_inside_the_collective("stall");
@@ -795,11 +996,25 @@ fn a_rank_that_exits_inside_an_mlx_collective_fails_the_survivor_typed() {
 
 #[test]
 fn a_rank_that_exits_mid_run_fails_the_survivor_typed() {
+    cpu_process(
+        "train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed",
+        a_rank_that_exits_mid_run_fails_the_survivor_typed_body,
+    );
+}
+
+fn a_rank_that_exits_mid_run_fails_the_survivor_typed_body() {
     lost_rank_case("die_at");
 }
 
 #[test]
 fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout() {
+    cpu_process(
+        "train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout",
+        a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body,
+    );
+}
+
+fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body() {
     lost_rank_case("stall_at");
 }
 

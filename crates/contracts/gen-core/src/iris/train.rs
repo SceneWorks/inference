@@ -3197,6 +3197,7 @@ pub mod ac;
 pub mod depth;
 pub mod dist;
 pub mod holdout;
+pub mod lineage;
 pub mod pipeline;
 pub mod repa;
 pub mod shapes;

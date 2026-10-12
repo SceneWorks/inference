@@ -20,7 +20,7 @@ use mlx_gen_iris::train::Window;
 use mlx_rs::{Array, Dtype};
 
 use crate::common::{
-    assert_close, fixture, host_f32, host_i32, on_cpu, tiny_backbone, tiny_config,
+    assert_close, cpu_process, fixture, host_f32, host_i32, on_cpu, tiny_backbone, tiny_config,
 };
 
 const GOLDEN: &str = "iris_train_golden.safetensors";
@@ -159,6 +159,13 @@ fn assert_vec(name: &str, got: &[f32], want: &[f32], tol: f32) {
 
 #[test]
 fn flow_loss_matches_rectified_flow() {
+    cpu_process(
+        "train_parity::flow_loss_matches_rectified_flow",
+        flow_loss_matches_rectified_flow_body,
+    );
+}
+
+fn flow_loss_matches_rectified_flow_body() {
     on_cpu(|| {
         let g = golden();
         let (model, params) = full_model();
@@ -180,6 +187,13 @@ fn flow_loss_matches_rectified_flow() {
 
 #[test]
 fn newton_schulz_matches_dion() {
+    cpu_process(
+        "train_parity::newton_schulz_matches_dion",
+        newton_schulz_matches_dion_body,
+    );
+}
+
+fn newton_schulz_matches_dion_body() {
     on_cpu(|| {
         let g = golden();
         for name in ["tall", "wide", "square"] {
@@ -304,11 +318,25 @@ fn full_case(kind: OptimizerKind, tag: &str, rel_tol: f32) {
 
 #[test]
 fn full_training_adamw_matches_upstream() {
+    cpu_process(
+        "train_parity::full_training_adamw_matches_upstream",
+        full_training_adamw_matches_upstream_body,
+    );
+}
+
+fn full_training_adamw_matches_upstream_body() {
     full_case(OptimizerKind::AdamW, "adamw", 2e-2);
 }
 
 #[test]
 fn full_training_muon_matches_upstream() {
+    cpu_process(
+        "train_parity::full_training_muon_matches_upstream",
+        full_training_muon_matches_upstream_body,
+    );
+}
+
+fn full_training_muon_matches_upstream_body() {
     full_case(OptimizerKind::Muon, "muon", 5e-2);
 }
 
@@ -423,20 +451,48 @@ fn adapter_case(kind_name: &str, opt_kind: OptimizerKind, tol: f32) {
 
 #[test]
 fn lora_adamw_matches_oracle() {
+    cpu_process(
+        "train_parity::lora_adamw_matches_oracle",
+        lora_adamw_matches_oracle_body,
+    );
+}
+
+fn lora_adamw_matches_oracle_body() {
     adapter_case("lora", OptimizerKind::AdamW, 2e-2);
 }
 
 #[test]
 fn lora_muon_matches_oracle() {
+    cpu_process(
+        "train_parity::lora_muon_matches_oracle",
+        lora_muon_matches_oracle_body,
+    );
+}
+
+fn lora_muon_matches_oracle_body() {
     adapter_case("lora", OptimizerKind::Muon, 5e-2);
 }
 
 #[test]
 fn lokr_adamw_matches_oracle() {
+    cpu_process(
+        "train_parity::lokr_adamw_matches_oracle",
+        lokr_adamw_matches_oracle_body,
+    );
+}
+
+fn lokr_adamw_matches_oracle_body() {
     adapter_case("lokr", OptimizerKind::AdamW, 2e-3);
 }
 
 #[test]
 fn lokr_muon_matches_oracle() {
+    cpu_process(
+        "train_parity::lokr_muon_matches_oracle",
+        lokr_muon_matches_oracle_body,
+    );
+}
+
+fn lokr_muon_matches_oracle_body() {
     adapter_case("lokr", OptimizerKind::Muon, 6e-2);
 }
