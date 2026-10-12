@@ -11,7 +11,7 @@ use mlx_gen_iris::solver::{cfg_combine, sample};
 use mlx_rs::ops::{stack_axis, tanh};
 use mlx_rs::Array;
 
-use crate::common::{assert_close, fixture};
+use crate::common::{assert_close, cpu_process, fixture};
 
 /// `tanh(x)·(0.5 + t) + y·(1 − t)` with `t = t_model / 1000` — the oracle's `analytic_model`.
 fn analytic(x: &Array, t_model: f32, y: f32) -> Array {
@@ -44,6 +44,13 @@ fn default_grid_matches_upstream_time_grid() {
 
 #[test]
 fn multistep_trajectory_matches_upstream() {
+    cpu_process(
+        "solver_parity::multistep_trajectory_matches_upstream",
+        multistep_trajectory_matches_upstream_body,
+    );
+}
+
+fn multistep_trajectory_matches_upstream_body() {
     let golden = fixture("iris_solver_golden.safetensors");
     let z = golden.require("z").unwrap();
     let plan = dpm_solver_plan(7, 2, 4.0).unwrap();
@@ -89,6 +96,13 @@ fn multistep_trajectory_matches_upstream() {
 
 #[test]
 fn cancellation_returns_the_typed_error_not_a_partial_state() {
+    cpu_process(
+        "solver_parity::cancellation_returns_the_typed_error_not_a_partial_state",
+        cancellation_returns_the_typed_error_not_a_partial_state_body,
+    );
+}
+
+fn cancellation_returns_the_typed_error_not_a_partial_state_body() {
     let golden = fixture("iris_solver_golden.safetensors");
     let plan = dpm_solver_plan(7, 2, 4.0).unwrap();
     let cancel = CancelFlag::new();
@@ -117,6 +131,13 @@ fn cancellation_returns_the_typed_error_not_a_partial_state() {
 /// readings integrate to different trajectories.
 #[test]
 fn the_step_callback_receives_each_steps_predicted_clean_image() {
+    cpu_process(
+        "solver_parity::the_step_callback_receives_each_steps_predicted_clean_image",
+        the_step_callback_receives_each_steps_predicted_clean_image_body,
+    );
+}
+
+fn the_step_callback_receives_each_steps_predicted_clean_image_body() {
     let golden = fixture("iris_solver_golden.safetensors");
     let z = golden.require("z").unwrap();
     let plan = dpm_solver_plan(7, 2, 4.0).unwrap();

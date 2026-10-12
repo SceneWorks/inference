@@ -36,7 +36,7 @@ use mlx_gen_iris::train::dist::MlxCollective;
 use mlx_rs::{Array, Dtype};
 use serde_json::{json, Value as Json};
 
-use crate::common::{on_cpu, tiny_backbone, tiny_text_encoder};
+use crate::common::{cpu_process, on_cpu, tiny_backbone, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
 const CHILD_ENV: &str = "IRIS_DIST_CHILD";
@@ -235,6 +235,7 @@ fn rank_entry() {
     // A rank process is all CPU: the default device too, not only the task-local stream (the
     // array operators and `index` target the default device).
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    crate::common::metal_guard::forbid_metal();
     let result = if j.get("probe").is_some() {
         run_probe(&j)
     } else {
@@ -425,6 +426,13 @@ fn shared_run(
 /// DDP run, bit for bit — trainable, EMA, optimizer state and export.
 #[test]
 fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit() {
+    cpu_process(
+        "train_distributed::ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit",
+        ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body,
+    );
+}
+
+fn ddp_over_tcp_and_over_mlx_ring_agree_bit_for_bit_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let ddp = json!({"strategy": "ddp"});
@@ -491,6 +499,13 @@ fn assert_matches_ddp(ddp: &Path, other: &Path, what: &str, tol: f32) {
 
 #[test]
 fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
+    cpu_process(
+        "train_distributed::fsdp_full_and_grad_op_sharding_reproduce_ddp",
+        fsdp_full_and_grad_op_sharding_reproduce_ddp_body,
+    );
+}
+
+fn fsdp_full_and_grad_op_sharding_reproduce_ddp_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     for (optimizer, tol) in [("adamw", ADAMW_TOL), (UNCLIPPED_MUON, ADAMW_TOL)] {
@@ -541,6 +556,13 @@ fn fsdp_full_and_grad_op_sharding_reproduce_ddp() {
 
 #[test]
 fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
+    cpu_process(
+        "train_distributed::hybrid_sharding_over_four_ranks_reproduces_ddp",
+        hybrid_sharding_over_four_ranks_reproduces_ddp_body,
+    );
+}
+
+fn hybrid_sharding_over_four_ranks_reproduces_ddp_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let ddp = shared_run(
@@ -565,6 +587,13 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
 
 #[test]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
+    cpu_process(
+        "train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards",
+        a_sharded_checkpoint_resumes_exactly_and_reshards_body,
+    );
+}
+
+fn a_sharded_checkpoint_resumes_exactly_and_reshards_body() {
     let (data, scratch) = (tmp(), tmp());
     write_dataset(data.path());
     let dist = json!({"strategy": "fsdp2", "sharding": "full", "checkpoint_io": "dcp"});
@@ -795,11 +824,25 @@ fn a_rank_that_exits_inside_an_mlx_collective_fails_the_survivor_typed() {
 
 #[test]
 fn a_rank_that_exits_mid_run_fails_the_survivor_typed() {
+    cpu_process(
+        "train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed",
+        a_rank_that_exits_mid_run_fails_the_survivor_typed_body,
+    );
+}
+
+fn a_rank_that_exits_mid_run_fails_the_survivor_typed_body() {
     lost_rank_case("die_at");
 }
 
 #[test]
 fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout() {
+    cpu_process(
+        "train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout",
+        a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body,
+    );
+}
+
+fn a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout_body() {
     lost_rank_case("stall_at");
 }
 

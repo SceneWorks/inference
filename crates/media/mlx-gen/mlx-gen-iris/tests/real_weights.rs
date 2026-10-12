@@ -23,7 +23,7 @@ use mlx_gen_iris::{
 };
 use mlx_rs::Dtype;
 
-use crate::common::{assert_close, errors, fixtures, host_i32};
+use crate::common::{assert_close, cpu_process, errors, fixtures, host_i32};
 
 fn env_dir(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
@@ -171,6 +171,13 @@ fn real_conditioning_and_forward_match_upstream() {
 #[test]
 #[ignore = "needs the real weights + IRIS_REAL_GOLDEN (tools/dump_iris_realweight.py)"]
 fn real_backbone_matches_upstream_in_fp32_on_cpu() {
+    cpu_process(
+        "real_weights::real_backbone_matches_upstream_in_fp32_on_cpu",
+        real_backbone_matches_upstream_in_fp32_on_cpu_body,
+    );
+}
+
+fn real_backbone_matches_upstream_in_fp32_on_cpu_body() {
     let backbone = env_dir("IRIS_WEIGHTS_DIR");
     let golden = Weights::from_file(env_dir("IRIS_REAL_GOLDEN")).unwrap();
     let config = IrisConfig::from_dir(&backbone).unwrap();

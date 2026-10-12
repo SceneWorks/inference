@@ -12,7 +12,7 @@ use mlx_gen::{
     Precision, PreviewSink, WeightsSource,
 };
 
-use crate::common::{fixtures, tiny_backbone, tiny_text_encoder};
+use crate::common::{cpu_process, fixtures, tiny_backbone, tiny_text_encoder};
 
 const ID: &str = "iris_3b";
 /// 12 caption tokens against the miniature's 10-token window minus its suffix.
@@ -71,6 +71,13 @@ fn images(g: &dyn Generator, req: &GenerationRequest) -> Vec<Image> {
 
 #[test]
 fn every_advertised_control_changes_the_render() {
+    cpu_process(
+        "controls_contract::every_advertised_control_changes_the_render",
+        every_advertised_control_changes_the_render_body,
+    );
+}
+
+fn every_advertised_control_changes_the_render_body() {
     let g = load();
     let base = images(g.as_ref(), &request());
     let cases: Vec<(&str, GenerationRequest)> = vec![
@@ -168,7 +175,10 @@ fn every_advertised_control_changes_the_render() {
 fn a_prompt_batch_renders_one_image_per_prompt_per_count() {
     // FP32 compute, so the batched solve is compared with the single renders at f32 rounding rather
     // than at bf16's batch-size-dependent GEMM rounding.
-    crate::common::on_cpu(batch_case);
+    cpu_process(
+        "controls_contract::a_prompt_batch_renders_one_image_per_prompt_per_count",
+        batch_case,
+    );
 }
 
 fn batch_case() {
@@ -230,6 +240,13 @@ fn batch_case() {
 
 #[test]
 fn caption_overflow_policies_are_honoured() {
+    cpu_process(
+        "controls_contract::caption_overflow_policies_are_honoured",
+        caption_overflow_policies_are_honoured_body,
+    );
+}
+
+fn caption_overflow_policies_are_honoured_body() {
     let g = load();
     let req = |policy: Option<CaptionOverflowPolicy>| GenerationRequest {
         prompt: OVERFLOW.into(),
@@ -271,6 +288,13 @@ fn caption_overflow_policies_are_honoured() {
 
 #[test]
 fn previews_stream_the_patch_pooled_clean_image_every_step() {
+    cpu_process(
+        "controls_contract::previews_stream_the_patch_pooled_clean_image_every_step",
+        previews_stream_the_patch_pooled_clean_image_every_step_body,
+    );
+}
+
+fn previews_stream_the_patch_pooled_clean_image_every_step_body() {
     let g = load();
     assert!(g.descriptor().capabilities.supports_preview);
     let frames = Arc::new(Mutex::new(Vec::new()));
@@ -333,6 +357,13 @@ fn previews_stream_the_patch_pooled_clean_image_every_step() {
 
 #[test]
 fn adapters_load_through_the_catalog_and_report_provenance() {
+    cpu_process(
+        "controls_contract::adapters_load_through_the_catalog_and_report_provenance",
+        adapters_load_through_the_catalog_and_report_provenance_body,
+    );
+}
+
+fn adapters_load_through_the_catalog_and_report_provenance_body() {
     let lora = AdapterSpec::new(
         fixtures().join("iris_lora.safetensors"),
         0.75,
@@ -384,6 +415,13 @@ fn adapters_load_through_the_catalog_and_report_provenance() {
 
 #[test]
 fn controls_the_route_does_not_have_are_refused() {
+    cpu_process(
+        "controls_contract::controls_the_route_does_not_have_are_refused",
+        controls_the_route_does_not_have_are_refused_body,
+    );
+}
+
+fn controls_the_route_does_not_have_are_refused_body() {
     let g = load();
     for (name, req) in [
         (

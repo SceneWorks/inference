@@ -6,14 +6,16 @@
 //! Tolerances:
 //! * FP32 (`Precision::Fp32` compute, MLX CPU stream) vs upstream's FP32 CPU path: only summation
 //!   order differs — 1e-4 of peak (measured ~2e-6 adapter, ~3e-5 velocity).
-//! * bf16 compute (the release's autocast policy) on the GPU vs the FP32 oracle: bf16 matmul and
-//!   attention rounding — 5e-2 of peak.
+//! * bf16 compute (the release's autocast policy) vs the FP32 oracle: bf16 matmul and attention
+//!   rounding — 5e-2 of peak.
+//!
+//! Every test runs in a CPU-default child (`cpu_process`).
 
 use mlx_gen::gen_core::iris::IrisConfig;
 use mlx_gen_iris::{load_backbone, TextBatch};
 use mlx_rs::Dtype;
 
-use crate::common::{assert_close, fixture, host_i32, on_cpu, tiny_backbone};
+use crate::common::{assert_close, cpu_process, fixture, host_i32, on_cpu, tiny_backbone};
 
 fn masks(flat: Vec<i32>, rows: usize) -> Vec<Vec<i32>> {
     flat.chunks(flat.len() / rows)
@@ -23,6 +25,13 @@ fn masks(flat: Vec<i32>, rows: usize) -> Vec<Vec<i32>> {
 
 #[test]
 fn backbone_and_pixel_head_match_upstream_in_fp32() {
+    cpu_process(
+        "dit_parity::backbone_and_pixel_head_match_upstream_in_fp32",
+        backbone_and_pixel_head_match_upstream_in_fp32_body,
+    );
+}
+
+fn backbone_and_pixel_head_match_upstream_in_fp32_body() {
     on_cpu(|| {
         let config = IrisConfig::from_dir(&tiny_backbone()).unwrap();
         let dit = load_backbone(&tiny_backbone(), &config, Dtype::Float32).unwrap();
@@ -52,6 +61,13 @@ fn backbone_and_pixel_head_match_upstream_in_fp32() {
 
 #[test]
 fn bf16_compute_stays_within_bf16_distance_of_fp32() {
+    cpu_process(
+        "dit_parity::bf16_compute_stays_within_bf16_distance_of_fp32",
+        bf16_compute_stays_within_bf16_distance_of_fp32_body,
+    );
+}
+
+fn bf16_compute_stays_within_bf16_distance_of_fp32_body() {
     let config = IrisConfig::from_dir(&tiny_backbone()).unwrap();
     let dit = load_backbone(&tiny_backbone(), &config, Dtype::Bfloat16).unwrap();
     let golden = fixture("iris_dit_golden.safetensors");
@@ -78,6 +94,13 @@ fn bf16_compute_stays_within_bf16_distance_of_fp32() {
 
 #[test]
 fn a_config_that_disagrees_with_the_checkpoint_is_a_load_error() {
+    cpu_process(
+        "dit_parity::a_config_that_disagrees_with_the_checkpoint_is_a_load_error",
+        a_config_that_disagrees_with_the_checkpoint_is_a_load_error_body,
+    );
+}
+
+fn a_config_that_disagrees_with_the_checkpoint_is_a_load_error_body() {
     let mut config = IrisConfig::from_dir(&tiny_backbone()).unwrap();
     config.model.depth = 2; // drops block 2 → its keys are left over
     let err = load_backbone(&tiny_backbone(), &config, Dtype::Float32)

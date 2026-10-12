@@ -23,8 +23,8 @@ use mlx_rs::{Array, Dtype};
 use serde_json::json;
 
 use crate::common::{
-    assert_close, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone, tiny_config,
-    tiny_text_encoder,
+    assert_close, cpu_process, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone,
+    tiny_config, tiny_text_encoder,
 };
 
 const ID: &str = "iris_3b";
@@ -148,12 +148,26 @@ fn check_trained_elsewhere(backend: &str) {
 
 #[test]
 fn candle_trained_artifacts_load_and_match_on_mlx() {
+    cpu_process(
+        "train_cross_backend::candle_trained_artifacts_load_and_match_on_mlx",
+        candle_trained_artifacts_load_and_match_on_mlx_body,
+    );
+}
+
+fn candle_trained_artifacts_load_and_match_on_mlx_body() {
     check_trained_elsewhere("candle");
 }
 
 /// The MLX-produced fixtures still load here (and their recorded forward is this backend's).
 #[test]
 fn mlx_trained_fixtures_match_their_recorded_forward() {
+    cpu_process(
+        "train_cross_backend::mlx_trained_fixtures_match_their_recorded_forward",
+        mlx_trained_fixtures_match_their_recorded_forward_body,
+    );
+}
+
+fn mlx_trained_fixtures_match_their_recorded_forward_body() {
     check_trained_elsewhere("mlx");
 }
 
@@ -164,6 +178,13 @@ fn mlx_trained_fixtures_match_their_recorded_forward() {
 #[test]
 #[ignore = "fixture producer: writes into IRIS_CROSS_BACKEND_OUT"]
 fn produce_cross_backend_fixtures() {
+    cpu_process(
+        "train_cross_backend::produce_cross_backend_fixtures",
+        produce_cross_backend_fixtures_body,
+    );
+}
+
+fn produce_cross_backend_fixtures_body() {
     on_cpu(|| {
         let out =
             PathBuf::from(std::env::var("IRIS_CROSS_BACKEND_OUT").expect("IRIS_CROSS_BACKEND_OUT"));

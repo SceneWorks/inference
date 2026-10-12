@@ -16,7 +16,8 @@ use mlx_gen_iris::{load_backbone_with_adapters, TextBatch};
 use mlx_rs::Dtype;
 
 use crate::common::{
-    assert_close, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone, tiny_config,
+    assert_close, cpu_process, errors, fixture, fixtures, host_i32, on_cpu, tiny_backbone,
+    tiny_config,
 };
 
 const TOL: f32 = 2e-3;
@@ -27,6 +28,13 @@ fn spec(file: &str, kind: AdapterKind, scale: f32) -> AdapterSpec {
 
 #[test]
 fn lora_and_lokr_match_upstream_merged_weights() {
+    cpu_process(
+        "adapter_parity::lora_and_lokr_match_upstream_merged_weights",
+        lora_and_lokr_match_upstream_merged_weights_body,
+    );
+}
+
+fn lora_and_lokr_match_upstream_merged_weights_body() {
     on_cpu(|| {
         let config = tiny_config();
         let golden = fixture("iris_adapter_golden.safetensors");
@@ -83,6 +91,13 @@ fn lora_and_lokr_match_upstream_merged_weights() {
 
 #[test]
 fn an_adapter_for_another_task_or_family_is_refused() {
+    cpu_process(
+        "adapter_parity::an_adapter_for_another_task_or_family_is_refused",
+        an_adapter_for_another_task_or_family_is_refused_body,
+    );
+}
+
+fn an_adapter_for_another_task_or_family_is_refused_body() {
     let config = tiny_config();
     let load = |file: &str| {
         load_backbone_with_adapters(

@@ -15,7 +15,7 @@ use mlx_gen_iris::text_encoder::caption_overflow_warning;
 use mlx_gen_iris::IrisTextEncoder;
 use mlx_rs::Array;
 
-use crate::common::{assert_close, fixture, host_i32, tiny_config, tiny_text_encoder};
+use crate::common::{assert_close, cpu_process, fixture, host_i32, tiny_config, tiny_text_encoder};
 
 fn encoder() -> IrisTextEncoder {
     IrisTextEncoder::load(&tiny_text_encoder(), &tiny_config().text_encoder)
@@ -33,6 +33,13 @@ const PROMPTS: [(&str, &str); 3] = [
 
 #[test]
 fn template_pieces_tokenize_like_upstream() {
+    cpu_process(
+        "text_parity::template_pieces_tokenize_like_upstream",
+        template_pieces_tokenize_like_upstream_body,
+    );
+}
+
+fn template_pieces_tokenize_like_upstream_body() {
     let te = encoder();
     let golden = fixture("iris_text_golden.safetensors");
     assert_eq!(
@@ -47,6 +54,13 @@ fn template_pieces_tokenize_like_upstream() {
 
 #[test]
 fn windows_masks_and_layer_states_match_upstream() {
+    cpu_process(
+        "text_parity::windows_masks_and_layer_states_match_upstream",
+        windows_masks_and_layer_states_match_upstream_body,
+    );
+}
+
+fn windows_masks_and_layer_states_match_upstream_body() {
     let te = encoder();
     let golden = fixture("iris_text_golden.safetensors");
     for (name, prompt) in PROMPTS {
@@ -95,6 +109,13 @@ fn windows_masks_and_layer_states_match_upstream() {
 
 #[test]
 fn empty_negative_prompt_is_the_training_null() {
+    cpu_process(
+        "text_parity::empty_negative_prompt_is_the_training_null",
+        empty_negative_prompt_is_the_training_null_body,
+    );
+}
+
+fn empty_negative_prompt_is_the_training_null_body() {
     let te = encoder();
     let golden = fixture("iris_text_golden.safetensors");
     let null = te.encode("").unwrap();
@@ -109,6 +130,13 @@ fn empty_negative_prompt_is_the_training_null() {
 
 #[test]
 fn caption_overflow_is_warned_under_the_release_policy() {
+    cpu_process(
+        "text_parity::caption_overflow_is_warned_under_the_release_policy",
+        caption_overflow_is_warned_under_the_release_policy_body,
+    );
+}
+
+fn caption_overflow_is_warned_under_the_release_policy_body() {
     let te = encoder();
     // Upstream's oracle log for this prompt: "longest 14 tokens, budget 7".
     let overflow = te.window(PROMPTS[1].1).unwrap();

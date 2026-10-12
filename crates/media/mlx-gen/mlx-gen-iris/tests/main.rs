@@ -22,6 +22,9 @@ mod controls_contract;
 #[path = "controls_parity.rs"]
 mod controls_parity;
 
+#[path = "cpu_child_guard.rs"]
+mod cpu_child_guard;
+
 #[path = "curricula_lifecycle.rs"]
 mod curricula_lifecycle;
 
@@ -54,6 +57,9 @@ mod e2e_parity;
 
 #[path = "generator_contract.rs"]
 mod generator_contract;
+
+#[path = "lib_ops.rs"]
+mod lib_ops;
 
 #[path = "real_weights.rs"]
 mod real_weights;
