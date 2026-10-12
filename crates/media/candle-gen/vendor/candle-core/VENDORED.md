@@ -140,7 +140,11 @@ taps were unaffected. A run that weights `latent_lpips_loss` now trains that par
 strength the weight states. The Iris LPIPS-VGG has five real pools (the last unused), so the fix
 matters there for every tap past the first. `tests/grad_tests.rs::max_pool2d_grad` pins
 a unique maximum, a tie and an odd trailing row / column on CPU, CUDA and Metal; upstream's
-`grad_tests` / `pool_tests` / `conv_tests` / `tensor_tests` pass on this copy.
+`grad_tests` / `pool_tests` / `conv_tests` / `tensor_tests` pass on this copy. This crate is outside
+the workspace, so CI never runs those tests; the CI-run pin is `candle-gen`'s
+`train::latent_lpips::tests::max_pool_backward_is_the_finite_difference_gradient` (an f64 central
+difference on a tie-free odd input, torch's gradient on the tie case, and the refused stride < kernel
+backward).
 
 ## Eager behaviour is unchanged outside the guard
 
