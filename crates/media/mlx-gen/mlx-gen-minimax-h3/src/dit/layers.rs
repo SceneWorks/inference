@@ -306,6 +306,16 @@ impl DitAttention {
         rope: Option<(&MmRope, &MmRopeTables)>,
         bounded: BoundedAttention<'_>,
     ) -> Result<Array> {
+        self.forward_bounded_veda(x, rope, bounded, None)
+    }
+
+    pub(crate) fn forward_bounded_veda(
+        &self,
+        x: &Array,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+        bounded: BoundedAttention<'_>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+    ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -340,7 +350,10 @@ impl DitAttention {
         // than from local arithmetic — a probe that re-derived the boundaries could agree with itself
         // while the kernel did something else.
         record_planned_attention(bounded, b, h, seq);
-        let out = sdpa_bounded_bhsd(&qh, &kh, &vh, scale, None, bounded)?;
+        let out = match veda {
+            Some((runtime, layer)) => runtime.attention(layer, &qh, &kh, &vh, bounded)?,
+            None => sdpa_bounded_bhsd(&qh, &kh, &vh, scale, None, bounded)?,
+        };
 
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?

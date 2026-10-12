@@ -329,6 +329,18 @@ impl CheckpointMeta {
         Ok(me)
     }
 
+    /// Parse an already-owned safetensors buffer. Integrity-sensitive components can hash and
+    /// consume the same bytes without reopening a path between validation and materialization.
+    pub fn from_bytes(buffer: Vec<u8>) -> Result<Self> {
+        let mut me = Self {
+            buffers: Vec::new(),
+            index: BTreeMap::new(),
+            file_metadata: BTreeMap::new(),
+        };
+        me.add_buffer(buffer, Path::new("<validated-buffer>"))?;
+        Ok(me)
+    }
+
     /// Open and merge every `.safetensors` file under `dir` (sharded checkpoints). Keys are unioned;
     /// on a duplicate key the later file (sorted by path) wins — the same merge semantics as
     /// mlx-gen's `Weights::from_dir`.
@@ -362,7 +374,10 @@ impl CheckpointMeta {
         // for lazy random-access tensor reads. This is intended for adapter-sized checkpoints; calling
         // `from_dir` on a multi-GB *base-model* dir would hold every file resident (host RAM). An mmap
         // backing (page on demand) is the efficiency follow-up if base-model use is ever needed (F-038).
-        let buf = std::fs::read(path)?;
+        self.add_buffer(std::fs::read(path)?, path)
+    }
+
+    fn add_buffer(&mut self, buf: Vec<u8>, path: &Path) -> Result<()> {
         // `read_metadata` returns (header_json_len, Metadata); the data region begins at 8 + n and
         // each tensor's data_offsets are relative to it.
         let (n, meta) = SafeTensors::read_metadata(&buf)
