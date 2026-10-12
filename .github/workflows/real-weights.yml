@@ -5568,8 +5568,9 @@ jobs:
   # order as nvidia-smi does; the listener exposes only one card (`cuda:1` is an invalid ordinal
   # there), so the scenarios opt explicitly into `dist.world.share_device` and a check proves a
   # rank without its card is refused typed otherwise — over the host TCP transport, as Windows has
-  # no NCCL); the miniature
-  # fp16 + stage-preset lifecycle on the device; and the bounded
+  # no NCCL; and, sc-25690, ranks that see different resume checkpoints refusing typed); the
+  # miniature fp16 + stage-preset lifecycle and the checkpoint lineage (sc-25690) on the device;
+  # and the bounded
   # official curriculum on real weights (`stage1_256` + REPA → `stage2_512` new phase, batch 1, four
   # steps). Logs, per-check VRAM lines and the curriculum's metrics go in the evidence artifact.
   candle-iris-curricula:

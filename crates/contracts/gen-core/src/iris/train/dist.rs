@@ -1169,9 +1169,9 @@ fn io_lost(rank: usize, op: &str, e: impl std::fmt::Display) -> Error {
     .into_error()
 }
 
-/// The socket timeout of one blocking read / write call: every transport wait is sliced into calls
-/// this long so it can observe its bound and the run's cancel flag between them.
-const IO_SLICE: Duration = Duration::from_millis(200);
+/// The shortest admission wait a joined rank is given (the rest of the rendezvous bound, at least
+/// this).
+const MIN_ADMISSION_WAIT: Duration = Duration::from_millis(200);
 
 /// TCP keepalive (sc-25690): a peer that vanishes without a reset (power loss, a partitioned
 /// network) stops answering the kernel's probes, which fails the connection after about
@@ -1211,6 +1211,7 @@ struct Waiter<'a> {
     pace: &'a Pace,
     deadline: Instant,
     cancel_seen: Option<Instant>,
+    spins: u32,
 }
 
 impl<'a> Waiter<'a> {
@@ -1219,11 +1220,24 @@ impl<'a> Waiter<'a> {
             pace,
             deadline: Instant::now() + pace.limit,
             cancel_seen: None,
+            spins: 0,
         }
     }
 
     fn progress(&mut self) {
         self.deadline = Instant::now() + self.pace.limit;
+        self.spins = 0;
+    }
+
+    /// Pause before the next attempt of a call that would block: a few yields (an answer that is
+    /// about to arrive costs no sleep), then 1 ms sleeps.
+    fn pause(&mut self) {
+        if self.spins < 64 {
+            self.spins += 1;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A slice passed without progress: keep waiting, or end the wait typed: [`Error::Canceled`]
@@ -1249,7 +1263,11 @@ impl<'a> Waiter<'a> {
     }
 }
 
-fn is_slice_expiry(e: &std::io::Error) -> bool {
+/// The transport sockets are non-blocking: a call that would block returns at once, so a wait
+/// observes its bound and the cancel flag between attempts, and no byte is ever lost or duplicated
+/// to an expired socket timeout (a timed-out blocking `send` / `recv` leaves a Windows socket in
+/// an indeterminate state). Between attempts a waiter yields, then sleeps 1 ms.
+fn would_block(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{TimedOut, WouldBlock};
     matches!(e.kind(), WouldBlock | TimedOut)
 }
@@ -1263,7 +1281,10 @@ fn write_all(s: &mut TcpStream, buf: &[u8], w: &mut Waiter, peer: usize, op: &st
                 sent += n;
                 w.progress();
             }
-            Err(e) if is_slice_expiry(&e) => w.idle(peer, op)?,
+            Err(e) if would_block(&e) => {
+                w.idle(peer, op)?;
+                w.pause();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(io_lost(peer, op, e)),
         }
@@ -1271,8 +1292,8 @@ fn write_all(s: &mut TcpStream, buf: &[u8], w: &mut Waiter, peer: usize, op: &st
     Ok(())
 }
 
-/// Fill `buf` completely. Bytes that arrived before a slice expired are kept (a timed-out
-/// `read_exact` would drop them).
+/// Fill `buf` completely, keeping every byte that arrived before a call would have blocked
+/// (`read_exact` would drop them).
 fn read_exact(
     s: &mut TcpStream,
     buf: &mut [u8],
@@ -1294,7 +1315,10 @@ fn read_exact(
                 filled += n;
                 w.progress();
             }
-            Err(e) if is_slice_expiry(&e) => w.idle(peer, op)?,
+            Err(e) if would_block(&e) => {
+                w.idle(peer, op)?;
+                w.pause();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(io_lost(peer, op, e)),
         }
@@ -1504,7 +1528,7 @@ impl TcpCollective {
     /// description and [`World::token`].
     ///
     /// The whole rendezvous (accepting, connect retries, the admission answer) is bounded by
-    /// [`World::rendezvous_bound`] and polls `cancel` at least every 200 ms: a cancelled
+    /// [`World::rendezvous_bound`] and polls `cancel` between its attempts: a cancelled
     /// rendezvous is [`Error::Canceled`] at once (there is no training state to save yet). The
     /// returned collective keeps `cancel` for every later wait ([`World::cancel_grace`]).
     pub fn connect(world: &World, cancel: &CancelFlag) -> Result<Self> {
@@ -1560,7 +1584,7 @@ impl TcpCollective {
                 }
                 match listener.accept() {
                     Ok((mut s, from)) => {
-                        let ready = s.set_nonblocking(false).is_ok() && configure(&s).is_ok();
+                        let ready = configure(&s).is_ok();
                         let verdict = if ready {
                             admit(&mut s, &hello_pace, world, &peers)
                         } else {
@@ -1661,7 +1685,7 @@ impl TcpCollective {
             let left = Pace {
                 limit: deadline
                     .saturating_duration_since(Instant::now())
-                    .max(IO_SLICE),
+                    .max(MIN_ADMISSION_WAIT),
                 ..rendezvous.clone()
             };
             let answer = recv_frame(&mut stream, &left, 0, 0, 0, "rendezvous", HELLO_MAX)?;
@@ -1785,14 +1809,12 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| io_lost(0, "rendezvous resolve", format!("{host} has no address")))
 }
 
-/// Every transport socket: no Nagle delay, blocking calls sliced to [`IO_SLICE`] (the waits poll
-/// their bound and the cancel flag between slices), and TCP keepalive.
+/// Every transport socket: no Nagle delay, non-blocking (the waits poll their bound and the cancel
+/// flag between attempts, [`would_block`]), and TCP keepalive.
 fn configure(s: &TcpStream) -> Result<()> {
     s.set_nodelay(true)
         .map_err(|e| io_lost(0, "configure", e))?;
-    s.set_read_timeout(Some(IO_SLICE))
-        .map_err(|e| io_lost(0, "configure", e))?;
-    s.set_write_timeout(Some(IO_SLICE))
+    s.set_nonblocking(true)
         .map_err(|e| io_lost(0, "configure", e))?;
     keepalive::enable(s).map_err(|e| io_lost(0, "configure keepalive", e))
 }
@@ -2577,7 +2599,7 @@ mod tests {
         assert_eq!(out[3].as_ref().unwrap(), &vec![4.0; 2]);
     }
 
-    // ---- sc-25690: cancellable, separately bounded rendezvous; sliced waits; keepalive ----
+    // ---- sc-25690: cancellable, separately bounded rendezvous; polled waits; keepalive ----
 
     fn cancelled() -> CancelFlag {
         let c = CancelFlag::new();
@@ -2733,10 +2755,10 @@ mod tests {
         peer.join().unwrap();
     }
 
-    /// A frame whose bytes arrive across several socket slices is reassembled whole: the sliced
-    /// wait keeps what arrived before a slice expired.
+    /// A frame whose bytes arrive in several pieces is reassembled whole: the polled
+    /// wait keeps what arrived before a call would have blocked.
     #[test]
-    fn a_frame_split_across_slices_is_read_whole() {
+    fn a_frame_arriving_in_pieces_is_read_whole() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let sender = std::thread::spawn(move || {
@@ -2748,7 +2770,7 @@ mod tests {
             for piece in [&frame[..5], &frame[5..19], &frame[19..]] {
                 s.write_all(piece).unwrap();
                 s.flush().unwrap();
-                std::thread::sleep(IO_SLICE * 3);
+                std::thread::sleep(Duration::from_millis(300));
             }
         });
         let (mut s, _) = l.accept().unwrap();

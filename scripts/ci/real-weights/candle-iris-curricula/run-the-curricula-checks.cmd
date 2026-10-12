@@ -13,10 +13,18 @@ call :run_one fsdp_full_and_grad_op_sharding_reproduce_ddp train_distributed::fs
 call :run_one a_sharded_checkpoint_resumes_exactly_and_reshards train_distributed::a_sharded_checkpoint_resumes_exactly_and_reshards || set "IRIS_FAILED=1"
 call :run_one a_rank_that_exits_mid_run_fails_the_survivor_typed train_distributed::a_rank_that_exits_mid_run_fails_the_survivor_typed || set "IRIS_FAILED=1"
 call :run_one a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout train_distributed::a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_timeout || set "IRIS_FAILED=1"
+rem sc-25690: ranks that resolve different resume checkpoints refuse typed (Windows sockets:
+rem the non-blocking polled transport with TCP keepalive).
+call :run_one ranks_that_see_different_checkpoints_refuse_to_resume train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume || set "IRIS_FAILED=1"
 set "IRIS_DIST_SHARE_DEVICE="
 rem The miniature curricula lifecycle on the device (fp16 trains here: CUDA has half GEMM).
 call :run_one fp16_trains_with_the_dynamic_loss_scaler curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler || set "IRIS_FAILED=1"
 call :run_one stage_presets_chain_256_to_512_with_repa_and_a_new_phase curricula_lifecycle::stage_presets_chain_256_to_512_with_repa_and_a_new_phase || set "IRIS_FAILED=1"
+rem sc-25690: the checkpoint lineage on the device (cross-epoch cancel -> resume exact, a fresh
+rem run beside another run's checkpoints, the whole-directory export; NTFS renames).
+call :run_one a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly || set "IRIS_FAILED=1"
+call :run_one a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints || set "IRIS_FAILED=1"
+call :run_one a_full_model_export_replaces_its_directory_whole train_lineage::a_full_model_export_replaces_its_directory_whole || set "IRIS_FAILED=1"
 rem The bounded official curriculum on real weights (stage1_256 + REPA -> stage2_512 new phase).
 call :run_one real_stage_presets_resume_256_to_512_with_repa curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa --ignored || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1
