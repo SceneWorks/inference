@@ -999,6 +999,14 @@ impl JointDit {
     }
 
     /// Enable request-scoped learned attention only after the dense model is established.
+    #[cfg(test)]
+    pub(crate) fn veda_calls(&self) -> Vec<(usize, usize, mlx_gen::gen_core::VedaRequest)> {
+        self.veda
+            .as_ref()
+            .map(|v| v.calls.borrow().clone())
+            .unwrap_or_default()
+    }
+
     pub fn prepare_veda(
         &mut self,
         request: &mlx_gen::gen_core::VedaRequest,

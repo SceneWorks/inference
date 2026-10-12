@@ -387,6 +387,12 @@ fn native_veda_controls_preserve_carriers_and_capture_published_schedules() {
                 assert_eq!(want.as_slice::<f32>(), got.as_slice::<f32>(), "{name}");
             }
         }
+        let calls = model.veda_calls();
+        assert_eq!(calls.len(), evals * 2, "{name}");
+        for (index, (layer, step, controls)) in calls.iter().enumerate() {
+            assert_eq!((*layer, *step), (index % 2, index / 2), "{name}");
+            assert_eq!(controls, &request, "{name}");
+        }
         let r = report.borrow();
         // layer1 is always full; first/last evaluation are full in both layers.
         // A fake/default step0 would make every attention call dense and fail this discriminator.

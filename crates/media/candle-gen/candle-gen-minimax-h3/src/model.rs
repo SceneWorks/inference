@@ -2032,6 +2032,7 @@ mod tests {
                 adapter_spec(turbo, AdapterKind::Lora, None, None),
                 adapter_spec(style, AdapterKind::Lora, None, None),
             ];
+            load(&spec).expect("native registry accepts optional sparse staging at every tier");
             let model = MiniMaxH3::load(&spec).unwrap();
             assert_eq!(model.requested_tier(), expected);
             assert_eq!(model.veda_component.as_ref(), Some(&missing));
@@ -2051,6 +2052,61 @@ mod tests {
             });
             model.validate(&request).unwrap();
             assert_eq!(model.resolve_task(&request).unwrap().0, MiniMaxH3Task::T2va);
+            use candle_gen::gen_core::Conditioning;
+            for indices in [vec![0], vec![123], vec![0, 123]] {
+                request.conditioning = indices
+                    .iter()
+                    .map(|&frame_idx| Conditioning::Keyframe {
+                        image: ref_image(64, 64),
+                        frame_idx,
+                        strength: 1.0,
+                    })
+                    .collect();
+                model.validate(&request).unwrap();
+                assert_eq!(
+                    model.resolve_task(&request).unwrap().0,
+                    MiniMaxH3Task::Fl2va
+                );
+                assert_eq!(
+                    request
+                        .keyframes()
+                        .iter()
+                        .map(|k| k.frame_idx)
+                        .collect::<Vec<_>>(),
+                    indices
+                );
+            }
+            request.conditioning = vec![
+                Conditioning::ReferenceVideo {
+                    frames: vec![ref_image(64, 64); 30],
+                    fps: 30.0,
+                    audio: Some(ref_track()),
+                },
+                ref_conditioning(),
+                Conditioning::ReferenceAudio {
+                    audio: ref_track(),
+                    strength: None,
+                },
+                ref_conditioning(),
+            ];
+            model.validate(&request).unwrap();
+            let (task, references) = model.resolve_task(&request).unwrap();
+            assert_eq!(task, MiniMaxH3Task::Ref2va);
+            let refs = references.unwrap();
+            use crate::reference::ReferenceKind::{Audio, Image as I, Video};
+            assert_eq!(
+                refs.as_slice().iter().map(|r| r.kind()).collect::<Vec<_>>(),
+                [Video, I, Audio, I]
+            );
+            if let Ref2VaReference::Video(clip) = &refs.as_slice()[0] {
+                assert_eq!(clip.frames.len(), 30);
+                assert_eq!(clip.fps, 30.0);
+                assert_eq!(clip.audio.as_ref().unwrap().samples, ref_track().samples);
+            } else {
+                panic!("reference clip order must be preserved");
+            }
+            assert_eq!(model.requested_tier(), expected);
+
             assert!(
                 !missing.exists(),
                 "offload/load must not fetch or require optional predictor"
