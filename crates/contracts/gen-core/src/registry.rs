@@ -3721,6 +3721,7 @@ mod tests {
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
             max_reference_images: 0,
+            techniques: crate::train::TrainingTechniques::NONE,
         }
     }
 
@@ -3797,6 +3798,7 @@ mod tests {
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
             max_reference_images: 0,
+            techniques: crate::train::TrainingTechniques::NONE,
         }
     }
 
@@ -3813,6 +3815,7 @@ mod tests {
             // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
             supports_full_finetune: false,
             max_reference_images: 0,
+            techniques: crate::train::TrainingTechniques::NONE,
         }
     }
 

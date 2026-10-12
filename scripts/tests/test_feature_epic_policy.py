@@ -12,7 +12,9 @@ from types import SimpleNamespace
 from scripts.ci.feature_epic_policy import (
     PolicyError,
     resolve_local_commit,
+    resolve_local_commit_ancestry,
     resolve_local_merge_parents,
+    resolve_remote_base_branch,
     resolve_remote_feature_branch,
     validate_event,
 )
@@ -176,6 +178,9 @@ def validate(
     feature_resolver=canonical_feature,
     commit_parent_resolver=lambda _commit: (PR_BASE_SHA, PR_HEAD_SHA),
     commit_peeler=None,
+    base_branch_resolver=lambda _branch: PR_BASE_SHA,
+    commit_ancestry_resolver=lambda ancestor, descendant: ancestor == descendant,
+    effective_base_writer=None,
 ) -> str:
     if use_event_sha:
         active_sha = active_sha_for(event_name, payload)
@@ -187,6 +192,9 @@ def validate(
         feature_resolver=feature_resolver,
         commit_parent_resolver=commit_parent_resolver,
         commit_peeler=commit_peeler,
+        base_branch_resolver=base_branch_resolver,
+        commit_ancestry_resolver=commit_ancestry_resolver,
+        effective_base_writer=effective_base_writer,
     )
 
 
@@ -418,7 +426,7 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         self.assert_rejected(
             "pull_request",
             event,
-            "exact payload base/head parents",
+            "must descend from the payload base",
             use_event_sha=False,
             active_sha="7" * 40,
             commit_parent_resolver=lambda _commit: ("7" * 40, PR_HEAD_SHA),
@@ -429,6 +437,101 @@ class FeatureEpicPolicyTests(unittest.TestCase):
             "GITHUB_SHA must be a lowercase 40-hex",
             use_event_sha=False,
             active_sha="not-a-commit",
+        )
+
+    def test_pull_request_accepts_stale_payload_base_and_exports_test_merge_base(self) -> None:
+        payload_base = PR_BASE_SHA
+        merge_base = "7" * 40
+        canonical_tip = "8" * 40
+        ancestry = {(payload_base, merge_base), (merge_base, canonical_tip)}
+        exported = []
+
+        reason = validate(
+            "pull_request",
+            pull_request_event("fix/cuda-build", "main"),
+            commit_parent_resolver=lambda _commit: (merge_base, PR_HEAD_SHA),
+            base_branch_resolver=lambda branch: canonical_tip if branch == "main" else OTHER_COMMIT_SHA,
+            commit_ancestry_resolver=lambda ancestor, descendant: (ancestor, descendant) in ancestry,
+            effective_base_writer=exported.append,
+        )
+
+        self.assertIn("ordinary pull request", reason)
+        self.assertEqual(exported, [merge_base])
+
+    def test_pull_request_accepts_exact_base_and_canonical_tip_advancing_after_merge(self) -> None:
+        advanced_tip = "8" * 40
+        for canonical_tip, ancestry in (
+            (PR_BASE_SHA, {(PR_BASE_SHA, PR_BASE_SHA)}),
+            (advanced_tip, {(PR_BASE_SHA, PR_BASE_SHA), (PR_BASE_SHA, advanced_tip)}),
+        ):
+            with self.subTest(canonical_tip=canonical_tip):
+                validate(
+                    "pull_request",
+                    pull_request_event("fix/cuda-build", "main"),
+                    base_branch_resolver=lambda _branch, tip=canonical_tip: tip,
+                    commit_ancestry_resolver=lambda ancestor, descendant, graph=ancestry: (
+                        ancestor,
+                        descendant,
+                    ) in graph,
+                )
+
+    def test_pull_request_rejects_untrusted_base_and_parent_shapes(self) -> None:
+        merge_base = "7" * 40
+        canonical_tip = "8" * 40
+        cases = (
+            (
+                "rollback or divergent payload base",
+                lambda _commit: (merge_base, PR_HEAD_SHA),
+                lambda ancestor, descendant: (ancestor, descendant) == (merge_base, canonical_tip),
+                "must descend from the payload base",
+            ),
+            (
+                "base parent outside canonical branch",
+                lambda _commit: (merge_base, PR_HEAD_SHA),
+                lambda ancestor, descendant: (ancestor, descendant) == (PR_BASE_SHA, merge_base),
+                "must belong to the canonical base branch",
+            ),
+            (
+                "reversed parents",
+                lambda _commit: (PR_HEAD_SHA, PR_BASE_SHA),
+                lambda _ancestor, _descendant: True,
+                "exact payload head as its second parent",
+            ),
+            (
+                "wrong head parent",
+                lambda _commit: (PR_BASE_SHA, OTHER_COMMIT_SHA),
+                lambda _ancestor, _descendant: True,
+                "exact payload head as its second parent",
+            ),
+        )
+        for label, parents, ancestry, pattern in cases:
+            with self.subTest(label=label):
+                self.assert_rejected(
+                    "pull_request",
+                    pull_request_event("fix/cuda-build", "main"),
+                    pattern,
+                    commit_parent_resolver=parents,
+                    base_branch_resolver=lambda _branch: canonical_tip,
+                    commit_ancestry_resolver=ancestry,
+                )
+
+    def test_pull_request_requires_exact_canonical_base_repository_and_ref(self) -> None:
+        self.assert_rejected(
+            "pull_request",
+            pull_request_event(
+                "fix/cuda-build", "main", base_repository="attacker/inference"
+            ),
+            "base.repo.full_name must be",
+        )
+
+        def wrong_ref(_branch: str) -> str:
+            raise PolicyError("origin did not return exactly canonical base ref 'refs/heads/main'")
+
+        self.assert_rejected(
+            "pull_request",
+            pull_request_event("fix/cuda-build", "main"),
+            "exactly canonical base ref",
+            base_branch_resolver=wrong_ref,
         )
 
     def test_pull_request_binds_unavailable_payload_merge_sha_to_local_parents(self) -> None:
@@ -449,7 +552,7 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         self.assert_rejected(
             "pull_request",
             event,
-            "exact payload base/head parents",
+            "must descend from the payload base",
             use_event_sha=False,
             active_sha=PR_MERGE_SHA,
             commit_parent_resolver=lambda _commit: ("7" * 40, PR_HEAD_SHA),
@@ -712,6 +815,79 @@ class FeatureEpicPolicyTests(unittest.TestCase):
                     )
                     self.assertIn(expected_text, result.stdout)
 
+    def test_cli_exports_the_validated_base_from_a_stale_payload_test_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin"
+            origin.mkdir()
+            git(origin, "init", "-q")
+            git(origin, "commit", "-q", "--allow-empty", "--no-verify", "-m", "payload base")
+            payload_base = git(origin, "rev-parse", "HEAD")
+            git(origin, "commit", "-q", "--allow-empty", "--no-verify", "-m", "current base")
+            merge_base = git(origin, "rev-parse", "HEAD")
+            tree = git(origin, "rev-parse", "HEAD^{tree}")
+            head = git(origin, "commit-tree", "-m", "pull request head", "-p", payload_base, tree)
+            merge = git(
+                origin,
+                "commit-tree",
+                "-m",
+                "GitHub test merge",
+                "-p",
+                merge_base,
+                "-p",
+                head,
+                tree,
+            )
+            git(origin, "branch", "-M", "main")
+            git(origin, "update-ref", "refs/pull/1/merge", merge)
+
+            checkout = root / "checkout"
+            checkout.mkdir()
+            git(checkout, "init", "-q")
+            git(checkout, "remote", "add", "origin", str(origin))
+            git(
+                checkout,
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/pull/1/merge:refs/remotes/pull/1/merge",
+            )
+            git(checkout, "checkout", "-q", "--detach", merge)
+
+            event = pull_request_event("fix/cuda-build", "main")
+            event["pull_request"]["base"]["sha"] = payload_base
+            event["pull_request"]["head"]["sha"] = head
+            event["pull_request"]["merge_commit_sha"] = merge
+            event_path = root / "event.json"
+            output_path = root / "github-output"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--event-name",
+                    "pull_request",
+                    "--event-path",
+                    str(event_path),
+                    "--repository",
+                    REPOSITORY,
+                    "--active-sha",
+                    merge,
+                    "--github-output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                cwd=checkout,
+                env=hermetic_git_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), f"effective_base_sha={merge_base}\n")
+
     def test_dispatch_is_allowed_but_unknown_events_fail_closed(self) -> None:
         payload = {"repository": {"full_name": REPOSITORY}}
         reason = validate(
@@ -786,6 +962,60 @@ class FeatureEpicPolicyTests(unittest.TestCase):
         )
         self.assertNotIn("shell", calls[0][1])
         self.assertEqual(calls[0][1]["timeout"], 30)
+
+    def test_remote_base_resolver_requires_the_exact_named_origin_ref(self) -> None:
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{PR_BASE_SHA}\trefs/heads/main\n",
+                stderr="",
+            )
+
+        self.assertEqual(resolve_remote_base_branch("main", runner=runner), PR_BASE_SHA)
+        self.assertEqual(
+            calls[0][0],
+            ["git", "ls-remote", "--heads", "origin", "refs/heads/main"],
+        )
+        self.assertNotIn("shell", calls[0][1])
+
+        for output in (
+            "",
+            f"{PR_BASE_SHA}\trefs/heads/not-main\n",
+            f"{PR_BASE_SHA}\trefs/heads/main\n{OTHER_COMMIT_SHA}\trefs/heads/main\n",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(PolicyError, "exactly canonical base ref"):
+                    resolve_remote_base_branch(
+                        "main",
+                        runner=lambda *_args, value=output, **_kwargs: SimpleNamespace(
+                            returncode=0, stdout=value, stderr=""
+                        ),
+                    )
+
+    def test_local_ancestry_resolver_distinguishes_false_from_git_failure(self) -> None:
+        for returncode, expected in ((0, True), (1, False)):
+            with self.subTest(returncode=returncode):
+                self.assertEqual(
+                    resolve_local_commit_ancestry(
+                        PR_BASE_SHA,
+                        PR_HEAD_SHA,
+                        runner=lambda *_args, code=returncode, **_kwargs: SimpleNamespace(
+                            returncode=code, stdout="", stderr=""
+                        ),
+                    ),
+                    expected,
+                )
+        with self.assertRaisesRegex(PolicyError, "could not inspect commit ancestry"):
+            resolve_local_commit_ancestry(
+                PR_BASE_SHA,
+                PR_HEAD_SHA,
+                runner=lambda *_args, **_kwargs: SimpleNamespace(
+                    returncode=128, stdout="", stderr="missing object"
+                ),
+            )
 
     def test_remote_resolver_fails_on_zero_multiple_or_noncanonical_refs(self) -> None:
         cases = (

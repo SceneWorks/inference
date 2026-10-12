@@ -48,6 +48,7 @@ pub mod memory;
 pub mod mllm;
 pub mod nn;
 pub mod preview;
+pub mod pth;
 pub mod quant;
 // The parameterized QK-norm + RoPE + layout primitive and the adapter/quant-aware fused QKV
 // projection (SC-18319, epic 18304 P4). Shared so the ~10 expressible families stop open-coding the

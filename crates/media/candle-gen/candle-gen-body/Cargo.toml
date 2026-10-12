@@ -1,0 +1,16 @@
+[package]
+name = "candle-gen-body"
+version = "0.0.0"
+edition = "2021"
+description = "Body perceptual losses for candle-gen trainers (epic 2123, sc-24832): ViTPose+ bone-length proportions, HybrIK SMPL-beta shape and Sapiens surface normals as frozen, differentiable models on the shared decoded-x0 perceptual path. The candle twin of mlx-gen-body."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this crate links exactly one gen-core / candle build.
+candle-gen = { path = "../candle-gen" }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]

@@ -19,3 +19,6 @@ mod preview_real_weights;
 
 #[path = "trainer_cuda_smoke.rs"]
 mod trainer_cuda_smoke;
+
+#[path = "trainer_weights_free.rs"]
+mod trainer_weights_free;

@@ -114,6 +114,19 @@ pub fn accumulate_grads(acc: &mut Option<GradStore>, grads: GradStore, vars: &[V
     Ok(())
 }
 
+/// The number of micro-step gradients actually accumulated into the window that closes at
+/// 1-based `micro_step`: the configured `accumulation` for a full window, the remainder for the
+/// final partial flush (`steps % accumulation != 0`). Dividing by this — not the configured value —
+/// makes every update, including the tail, a true mean of the gradients it holds (F-017/F-034; the
+/// shared rule for the trainers that average inline: SDXL, Kolors).
+pub fn accumulation_divisor(micro_step: u32, accumulation: u32) -> u32 {
+    let accumulation = accumulation.max(1);
+    match micro_step % accumulation {
+        0 => accumulation,
+        pending => pending,
+    }
+}
+
 /// Scale every `Var`'s gradient in `grads` by `factor` in place — the `1/accumulation` averaging
 /// applied before [`clip_grad_norm`] + [`TrainOptimizer::step`].
 pub fn scale_grads(grads: &mut GradStore, vars: &[Var], factor: f64) -> Result<()> {
@@ -655,6 +668,29 @@ impl Prodigy {
 
 #[cfg(test)]
 mod tests {
+    /// sc-24827 review: the final partial window divides by what it actually holds. steps = 3,
+    /// accumulation = 2: the update at step 2 averages 2 grads, the tail flush at step 3 averages 1.
+    ///
+    /// *Mutation that reds this:* returning the configured `accumulation` unconditionally (the old
+    /// candle SDXL `1 / accum` scaling).
+    #[test]
+    fn accumulation_divisor_is_the_actual_window_size() {
+        assert_eq!(super::accumulation_divisor(2, 2), 2);
+        assert_eq!(
+            super::accumulation_divisor(3, 2),
+            1,
+            "steps=3, accum=2 tail flush"
+        );
+        assert_eq!(super::accumulation_divisor(7, 4), 3);
+        assert_eq!(super::accumulation_divisor(8, 4), 4);
+        assert_eq!(super::accumulation_divisor(5, 1), 1);
+        assert_eq!(
+            super::accumulation_divisor(5, 0),
+            1,
+            "accumulation 0 is treated as 1"
+        );
+    }
+
     use super::*;
     use candle_core::Device;
     use candle_nn::{AdamW as CandleAdamW, Optimizer, ParamsAdamW};

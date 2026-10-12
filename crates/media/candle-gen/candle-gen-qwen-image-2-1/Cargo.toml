@@ -15,6 +15,8 @@ autotests = false
 # Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
+# Epic 2123 E8: the shared auxiliary perceptual-loss builder (depth anchoring via TAEQI2.1 + DA2).
+candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 # Direct candle deps for the ported DiT / VAE / Qwen3-VL tower. Same workspace pin candle-gen uses,
 # so cargo unifies to one candle build (no skew).
 candle-core = { workspace = true }
@@ -43,8 +45,8 @@ image = { workspace = true }
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-llm/metal"]
-cuda = ["candle-gen/cuda", "candle-llm/cuda"]
+metal = ["candle-gen/metal", "candle-llm/metal", "candle-gen-perceptual/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda", "candle-gen-perceptual/cuda"]
 
 [dev-dependencies]
 # gen-core conformance suite: drives this provider through the public Generator contract

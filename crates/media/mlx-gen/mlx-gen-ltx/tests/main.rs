@@ -133,3 +133,6 @@ mod vae_parity;
 
 #[path = "vocoder_parity.rs"]
 mod vocoder_parity;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

@@ -13,8 +13,14 @@ autotests = false
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
+# The FaceMesh fx-program checkpoint's structure travels as JSON in its safetensors metadata
+# (sc-24831).
+serde_json = { workspace = true }
 
 [dev-dependencies]
+# The face-loss parity fixture pins its producer script's sha256 (sc-24831).
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 # `face_cosine` example (epic 10871 P4.2 identity scoring) loads PNG/JPG inputs.
 image = { workspace = true }
 

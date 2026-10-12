@@ -12,6 +12,9 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+# Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
+# (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
@@ -39,6 +42,9 @@ sha2 = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
+# Depth anchoring (epic 2123, sc-24830): the frozen Depth-Anything-V2 perceptor the trainer's
+# decoded-x0 depth loss runs. Depends only on core (acyclic).
+mlx-gen-depth = { path = "../mlx-gen-depth" }
 sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
 

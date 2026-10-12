@@ -7,10 +7,12 @@ autotests = false
 
 [features]
 default = []
-cuda = ["candle-gen/cuda", "candle-gen-boogu/cuda", "candle-transformers/cuda"]
+cuda = ["candle-gen/cuda", "candle-gen-boogu/cuda", "candle-transformers/cuda", "candle-gen-perceptual/cuda"]
 testkit = ["candle-gen/testkit"]
 
 [dependencies]
+# The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath.
+candle-gen-perceptual = { path = "../candle-gen-perceptual" }
 candle-gen = { path = "../candle-gen" }
 candle-gen-boogu = { path = "../candle-gen-boogu" }
 candle-core = { workspace = true }
@@ -25,6 +27,7 @@ sha2 = { workspace = true }
 safetensors07 = { package = "safetensors", version = "0.7" }
 
 [dev-dependencies]
+candle-gen-depth = { path = "../candle-gen-depth" }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

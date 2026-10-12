@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 101
+EXPECTED_MEMBER_COUNT = 105
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -236,6 +236,15 @@ CROSS_BACKEND_GEOMETRY_EXEMPT_FAMILIES: dict[str, str] = {}
 # Both entries are real, and both were reached by reading the crates rather than by finding the gate
 # inconvenient.
 CROSS_BACKEND_GEOMETRY_NO_SHARED_CONSTANTS: dict[str, str] = {
+    "body": (
+        "`mlx-gen-body` / `candle-gen-body` (sc-24832) declare no geometry constant of their own: "
+        "every model hyper-parameter, input size, threshold and resampling matrix of the three body "
+        "losses lives once in the backend-neutral `gen_core::train::body` (`VitPoseConfig`, "
+        "`HybrikConfig`, `SapiensConfig`, `VIS_THRESHOLD`, `NORMAL_SIZE`, …) that both crates "
+        "consume, and both are held to one committed reference fixture "
+        "(`docs/migration/body-losses-reference/`). One declaration, nothing for a cross-backend "
+        "comparison to hold; if either crate declares its own copy, this entry goes stale."
+    ),
     "joycaption": (
         "`mlx-gen-joycaption` declares no constant at all, of any visibility: its whole surface is "
         "`mlx_gen::register_captioner! { pub(crate) const REGISTRATION = descriptor => load }` "
@@ -2663,6 +2672,62 @@ def _narrowed_divergence_violations(
     return violations
 
 
+# Epic 2123 (feature-end review): the backend-neutral training kits' twin files under each root
+# crate's `src/train/` — the shared perceptual path and its decoders/losses — whose constants
+# (loss weights, scales, tap levels, decoder norm parameters) both backends must agree on. The
+# root `candle-gen` / `mlx-gen` crates are not a `candle-gen-X`/`mlx-gen-X` family pair, so the
+# family loop below never reached them.
+CROSS_BACKEND_ROOT_TRAIN_TWINS = (
+    "perceptual.rs",
+    "tae.rs",
+    "taehv.rs",
+    "vae_anchor.rs",
+    "latent_lpips.rs",
+)
+CROSS_BACKEND_ROOT_CRATES = ("crates/media/candle-gen/candle-gen", "crates/media/mlx-gen")
+
+
+def _root_train_twin_violations(root: Path) -> list[str]:
+    """Clause 2 of `check_cross_backend_geometry` for `CROSS_BACKEND_ROOT_TRAIN_TWINS`: every
+    visibility-carrying constant both root crates declare in the same twin file must agree. A
+    missing twin file, or a twin set sharing no constant at all, is a failure (fail-closed)."""
+    violations: list[str] = []
+    candle_root, mlx_root = (root / crate / "src" / "train" for crate in CROSS_BACKEND_ROOT_CRATES)
+    compared = 0
+    for name in CROSS_BACKEND_ROOT_TRAIN_TWINS:
+        sides: list[dict[str, set[str]]] = []
+        for directory in (candle_root, mlx_root):
+            path = directory / name
+            if not path.is_file():
+                violations.append(
+                    f"root train twin {path.relative_to(root).as_posix()} is missing, so its "
+                    "constants cannot be compared with the other backend's"
+                )
+                break
+            declarations: dict[str, set[str]] = {}
+            for constant, value in _rust_const_declarations(path.read_text(encoding="utf-8")).items():
+                declarations.setdefault(constant, set()).add(value)
+            sides.append(declarations)
+        if len(sides) != 2:
+            continue
+        candle, mlx = sides
+        for constant in sorted(set(candle) & set(mlx)):
+            compared += 1
+            if _canonical_const_values(candle[constant], candle) != _canonical_const_values(
+                mlx[constant], mlx
+            ):
+                violations.append(
+                    f"root train twin {name}: `{constant}` diverges: candle-gen says "
+                    f"{sorted(candle[constant])}, mlx-gen says {sorted(mlx[constant])}"
+                )
+    if compared == 0 and not violations:
+        violations.append(
+            "root train twins: the two root crates share no constant across "
+            f"{', '.join(CROSS_BACKEND_ROOT_TRAIN_TWINS)}, so nothing was compared"
+        )
+    return violations
+
+
 def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
     """Fail when a family's two backends declare different geometry, in shipped code or in fixtures.
 
@@ -2687,6 +2752,10 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        ``CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS``, so that recording one known difference does not
        stop comparing the rest of the aggregate. Every path that diverges must be listed, and every
        listed path must still diverge.
+
+       The same comparison covers the root crates' backend-neutral training-kit twins
+       (``CROSS_BACKEND_ROOT_TRAIN_TWINS`` under ``candle-gen``/``mlx-gen`` ``src/train/``), which
+       are not a ``candle-gen-X``/``mlx-gen-X`` pair.
 
        A family that shares *no* constant name is compared against nothing while every other clause
        passes, so that is a failure too, unless it is listed in
@@ -2930,6 +2999,8 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
                     f"says {sorted(candle_fixtures[constant])}, {mlx_relative}/tests says "
                     f"{sorted(mlx_fixtures[constant])}"
                 )
+
+    violations.extend(_root_train_twin_violations(root))
 
     for family, constant in sorted(
         (set(CROSS_BACKEND_GEOMETRY_EXEMPTIONS) | set(CROSS_BACKEND_GEOMETRY_FIELD_EXEMPTIONS))

@@ -1,0 +1,33 @@
+{
+  "kind": "DIAGNOSTIC_ONLY",
+  "purpose": "DIAGNOSTIC_ONLY",
+  "acceptanceEvidence": false,
+  "repository": "SceneWorks/inference",
+  "releaseId": 402708057,
+  "trainingProvenance": {
+    "sourceCandidate": "d0775d4922f38e442d38485d412405997f9abc80",
+    "runId": 37249426665,
+    "steps": 120,
+    "datasetSha256": "44a19887ab4c11293069c5ae2b2a5022ed53eec4bdbbe423a75cc82136b09ba4"
+  },
+  "adapters": [
+    {
+      "name": "mlx_failed_balanced_edit_lokr",
+      "kind": "lokr",
+      "assetId": 611294721,
+      "assetName": "diagnostic_only_qwen21_edit_120step_1a853514.safetensors",
+      "size": 6759417,
+      "sha256": "1a8535148c65d266d2b583d88a4c0b056d0e8e55eca9c9fa05378d67b5fde781",
+      "file": "qwen21_edit_lokr_120step_1a853.safetensors"
+    },
+    {
+      "name": "training_receipt",
+      "kind": "diagnostic_training_receipt",
+      "assetId": 611294720,
+      "assetName": "diagnostic_only_qwen21_edit_120step_1a853514_training.json",
+      "size": 53379,
+      "sha256": "f7abbffe6aa4f1a0117e549524e5cfcc3cde2fc1214d1eec2ed3fe49a2567c74",
+      "file": "qwen21_edit_lokr_120step_1a853_training.json"
+    }
+  ]
+}

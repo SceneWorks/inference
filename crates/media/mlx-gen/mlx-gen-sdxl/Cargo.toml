@@ -10,6 +10,9 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+# Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
+# (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 mlx-gen = { path = ".." }
 # Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): the `sdxl` PiD student as an
 # opt-in 4× decode replacement for the SDXL-family VAE. `mlx-gen-pid` depends only on the mlx-gen

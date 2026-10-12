@@ -15,7 +15,6 @@ use std::path::Path;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
-use candle_gen::candle_nn::{LayerNorm, Module};
 use candle_gen::{CandleError, Result};
 
 /// A loaded Depth Anything V2 weight map. Tensors are coerced to f32 on load — the parity oracle is
@@ -29,6 +28,11 @@ impl Weights {
     /// `mlx_gen::weights::Weights::empty()` + `insert`).
     pub fn from_map(map: HashMap<String, Tensor>) -> Self {
         Self { map }
+    }
+
+    /// Every tensor key (e.g. to write a synthetic checkpoint to disk in tests).
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
     }
 
     /// Load every tensor from one `.safetensors` file onto `device`, coercing to f32.
@@ -147,10 +151,16 @@ impl Linear {
     }
 }
 
-/// LayerNorm over the last dim with explicit weight/bias.
+/// LayerNorm over the last dim with explicit weight/bias, written with **composable** ops (mean,
+/// variance, affine) rather than candle's fused `candle_nn::ops::layer_norm`, which is
+/// `apply_op3_no_bwd` and so silently stops the gradient — this estimator also runs inside the
+/// depth-anchoring training loss (epic 2123, sc-24830), where the gradient must reach the pixels.
 pub(crate) fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f64) -> Result<Tensor> {
-    let ln = LayerNorm::new(w.clone(), b.clone(), eps);
-    Ok(ln.forward(x)?)
+    let mean = x.mean_keepdim(D::Minus1)?;
+    let xc = x.broadcast_sub(&mean)?;
+    let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
+    let normed = xc.broadcast_div(&(var + eps)?.sqrt()?)?;
+    Ok(normed.broadcast_mul(w)?.broadcast_add(b)?)
 }
 
 /// Scaled-dot-product attention, no mask. `q`/`k`/`v`: `[b, nh, seq, hd]` → `[b, nh, seq, hd]`.
@@ -175,7 +185,26 @@ pub(crate) fn conv2d_nhwc(
     stride: usize,
     padding: usize,
 ) -> Result<Tensor> {
-    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let mut xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let mut padding = padding;
+    if stride > 1 {
+        // candle's Conv2D backward derives the transposed conv's `output_padding` from the HEIGHT
+        // alone and applies it to both axes, so a strided conv whose rows and columns leave
+        // different remainders (e.g. the DPT ×0.5 reassemble on an aspect-preserving 3×4 grid)
+        // fails its backward with a shape mismatch. Pad explicitly and crop to the extent the
+        // windows actually read: identical forward values, and both remainders become zero.
+        let (_, _, h, wd) = xc.dims4()?;
+        let k = (w.dim(2)?, w.dim(3)?);
+        let xp = xc
+            .pad_with_zeros(2, padding, padding)?
+            .pad_with_zeros(3, padding, padding)?;
+        let used = |n: usize, k: usize| ((n + 2 * padding - k) / stride) * stride + k;
+        xc = xp
+            .narrow(2, 0, used(h, k.0))?
+            .narrow(3, 0, used(wd, k.1))?
+            .contiguous()?;
+        padding = 0;
+    }
     let mut y = xc.conv2d(w, padding, stride, 1, 1)?; // [N, O, H', W']
     if let Some(b) = bias {
         y = y.broadcast_add(&b.reshape((1, b.elem_count(), 1, 1))?)?;
@@ -276,6 +305,45 @@ mod tests {
                 assert!((s - 1.0).abs() < 1e-5, "align_corners={ac} row sums to {s}");
             }
         }
+    }
+
+    /// The backward-safe strided path computes exactly candle's padded strided conv, and its
+    /// backward works when rows and columns leave different remainders (3x4 at stride 2). Mutation:
+    /// get the crop extent wrong (`+ 1`) => values/shape differ => red; drop the explicit-pad branch
+    /// => the backward shape mismatch returns => red.
+    #[test]
+    fn strided_conv_matches_candle_and_backpropagates_on_uneven_grids() {
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0f32, 1f32, (1, 3, 4, 5), &dev).unwrap(); // NHWC 3x4, 5 ch
+        let w = Tensor::randn(0f32, 1f32, (2, 5, 3, 3), &dev).unwrap();
+        let ours = conv2d_nhwc(&x, &w, None, 2, 1).unwrap();
+        let direct = x
+            .permute([0, 3, 1, 2])
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .conv2d(&w, 1, 2, 1, 1)
+            .unwrap()
+            .permute([0, 2, 3, 1])
+            .unwrap();
+        assert_eq!(ours.dims(), direct.dims());
+        let d = (&ours - &direct)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(d < 1e-5, "{d}");
+        let v = candle_gen::candle_core::Var::from_tensor(&x).unwrap();
+        let g = conv2d_nhwc(v.as_tensor(), &w, None, 2, 1)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        assert_eq!(g.get(v.as_tensor()).unwrap().dims(), x.dims());
     }
 
     #[test]

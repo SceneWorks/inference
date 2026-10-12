@@ -207,14 +207,15 @@ def posix_shell() -> str | None:
 
 
 def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         [shell, "-n"],
-        input=script,
-        text=True,
-        encoding="utf-8",
+        # Windows text-mode stdin translates LF to CRLF before Bash reads it.
+        input=script.encode("utf-8"),
         capture_output=True,
         check=False,
     )
+    return subprocess.CompletedProcess(result.args, result.returncode,
+        result.stdout.decode("utf-8"), result.stderr.decode("utf-8"))
 
 
 def chroma_packed_build_script() -> str:
@@ -1500,6 +1501,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
         result = bash_syntax_check(self.require_posix_shell(), script)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bash_syntax_check_preserves_lf_under_windows_stdin_translation(self) -> None:
+        from unittest.mock import patch
+        shell = self.require_posix_shell()
+        native_run = subprocess.run
+        script = "for bits in 4 8; do\n  :\ndone\n"
+        def windows_stdin(command, **kwargs):
+            payload = kwargs["input"]
+            if isinstance(payload, str):
+                payload = payload.replace("\n", "\r\n").encode("utf-8")
+            return native_run(command, input=payload, text=False, capture_output=True, check=False)
+        with patch.object(subprocess, "run", side_effect=windows_stdin):
+            actual = bash_syntax_check(shell, script)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            # The previous text-mode implementation must fail the same discriminator.
+            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                                    capture_output=True, check=False)
+            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".
@@ -4011,6 +4030,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             1,
             "the feature-epic policy must run exactly once in the always-created changes job",
         )
+        self.assertEqual(policy_steps[0].get("id"), "topology")
         self.assertNotIn(
             "if",
             policy_steps[0],
@@ -4043,6 +4063,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         triggers = workflow[True]
         self.assertIn("pull_request", triggers)
         self.assertIn("merge_group", triggers)
+
+    def test_pull_request_diff_consumers_use_the_validated_merge_base_parent(self) -> None:
+        workflow_text = WORKFLOW.read_text(encoding="utf-8")
+        base_assignments = [
+            line.strip()
+            for line in workflow_text.splitlines()
+            if line.strip().startswith("BASE_SHA:")
+        ]
+        self.assertTrue(base_assignments)
+        for assignment in base_assignments:
+            with self.subTest(assignment=assignment):
+                self.assertIn("steps.topology.outputs.effective_base_sha", assignment)
+                self.assertNotIn("github.event.pull_request.base.sha", assignment)
 
     def test_gate_aggregates_every_lane_and_runs_when_they_fail(self) -> None:
         workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
@@ -4454,12 +4487,31 @@ class WindowsBashSelectionTests(unittest.TestCase):
             "${{ inputs.qwen_image_2_1_third_party_lora }}"
         ):
             errors.append("the third-party hook must reach the job through env, not interpolation")
+        release_options = {
+            key: value
+            for key, value in job["env"].items()
+            if key.startswith("CARGO_PROFILE_RELEASE_")
+        }
+        if release_options != {"CARGO_PROFILE_RELEASE_STRIP": "none"}:
+            errors.append(f"the release-strip workaround changed: {release_options!r}")
+        if any(key in job["env"] for key in ("RUSTC_WRAPPER", "SCCACHE_DISABLE")):
+            errors.append("the Qwen lane disables or replaces the configured compiler wrapper")
+        for name, other in workflow["jobs"].items():
+            if name != "mlx-qwen-image-2-1" and "CARGO_PROFILE_RELEASE_STRIP" in other.get("env", {}):
+                errors.append(f"the release-strip workaround leaked into {name}")
 
         models = {
             model["key"]: model
             for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
         }
         steps = {step.get("name"): step for step in job["steps"]}
+        target = steps.get("Initialize isolated Qwen-Image 2.1 Cargo target", {})
+        target_run = target.get("run", "")
+        if target.get("shell") != "bash" or target_run.count("CARGO_TARGET_DIR") != 1:
+            errors.append("the isolated Qwen Cargo target initializer changed")
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+        if re.search(r"(?:cargo\s+clean|rm\s+-rf[^\n]*(?:target|cargo))", commands, re.IGNORECASE):
+            errors.append("the Qwen lane clears a Cargo target or cache")
         resolve = steps.get("Resolve runner-local snapshot paths", {}).get("run", "")
         materialize = steps.get("Materialize and verify immutable snapshots", {}).get("run", "")
         for key, variable in (
@@ -4513,7 +4565,11 @@ class WindowsBashSelectionTests(unittest.TestCase):
         upload = steps.get("Keep the Qwen-Image 2.1 MLX evidence", {})
         if upload.get("with", {}).get("name") != "qwen-image-2-1-mlx-evidence":
             errors.append("the evidence artifact is not `qwen-image-2-1-mlx-evidence`")
-        if upload.get("if") != "${{ !cancelled() }}":
+        if upload.get("if") != (
+            "${{ always() && (inputs.qwen_image_2_1_lora_phase == "
+            "'current-diagnostic' || inputs.qwen_image_2_1_lora_phase == "
+            "'current-trajectory' || !cancelled()) }}"
+        ):
             errors.append("the evidence upload must survive a failed gate")
         if upload.get("with", {}).get("if-no-files-found") != "error":
             errors.append("an empty evidence upload must red")
@@ -4554,11 +4610,24 @@ class WindowsBashSelectionTests(unittest.TestCase):
                 {"MLX_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "/somewhere/else"}
             ),
             lambda job: job["steps"][-1].pop("if"),
+            lambda job: job["env"].pop("CARGO_PROFILE_RELEASE_STRIP"),
+            lambda job: job["env"].update({"CARGO_PROFILE_RELEASE_STRIP": "symbols"}),
+            lambda job: job["env"].update({"CARGO_PROFILE_RELEASE_LTO": "true"}),
+            lambda job: job["env"].update({"RUSTC_WRAPPER": ""}),
+            lambda job: next(
+                step for step in job["steps"]
+                if step.get("name") == "Initialize isolated Qwen-Image 2.1 Cargo target"
+            ).update({"run": 'rm -rf "$CARGO_TARGET_DIR"'}),
         ):
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"]["mlx-qwen-image-2-1"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
+        mutated = copy.deepcopy(workflow)
+        mutated["jobs"]["mlx-qwen-image-producers"].setdefault("env", {})[
+            "CARGO_PROFILE_RELEASE_STRIP"
+        ] = "none"
+        self.assertTrue(self.mlx_qwen_image_2_1_lane_errors(mutated, source))
 
 
 class WorkflowFileSizeTests(unittest.TestCase):
@@ -4595,6 +4664,64 @@ class WorkflowFileSizeTests(unittest.TestCase):
             set(yaml.safe_load(real_weights_inline_text())["jobs"]),
             set(yaml.safe_load(workflow_text)["jobs"]),
         )
+
+
+class Qwen21TerminalPhysicalCeilingTests(unittest.TestCase):
+    CAP = "QWEN_IMAGE_2_1_FOOTPRINT_CEILING_GB"
+    JOB = "mlx-qwen-image-2-1"
+
+    @classmethod
+    def ceiling_errors(cls, workflow: dict) -> list[str]:
+        errors: list[str] = []
+        jobs = workflow.get("jobs", {})
+        job = jobs.get(cls.JOB, {})
+        if job.get("env", {}).get(cls.CAP) != "100":
+            errors.append("Qwen 2.1 profile must bind the existing physical cap to literal 100 GB")
+        if cls.CAP in workflow.get("env", {}):
+            errors.append("Qwen's selected cap must not change other profiles through global env")
+        for name, other in jobs.items():
+            if name != cls.JOB and cls.CAP in other.get("env", {}):
+                errors.append(f"Qwen's selected cap leaked into {name}")
+        for step in job.get("steps", []):
+            if cls.CAP in step.get("env", {}):
+                errors.append("a step must not override the fixed profile cap")
+            if re.search(rf"\b{cls.CAP}\s*=", step.get("run", "")):
+                errors.append("a script must not override the fixed profile cap")
+        return errors
+
+    def test_selected_profile_binds_existing_cap_without_other_profile_changes(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.ceiling_errors(workflow), [])
+
+    def test_omitted_raised_dynamic_or_unscoped_caps_are_rejected(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        mutations = []
+        for value in [None, "101", "nan", "${{ vars.QWEN_PHYSICAL_CAP || '100' }}"]:
+            mutant = copy.deepcopy(workflow)
+            env = mutant["jobs"][self.JOB]["env"]
+            if value is None:
+                env.pop(self.CAP)
+            else:
+                env[self.CAP] = value
+            mutations.append((f"job value {value!r}", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["env"].pop(self.CAP)
+        mutant.setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("global instead of profile", mutant))
+        mutant = copy.deepcopy(workflow)
+        other = next(name for name in mutant["jobs"] if name != self.JOB)
+        mutant["jobs"][other].setdefault("env", {})[self.CAP] = "100"
+        mutations.append(("other job leak", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"][0].setdefault("env", {})[self.CAP] = "101"
+        mutations.append(("step env override", mutant))
+        mutant = copy.deepcopy(workflow)
+        mutant["jobs"][self.JOB]["steps"].append({"run": f"export {self.CAP}=101"})
+        mutations.append(("script override", mutant))
+        self.assertEqual(len(mutations), 8)
+        for name, mutant in mutations:
+            with self.subTest(mutation=name):
+                self.assertTrue(self.ceiling_errors(mutant))
 
 
 if __name__ == "__main__":

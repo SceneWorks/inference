@@ -24,6 +24,9 @@ mlx-rs = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]
+# Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
+# (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

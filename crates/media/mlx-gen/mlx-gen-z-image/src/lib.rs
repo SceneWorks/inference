@@ -40,6 +40,7 @@ pub mod rope_embedder;
 pub mod text_encoder;
 pub mod timestep_embedder;
 pub mod training;
+mod training_adapter;
 pub mod transformer;
 pub mod transformer_block;
 pub mod vae;

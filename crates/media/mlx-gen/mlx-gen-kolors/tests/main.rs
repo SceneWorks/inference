@@ -78,3 +78,6 @@ mod unet_parity;
 
 #[path = "unified_sampler_smoke.rs"]
 mod unified_sampler_smoke;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

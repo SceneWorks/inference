@@ -45,6 +45,10 @@ pub(crate) fn assert_owner() {
     }
 }
 struct VariantScope(Variant);
+/// Caller-thread ownership only; no alternate representation or capture enabled.
+pub(crate) fn production_owner_scope() -> impl Drop {
+    VariantScope::enter(Variant::Production)
+}
 impl VariantScope {
     fn enter(variant: Variant) -> Self {
         let mut owner = OWNER.lock().unwrap();
@@ -193,10 +197,11 @@ pub(crate) fn install_variant(host: &mut QwenImage21Transformer, spec: &LoadSpec
     Ok(())
 }
 
-fn retirement_boundary() {
+pub(crate) fn retirement_boundary() {
     // Exact mlx-rs48ff5e7 vendored mlx-c stream.h/stream.cpp ABI. The loaded
     // library/source identity is separately captured as MLXv0.32.0 in the lane.
-    // This boundary runs ONLY while constructing the alternate test overlay.
+    // This boundary is test-only: alternate-overlay construction and the
+    // separate conditioning/velocity diagnostic's explicit phase retirement.
     assert!(mlx_rs::task_local_default_stream().is_none());
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -400,6 +405,43 @@ pub(crate) fn capture_linear(path: &str, linear: &AdaptableLinear, x: &Array) ->
             "selectedDirectDeltaBF16AsF32":coefficients,"componentChecks":checks}));
         Ok(())
     })
+}
+
+struct CaptureReset;
+impl Drop for CaptureReset {
+    fn drop(&mut self) {
+        CAPTURE.with(|capture| {
+            capture.borrow_mut().take();
+        });
+    }
+}
+
+/// Run one already-fixed production forward while observing three representative
+/// first-block target modules. Each structured and materialized-direct residual
+/// consumes the same three copied activation rows. This is deliberately a 3/224
+/// sample and never a whole-model equivalence or acceptance claim.
+pub(crate) fn capture_same_activation_residuals<T>(
+    adapter: &Path,
+    forward: impl FnOnce() -> Result<T>,
+) -> Result<(T, BTreeMap<String, Value>)> {
+    assert_owner();
+    let (params, paths) = read_params(adapter)?;
+    assert_eq!(params.len(), 672);
+    assert_eq!(paths.len(), 224);
+    CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        assert!(capture.is_none(), "nested residual capture refused");
+        *capture = Some(Capture {
+            params,
+            rows: BTreeMap::new(),
+        });
+    });
+    let reset = CaptureReset;
+    let output = forward()?;
+    let rows = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap().rows);
+    drop(reset);
+    assert_eq!(rows.len(), 3, "representative 3/224 residual sample");
+    Ok((output, rows))
 }
 
 fn checked_file(path: &Path, bytes: u64, sha: &str) {

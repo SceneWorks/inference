@@ -25,6 +25,7 @@
 //! [`DepthAnythingV2::estimate_control_rgb8`] takes an arbitrary RGB8 image and returns a
 //! min/max-normalized grayscale-broadcast RGB depth-control image (same `width`·`height`).
 
+pub mod anchor;
 pub mod backbone;
 pub mod common;
 pub mod config;
@@ -102,11 +103,21 @@ impl DepthAnythingV2 {
         Ok(Tensor::from_vec(buf, (1, size, size, 3), &self.device)?)
     }
 
-    /// Run the model on a normalized NHWC input `[1, image_size, image_size, 3]` → a depth map
+    /// Run the model on a normalized NHWC input `[1, image_size, image_size, 3]` -> a depth map
     /// `[H, W]` (f32, model units; relative depth). Exposed for parity/testing; most callers want
     /// [`estimate_control_rgb8`](Self::estimate_control_rgb8).
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let grid = self.cfg.grid();
+        let depth = self.forward_batch(pixel_values)?; // [1, H, W]
+        let (_, h, wd) = depth.dims3()?;
+        Ok(depth.reshape((h, wd))?)
+    }
+
+    /// Batched [`forward`](Self::forward): normalized NHWC `[B, H, W, 3]` (sides multiples of the
+    /// patch size) -> depth `[B, H, W]`.
+    pub fn forward_batch(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let (_, h, w, _) = pixel_values.dims4()?;
+        let p = self.cfg.patch_size;
+        let grid = (h / p, w / p);
         let hidden = self.backbone.forward(pixel_values)?;
         if hidden.len() != 4 {
             return Err(CandleError::Msg(format!(
@@ -115,9 +126,26 @@ impl DepthAnythingV2 {
             )));
         }
         let fused = self.neck.forward(&hidden, grid, self.cfg.hidden_size)?;
-        let depth = self.head.forward(&fused, grid)?; // [1, H, W]
-        let (_, h, wd) = depth.dims3()?;
-        Ok(depth.reshape((h, wd))?)
+        self.head.forward(&fused, grid)
+    }
+
+    /// The **differentiable** pixel entry point of the depth-anchoring training loss (epic 2123,
+    /// sc-24830; the Candle twin of the MLX `forward_pixels`): NHWC pixels `[B, H, W, 3]` in
+    /// `[0, 1]` -> depth `[B, h, w]` at the aspect-preserving model size
+    /// [`DepthAnythingConfig::input_hw`]. The resize (bilinear, half-pixel centers, separable
+    /// matmuls) and the ImageNet normalization are tensor ops, and every op in the graph has a candle
+    /// backward (composable LayerNorm / softmax), so the gradient reaches the pixels; the weights are
+    /// plain tensors (frozen). Live and reference maps come from this same call on same-sized decodes.
+    pub fn forward_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
+        let (_, h, w, _) = pixels.dims4()?;
+        let (mh, mw) = self.cfg.input_hw(h, w);
+        let x = pixels.to_dtype(candle_gen::candle_core::DType::F32)?;
+        let x = common::bilinear_resize(&x, mh, mw, false)?;
+        let dev = x.device();
+        let mean = Tensor::from_slice(&preprocess::IMAGE_MEAN, (1, 1, 1, 3), dev)?;
+        let std = Tensor::from_slice(&preprocess::IMAGE_STD, (1, 1, 1, 3), dev)?;
+        let x = x.broadcast_sub(&mean)?.broadcast_div(&std)?;
+        self.forward_batch(&x)
     }
 
     /// Arbitrary RGB8 HWC image (`width`·`height`·3 bytes) → a depth-control RGB8 image of the SAME

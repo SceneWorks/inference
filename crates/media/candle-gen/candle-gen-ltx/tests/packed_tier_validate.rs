@@ -664,7 +664,7 @@ fn packed_q8_renders_coherent_video() {
 /// valid by construction and every negative test perturbs exactly one thing. That ordering matters:
 /// a hand-written manifest drifts from the fixtures it describes, and the drift then looks like a
 /// caught fault.
-mod ltx25_fixture {
+pub(crate) mod ltx25_fixture {
     use std::path::{Path, PathBuf};
 
     /// The bit widths the fixtures pack at, mirroring the shipped tiers.

@@ -63,6 +63,7 @@ fn short_train_produces_loadable_adapter() {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }],
         config: TrainingConfig {
             rank: 4,
@@ -146,6 +147,7 @@ fn short_train_checkpointed_produces_loadable_adapter() {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         }],
         config: TrainingConfig {
             rank: 4,
