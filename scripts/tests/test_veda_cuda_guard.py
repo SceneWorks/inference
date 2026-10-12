@@ -17,6 +17,19 @@ _spec.loader.exec_module(s0)
 
 class VedaCudaGuardTests(unittest.TestCase):
 
+    def test_non_ascii_inventory_and_receipts_are_utf8_with_lf(self):
+        xml = "<nvidia_smi_log>\n<gpu><uuid>GPU-test</uuid><product_name>☃</product_name><processes/></gpu>\n</nvidia_smi_log>\n"
+        csv = "0, GPU-test, GPU ☃, 596.36, 97887, 100, 0"
+        with tempfile.TemporaryDirectory() as temp, patch.object(s0, "command", side_effect=[csv, xml, ""]):
+            out = Path(temp)
+            devices, _ = s0.inventory(out, "unicode")
+            self.assertEqual(devices[0]["name"], "GPU ☃")
+            self.assertEqual((out / "unicode-nvidia-smi.xml").read_bytes(), xml.encode("utf-8"))
+            s0.persist_receipt(out, {"devices": devices})
+            data = (out / "receipt.json").read_bytes()
+            self.assertNotIn(b"\r\n", data)
+            self.assertEqual(json.loads(data.decode("utf-8"))["devices"], devices)
+
     def test_expired_inventory_deadline_does_not_launch_driver_probe(self):
         with patch.object(s0.subprocess, "check_output") as probe:
             with self.assertRaisesRegex(TimeoutError, "sampling deadline"):

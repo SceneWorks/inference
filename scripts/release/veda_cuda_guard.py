@@ -38,7 +38,7 @@ def inventory(out: Path | None = None, label: str = "snapshot",
         devices.append(dict(index=int(i), uuid=uuid, name=name, driver=driver, total_mib=int(total), used_mib=int(used), utilization_percent=int(utilization)))
     xml = command(["nvidia-smi", "-q", "-x"], deadline)
     if out is not None:
-        (out / f"{label}-nvidia-smi.xml").write_text(xml)
+        (out / f"{label}-nvidia-smi.xml").write_text(xml, encoding="utf-8", newline="\n")
     xml_uuids = {(gpu.findtext("uuid") or "").strip() for gpu in ET.fromstring(xml).findall("gpu")}
     if xml_uuids != {device["uuid"] for device in devices}:
         raise RuntimeError("driver XML and CSV GPU identities differ")
@@ -118,13 +118,13 @@ def sample_baseline(device: dict, out: Path, phase: str,
             sample["selected_used_mib"] = current["used_mib"]
         return current, baseline
     finally:
-        (out / f"{phase}-samples.json").write_text(json.dumps(samples, indent=2))
+        (out / f"{phase}-samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8", newline="\n")
 
 
 def claim_device(out: Path):
     import msvcrt
     devices, processes = inventory(out, "admission")
-    (out / "admission-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2))
+    (out / "admission-inventory.json").write_text(json.dumps(dict(devices=devices, processes=processes), indent=2), encoding="utf-8", newline="\n")
     # Public is host-global for both listeners, unlike runner.temp/workspaces.
     lock_dir = Path(os.environ["PUBLIC"]) / "SceneWorks" / "gpu-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +158,7 @@ def verify_idle(device: dict, out: Path, phase: str, baseline: dict):
 
 def persist_receipt(out: Path, receipt: dict):
     temporary = out / "receipt.json.tmp"
-    temporary.write_text(json.dumps(receipt, indent=2))
+    temporary.write_text(json.dumps(receipt, indent=2), encoding="utf-8", newline="\n")
     temporary.replace(out / "receipt.json")
 
 
