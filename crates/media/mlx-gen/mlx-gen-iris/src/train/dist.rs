@@ -17,6 +17,7 @@
 //! is abandoned, the collective is poisoned (every later call fails with the same `RankLost`),
 //! and the process must exit — MLX offers no way to cancel a collective.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::rc::Rc;
@@ -63,6 +64,8 @@ pub struct MlxCollective {
     /// The run's cancel flag: a collective wait ends [`gen_core::Error::Canceled`] once a pending
     /// cancel outlived [`World::cancel_grace`] (sc-25690).
     cancel: CancelFlag,
+    /// [`Collective::set_cancel_armed`].
+    cancel_armed: bool,
 }
 
 /// The MLX group handle, moved to the collective's worker thread.
@@ -123,15 +126,25 @@ enum WaitEnd {
     Canceled,
 }
 
+/// How a [`bounded_wait`] observes the run's cancel flag.
+struct CancelWatch<'a> {
+    cancel: &'a CancelFlag,
+    /// `None`: disarmed ([`Collective::set_cancel_armed`]) — a pending cancel never ends the wait.
+    grace: Option<Duration>,
+    /// When a pending cancel was first observed: one budget across every wait of the collective
+    /// (shared with its side channel), never renewed per wait.
+    seen: &'a Cell<Option<Instant>>,
+}
+
 /// Run `work` (a call that may block inside MLX forever: MLX's socket backends take no timeout)
-/// on a worker thread and wait for it in short slices: at most `bound`, and at most `grace` once
-/// `cancel` is set. On either expiry the worker is abandoned, still blocked in MLX.
+/// on a worker thread and wait for it in short slices: at most `bound`, and (armed) at most the
+/// grace once the cancel is pending. On either expiry the worker is abandoned, still blocked in
+/// MLX.
 fn bounded_wait<T: Send + 'static>(
     name: &str,
     work: impl FnOnce() -> std::result::Result<T, String> + Send + 'static,
     bound: Duration,
-    cancel: &CancelFlag,
-    grace: Duration,
+    watch: &CancelWatch,
 ) -> std::result::Result<T, WaitEnd> {
     const SLICE: Duration = Duration::from_millis(200);
     let (tx, rx) = mpsc::channel();
@@ -142,7 +155,6 @@ fn bounded_wait<T: Send + 'static>(
         })
         .map_err(|e| WaitEnd::Failed(format!("could not start the worker: {e}")))?;
     let deadline = Instant::now() + bound;
-    let mut cancel_seen: Option<Instant> = None;
     loop {
         match rx.recv_timeout(SLICE) {
             Ok(Ok(v)) => return Ok(v),
@@ -151,8 +163,15 @@ fn bounded_wait<T: Send + 'static>(
                 return Err(WaitEnd::Failed("the worker panicked".into()))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if cancel.is_cancelled() {
-                    let seen = *cancel_seen.get_or_insert_with(Instant::now);
+                if let (Some(grace), true) = (watch.grace, watch.cancel.is_cancelled()) {
+                    let seen = match watch.seen.get() {
+                        Some(t) => t,
+                        None => {
+                            let now = Instant::now();
+                            watch.seen.set(Some(now));
+                            now
+                        }
+                    };
                     if seen.elapsed() >= grace {
                         return Err(WaitEnd::Canceled);
                     }
@@ -176,8 +195,7 @@ fn bounded_collective(
     shape: Vec<i32>,
     f: MlxCollectiveFn,
     timeout: Duration,
-    cancel: &CancelFlag,
-    grace: Duration,
+    watch: &CancelWatch,
     rank: usize,
     op: &str,
 ) -> std::result::Result<Vec<f32>, (DistError, bool)> {
@@ -190,8 +208,7 @@ fn bounded_collective(
         op,
         move || run_collective(group, &data, &shape, f),
         timeout,
-        cancel,
-        grace,
+        watch,
     ) {
         Ok(v) => Ok(v),
         Err(WaitEnd::Failed(e)) => Err((lost(format!("MLX distributed {op} failed ({e})")), false)),
@@ -266,13 +283,13 @@ impl MlxCollective {
                 mlx_sys::mlx_distributed_init(true, ptr)
             }))
         };
-        let group = match bounded_wait(
-            "init",
-            init,
-            world.rendezvous_bound(),
+        let seen = Cell::new(None);
+        let watch = CancelWatch {
             cancel,
-            Duration::ZERO,
-        ) {
+            grace: Some(Duration::ZERO),
+            seen: &seen,
+        };
+        let group = match bounded_wait("init", init, world.rendezvous_bound(), &watch) {
             Ok(g) => g.0,
             Err(WaitEnd::Canceled) => return Err(gen_core::Error::Canceled),
             Err(WaitEnd::Expired) => {
@@ -320,6 +337,7 @@ impl MlxCollective {
             side,
             poisoned: None,
             cancel: cancel.clone(),
+            cancel_armed: true,
         })
     }
 
@@ -348,8 +366,11 @@ impl MlxCollective {
             shape,
             f,
             self.world.timeout,
-            &self.cancel,
-            self.world.cancel_grace,
+            &CancelWatch {
+                cancel: &self.cancel,
+                grace: self.cancel_armed.then_some(self.world.cancel_grace),
+                seen: self.side.cancel_first_seen(),
+            },
             self.world.rank,
             op,
         );
@@ -457,6 +478,11 @@ impl Collective for MlxCollective {
 
     fn barrier(&mut self, tag: &str) -> gen_core::Result<()> {
         self.side.barrier(tag)
+    }
+
+    fn set_cancel_armed(&mut self, armed: bool) -> bool {
+        self.side.set_cancel_armed(armed);
+        std::mem::replace(&mut self.cancel_armed, armed)
     }
 
     fn all_reduce_f64(&mut self, data: &mut [f64], op: ReduceOp) -> gen_core::Result<()> {
@@ -695,20 +721,21 @@ mod tests {
         assert!(encode_len(u32::MAX as usize + 1).is_err());
     }
 
-    /// [`bounded_wait`] with its bound and grace in milliseconds.
+    /// [`bounded_wait`] with its bound and grace in milliseconds (`None`: disarmed) and a fresh
+    /// first-seen record.
     fn run_bounded<T: Send + 'static>(
         work: impl FnOnce() -> std::result::Result<T, String> + Send + 'static,
         bound_ms: u64,
         flag: &CancelFlag,
-        grace_ms: u64,
+        grace_ms: Option<u64>,
     ) -> std::result::Result<T, WaitEnd> {
-        bounded_wait(
-            "t",
-            work,
-            Duration::from_millis(bound_ms),
-            flag,
-            Duration::from_millis(grace_ms),
-        )
+        let seen = Cell::new(None);
+        let watch = CancelWatch {
+            cancel: flag,
+            grace: grace_ms.map(Duration::from_millis),
+            seen: &seen,
+        };
+        bounded_wait("t", work, Duration::from_millis(bound_ms), &watch)
     }
 
     /// A call that blocks forever (MLX's init or a collective on a vanished peer): the wait ends
@@ -727,12 +754,15 @@ mod tests {
             Ok(7)
         }
         let flag = CancelFlag::new();
-        let expired = run_bounded(forever, 300, &flag, 0);
+        let expired = run_bounded(forever, 300, &flag, Some(0));
         assert!(matches!(expired, Err(WaitEnd::Expired)), "{expired:?}");
         flag.cancel();
-        let cancelled = run_bounded(forever, 3_600_000, &flag, 0);
+        let cancelled = run_bounded(forever, 3_600_000, &flag, Some(0));
         assert!(matches!(cancelled, Err(WaitEnd::Canceled)), "{cancelled:?}");
-        let answered = run_bounded(late, 3_600_000, &flag, 60_000);
+        let answered = run_bounded(late, 3_600_000, &flag, Some(60_000));
         assert!(matches!(answered, Ok(7)), "{answered:?}");
+        // disarmed: a pending cancel never ends the wait (a writer finishing a cancel-save)
+        let disarmed = run_bounded(late, 3_600_000, &flag, None);
+        assert!(matches!(disarmed, Ok(7)), "{disarmed:?}");
     }
 }

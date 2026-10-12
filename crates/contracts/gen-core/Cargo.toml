@@ -42,7 +42,7 @@ image = { workspace = true }
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
 # same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
 # Win32_Networking_WinSock: TCP keepalive on the Iris training transport's sockets (sc-25690).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [target.'cfg(unix)'.dependencies]
 # TCP keepalive on the Iris training transport's sockets (`setsockopt`; std exposes none of it,

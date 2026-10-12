@@ -158,6 +158,12 @@ fn run_job(j: &Json) -> Json {
         trigger_words: Vec::new(),
         cancel: Default::default(),
     };
+    if let Some(ms) = j["writer_delay_ms"].as_u64() {
+        std::env::set_var(
+            candle_gen::gen_core::iris::train::dist::WRITER_TEST_DELAY_ENV,
+            ms.to_string(),
+        );
+    }
     let flag = req.cancel.clone();
     let cancel_at = j["cancel_at"].as_u64().map(|v| v as u32);
     let die_at = j["die_at"].as_u64().map(|v| v as u32);
@@ -544,6 +550,42 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     let d = max_diff(&export(ddp.path()), &export(hybrid.path()));
     eprintln!("hybrid 2x2 vs ddp export: max |Δ| = {d:.3e}");
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
+}
+
+/// sc-25690: once the collective cancel agreement decided, the cancel-save and the export wait
+/// for their writer however long its writes take: a rank-0 write slower than the cancel grace
+/// still ends in a clean cancel with a checkpoint and an export on every rank (no peer gives up
+/// at the grace, rank 0 sees no lost rank).
+#[test]
+fn a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports() {
+    let (data, scratch, out) = (tmp(), tmp(), tmp());
+    write_dataset(data.path());
+    let mut world = tcp_world(2, 1);
+    world["cancel_grace_secs"] = json!(1);
+    let jobs = (0..2)
+        .map(|r| {
+            let mut j = job(
+                data.path(),
+                out.path(),
+                r,
+                world.clone(),
+                json!({"strategy": "ddp"}),
+                4,
+                Some(2),
+            );
+            if r == 0 {
+                j["writer_delay_ms"] = json!(2500);
+            }
+            j
+        })
+        .collect();
+    let res = launch(jobs, scratch.path());
+    for r in &res {
+        assert_eq!(r["steps"], 2, "a clean cancel at step 2 on every rank: {r}");
+    }
+    let s = read_checkpoint_state(&latest(out.path())).unwrap();
+    assert_eq!(s.step, 2);
+    assert!(ok(&res[0]).is_file(), "the export was written");
 }
 
 /// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a

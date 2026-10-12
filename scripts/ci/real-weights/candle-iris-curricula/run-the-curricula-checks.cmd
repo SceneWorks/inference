@@ -16,6 +16,8 @@ call :run_one a_rank_that_stalls_mid_run_fails_the_survivor_typed_within_the_tim
 rem sc-25690: ranks that resolve different resume checkpoints refuse typed (Windows sockets:
 rem the non-blocking polled transport with TCP keepalive).
 call :run_one ranks_that_see_different_checkpoints_refuse_to_resume train_distributed::ranks_that_see_different_checkpoints_refuse_to_resume || set "IRIS_FAILED=1"
+rem A cancel whose rank-0 cancel-save / export outlasts the cancel grace still ends cleanly.
+call :run_one a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports train_distributed::a_cancel_with_a_writer_slower_than_the_grace_still_saves_and_exports || set "IRIS_FAILED=1"
 set "IRIS_DIST_SHARE_DEVICE="
 rem The miniature curricula lifecycle on the device (fp16 trains here: CUDA has half GEMM).
 call :run_one fp16_trains_with_the_dynamic_loss_scaler curricula_lifecycle::fp16_trains_with_the_dynamic_loss_scaler || set "IRIS_FAILED=1"
@@ -25,6 +27,7 @@ rem run beside another run's checkpoints, the whole-directory export; NTFS renam
 call :run_one a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly train_lineage::a_cancel_at_a_new_epochs_first_batch_after_a_resume_resumes_exactly || set "IRIS_FAILED=1"
 call :run_one a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints train_lineage::a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints || set "IRIS_FAILED=1"
 call :run_one a_full_model_export_replaces_its_directory_whole train_lineage::a_full_model_export_replaces_its_directory_whole || set "IRIS_FAILED=1"
+call :run_one a_refused_resume_leaves_the_checkpoint_root_untouched train_lineage::a_refused_resume_leaves_the_checkpoint_root_untouched || set "IRIS_FAILED=1"
 rem The bounded official curriculum on real weights (stage1_256 + REPA -> stage2_512 new phase).
 call :run_one real_stage_presets_resume_256_to_512_with_repa curricula_real_weights::real_stage_presets_resume_256_to_512_with_repa --ignored || set "IRIS_FAILED=1"
 if not "%IRIS_FAILED%"=="0" exit /b 1

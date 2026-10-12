@@ -39,6 +39,7 @@
 //!   the `ring` / `jaccl` / `mpi` backends, exposed by the pinned mlx-rs fork's `mlx-sys`) behind
 //!   the same [`Collective`] trait, in `mlx-gen-iris`.
 
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -395,6 +396,23 @@ impl World {
     /// The rendezvous bound: [`Self::rendezvous_timeout`], never longer than [`Self::timeout`].
     pub fn rendezvous_bound(&self) -> Duration {
         self.rendezvous_timeout.min(self.timeout)
+    }
+}
+
+/// The environment variable of [`writer_test_delay`].
+#[doc(hidden)]
+pub const WRITER_TEST_DELAY_ENV: &str = "SCENEWORKS_IRIS_TEST_WRITER_DELAY_MS";
+
+/// Test seam (sc-25690): the multi-process tests make the writing rank's checkpoint / export
+/// writes slow (longer than the cancel grace) by setting [`WRITER_TEST_DELAY_ENV`] in the rank
+/// process; unset — always, outside those tests — it does nothing.
+#[doc(hidden)]
+pub fn writer_test_delay() {
+    if let Some(ms) = std::env::var(WRITER_TEST_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -893,6 +911,12 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
         ));
     }
     let cancel_grace = u("cancel_grace_secs", DEFAULT_CANCEL_GRACE_SECS)?;
+    if cancel_grace == 0 {
+        // A zero grace would end the cancel agreement's own wait at its first idle poll.
+        return Err(Error::Msg(
+            "iris training: dist.world.cancel_grace_secs must be >= 1".into(),
+        ));
+    }
     Ok(World {
         rank,
         local_rank,
@@ -1035,6 +1059,16 @@ pub trait Collective {
 
     /// `f64` reduction across the whole world (counters, flags).
     fn all_reduce_f64(&mut self, data: &mut [f64], op: ReduceOp) -> Result<()>;
+
+    /// Arm or disarm the cancel grace of this collective's waits; returns the previous setting.
+    /// Armed (the default of a transport), a wait ends [`Error::Canceled`] once a pending cancel
+    /// outlived [`World::cancel_grace`]. Trainers disarm it once the collective cancel agreement
+    /// decided to stop, and around checkpoint / export writes: there the slow party is a writing
+    /// rank, not a stalled peer, so those waits stay bounded by [`World::timeout`] only (sc-25690).
+    fn set_cancel_armed(&mut self, armed: bool) -> bool {
+        let _ = armed;
+        false
+    }
 }
 
 /// The single-process collective (world size 1): every operation is the identity.
@@ -1188,11 +1222,33 @@ struct Pace {
     limit: Duration,
     /// The run's cancel flag.
     cancel: CancelFlag,
-    /// How long a wait may continue once a cancel is pending: zero during the rendezvous (no
+    /// How long waits may continue once a cancel is pending: zero during the rendezvous (no
     /// training state exists yet); during training, long enough for the peers (cancelled too) to
     /// reach the collective cancel agreement at their next step boundary, so a cooperative cancel
     /// still ends in the coordinated durable save ([`World::cancel_grace`]).
     grace: Duration,
+    /// Whether a pending cancel may end a wait at all ([`Collective::set_cancel_armed`]).
+    armed: Cell<bool>,
+    /// When a pending cancel was first observed by any wait of this transport: the grace is one
+    /// budget for the whole transport, never renewed per frame or per collective.
+    cancel_seen: Cell<Option<Instant>>,
+}
+
+impl Pace {
+    fn new(limit: Duration, cancel: &CancelFlag, grace: Duration) -> Self {
+        Self {
+            limit,
+            cancel: cancel.clone(),
+            grace,
+            armed: Cell::new(true),
+            cancel_seen: Cell::new(None),
+        }
+    }
+
+    /// A pace with another bound, sharing nothing else's state.
+    fn with_limit(&self, limit: Duration) -> Self {
+        Self::new(limit, &self.cancel, self.grace)
+    }
 }
 
 impl std::fmt::Debug for Pace {
@@ -1201,16 +1257,16 @@ impl std::fmt::Debug for Pace {
             .field("limit", &self.limit)
             .field("cancelled", &self.cancel.is_cancelled())
             .field("grace", &self.grace)
+            .field("armed", &self.armed.get())
             .finish()
     }
 }
 
-/// One wait's bookkeeping: an inactivity deadline (reset by progress) and when a pending cancel
-/// was first observed.
+/// One wait's bookkeeping: an inactivity deadline (reset by progress); the cancel bookkeeping is
+/// the transport's ([`Pace::cancel_seen`]).
 struct Waiter<'a> {
     pace: &'a Pace,
     deadline: Instant,
-    cancel_seen: Option<Instant>,
     spins: u32,
 }
 
@@ -1219,7 +1275,6 @@ impl<'a> Waiter<'a> {
         Self {
             pace,
             deadline: Instant::now() + pace.limit,
-            cancel_seen: None,
             spins: 0,
         }
     }
@@ -1243,8 +1298,15 @@ impl<'a> Waiter<'a> {
     /// A slice passed without progress: keep waiting, or end the wait typed: [`Error::Canceled`]
     /// once a pending cancel outlived the grace, [`DistError::RankLost`] once the bound passed.
     fn idle(&mut self, peer: usize, op: &str) -> Result<()> {
-        if self.pace.cancel.is_cancelled() {
-            let seen = *self.cancel_seen.get_or_insert_with(Instant::now);
+        if self.pace.armed.get() && self.pace.cancel.is_cancelled() {
+            let seen = match self.pace.cancel_seen.get() {
+                Some(t) => t,
+                None => {
+                    let now = Instant::now();
+                    self.pace.cancel_seen.set(Some(now));
+                    now
+                }
+            };
             if seen.elapsed() >= self.pace.grace {
                 return Err(Error::Canceled);
             }
@@ -1267,9 +1329,11 @@ impl<'a> Waiter<'a> {
 /// observes its bound and the cancel flag between attempts, and no byte is ever lost or duplicated
 /// to an expired socket timeout (a timed-out blocking `send` / `recv` leaves a Windows socket in
 /// an indeterminate state). Between attempts a waiter yields, then sleeps 1 ms.
+///
+/// Only `WouldBlock` retries: on a non-blocking socket `TimedOut` means TCP keepalive declared the
+/// peer dead, a lost rank (sc-25690).
 fn would_block(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
-    matches!(e.kind(), WouldBlock | TimedOut)
+    e.kind() == std::io::ErrorKind::WouldBlock
 }
 
 fn write_all(s: &mut TcpStream, buf: &[u8], w: &mut Waiter, peer: usize, op: &str) -> Result<()> {
@@ -1535,16 +1599,8 @@ impl TcpCollective {
         assert_single_world(world).map_err(DistError::into_error)?;
         let bound = world.rendezvous_bound();
         let deadline = Instant::now() + bound;
-        let rendezvous = Pace {
-            limit: bound,
-            cancel: cancel.clone(),
-            grace: Duration::ZERO,
-        };
-        let pace = Pace {
-            limit: world.timeout,
-            cancel: cancel.clone(),
-            grace: world.cancel_grace,
-        };
+        let rendezvous = Pace::new(bound, cancel, Duration::ZERO);
+        let pace = Pace::new(world.timeout, cancel, world.cancel_grace);
         let mut peers: Vec<Option<TcpStream>> = (0..world.world_size).map(|_| None).collect();
         let hello = json!({
             "magic": MAGIC,
@@ -1571,10 +1627,7 @@ impl TcpCollective {
             listener
                 .set_nonblocking(true)
                 .map_err(|e| io_lost(0, "rendezvous", e))?;
-            let hello_pace = Pace {
-                limit: bound.min(HELLO_WAIT),
-                ..rendezvous.clone()
-            };
+            let hello_pace = rendezvous.with_limit(bound.min(HELLO_WAIT));
             let mut joined = 1usize;
             let mut dropped: Vec<String> = Vec::new();
             let mut split: Vec<String> = Vec::new();
@@ -1682,12 +1735,11 @@ impl TcpCollective {
             )?;
             // The admission answer comes once the whole world joined: bounded by what is left of
             // the rendezvous.
-            let left = Pace {
-                limit: deadline
+            let left = rendezvous.with_limit(
+                deadline
                     .saturating_duration_since(Instant::now())
                     .max(MIN_ADMISSION_WAIT),
-                ..rendezvous.clone()
-            };
+            );
             let answer = recv_frame(&mut stream, &left, 0, 0, 0, "rendezvous", HELLO_MAX)?;
             if answer != ADMITTED {
                 let why = answer
@@ -1704,6 +1756,13 @@ impl TcpCollective {
             seq: 0,
             pace,
         })
+    }
+
+    /// When this transport first observed a pending cancel ([`World::cancel_grace`] is one budget
+    /// from then on); a collective layered on this one (MLX's) shares it.
+    #[doc(hidden)]
+    pub fn cancel_first_seen(&self) -> &Cell<Option<Instant>> {
+        &self.pace.cancel_seen
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -1816,20 +1875,55 @@ fn configure(s: &TcpStream) -> Result<()> {
         .map_err(|e| io_lost(0, "configure", e))?;
     s.set_nonblocking(true)
         .map_err(|e| io_lost(0, "configure", e))?;
-    keepalive::enable(s).map_err(|e| io_lost(0, "configure keepalive", e))
+    if let Err(e) = keepalive::enable(s) {
+        // Never fatal: a socket without keepalive still works; only a vanished peer is then
+        // detected at the transport timeout instead of by the probes.
+        eprintln!("iris distributed: TCP keepalive unavailable on this socket ({e})");
+    }
+    Ok(())
 }
 
 /// `SO_KEEPALIVE` with the probe timing of [`KEEPALIVE_IDLE_SECS`] / [`KEEPALIVE_INTERVAL_SECS`] /
-/// [`KEEPALIVE_PROBES`] (std exposes none of it).
+/// [`KEEPALIVE_PROBES`] (std exposes none of it). Only `SO_KEEPALIVE` itself is required; the
+/// timing is best effort (sc-25690): a host without the per-socket TCP options (Windows before
+/// 10 1709 / Server 2019) gets the timing through `SIO_KEEPALIVE_VALS` (all but the probe count,
+/// which is the system's), else keeps the system's timing.
 mod keepalive {
     use super::{KEEPALIVE_IDLE_SECS, KEEPALIVE_INTERVAL_SECS, KEEPALIVE_PROBES};
     use std::net::TcpStream;
+
+    /// One socket option: `(level, name, value)`.
+    pub(super) type Set<'a> = dyn Fn(i32, i32, u32) -> std::io::Result<()> + 'a;
+
+    /// The option numbers of one platform.
+    pub(super) struct Opts {
+        pub sol_socket: i32,
+        pub so_keepalive: i32,
+        pub ipproto_tcp: i32,
+        pub idle: i32,
+        pub interval: i32,
+        pub probes: i32,
+    }
+
+    /// Enable keepalive through `set`; `Ok(false)` when the timing could not be applied (the
+    /// caller may fall back), `Err` only when `SO_KEEPALIVE` itself failed.
+    pub(super) fn apply(set: &Set, o: &Opts) -> std::io::Result<bool> {
+        set(o.sol_socket, o.so_keepalive, 1)?;
+        let timed = [
+            (o.idle, KEEPALIVE_IDLE_SECS),
+            (o.interval, KEEPALIVE_INTERVAL_SECS),
+            (o.probes, KEEPALIVE_PROBES),
+        ]
+        .iter()
+        .all(|&(name, v)| set(o.ipproto_tcp, name, v).is_ok());
+        Ok(timed)
+    }
 
     #[cfg(unix)]
     pub fn enable(s: &TcpStream) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
         let fd = s.as_raw_fd();
-        let set = |level: libc::c_int, name: libc::c_int, v: u32| -> std::io::Result<()> {
+        let set = |level: i32, name: i32, v: u32| -> std::io::Result<()> {
             let v = v as libc::c_int;
             // SAFETY: a valid socket descriptor and a pointer/length to one live c_int.
             let r = unsafe {
@@ -1847,17 +1941,23 @@ mod keepalive {
                 Err(std::io::Error::last_os_error())
             }
         };
-        set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-        #[cfg(target_vendor = "apple")]
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, KEEPALIVE_IDLE_SECS)?;
-        #[cfg(not(target_vendor = "apple"))]
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
-        set(
-            libc::IPPROTO_TCP,
-            libc::TCP_KEEPINTVL,
-            KEEPALIVE_INTERVAL_SECS,
-        )?;
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+        let opts = Opts {
+            sol_socket: libc::SOL_SOCKET,
+            so_keepalive: libc::SO_KEEPALIVE,
+            ipproto_tcp: libc::IPPROTO_TCP,
+            #[cfg(target_vendor = "apple")]
+            idle: libc::TCP_KEEPALIVE,
+            #[cfg(not(target_vendor = "apple"))]
+            idle: libc::TCP_KEEPIDLE,
+            interval: libc::TCP_KEEPINTVL,
+            probes: libc::TCP_KEEPCNT,
+        };
+        if !apply(&set, &opts)? {
+            eprintln!(
+                "iris distributed: TCP keepalive timing unavailable on this host; the system's \
+                 keepalive timing applies"
+            );
+        }
         Ok(())
     }
 
@@ -1865,8 +1965,8 @@ mod keepalive {
     pub fn enable(s: &TcpStream) -> std::io::Result<()> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::Networking::WinSock::{
-            setsockopt, IPPROTO_TCP, SOCKET, SOL_SOCKET, SO_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
-            TCP_KEEPINTVL,
+            setsockopt, tcp_keepalive, WSAIoctl, IPPROTO_TCP, SIO_KEEPALIVE_VALS, SOCKET,
+            SOL_SOCKET, SO_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL,
         };
         let sock = s.as_raw_socket() as SOCKET;
         let set = |level: i32, name: i32, v: u32| -> std::io::Result<()> {
@@ -1888,10 +1988,47 @@ mod keepalive {
                 Err(std::io::Error::last_os_error())
             }
         };
-        set(SOL_SOCKET, SO_KEEPALIVE, 1)?;
-        set(IPPROTO_TCP, TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
-        set(IPPROTO_TCP, TCP_KEEPINTVL, KEEPALIVE_INTERVAL_SECS)?;
-        set(IPPROTO_TCP, TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+        let opts = Opts {
+            sol_socket: SOL_SOCKET,
+            so_keepalive: SO_KEEPALIVE,
+            ipproto_tcp: IPPROTO_TCP,
+            idle: TCP_KEEPIDLE,
+            interval: TCP_KEEPINTVL,
+            probes: TCP_KEEPCNT,
+        };
+        if apply(&set, &opts)? {
+            return Ok(());
+        }
+        // Pre-1709 Windows: the per-socket timing through the keepalive ioctl (milliseconds; the
+        // probe count stays the system's).
+        let vals = tcp_keepalive {
+            onoff: 1,
+            keepalivetime: KEEPALIVE_IDLE_SECS * 1000,
+            keepaliveinterval: KEEPALIVE_INTERVAL_SECS * 1000,
+        };
+        let mut returned = 0u32;
+        // SAFETY: a valid socket, an input buffer of one live `tcp_keepalive`, no output buffer,
+        // no overlapped I/O (a blocking-style ioctl that completes at once).
+        let r = unsafe {
+            WSAIoctl(
+                sock,
+                SIO_KEEPALIVE_VALS,
+                (&vals as *const tcp_keepalive).cast(),
+                std::mem::size_of::<tcp_keepalive>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if r != 0 {
+            eprintln!(
+                "iris distributed: TCP keepalive timing unavailable on this host ({}); the \
+                 system's keepalive timing applies",
+                std::io::Error::last_os_error()
+            );
+        }
         Ok(())
     }
 
@@ -2090,6 +2227,10 @@ impl Collective for TcpCollective {
         data.copy_from_slice(&bytes_f64(&out));
         Ok(())
     }
+
+    fn set_cancel_armed(&mut self, armed: bool) -> bool {
+        self.pace.armed.replace(armed)
+    }
 }
 
 #[cfg(test)]
@@ -2119,11 +2260,7 @@ mod tests {
 
     /// A raw-frame test's wait: 5 s, never cancelled.
     fn test_pace() -> Pace {
-        Pace {
-            limit: Duration::from_secs(5),
-            cancel: CancelFlag::new(),
-            grace: Duration::ZERO,
-        }
+        Pace::new(Duration::from_secs(5), &CancelFlag::new(), Duration::ZERO)
     }
 
     fn free_port() -> u16 {
@@ -2622,31 +2759,26 @@ mod tests {
         w1.local_rank = 1;
         let e = TcpCollective::connect(&w1, &cancelled()).unwrap_err();
         assert!(matches!(e, Error::Canceled), "connecting rank: {e}");
-        // A rank that joined and waits for the rest of the world to be admitted.
-        let port = free_port();
-        let mut w0 = world(0, 3, port);
-        w0.rendezvous_timeout = Duration::from_secs(5);
-        let coordinator = {
-            let w0 = w0.clone();
-            std::thread::spawn(move || TcpCollective::connect(&w0, &CancelFlag::new()))
-        };
-        let mut w1 = w0.clone();
-        w1.rank = 1;
-        w1.local_rank = 1;
+        // A rank that joined and waits for its admission answer: a stand-in coordinator that
+        // accepted it and read its hello (so the rank is provably in the admission wait) before
+        // the cancel trips.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut w1 = world(1, 3, port);
+        w1.rendezvous_timeout = Duration::from_secs(5);
         let flag = CancelFlag::new();
-        let trip = {
-            let flag = flag.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(500));
-                flag.cancel();
-            })
+        let rank1 = {
+            let (w1, flag) = (w1.clone(), flag.clone());
+            std::thread::spawn(move || TcpCollective::connect(&w1, &flag))
         };
-        let e = TcpCollective::connect(&w1, &flag).unwrap_err();
+        let (mut s, _) = l.accept().unwrap();
+        configure(&s).unwrap();
+        let hello = recv_frame(&mut s, &test_pace(), 0, 0, 1, "rendezvous", HELLO_MAX).unwrap();
+        assert!(String::from_utf8_lossy(&hello).contains("\"rank\":1"));
+        flag.cancel();
+        let e = rank1.join().unwrap().unwrap_err();
         assert!(matches!(e, Error::Canceled), "admitted-wait rank: {e}");
-        trip.join().unwrap();
-        // rank 2 never came: the coordinator still ends typed at its own bound
-        let e = coordinator.join().unwrap().unwrap_err();
-        assert!(dist_error(&e).is_some(), "{e}");
+        drop(s);
     }
 
     /// The coordinator's wait for one accepted connection's hello honours a cancel too.
@@ -2661,11 +2793,7 @@ mod tests {
         });
         let (mut s, _) = l.accept().unwrap();
         configure(&s).unwrap();
-        let pace = Pace {
-            limit: Duration::from_secs(5),
-            cancel: cancelled(),
-            grace: Duration::ZERO,
-        };
+        let pace = Pace::new(Duration::from_secs(5), &cancelled(), Duration::ZERO);
         let w = world(0, 2, port);
         let peers: Vec<Option<TcpStream>> = vec![None, None];
         assert!(matches!(
@@ -2696,12 +2824,15 @@ mod tests {
         );
         // configured constants, read as their printed values (no clock is involved)
         assert_eq!(format!("{:?}", World::single().rendezvous_timeout), "600s");
-        let cfg = world_options(30, 0);
+        let cfg = world_options(30, 7);
         let parsed = parse_dist(Some(&cfg), false, true).unwrap();
         assert_eq!(format!("{:?}", parsed.world.rendezvous_timeout), "30s");
-        assert_eq!(format!("{:?}", parsed.world.cancel_grace), "0ns");
+        assert_eq!(format!("{:?}", parsed.world.cancel_grace), "7s");
         let zero = world_options(0, 120);
         assert!(parse_dist(Some(&zero), false, true).is_err());
+        // a zero grace would end the cancel agreement's own wait at its first idle poll
+        let no_grace = world_options(30, 0);
+        assert!(parse_dist(Some(&no_grace), false, true).is_err());
     }
 
     /// A cancel pending in a collective wait lets the peers arrive within the grace (the
@@ -2813,5 +2944,110 @@ mod tests {
             get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
         );
         assert_eq!(probes, (6, 10));
+    }
+
+    /// sc-25690: only `WouldBlock` retries; on a non-blocking socket `TimedOut` is keepalive
+    /// declaring the peer dead.
+    #[test]
+    fn a_keepalive_timeout_is_a_lost_peer_not_a_retry() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert!(would_block(&IoError::from(ErrorKind::WouldBlock)));
+        assert!(!would_block(&IoError::from(ErrorKind::TimedOut)));
+        assert!(!would_block(&IoError::from(ErrorKind::ConnectionReset)));
+    }
+
+    /// sc-25690: keepalive timing is best effort; only `SO_KEEPALIVE` itself is required.
+    #[test]
+    fn keepalive_timing_failures_are_not_fatal() {
+        let opts = keepalive::Opts {
+            sol_socket: 1,
+            so_keepalive: 2,
+            ipproto_tcp: 3,
+            idle: 4,
+            interval: 5,
+            probes: 6,
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let old_windows = |level: i32, name: i32, v: u32| -> std::io::Result<()> {
+            calls.borrow_mut().push((level, name, v));
+            if level == 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(!keepalive::apply(&old_windows, &opts).unwrap());
+        assert_eq!(calls.borrow()[0], (1, 2, 1), "SO_KEEPALIVE first");
+        let modern = |_: i32, _: i32, _: u32| -> std::io::Result<()> { Ok(()) };
+        assert!(keepalive::apply(&modern, &opts).unwrap());
+        let none = |level: i32, _: i32, _: u32| -> std::io::Result<()> {
+            if level == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(keepalive::apply(&none, &opts).is_err());
+    }
+
+    /// Two ranks of a fresh loopback world: `(rank 0's collective, rank 1's thread)`; rank 1 runs
+    /// `peer` on its collective.
+    fn pair<T: Send + 'static>(
+        w0: World,
+        flag0: &CancelFlag,
+        peer: impl FnOnce(&mut TcpCollective) -> T + Send + 'static,
+    ) -> (TcpCollective, std::thread::JoinHandle<T>) {
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let h = std::thread::spawn(move || {
+            let mut c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
+            peer(&mut c)
+        });
+        (TcpCollective::connect(&w0, flag0).unwrap(), h)
+    }
+
+    /// sc-25690: a disarmed collective (the cancel agreement decided, or a checkpoint / export
+    /// write in progress) waits for a slow writer past the cancel grace.
+    #[test]
+    fn a_disarmed_collective_outwaits_the_cancel_grace() {
+        let mut w0 = world(0, 2, free_port());
+        w0.timeout = Duration::from_secs(3600);
+        w0.cancel_grace = Duration::from_millis(200);
+        let flag = CancelFlag::new();
+        let (mut c, peer) = pair(w0, &flag, |c| {
+            // the writing rank: busy for well past the grace before it reaches the barrier
+            std::thread::sleep(Duration::from_millis(1200));
+            c.barrier("checkpoint")
+        });
+        flag.cancel();
+        assert!(c.set_cancel_armed(false), "transports start armed");
+        c.barrier("checkpoint").unwrap();
+        peer.join().unwrap().unwrap();
+        assert!(!c.set_cancel_armed(true));
+    }
+
+    /// sc-25690: the grace is one budget for the whole transport, not renewed per frame or per
+    /// collective: a peer that answers every collective just inside the grace still ends the waits
+    /// once the pending cancel is older than the grace.
+    #[test]
+    fn the_cancel_grace_is_not_renewed_per_collective() {
+        let mut w0 = world(0, 2, free_port());
+        w0.timeout = Duration::from_secs(3600);
+        w0.cancel_grace = Duration::from_millis(700);
+        let flag = CancelFlag::new();
+        let (mut c, peer) = pair(w0, &flag, |c| {
+            for _ in 0..4 {
+                std::thread::sleep(Duration::from_millis(400));
+                if c.barrier("slow").is_err() {
+                    break;
+                }
+            }
+        });
+        flag.cancel();
+        let outcome = (0..4).try_for_each(|_| c.barrier("slow"));
+        assert!(matches!(outcome, Err(Error::Canceled)), "{outcome:?}");
+        drop(c);
+        peer.join().unwrap();
     }
 }

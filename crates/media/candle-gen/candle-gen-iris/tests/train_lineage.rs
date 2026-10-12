@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
+use candle_gen::gen_core::iris::train::lineage::prior_checkpoint_root;
 use candle_gen::gen_core::iris::train::{
     checkpoint_root, latest_checkpoint, list_checkpoints, read_checkpoint_state, OPTIONS_KEY,
 };
@@ -200,10 +201,7 @@ fn a_fresh_run_starts_its_own_lineage_beside_another_runs_checkpoints() {
         [1, 2],
         "retention keeps the new run's checkpoints"
     );
-    let prior = out.path().join(format!(
-        "{}.prior-1",
-        root.file_name().unwrap().to_str().unwrap()
-    ));
+    let prior = prior_checkpoint_root(out.path(), name);
     assert_eq!(
         steps_in(&prior),
         [3, 4],
@@ -243,4 +241,43 @@ fn a_full_model_export_replaces_its_directory_whole() {
         staged.is_empty(),
         "no staging directory is left: {staged:?}"
     );
+}
+
+/// sc-25690: a resume source refused at validation leaves the output's checkpoint root as it was
+/// (retirement runs only after the source was validated and loaded).
+#[test]
+fn a_refused_resume_leaves_the_checkpoint_root_untouched() {
+    let data = tempfile::tempdir().unwrap();
+    let items = dataset(data.path());
+    let (other, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let name = "refused.safetensors";
+    let mut cfg = config(2);
+    cfg.save_every = 1;
+    run(&items, cfg.clone(), other.path(), name, None);
+    run(&items, cfg.clone(), out.path(), name, None);
+    let root = checkpoint_root(out.path(), name);
+    assert_eq!(steps_in(&root), [1, 2]);
+    // An external resume source of another adapter shape: refused at validation.
+    let mut wrong = cfg.clone();
+    wrong.rank = 4;
+    wrong.model_options.insert(
+        OPTIONS_KEY.into(),
+        json!({"resume_from": checkpoint_root(other.path(), name)}),
+    );
+    let req = TrainingRequest {
+        items: items.clone(),
+        config: wrong,
+        output_dir: out.path().to_path_buf(),
+        file_name: name.into(),
+        trigger_words: Vec::new(),
+        cancel: Default::default(),
+    };
+    let err = trainer().train(&req, &mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("different state"), "{err}");
+    assert_eq!(
+        steps_in(&root),
+        [1, 2],
+        "the refused run moved nothing aside"
+    );
+    assert!(!prior_checkpoint_root(out.path(), name).exists());
 }

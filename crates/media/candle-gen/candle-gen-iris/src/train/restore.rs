@@ -700,9 +700,7 @@ impl Run {
             (None, true) => latest_checkpoint(&ckpt_root),
             (None, false) => None,
         };
-        // sc-25690: the checkpoints under the root that are not this run's lineage move aside
-        // before its first publish (retention and `latest` see only this run's).
-        retire_foreign_checkpoints(&ckpt_root, resume_dir.as_deref())?;
+        let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -736,6 +734,10 @@ impl Run {
                 pos = saved.batches_consumed;
             }
         }
+        // sc-25690: the checkpoints under the root that are not this run's lineage move aside
+        // before its first publish (retention and `latest` see only this run's) — once the resume
+        // source was validated, so a refused resume leaves the root as it was.
+        retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         let _ = &mut params;
         Ok(Self {
             plan,

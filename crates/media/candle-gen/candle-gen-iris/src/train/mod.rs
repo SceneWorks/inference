@@ -391,6 +391,9 @@ impl Collective for Recording {
         let r = self.inner.all_reduce_f64(data, op);
         self.note(r)
     }
+    fn set_cancel_armed(&mut self, armed: bool) -> bool {
+        self.inner.set_cancel_armed(armed)
+    }
 }
 
 // =============================================================================================
@@ -1106,12 +1109,7 @@ impl Run {
         };
         let writes_checkpoints =
             elect_checkpoint_writer(topo.coll.as_mut(), plan.dist.checkpoint_io, &ckpt_root)?;
-        if writes_checkpoints {
-            retire_foreign_checkpoints(&ckpt_root, resume_dir.as_deref())?;
-        }
-        if plan.dist.world.world_size > 1 {
-            topo.coll.barrier("checkpoint lineage")?;
-        }
+        let resume_src = resume_dir.clone();
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -1230,6 +1228,15 @@ impl Run {
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(1) as u32;
             resume_position = Some(position);
+        }
+        // sc-25690: the root's checkpoints that are not this run's lineage move aside before its
+        // first publish, and only once the resume source was validated and loaded (a refused
+        // resume leaves the root as it was).
+        if writes_checkpoints {
+            retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
+        }
+        if plan.dist.world.world_size > 1 {
+            topo.coll.barrier("checkpoint lineage")?;
         }
         let run = Self {
             plan,
@@ -1490,6 +1497,9 @@ impl Run {
                 self.any(&mut cancel)?;
                 if cancel[0] > 0.0 {
                     cancelled = true;
+                    // The agreement decided: the cancel-save and export that follow wait for the
+                    // writer however long its writes take (bounded by the transport timeout).
+                    self.topo.coll.set_cancel_armed(false);
                     break;
                 }
                 let position = skip + local_step;
@@ -1926,6 +1936,22 @@ impl Run {
         b: (u32, usize, usize, usize),
         position: JsonValue,
     ) -> Result<()> {
+        // The waits of a checkpoint are for its writer, not a stalled peer: a cancel arriving
+        // while a large checkpoint is written must not end them (sc-25690).
+        let armed = self.topo.coll.set_cancel_armed(false);
+        let r = self.write_checkpoint(b, position);
+        self.topo.coll.set_cancel_armed(armed);
+        r
+    }
+
+    fn write_checkpoint(
+        &mut self,
+        b: (u32, usize, usize, usize),
+        position: JsonValue,
+    ) -> Result<()> {
+        if self.topo.is_main() {
+            gen_core::iris::train::dist::writer_test_delay();
+        }
         let state = self.state(position, (b.0, b.1));
         let io = self.plan.dist.checkpoint_io;
         let world = self.plan.dist.world.clone();
@@ -2049,6 +2075,14 @@ impl Run {
 
     /// Write the final artifact; the main rank writes, every rank returns the same path.
     fn export(&mut self, req: &TrainingRequest) -> Result<PathBuf> {
+        // As a checkpoint: the export's waits are for its writer (sc-25690).
+        let armed = self.topo.coll.set_cancel_armed(false);
+        let r = self.write_export(req);
+        self.topo.coll.set_cancel_armed(armed);
+        r
+    }
+
+    fn write_export(&mut self, req: &TrainingRequest) -> Result<PathBuf> {
         let which = self.plan.export_weights;
         let tensors = self.selected_full(which)?;
         let path = match &self.model.trainable {
@@ -2062,6 +2096,7 @@ impl Run {
             self.topo.coll.barrier("export")?;
             return Ok(path);
         }
+        gen_core::iris::train::dist::writer_test_delay();
         std::fs::create_dir_all(&req.output_dir)
             .map_err(|e| Error::Msg(format!("iris export: {}: {e}", req.output_dir.display())))?;
         match &self.model.trainable {
