@@ -1,0 +1,43 @@
+# Iris-3B stage 2: 512px multi-aspect buckets, steps 365,000 -> 530,000.
+#
+# Starts from the final stage-1 checkpoint. resume_data_policy=new_phase keeps
+# its step counter, weights, EMA, optimizer and scheduler, and reads this
+# stage's data from the beginning. To restart this stage after an interruption,
+# override train.resume_from=latest train.resume_data_policy=exact.
+#
+# Global batch 1024 = train.batch_size 16 per GPU x 64 GPUs (8 nodes x 8 GPUs);
+# see stage1_256.yaml for other GPU counts.
+name: iris-3b-stage2-512
+work_dir: output/iris-3b/stage2_512
+wandb_project: iris
+
+flow:
+  shift: 3.0
+
+data:
+  data_dirs: [/path/to/wids/dataset]   # one or more scripts/prepare_wids.py outputs
+  image_size: 512
+  shape_policy: bucket       # aspect_ratio_bucket defaults to shared21-512
+
+train:
+  batch_size: 16
+  expected_global_batch: 1024
+  num_epochs: 1000           # max_steps is the horizon
+  max_steps: 530000
+  resume_from: /path/to/stage1_256/checkpoints/epoch_N_step_365000.pth
+  resume_data_policy: new_phase
+  dist:
+    # hybrid sharding, one sharded copy per node (see stage1_256.yaml)
+    strategy: fsdp2
+    sharding: hybrid
+    mesh:
+      dp_shard: 8
+  perf:
+    lazy_sync: true          # required for multi-node runs
+    foreach_ema: true
+    skip_dropped_text: true
+    compile: true
+    compile_mode: max-autotune-no-cudagraphs
+  save_every_steps: 5000
+  keep_last_checkpoints: 3
+  sample_every_steps: 5000

@@ -782,6 +782,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
     expected_lock_counts = {
         # 36 since sc-24163 added the `mlx-qwen-image-2-1` job;
         # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
+        # 37 since sc-25687 added the dispatch-only `mlx-iris-depth-train` job;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -790,11 +791,15 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 27 since sc-17284 added the `mlx-qwen-image`, `mlx-qwen-image-pid` and
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
-        MACOS_HUB_LOCK: 36,
+        # 38 since sc-25688 added the dispatch-only `mlx-iris-restore-train` job;
+        # 39 since sc-25689 added the dispatch-only `mlx-iris-curricula-train` job.
+        MACOS_HUB_LOCK: 39,
+        # 15 since sc-25689 added the dispatch-only `candle-iris-curricula` job;
+        # 14 since sc-25680 added the `candle-iris` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 13,
+        WINDOWS_HUB_LOCK: 15,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1080,13 +1085,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
         # after sc-24114 added `candle-qwen-image-2-1`; 36 macOS after sc-24163 added
-        # `mlx-qwen-image-2-1`.
+        # `mlx-qwen-image-2-1`; 37 macOS after sc-25687 added `mlx-iris-depth-train`; 38 after
+        # sc-25688 added `mlx-iris-restore-train`; 39 macOS / 15 Windows after sc-25689 added
+        # `mlx-iris-curricula-train` and `candle-iris-curricula`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 36)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 39)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 15)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(

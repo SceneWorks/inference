@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 105
+EXPECTED_MEMBER_COUNT = 107
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -35,8 +35,8 @@ INTERNAL_PACKAGES = {
     "runtime-cuda",
 }
 PINNED_WORKSPACE_DEPENDENCIES = {
-    "mlx-rs": ("pmetal-mlx-rs", "48ff5e78a49e0a513f1976b0b1af70f9a5305f00"),
-    "mlx-sys": ("pmetal-mlx-sys", "48ff5e78a49e0a513f1976b0b1af70f9a5305f00"),
+    "mlx-rs": ("pmetal-mlx-rs", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
+    "mlx-sys": ("pmetal-mlx-sys", "fe22998bf73e5e785d7659beb2f24d624b785bda"),
     "candle-core": ("candle-core", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-nn": ("candle-nn", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),
     "candle-transformers": ("candle-transformers", "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"),

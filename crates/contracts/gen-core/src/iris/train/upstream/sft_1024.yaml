@@ -1,0 +1,43 @@
+# Iris-3B supervised fine-tuning at 1024px, steps 625,000 -> 665,000.
+#
+# Starts from the final stage-3 checkpoint with resume_data_policy=new_phase
+# (see stage2_512.yaml) with a constant learning
+# rate of 4e-5 and no warmup.
+#
+# Global batch 512 = train.batch_size 8 per GPU x 64 GPUs (8 nodes x 8 GPUs).
+name: iris-3b-sft-1024
+work_dir: output/iris-3b/sft_1024
+wandb_project: iris
+
+data:
+  data_dirs: [/path/to/wids/dataset]   # one or more scripts/prepare_wids.py outputs
+  image_size: 1024
+  shape_policy: bucket
+  aspect_ratio_bucket: shared21-1024
+
+train:
+  batch_size: 8
+  expected_global_batch: 512
+  num_epochs: 1000           # max_steps is the horizon
+  max_steps: 665000
+  resume_from: /path/to/stage3_1024/checkpoints/epoch_N_step_625000.pth
+  resume_data_policy: new_phase
+  override_lr_on_resume: true
+  optimizer:
+    lr: 4.0e-5
+    warmup_steps: 0
+  dist:
+    # hybrid sharding, one sharded copy per node (see stage1_256.yaml)
+    strategy: fsdp2
+    sharding: hybrid
+    mesh:
+      dp_shard: 8
+  perf:
+    lazy_sync: true          # required for multi-node runs
+    foreach_ema: true
+    skip_dropped_text: true
+    compile: true
+    compile_mode: max-autotune-no-cudagraphs
+  save_every_steps: 5000
+  keep_last_checkpoints: 3
+  sample_every_steps: 5000

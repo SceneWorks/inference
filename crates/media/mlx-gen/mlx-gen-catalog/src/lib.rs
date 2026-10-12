@@ -30,6 +30,7 @@ pub mod providers {
     pub use mlx_gen_flux2 as flux2;
     pub use mlx_gen_ideogram as ideogram;
     pub use mlx_gen_instantid as instantid;
+    pub use mlx_gen_iris as iris;
     pub use mlx_gen_joycaption as joycaption;
     pub use mlx_gen_kolors as kolors;
     pub use mlx_gen_krea as krea;
@@ -96,6 +97,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_flux::register_providers(registry);
     let registry = mlx_gen_flux2::register_providers(registry);
     let registry = mlx_gen_ideogram::register_providers(registry);
+    let registry = mlx_gen_iris::register_providers(registry);
     let registry = mlx_gen_joycaption::register_providers(registry);
     let registry = mlx_gen_kolors::register_providers(registry);
     let registry = mlx_gen_krea::register_providers(registry);
@@ -789,7 +791,7 @@ mod tests {
         }
     }
 
-    const PREVIEW_PROVIDER_IDS: [&str; 38] = [
+    const PREVIEW_PROVIDER_IDS: [&str; 39] = [
         "anima_base",
         "anima_aesthetic",
         "anima_turbo",
@@ -828,6 +830,8 @@ mod tests {
         "z_image_control",
         "z_image_turbo",
         "z_image_turbo_control",
+        // sc-25681: pixel space — the step's predicted clean image, patch-pooled, decoded exactly.
+        "iris_3b",
     ];
 
     #[test]
@@ -862,6 +866,8 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
+                "iris" => None,
                 // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
                 // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
                 // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
@@ -1804,7 +1810,15 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(registry.transforms().len(), 0);
+        // sc-25683: the Iris-3B restorer is the catalog's first (image) transform.
+        let transforms: Vec<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(transforms, ["iris_3b_restore"]);
+        assert!(registry
+            .transforms()
+            .all(|r| (r.descriptor)().backend == "mlx"));
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -1840,6 +1854,7 @@ mod tests {
                 "flux2_dev_control",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "iris_3b",
                 "kolors",
                 "krea_2_turbo",
                 "krea_2_raw",
@@ -1894,6 +1909,9 @@ mod tests {
                 "anima_base",
                 "anima_aesthetic",
                 "anima_turbo",
+                "iris_3b",
+                "iris_3b_depth",
+                "iris_3b_restore",
                 "kolors",
                 "krea_2_raw",
                 "lens",
@@ -1918,8 +1936,9 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
-        // this is where a surface change and a mapping change meet. All seventeen trainer ids are
-        // also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
+        // this is where a surface change and a mapping change meet. All trainer ids but
+        // `iris_3b_depth` (sc-25687) are also generator ids (or, for `iris_3b_restore`,
+        // sc-25688, the transform id), which is why 67 generators + 1 captioner + 2 embedders are 70
         // distinct ids.
         //
         // Registration is never conditioned on the mapping — 60 < 70 because ten ids load nothing
@@ -1931,10 +1950,15 @@ mod tests {
             .chain(&captioners)
             .chain(&image_embedders)
             .chain(&text_embedders)
+            .chain(&transforms)
             .collect();
         // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
-        assert_eq!(distinct.len(), 71);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 61);
+        // sc-25679 adds `iris_3b` (a generator with its own complete row): 72 / 62.
+        // sc-25683 adds `iris_3b_restore` (a transform with its own complete row): 73 / 63.
+        // sc-25687 adds the `iris_3b_depth` trainer (not a generator id; its own complete row):
+        // 74 / 64.
+        assert_eq!(distinct.len(), 74);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 64);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

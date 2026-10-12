@@ -35,6 +35,7 @@ backend is underneath.
 > | SD3.5 | `sd3_5_large`, `sd3_5_large_turbo`, `sd3_5_medium` | MMDiT + triple text-encoder aggregator + 16-ch VAE |
 > | Lens | `lens`, `lens_turbo` | gpt-oss-20B MoE encoder + dual-stream MMDiT + FLUX.2 VAE |
 > | Bernini | `bernini`, `bernini_renderer` | ByteDance Wan2.2-T2V-A14B dual-expert renderer (planner + renderer) |
+> | Iris-3B | `iris_3b` | pixel-space hybrid dual/single-stream DiT + PiT pixel head (no VAE); Qwen3-VL-4B 12-layer conditioning; FlowDPM-Solver++ |
 >
 > Identity-preserving stacks compose the above rather than registering standalone engines:
 > **InstantID** (`candle-gen-instantid`) layers the IP-Adapter/ControlNet + kps/openpose control render +
@@ -93,6 +94,7 @@ candle-gen/                 # workspace root
   candle-gen-sd3/           # Stable Diffusion 3.5 Large/Large-Turbo/Medium (MMDiT + triple TE + 16-ch VAE)
   candle-gen-lens/          # Lens / Lens-Turbo (gpt-oss-20B MoE encoder + dual-stream MMDiT + FLUX.2 VAE)
   candle-gen-bernini/       # Bernini (ByteDance Wan2.2-T2V-A14B dual-expert renderer)
+  candle-gen-iris/          # Iris-3B (pixel-space DiT + PiT head, Qwen3-VL-4B conditioning, FlowDPM-Solver++)
   candle-gen-instantid/     # InstantID identity-preserving SDXL (IP-Adapter/ControlNet + FaceEmbedder)
   candle-gen-pulid/         # PuLID-FLUX identity injection (EVA02-CLIP + IDFormer into FLUX.1-dev)
   # --- video generators ---

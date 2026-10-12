@@ -25,6 +25,7 @@ pub mod providers {
     pub use candle_gen_flux2 as flux2;
     pub use candle_gen_ideogram as ideogram;
     pub use candle_gen_instantid as instantid;
+    pub use candle_gen_iris as iris;
     pub use candle_gen_joycaption as joycaption;
     pub use candle_gen_kolors as kolors;
     pub use candle_gen_krea as krea;
@@ -101,6 +102,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
     let registry = candle_gen_ideogram::register_providers(registry);
+    let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
     let registry = candle_gen_kolors::register_providers(registry);
     let registry = candle_gen_krea::register_providers(registry);
@@ -616,6 +618,9 @@ mod preview_advertising {
         "sana_sprint_1600m",
         "sensenova_u1_8b",
         "sensenova_u1_8b_fast",
+        // sc-25681: pixel space — the frame is the step's predicted clean image, patch-pooled and
+        // decoded exactly (`(x + 1)/2`), so there is no fit to measure.
+        "iris_3b",
     ];
 
     /// The two SANA rows above, named so `sana_base_and_sprint_are_two_independent_rows` can bind
@@ -871,7 +876,15 @@ mod preview_advertising {
     /// so the projection and the preview surface are the same question. sc-24111 is the story that
     /// carries the RGBA output surface, and it is where the fit and the wiring belong together.
     /// Its MLX twin (sc-24108) advertises `supports_preview: false` for the same reason.
+    ///
+    /// `iris_3b` left this class in sc-25681: it is wired on both backends (pixel space, so the
+    /// step's predicted clean image is the frame and no latent fit exists to defer on).
     const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
+
+    /// The epics that own the deferred routes above. An epic is a container, not the unit of work
+    /// that wires a preview, so a deferred route that names one of these instead of a story has
+    /// not actually recorded who wires it.
+    const PREVIEW_DEFERRED_ROUTE_EPICS: &[&str] = &["sc-24107", "sc-25678"];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1365,6 +1378,21 @@ mod preview_advertising {
             register: candle_gen_seedvr2::register_providers,
             denoise: Denoise::Bespoke,
             routes: &[],
+        },
+        ProviderCrate {
+            dir: "candle-gen-iris",
+            // The FlowDPM-Solver++ is a bespoke loop (`solver::sample`) — no shared driver site.
+            // sc-25681 wires it through one direct `emit_preview_at` in `pipeline.rs::denoise`,
+            // the single denoise every Iris generation request runs (prompt batch and `count`
+            // included), emitting the step's patch-pooled predicted clean image.
+            register: candle_gen_iris::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[FileRoutes {
+                file: "pipeline.rs",
+                hooked: 0,
+                direct: 1,
+                dark: &[],
+            }],
         },
         ProviderCrate {
             dir: "candle-gen-sensenova",
@@ -4073,6 +4101,10 @@ mod preview_advertising {
                 "{id} is deferred rather than rejected, so it must name the story that wires it — \
                  got {story:?}"
             );
+            assert!(
+                !PREVIEW_DEFERRED_ROUTE_EPICS.contains(story),
+                "{id} names {story}, which is an epic, not the story that wires the preview"
+            );
         }
 
         for (label, class, declared) in [
@@ -5134,6 +5166,8 @@ mod tests {
                 "svd" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
+                // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
+                "iris" => None,
                 // MiniMax-H3's denoiser emits a 24-channel joint audio+video latent on the
                 // 17-frame clip lattice (token-dropped, seam-blended dual decode — see the crate's
                 // `chunking` module). No `LatentTemporalLaw` variant expresses that mapping and no
@@ -5789,7 +5823,15 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(registry.transforms().len(), 0);
+        // sc-25683: the Iris-3B restorer is the catalog's first (image) transform.
+        let transforms: Vec<String> = registry
+            .transforms()
+            .map(|r| (r.descriptor)().id.to_string())
+            .collect();
+        assert_eq!(transforms, ["iris_3b_restore"]);
+        assert!(registry
+            .transforms()
+            .all(|r| (r.descriptor)().backend == "candle"));
         assert_eq!(
             registry.descriptor_conformance_errors(),
             Vec::<String>::new()
@@ -5820,6 +5862,7 @@ mod tests {
                 "flux2_dev",
                 "ideogram_4",
                 "ideogram_4_turbo",
+                "iris_3b",
                 "kolors",
                 "krea_2_turbo",
                 "krea_2_raw",
@@ -5865,6 +5908,9 @@ mod tests {
             trainers,
             [
                 "anima_base",
+                "iris_3b",
+                "iris_3b_depth",
+                "iris_3b_restore",
                 "kolors",
                 "krea_2_raw",
                 "krea_2_control",
@@ -5890,13 +5936,17 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Fourteen of the sixteen trainer ids are
-        // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 56
-        // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 61 distinct ids (sc-24109
+        // where a surface change and a mapping change meet. Fifteen of the seventeen trainer ids are
+        // also generator ids (`krea_2_control` and `ltx_2_3` are trainer-only), which is why 57
+        // generators + 2 trainer-only ids + 1 captioner + 2 embedders are 62 distinct ids (sc-24109
         // adds `qwen_image_2_1`, a generator with its own component row; its sc-24160 trainer
-        // reuses that row).
+        // reuses that row; sc-25680 adds `iris_3b`, a generator with its own complete row; sc-25683
+        // adds the `iris_3b_restore` transform with its own complete row: 63 / 53; the sc-25686
+        // `iris_3b` trainer reuses the generator's row and adds no id; the sc-25687 `iris_3b_depth`
+        // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
+        // trainer reuses the transform's id and row and adds no id).
         //
-        // Registration is never conditioned on the mapping: 51 < 61 because ten ids load nothing
+        // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -5906,9 +5956,10 @@ mod tests {
             .chain(&captioners)
             .chain(&image_embedders)
             .chain(&text_embedders)
+            .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 61);
-        assert_eq!(super::provider_components().len(), 51);
+        assert_eq!(distinct.len(), 64);
+        assert_eq!(super::provider_components().len(), 54);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is
