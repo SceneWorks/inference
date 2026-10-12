@@ -252,7 +252,7 @@ fn hybrid_probe(j: &Json, coll: MlxCollective) -> Json {
     let mine = on_cpu(|| to_host(&rows[&key])).unwrap();
     // a sub-group reduction of rows whose length differs across the groups
     let groups = Partition(vec![0, 1, 0, 1]);
-    let mut v = vec![rank as f32; if rank % 2 == 0 { 3 } else { 2 }];
+    let mut v = vec![rank as f32; if rank.is_multiple_of(2) { 3 } else { 2 }];
     on_cpu(|| {
         topo.coll
             .all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &groups)

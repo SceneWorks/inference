@@ -1504,7 +1504,7 @@ impl TcpCollective {
     /// description and [`World::token`].
     ///
     /// The whole rendezvous (accepting, connect retries, the admission answer) is bounded by
-    /// [`World::rendezvous_bound`] and polls `cancel` at least every [`IO_SLICE`]: a cancelled
+    /// [`World::rendezvous_bound`] and polls `cancel` at least every 200 ms: a cancelled
     /// rendezvous is [`Error::Canceled`] at once (there is no training state to save yet). The
     /// returned collective keeps `cancel` for every later wait ([`World::cancel_grace`]).
     pub fn connect(world: &World, cancel: &CancelFlag) -> Result<Self> {
