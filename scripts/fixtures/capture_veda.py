@@ -14,7 +14,7 @@ mods={}
 for name in ['tiling','plans','selection','predictor']:
  spec=importlib.util.spec_from_file_location('frozen.'+name,root/(name+'.py'));m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m);mods[name]=m
 tiling,plans,selection,predictor=(mods[n] for n in ['tiling','plans','selection','predictor'])
-plan_json=json.loads(json.loads(a.header.read_text())['__metadata__']['plans'])
+plan_json=json.loads(json.loads(a.header.read_text(encoding='utf-8'))['__metadata__']['plans'])
 table=plans.PlanTable([plans.TilePlan.from_json(p) for p in plan_json.values()])
 choices=[]
 for grid in [p.grid for p in table.plans.values()]+[(t,w,h) for t,h,w in [p.grid for p in table.plans.values()]]+[(42,24,42),(62,19,31),(37,32,18),(37,18,32),(72,24,42),(37,25,43),(7,10,18)]:
@@ -63,5 +63,5 @@ for n in [3,4,7,8,10,16,24,32,63,64,65,129,256,512]:
    values=[float(random.randrange(4)) for _ in range(n)];own=random.randrange(n);scores=torch.tensor(values);scores[own]=float('inf')
    topk_probes.append(dict(scores=values,own=own,k=count,prefix=sorted(torch.topk(scores,count).indices[:count-1].tolist())))
 result=dict(provenance=dict(revision='60bfae688897dc41bc8685ca9f3130d7ed8f3b0c',torch=torch.__version__,safetensors=safetensors.__version__,device='cpu',machine='arm64',input_dtype='bfloat16',projection_storage='float8_e4m3fn scaled FP32 then bfloat16',scorer_dtype='float32',score_fixture_dtype='float32',tie_authority='PyTorch CPU libc++ nth_element/partial_sort',source_sha256={str(p.relative_to(a.source)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob('*.py')},header_sha256=hashlib.sha256(a.header.read_bytes()).hexdigest(),empty_key_rule='Empty diagonals excluded per E2; source scatter_ would re-enable an artificial empty diagonal (positive grid layouts contain no empty tiles)'),choices=choices,layouts=layouts,selections=cases,scorers=scorers,topk_probes=topk_probes,rounding_probes=[dict(input=v,cost=int(round(v,3)*1000+0.5)) for v in [0.0005,0.0015,0.0025,1.2345,1.2355,0.1235,0.9995]])
-a.out.write_text(json.dumps(result,separators=(',',':'))+'\n')
+a.out.write_text(json.dumps(result,separators=(',',':'))+'\n', encoding='utf-8', newline='\n')
 print(json.dumps(dict(torch=torch.__version__,plans=len(plan_json),choices=len(choices),layouts=len(layouts),selections=len(cases),scorers=len(scorers),topk_probes=len(topk_probes),fixture_sha256=hashlib.sha256(a.out.read_bytes()).hexdigest())))
