@@ -19,10 +19,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use candle_gen::attention::AttentionPlan;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::iris;
+use candle_gen::gen_core::CancelFlag;
 use candle_gen::quant::LokrFactors;
 use candle_gen::{CandleError as Error, Result};
 
@@ -112,6 +114,9 @@ pub struct Checkpoint {
     prefix: String,
     keys: BTreeSet<String>,
     used: RefCell<BTreeSet<String>>,
+    /// The dtype each key a [`Loader`] consumed is held in once its module is built — the
+    /// load-exact width inventory `crate::memory_strategy` prices a backbone against.
+    stored: RefCell<BTreeMap<String, DType>>,
     /// Forward-time adapter residuals keyed by projection path (`blocks.3.attn_proj`), handed to the
     /// [`Loader`] when it builds that projection.
     residuals: RefCell<BTreeMap<String, Vec<Residual>>>,
@@ -137,6 +142,7 @@ impl Checkpoint {
             prefix: prefix.to_owned(),
             keys,
             used: RefCell::new(BTreeSet::new()),
+            stored: RefCell::new(BTreeMap::new()),
             residuals: RefCell::new(BTreeMap::new()),
         })
     }
@@ -151,6 +157,7 @@ impl Checkpoint {
             device: device.clone(),
             prefix: String::new(),
             used: RefCell::new(BTreeSet::new()),
+            stored: RefCell::new(BTreeMap::new()),
             residuals: RefCell::new(BTreeMap::new()),
         }
     }
@@ -185,6 +192,17 @@ impl Checkpoint {
             Source::Mmap(vb) => vb.get_unchecked(&format!("{}{key}", self.prefix))?,
             Source::Map(map) => map[key].clone(),
         })
+    }
+
+    /// Record the dtype `key` is held in by the module built from it.
+    fn record_stored(&self, key: &str, dtype: DType) {
+        self.stored.borrow_mut().insert(key.to_owned(), dtype);
+    }
+
+    /// The dtype every [`Loader`]-built key is held in (keys without this view's prefix): the
+    /// compute dtype for a projection's weight and bias, f32 for everything else.
+    pub fn stored_dtypes(&self) -> BTreeMap<String, DType> {
+        self.stored.borrow().clone()
     }
 
     /// The residuals installed on projection `path` (handed out once).
@@ -272,10 +290,17 @@ pub struct Loader<'a> {
 impl Loader<'_> {
     /// A tensor kept in f32 (norm gains, adaLN biases, the text position table).
     pub fn f32(&self, key: &str) -> Result<Tensor> {
+        self.weights.record_stored(key, DType::F32);
         to(&self.weights.take(key)?, DType::F32)
     }
 
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
+        self.weights
+            .record_stored(&format!("{prefix}.weight"), self.compute);
+        if bias {
+            self.weights
+                .record_stored(&format!("{prefix}.bias"), self.compute);
+        }
         let weight = to(
             &self.weights.take(&format!("{prefix}.weight"))?,
             self.compute,
@@ -362,6 +387,28 @@ impl Residual {
             Residual::Kron(f) => (f.shape(), true),
             Residual::Delta(d) => (d.dims2()?, true),
         })
+    }
+
+    /// Device bytes this residual holds once installed (`Self::prepare`) and run, for a backbone
+    /// at `compute` whose GEMMs run at `kernel` (the compute dtype on a GPU, f32 on the Candle CPU
+    /// backend). A LoRA is its two f32 factors (the forward casts the activation, never the
+    /// factors); a LoHa factorisation or a dense delta is held in `compute`; a structured LoKr is
+    /// its f32 factors plus the `kernel`-dtype copies its first forward caches, priced as if both
+    /// factors were copied (at an f32 kernel the left factor's "copy" is a shared handle, so that
+    /// case is over-priced by the left factor's bytes — a bound, never an under-count).
+    pub fn resident_bytes(&self, compute: DType, kernel: DType) -> u64 {
+        let elements = |t: &Tensor| t.elem_count() as u64;
+        match self {
+            Residual::Lora { a, b } => (elements(a) + elements(b)) * 4,
+            Residual::LowRank { a, b } => {
+                (elements(a) + elements(b)) * compute.size_in_bytes() as u64
+            }
+            Residual::Delta(d) => elements(d) * compute.size_in_bytes() as u64,
+            Residual::Kron(f) => {
+                let factors = f.resident_f32_bytes() as u64;
+                factors + factors / 4 * kernel.size_in_bytes() as u64
+            }
+        }
     }
 
     /// The residual as the forward holds it: LoRA and LoKr factors f32 on `device` (a LoKr's GEMMs
@@ -622,23 +669,129 @@ pub fn attention(
     // Under autograd (training) the fused `softmax_last_dim` (no backward) is replaced by the
     // composable softmax over the same axis.
     let differentiable = q.track_op() || k.track_op() || v.track_op() || composable_forced();
-    let out = candle_gen::sdpa_budgeted_bhsd(
-        &q,
-        &k,
-        &v,
-        scale,
-        mask.as_ref(),
-        |s: &Tensor| {
-            if differentiable {
-                softmax(s, D::Minus1)
-            } else {
-                softmax_last_dim(s)
-            }
-        },
-        candle_gen::ATTN_SCORES_BUDGET,
-    )?;
+    let softmax_fn = |s: &Tensor| {
+        if differentiable {
+            softmax(s, D::Minus1)
+        } else {
+            softmax_last_dim(s)
+        }
+    };
+    let out = match attention_scope() {
+        // No request selected the bounded-attention rung: the i32-overflow guard alone, exactly the
+        // pre-rung forward.
+        None => candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask.as_ref(),
+            softmax_fn,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?,
+        Some(scope) => bounded_attention(&q, &k, &v, scale, mask.as_ref(), &softmax_fn, &scope)?,
+    };
     let out = to(&out, compute)?;
     Ok(out.transpose(1, 2)?.reshape((b, n, h * d))?)
+}
+
+/// A request's admitted bounded-attention plan (memory-ladder rung 3): the largest scores tensor one
+/// attention kernel launch may build, and the request's cancel flag (checked between chunks).
+#[derive(Clone)]
+pub struct AttentionScope {
+    budget: usize,
+    cancel: CancelFlag,
+}
+
+thread_local! {
+    static ATTENTION_SCOPE: RefCell<Option<AttentionScope>> = const { RefCell::new(None) };
+}
+
+fn attention_scope() -> Option<AttentionScope> {
+    ATTENTION_SCOPE.with(|scope| scope.borrow().clone())
+}
+
+/// Run `f` with every [`attention`] on this thread bounded to `budget` score elements per kernel
+/// launch (`None` leaves the forward untouched). The budget is capped at the i32-overflow guard
+/// ([`candle_gen::ATTN_SCORES_BUDGET`]), which a memory selection may tighten but never loosen.
+/// The previous scope is restored on every exit, including an unwinding one.
+pub fn with_attention_budget<T>(
+    budget: Option<usize>,
+    cancel: &CancelFlag,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<AttentionScope>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ATTENTION_SCOPE.with(|scope| *scope.borrow_mut() = self.0.take());
+        }
+    }
+    let Some(budget) = budget else {
+        return f();
+    };
+    let scope = AttentionScope {
+        budget: budget.min(candle_gen::ATTN_SCORES_BUDGET),
+        cancel: cancel.clone(),
+    };
+    let _restore = Restore(ATTENTION_SCOPE.with(|slot| slot.borrow_mut().replace(scope)));
+    f()
+}
+
+/// How many batch rows one bounded kernel launch may take: the most whose **single query row**
+/// (`rows · heads · keys` score elements) fits `budget`, never fewer than one. The shared planner
+/// chunks the query axis only, and the PiT pixel stage folds every patch into the batch axis (a
+/// 1024² CFG pass is 8192 rows of 256 keys), so without this split one query row of that stage
+/// alone would exceed the budget the request admitted.
+pub fn attention_batch_group(batch: usize, heads: usize, keys: usize, budget: usize) -> usize {
+    (budget / (heads * keys).max(1)).clamp(1, batch.max(1))
+}
+
+/// [`attention`]'s kernel under an [`AttentionScope`]: batch groups of
+/// [`attention_batch_group`] rows, each chunked over its query rows by the shared rung-3 planner
+/// ([`candle_gen::sdpa_planned_bhsd`]). Rows and query rows are independent, so the result equals
+/// the single pass to GEMM-order rounding.
+fn bounded_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    softmax: &dyn Fn(&Tensor) -> candle_gen::candle_core::Result<Tensor>,
+    scope: &AttentionScope,
+) -> Result<Tensor> {
+    let (b, h, _, _) = q.dims4()?;
+    let sk = k.dim(2)?;
+    let plan = AttentionPlan::budgeted(candle_gen::attention::attention_budget_from_usize(
+        scope.budget,
+    ))
+    .with_cancel(&scope.cancel);
+    let group = attention_batch_group(b, h, sk, scope.budget);
+    if group >= b {
+        return candle_gen::sdpa_planned_bhsd(q, k, v, scale, mask, softmax, plan);
+    }
+    let mut parts = Vec::with_capacity(b.div_ceil(group));
+    let mut start = 0;
+    while start < b {
+        if scope.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let len = group.min(b - start);
+        // A per-row mask follows its rows; a broadcast `[1, …]` mask serves every group.
+        let mask = match mask {
+            Some(m) if m.dim(0)? == b => Some(m.narrow(0, start, len)?),
+            other => other.cloned(),
+        };
+        parts.push(candle_gen::sdpa_planned_bhsd(
+            &q.narrow(0, start, len)?,
+            &k.narrow(0, start, len)?,
+            &v.narrow(0, start, len)?,
+            scale,
+            mask.as_ref(),
+            softmax,
+            plan,
+        )?);
+        start += len;
+    }
+    Ok(Tensor::cat(&parts, 0)?)
 }
 
 /// `TransformerTextEmbedder`'s key mask: real keys OR the diagonal, additive `[B, 1, T, T]` f32.
@@ -820,5 +973,158 @@ mod tests {
             .unwrap();
         let y = rope.apply(&x).unwrap().flatten_all().unwrap();
         assert_eq!(y.to_vec1::<f32>().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    fn ramp(shape: (usize, usize, usize, usize), phase: f32) -> Tensor {
+        let n = shape.0 * shape.1 * shape.2 * shape.3;
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.37 + phase).sin()) * 0.5)
+            .collect();
+        Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+    }
+
+    /// sc-25690, rung 3: under an admitted budget no kernel launch builds a scores tensor larger
+    /// than the budget — including when ONE query row of the whole batch already exceeds it, the
+    /// PiT pixel stage's shape (every patch is a batch row) — and the result is the single pass.
+    ///
+    /// The softmax closure is handed the real scores tensor of each launch, so its element count
+    /// is observed, not derived.
+    ///
+    /// *Mutation that reds this:* `let group = b;` in `bounded_attention` (drop the batch split):
+    /// the 24-element budget then launches 4·2·8 = 64-element rows.
+    #[test]
+    fn a_bounded_attention_never_launches_scores_over_its_budget() {
+        let (b, h, s, d) = (4, 2, 8, 4);
+        let q = ramp((b, h, s, d), 0.1);
+        let k = ramp((b, h, s, d), 0.7);
+        let v = ramp((b, h, s, d), 1.3);
+        let scale = 1.0 / (d as f64).sqrt();
+        let single = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            None,
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )
+        .unwrap();
+        // 512 = the whole scores tensor (no chunking), 128 = one batch row, 24 = less than one
+        // query row of the batch (4·2·8 = 64), 16 = exactly one query row of one batch row.
+        for budget in [512usize, 128, 24, 16] {
+            let largest = std::cell::Cell::new(0usize);
+            let launches = std::cell::Cell::new(0usize);
+            let recording = |scores: &Tensor| {
+                largest.set(largest.get().max(scores.elem_count()));
+                launches.set(launches.get() + 1);
+                softmax_last_dim(scores)
+            };
+            let scope = AttentionScope {
+                budget,
+                cancel: CancelFlag::new(),
+            };
+            let out = bounded_attention(&q, &k, &v, scale, None, &recording, &scope).unwrap();
+            assert!(
+                largest.get() <= budget,
+                "budget {budget}: a launch built {} score elements",
+                largest.get()
+            );
+            assert_eq!(launches.get() > 1, budget < 512, "budget {budget}");
+            let diff = (&out - &single)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-5,
+                "budget {budget}: off the single pass by {diff}"
+            );
+        }
+        assert_eq!(attention_batch_group(4, 2, 8, 24), 1);
+        assert_eq!(attention_batch_group(4, 2, 8, 40), 2);
+        assert_eq!(attention_batch_group(4, 2, 8, 512), 4);
+        // Never zero rows, even below one query row of one batch row.
+        assert_eq!(attention_batch_group(4, 2, 8, 3), 1);
+    }
+
+    /// A per-row mask follows its rows through the batch split; a tripped cancel flag is the typed
+    /// cancellation, checked between launches.
+    #[test]
+    fn a_bounded_attention_narrows_a_per_row_mask_and_honours_cancel() {
+        let (b, h, s, d) = (3, 2, 4, 4);
+        let q = ramp((b, h, s, d), 0.2);
+        let k = ramp((b, h, s, d), 0.9);
+        let v = ramp((b, h, s, d), 1.7);
+        // Row 1 masks its last two keys; rows 0 and 2 mask nothing.
+        let mut mask = vec![0f32; b * s * s];
+        for query in 0..s {
+            for key in 2..s {
+                mask[(s + query) * s + key] = f32::NEG_INFINITY;
+            }
+        }
+        let mask = Tensor::from_vec(mask, (b, 1, s, s), &Device::Cpu).unwrap();
+        let scale = 0.5;
+        let single = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(&mask),
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )
+        .unwrap();
+        let scope = AttentionScope {
+            budget: 8,
+            cancel: CancelFlag::new(),
+        };
+        let out =
+            bounded_attention(&q, &k, &v, scale, Some(&mask), &softmax_last_dim, &scope).unwrap();
+        let diff = (&out - &single)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-5, "masked rows off the single pass by {diff}");
+
+        scope.cancel.cancel();
+        assert!(matches!(
+            bounded_attention(&q, &k, &v, scale, Some(&mask), &softmax_last_dim, &scope),
+            Err(Error::Canceled)
+        ));
+    }
+
+    /// The scope bounds only the closure it wraps, tightens but never loosens the i32-overflow
+    /// guard, and `None` installs nothing.
+    #[test]
+    fn the_attention_scope_is_restored_on_exit_and_capped_at_the_overflow_guard() {
+        let cancel = CancelFlag::new();
+        assert!(attention_scope().is_none());
+        with_attention_budget(None, &cancel, || assert!(attention_scope().is_none()));
+        with_attention_budget(Some(64), &cancel, || {
+            assert_eq!(attention_scope().unwrap().budget, 64);
+            with_attention_budget(Some(usize::MAX), &cancel, || {
+                assert_eq!(
+                    attention_scope().unwrap().budget,
+                    candle_gen::ATTN_SCORES_BUDGET
+                );
+            });
+            assert_eq!(
+                attention_scope().unwrap().budget,
+                64,
+                "the outer scope returns"
+            );
+        });
+        assert!(attention_scope().is_none());
     }
 }

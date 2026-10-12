@@ -62,9 +62,15 @@ pub struct IrisRestorer {
     /// `[1, T, L, D]` f32 empty-prompt states on the backbone's device.
     states: Tensor,
     mask: Vec<Vec<i32>>,
+    /// The spec this restorer was loaded from — the load identity its memory contract is checked
+    /// against.
+    spec: LoadSpec,
+    /// The loaded memory contract ([`crate::memory_strategy::restoration_contract`] over the export
+    /// on disk); `None` when the spec has no contract.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
-fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     let refusals: [(&str, bool); 8] = [
         ("quantize", spec.quantize.is_some()),
         ("adapters", !spec.adapters.is_empty()),
@@ -97,6 +103,9 @@ impl IrisRestorer {
     /// [`load`](Self::load) onto an explicit device.
     pub fn load_on(spec: &LoadSpec, device: &Device) -> Result<Self> {
         refuse_unsupported_spec(spec)?;
+        // Priced from the export's tensor headers. Pricing never decides whether a load succeeds;
+        // a spec with no contract publishes none.
+        let memory_strategy = crate::memory_strategy::restoration_contract(spec).ok();
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
         let prompt = resources.empty_prompt()?;
         let dit = load_backbone(
@@ -113,7 +122,29 @@ impl IrisRestorer {
             dit,
             states,
             mask: vec![prompt.mask],
+            spec: spec.clone(),
+            memory_strategy,
         })
+    }
+
+    /// The memory contract of the spec this restorer was loaded from — the one
+    /// [`crate::memory_strategy::RESTORATION_MEMORY_REGISTRATION`] builds for it — or `None` when
+    /// that spec has no contract.
+    pub fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    /// The registered restoration safety check against this restorer's own load.
+    pub fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        match &self.memory_strategy {
+            Some(contract) => {
+                crate::memory_strategy::restoration_safety_check(&self.spec, contract, context)
+            }
+            None => crate::memory_strategy::unpriced_safety_check(MODEL_ID, context),
+        }
     }
 
     /// The export's `task` settings (`sigma`, `tile`) the restorer runs with.

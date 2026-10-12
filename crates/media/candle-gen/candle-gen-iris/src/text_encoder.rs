@@ -77,21 +77,25 @@ fn from_llm(e: candle_llm::Error) -> Error {
 /// Candle CPU backend, which has no half-precision GEMM (the same CPU policy every `candle_llm`
 /// decoder follows — [`candle_llm::compute_dtype`]).
 pub fn tower_dtype(cfg: &TextEncoderConfig, device: &Device) -> Result<DType> {
-    let declared = match cfg.dtype.as_str() {
-        "bfloat16" | "bf16" => DType::BF16,
-        "float16" | "fp16" | "half" => DType::F16,
-        "float32" | "fp32" | "float" => DType::F32,
-        other => {
-            return Err(Error::Unsupported(format!(
-                "iris: text_encoder.dtype = {other} is not a dtype the Qwen3-VL tower can run in"
-            )))
-        }
-    };
+    let declared = declared_tower_dtype(cfg)?;
     Ok(if device.is_cpu() {
         DType::F32
     } else {
         declared
     })
+}
+
+/// The dtype the backbone's `text_encoder.dtype` names — what the tower runs in on a GPU device
+/// ([`tower_dtype`]).
+pub fn declared_tower_dtype(cfg: &TextEncoderConfig) -> Result<DType> {
+    match cfg.dtype.as_str() {
+        "bfloat16" | "bf16" => Ok(DType::BF16),
+        "float16" | "fp16" | "half" => Ok(DType::F16),
+        "float32" | "fp32" | "float" => Ok(DType::F32),
+        other => Err(Error::Unsupported(format!(
+            "iris: text_encoder.dtype = {other} is not a dtype the Qwen3-VL tower can run in"
+        ))),
+    }
 }
 
 /// The text-encoder shard files of a `Qwen/Qwen3-VL-4B-Instruct` snapshot: the indexed shards when

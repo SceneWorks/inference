@@ -98,6 +98,13 @@ pub struct Iris3b {
     residency: Residency<IrisTextEncoder, Heavy>,
     /// One report per installed adapter file, from the most recent backbone load.
     adapter_reports: Arc<Mutex<Vec<AdapterApplyReport>>>,
+    /// The spec this generator was loaded from — the load identity the memory-strategy seam checks
+    /// a request selection against.
+    spec: LoadSpec,
+    /// The loaded memory contract ([`crate::memory_strategy::generation_contract`] over the
+    /// resources on disk), published through [`Generator::memory_strategy_contract`]. `None` when
+    /// this load's inventory could not be priced — see [`load_inner`].
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
 }
 
 /// The compute dtype a load spec selects: the release's bf16 autocast by default, upstream's FP32
@@ -160,7 +167,7 @@ pub fn load_backbone_with_adapters(
     Ok((dit, reports))
 }
 
-fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
         ("text_encoder", spec.text_encoder.is_some()),
@@ -196,6 +203,14 @@ fn load_inner(spec: &LoadSpec) -> Result<Iris3b> {
     let config = IrisConfig::from_dir(&resources.backbone_dir)?;
     config.validate_supported()?;
     let compute = compute_dtype(spec);
+    // Priced from the resources on disk (tensor headers, plus the adapter stack as the loader would
+    // install it) before any backbone or encoder weight is read. Pricing never decides whether
+    // a load succeeds: `Sequential` defers both components to the first request, so a resource it
+    // has not opened yet (a missing text-encoder shard, an adapter it would refuse) is still that
+    // request's typed error, exactly as before. Such a load simply publishes no contract — the
+    // unverified, resident-only state — rather than one priced from an inventory it cannot read.
+    // A caller that wants the reason asks the registration, which returns the error.
+    let memory_strategy = crate::memory_strategy::generation_contract(spec).ok();
     let device = candle_gen::default_device()?;
     let te_dir = resources.text_encoder_dir.clone();
     let te_cfg = config.text_encoder.clone();
@@ -231,7 +246,27 @@ fn load_inner(spec: &LoadSpec) -> Result<Iris3b> {
         device,
         residency,
         adapter_reports,
+        spec: spec.clone(),
+        memory_strategy,
     })
+}
+
+/// Whether one request runs staged (text encoder loaded, encoded and dropped before the backbone
+/// loads): the request's admitted `GenerationMemory::stage_residency`, written by the
+/// memory-strategy scope, OR a `Sequential` load policy. A request can stage a warm-loaded
+/// generator, never un-stage a sequential one.
+pub(crate) fn stage_residency_for(spec: &LoadSpec, req: &GenerationRequest) -> bool {
+    req.memory.is_some_and(|memory| memory.stage_residency)
+        || spec.offload_policy == gen_core::OffloadPolicy::Sequential
+}
+
+/// The attention score budget a request selected (`GenerationMemory::chunk_attention` with its
+/// admitted `attention_chunk_size`), or `None` for the unbounded forward.
+pub(crate) fn attention_budget_for(req: &GenerationRequest) -> Option<usize> {
+    req.memory
+        .filter(|memory| memory.chunk_attention)
+        .and_then(|memory| memory.attention_chunk_size)
+        .map(|size| size as usize)
 }
 
 impl Iris3b {
@@ -246,7 +281,10 @@ impl Iris3b {
         let total = (params.steps as u32) * req.count;
         let flow = self.config.flow.clone();
         let device = self.device.clone();
-        let (images, warnings) = self.residency.run(
+        let attention_budget = attention_budget_for(req);
+        let (images, warnings) = self.residency.run_request_scoped(
+            stage_residency_for(&self.spec, req),
+            false,
             &req.cancel,
             false,
             on_progress,
@@ -264,21 +302,24 @@ impl Iris3b {
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height, &device)?;
                     let done = c * params.steps as u32;
-                    let x = denoise(
-                        &heavy.dit,
-                        &flow,
-                        &conditioning,
-                        &z,
-                        &params,
-                        &req.cancel,
-                        |step| {
-                            on_progress(Progress::Step {
-                                current: done + step as u32,
-                                total,
-                            })
-                        },
-                        &req.preview,
-                    )?;
+                    let x =
+                        crate::nn::with_attention_budget(attention_budget, &req.cancel, || {
+                            denoise(
+                                &heavy.dit,
+                                &flow,
+                                &conditioning,
+                                &z,
+                                &params,
+                                &req.cancel,
+                                |step| {
+                                    on_progress(Progress::Step {
+                                        current: done + step as u32,
+                                        total,
+                                    })
+                                },
+                                &req.preview,
+                            )
+                        })?;
                     samples.push(x);
                 }
                 // Pixel space: the "decode" is only the [−1, 1] → RGB8 conversion.
@@ -311,8 +352,38 @@ impl Iris3b {
             .capabilities
             .validate_request(MODEL_ID, req)?;
         validate_generation_request(MODEL_ID, req, &self.config)?;
+        refuse_unhonored_memory(req)?;
         Ok(())
     }
+}
+
+/// Refuse the memory-ladder controls this route has no mechanism for, so none is accepted and
+/// ignored: there is no decoder to tile (pixel space) and no block-streaming loader. Staged
+/// residency and bounded attention are honoured ([`stage_residency_for`], [`attention_budget_for`]).
+fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
+    let Some(memory) = req.memory else {
+        return Ok(());
+    };
+    let refusals = [
+        ("tile_vae_decode", memory.tile_vae_decode),
+        (
+            "stream_transformer_blocks",
+            memory.stream_transformer_blocks,
+        ),
+        (
+            "chunk_attention without an attention_chunk_size",
+            memory.chunk_attention && memory.attention_chunk_size.is_none(),
+        ),
+    ];
+    for (control, set) in refusals {
+        if set {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: GenerationMemory::{control} is not a memory strategy of the Iris-3B \
+                 generation route (it stages residency and bounds attention)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Generator for Iris3b {
@@ -329,6 +400,40 @@ impl Generator for Iris3b {
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         self.validate_impl(req).map_err(Into::into)
+    }
+
+    /// The contract for the spec this generator was loaded from — the same one
+    /// [`crate::memory_strategy::MEMORY_REGISTRATION`] builds for it.
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        match &self.memory_strategy {
+            Some(contract) => {
+                crate::memory_strategy::generation_safety_check(&self.spec, contract, context)
+            }
+            None => crate::memory_strategy::unpriced_safety_check(MODEL_ID, context),
+        }
+    }
+
+    /// The registered executable seam on the loaded generator: it writes the admitted
+    /// `GenerationMemory` onto the request, which [`Self::generate`] then honours.
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        match &self.memory_strategy {
+            Some(contract) => {
+                crate::memory_strategy::generation_begin_request(&self.spec, contract, context)
+            }
+            // No contract was priced for this load, so no optimized rung is admitted and there is
+            // no scope to open.
+            None => Ok(None),
+        }
     }
 
     fn generate(

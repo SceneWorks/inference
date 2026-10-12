@@ -3499,6 +3499,14 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
+        // sc-25690: the three Iris inference routes — generation (staged residency + bounded
+        // attention), and the generator-less depth and restoration routes (resident, composed).
+        MemoryRouteCrate {
+            dir: "candle-gen-iris",
+            register_providers: candle_gen_iris::register_providers,
+            register_surfaces: Some(candle_gen_iris::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
         MemoryRouteCrate {
             dir: "candle-gen-kolors",
             register_providers: candle_gen_kolors::register_providers,
