@@ -24,7 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::train::flow_match::{self, sample_noise, sample_unit_timestep};
+use candle_gen::gen_core::train::ResolutionBucket;
+use candle_gen::gen_core::BucketSchedule;
+use candle_gen::train::flow_match::{
+    self, item_major_schedule, sample_noise, sample_unit_timestep,
+};
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::{CandleError, Result};
 
@@ -106,7 +110,8 @@ pub struct ControlTrainConfig {
     pub compute_dtype: DType,
     /// Write a checkpoint every N updates (0 = only at the end of `run`).
     pub save_every: u32,
-    /// Bucketed square edge the samples were encoded at — recorded in the checkpoint meta sidecar.
+    /// Bucketed square edge the samples were encoded at (the largest bucket edge when
+    /// [`ControlTrainer::with_resolution_buckets`] is used) — recorded in the checkpoint meta sidecar.
     pub resolution: u32,
     /// Control type this branch is trained for (`"pose"`/`"canny"`/`"depth"`/…). Recorded in the
     /// checkpoint/overlay meta `kind` (`"{control_type}_control_branch"`) so registration describes it
@@ -169,6 +174,9 @@ pub enum TrainEvent {
     Checkpoint { step: u32, path: PathBuf },
 }
 
+/// Error-message prefix for the trainer's typed errors.
+const LABEL: &str = "control trainer";
+
 /// Interval (in updates) between fixed-probe telemetry emissions during `run`.
 const TELEMETRY_EVERY: u32 = 50;
 
@@ -194,6 +202,10 @@ pub struct ControlTrainer {
     /// Updates completed so far (nonzero when resumed from a checkpoint).
     step: u32,
     out_dir: PathBuf,
+    /// Which sample each micro-step trains on (sc-2127): the plain `micro % samples.len()`
+    /// round-robin by default; a seeded per-epoch `(item, bucket)` shuffle over an item-major
+    /// sample list after [`with_resolution_buckets`](Self::with_resolution_buckets).
+    schedule: BucketSchedule,
 }
 
 impl ControlTrainer {
@@ -242,6 +254,7 @@ impl ControlTrainer {
             cfg.lr * cfg.proj_lr_mult,
             cfg.proj_weight_decay,
         )?;
+        let schedule = item_major_schedule(LABEL, samples.len(), &[], cfg.seed)?;
         Ok(Self {
             dit,
             branch,
@@ -253,7 +266,23 @@ impl ControlTrainer {
             opt_proj,
             step: start_step,
             out_dir,
+            schedule,
         })
+    }
+
+    /// Walk the samples as an **item-major** multi-resolution set (sc-2127): `samples[item *
+    /// buckets.len() + bucket]` is the item encoded at `buckets[bucket]`, and each epoch visits
+    /// every item at each bucket `repeats` times in a shuffle seeded from `cfg.seed`. A single
+    /// bucket keeps the default round-robin. Errors when the sample count is not a whole number of
+    /// items over `buckets`.
+    pub fn with_resolution_buckets(mut self, buckets: &[ResolutionBucket]) -> Result<Self> {
+        self.schedule = item_major_schedule(LABEL, self.samples.len(), buckets, self.cfg.seed)?;
+        Ok(self)
+    }
+
+    /// The sample index micro-step `micro` (0-based, counted across updates) trains on.
+    fn sample_index(&self, micro: u32) -> usize {
+        self.schedule.cache_index(micro as usize)
     }
 
     /// Updates completed so far.
@@ -273,7 +302,7 @@ impl ControlTrainer {
             let micro = self.step * self.cfg.batch + j;
             // The cache is CPU-resident (dataset-size-independent VRAM); copy this sample's tensors to
             // the device for the micro-step only — they drop at the end of the iteration.
-            let s = &self.samples[(micro as usize) % self.samples.len()];
+            let s = &self.samples[self.sample_index(micro)];
             let x0 = s.x0.to_device(&self.device)?;
             let ctrl = s.ctrl.to_device(&self.device)?;
             let cap = s.cap.to_device(&self.device)?;
@@ -447,6 +476,81 @@ mod tests {
     use crate::loader::Weights;
     use crate::testfix::{randn_seeded, tiny_batch_seeded, tiny_dit_seeded};
     use rand::{rngs::StdRng, SeedableRng};
+
+    /// A tiny-DiT control trainer over 2 items × 2 buckets, item-major: per item a 4×4 latent
+    /// sample then an 8×8 one (target + control at the same size), sharing one caption.
+    fn two_item_two_size_trainer(rng: &mut StdRng, out: &Path) -> ControlTrainer {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit_seeded(&tmp, rng);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        let latent_ch = c.in_channels / (c.patch_size * c.patch_size);
+        let mut samples = Vec::new();
+        for _item in 0..2 {
+            let cap = randn_seeded(rng, 0.0, 0.05, &[3, c.num_text_layers, c.text_hidden_dim]);
+            for lat in [4usize, 8] {
+                samples.push(ControlSample {
+                    x0: randn_seeded(rng, 0.0, 0.05, &[1, latent_ch, lat, lat]),
+                    ctrl: randn_seeded(rng, 0.0, 0.05, &[1, latent_ch, lat, lat]),
+                    cap: cap.clone(),
+                });
+            }
+        }
+        let cfg = ControlTrainConfig {
+            batch: 1,
+            max_steps: 8,
+            grad_checkpoint: false,
+            compute_dtype: DType::F32,
+            save_every: 0,
+            ..Default::default()
+        };
+        ControlTrainer::new(dit, branch, samples, cfg, out.to_path_buf(), 0, dev).unwrap()
+    }
+
+    /// sc-2127: by default the trainer walks its samples round-robin (`micro % len`, the
+    /// pre-bucket order); `with_resolution_buckets` switches to the item-major bucket mix (each item
+    /// visited at each bucket `repeats` times per epoch), refuses a sample count that is not a whole
+    /// number of items, and `step` trains across samples encoded at DIFFERENT latent sizes.
+    #[test]
+    fn control_trainer_walks_item_major_buckets() {
+        let mut rng = StdRng::seed_from_u64(2127);
+        let out = tempfile::tempdir().unwrap();
+        let rb = |resolution, repeats| ResolutionBucket {
+            resolution,
+            repeats,
+        };
+
+        let tr = two_item_two_size_trainer(&mut rng, out.path());
+        for micro in 0..40u32 {
+            assert_eq!(tr.sample_index(micro), micro as usize % 4);
+        }
+        let err = tr
+            .with_resolution_buckets(&[rb(256, 1), rb(512, 1), rb(768, 1)])
+            .err()
+            .expect("4 samples over 3 buckets is not a whole number of items")
+            .to_string();
+        assert!(err.contains("not a whole number of items"), "{err}");
+
+        let mut tr = two_item_two_size_trainer(&mut rng, out.path())
+            .with_resolution_buckets(&[rb(512, 3), rb(1024, 1)])
+            .unwrap();
+        // One epoch = 2 items · (3 + 1) = 8 samples: each item 3× at bucket 0, 1× at bucket 1.
+        let mut counts = [0u32; 4];
+        for micro in 0..8u32 {
+            counts[tr.sample_index(micro)] += 1;
+        }
+        assert_eq!(counts, [3, 1, 3, 1]);
+        // Both latent sizes reach the loss within the epoch; every update stays finite.
+        for _ in 0..8 {
+            let rep = tr.step().unwrap();
+            assert!(
+                rep.loss.is_finite(),
+                "non-finite loss at update {}",
+                rep.step
+            );
+        }
+    }
 
     /// The trainer's optimizer loop lowers the loss on a fixed held-out probe point — the library twin
     /// of `control::tests::backward_reaches_branch_and_descends`, exercising `ControlTrainer::run`

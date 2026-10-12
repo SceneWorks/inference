@@ -174,6 +174,43 @@ pub fn load_text_encoder(root: &Path) -> Result<QwenImage21TextEncoder> {
     load_text_encoder_from(&root.join("text_encoder"), vision.as_ref())
 }
 
+/// Isolated diagnostic: change only the language source. The vision tower and
+/// processor always come from the same dense snapshot, including for Q4 language.
+#[cfg(test)]
+pub(crate) fn diagnostic_language_with_fixed_vision(
+    language_root: &Path,
+    vision_root: &Path,
+) -> Result<QwenImage21TextEncoder> {
+    crate::q4_diagnostic::assert_owner();
+    let cfg = TextEncoderConfig::from_json_file(&language_root.join("text_encoder/config.json"))?;
+    let language = Weights::from_dir(language_root.join("text_encoder"))?;
+    let encoder = QwenImage21TextEncoder::from_weights(&language, TEXT_ENCODER_PREFIX, &cfg)?;
+    language.materialize_accessed()?;
+    drop(language);
+    let vision =
+        load_vision_config(vision_root)?.ok_or_else(crate::pipeline::missing_vision_tower)?;
+    let weights = Weights::from_dir(vision_root.join("text_encoder"))?;
+    let visual = weights
+        .keys()
+        .filter(|key| key.starts_with(VISION_TOWER_PREFIX))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|key| weights.require(&key).map(|array| (key, array.clone())))
+        .collect::<Result<HashMap<_, _>>>()?;
+    if visual.is_empty() {
+        return Err("diagnostic fixed vision source is empty".into());
+    }
+    let tower = mlx_llm::models::Qwen3VLVisionModel::from_weights(
+        &mlx_llm::primitives::Weights::from_map(visual),
+        VISION_TOWER_PREFIX,
+        vision.tower.clone(),
+    )
+    .map_err(|e| Error::Msg(format!("diagnostic fixed vision: {e}")))?;
+    weights.materialize_accessed()?;
+    Ok(encoder.with_vision(tower, vision))
+}
+
 /// The DiT from `<root>/transformer/`.
 pub fn load_transformer(root: &Path) -> Result<QwenImage21Transformer> {
     let (w, transformer) = transformer_graph(root)?;

@@ -45,6 +45,7 @@ fn train_lora(tmp: &Path) -> PathBuf {
             control_image_path: None,
             model_options: Default::default(),
             reference_image_paths: Vec::new(),
+            subject_mask_path: None,
         });
     }
     let mut trainer = mlx_gen_kolors::provider_registry()

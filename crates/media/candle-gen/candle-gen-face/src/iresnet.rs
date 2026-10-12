@@ -16,10 +16,28 @@ use candle_gen::Result;
 
 use crate::common::{Conv, Weights};
 
-/// iresnet100 block counts per layer (`layer1..layer4`).
-const LAYERS: [usize; 4] = [3, 13, 30, 3];
-/// Flattened head input = 512 channels × 7 × 7 feature map.
-const FLAT: usize = 512 * 7 * 7;
+/// The iresnet100 (antelopev2 `glintr100`) and iresnet50 (buffalo_l `w600k_r50`, the upstream
+/// ai-toolkit-perceptual identity-loss checkpoint, sc-24831) per-layer block counts — the one
+/// gen-core definition both backends re-export (mlx-gen-face's `iresnet.rs` does the same).
+pub use candle_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
+
+/// The per-layer block counts a converted checkpoint carries, read from its keys
+/// (`layer{l}.{b}.conv1.weight`) — the twin of mlx-gen-face's `infer_layers` (sc-24831).
+pub fn infer_layers(has_key: impl Fn(&str) -> bool) -> Result<[usize; 4]> {
+    let mut layers = [0usize; 4];
+    for (li, n) in layers.iter_mut().enumerate() {
+        while has_key(&format!("layer{}.{}.conv1.weight", li + 1, *n)) {
+            *n += 1;
+        }
+        if *n == 0 {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "ArcFace checkpoint has no layer{l} blocks (missing layer{l}.0.conv1.weight)",
+                l = li + 1
+            )));
+        }
+    }
+    Ok(layers)
+}
 
 /// PReLU with a per-channel `slope` (`[1,C,1,1]`, broadcast over an NCHW map):
 /// `max(x,0) + slope · min(x,0)`. `min(x,0) = x − relu(x)`, avoiding a scalar-min op.
@@ -95,10 +113,17 @@ pub struct ArcFace {
 }
 
 impl ArcFace {
-    /// Load from the converted `arcface_iresnet100.safetensors` (shared with the MLX path).
+    /// Load from a converted IResNet checkpoint (shared with the MLX path) — any depth: the block
+    /// counts are read from the keys ([`infer_layers`]) and every width from the tensors' shapes.
+    ///
+    /// The epic-2123 identity loss (sc-24831) uses the shipped glintr100 (iresnet100); upstream's
+    /// buffalo_l `w600k_r50` (iresnet50) loads here unchanged once converted with
+    /// `ARCFACE_ONNX=<w600k_r50.onnx> ARCFACE_LAYERS=3,4,14,3 python3
+    /// crates/media/mlx-gen/tools/convert_glintr100.py`.
     pub(crate) fn from_weights(w: &Weights) -> Result<Self> {
-        let mut layers = Vec::with_capacity(LAYERS.len());
-        for (li, &nb) in LAYERS.iter().enumerate() {
+        let depth = infer_layers(|k| w.contains(k))?;
+        let mut layers = Vec::with_capacity(depth.len());
+        for (li, &nb) in depth.iter().enumerate() {
             let l = li + 1;
             let mut blocks = Vec::with_capacity(nb);
             for b in 0..nb {
@@ -146,7 +171,8 @@ impl ArcFace {
         // Head: bn2, then flatten in NCHW (channel-major) order — already the onnx `Flatten` layout.
         h = self.bn2.forward_spatial(&h)?;
         let n = h.dim(0)?;
-        h = h.contiguous()?.reshape((n, FLAT))?;
+        let flat = h.elem_count() / n;
+        h = h.contiguous()?.reshape((n, flat))?;
         // fc Linear: [N,25088] @ [25088,512] + [512].
         let fc_b = self.fc_b.reshape((1, self.fc_b.elem_count()))?;
         h = h.matmul(&self.fc_w.t()?)?.broadcast_add(&fc_b)?;

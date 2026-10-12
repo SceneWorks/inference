@@ -22,8 +22,13 @@ mlx-rs = { workspace = true }
 # Link-time self-registration of the three anima generators into the `mlx_gen` registry.
 # Encode the e2e real-weight smoke output to PNG (real-weights generate test); mirrors mlx-gen-krea.
 image = { workspace = true }
+# The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath (depth anchoring
+# through TAEW2.1, the Qwen-Image VAE's tiny decoder).
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
 
 [dev-dependencies]
+# Tiny random-init Depth-Anything-V2 for the depth-anchoring step tests (sc-24830).
+mlx-gen-depth = { path = "../mlx-gen-depth" }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

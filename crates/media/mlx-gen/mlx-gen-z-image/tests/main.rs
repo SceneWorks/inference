@@ -136,6 +136,9 @@ mod vae_submodules;
 #[path = "vae_tiling_real_weights.rs"]
 mod vae_tiling_real_weights;
 
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;
+
 #[path = "z_control_transformer.rs"]
 mod z_control_transformer;
 

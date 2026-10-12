@@ -39,12 +39,15 @@ impl DepthHead {
     }
 
     /// `fused`: the neck's fused NHWC map `[B, h, w, fusion_hidden]`. `patch_grid` is the backbone
-    /// token-grid side (37 at the default size) — the head upsamples to `patch_grid · patch_size`
+    /// token grid `(rows, cols)` (37×37 at the default size) — the head upsamples to `patch_grid · patch_size`
     /// (the input resolution). Returns `[B, H, W]`.
-    pub fn forward(&self, fused: &Array, patch_grid: i32) -> Result<Array> {
+    pub fn forward(&self, fused: &Array, patch_grid: (i32, i32)) -> Result<Array> {
         let x = conv2d(fused, &self.conv1_w, Some(&self.conv1_b), 1, 1)?;
-        let full = patch_grid * self.patch_size;
-        let x = bilinear_resize(&x, full, full, true)?;
+        let (full_h, full_w) = (
+            patch_grid.0 * self.patch_size,
+            patch_grid.1 * self.patch_size,
+        );
+        let x = bilinear_resize(&x, full_h, full_w, true)?;
         let x = conv2d(&x, &self.conv2_w, Some(&self.conv2_b), 1, 1)?;
         let x = relu(&x)?;
         let x = conv2d(&x, &self.conv3_w, Some(&self.conv3_b), 1, 0)?;

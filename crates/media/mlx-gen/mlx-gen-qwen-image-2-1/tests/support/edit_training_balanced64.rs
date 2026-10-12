@@ -1,29 +1,33 @@
 //! Fixed training-only balanced64 recipe; no evaluation image or seed input.
 use sha2::{Digest, Sha256};
-pub const PLAN_SHA256: &str = "6903bcda286ac03e4524b736d579a2efcce299b1484d742460899b53e3e6675e";
-pub const VERSION: &str = "balanced64-v1";
-pub const EDGE: u32 = 512;
+pub const PLAN_SHA256: &str = "d10ba00492eea5cf38af59964f75c671490aebfd21f8a7b0314b9ac7ab9bb078";
+pub const VERSION: &str = "balanced64-native768-v2";
+pub const EDGE: u32 = 768;
+const LOGICAL_EDGE: u32 = 512;
 pub const ITEMS: u32 = 6;
+/// Native Rust PNG encoder and the existing ordered dataset receipt schema.
+pub const DATASET_PNG_SHA256: &str =
+    "62d762a977a23d6df0a8435e73ee2abcc026909e3558c6a1f20bfb17e091ef9c";
 const MULTIPLIERS: [u32; 6] = [13, 17, 29, 37, 45, 53];
 const OFFSETS: [u32; 6] = [7, 19, 31, 43, 55, 3];
 const SOURCE_HASHES: [&str; 6] = [
-    "7bb13657f750512f953eb17a0509e0869422ba51c2a61e610f1e25a291138565",
-    "4dbc037a60b1e29191e9c60efadb59b6a07cd185efe3784ab986c4d9d379fadb",
-    "5e1303a277233d35878f86b5d7ac0a88a26e18c3bbfdfb787199256ed411a50b",
-    "be036fbe4c9c90e72ce2fe1b67ed89ed5a739a90f45954344fbd701e3ba07604",
-    "462d5793375c2ca45618fa344c62cd677b99254e872c3a6d7bd8dbc5bf374dad",
-    "948f08687280073439e8d16eaea85a30807a05824c754effbce993ba71c17a43",
+    "4d8ef7e419ad067c19a753e8921b2738c736e11e8343f2120206b9f1582bc1ec",
+    "4e1574282a97569857742a1548ed9e7d02278334e137aafe3ccd36059f18db16",
+    "aefe45e5caa08e94dda6e26b175e89ae59ac052049b8fb2edb6e58d23e32b033",
+    "7bb37fb6dd545f16050bec670d84b4849c462beb8962c7c2ba439ac4f025bd49",
+    "3c312732ff08d0e5c79c9011a4a7326ea3c4420733e144ea14d4a5c1b18bf87d",
+    "d92441ffc91f0eda81e744d78b305725bac99564471e8b8851a4a702ec52eb39",
 ];
 const TARGET_HASHES: [&str; 6] = [
-    "8e20702fad90785b277408ebf04c0b7c25bf72ee2aab60202f26437e0dab14c8",
-    "69ef8c6378d394ec24aa48f39ab0279c8137a168d8a3ece91f757ec4b63580b1",
-    "0b2976bb621804d5ba80124e2018ebe6f167752ba16925d12225bd5529c2382c",
-    "55f593905c8ac186f552accf6d470311fe19c2fd2abad0b294e8acb3ad051f7d",
-    "f336b0e45190e538d759a8615b18efbbd2020b5feafc7190667c5b686591969d",
-    "795496800b8a240bb37697aeb2eafdb7cc7425634e3315767b1ab66a693a107f",
+    "f7677e63d03369b231eaab8651e3d1dbca2d93a6947557869e48caf13f63c5b2",
+    "2ee36ede5bfaeed0e0e3f9da23f6dd578393fd032fd7a70606d8e34bca5cb8ae",
+    "917a8e1f97fccefe018efb65cfbd99289278ff816e830f14cbe5e901638ed784",
+    "f1b5bafe24331c56cf8e8bddf6ebaab6a310098caf48d91331ef2e424b09b620",
+    "0d44cde7e5c1ee0b2ae27485462515581fe177c71f68da2db009d21796db6782",
+    "b58c5ced92159f7b361c83367478781066f01f13df7a02935648a7643518f239",
 ];
 fn coordinates(item: u32, x: u32, y: u32) -> (u32, u32) {
-    assert!(item < ITEMS && x < EDGE && y < EDGE);
+    assert!(item < ITEMS && x < LOGICAL_EDGE && y < LOGICAL_EDGE);
     let tri = |z: u32| 64 - ((z % 256) as i32 - 128).abs();
     match item {
         0 => (x, y),
@@ -49,17 +53,24 @@ fn pixel_parts(item: u32, x: u32, y: u32) -> ([u8; 3], [u32; 3]) {
     let source = std::array::from_fn(|c| (64 * (3 - q[c]) + offsets[c]) as u8);
     (source, q)
 }
+/// Native 768 coordinates repeat the original 512 layout by floor(2*x/3).
+/// This is deliberately not a bijection: each logical pixel occurs 1, 2 or 4 times.
+fn native_pixel_parts(item: u32, x: u32, y: u32) -> ([u8; 3], [u32; 3]) {
+    assert!(x < EDGE && y < EDGE);
+    pixel_parts(item, x * LOGICAL_EDGE / EDGE, y * LOGICAL_EDGE / EDGE)
+}
 pub fn training_pixel(item: u32, x: u32, y: u32, edge: u32) -> [u8; 3] {
     assert_eq!(
         edge, EDGE,
-        "heldout/native768 dimensions must never enter training generator"
+        "only the frozen native768 training dimensions are supported"
     );
-    pixel_parts(item, x, y).0
+    native_pixel_parts(item, x, y).0
 }
 #[derive(Debug)]
 pub struct Audit {
     pub source_sha256: String,
     pub target_sha256: String,
+    pub source_channel_counts: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -91,7 +102,7 @@ pub fn recipe_is_fixed(mut actual: Recipe, bounded_probe: bool) -> bool {
             learning_rate: 1e-4,
             seed: 42,
             checkpointing: true,
-            edge: 512,
+            edge: EDGE,
             references: 1,
             steps: 120,
             lokr: true,
@@ -109,7 +120,7 @@ pub fn audit(item: u32, source: &[u8], target: &[u8]) -> Audit {
     for y in 0..EDGE {
         for x in 0..EDGE {
             let offset = ((y * EDGE + x) * 3) as usize;
-            let (expected, q) = pixel_parts(item, x, y);
+            let (expected, q) = native_pixel_parts(item, x, y);
             assert_eq!(&source[offset..offset + 3], expected);
             let expected_target = q.map(|c| (c * 85) as u8);
             assert_eq!(
@@ -124,8 +135,15 @@ pub fn audit(item: u32, source: &[u8], target: &[u8]) -> Audit {
             }
         }
     }
-    assert!(colours.iter().all(|&count| count == 4096));
-    assert!(input_counts.iter().flatten().all(|&count| count == 1024));
+    assert!(colours.iter().all(|&count| count == 9216));
+    assert!(input_counts[..2]
+        .iter()
+        .flatten()
+        .all(|&count| count == 2304));
+    let blue_range = if item < 2 { (2048, 2560) } else { (1536, 3072) };
+    assert_eq!(*input_counts[2].iter().min().unwrap(), blue_range.0);
+    assert_eq!(*input_counts[2].iter().max().unwrap(), blue_range.1);
+    assert!(input_counts.iter().flatten().all(|&count| count > 0));
     let source_sha256 = format!("{:x}", Sha256::digest(source));
     let target_sha256 = format!("{:x}", Sha256::digest(target));
     assert_eq!(source_sha256, SOURCE_HASHES[item as usize]);
@@ -133,6 +151,7 @@ pub fn audit(item: u32, source: &[u8], target: &[u8]) -> Audit {
     Audit {
         source_sha256,
         target_sha256,
+        source_channel_counts: input_counts.iter().map(|c| c.to_vec()).collect(),
     }
 }
 #[cfg(test)]
@@ -142,10 +161,10 @@ mod tests {
     use super::*;
     #[test]
     fn exhaustive_real_rgb_counts_canonical_transform_and_frozen_raw_hashes() {
-        assert_eq!(VERSION, "balanced64-v1");
+        assert_eq!(VERSION, "balanced64-native768-v2");
         assert_eq!(
             PLAN_SHA256,
-            "6903bcda286ac03e4524b736d579a2efcce299b1484d742460899b53e3e6675e"
+            "d10ba00492eea5cf38af59964f75c671490aebfd21f8a7b0314b9ac7ab9bb078"
         );
         let mut hashes = std::collections::BTreeSet::new();
         for item in 0..ITEMS {
@@ -161,19 +180,19 @@ mod tests {
             assert!(hashes.insert(actual.target_sha256));
             // Training layouts are never the canonical evaluation palette layout.
             assert!((0..EDGE).any(|y| (0..EDGE)
-                .any(|x| pixel_parts(item, x, y).1.map(|q| (85 * q) as u8)
+                .any(|x| native_pixel_parts(item, x, y).1.map(|q| (85 * q) as u8)
                     != canonical::palette_pixel(x, y, EDGE))));
         }
         assert_eq!(hashes.len(), 12);
     }
     #[test]
-    fn every_spatial_layout_is_bijective_and_heldout_inputs_are_refused() {
+    fn logical512_layouts_are_bijective_and_heldout_inputs_are_refused() {
         for item in 0..ITEMS {
-            let mut seen = vec![false; (EDGE * EDGE) as usize];
-            for y in 0..EDGE {
-                for x in 0..EDGE {
+            let mut seen = vec![false; (LOGICAL_EDGE * LOGICAL_EDGE) as usize];
+            for y in 0..LOGICAL_EDGE {
+                for x in 0..LOGICAL_EDGE {
                     let (u, v) = coordinates(item, x, y);
-                    let index = (v * EDGE + u) as usize;
+                    let index = (v * LOGICAL_EDGE + u) as usize;
                     assert!(!seen[index]);
                     seen[index] = true;
                 }
@@ -183,7 +202,27 @@ mod tests {
         for item in [6, 99, 1000] {
             assert!(std::panic::catch_unwind(|| training_pixel(item, 0, 0, EDGE)).is_err());
         }
-        assert!(std::panic::catch_unwind(|| training_pixel(0, 0, 0, 768)).is_err());
+        assert!(std::panic::catch_unwind(|| training_pixel(0, 0, 0, 512)).is_err());
+    }
+    #[test]
+    fn native768_mapping_has_exact_one_two_four_multiplicities() {
+        let mut counts = vec![0u32; (LOGICAL_EDGE * LOGICAL_EDGE) as usize];
+        for y in 0..EDGE {
+            for x in 0..EDGE {
+                let (u, v) = (x * LOGICAL_EDGE / EDGE, y * LOGICAL_EDGE / EDGE);
+                counts[(v * LOGICAL_EDGE + u) as usize] += 1;
+            }
+        }
+        for v in 0..LOGICAL_EDGE {
+            for u in 0..LOGICAL_EDGE {
+                let expected = (if u % 2 == 0 { 2 } else { 1 }) * (if v % 2 == 0 { 2 } else { 1 });
+                assert_eq!(counts[(v * LOGICAL_EDGE + u) as usize], expected);
+            }
+        }
+        assert_eq!(counts.iter().filter(|&&n| n == 1).count(), 65536);
+        assert_eq!(counts.iter().filter(|&&n| n == 2).count(), 131072);
+        assert_eq!(counts.iter().filter(|&&n| n == 4).count(), 65536);
+        assert_eq!(counts.iter().sum::<u32>(), EDGE * EDGE);
     }
     #[test]
     fn fixed_recipe_rejects_every_training_parameter_drift() {
@@ -194,7 +233,7 @@ mod tests {
             learning_rate: 1e-4,
             seed: 42,
             checkpointing: true,
-            edge: 512,
+            edge: EDGE,
             references: 1,
             steps: 120,
             lokr: true,
@@ -218,7 +257,7 @@ mod tests {
                 ..recipe
             },
             Recipe {
-                edge: 768,
+                edge: 512,
                 ..recipe
             },
             Recipe {

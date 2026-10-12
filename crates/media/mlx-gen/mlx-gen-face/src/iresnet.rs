@@ -29,10 +29,28 @@ use mlx_rs::Array;
 
 use crate::common::Conv;
 
-/// iresnet100 block counts per layer (`layer1..layer4`).
-const LAYERS: [usize; 4] = [3, 13, 30, 3];
-/// Flattened head input = 512 channels × 7 × 7 feature map.
-const FLAT: i32 = 512 * 7 * 7;
+/// Per-layer block counts of glintr100 (iresnet100) and w600k_r50 (iresnet50, upstream's identity
+/// checkpoint) — one definition, in gen-core (sc-24831).
+pub use mlx_gen::gen_core::train::face_loss::{IRESNET100_LAYERS, IRESNET50_LAYERS};
+
+/// The per-layer block counts a converted checkpoint carries, read from its keys
+/// (`layer{l}.{b}.conv1.weight`), so one loader serves iresnet100 (`glintr100`), iresnet50
+/// (`w600k_r50`) and any other IResNet depth (sc-24831). Every layer needs at least one block.
+pub fn infer_layers(has_key: impl Fn(&str) -> bool) -> Result<[usize; 4]> {
+    let mut layers = [0usize; 4];
+    for (li, n) in layers.iter_mut().enumerate() {
+        while has_key(&format!("layer{}.{}.conv1.weight", li + 1, *n)) {
+            *n += 1;
+        }
+        if *n == 0 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "ArcFace checkpoint has no layer{l} blocks (missing layer{l}.0.conv1.weight)",
+                l = li + 1
+            )));
+        }
+    }
+    Ok(layers)
+}
 
 /// PReLU with a per-channel `slope` (`[C]`, broadcast over the NHWC channel axis):
 /// `max(x, 0) + slope · min(x, 0)`.
@@ -103,10 +121,18 @@ pub struct ArcFace {
 }
 
 impl ArcFace {
-    /// Load from the converted `arcface_iresnet100.safetensors` (see `tools/convert_glintr100.py`).
+    /// Load from a converted IResNet checkpoint — `arcface_iresnet100.safetensors` (see
+    /// `tools/convert_glintr100.py`) or any other depth: the per-layer block counts are read from
+    /// the keys ([`infer_layers`]) and every width from the stored tensors' shapes.
+    ///
+    /// The epic-2123 identity loss (sc-24831) uses the shipped glintr100 (iresnet100). Upstream
+    /// ai-toolkit-perceptual uses buffalo_l `w600k_r50` (iresnet50) instead; a converted
+    /// `w600k_r50` loads here unchanged — convert it with
+    /// `ARCFACE_ONNX=<w600k_r50.onnx> ARCFACE_LAYERS=3,4,14,3 python3 tools/convert_glintr100.py`.
     pub fn from_weights(w: &Weights) -> Result<Self> {
-        let mut layers = Vec::with_capacity(LAYERS.len());
-        for (li, &nb) in LAYERS.iter().enumerate() {
+        let depth = infer_layers(|k| w.get(k).is_some())?;
+        let mut layers = Vec::with_capacity(depth.len());
+        for (li, &nb) in depth.iter().enumerate() {
             let l = li + 1;
             let mut blocks = Vec::with_capacity(nb);
             for b in 0..nb {
@@ -138,6 +164,15 @@ impl ArcFace {
         })
     }
 
+    /// Block counts per layer of the loaded checkpoint (`[3,13,30,3]` for `glintr100`).
+    pub fn layers(&self) -> [usize; 4] {
+        let mut out = [0usize; 4];
+        for (o, l) in out.iter_mut().zip(&self.layers) {
+            *o = l.len();
+        }
+        out
+    }
+
     /// Compute the 512-d recognition embedding for a batch of aligned face crops.
     ///
     /// `x`: NHWC `[N, 112, 112, 3]` f32, normalized as `(rgb - 127.5) / 127.5` (the antelopev2
@@ -155,7 +190,7 @@ impl ArcFace {
         // `Flatten`, then fc Linear + features BN.
         h = self.bn2.forward(&h)?;
         let n = h.shape()[0];
-        h = h.transpose_axes(&[0, 3, 1, 2])?.reshape(&[n, FLAT])?;
+        h = h.transpose_axes(&[0, 3, 1, 2])?.reshape(&[n, -1])?;
         h = nn::linear(&h, &self.fc.w, &self.fc.b)?;
         h = self.features.forward(&h)?;
         Ok(h)

@@ -1,0 +1,19 @@
+[package]
+name = "mlx-gen-perceptual"
+version = "0.0.0"
+edition = "2021"
+description = "The shared auxiliary perceptual-loss builder for the mlx-gen trainers (epic 2123): one TrainingConfig -> PerceptualPath seam every trainer calls; each loss (depth anchoring, identity, body, latent losses) is one arm."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+mlx-gen-depth = { path = "../mlx-gen-depth" }
+# ArcFace identity + FaceMesh landmark arms (sc-24831).
+mlx-gen-face = { path = "../mlx-gen-face" }
+mlx-gen-body = { path = "../mlx-gen-body" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

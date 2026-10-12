@@ -30,9 +30,17 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-LAYERS = [3, 13, 30, 3]  # iresnet100
+# iresnet100 (glintr100) by default. Any other insightface IResNet converts with the same graph
+# walk (sc-24831) — e.g. buffalo_l `w600k_r50` (iresnet50, upstream ai-toolkit-perceptual's
+# identity-loss ArcFace):
+#   ARCFACE_ONNX=~/.insightface/models/buffalo_l/w600k_r50.onnx ARCFACE_LAYERS=3,4,14,3 \
+#     python3 convert_glintr100.py
+# The native loaders read the depth from the emitted keys, so the output loads unchanged.
+LAYERS = [int(n) for n in os.environ.get("ARCFACE_LAYERS", "3,13,30,3").split(",")]
 BN_EPS = 1e-5
-GLINTR = os.path.expanduser("~/.insightface/models/antelopev2/glintr100.onnx")
+GLINTR = os.path.expanduser(
+    os.environ.get("ARCFACE_ONNX", "~/.insightface/models/antelopev2/glintr100.onnx")
+)
 OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "golden")
 
 

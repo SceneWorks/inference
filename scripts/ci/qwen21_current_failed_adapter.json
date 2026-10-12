@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "kind": "DIAGNOSTIC_ONLY",
+  "accepted": false,
+  "acceptanceEvidence": false,
+  "repository": "SceneWorks/inference",
+  "workflowPath": ".github/workflows/real-weights.yml",
+  "workflowJobKey": "mlx-qwen-image-2-1",
+  "workflowJobName": "MLX Qwen-Image 2.1 LoRA/LoKr real weights",
+  "selector": "conditioning_velocity_diagnostic::diagnostic_current_failed_adapter_dense_q4_conditioning_velocity",
+  "source": {
+    "baseCommit": "ce820faecb332263b8c940eb937be71c9c055689",
+    "baseTree": "35387613d4dd28ea2f3bd7b86c4768059b5bbd7a",
+    "sceneWorksFbdCommit": "fbd74e46ef77811e42f0eae8266ab078881f17f7",
+    "runId": 37392084691,
+    "runAttempt": 1,
+    "jobId": 112039296411,
+    "jobName": "MLX Qwen-Image 2.1 LoRA/LoKr real weights",
+    "runnerId": 5281,
+    "runnerName": "nax-macos-2",
+    "labels": ["self-hosted", "macOS", "ARM64", "rw-mage"],
+    "jobLogBytes": 286177,
+    "jobLogSha256": "9b1ee016481e3d24571dbb24663345cd81269417e9fff1a242fd7e148b2dc79c"
+  },
+  "artifact": {
+    "id": 11383988900,
+    "name": "qwen-image-2-1-mlx-evidence",
+    "bytes": 503983926,
+    "sha256": "d5a17f4881645ae5bbe9f94c8e43058c5276e3851f3e9897434b9506c3dd6b21",
+    "expiresAt": "2026-11-05T02:23:09Z"
+  },
+  "members": [
+    {
+      "archivePath": "adapters/qwen21_edit_lokr.safetensors",
+      "file": "qwen21_edit_lokr.safetensors",
+      "bytes": 6759417,
+      "sha256": "33ab069111f5a085a2870e9d6ccf7a0f6e2357f2ed1bcb67c590a9561878e354"
+    },
+    {
+      "archivePath": "edit_lokr.json",
+      "file": "edit_lokr.json",
+      "bytes": 156097,
+      "sha256": "2728e1b79f92f5f7101358f72f0a65d2f121480ca8a6282065e98e8e1f14a223"
+    },
+    {
+      "archivePath": "edit/edit-training-protocol.json",
+      "file": "edit-training-protocol.json",
+      "bytes": 91960,
+      "sha256": "a3a52a0b47511f6cdbf6fdd350273d3d76ed1d707b12b8fb3297760d05ac9c80"
+    }
+  ],
+  "validateOnlyMembers": [
+    {
+      "archivePath": "mlx-build-identity.json",
+      "bytes": 2407,
+      "sha256": "a5ef4ddabede447c3011ef57065a258f074212cb79bf054e7920b99d6665c7e8"
+    }
+  ],
+  "training": {
+    "steps": 120,
+    "datasetSha256": "62d762a977a23d6df0a8435e73ee2abcc026909e3558c6a1f20bfb17e091ef9c"
+  },
+  "snapshots": {
+    "denseRevision": "790c92633540aa0cb11d9abf19eb46d861714758",
+    "packedRevision": "1691de01c24a070131e0a28bf4c065fd027f4fe9"
+  },
+  "mlxBuild": {
+    "mlxRsRevision": "48ff5e78a49e0a513f1976b0b1af70f9a5305f00",
+    "coreTag": "v0.32.0",
+    "fingerprint": "ac16f1de259a6259db3a2d1a0c41f28c9b33645aa18ac8ce07909783903c49fc"
+  },
+  "liveHost": {
+    "runnerId": 5281,
+    "runnerName": "nax-macos-2",
+    "labels": ["self-hosted", "macOS", "ARM64", "rw-mage"],
+    "hardwareModel": "Mac17,6",
+    "cpuBrand": "Apple M5 Max",
+    "memoryBytes": 137438953472,
+    "kernel": "Darwin",
+    "architecture": "arm64"
+  }
+}

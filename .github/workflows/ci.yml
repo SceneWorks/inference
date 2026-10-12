@@ -85,6 +85,7 @@ jobs:
       # unconditional for every CI event and is itself required by the aggregate `CI gate`.
       # A path-gated lane would let a docs-only topology violation merge without a verdict.
       - name: Enforce feature-epic pull-request topology
+        id: topology
         run: python3 scripts/ci/feature_epic_policy.py
       # Every BASE_SHA below must name `github.event.merge_group.base_sha`. A merge_group event
       # carries NEITHER `pull_request.base.sha` NOR `before`, and the two consumers fail in
@@ -96,14 +97,14 @@ jobs:
       # present for the `git diff`.
       - name: Validate append-only code-review finding allocations
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          BASE_SHA: ${{ steps.topology.outputs.effective_base_sha || github.event.merge_group.base_sha || github.event.before }}
         run: python3 scripts/check-review-findings.py --base "$BASE_SHA"
       - name: Expand changed paths through workspace dependencies
         id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          BASE_SHA: ${{ steps.topology.outputs.effective_base_sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
           DISPATCH_LANES: ${{ inputs.lanes }}
         run: |

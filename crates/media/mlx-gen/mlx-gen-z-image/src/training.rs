@@ -26,22 +26,28 @@
 //! sc-3043 generalizes this into a reusable `Trainer` surface (dataset/VAE-cache/bucket, checkpoint,
 //! LR schedule, the `lora_train` job); sc-3044 hardens it for Z-Image + adds LoKr.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::gen_core;
+use mlx_gen::gen_core::{self, BucketSchedule};
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::train::checkpoint::{self, checkpoint_filename};
-use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
+use mlx_gen::train::dataset::{bucket_edges, center_crop_square};
 use mlx_gen::train::lora::{
-    accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
-    TrainAdapter,
+    accumulate_grads, adapter_optimizer_update, average_grads, build_lokr_targets,
+    build_lora_targets, LoraParams, TrainAdapter,
 };
+use mlx_gen::train::perceptual::{
+    combine_step_loss, step_sample, AuxDriver, Parameterization, PerceptualPath, StepPlan,
+};
+use mlx_gen::train::tae::TinyDecoderConfig;
 // Re-export the `LoraTarget` that `build_lora_targets` returns so the crate's public surface is
 // unchanged (the host-generic factor machinery moved to `mlx_gen::train::lora` in sc-3045).
 pub use mlx_gen::train::lora::LoraTarget;
+use mlx_gen::train::loss::{prepared_subject_mask_weight, reduce_loss};
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
+use mlx_gen::train::subject_mask::{CropBox, PreparedSubjectMask};
 use mlx_gen::{
     FlowMatchEuler, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -50,13 +56,13 @@ use mlx_gen::{
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{multiply, subtract};
-use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::model::{MODEL_ID, SCHEDULE_SHIFT};
 use crate::pipeline::encode_init_latents;
 use crate::text_encoder::TextEncoder;
+use crate::training_adapter::{merge_training_adapter, MergedTrainingAdapter};
 use crate::transformer::ZImageTransformer;
 use crate::vae::Vae;
 
@@ -99,6 +105,10 @@ pub struct ZImageTurboTrainer {
     text_encoder: Option<TextEncoder>,
     vae: Vae,
     transformer: ZImageTransformer,
+    /// The training adapter (sc-25213) merged into `transformer`'s base by a run on this instance.
+    /// The merge is destructive (the bare weights are not kept), so a later run on the same instance
+    /// may only reuse the same adapter — anything else must reload the trainer.
+    training_adapter: Option<MergedTrainingAdapter>,
 }
 
 fn trainer_descriptor() -> TrainerDescriptor {
@@ -115,29 +125,75 @@ fn trainer_descriptor() -> TrainerDescriptor {
         // `validate_full_finetune_request` floor makes a `full_finetune` request a typed reject.
         supports_full_finetune: false,
         max_reference_images: 0,
+        // Epic 2123: weight + gradient noise at the shared adapter optimizer update
+        // (`adapter_optimizer_update`, sc-24826/sc-24827), multi-resolution buckets (sc-2127),
+        // depth anchoring (sc-2125) — the shared decoded-x0 perceptual path (TAEF1 decode →
+        // Depth-Anything-V2 → cached round-trip reference) — and subject-masked loss (sc-24828,
+        // a per-(item, bucket) weight map cached next to each latent, applied by `reduce_loss`),
+        // and the body losses (sc-24832: ViTPose proportion, HybrIK shape, Sapiens normals) on the
+        // same perceptual path through the `mlx-gen-perceptual` builder's arms.
+        // sc-24833: the VAE anchor (TAEF1 decode → FLUX.2 encoder taps) and E-LatentLPIPS (the
+        // FLUX.1 16-channel family weights) through the shared aux-loss builder.
+        techniques: gen_core::train::TrainingTechniques {
+            resolution_buckets: true,
+            depth_anchoring: true,
+            subject_mask_loss: true,
+            // sc-24831: the ArcFace identity + FaceMesh landmark losses, picked up through the
+            // same shared perceptual builder arms (no trainer-loop change).
+            identity_loss: true,
+            face_landmark_loss: true,
+            body_proportion_loss: true,
+            body_shape_loss: true,
+            normal_loss: true,
+            vae_anchor_loss: true,
+            latent_lpips_loss: true,
+            // sc-25213: the de-distill training adapter, merged into the frozen base for the
+            // training forward/backward and cancelled for previews (`crate::training_adapter`).
+            training_adapter: true,
+            ..gen_core::train::TrainingTechniques::ADAPTER_NOISE
+        },
     }
 }
 
 /// Construct the trainer from a snapshot directory (the diffusers multi-component tree). No
 /// quantization — training needs the dense base. Registered via [`mlx_gen::TrainerRegistration`].
+///
+/// The weights load lazily (sc-2124): construction only checks the spec, so `validate` and `train`'s
+/// refusal floors never read weights; see [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer).
 pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(mlx_gen::Error::Msg(
-                "z_image_turbo trainer expects a snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
-    };
-    Ok(Box::new(ZImageTurboTrainer {
+    snapshot_root(spec)?;
+    Ok(Box::new(
+        mlx_gen::train::lazy::LazyTrainer::new(trainer_descriptor(), validate_floors, {
+            let spec = spec.clone();
+            move || load_weights(&spec)
+        })
+        .validating_on_base_when(mlx_gen::train::lazy::custom_targets),
+    ))
+}
+
+/// The snapshot directory a trainer spec names — a single `.safetensors` file is refused.
+fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(mlx_gen::Error::Msg(
+            "z_image_turbo trainer expects a snapshot directory (tokenizer/ text_encoder/ \
+             transformer/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
+fn load_weights(spec: &LoadSpec) -> Result<ZImageTurboTrainer> {
+    let root = snapshot_root(spec)?;
+    Ok(ZImageTurboTrainer {
         descriptor: trainer_descriptor(),
         tokenizer: crate::loader::load_tokenizer(root)?,
         text_encoder: Some(crate::loader::load_text_encoder(root)?),
         vae: crate::loader::load_vae(root)?,
         transformer: crate::loader::load_transformer(root)?,
-    }))
+        training_adapter: None,
+    })
 }
 
 // The trainer registration constant bridges the crate's rich `Result` into backend-neutral
@@ -225,20 +281,29 @@ fn validate_request(req: &TrainingRequest) -> Result<()> {
     Ok(())
 }
 
+/// Every weights-free [`Trainer::validate`] floor — all of it but the target-module match.
+fn validate_floors(descriptor: &TrainerDescriptor, req: &TrainingRequest) -> gen_core::Result<()> {
+    // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+    // request (typed `Unsupported`) rather than silently training a plain adapter.
+    gen_core::train::validate_control_request(descriptor, req)?;
+    // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
+    // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
+    gen_core::train::validate_full_finetune_request(descriptor, req)?;
+    // Shared training-technique floor (epic 2123 E3): a technique this trainer does not
+    // declare (e.g. `weight_noise_sigma > 0`) is a typed refusal, never silently ignored.
+    gen_core::train::validate_training_techniques(descriptor, req)?;
+    gen_core::train::validate_edit_request(descriptor, req)?;
+    validate_request(req)?;
+    Ok(())
+}
+
 impl Trainer for ZImageTurboTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
-        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
-        // request (typed `Unsupported`) rather than silently training a plain adapter.
-        gen_core::train::validate_control_request(self.descriptor(), req)?;
-        // Shared full-base-fine-tune floor (sc-14056): an adapter-only trainer must reject a
-        // `full_finetune` request (typed `Unsupported`) rather than silently training a LoRA.
-        gen_core::train::validate_full_finetune_request(self.descriptor(), req)?;
-        gen_core::train::validate_edit_request(self.descriptor(), req)?;
-        validate_request(req)?;
+        validate_floors(self.descriptor(), req)?;
         // Non-default `lora_target_modules` that match no adaptable module on the DiT would resolve
         // to an empty target set — a full-length run that trains zero parameters yet "succeeds"
         // (F-041). Catch it here, where the loaded DiT is available to match suffixes against.
@@ -258,6 +323,9 @@ impl Trainer for ZImageTurboTrainer {
         req: &TrainingRequest,
         on_progress: &mut dyn FnMut(TrainingProgress),
     ) -> gen_core::Result<TrainingOutput> {
+        // Epic 2123 E3: refuse an unsupported technique at the `train` entry point too, before
+        // any loading/caching — a caller that skips `validate` must not get it silently ignored.
+        gen_core::train::validate_training_techniques(self.descriptor(), req)?;
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -273,7 +341,10 @@ impl ZImageTurboTrainer {
         self.validate(req)?;
         let cfg = &req.config;
         on_progress(TrainingProgress::Preparing);
-        let edge = bucket_resolution(cfg.resolution);
+        // sc-2127 — one training edge per resolution bucket (just `[resolution]` when buckets are
+        // off). Memory guards and previews size for the largest (epic 2123 E7).
+        let edges = bucket_edges(cfg);
+        let edge = preflight_edge(&edges);
 
         // sc-4887 — training compute dtype. bf16 halves the activation working set (and the resident
         // base) and is the ecosystem-standard mixed precision; the trainable factors / loss / grads /
@@ -303,18 +374,38 @@ impl ZImageTurboTrainer {
         // BEFORE the (~minutes-long) latent caching — when gradient checkpointing is not enabled.
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
-        if !will_checkpoint {
-            preflight_memory_guard(edge, use_bf16)?;
+        // Epic 2123 E7: the training-time auxiliary models (TAEF1 + Depth-Anything-V2) count
+        // against the budget on BOTH paths — the default Z-Image preset trains checkpointed, so a
+        // dense-only check would let a depth job skip admission entirely.
+        // One cached depth reference per (item, bucket) entry, sized here at the largest edge.
+        // sc-25213: the training adapter's preview-cancel factors stay resident once the first
+        // preview renders, so they count too (0 without an adapter or without previews).
+        let aux_gb = perceptual_footprint_gb(cfg, edge, req.items.len() * edges.len())
+            + training_adapter_preview_gb(cfg)?;
+        if !will_checkpoint || aux_gb > 0.0 {
+            preflight_memory_guard(cfg, edge, use_bf16, aux_gb, will_checkpoint)?;
         }
 
-        if use_bf16 {
-            self.transformer.cast_weights(Dtype::Bfloat16)?;
-        }
+        // sc-25213: merge the training adapter (before any caching, so an unreadable adapter fails
+        // fast), then cast to the compute dtype. Off ⇒ exactly the pre-sc-25213 cast.
+        prepare_training_base(
+            &mut self.training_adapter,
+            &mut self.transformer,
+            cfg,
+            use_bf16,
+        )?;
+
+        // Epic 2123 depth anchoring (sc-2125): load the frozen TAEF1 decoder + Depth-Anything-V2
+        // before the (minutes-long) caching pass, so a missing/corrupt aux checkpoint fails fast.
+        let perceptual = load_perceptual_path(cfg)?;
 
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
-        let mut cache: Vec<(Array, Array)> = Vec::with_capacity(req.items.len());
+        // Item-major: `cache[item * edges.len() + bucket]` (sc-2127). Each entry: clean latent,
+        // caption embeds, and (subject-masked loss, sc-24828) that bucket's latent loss-weight map
+        // — `None` when the technique is off.
+        let mut cache: Vec<CacheEntry> = Vec::with_capacity(req.items.len() * edges.len());
         for (i, item) in req.items.iter().enumerate() {
             if req.cancel.is_cancelled() {
                 break;
@@ -324,7 +415,12 @@ impl ZImageTurboTrainer {
                 total,
             });
             let img = center_crop_square(&decode_image(&item.image_path)?);
-            let x0 = encode_init_latents(&self.vae, &img, edge, edge)?; // clean latent [16,1,h,w]
+            // sc-24828: the item's subject mask is read + checked once, then resampled per bucket.
+            let mask = PreparedSubjectMask::load_if_enabled(
+                "z_image_turbo trainer",
+                item,
+                cfg.subject_mask_loss.as_ref(),
+            )?;
             let text_encoder = self.text_encoder.as_ref().ok_or_else(|| {
                 mlx_gen::Error::Msg(
                     "z_image_turbo trainer: text encoder already freed (caching after train loop)"
@@ -339,8 +435,15 @@ impl ZImageTurboTrainer {
                 // Trainers never select a memory rung: the resident encoder is the training path.
                 None,
             )?;
-            eval([&x0, &cap])?;
-            cache.push((x0, cap));
+            eval([&cap])?;
+            // clean latent [16,1,h,w] per bucket edge
+            cache_item_buckets(
+                &edges,
+                mask.as_ref(),
+                &cap,
+                |edge| encode_init_latents(&self.vae, &img, edge, edge),
+                &mut cache,
+            )?;
         }
         if cache.is_empty() {
             // sc-4895 — disambiguate the two ways the cache ends up empty. A cancel tripped during
@@ -352,6 +455,21 @@ impl ZImageTurboTrainer {
             }
             return Err("z_image_turbo trainer: no usable dataset items".into());
         }
+
+        // Epic 2123 E8: each image's perceptual reference (TAEF1 decode of its cached clean latent →
+        // DA2 depth) is computed exactly once per job, by the `AuxDriver` before the loop.
+        // sc-24832: the job's subject masks (restricted normal loss) reach every reference,
+        // cropped like the image and resampled onto its decoded size.
+        let aux_masks = match perceptual {
+            Some(_) => mlx_gen::train::subject_mask::PerceptualSubjectMasks::load(
+                "z_image_turbo trainer",
+                &req.items,
+                cfg,
+                edges.len(),
+                CropBox::center_square,
+            )?,
+            None => None,
+        };
 
         // sc-5637 — pre-encode the preview-sample prompts while the Qwen encoder is still resident
         // (it is freed just below, sc-4952). Each `sample_every` cadence reuses these cached cap
@@ -507,6 +625,24 @@ impl ZImageTurboTrainer {
         }
 
         // --- train loop ---
+        // sc-2127: which cached (item, bucket) latent each step trains on (round-robin over items
+        // for a single bucket — the pre-bucket order; a seeded per-epoch shuffle otherwise).
+        let schedule =
+            BucketSchedule::new(cache.len() / edges.len(), &cfg.training_buckets(), cfg.seed);
+        // Epic 2123 E8: the perceptual alternation interleaves optimizer windows over the
+        // schedule's epochs (sc-2124) — a pure function of the step, so a resumed run needs no
+        // replay.
+        let mut aux_driver = match perceptual {
+            Some(path) => Some(aux_driver(
+                path,
+                &cache,
+                aux_masks,
+                &schedule,
+                accum,
+                &req.cancel,
+            )?),
+            None => None,
+        };
         let mut accumulated: Option<LoraParams> = None;
         let mut last_loss = 0.0f32;
         let mut steps_run = start_step;
@@ -514,35 +650,20 @@ impl ZImageTurboTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
-            let sigma = sample_sigma(
-                &cfg.timestep_type,
-                &cfg.timestep_bias,
-                cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
-            )?;
-            let noise = random::normal::<f32>(
-                x0.shape(),
-                None,
-                None,
-                Some(&random::key(
-                    cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
-                )?),
-            )?;
-            let (loss, grads) = compute_loss_grads(
+            let (losses, grads) = run_train_step(
                 &mut self.transformer,
                 &params,
                 &adapter,
-                alpha,
-                rank,
-                x0,
-                cap,
-                sigma,
-                &noise,
+                cfg,
+                &cache,
+                &schedule,
+                aux_driver.as_mut(),
+                step,
                 mae,
                 checkpoint_main,
                 compute_dtype,
             )?;
-            last_loss = loss;
+            last_loss = losses.total;
             steps_run = step;
             accumulate_grads(&mut accumulated, grads)?;
 
@@ -564,13 +685,7 @@ impl ZImageTurboTrainer {
                         .expect("an update fires only after accumulation"),
                     window,
                 )?;
-                let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
-                let clipped: LoraParams = clipped
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into_owned()))
-                    .collect();
-                opt.step(&mut params, &clipped)?;
-                eval(params.values())?;
+                optimizer_update(&mut opt, &mut params, &avg, cfg, update_idx)?;
                 update_idx += 1;
             }
 
@@ -604,6 +719,12 @@ impl ZImageTurboTrainer {
                         lora_dtype,
                         LOKR_DTYPE,
                     )?;
+                    // sc-25213: previews render as the user will see the LoRA — on the bare
+                    // distilled base, so the merged training adapter is cancelled for the render
+                    // and restored before the next step.
+                    if let Some(merged) = self.training_adapter.as_mut() {
+                        merged.push_cancel(&mut self.transformer)?;
+                    }
                     let total = sample_caps.len() as u32;
                     for (i, (prompt, cap)) in sample_caps.iter().enumerate() {
                         if req.cancel.is_cancelled() {
@@ -643,6 +764,9 @@ impl ZImageTurboTrainer {
                             ),
                         }
                     }
+                    if let Some(merged) = &self.training_adapter {
+                        merged.pop_cancel(&mut self.transformer)?;
+                    }
                 }
             }
         }
@@ -677,6 +801,265 @@ impl ZImageTurboTrainer {
     }
 }
 
+/// The frozen base a run trains on (sc-25213): the training adapter merged in at its loaded
+/// precision (one rounding of `W + Δ`, see [`merge_training_adapter`]), THEN the bf16 compute cast
+/// — ai-toolkit's order. Merging after the cast would round the delta, and the sum, onto an
+/// already-rounded bf16 weight, losing sub-half-ulp delta entries. Without an adapter this is
+/// exactly the pre-sc-25213 cast.
+fn prepare_training_base(
+    merged: &mut Option<MergedTrainingAdapter>,
+    transformer: &mut ZImageTransformer,
+    cfg: &TrainingConfig,
+    use_bf16: bool,
+) -> Result<()> {
+    apply_training_adapter(merged, transformer, cfg)?;
+    if use_bf16 {
+        transformer.cast_weights(Dtype::Bfloat16)?;
+    }
+    Ok(())
+}
+
+/// Resident memory (GB) the training adapter's preview-cancel factors hold once previews render
+/// (sc-25213, epic 2123 E7): the adapter file's size when the run has both an adapter and preview
+/// sampling, else `0`. An unreadable adapter file is an error naming it.
+fn training_adapter_preview_gb(cfg: &TrainingConfig) -> Result<f64> {
+    let previews = cfg.sample_every > 0 && !cfg.sample_prompts.is_empty();
+    match (&cfg.training_adapter, previews) {
+        (Some(file), true) => {
+            let bytes = std::fs::metadata(file)
+                .map_err(|e| {
+                    mlx_gen::Error::Msg(format!(
+                        "training adapter {} could not be read: {e}",
+                        file.display()
+                    ))
+                })?
+                .len();
+            Ok(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
+        _ => Ok(0.0),
+    }
+}
+
+/// Bring the DiT's frozen base in line with `cfg.training_adapter` (sc-25213): merge it on the
+/// first run that names it; a later run on the same trainer instance must name the same file (the
+/// merge cannot be undone without the bare weights, which are not kept) — anything else is refused
+/// with a reload instruction. `None` on an unmerged instance is a no-op: the base is untouched.
+fn apply_training_adapter(
+    merged: &mut Option<MergedTrainingAdapter>,
+    transformer: &mut ZImageTransformer,
+    cfg: &TrainingConfig,
+) -> Result<()> {
+    match (merged.as_ref(), &cfg.training_adapter) {
+        (None, None) => Ok(()),
+        (None, Some(file)) => {
+            *merged = Some(merge_training_adapter(transformer, file)?);
+            Ok(())
+        }
+        (Some(m), Some(file)) if &m.file == file => Ok(()),
+        (Some(m), requested) => Err(format!(
+            "z_image_turbo trainer: this trainer instance's base already carries the training \
+             adapter {} from a previous run, but this run asks for {}; reload the trainer",
+            m.file.display(),
+            requested
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |p| p.display().to_string())
+        )
+        .into()),
+    }
+}
+
+/// One real optimizer update over the (already window-averaged) adapter gradients — the shared
+/// [`adapter_optimizer_update`]: clip to unit global norm, epic 2123 gradient noise (sc-24827),
+/// step the optimizer, materialize the factors, then weight noising (sc-24826), both seeded from
+/// `(cfg.seed, update_idx)`. Only ever called once per *update* (never per gradient-accumulation
+/// micro-step), and only `params` (adapter factors) is touched — the frozen base weights live in
+/// the transformer and are not reachable from here. With both techniques off this is exactly the
+/// pre-epic-2123 update (clip → step → eval).
+fn optimizer_update(
+    opt: &mut TrainOptimizer,
+    params: &mut LoraParams,
+    avg_grads: &LoraParams,
+    cfg: &TrainingConfig,
+    update_idx: u32,
+) -> Result<()> {
+    adapter_optimizer_update(opt, params, avg_grads, cfg, update_idx, cfg.seed)
+}
+
+/// The per-step loss breakdown [`compute_loss_grads`] returns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StepLosses {
+    /// The differentiated step loss.
+    total: f32,
+    /// The diffusion (velocity-regression) term, `None` on an aux-only step (it contributed zero).
+    diffusion: Option<f32>,
+    /// The weighted aux-loss term, `None` when no aux loss contributed this step.
+    aux: Option<f32>,
+}
+
+/// One aux-loss step's view of the trainer's [`PerceptualPath`].
+struct AuxStep<'a> {
+    path: &'a PerceptualPath,
+    plan: &'a StepPlan,
+    /// Dataset index of this step's image (selects its cached reference).
+    image: usize,
+}
+
+/// Build the epic-2123 perceptual path from the config: `None` when no aux loss is enabled (the
+/// default — nothing is loaded and every step is the plain diffusion step). The floor
+/// ([`gen_core::train::validate_training_techniques`]) has already required both directories.
+fn load_perceptual_path(cfg: &TrainingConfig) -> Result<Option<PerceptualPath>> {
+    mlx_gen_perceptual::build_perceptual_path(cfg, &aux_loss_context())
+}
+
+/// Z-Image's latent family for the shared aux-loss builder (epic 2123 E8): the FLUX.1 16-channel
+/// VAE latent, decoded by TAEF1.
+fn aux_loss_context() -> mlx_gen_perceptual::AuxLossContext<'static> {
+    mlx_gen_perceptual::AuxLossContext {
+        label: "z_image_turbo trainer",
+        decoder: taef1_decoder(),
+        latent_lpips: Some(gen_core::train::LatentLpipsFamily::Flux),
+    }
+}
+
+fn taef1_decoder() -> mlx_gen_perceptual::DecoderSpec {
+    mlx_gen_perceptual::DecoderSpec::Tiny {
+        name: "TAEF1",
+        config: TinyDecoderConfig::taef1().into(),
+    }
+}
+
+/// One `train_impl` cache entry (item-major, `cache[item * n_buckets + bucket]`, sc-2127): the
+/// clean latent, the caption embeds, and — subject-masked loss on (sc-24828) — that bucket's latent
+/// loss-weight map, the same shape as the latent.
+type CacheEntry = (Array, Array, Option<Array>);
+
+/// Append one item's cache entries, one per bucket edge (item-major, sc-2127): `encode(edge)` is
+/// the bucket's clean latent, and — sc-24828 — its loss-weight map is the item's already-loaded
+/// mask cropped with the center square `center_crop_square` cut, area-averaged onto THIS bucket's
+/// latent grid and broadcast to that latent's shape (`None` when masked loss is off).
+fn cache_item_buckets(
+    edges: &[u32],
+    mask: Option<&PreparedSubjectMask>,
+    cap: &Array,
+    mut encode: impl FnMut(u32) -> Result<Array>,
+    cache: &mut Vec<CacheEntry>,
+) -> Result<()> {
+    for &edge in edges {
+        let x0 = encode(edge)?;
+        let mask_weight = prepared_subject_mask_weight(
+            "z_image_turbo trainer",
+            mask,
+            CropBox::center_square,
+            x0.shape(),
+        )?;
+        eval([&x0])?;
+        cache.push((x0, cap.clone(), mask_weight));
+    }
+    Ok(())
+}
+
+/// The loop's [`AuxDriver`] (epic 2123 E8): every cached entry's perceptual reference computed once
+/// (its clean `[C, 1, h, w]` latent, unpacked to the decoder's NCHW layout), the alternation over
+/// the schedule's epochs with `accum` micro-steps per update. Hands the path the job's subject
+/// masks first (sc-24832), so a mask-reading loss gets each entry's item mask on its decoded grid.
+fn aux_driver(
+    mut path: PerceptualPath,
+    cache: &[CacheEntry],
+    masks: Option<mlx_gen::train::subject_mask::PerceptualSubjectMasks>,
+    schedule: &BucketSchedule,
+    accum: u32,
+    cancel: &mlx_gen::gen_core::runtime::CancelFlag,
+) -> Result<AuxDriver> {
+    path.attach_subject_masks(masks);
+    AuxDriver::prepare(
+        path,
+        cache.len(),
+        |i| crate::pipeline::unpack_latents(&cache[i].0),
+        schedule,
+        accum,
+        cancel,
+    )
+}
+
+/// Extra training memory (GB) the enabled perceptual losses add at the bucketed `edge` — the
+/// TAEF1 decoder + the selected Depth-Anything-V2 (resident f32 weights and one differentiable
+/// forward/backward each) plus the cached per-image depth references (epic 2123 E7). `0` when
+/// depth anchoring is off.
+fn perceptual_footprint_gb(cfg: &TrainingConfig, edge: u32, images: usize) -> f64 {
+    mlx_gen_perceptual::perceptual_footprint_gb(
+        cfg,
+        &taef1_decoder(),
+        mlx_gen_perceptual::AuxGeometry::image(edge, images),
+    )
+}
+
+/// One training micro-step on the 1-based `step`: pick the step's cached item, sample its σ and
+/// noise (seeded, exactly as before epic 2123), plan the step's loss terms through the perceptual
+/// path (when one is configured: the alternation key comes from the step's optimizer window, and
+/// an aux-only step trains at σ remapped into the loss window), and run [`compute_loss_grads`].
+/// With no perceptual path every step is the plain diffusion step, bit-identical to the
+/// pre-epic-2123 loop.
+#[allow(clippy::too_many_arguments)]
+fn run_train_step(
+    transformer: &mut ZImageTransformer,
+    params: &LoraParams,
+    adapter: &TrainAdapter,
+    cfg: &TrainingConfig,
+    cache: &[CacheEntry],
+    schedule: &BucketSchedule,
+    perceptual: Option<&mut AuxDriver>,
+    step: u32,
+    mae: bool,
+    checkpoint_main: Option<&[Vec<String>]>,
+    compute_dtype: Dtype,
+) -> Result<(StepLosses, LoraParams)> {
+    // sc-2127: the step's (item, bucket) from the bucket schedule. The perceptual references are
+    // keyed per cache entry (item, bucket) — each bucket's clean latent decodes to its own size —
+    // while the alternation is keyed on the step's window.
+    let sample = step_sample(perceptual, step, schedule);
+    let entry = sample.entry;
+    let (x0, cap, mask_weight) = &cache[entry];
+    let mut sigma = sample_sigma(
+        &cfg.timestep_type,
+        &cfg.timestep_bias,
+        cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(step as u64),
+    )?;
+    let noise = random::normal::<f32>(
+        x0.shape(),
+        None,
+        None,
+        Some(&random::key(
+            cfg.seed.wrapping_add(step as u64).wrapping_mul(2) + 1,
+        )?),
+    )?;
+    let planned = sample.plan(sigma)?;
+    if let Some(p) = &planned {
+        sigma = p.plan.noise_level;
+    }
+    let aux = planned.as_ref().map(|p| AuxStep {
+        path: p.path,
+        plan: &p.plan,
+        image: p.entry,
+    });
+    compute_loss_grads(
+        transformer,
+        params,
+        adapter,
+        cfg.alpha,
+        cfg.rank as f32,
+        x0,
+        cap,
+        sigma,
+        &noise,
+        mae,
+        // sc-24828: the weight cached in the SAME (item, bucket) slot as `x0`.
+        mask_weight.as_ref(),
+        checkpoint_main,
+        compute_dtype,
+        aux,
+    )
+}
+
 /// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, as a function of the
 /// unified token count `s` — an empirical fit to peaks measured on the 128 GB target.
 ///
@@ -703,30 +1086,86 @@ fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
     }
 }
 
+/// The checkpointed DiT baseline the auxiliary-model guard stacks on: the resident-base term of
+/// [`projected_dense_peak_gb`] (block checkpointing removes most of the activation terms; the base
+/// weights stay). A lower bound — measured block-checkpointed bf16 at 1024 is ~23 GB.
+fn checkpointed_baseline_gb(bf16: bool) -> f64 {
+    projected_dense_peak_gb(0.0, bf16)
+}
+
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. `edge` is the bucketed training
 /// edge; the unified token count is ≈ `(edge/16)²` (latent /8, patch 2) plus the small padded
 /// caption block. The budget is MLX's own reported memory limit (≈ the device's recommended working
 /// set), scaled by 0.85 to leave headroom for the worker/host — exceeding it is the regime where the
-/// dense run was observed to die. Only consulted when gradient checkpointing is OFF.
-fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
+/// dense run was observed to die. Consulted when gradient checkpointing is OFF, and — whenever the
+/// training-time auxiliary models add memory — when it is on too. `extra_gb` is those models'
+/// footprint ([`perceptual_footprint_gb`], epic 2123 E7), added on top of the DiT projection. With
+/// `checkpointed`, the DiT projection is [`checkpointed_baseline_gb`] (no fitted checkpointed curve
+/// exists, so the resident base is the lower bound the auxiliary models stack on).
+fn preflight_memory_guard(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+) -> Result<()> {
+    preflight_memory_guard_with_budget(cfg, edge, bf16, extra_gb, checkpointed, get_memory_limit())
+}
+
+/// The edge the memory pre-flight (and the preview render) sizes for: the largest bucket edge
+/// (epic 2123 E7, sc-2127) — a bucketed run's peak is its largest latent.
+fn preflight_edge(edges: &[u32]) -> u32 {
+    edges.iter().copied().max().unwrap_or(0)
+}
+
+/// [`preflight_memory_guard`] against an explicit memory budget (`budget_bytes`, the live MLX limit
+/// in production) — so the guard's arithmetic is testable on any host. A checkpointed refusal goes
+/// through the shared [`mlx_gen_perceptual::check_aux_memory`], naming `cfg`'s enabled aux losses.
+fn preflight_memory_guard_with_budget(
+    cfg: &TrainingConfig,
+    edge: u32,
+    bf16: bool,
+    extra_gb: f64,
+    checkpointed: bool,
+    budget_bytes: usize,
+) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     // The padded caption block can reach the model's max prompt length (~512 tokens), not just the
     // 32-token padding granularity; under-counting it lets a near-threshold long-prompt dense run slip
     // past this guard into a SIGKILL instead of the catchable error. Use a conservative cap (F-057).
     let s = tokens_per_side * tokens_per_side + (512.0 + 32.0);
-    let projected = projected_dense_peak_gb(s, bf16);
-    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let projected = if checkpointed {
+        checkpointed_baseline_gb(bf16)
+    } else {
+        projected_dense_peak_gb(s, bf16)
+    } + extra_gb;
+    let budget_gb = budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let safe = budget_gb * 0.85;
+    if checkpointed {
+        return mlx_gen_perceptual::check_aux_memory(
+            "z_image_turbo trainer",
+            cfg,
+            &format!("a checkpointed training step at resolution {edge}"),
+            extra_gb,
+            projected,
+            safe,
+            &format!("{budget_gb:.0} GB MLX limit × 0.85"),
+        );
+    }
     if projected > safe {
-        return Err(format!(
-            "z_image_turbo trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
-             (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
-             safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
-             worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
-             Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
-        )
-        .into());
+        return Err(mlx_gen_perceptual::name_aux_losses(
+            format!(
+                "z_image_turbo trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+                 (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
+                 safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
+                 worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
+                 Checkpointing (recomputes block activations in the backward) or reduce the training resolution."
+            )
+            .into(),
+            cfg,
+            extra_gb,
+        ));
     }
     Ok(())
 }
@@ -805,7 +1244,11 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
 /// DiT, regress the (already-negated) `forward()` output toward the velocity `noise - x0`, return
-/// `(loss, grads)`.
+/// the step's loss breakdown and the grads of its total.
+/// `aux` (epic 2123 E8) carries the step's [`StepPlan`]: on an aux-only step the diffusion term is
+/// not computed (it contributes zero) and the loss is the weighted perceptual term on the model's
+/// x0 estimate `x_t − σ·v`; with `aux = None` (or a diffusion-only plan with no aux loss) the
+/// traced graph is exactly the pre-epic-2123 one.
 /// `checkpoint_main`, when `Some`, lists per-main-block LOCAL LoRA target paths and switches the
 /// forward to the gradient-checkpointed path (sc-4874) — each main block recomputes its activations
 /// in the backward instead of retaining them. `None` runs the dense (activation-retaining) forward.
@@ -824,11 +1267,18 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    mask_weight: Option<&Array>,
     checkpoint_main: Option<&[Vec<String>]>,
     dtype: Dtype,
-) -> Result<(f32, LoraParams)> {
-    let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
-    let x_t = x_t.as_dtype(dtype)?; // no-op in f32 mode
+    aux: Option<AuxStep<'_>>,
+) -> Result<(StepLosses, LoraParams)> {
+    let (x_t_f32, target, timestep) = build_batch(x0, noise, sigma)?;
+    let mask_weight = mask_weight.cloned();
+    let x_t = x_t_f32.as_dtype(dtype)?; // no-op in f32 mode
+    let (diffusion_on, aux_on) = match &aux {
+        Some(a) => (a.plan.diffusion, !a.plan.aux.is_empty()),
+        None => (true, false),
+    };
     let capf = cap.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
@@ -861,18 +1311,44 @@ fn compute_loss_grads(
                 .forward_with(&prep, &x_t, timestep)
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
-        let diff = subtract(&v, &target)?;
-        // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
-        let loss = if mae {
-            diff.abs()?.mean(None)?
+        let diffusion = if diffusion_on {
+            let diff = subtract(&v, &target)?;
+            // MSE / MAE, subject-mask weighted when on (sc-24828) — reduces to a 0-d scalar (grad
+            // requires a scalar cotangent).
+            Some(reduce_loss(&diff, mask_weight.as_ref(), mae)?)
         } else {
-            diff.square()?.mean(None)?
+            None
         };
-        Ok(vec![loss])
+        let aux_term = match &aux {
+            Some(a) if aux_on => {
+                // x0 estimate in f32 from the (already-negated) velocity: x0 = x_t − σ·v.
+                let x0_hat = Parameterization::FlowNoiseMinusX0 { sigma }
+                    .recover_x0(&x_t_f32, &v.as_dtype(Dtype::Float32)?)
+                    .and_then(|x| crate::pipeline::unpack_latents(&x))
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                a.path
+                    .aux_loss(a.plan, a.image, &x0_hat)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+                    .map(|t| t.weighted)
+            }
+            _ => None,
+        };
+        // Only the first output is differentiated; the other two are reported terms.
+        let zero = || Array::from_f32(0.0);
+        let d_out = diffusion.clone().unwrap_or_else(zero);
+        let a_out = aux_term.clone().unwrap_or_else(zero);
+        let total =
+            combine_step_loss(diffusion, aux_term).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(vec![total, d_out, a_out])
     };
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
-    Ok((val[0].item::<f32>(), grads))
+    let losses = StepLosses {
+        total: val[0].item::<f32>(),
+        diffusion: diffusion_on.then(|| val[1].item::<f32>()),
+        aux: aux_on.then(|| val[2].item::<f32>()),
+    };
+    Ok((losses, grads))
 }
 
 // ===========================================================================================
@@ -983,9 +1459,12 @@ mod first_step_repro {
             0.5,
             &noise,
             false,
+            None,
             checkpoint_main,
             dtype,
+            None,
         )?;
+        let loss = loss.total;
         // `compute_loss_grads` only forces the loss (forward). The real trainer forces the backward
         // at the step-1 optimizer `eval`; do the same here so the peak reflects the true working set.
         eval(grads.values())?;
@@ -1033,6 +1512,7 @@ mod first_step_repro {
             text_encoder: Some(crate::loader::load_text_encoder(&root).unwrap()),
             vae: crate::loader::load_vae(&root).unwrap(),
             transformer: crate::loader::load_transformer(&root).unwrap(),
+            training_adapter: None,
         };
         let cfg = TrainingConfig {
             rank: 16,
@@ -1094,7 +1574,9 @@ mod first_step_repro {
                 &noise,
                 false,
                 None,
+                None,
                 Dtype::Float32,
+                None,
             )
             .unwrap();
             // `loss.item()` inside `compute_loss_grads` already forced the FORWARD graph.
@@ -1246,8 +1728,10 @@ mod first_step_repro {
                 0.5,
                 &noise,
                 false,
+                None,
                 ck,
                 Dtype::Float32,
+                None,
             )
             .unwrap();
             eval(g.values()).unwrap();
@@ -1310,7 +1794,9 @@ mod first_step_repro {
                 &noise,
                 false,
                 None,
+                None,
                 Dtype::Float32,
+                None,
             )
             .unwrap();
             eval(g.values()).unwrap();
@@ -1429,11 +1915,13 @@ mod first_step_repro {
                 &noise,
                 false,
                 None,
+                None,
                 dt,
+                None,
             )
             .unwrap();
             eval(g.values()).unwrap();
-            (l, g)
+            (l.total, g)
         };
         let (f32_loss, g_f32) = grads_of(&mut trainer, Dtype::Float32);
 
@@ -1585,6 +2073,7 @@ mod validate_request_tests {
                     control_image_path: None,
                     model_options: Default::default(),
                     reference_image_paths: Vec::new(),
+                    subject_mask_path: None,
                 })
                 .collect(),
             config: TrainingConfig {
@@ -1632,5 +2121,1727 @@ mod validate_request_tests {
         assert!(with(|c| c.loss_type = "L1".into()).is_ok());
         // A default request (sigmoid / balanced / mse) is accepted.
         assert!(validate_request(&request(1, 100, 16)).is_ok());
+    }
+}
+
+/// sc-24826 (epic 2123 weight noising) — the Z-Image optimizer-update seam on a tiny synthetic
+/// adapter host: real `build_lora_targets`/`build_lokr_targets` factors, a real `TrainOptimizer`, and
+/// the same [`optimizer_update`] `train_impl` calls. Seconds, < 1 MB.
+#[cfg(test)]
+mod weight_noise_update_tests {
+    use super::*;
+    use mlx_gen::adapters::AdaptableLinear;
+    use mlx_rs::optimizers::clip_grad_norm;
+
+    struct OneLin(AdaptableLinear);
+    impl AdaptableHost for OneLin {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            (path == ["to_q"]).then_some(&mut self.0)
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec!["to_q".to_string()]
+        }
+    }
+
+    fn host() -> OneLin {
+        let w =
+            random::normal::<f32>(&[64, 64], None, None, Some(&random::key(3).unwrap())).unwrap();
+        OneLin(AdaptableLinear::dense(w, None))
+    }
+
+    fn base_weight(h: &OneLin) -> Vec<f32> {
+        let (w, _) = h.0.dense_weight().expect("dense host");
+        eval([w]).unwrap();
+        w.as_slice::<f32>().to_vec()
+    }
+
+    fn vals(a: &Array) -> Vec<f32> {
+        eval([a]).unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+    }
+
+    /// Fixed synthetic gradients for every factor (sorted keys ⇒ deterministic).
+    fn grads(params: &LoraParams, update: u32) -> LoraParams {
+        let mut keys: Vec<_> = params.keys().cloned().collect();
+        keys.sort();
+        keys.into_iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let key = random::key(1000 + 31 * update as u64 + i as u64).unwrap();
+                let g = random::normal::<f32>(params[&k].shape(), None, None, Some(&key)).unwrap();
+                (k, g)
+            })
+            .collect()
+    }
+
+    fn setup(kind: NetworkType) -> (OneLin, TrainAdapter, LoraParams) {
+        let mut h = host();
+        let paths = vec!["to_q".to_string()];
+        let (adapter, params) = match kind {
+            NetworkType::Lora => {
+                let (t, p) = build_lora_targets(&mut h, &paths, 8, 7).unwrap();
+                (TrainAdapter::Lora { targets: t }, p)
+            }
+            NetworkType::Lokr => {
+                let (t, p) = build_lokr_targets(&mut h, &paths, 8, -1, 7).unwrap();
+                (TrainAdapter::Lokr { targets: t }, p)
+            }
+        };
+        (h, adapter, params)
+    }
+
+    fn run(kind: NetworkType, sigma: f32, updates: u32) -> (LoraParams, Vec<f32>, Vec<f32>) {
+        let (mut h, adapter, mut params) = setup(kind);
+        let base_before = base_weight(&h);
+        let cfg = TrainingConfig {
+            seed: 7,
+            weight_noise_sigma: sigma,
+            ..Default::default()
+        };
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
+        for u in 0..updates {
+            let g = grads(&params, u);
+            optimizer_update(&mut opt, &mut params, &g, &cfg, u).unwrap();
+            // Install exactly as a train step does — the base must survive it untouched.
+            adapter
+                .install(&mut h, &params, 8.0, 8.0, LOKR_DTYPE)
+                .unwrap();
+        }
+        (params, base_before, base_weight(&h))
+    }
+
+    /// AC1: a sigma-0.0125 update differs from the sigma-0 update by noise whose RMS is
+    /// `sigma · rms(w)` per adapter tensor (LoRA A/B and every LoKr factor), and the base weight is
+    /// bit-identical before and after training.
+    #[test]
+    fn sigma_noise_is_rms_relative_per_adapter_tensor_and_base_is_untouched() {
+        let sigma = 0.0125f32;
+        for kind in [NetworkType::Lora, NetworkType::Lokr] {
+            let (clean, _, _) = run(kind, 0.0, 1);
+            let (noisy, base_before, base_after) = run(kind, sigma, 1);
+            assert_eq!(base_before, base_after, "{kind:?}: base weight changed");
+            assert_eq!(clean.len(), noisy.len());
+            for (k, c) in &clean {
+                let c = vals(c);
+                let n = vals(&noisy[k]);
+                let delta: Vec<f32> = c.iter().zip(&n).map(|(a, b)| b - a).collect();
+                let ratio = rms(&delta) / (sigma as f64 * rms(&c));
+                assert!(
+                    (0.8..1.2).contains(&ratio),
+                    "{kind:?} {k}: delta rms / (sigma·rms(w)) = {ratio} (n={})",
+                    c.len()
+                );
+            }
+        }
+    }
+
+    /// Two SEPARATE Metal executions of the same seeded update graph agree only to a few ulps
+    /// (Metal reductions are not bit-deterministic across runs), so they are compared within
+    /// `1e-6 + 1e-5·max|want|`; the guarded mutations (noise in an "off" update, a drifting noise
+    /// seed) move values by orders of magnitude more.
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        let scale = want.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tol = 1e-6 + 1e-5 * scale;
+        let diff = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff <= tol, "{what}: max |diff| {diff} > tolerance {tol}");
+    }
+
+    /// AC3 (E1): with sigma 0 the update is the pre-sc-24826 update (clip → step → eval, no noise
+    /// call), over several updates — within [`assert_close`], as the two runs are separate Metal
+    /// executions.
+    #[test]
+    fn sigma_zero_update_matches_the_legacy_update() {
+        let (new, _, _) = run(NetworkType::Lora, 0.0, 3);
+        let (_, _, mut legacy) = setup(NetworkType::Lora);
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-2, 0.0).unwrap();
+        for u in 0..3 {
+            let g = grads(&legacy, u);
+            let (clipped, _) = clip_grad_norm(&g, 1.0).unwrap();
+            let clipped: LoraParams = clipped
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
+            opt.step(&mut legacy, &clipped).unwrap();
+            eval(legacy.values()).unwrap();
+        }
+        for (k, v) in &legacy {
+            assert_close(&vals(&new[k]), &vals(v), &format!("{k} at sigma 0"));
+        }
+    }
+
+    /// E4: two seeded noisy runs produce the same adapter (within [`assert_close`]).
+    #[test]
+    fn seeded_noisy_runs_are_reproducible() {
+        let (a, _, _) = run(NetworkType::Lora, 0.0125, 3);
+        let (b, _, _) = run(NetworkType::Lora, 0.0125, 3);
+        for (k, v) in &a {
+            assert_close(&vals(&b[k]), &vals(v), &format!("{k} reproducible"));
+        }
+    }
+
+    /// E3: the Z-Image MLX descriptor declares weight noise, so the shared floor accepts it.
+    #[test]
+    fn descriptor_declares_weight_noise() {
+        assert!(trainer_descriptor().techniques.weight_noise);
+    }
+
+    /// sc-24828: Z-Image MLX honours subject-masked loss (cache + `reduce_loss` in the closure).
+    #[test]
+    fn descriptor_declares_subject_mask_loss() {
+        assert!(trainer_descriptor().techniques.subject_mask_loss);
+    }
+
+    /// sc-24828 × sc-2127: with mask loss on and two buckets, each cache entry's weight map has
+    /// THAT bucket's latent shape, and the background (right half of the center-square crop, with
+    /// `background_weight` 0) is zero at both grids. The 48×32 image's center square is x ∈ [8, 40);
+    /// the subject is x < 24 — the crop's left half.
+    #[test]
+    fn subject_mask_weight_is_computed_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (iw, ih) = (48u32, 32u32);
+        let image_path = tmp.path().join("a.png");
+        image::RgbImage::new(iw, ih).save(&image_path).unwrap();
+        let mask_path = tmp.path().join("a_mask.png");
+        image::GrayImage::from_fn(iw, ih, |x, _| image::Luma([if x < 24 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let item = gen_core::TrainingItem {
+            image_path,
+            caption: "a".into(),
+            subject_mask_path: Some(mask_path),
+            ..Default::default()
+        };
+        let cfg = gen_core::SubjectMaskLoss {
+            background_weight: 0.0,
+            subject_weight: 1.0,
+        };
+        let mask = PreparedSubjectMask::load("t", &item, &cfg).unwrap();
+        let cap = Array::zeros::<f32>(&[8, 32]).unwrap();
+        let edges = [32u32, 48];
+        let mut cache = Vec::new();
+        cache_item_buckets(
+            &edges,
+            Some(&mask),
+            &cap,
+            |edge| {
+                let g = (edge / 8) as i32;
+                Ok(Array::zeros::<f32>(&[16, 1, g, g])?)
+            },
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(cache.len(), 2);
+        for (x0, _, w) in &cache {
+            let w = w.as_ref().expect("mask loss on ⇒ a weight map");
+            assert_eq!(
+                w.shape(),
+                x0.shape(),
+                "weight must match its own bucket's latent"
+            );
+            let g = x0.shape()[3] as usize;
+            let dense = multiply(w, Array::ones::<f32>(w.shape()).unwrap()).unwrap();
+            let v = dense.as_slice::<f32>();
+            // One [g, g] plane (all channels are the same broadcast plane).
+            for y in 0..g {
+                for x in 0..g {
+                    let val = v[y * g + x];
+                    if x < g / 2 {
+                        assert!(val > 0.99, "subject cell ({y},{x}) of {g}x{g} = {val}");
+                    } else {
+                        assert_eq!(val, 0.0, "background cell ({y},{x}) of {g}x{g}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// sc-2127: the descriptor declares resolution buckets, and the memory pre-flight sizes a
+    /// bucketed run for its largest edge (the legacy single edge when buckets are off).
+    #[test]
+    fn buckets_are_declared_and_preflight_sizes_for_the_largest_edge() {
+        assert!(trainer_descriptor().techniques.resolution_buckets);
+        let mut cfg = TrainingConfig {
+            resolution: 768,
+            ..Default::default()
+        };
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 768);
+        cfg.resolution_buckets = vec![
+            gen_core::ResolutionBucket {
+                resolution: 1024,
+                repeats: 1,
+            },
+            gen_core::ResolutionBucket {
+                resolution: 512,
+                repeats: 16,
+            },
+        ];
+        assert_eq!(bucket_edges(&cfg), vec![1024, 512]);
+        assert_eq!(preflight_edge(&bucket_edges(&cfg)), 1024);
+    }
+}
+
+/// sc-2125 (epic 2123 depth anchoring) — the Z-Image step seam on the tiny synthetic DiT fixture
+/// (`tests/fixtures/z_transformer.safetensors`: dim 96, 2 main + 1 refiner layers, 4 latent
+/// channels) with a random-init tiny TAESD decoder (4 latent channels) and a random-init tiny
+/// Depth-Anything-V2. Drives the same [`run_train_step`] / [`aux_driver`] /
+/// [`compute_loss_grads`] `train_impl` runs. Seconds, a few MB; no weights downloaded.
+#[cfg(test)]
+mod depth_anchoring_tests {
+    use super::*;
+    use mlx_gen::train::perceptual::AuxLossSchedule;
+    use mlx_gen::weights::Weights;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/z_transformer.safetensors"
+    );
+
+    fn tiny_dit() -> ZImageTransformer {
+        let cfg = crate::ZImageTransformerConfig {
+            patch_size: 2,
+            f_patch_size: 1,
+            in_channels: 4,
+            dim: 96,
+            n_layers: 2,
+            n_refiner_layers: 1,
+            n_heads: 4,
+            norm_eps: 1e-5,
+            cap_feat_dim: 32,
+            rope_theta: 256.0,
+            t_scale: 1000.0,
+            axes_dims: vec![8, 8, 8],
+            axes_lens: vec![64, 64, 64],
+            frequency_embedding_size: 256,
+        };
+        ZImageTransformer::from_weights(&Weights::from_file(FIXTURE).unwrap(), "w", cfg).unwrap()
+    }
+
+    fn schedule() -> AuxLossSchedule {
+        AuxLossSchedule {
+            weight: 0.1,
+            t_min: 0.0,
+            t_max: 1.0,
+            every_n: 2,
+        }
+    }
+
+    fn path() -> PerceptualPath {
+        mlx_gen_perceptual::testing::tiny_depth_path(4, schedule()).unwrap()
+    }
+
+    fn cfg() -> TrainingConfig {
+        let mut cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            train_dtype: "f32".into(),
+            ..Default::default()
+        };
+        cfg.depth_anchoring.schedule = schedule();
+        cfg
+    }
+
+    /// `n` cached items: clean `[4, 1, 4, 4]` latents (32×32 decoded) + `[8, 32]` caption feats.
+    fn cache_n(n: u64) -> Vec<CacheEntry> {
+        (0..n)
+            .map(|i| {
+                let x0 = random::normal::<f32>(
+                    &[4, 1, 4, 4],
+                    None,
+                    None,
+                    Some(&random::key(100 + i).unwrap()),
+                )
+                .unwrap();
+                let cap = random::normal::<f32>(
+                    &[8, 32],
+                    None,
+                    None,
+                    Some(&random::key(200 + i).unwrap()),
+                )
+                .unwrap();
+                eval([&x0, &cap]).unwrap();
+                (x0, cap, None)
+            })
+            .collect()
+    }
+
+    fn cache() -> Vec<CacheEntry> {
+        cache_n(3)
+    }
+
+    fn adapter(dit: &mut ZImageTransformer, cfg: &TrainingConfig) -> (TrainAdapter, LoraParams) {
+        let paths = resolve_target_paths(dit, cfg);
+        assert!(!paths.is_empty());
+        let (targets, params) = build_lora_targets(dit, &paths, cfg.rank as i32, cfg.seed).unwrap();
+        (TrainAdapter::Lora { targets }, params)
+    }
+
+    /// A prepared driver (references built, alternation over `schedule`'s items, as `train_impl`
+    /// does).
+    fn prepared_with(cache: &[CacheEntry], schedule: &BucketSchedule, accum: u32) -> AuxDriver {
+        aux_driver(path(), cache, None, schedule, accum, &Default::default()).unwrap()
+    }
+
+    /// [`prepared_with`] for a single-bucket cache (one entry per item).
+    fn prepared(cache: &[CacheEntry], accum: u32) -> AuxDriver {
+        prepared_with(cache, &single_bucket(cache), accum)
+    }
+
+    /// The single-bucket schedule `train_impl` builds when buckets are off (round-robin).
+    fn single_bucket(cache: &[CacheEntry]) -> BucketSchedule {
+        BucketSchedule::new(
+            cache.len(),
+            &[gen_core::train::ResolutionBucket {
+                resolution: 64,
+                repeats: 1,
+            }],
+            7,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_with(
+        dit: &mut ZImageTransformer,
+        params: &LoraParams,
+        adapter: &TrainAdapter,
+        cfg: &TrainingConfig,
+        cache: &[CacheEntry],
+        schedule: &BucketSchedule,
+        path: Option<&mut AuxDriver>,
+        n: u32,
+    ) -> (StepLosses, LoraParams) {
+        let (l, g) = run_train_step(
+            dit,
+            params,
+            adapter,
+            cfg,
+            cache,
+            schedule,
+            path,
+            n,
+            false,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l, g)
+    }
+
+    fn step(
+        dit: &mut ZImageTransformer,
+        params: &LoraParams,
+        adapter: &TrainAdapter,
+        cfg: &TrainingConfig,
+        cache: &[CacheEntry],
+        path: Option<&mut AuxDriver>,
+        n: u32,
+    ) -> (StepLosses, LoraParams) {
+        let schedule = single_bucket(cache);
+        step_with(dit, params, adapter, cfg, cache, &schedule, path, n)
+    }
+
+    /// Run micro-steps `1..=steps` through the real step seam over `schedule`; per step
+    /// `(dataset item, is_depth_step)`. Returns the driver too, for its reference counter.
+    fn run_kinds_with(
+        cache: &[CacheEntry],
+        schedule: &BucketSchedule,
+        accum: u32,
+        steps: u32,
+    ) -> (Vec<(usize, bool)>, AuxDriver) {
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let mut d = prepared_with(cache, schedule, accum);
+        let kinds = (1..=steps)
+            .map(|n| {
+                let (l, _) = step_with(
+                    &mut dit,
+                    &params,
+                    &adapter,
+                    &cfg,
+                    cache,
+                    schedule,
+                    Some(&mut d),
+                    n,
+                );
+                assert_eq!(
+                    l.diffusion.is_none(),
+                    l.aux.is_some(),
+                    "step {n}: a step is diffusion XOR depth here: {l:?}"
+                );
+                (schedule.sample((n - 1) as usize).0, l.aux.is_some())
+            })
+            .collect();
+        (kinds, d)
+    }
+
+    fn run_kinds(cache: &[CacheEntry], accum: u32, steps: u32) -> Vec<(usize, bool)> {
+        run_kinds_with(cache, &single_bucket(cache), accum, steps).0
+    }
+
+    fn abs_sum(g: &LoraParams, filter: &str) -> f32 {
+        let picked: Vec<f32> = g
+            .iter()
+            .filter(|(k, _)| k.ends_with(filter))
+            .map(|(_, v)| v.abs().unwrap().sum(None).unwrap().item::<f32>())
+            .collect();
+        assert!(
+            !picked.is_empty(),
+            "no '{filter}' grads in {:?}",
+            g.keys().collect::<Vec<_>>()
+        );
+        picked.iter().sum()
+    }
+
+    /// AC1: a depth step (an image's every 2nd update) produces a non-zero gradient on the LoRA
+    /// factors while the diffusion term contributes nothing (the differentiated total IS the
+    /// weighted depth term); a diffusion step carries no depth term. Mutation: force
+    /// `diffusion_on = true` in `compute_loss_grads` ⇒ the depth step reports a diffusion term and
+    /// total ≠ aux ⇒ red.
+    #[test]
+    fn depth_step_trains_the_lora_through_depth_only() {
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(1);
+        let mut d = prepared(&cache, 1);
+
+        let (diff, _) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 1);
+        assert_eq!(diff.aux, None, "diffusion step carries no depth term");
+        assert_eq!(Some(diff.total), diff.diffusion);
+
+        let (depth, g) = step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), 2);
+        assert_eq!(
+            depth.diffusion, None,
+            "depth step must not compute the diffusion loss"
+        );
+        let aux = depth.aux.expect("depth step carries the depth term");
+        assert!(aux > 0.0 && aux.is_finite(), "depth term {aux}");
+        assert_eq!(
+            depth.total, aux,
+            "the differentiated loss is the depth term alone"
+        );
+        // LoRA B starts at zero, so dL/dB is where a depth gradient first appears.
+        let gb = abs_sum(&g, ".lora_b");
+        assert!(
+            gb > 0.0 && gb.is_finite(),
+            "depth step LoRA-B grad |Σ| = {gb}"
+        );
+    }
+
+    /// Review blocker, through the real step seam: with N = 2 and N = 4 images and `every_n = 2`,
+    /// every image gets at least one diffusion step and one depth step within 3 periods = 3·N steps
+    /// (a bare global-step key would lock even images to diffusion and odd images to depth; the
+    /// period-drifting window key flips each slot within any 3 periods). Mutation: drop the period
+    /// drift ⇒ red.
+    #[test]
+    fn every_image_gets_diffusion_and_depth_steps() {
+        for n in [2u64, 4] {
+            let cache = cache_n(n);
+            let kinds = run_kinds(&cache, 1, 3 * n as u32);
+            for image in 0..n as usize {
+                let mine: Vec<bool> = kinds
+                    .iter()
+                    .filter(|(i, _)| *i == image)
+                    .map(|(_, d)| *d)
+                    .collect();
+                assert!(
+                    mine.contains(&true) && mine.contains(&false),
+                    "N={n}: image {image} got {mine:?} ({kinds:?})"
+                );
+            }
+        }
+    }
+
+    /// Review major, through the real step seam: with gradient accumulation 2 both micro-steps of
+    /// each optimizer window share one step kind (no averaged diffusion+depth update), and depth
+    /// updates still happen. Mutation: build the tracker with accumulation 1 in `prepared` ⇒ red.
+    #[test]
+    fn accumulation_windows_share_one_step_kind() {
+        let cache = cache();
+        let kinds = run_kinds(&cache, 2, 8);
+        for w in kinds.chunks(2) {
+            assert_eq!(w[0].1, w[1].1, "window {w:?} mixes step kinds ({kinds:?})");
+        }
+        assert!(kinds.iter().any(|(_, d)| *d), "{kinds:?}");
+    }
+
+    /// sc-2127 integration: with two resolution buckets (item-major cache, seeded shuffle) and
+    /// depth on, the optimizer windows interleave (never two depth steps in a row, sc-2124) and
+    /// every image gets both kinds across its buckets — and the depth reference is built once per
+    /// (image, bucket) cache entry (each bucket's clean latent decodes to its own size), so the
+    /// counter equals the entry count after two epochs; a depth step trains on the scheduled
+    /// entry's latent against that entry's reference. Mutations: key the alternation per epoch
+    /// (`AuxAlternation::new(1, epoch_len)`) in `AuxDriver::prepare_keyed` ⇒ a depth run ⇒ red; key
+    /// the reference on the item, or pick the latent round-robin instead of from the schedule ⇒ the
+    /// depth term differs from the scheduled entry's ⇒ red.
+    #[test]
+    fn two_buckets_interleave_with_per_entry_references() {
+        let items = 2usize;
+        let buckets = [
+            gen_core::train::ResolutionBucket {
+                resolution: 32,
+                repeats: 1,
+            },
+            gen_core::train::ResolutionBucket {
+                resolution: 48,
+                repeats: 1,
+            },
+        ];
+        // Item-major: cache[item * 2 + bucket]; bucket 0 = 4×4 latents, bucket 1 = 6×6.
+        let cache: Vec<CacheEntry> = (0..items as u64)
+            .flat_map(|i| {
+                [4i32, 6].into_iter().map(move |side| {
+                    let x0 = random::normal::<f32>(
+                        &[4, 1, side, side],
+                        None,
+                        None,
+                        Some(&random::key(300 + 10 * i + side as u64).unwrap()),
+                    )
+                    .unwrap();
+                    let cap = random::normal::<f32>(
+                        &[8, 32],
+                        None,
+                        None,
+                        Some(&random::key(400 + i).unwrap()),
+                    )
+                    .unwrap();
+                    eval([&x0, &cap]).unwrap();
+                    (x0, cap, None)
+                })
+            })
+            .collect();
+        let schedule = BucketSchedule::new(items, &buckets, 7);
+        assert_eq!(schedule.n_buckets(), 2);
+        let steps = 2 * schedule.epoch_len() as u32;
+
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let mut d = prepared_with(&cache, &schedule, 1);
+        let mut kinds = Vec::new();
+        let mut checked_depth_step = false;
+        for n in 1..=steps {
+            let (l, _) = step_with(
+                &mut dit,
+                &params,
+                &adapter,
+                &cfg,
+                &cache,
+                &schedule,
+                Some(&mut d),
+                n,
+            );
+            let k = (n - 1) as usize;
+            let (item, _) = schedule.sample(k);
+            let entry = schedule.cache_index(k);
+            kinds.push((item, l.aux.is_some()));
+            // Every step recomputed with the scheduled entry's latent and reference (and, on depth
+            // steps whose entry differs from the item index, that proves the reference key).
+            {
+                let key =
+                    mlx_gen::train::perceptual::AuxAlternation::new(schedule.epoch_len(), 1).key(n);
+                let raw = sample_sigma(
+                    &cfg.timestep_type,
+                    &cfg.timestep_bias,
+                    cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(n as u64),
+                )
+                .unwrap();
+                let plan = d.path().plan(key, entry, raw).unwrap();
+                let (x0, cap, _) = &cache[entry];
+                let noise = random::normal::<f32>(
+                    x0.shape(),
+                    None,
+                    None,
+                    Some(
+                        &random::key(cfg.seed.wrapping_add(n as u64).wrapping_mul(2) + 1).unwrap(),
+                    ),
+                )
+                .unwrap();
+                let (expected, _) = compute_loss_grads(
+                    &mut dit,
+                    &params,
+                    &adapter,
+                    cfg.alpha,
+                    cfg.rank as f32,
+                    x0,
+                    cap,
+                    plan.noise_level,
+                    &noise,
+                    false,
+                    None,
+                    None,
+                    Dtype::Float32,
+                    Some(AuxStep {
+                        path: d.path(),
+                        plan: &plan,
+                        image: entry,
+                    }),
+                )
+                .unwrap();
+                assert_eq!(l, expected, "step {n} (item {item}, entry {entry})");
+                checked_depth_step |= l.aux.is_some() && entry != item;
+            }
+        }
+        assert!(
+            checked_depth_step,
+            "no depth step on an entry != its item: {kinds:?}"
+        );
+        // The seeded schedule is not the round-robin walk (so the recompute above also pins the
+        // latent choice to the schedule).
+        assert!((0..steps as usize).any(|k| schedule.cache_index(k) != k % cache.len()));
+        // Both buckets are actually visited.
+        let entries: std::collections::BTreeSet<usize> = (0..steps as usize)
+            .map(|k| schedule.cache_index(k))
+            .collect();
+        assert_eq!(entries.len(), cache.len());
+        assert!(
+            kinds.windows(2).all(|w| !(w[0].1 && w[1].1)),
+            "two depth steps in a row: {kinds:?}"
+        );
+        for image in 0..items {
+            let mine: Vec<bool> = kinds
+                .iter()
+                .filter(|(i, _)| *i == image)
+                .map(|(_, d)| *d)
+                .collect();
+            assert!(
+                mine.contains(&true) && mine.contains(&false),
+                "image {image} ({kinds:?})"
+            );
+        }
+        assert_eq!(d.path().reference_computations(), cache.len());
+    }
+
+    /// AC2: the reference depth is computed once per image per job (per (image, bucket) cache
+    /// entry with buckets on; one bucket here) — three epochs over three images leave the counter
+    /// at 3 (only the `AuxDriver` builds references; the step never does). Mutation: build the
+    /// references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
+    #[test]
+    fn reference_depth_is_computed_once_per_image_across_epochs() {
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache();
+        let mut d = prepared(&cache, 1);
+        assert_eq!(d.path().reference_computations(), cache.len());
+        for n in 1..=(3 * cache.len() as u32) {
+            step(&mut dit, &params, &adapter, &cfg, &cache, Some(&mut d), n);
+        }
+        assert_eq!(d.path().reference_computations(), cache.len());
+    }
+
+    /// E1: with depth anchoring off nothing is loaded and the step is bit-identical to the
+    /// pre-epic-2123 step (the legacy loss closure, reproduced here verbatim); a diffusion-only step
+    /// of an enabled path is bit-identical too. Mutation: always add `aux_term` (e.g. a 0-weighted
+    /// copy) or reorder the loss reduction ⇒ red.
+    #[test]
+    fn everything_off_is_bit_identical_to_the_legacy_step() {
+        assert!(load_perceptual_path(&TrainingConfig::default())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            perceptual_footprint_gb(&TrainingConfig::default(), 1024, 10),
+            0.0
+        );
+
+        let mut dit = tiny_dit();
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache();
+        let (off, g_off) = step(&mut dit, &params, &adapter, &cfg, &cache, None, 1);
+        assert_eq!(off.aux, None);
+
+        // The pre-sc-2125 `compute_loss_grads` body for step 1 (same item / sigma / noise).
+        let (x0, cap, _) = &cache[0];
+        let sigma = sample_sigma(
+            &cfg.timestep_type,
+            &cfg.timestep_bias,
+            cfg.seed.wrapping_mul(0x9E37_79B9).wrapping_add(1),
+        )
+        .unwrap();
+        let noise = random::normal::<f32>(
+            x0.shape(),
+            None,
+            None,
+            Some(&random::key(cfg.seed.wrapping_add(1).wrapping_mul(2) + 1).unwrap()),
+        )
+        .unwrap();
+        let (x_t, target, timestep) = build_batch(x0, &noise, sigma).unwrap();
+        let capf = cap.clone();
+        let dit_ref = &mut dit;
+        let adapter_ref = &adapter;
+        let legacy = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+            adapter_ref.install_as(dit_ref, &p, 4.0, 4.0, None, LOKR_DTYPE)?;
+            let sh = x_t.shape();
+            let prep = dit_ref
+                .prepare((sh[0], sh[1], sh[2], sh[3]), &capf)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let v = dit_ref
+                .forward_with(&prep, &x_t, timestep)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            Ok(vec![subtract(&v, &target)?.square()?.mean(None)?])
+        };
+        let (val, g_legacy) = keyed_value_and_grad(legacy)(params.clone(), 0).unwrap();
+        eval(g_legacy.values()).unwrap();
+        assert_eq!(off.total, val[0].item::<f32>());
+        assert_eq!(off.diffusion, Some(off.total));
+        let bits =
+            |a: &Array| -> Vec<u32> { a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect() };
+        for (k, v) in &g_legacy {
+            assert_eq!(
+                bits(v),
+                bits(&g_off[k]),
+                "{k}: off grads differ from the legacy step"
+            );
+        }
+
+        // A diffusion-only step of an enabled path takes exactly the same graph.
+        let mut dit2 = tiny_dit();
+        let dcfg = self::cfg();
+        let (adapter2, params2) = self::adapter(&mut dit2, &dcfg);
+        let mut d = prepared(&cache, 1);
+        let (on1, g_on1) = step(
+            &mut dit2,
+            &params2,
+            &adapter2,
+            &dcfg,
+            &cache,
+            Some(&mut d),
+            1,
+        );
+        let mut dit3 = tiny_dit();
+        let (_, params3) = self::adapter(&mut dit3, &dcfg);
+        let (none1, g_none1) = step(&mut dit3, &params3, &adapter2, &dcfg, &cache, None, 1);
+        assert_eq!(on1, none1);
+        for (k, v) in &g_none1 {
+            assert_eq!(bits(v), bits(&g_on1[k]), "{k}");
+        }
+    }
+
+    /// E7: depth anchoring grows the trainer memory estimate by the TAEF1 + DA2 footprint, more for
+    /// a larger DA2, and the pre-flight guard counts it on the dense and the checkpointed path
+    /// (host-independent: synthetic budgets).
+    #[test]
+    fn memory_estimate_includes_the_aux_models() {
+        let mut on = TrainingConfig::default();
+        on.depth_anchoring.schedule = schedule();
+        let small = perceptual_footprint_gb(&on, 1024, 10);
+        on.depth_anchoring.model_size = gen_core::train::DepthModelSize::Large;
+        let large = perceptual_footprint_gb(&on, 1024, 10);
+        assert!(
+            small > 0.0 && large > small,
+            "small {small} GB, large {large} GB"
+        );
+        // The DA2-Large weights alone are ~1.3 GB.
+        assert!(large - small > 1.0, "large - small = {} GB", large - small);
+
+        // The guard against fixed synthetic budgets (never the host's): a budget whose safe share
+        // sits halfway between the DiT projection and projection + aux admits the plain run and
+        // refuses the depth run — on the dense path and on the (default) checkpointed path.
+        // Mutations: drop `+ extra_gb` (dense or checkpointed branch) ⇒ the aux case passes ⇒ red;
+        // skip the checkpointed branch's projection ⇒ red.
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let between = |base_gb: f64| ((base_gb + large / 2.0) / 0.85 * GIB) as usize;
+        let dense_tokens = (64.0f64 / 16.0).ceil().powi(2) + 544.0;
+        let dense_base = projected_dense_peak_gb(dense_tokens, true);
+        let budget = between(dense_base);
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, 0.0, false, budget).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, large, false, budget).is_err());
+        let ckpt_base = checkpointed_baseline_gb(true);
+        let budget = between(ckpt_base);
+        assert!(preflight_memory_guard_with_budget(&on, 1024, true, 0.0, true, budget).is_ok());
+        let err = preflight_memory_guard_with_budget(&on, 1024, true, large, true, budget)
+            .unwrap_err()
+            .to_string();
+        // The checkpointed refusal names the enabled aux losses (the shared E7 guard).
+        assert!(err.contains("[depth]"), "{err}");
+        // A budget comfortably above projection + aux admits the depth run on both paths.
+        let roomy = ((dense_base.max(ckpt_base) + large) / 0.85 * GIB) as usize * 2;
+        assert!(preflight_memory_guard_with_budget(&on, 64, true, large, false, roomy).is_ok());
+        assert!(preflight_memory_guard_with_budget(&on, 1024, true, large, true, roomy).is_ok());
+    }
+
+    /// E3: the Z-Image MLX descriptor declares depth anchoring.
+    #[test]
+    fn descriptor_declares_depth_anchoring() {
+        assert!(trainer_descriptor().techniques.depth_anchoring);
+        // sc-24831: the face losses ride the same builder arms.
+        assert!(trainer_descriptor().techniques.identity_loss);
+        assert!(trainer_descriptor().techniques.face_landmark_loss);
+    }
+
+    /// sc-24832: Z-Image builds its perceptual path through the builder, so it declares the body
+    /// losses the builder's arms provide.
+    #[test]
+    fn descriptor_declares_the_body_losses() {
+        let t = trainer_descriptor().techniques;
+        assert!(t.body_proportion_loss && t.body_shape_loss && t.normal_loss);
+    }
+
+    /// A missing aux checkpoint is a clear error naming the model, before any caching.
+    #[test]
+    fn missing_aux_weights_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.perceptual_decoder_dir = Some(tmp.path().join("no-taef1"));
+        c.depth_anchoring.model_dir = Some(tmp.path().join("no-da2"));
+        let err = load_perceptual_path(&c)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("TAEF1"), "{err}");
+    }
+
+    /// sc-24833 (epic 2123 E8): the two latent-space perceptual losses through Z-Image's REAL step
+    /// seam — a path holding the VAE anchor (decoded-x0, FLUX.2-encoder graph on formula weights)
+    /// and E-LatentLPIPS (latent input; 4-channel formula weights for the 4-channel fixture DiT),
+    /// both additive (`every_n = 1`). Each image's references are built once however many steps run;
+    /// every step carries the diffusion term AND the weighted aux term; and the aux term alone moves
+    /// the LoRA gradient (the same step with the losses zero-weighted differs). Mutations: drop the
+    /// `aux_term` from `combine_step_loss` in `compute_loss_grads` ⇒ the gradients match ⇒ red;
+    /// build the references in `AuxDriver::prepare_keyed` for one entry too few ⇒ red.
+    #[test]
+    fn latent_perceptual_losses_train_the_lora_through_the_step_seam() {
+        use mlx_gen::train::latent_lpips::{
+            formula_weights as lpips_w, LatentLpips, LatentLpipsLoss,
+        };
+        use mlx_gen::train::perceptual::AuxLoss;
+        use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+        use mlx_gen::train::vae_anchor::{
+            formula_weights as va_w, VaeAnchorEncoder, VaeAnchorEncoderConfig, VaeAnchorLoss,
+        };
+        let build = |weight: f32| {
+            let sched = AuxLossSchedule {
+                weight,
+                t_min: 0.0,
+                t_max: 1.0,
+                every_n: 1,
+            };
+            let dec_cfg = mlx_gen_perceptual::testing::tiny_decoder_config(4);
+            let dec = TinyDecoder::from_weights(
+                &synthetic_tiny_decoder_weights(&dec_cfg, 11).unwrap(),
+                dec_cfg,
+            )
+            .unwrap();
+            let va_cfg = VaeAnchorEncoderConfig::with_base(32);
+            let va =
+                VaeAnchorLoss::new(VaeAnchorEncoder::from_weights(&va_w(&va_cfg), va_cfg).unwrap());
+            let lp = LatentLpipsLoss::new(LatentLpips::from_weights(&lpips_w(4), 4).unwrap());
+            PerceptualPath::new(
+                Some(Box::new(dec)),
+                vec![
+                    AuxLoss {
+                        schedule: sched,
+                        loss: Box::new(va),
+                    },
+                    AuxLoss {
+                        schedule: sched,
+                        loss: Box::new(lp),
+                    },
+                ],
+            )
+            .unwrap()
+        };
+        let mut dit = tiny_dit();
+        let cfg = cfg();
+        let (adapter, params) = adapter(&mut dit, &cfg);
+        let cache = cache_n(2);
+        let run = |dit: &mut ZImageTransformer, weight: f32, steps: u32| {
+            let mut d = aux_driver(
+                build(weight),
+                &cache,
+                None,
+                &single_bucket(&cache),
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            for n in 1..=steps {
+                out.push(step(dit, &params, &adapter, &cfg, &cache, Some(&mut d), n));
+            }
+            (out, d.path().reference_computations())
+        };
+        let (steps, refs) = run(&mut dit, 0.5, 4);
+        assert_eq!(refs, 2, "references are built once per image");
+        for (n, (l, _)) in steps.iter().enumerate() {
+            let aux = l
+                .aux
+                .unwrap_or_else(|| panic!("step {n}: additive aux term missing: {l:?}"));
+            let diff = l.diffusion.expect("additive: the diffusion term stays");
+            assert!(aux > 0.0 && aux.is_finite(), "step {n}: aux {aux}");
+            assert!(
+                (l.total - (diff + aux)).abs() <= 1e-4 * l.total.abs().max(1.0),
+                "{l:?}"
+            );
+        }
+        // Same step, losses scheduled but zero-weighted vs weighted: only the aux term differs.
+        let (zero, _) = run(&mut dit, 1e-12, 1);
+        let (with, _) = run(&mut dit, 0.5, 1);
+        let (gz, gw) = (
+            abs_sum(&zero[0].1, ".lora_b"),
+            abs_sum(&with[0].1, ".lora_b"),
+        );
+        assert!(
+            (gz - gw).abs() > 1e-6 * gz.max(1e-12),
+            "the aux term must move the LoRA gradient: {gz} vs {gw}"
+        );
+    }
+}
+
+/// sc-24832: the Z-Image reference preparation hands each cache entry its item's subject mask —
+/// cropped like the image (centre square) and resampled onto that entry's decoded grid — to a
+/// mask-reading loss. Mutation: drop `path.attach_subject_masks(masks)` from
+/// `aux_driver` ⇒ the probe sees no mask ⇒ red.
+#[cfg(test)]
+mod subject_mask_reference_tests {
+    use super::*;
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use mlx_gen::train::perceptual::{AuxLoss, AuxLossSchedule, LossReference, PerceptualLoss};
+    use mlx_gen::train::subject_mask::PerceptualSubjectMasks;
+    use mlx_gen::train::tae::{synthetic_tiny_decoder_weights, TinyDecoder};
+    use mlx_gen::train::TrainingItem;
+
+    type Seen = Rc<RefCell<Vec<Option<(Vec<i32>, Vec<f32>)>>>>;
+    /// Records the mask every reference receives: `(shape, values)`, or `None`.
+    struct MaskProbe(Seen);
+    impl PerceptualLoss for MaskProbe {
+        fn name(&self) -> &'static str {
+            "mask-probe"
+        }
+        fn reference(&self, clean: &Array) -> mlx_gen::Result<Option<LossReference>> {
+            self.reference_with_mask(clean, None)
+        }
+        fn reference_with_mask(
+            &self,
+            _clean: &Array,
+            mask: Option<&Array>,
+        ) -> mlx_gen::Result<Option<LossReference>> {
+            self.0.borrow_mut().push(mask.map(|m| {
+                m.eval().unwrap();
+                (m.shape().to_vec(), m.as_slice::<f32>().to_vec())
+            }));
+            Ok(Some(Box::new(())))
+        }
+        fn loss(&self, live: &Array, _r: &dyn Any) -> mlx_gen::Result<Array> {
+            Ok(live.mean(None)?)
+        }
+    }
+
+    fn write_png(
+        dir: &std::path::Path,
+        name: &str,
+        f: impl Fn(u32, u32) -> u8,
+    ) -> std::path::PathBuf {
+        let p = dir.join(name);
+        image::GrayImage::from_fn(12, 8, |x, y| image::Luma([f(x, y)]))
+            .save(&p)
+            .unwrap();
+        p
+    }
+
+    #[test]
+    fn the_reference_path_hands_each_entry_its_items_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = write_png(dir.path(), "img.png", |_, _| 128);
+        let masks = [
+            write_png(dir.path(), "right.png", |x, _| if x >= 6 { 255 } else { 0 }),
+            write_png(dir.path(), "top.png", |_, y| if y < 4 { 255 } else { 0 }),
+        ];
+        let items: Vec<TrainingItem> = masks
+            .iter()
+            .map(|m| {
+                let mut it = TrainingItem::captioned(img.clone(), "c".into());
+                it.subject_mask_path = Some(m.clone());
+                it
+            })
+            .collect();
+        let mut cfg = TrainingConfig::default();
+        cfg.body_losses.normal.weight = 0.1;
+        cfg.body_losses.normal_restrict_to_subject = true;
+        // Two items × one bucket; [4, 1, 4, 4] latents decode to 32×32.
+        let cache: Vec<CacheEntry> = (0..2u64)
+            .map(|i| {
+                let x0 = random::normal::<f32>(
+                    &[4, 1, 4, 4],
+                    None,
+                    None,
+                    Some(&random::key(i).unwrap()),
+                )
+                .unwrap();
+                (x0, Array::from_f32(0.0), None)
+            })
+            .collect();
+        let dcfg = mlx_gen_perceptual::testing::tiny_decoder_config(4);
+        let dec =
+            TinyDecoder::from_weights(&synthetic_tiny_decoder_weights(&dcfg, 3).unwrap(), dcfg)
+                .unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let path = PerceptualPath::new(
+            Some(Box::new(dec)),
+            vec![AuxLoss {
+                schedule: AuxLossSchedule {
+                    weight: 0.1,
+                    t_min: 0.0,
+                    t_max: 1.0,
+                    every_n: 1,
+                },
+                loss: Box::new(MaskProbe(seen.clone())),
+            }],
+        )
+        .unwrap();
+        let loaded =
+            PerceptualSubjectMasks::load("t", &items, &cfg, 1, CropBox::center_square).unwrap();
+        let expected = loaded.clone().unwrap();
+        let schedule = BucketSchedule::new(
+            cache.len(),
+            &[gen_core::train::ResolutionBucket {
+                resolution: 256,
+                repeats: 1,
+            }],
+            7,
+        );
+        aux_driver(path, &cache, loaded, &schedule, 1, &Default::default()).unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        for (entry, got) in seen.iter().enumerate() {
+            let (shape, values) = got.as_ref().expect("every reference gets its mask");
+            assert_eq!(shape, &vec![32, 32]);
+            assert_eq!(
+                values,
+                &expected.pixel_mask(entry, 32, 32).unwrap(),
+                "entry {entry}"
+            );
+        }
+        assert_ne!(seen[0], seen[1], "each entry carries its own item's mask");
+        // Off ⇒ no mask reaches the loss.
+        let none = PerceptualSubjectMasks::load(
+            "t",
+            &items,
+            &TrainingConfig::default(),
+            1,
+            CropBox::center_square,
+        )
+        .unwrap();
+        assert!(none.is_none());
+    }
+}
+
+/// sc-25213 — the training adapter (ai-toolkit `assistant_lora_path`) on the tiny synthetic DiT
+/// fixture: merged into the frozen base for training, cancelled for previews, never saved, and a
+/// strict no-op when unset. Seconds, a few MB; no weights downloaded.
+#[cfg(test)]
+mod training_adapter_tests {
+    use super::*;
+    use mlx_gen::weights::Weights;
+    use mlx_rs::ops::array_eq;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/z_transformer.safetensors"
+    );
+
+    fn tiny_dit() -> ZImageTransformer {
+        let cfg = crate::ZImageTransformerConfig {
+            patch_size: 2,
+            f_patch_size: 1,
+            in_channels: 4,
+            dim: 96,
+            n_layers: 2,
+            n_refiner_layers: 1,
+            n_heads: 4,
+            norm_eps: 1e-5,
+            cap_feat_dim: 32,
+            rope_theta: 256.0,
+            t_scale: 1000.0,
+            axes_dims: vec![8, 8, 8],
+            axes_lens: vec![64, 64, 64],
+            frequency_embedding_size: 256,
+        };
+        ZImageTransformer::from_weights(&Weights::from_file(FIXTURE).unwrap(), "w", cfg).unwrap()
+    }
+
+    /// The ai-toolkit de-distill adapter's module families (main layers: attention, FFN, AdaLN),
+    /// plus a refiner projection, each spelled as the shipped files spell them.
+    const TARGETS: [&str; 4] = [
+        "layers.0.attention.to_k",
+        "layers.1.feed_forward.w2",
+        "layers.0.adaLN_modulation.0",
+        "noise_refiner.0.attention.to_out.0",
+    ];
+
+    fn lin<'a>(
+        dit: &'a mut ZImageTransformer,
+        path: &str,
+    ) -> &'a mut mlx_gen::adapters::AdaptableLinear {
+        let parts: Vec<&str> = path.split('.').collect();
+        dit.adaptable_mut(&parts).unwrap()
+    }
+
+    fn weight(dit: &mut ZImageTransformer, path: &str) -> Array {
+        lin(dit, path).dense_weight().unwrap().0.clone()
+    }
+
+    /// Write an ai-toolkit-format adapter (`diffusion_model.<path>.lora_{A,B}.weight`, no `.alpha`
+    /// ⇒ strength `B·A`) over `targets`; returns the file and each target's `[out, in]` delta.
+    fn write_adapter(
+        dir: &Path,
+        name: &str,
+        targets: &[&str],
+        seed: u64,
+    ) -> (PathBuf, BTreeMap<String, Array>) {
+        let mut dit = tiny_dit();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        let mut deltas = BTreeMap::new();
+        for (i, t) in targets.iter().enumerate() {
+            let shape = lin(&mut dit, t).base_shape();
+            let (out, inp) = (shape[0], shape[1]);
+            let key = |k: u64| random::key(seed * 100 + i as u64 * 2 + k).unwrap();
+            let a = random::normal::<f32>(&[4, inp], None, Some(0.05), Some(&key(0))).unwrap();
+            let b = random::normal::<f32>(&[out, 4], None, Some(0.05), Some(&key(1))).unwrap();
+            deltas.insert(t.to_string(), mlx_rs::ops::matmul(&b, &a).unwrap());
+            owned.push((format!("diffusion_model.{t}.lora_A.weight"), a));
+            owned.push((format!("diffusion_model.{t}.lora_B.weight"), b));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let path = dir.join(name);
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &path).unwrap();
+        (path, deltas)
+    }
+
+    fn cfg_with(adapter: Option<PathBuf>) -> TrainingConfig {
+        TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            seed: 7,
+            train_dtype: "f32".into(),
+            training_adapter: adapter,
+            ..Default::default()
+        }
+    }
+
+    fn cache() -> Vec<CacheEntry> {
+        let x0 = random::normal::<f32>(&[4, 1, 4, 4], None, None, Some(&random::key(100).unwrap()))
+            .unwrap();
+        let cap =
+            random::normal::<f32>(&[8, 32], None, None, Some(&random::key(200).unwrap())).unwrap();
+        eval([&x0, &cap]).unwrap();
+        vec![(x0, cap, None)]
+    }
+
+    fn one_step(
+        dit: &mut ZImageTransformer,
+        cfg: &TrainingConfig,
+    ) -> (f32, LoraParams, TrainAdapter, LoraParams) {
+        one_step_at(dit, cfg, Dtype::Float32)
+    }
+
+    fn one_step_at(
+        dit: &mut ZImageTransformer,
+        cfg: &TrainingConfig,
+        compute: Dtype,
+    ) -> (f32, LoraParams, TrainAdapter, LoraParams) {
+        let paths = resolve_target_paths(dit, cfg);
+        let (targets, params) = build_lora_targets(dit, &paths, 4, cfg.seed).unwrap();
+        let adapter = TrainAdapter::Lora { targets };
+        let cache = cache();
+        let schedule = BucketSchedule::new(
+            1,
+            &[gen_core::train::ResolutionBucket {
+                resolution: 32,
+                repeats: 1,
+            }],
+            7,
+        );
+        let (l, g) = run_train_step(
+            dit, &params, &adapter, cfg, &cache, &schedule, None, 1, false, None, compute,
+        )
+        .unwrap();
+        eval(g.values()).unwrap();
+        (l.total, g, adapter, params)
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        a.as_slice::<f32>().iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// (a) The merged base differs from the bare base by EXACTLY the adapter delta on each targeted
+    /// linear, and is bit-identical everywhere else; no residual is left on any stack.
+    /// Mutations: skip `merge_dense_delta` ⇒ the targeted assert fails; merge at scale 2 (or fold
+    /// `a·b` untransposed) ⇒ the delta assert fails; merge every candidate ⇒ the untouched assert fails.
+    #[test]
+    fn the_merge_adds_exactly_the_adapter_delta_to_the_targeted_base_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, deltas) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 1);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(file.clone()))).unwrap();
+        let merged = slot.expect("an adapter run records its merge");
+        assert_eq!(merged.file, file);
+        assert_eq!(
+            merged.paths.iter().cloned().collect::<BTreeSet<_>>(),
+            TARGETS
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        for path in AdaptableHost::adaptable_paths(&dit) {
+            let (before, after) = (weight(&mut bare, &path), weight(&mut dit, &path));
+            assert!(
+                lin(&mut dit, &path).adapters().is_empty(),
+                "{path}: stack left behind"
+            );
+            match deltas.get(&path) {
+                Some(delta) => {
+                    // Judged against the delta's own size: MLX's f32 GPU GEMM carries ~1e-3
+                    // relative error, so `B·A` here and in the merge may round differently.
+                    let max_abs = |a: &Array| -> f32 { a.abs().unwrap().max(None).unwrap().item() };
+                    let got = mlx_rs::ops::subtract(&after, &before).unwrap();
+                    let off = max_abs(&mlx_rs::ops::subtract(&got, delta).unwrap());
+                    assert!(
+                        off <= 0.01 * max_abs(delta),
+                        "{path}: merged weight is not base + B·A (off by {off})"
+                    );
+                    assert!(
+                        !array_eq(&after, &before, None).unwrap().item::<bool>(),
+                        "{path}"
+                    );
+                }
+                None => assert_eq!(
+                    bits(&after),
+                    bits(&before),
+                    "{path}: untargeted weight changed"
+                ),
+            }
+        }
+    }
+
+    /// Previews render without the adapter: the -1.0 cancel brings each merged linear back to the
+    /// bare forward, and popping it restores the merged forward bit-for-bit (with the trainable
+    /// adapter installed underneath, as during a real preview).
+    /// Mutations: push the cancel at +1.0 ⇒ the bare-forward assert fails; skip `pop_cancel` ⇒ the
+    /// restored assert fails.
+    #[test]
+    fn the_preview_cancel_renders_the_bare_base_and_pops_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 2);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let cfg = cfg_with(Some(file));
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg).unwrap();
+        let mut merged = slot.unwrap();
+        // The trainable adapter sits on the attention targets underneath, as `install_as` leaves it.
+        let paths = resolve_target_paths(&dit, &cfg);
+        let (targets, params) = build_lora_targets(&mut dit, &paths, 4, 7).unwrap();
+        let train = TrainAdapter::Lora { targets };
+        train
+            .install_as(&mut dit, &params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        train
+            .install_as(&mut bare, &params, 4.0, 4.0, None, LOKR_DTYPE)
+            .unwrap();
+        for path in TARGETS {
+            let inp = lin(&mut dit, path).base_shape()[1];
+            let x = random::normal::<f32>(&[3, inp], None, None, Some(&random::key(9).unwrap()))
+                .unwrap();
+            let y_bare = lin(&mut bare, path).forward(&x).unwrap();
+            let y_merged = lin(&mut dit, path).forward(&x).unwrap();
+            // MLX's f32 GPU GEMM carries ~1e-3 relative error on this hardware, so the cancel is
+            // judged against the adapter's own contribution: the preview forward must sit within 2%
+            // of it from the bare forward (a missing or sign-flipped cancel is off by 100% / 200%).
+            let max_abs = |a: &Array, b: &Array| -> f32 {
+                mlx_rs::ops::subtract(a, b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item()
+            };
+            let contribution = max_abs(&y_merged, &y_bare);
+            assert!(contribution > 1e-3, "{path}: the adapter changed nothing");
+            merged.push_cancel(&mut dit).unwrap();
+            let y_cancel = lin(&mut dit, path).forward(&x).unwrap();
+            assert!(
+                max_abs(&y_cancel, &y_bare) <= 0.02 * contribution,
+                "{path}: the preview forward is not the bare base"
+            );
+            merged.pop_cancel(&mut dit).unwrap();
+            let y_back = lin(&mut dit, path).forward(&x).unwrap();
+            assert_eq!(
+                bits(&y_back),
+                bits(&y_merged),
+                "{path}: pop did not restore"
+            );
+        }
+    }
+
+    /// (b) + training: a step on the merged base trains against base + adapter (its loss and
+    /// gradients differ from the bare base's), and the saved adapter holds ONLY the trainable
+    /// targets' `lora_A`/`lora_B`/`alpha` — no de-distill key, no `diffusion_model.` prefix.
+    /// Mutations: drop the `apply_training_adapter` call's merge ⇒ the loss assert fails; save the
+    /// training adapter's keys alongside ⇒ the key-set assert fails.
+    #[test]
+    fn training_runs_on_the_merged_base_and_saves_only_the_trainable_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 3);
+        let mut bare = tiny_dit();
+        let mut dit = tiny_dit();
+        let cfg = cfg_with(Some(file));
+        apply_training_adapter(&mut None, &mut dit, &cfg).unwrap();
+        let (loss_bare, g_bare, _, _) = one_step(&mut bare, &cfg_with(None));
+        let (loss, g, adapter, params) = one_step(&mut dit, &cfg);
+        assert_ne!(
+            loss.to_bits(),
+            loss_bare.to_bits(),
+            "the step ignored the merged adapter"
+        );
+        assert!(g.keys().any(|k| bits(&g[k]) != bits(&g_bare[k])));
+
+        let out = tmp.path().join("lora.safetensors");
+        adapter.save(&params, 4.0, 4.0, -1, "", &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let saved = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let keys: BTreeSet<String> = saved.names().into_iter().map(String::from).collect();
+        let want: BTreeSet<String> = adapter
+            .paths()
+            .iter()
+            .flat_map(|p| ["lora_A.weight", "lora_B.weight", "alpha"].map(|s| format!("{p}.{s}")))
+            .collect();
+        assert_eq!(keys, want);
+        assert!(keys
+            .iter()
+            .all(|k| !k.starts_with("diffusion_model.") && !k.contains("feed_forward")));
+    }
+
+    /// (c) E1: with no training adapter the trainer's base preparation is exactly the pre-sc-25213
+    /// path — the bf16 compute cast and nothing else (f32: nothing at all). Every adaptable weight
+    /// and a seeded step's loss and gradients are compared bit-for-bit against a DiT taken through
+    /// that reference path by hand.
+    /// Mutations: make `prepare_training_base` skip (or repeat with another dtype) the cast, or touch
+    /// the base in the `(None, None)` arm (e.g. a stray f32 round trip that is lossy, or a merge) ⇒ red.
+    #[test]
+    fn no_training_adapter_prepares_exactly_the_pre_change_base() {
+        for (use_bf16, compute) in [(false, Dtype::Float32), (true, Dtype::Bfloat16)] {
+            let cfg = TrainingConfig {
+                train_dtype: if use_bf16 { "bf16" } else { "f32" }.into(),
+                ..cfg_with(None)
+            };
+            let mut reference = tiny_dit();
+            if use_bf16 {
+                reference.cast_weights(Dtype::Bfloat16).unwrap();
+            }
+            let mut dit = tiny_dit();
+            let mut slot = None;
+            prepare_training_base(&mut slot, &mut dit, &cfg, use_bf16).unwrap();
+            assert!(slot.is_none());
+            for path in AdaptableHost::adaptable_paths(&dit) {
+                let (got, want) = (weight(&mut dit, &path), weight(&mut reference, &path));
+                assert_eq!(got.dtype(), want.dtype(), "{path}");
+                assert_eq!(
+                    bits32(&got),
+                    bits32(&want),
+                    "{path}: base differs from the pre-change path (bf16={use_bf16})"
+                );
+            }
+            let (l0, g0, _, _) = one_step_at(&mut reference, &cfg, compute);
+            let (l1, g1, _, _) = one_step_at(&mut dit, &cfg, compute);
+            assert_eq!(l0.to_bits(), l1.to_bits(), "bf16={use_bf16}");
+            for (k, v) in &g0 {
+                assert_eq!(bits32(v), bits32(&g1[k]), "{k} (bf16={use_bf16})");
+            }
+        }
+    }
+
+    /// Any-dtype bit view (an f32 copy of a bf16 array is exact, so equal bits ⇔ equal values).
+    fn bits32(a: &Array) -> Vec<u32> {
+        bits(&a.as_dtype(Dtype::Float32).unwrap())
+    }
+
+    /// An ai-toolkit-format adapter whose `B·A` is EXACT in f32 (power-of-two factors, at most four
+    /// terms per entry), so the expected merged weight can be formed independently of the GEMM.
+    /// Entries reach ~2^-9 and carry more mantissa than bf16 holds — around a bf16 ulp of the
+    /// fixture's weights, where the rounding order decides the result. Returns the file and each target's exact `[out, in]` delta.
+    fn write_exact_adapter(dir: &Path, targets: &[&str]) -> (PathBuf, BTreeMap<String, Array>) {
+        let mut dit = tiny_dit();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        let mut deltas = BTreeMap::new();
+        for t in targets {
+            let shape = lin(&mut dit, t).base_shape();
+            let (out, inp) = (shape[0] as usize, shape[1] as usize);
+            let a: Vec<f32> = (0..4 * inp)
+                .map(|k| {
+                    let (r, i) = (k / inp, k % inp);
+                    if (r + i) % 3 == 0 {
+                        // 1..=256 × 2^-16: products with ±2^-4 stay exact in f32 but need more
+                        // mantissa than bf16 holds, so rounding Δ itself changes the result.
+                        (1 + (i * 31 + r * 17) % 256) as f32 * 2f32.powi(-16)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let b: Vec<f32> = (0..out * 4)
+                .map(|k| {
+                    if (k / 4 * 7 + k % 4) % 2 == 0 {
+                        2f32.powi(-4)
+                    } else {
+                        -(2f32.powi(-4))
+                    }
+                })
+                .collect();
+            let mut d = vec![0f32; out * inp];
+            for o in 0..out {
+                for i in 0..inp {
+                    d[o * inp + i] = (0..4).map(|r| b[o * 4 + r] * a[r * inp + i]).sum();
+                }
+            }
+            deltas.insert(
+                t.to_string(),
+                Array::from_slice(&d, &[out as i32, inp as i32]),
+            );
+            owned.push((
+                format!("diffusion_model.{t}.lora_A.weight"),
+                Array::from_slice(&a, &[4, inp as i32]),
+            ));
+            owned.push((
+                format!("diffusion_model.{t}.lora_B.weight"),
+                Array::from_slice(&b, &[out as i32, 4]),
+            ));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let path = dir.join("exact.safetensors");
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &path).unwrap();
+        (path, deltas)
+    }
+
+    /// Finding 1: the merge rounds `W + Δ` ONCE, before the bf16 compute cast — for an f32-loaded
+    /// base (the trainer's merge-then-cast order) and for a bf16-loaded base (the per-linear f32
+    /// widen-merge-narrow). The f32-base case also proves the assertion can tell: the old
+    /// cast-then-merge order (bf16 weight + bf16-rounded delta, summed in bf16) gives different bits.
+    /// Mutation: merge after the cast in `prepare_training_base` ⇒ the f32-base single-rounding
+    /// assert fails.
+    #[test]
+    fn the_merge_rounds_once_before_the_compute_cast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, deltas) = write_exact_adapter(tmp.path(), &TARGETS);
+        for bf16_loaded in [false, true] {
+            let mut bare = tiny_dit();
+            let mut dit = tiny_dit();
+            if bf16_loaded {
+                bare.cast_weights(Dtype::Bfloat16).unwrap();
+                dit.cast_weights(Dtype::Bfloat16).unwrap();
+            }
+            let cfg = TrainingConfig {
+                train_dtype: "bf16".into(),
+                ..cfg_with(Some(file.clone()))
+            };
+            prepare_training_base(&mut None, &mut dit, &cfg, true).unwrap();
+            let mut discriminates = false;
+            for (path, delta) in &deltas {
+                let w = weight(&mut bare, path).as_dtype(Dtype::Float32).unwrap();
+                let once = mlx_rs::ops::add(&w, delta)
+                    .unwrap()
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap();
+                let twice = mlx_rs::ops::add(
+                    w.as_dtype(Dtype::Bfloat16).unwrap(),
+                    delta.as_dtype(Dtype::Bfloat16).unwrap(),
+                )
+                .unwrap();
+                let got = weight(&mut dit, path);
+                assert_eq!(got.dtype(), Dtype::Bfloat16, "{path}");
+                assert_eq!(
+                    bits32(&got),
+                    bits32(&once),
+                    "{path}: merged weight is not ONE rounding of W + Δ (bf16_loaded={bf16_loaded})"
+                );
+                discriminates |= bits32(&once) != bits32(&twice);
+            }
+            // f32-loaded base: the old cast-then-merge order rounds twice and gives different bits
+            // on some entry — so this case proves the order. (On a bf16-loaded base the two orders
+            // differ only at rare near-ties; that case pins the single-rounding result itself.)
+            if !bf16_loaded {
+                assert!(
+                    discriminates,
+                    "the f32-base case cannot discriminate the merge order"
+                );
+            }
+        }
+    }
+
+    /// Finding 2: the preview cancel reads the adapter file once. After the first push/pop the file
+    /// is deleted; every later preview still cancels to the same bits (built residuals reused).
+    /// Mutation: re-run the loader on every `push_cancel` ⇒ the second push fails (file gone) ⇒ red.
+    #[test]
+    fn the_preview_cancel_is_built_once_and_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 8);
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(file.clone()))).unwrap();
+        let mut merged = slot.unwrap();
+        assert!(!merged.cancel_built());
+        let path = TARGETS[1];
+        let inp = lin(&mut dit, path).base_shape()[1];
+        let x =
+            random::normal::<f32>(&[3, inp], None, None, Some(&random::key(11).unwrap())).unwrap();
+        merged.push_cancel(&mut dit).unwrap();
+        let first = lin(&mut dit, path).forward(&x).unwrap();
+        merged.pop_cancel(&mut dit).unwrap();
+        assert!(merged.cancel_built());
+        std::fs::remove_file(&file).unwrap();
+        for _ in 0..2 {
+            merged.push_cancel(&mut dit).unwrap();
+            let again = lin(&mut dit, path).forward(&x).unwrap();
+            assert_eq!(bits(&again), bits(&first));
+            merged.pop_cancel(&mut dit).unwrap();
+            assert!(lin(&mut dit, path).adapters().is_empty());
+        }
+    }
+
+    /// E7 for the cached cancel: it counts only with an adapter AND previews; a missing file is a
+    /// named error. Mutation: return 0 always ⇒ red.
+    #[test]
+    fn the_preview_cancel_residency_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 9);
+        let size = std::fs::metadata(&file).unwrap().len() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let previews = |cfg: TrainingConfig| TrainingConfig {
+            sample_every: 10,
+            sample_prompts: vec!["p".into()],
+            ..cfg
+        };
+        assert_eq!(
+            training_adapter_preview_gb(&cfg_with(Some(file.clone()))).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            training_adapter_preview_gb(&previews(cfg_with(None))).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            training_adapter_preview_gb(&previews(cfg_with(Some(file.clone())))).unwrap(),
+            size
+        );
+        let err = training_adapter_preview_gb(&previews(cfg_with(Some(
+            tmp.path().join("gone.safetensors"),
+        ))))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gone.safetensors"), "{err}");
+    }
+
+    /// The merge is destructive, so a reused trainer instance accepts only the same adapter again
+    /// (without merging it twice) and refuses a different one or none with a reload instruction.
+    /// Mutation: drop the same-file arm ⇒ the second merge doubles the delta / errors.
+    #[test]
+    fn a_reused_trainer_never_merges_twice_or_silently_swaps_adapters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 4);
+        let (b, _) = write_adapter(tmp.path(), "b.safetensors", &TARGETS, 5);
+        let mut dit = tiny_dit();
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(a.clone()))).unwrap();
+        let once = weight(&mut dit, TARGETS[0]);
+        apply_training_adapter(&mut slot, &mut dit, &cfg_with(Some(a))).unwrap();
+        assert_eq!(bits(&weight(&mut dit, TARGETS[0])), bits(&once));
+        for other in [Some(b), None] {
+            let err = apply_training_adapter(&mut slot, &mut dit, &cfg_with(other))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reload the trainer"), "{err}");
+        }
+    }
+
+    /// A target the DiT does not have, or an unreadable file, is a named error — never a silent
+    /// partial merge or a bare-base run.
+    #[test]
+    fn a_bad_training_adapter_is_a_named_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, _) = write_adapter(tmp.path(), "a.safetensors", &TARGETS, 6);
+        // Re-key one target onto a layer the 2-layer fixture does not have.
+        let bytes = std::fs::read(&file).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut owned: Vec<(String, Array)> = Vec::new();
+        for name in st.names() {
+            let view = st.tensor(name).unwrap();
+            let data: Vec<f32> = view
+                .data()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
+            owned.push((
+                name.replace("layers.1.", "layers.7."),
+                Array::from_slice(&data, &shape),
+            ));
+        }
+        let entries: Vec<(String, &Array)> = owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let bad = tmp.path().join("bad.safetensors");
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, &bad).unwrap();
+        let err = apply_training_adapter(&mut None, &mut tiny_dit(), &cfg_with(Some(bad)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("layers.7.feed_forward.w2"), "{err}");
+
+        let missing = tmp.path().join("missing.safetensors");
+        let err = apply_training_adapter(&mut None, &mut tiny_dit(), &cfg_with(Some(missing)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing.safetensors"), "{err}");
+    }
+
+    /// Key format of the shipped ostris adapters (`zimage_turbo_training_adapter_v{1,2}`, inspected
+    /// at revision 654cd1bf: 480 keys = 30 main layers × these 8 modules × `lora_{A,B}.weight`, all
+    /// with the `diffusion_model.` prefix and no `.alpha`): every module family merges on a layer.
+    /// Mutation: drop `feed_forward`/`adaLN_modulation` routing from the DiT host ⇒ red.
+    #[test]
+    fn every_module_family_of_the_shipped_ostris_adapters_merges() {
+        const OSTRIS_MODULES: [&str; 8] = [
+            "attention.to_q",
+            "attention.to_k",
+            "attention.to_v",
+            "attention.to_out.0",
+            "feed_forward.w1",
+            "feed_forward.w2",
+            "feed_forward.w3",
+            "adaLN_modulation.0",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let targets: Vec<String> = OSTRIS_MODULES
+            .iter()
+            .map(|m| format!("layers.1.{m}"))
+            .collect();
+        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let (file, _) = write_adapter(tmp.path(), "ostris.safetensors", &refs, 7);
+        let mut slot = None;
+        apply_training_adapter(&mut slot, &mut tiny_dit(), &cfg_with(Some(file))).unwrap();
+        assert_eq!(
+            slot.unwrap().paths.into_iter().collect::<BTreeSet<_>>(),
+            targets.into_iter().collect::<BTreeSet<_>>()
+        );
     }
 }

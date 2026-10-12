@@ -85,3 +85,6 @@ mod vae_parity;
 
 #[path = "vae_tiling_inheritance.rs"]
 mod vae_tiling_inheritance;
+
+#[path = "weights_free_trainer_conformance.rs"]
+mod weights_free_trainer_conformance;

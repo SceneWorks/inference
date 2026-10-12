@@ -48,7 +48,9 @@ pub struct EncoderOutputs {
     pub t5_hidden: Tensor,
 }
 
-/// The two SD3.5 conditioning tensors fed to the MMDiT.
+/// The two SD3.5 conditioning tensors fed to the MMDiT. `Clone` is refcounted (the trainer shares
+/// one caption's conditioning across that item's resolution buckets).
+#[derive(Clone)]
 pub struct Sd3Conditioning {
     /// `[B, pooled_dim]` (2048) — added to the timestep embedding.
     pub pooled: Tensor,

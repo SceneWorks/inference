@@ -65,7 +65,8 @@ pub mod model_vace;
 pub mod patchify;
 pub mod pipeline;
 pub mod product_load;
-pub mod pth;
+/// The torch `.pth` reader moved to [`mlx_gen::pth`] (sc-24833); re-exported at its historical path.
+pub use mlx_gen::pth;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;

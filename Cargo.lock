@@ -510,6 +510,8 @@ name = "candle-gen-anima"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-qwen-image",
  "image",
  "rand",
@@ -533,6 +535,13 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-body"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
 ]
 
 [[package]]
@@ -644,6 +653,10 @@ dependencies = [
  "candle-gen",
  "candle-nn",
  "image",
+ "safetensors 0.7.0",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -731,6 +744,7 @@ name = "candle-gen-kolors"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-sdxl",
  "candle-transformers",
@@ -750,6 +764,8 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-boogu",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",
@@ -768,6 +784,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-llm",
  "image",
@@ -785,6 +802,8 @@ name = "candle-gen-ltx"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-llm",
  "image",
  "rand",
@@ -805,6 +824,8 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-gen-boogu",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "candle-nn",
  "candle-transformers",
  "image",
@@ -846,6 +867,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-perceptual"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-body",
+ "candle-gen-depth",
+ "candle-gen-face",
+ "tempfile",
 ]
 
 [[package]]
@@ -898,6 +930,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-llm",
  "candle-nn",
  "image",
@@ -957,6 +990,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-nn",
  "candle-transformers",
  "image",
@@ -976,6 +1010,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
@@ -1039,6 +1074,8 @@ name = "candle-gen-wan"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-depth",
+ "candle-gen-perceptual",
  "image",
  "rand",
  "rand_distr",
@@ -1057,6 +1094,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-perceptual",
  "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
@@ -2304,6 +2342,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -2312,6 +2351,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-qwen-image",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -2333,6 +2374,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "mlx-gen-body"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
 ]
 
 [[package]]
@@ -2434,6 +2483,9 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2511,6 +2563,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
@@ -2528,6 +2581,8 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-boogu",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-gen-qwen-image",
  "mlx-gen-wan",
@@ -2558,6 +2613,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux2",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "mlx-llm",
  "pmetal-mlx-rs",
@@ -2572,6 +2628,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -2587,6 +2645,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-boogu",
+ "mlx-gen-perceptual",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
@@ -2619,6 +2678,18 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-perceptual"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "mlx-gen-body",
+ "mlx-gen-depth",
+ "mlx-gen-face",
+ "pmetal-mlx-rs",
  "tempfile",
 ]
 
@@ -2665,6 +2736,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-z-image",
  "mlx-llm",
  "pmetal-mlx-rs",
@@ -2725,6 +2798,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-flux",
+ "mlx-gen-perceptual",
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -2740,6 +2814,7 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "regex",
@@ -2794,12 +2869,13 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
  "unicode-normalization",
- "zip 8.6.0",
 ]
 
 [[package]]
@@ -2808,6 +2884,8 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-depth",
+ "mlx-gen-perceptual",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "safetensors 0.4.5",
@@ -3534,6 +3612,7 @@ version = "0.1.0"
 dependencies = [
  "core-llm",
  "exr",
+ "image",
  "safetensors 0.4.5",
  "serde_json",
  "sha2",
