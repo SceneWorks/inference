@@ -115,6 +115,20 @@ pub struct Checkpoint {
     /// Forward-time adapter residuals keyed by projection path (`blocks.3.attn_proj`), handed to the
     /// [`Loader`] when it builds that projection.
     residuals: RefCell<BTreeMap<String, Vec<Residual>>>,
+    /// Every tensor a [`Loader`] built from an in-memory map, at the dtype it was built in
+    /// ([`loaded`](Self::loaded)).
+    loaded: RefCell<HashMap<String, Tensor>>,
+}
+
+thread_local! {
+    static LOADER_CAST_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes this thread's [`Loader`]s produced by casting a checkpoint tensor to another dtype — a
+/// test probe: a second copy of a backbone's weights is otherwise invisible.
+#[doc(hidden)]
+pub fn loader_cast_bytes() -> usize {
+    LOADER_CAST_BYTES.with(|c| c.get())
 }
 
 impl Checkpoint {
@@ -138,6 +152,7 @@ impl Checkpoint {
             keys,
             used: RefCell::new(BTreeSet::new()),
             residuals: RefCell::new(BTreeMap::new()),
+            loaded: RefCell::new(HashMap::new()),
         })
     }
 
@@ -152,6 +167,7 @@ impl Checkpoint {
             prefix: String::new(),
             used: RefCell::new(BTreeSet::new()),
             residuals: RefCell::new(BTreeMap::new()),
+            loaded: RefCell::new(HashMap::new()),
         }
     }
 
@@ -185,6 +201,37 @@ impl Checkpoint {
             Source::Mmap(vb) => vb.get_unchecked(&format!("{}{key}", self.prefix))?,
             Source::Map(map) => map[key].clone(),
         })
+    }
+
+    /// [`take`](Self::take) at `dtype`, as the modules hold it.
+    fn take_as(&self, key: &str, dtype: DType) -> Result<Tensor> {
+        let stored = self.take(key)?;
+        let cast = to(&stored, dtype)?;
+        if stored.dtype() != dtype {
+            let bytes = cast.elem_count() * dtype.size_in_bytes();
+            LOADER_CAST_BYTES.with(|c| c.set(c.get() + bytes));
+        }
+        if matches!(self.source, Source::Map(_)) {
+            self.loaded
+                .borrow_mut()
+                .insert(key.to_owned(), cast.clone());
+        }
+        Ok(cast)
+    }
+
+    /// The in-memory tensors of this checkpoint as the modules built from it hold them: each one a
+    /// [`Loader`] read at the dtype it was read in (the very tensor, on the tape if its source is),
+    /// the rest as stored. A second model built from these shares the first one's casts instead of
+    /// casting the source again (sc-25690).
+    pub fn loaded(&self) -> HashMap<String, Tensor> {
+        let loaded = self.loaded.borrow();
+        match &self.source {
+            Source::Mmap(_) => HashMap::new(),
+            Source::Map(map) => map
+                .iter()
+                .map(|(k, v)| (k.clone(), loaded.get(k).unwrap_or(v).clone()))
+                .collect(),
+        }
     }
 
     /// The residuals installed on projection `path` (handed out once).
@@ -272,19 +319,18 @@ pub struct Loader<'a> {
 impl Loader<'_> {
     /// A tensor kept in f32 (norm gains, adaLN biases, the text position table).
     pub fn f32(&self, key: &str) -> Result<Tensor> {
-        to(&self.weights.take(key)?, DType::F32)
+        self.weights.take_as(key, DType::F32)
     }
 
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
-        let weight = to(
-            &self.weights.take(&format!("{prefix}.weight"))?,
-            self.compute,
-        )?;
+        let weight = self
+            .weights
+            .take_as(&format!("{prefix}.weight"), self.compute)?;
         let bias = if bias {
-            Some(to(
-                &self.weights.take(&format!("{prefix}.bias"))?,
-                self.compute,
-            )?)
+            Some(
+                self.weights
+                    .take_as(&format!("{prefix}.bias"), self.compute)?,
+            )
         } else {
             None
         };
@@ -479,10 +525,21 @@ impl RmsNorm {
             // Under autograd (training, sc-25686): candle's fused `rms_norm` is a CustomOp with no
             // backward, which would silently zero every upstream gradient — the same f32 math in
             // composable ops instead.
-            let dim = x.dim(D::Minus1)? as f64;
-            let ms = (x.sqr()?.sum_keepdim(D::Minus1)? / dim)?;
-            let rms = (ms + self.eps as f64)?.sqrt()?;
-            return Ok(x.broadcast_div(&rms)?.broadcast_mul(&self.weight)?);
+            // One tape node (sc-25690): the chain reads `x` twice — the quotient, which the plain
+            // backward reaches first, then the mean square.
+            let eps = self.eps as f64;
+            return Ok(crate::tape::fold3(
+                "iris-rms-norm",
+                &x,
+                &x,
+                &self.weight,
+                move |x, squared, gain| {
+                    let dim = squared.dim(D::Minus1)? as f64;
+                    let ms = (squared.sqr()?.sum_keepdim(D::Minus1)? / dim)?;
+                    let rms = (ms + eps)?.sqrt()?;
+                    x.broadcast_div(&rms)?.broadcast_mul(gain)
+                },
+            )?);
         }
         Ok(candle_gen::candle_nn::ops::rms_norm(
             &x,
@@ -622,21 +679,31 @@ pub fn attention(
     // Under autograd (training) the fused `softmax_last_dim` (no backward) is replaced by the
     // composable softmax over the same axis.
     let differentiable = q.track_op() || k.track_op() || v.track_op() || composable_forced();
-    let out = candle_gen::sdpa_budgeted_bhsd(
-        &q,
-        &k,
-        &v,
-        scale,
-        mask.as_ref(),
-        |s: &Tensor| {
-            if differentiable {
-                softmax(s, D::Minus1)
-            } else {
-                softmax_last_dim(s)
-            }
-        },
-        candle_gen::ATTN_SCORES_BUDGET,
-    )?;
+    let out = if differentiable {
+        // One tape node (sc-25690): the scores, their scaled / masked forms and the softmax's own
+        // intermediates are `[B, heads, N, N]` each and none is an operand of anything else.
+        crate::tape::fold3("iris-sdpa", &q, &k, &v, move |q, k, v| {
+            candle_gen::sdpa_budgeted_bhsd(
+                q,
+                k,
+                v,
+                scale,
+                mask.as_ref(),
+                |s: &Tensor| softmax(s, D::Minus1),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )
+        })?
+    } else {
+        candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask.as_ref(),
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?
+    };
     let out = to(&out, compute)?;
     Ok(out.transpose(1, 2)?.reshape((b, n, h * d))?)
 }

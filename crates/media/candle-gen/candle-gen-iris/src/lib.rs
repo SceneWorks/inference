@@ -50,6 +50,7 @@ pub mod nn;
 pub mod pipeline;
 pub mod restoration;
 pub mod solver;
+pub mod tape;
 pub mod text_encoder;
 pub mod train;
 

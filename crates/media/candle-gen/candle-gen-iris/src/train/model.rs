@@ -210,6 +210,53 @@ impl TrainModel {
     }
 }
 
+impl TrainModel {
+    /// [`dit`](Self::dit) on the tape plus, when `tape_free` is asked for, the same backbone off
+    /// it — the activation-checkpointing regions' forward. A full run's two backbones share one
+    /// set of compute-dtype weights (the tape-free one holds the tracked one's casts, detached):
+    /// casting the f32 masters a second time is another half backbone resident for the whole step.
+    pub fn dit_pair(
+        &self,
+        trainable: &Tensors,
+        tape_free: bool,
+    ) -> Result<(IrisDiT, Option<IrisDiT>)> {
+        if !tape_free {
+            return Ok((self.dit(trainable)?, None));
+        }
+        match &self.trainable {
+            Trainable::Full => {
+                let map: HashMap<String, Tensor> = trainable
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let ckpt = Checkpoint::from_tensors(map, &self.device);
+                let tracked =
+                    IrisDiT::from_checkpoint(&ckpt, &self.cfg, self.compute, &self.device)?;
+                let shared = ckpt
+                    .loaded()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.detach()))
+                    .collect();
+                let free = IrisDiT::from_checkpoint(
+                    &Checkpoint::from_tensors(shared, &self.device),
+                    &self.cfg,
+                    self.compute,
+                    &self.device,
+                )?;
+                Ok((tracked, Some(free)))
+            }
+            Trainable::Adapter { .. } => {
+                let detached: Tensors = trainable
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.detach()))
+                    .collect();
+                Ok((self.dit(trainable)?, Some(self.dit(&detached)?)))
+            }
+        }
+    }
+}
+
 /// One micro-batch, assembled host-side from the data walk and the positional draws.
 pub struct StepBatch {
     /// `[B, C, H, W]` f32 in `[−1, 1]`.
@@ -865,13 +912,7 @@ pub fn loss_and_grads_ext(
     grad_scale: f32,
 ) -> Result<(f32, Option<f32>, Tensors)> {
     let snap = super::optim::snapshot(params);
-    let tracked = model.dit(&snap)?;
-    let detached: Tensors = snap.iter().map(|(k, v)| (k.clone(), v.detach())).collect();
-    let tape_free = if extras.ac.active() {
-        Some(model.dit(&detached)?)
-    } else {
-        None
-    };
+    let (tracked, tape_free) = model.dit_pair(&snap, extras.ac.active())?;
     let dummy;
     let mut hooks = TrainHooks {
         tape_free: match &tape_free {

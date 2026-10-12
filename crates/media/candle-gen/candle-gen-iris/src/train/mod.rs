@@ -82,8 +82,8 @@ use model::{
     AdapterTarget, RepaTargets, StepBatch, TrainExtras, TrainModel, Trainable,
 };
 use optim::{
-    clip_grads, ema_update, mul_s, save_tensors, snapshot, IrisOptimizer, MuonShards, Params,
-    Tensors,
+    clip_grads, ema_update, grad_norm, mul_s, save_tensors, snapshot, IrisOptimizer, MuonShards,
+    Params, Tensors,
 };
 use teacher::{spatial_normalize, Teacher};
 
@@ -1689,7 +1689,9 @@ impl Run {
         if plan.log_block_grad_norms && self.topo.is_main() {
             self.log_block_norms(&grads)?;
         }
-        let (local_norm, _) = clip_grads(grads.clone(), plan.gradient_clip)?;
+        // The norm alone: `clip_grads` would also build a second, scaled gradient map (one more
+        // backbone in f32) only to drop it (sc-25690).
+        let local_norm = grad_norm(&grads)?;
         let norm = self.topo.global_sq_norm(local_norm * local_norm)?.sqrt();
         if plan.lazy_sync && !norm.is_finite() {
             return Ok(WindowOutcome::NonFinite);
