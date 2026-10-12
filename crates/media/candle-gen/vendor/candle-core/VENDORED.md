@@ -97,7 +97,9 @@ used as a matmul rhs — every base projection of an adapter run — therefore c
 weight-gradient GEMM (`lhsᵀ · grad`, `[in, out]`) plus a `zeros_like` accumulator, and since that
 operand is never a node of the walk its entry is never consumed: it stays in the `GradStore` until
 the store drops (sc-25686: the Iris LoRA step peaked at 45 GB on CUDA against MLX's ~15 GB; the
-Qwen-Image 2.1 trainer's `DEAD_WEIGHT_GRAD_COPIES` prices the same retention). The patch guards each
+Qwen-Image 2.1 trainer's `DEAD_WEIGHT_GRAD_COPIES` priced the same retention at 3 copies; re-measured
+on CUDA after this patch it is 0, and 24 of its 36 `BACKWARD_RETAINED_HIDDEN` chain tensors went with
+it). The patch guards each
 operand of the multi-input arms (`Binary` add/sub/mul/div/min/max, `WhereCond`, the convolutions,
 `SliceScatter0`, `Scatter`/`ScatterAdd`/`IndexAdd`, `Matmul`, `Cat`, and the `CustomOp2`/`CustomOp3`
 results) with membership in the walked set; single-input arms are reached only through a walked node
