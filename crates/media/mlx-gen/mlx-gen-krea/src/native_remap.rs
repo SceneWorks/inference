@@ -1,8 +1,9 @@
 //! Community **single-file** Krea 2 DiT → in-memory diffusers-key remap (epic 14015, sc-14017 S0b).
 //!
 //! A ComfyUI-exported single-file Krea 2 checkpoint (e.g. `kreamania_variant5.safetensors`, a dense
-//! bf16 merge) stores the DiT under **native-mmdit** tensor names beneath the
-//! `model.diffusion_model.` prefix — `blocks.N.attn.{wq,wk,wv,wo,gate}`, `blocks.N.mlp.{gate,up,down}`,
+//! bf16 merge) stores the DiT under **native-mmdit** tensor names, either beneath the
+//! `model.diffusion_model.` prefix or bare (e.g. `lodestones/Kroma`'s `kroma-v0.3.1-turbo-opd`; the
+//! prefix is detected per file by [`detect_native_prefix_from_keys`]) — `blocks.N.attn.{wq,wk,wv,wo,gate}`, `blocks.N.mlp.{gate,up,down}`,
 //! `blocks.N.{prenorm,postnorm}.scale`, `blocks.N.attn.qknorm.{qnorm,knorm}.scale`, `blocks.N.mod.lin`,
 //! the `txtfusion.{layerwise_blocks,refiner_blocks}.*` text-fusion stacks + `txtfusion.projector`,
 //! `txtmlp.*`, `tmlp.*`, `tproj.*`, `first.*`, and `last.{linear,modulation,norm}.*`.
@@ -109,36 +110,67 @@ impl<'cfg> DeclaredLogicalShapes<'cfg> {
 /// an MXFP8 layer's 32-padded storage unpads to the architecture's real geometry and the DiT loads.
 /// Constructed with [`without_config`](Self::without_config) it declares nothing and the previous
 /// fail-closed behaviour stands unchanged — see [`DeclaredLogicalShapes::NotInScope`].
+///
+/// # `prefix`: a property of the file
+///
+/// `prefix` is the namespace detected on the file being planned ([`detect_native_prefix_from_keys`]:
+/// `"model.diffusion_model."` for the ComfyUI community single files, `""` for bare-keyed exports such
+/// as `lodestones/Kroma`). It is carried on the value rather than hardcoded, and `logical_key`
+/// refuses a key that does not carry it, instead of accepting both spellings and letting two prefixes
+/// collide onto one logical key. Mirrors candle's `KreaNativeToDiffusersMapping`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KreaNativeToDiffusersMapping<'cfg> {
+    prefix: &'cfg str,
     shapes: DeclaredLogicalShapes<'cfg>,
 }
 
 impl<'cfg> KreaNativeToDiffusersMapping<'cfg> {
     pub const MAPPING_ID: &'static str = "krea-native-to-diffusers-v1";
 
-    /// The key mapping with the architecture config in scope: `logical_shape` declares the true
-    /// unpadded shape of every key the [`Krea2Transformer`](crate::transformer::Krea2Transformer)
-    /// loads.
-    pub const fn for_config(cfg: &'cfg Krea2Config) -> Self {
-        Self {
-            shapes: DeclaredLogicalShapes::FromConfig(cfg),
-        }
+    /// The namespace prefix used by files whose DiT is nested under a wrapper module.
+    pub const DIFFUSION_MODEL_PREFIX: &'static str = "model.diffusion_model.";
+
+    /// The key mapping for a file under `prefix` with the architecture config in scope:
+    /// `logical_shape` declares the true unpadded shape of every key the
+    /// [`Krea2Transformer`](crate::transformer::Krea2Transformer) loads.
+    pub const fn for_config(prefix: &'cfg str, cfg: &'cfg Krea2Config) -> Self {
+        Self::new(prefix, DeclaredLogicalShapes::FromConfig(cfg))
     }
 
-    /// The key mapping with **no** config in scope — `logical_shape` declares nothing. See
-    /// [`DeclaredLogicalShapes::NotInScope`] for when that is the correct choice.
-    pub const fn without_config() -> Self {
-        Self {
-            shapes: DeclaredLogicalShapes::NotInScope,
-        }
+    /// The key mapping for a file under `prefix` with **no** config in scope — `logical_shape`
+    /// declares nothing. See [`DeclaredLogicalShapes::NotInScope`] for when that is the correct
+    /// choice.
+    pub const fn without_config(prefix: &'cfg str) -> Self {
+        Self::new(prefix, DeclaredLogicalShapes::NotInScope)
     }
 
-    /// Build from an already-decided [`DeclaredLogicalShapes`] — the form the loader threads from
-    /// its callers, so the "config or not" decision is made once at the entry point.
-    pub const fn new(shapes: DeclaredLogicalShapes<'cfg>) -> Self {
-        Self { shapes }
+    /// Build from a file's detected prefix and an already-decided [`DeclaredLogicalShapes`] — the
+    /// form the loader threads from its callers, so the "config or not" decision is made once at the
+    /// entry point.
+    pub const fn new(prefix: &'cfg str, shapes: DeclaredLogicalShapes<'cfg>) -> Self {
+        Self { prefix, shapes }
     }
+}
+
+/// The DiT namespace a native single file uses, detected from its tensor keys: the
+/// `model.diffusion_model.` prefix if any key carries it, else `""` (bare keys). A file mixing both
+/// spellings detects the prefix, and its bare keys then refuse as unmapped. Same rule as candle's
+/// `detect_native_prefix_from_keys`.
+pub fn detect_native_prefix_from_keys<'a>(mut keys: impl Iterator<Item = &'a str>) -> &'static str {
+    const PREFIX: &str = KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
+    if keys.any(|k| k.starts_with(PREFIX)) {
+        PREFIX
+    } else {
+        ""
+    }
+}
+
+/// [`detect_native_prefix_from_keys`] over a safetensors file's header.
+pub fn detect_native_prefix(dit_file: &std::path::Path) -> Result<&'static str> {
+    let headers = mlx_gen::gen_core::safetensors_path_tensor_headers(dit_file)?;
+    Ok(detect_native_prefix_from_keys(
+        headers.iter().map(|h| h.name.as_str()),
+    ))
 }
 
 impl LogicalKeyMapping for KreaNativeToDiffusersMapping<'_> {
@@ -147,7 +179,7 @@ impl LogicalKeyMapping for KreaNativeToDiffusersMapping<'_> {
     }
 
     fn logical_key(&self, physical_key: &str) -> Option<String> {
-        native_dit_key_to_diffusers(physical_key)
+        native_bare_key_to_diffusers(physical_key.strip_prefix(self.prefix)?)
     }
 
     fn logical_shape(&self, logical_key: &str) -> Option<Vec<usize>> {
@@ -349,10 +381,13 @@ fn block_leaf_shape(
 /// line up 1:1 (the only reshapes — `time_mod_proj` / `scale_shift_table` — are done by the DiT), so this
 /// is a pure rename.
 pub fn native_dit_key_to_diffusers(key: &str) -> Option<String> {
-    // The ComfyUI single file namespaces the whole DiT under `model.diffusion_model.`; a DiT tensor
-    // without it is unrecognized (returns `None` → fail-closed at the call site).
-    let key = key.strip_prefix("model.diffusion_model.")?;
+    native_bare_key_to_diffusers(
+        key.strip_prefix(KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX)?,
+    )
+}
 
+/// [`native_dit_key_to_diffusers`] for a **bare** key (namespace prefix already stripped).
+pub fn native_bare_key_to_diffusers(key: &str) -> Option<String> {
     // Top-level (non-block) tensors.
     let top = match key {
         "first.weight" => Some("img_in.weight"),
@@ -429,8 +464,8 @@ pub fn native_dit_key_to_diffusers(key: &str) -> Option<String> {
 /// directly. Values and dtypes are preserved verbatim.
 ///
 /// Fails closed (typed [`Error::Msg`]) — never a silent skip — when:
-/// * an on-disk key maps to `None` ([`native_dit_key_to_diffusers`]) — a foreign/unexpected tensor, or a
-///   key missing the `model.diffusion_model.` prefix; or
+/// * an on-disk key maps to `None` — a foreign/unexpected tensor, or a key outside the namespace
+///   [`detect_native_prefix_from_keys`] detected for this set (a bare key in a prefixed file); or
 /// * two distinct native keys collide onto the same diffusers key (a non-injective mapping).
 ///
 /// Presence of every diffusers key the DiT needs (and the representative shape checks) is the separate
@@ -439,6 +474,7 @@ pub fn native_dit_key_to_diffusers(key: &str) -> Option<String> {
 /// enforced here.
 pub fn remap_native_dit_to_diffusers(mut native: Weights) -> Result<Weights> {
     let keys: Vec<String> = native.keys().map(str::to_string).collect();
+    let prefix = detect_native_prefix_from_keys(keys.iter().map(String::as_str));
 
     let mut out = Weights::empty();
     // diffusers key → the native key that produced it, for a precise collision diagnostic.
@@ -447,7 +483,10 @@ pub fn remap_native_dit_to_diffusers(mut native: Weights) -> Result<Weights> {
     let mut collisions: Vec<String> = Vec::new();
 
     for native_key in keys {
-        let Some(diffusers_key) = native_dit_key_to_diffusers(&native_key) else {
+        let Some(diffusers_key) = native_key
+            .strip_prefix(prefix)
+            .and_then(native_bare_key_to_diffusers)
+        else {
             unmapped.push(native_key);
             continue;
         };
@@ -466,7 +505,7 @@ pub fn remap_native_dit_to_diffusers(mut native: Weights) -> Result<Weights> {
         unmapped.sort();
         return Err(Error::Msg(format!(
             "krea single-file remap: {} on-disk DiT key(s) have no diffusers mapping (unrecognized \
-             checkpoint, wrong family, or a key outside the `model.diffusion_model.` DiT namespace): \
+             checkpoint, wrong family, or a key outside the file's detected DiT namespace): \
              [{}]",
             unmapped.len(),
             preview(&unmapped),
@@ -768,6 +807,70 @@ mod tests {
         );
     }
 
+    /// **A bare-keyed native file remaps exactly like the prefixed one** (e.g. `lodestones/Kroma`,
+    /// which ships the same 430 tensors without `model.diffusion_model.`). Covers both the in-memory
+    /// remap and the plan-driven mapping the loader uses.
+    #[test]
+    fn bare_keyed_file_remaps_like_the_prefixed_one() {
+        let prefixed = variant5_native_keys();
+        let bare: Vec<String> = prefixed
+            .iter()
+            .map(|k| {
+                k.strip_prefix(KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            detect_native_prefix_from_keys(bare.iter().map(String::as_str)),
+            ""
+        );
+        assert_eq!(
+            detect_native_prefix_from_keys(prefixed.iter().map(String::as_str)),
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX
+        );
+
+        let remap_keys = |keys: &[String]| -> BTreeSet<String> {
+            let mut w = Weights::empty();
+            for k in keys {
+                w.insert(k.clone(), stub());
+            }
+            match remap_native_dit_to_diffusers(w) {
+                Ok(out) => out.keys().map(str::to_string).collect(),
+                Err(e) => panic!("remap failed: {e}"),
+            }
+        };
+        assert_eq!(remap_keys(&bare), remap_keys(&prefixed));
+
+        let bare_mapping = KreaNativeToDiffusersMapping::without_config("");
+        for (b, p) in bare.iter().zip(&prefixed) {
+            assert_eq!(bare_mapping.logical_key(b), native_dit_key_to_diffusers(p));
+        }
+        // A bare-detected mapping refuses a prefixed key, and vice versa: one spelling per file.
+        assert_eq!(bare_mapping.logical_key(&prefixed[0]), None);
+        assert_eq!(
+            KreaNativeToDiffusersMapping::without_config(
+                KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX
+            )
+            .logical_key(&bare[0]),
+            None
+        );
+    }
+
+    /// **A file mixing both spellings fails closed**: the prefix is detected, so the bare key is
+    /// unmapped rather than collapsing onto the same diffusers key.
+    #[test]
+    fn mixed_prefix_file_fails_closed() {
+        let mut w = Weights::empty();
+        w.insert("model.diffusion_model.first.weight", stub());
+        w.insert("first.bias", stub());
+        let err = match remap_native_dit_to_diffusers(w) {
+            Ok(_) => panic!("a mixed-prefix file must fail closed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("first.bias"), "error must name the key: {err}");
+    }
+
     /// **Fail-closed on a native key inside the DiT namespace that is not a recognized leaf.** A
     /// truncated/garbage tensor under the prefix (`…blocks.0.attn.bogus`) still errors.
     #[test]
@@ -928,7 +1031,9 @@ mod tests {
     /// The key correspondence and the registered mapping id are unaffected by the state.
     #[test]
     fn without_a_config_no_logical_shape_is_declared() {
-        let mapping = KreaNativeToDiffusersMapping::without_config();
+        let mapping = KreaNativeToDiffusersMapping::without_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+        );
         for key in expected_transformer_keys(&asymmetric_config()) {
             assert_eq!(
                 mapping.logical_shape(&key),
@@ -943,8 +1048,11 @@ mod tests {
         let cfg = asymmetric_config();
         assert_eq!(
             mapping.logical_key("model.diffusion_model.blocks.0.attn.wq.weight"),
-            KreaNativeToDiffusersMapping::for_config(&cfg)
-                .logical_key("model.diffusion_model.blocks.0.attn.wq.weight"),
+            KreaNativeToDiffusersMapping::for_config(
+                KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+                &cfg
+            )
+            .logical_key("model.diffusion_model.blocks.0.attn.wq.weight"),
             "the key correspondence carries no config and cannot depend on the state"
         );
     }
@@ -955,7 +1063,10 @@ mod tests {
     #[test]
     fn every_expected_transformer_key_has_a_declared_shape() {
         let cfg = asymmetric_config();
-        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        let mapping = KreaNativeToDiffusersMapping::for_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            &cfg,
+        );
         for key in expected_transformer_keys(&cfg) {
             assert!(
                 mapping.logical_shape(&key).is_some(),
@@ -970,7 +1081,10 @@ mod tests {
     #[test]
     fn declared_shapes_satisfy_the_dit_architecture_validation() {
         let cfg = asymmetric_config();
-        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        let mapping = KreaNativeToDiffusersMapping::for_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            &cfg,
+        );
         let mut w = Weights::empty();
         for key in expected_transformer_keys(&cfg) {
             let shape = mapping
@@ -989,8 +1103,14 @@ mod tests {
     fn declared_shapes_track_the_config_rather_than_a_published_model() {
         let tiny = asymmetric_config();
         let turbo = Krea2Config::turbo();
-        let a = KreaNativeToDiffusersMapping::for_config(&tiny);
-        let b = KreaNativeToDiffusersMapping::for_config(&turbo);
+        let a = KreaNativeToDiffusersMapping::for_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            &tiny,
+        );
+        let b = KreaNativeToDiffusersMapping::for_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            &turbo,
+        );
 
         // Single-stream GQA: Q spans all heads, K/V only the KV heads.
         assert_eq!(
@@ -1061,7 +1181,10 @@ mod tests {
     #[test]
     fn keys_outside_the_architecture_are_not_declared() {
         let cfg = asymmetric_config();
-        let mapping = KreaNativeToDiffusersMapping::for_config(&cfg);
+        let mapping = KreaNativeToDiffusersMapping::for_config(
+            KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+            &cfg,
+        );
         for key in [
             "foreign.weight",
             "transformer_blocks.0.attn.bogus.weight",
