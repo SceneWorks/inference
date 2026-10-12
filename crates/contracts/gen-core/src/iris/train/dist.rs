@@ -2263,6 +2263,11 @@ mod tests {
         Pace::new(Duration::from_secs(5), &CancelFlag::new(), Duration::ZERO)
     }
 
+    /// A 5 s wait whose run is already cancelled (no grace).
+    fn cancelled_pace() -> Pace {
+        Pace::new(Duration::from_secs(5), &cancelled(), Duration::ZERO)
+    }
+
     fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -2793,7 +2798,7 @@ mod tests {
         });
         let (mut s, _) = l.accept().unwrap();
         configure(&s).unwrap();
-        let pace = Pace::new(Duration::from_secs(5), &cancelled(), Duration::ZERO);
+        let pace = cancelled_pace();
         let w = world(0, 2, port);
         let peers: Vec<Option<TcpStream>> = vec![None, None];
         assert!(matches!(

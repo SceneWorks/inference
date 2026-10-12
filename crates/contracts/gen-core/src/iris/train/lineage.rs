@@ -923,7 +923,7 @@ mod tests {
             };
             elect_checkpoint_writer(&mut view, CheckpointIo::PerNode, &base).is_err()
         });
-        assert_eq!(got[1], true, "rank 1's election failed");
+        assert!(got[1], "rank 1's election failed");
         assert_eq!(
             std::fs::read_dir(&root).unwrap().count(),
             0,
