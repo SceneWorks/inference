@@ -19,6 +19,20 @@ bin="$(cat "$RUNNER_TEMP/iris-memory-probe-test-binary")"
 mem_bytes="$(sysctl -n hw.memsize)"
 failed=0
 names=()
+# The `iris_memory_mlx_steady_steps` dispatch input (empty = the default matrix): N optimizer steps,
+# cache off only, without the shape the guard stops — to see whether the per-step active peak has
+# settled. The value is an untrusted dispatch input: digits only, never interpolated.
+steps=2
+caches=(default none)
+steady="${IRIS_PROBE_STEADY_STEPS:-}"
+if [[ -n "$steady" ]]; then
+  if [[ ! "$steady" =~ ^[1-9][0-9]?$ ]]; then
+    echo "::error::iris_memory_mlx_steady_steps must be 1-99"
+    exit 1
+  fi
+  steps="$steady"
+  caches=(none)
+fi
 probe() { # $1 task, $2 size, $3 ac, $4 cache
   local name="$1-$2-ac-$3-cache-$4" log free_pct free_gb
   names+=("$name")
@@ -41,7 +55,7 @@ probe() { # $1 task, $2 size, $3 ac, $4 cache
   fi
   local rc=0
   IRIS_PROBE_TASK="$1" IRIS_PROBE_SIZE="$2" IRIS_PROBE_AC="$3" IRIS_PROBE_MLX_CACHE="$4" \
-    IRIS_PROBE_STEPS=2 TMPDIR="$RUNNER_TEMP" \
+    IRIS_PROBE_STEPS="$steps" TMPDIR="$RUNNER_TEMP" \
     python3.12 scripts/ci/iris_restore_footprint_guard.py 115 600 \
     "$bin" train_memory_probe::real_training_memory_probe --ignored --exact --nocapture --test-threads 1 \
     > "$log" 2>&1 || rc=$?
@@ -49,7 +63,7 @@ probe() { # $1 task, $2 size, $3 ac, $4 cache
   python3.12 scripts/ci/iris_memory_probe_row.py mlx --name "$name" --log "$log" --rc "$rc" \
     --summary "$IRIS_OUT/summary.txt" || failed=1
 }
-for cache in default none; do
+for cache in "${caches[@]}"; do
   probe generation 1024 full "$cache"
   probe generation 1024 none "$cache"
   probe depth 1024 none "$cache"
@@ -57,7 +71,7 @@ for cache in default none; do
   probe depth 512 none "$cache"
   probe restoration 512 none "$cache"
   # Last in each pass: the one shape the guard stops.
-  probe restoration 1024 none "$cache"
+  [[ -n "$steady" ]] || probe restoration 1024 none "$cache"
 done
 cat "$IRIS_OUT/summary.txt"
 python3.12 scripts/ci/iris_memory_probe_row.py expect --backend mlx \

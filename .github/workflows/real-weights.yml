@@ -295,6 +295,11 @@ on:
         type: string
         required: false
         default: ""
+      iris_memory_mlx_steady_steps:
+        description: "iris-memory-mlx only: run the steady-state pass (cache off, no restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -5650,6 +5655,7 @@ jobs:
       IRIS_CRITIC_TRUNK_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup/snapshots/9f3e8ee3f383c672388d9178afe70af9e63ac9df
       IRIS_LPIPS_VGG16_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--timm--vgg16.tv_in1k/snapshots/b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
       IRIS_LPIPS_LIN_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--vivym--lpips/snapshots/270571f1fb2a2c4c5f920cec96cd87838c345982
+      IRIS_PROBE_STEADY_STEPS: ${{ inputs.iris_memory_mlx_steady_steps }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Check the host (nax-macos-2, >= 128 GB)
