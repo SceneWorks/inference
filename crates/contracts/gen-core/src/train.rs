@@ -384,7 +384,7 @@ impl IdentityLossConfig {
 impl Default for IdentityLossConfig {
     fn default() -> Self {
         Self {
-            schedule: AuxLossSchedule::OFF,
+            schedule: PIXEL_PERCEPTUAL_SCHEDULE,
             min_cos: Self::DEFAULT_MIN_COS,
             reference_mode: IdentityReferenceMode::default(),
         }
@@ -393,14 +393,23 @@ impl Default for IdentityLossConfig {
 
 /// [`TrainingConfig::face_landmark_loss`] — the FaceMesh landmark loss schedule plus the frozen
 /// FaceMesh-v2 checkpoint it runs.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FaceLandmarkLossConfig {
-    /// Weight / window / alternation. Off by default.
+    /// Weight / window / alternation. Off by default ([`PIXEL_PERCEPTUAL_SCHEDULE`]).
     pub schedule: AuxLossSchedule,
     /// Directory holding the converted FaceMesh-v2 program checkpoint
     /// (`face_landmarks_detector.safetensors`). Required (a typed refusal otherwise) when the loss is
     /// enabled.
     pub model_dir: Option<PathBuf>,
+}
+
+impl Default for FaceLandmarkLossConfig {
+    fn default() -> Self {
+        Self {
+            schedule: PIXEL_PERCEPTUAL_SCHEDULE,
+            model_dir: None,
+        }
+    }
 }
 
 /// The weights of [`TrainingConfig::subject_mask_loss`] (epic 2123, sc-24828). A latent cell with
@@ -566,9 +575,9 @@ impl DepthModelSize {
 
 /// [`TrainingConfig::depth_anchoring`] — the depth-anchoring loss schedule plus the frozen
 /// Depth-Anything-V2 checkpoint it runs.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DepthAnchoringConfig {
-    /// Weight / window / alternation. Off by default.
+    /// Weight / window / alternation. Off by default ([`PIXEL_PERCEPTUAL_SCHEDULE`]).
     pub schedule: AuxLossSchedule,
     /// Which DA2 checkpoint [`model_dir`](Self::model_dir) holds.
     pub model_size: DepthModelSize,
@@ -576,6 +585,42 @@ pub struct DepthAnchoringConfig {
     /// refusal otherwise) when the loss is enabled.
     pub model_dir: Option<PathBuf>,
 }
+
+impl Default for DepthAnchoringConfig {
+    fn default() -> Self {
+        Self {
+            schedule: PIXEL_PERCEPTUAL_SCHEDULE,
+            model_size: DepthModelSize::default(),
+            model_dir: None,
+        }
+    }
+}
+
+/// The default schedule of the **decoded-x0 (pixel-space)** auxiliary losses whose upstream window
+/// was `[0, 1]` — depth anchoring, the identity and face-landmark losses and the body-proportion
+/// loss (sc-2124; body shape / normal keep upstream's [`BODY_SURFACE_SCHEDULE`]) — once given a
+/// weight: the low-noise window `[0, 0.5]` the latent losses use ([`LATENT_PERCEPTUAL_SCHEDULE`])
+/// and upstream's every-other-update alternation (`every_n = 2`). Near pure noise the decoded x0
+/// is mush, so an aux-only update there trains the adapter toward the frozen model's reading of
+/// noise; the real-weight A/B saw `[0, 1]` destroy likeness on SDXL and hurt Z-Image. Weight `0`
+/// ⇒ off. An explicit window is honoured unchanged.
+pub const PIXEL_PERCEPTUAL_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
+    weight: 0.0,
+    t_min: 0.0,
+    t_max: 0.5,
+    every_n: 2,
+};
+
+/// The default schedule of the **body shape and surface-normal** losses (sc-2124): upstream
+/// ai-toolkit-perceptual's `[0.4, 0.8]` window, every-other-update alternation. Unlike the other
+/// decoded-x0 losses (upstream `[0, 1]`, here [`PIXEL_PERCEPTUAL_SCHEDULE`]) this window already
+/// excludes the top of the noise range, so it is kept. Weight `0` ⇒ off.
+pub const BODY_SURFACE_SCHEDULE: AuxLossSchedule = AuxLossSchedule {
+    weight: 0.0,
+    t_min: 0.4,
+    t_max: 0.8,
+    every_n: 2,
+};
 
 /// The upstream (ai-toolkit-perceptual) default schedule of the two latent-space perceptual losses
 /// (sc-24833) once given a weight: window `[0, 0.5]` (`*_loss_min_t` / `*_loss_max_t`) and
@@ -2511,6 +2556,43 @@ mod tests {
         );
     }
 
+    /// sc-2124: the decoded-x0 aux losses whose upstream window was `[0, 1]` (depth, identity,
+    /// landmark, body proportion) default to the latent losses' low-noise window `[0, 0.5]`; body
+    /// shape / normal keep upstream's `[0.4, 0.8]`; all alternate every other update. Mutation:
+    /// default any of them to `AuxLossSchedule::OFF` (window `[0, 1]`) ⇒ red.
+    #[test]
+    fn pixel_space_aux_losses_default_to_the_low_noise_window() {
+        let c = TrainingConfig::default();
+        let pixel = [
+            ("depth", c.depth_anchoring.schedule),
+            ("identity", c.identity_loss.schedule),
+            ("landmark", c.face_landmark_loss.schedule),
+            ("proportion", c.body_losses.proportion),
+        ];
+        for (name, s) in pixel {
+            assert_eq!(
+                (s.weight, s.t_min, s.t_max, s.every_n),
+                (0.0, 0.0, 0.5, 2),
+                "{name}"
+            );
+            assert!(s.validate(name).is_ok());
+        }
+        assert_eq!(
+            PIXEL_PERCEPTUAL_SCHEDULE.t_max,
+            LATENT_PERCEPTUAL_SCHEDULE.t_max
+        );
+        for (name, s) in [
+            ("shape", c.body_losses.shape),
+            ("normal", c.body_losses.normal),
+        ] {
+            assert_eq!(
+                (s.weight, s.t_min, s.t_max, s.every_n),
+                (0.0, 0.4, 0.8, 2),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn validate_training_techniques_depth_anchoring_floor() {
         // sc-2125 (epic 2123 E3): depth anchoring is refused unless the descriptor declares it,
@@ -2525,7 +2607,10 @@ mod tests {
 
         // Off (the default) ⇒ no-op everywhere.
         let off = train_req(None, items);
-        assert_eq!(off.config.depth_anchoring.schedule, AuxLossSchedule::OFF);
+        assert_eq!(
+            off.config.depth_anchoring.schedule,
+            PIXEL_PERCEPTUAL_SCHEDULE
+        );
         assert!(!off.config.depth_anchoring.schedule.is_enabled());
         assert!(validate_training_techniques(&plain, &off).is_ok());
 
@@ -2605,8 +2690,11 @@ mod tests {
         face_desc.techniques.face_landmark_loss = true;
 
         let off = train_req(None, items);
-        assert_eq!(off.config.identity_loss.schedule, AuxLossSchedule::OFF);
-        assert_eq!(off.config.face_landmark_loss.schedule, AuxLossSchedule::OFF);
+        assert_eq!(off.config.identity_loss.schedule, PIXEL_PERCEPTUAL_SCHEDULE);
+        assert_eq!(
+            off.config.face_landmark_loss.schedule,
+            PIXEL_PERCEPTUAL_SCHEDULE
+        );
         assert_eq!(off.config.identity_loss.min_cos, 0.2);
         assert_eq!(
             off.config.identity_loss.reference_mode,
