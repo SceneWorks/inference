@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -5271,3 +5271,57 @@ jobs:
           path: ${{ runner.temp }}/qwen-image-2-1-mlx-evidence
           if-no-files-found: error
           retention-days: 30
+
+  veda-s3-cuda:
+    name: Veda S3 bounded native kernel validation (CUDA only)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-s3-cuda'
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+    # The owned build/lint/self-test has a hard one-hour deadline; reserve setup and artifact time.
+    timeout-minutes: 75
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Prepare normalized evidence paths and require admitted CUDA listener
+        shell: cmd
+        run: |
+          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "S3_OUTPUT_DIR=%%~fI"
+          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-target-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "CARGO_TARGET_DIR=%%~fI"
+          mkdir "%S3_OUTPUT_DIR%" || exit /b 1
+          echo S3_OUTPUT_DIR=%S3_OUTPUT_DIR%>>"%GITHUB_ENV%"
+          echo CARGO_TARGET_DIR=%CARGO_TARGET_DIR%>>"%GITHUB_ENV%"
+          >"%S3_OUTPUT_DIR%\preflight.json" echo {"instrument":"veda_s3_cuda","complete":false,"status":"tooling_not_yet_checked","runner":"%RUNNER_NAME%","host":"%COMPUTERNAME%","source_commit":"%GITHUB_SHA%","gpu_started":false,"device_test_started":false}
+          if not "%RUNNER_NAME%"=="cuda-windows" if not "%RUNNER_NAME%"=="cuda-windows-2" (
+            echo Unexpected CUDA listener %RUNNER_NAME%
+            exit /b 1
+          )
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\veda-s3-cuda\install-reviewed-cpython-3-12.cmd
+      - name: Select existing Git Bash for toolchain action
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+          components: clippy
+      - name: Claim idle physical GPU, build/lint exact source, and execute bounded S3 gates
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\release\veda_s3_cuda.py'
+      - name: Preserve CUDA S3 evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-s3-cuda-${{ github.sha }}
+          path: ${{ runner.temp }}/veda-s3-cuda-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error

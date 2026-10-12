@@ -778,6 +778,22 @@ mod tests {
             assert!(failed.tested.borrow().is_none());
             let _ = failed.attention(0, 2, &q, &k, &v, 0.25).unwrap();
             assert_eq!(failed_report.borrow().dense_calls, 2);
+            let Device::Cuda(cuda) = &dev else {
+                unreachable!()
+            };
+            println!(
+                "S3_DEVICE_RECEIPT {}",
+                serde_json::json!({
+                    "schema":"sc-25771-actual-cuda-kernel-v1", "kernel":KERNEL,
+                    "device_ordinal":cuda.cuda_stream().context().ordinal(),
+                    "dtype":format!("{dtype:?}"), "self_test_dimensions":[16,128],
+                    "native_batch":2, "native_heads":2,
+                    "sparse_calls":report.borrow().sparse_calls,
+                    "predictor_score_calls":report.borrow().predictor_score_calls,
+                    "forced_failure_dense":true, "unsupported_dtype_dense":true,
+                    "intentional_dense_identity":true,
+                })
+            );
         }
     }
     #[test]
