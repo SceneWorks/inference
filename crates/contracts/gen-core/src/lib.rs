@@ -298,4 +298,4 @@ pub use transform::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod veda;
-pub use veda::{VedaExecutionReport, VedaRequest};
+pub use veda::{VedaBudget, VedaExecutionReport, VedaRequest};
