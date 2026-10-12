@@ -53,9 +53,12 @@ fn max_pool2(x: &Array) -> Result<Array> {
     use mlx_rs::ops::indexing::IndexOp;
     let sh = x.shape();
     let (b, h, w, c) = (sh[0], sh[1] / 2, sh[2] / 2, sh[3]);
-    Ok(x.index((.., ..2 * h, ..2 * w, ..))
-        .reshape(&[b, h, 2, w, 2, c])?
-        .max_axes(&[2, 4], false)?)
+    Ok(x.index_device(
+        (.., ..2 * h, ..2 * w, ..),
+        mlx_rs::Stream::task_local_or_default(),
+    )
+    .reshape(&[b, h, 2, w, 2, c])?
+    .max_axes(&[2, 4], false)?)
 }
 
 impl Lpips {

@@ -129,8 +129,20 @@ enum Slot {
     Muon {
         momentum: Array,
         split: Option<usize>,
+        /// The full matrix `(rows, cols)` (a sharded run holds only some rows of `momentum`).
+        full: (usize, usize),
     },
     Frozen,
+}
+
+/// A sharded run's Muon seam (sc-25689): Dion orthogonalizes each matrix **whole**, so the
+/// optimizer gathers every shard's rows of the update, orthogonalizes the full matrix, and keeps
+/// its own rows.
+pub trait MuonShards {
+    /// The full `[rows, cols]` matrix assembled from every shard's `rows` of `key`.
+    fn gather(&mut self, key: &str, rows: &Array) -> Result<Array>;
+    /// This rank's rows of a full matrix of `key`.
+    fn own_rows(&self, key: &str, full: &Array) -> Result<Array>;
 }
 
 /// The run's optimizer over a keyed parameter map.
@@ -148,6 +160,17 @@ impl IrisOptimizer {
         params: &Params,
         route: impl Fn(&str, usize) -> ParamRoute,
     ) -> Result<Self> {
+        Self::new_sharded(plan, params, &HashMap::new(), route)
+    }
+
+    /// [`Self::new`] over a sharded run's parameter **rows**; `full_rows[k]` is the full row count
+    /// of a sharded matrix (absent = `params[k]` is the whole tensor).
+    pub fn new_sharded(
+        plan: &OptimizerPlan,
+        params: &Params,
+        full_rows: &HashMap<Rc<str>, usize>,
+        route: impl Fn(&str, usize) -> ParamRoute,
+    ) -> Result<Self> {
         let mut slots = HashMap::with_capacity(params.len());
         for (k, p) in params {
             let slot = match route(k, p.ndim()) {
@@ -163,9 +186,14 @@ impl IrisOptimizer {
                             p.shape()
                         )));
                     }
+                    let sh = p.shape();
                     Slot::Muon {
-                        momentum: Array::zeros::<f32>(p.shape())?,
+                        momentum: Array::zeros::<f32>(sh)?,
                         split,
+                        full: (
+                            full_rows.get(k).copied().unwrap_or(sh[0] as usize),
+                            sh[1] as usize,
+                        ),
                     }
                 }
             };
@@ -189,6 +217,18 @@ impl IrisOptimizer {
 
     /// One optimizer step at learning rate `lr` over (clipped) `grads`, in place.
     pub fn step(&mut self, params: &mut Params, grads: &Params, lr: f64) -> Result<()> {
+        self.step_sharded(params, grads, lr, None)
+    }
+
+    /// [`Self::step`] over a sharded run's rows: AdamW, the momentum and the weight decay are
+    /// elementwise on the rows; each Muon update is orthogonalized whole through `shards`.
+    pub fn step_sharded(
+        &mut self,
+        params: &mut Params,
+        grads: &Params,
+        lr: f64,
+        mut shards: Option<&mut dyn MuonShards>,
+    ) -> Result<()> {
         self.t += 1;
         let (b1, b2) = self.plan.betas;
         let wd = self.plan.weight_decay;
@@ -230,16 +270,27 @@ impl IrisOptimizer {
                     let denom = sqrt(&*v)?.divide(s(bc2.sqrt()))?.add(s(eps))?;
                     p.subtract(&m.divide(&denom)?.multiply(s(lr / bc1))?)?
                 }
-                Slot::Muon { momentum, split } => {
+                Slot::Muon {
+                    momentum,
+                    split,
+                    full,
+                } => {
                     *momentum = momentum.multiply(s(mu))?.add(&g)?;
                     let u = if self.plan.muon_nesterov {
                         momentum.multiply(s(mu))?.add(&g)?
                     } else {
                         momentum.clone()
                     };
-                    let u = orthogonalize(&u.as_dtype(Dtype::Bfloat16)?, *split, adjust)?;
-                    let sh = p.shape();
-                    let adjusted = lr * adjust.ratio(sh[0] as usize, sh[1] as usize);
+                    let u = match shards.as_deref_mut() {
+                        None => orthogonalize(&u.as_dtype(Dtype::Bfloat16)?, *split, adjust)?,
+                        Some(sh) => {
+                            let whole = sh.gather(&k, &u)?;
+                            let o =
+                                orthogonalize(&whole.as_dtype(Dtype::Bfloat16)?, *split, adjust)?;
+                            sh.own_rows(&k, &o)?
+                        }
+                    };
+                    let adjusted = lr * adjust.ratio(full.0, full.1);
                     let p = p.multiply(s(1.0 - lr * wd))?;
                     let step = scale_bf16(&u, adjusted, 0.0)?;
                     p.subtract(&step.as_dtype(Dtype::Float32)?)?
@@ -283,6 +334,9 @@ impl IrisOptimizer {
                 Slot::Frozen => {}
             }
         }
+        // Name order: a sharded checkpoint gathers these collectively, so every rank must visit
+        // them in the same sequence (the slot map's iteration order is per-process).
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
@@ -340,7 +394,7 @@ pub fn clip_grads(grads: Params, max_norm: f64) -> Result<(f64, Params)> {
         let axes: Vec<i32> = (0..g.ndim() as i32).collect();
         total = total.add(&sum_axes(&g.square()?, &axes[..], false)?)?;
     }
-    let total = sqrt(&total)?.item::<f32>() as f64;
+    let total = super::scalar_f32(&sqrt(&total)?)? as f64;
     let coef = gen_core::iris::train::clip_coefficient(max_norm, total);
     let c = s(coef);
     let mut out = HashMap::with_capacity(grads.len());

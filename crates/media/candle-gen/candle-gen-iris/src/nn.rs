@@ -475,7 +475,7 @@ pub struct RmsNorm {
 impl RmsNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = to(x, DType::F32)?.contiguous()?;
-        if x.track_op() || self.weight.track_op() {
+        if x.track_op() || self.weight.track_op() || composable_forced() {
             // Under autograd (training, sc-25686): candle's fused `rms_norm` is a CustomOp with no
             // backward, which would silently zero every upstream gradient — the same f32 math in
             // composable ops instead.
@@ -492,7 +492,27 @@ impl RmsNorm {
     }
 }
 
+thread_local! {
+    static FORCE_COMPOSABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the composable (autograd) forms of the fused RMSNorm / softmax are forced on this thread.
+pub fn composable_forced() -> bool {
+    FORCE_COMPOSABLE.with(|c| c.get())
+}
+
+/// Run `f` with the composable forms of the fused kernels forced even on untracked tensors (sc-25689):
+/// an activation-checkpointing region's tape-free forward must compute exactly what its tracked
+/// recompute computes.
+pub fn with_composable<T>(f: impl FnOnce() -> T) -> T {
+    let prev = FORCE_COMPOSABLE.with(|c| c.replace(true));
+    let out = f();
+    FORCE_COMPOSABLE.with(|c| c.set(prev));
+    out
+}
+
 /// Rotation tables `(cos, sin)`, `[n, pairs]` f32, for [`Rope::apply`].
+#[derive(Clone)]
 pub struct Rope {
     pub cos: Tensor,
     pub sin: Tensor,
@@ -520,6 +540,21 @@ impl Rope {
         device: &Device,
     ) -> Result<Self> {
         let angles = iris::rope_2d_angles(head_dim, height, width, theta, scale);
+        Self::from_angles(&angles, height * width, 2 * (head_dim / 4), device)
+    }
+
+    /// [`Self::grid_2d`] under `model.rope_aspect` (`square = true`: each axis normalized to
+    /// `[0, scale]` on its own — `gen_core::iris::rope_2d_angles_aspect`).
+    pub fn grid_2d_aspect(
+        head_dim: usize,
+        height: usize,
+        width: usize,
+        theta: f32,
+        scale: f32,
+        square: bool,
+        device: &Device,
+    ) -> Result<Self> {
+        let angles = iris::rope_2d_angles_aspect(head_dim, height, width, theta, scale, square);
         Self::from_angles(&angles, height * width, 2 * (head_dim / 4), device)
     }
 
@@ -586,7 +621,7 @@ pub fn attention(
     let scale = 1.0 / (d as f64).sqrt();
     // Under autograd (training) the fused `softmax_last_dim` (no backward) is replaced by the
     // composable softmax over the same axis.
-    let differentiable = q.track_op() || k.track_op() || v.track_op();
+    let differentiable = q.track_op() || k.track_op() || v.track_op() || composable_forced();
     let out = candle_gen::sdpa_budgeted_bhsd(
         &q,
         &k,

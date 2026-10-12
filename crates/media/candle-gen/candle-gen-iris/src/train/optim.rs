@@ -169,8 +169,20 @@ enum Slot {
     Muon {
         momentum: Tensor,
         split: Option<usize>,
+        /// The full matrix `(rows, cols)` (a sharded run holds only some rows of `momentum`).
+        full: (usize, usize),
     },
     Frozen,
+}
+
+/// A sharded run's Muon seam (sc-25689): Dion orthogonalizes each matrix **whole**, so the
+/// optimizer gathers every shard's rows of the update, orthogonalizes the full matrix, and keeps
+/// its own rows.
+pub trait MuonShards {
+    /// The full `[rows, cols]` matrix assembled from every shard's `rows` of `key`.
+    fn gather(&mut self, key: &str, rows: &Tensor) -> Result<Tensor>;
+    /// This rank's rows of a full matrix of `key`.
+    fn own_rows(&self, key: &str, full: &Tensor) -> Result<Tensor>;
 }
 
 /// The run's optimizer over a keyed parameter map.
@@ -186,6 +198,17 @@ impl IrisOptimizer {
     pub fn new(
         plan: &OptimizerPlan,
         params: &Params,
+        route: impl Fn(&str, usize) -> ParamRoute,
+    ) -> Result<Self> {
+        Self::new_sharded(plan, params, &HashMap::new(), route)
+    }
+
+    /// [`Self::new`] over a sharded run's parameter **rows**; `full_rows[k]` is the full row count
+    /// of a sharded matrix (absent = `params[k]` is the whole tensor).
+    pub fn new_sharded(
+        plan: &OptimizerPlan,
+        params: &Params,
+        full_rows: &HashMap<String, usize>,
         route: impl Fn(&str, usize) -> ParamRoute,
     ) -> Result<Self> {
         let mut slots = BTreeMap::new();
@@ -205,9 +228,11 @@ impl IrisOptimizer {
                             p.dims()
                         )));
                     }
+                    let (rows, cols) = p.dims2()?;
                     Slot::Muon {
                         momentum: zeros()?,
                         split,
+                        full: (full_rows.get(k).copied().unwrap_or(rows), cols),
                     }
                 }
             };
@@ -231,6 +256,18 @@ impl IrisOptimizer {
 
     /// One optimizer step at learning rate `lr` over (clipped) `grads`, in place.
     pub fn step(&mut self, params: &Params, grads: &Tensors, lr: f64) -> Result<()> {
+        self.step_sharded(params, grads, lr, None)
+    }
+
+    /// [`Self::step`] over a sharded run's rows: AdamW, the momentum and the weight decay are
+    /// elementwise on the rows; each Muon update is orthogonalized whole through `shards`.
+    pub fn step_sharded(
+        &mut self,
+        params: &Params,
+        grads: &Tensors,
+        lr: f64,
+        mut shards: Option<&mut dyn MuonShards>,
+    ) -> Result<()> {
         self.t += 1;
         let (b1, b2) = self.plan.betas;
         let wd = self.plan.weight_decay;
@@ -268,22 +305,36 @@ impl IrisOptimizer {
                     let denom = add_s(&div_s(&v.sqrt()?, bc2.sqrt())?, eps)?;
                     p.sub(&mul_s(&m.div(&denom)?, lr / bc1)?)?
                 }
-                Slot::Muon { momentum, split } => {
+                Slot::Muon {
+                    momentum,
+                    split,
+                    full,
+                } => {
                     *momentum = mul_s(momentum, mu)?.add(&g)?;
                     let u = if nesterov {
                         mul_s(momentum, mu)?.add(&g)?
                     } else {
                         momentum.clone()
                     };
-                    let u = orthogonalize(&u.to_dtype(DType::BF16)?, *split, adjust)?;
-                    let (rows, cols) = p.dims2()?;
-                    let adjusted = lr * adjust.ratio(rows, cols);
+                    let u = match shards.as_deref_mut() {
+                        None => orthogonalize(&u.to_dtype(DType::BF16)?, *split, adjust)?,
+                        Some(sh) => {
+                            let whole = sh.gather(k, &u)?;
+                            let o = orthogonalize(&whole.to_dtype(DType::BF16)?, *split, adjust)?;
+                            sh.own_rows(k, &o)?
+                        }
+                    };
+                    let adjusted = lr * adjust.ratio(full.0, full.1);
                     let p = mul_s(&p, 1.0 - lr * wd)?;
                     let step = scale_bf16(&u, adjusted, 0.0)?;
                     p.sub(&step.to_dtype(DType::F32)?)?
                 }
             };
-            var.set(&new_p)?;
+            if var.elem_count() > 0 {
+                // A zero-row shard (more shards than rows) has nothing to update (and candle hands
+                // its empty input back from the update arithmetic).
+                var.set(&new_p)?;
+            }
         }
         Ok(())
     }

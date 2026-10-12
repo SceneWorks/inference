@@ -16,16 +16,55 @@ pub fn rope_2d_angles(
     theta: f32,
     scale: f32,
 ) -> Vec<f32> {
+    rope_2d_angles_aspect(head_dim, height, width, theta, scale, false)
+}
+
+/// `torch.linspace(0, end, n)` in f32 (the symmetric two-sided evaluation).
+fn linspace_f32(end: f32, n: usize) -> Vec<f32> {
+    if n == 1 {
+        return vec![0.0];
+    }
+    let step = end / (n - 1) as f32;
+    let half = n / 2;
+    (0..n)
+        .map(|i| {
+            if i < half {
+                step * i as f32
+            } else {
+                end - step * (n - 1 - i) as f32
+            }
+        })
+        .collect()
+}
+
+/// [`rope_2d_angles`] under `rope_aspect`: `square = false` is `isotropic` (one shared step), and
+/// `square = true` normalizes each axis to `[0, scale]` independently (`torch.linspace(0, scale,
+/// n)` per axis — aspect-blind; stage 1 of the official curriculum trains with it). On a square
+/// grid the two coincide up to the linspace rounding.
+pub fn rope_2d_angles_aspect(
+    head_dim: usize,
+    height: usize,
+    width: usize,
+    theta: f32,
+    scale: f32,
+    square: bool,
+) -> Vec<f32> {
     let n_pairs = head_dim / 4;
     let freqs: Vec<f32> = (0..n_pairs)
         .map(|j| 1.0 / theta.powf((4 * j) as f32 / head_dim as f32))
         .collect();
-    let step = scale / ((height.max(width) as f32) - 1.0).max(1.0);
+    let (xs, ys): (Vec<f32>, Vec<f32>) = if square {
+        (linspace_f32(scale, width), linspace_f32(scale, height))
+    } else {
+        let step = scale / ((height.max(width) as f32) - 1.0).max(1.0);
+        (
+            (0..width).map(|c| c as f32 * step).collect(),
+            (0..height).map(|r| r as f32 * step).collect(),
+        )
+    };
     let mut angles = Vec::with_capacity(height * width * 2 * n_pairs);
-    for r in 0..height {
-        let y = r as f32 * step;
-        for c in 0..width {
-            let x = c as f32 * step;
+    for &y in &ys {
+        for &x in &xs {
             for f in &freqs {
                 angles.push(x * f);
                 angles.push(y * f);

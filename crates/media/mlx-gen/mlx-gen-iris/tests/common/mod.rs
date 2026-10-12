@@ -36,6 +36,41 @@ pub fn on_cpu<T>(f: impl FnOnce() -> T) -> T {
     mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), f)
 }
 
+const CPU_CHILD_ENV: &str = "IRIS_TEST_CPU_CHILD";
+const CPU_CHILD_DONE: &str = "IRIS_TEST_CPU_CHILD_DONE";
+
+/// Run `body` in a child process of this test binary whose MLX **default device** is the CPU
+/// (sc-25689). [`on_cpu`] sets only mlx-rs's task-local stream, which the array operators, `index`
+/// and a few other entry points do not consult — they target the default device (the GPU on a
+/// Mac). A process-wide CPU default in a dedicated child keeps every op of `body` off the GPU
+/// without changing the device under the binary's other tests. `test` is the test's full path in
+/// the integration binary (`module::name`).
+pub fn cpu_process(test: &str, body: fn()) {
+    if std::env::var(CPU_CHILD_ENV).as_deref() == Ok(test) {
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        on_cpu(body);
+        std::fs::write(std::env::var(CPU_CHILD_DONE).unwrap(), b"ok").unwrap();
+        return;
+    }
+    let done = tempfile::tempdir().unwrap();
+    let marker = done.path().join("done");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads",
+            "1",
+            "--include-ignored",
+        ])
+        .env(CPU_CHILD_ENV, test)
+        .env(CPU_CHILD_DONE, &marker)
+        .status()
+        .expect("spawn the CPU child");
+    assert!(status.success(), "{test} failed in its CPU child");
+    assert!(marker.is_file(), "{test}: the CPU child ran no body");
+}
+
 pub fn fixture(name: &str) -> Weights {
     Weights::from_file(fixtures().join(name)).expect("committed fixture loads")
 }

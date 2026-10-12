@@ -22,6 +22,15 @@ mod controls_contract;
 #[path = "controls_parity.rs"]
 mod controls_parity;
 
+#[path = "curricula_lifecycle.rs"]
+mod curricula_lifecycle;
+
+#[path = "curricula_parity.rs"]
+mod curricula_parity;
+
+#[path = "curricula_real_weights.rs"]
+mod curricula_real_weights;
+
 #[path = "depth_parity.rs"]
 mod depth_parity;
 
@@ -72,6 +81,9 @@ mod text_parity;
 
 #[path = "train_cross_backend.rs"]
 mod train_cross_backend;
+
+#[path = "train_distributed.rs"]
+mod train_distributed;
 
 #[path = "train_lifecycle.rs"]
 mod train_lifecycle;

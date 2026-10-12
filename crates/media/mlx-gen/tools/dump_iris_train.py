@@ -340,3 +340,371 @@ save_safetensors(
         "shift": SHIFT, "rank": RANK, "alpha": ALPHA, "dion": DION_COMMIT,
     },
 )
+
+
+# =================================================================================================
+# sc-25689 — curricula, shapes, REPA / iREPA, activation checkpointing, holdout validation
+# =================================================================================================
+# Writes `mlx-gen-iris/tests/fixtures/iris_curricula_golden.safetensors` from the same frozen
+# modules (plus `repa.py`, `models/ac.py`, `data/{shapes,buckets,samplers,datasets}.py`) and the
+# `facebookresearch/dinov2` model code @ DINOV2_COMMIT (the source's torch-hub teacher). The REPA
+# teacher here is a seeded miniature `DinoVisionTransformer` (the same class `dinov2_vitb14`
+# builds) handed to the frozen `REPALoss` through `torch.hub.load`, so the alignment math runs
+# upstream's code verbatim. Run the whole script (it regenerates both fixtures):
+#     IRIS_SRC=… DION_SRC=… DINOV2_SRC=/path/to/dinov2 python -I tools/dump_iris_train.py
+# With DINOV2_HUB_WEIGHTS (dinov2_vitb14_pretrain.pth) and DINOV2_HF_DIR (facebook/dinov2-base @
+# DINOV2_HF_REVISION) set it also proves the two release-teacher resources hold the same tensors and
+# writes the real-teacher reference `iris_repa_teacher_real.safetensors`.
+import json  # noqa: E402
+import math  # noqa: E402
+from functools import partial  # noqa: E402
+
+S11_UPSTREAM_SHA256 = {
+    "src/iris3b/repa.py": "a2895bc4d903db9aaa3f44888d202b2c0a132127d6cc6aabfc951bb2f6262a75",
+    "src/iris3b/models/ac.py": "c62f9a67d3849bfea966593051d1f9499c78c967a1f3dea7bd3fe990f38ce01a",
+    "src/iris3b/data/shapes.py": "cded8bf52607fe65cc36f36e3f60d03daf193ef8d6cc3d17620ae34eb4d41209",
+    "src/iris3b/data/buckets.py": "58fdb2c1d0e840c4ff7ee55f0e53975b209612240243d70bf8fc03da00d367c1",
+    "src/iris3b/data/samplers.py": "c8a0ed0a5709d6c9faa248fba3c70b768ae0d7542709e823a844843731a09ad6",
+    "src/iris3b/data/datasets.py": "05ab9064d9fbd2b7bdd390957512be6ba65e4d131796911dd325b229a2b48df8",
+}
+DINOV2_COMMIT = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+DINOV2_HF_REVISION = "f9e44c814b77203eaa57a6bdbbd535f21ede1415"
+_verify(require_env("IRIS_SRC", "the iris-3b checkout"), S11_UPSTREAM_SHA256, None)
+DINOV2_SRC = require_env("DINOV2_SRC", f"a checkout of facebookresearch/dinov2 at {DINOV2_COMMIT}")
+_verify(DINOV2_SRC, {}, DINOV2_COMMIT)
+sys.path.insert(0, DINOV2_SRC)
+
+from dinov2.layers import MemEffAttention, NestedTensorBlock  # noqa: E402
+from dinov2.models.vision_transformer import DinoVisionTransformer  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from iris3b.config import RepaConfig  # noqa: E402
+from iris3b.data.buckets import TRAIN_BUCKETS  # noqa: E402
+from iris3b.data.datasets import _center_crop, _resize_covering, _to_tensor  # noqa: E402
+from iris3b.data.samplers import RangedSampler, ShapeBatchSampler  # noqa: E402
+from iris3b.data.shapes import AreaPolicy, BucketPolicy  # noqa: E402
+from iris3b.models import ac as upstream_ac  # noqa: E402
+from iris3b.repa import REPALoss, _spatial_normalize  # noqa: E402
+from iris3b.train.trainer import TrainModel  # noqa: E402
+
+cur: dict[str, torch.Tensor] = {}
+meta: dict[str, str] = {"dinov2": DINOV2_COMMIT}
+
+# ---- shapes ------------------------------------------------------------------------------------
+NATIVE = [(1000, 1000), (300, 1200), (2000, 500), (600, 300), (480, 640), (31, 47), (1024, 256), (700, 701)]
+for table in ("shared21-512", "shared21-1024"):
+    pol = BucketPolicy(table)
+    meta[f"bucket.{table}"] = json.dumps([[s.height, s.width] for s in (pol.target(h, w) for h, w in NATIVE)])
+area = AreaPolicy(tokens=(256 // 16) ** 2, patch=16, align=32, max_ratio=4.0)
+meta["area.256.16.32.4"] = json.dumps([[s.height, s.width] for s in (area.target(h, w) for h, w in NATIVE)])
+small = AreaPolicy(tokens=(32 // 4) ** 2, patch=4, align=8, max_ratio=4.0)
+meta["area.32.4.8.4"] = json.dumps([[s.height, s.width] for s in (small.target(h, w) for h, w in NATIVE)])
+# PixelDataset's shape-varying transform (covering resize + center crop) of a 31x47 image.
+gimg = torch.Generator().manual_seed(11)
+rgb = (torch.rand(31, 47, 3, generator=gimg) * 255).to(torch.uint8)
+cur["shape.rgb"] = rgb
+tgt = small.target(31, 47)
+pil = Image.fromarray(rgb.numpy(), "RGB")
+cur["shape.chw"] = _to_tensor(_center_crop(_resize_covering(pil, 31, 47, tgt.height, tgt.width), tgt.height, tgt.width))
+meta["shape.target"] = json.dumps([tgt.height, tgt.width])
+
+# ---- samplers ----------------------------------------------------------------------------------
+s0 = RangedSampler(1300, rank=0, world_size=2)
+s1 = RangedSampler(1300, rank=1, world_size=2)
+meta["ranged.1300.w2"] = json.dumps([list(map(list, s0.ranges)), list(map(list, s1.ranges))])
+state = RangedSampler(640, rank=0, world_size=2).resume_state(3, 4)
+meta["ranged.640.w2.state"] = json.dumps(state)
+re4 = []
+for r in range(4):
+    s = RangedSampler(640, rank=r, world_size=4)
+    s.load_resume_state(state)
+    re4.append(list(map(list, s.ranges)))
+meta["ranged.640.w2_to_w4"] = json.dumps(re4)
+
+
+class _KeyDataset:
+    def __init__(self, n):
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def key_of(self, idx):
+        return "a" if idx % 3 == 0 else "b"
+
+
+kd = _KeyDataset(30)
+sb = ShapeBatchSampler(RangedSampler(30), kd, 2, drop_last=True)
+sb.set_epoch(1)
+meta["shape_batches.30.b2"] = json.dumps(sb.plan())
+sb.set_epoch(1)
+sb.set_start_batches(0, 2)
+sstate = sb.resume_state(4, 2, samples_per_rank=8)
+meta["shape_batches.state"] = json.dumps(sstate)
+sb3 = ShapeBatchSampler(RangedSampler(30), kd, 3, drop_last=True)
+sb3.set_epoch(1)
+sb3.load_resume_state(sstate)
+meta["shape_batches.regroup_b3"] = json.dumps(list(iter(sb3)))
+
+# ---- activation checkpointing: identical gradients ---------------------------------------------
+def grads_under(policy: str, every: int = 2) -> dict[str, torch.Tensor]:
+    m = fresh_model()
+    m.train()
+    m.activation_checkpointing = policy
+    m.ac_selective_every = every
+    flow_loss(m, MICRO[0]).backward()
+    return {n: p.grad.detach().clone() for n, p in m.named_parameters() if p.grad is not None}
+
+
+g_none = grads_under("none")
+ac_max = {}
+for policy, every in (("full", 2), ("selective_op", 2), ("selective_layer", 2), ("selective_layer", 1)):
+    upstream_ac.validate_policy(policy, every)
+    g = grads_under(policy, every)
+    ac_max[f"{policy}:{every}"] = max((g[n] - g_none[n]).abs().max().item() for n in g_none)
+    assert set(g) == set(g_none)
+meta["ac.max_abs_diff_vs_none"] = json.dumps(ac_max)
+for n in SUBSET:
+    if n in g_none:
+        cur[f"ac.none.grad.{n}"] = g_none[n]
+
+# ---- non-square (bucket) step, both RoPE laws --------------------------------------------------
+gns = torch.Generator().manual_seed(21)
+B2 = 2
+ns = {
+    "x0": torch.rand(B2, C, 8, 16, generator=gns) * 2 - 1,
+    "noise": torch.randn(B2, C, 8, 16, generator=gns),
+    "t_idx": torch.tensor([250, 777]),
+    "y": MICRO[0]["y"],
+    "y_mask": MICRO[0]["y_mask"],
+}
+for k, v in ns.items():
+    cur[f"ns.{k}"] = v.float() if k != "t_idx" else v.to(torch.int32)
+for aspect in ("isotropic", "square"):
+    cfg_a = ModelConfig(**{**model_cfg, "rope_aspect": aspect})
+    m = IrisDiT(cfg_a)
+    m.load_state_dict(BASE, strict=True)
+    m = m.float()
+    loss = flow_loss(m, ns)
+    loss.backward()
+    cur[f"ns.{aspect}.loss"] = loss.detach().reshape(1)
+    named = dict(m.named_parameters())
+    for n in SUBSET:
+        cur[f"ns.{aspect}.grad.{n}"] = named[n].grad.detach().clone()
+
+# ---- REPA / iREPA ------------------------------------------------------------------------------
+torch.manual_seed(77)
+
+
+def tiny_teacher(registers: int = 0) -> DinoVisionTransformer:
+    t = DinoVisionTransformer(
+        img_size=518,
+        patch_size=14,
+        embed_dim=32,
+        depth=2,
+        num_heads=2,
+        mlp_ratio=4,
+        block_fn=partial(NestedTensorBlock, attn_class=MemEffAttention),
+        init_values=1.0,
+        ffn_layer="mlp",
+        block_chunks=0,
+        num_register_tokens=registers,
+        interpolate_antialias=registers > 0,
+        interpolate_offset=0.0 if registers > 0 else 0.1,
+    )
+    with torch.no_grad():
+        for p in t.parameters():
+            p.add_(torch.randn_like(p) * 0.02)  # move off the trunc-normal / ones init
+        for blk in t.blocks:
+            blk.ls1.gamma.uniform_(0.5, 1.5)
+            blk.ls2.gamma.uniform_(0.5, 1.5)
+    return t.eval()
+
+
+TEACHER = tiny_teacher()
+TEACHER_REG = tiny_teacher(registers=4)
+for name, t in (("teacher", TEACHER), ("teacher_reg", TEACHER_REG)):
+    for k, v in t.state_dict().items():
+        cur[f"{name}.{k}"] = v
+torch.hub.load = lambda *a, **k: TEACHER  # REPALoss's teacher, through upstream's own call
+
+IMAGES = MICRO[0]["x0"]  # [2, 3, 16, 16] clean images in [-1, 1]
+CASES = {
+    # teacher grid 2x2 < student 4x4: the student meets the teacher on 2x2
+    "repa_t2": dict(variant="repa", teacher_image_size=28, teacher_match_student=False),
+    # teacher sized to the student grid; iREPA's spatial normalization
+    "irepa_match": dict(variant="irepa", teacher_image_size=224, teacher_match_student=True, spatial_norm_gamma=0.7),
+    # teacher grid 6x6 > student 4x4: the teacher meets the student on 4x4
+    "repa_t6": dict(variant="repa", teacher_image_size=84, teacher_match_student=False),
+}
+REPA_WEIGHT = 0.5
+REPA_LAYER = 2
+for case, kw in CASES.items():
+    rcfg = RepaConfig(
+        weight=REPA_WEIGHT, teacher_dim=32, proj_hidden_dim=24, teacher_patch_size=14, **kw
+    )
+    torch.manual_seed(1000 + len(case))
+    repa = REPALoss(rcfg, student_dim=MODEL_CFG.hidden_size)
+    assert repa.available
+    cfg_r = ModelConfig(**{**model_cfg, "repa_layer": REPA_LAYER})
+    core = IrisDiT(cfg_r)
+    core.load_state_dict(BASE, strict=True)
+    core = core.float()
+    tm = TrainModel(core, repa)
+    for k, v in repa.projector.state_dict().items():
+        cur[f"repa.{case}.projector.{k}"] = v.detach().clone()
+    out_l = FLOW.training_loss(
+        tm, IMAGES, MICRO[0]["y"], timestep_idx=MICRO[0]["t_idx"], noise=MICRO[0]["noise"],
+        model_kwargs={"clean": IMAGES, "y_mask": MICRO[0]["y_mask"]},
+    )
+    total = out_l.loss + REPA_WEIGHT * out_l.repa_loss
+    total.backward()
+    cur[f"repa.{case}.flow"] = out_l.loss.detach().reshape(1)
+    cur[f"repa.{case}.repa"] = out_l.repa_loss.detach().reshape(1)
+    named = dict(tm.named_parameters())
+    for k, p in repa.projector.named_parameters():
+        cur[f"repa.{case}.grad.projector.{k}"] = p.grad.detach().clone()
+    for n in SUBSET:
+        cur[f"repa.{case}.grad.{n}"] = named[f"model.{n}"].grad.detach().clone()
+    grid = repa._teacher_grid((4, 4))
+    with torch.no_grad():
+        tt = repa._teacher_tokens(IMAGES, grid)
+        cur[f"repa.{case}.teacher_tokens"] = tt
+        if kw["variant"] == "irepa":
+            cur[f"repa.{case}.teacher_normalized"] = _spatial_normalize(tt, rcfg.spatial_norm_gamma)
+    meta[f"repa.{case}"] = json.dumps({**kw, "grid": list(grid)})
+# the register teacher's antialiased position-table resize
+with torch.no_grad():
+    x = (IMAGES.float() + 1.0) / 2.0
+    x = torch.nn.functional.interpolate(x, size=(42, 42), mode="bicubic", align_corners=False)
+    mean = x.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = x.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    cur["teacher_reg.tokens_3x3"] = TEACHER_REG.forward_features((x - mean) / std)["x_norm_patchtokens"]
+meta["repa.weight"] = str(REPA_WEIGHT)
+meta["repa.layer"] = str(REPA_LAYER)
+
+# ---- frozen-grid holdout validation ------------------------------------------------------------
+M64 = (1 << 64) - 1
+
+
+def mix_seed(parts):
+    h = 0
+    for p in parts:
+        h = (h + p + 0x9E3779B97F4A7C15) & M64
+        h ^= h >> 30
+        h = (h * 0xBF58476D1CE4E5B9) & M64
+        h ^= h >> 27
+        h = (h * 0x94D049BB133111EB) & M64
+        h ^= h >> 31
+    return h & 0x7FFFFFFFFFFFFFFF
+
+
+class HostRng:
+    """`gen_core::iris::train::HostRng` (SplitMix64 + Box-Muller), for the native noise grid."""
+
+    def __init__(self, seed):
+        self.state = seed & M64
+        self.spare = None
+
+    def next_u64(self):
+        self.state = (self.state + 0x9E3779B97F4A7C15) & M64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
+        return z ^ (z >> 31)
+
+    def uniform(self):
+        return (self.next_u64() >> 11) * (1.0 / (1 << 53))
+
+    def normal(self):
+        if self.spare is not None:
+            v, self.spare = self.spare, None
+            return v
+        u1 = 1.0 - self.uniform()
+        u2 = self.uniform()
+        r = math.sqrt(-2.0 * math.log(u1))
+        th = 2.0 * math.pi * u2
+        self.spare = r * math.sin(th)
+        return r * math.cos(th)
+
+
+VAL_GRID_SEED, VAL_T_STRIDE = 0x5AF1, 619
+ks = [0, 1, 2]
+gv = torch.Generator().manual_seed(31)
+val_x0 = torch.rand(len(ks), C, S, S, generator=gv) * 2 - 1
+val_noise = torch.stack([
+    torch.tensor((lambda r: [r.normal() for _ in range(C * S * S)])(HostRng(mix_seed([VAL_GRID_SEED, k]))), dtype=torch.float32).reshape(C, S, S)
+    for k in ks
+])
+val_t = torch.tensor([(k * VAL_T_STRIDE) % 1000 for k in ks])
+yv = torch.cat([MICRO[0]["y"], MICRO[1]["y"][:1]])
+mv = torch.cat([MICRO[0]["y_mask"], MICRO[1]["y_mask"][:1]])
+mval = fresh_model().eval()
+with torch.no_grad():
+    per = FLOW.training_loss(mval, val_x0, yv, timestep_idx=val_t, noise=val_noise, reduction="none",
+                             model_kwargs={"y_mask": mv}).loss
+cur["val.x0"] = val_x0
+cur["val.noise"] = val_noise
+cur["val.t_idx"] = val_t.to(torch.int32)
+cur["val.y"] = yv
+cur["val.y_mask"] = mv
+cur["val.per_sample"] = per
+
+save_safetensors(FIXTURE_DIR / "iris_curricula_golden.safetensors", cur, metadata=meta)
+
+# ---- the release teacher (real weights, optional) ----------------------------------------------
+HUB_WEIGHTS = os.environ.get("DINOV2_HUB_WEIGHTS")
+HF_DIR = os.environ.get("DINOV2_HF_DIR")
+if HUB_WEIGHTS and HF_DIR:
+    from dinov2.hub.backbones import dinov2_vitb14
+
+    hub_sd = torch.load(HUB_WEIGHTS, map_location="cpu")
+    hf = load_file(os.path.join(HF_DIR, "model.safetensors"))
+    vitb = dinov2_vitb14(pretrained=False)
+    vitb.load_state_dict(hub_sd, strict=True)
+    vitb.eval()
+
+    def hf_name(k):  # hub → HF Dinov2Model (gen_core::iris::train::repa::hf_sources)
+        if k.startswith("blocks."):
+            i, leaf = k[len("blocks."):].split(".", 1)
+            base = f"encoder.layer.{i}"
+            return {
+                "attn.proj.weight": [f"{base}.attention.output.dense.weight"],
+                "attn.proj.bias": [f"{base}.attention.output.dense.bias"],
+                "ls1.gamma": [f"{base}.layer_scale1.lambda1"],
+                "ls2.gamma": [f"{base}.layer_scale2.lambda1"],
+                "attn.qkv.weight": [f"{base}.attention.attention.{p}.weight" for p in ("query", "key", "value")],
+                "attn.qkv.bias": [f"{base}.attention.attention.{p}.bias" for p in ("query", "key", "value")],
+            }.get(leaf, [f"{base}.{leaf}"])
+        return [{
+            "cls_token": "embeddings.cls_token",
+            "pos_embed": "embeddings.position_embeddings",
+            "mask_token": "embeddings.mask_token",
+            "patch_embed.proj.weight": "embeddings.patch_embeddings.projection.weight",
+            "patch_embed.proj.bias": "embeddings.patch_embeddings.projection.bias",
+            "norm.weight": "layernorm.weight",
+            "norm.bias": "layernorm.bias",
+        }[k]]
+
+    worst = 0.0
+    for k, v in hub_sd.items():
+        parts = [hf[n] for n in hf_name(k)]
+        w = torch.cat(parts, 0) if len(parts) > 1 else parts[0].reshape(v.shape)
+        worst = max(worst, (w.float() - v.float()).abs().max().item())
+    assert worst == 0.0, f"the HF dinov2-base mirror differs from the hub checkpoint by {worst}"
+    gr = torch.Generator().manual_seed(41)
+    img = torch.rand(1, 3, 64, 64, generator=gr) * 2 - 1
+    real = {"image": img}
+    torch.hub.load = lambda *a, **k: vitb
+    for grid_name, rkw in (("g16", dict(teacher_image_size=224)), ("g4_match", dict(teacher_match_student=True))):
+        rcfg = RepaConfig(weight=0.5, **rkw)
+        rl = REPALoss(rcfg, student_dim=MODEL_CFG.hidden_size)
+        grid = rl._teacher_grid((4, 4))
+        with torch.no_grad():
+            tok = rl._teacher_tokens(img, grid)
+        real[f"{grid_name}.tokens"] = tok
+    save_safetensors(
+        FIXTURE_DIR / "iris_repa_teacher_real.safetensors",
+        real,
+        metadata={"dinov2": DINOV2_COMMIT, "hf_revision": DINOV2_HF_REVISION, "hub_vs_hf_max_abs": str(worst)},
+    )

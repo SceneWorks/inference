@@ -178,6 +178,7 @@ pub fn chunk_last(x: &Array, n: i32) -> Result<Vec<Array>> {
 }
 
 /// Rotation tables `(cos, sin)`, `[n, pairs]` f32, for `apply_rope`.
+#[derive(Clone)]
 pub struct Rope {
     pub cos: Array,
     pub sin: Array,
@@ -198,7 +199,20 @@ impl Rope {
     /// `head_dim/4` frequencies, interleaved (x, y) per pair along the last axis, row-major grid,
     /// both axes at one step `scale / (max(h, w) − 1)`.
     pub fn grid_2d(head_dim: usize, height: usize, width: usize, theta: f32, scale: f32) -> Self {
-        let angles = iris::rope_2d_angles(head_dim, height, width, theta, scale);
+        Self::grid_2d_aspect(head_dim, height, width, theta, scale, false)
+    }
+
+    /// [`Self::grid_2d`] under `model.rope_aspect` (`square = true`: each axis normalized to
+    /// `[0, scale]` on its own — `gen_core::iris::rope_2d_angles_aspect`).
+    pub fn grid_2d_aspect(
+        head_dim: usize,
+        height: usize,
+        width: usize,
+        theta: f32,
+        scale: f32,
+        square: bool,
+    ) -> Self {
+        let angles = iris::rope_2d_angles_aspect(head_dim, height, width, theta, scale, square);
         Self::from_angles(&angles, height * width, 2 * (head_dim / 4))
     }
 

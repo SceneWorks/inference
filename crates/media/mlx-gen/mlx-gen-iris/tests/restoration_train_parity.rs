@@ -1,6 +1,7 @@
 //! The restoration recipe's training-only networks and loss terms on MLX vs HYPIR's own code
-//! (`tools/dump_iris_restoration_train.py` → `iris_restoration_train_golden.safetensors`), FP32 on
-//! the default (Metal) stream — the production path:
+//! (`tools/dump_iris_restoration_train.py` → `iris_restoration_train_golden.safetensors`), FP32, each
+//! case in a CPU-default child process (`common::cpu_process`, sc-25689: no op reaches the GPU;
+//! the Metal production path is the dispatch-only real-weight lane's):
 //!
 //! * LPIPS-VGG (formula weights, the real VGG16 / LPIPS-v0.1 architecture): per-sample distances and
 //!   `d mean(LPIPS) / d in0`;
@@ -11,10 +12,11 @@
 //! * the generator loss of `BaseTrainer.optimize_generator` — `mse + 5·LPIPS + 0.5·D(x, for_G)`:
 //!   each term, the total, and each term's input gradient.
 //!
-//! Tolerances are relative to each tensor's peak and cover Metal's reduced-precision f32 GEMM/conv
+//! Tolerances are relative to each tensor's peak; set for Metal's reduced-precision f32 GEMM/conv
 //! accumulation (TF32-class, measured ≤ 2.7e-3 of peak on the critic logits, ≤ 1.5e-2 on the
 //! smallest gradient term, whose own peak is ~40× below the total's): [`FWD`] for maps, logits and
-//! gradients, [`SCALAR`] for the reduced losses and the optimizer step.
+//! gradients, [`SCALAR`] for the reduced losses and the optimizer step — they hold a fortiori on the
+//! CPU's true f32.
 //!
 //! (On the MLX CPU stream these gradients used to change from run to run. The cause was MLX's CPU
 //! direct convolution, not its GEMM: with the ConvNeXt 7x7 depthwise conv (padding 3) on the
@@ -118,6 +120,13 @@ fn exc(e: mlx_gen::Error) -> mlx_rs::error::Exception {
 
 #[test]
 fn lpips_vgg_matches_the_lpips_package() {
+    crate::common::cpu_process(
+        "restoration_train_parity::lpips_vgg_matches_the_lpips_package",
+        lpips_vgg_matches_the_lpips_package_body,
+    );
+}
+
+fn lpips_vgg_matches_the_lpips_package_body() {
     {
         let g = golden();
         let net = Lpips::formula(VGG16_WIDTHS).unwrap();
@@ -141,6 +150,13 @@ fn lpips_vgg_matches_the_lpips_package() {
 
 #[test]
 fn critic_trunk_features_match_hypirs_visual_forward() {
+    crate::common::cpu_process(
+        "restoration_train_parity::critic_trunk_features_match_hypirs_visual_forward",
+        critic_trunk_features_match_hypirs_visual_forward_body,
+    );
+}
+
+fn critic_trunk_features_match_hypirs_visual_forward_body() {
     {
         let g = golden();
         let critic = mini_critic(&g);
@@ -165,6 +181,13 @@ fn critic_trunk_features_match_hypirs_visual_forward() {
 
 #[test]
 fn the_generator_term_and_its_gradient_match() {
+    crate::common::cpu_process(
+        "restoration_train_parity::the_generator_term_and_its_gradient_match",
+        the_generator_term_and_its_gradient_match_body,
+    );
+}
+
+fn the_generator_term_and_its_gradient_match_body() {
     {
         let g = golden();
         let critic = mini_critic(&g);
@@ -203,6 +226,13 @@ fn the_generator_term_and_its_gradient_match() {
 
 #[test]
 fn the_critic_step_matches_power_iterations_losses_grads_and_adamw() {
+    crate::common::cpu_process(
+        "restoration_train_parity::the_critic_step_matches_power_iterations_losses_grads_and_adamw",
+        the_critic_step_matches_power_iterations_losses_grads_and_adamw_body,
+    );
+}
+
+fn the_critic_step_matches_power_iterations_losses_grads_and_adamw_body() {
     {
         let g = golden();
         let critic = mini_critic(&g);
@@ -318,6 +348,13 @@ fn the_critic_step_matches_power_iterations_losses_grads_and_adamw() {
 
 #[test]
 fn the_generator_loss_terms_and_gradients_match_optimize_generator() {
+    crate::common::cpu_process(
+        "restoration_train_parity::the_generator_loss_terms_and_gradients_match_optimize_generator",
+        the_generator_loss_terms_and_gradients_match_optimize_generator_body,
+    );
+}
+
+fn the_generator_loss_terms_and_gradients_match_optimize_generator_body() {
     {
         let g = golden();
         let critic = mini_critic(&g);

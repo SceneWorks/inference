@@ -18,7 +18,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Tensor, Var};
+use candle_gen::candle_core::{DType, Device, Tensor, TensorId, Var, D};
+use candle_gen::gen_core::iris::train::ac::AcPolicy;
+use candle_gen::gen_core::iris::train::repa::{
+    bilinear_matrix, RepaPlan, RepaVariant, PROJECTOR_PREFIX,
+};
 use candle_gen::gen_core::iris::train::{
     backbone_tensor_shapes, init_kind, mix_seed, FlowObjective, HostRng, InitKind, Prediction,
 };
@@ -28,8 +32,8 @@ use candle_gen::{CandleError as Error, Result};
 
 use super::optim::{mul_s, Params, Tensors};
 use crate::adapters::{lokr_residual, lora_residual};
-use crate::dit::{IrisDiT, TextBatch};
-use crate::nn::{Checkpoint, Residual};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks, PixelCtx, TextBatch, TrunkCtx};
+use crate::nn::{with_composable, Checkpoint, Residual};
 
 /// The adapter parameterization.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,6 +184,7 @@ impl TrainModel {
             Trainable::Full => {
                 let map: HashMap<String, Tensor> = trainable
                     .iter()
+                    .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 let ckpt = Checkpoint::from_tensors(map, &self.device);
@@ -429,6 +434,506 @@ pub fn adapter_tensors(
             format!("{}.alpha", t.path),
             Tensor::from_vec(vec![kind.alpha()], (1,), &Device::Cpu)?,
         ));
+    }
+    Ok(out)
+}
+
+// =============================================================================================
+// sc-25689: activation checkpointing (segmented recompute), REPA, per-sample (holdout) loss
+// =============================================================================================
+
+/// What a training forward adds to the inference graph: the REPA objective and the activation
+/// checkpointing policy.
+#[derive(Clone, Debug)]
+pub struct TrainExtras {
+    pub repa: Option<RepaPlan>,
+    pub ac: AcPolicy,
+}
+
+impl Default for TrainExtras {
+    fn default() -> Self {
+        Self {
+            repa: None,
+            ac: AcPolicy::None,
+        }
+    }
+}
+
+/// One micro-batch's REPA targets: the frozen teacher's tokens (spatially normalized under iREPA)
+/// and the student / teacher patch grids.
+pub struct RepaTargets {
+    /// `[B, Nt, Dt]` f32.
+    pub teacher: Tensor,
+    pub student_grid: (usize, usize),
+    pub teacher_grid: (usize, usize),
+}
+
+/// One activation-checkpointing region of a forward: its original inputs (on the tape, or not)
+/// and the boundary `Var`s its tape-free outputs became.
+enum Region {
+    Trunk {
+        i: usize,
+        ctx: TrunkCtx,
+        inputs: Vec<Tensor>,
+        has_txt: bool,
+        outs: (Var, Var),
+    },
+    Pixel {
+        i: usize,
+        ctx: PixelCtx,
+        inputs: Vec<Tensor>,
+        out: Var,
+    },
+}
+
+thread_local! {
+    static CHECKPOINTED_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many activation-checkpointed regions this thread's training forwards entered — a test
+/// probe: a policy's region set is otherwise invisible (the gradient is the plain graph's either
+/// way).
+#[doc(hidden)]
+pub fn checkpointed_regions() -> usize {
+    CHECKPOINTED_REGIONS.with(|c| c.get())
+}
+
+fn note_checkpointed_region() {
+    CHECKPOINTED_REGIONS.with(|c| c.set(c.get() + 1));
+}
+
+/// The training forward's hooks. A checkpointed region runs **off the tape** on the detached
+/// backbone (`tape_free`, composable kernels forced so it computes exactly what its recompute
+/// computes) and hands its outputs on as fresh boundary `Var`s; the segmented backward
+/// ([`backward_segmented`]) replays it on the tape. Candle has no checkpoint primitive; this is
+/// the chain rule over the region boundary — the gradient of the plain graph.
+struct TrainHooks<'a> {
+    tape_free: &'a IrisDiT,
+    ac: AcPolicy,
+    capture: Option<usize>,
+    captured: Option<Tensor>,
+    regions: Vec<Region>,
+}
+
+impl ForwardHooks for TrainHooks<'_> {
+    fn trunk_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &TrunkCtx,
+        s: &Tensor,
+        y: &Tensor,
+        core_img: &Tensor,
+        core_txt: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (so, yo) = if self.ac.should_checkpoint(i) {
+            note_checkpointed_region();
+            let (so, yo) = with_composable(|| {
+                self.tape_free.run_trunk_block(
+                    i,
+                    ctx,
+                    &s.detach(),
+                    &y.detach(),
+                    &core_img.detach(),
+                    core_txt.map(Tensor::detach).as_ref(),
+                )
+            })?;
+            let sv = Var::from_tensor(&so)?;
+            let yv = Var::from_tensor(&yo)?;
+            let mut inputs = vec![s.clone(), y.clone(), core_img.clone()];
+            if let Some(t) = core_txt {
+                inputs.push(t.clone());
+            }
+            self.regions.push(Region::Trunk {
+                i,
+                ctx: ctx.clone(),
+                inputs,
+                has_txt: core_txt.is_some(),
+                outs: (sv.clone(), yv.clone()),
+            });
+            (sv.as_tensor().clone(), yv.as_tensor().clone())
+        } else {
+            dit.run_trunk_block(i, ctx, s, y, core_img, core_txt)?
+        };
+        if self.capture == Some(i + 1) {
+            self.captured = Some(so.clone());
+        }
+        Ok((so, yo))
+    }
+
+    fn pixel_block(
+        &mut self,
+        dit: &IrisDiT,
+        i: usize,
+        ctx: &PixelCtx,
+        pixels: &Tensor,
+        s_cond: &Tensor,
+    ) -> Result<Tensor> {
+        if !self.ac.should_checkpoint(i) {
+            return dit.run_pixel_block(i, ctx, pixels, s_cond);
+        }
+        note_checkpointed_region();
+        let out = with_composable(|| {
+            self.tape_free
+                .run_pixel_block(i, ctx, &pixels.detach(), &s_cond.detach())
+        })?;
+        let v = Var::from_tensor(&out)?;
+        self.regions.push(Region::Pixel {
+            i,
+            ctx: ctx.clone(),
+            inputs: vec![pixels.clone(), s_cond.clone()],
+            out: v.clone(),
+        });
+        Ok(v.as_tensor().clone())
+    }
+}
+
+/// `Σ sum(a · b)` over the pairs with a cotangent, or `None` when there is none.
+fn surrogate(pairs: &[(Tensor, Option<Tensor>)]) -> Result<Option<Tensor>> {
+    let mut acc: Option<Tensor> = None;
+    for (a, g) in pairs {
+        let Some(g) = g else { continue };
+        let term = a
+            .to_dtype(DType::F32)?
+            .mul(&g.to_dtype(DType::F32)?)?
+            .sum_all()?;
+        acc = Some(match acc {
+            None => term,
+            Some(x) => x.add(&term)?,
+        });
+    }
+    Ok(acc)
+}
+
+/// Add every parameter gradient of `store` into `acc`.
+fn merge_params(
+    acc: &mut Tensors,
+    store: &candle_gen::candle_core::backprop::GradStore,
+    params: &Params,
+) -> Result<()> {
+    for (k, v) in params {
+        if let Some(g) = store.get(v.as_tensor()) {
+            let g = g.detach();
+            let s = match acc.remove(k) {
+                Some(prev) => prev.add(&g)?,
+                None => g,
+            };
+            acc.insert(k.clone(), s);
+        }
+    }
+    Ok(())
+}
+
+/// Add the gradients `store` holds for the earlier regions' boundary `Var`s into `cot`.
+fn merge_boundaries(
+    cot: &mut HashMap<TensorId, Tensor>,
+    store: &candle_gen::candle_core::backprop::GradStore,
+    regions: &[Region],
+) -> Result<()> {
+    for r in regions {
+        let outs: Vec<&Var> = match r {
+            Region::Trunk { outs, .. } => vec![&outs.0, &outs.1],
+            Region::Pixel { out, .. } => vec![out],
+        };
+        for v in outs {
+            if let Some(g) = store.get(v.as_tensor()) {
+                let id = v.as_tensor().id();
+                let s = match cot.remove(&id) {
+                    Some(prev) => prev.add(&g.detach())?,
+                    None => g.detach(),
+                };
+                cot.insert(id, s);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The gradient of `loss` over `params` through a forward with checkpointed `regions`: the plain
+/// backward to the last boundaries, then, region by region in reverse, its recompute on the tape
+/// (the region's own parameter gradients and its input cotangents) and the propagation of those
+/// cotangents into whatever produced its inputs.
+fn backward_segmented(
+    loss: &Tensor,
+    regions: Vec<Region>,
+    tracked: &IrisDiT,
+    params: &Params,
+) -> Result<Tensors> {
+    let mut acc = Tensors::new();
+    let mut cot: HashMap<TensorId, Tensor> = HashMap::new();
+    let store = loss.backward()?;
+    merge_params(&mut acc, &store, params)?;
+    merge_boundaries(&mut cot, &store, &regions)?;
+    drop(store);
+    for idx in (0..regions.len()).rev() {
+        let (earlier, rest) = regions.split_at(idx);
+        let region = &rest[0];
+        let take = |cot: &mut HashMap<TensorId, Tensor>, v: &Var| cot.remove(&v.as_tensor().id());
+        let (outs, in_vars): (Vec<(Tensor, Option<Tensor>)>, Vec<Var>) = match region {
+            Region::Trunk {
+                i,
+                ctx,
+                inputs,
+                has_txt,
+                outs,
+            } => {
+                let vars: Vec<Var> = inputs
+                    .iter()
+                    .map(|t| Var::from_tensor(&t.detach()))
+                    .collect::<candle_gen::candle_core::Result<_>>()?;
+                let (so, yo) = tracked.run_trunk_block(
+                    *i,
+                    ctx,
+                    vars[0].as_tensor(),
+                    vars[1].as_tensor(),
+                    vars[2].as_tensor(),
+                    has_txt.then(|| vars[3].as_tensor()),
+                )?;
+                (
+                    vec![(so, take(&mut cot, &outs.0)), (yo, take(&mut cot, &outs.1))],
+                    vars,
+                )
+            }
+            Region::Pixel {
+                i,
+                ctx,
+                inputs,
+                out,
+            } => {
+                let vars: Vec<Var> = inputs
+                    .iter()
+                    .map(|t| Var::from_tensor(&t.detach()))
+                    .collect::<candle_gen::candle_core::Result<_>>()?;
+                let o =
+                    tracked.run_pixel_block(*i, ctx, vars[0].as_tensor(), vars[1].as_tensor())?;
+                (vec![(o, take(&mut cot, out))], vars)
+            }
+        };
+        let Some(sur) = surrogate(&outs)? else {
+            continue;
+        };
+        let st = sur.backward()?;
+        merge_params(&mut acc, &st, params)?;
+        let inputs = match region {
+            Region::Trunk { inputs, .. } | Region::Pixel { inputs, .. } => inputs,
+        };
+        let pairs: Vec<(Tensor, Option<Tensor>)> = inputs
+            .iter()
+            .zip(&in_vars)
+            .filter(|(orig, _)| orig.track_op())
+            .map(|(orig, v)| (orig.clone(), st.get(v.as_tensor()).map(Tensor::detach)))
+            .collect();
+        drop(st);
+        if let Some(sur2) = surrogate(&pairs)? {
+            let st2 = sur2.backward()?;
+            merge_params(&mut acc, &st2, params)?;
+            merge_boundaries(&mut cot, &st2, earlier)?;
+        }
+    }
+    Ok(acc)
+}
+
+/// `F.normalize(x, dim=-1)`: `x / max(‖x‖₂, 1e−12)`.
+fn l2_normalize(x: &Tensor) -> Result<Tensor> {
+    let n = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?.maximum(1e-12)?;
+    Ok(x.broadcast_div(&n)?)
+}
+
+/// `_resize_token_grid`: bilinearly resample `[B, h·w, C]` tokens onto `dst`.
+pub fn resize_token_grid(
+    tokens: &Tensor,
+    src: (usize, usize),
+    dst: (usize, usize),
+) -> Result<Tensor> {
+    let (b, _, c) = tokens.dims3()?;
+    let dev = tokens.device();
+    let mh = Tensor::from_vec(bilinear_matrix(src.0, dst.0), (dst.0, src.0), dev)?;
+    let mw = Tensor::from_vec(bilinear_matrix(src.1, dst.1), (dst.1, src.1), dev)?;
+    let x = tokens
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((b, c, src.0, src.1))?;
+    let x = mh.broadcast_matmul(&x)?.broadcast_matmul(&mw.t()?)?;
+    Ok(x.reshape((b, c, dst.0 * dst.1))?
+        .transpose(1, 2)?
+        .contiguous()?)
+}
+
+fn project(plan: &RepaPlan, p: &Tensors, x: &Tensor, grid: (usize, usize)) -> Result<Tensor> {
+    let get = |leaf: &str| -> Result<&Tensor> {
+        let k = format!("{PROJECTOR_PREFIX}{leaf}");
+        p.get(&k)
+            .ok_or_else(|| Error::Msg(format!("iris repa: projector tensor {k} missing")))
+    };
+    let lin = |x: &Tensor, i: usize| -> Result<Tensor> {
+        Ok(x.broadcast_matmul(&get(&format!("{i}.weight"))?.t()?)?
+            .broadcast_add(get(&format!("{i}.bias"))?)?)
+    };
+    match plan.variant {
+        RepaVariant::Repa => {
+            let h = lin(x, 0)?.silu()?;
+            let h = lin(&h, 2)?.silu()?;
+            lin(&h, 4)
+        }
+        RepaVariant::Irepa => {
+            let (b, n, d) = x.dims3()?;
+            let xs = x
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, d, grid.0, grid.1))?;
+            let y = xs.conv2d(get("weight")?, 1, 1, 1, 1)?;
+            let t = y.dim(1)?;
+            let y = y.broadcast_add(&get("bias")?.reshape((1, t, 1, 1))?)?;
+            Ok(y.reshape((b, t, n))?.transpose(1, 2)?.contiguous()?)
+        }
+    }
+}
+
+/// `REPALoss.forward` given the teacher's tokens: `−mean(cos(student, teacher))`.
+pub fn repa_loss(
+    plan: &RepaPlan,
+    p: &Tensors,
+    student_tokens: &Tensor,
+    t: &RepaTargets,
+) -> Result<Tensor> {
+    let x = student_tokens.to_dtype(DType::F32)?;
+    let mut student = l2_normalize(&project(plan, p, &x, t.student_grid)?)?;
+    let mut teacher = t.teacher.clone();
+    if t.teacher_grid != t.student_grid {
+        let nt = t.teacher_grid.0 * t.teacher_grid.1;
+        let ns = t.student_grid.0 * t.student_grid.1;
+        if nt > ns {
+            teacher = resize_token_grid(&teacher, t.teacher_grid, t.student_grid)?;
+        } else {
+            student = resize_token_grid(&student, t.student_grid, t.teacher_grid)?;
+        }
+    }
+    let teacher = l2_normalize(&teacher)?;
+    let student = l2_normalize(&student)?;
+    let cos = student.mul(&teacher)?.sum(D::Minus1)?;
+    Ok(cos.mean_all()?.neg()?)
+}
+
+fn per_sample_loss(
+    dit: &IrisDiT,
+    b: &StepBatch,
+    obj: &FlowObjective,
+    hooks: &mut dyn ForwardHooks,
+) -> Result<Tensor> {
+    let one_minus = b.sigma.affine(-1.0, 1.0)?;
+    let x_t = one_minus
+        .broadcast_mul(&b.x0)?
+        .add(&b.sigma.broadcast_mul(&b.noise)?)?;
+    let out = dit.forward_hooked(
+        &x_t,
+        &b.t,
+        &TextBatch {
+            states: &b.states,
+            mask: &b.masks,
+        },
+        hooks,
+    )?;
+    let target = b.noise.sub(&b.x0)?;
+    let pred = match obj.prediction {
+        Prediction::Velocity => out,
+        Prediction::Clean => {
+            let floor = b.sigma.clamp(obj.x_pred_sigma_min as f32, f32::INFINITY)?;
+            x_t.sub(&out)?.broadcast_div(&floor)?
+        }
+    };
+    let err = pred.sub(&target)?.sqr()?;
+    let (n, c, h, w) = err.dims4()?;
+    Ok(err.reshape((n, c * h * w))?.mean(1)?)
+}
+
+/// The per-sample rectified-flow loss `[B]` (`reduction="none"`, the holdout grid's form).
+pub fn flow_loss_per_sample(dit: &IrisDiT, b: &StepBatch, obj: &FlowObjective) -> Result<Tensor> {
+    per_sample_loss(dit, b, obj, &mut NoHooks)
+}
+
+/// The losses of one micro-batch and the gradient of `(flow + weight · repa) · grad_scale` over
+/// every trainable tensor (backbone or adapter factors, plus the REPA projector; a zero gradient
+/// for a tensor the graph never reads). Returns the unscaled flow and REPA losses.
+#[allow(clippy::too_many_arguments)]
+pub fn loss_and_grads_ext(
+    model: &TrainModel,
+    params: &Params,
+    batch: &StepBatch,
+    obj: &FlowObjective,
+    extras: &TrainExtras,
+    repa: Option<&RepaTargets>,
+    grad_scale: f32,
+) -> Result<(f32, Option<f32>, Tensors)> {
+    let snap = super::optim::snapshot(params);
+    let tracked = model.dit(&snap)?;
+    let detached: Tensors = snap.iter().map(|(k, v)| (k.clone(), v.detach())).collect();
+    let tape_free = if extras.ac.active() {
+        Some(model.dit(&detached)?)
+    } else {
+        None
+    };
+    let dummy;
+    let mut hooks = TrainHooks {
+        tape_free: match &tape_free {
+            Some(d) => d,
+            None => {
+                dummy = &tracked;
+                dummy
+            }
+        },
+        ac: extras.ac,
+        capture: extras.repa.as_ref().map(|r| r.layer),
+        captured: None,
+        regions: Vec::new(),
+    };
+    let flow = per_sample_loss(&tracked, batch, obj, &mut hooks)?.mean(0)?;
+    let repa_l = match (&extras.repa, repa) {
+        (Some(plan), Some(t)) => {
+            let feats = hooks.captured.take().ok_or_else(|| {
+                Error::Msg(format!("iris repa: block {} was never reached", plan.layer))
+            })?;
+            Some(repa_loss(plan, &snap, &feats, t)?)
+        }
+        (Some(_), None) => {
+            return Err(Error::Msg(
+                "iris repa: the micro-batch carries no teacher targets".into(),
+            ))
+        }
+        _ => None,
+    };
+    let total = match (&repa_l, &extras.repa) {
+        (Some(r), Some(plan)) => flow.add(&mul_s(r, plan.weight)?)?,
+        _ => flow.clone(),
+    };
+    let scaled = mul_s(&total, grad_scale as f64)?;
+    let regions = std::mem::take(&mut hooks.regions);
+    let mut grads = backward_segmented(&scaled, regions, &tracked, params)?;
+    drop(tracked);
+    for (k, v) in params {
+        if !grads.contains_key(k) {
+            grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
+        }
+    }
+    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()?) };
+    Ok((
+        scalar(&flow)?,
+        repa_l.as_ref().map(scalar).transpose()?,
+        grads,
+    ))
+}
+
+/// PyTorch-default init of the REPA projector (`U(±1/√fan_in)`), from the shared host RNG keyed
+/// on `mix_seed(seed, fnv(key))`.
+pub fn init_projector(plan: &RepaPlan, seed: u64, device: &Device) -> Result<Params> {
+    let mut out = Params::new();
+    for (key, shape) in plan.projector_shapes() {
+        let bound = plan.projector_init_bound(&key);
+        let n: usize = shape.iter().product();
+        let mut rng = HostRng::new(mix_seed(&[seed, fnv(&key)]));
+        out.insert(
+            key.clone(),
+            to_var(uniform(&mut rng, n, bound), &shape, device)?,
+        );
     }
     Ok(out)
 }

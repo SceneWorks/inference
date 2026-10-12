@@ -118,6 +118,9 @@ libc = "0.2"
 # forever; a `TempDir` guard removes the tree on `Drop`, including out of a panicking test, and
 # draws its uniqueness from OS randomness rather than a recyclable PID.
 tempfile = "3"
+# Build scripts that compile a C/C++ shim (mlx-gen-iris's JACCL-absent stub, sc-25689). Already in
+# the resolved graph transitively (mlx-sys, candle).
+cc = "1"
 
 # Preserve Candle's dependency optimization for debug/test parity suites.
 [profile.dev.package."*"]

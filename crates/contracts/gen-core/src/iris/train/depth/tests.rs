@@ -605,6 +605,12 @@ fn depth_resume_checks_task_state_base_and_data() {
         dataset_fingerprint: "ds".into(),
         base_identity: "base".into(),
         task: IrisTask::Depth,
+        stage: None,
+        parent_stage: None,
+        data_position: None,
+        dist: None,
+        repa_projector: None,
+        grad_scaler: None,
     };
     check_depth_resume(&saved, &plan, "ds", "base").unwrap();
     assert!(check_depth_resume(&saved, &plan, "other", "base").is_err());

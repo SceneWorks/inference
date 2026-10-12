@@ -32,7 +32,8 @@
 //!   (upstream's checkpoint names).
 //! * Previews follow the shared contract: empty [`TrainingConfig::sample_prompts`] (or
 //!   `sample_every = 0`) renders nothing; at most [`PREVIEW_PROMPT_CAP`] prompts render per cadence;
-//!   no extra render at step 1. Upstream's seven default validation prompts are an explicit opt-in
+//!   no extra render at step 1. Upstream's validation prompts (its seven defaults, or a translated
+//!   config's own list — every one, uncapped, as upstream renders them) are an explicit opt-in
 //!   (`upstream_validation_prompts`).
 //! * [`TrainingConfig::resolution`] is upstream's fixed-square `data.image_size` (shortest-side
 //!   bicubic resize + center crop); it must be a multiple of the backbone's `patch_size` and is
@@ -165,7 +166,13 @@ impl HostRng {
 /// `torch.manual_seed(mix_seed(train.seed, rank, epoch, position))` upstream; single device, so
 /// rank is 0.
 pub fn batch_seed(seed: u64, epoch: u32, position: usize) -> u64 {
-    mix_seed(&[seed, 0, epoch as u64, position as u64])
+    batch_seed_rank(seed, 0, epoch, position)
+}
+
+/// [`batch_seed`] of `rank` (`mix_seed(train.seed, rank, epoch, position)`): every rank draws its
+/// own positional stream (sc-25689).
+pub fn batch_seed_rank(seed: u64, rank: usize, epoch: u32, position: usize) -> u64 {
+    mix_seed(&[seed, rank as u64, epoch as u64, position as u64])
 }
 
 /// The caption-choice key of dataset `index` in `epoch` (`_caption_rng`: `mix_seed(seed, epoch,
@@ -1140,6 +1147,49 @@ pub enum MixedPrecision {
     Bf16,
     /// `no`: f32 throughout.
     Fp32,
+    /// `fp16` autocast over f32 masters with accelerate's dynamic loss scaling ([`GradScaler`]).
+    Fp16,
+}
+
+/// accelerate's fp16 `GradScaler` (torch defaults: initial scale 2¹⁶, growth ×2 every 2000
+/// consecutive finite steps, backoff ×0.5 on a non-finite gradient). The loss is scaled before the
+/// backward, the gradients unscaled before clipping; a non-finite unscaled gradient skips the
+/// optimizer **and** scheduler step (the EMA, updated before the step upstream, still advances).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradScaler {
+    pub scale: f64,
+    pub growth_tracker: u32,
+}
+
+/// `torch.amp.GradScaler` defaults.
+pub const GRAD_SCALER_INIT: f64 = 65536.0;
+pub const GRAD_SCALER_GROWTH: f64 = 2.0;
+pub const GRAD_SCALER_BACKOFF: f64 = 0.5;
+pub const GRAD_SCALER_INTERVAL: u32 = 2000;
+
+impl Default for GradScaler {
+    fn default() -> Self {
+        Self {
+            scale: GRAD_SCALER_INIT,
+            growth_tracker: 0,
+        }
+    }
+}
+
+impl GradScaler {
+    /// `update()` after a step whose unscaled gradients were finite (`found_inf = false`) or not.
+    pub fn update(&mut self, found_inf: bool) {
+        if found_inf {
+            self.scale *= GRAD_SCALER_BACKOFF;
+            self.growth_tracker = 0;
+        } else {
+            self.growth_tracker += 1;
+            if self.growth_tracker == GRAD_SCALER_INTERVAL {
+                self.scale *= GRAD_SCALER_GROWTH;
+                self.growth_tracker = 0;
+            }
+        }
+    }
 }
 
 /// Which weights a preview render or an export reads.
@@ -1226,7 +1276,7 @@ pub struct PreviewPlan {
 /// | `resume_data_policy`, `override_lr_on_resume` | `train.*` | `"exact"`, false |
 /// | `preview_weights` | (raw `core`) | the `export_weights` default (`"raw"` / `"ema"`) |
 /// | `preview_negative_prompt` | `sample.negative_prompt` | `""` |
-/// | `upstream_validation_prompts` | `validation_prompts` default | false (true: render [`DEFAULT_VALIDATION_PROMPTS`] when `sample_prompts` is empty) |
+/// | `upstream_validation_prompts` | `validation_prompts` | false (true: render [`DEFAULT_VALIDATION_PROMPTS`]; a list: render those prompts — uncapped, when `sample_prompts` is empty) |
 /// | `export_weights` | `export_checkpoint.py` (EMA when on) | full model: `"ema"` when EMA is on, else `"raw"`; LoRA / LoKr: `"raw"` |
 ///
 /// The adapter default is `raw` because upstream ships no adapter EMA/export and an EMA at the
@@ -1272,6 +1322,37 @@ const OPTION_KEYS: [&str; 33] = [
     "export_weights",
 ];
 const OPTION_KEYS_EXTRA: [&str; 2] = ["export_dtype", "upstream_validation_prompts"];
+/// The curriculum / shape / alignment / checkpointing / validation / distribution options (S11).
+const OPTION_KEYS_S11: [&str; 28] = [
+    "stage",
+    "parent_stage",
+    "run_name",
+    "tracking",
+    "data_type",
+    "shape_policy",
+    "aspect_ratio_bucket",
+    "shape_align",
+    "shape_max_ratio",
+    "architecture",
+    "text_encoder",
+    "num_train_timesteps",
+    "rope_aspect",
+    "repa",
+    "expected_global_batch",
+    "activation_checkpointing",
+    "ac_selective_every",
+    "scale_warmup_by_world",
+    "dist",
+    "resume_optimizer",
+    "save_every_epochs",
+    "log_every",
+    "log_block_grad_norms",
+    "val_every_steps",
+    "val_samples",
+    "perf",
+    "preview_at_step_one",
+    "preview_order",
+];
 
 impl IrisTrainOptions {
     /// Read the options object from a request (absent = all defaults). Unknown keys are refused.
@@ -1286,12 +1367,16 @@ impl IrisTrainOptions {
             }
         };
         for key in map.keys() {
-            if !OPTION_KEYS.contains(&key.as_str()) && !OPTION_KEYS_EXTRA.contains(&key.as_str()) {
+            if !OPTION_KEYS.contains(&key.as_str())
+                && !OPTION_KEYS_EXTRA.contains(&key.as_str())
+                && !OPTION_KEYS_S11.contains(&key.as_str())
+            {
                 return Err(Error::Unsupported(format!(
                     "iris training: model_options.{OPTIONS_KEY}.{key} is not an Iris training \
-                     option (known: {}, {})",
+                     option (known: {}, {}, {})",
                     OPTION_KEYS.join(", "),
-                    OPTION_KEYS_EXTRA.join(", ")
+                    OPTION_KEYS_EXTRA.join(", "),
+                    OPTION_KEYS_S11.join(", ")
                 )));
             }
         }
@@ -1367,6 +1452,13 @@ pub struct TrainFlowDefaults {
     pub x_pred_sigma_min: f64,
     pub shift_base_tokens: usize,
     pub adaln_zero_init: bool,
+    /// `model.repa_layer` (1-based trunk block the REPA loss reads; 0 disables capture).
+    pub repa_layer: usize,
+    /// `model.modulation_rank` / `model.rope_frame_theta` (architecture keys the inference config
+    /// does not carry; checked when a translated config names them).
+    pub modulation_rank: usize,
+    pub rope_frame_theta: f64,
+    pub attn_backend: String,
 }
 
 impl TrainFlowDefaults {
@@ -1382,6 +1474,10 @@ impl TrainFlowDefaults {
             x_pred_sigma_min: flow.f64("x_pred_sigma_min", 0.05)?,
             shift_base_tokens: flow.usize("shift_base_tokens", 256)?,
             adaln_zero_init: model.bool("adaln_zero_init", true)?,
+            repa_layer: model.usize("repa_layer", 10)?,
+            modulation_rank: model.usize("modulation_rank", 64)?,
+            rope_frame_theta: model.f64("rope_frame_theta", 10.0)?,
+            attn_backend: model.string("attn_backend", "sdpa")?,
         })
     }
 
@@ -1430,6 +1526,42 @@ pub struct IrisTrainPlan {
     pub override_lr_on_resume: bool,
     pub export_weights: WeightsSelect,
     pub export_bf16: bool,
+    // ---- curricula, data shapes, alignment, checkpointing, validation, distribution (S11) ----
+    /// The curriculum stage this run is (`stage1_256` … or a custom id) and its parent stage.
+    pub stage: Option<String>,
+    pub parent_stage: Option<String>,
+    /// `name` / tracking metadata recorded in `state.json` and `metrics.jsonl`.
+    pub run_name: Option<String>,
+    pub tracking: JsonValue,
+    /// `data.shape_policy` resolved (fixed / bucket / area) and its identity.
+    pub shape: shapes::ShapePolicy,
+    pub shape_policy_id: String,
+    /// The image RoPE law the run trains (and exports): the backbone's, or the `rope_aspect`
+    /// override (stage 1 trains `square`).
+    pub rope_aspect: String,
+    /// Representation alignment (`repa.weight > 0`).
+    pub repa: Option<repa::RepaPlan>,
+    /// `train.activation_checkpointing`.
+    pub ac: ac::AcPolicy,
+    /// Frozen-grid holdout validation.
+    pub holdout: holdout::HoldoutPlan,
+    /// Replication / sharding topology and this process's place in it.
+    pub dist: dist::DistPlan,
+    pub expected_global_batch: Option<usize>,
+    pub scale_warmup_by_world: bool,
+    /// `perf.lazy_sync`: the non-finite guard reads the clipped gradient norm.
+    pub lazy_sync: bool,
+    /// The `perf` flags as requested (each mapped; recorded).
+    pub perf: JsonValue,
+    pub save_every_epochs: u32,
+    pub log_every: u32,
+    pub log_block_grad_norms: bool,
+    /// `resume_optimizer: core` — keep the backbone's optimizer state, start auxiliary heads cold.
+    pub resume_optimizer_core: bool,
+    /// Upstream also renders previews at optimizer step 1.
+    pub preview_at_step_one: bool,
+    /// The preview solver order (`sample.order`).
+    pub preview_order: usize,
 }
 
 impl IrisTrainPlan {
@@ -1447,13 +1579,28 @@ impl IrisTrainPlan {
         let opts = IrisTrainOptions::from_config(cfg)?;
         let unsupported = |what: String| Err(Error::Unsupported(format!("iris training: {what}")));
 
-        if cfg.gradient_checkpointing {
-            return unsupported(
-                "gradient (activation) checkpointing is not implemented by the native Iris trainer \
-                 (upstream train.activation_checkpointing policies)"
-                    .into(),
-            );
-        }
+        // `TrainingConfig::gradient_checkpointing` is the shared toggle; the Iris option names the
+        // upstream policy. The toggle alone means `full`; the toggle with an explicit `none` is a
+        // contradiction.
+        let ac_every = opts.u64("ac_selective_every")?.unwrap_or(2) as usize;
+        let ac = match (
+            opts.string("activation_checkpointing")?,
+            cfg.gradient_checkpointing,
+        ) {
+            (None, false) => ac::AcPolicy::None,
+            (None, true) => ac::AcPolicy::Full,
+            (Some(p), toggle) => {
+                let p = ac::AcPolicy::parse(&p, ac_every)?;
+                if toggle && p == ac::AcPolicy::None {
+                    return Err(Error::Msg(
+                        "iris training: gradient_checkpointing = true contradicts \
+                         activation_checkpointing = none"
+                            .into(),
+                    ));
+                }
+                p
+            }
+        };
         let loss = cfg.loss_type.trim().to_ascii_lowercase();
         if !(loss.is_empty() || loss == "mse") {
             return unsupported(format!(
@@ -1471,10 +1618,10 @@ impl IrisTrainPlan {
         let mixed_precision = match cfg.train_dtype.trim().to_ascii_lowercase().as_str() {
             "bf16" | "bfloat16" => MixedPrecision::Bf16,
             "f32" | "fp32" | "float32" | "no" => MixedPrecision::Fp32,
+            "fp16" | "f16" | "float16" => MixedPrecision::Fp16,
             other => {
                 return unsupported(format!(
-                    "train_dtype {other:?} (upstream mixed_precision bf16 | no; fp16 is not \
-                     implemented)"
+                    "train_dtype {other:?} (upstream mixed_precision bf16 | fp16 | no)"
                 ))
             }
         };
@@ -1500,8 +1647,12 @@ impl IrisTrainPlan {
                 "iris training: weight_decay must be >= 0".into(),
             ));
         }
-        if cfg.steps == 0 {
-            return Err(Error::Msg("iris training: steps must be >= 1".into()));
+        // `steps = 0` is upstream's `max_steps: 0` (the `num_epochs` horizon); it needs an epoch cap.
+        if cfg.steps == 0 && opts.u64("num_epochs")?.is_none() {
+            return Err(Error::Msg(
+                "iris training: steps must be >= 1 (or 0 with num_epochs: the epoch horizon)"
+                    .into(),
+            ));
         }
         let patch = config.model.patch_size;
         let image_size = cfg.resolution as usize;
@@ -1529,6 +1680,107 @@ impl IrisTrainPlan {
             }
         }
         let accum_u32 = grad_accum as u32;
+
+        // ---- distribution (before the LR scaling, which reads the global batch) ----------------
+        let resume_optimizer_core = match opts.string("resume_optimizer")?.as_deref() {
+            None | Some("full") => false,
+            Some("core") => true,
+            Some(other) => {
+                return Err(Error::Msg(format!(
+                    "iris training: resume_optimizer {other:?} (full | core)"
+                )))
+            }
+        };
+        let log_block_grad_norms = opts.bool("log_block_grad_norms", false)?;
+        let dist = dist::parse_dist(
+            opts.get("dist"),
+            log_block_grad_norms,
+            !resume_optimizer_core,
+        )?;
+        let expected_global_batch = opts.u64("expected_global_batch")?.map(|v| v as usize);
+        if expected_global_batch == Some(0) {
+            return Err(Error::Msg(
+                "iris training: expected_global_batch must be positive".into(),
+            ));
+        }
+        let global_batch = dist::effective_batch(
+            batch_size,
+            dist.world.world_size,
+            grad_accum,
+            expected_global_batch,
+        )
+        .map_err(dist::DistError::into_error)?;
+        let (perf, lazy_sync) = parse_perf(opts.get("perf"))?;
+        if dist.world.num_nodes > 1 && !lazy_sync {
+            return Err(Error::Msg(
+                "iris training: multi-node runs require perf.lazy_sync = true (scripts/train.py): \
+                 the non-finite guard must read the all-reduced gradient norm"
+                    .into(),
+            ));
+        }
+
+        // ---- data shapes ---------------------------------------------------------------------
+        let data_type = opts.string("data_type")?.unwrap_or_else(|| "pixel".into());
+        if !matches!(data_type.as_str(), "pixel" | "pixel_multiscale") {
+            return unsupported(format!(
+                "data_type {data_type:?} (pixel | pixel_multiscale; the synthetic smoke datasets \
+                 are upstream test fixtures)"
+            ));
+        }
+        let policy_name = match opts.string("shape_policy")?.filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None if data_type.ends_with("multiscale") => "bucket".into(),
+            None => "fixed".into(),
+        };
+        let bucket = opts
+            .string("aspect_ratio_bucket")?
+            .unwrap_or_else(|| "shared21-512".into());
+        let align = opts.u64("shape_align")?.unwrap_or(32) as usize;
+        let max_ratio = opts.f64("shape_max_ratio", 4.0)?;
+        let shape =
+            shapes::ShapePolicy::build(&policy_name, image_size, patch, &bucket, align, max_ratio)?;
+        let shape_policy_id =
+            shapes::shape_policy_id(&policy_name, image_size, &bucket, align, max_ratio, patch);
+        upstream::check_resources(
+            config,
+            flow_defaults,
+            opts.get("architecture"),
+            opts.get("text_encoder"),
+            opts.get("num_train_timesteps"),
+        )?;
+        let rope_aspect = opts
+            .string("rope_aspect")?
+            .unwrap_or_else(|| config.model.rope_aspect.clone());
+        if !matches!(rope_aspect.as_str(), "square" | "isotropic") {
+            return Err(Error::Msg(format!(
+                "iris training: rope_aspect {rope_aspect:?} (square | isotropic)"
+            )));
+        }
+        let repa = repa::RepaPlan::parse(
+            opts.get("repa"),
+            flow_defaults.repa_layer,
+            config.model.hidden_size,
+            config.model.depth,
+        )?;
+        let holdout = holdout::HoldoutPlan {
+            every: opts.u64("val_every_steps")?.unwrap_or(0) as u32,
+            samples: opts.u64("val_samples")?.unwrap_or(8192) as usize,
+        };
+        let preview_order = opts.u64("preview_order")?.unwrap_or(2) as usize;
+        if preview_order == 0 {
+            return Err(Error::Msg(
+                "iris training: preview_order must be >= 1".into(),
+            ));
+        }
+        let stage = opts.string("stage")?;
+        let parent_stage = match (opts.string("parent_stage")?, stage.as_deref()) {
+            (Some(p), _) => Some(p),
+            (None, Some(s)) => upstream::stage_preset(s)
+                .ok()
+                .and_then(|p| p.parent.map(str::to_string)),
+            (None, None) => None,
+        };
+        let tracking = opts.get("tracking").cloned().unwrap_or(JsonValue::Null);
 
         // ---- artifact --------------------------------------------------------------------------
         let artifact = if cfg.full_finetune {
@@ -1673,7 +1925,8 @@ impl IrisTrainPlan {
             ));
         }
         let base_lr = cfg.learning_rate as f64;
-        let lr = scale_lr(base_lr, &auto_lr, batch_size * grad_accum, base_batch_size)?;
+        // `effective_batch` = batch_size × world_size × grad_accum.
+        let lr = scale_lr(base_lr, &auto_lr, global_batch, base_batch_size)?;
         let optimizer = OptimizerPlan {
             kind,
             base_lr,
@@ -1792,22 +2045,47 @@ impl IrisTrainPlan {
                 )))
             }
         };
-        let upstream_prompts = opts.bool("upstream_validation_prompts", false)?;
+        // `upstream_validation_prompts`: true = upstream's seven defaults, a list = a translated
+        // config's own `validation_prompts` (upstream renders every one: uncapped).
+        let upstream_prompts: Option<Vec<String>> = match opts.get("upstream_validation_prompts") {
+            None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => None,
+            Some(JsonValue::Bool(true)) => Some(
+                DEFAULT_VALIDATION_PROMPTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            Some(JsonValue::Array(a)) => Some(
+                a.iter()
+                    .map(|v| {
+                        v.as_str().map(str::to_string).ok_or_else(|| {
+                            Error::Msg(format!(
+                                "iris training: upstream_validation_prompts entries must be \
+                                 strings, got {v}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            Some(v) => {
+                return Err(Error::Msg(format!(
+                    "iris training: upstream_validation_prompts must be a bool or a list of \
+                     prompts, got {v}"
+                )))
+            }
+        };
         let prompts: Vec<String> = match (cfg.sample_prompts.is_empty(), upstream_prompts) {
-            (true, true) => DEFAULT_VALIDATION_PROMPTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            (true, false) => Vec::new(),
-            (false, false) => cfg
+            (true, Some(list)) => list,
+            (true, None) => Vec::new(),
+            (false, None) => cfg
                 .sample_prompts
                 .iter()
                 .take(PREVIEW_PROMPT_CAP)
                 .cloned()
                 .collect(),
-            (false, true) => {
+            (false, Some(_)) => {
                 return Err(Error::Msg(
-                    "iris training: upstream_validation_prompts renders upstream's default \
+                    "iris training: upstream_validation_prompts renders upstream's validation \
                      prompts in place of sample_prompts — set one or the other"
                         .into(),
                 ))
@@ -1868,7 +2146,52 @@ impl IrisTrainPlan {
             override_lr_on_resume: opts.bool("override_lr_on_resume", false)?,
             export_weights,
             export_bf16,
+            stage,
+            parent_stage,
+            run_name: opts.string("run_name")?,
+            tracking,
+            shape,
+            shape_policy_id,
+            rope_aspect,
+            repa,
+            ac,
+            holdout,
+            dist,
+            expected_global_batch,
+            scale_warmup_by_world: opts.bool("scale_warmup_by_world", true)?,
+            lazy_sync,
+            perf,
+            save_every_epochs: opts.u64("save_every_epochs")?.unwrap_or(0) as u32,
+            log_every: opts.u64("log_every")?.unwrap_or(20) as u32,
+            log_block_grad_norms,
+            resume_optimizer_core,
+            preview_at_step_one: opts.bool("preview_at_step_one", false)?,
+            preview_order,
         })
+    }
+
+    /// The world size the scheduler multiplies warmup / horizon by (`scale_warmup_by_world`), and
+    /// the scheduler steps one optimizer step advances (accelerate steps a prepared scheduler once
+    /// per process).
+    pub fn scheduler_world(&self) -> u64 {
+        self.dist.world.world_size as u64
+    }
+
+    /// The `LambdaLR` factor at scheduler step `sched_step` for a run of `total` optimizer steps
+    /// (`build_lr_scheduler`: warmup and the cosine horizon × world size under
+    /// `scale_warmup_by_world`; the scheduler advances `world_size` per optimizer step).
+    pub fn lr_factor_at(&self, sched_step: u64, total: u64) -> f64 {
+        let mult = if self.scale_warmup_by_world {
+            self.scheduler_world()
+        } else {
+            1
+        };
+        lr_factor(
+            self.schedule,
+            sched_step,
+            self.warmup_steps * mult,
+            total * mult,
+        )
     }
 
     /// The stage token count (`(image_size / patch)²`).
@@ -1903,14 +2226,14 @@ impl IrisTrainPlan {
         )
     }
 
-    /// The data-shaping identity an `exact` resume additionally requires.
+    /// The data-shaping identity an `exact` resume additionally requires. The micro-batch and the
+    /// accumulation length are not part of it: upstream's cursor survives a micro-batch change
+    /// (the ranged walk resumes by samples; shape batching replays its regroup history).
     pub fn data_identity(&self) -> String {
-        format!(
-            "image_size={};batch={};accum={};seed={};caption_field={};caption_fields={:?};\
+        let mut id = format!(
+            "image_size={};seed={};caption_field={};caption_fields={:?};\
              text_dropout={};sampler={:?};prediction={};shift={}",
             self.image_size,
-            self.batch_size,
-            self.grad_accum,
             self.seed,
             self.caption_field,
             self.caption_fields,
@@ -1918,8 +2241,111 @@ impl IrisTrainPlan {
             self.flow.sampler,
             prediction_name(self.flow.prediction),
             self.flow.shift
-        )
+        );
+        if !self.shape.uniform() {
+            id.push_str(&format!(";shape={}", self.shape_policy_id));
+        }
+        id
     }
+
+    /// The data identity a pre-sc-25689 checkpoint (no `data_position`) recorded, which also
+    /// pinned the micro-batch and accumulation it trained with — rebuilt from this plan with the
+    /// **saved** `batch` / `accum` ([`CheckpointState::legacy_batch`]), so an exact resume of such a
+    /// checkpoint compares like with like (and, as for a current checkpoint, survives a micro-batch
+    /// change: the ranged walk resumes by samples). A non-uniform shape policy did not exist then:
+    /// it stays part of the identity, so such a run never matches a legacy checkpoint.
+    pub fn legacy_data_identity(&self, batch: usize, accum: usize) -> String {
+        let mut id = format!(
+            "image_size={};batch={batch};accum={accum};seed={};caption_field={};\
+             caption_fields={:?};text_dropout={};sampler={:?};prediction={};shift={}",
+            self.image_size,
+            self.seed,
+            self.caption_field,
+            self.caption_fields,
+            self.text_dropout,
+            self.flow.sampler,
+            prediction_name(self.flow.prediction),
+            self.flow.shift
+        );
+        if !self.shape.uniform() {
+            id.push_str(&format!(";shape={}", self.shape_policy_id));
+        }
+        id
+    }
+
+    /// Validate the curriculum lineage of a resume: the checkpoint's stage must be this run's own
+    /// stage (an exact restart) or, under `new_phase`, its parent stage.
+    pub fn check_lineage(&self, saved_stage: Option<&str>) -> Result<()> {
+        let (Some(saved), Some(mine)) = (saved_stage, self.stage.as_deref()) else {
+            return Ok(());
+        };
+        if saved == mine {
+            return Ok(());
+        }
+        if self.parent_stage.as_deref() == Some(saved)
+            && self.resume_data_policy == ResumeDataPolicy::NewPhase
+        {
+            return Ok(());
+        }
+        Err(Error::Msg(format!(
+            "iris resume: the checkpoint is from stage {saved:?}; stage {mine:?} continues {} \
+             (resume_data_policy new_phase) or restarts itself",
+            self.parent_stage
+                .as_deref()
+                .map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| "no parent".into())
+        )))
+    }
+}
+
+/// Read the `perf` object (upstream `PerfConfig`): every key validated as upstream does; only
+/// `lazy_sync` changes the native loop (see [`upstream::UPSTREAM_OPTIONS`] for the mapping of the
+/// others). Returns the normalized object and `lazy_sync`.
+fn parse_perf(raw: Option<&JsonValue>) -> Result<(JsonValue, bool)> {
+    let empty = JsonMap::new();
+    let obj = match raw {
+        None | Some(JsonValue::Null) => &empty,
+        Some(JsonValue::Object(m)) => m,
+        Some(v) => {
+            return Err(Error::Msg(format!(
+                "iris training: perf must be an object, got {v}"
+            )))
+        }
+    };
+    const BOOLS: [&str; 6] = [
+        "foreach_ema",
+        "fused_adamw",
+        "skip_dropped_text",
+        "lazy_sync",
+        "compile",
+        "compile_fullgraph",
+    ];
+    let mut out = JsonMap::new();
+    for (k, v) in obj {
+        let ok = match k.as_str() {
+            b if BOOLS.contains(&b) => v.is_boolean(),
+            "compile_mode" => v.is_string(),
+            "compile_scope" => matches!(v.as_str(), Some("block" | "model")),
+            "compile_dynamic" => matches!(v.as_str(), Some("auto" | "true" | "false")),
+            "recompile_limit" => v.is_u64(),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "iris training: perf.{other} is not a PerfConfig option"
+                )))
+            }
+        };
+        if !ok {
+            return Err(Error::Msg(format!(
+                "iris training: perf.{k} has an invalid value {v}"
+            )));
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    let lazy = out
+        .get("lazy_sync")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    Ok((JsonValue::Object(out), lazy))
 }
 
 fn digest_strings(items: &[String]) -> String {
@@ -2372,6 +2798,21 @@ pub struct CheckpointState {
     pub base_identity: String,
     /// The task the run trains (`state.json` `task`; the trainer id follows from it).
     pub task: IrisTask,
+    /// The curriculum stage the run trained (`None` for a run outside the official curriculum,
+    /// and in checkpoints written before sc-25689).
+    pub stage: Option<String>,
+    pub parent_stage: Option<String>,
+    /// The exact data cursor (upstream's `data_position`: the ranged walk's or the shape
+    /// batcher's resume state plus `epoch` / `batches_consumed`). Absent in pre-sc-25689
+    /// checkpoints, where `epoch` + `batches_consumed` on one rank describe it.
+    pub data_position: Option<JsonValue>,
+    /// The topology that wrote the checkpoint ([`dist::DistPlan::identity`]).
+    pub dist: Option<JsonValue>,
+    /// The REPA projector's identity when the checkpoint carries one
+    /// ([`repa::RepaPlan::projector_identity`]).
+    pub repa_projector: Option<String>,
+    /// fp16 runs: the loss scaler.
+    pub grad_scaler: Option<GradScaler>,
 }
 
 /// The trainer id of an Iris task's trainer.
@@ -2391,6 +2832,21 @@ pub fn parse_task(name: &str) -> Result<IrisTask> {
 }
 
 impl CheckpointState {
+    /// A pre-sc-25689 checkpoint (no `data_position`): the `(batch, accum)` its data identity
+    /// recorded — the micro-batch its `batches_consumed` counts. `None` for a current checkpoint.
+    pub fn legacy_batch(&self) -> Option<(usize, usize)> {
+        if self.data_position.is_some() {
+            return None;
+        }
+        let field = |k: &str| {
+            self.data_identity
+                .split(';')
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        Some((field("batch")?, field("accum")?))
+    }
+
     pub fn to_json(&self) -> JsonValue {
         json!({
             "format": CHECKPOINT_FORMAT,
@@ -2414,6 +2870,14 @@ impl CheckpointState {
             "data_identity": self.data_identity,
             "dataset_fingerprint": self.dataset_fingerprint,
             "base_identity": self.base_identity,
+            "stage": self.stage,
+            "parent_stage": self.parent_stage,
+            "data_position": self.data_position,
+            "dist": self.dist,
+            "repa_projector": self.repa_projector,
+            "grad_scaler": self.grad_scaler.as_ref().map(|g| json!({
+                "scale": g.scale, "growth_tracker": g.growth_tracker
+            })),
         })
     }
 
@@ -2454,6 +2918,34 @@ impl CheckpointState {
             dataset_fingerprint: s("dataset_fingerprint")?,
             base_identity: s("base_identity")?,
             task: parse_task(&s("task")?)?,
+            stage: v
+                .get("stage")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            parent_stage: v
+                .get("parent_stage")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            data_position: v.get("data_position").filter(|d| !d.is_null()).cloned(),
+            dist: v.get("dist").filter(|d| !d.is_null()).cloned(),
+            repa_projector: v
+                .get("repa_projector")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            grad_scaler: match v.get("grad_scaler").filter(|g| !g.is_null()) {
+                None => None,
+                Some(g) => Some(GradScaler {
+                    scale: g
+                        .get("scale")
+                        .and_then(JsonValue::as_f64)
+                        .ok_or_else(|| bad("grad_scaler.scale"))?,
+                    growth_tracker: g
+                        .get("growth_tracker")
+                        .and_then(JsonValue::as_u64)
+                        .ok_or_else(|| bad("grad_scaler.growth_tracker"))?
+                        as u32,
+                }),
+            },
         })
     }
 }
@@ -2625,6 +3117,45 @@ pub fn check_resume(
             saved.task.name()
         )));
     }
+    plan.check_lineage(saved.stage.as_deref())?;
+    if let (Some(mine), Some(saved_id)) = (&plan.repa, &saved.repa_projector) {
+        if &mine.projector_identity() != saved_id && !plan.resume_optimizer_core {
+            return Err(Error::Msg(format!(
+                "iris resume: the checkpoint's REPA projector ({saved_id}) differs from this run's \
+                 ({}); resume_optimizer core starts the new projector cold",
+                mine.projector_identity()
+            )));
+        }
+    }
+    if plan.repa.is_some() && saved.repa_projector.is_none() && !plan.resume_optimizer_core {
+        return Err(Error::Msg(
+            "iris resume: this run adds a REPA projector the checkpoint does not carry; \
+             resume_optimizer core starts it cold (upstream's full optimizer load would refuse \
+             the new parameter group)"
+                .into(),
+        ));
+    }
+    // A projector the resumed run drops (`repa.weight = 0`), under a full optimizer resume: upstream's
+    // replicated load refuses the changed parameter routing (`ckpt.py` `_validate_optimizer_layout`:
+    // the saved `aux` group holds the projector, the live one is empty), while its FSDP2 load forgets
+    // the stale `aux` group (`trainer.py` `_drop_stale_aux_group`) — the official stage-1 → stage-2
+    // continuation. Mirrored per strategy; `resume_optimizer: core` resumes without it either way.
+    if plan.repa.is_none() && saved.repa_projector.is_some() && !plan.resume_optimizer_core {
+        if !plan.dist.sharded() {
+            return Err(Error::Unsupported(
+                "iris resume: the checkpoint carries a REPA projector (and its optimizer state) \
+                 that this run drops (repa.weight = 0); a full optimizer resume of a replicated \
+                 (ddp) run refuses the changed parameter routing, as upstream's \
+                 _validate_optimizer_layout does (ckpt.py). Set resume_optimizer: core to resume \
+                 the backbone's optimizer state without the projector"
+                    .into(),
+            ));
+        }
+        eprintln!(
+            "iris resume: this run trains no REPA projector; dropping the checkpoint's projector \
+             and its optimizer state (upstream's FSDP2 load forgets the stale aux group)"
+        );
+    }
     if saved.state_identity != plan.state_identity() {
         return Err(Error::Msg(format!(
             "iris resume: the checkpoint trained a different state ({}) than this run ({}); \
@@ -2639,12 +3170,16 @@ pub fn check_resume(
         ));
     }
     if plan.resume_data_policy == ResumeDataPolicy::Exact {
-        if saved.data_identity != plan.data_identity() {
+        // A pre-sc-25689 checkpoint recorded its micro-batch / accumulation in the identity.
+        let requested = match saved.legacy_batch() {
+            Some((batch, accum)) => plan.legacy_data_identity(batch, accum),
+            None => plan.data_identity(),
+        };
+        if saved.data_identity != requested {
             return Err(Error::Msg(format!(
-                "iris resume: data shaping differs (saved {}, requested {}); resume_data_policy \
-                 new_phase starts the current dataset fresh",
+                "iris resume: data shaping differs (saved {}, requested {requested}); \
+                 resume_data_policy new_phase starts the current dataset fresh",
                 saved.data_identity,
-                plan.data_identity()
             )));
         }
         if saved.dataset_fingerprint != dataset_fingerprint {
@@ -2658,7 +3193,14 @@ pub fn check_resume(
     Ok(())
 }
 
+pub mod ac;
 pub mod depth;
+pub mod dist;
+pub mod holdout;
+pub mod pipeline;
+pub mod repa;
+pub mod shapes;
+pub mod upstream;
 
 #[cfg(test)]
 mod tests;

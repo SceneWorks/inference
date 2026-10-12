@@ -1,4 +1,5 @@
-"""External memory guard for the sc-25688 real-weight MLX run (`mlx-iris-restore-train`).
+"""External memory guard for the sc-25688 real-weight MLX run (`mlx-iris-restore-train`), also
+used by sc-25689's `mlx-iris-curricula-train` (caps 20 GB / 100 GB, see its run script).
 
 Runs argv[3:] as a child, polls its macOS phys_footprint (proc_pid_rusage RUSAGE_INFO_V4 — includes
 Metal / unified-memory buffers) every 0.25 s, SIGTERMs it when the footprint crosses the cap (GB,

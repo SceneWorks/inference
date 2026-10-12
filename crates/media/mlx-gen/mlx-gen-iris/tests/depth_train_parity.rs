@@ -94,6 +94,13 @@ fn setup() -> (DepthModel, Params) {
 
 #[test]
 fn one_step_matches_the_torch_oracle() {
+    crate::common::cpu_process(
+        "depth_train_parity::one_step_matches_the_torch_oracle",
+        one_step_matches_the_torch_oracle_body,
+    );
+}
+
+fn one_step_matches_the_torch_oracle_body() {
     on_cpu(|| {
         let g = fixture("iris_depth_train_golden.safetensors");
         let batch = golden_batch(&g);
@@ -207,6 +214,13 @@ fn one_step_matches_the_torch_oracle() {
 /// Eq. 5 on tensors equals the contract's host reference (both reductions, masked rows).
 #[test]
 fn tensor_loss_matches_the_host_reference() {
+    crate::common::cpu_process(
+        "depth_train_parity::tensor_loss_matches_the_host_reference",
+        tensor_loss_matches_the_host_reference_body,
+    );
+}
+
+fn tensor_loss_matches_the_host_reference_body() {
     on_cpu(|| {
         let g = fixture("iris_depth_train_golden.safetensors");
         let mut batch = golden_batch(&g);

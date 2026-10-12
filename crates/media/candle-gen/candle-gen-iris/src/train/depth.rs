@@ -611,6 +611,12 @@ impl Run {
         let compute = match plan.mixed_precision {
             MixedPrecision::Bf16 => DType::BF16,
             MixedPrecision::Fp32 => DType::F32,
+            // Only the generation plan resolves fp16 (sc-25689); this task's plan never does.
+            MixedPrecision::Fp16 => {
+                return Err(Error::Unsupported(
+                    "iris training: fp16 mixed precision is the generation trainer's".into(),
+                ))
+            }
         };
         let total = req.items.len() as u32;
         let kept = depth_dataset_pass(req, &plan, |i| {
@@ -900,6 +906,12 @@ impl Run {
             dataset_fingerprint: self.dataset_fingerprint.clone(),
             base_identity: self.base_identity.clone(),
             task: IrisTask::Depth,
+            stage: None,
+            parent_stage: None,
+            data_position: None,
+            dist: None,
+            repa_projector: None,
+            grad_scaler: None,
         }
     }
 

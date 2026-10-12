@@ -1,7 +1,9 @@
 //! The MLX Iris restoration trainer end to end on miniature networks (sc-25688): the miniature
 //! `upscaler/` export as the generator, the miniature timm ConvNeXt of the parity fixture as the
-//! critic trunk, LPIPS-VGG at reduced widths on formula weights. Runs on the default (Metal) stream
-//! (run-to-run deterministic; see `restoration_train_parity` for why not the CPU stream).
+//! critic trunk, LPIPS-VGG at reduced widths on formula weights. Each case runs in a CPU-default child
+//! process (`common::cpu_process`, sc-25689: no op reaches the GPU, which the dev Mac's other work
+//! owns; run-to-run deterministic since the fork's CPU-conv border fix — see
+//! `restoration_train_parity`). The Metal production path is the dispatch-only real-weight lane's.
 //!
 //! * every published loss term is active: zeroing any one weight changes the generator update, and
 //!   the update moves with each term;
@@ -207,6 +209,13 @@ fn assert_same(a: &Path, b: &Path) {
 
 #[test]
 fn every_published_loss_term_moves_the_generator_update() {
+    crate::common::cpu_process(
+        "restoration_train_lifecycle::every_published_loss_term_moves_the_generator_update",
+        every_published_loss_term_moves_the_generator_update_body,
+    );
+}
+
+fn every_published_loss_term_moves_the_generator_update_body() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 1);
     let pair = |opts: serde_json::Value| -> Vec<f32> {
@@ -314,6 +323,13 @@ fn psnr_lpips(trainer_dir: &Path, items: &[TrainingItem], export: &Path) -> (f64
 
 #[test]
 fn overfitting_a_few_pairs_improves_psnr_and_lpips() {
+    crate::common::cpu_process(
+        "restoration_train_lifecycle::overfitting_a_few_pairs_improves_psnr_and_lpips",
+        overfitting_a_few_pairs_improves_psnr_and_lpips_body,
+    );
+}
+
+fn overfitting_a_few_pairs_improves_psnr_and_lpips_body() {
     let tmp = tempfile::tempdir().unwrap();
     let items = pair_items(tmp.path(), 2);
     let (p0, l0) = psnr_lpips(tmp.path(), &items, &export_dir());
@@ -334,6 +350,10 @@ fn overfitting_a_few_pairs_improves_psnr_and_lpips() {
 
 #[test]
 fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
+    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit", cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body);
+}
+
+fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 3);
     let opts = json!({"degradation": mini_degradation(), "ema_decay": 0.9});
@@ -400,6 +420,10 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
 
 #[test]
 fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse() {
+    crate::common::cpu_process("restoration_train_lifecycle::the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse", the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_body);
+}
+
+fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_body() {
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 2);
     let mut cfg = config(4, json!({"degradation": mini_degradation()}));
