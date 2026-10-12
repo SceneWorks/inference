@@ -157,7 +157,7 @@ fn nth(v: &mut [(f32, usize)], kth: usize) {
 }
 fn sift(v: &mut [(f32, usize)], mut root: usize, n: usize) {
     // libc++'s heap is inverse to the descending comparison: the least
-    // wanted value is at the root, and the right child wins equivalent ties.
+    // wanted value is at the root, and the left child wins equivalent ties.
     let value = v[root];
     loop {
         let mut child = 2 * root + 1;

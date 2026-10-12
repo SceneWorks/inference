@@ -221,11 +221,10 @@ impl PackedLayout {
                 rows.len()
             )));
         }
-        let condition_spans = if num_condition_video_rows > 0 {
-            vec![condition_start as usize..audio_start as usize]
-        } else {
-            vec![]
-        };
+        let condition_spans = (num_condition_video_rows > 0)
+            .then_some(condition_start as usize..audio_start as usize)
+            .into_iter()
+            .collect();
         let position_ids = to_array(&rows)?;
 
         // --- indices ---------------------------------------------------------------------------

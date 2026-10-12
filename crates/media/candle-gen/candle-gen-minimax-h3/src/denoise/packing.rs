@@ -213,11 +213,10 @@ impl PackedLayout {
                 rows.len()
             )));
         }
-        let condition_spans = if num_condition_video_rows > 0 {
-            vec![condition_start as usize..audio_start as usize]
-        } else {
-            vec![]
-        };
+        let condition_spans = (num_condition_video_rows > 0)
+            .then_some(condition_start..audio_start)
+            .into_iter()
+            .collect();
         let position_ids = to_tensor(&rows, device)?;
 
         // --- indices ---------------------------------------------------------------------------
@@ -458,7 +457,7 @@ impl PackedLayout {
                 cursor += 1;
             }
             if cursor > video_start {
-                condition_spans.push(video_start as usize..cursor as usize);
+                condition_spans.push(video_start..cursor);
             }
             rotary_time += advance;
         }
@@ -536,11 +535,11 @@ impl PackedLayout {
             }
         }
         let grid = [
-            self.geometry.num_latent_frames as usize,
-            (self.geometry.latent_height / 2) as usize,
-            (self.geometry.latent_width / 2) as usize,
+            self.geometry.num_latent_frames,
+            self.geometry.latent_height / 2,
+            self.geometry.latent_width / 2,
         ];
-        let generated = &self.video_indices[self.num_condition_video_rows as usize..];
+        let generated = &self.video_indices[self.num_condition_video_rows..];
         let start = *generated
             .first()
             .ok_or_else(|| CandleError::Msg("Veda missing target rows".into()))?
@@ -554,8 +553,7 @@ impl PackedLayout {
             return Err(CandleError::Msg("Veda generated span/grid mismatch".into()));
         }
         spans.push(TiledSpan { start, grid, shape });
-        Layout::from_spans(&spans, self.seq_len as usize)
-            .map_err(|e| CandleError::Msg(e.to_string()))
+        Layout::from_spans(&spans, self.seq_len).map_err(|e| CandleError::Msg(e.to_string()))
     }
 
     /// Rows in the packed sequence.
@@ -818,7 +816,7 @@ mod tests {
             let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
             assert_eq!(tiled.target_tokens, 37 * 6);
             assert_eq!(tiled.ref_tokens, anchors.len() * 6);
-            assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len() as usize);
+            assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len());
             for (row, &slot) in tiled.inverse.iter().enumerate() {
                 assert_eq!(tiled.perm[slot as usize], row as i32);
             }
