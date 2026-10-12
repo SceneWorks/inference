@@ -324,11 +324,11 @@ impl Bundle {
     pub fn choose(&self, grid: [usize; 3]) -> Plan {
         let cost = |p: &Plan| {
             (
-                ((((p.grid[2] as f64 / p.grid[1] as f64).ln()
-                    - (grid[2] as f64 / grid[1] as f64).ln())
-                .abs()
-                    * 1000.0)
-                    .round() as u64),
+                rounded_aspect_cost(
+                    ((p.grid[2] as f64 / p.grid[1] as f64).ln()
+                        - (grid[2] as f64 / grid[1] as f64).ln())
+                    .abs(),
+                ),
                 p.grid[0].abs_diff(grid[0]),
                 p.shapes.iter().map(|s| s.tiles(grid)).sum::<usize>(),
             )
@@ -364,6 +364,16 @@ impl Bundle {
             .map(|v| v.len() * 2)
             .sum::<usize>()) as u64
     }
+}
+
+// Python round(distance, 3) rounds the original binary64 to the nearest
+// decimal, ties to even. Multiplying by 1000 and rounding can move a midpoint
+// (e.g. 1.2345), changing which temporal/padding tie-breaker gets considered.
+fn rounded_aspect_cost(distance: f64) -> u64 {
+    format!("{distance:.3}")
+        .replace('.', "")
+        .parse()
+        .unwrap_or(u64::MAX)
 }
 
 /// One contiguous native T/H/W row-major span. References precede the target.
@@ -915,6 +925,15 @@ mod tests {
             Budget::Ratio(v[1].as_f64().unwrap())
         } else {
             Budget::Tiles(v[1].as_f64().unwrap())
+        }
+    }
+    #[test]
+    fn frozen_log_aspect_cost_keeps_python_decimal_rounding() {
+        for c in fixture()["rounding_probes"].as_array().unwrap() {
+            assert_eq!(
+                rounded_aspect_cost(c["input"].as_f64().unwrap()),
+                us(&c["cost"]) as u64
+            );
         }
     }
     #[test]
