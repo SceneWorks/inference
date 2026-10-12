@@ -663,6 +663,17 @@ impl AuxStep<'_> {
             .aux_loss(&self.plan, self.entry, x0)?
             .map(|t| t.weighted))
     }
+
+    /// [`aux_loss`](Self::aux_loss) scaled by the parameterisation's aux `gain`
+    /// ([`Parameterization::aux_gain`](super::perceptual::Parameterization::aux_gain), sc-2124). A
+    /// gain of exactly `1` returns the ungained term untouched.
+    pub fn aux_loss_gained(&self, x0: &Tensor, gain: f32) -> Result<Option<Tensor>> {
+        let term = self.aux_loss(x0)?;
+        if gain == 1.0 {
+            return Ok(term);
+        }
+        Ok(term.map(|t| t * f64::from(gain)).transpose()?)
+    }
 }
 
 /// `(diffusion term contributes, aux term contributes)` for an optional planned step — `(true,
