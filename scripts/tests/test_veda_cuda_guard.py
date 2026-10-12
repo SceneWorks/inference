@@ -28,7 +28,7 @@ class VedaCudaGuardTests(unittest.TestCase):
             output=Path(out)
             s0.persist_receipt(output,dict(complete=False,status="random_complete",results=[dict(returncode=0)]))
             import json
-            self.assertEqual(json.loads((output/"receipt.json").read_text())["status"],"random_complete")
+            self.assertEqual(json.loads((output/"receipt.json").read_text(encoding="utf-8"))["status"],"random_complete")
             self.assertFalse((output/"receipt.json.tmp").exists())
 
     def test_idle_requires_no_process_low_memory_and_low_utilization(self):
@@ -79,7 +79,7 @@ class VedaCudaGuardTests(unittest.TestCase):
             self.assertEqual(checked, device)
             self.assertEqual(inventory.call_count, 10)
             self.assertEqual(baseline["process_identities"], [("GPU-test", "1", "C+G")])
-            self.assertEqual(len(json.loads((Path(out) / "random-samples.json").read_text())), 5)
+            self.assertEqual(len(json.loads((Path(out) / "random-samples.json").read_text(encoding="utf-8"))), 5)
 
     def test_baseline_refuses_activity_identity_changes_and_rising_memory(self):
         device = dict(uuid="GPU-test", used_mib=1164, utilization_percent=0)
@@ -98,7 +98,7 @@ class VedaCudaGuardTests(unittest.TestCase):
             with self.subTest(item=item), tempfile.TemporaryDirectory() as out, patch.object(s0, "inventory", side_effect=[([device], row), ([item[0]], item[1])]), patch.object(s0.time, "sleep"):
                 with self.assertRaises(RuntimeError):
                     s0.sample_baseline(device, Path(out), "random", baseline)
-                self.assertEqual(len(json.loads((Path(out) / "random-samples.json").read_text())), 2)
+                self.assertEqual(len(json.loads((Path(out) / "random-samples.json").read_text(encoding="utf-8"))), 2)
         with tempfile.TemporaryDirectory() as out, patch.object(s0, "inventory", side_effect=[([dict(device, used_mib=1163)], row), ([device], row)]), patch.object(s0.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "baseline changed"):
                 s0.sample_baseline(device, Path(out), "random", baseline)

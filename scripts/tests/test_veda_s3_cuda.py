@@ -30,7 +30,7 @@ class S3CudaTests(unittest.TestCase):
             argv=s3.batch_command(phase)
             self.assertEqual(argv[:3],["cmd","/d","/c"])
             self.assertEqual(len(argv),4)
-            script=(ROOT/argv[3].replace("\\","/")).read_text()
+            script=(ROOT/argv[3].replace("\\","/")).read_text(encoding="utf-8")
             self.assertIn('call "%VCVARS%" || exit /b 1',script)
             self.assertIn("--locked",script)
             self.assertIn("-j2",script)
@@ -38,8 +38,8 @@ class S3CudaTests(unittest.TestCase):
             self.assertNotIn("--example",script)
             self.assertNotIn("--ignored",script)
             self.assertIn("exit /b %errorlevel%",script)
-        self.assertIn("--no-run --message-format=json",(ROOT/s3.batch_command("build")[3].replace("\\","/")).read_text())
-        self.assertIn("-- -D warnings",(ROOT/s3.batch_command("lint")[3].replace("\\","/")).read_text())
+        self.assertIn("--no-run --message-format=json",(ROOT/s3.batch_command("build")[3].replace("\\","/")).read_text(encoding="utf-8"))
+        self.assertIn("-- -D warnings",(ROOT/s3.batch_command("lint")[3].replace("\\","/")).read_text(encoding="utf-8"))
         with self.assertRaises(ValueError):s3.batch_command("random")
 
     def test_exact_cargo_artifact_required_not_stale_glob(self):
@@ -85,23 +85,23 @@ class S3CudaTests(unittest.TestCase):
             receipt=dict(results=[])
             with patch.object(s3.guard,"execute_owned",return_value=dict(returncode=17,timeout=False)):
                 result=s3.append_result(receipt,out,"test",["binary"],time.monotonic()+30,Mock)
-            persisted=json.loads((out/"receipt.json").read_text())
+            persisted=json.loads((out/"receipt.json").read_text(encoding="utf-8"))
             self.assertEqual(result["returncode"],17)
             self.assertEqual(persisted["results"][0]["stdout_sha256"],s3.hash_file(out/"test.stdout.log"))
             self.assertEqual(persisted["results"][0]["stderr_sha256"],s3.hash_file(out/"test.stderr.log"))
 
     def test_device_gate_source_is_nonignored_and_requires_cuda(self):
-        source=(ROOT/"crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs").read_text()
+        source=(ROOT/"crates/media/candle-gen/candle-gen-minimax-h3/src/veda.rs").read_text(encoding="utf-8")
         before,gate=source.split("fn actual_cuda_kernel_gate()",1)
         self.assertNotIn("#[ignore",before[before.rfind("/// Coordinator"):])
         self.assertIn('Device::new_cuda(0).expect("S3 requires an exclusively admitted CUDA device")',gate)
         self.assertNotIn("else { return",gate)
         self.assertIn("S3_DEVICE_RECEIPT",gate)
-        self.assertIn('os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if absent else device["uuid"]',Path(s3.__file__).read_text())
+        self.assertIn('os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if absent else device["uuid"]',Path(s3.__file__).read_text(encoding="utf-8"))
 
     def test_workflow_is_manual_scoped_and_preserves_deadline_upload(self):
         import yaml
-        workflow=yaml.safe_load((ROOT/".github/workflows/real-weights.yml").read_text())
+        workflow=yaml.safe_load((ROOT/".github/workflows/real-weights.yml").read_text(encoding="utf-8"))
         job=workflow["jobs"]["veda-s3-cuda"]
         self.assertEqual(job["if"],"github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-s3-cuda'")
         self.assertEqual(job["timeout-minutes"],75)
