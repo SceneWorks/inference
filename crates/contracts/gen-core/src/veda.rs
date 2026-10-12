@@ -165,6 +165,9 @@ pub struct VedaExecutionReport {
     pub predictor: Option<String>,
     pub plan: Option<String>,
     pub exact_plan: bool,
+    /// Actual native patch grid and the selected trained plan grid, including transposition.
+    pub execution_grid: Option<[usize; 3]>,
+    pub plan_grid: Option<[usize; 3]>,
     pub predictor_load_attempts: u64,
     pub predictor_score_calls: u64,
     pub sparse_calls: u64,
@@ -177,9 +180,97 @@ pub struct VedaExecutionReport {
     pub fallback_reason: Option<String>,
 }
 
+impl VedaExecutionReport {
+    /// Fraction of full attention actually computed over all successful joint-attention calls.
+    /// Numerator includes dense exceptions and global/reference work, excluding padded rows.
+    pub fn total_attention_fraction(&self) -> Option<f64> {
+        (self.dense_token_pairs > 0)
+            .then(|| self.selected_token_pairs as f64 / self.dense_token_pairs as f64)
+    }
+
+    /// Provider-owned post-generation carrier. An unobserved/default report is never called dense.
+    pub fn outcome_json(&self) -> serde_json::Value {
+        let effective = match (self.sparse_calls > 0, self.dense_calls > 0) {
+            (true, true) => "mixed",
+            (true, false) => "sparse",
+            (false, true) => "dense",
+            (false, false) => "unobserved",
+        };
+        serde_json::json!({
+            "requested": self.requested,
+            "effective": effective,
+            "kernel": self.kernel,
+            "predictor": self.predictor,
+            "plan": self.plan,
+            "planMatch": self.plan.as_ref().map(|_| if self.exact_plan { "exact" } else { "nearest" }),
+            "executionGrid": self.execution_grid,
+            "planGrid": self.plan_grid,
+            "totalAttentionFraction": self.total_attention_fraction(),
+            "selectedTokenPairs": self.selected_token_pairs,
+            "denseTokenPairs": self.dense_token_pairs,
+            "sparseCalls": self.sparse_calls,
+            "denseCalls": self.dense_calls,
+            "predictorLoadAttempts": self.predictor_load_attempts,
+            "predictorScoreCalls": self.predictor_score_calls,
+            "workspaceBytes": self.workspace_bytes,
+            "fallbackReason": self.fallback_reason,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observed_fraction_prices_sparse_globals_references_and_dense_exceptions() {
+        // Generated 256 + reference 128 + globals 3 valid rows. Retain one 128-row
+        // generated tile, all reference keys and globals; reference/global queries are dense.
+        let seq = 387u64;
+        let sparse = 256 * (128 + 128 + 3) + (128 + 3) * seq;
+        let mut report = VedaExecutionReport {
+            requested: true,
+            kernel: Some("actual-device-kernel".into()),
+            plan: Some("trained_T".into()),
+            execution_grid: Some([2, 7, 9]),
+            plan_grid: Some([2, 8, 9]),
+            sparse_calls: 1,
+            selected_token_pairs: sparse,
+            dense_token_pairs: seq * seq,
+            ..Default::default()
+        };
+        // One deliberate dense layer and one deliberate dense step both add full work.
+        for _ in 0..2 {
+            report.dense_calls += 1;
+            report.selected_token_pairs += seq * seq;
+            report.dense_token_pairs += seq * seq;
+        }
+        let outcome = report.outcome_json();
+        assert_eq!(outcome["effective"], "mixed");
+        assert_eq!(outcome["planMatch"], "nearest");
+        assert_eq!(outcome["planGrid"], serde_json::json!([2, 8, 9]));
+        assert_eq!(
+            outcome["totalAttentionFraction"].as_f64(),
+            Some((sparse + 2 * seq * seq) as f64 / (3 * seq * seq) as f64)
+        );
+        let dense = VedaExecutionReport {
+            requested: true,
+            dense_calls: 3,
+            selected_token_pairs: 3 * seq * seq,
+            dense_token_pairs: 3 * seq * seq,
+            fallback_reason: Some("actual-device self-test failed".into()),
+            ..Default::default()
+        }
+        .outcome_json();
+        assert_eq!(dense["effective"], "dense");
+        assert_eq!(dense["totalAttentionFraction"], 1.0);
+        assert!(dense["kernel"].is_null());
+        assert_eq!(
+            VedaExecutionReport::default().outcome_json()["effective"],
+            "unobserved"
+        );
+        assert!(VedaExecutionReport::default().outcome_json()["totalAttentionFraction"].is_null());
+    }
+
     #[test]
     fn frozen_controls_and_independent_budgets() {
         let mut request = VedaRequest {

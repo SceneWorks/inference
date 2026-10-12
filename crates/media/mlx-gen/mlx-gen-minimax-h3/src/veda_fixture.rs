@@ -225,6 +225,11 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     assert!(report.predictor_score_calls > 0);
     assert!(report.selected_token_pairs < report.dense_token_pairs);
     assert!(report.exact_plan);
+    let outcome = report.outcome_json();
+    assert_eq!(outcome["effective"], "sparse");
+    assert_eq!(outcome["planMatch"], "exact");
+    assert_eq!(outcome["executionGrid"], outcome["planGrid"]);
+    assert!(outcome["totalAttentionFraction"].as_f64().unwrap() < 1.0);
     assert!(report.fallback_reason.is_none());
     assert_eq!(report.kernel.as_deref(), Some(crate::veda::KERNEL));
     assert_ne!(
@@ -236,6 +241,9 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     let missing = generator.veda_execution_report().unwrap();
     assert_eq!(missing.sparse_calls, 0);
     assert_eq!(missing.dense_calls, 2);
+    assert_eq!(missing.outcome_json()["effective"], "dense");
+    assert_eq!(missing.outcome_json()["totalAttentionFraction"], 1.0);
+    assert!(missing.outcome_json()["kernel"].is_null());
     assert!(missing
         .fallback_reason
         .unwrap()
@@ -246,6 +254,9 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     let failed = generator.veda_execution_report().unwrap();
     assert_eq!(failed.sparse_calls, 0);
     assert_eq!(failed.dense_calls, 2);
+    assert_eq!(failed.outcome_json()["effective"], "dense");
+    assert_eq!(failed.outcome_json()["totalAttentionFraction"], 1.0);
+    assert!(failed.outcome_json()["kernel"].is_null());
     assert!(failed
         .fallback_reason
         .unwrap()
@@ -257,6 +268,12 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         .unwrap()
         .fallback_reason
         .is_none());
+    let later = generator.veda_execution_report().unwrap().outcome_json();
+    assert_eq!(later["requested"], false);
+    assert!(later["kernel"].is_null());
+    assert!(later["plan"].is_null());
+    assert!(later["fallbackReason"].is_null());
+    println!("S7 observed generator outcome: {}", outcome);
     println!("S1 native Generator: canonical1344x768/124f, 2 fixture DiT blocks, learned score calls={}, selected/dense={}/{}, dense/off identity, missing/self-test fallbacks verified",report.predictor_score_calls,report.selected_token_pairs,report.dense_token_pairs);
 }
 #[test]

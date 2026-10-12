@@ -99,6 +99,8 @@ impl VedaRuntime {
         r.predictor = Some(bundle.identity.clone());
         r.plan = Some(plan.name.clone());
         r.exact_plan = plan.grid == grid;
+        r.execution_grid = Some(grid);
+        r.plan_grid = Some(plan.grid);
         r.workspace_bytes = r.workspace_bytes.max(bundle.host_bytes());
         Ok(Prepared {
             bundle,
@@ -830,6 +832,31 @@ mod tests {
         let m = veda_int8::Mask::new(&selected, &l.valid, 1).unwrap();
         m.validate().unwrap();
         assert!(l.valid.iter().any(|&v| v > 0 && v < 128));
+        // Full denominator uses real rows across generated/reference/global segments, never padded slots.
+        let valid = l.valid.iter().sum::<usize>() as u64;
+        assert_eq!(valid, 161);
+        let pairs = selected
+            .iter()
+            .enumerate()
+            .map(|(q, keys)| {
+                l.valid[q] as u64 * keys.iter().map(|&k| l.valid[k] as u64).sum::<u64>()
+            })
+            .sum::<u64>();
+        let global_rows = globals.iter().map(|&t| l.valid[t] as u64).sum::<u64>();
+        let global_pairs = global_rows * valid;
+        assert!(pairs >= global_pairs);
+        assert!(pairs < valid * valid);
+        let report = VedaExecutionReport {
+            sparse_calls: 1,
+            dense_calls: 2,
+            selected_token_pairs: pairs + 2 * valid * valid,
+            dense_token_pairs: 3 * valid * valid,
+            ..Default::default()
+        };
+        assert_eq!(
+            report.total_attention_fraction(),
+            Some((pairs + 2 * 161 * 161) as f64 / (3 * 161 * 161) as f64)
+        );
     }
     #[test]
     fn actual_device_self_test_cannot_pass_on_cpu() {
