@@ -42,6 +42,9 @@ const DECODER_HIDDEN: usize = 4608;
 const MAX_CONTEXT_TOKENS: usize = 16_000;
 // The exact local tokenizer is verified at load time to encode `<svg` as two IDs.
 const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+/// Hard wall-time cap for one SVG decode. Sized so a decode that uses the whole context window
+/// can finish; hosts may request less.
+const MAX_WALL_TIME: Duration = Duration::from_secs(600);
 const MAX_NEW_TOKENS: u32 = (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// Snapshot-local observation, rather than a fabricated process-global CUDA allocation number.
@@ -401,8 +404,7 @@ fn svg_text_output(
         &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<(StarVectorOutput, Option<DecodeRecord>)>,
 ) -> CoreResult<TextLlmOutput> {
-    let svg_request =
-        StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, Duration::from_secs(120));
+    let svg_request = StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, MAX_WALL_TIME);
     let (output, record) = decode(&svg_request, &mut |event| match event {
         StarVectorStreamEvent::Source { text, index } => on_event(StreamEvent::Token {
             id: index,
@@ -537,7 +539,7 @@ pub fn starvector_descriptor() -> StarVectorDescriptor {
             image_token_count: IMAGE_TOKENS as u32,
         },
         max_svg_bytes: 2 * 1024 * 1024,
-        max_wall_time: Some(Duration::from_secs(120)),
+        max_wall_time: Some(MAX_WALL_TIME),
     }
 }
 pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistration {
@@ -907,6 +909,10 @@ mod tests {
         assert_eq!(text.id, PROVIDER_ID);
         assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
         assert_eq!(text.capabilities.max_new_tokens, 15_422);
+        assert_eq!(
+            starvector_descriptor().max_wall_time,
+            Some(Duration::from_secs(600))
+        );
         core_llm::validate_advertised_generated_token_cap(
             text.capabilities.max_new_tokens,
             text.capabilities.max_context_tokens,

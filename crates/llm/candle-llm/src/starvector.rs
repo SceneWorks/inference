@@ -43,6 +43,9 @@ const MAX_CONTEXT_TOKENS: usize = 8_192;
 // The loaded snapshot tokenizer must still encode the fixed decoder prompt as two IDs; `load`
 // checks that before the descriptor is trusted by request validation.
 const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+/// Hard wall-time cap for one SVG decode. Sized so a decode that uses the whole context window
+/// can finish; hosts may request less.
+const MAX_WALL_TIME: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_NEW_TOKENS: u32 =
     (MAX_CONTEXT_TOKENS - (IMAGE_TOKEN_COUNT + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
@@ -486,7 +489,7 @@ pub fn svg_descriptor() -> core_llm::StarVectorDescriptor {
             image_token_count: 257,
         },
         max_svg_bytes: 2 * 1024 * 1024,
-        max_wall_time: Some(std::time::Duration::from_secs(120)),
+        max_wall_time: Some(MAX_WALL_TIME),
     }
 }
 impl core_llm::TextLlm for CandleStarVectorProvider {
@@ -538,11 +541,7 @@ fn svg_text_output(
         &core_llm::StarVectorRequest,
     ) -> core_llm::Result<(core_llm::StarVectorOutput, Option<DecodeRecord>)>,
 ) -> core_llm::Result<core_llm::TextLlmOutput> {
-    let svg = core_llm::StarVectorRequest::new(
-        req.clone(),
-        1_000_000,
-        std::time::Duration::from_secs(120),
-    );
+    let svg = core_llm::StarVectorRequest::new(req.clone(), 1_000_000, MAX_WALL_TIME);
     let (out, record) = decode(&svg)?;
     let finish = match out.finish_reason {
         core_llm::StarVectorFinishReason::Cancelled => core_llm::FinishReason::Cancelled,
@@ -933,6 +932,10 @@ mod tests {
         let text = descriptor();
         assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
         assert_eq!(text.capabilities.max_new_tokens, 7_933);
+        assert_eq!(
+            svg_descriptor().max_wall_time,
+            Some(std::time::Duration::from_secs(600))
+        );
         core_llm::validate_advertised_generated_token_cap(
             text.capabilities.max_new_tokens,
             text.capabilities.max_context_tokens,
