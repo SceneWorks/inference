@@ -69,10 +69,17 @@ pub struct IrisRestorer {
     /// `[1, T, L, D]` f32 empty-prompt states.
     states: Array,
     mask: Vec<Vec<i32>>,
+    /// The loaded memory contract ([`crate::memory_strategy::export_contract`] over the export on
+    /// disk) — the one [`crate::memory_strategy::RESTORE_MEMORY_REGISTRATION`] builds for this
+    /// load.
+    memory_strategy: gen_core::MemoryProviderContract,
+    /// The precision this restorer computes in — the numeric tier its safety check binds to.
+    precision: mlx_gen::Precision,
 }
 
 /// Refuse every load knob the restoration route does not implement, by name.
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
     let refusals: [(&str, bool); 8] = [
         ("quantize", spec.quantize.is_some()),
         ("adapters", !spec.adapters.is_empty()),
@@ -110,7 +117,14 @@ impl IrisRestorer {
         let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
         let states = Array::from_slice(&prompt.embeddings, &shape);
         eval([&states])?;
+        let memory_strategy = crate::memory_strategy::export_contract(
+            gen_core::iris::IrisTask::Restoration,
+            spec.precision,
+            &resources.export,
+        )?;
         Ok(Self {
+            memory_strategy,
+            precision: spec.precision,
             descriptor: descriptor(),
             config: resources.export.config,
             settings: resources.settings,
@@ -118,6 +132,23 @@ impl IrisRestorer {
             states,
             mask: vec![prompt.mask],
         })
+    }
+
+    /// The loaded memory-strategy contract of this restorer (sc-25690): the resident baseline —
+    /// which is already one backbone forward per export tile — priced from the export's tensor
+    /// headers. [`Transform`] has no memory seam, so this is its `memory_strategy_contract`.
+    pub fn memory_strategy_contract(&self) -> &gen_core::MemoryProviderContract {
+        &self.memory_strategy
+    }
+
+    /// The registered restoration safety check against this restorer's own load: the shared
+    /// handshake bound to the precision it computes in, then the restoration route gate. Admit a
+    /// request at [`crate::memory_strategy::restoration_memory_geometry`] of its plan.
+    pub fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(self.precision, &self.memory_strategy, context)
     }
 
     /// The export's `task` settings (`sigma`, `tile`) the restorer runs with.

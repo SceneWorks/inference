@@ -741,3 +741,43 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
   = 60 GB before activations, the critic and LPIPS — above this lane's 40 GB guard; it is exercised on
   the miniature (`restoration_train_lifecycle`).
 
+
+## Memory-strategy contract (sc-25690)
+
+Upstream ships no memory policy; this is the repo's shared ladder (`gen_core::MemoryProviderContract`)
+declared for what each MLX route actually runs. `src/memory_strategy.rs` owns all three contracts, and
+`register_providers` registers each with its weights-free fixture and behavior seam. `iris_3b` is a
+registry generator; depth (a provider-specific API) and restoration (a transform) are registered as
+composed routes.
+
+| | `iris_3b` | `iris_3b_depth` | `iris_3b_restore` |
+|---|---|---|---|
+| Memory mode key | `text_to_image` | `depth` | `restoration` |
+| Resident | implemented | implemented | implemented (one backbone forward per export tile, always) |
+| StagedResidency | implemented (text encoder → encode → drop → backbone) | not applicable (no text encoder) | not applicable (no text encoder) |
+| BoundedDecode | not applicable (pixel space) | not applicable | not applicable |
+| BoundedAttention | missing | missing | missing |
+| BoundedTransformerResidency | missing | missing | missing |
+| Calibration fingerprint | `iris-3b-mlx-derived-2026-10-12-v1` | `iris-3b-depth-mlx-derived-2026-10-12-v1` | `iris-3b-restore-mlx-derived-2026-10-12-v1` |
+| Witnessed load surfaces | `bf16:resident:eager`, `bf16:sequential:eager` | same | same |
+| Admission geometry | request width × height; batch = prompts × count | `depth_memory_geometry(plan)` (the model grid) | `restoration_memory_geometry(plan)` (the processing size); `restoration_forward_pixels(plan)` is the one-tile forward bound |
+| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, bf16) + backbone at the compute dtype + adapter overlays | `empty_prompt.safetensors` (stored f32) + backbone and reducer at the compute dtype | `empty_prompt.safetensors` + backbone at the compute dtype |
+
+Staged residency is a per-request decision on generation: the request scope writes
+`GenerationMemory::stage_residency`, and a `Sequential` load stages every request. The scope bounds
+`prompts × count` by the admitted batch (a prompt batch denoises its rows together), and
+`Iris3b::validate` refuses the controls the route has no mechanism for (`tile_vae_decode`,
+`chunk_attention`, `stream_transformer_blocks`). No loader has a deferred-materialization load
+shape: all three refuse `LoadShape::DeferredMaterialization` at load, and a deferred or quantized
+spec has no contract. The loaded models publish the same contract their registration builds and the
+registered safety check (`Generator::memory_strategy_contract` / `memory_strategy_safety_check` for
+generation; the inherent methods of the same names on `IrisDepth` and `IrisRestorer`). An adapted
+generation load prices its stack as the typed overlay components
+`iris_3b.adapters.forward_residuals` and `iris_3b.adapters.materialized_deltas`, and its behavior
+fixture carries the overlay key `lora`. Nothing numeric beyond header-priced resident bytes is published, and no activation
+anchor is registered: those are measurements the epic's terminal campaign owns.
+
+Verification: `memory_strategy` unit tests (declaration, admission gate, pricing, registry
+conformance) and `tests/memory_contract.rs` (a staged selection on a warm generator loads the two
+components in staged order and renders the identical image; the encoder-free loaders publish their
+registered contract).

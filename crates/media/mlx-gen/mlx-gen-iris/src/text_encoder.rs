@@ -70,6 +70,21 @@ fn from_llm(e: mlx_llm::Error) -> Error {
     }
 }
 
+/// The safetensors files [`IrisTextEncoder::load`] opens for the snapshot at `dir`: the shards its
+/// `model.safetensors.index.json` names, else the single `model.safetensors`. Shared with the
+/// memory contract's asset pricing ([`crate::memory_strategy`]) so both read one file list.
+pub(crate) fn weight_shards(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let roots = snapshot_shard_roots(dir).map_err(Error::from)?;
+    Ok(
+        match resolve_indexed_safetensors_shards(dir, "model.safetensors.index.json", &roots)
+            .map_err(Error::from)?
+        {
+            Some(shards) => shards.into_iter().map(|s| s.loader_path).collect(),
+            None => vec![dir.join("model.safetensors")],
+        },
+    )
+}
+
 impl IrisTextEncoder {
     /// Load from a `Qwen/Qwen3-VL-4B-Instruct` snapshot directory under the backbone's
     /// `text_encoder` config section. Only the language tower's tensors are read.
@@ -100,14 +115,7 @@ impl IrisTextEncoder {
             )));
         }
 
-        let roots = snapshot_shard_roots(dir).map_err(Error::from)?;
-        let files: Vec<std::path::PathBuf> =
-            match resolve_indexed_safetensors_shards(dir, "model.safetensors.index.json", &roots)
-                .map_err(Error::from)?
-            {
-                Some(shards) => shards.into_iter().map(|s| s.loader_path).collect(),
-                None => vec![dir.join("model.safetensors")],
-            };
+        let files = weight_shards(dir)?;
         let mut tensors = HashMap::new();
         for file in &files {
             if !file.is_file() {

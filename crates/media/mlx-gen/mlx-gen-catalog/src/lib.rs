@@ -1034,8 +1034,14 @@ mod tests {
         // sc-24112 adds `qwen_image_2_1`: the MLX Qwen-Image 2.1 route now publishes the shared
         // ladder (Resident / StagedResidency / BoundedDecode implemented, the two bounded-DiT rungs
         // classified `StructurallyNotApplicable`), so it joins both registries — 58/55 -> 59/56.
-        assert_eq!(registry.memory_strategy_registrations().len(), 59);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 56);
+        // sc-25690 adds the three Iris-3B inference routes: `iris_3b` (Resident and
+        // StagedResidency implemented; pixel space, so BoundedDecode is `StructurallyNotApplicable`
+        // and the two bounded-DiT rungs are `Missing`) and the encoder-free `iris_3b_depth` and
+        // `iris_3b_restore` (Resident only). All three publish a contract fixture rather than a
+        // resident-only witness, because each classifies a rung as structurally absent, which the
+        // resident-only witness cannot express — 59/56 -> 62/59.
+        assert_eq!(registry.memory_strategy_registrations().len(), 62);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 59);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1062,8 +1068,22 @@ mod tests {
         // both offload policies and both materialization shapes (its contract classifies the
         // bounded-DiT rungs rather than narrowing its selector universe), so it joins the 12-apiece
         // group — 51 -> 52.
-        assert_eq!(surfaces.len(), 52 * 12 + 6 + 3 + 2 * 3);
-        assert!(surfaces.iter().all(|surface| !surface.composed));
+        //
+        // sc-25690's three Iris-3B routes are a FOURTH narrowed shape: one dense tier (every Iris
+        // loader refuses `LoadSpec::quantize`), eagerly materialized (no Iris loader has a
+        // deferred load shape, and each refuses one), under both offload policies — 2 apiece.
+        assert_eq!(surfaces.len(), 52 * 12 + 6 + 3 + 2 * 3 + 3 * 2);
+        // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
+        // and Iris restoration (a transform): real routes with no gen-core generator registration.
+        let composed: std::collections::BTreeSet<_> = surfaces
+            .iter()
+            .filter(|surface| surface.composed)
+            .map(|surface| surface.contract.provider_id.as_str())
+            .collect();
+        assert_eq!(
+            composed.into_iter().collect::<Vec<_>>(),
+            ["iris_3b_depth", "iris_3b_restore"]
+        );
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
