@@ -616,7 +616,17 @@ impl JointDit {
         predictor: Option<&std::path::Path>,
         report: crate::veda::ReportSink,
     ) {
-        self.veda = crate::veda::VedaRuntime::prepare(request, predictor, report);
+        let cfg = self.dit.config();
+        self.veda = crate::veda::VedaRuntime::prepare(
+            request,
+            predictor,
+            &self.layout,
+            cfg.num_layers,
+            cfg.num_attention_heads,
+            cfg.attention_head_dim,
+            &self.dit.device,
+            report,
+        );
     }
 
     /// Bytes of `adaln_proj` weight the eviction released — 0 under [`AdaLnResidency::Resident`].

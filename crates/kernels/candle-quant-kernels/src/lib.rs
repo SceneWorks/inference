@@ -56,6 +56,7 @@ pub mod nvfp4_outlier;
 pub mod nvfp4_weight;
 pub mod nvrtc;
 pub mod sm120_gate;
+pub mod veda_int8;
 pub mod yue2_stable_conv;
 
 pub use cublaslt::{
