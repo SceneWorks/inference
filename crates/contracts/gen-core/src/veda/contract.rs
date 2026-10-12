@@ -44,14 +44,17 @@ pub struct Plan {
     pub grid: [usize; 3],
     pub shapes: Vec<TileShape>,
     pub heads: Vec<Vec<usize>>,
+    /// Frozen search/training provenance, retained without interpreting it as runtime controls.
+    pub provenance: Option<Value>,
 }
 impl Plan {
     pub fn parse(v: &Value, layers: usize, heads: usize) -> Result<Self> {
         if !v.as_object().is_some_and(|m| {
-            m.len() == 4
-                && ["geometry", "grid", "shapes", "head_shape"]
-                    .iter()
-                    .all(|k| m.contains_key(*k))
+            m.keys().all(|k| {
+                ["geometry", "grid", "shapes", "head_shape", "provenance"].contains(&k.as_str())
+            }) && ["geometry", "grid", "shapes", "head_shape"]
+                .iter()
+                .all(|k| m.contains_key(*k))
         }) {
             return Err(bad("invalid plan fields"));
         }
@@ -118,6 +121,7 @@ impl Plan {
             grid: [grid[0], grid[1], grid[2]],
             shapes,
             heads: hs,
+            provenance: v.get("provenance").cloned(),
         })
     }
     pub fn transposed(&self) -> Self {
@@ -126,6 +130,7 @@ impl Plan {
             grid: [self.grid[0], self.grid[2], self.grid[1]],
             shapes: self.shapes.iter().map(|s| s.transpose()).collect(),
             heads: self.heads.clone(),
+            provenance: self.provenance.clone(),
         }
     }
 }
@@ -937,6 +942,7 @@ mod tests {
         for c in fixture()["choices"].as_array().unwrap() {
             let grid = usize_vec(&c["grid"]).try_into().unwrap();
             let p = bundle.choose(grid);
+            assert!(p.provenance.is_some());
             assert_eq!(p.name, c["name"].as_str().unwrap());
             assert_eq!(p.grid.to_vec(), usize_vec(&c["plan_grid"]));
             assert_eq!(p.grid == grid, c["exact"].as_bool().unwrap());
