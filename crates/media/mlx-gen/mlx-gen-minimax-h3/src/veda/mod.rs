@@ -3,9 +3,9 @@
 //! `60bfae688897dc41bc8685ca9f3130d7ed8f3b0c`; upstream MIT notice: `LICENSE.upstream`.
 pub mod contract;
 use crate::denoise::PackedLayout;
-use contract::{Bundle, Layout, Plan, TileShape, TILE};
+use contract::{Budget, Bundle, Layout, Plan, PredictorOps, TileShape, TILE};
 use mlx_gen::attention::{sdpa_bounded_bhsd, slice_axis, BoundedAttention};
-use mlx_gen::gen_core::{VedaExecutionReport, VedaRequest};
+use mlx_gen::gen_core::{VedaBudget, VedaExecutionReport, VedaRequest};
 use mlx_gen::{Error, Result};
 use mlx_rs::{
     ops::{concatenate_axis, r#where},
@@ -23,9 +23,11 @@ pub struct VedaRuntime {
     bundle: Bundle,
     plan: Plan,
     layouts: BTreeMap<TileShape, Layout>,
-    ratio: f64,
+    request: VedaRequest,
     report: ReportSink,
     failed: RefCell<bool>,
+    #[cfg(test)]
+    pub(crate) calls: RefCell<Vec<(usize, usize, VedaRequest)>>,
 }
 impl VedaRuntime {
     /// Called only for an enabled request, after the native packed layout is established.
@@ -43,13 +45,7 @@ impl VedaRuntime {
         }
         report.borrow_mut().predictor_load_attempts += 1;
         let result = (|| {
-            if !request.sparsity_percent.is_finite()
-                || !(0.0..100.0).contains(&request.sparsity_percent)
-            {
-                return Err(Error::Msg(
-                    "Veda sparsity must be finite and in [0,100)".into(),
-                ));
-            }
+            request.validate(layers, usize::MAX).map_err(Error::Msg)?;
             let path = path.ok_or_else(|| {
                 Error::Msg(
                     "Veda predictor component is missing; repair/install the managed component"
@@ -74,11 +70,6 @@ impl VedaRuntime {
         report: ReportSink,
         self_test: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
-        if packed.num_condition_video_rows() != 0 || packed.num_condition_audio_rows() != 0 {
-            return Err(Error::Msg(
-                "Veda sparse attention is unavailable for this conditioning layout; dense attention executed".into(),
-            ));
-        }
         let g = packed.geometry();
         // Infer patch grid from the actual native layout, never from output pixels.
         let rows = packed.rows_per_frame() as usize;
@@ -89,25 +80,9 @@ impl VedaRuntime {
         }
         let grid = [g.num_latent_frames as usize, grid_h, grid_w];
         let plan = bundle.choose(grid);
-        let start = *packed
-            .video_indices()
-            .first()
-            .ok_or_else(|| Error::Msg("Veda missing target rows".into()))?
-            as usize;
-        if !packed
-            .video_indices()
-            .iter()
-            .enumerate()
-            .all(|(i, &r)| r as usize == start + i)
-        {
-            return Err(Error::Msg("Veda generated span must be contiguous".into()));
-        }
         let mut layouts = BTreeMap::new();
         for &shape in &plan.shapes {
-            layouts.insert(
-                shape,
-                Layout::t2va(start, grid, shape, packed.seq_len() as usize)?,
-            );
+            layouts.insert(shape, packed.veda_layout(shape)?);
         }
         // Actual-device check precedes sparse production calls. Failure leaves this request dense.
         self_test()?;
@@ -121,9 +96,11 @@ impl VedaRuntime {
             bundle,
             plan,
             layouts,
-            ratio: 1.0 - request.sparsity_percent / 100.0,
+            request: request.clone(),
             report,
             failed: RefCell::new(false),
+            #[cfg(test)]
+            calls: Default::default(),
         })
     }
     #[cfg(test)]
@@ -160,12 +137,17 @@ impl VedaRuntime {
     pub fn attention(
         &self,
         layer: usize,
+        step: usize,
         q: &Array,
         k: &Array,
         v: &Array,
         bounded: BoundedAttention<'_>,
     ) -> Result<Array> {
-        if *self.failed.borrow() {
+        #[cfg(test)]
+        self.calls
+            .borrow_mut()
+            .push((layer, step, self.request.clone()));
+        if *self.failed.borrow() || self.request.full_attention(layer, step) {
             self.record_dense(q);
             return sdpa_bounded_bhsd(
                 q,
@@ -276,7 +258,16 @@ impl VedaRuntime {
                 let (qt, kt, vt) = (tile(q)?, tile(k)?, tile(v)?);
                 let scores = learned_scores(&self.bundle, layer, chunk, layout, &qt, &kt)?;
                 self.report.borrow_mut().predictor_score_calls += 1;
-                let rows = layout.select(&scores, n, self.ratio)?;
+                let budget = |b: &VedaBudget| match b {
+                    VedaBudget::SparsityPercent(p) => Budget::Ratio(1.0 - p / 100.0),
+                    VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
+                };
+                let rows = layout.select_with_budgets(
+                    &scores,
+                    n,
+                    budget(&self.request.generated),
+                    budget(&self.request.reference),
+                )?;
                 let chunk_pairs: u64 = rows
                     .iter()
                     .enumerate()
@@ -320,45 +311,59 @@ fn learned_scores(
     q: &Array,
     k: &Array,
 ) -> Result<Vec<f32>> {
-    let d = bundle.dim as i32;
-    let h = heads.len() as i32;
-    let n = layout.video as i32;
-    let valid: Vec<bool> = layout.valid[..layout.video]
-        .iter()
-        .flat_map(|&c| (0..TILE).map(move |r| r < c))
-        .collect();
-    let valid = Array::from_slice(&valid, &[1, n, TILE as i32, 1]);
-    let counts: Vec<f32> = layout.valid[..layout.video]
-        .iter()
-        .map(|&c| c.max(1) as f32)
-        .collect();
-    let counts = Array::from_slice(&counts, &[1, n, 1]);
-    let ok: Vec<bool> = layout.valid[..layout.video]
-        .iter()
-        .map(|&c| c > 0)
-        .collect();
-    let ok = Array::from_slice(&ok, &[1, n, 1]);
-    let pool = |a: &Array| -> Result<Array> {
+    contract::learned_scores(bundle, layer, heads, layout, q, k, &MlxPredictorOps)
+}
+struct MlxPredictorOps;
+impl PredictorOps for MlxPredictorOps {
+    type Tensor = Array;
+    type Error = Error;
+    fn pool(&self, a: &Array, layout: &Layout, _heads: usize, _dim: usize) -> Result<Array> {
+        let n = layout.video as i32;
+        let valid: Vec<bool> = layout.valid[..layout.video]
+            .iter()
+            .flat_map(|&c| (0..TILE).map(move |r| r < c))
+            .collect();
+        let valid = Array::from_slice(&valid, &[1, n, TILE as i32, 1]);
+        let counts: Vec<f32> = layout.valid[..layout.video]
+            .iter()
+            .map(|&c| c.max(1) as f32)
+            .collect();
+        let counts = Array::from_slice(&counts, &[1, n, 1]);
+        let ok: Vec<bool> = layout.valid[..layout.video]
+            .iter()
+            .map(|&c| c > 0)
+            .collect();
+        let ok = Array::from_slice(&ok, &[1, n, 1]);
         let a = slice_axis(a, 1, 0, n)?.as_dtype(Dtype::Float32)?;
         let mean = a.sum_axis(2, false)?.divide(&counts)?;
         let max = r#where(&valid, &a, Array::from_f32(f32::NEG_INFINITY))?.max_axis(2, false)?;
         let min = r#where(&valid, &a, Array::from_f32(f32::INFINITY))?.min_axis(2, false)?;
         let f = concatenate_axis(&[&mean, &max, &min], -1)?;
         Ok(r#where(&ok, &f, Array::from_f32(0.0))?)
-    };
-    let (fq, fk) = (pool(q)?, pool(k)?);
-    let pq = Array::from_slice(&bundle.projection(layer, heads, true), &[h, 3 * d, d]);
-    let pk = Array::from_slice(&bundle.projection(layer, heads, false), &[h, 3 * d, d]);
-    let qh = fq.matmul(&pq)?.add(&slice_axis(&fq, 2, 0, d)?)?;
-    let kh = fk.matmul(&pk)?.add(&slice_axis(&fk, 2, 0, d)?)?;
-    let scores = qh
-        .matmul(&kh.transpose_axes(&[0, 2, 1])?)?
-        .divide(Array::from_f32((d as f32).sqrt()))?
-        .reshape(&[-1])?;
-    // Logical flatten is required: MLX fast kernels can return non-row-major physical strides.
-    mlx_rs::transforms::eval([&scores])?;
-    Ok(scores.as_slice::<f32>().to_vec())
+    }
+    fn project(&self, f: &Array, p: &[f32], heads: usize, dim: usize) -> Result<Array> {
+        Ok(f.matmul(Array::from_slice(
+            p,
+            &[heads as i32, (3 * dim) as i32, dim as i32],
+        ))?)
+    }
+    fn prefix(&self, f: &Array, dim: usize) -> Result<Array> {
+        slice_axis(f, 2, 0, dim as i32)
+    }
+    fn add(&self, a: &Array, b: &Array) -> Result<Array> {
+        Ok(a.add(b)?)
+    }
+    fn dot_scaled(&self, q: &Array, k: &Array, divisor: f32) -> Result<Vec<f32>> {
+        let scores = q
+            .matmul(&k.transpose_axes(&[0, 2, 1])?)?
+            .divide(Array::from_f32(divisor))?
+            .reshape(&[-1])?;
+        // Logical flatten, because physical MLX result strides need not be row-major.
+        mlx_rs::transforms::eval([&scores])?;
+        Ok(scores.as_slice::<f32>().to_vec())
+    }
 }
+
 fn gather_attention(
     l: &Layout,
     selected: &[Vec<usize>],
@@ -552,4 +557,107 @@ pub fn device_self_test() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod frozen_tests {
+    use super::*;
+    /// Requires the coordinator's exclusive Metal token; never runs in CPU gates.
+    #[test]
+    #[ignore = "requires exclusive coordinator admission for an actual MLX device"]
+    fn frozen_upstream_device_scores_select_exact_masks() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../contracts/gen-core/tests/fixtures/veda/frozen.json"
+        )))
+        .unwrap();
+        let uv = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_u64().unwrap() as usize)
+                .collect::<Vec<_>>()
+        };
+        let fv = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        for c in fixture["scorers"].as_array().unwrap() {
+            let spans = c["layout"]["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| contract::TiledSpan {
+                    start: s["start"].as_u64().unwrap() as usize,
+                    grid: uv(&s["grid"]).try_into().unwrap(),
+                    shape: TileShape(uv(&s["shape"]).try_into().unwrap()),
+                })
+                .collect::<Vec<_>>();
+            let layout =
+                Layout::from_spans(&spans, c["layout"]["seq"].as_u64().unwrap() as usize).unwrap();
+            let heads = c["heads"].as_u64().unwrap() as usize;
+            let dim = c["dim"].as_u64().unwrap() as usize;
+            let pq = c["proj"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as u16)
+                .collect::<Vec<_>>();
+            let mut pk = vec![0; pq.len()];
+            for h in 0..heads {
+                for i in 0..3 * dim {
+                    for d in 0..dim {
+                        pk[(h * 3 * dim + i) * dim + d] =
+                            pq[(h * 3 * dim + 3 * dim - 1 - i) * dim + d];
+                    }
+                }
+            }
+            let bundle = Bundle {
+                identity: "frozen-capture-fixture".into(),
+                layers: 1,
+                heads,
+                dim,
+                plans: vec![],
+                q: vec![pq],
+                k: vec![pk],
+            };
+            let shape = [
+                heads as i32,
+                layout.valid.len() as i32,
+                TILE as i32,
+                dim as i32,
+            ];
+            let q = Array::from_slice(&fv(&c["q"]), &shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let k = Array::from_slice(&fv(&c["k"]), &shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let scores = learned_scores(
+                &bundle,
+                0,
+                &(0..heads as i32).collect::<Vec<_>>(),
+                &layout,
+                &q,
+                &k,
+            )
+            .unwrap();
+            let masks = layout
+                .select_with_budgets(&scores, heads, Budget::Tiles(2.3), Budget::Tiles(1.5))
+                .unwrap();
+            let expected = c["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(&uv)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                masks, expected,
+                "device logits must select frozen masks exactly"
+            );
+        }
+    }
 }

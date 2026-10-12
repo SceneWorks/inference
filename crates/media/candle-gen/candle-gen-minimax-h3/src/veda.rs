@@ -1,4 +1,6 @@
 //! Job-local attention controls. CUDA sparse execution replaces this dense fallback at integration.
+pub use candle_gen::gen_core::veda::contract;
+
 use std::{cell::RefCell, rc::Rc};
 
 use candle_gen::{

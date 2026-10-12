@@ -114,8 +114,11 @@ pub struct PackedLayout {
     rows_per_frame: i32,
     num_condition_video_rows: i32,
     num_condition_audio_rows: i32,
+    /// Exact native conditioning segments, retained independently of audio gaps.
+    condition_spans: Vec<std::ops::Range<usize>>,
     seq_len: i32,
     position_ids: Array,
+    position_rows: Vec<[f64; 3]>,
     token_tags: Array,
     row_classes: Array,
     video_indices: Vec<i32>,
@@ -218,6 +221,11 @@ impl PackedLayout {
                 rows.len()
             )));
         }
+        let condition_spans = if num_condition_video_rows > 0 {
+            vec![condition_start as usize..audio_start as usize]
+        } else {
+            vec![]
+        };
         let position_ids = to_array(&rows)?;
 
         // --- indices ---------------------------------------------------------------------------
@@ -237,6 +245,8 @@ impl PackedLayout {
             num_condition_audio_rows,
             seq_len,
             position_ids,
+            rows,
+            condition_spans,
             text_token_tags,
             video_indices,
             audio_indices,
@@ -260,6 +270,8 @@ impl PackedLayout {
         num_condition_audio_rows: i32,
         seq_len: i32,
         position_ids: Array,
+        position_rows: Vec<[f64; 3]>,
+        condition_spans: Vec<std::ops::Range<usize>>,
         text_token_tags: &[i32],
         video_indices: Vec<i32>,
         audio_indices: Vec<i32>,
@@ -322,6 +334,8 @@ impl PackedLayout {
             num_condition_audio_rows,
             seq_len,
             position_ids,
+            position_rows,
+            condition_spans,
             token_tags: Array::from_slice(&tags, &[seq_len]),
             row_classes: Array::from_slice(&classes, &[seq_len]),
             video_indices,
@@ -421,6 +435,7 @@ impl PackedLayout {
         let mut audio_indices: Vec<i32> = Vec::new();
         let mut cursor = num_text_tokens;
         // The shared audio/video rotary clock: it starts where the text rows end.
+        let mut condition_spans = Vec::new();
         let mut rotary_time = f64::from(num_text_tokens);
 
         for (i, r) in references.iter().enumerate() {
@@ -439,10 +454,14 @@ impl PackedLayout {
                 rows.push(row);
                 cursor += 1;
             }
+            let video_start = cursor;
             for row in video_rows {
                 video_indices.push(cursor);
                 rows.push(row);
                 cursor += 1;
+            }
+            if cursor > video_start {
+                condition_spans.push(video_start as usize..cursor as usize);
             }
             rotary_time += advance;
         }
@@ -496,11 +515,54 @@ impl PackedLayout {
             num_condition_audio_rows,
             seq_len,
             position_ids,
+            rows,
+            condition_spans,
             text_token_tags,
             video_indices,
             audio_indices,
             text_indices,
         )
+    }
+
+    /// Map actual packed reference/generated rows into the shared frozen Veda contract.
+    /// Reference segments whose positions cannot prove a T/H/W row-major grid stay global.
+    pub fn veda_layout(
+        &self,
+        shape: mlx_gen::gen_core::veda::contract::TileShape,
+    ) -> Result<mlx_gen::gen_core::veda::contract::Layout> {
+        use mlx_gen::gen_core::veda::contract::{
+            least_padding_shape, segment_grid, Layout, TiledSpan,
+        };
+        let mut spans = Vec::new();
+        for range in &self.condition_spans {
+            if let Some(grid) = segment_grid(&self.position_rows[range.clone()]) {
+                spans.push(TiledSpan {
+                    start: range.start,
+                    grid,
+                    shape: least_padding_shape(grid),
+                });
+            }
+        }
+        let grid = [
+            self.geometry.num_latent_frames as usize,
+            (self.geometry.latent_height / 2) as usize,
+            (self.geometry.latent_width / 2) as usize,
+        ];
+        let generated = &self.video_indices[self.num_condition_video_rows as usize..];
+        let start = *generated
+            .first()
+            .ok_or_else(|| Error::Msg("Veda missing target rows".into()))?
+            as usize;
+        if grid.iter().product::<usize>() != generated.len()
+            || !generated
+                .iter()
+                .enumerate()
+                .all(|(i, &r)| r as usize == start + i)
+        {
+            return Err(Error::Msg("Veda generated span/grid mismatch".into()));
+        }
+        spans.push(TiledSpan { start, grid, shape });
+        Layout::from_spans(&spans, self.seq_len as usize).map_err(|e| Error::Msg(e.to_string()))
     }
 
     /// Rows in the packed sequence.
@@ -672,6 +734,42 @@ mod tests {
     fn layout(anchors: &[KeyframeAnchor]) -> PackedLayout {
         let geometry = JointGeometry::new(TEST_FRAMES, 4, 6).unwrap();
         PackedLayout::build(geometry, [1, 2, 2], &[TEXT_TAG; 5], 2, anchors).unwrap()
+    }
+
+    #[test]
+    fn veda_native_layout_retains_reference_global_and_target_rows() {
+        use mlx_gen::gen_core::veda::contract::{Budget, TileShape};
+        for anchors in [
+            vec![],
+            vec![KeyframeAnchor::First],
+            vec![KeyframeAnchor::Last],
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+        ] {
+            let packed = layout(&anchors);
+            let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
+            assert_eq!(tiled.target_tokens, 37 * 6);
+            assert_eq!(tiled.ref_tokens, anchors.len() * 6);
+            assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len() as usize);
+            for (row, &slot) in tiled.inverse.iter().enumerate() {
+                assert_eq!(tiled.perm[slot as usize], row as i32);
+            }
+            let masks = tiled
+                .select_with_budgets(
+                    &vec![0.0; tiled.video * tiled.video],
+                    1,
+                    Budget::Tiles(1.0),
+                    Budget::Ratio(1.0),
+                )
+                .unwrap();
+            for (row, keys) in masks.iter().enumerate() {
+                if row < tiled.video {
+                    assert!(keys.contains(&row));
+                    assert!((0..tiled.reference).all(|r| keys.contains(&r)));
+                } else {
+                    assert_eq!(keys.len(), tiled.valid.len());
+                }
+            }
+        }
     }
 
     #[test]

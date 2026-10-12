@@ -289,3 +289,7 @@ mod tests {
         }
     }
 }
+
+/// Frozen tensor-neutral tiling, predictor and selection contract.
+pub mod contract;
+mod topk;
