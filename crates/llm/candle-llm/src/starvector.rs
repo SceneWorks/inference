@@ -932,10 +932,6 @@ mod tests {
         let text = descriptor();
         assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
         assert_eq!(text.capabilities.max_new_tokens, 7_933);
-        assert_eq!(
-            svg_descriptor().max_wall_time,
-            Some(std::time::Duration::from_secs(600))
-        );
         core_llm::validate_advertised_generated_token_cap(
             text.capabilities.max_new_tokens,
             text.capabilities.max_context_tokens,

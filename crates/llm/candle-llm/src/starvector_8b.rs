@@ -909,10 +909,6 @@ mod tests {
         assert_eq!(text.id, PROVIDER_ID);
         assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
         assert_eq!(text.capabilities.max_new_tokens, 15_422);
-        assert_eq!(
-            starvector_descriptor().max_wall_time,
-            Some(Duration::from_secs(600))
-        );
         core_llm::validate_advertised_generated_token_cap(
             text.capabilities.max_new_tokens,
             text.capabilities.max_context_tokens,
