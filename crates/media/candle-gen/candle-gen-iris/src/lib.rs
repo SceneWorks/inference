@@ -100,14 +100,14 @@ pub fn register_memory_contract_surfaces(
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
         .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::DEPTH_MEMORY_FIXTURE)
+        .register_memory_contract_fixture(memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION)
-        .register_composed_memory_strategy(memory_strategy::RESTORATION_MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy::RESTORATION_MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::RESTORATION_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_composed_memory_strategy(memory_strategy::RESTORE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Iris provider catalog.

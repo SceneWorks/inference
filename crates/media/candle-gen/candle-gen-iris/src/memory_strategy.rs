@@ -27,9 +27,29 @@
 //!
 //! # Derived, never measured
 //!
-//! Every byte figure here is read from tensor headers at the width the loader materializes each
-//! tensor in; nothing is an on-device observation. The published attention budgets are derived
-//! candidates pending the epic-end campaign, not a measured ladder.
+//! Every byte figure here is read from safetensors **headers** at the width the loader holds each
+//! tensor in — the backbone, the text encoder, the empty-prompt states and the adapter stack alike
+//! ([`crate::adapters::adapter_footprint`] reads no adapter tensor). Nothing is an on-device
+//! observation, and pricing a contract costs a few header reads however often a caller asks. The
+//! published attention budget is the shared 64 Mi operating point, a derived candidate pending the
+//! epic-end campaign, not a measurement on Iris.
+//!
+//! Every loader prices its contract before it reads a weight and propagates a pricing error, so a
+//! spec with no contract — a deferred materialization shape, an incomplete text encoder, a refused
+//! adapter — fails `load` with that reason on every offload policy.
+//!
+//! # What bounded attention does to the image
+//!
+//! Chunking the query rows (and, for the PiT pixel stage, the batch rows) computes the same
+//! attention: rows are independent, so the result equals the single pass to GEMM-order f32
+//! rounding. On the FP32 path a bounded render is the unbounded one to within one RGB8 level.
+//! Under the bf16 policy — the only tier these contracts witness — every projection re-rounds its
+//! output to bf16, so that f32 ulp can become one bf16 step and travel through the remaining
+//! blocks and solver steps: a bounded bf16 render is **not** bit-identical to the unbounded one.
+//! The declared bound, held by `tests/memory_strategy.rs` on the miniature snapshot (Candle CPU,
+//! three seeds × three binding budgets): no channel moves by more than **8 RGB8 levels** and the
+//! mean absolute change is at most **1.0 level** (observed on arm64 macOS: 2 levels and 0.20). It
+//! is a bound on the miniature, not a measurement of the release weights on CUDA.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -62,21 +82,22 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "iris-3b-candle-derived-2026-10
 /// Content fingerprint of the depth contract.
 pub const DEPTH_MEMORY_CALIBRATION_FINGERPRINT: &str = "iris-3b-depth-candle-derived-2026-10-12-v1";
 /// Content fingerprint of the restoration contract.
-pub const RESTORATION_MEMORY_CALIBRATION_FINGERPRINT: &str =
+pub const RESTORE_MEMORY_CALIBRATION_FINGERPRINT: &str =
     "iris-3b-restore-candle-derived-2026-10-12-v1";
 
-/// The published attention score budgets (elements of one `[rows, heads, queries, keys]` scores
-/// tensor) — **derived candidates, pending the epic-end campaign**. 64 Mi is the shared rung-3
-/// operating point ([`candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`]); the two below
-/// halve it. The floor one kernel launch can reach is a single query row of a single batch row,
-/// `heads · keys` — 333,680 elements for the release trunk at 2048² (20 heads × (128² + 300) keys)
-/// — so every published budget is honoured at every admitted geometry.
-pub const ATTENTION_CHUNK_SIZES: &[u32] = &[67_108_864, 33_554_432, 16_777_216];
+/// The published attention score budget (elements of one `[rows, heads, queries, keys]` scores
+/// tensor): the shared rung-3 operating point
+/// ([`candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`], 64 Mi), like the sibling families.
+/// A **derived candidate, pending the epic-end campaign** — nothing here measured it on Iris. The
+/// floor one kernel launch can reach is a single query row of a single batch row, `heads · keys` —
+/// 333,680 elements for the release trunk at 2048² (20 heads × (128² + 300) keys) — so the budget
+/// is honoured at every admitted geometry.
+pub const ATTENTION_CHUNK_SIZE: u32 = 67_108_864;
 
 /// `MemoryRunContext::mode` key of the depth route ([`IrisTask::name`]).
 pub const DEPTH_MEMORY_MODE: &str = "depth";
 /// `MemoryRunContext::mode` key of the restoration route ([`IrisTask::name`]).
-pub const RESTORATION_MEMORY_MODE: &str = "restoration";
+pub const RESTORE_MEMORY_MODE: &str = "restoration";
 
 // ================================================================================================
 // Pricing.
@@ -205,28 +226,34 @@ pub fn empty_prompt_bytes(file: &Path) -> gen_core::Result<u64> {
     )
 }
 
-/// Device bytes of `spec`'s adapter stack beside the generation backbone — every residual the
-/// loader installs ([`crate::adapters::merge_adapters`], the load path's own admission), priced as
-/// the forward holds it ([`crate::nn::Residual::resident_bytes`]). An adapter the loader would
-/// refuse is refused here, never admitted as free.
-pub fn adapter_overlay_bytes(spec: &LoadSpec, backbone_dir: &Path) -> gen_core::Result<u64> {
+/// Component id of the adapter residuals the forward applies as factors (LoRA, structured LoKr,
+/// low-rank LoHa). The MLX twin publishes the same id.
+pub const ADAPTER_RESIDUALS_COMPONENT_ID: &str = "iris_3b.adapters.forward_residuals";
+/// Component id of the adapter residuals held as a full `[out, in]` delta (a LoHa at or above its
+/// break-even rank, a LoKr whose factors are not plain matrices). The MLX twin publishes the same
+/// id.
+pub const ADAPTER_DELTAS_COMPONENT_ID: &str = "iris_3b.adapters.materialized_deltas";
+
+/// Device bytes of `spec`'s adapter stack beside the generation backbone, priced from each
+/// adapter file's safetensors **header** ([`crate::adapters::adapter_footprint`]) — no adapter
+/// tensor is read. Every refusal the loader can make from a header is made here, so an adapter is
+/// never admitted as free.
+pub fn adapter_overlay(
+    spec: &LoadSpec,
+    backbone_dir: &Path,
+) -> gen_core::Result<crate::adapters::AdapterFootprint> {
     if spec.adapters.is_empty() {
-        return Ok(0);
+        return Ok(crate::adapters::AdapterFootprint::default());
     }
     let compute = compute_dtype(spec);
-    let kernel = production_kernel_dtype(compute);
-    let merged = crate::adapters::merge_adapters(
+    Ok(crate::adapters::adapter_footprint(
         &crate::nn::safetensors_shapes(&backbone_dir.join(BACKBONE_WEIGHTS_FILE))?,
         &spec.adapters,
         IrisTask::Generation,
         MODEL_ID,
-    )?;
-    Ok(merged
-        .residuals
-        .values()
-        .flatten()
-        .map(|residual| residual.resident_bytes(compute, kernel))
-        .fold(0_u64, u64::saturating_add))
+        compute.size_in_bytes() as u64,
+        production_kernel_dtype(compute).size_in_bytes() as u64,
+    )?)
 }
 
 /// Architecture axes for one resolved load, read from the task's own `config.yaml`.
@@ -279,9 +306,7 @@ fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
 // ================================================================================================
 
 /// No Iris loader has a deferred (block-streaming) materialization shape, so a spec asking for one
-/// has no contract — the same refusal from the production and the weights-free contract factory.
-/// (The loaders themselves treat the shape as advisory and build the same eager model; such a load
-/// publishes no contract.)
+/// has no contract — and, because every loader prices its contract first, no load either.
 fn refuse_deferred_materialization(model_id: &str, spec: &LoadSpec) -> gen_core::Result<()> {
     if spec.load_shape == LoadShape::DeferredMaterialization {
         return Err(gen_core::Error::Unsupported(format!(
@@ -341,7 +366,8 @@ pub fn weights_free_memory_strategy_contract(
             MemoryFormulaVariable::AssetBytes,
             MemoryFormulaVariable::PixelCount,
             MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
+            // No conditioning-token variable: the text window is the checkpoint's fixed
+            // `text_len`, whatever the prompt.
             MemoryFormulaVariable::AttentionChunkSize,
         ],
     };
@@ -359,7 +385,7 @@ pub fn weights_free_memory_strategy_contract(
         };
         capability.parameters = match capability.strategy {
             MemoryStrategy::BoundedAttention => MemoryParameterRanges {
-                attention_chunk_sizes: ATTENTION_CHUNK_SIZES.to_vec(),
+                attention_chunk_sizes: vec![ATTENTION_CHUNK_SIZE],
                 ..Default::default()
             },
             _ => MemoryParameterRanges::default(),
@@ -393,34 +419,52 @@ pub fn generation_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCo
     };
     price_adapter_stack(
         &mut contract,
-        adapter_overlay_bytes(spec, &resources.backbone_dir)?,
+        adapter_overlay(spec, &resources.backbone_dir)?,
     );
     Ok(contract)
 }
 
-/// Declare a non-zero adapter stack as a typed auxiliary component beside the base components
+/// Declare a non-zero adapter stack as typed auxiliary components beside the base components
 /// (never inside `base_bytes`), with `OverlayBytes` in the formula. Iris adapters are forward-time
-/// residuals — never folded into the base weight — so the whole stack is resident for the render.
-fn price_adapter_stack(contract: &mut MemoryProviderContract, overlay_bytes: u64) {
-    if overlay_bytes == 0 {
+/// residuals — never folded into the base weight — so both classes are resident for the render. A
+/// class the stack does not contain declares nothing (a zero-byte component is not a component).
+fn price_adapter_stack(
+    contract: &mut MemoryProviderContract,
+    overlay: crate::adapters::AdapterFootprint,
+) {
+    if overlay.total() == 0 {
         return;
     }
-    contract.asset_facts.overlay_bytes = overlay_bytes;
+    contract.asset_facts.overlay_bytes = overlay.total();
     let MemoryFormulaKind::PhaseEnvelope { phases, variables } = &contract.formula else {
         return;
     };
     let mut variables = variables.clone();
     variables.push(MemoryFormulaVariable::OverlayBytes);
+    let resident_components = [
+        (
+            ADAPTER_RESIDUALS_COMPONENT_ID,
+            overlay.forward_residual_bytes,
+        ),
+        (
+            ADAPTER_DELTAS_COMPONENT_ID,
+            overlay.materialized_delta_bytes,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, bytes)| *bytes > 0)
+    .map(|(id, resident_bytes)| gen_core::MemoryResidentComponent {
+        id: id.to_owned(),
+        kind: gen_core::MemoryComponentKind::AdapterStack,
+        resident_bytes,
+        bounded_by: None,
+        residency: gen_core::MemoryComponentResidency::WholeRender,
+    })
+    .collect();
     contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
         phases: phases.clone(),
         variables,
-        resident_components: vec![gen_core::MemoryResidentComponent {
-            id: "iris_3b_adapter_stack".to_owned(),
-            kind: gen_core::MemoryComponentKind::AdapterStack,
-            resident_bytes: overlay_bytes,
-            bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
-        }],
+        resident_components,
     };
 }
 
@@ -506,7 +550,7 @@ pub fn weights_free_restoration_contract(
     crate::restoration::refuse_unsupported_spec(spec)?;
     weights_free_downstream_contract(
         RESTORATION_MODEL_ID,
-        RESTORATION_MEMORY_CALIBRATION_FINGERPRINT,
+        RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
         spec,
     )
 }
@@ -587,6 +631,12 @@ pub fn generation_safety_check(
                 "{MODEL_ID}: the generation route takes no reference images"
             )));
         }
+        if context.geometry.frames > 1 {
+            return Err(unsupported(format!(
+                "{MODEL_ID}: a still-image route cannot admit {} frames",
+                context.geometry.frames
+            )));
+        }
         if context.use_pid {
             return Err(unsupported(format!(
                 "{MODEL_ID}: there is no PiD decoder on this route"
@@ -621,6 +671,12 @@ fn downstream_safety_check(
                 "{model_id}: one source image per request and no reference images"
             )));
         }
+        if context.geometry.frames > 1 {
+            return Err(unsupported(format!(
+                "{model_id}: a still-image route cannot admit {} frames",
+                context.geometry.frames
+            )));
+        }
         if context.use_pid {
             return Err(unsupported(format!(
                 "{model_id}: there is no PiD decoder on this route"
@@ -645,7 +701,7 @@ pub fn depth_safety_check(
     downstream_safety_check(DEPTH_MODEL_ID, DEPTH_MEMORY_MODE, spec, contract, context)
 }
 
-/// The restoration safety check ([`RESTORATION_MEMORY_MODE`], resident only).
+/// The restoration safety check ([`RESTORE_MEMORY_MODE`], resident only).
 pub fn restoration_safety_check(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -653,26 +709,11 @@ pub fn restoration_safety_check(
 ) -> MemorySafetyDecision {
     downstream_safety_check(
         RESTORATION_MODEL_ID,
-        RESTORATION_MEMORY_MODE,
+        RESTORE_MEMORY_MODE,
         spec,
         contract,
         context,
     )
-}
-
-/// The safety check of a load that published no contract — the unverified state every
-/// non-adopting provider has: the resident baseline only.
-pub(crate) fn unpriced_safety_check(
-    model_id: &str,
-    context: &MemoryRunContext,
-) -> MemorySafetyDecision {
-    if context.selection.strategy == MemoryStrategy::Resident {
-        MemorySafetyDecision::Accept
-    } else {
-        MemorySafetyDecision::Reject {
-            reason: format!("{model_id}: this load published no memory-strategy contract"),
-        }
-    }
 }
 
 /// The provider-owned valid fixture of each optimized rung generation implements.
@@ -852,7 +893,7 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
 };
 
 /// The generation route's weights-free contract fixture.
-pub const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+pub const MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: weights_free_memory_strategy_contract,
@@ -876,7 +917,7 @@ pub const DEPTH_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::Me
 };
 
 /// The depth route's weights-free contract fixture.
-pub const DEPTH_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+pub const DEPTH_MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: DEPTH_MODEL_ID,
         contract: weights_free_depth_contract,
@@ -895,7 +936,7 @@ pub const DEPTH_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistrati
     };
 
 /// The restoration route's registration (a composed route: restoration is a `Transform`).
-pub const RESTORATION_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+pub const RESTORE_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
         provider_id: RESTORATION_MODEL_ID,
         contract: restoration_contract,
@@ -903,7 +944,7 @@ pub const RESTORATION_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     };
 
 /// The restoration route's weights-free contract fixture.
-pub const RESTORATION_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+pub const RESTORE_MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: RESTORATION_MODEL_ID,
         contract: weights_free_restoration_contract,
@@ -912,7 +953,7 @@ pub const RESTORATION_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistratio
 
 /// The restoration route's behavior registration: no optimized fixture, and admission through
 /// [`restoration_safety_check`].
-pub const RESTORATION_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+pub const RESTORE_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: RESTORATION_MODEL_ID,
         valid_fixtures: downstream_valid_fixtures,
@@ -1004,9 +1045,25 @@ mod tests {
                 .unwrap()
                 .parameters
                 .attention_chunk_sizes,
-            ATTENTION_CHUNK_SIZES
+            [ATTENTION_CHUNK_SIZE]
+        );
+        assert_eq!(
+            u64::from(ATTENTION_CHUNK_SIZE),
+            candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET
         );
         assert!(generation.lifecycle.attention_chunking && !generation.lifecycle.decode_tiling);
+        // The text window is a fixed `text_len`, so the formula has no conditioning-token input.
+        for variable in [
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+            MemoryFormulaVariable::AttentionChunkSize,
+        ] {
+            assert!(generation.formula.uses(variable), "{variable:?}");
+        }
+        assert!(!generation
+            .formula
+            .uses(MemoryFormulaVariable::ConditioningTokenCount));
         gen_core_testkit::memory_strategy_conformance(&generation);
 
         for (contract, id) in [
@@ -1062,7 +1119,7 @@ mod tests {
         let fingerprints = [
             MEMORY_CALIBRATION_FINGERPRINT,
             DEPTH_MEMORY_CALIBRATION_FINGERPRINT,
-            RESTORATION_MEMORY_CALIBRATION_FINGERPRINT,
+            RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
         ];
         for fingerprint in fingerprints {
             gen_core::validate_calibration_fingerprint(fingerprint).unwrap();
@@ -1083,13 +1140,13 @@ mod tests {
             ),
             (
                 weights_free_restoration_contract(&unresolved()).unwrap(),
-                RESTORATION_MEMORY_CALIBRATION_FINGERPRINT,
+                RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
             ),
         ] {
             assert_eq!(contract.calibration.unwrap().fingerprint, fingerprint);
         }
         assert_eq!(DEPTH_MEMORY_MODE, IrisTask::Depth.name());
-        assert_eq!(RESTORATION_MEMORY_MODE, IrisTask::Restoration.name());
+        assert_eq!(RESTORE_MEMORY_MODE, IrisTask::Restoration.name());
     }
 
     /// The axes come from each task's own `config.yaml`, and a weights-free surface publishes none.
@@ -1382,117 +1439,274 @@ mod tests {
         }
     }
 
-    /// A non-empty adapter stack is priced as a typed auxiliary component beside the base — the
-    /// residuals the loader installs, at the widths the forward holds them in — and an adapter the
-    /// loader refuses has no contract.
-    ///
-    /// *Mutation that reds this:* dropping the `price_adapter_stack` call from
-    /// `generation_contract` (the adapted load prices like the plain one).
-    #[test]
-    fn a_non_empty_adapter_stack_prices_a_resident_overlay() {
-        let plain = generation_spec();
-        let base = generation_contract(&plain).unwrap();
-        assert!(!base.formula.uses(MemoryFormulaVariable::OverlayBytes));
+    /// Bytes the loader's installed residuals hold, by class — counted from the residual tensors
+    /// `merge_adapters` builds, with a structured LoKr asked for its own device bytes after one
+    /// forward at the kernel dtype (which is when it caches its copies).
+    fn installed(adapters: &[AdapterSpec], compute: DType) -> crate::adapters::AdapterFootprint {
+        use crate::nn::Residual;
+        use candle_gen::candle_core::Tensor;
 
-        let lora = AdapterSpec::new(
-            fixtures().join("iris_lora.safetensors"),
-            1.0,
-            AdapterKind::Lora,
-        );
-        let lokr = AdapterSpec::new(
-            fixtures().join("iris_lokr.safetensors"),
-            1.0,
-            AdapterKind::Lokr,
-        );
+        let kernel = production_kernel_dtype(compute);
+        let device = candle_gen::default_device().unwrap();
         let shapes = safetensors_shapes(
             &fixtures()
                 .join("tiny-snapshot/iris")
                 .join(BACKBONE_WEIGHTS_FILE),
         )
         .unwrap();
-        let installed = |adapters: &[AdapterSpec]| -> u64 {
+        let merged =
             crate::adapters::merge_adapters(&shapes, adapters, IrisTask::Generation, MODEL_ID)
-                .unwrap()
-                .residuals
-                .values()
-                .flatten()
-                .map(|residual| match residual {
-                    // f32 factors, whatever the compute dtype.
-                    crate::nn::Residual::Lora { a, b } => {
-                        ((a.elem_count() + b.elem_count()) * 4) as u64
-                    }
-                    other => {
-                        other.resident_bytes(DType::BF16, production_kernel_dtype(DType::BF16))
-                    }
-                })
-                .sum()
-        };
-        let lora_bytes = installed(std::slice::from_ref(&lora));
-        assert!(lora_bytes > 0);
-
-        let adapted = plain.clone().with_adapters(vec![lora.clone()]);
-        let contract = generation_contract(&adapted).unwrap();
-        assert_eq!(contract.asset_facts.overlay_bytes, lora_bytes);
-        assert_eq!(
-            contract.asset_facts.base_bytes, base.asset_facts.base_bytes,
-            "the overlay is declared beside the base, never inside it"
-        );
-        assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
-        assert!(
-            contract.conformance_errors().is_empty(),
-            "{:?}",
-            contract.conformance_errors()
-        );
-        let components = contract.resident_components();
-        assert_eq!(components.len(), 1, "{components:?}");
-        assert_eq!(components[0].steady_state_bytes(), lora_bytes);
-        assert!(contract.total_resident_bytes() > base.total_resident_bytes());
-
-        let stacked = plain
-            .clone()
-            .with_adapters(vec![lora.clone(), lokr.clone()]);
-        let both = generation_contract(&stacked).unwrap();
-        assert_eq!(both.asset_facts.overlay_bytes, installed(&[lora, lokr]));
-        assert!(both.asset_facts.overlay_bytes > lora_bytes);
-        assert!(both.conformance_errors().is_empty());
-
-        // The loader's own refusals are the contract's: a depth-task adapter on the generation
-        // route, and a file that is not on disk.
-        for refused in [
-            fixtures().join("iris_lora_depth_task.safetensors"),
-            fixtures().join("absent.safetensors"),
-        ] {
-            let spec = plain.clone().with_adapters(vec![AdapterSpec::new(
-                refused,
-                1.0,
-                AdapterKind::Lora,
-            )]);
-            assert!(generation_contract(&spec).is_err());
+                .unwrap();
+        let mut footprint = crate::adapters::AdapterFootprint::default();
+        for residual in merged.residuals.values().flatten() {
+            match residual {
+                Residual::Lora { a, b } => {
+                    assert_eq!((a.dtype(), b.dtype()), (DType::F32, DType::F32));
+                    footprint.forward_residual_bytes +=
+                        ((a.elem_count() + b.elem_count()) * 4) as u64;
+                }
+                Residual::Kron(factors) => {
+                    let factors = factors.to_device(&device).unwrap();
+                    let (_, inputs) = factors.shape();
+                    factors
+                        .residual(&Tensor::zeros((1, inputs), kernel, &device).unwrap())
+                        .unwrap();
+                    footprint.forward_residual_bytes += factors.device_bytes() as u64;
+                }
+                Residual::LowRank { a, b } => {
+                    footprint.forward_residual_bytes +=
+                        (a.elem_count() + b.elem_count()) as u64 * width(compute);
+                }
+                Residual::Delta(delta) => {
+                    footprint.materialized_delta_bytes +=
+                        delta.elem_count() as u64 * width(compute);
+                }
+            }
         }
+        footprint
     }
 
-    /// Residual pricing follows the dtype the forward holds each kind in.
-    ///
-    /// *Mutation that reds this:* pricing a LoRA's factors at the compute width.
-    #[test]
-    fn a_residual_is_priced_at_the_width_the_forward_holds_it_in() {
+    /// A stamped third-party LoHa over the miniature's `[64, 64]` `blocks.2.q_proj`, rank `rank`
+    /// on both Hadamard pairs.
+    fn loha_file(dir: &Path, rank: usize) -> AdapterSpec {
         use candle_gen::candle_core::Tensor;
         let zeros = |shape: (usize, usize)| Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap();
-        let lora = crate::nn::Residual::Lora {
-            a: zeros((16, 2)),
-            b: zeros((2, 24)),
+        let tensors = [
+            ("blocks.2.q_proj.hada_w1_a", zeros((64, rank))),
+            ("blocks.2.q_proj.hada_w1_b", zeros((rank, 64))),
+            ("blocks.2.q_proj.hada_w2_a", zeros((64, rank))),
+            ("blocks.2.q_proj.hada_w2_b", zeros((rank, 64))),
+        ];
+        let meta: std::collections::HashMap<String, String> = [
+            ("family", "iris"),
+            ("irisTask", "generation"),
+            ("baseModel", MODEL_ID),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let path = dir.join(format!("loha-r{rank}.safetensors"));
+        let list: Vec<(&str, &Tensor)> = tensors.iter().map(|(key, t)| (*key, t)).collect();
+        safetensors::serialize_to_file(list, Some(meta), &path).unwrap();
+        AdapterSpec::new(path, 1.0, AdapterKind::Lora)
+    }
+
+    fn fixture_adapter(file: &str, kind: AdapterKind) -> AdapterSpec {
+        AdapterSpec::new(fixtures().join(file), 1.0, kind)
+    }
+
+    /// The header-only footprint is, byte for byte and class for class, what the loader installs:
+    /// a LoRA's f32 factors, a structured LoKr's factors plus its cached copies, a LoHa's low-rank
+    /// factorisation below the break-even rank and its dense delta at or above it.
+    ///
+    /// *Mutations that red this:* pricing a LoRA at the compute width; pricing every LoHa as a
+    /// low-rank residual (drop the break-even filter); pricing a structured LoKr at its stored
+    /// factor bytes.
+    #[test]
+    fn the_header_only_adapter_footprint_is_what_the_loader_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lora = fixture_adapter("iris_lora.safetensors", AdapterKind::Lora);
+        let lokr = fixture_adapter("iris_lokr.safetensors", AdapterKind::Lokr);
+        let low_rank = loha_file(tmp.path(), 2);
+        let dense = loha_file(tmp.path(), 8);
+        let backbone = fixtures().join("tiny-snapshot/iris");
+        for precision in [Precision::Bf16, Precision::Fp32] {
+            let mut plain = generation_spec();
+            plain.precision = precision;
+            let compute = compute_dtype(&plain);
+            let mut classes = (0, 0);
+            for stack in [
+                vec![lora.clone()],
+                vec![lokr.clone()],
+                vec![low_rank.clone()],
+                vec![dense.clone()],
+                vec![lora.clone(), lokr.clone(), low_rank.clone(), dense.clone()],
+            ] {
+                let spec = plain.clone().with_adapters(stack.clone());
+                let priced = adapter_overlay(&spec, &backbone).unwrap();
+                assert_eq!(
+                    priced,
+                    installed(&stack, compute),
+                    "{precision:?}: {stack:?}"
+                );
+                assert!(priced.total() > 0);
+                classes = (
+                    classes.0 + u64::from(priced.forward_residual_bytes > 0),
+                    classes.1 + u64::from(priced.materialized_delta_bytes > 0),
+                );
+            }
+            // Four stacks apply factors (LoRA, LoKr, low-rank LoHa, the mixed stack); two hold a
+            // delta (the dense LoHa, the mixed stack).
+            assert_eq!(classes, (4, 2), "{precision:?}");
+        }
+        // The break-even rank: 4·(64 + 64) < 64·64 factorises; 64·(64 + 64) does not.
+        let spec = generation_spec().with_adapters(vec![low_rank]);
+        assert_eq!(
+            adapter_overlay(&spec, &backbone).unwrap(),
+            crate::adapters::AdapterFootprint {
+                forward_residual_bytes: 4 * (64 + 64) * 2,
+                materialized_delta_bytes: 0,
+            }
+        );
+        let spec = generation_spec().with_adapters(vec![dense]);
+        assert_eq!(
+            adapter_overlay(&spec, &backbone).unwrap(),
+            crate::adapters::AdapterFootprint {
+                forward_residual_bytes: 0,
+                materialized_delta_bytes: 64 * 64 * 2,
+            }
+        );
+    }
+
+    /// Pricing reads the adapter's header and nothing else: a file cut off right after its header
+    /// prices exactly like the whole file, though the loader cannot read it.
+    ///
+    /// *Mutation that reds this:* pricing through `merge_adapters` (it reads the tensors).
+    #[test]
+    fn adapter_pricing_reads_only_the_safetensors_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whole = fixtures().join("iris_lokr.safetensors");
+        let bytes = std::fs::read(&whole).unwrap();
+        let header = 8 + u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        assert!(header < bytes.len());
+        let cut = tmp.path().join("header-only.safetensors");
+        std::fs::write(&cut, &bytes[..header]).unwrap();
+
+        let backbone = fixtures().join("tiny-snapshot/iris");
+        let priced = |path: std::path::PathBuf| {
+            let spec = generation_spec().with_adapters(vec![AdapterSpec::new(
+                path,
+                1.0,
+                AdapterKind::Lokr,
+            )]);
+            adapter_overlay(&spec, &backbone).unwrap()
         };
-        // f32 factors under every compute dtype.
-        assert_eq!(lora.resident_bytes(DType::BF16, DType::BF16), 80 * 4);
-        assert_eq!(lora.resident_bytes(DType::F32, DType::F32), 80 * 4);
-        let low_rank = crate::nn::Residual::LowRank {
-            a: zeros((16, 4)),
-            b: zeros((4, 24)),
+        assert_eq!(priced(cut.clone()), priced(whole));
+        let shapes = safetensors_shapes(&backbone.join(BACKBONE_WEIGHTS_FILE)).unwrap();
+        assert!(crate::adapters::merge_adapters(
+            &shapes,
+            &[AdapterSpec::new(cut, 1.0, AdapterKind::Lokr)],
+            IrisTask::Generation,
+            MODEL_ID,
+        )
+        .is_err());
+    }
+
+    /// A non-empty adapter stack is declared as typed auxiliary components beside the base — one
+    /// per class the stack actually contains — and an adapter the loader refuses from its header
+    /// has no contract.
+    ///
+    /// *Mutations that red this:* dropping the `price_adapter_stack` call from
+    /// `generation_contract`; declaring both classes under one component id.
+    #[test]
+    fn a_non_empty_adapter_stack_prices_typed_overlay_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = generation_spec();
+        let base = generation_contract(&plain).unwrap();
+        assert!(!base.formula.uses(MemoryFormulaVariable::OverlayBytes));
+        assert!(base.resident_components().is_empty());
+
+        let lora = fixture_adapter("iris_lora.safetensors", AdapterKind::Lora);
+        let dense = loha_file(tmp.path(), 8);
+        let backbone = fixtures().join("tiny-snapshot/iris");
+        let components = |stack: Vec<AdapterSpec>| {
+            let spec = plain.clone().with_adapters(stack);
+            let overlay = adapter_overlay(&spec, &backbone).unwrap();
+            let contract = generation_contract(&spec).unwrap();
+            assert_eq!(contract.asset_facts.overlay_bytes, overlay.total());
+            assert_eq!(
+                contract.asset_facts.base_bytes, base.asset_facts.base_bytes,
+                "the overlay is declared beside the base, never inside it"
+            );
+            assert!(contract.formula.uses(MemoryFormulaVariable::OverlayBytes));
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{:?}",
+                contract.conformance_errors()
+            );
+            assert!(contract.total_resident_bytes() > base.total_resident_bytes());
+            let declared: Vec<(String, u64)> = contract
+                .resident_components()
+                .iter()
+                .map(|component| (component.id.clone(), component.steady_state_bytes()))
+                .collect();
+            (overlay, declared)
         };
-        assert_eq!(low_rank.resident_bytes(DType::BF16, DType::BF16), 160 * 2);
-        assert_eq!(low_rank.resident_bytes(DType::F32, DType::F32), 160 * 4);
-        let delta = crate::nn::Residual::Delta(zeros((24, 16)));
-        assert_eq!(delta.resident_bytes(DType::BF16, DType::F32), 384 * 2);
+
+        // A LoRA is applied as factors only: one component, the residuals.
+        let (overlay, declared) = components(vec![lora.clone()]);
+        assert_eq!(
+            declared,
+            [(
+                "iris_3b.adapters.forward_residuals".to_owned(),
+                overlay.forward_residual_bytes
+            )]
+        );
+        // A dense LoHa is held as a delta only: one component, the deltas.
+        let (overlay, declared) = components(vec![dense.clone()]);
+        assert_eq!(
+            declared,
+            [(
+                "iris_3b.adapters.materialized_deltas".to_owned(),
+                overlay.materialized_delta_bytes
+            )]
+        );
+        // Both together: both components, each at its own bytes.
+        let (overlay, declared) = components(vec![lora, dense]);
+        assert_eq!(
+            declared,
+            [
+                (
+                    ADAPTER_RESIDUALS_COMPONENT_ID.to_owned(),
+                    overlay.forward_residual_bytes
+                ),
+                (
+                    ADAPTER_DELTAS_COMPONENT_ID.to_owned(),
+                    overlay.materialized_delta_bytes
+                ),
+            ]
+        );
+
+        // Refusals the loader makes are made from the header: another task's adapter, a kind the
+        // file contradicts, per-pass scales, and a file that is not on disk.
+        let refused = |adapter: AdapterSpec| {
+            generation_contract(&plain.clone().with_adapters(vec![adapter]))
+                .expect_err("a refused adapter has no contract")
+                .to_string()
+        };
+        let wrong_task = refused(fixture_adapter(
+            "iris_lora_depth_task.safetensors",
+            AdapterKind::Lora,
+        ));
+        assert!(wrong_task.contains("task"), "{wrong_task}");
+        let mislabeled = refused(fixture_adapter("iris_lora.safetensors", AdapterKind::Lokr));
+        assert!(mislabeled.contains("declared LoKr"), "{mislabeled}");
+        let mislabeled = refused(fixture_adapter("iris_lokr.safetensors", AdapterKind::Lora));
+        assert!(mislabeled.contains("networkType=lokr"), "{mislabeled}");
+        let mut scaled = fixture_adapter("iris_lora.safetensors", AdapterKind::Lora);
+        scaled.moe_expert = Some(gen_core::MoeExpert::High);
+        assert!(refused(scaled).contains("MoE expert"));
+        refused(fixture_adapter("absent.safetensors", AdapterKind::Lora));
     }
 
     fn fixture_context(
@@ -1536,7 +1750,10 @@ mod tests {
             crossed.selection.tier.quant = Some(Quant::Q4);
             let mut fp32 = context.clone();
             fp32.selection.tier.precision = Precision::Fp32;
+            let mut clip = context.clone();
+            clip.geometry.frames = 2;
             for (name, context) in [
+                ("frames", clip),
                 ("edit", edit),
                 ("reference", referenced),
                 ("pid", pid),
@@ -1558,7 +1775,7 @@ mod tests {
         let mut window = decode.clone();
         window.selection.strategy = MemoryStrategy::BoundedTransformerResidency;
         let mut budget = fixture_context(&spec, &contract, MemoryStrategy::BoundedAttention);
-        budget.selection.parameters.attention_chunk_size = Some(1_000);
+        budget.selection.parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZE / 2);
         for context in [decode, window, budget] {
             assert!(matches!(
                 generation_safety_check(&spec, &contract, &context),
@@ -1598,12 +1815,11 @@ mod tests {
         assert!(memory.stage_residency && !memory.chunk_attention);
         assert!(crate::model::stage_residency_for(&spec, &request));
         assert_eq!(crate::model::attention_budget_for(&request), None);
-        assert!(scope.configure_attention(ATTENTION_CHUNK_SIZES[0]).is_err());
+        assert!(scope.configure_attention(ATTENTION_CHUNK_SIZE).is_err());
         assert!(scope.configure_decode(512, 64, staged.geometry).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
 
-        let mut bounded = fixture_context(&spec, &contract, MemoryStrategy::BoundedAttention);
-        bounded.selection.parameters.attention_chunk_size = Some(ATTENTION_CHUNK_SIZES[1]);
+        let bounded = fixture_context(&spec, &contract, MemoryStrategy::BoundedAttention);
         let mut request = GenerationRequest {
             width: bounded.geometry.width,
             height: bounded.geometry.height,
@@ -1617,11 +1833,11 @@ mod tests {
         assert!(memory.chunk_attention && !memory.stage_residency);
         assert_eq!(
             crate::model::attention_budget_for(&request),
-            Some(ATTENTION_CHUNK_SIZES[1] as usize)
+            Some(ATTENTION_CHUNK_SIZE as usize)
         );
         assert!(!crate::model::stage_residency_for(&spec, &request));
-        scope.configure_attention(ATTENTION_CHUNK_SIZES[1]).unwrap();
-        assert!(scope.configure_attention(ATTENTION_CHUNK_SIZES[0]).is_err());
+        scope.configure_attention(ATTENTION_CHUNK_SIZE).unwrap();
+        assert!(scope.configure_attention(ATTENTION_CHUNK_SIZE / 2).is_err());
         scope.finish(MemoryRunOutcome::Complete).unwrap();
 
         // Admitted for one image: a three-prompt batch is three rows of the same solve.
@@ -1720,16 +1936,16 @@ mod tests {
             (
                 weights_free_depth_contract(&spec).unwrap(),
                 DEPTH_MEMORY_MODE,
-                RESTORATION_MEMORY_MODE,
+                RESTORE_MEMORY_MODE,
                 depth_safety_check,
                 DEPTH_MEMORY_BEHAVIOR_REGISTRATION,
             ),
             (
                 weights_free_restoration_contract(&spec).unwrap(),
-                RESTORATION_MEMORY_MODE,
+                RESTORE_MEMORY_MODE,
                 DEPTH_MEMORY_MODE,
                 restoration_safety_check,
-                RESTORATION_MEMORY_BEHAVIOR_REGISTRATION,
+                RESTORE_MEMORY_BEHAVIOR_REGISTRATION,
             ),
         ];
         for (contract, mode, other_mode, check, behavior) in routes {
@@ -1757,7 +1973,10 @@ mod tests {
             tier.selection.tier.precision = Precision::Fp32;
             let mut over_budget = context.clone();
             over_budget.predicted_peak_bytes = u64::MAX;
+            let mut clip = context.clone();
+            clip.geometry.frames = 2;
             let mut refused = vec![
+                clip,
                 crossed_mode,
                 text_to_image,
                 batch,
@@ -1986,12 +2205,12 @@ mod tests {
         let mut spec = restoration_spec();
         spec.precision = Precision::Fp32;
         let restorer = crate::IrisRestorer::load_on(&spec, &Device::Cpu).unwrap();
-        let contract = restorer.memory_strategy_contract().unwrap();
+        let contract = restorer.memory_strategy_contract();
         assert_eq!(
             contract,
-            &(RESTORATION_MEMORY_REGISTRATION.contract)(&spec).unwrap()
+            &(RESTORE_MEMORY_REGISTRATION.contract)(&spec).unwrap()
         );
-        let mut context = downstream_context(contract, RESTORATION_MEMORY_MODE);
+        let mut context = downstream_context(contract, RESTORE_MEMORY_MODE);
         context.selection.tier = loaded_tier(&spec);
         assert_eq!(
             restorer.memory_strategy_safety_check(&context),
@@ -2001,32 +2220,42 @@ mod tests {
         let mut spec = depth_spec();
         spec.precision = Precision::Fp32;
         let depth = crate::depth::load_depth(&spec).unwrap();
-        let contract = depth.memory_strategy_contract().unwrap();
+        let contract = depth.memory_strategy_contract();
         assert_eq!(
             contract,
             &(DEPTH_MEMORY_REGISTRATION.contract)(&spec).unwrap()
         );
+        // A model built from an already-resolved export publishes the contract of the load it is.
+        let export = TaskExport::from_dir(
+            &fixtures().join("tiny-depth"),
+            IrisTask::Depth,
+            DEPTH_MODEL_ID,
+        )
+        .unwrap();
+        let built = crate::depth::load_depth_export(export, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(built.memory_strategy_contract(), contract);
         let mut context = downstream_context(contract, DEPTH_MEMORY_MODE);
         context.selection.tier = loaded_tier(&spec);
         assert_eq!(
             depth.memory_strategy_safety_check(&context),
             MemorySafetyDecision::Accept
         );
-        context.mode = MemoryMode::Other(RESTORATION_MEMORY_MODE.to_owned());
+        context.mode = MemoryMode::Other(RESTORE_MEMORY_MODE.to_owned());
         assert!(matches!(
             depth.memory_strategy_safety_check(&context),
             MemorySafetyDecision::Reject { .. }
         ));
     }
 
-    /// Pricing never decides whether a load succeeds. A load whose inventory cannot be priced
-    /// (here: a `Sequential` load whose text-encoder shard is missing, which the loader only opens
-    /// at the first request) still loads, publishes no contract, and admits the resident baseline
-    /// alone — while the registration reports why there is none.
+    /// Every loader prices its contract before it reads a weight, so a spec whose contract cannot
+    /// be priced fails `load` with the pricing reason — on every offload policy, including the
+    /// `Sequential` one that would otherwise only meet the problem at the first render.
     ///
-    /// *Mutation that reds this:* `generation_contract(spec)?` in `load_inner` (the load fails).
+    /// *Mutations that red this:* pricing the weights-free contract at load instead of the
+    /// resolved one (the `Sequential` load with a missing shard then succeeds); dropping
+    /// `refuse_deferred_materialization` from a contract factory (a deferred spec then loads).
     #[test]
-    fn a_load_that_cannot_be_priced_still_loads_and_publishes_no_contract() {
+    fn a_load_whose_contract_cannot_be_priced_fails_with_the_pricing_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let source = fixtures().join("tiny-snapshot/text_encoder");
         for name in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
@@ -2037,39 +2266,61 @@ mod tests {
             r#"{"metadata":{},"weight_map":{"model.language_model.norm.weight":"model-00001-of-00001.safetensors"}}"#,
         )
         .unwrap();
-        let mut spec = generation_spec().with_offload_policy(OffloadPolicy::Sequential);
-        spec.components.insert(
-            TEXT_ENCODER_COMPONENT.into(),
-            WeightsSource::Dir(tmp.path().to_path_buf()),
-        );
-        assert!((MEMORY_REGISTRATION.contract)(&spec).is_err());
-        let generator = crate::model::load(&spec).expect("sequential defers the encoder");
-        assert!(generator.memory_strategy_contract().is_none());
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            // A text-encoder shard the index names is missing.
+            let mut spec = generation_spec().with_offload_policy(policy);
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(tmp.path().to_path_buf()),
+            );
+            let priced = (MEMORY_REGISTRATION.contract)(&spec)
+                .expect_err("an incomplete text encoder has no contract")
+                .to_string();
+            assert!(priced.contains("model-00001-of-00001"), "{priced}");
+            let loaded = crate::model::load(&spec)
+                .err()
+                .expect("the load must fail")
+                .to_string();
+            assert_eq!(
+                loaded, priced,
+                "{policy:?}: load reports the pricing reason"
+            );
 
-        let priced = generation_contract(&generation_spec()).unwrap();
-        let resident = downstream_context(&priced, "text_to_image");
-        assert_eq!(
-            generator.memory_strategy_safety_check(&resident),
-            MemorySafetyDecision::Accept
-        );
-        let staged = fixture_context(&generation_spec(), &priced, MemoryStrategy::StagedResidency);
+            // An adapter the loader would refuse.
+            let spec = generation_spec()
+                .with_offload_policy(policy)
+                .with_adapters(vec![AdapterSpec::new(
+                    fixtures().join("iris_lora_depth_task.safetensors"),
+                    1.0,
+                    AdapterKind::Lora,
+                )]);
+            let loaded = crate::model::load(&spec)
+                .err()
+                .expect("the load must fail")
+                .to_string();
+            assert!(loaded.contains("task"), "{policy:?}: {loaded}");
+        }
+
+        // No Iris loader has a deferred materialization shape: a typed refusal at load.
+        let deferred = |spec: LoadSpec| spec.with_load_shape(LoadShape::DeferredMaterialization);
+        let refusals = [
+            crate::model::load(&deferred(generation_spec()))
+                .err()
+                .map(|e| e.to_string()),
+            crate::IrisRestorer::load_on(&deferred(restoration_spec()), &Device::Cpu)
+                .err()
+                .map(|e| gen_core::Error::from(e).to_string()),
+            crate::depth::load_depth(&deferred(depth_spec()))
+                .err()
+                .map(|e| gen_core::Error::from(e).to_string()),
+        ];
+        for refusal in refusals {
+            let refusal = refusal.expect("a deferred spec must not load");
+            assert!(refusal.contains("DeferredMaterialization"), "{refusal}");
+        }
         assert!(matches!(
-            generator.memory_strategy_safety_check(&staged),
-            MemorySafetyDecision::Reject { .. }
+            crate::model::load(&deferred(generation_spec())),
+            Err(gen_core::Error::Unsupported(_))
         ));
-        assert!(generator
-            .begin_memory_strategy_request(&staged)
-            .unwrap()
-            .is_none());
-
-        // The loaders treat a deferred shape as advisory; such a load has no contract either.
-        let deferred = restoration_spec().with_load_shape(LoadShape::DeferredMaterialization);
-        let restorer = crate::IrisRestorer::load_on(&deferred, &Device::Cpu).unwrap();
-        assert!(restorer.memory_strategy_contract().is_none());
-        let deferred = depth_spec().with_load_shape(LoadShape::DeferredMaterialization);
-        assert!(crate::depth::load_depth(&deferred)
-            .unwrap()
-            .memory_strategy_contract()
-            .is_none());
     }
 }

@@ -181,7 +181,10 @@ fn an_admitted_attention_budget_bounds_the_render() {
         .parameters
         .attention_chunk_size
         .expect("a bounded-attention selection names its budget");
-    assert!(candle_gen_iris::memory_strategy::ATTENTION_CHUNK_SIZES.contains(&admitted));
+    assert_eq!(
+        admitted,
+        candle_gen_iris::memory_strategy::ATTENTION_CHUNK_SIZE
+    );
     let mut scope = generator
         .begin_memory_strategy_request(&context)
         .unwrap()
@@ -272,4 +275,73 @@ fn an_unhonoured_memory_control_is_refused() {
         ..Default::default()
     });
     generator.validate(&honoured).unwrap();
+}
+
+/// Declared bound on the bf16 render's largest single-channel pixel change under a binding
+/// attention budget, in RGB8 levels.
+const BF16_BOUNDED_MAX_ABS_LEVELS: u8 = 8;
+/// Declared bound on the bf16 render's mean absolute pixel change under a binding attention
+/// budget, in RGB8 levels. Not scale-invariant: it bounds the size of the change, not its shape.
+const BF16_BOUNDED_MEAN_ABS_LEVELS: f64 = 1.0;
+
+/// Rung 3 on the tier the contract actually witnesses (bf16). The chunked kernels compute the same
+/// attention to f32 rounding (`nn` unit tests, and the FP32 render above), but under the bf16
+/// policy every projection re-rounds its output to bf16, so an f32 ulp of GEMM-order difference can
+/// become one bf16 step and travel through the remaining blocks and solver steps. The render is
+/// therefore not bit-identical; it is held to a declared bound instead, on two metrics: the largest
+/// single-channel change and the mean absolute change, both in RGB8 levels, over three seeds and
+/// three binding budgets on the miniature snapshot.
+///
+/// *Mutation that reds this:* dropping the per-row mask narrowing in `nn::bounded_attention`, or
+/// chunking the key axis instead of the query axis (either changes the attention, not its
+/// rounding).
+#[test]
+fn a_bf16_render_under_a_binding_attention_budget_stays_inside_the_declared_bound() {
+    let generator = load(Precision::Bf16);
+    let mut worst_max = 0u8;
+    let mut worst_mean = 0f64;
+    for seed in [42u64, 7, 1234] {
+        let mut plain = request();
+        plain.seed = Some(seed);
+        chunk_probe::reset();
+        let (unbounded, _) = render(generator.as_ref(), &plain);
+        assert_eq!(chunk_probe::max_chunk_count(), 1);
+        for budget in [64u32, 512, 4096] {
+            let mut bounded_request = plain.clone();
+            bounded_request.memory = Some(GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(budget),
+                ..Default::default()
+            });
+            chunk_probe::reset();
+            let (bounded, _) = render(generator.as_ref(), &bounded_request);
+            assert!(
+                chunk_probe::max_chunk_count() > 1,
+                "budget {budget} must bind on the miniature"
+            );
+            assert_eq!(bounded.len(), unbounded.len());
+            let max = bounded
+                .iter()
+                .zip(&unbounded)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            let mean = bounded
+                .iter()
+                .zip(&unbounded)
+                .map(|(a, b)| f64::from(a.abs_diff(*b)))
+                .sum::<f64>()
+                / bounded.len() as f64;
+            worst_max = worst_max.max(max);
+            worst_mean = worst_mean.max(mean);
+        }
+    }
+    assert!(
+        worst_max <= BF16_BOUNDED_MAX_ABS_LEVELS,
+        "largest pixel change {worst_max} exceeds the declared {BF16_BOUNDED_MAX_ABS_LEVELS} levels"
+    );
+    assert!(
+        worst_mean <= BF16_BOUNDED_MEAN_ABS_LEVELS,
+        "mean pixel change {worst_mean:.4} exceeds the declared {BF16_BOUNDED_MEAN_ABS_LEVELS} levels"
+    );
 }

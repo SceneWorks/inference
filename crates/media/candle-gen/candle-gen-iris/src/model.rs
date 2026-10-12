@@ -102,9 +102,8 @@ pub struct Iris3b {
     /// a request selection against.
     spec: LoadSpec,
     /// The loaded memory contract ([`crate::memory_strategy::generation_contract`] over the
-    /// resources on disk), published through [`Generator::memory_strategy_contract`]. `None` when
-    /// this load's inventory could not be priced — see [`load_inner`].
-    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    /// resources on disk), published through [`Generator::memory_strategy_contract`].
+    memory_strategy: gen_core::MemoryProviderContract,
 }
 
 /// The compute dtype a load spec selects: the release's bf16 autocast by default, upstream's FP32
@@ -203,14 +202,12 @@ fn load_inner(spec: &LoadSpec) -> Result<Iris3b> {
     let config = IrisConfig::from_dir(&resources.backbone_dir)?;
     config.validate_supported()?;
     let compute = compute_dtype(spec);
-    // Priced from the resources on disk (tensor headers, plus the adapter stack as the loader would
-    // install it) before any backbone or encoder weight is read. Pricing never decides whether
-    // a load succeeds: `Sequential` defers both components to the first request, so a resource it
-    // has not opened yet (a missing text-encoder shard, an adapter it would refuse) is still that
-    // request's typed error, exactly as before. Such a load simply publishes no contract — the
-    // unverified, resident-only state — rather than one priced from an inventory it cannot read.
-    // A caller that wants the reason asks the registration, which returns the error.
-    let memory_strategy = crate::memory_strategy::generation_contract(spec).ok();
+    // The loaded contract is priced from tensor headers BEFORE any weight is read, so a spec the
+    // registration refuses is the same refusal through `load`. It is also the load-time admission
+    // on every offload policy: `Sequential` defers both components to the first render, so without
+    // this a missing text-encoder shard, an adapter the loader would refuse, or a deferred
+    // materialization shape no Iris loader has would pass `load` and fail mid-generate.
+    let memory_strategy = crate::memory_strategy::generation_contract(spec)?;
     let device = candle_gen::default_device()?;
     let te_dir = resources.text_encoder_dir.clone();
     let te_cfg = config.text_encoder.clone();
@@ -405,19 +402,14 @@ impl Generator for Iris3b {
     /// The contract for the spec this generator was loaded from — the same one
     /// [`crate::memory_strategy::MEMORY_REGISTRATION`] builds for it.
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
-        self.memory_strategy.as_ref()
+        Some(&self.memory_strategy)
     }
 
     fn memory_strategy_safety_check(
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        match &self.memory_strategy {
-            Some(contract) => {
-                crate::memory_strategy::generation_safety_check(&self.spec, contract, context)
-            }
-            None => crate::memory_strategy::unpriced_safety_check(MODEL_ID, context),
-        }
+        crate::memory_strategy::generation_safety_check(&self.spec, &self.memory_strategy, context)
     }
 
     /// The registered executable seam on the loaded generator: it writes the admitted
@@ -426,14 +418,7 @@ impl Generator for Iris3b {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        match &self.memory_strategy {
-            Some(contract) => {
-                crate::memory_strategy::generation_begin_request(&self.spec, contract, context)
-            }
-            // No contract was priced for this load, so no optimized rung is admitted and there is
-            // no scope to open.
-            None => Ok(None),
-        }
+        crate::memory_strategy::generation_begin_request(&self.spec, &self.memory_strategy, context)
     }
 
     fn generate(

@@ -389,28 +389,6 @@ impl Residual {
         })
     }
 
-    /// Device bytes this residual holds once installed (`Self::prepare`) and run, for a backbone
-    /// at `compute` whose GEMMs run at `kernel` (the compute dtype on a GPU, f32 on the Candle CPU
-    /// backend). A LoRA is its two f32 factors (the forward casts the activation, never the
-    /// factors); a LoHa factorisation or a dense delta is held in `compute`; a structured LoKr is
-    /// its f32 factors plus the `kernel`-dtype copies its first forward caches, priced as if both
-    /// factors were copied (at an f32 kernel the left factor's "copy" is a shared handle, so that
-    /// case is over-priced by the left factor's bytes — a bound, never an under-count).
-    pub fn resident_bytes(&self, compute: DType, kernel: DType) -> u64 {
-        let elements = |t: &Tensor| t.elem_count() as u64;
-        match self {
-            Residual::Lora { a, b } => (elements(a) + elements(b)) * 4,
-            Residual::LowRank { a, b } => {
-                (elements(a) + elements(b)) * compute.size_in_bytes() as u64
-            }
-            Residual::Delta(d) => elements(d) * compute.size_in_bytes() as u64,
-            Residual::Kron(f) => {
-                let factors = f.resident_f32_bytes() as u64;
-                factors + factors / 4 * kernel.size_in_bytes() as u64
-            }
-        }
-    }
-
     /// The residual as the forward holds it: LoRA and LoKr factors f32 on `device` (a LoKr's GEMMs
     /// cast them to the activation dtype); a LoHa factorisation or a delta in `compute`.
     fn prepare(self, compute: DType, device: &Device) -> Result<Self> {

@@ -203,9 +203,10 @@ fn missing_or_incomplete_resources_are_load_errors() {
 
 #[test]
 fn a_truncated_text_encoder_shard_is_a_load_error_under_both_policies() {
-    // An indexed snapshot whose index names a shard that is not on disk: `Resident` refuses at load,
-    // `Sequential` (which defers the encoder to the first request) refuses at generate — both typed
-    // errors naming the shard, never a panic or a silent fallback.
+    // An indexed snapshot whose index names a shard that is not on disk: both policies refuse at
+    // load with an error naming the shard, never a panic or a silent fallback. `Sequential` defers
+    // the encoder itself to the first request, but every load prices its memory contract from the
+    // tensor headers first (sc-25690), so the missing shard is found before any render starts.
     let dir = tempfile::tempdir().unwrap();
     for name in [
         "config.json",
@@ -231,11 +232,9 @@ fn a_truncated_text_encoder_shard_is_a_load_error_under_both_policies() {
     assert!(err.to_string().contains("model-00001-of-00001"), "{err}");
 
     let spec = spec.with_offload_policy(OffloadPolicy::Sequential);
-    let g = registry
+    let err = registry
         .load(ID, &spec)
-        .expect("sequential defers the encoder");
-    let err = g
-        .generate(&request(), &mut |_| {})
-        .expect_err("sequential must fail at generate");
+        .err()
+        .expect("sequential must fail at load too");
     assert!(err.to_string().contains("model-00001-of-00001"), "{err}");
 }
