@@ -97,5 +97,8 @@ mod train_lifecycle;
 #[path = "train_lineage.rs"]
 mod train_lineage;
 
+#[path = "train_memory_probe.rs"]
+mod train_memory_probe;
+
 #[path = "train_parity.rs"]
 mod train_parity;
