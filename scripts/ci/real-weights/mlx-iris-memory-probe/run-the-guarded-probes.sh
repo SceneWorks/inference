@@ -2,15 +2,26 @@
 # steps + export), one process per shape under the external phys_footprint guard
 # (scripts/ci/iris_restore_footprint_guard.py: cap 115 GB, 10 min wall each). Each probe starts only
 # when `memory_pressure` reports >= 120 GB free (free % x total RAM, decimal GB) right before it.
-# A guard stop is a MEASURED LOWER BOUND (the shape needs > 115 GB here), never a peak. Order: the
-# 1024² shapes the product floors are declared for first, then 512² (the largest-that-fits basis).
-# The depth and restoration trainers refuse activation checkpointing, so only generation has an
-# `ac=full` row. Report-only: nothing is gated on a number.
+#
+# Every shape runs TWICE, because the process footprint and the shape's need are different things:
+#   cache=default  MLX's own buffer-cache limit, as the product runs. The trainer does not clear the
+#                  cache per step, so the footprint climbs to the allocator's GC limit and stays there.
+#   cache=none     the test sets the cache limit to 0 (the trainer is untouched), so the footprint
+#                  tracks the live bytes.
+# In both, MLX's own `get_peak_memory` (reset before the load) is the shape's live-byte peak. Each
+# row is classified by scripts/ci/iris_memory_probe_row.py (all figures decimal GB): MEASURED,
+# CACHE-SATURATED (the footprint is the allocator ceiling, not the shape), GUARD-STOP (lower bound:
+# the footprint crossed 115 GB) or FAILED. Order: the 1024² shapes the product floors are declared
+# for first, then 512² (the largest-that-fits basis). The depth and restoration trainers refuse
+# activation checkpointing, so only generation has an `ac=full` row. Report-only: nothing is gated on
+# a number; the job is red only for a FAILED / NOT RUN / missing row.
 bin="$(cat "$RUNNER_TEMP/iris-memory-probe-test-binary")"
 mem_bytes="$(sysctl -n hw.memsize)"
 failed=0
-probe() { # $1 task, $2 size, $3 ac
-  local name="$1-$2-ac-$3" log free_pct free_gb
+names=()
+probe() { # $1 task, $2 size, $3 ac, $4 cache
+  local name="$1-$2-ac-$3-cache-$4" log free_pct free_gb
+  names+=("$name")
   log="$IRIS_OUT/$name.log"
   free_pct="$(/usr/bin/memory_pressure -Q 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')"
   free_gb=$(( mem_bytes / 1000000000 * ${free_pct:-0} / 100 ))
@@ -19,28 +30,26 @@ probe() { # $1 task, $2 size, $3 ac
     failed=1
     return
   fi
-  local rc=0 guard
-  IRIS_PROBE_TASK="$1" IRIS_PROBE_SIZE="$2" IRIS_PROBE_AC="$3" IRIS_PROBE_STEPS=2 TMPDIR="$RUNNER_TEMP" \
+  local rc=0
+  IRIS_PROBE_TASK="$1" IRIS_PROBE_SIZE="$2" IRIS_PROBE_AC="$3" IRIS_PROBE_MLX_CACHE="$4" \
+    IRIS_PROBE_STEPS=2 TMPDIR="$RUNNER_TEMP" \
     python3.12 scripts/ci/iris_restore_footprint_guard.py 115 600 \
     "$bin" train_memory_probe::real_training_memory_probe --ignored --exact --nocapture --test-threads 1 \
     > "$log" 2>&1 || rc=$?
   cat "$log"
-  guard="$(grep '^\[guard\] exit=' "$log" | tail -1 || true)"
-  if grep -q "test result: ok. 1 passed" "$log"; then
-    echo "[[IRIS_MEMORY_PROBE_MLX]] $name MEASURED $guard" | tee -a "$IRIS_OUT/summary.txt"
-  elif grep -q '^\[guard\] SIGTERM: footprint' "$log"; then
-    echo "[[IRIS_MEMORY_PROBE_MLX]] $name LOWER-BOUND (> 115 GB) $guard" | tee -a "$IRIS_OUT/summary.txt"
-  else
-    echo "[[IRIS_MEMORY_PROBE_MLX]] $name FAILED rc=$rc $guard" | tee -a "$IRIS_OUT/summary.txt"
-    failed=1
-  fi
+  python3.12 scripts/ci/iris_memory_probe_row.py mlx --name "$name" --log "$log" --rc "$rc" \
+    --summary "$IRIS_OUT/summary.txt" || failed=1
 }
-probe generation 1024 full
-probe generation 1024 none
-probe depth 1024 none
-probe restoration 1024 none
-probe generation 512 none
-probe depth 512 none
-probe restoration 512 none
+for cache in default none; do
+  probe generation 1024 full "$cache"
+  probe generation 1024 none "$cache"
+  probe depth 1024 none "$cache"
+  probe restoration 1024 none "$cache"
+  probe generation 512 none "$cache"
+  probe depth 512 none "$cache"
+  probe restoration 512 none "$cache"
+done
 cat "$IRIS_OUT/summary.txt"
+python3.12 scripts/ci/iris_memory_probe_row.py expect --backend mlx \
+  --summary "$IRIS_OUT/summary.txt" "${names[@]}" || failed=1
 exit "$failed"

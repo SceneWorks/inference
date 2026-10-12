@@ -1,15 +1,28 @@
 //! sc-25690 (epic 25678 terminal measurement) — the Candle twin of the MLX probe: ONE bounded
 //! real-weight training run of an Iris task at a chosen square size and activation-checkpointing
 //! policy on the build's device (`cuda:0` under `--features cuda`; select the card with
-//! `CUDA_VISIBLE_DEVICES`), its device VRAM sampled from BEFORE the load by `VramProbe` (report-only) (the probe itself asserts only that the run trains finitely and exports). Nothing is
-//! gated on the number; the runner records the guard's peak as the measured floor of that shape.
+//! `CUDA_VISIBLE_DEVICES`). Report-only: the probe asserts that its instruments are trustworthy and
+//! that the run trains finitely and exports; nothing is gated on a number.
 //!
-//! Inputs (env):
+//! Three quantities are printed, all in decimal GB (1e9 bytes), for the whole run (context + load +
+//! train + export):
+//! * `used_high_gb` — the driver pool's `USED_MEM_HIGH`: the continuous high-water of concurrently
+//!   LIVE bytes. This is what the shape needs.
+//! * `reserved_high_gb` — the pool's `RESERVED_MEM_HIGH`: live + cached-free bytes the pool held from
+//!   the driver, the unit `nvidia-smi` and an admission gate read.
+//! * `device_overall_peak_gb` — `VramProbe`'s polled device-level `nvidia-smi memory.used` over the
+//!   pre-load baseline. It misses sub-poll transients and saturates at the card's size, so it is the
+//!   cross-check, not the answer (`candle_gen::cuda_mempool` module docs).
+//!
+//! The counters are printed when the run fails too (an out-of-memory row then carries how far the
+//! pool got), and the runner classifies the row (`scripts/ci/iris_memory_probe_row.py`).
+//!
+//! Inputs (env) — all REQUIRED, so a misspelled variable cannot silently measure another shape:
 //! * `IRIS_PROBE_TASK` — `generation` | `depth` | `restoration`.
 //! * `IRIS_PROBE_SIZE` — the square training size (px), e.g. 1024.
-//! * `IRIS_PROBE_AC` — `none` (default) | `full` (generation only: the depth and restoration
-//!   trainers refuse activation checkpointing).
-//! * `IRIS_PROBE_STEPS` — optimizer steps (default 2).
+//! * `IRIS_PROBE_AC` — `none` | `full` (generation only: the depth and restoration trainers refuse
+//!   activation checkpointing).
+//! * `IRIS_PROBE_STEPS` — optimizer steps.
 //! * `IRIS_WEIGHTS_DIR` — the `speridlabs/iris-3b` snapshot root (generation backbone + `depth/`);
 //!   `IRIS_TEXT_ENCODER_DIR` (generation); `IRIS_UPSCALER_DIR`, `IRIS_LPIPS_VGG16_DIR`,
 //!   `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (restoration).
@@ -26,14 +39,91 @@ use candle_gen::gen_core::{
     CancelFlag, LoadSpec, TrainingConfig, TrainingItem, TrainingProgress, TrainingRequest,
     WeightsSource,
 };
-use candle_gen::testkit::{probe_gpu, used_mib, VramProbe};
+use candle_gen::testkit::VramProbe;
 
-fn env_dir(name: &str) -> PathBuf {
-    PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
+/// The selected card must be idle before the load: a resident tenant contaminates a device-level
+/// peak. The CUDA box's free card idles at 0.2-0.9 GB (WDDM desktop residency).
+const MAX_IDLE_BASELINE_GB: f64 = 2.0;
+
+/// Trap 2 of `candle_gen::cuda_mempool`: a high-water mark zeroed while the pool still holds pages
+/// snaps straight back to them. The pool of a fresh process must hold (next to) nothing.
+#[cfg(feature = "cuda")]
+const MAX_QUIESCED_POOL_BYTES: u64 = 64 << 20;
+
+fn env_req(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+fn env_dir(name: &str) -> PathBuf {
+    PathBuf::from(env_req(name))
+}
+
+/// The device's default stream-ordered pool — the one candle allocates every tensor from — with its
+/// high-water marks zeroed on a quiesced pool.
+#[cfg(feature = "cuda")]
+struct PoolMeter {
+    pool: candle_gen::cuda_mempool::MemPool,
+    // Keeps the device's primary context retained (and current on this thread) for the reads.
+    _device: candle_gen::candle_core::Device,
+}
+
+#[cfg(feature = "cuda")]
+impl PoolMeter {
+    fn start() -> Self {
+        let device = candle_gen::default_device().expect("the CUDA device");
+        let pool = candle_gen::cuda_mempool::MemPool::device_default(0)
+            .expect("the CUDA default memory pool");
+        let used = pool.used().expect("USED_MEM_CURRENT");
+        let reserved = pool.reserved().expect("RESERVED_MEM_CURRENT");
+        eprintln!(
+            "[[IRIS_MEMORY_PROBE]] cuda_pool_at_reset used_bytes={used} reserved_bytes={reserved}"
+        );
+        assert!(
+            reserved <= MAX_QUIESCED_POOL_BYTES,
+            "the pool already holds {reserved} bytes: its high-water marks cannot be reset"
+        );
+        assert!(pool.reset_high_water(), "reset the pool high-water marks");
+        Self {
+            pool,
+            _device: device,
+        }
+    }
+
+    /// `(USED_MEM_HIGH, RESERVED_MEM_HIGH)` in bytes.
+    fn highs(&self) -> (u64, u64) {
+        (
+            self.pool.used_high().expect("USED_MEM_HIGH"),
+            self.pool.reserved_high().expect("RESERVED_MEM_HIGH"),
+        )
+    }
+
+    /// A completed run allocated through this pool, and a pool never reserves less than is live:
+    /// anything else means the counters read some other pool (trap 1) or were never reset.
+    fn assert_measured(&self) {
+        let (live, reserved) = self.highs();
+        assert!(
+            live > 0 && reserved >= live,
+            "the pool counters are not a measurement: USED_MEM_HIGH {live}, RESERVED_MEM_HIGH {reserved}"
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+struct PoolMeter;
+
+#[cfg(not(feature = "cuda"))]
+impl PoolMeter {
+    fn start() -> Self {
+        panic!("the Candle memory probe measures a CUDA device: build with --features cuda")
+    }
+
+    fn highs(&self) -> (u64, u64) {
+        panic!("the Candle memory probe measures a CUDA device: build with --features cuda")
+    }
+
+    fn assert_measured(&self) {
+        panic!("the Candle memory probe measures a CUDA device: build with --features cuda")
+    }
 }
 
 /// A deterministic, non-constant RGB image of `size`² (a soft two-axis gradient with a checker).
@@ -71,10 +161,18 @@ fn write_npy(path: &Path, h: u32, w: u32, f: impl Fn(u32, u32) -> f32) {
 #[test]
 #[ignore = "needs the real Iris weights for IRIS_PROBE_TASK and a CUDA device"]
 fn real_training_memory_probe() {
-    let task = env_or("IRIS_PROBE_TASK", "generation");
-    let size: u32 = env_or("IRIS_PROBE_SIZE", "256").parse().unwrap();
-    let ac = env_or("IRIS_PROBE_AC", "none");
-    let steps: u32 = env_or("IRIS_PROBE_STEPS", "2").parse().unwrap();
+    let task = env_req("IRIS_PROBE_TASK");
+    let size: u32 = env_req("IRIS_PROBE_SIZE")
+        .parse()
+        .expect("IRIS_PROBE_SIZE: a pixel count");
+    let ac = env_req("IRIS_PROBE_AC");
+    assert!(
+        matches!(ac.as_str(), "none" | "full"),
+        "IRIS_PROBE_AC {ac:?}: none | full"
+    );
+    let steps: u32 = env_req("IRIS_PROBE_STEPS")
+        .parse()
+        .expect("IRIS_PROBE_STEPS: a step count");
     let work = tempfile::tempdir().unwrap();
     let data = work.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -205,10 +303,15 @@ fn real_training_memory_probe() {
          steps={} batch=1 full_finetune=true optimizer={} dtype={}",
         config.steps, config.optimizer, config.train_dtype
     );
-    // Sampled from before the load, so the reported peak is the whole run's device delta.
-    let probe_vram = used_mib(probe_gpu()).is_some();
-    let mut probe = probe_vram.then(VramProbe::start_rendered);
-    let phase = probe.as_ref().map(VramProbe::phase);
+    // The device baseline is read BEFORE the context exists (a failed `nvidia-smi` query panics), so
+    // the polled peak is the whole run's device delta: context + load + train + export.
+    let mut probe = VramProbe::start_rendered().assert_idle(MAX_IDLE_BASELINE_GB);
+    eprintln!(
+        "[[IRIS_MEMORY_PROBE]] cuda_baseline baseline_gb={:.2}",
+        probe.report().baseline_gb
+    );
+    let phase = probe.phase();
+    let pool = PoolMeter::start();
     let start = std::time::Instant::now();
     let mut trainer = candle_gen_iris::provider_registry()
         .unwrap()
@@ -227,8 +330,10 @@ fn real_training_memory_probe() {
         cancel: CancelFlag::default(),
     };
     let mut last = std::time::Instant::now();
-    let res = trainer
-        .train(&req, &mut |p| {
+    // The counters are printed whether or not the run survives: an out-of-memory row reports how far
+    // the pool got instead of nothing.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trainer.train(&req, &mut |p| {
             if let TrainingProgress::Training { step, total, loss } = p {
                 eprintln!(
                     "[[IRIS_MEMORY_PROBE]] step {step}/{total} loss {loss:.4} ({:.1}s)",
@@ -238,15 +343,29 @@ fn real_training_memory_probe() {
                 last = std::time::Instant::now();
             }
         })
-        .unwrap();
+    }));
+    if let Ok(Err(error)) = &outcome {
+        eprintln!("[[IRIS_MEMORY_PROBE]] train failed: {error:?}");
+    }
     drop(trainer);
-    if let (Some(p), Some(phase)) = (probe.as_mut(), phase) {
-        p.end_load(phase);
-    }
-    match &probe {
-        Some(p) => eprintln!("[[IRIS_MEMORY_PROBE]] vram {}", p.report()),
-        None => eprintln!("[[IRIS_MEMORY_PROBE]] vram: nvidia-smi unavailable, not measured"),
-    }
+    // One phase over the whole run, so only the overall peak means anything.
+    probe.end_gen(phase);
+    let vram = probe.report();
+    let (used_high, reserved_high) = pool.highs();
+    eprintln!(
+        "[[IRIS_MEMORY_PROBE]] cuda_memory used_high_gb={:.2} reserved_high_gb={:.2} \
+         device_overall_peak_gb={:.2} baseline_gb={:.2}",
+        used_high as f64 / 1e9,
+        reserved_high as f64 / 1e9,
+        vram.peak_gb,
+        vram.baseline_gb
+    );
+    let res = match outcome {
+        Ok(res) => res.unwrap(),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    vram.assert_trustworthy(MAX_IDLE_BASELINE_GB);
+    pool.assert_measured();
     eprintln!(
         "[[IRIS_MEMORY_PROBE]] done: {} steps, final loss {:.4}, total {:.1}s → {}",
         res.steps,

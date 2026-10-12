@@ -5632,9 +5632,11 @@ jobs:
   # DISPATCH-ONLY (`iris-memory-mlx` profile; never `all`, never the schedule; nothing is gated on
   # its numbers). nax-macos-2 only (the first step FAILS on any other runner, before any build or
   # GPU work). One `train_memory_probe` process per shape — generation 1024² with and without
-  # activation checkpointing, depth and restoration at 1024², then all three at 512² — each under
+  # activation checkpointing, depth and restoration at 1024², then all three at 512², each with
+  # MLX's default buffer-cache limit and again with the cache disabled by the test — each under
   # the external phys_footprint guard (cap 115 GB, 10 min wall), started only when
-  # `memory_pressure` reports >= 120 GB free; a guard stop is recorded as a measured lower bound.
+  # `memory_pressure` reports >= 120 GB free. Rows carry MLX's own active peak next to the
+  # footprint and are classified by scripts/ci/iris_memory_probe_row.py (decimal GB throughout).
   # Run-scoped CARGO_TARGET_DIR, release profile unstripped (rust-lang/rust#157750).
   mlx-iris-memory-probe:
     name: MLX Iris-3B full fine-tune memory probes
@@ -5683,8 +5685,9 @@ jobs:
   # sc-25690 — the CUDA twin (`iris-memory-cuda` profile; dispatch-only, gates nothing). Same box,
   # labels, toolchain, Python and sccache rule as `candle-iris` (whose install / materialize helpers it
   # reuses). It runs the same shapes on the card with the MOST free memory at the start (selected
-  # with CUDA_VISIBLE_DEVICES in PCI bus order; the inventory is recorded), the test's VramProbe
-  # sampling device VRAM from before the load; a CUDA OOM is recorded as "exceeds this card".
+  # with CUDA_VISIBLE_DEVICES in PCI bus order; the card is snapshotted before every probe). The
+  # test prints the driver pool's USED/RESERVED high-water marks next to the polled device peak;
+  # rows are classified by scripts/ci/iris_memory_probe_row.py (a CUDA OOM = "exceeds this card").
   candle-iris-memory-probe:
     name: Candle Iris-3B full fine-tune memory probes (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-memory-cuda'

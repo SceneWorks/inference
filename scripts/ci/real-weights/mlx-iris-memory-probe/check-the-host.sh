@@ -1,6 +1,8 @@
 # sc-25690: the Iris full-fine-tune memory probes run only on nax-macos-2 with >= 128 GB unified
-# memory. Explicitly dispatched, so a wrong box or a busy one FAILS here (before any build or GPU
-# work) instead of reporting a green skip.
+# memory. Explicitly dispatched, so a wrong or too-small box FAILS here (before any build or GPU
+# work) instead of reporting a green skip. Only the runner name and the total RAM are checked here;
+# `memory_pressure` is recorded for the evidence, and a BUSY box is refused per probe by
+# run-the-guarded-probes.sh (>= 120 GB free right before each one).
 IRIS_OUT="$RUNNER_TEMP/iris-memory-probe-mlx-evidence"
 mkdir -p "$IRIS_OUT"
 echo "IRIS_OUT=$IRIS_OUT" >> "$GITHUB_ENV"

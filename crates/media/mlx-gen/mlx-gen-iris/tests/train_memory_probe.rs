@@ -1,14 +1,31 @@
 //! sc-25690 (epic 25678 terminal measurement) — ONE bounded real-weight training run of an Iris
-//! task at a chosen square size and activation-checkpointing policy, for the external memory guard
-//! to measure (the probe itself asserts only that the run trains finitely and exports). Nothing is
-//! gated on the number; the runner records the guard's peak as the measured floor of that shape.
+//! task at a chosen square size and activation-checkpointing policy. Report-only: the probe asserts
+//! that its counters are a measurement and that the run trains finitely and exports; nothing is
+//! gated on a number.
 //!
-//! Inputs (env):
+//! Two different quantities come out of a run, both in decimal GB (1e9 bytes):
+//! * `active_peak_gb` — MLX's own `get_peak_memory`, reset before the load: the high-water of bytes
+//!   held by LIVE arrays. This is what the shape needs, and it does not depend on the buffer cache.
+//! * the process `phys_footprint` the external guard polls
+//!   (`scripts/ci/iris_restore_footprint_guard.py`) — active bytes PLUS MLX's buffer cache
+//!   (freed-but-retained Metal buffers) plus the process's non-MLX memory. The trainer does not clear
+//!   the cache per step, so under the default cache limit the footprint climbs to MLX's allocator GC
+//!   limit (0.95 x the device's recommended working set) and sits there: an allocator ceiling, not
+//!   the shape's peak. `IRIS_PROBE_MLX_CACHE=none` sets the cache limit to 0 from this test (the
+//!   trainer is untouched), which makes the footprint track the active bytes instead.
+//!
+//! The limits are printed before the load and the counters at every step (a guard stop kills the
+//! process, so the last step line is then the lower bound) and at the end, whether or not the run
+//! survives. The runner classifies the row (`scripts/ci/iris_memory_probe_row.py`).
+//!
+//! Inputs (env) — all REQUIRED, so a misspelled variable cannot silently measure another shape:
 //! * `IRIS_PROBE_TASK` — `generation` | `depth` | `restoration`.
 //! * `IRIS_PROBE_SIZE` — the square training size (px), e.g. 1024.
-//! * `IRIS_PROBE_AC` — `none` (default) | `full` (generation only: the depth and restoration
-//!   trainers refuse activation checkpointing).
-//! * `IRIS_PROBE_STEPS` — optimizer steps (default 2).
+//! * `IRIS_PROBE_AC` — `none` | `full` (generation only: the depth and restoration trainers refuse
+//!   activation checkpointing).
+//! * `IRIS_PROBE_STEPS` — optimizer steps.
+//! * `IRIS_PROBE_MLX_CACHE` — `default` (MLX's own cache limit, as the product runs) | `none` (cache
+//!   limit 0).
 //! * `IRIS_WEIGHTS_DIR` — the `speridlabs/iris-3b` snapshot root (generation backbone + `depth/`);
 //!   `IRIS_TEXT_ENCODER_DIR` (generation); `IRIS_UPSCALER_DIR`, `IRIS_LPIPS_VGG16_DIR`,
 //!   `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (restoration).
@@ -26,12 +43,21 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
-fn env_dir(name: &str) -> PathBuf {
-    PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is required")))
+use mlx_rs::memory::{
+    get_active_memory, get_cache_memory, get_memory_limit, get_peak_memory, reset_peak_memory,
+    set_cache_limit,
+};
+
+fn env_req(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+fn env_dir(name: &str) -> PathBuf {
+    PathBuf::from(env_req(name))
+}
+
+fn gb(bytes: usize) -> f64 {
+    bytes as f64 / 1e9
 }
 
 /// A deterministic, non-constant RGB image of `size`² (a soft two-axis gradient with a checker).
@@ -69,10 +95,23 @@ fn write_npy(path: &Path, h: u32, w: u32, f: impl Fn(u32, u32) -> f32) {
 #[test]
 #[ignore = "needs the real Iris weights for IRIS_PROBE_TASK and the GPU; run under an external memory guard"]
 fn real_training_memory_probe() {
-    let task = env_or("IRIS_PROBE_TASK", "generation");
-    let size: u32 = env_or("IRIS_PROBE_SIZE", "256").parse().unwrap();
-    let ac = env_or("IRIS_PROBE_AC", "none");
-    let steps: u32 = env_or("IRIS_PROBE_STEPS", "2").parse().unwrap();
+    let task = env_req("IRIS_PROBE_TASK");
+    let size: u32 = env_req("IRIS_PROBE_SIZE")
+        .parse()
+        .expect("IRIS_PROBE_SIZE: a pixel count");
+    let ac = env_req("IRIS_PROBE_AC");
+    assert!(
+        matches!(ac.as_str(), "none" | "full"),
+        "IRIS_PROBE_AC {ac:?}: none | full"
+    );
+    let steps: u32 = env_req("IRIS_PROBE_STEPS")
+        .parse()
+        .expect("IRIS_PROBE_STEPS: a step count");
+    let cache = env_req("IRIS_PROBE_MLX_CACHE");
+    assert!(
+        matches!(cache.as_str(), "default" | "none"),
+        "IRIS_PROBE_MLX_CACHE {cache:?}: default | none"
+    );
     let work = tempfile::tempdir().unwrap();
     let data = work.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -203,6 +242,31 @@ fn real_training_memory_probe() {
          steps={} batch=1 full_finetune=true optimizer={} dtype={}",
         config.steps, config.optimizer, config.train_dtype
     );
+    // Once, on this thread, before any weight is read. The cache limit can only be read by setting
+    // it; `default` puts MLX's own value straight back.
+    let default_cache_limit = set_cache_limit(0);
+    let cache_limit = if cache == "none" {
+        0
+    } else {
+        set_cache_limit(default_cache_limit);
+        default_cache_limit
+    };
+    let memory_limit = get_memory_limit();
+    let recommended = mlx_gen::memory::recommended_working_set_bytes()
+        .expect("Metal's recommended working set (MLX device_info)") as usize;
+    // MLX's metal allocator: `gc_limit = min(0.95 * max_recommended_working_set_size, block_limit)`,
+    // and `block_limit` is what `get_memory_limit` returns. Above it a malloc releases cached buffers
+    // first, so an `active + cache` footprint cannot settle higher.
+    let gc_limit = ((recommended as f64 * 0.95) as usize).min(memory_limit);
+    eprintln!(
+        "[[IRIS_MEMORY_PROBE]] mlx_limits cache_mode={cache} cache_limit_gb={:.2} gc_limit_gb={:.2} \
+         memory_limit_gb={:.2} recommended_working_set_gb={:.2}",
+        gb(cache_limit),
+        gb(gc_limit),
+        gb(memory_limit),
+        gb(recommended)
+    );
+    reset_peak_memory();
     let start = std::time::Instant::now();
     let mut trainer = mlx_gen_iris::provider_registry()
         .unwrap()
@@ -221,19 +285,42 @@ fn real_training_memory_probe() {
         cancel: CancelFlag::default(),
     };
     let mut last = std::time::Instant::now();
-    let res = trainer
-        .train(&req, &mut |p| {
+    // The counters are printed whether or not the run survives.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trainer.train(&req, &mut |p| {
             if let TrainingProgress::Training { step, total, loss } = p {
                 eprintln!(
-                    "[[IRIS_MEMORY_PROBE]] step {step}/{total} loss {loss:.4} ({:.1}s)",
-                    last.elapsed().as_secs_f32()
+                    "[[IRIS_MEMORY_PROBE]] step {step}/{total} loss {loss:.4} ({:.1}s) \
+                     active_peak_gb={:.2} active_gb={:.2} cache_gb={:.2}",
+                    last.elapsed().as_secs_f32(),
+                    gb(get_peak_memory()),
+                    gb(get_active_memory()),
+                    gb(get_cache_memory())
                 );
                 assert!(loss.is_finite(), "non-finite loss at step {step}");
                 last = std::time::Instant::now();
             }
         })
-        .unwrap();
+    }));
+    if let Ok(Err(error)) = &outcome {
+        eprintln!("[[IRIS_MEMORY_PROBE]] train failed: {error:?}");
+    }
+    // The cache is read before the trainer is dropped: the drop moves its live buffers into it.
+    let (active_peak, cache_end) = (get_peak_memory(), get_cache_memory());
+    eprintln!(
+        "[[IRIS_MEMORY_PROBE]] mlx_memory active_peak_gb={:.2} cache_end_gb={:.2}",
+        gb(active_peak),
+        gb(cache_end)
+    );
     drop(trainer);
+    let res = match outcome {
+        Ok(res) => res.unwrap(),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        active_peak > 0,
+        "MLX reported a zero active peak: not a measurement"
+    );
     eprintln!(
         "[[IRIS_MEMORY_PROBE]] done: {} steps, final loss {:.4}, total {:.1}s → {}",
         res.steps,
