@@ -606,7 +606,9 @@ pub fn install_additive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfix::randn_seeded;
     use candle_gen::candle_core::{DType, Device};
+    use rand::{rngs::StdRng, SeedableRng};
 
     /// A tiny stand-in for the base Lens DiT tensor map: the fused `img_qkv` + the `to_out.0`
     /// projection + one conv (4-D) weight that a 2-D adapter must never touch.
@@ -769,10 +771,11 @@ mod tests {
     #[test]
     fn merge_lora_honors_lora_adapter_metadata_alpha() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45a001);
         let mut map = base_map();
         let path = "transformer_blocks.0.attn.img_qkv";
-        let down = Tensor::randn(0f32, 1f32, (8, 4), &dev).unwrap(); // A [r=8, in=4]
-        let up = Tensor::randn(0f32, 1f32, (12, 8), &dev).unwrap(); // B [out=12, r=8] (fused qkv)
+        let down = randn_seeded(&mut rng, 1.0, &[8, 4], &dev); // A [r=8, in=4]
+        let up = randn_seeded(&mut rng, 1.0, &[12, 8], &dev); // B [out=12, r=8] (fused qkv)
         let af = AdapterFile {
             tensors: HashMap::from([
                 (format!("{path}.lora_A.weight"), down.clone()),
@@ -925,6 +928,7 @@ mod tests {
         }
 
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45a002);
         let path = "transformer_blocks.3.attn.to_add_out";
         let base_w = Tensor::zeros((4, 4), DType::F32, &dev).unwrap();
         let mut host = Host(LoraLinear::from_linear(
@@ -937,7 +941,7 @@ mod tests {
         // rank 2, alpha 4 ⇒ effective 2.0. Force B (vars[1]) nonzero so ΔW ≠ 0 (zero-init B no-ops).
         let set =
             build_lora_targets(&mut host, &["to_add_out".to_string()], 2, 4.0, 7, &dev).unwrap();
-        let up_randn = Tensor::randn(0f32, 1f32, (4, 2), &dev).unwrap();
+        let up_randn = randn_seeded(&mut rng, 1.0, &[4, 2], &dev);
         set.vars[1].set(&up_randn).unwrap(); // vars = [down(A), up(B)]
 
         // Write the real PEFT file the DiT trainer emits (empty prefix → bare dotted keys), then
@@ -1023,10 +1027,11 @@ mod tests {
         use candle_gen::candle_nn::Linear;
         use candle_gen::quant::AdaptLinear;
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45a003);
         let (out_dim, in_dim, rank) = (16usize, 12usize, 3usize);
         let path = "transformer_blocks.0.attn.to_out.0";
-        let down = Tensor::randn(0f32, 1f32, (rank, in_dim), &dev).unwrap();
-        let up = Tensor::randn(0f32, 1f32, (out_dim, rank), &dev).unwrap();
+        let down = randn_seeded(&mut rng, 1.0, &[rank, in_dim], &dev);
+        let up = randn_seeded(&mut rng, 1.0, &[out_dim, rank], &dev);
         let (alpha, scale) = (6.0f32, 0.8f32); // ratio = alpha/rank = 2.0
         let af = AdapterFile {
             tensors: HashMap::from([
@@ -1048,7 +1053,7 @@ mod tests {
         assert_eq!(p.a.dims(), &[in_dim, rank], "a = downᵀ [in, rank]");
         assert_eq!(p.b.dims(), &[rank, out_dim], "b = upᵀ·ratio [rank, out]");
 
-        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let w = randn_seeded(&mut rng, 1.0, &[out_dim, in_dim], &dev);
         let mut additive = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
         additive
             .push_lora(p.a.clone(), p.b.clone(), p.scale)
@@ -1057,7 +1062,7 @@ mod tests {
         let folded =
             AdaptLinear::from_dense(Linear::new((w + delta).unwrap(), None), in_dim, out_dim);
 
-        let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
+        let x = randn_seeded(&mut rng, 1.0, &[2usize, in_dim], &dev);
         let d = (additive.forward(&x).unwrap() - folded.forward(&x).unwrap())
             .unwrap()
             .abs()

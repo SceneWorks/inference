@@ -794,12 +794,13 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 38 since sc-25688 added the dispatch-only `mlx-iris-restore-train` job;
         # 39 since sc-25689 added the dispatch-only `mlx-iris-curricula-train` job.
         MACOS_HUB_LOCK: 39,
+        # 16 since the sc-25678 follow-up added the dispatch-only `candle-qwen-image-2-1-train` job;
         # 15 since sc-25689 added the dispatch-only `candle-iris-curricula` job;
         # 14 since sc-25680 added the `candle-iris` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 15,
+        WINDOWS_HUB_LOCK: 16,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1087,13 +1088,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # after sc-24114 added `candle-qwen-image-2-1`; 36 macOS after sc-24163 added
         # `mlx-qwen-image-2-1`; 37 macOS after sc-25687 added `mlx-iris-depth-train`; 38 after
         # sc-25688 added `mlx-iris-restore-train`; 39 macOS / 15 Windows after sc-25689 added
-        # `mlx-iris-curricula-train` and `candle-iris-curricula`.
+        # `mlx-iris-curricula-train` and `candle-iris-curricula`; 16 Windows after the sc-25678
+        # follow-up added `candle-qwen-image-2-1-train`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 39)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 15)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 16)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(

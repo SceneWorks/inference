@@ -532,9 +532,11 @@ mod parity_tests {
     //! forward — the regression guard that the `LoraLinear` swap + composable softmax/rms/rope changed
     //! nothing.
     use super::*;
+    use crate::testfix::{randn_seeded, randomize_vars};
     use crate::transformer::LensTransformer;
-    use candle_gen::candle_core::{Device, Tensor};
+    use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{VarBuilder, VarMap};
+    use rand::{rngs::StdRng, SeedableRng};
 
     /// A tiny Lens-shaped config (2 layers, 2 heads × 8, 1 text layer) — exercises every vendored path
     /// cheaply on CPU while keeping the real arithmetic invariants: `patch² · out = 4·8 = 32 = in`,
@@ -559,6 +561,7 @@ mod parity_tests {
     #[test]
     fn vendored_dit_matches_stock_forward() {
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_d001);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
@@ -568,16 +571,13 @@ mod parity_tests {
         let stock = LensTransformer::new(&cfg, vb).unwrap();
         // Randomize every shared var so the forward runs on nontrivial weights (a fresh VarMap is
         // zero-init, which would make the comparison vacuous).
-        for v in vm.all_vars() {
-            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), &dev).unwrap())
-                .unwrap();
-        }
+        randomize_vars(&vm, &mut rng, 0.1, &dev);
 
         // image latents [1, frame·h·w, in_channels]; frame=1, grid 2×2 → 4 image tokens; 3 text tokens.
         let (frame, h, w) = (1usize, 2usize, 2usize);
         let img_len = frame * h * w;
-        let hidden = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), &dev).unwrap();
-        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let hidden = randn_seeded(&mut rng, 1.0, &[1, img_len, cfg.in_channels], &dev);
+        let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
         let feats = vec![feat];
 
         let y_v = vendored
@@ -646,27 +646,25 @@ mod parity_tests {
         use candle_gen::train::lora::build_lora_targets;
 
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45_d002);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let mut model = LensTransformerTrain::new(&cfg, vb).unwrap();
-        for v in vm.all_vars() {
-            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), &dev).unwrap())
-                .unwrap();
-        }
+        randomize_vars(&vm, &mut rng, 0.1, &dev);
         let targets: Vec<String> = LENS_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
         let set = build_lora_targets(&mut model, &targets, 4, 4.0, 0, &dev).unwrap();
         assert_eq!(set.vars.len(), 2 * 4 * cfg.num_layers); // (A,B) × 4 projections × layers
                                                             // Force every factor (incl. the zero-init B) nonzero so the residual is live everywhere.
         for v in &set.vars {
-            v.set(&Tensor::randn(0f32, 0.02f32, v.dims(), &dev).unwrap())
+            v.set(&randn_seeded(&mut rng, 0.02, v.dims(), &dev))
                 .unwrap();
         }
 
         let (frame, h, w) = (1usize, 2usize, 2usize);
         let img_len = frame * h * w;
-        let hs = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), &dev).unwrap();
-        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let hs = randn_seeded(&mut rng, 1.0, &[1, img_len, cfg.in_channels], &dev);
+        let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
 
         // Run the block stack via the public segments API and form a loss over both final streams.
         let (hidden, encoder, ctx) = model

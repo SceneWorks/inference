@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -4920,6 +4920,79 @@ jobs:
         with:
           name: qwen-image-2-1-cuda-evidence
           path: ${{ runner.temp }}/qwen-image-2-1-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25678 follow-up — the Qwen-Image 2.1 trainer's real CUDA training peak beside its preflight
+  # estimate. DISPATCH-ONLY (`qwen-image-2-1-train` profile; never `all`, never the schedule, no
+  # gate). Six bounded cells (10 steps each, one process per cell so each USED_MEM_HIGH is its own
+  # run): sc-24163's five A1 shapes plus one small dense step, run by
+  # `train_peak_real_weights::training_peak_is_within_the_preflight_estimate`. The log lines
+  # (`QWEN21_TRAIN_PEAK ...`) are the evidence for the footprint counts in the crate's
+  # `src/training.rs`. Only the bf16 snapshot is needed. Same box, labels, toolchain and sccache
+  # rule as `candle-qwen-image-2-1` above.
+  candle-qwen-image-2-1-train:
+    name: Candle Qwen-Image 2.1 training peaks (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-train'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 180
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen-Image-2.1\snapshots\790c92633540aa0cb11d9abf19eb46d861714758
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-train\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-train\require-operator-provided-models-root-and-initialize-evidenc.cmd
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%QWEN21_TRAIN_OUT%\cuda-device-inventory.csv"
+          type "%QWEN21_TRAIN_OUT%\cuda-device-inventory.csv"
+      - name: Materialize and verify the immutable snapshot
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-train\materialize-and-verify-the-immutable-snapshot.cmd
+      - name: Build the Qwen-Image 2.1 CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda --test integration --no-run || exit /b 1
+      - name: Measure the training peaks
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-train\measure-the-training-peaks.cmd
+      - name: Keep the training-peak evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen-image-2-1-train-cuda-evidence
+          path: ${{ runner.temp }}/qwen-image-2-1-train-cuda-evidence
           if-no-files-found: error
           retention-days: 30
 

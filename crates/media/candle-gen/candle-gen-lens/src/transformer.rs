@@ -1017,7 +1017,9 @@ pub fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testfix::randn_seeded;
     use candle_gen::candle_nn::VarMap;
+    use rand::{rngs::StdRng, SeedableRng};
 
     /// A tiny Lens-shaped DiT config (1 text layer) — enough to build a real `LensTransformer` on CPU
     /// so the public-boundary text-feature guard can be exercised without loading real weights.
@@ -1070,10 +1072,11 @@ mod tests {
         // (sc-9570) with this crate's exact `softmax_last_dim` closure, checked with and without the
         // `[B,1,1,Sk]` additive mask.
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45b001);
         let (b, h, s, d) = (2usize, 2usize, 7usize, 4usize);
-        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let q = randn_seeded(&mut rng, 1.0, &[b, h, s, d], &dev);
+        let k = randn_seeded(&mut rng, 1.0, &[b, h, s, d], &dev);
+        let v = randn_seeded(&mut rng, 1.0, &[b, h, s, d], &dev);
         let scale = (d as f64).powf(-0.5);
         let sm = |x: &Tensor| softmax_last_dim(x);
         // Mask the last two "text" positions of the second batch item (build_joint_mask shape).
@@ -1125,6 +1128,7 @@ mod tests {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         use std::collections::HashMap as Map;
         let dev = Device::Cpu;
+        let mut rng = StdRng::seed_from_u64(0x1e45b002);
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
@@ -1138,11 +1142,11 @@ mod tests {
             let path = format!("transformer_blocks.0.attn.{proj}");
             map.insert(
                 format!("{path}.lora_A.weight"),
-                Tensor::randn(0f32, 0.5f32, (rank, inner), &dev).unwrap(),
+                randn_seeded(&mut rng, 0.5, &[rank, inner], &dev),
             );
             map.insert(
                 format!("{path}.lora_B.weight"),
-                Tensor::randn(0f32, 0.5f32, (inner, rank), &dev).unwrap(),
+                randn_seeded(&mut rng, 0.5, &[inner, rank], &dev),
             );
         }
         let tmp_guard = tempfile::tempdir().unwrap();
@@ -1161,8 +1165,8 @@ mod tests {
 
         let (h, w) = (2usize, 2usize);
         let img_len = h * w;
-        let hidden = Tensor::randn(0f32, 1f32, (1, img_len, cfg.in_channels), &dev).unwrap();
-        let feat = Tensor::randn(0f32, 1f32, (1, 3, cfg.enc_hidden_dim), &dev).unwrap();
+        let hidden = randn_seeded(&mut rng, 1.0, &[1, img_len, cfg.in_channels], &dev);
+        let feat = randn_seeded(&mut rng, 1.0, &[1, 3, cfg.enc_hidden_dim], &dev);
         let y_base = base
             .forward(&hidden, std::slice::from_ref(&feat), None, 0.5, 1, h, w)
             .unwrap();
