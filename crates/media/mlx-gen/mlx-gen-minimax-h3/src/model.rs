@@ -1955,6 +1955,13 @@ impl Generator for MiniMaxH3 {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 
+    fn veda_workspace_bound(
+        &self,
+        req: mlx_gen::gen_core::veda::workspace::Request<'_>,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
+        crate::memory_strategy::veda_workspace_bound(req)
+    }
+
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
         Some(&self.memory_strategy)
     }

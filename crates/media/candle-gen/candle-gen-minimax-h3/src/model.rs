@@ -1845,6 +1845,14 @@ impl Generator for MiniMaxH3 {
         Ok(())
     }
 
+    fn veda_workspace_bound(
+        &self,
+        req: candle_gen::gen_core::veda::workspace::Request<'_>,
+    ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>>
+    {
+        crate::memory_strategy::veda_workspace_bound(req)
+    }
+
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
         Some(&self.contract)
     }

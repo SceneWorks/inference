@@ -14,14 +14,14 @@ use mlx_rs::{
 use std::{cell::RefCell, collections::BTreeMap, path::Path, rc::Rc};
 
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
-const COPY_BYTES: u64 = 256 * 1024 * 1024;
-const GATHER_BYTES: u64 = 512 * 1024 * 1024;
+use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
 pub const KERNEL: &str = "mlx-batched-gather-sdpa-v1";
 pub const SELF_TEST_ATOL: f32 = 0.025;
 
 pub struct VedaRuntime {
     bundle: Bundle,
     plan: Plan,
+    grid: [usize; 3],
     layouts: BTreeMap<TileShape, Layout>,
     request: VedaRequest,
     report: ReportSink,
@@ -52,6 +52,33 @@ impl VedaRuntime {
                         .into(),
                 )
             })?;
+            let g = packed.geometry();
+            let grid = [
+                g.num_latent_frames as usize,
+                (g.latent_height / 2) as usize,
+                (g.latent_width / 2) as usize,
+            ];
+            let plan = workspace::frozen_plan(grid)?;
+            let sizes = plan
+                .shapes
+                .iter()
+                .map(|&s| packed.veda_layout(s).map(|l| (s, LayoutSize::from(&l))))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            // Account loading even when checkpoint integrity/decode fails.
+            let initial = workspace::bound(
+                request,
+                Backend::Mlx,
+                &plan,
+                grid,
+                &sizes,
+                layers,
+                heads,
+                dim,
+                1,
+                2,
+                Limits::default(),
+            )?;
+            report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load(path, layers, heads, dim)?;
             Self::from_bundle(bundle, request, packed, report.clone(), device_self_test)
         })();
@@ -84,6 +111,24 @@ impl VedaRuntime {
         for &shape in &plan.shapes {
             layouts.insert(shape, packed.veda_layout(shape)?);
         }
+        let sizes = layouts
+            .iter()
+            .map(|(&s, l)| (s, LayoutSize::from(l)))
+            .collect();
+        let bound = workspace::bound(
+            request,
+            Backend::Mlx,
+            &plan,
+            grid,
+            &sizes,
+            bundle.layers,
+            bundle.heads,
+            bundle.dim,
+            1,
+            2,
+            Limits::default(),
+        )?;
+        report.borrow_mut().workspace_bytes = bound.total_bytes;
         // Actual-device check precedes sparse production calls. Failure leaves this request dense.
         {
             let mut r = report.borrow_mut();
@@ -97,6 +142,7 @@ impl VedaRuntime {
         Ok(Self {
             bundle,
             plan,
+            grid,
             layouts,
             request: request.clone(),
             report,
@@ -214,6 +260,28 @@ impl VedaRuntime {
             Dtype::Float32 => 4,
             _ => return Err(Error::Msg("Veda unsupported compute dtype".into())),
         };
+        let sizes = self
+            .layouts
+            .iter()
+            .map(|(&s, l)| (s, LayoutSize::from(l)))
+            .collect();
+        let bound = workspace::bound(
+            &self.request,
+            Backend::Mlx,
+            &self.plan,
+            self.grid,
+            &sizes,
+            self.bundle.layers,
+            self.bundle.heads,
+            dim,
+            1,
+            bytes as usize,
+            Limits::default(),
+        )?;
+        {
+            let mut r = self.report.borrow_mut();
+            r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
+        }
         let mut grouped: BTreeMap<TileShape, Vec<i32>> = BTreeMap::new();
         for (h, &si) in self.plan.heads[layer].iter().enumerate() {
             grouped
@@ -227,18 +295,14 @@ impl VedaRuntime {
         let mut high = 0u64;
         for (shape, heads) in grouped {
             let layout = &self.layouts[&shape];
-            // Bound the copies AND scorer before constructing any gathered tensor.
+            // The shared estimate and execution use identical allowances, including the
+            // minimum head/query/global batch. Refuse before index, QKV or scorer allocation.
             let slots = layout.perm.len();
-            let per_head = 3 * slots as u64 * dim as u64 * bytes
-                + 2 * (layout.video * 3 * dim * 4) as u64
-                + (layout.video * layout.video * 4) as u64
-                + (2 * 3 * dim * dim * 4) as u64;
-            let max_heads = (COPY_BYTES / per_head).min(heads.len() as u64) as usize;
-            if max_heads == 0 {
-                return Err(Error::Msg(
-                    "Veda minimum tile-copy/scorer head exceeds workspace allowance".into(),
-                ));
+            let reservation = &bound.chunks[&shape];
+            if let Some(reason) = &reservation.refusal {
+                return Err(Error::Msg(format!("Veda {reason}")));
             }
+            let max_heads = reservation.heads;
             for chunk in heads.chunks(max_heads) {
                 let n = chunk.len();
                 let index = Array::from_slice(chunk, &[n as i32]);
@@ -279,13 +343,12 @@ impl VedaRuntime {
                     })
                     .sum();
                 pairs += chunk_pairs;
-                let (out, scratch) = gather_attention(layout, &rows, &qt, &kt, &vt, dim, bytes)?;
-                high = high.max(
-                    per_head * n as u64
-                        + scratch
-                        + 2 * self.bundle.heads as u64 * seq as u64 * dim as u64 * bytes
-                        + self.bundle.host_bytes(),
-                );
+                let (out, scratch) =
+                    gather_attention(layout, &rows, &qt, &kt, &vt, dim, bytes, reservation)?;
+                let _ = scratch;
+                high = bound.total_bytes;
+                // Materialize the whole head-group output before the next tile/scorer graph.
+                mlx_rs::transforms::eval([&out])?;
                 pieces.push(out.reshape(&[1, n as i32, seq as i32, dim as i32])?);
                 head_order.extend(chunk);
             }
@@ -341,7 +404,10 @@ impl PredictorOps for MlxPredictorOps {
         let max = r#where(&valid, &a, Array::from_f32(f32::NEG_INFINITY))?.max_axis(2, false)?;
         let min = r#where(&valid, &a, Array::from_f32(f32::INFINITY))?.min_axis(2, false)?;
         let f = concatenate_axis(&[&mean, &max, &min], -1)?;
-        Ok(r#where(&ok, &f, Array::from_f32(0.0))?)
+        let pooled = r#where(&ok, &f, Array::from_f32(0.0))?;
+        // Release this pool's cast/where graph before constructing the other pooled operand.
+        mlx_rs::transforms::eval([&pooled])?;
+        Ok(pooled)
     }
     fn project(&self, f: &Array, p: &[f32], heads: usize, dim: usize) -> Result<Array> {
         Ok(f.matmul(Array::from_slice(
@@ -366,6 +432,7 @@ impl PredictorOps for MlxPredictorOps {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_attention(
     l: &Layout,
     selected: &[Vec<usize>],
@@ -374,6 +441,7 @@ fn gather_attention(
     v: &Array,
     dim: usize,
     bytes: u64,
+    reservation: &Chunk,
 ) -> Result<(Array, u64)> {
     let h = q.shape()[0] as usize;
     let n = l.valid.len();
@@ -385,13 +453,15 @@ fn gather_attention(
     if kmax == 0 {
         return Err(Error::Msg("Veda empty selection".into()));
     }
-    let per_row = h as u64 * kmax as u64 * TILE as u64 * (2 * dim as u64 * bytes + TILE as u64 * 4);
-    let rmax = (GATHER_BYTES / per_row).min(nv as u64) as usize;
-    if rmax == 0 {
+    if let Some(reason) = &reservation.refusal {
+        return Err(Error::Msg(format!("Veda {reason}")));
+    }
+    if kmax > reservation.selected_keys || h > reservation.heads {
         return Err(Error::Msg(
-            "Veda minimum sparse batch exceeds gather allowance".into(),
+            "Veda selection exceeds admitted gather bound".into(),
         ));
     }
+    let rmax = reservation.query_tiles;
     let flatk = k.reshape(&[(h * n) as i32, TILE as i32, dim as i32])?;
     let flatv = v.reshape(&[(h * n) as i32, TILE as i32, dim as i32])?;
     let mut outputs = Vec::new();
@@ -432,13 +502,8 @@ fn gather_attention(
         mlx_rs::transforms::eval([&out])?;
         outputs.push(out);
     }
-    let global_per_row = h as u64 * TILE as u64 * l.perm.len() as u64 * 4;
-    let global_rows = (GATHER_BYTES / global_per_row).min((n - nv) as u64) as usize;
-    if n > nv && global_rows == 0 {
-        return Err(Error::Msg(
-            "Veda minimum global batch exceeds workspace allowance".into(),
-        ));
-    }
+    // Globals never join sparse video query batches.
+    let global_rows = reservation.global_tiles;
     if n > nv {
         let keys = k.reshape(&[h as i32, 1, l.perm.len() as i32, dim as i32])?;
         let values = v.reshape(&[h as i32, 1, l.perm.len() as i32, dim as i32])?;
@@ -469,8 +534,7 @@ fn gather_attention(
     let tiled = concatenate_axis(&refs, 1)?;
     let out = tiled.take_axis(Array::from_slice(&l.inverse, &[l.seq as i32]), 1)?;
     mlx_rs::transforms::eval([&out])?;
-    let scratch = (rmax as u64 * per_row).max(global_rows as u64 * global_per_row)
-        + (l.perm.len() * dim * h) as u64 * bytes * 2;
+    let scratch = reservation.attention_bytes + (l.perm.len() * dim * h) as u64 * bytes * 2;
     Ok((out, scratch))
 }
 /// Bounded actual-device oracle, including partial video tiles, global rows, and a non-dense mask.
@@ -513,9 +577,32 @@ pub fn device_self_test() -> Result<()> {
             ])?,
         )
     };
-    let sparse = gather_attention(&l, &rows, &tile(&q)?, &tile(&k)?, &tile(&v)?, dim, 2)?
-        .0
-        .reshape(&[1, heads as i32, seq as i32, dim as i32])?;
+    let reservation = workspace::chunk(
+        LayoutSize::from(&l),
+        heads,
+        dim,
+        2,
+        Backend::Mlx,
+        &VedaRequest {
+            enabled: true,
+            generated: VedaBudget::KeyTiles(2),
+            reference: VedaBudget::KeyTiles(2),
+            ..Default::default()
+        },
+        Limits::default(),
+    )?;
+    let sparse = gather_attention(
+        &l,
+        &rows,
+        &tile(&q)?,
+        &tile(&k)?,
+        &tile(&v)?,
+        dim,
+        2,
+        &reservation,
+    )?
+    .0
+    .reshape(&[1, heads as i32, seq as i32, dim as i32])?;
     let mut mask = vec![false; heads * seq * seq];
     let mut pairs = 0usize;
     for head in 0..heads {
@@ -564,6 +651,49 @@ pub fn device_self_test() -> Result<()> {
 #[cfg(test)]
 mod frozen_tests {
     use super::*;
+    #[test]
+    #[ignore = "requires exclusive coordinator admission for actual MLX allocator accounting"]
+    fn full_self_test_lifetime_fits_declared_allocator_bound() {
+        let layout = Layout::t2va(17, [2, 9, 17], TileShape([2, 8, 8]), 323).unwrap();
+        let shape = TileShape([2, 8, 8]);
+        let plan = Plan {
+            name: "allocator-fixture".into(),
+            grid: [2, 9, 17],
+            shapes: vec![shape],
+            heads: vec![vec![0, 0]],
+            provenance: None,
+        };
+        let bound = workspace::bound(
+            &VedaRequest {
+                enabled: true,
+                ..Default::default()
+            },
+            Backend::Mlx,
+            &plan,
+            plan.grid,
+            &BTreeMap::from([(shape, LayoutSize::from(&layout))]),
+            1,
+            2,
+            128,
+            1,
+            2,
+            Limits::default(),
+        )
+        .unwrap();
+        mlx_rs::memory::clear_cache();
+        let baseline = mlx_rs::memory::get_active_memory() as u64;
+        mlx_rs::memory::reset_peak_memory();
+        device_self_test().unwrap();
+        let peak = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(baseline);
+        assert!(
+            peak <= bound.self_test_bytes,
+            "self-test owned peak {peak} > {}",
+            bound.self_test_bytes
+        );
+        assert!(peak <= bound.total_bytes);
+        println!("Veda allocator receipt: self_test_peak_bytes={peak}, self_test_bound_bytes={}, total_lifetime_bound_bytes={}",bound.self_test_bytes,bound.total_bytes);
+    }
+
     /// Requires the coordinator's exclusive Metal token; never runs in CPU gates.
     #[test]
     #[ignore = "requires exclusive coordinator admission for an actual MLX device"]

@@ -174,7 +174,8 @@ pub struct VedaExecutionReport {
     pub dense_calls: u64,
     pub selected_token_pairs: u64,
     pub dense_token_pairs: u64,
-    /// Maximum accounted workspace of any executed attention call, excluding the caller's input QKV.
+    /// Maximum conservative bound of owned predictor, layouts, full attention lifetimes and
+    /// dense fallback, including caller QKV. This is a problem bound, not an allocator peak.
     pub workspace_bytes: u64,
     /// Engine-observed reason for dense fallback; never inferred from requested settings.
     pub fallback_reason: Option<String>,
@@ -384,3 +385,4 @@ mod tests {
 /// Frozen tensor-neutral tiling, predictor and selection contract.
 pub mod contract;
 mod topk;
+pub mod workspace;
