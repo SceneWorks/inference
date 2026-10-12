@@ -221,6 +221,7 @@ const TIER_AGNOSTIC_COMPONENT_DIRS: [&str; 2] = ["vae", "audio_vae"];
 const KNOWN_COMPONENTS: &[&str] = &[
     crate::tier::DIT_COMPONENT,
     crate::tier::TEXT_ENCODER_COMPONENT,
+    crate::veda::COMPONENT,
 ];
 
 /// The component directories a given task reads, on top of [`TIER_AGNOSTIC_COMPONENT_DIRS`] and the
@@ -562,6 +563,7 @@ pub struct MiniMaxH3 {
     /// [`MiniMaxH3::load_task_dit`], onto the job-local DiT.
     adapters: Vec<AdapterSpec>,
     veda_report: crate::veda::ReportSink,
+    veda_component: Option<PathBuf>,
 }
 
 impl MiniMaxH3 {
@@ -632,6 +634,10 @@ impl MiniMaxH3 {
             contract: crate::memory_strategy::contract_for(spec)?,
             adapters: spec.adapters.clone(),
             veda_report: Default::default(),
+            veda_component: match spec.components.get(crate::veda::COMPONENT) {
+                Some(WeightsSource::File(path)) => Some(path.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -994,7 +1000,11 @@ impl MiniMaxH3 {
             AdaLnResidency::PrecomputeAndEvict,
         )?;
         if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
-            model.prepare_veda(request, self.veda_report.clone());
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
         }
         drop(context);
 
@@ -1304,7 +1314,11 @@ impl MiniMaxH3 {
             AdaLnResidency::PrecomputeAndEvict,
         )?;
         if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
-            model.prepare_veda(request, self.veda_report.clone());
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
         }
         drop(context);
 

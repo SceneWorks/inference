@@ -613,9 +613,10 @@ impl JointDit {
     pub fn prepare_veda(
         &mut self,
         request: &candle_gen::gen_core::VedaRequest,
+        predictor: Option<&std::path::Path>,
         report: crate::veda::ReportSink,
     ) {
-        self.veda = crate::veda::VedaRuntime::prepare(request, report);
+        self.veda = crate::veda::VedaRuntime::prepare(request, predictor, report);
     }
 
     /// Bytes of `adaln_proj` weight the eviction released — 0 under [`AdaLnResidency::Resident`].
@@ -855,7 +856,7 @@ mod veda_controls_tests {
         channels: usize,
         bits: Option<usize>,
         evals: usize,
-        shift: f64,
+        shift: f32,
         enabled: bool,
     ) -> (
         Vec<u32>,
@@ -864,17 +865,9 @@ mod veda_controls_tests {
     ) {
         let device = Device::Cpu;
         let w = weights(bits);
-        let mut dit = MiniMaxH3Dit::from_weights(
-            &w,
-            &config(),
-            &device,
-            if bits.is_none() {
-                DType::BF16
-            } else {
-                DType::F32
-            },
-        )
-        .unwrap();
+        // CPU Candle does not implement BF16 matmul; dense fixture arithmetic is F32.
+        // BF16 request/tier admission is tested at the native loader; device numerics stay gated.
+        let mut dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
         // Turbo then style: two additive factors on the actual native adaptable projection.
         let projection = dit
             .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
@@ -883,8 +876,8 @@ mod veda_controls_tests {
         for strength in [0.0625, 0.5] {
             projection
                 .push_lora(
-                    Tensor::full(0.01f32, (2, 64), &device).unwrap(),
-                    Tensor::full(0.02f32, (96, 2), &device).unwrap(),
+                    Tensor::full(0.01f32, (64, 2), &device).unwrap(),
+                    Tensor::full(0.02f32, (2, 96), &device).unwrap(),
                     strength,
                 )
                 .unwrap();
@@ -898,7 +891,7 @@ mod veda_controls_tests {
         let mut model = JointDit::new(
             dit,
             layout.clone(),
-            context,
+            &context,
             adaln.clone(),
             AdaLnResidency::PrecomputeAndEvict,
         )
@@ -912,7 +905,11 @@ mod veda_controls_tests {
         };
         controls.validate(2, evals).unwrap();
         let report = crate::veda::ReportSink::default();
-        model.prepare_veda(&controls, report.clone());
+        model.prepare_veda(
+            &controls,
+            Some(std::path::Path::new("/managed/predictor.safetensors")),
+            report.clone(),
+        );
         let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 64), &device).unwrap();
         let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
         let (outv, outa) = denoise_av(
