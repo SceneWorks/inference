@@ -148,7 +148,7 @@ pub fn load_backbone_with_adapters(
         eval([&array])?;
         weights.insert(key, array);
     }
-    let installed = crate::adapters::install(&weights, compute, adapters, task, base_model)?;
+    let installed = crate::adapters::install(&mut weights, compute, adapters, task, base_model)?;
     let (adapted, reports) = match installed {
         Some((adapted, reports)) => (Some(adapted), reports),
         None => (None, Vec::new()),

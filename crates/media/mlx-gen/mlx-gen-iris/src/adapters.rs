@@ -2,8 +2,10 @@
 //! file is installed through the shared strict loader
 //! ([`mlx_gen::adapters::loader::apply_adapters_strict`]) as a **forward-time residual** on the
 //! projection it targets — `y = base(x) + Σ adapter(x)` — so the base weight is never mutated. A
-//! LoKr applies through the structured Kronecker product (`Y = w1 · X · w2ᵀ`, never a materialized
-//! `[out, in]` delta); a LoRA as `scale · (x·Aᵀ)·Bᵀ`.
+//! LoRA applies as `scale · (x·Aᵀ)·Bᵀ`; a LoKr / LoHa as its reconstructed `[out, in]` delta (the
+//! projections are dense, so the shared loader materializes rather than taking its packed-base
+//! structured form), built in the backbone's compute dtype — f32 under `Precision::Fp32`, never
+//! rounded to bf16 below it (sc-25690, [`AdaptableHost::lycoris_dtype`]).
 //!
 //! Upstream Iris-3B ships no adapter code, so the surface is the repo's key layouts: PEFT/diffusers
 //! LoRA (`transformer.` / `diffusion_model.` prefixes or bare), kohya flattened LoRA, PEFT-stamped
@@ -31,7 +33,7 @@ use mlx_gen::gen_core::iris::{
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterApplyReport, AdapterSpec, Error, Result};
-use mlx_rs::Dtype;
+use mlx_rs::{Array, Dtype};
 
 use crate::nn::AdaptedLinears;
 
@@ -39,23 +41,35 @@ use crate::nn::AdaptedLinears;
 /// addressable by dotted module path — the install's host.
 struct ProjectionHost {
     linears: BTreeMap<String, AdaptableLinear>,
+    /// The backbone's compute dtype — also the dtype a LoKr / LoHa residual is built in, so an
+    /// FP32 load keeps the adapter f32 (as the Candle twin keeps its LoKr factors f32).
+    compute: Dtype,
 }
 
 impl ProjectionHost {
     /// Weights and biases in `compute`, exactly as [`crate::nn::Loader::linear`] builds a bare
     /// projection, so an adapted projection differs from the bare one only by its adapters.
-    fn from_weights(weights: &Weights, compute: Dtype) -> Result<Self> {
+    ///
+    /// The host is read through [`peek`], never `Weights::get`/`require`: those mark a key as
+    /// consumed, and the backbone build's unused-key check (config vs checkpoint) must see only the
+    /// keys the configured architecture reads — not every projection the install could reach.
+    fn from_weights(weights: &mut Weights, compute: Dtype) -> Result<Self> {
+        let mut keys: Vec<String> = weights
+            .keys()
+            .filter(|key| key.ends_with(".weight"))
+            .map(str::to_owned)
+            .collect();
+        keys.sort_unstable();
         let mut linears = BTreeMap::new();
-        for key in weights.keys() {
-            let Some(path) = key.strip_suffix(".weight") else {
+        for key in keys {
+            let path = key.strip_suffix(".weight").expect("filtered");
+            let Some(weight) = peek(weights, &key) else {
                 continue;
             };
-            let weight = weights.require(key)?;
             if weight.ndim() != 2 {
                 continue;
             }
-            let bias = weights
-                .get(&format!("{path}.bias"))
+            let bias = peek(weights, &format!("{path}.bias"))
                 .map(|b| b.as_dtype(compute))
                 .transpose()?;
             linears.insert(
@@ -63,8 +77,16 @@ impl ProjectionHost {
                 AdaptableLinear::dense(weight.as_dtype(compute)?, bias),
             );
         }
-        Ok(Self { linears })
+        Ok(Self { linears, compute })
     }
+}
+
+/// A handle on `key`'s tensor that leaves `weights`' consumed-key accounting untouched (`remove`
+/// and `insert` are not reads); the array is reference-counted, so this copies no data.
+fn peek(weights: &mut Weights, key: &str) -> Option<Array> {
+    let array = weights.remove(key)?;
+    weights.insert(key, array.clone());
+    Some(array)
 }
 
 impl AdaptableHost for ProjectionHost {
@@ -74,6 +96,10 @@ impl AdaptableHost for ProjectionHost {
 
     fn adaptable_paths(&self) -> Vec<String> {
         self.linears.keys().cloned().collect()
+    }
+
+    fn lycoris_dtype(&self) -> Dtype {
+        self.compute
     }
 }
 
@@ -96,7 +122,7 @@ pub fn adapter_identity(path: &Path) -> Result<HashMap<String, String>> {
 /// `task` on `base_model`. Returns the adapted projections for the model build and one report per
 /// file. An empty `specs` is `Ok(None)` (the bare build).
 pub fn install(
-    weights: &Weights,
+    weights: &mut Weights,
     compute: Dtype,
     specs: &[AdapterSpec],
     task: IrisTask,
