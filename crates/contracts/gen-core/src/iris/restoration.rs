@@ -793,23 +793,48 @@ fn blur(src: &[f32], h: usize, w: usize, dilation: usize) -> Vec<f32> {
     out
 }
 
-/// `_split` of one plane: `(high, low)` frequency parts that sum back to the input.
-fn split_plane(plane: &[f32], h: usize, w: usize) -> (Vec<f32>, Vec<f32>) {
+/// [`Error::Canceled`] once `cancel` is set.
+fn check_cancel(cancel: &CancelFlag) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok(())
+}
+
+/// `_split` of one plane: `(high, low)` frequency parts that sum back to the input. `cancel` is
+/// polled before every dilation.
+fn split_plane(
+    plane: &[f32],
+    h: usize,
+    w: usize,
+    cancel: &CancelFlag,
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let mut high = vec![0f32; plane.len()];
     let mut low = plane.to_vec();
     for &d in &COLOR_FIX_DILATIONS {
+        check_cancel(cancel)?;
         let blurred = blur(&low, h, w, d);
         for i in 0..high.len() {
             high[i] += low[i] - blurred[i];
         }
         low = blurred;
     }
-    (high, low)
+    Ok((high, low))
 }
 
 /// `wavelet_color_fix(content, reference)`: `content`'s high frequencies on `reference`'s low
 /// frequencies (both the same size). Channels run on scoped threads.
 pub fn wavelet_color_fix(content: &Planes, reference: &Planes) -> Result<Planes> {
+    wavelet_color_fix_cancellable(content, reference, &CancelFlag::new())
+}
+
+/// [`wavelet_color_fix`] polling `cancel` before every dilation of every plane — a cancel is
+/// [`Error::Canceled`].
+fn wavelet_color_fix_cancellable(
+    content: &Planes,
+    reference: &Planes,
+    cancel: &CancelFlag,
+) -> Result<Planes> {
     if (content.channels, content.height, content.width)
         != (reference.channels, reference.height, reference.width)
     {
@@ -823,18 +848,18 @@ pub fn wavelet_color_fix(content: &Planes, reference: &Planes) -> Result<Planes>
         let handles: Vec<_> = (0..content.channels)
             .map(|c| {
                 let (cp, rp) = (content.plane(c), reference.plane(c));
-                scope.spawn(move || {
-                    let (high, _) = split_plane(cp, h, w);
-                    let (_, low) = split_plane(rp, h, w);
-                    high.iter().zip(&low).map(|(a, b)| a + b).collect()
+                scope.spawn(move || -> Result<Vec<f32>> {
+                    let (high, _) = split_plane(cp, h, w, cancel)?;
+                    let (_, low) = split_plane(rp, h, w, cancel)?;
+                    Ok(high.iter().zip(&low).map(|(a, b)| a + b).collect())
                 })
             })
             .collect();
         handles
             .into_iter()
             .map(|h| h.join().expect("colour-fix worker panicked"))
-            .collect()
-    });
+            .collect::<Result<_>>()
+    })?;
     Ok(Planes {
         channels: content.channels,
         height: h,
@@ -869,9 +894,11 @@ pub fn fit_budget_image(image: &Image, to: Dims) -> Result<Image> {
 /// Run a planned restoration. `velocity(tile, height, width)` is the backend's one-step forward:
 /// it receives one `[3, height, width]` CHW f32 crop in `[-1, 1]` and returns the model's velocity
 /// `v` (same layout); the restored crop is `x − sigma · v` (f32). The cancel flag is checked before
-/// every tile and before post-processing — a cancel is [`Error::Canceled`] and no image.
+/// every tile, before post-processing, after the resize back, before every colour-fix dilation and
+/// after the colour fix — a cancel is [`Error::Canceled`] and no image.
 /// [`Progress::Step`] reports each finished tile (`current` of the plan's forward count);
 /// [`Progress::Decoding`] marks the post-processing (crop, resize back, colour fix, quantize).
+/// The fused padded model output is released once cropped, before the colour fix.
 pub fn restore(
     image: &Image,
     plan: &RestorationPlan,
@@ -880,11 +907,8 @@ pub fn restore(
     on_progress: &mut dyn FnMut(Progress),
     velocity: &mut TileVelocity,
 ) -> Result<Image> {
-    Ok(
-        restore_detailed(image, plan, sigma, cancel, on_progress, velocity)?
-            .restored
-            .to_rgb8(),
-    )
+    let (_, restored) = run_restoration(image, plan, sigma, cancel, on_progress, velocity, false)?;
+    Ok(restored.to_rgb8())
 }
 
 /// A backend's one-step forward over one tile: `(tile CHW f32 in [-1, 1], height, width)` → the
@@ -901,7 +925,8 @@ pub struct RestorationOutput {
     pub restored: Planes,
 }
 
-/// [`restore`] without the final 8-bit quantization (parity tests and float consumers).
+/// [`restore`] without the final 8-bit quantization (parity tests and float consumers). Keeps the
+/// fused padded output alive to return it.
 pub fn restore_detailed(
     image: &Image,
     plan: &RestorationPlan,
@@ -910,6 +935,25 @@ pub fn restore_detailed(
     on_progress: &mut dyn FnMut(Progress),
     velocity: &mut TileVelocity,
 ) -> Result<RestorationOutput> {
+    let (fused, restored) =
+        run_restoration(image, plan, sigma, cancel, on_progress, velocity, true)?;
+    Ok(RestorationOutput {
+        fused: fused.expect("kept on request"),
+        restored,
+    })
+}
+
+/// The restoration driver: `(fused, restored)`, with `fused` returned only when `keep_fused`
+/// (otherwise it is dropped as soon as it is cropped — 3×H×W f32 of the padded output).
+fn run_restoration(
+    image: &Image,
+    plan: &RestorationPlan,
+    sigma: f64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    velocity: &mut TileVelocity,
+    keep_fused: bool,
+) -> Result<(Option<Planes>, Planes)> {
     if Dims::new(image.width, image.height) != plan.source {
         return Err(Error::Msg(format!(
             "iris: the plan is for a {}x{} image, got {}x{}",
@@ -923,6 +967,7 @@ pub fn restore_detailed(
     };
     let lq = Planes::from_rgb8(&image)?;
     let reference = bicubic_scale_factor(&lq, plan.scale);
+    drop(lq);
     debug_assert_eq!(
         (reference.width as u32, reference.height as u32),
         (plan.output.width, plan.output.height)
@@ -1003,6 +1048,8 @@ pub fn restore_detailed(
                 total,
             });
         }
+        // The padded input (3×H×W f32) is dead once every tile has read it.
+        drop(padded);
         for plane in out.data.chunks_exact_mut(ph * pw) {
             for (v, w) in plane.iter_mut().zip(&weight) {
                 *v /= w;
@@ -1020,16 +1067,20 @@ pub fn restore_detailed(
         plan.processing.width as usize,
     );
     let mut y = fused.crop(0, 0, h, w);
+    // Only a parity consumer reads the padded fused output; release it before the colour fix.
+    let fused = keep_fused.then_some(fused);
     for v in &mut y.data {
         *v = (*v + 1.0) / 2.0;
     }
     if plan.enlarged {
         y = bicubic_aa_resize(&y, plan.output.height as usize, plan.output.width as usize);
     }
+    check_cancel(cancel)?;
     if plan.color_fix {
-        y = wavelet_color_fix(&y, &reference)?;
+        y = wavelet_color_fix_cancellable(&y, &reference, cancel)?;
+        check_cancel(cancel)?;
     }
-    Ok(RestorationOutput { fused, restored: y })
+    Ok((fused, y))
 }
 
 #[cfg(test)]
@@ -1370,6 +1421,78 @@ mod tests {
         assert!(matches!(err, Error::Canceled), "{err:?}");
         assert_eq!(calls, 3);
         assert_eq!(steps.len(), 3);
+    }
+
+    /// A cancel that arrives after the last tile (at [`Progress::Decoding`]) is honoured by the
+    /// post-processing — resize back, colour fix — and yields no image, for every combination of
+    /// the enlarge branch and the colour fix (sc-25690 I11).
+    /// MUTATION: drop the post-resize cancel check — RED on the no-colour-fix plans.
+    #[test]
+    fn cancellation_after_the_last_tile_yields_no_image() {
+        let mut enlarged = [false, false];
+        for (dims, color_fix) in [
+            (Dims::new(40, 24), false),
+            (Dims::new(40, 24), true),
+            (Dims::new(12, 8), false),
+            (Dims::new(12, 8), true),
+        ] {
+            let mut o = opts(4.0, InputSizing::Original);
+            o.color_fix = color_fix;
+            let p = plan(
+                dims,
+                &o,
+                TileGeometry {
+                    tile: 64,
+                    patch: 16,
+                },
+                MODEL_ID,
+            )
+            .unwrap();
+            enlarged[p.enlarged as usize] = true;
+            let image = Image {
+                width: dims.width,
+                height: dims.height,
+                pixels: vec![128; (dims.width * dims.height * 3) as usize],
+            };
+            let cancel = CancelFlag::new();
+            let mut calls = 0;
+            let err = restore(
+                &image,
+                &p,
+                0.5,
+                &cancel.clone(),
+                &mut |e| {
+                    if e == Progress::Decoding {
+                        cancel.cancel();
+                    }
+                },
+                &mut |tile, _, _| {
+                    calls += 1;
+                    Ok(vec![0.0; tile.len()])
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::Canceled),
+                "{dims:?} enlarged={} color_fix={color_fix}: {err:?}",
+                p.enlarged
+            );
+            assert_eq!(calls, p.forward_count(), "every tile ran before the cancel");
+        }
+        assert_eq!(enlarged, [true, true], "both enlarge branches are covered");
+    }
+
+    /// The colour fix's dilation pyramid polls the cancel flag (its cost grows with the output
+    /// area, so a cancel must not wait for it).
+    /// MUTATION: drop the per-dilation cancel check in `split_plane` — RED.
+    #[test]
+    fn colour_fix_honours_a_cancel() {
+        let p = Planes::zeros(3, 9, 11);
+        let cancel = CancelFlag::new();
+        assert!(wavelet_color_fix_cancellable(&p, &p, &cancel).is_ok());
+        cancel.cancel();
+        let err = wavelet_color_fix_cancellable(&p, &p, &cancel).unwrap_err();
+        assert!(matches!(err, Error::Canceled), "{err:?}");
     }
 
     #[test]

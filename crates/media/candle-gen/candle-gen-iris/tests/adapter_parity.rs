@@ -98,6 +98,50 @@ fn lora_and_lokr_deltas_and_forwards_match_upstream() {
     }
 }
 
+/// sc-25690 I8 (the MLX twin's test): a backbone whose `config.yaml` declares one pixel block fewer
+/// than its checkpoint carries is refused by the unused-key check, bare and with a LoRA or LoKr
+/// attached — the adapter path must not mask the mismatch.
+#[test]
+fn a_mismatched_checkpoint_is_refused_with_an_adapter_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = std::fs::read_to_string(tiny_backbone().join("config.yaml")).unwrap();
+    assert_eq!(text.matches("\n    depth: 2\n").count(), 1);
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        text.replace("\n    depth: 2\n", "\n    depth: 1\n"),
+    )
+    .unwrap();
+    std::fs::copy(
+        tiny_backbone().join("model.safetensors"),
+        dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let config = candle_gen::gen_core::iris::IrisConfig::from_dir(dir.path()).unwrap();
+    assert_eq!(config.model.pixel.depth, 1);
+    let lora = spec("iris_lora.safetensors", AdapterKind::Lora, 0.75);
+    let lokr = spec("iris_lokr.safetensors", AdapterKind::Lokr, 1.0);
+    for specs in [vec![], vec![lora], vec![lokr]] {
+        let err = load_backbone_with_adapters(
+            dir.path(),
+            &config,
+            DType::F32,
+            &cpu(),
+            &specs,
+            IrisTask::Generation,
+            "iris_3b",
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{} adapter(s): the mismatch must be refused", specs.len()));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not consume"),
+            "{} adapter(s): {msg}",
+            specs.len()
+        );
+        assert!(msg.contains("pixel_blocks.1."), "{msg}");
+    }
+}
+
 #[test]
 fn an_adapter_for_another_task_or_family_is_refused() {
     let config = tiny_config();
