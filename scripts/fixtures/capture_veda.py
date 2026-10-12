@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Capture the frozen upstream CPU oracle; never derive expected masks from Rust.
-Run in a CPU-only environment with torch==2.14.1 and safetensors==0.7.0.
+Run in a CPU-only environment with torch==2.14.1 and safetensors==0.8.0.
 The predictor header is the retained E7 artifact header; no real weight download.
 """
 import argparse, hashlib, importlib.util, json, pathlib, sys, types, random
@@ -33,7 +33,7 @@ for n,ref,valid in [(8,0,[128]*7+[4,3,0]),(10,3,[64,80,42]+[128]*6+[6,2,0]),(10,
   base=torch.arange(n*n,dtype=torch.int64).reshape(n,n)
   scores=(torch.zeros(n,n) if kind=='ties' else ((base*17+5)%31).float() if kind=='ranked' else (((base*17+5)%3).float()*2**-22+1))
   scores=torch.stack([scores,scores.flip(-1)])
-  for generated,reference in [(('ratio',0.1),('ratio',1.0)),(('tiles',2.3),('tiles',1.5)),(('ratio',1.0),('tiles',2.0))]:
+  for generated,reference in [(('ratio',0.1),('ratio',1.0)),(('tiles',2.3),('tiles',1.5)),(('ratio',1.0),('tiles',2.0)),(('tiles',1.2999999999995),('tiles',1.5))]:
    gb=selection.Budget(**{generated[0]:generated[1]});rb=selection.Budget(**{reference[0]:reference[1]})
    index,keep=selection.select(scores,l,selection.column_blocks(l,gb,rb));mask=selection.block_mask(index,keep,l)
    upstream_rows=[[torch.nonzero(row).view(-1).tolist() for row in head] for head in mask]
@@ -62,6 +62,6 @@ for n in [3,4,7,8,10,16,24,32,63,64,65,129,256,512]:
   for rep in range(10):
    values=[float(random.randrange(4)) for _ in range(n)];own=random.randrange(n);scores=torch.tensor(values);scores[own]=float('inf')
    topk_probes.append(dict(scores=values,own=own,k=count,prefix=sorted(torch.topk(scores,count).indices[:count-1].tolist())))
-result=dict(provenance=dict(revision='60bfae688897dc41bc8685ca9f3130d7ed8f3b0c',torch=torch.__version__,safetensors=safetensors.__version__,device='cpu',machine='arm64',input_dtype='bfloat16',projection_storage='float8_e4m3fn scaled FP32 then bfloat16',scorer_dtype='float32',score_fixture_dtype='float32',tie_authority='PyTorch CPU libc++ nth_element/partial_sort',source_sha256={str(p.relative_to(a.source)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob('*.py')},header_sha256=hashlib.sha256(a.header.read_bytes()).hexdigest(),empty_key_rule='Empty diagonals excluded per E2; source scatter_ would re-enable an artificial empty diagonal (positive grid layouts contain no empty tiles)'),choices=choices,layouts=layouts,selections=cases,scorers=scorers,topk_probes=topk_probes,rounding_probes=[dict(input=v,cost=int(round(v,3)*1000+0.5)) for v in [0.0005,0.0015,0.0025,1.2345,1.2355,0.1235,0.9995]])
+result=dict(provenance=dict(revision='60bfae688897dc41bc8685ca9f3130d7ed8f3b0c',torch=torch.__version__,safetensors=safetensors.__version__,device='cpu',machine='arm64',input_dtype='bfloat16',projection_storage='float8_e4m3fn scaled FP32 then bfloat16',scorer_dtype='float32',score_fixture_dtype='float32',tie_authority='PyTorch CPU libc++ nth_element/partial_sort',source_sha256={str(p.relative_to(a.source)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob('*.py')},header_sha256=hashlib.sha256(a.header.read_bytes()).hexdigest(),empty_key_rule='Empty diagonals excluded per E2; source scatter_ would re-enable an artificial empty diagonal (positive grid layouts contain no empty tiles)'),choices=choices,layouts=layouts,selections=cases,scorers=scorers,topk_probes=topk_probes,rounding_probes=[dict(input=v,cost=int(round(v,3)*1000+0.5)) for v in [0.0005,0.0015,0.0025,1.2345,1.2355,0.1235,0.9995]],split_budget_probes=[dict(budget=b,cols=10,split=list(selection.split_budget(b,10))) for b in [1.2999999999995,2.2999999999995,1.1000000000005,2.1000000000005,1.4999999999995]])
 a.out.write_text(json.dumps(result,separators=(',',':'))+'\n', encoding='utf-8', newline='\n')
 print(json.dumps(dict(torch=torch.__version__,plans=len(plan_json),choices=len(choices),layouts=len(layouts),selections=len(cases),scorers=len(scorers),topk_probes=len(topk_probes),fixture_sha256=hashlib.sha256(a.out.read_bytes()).hexdigest())))

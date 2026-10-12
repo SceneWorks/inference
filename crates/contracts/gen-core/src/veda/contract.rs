@@ -412,6 +412,17 @@ impl Budget {
         })
     }
 }
+fn split_budget(budget: f64, cols: usize) -> (usize, usize, f64) {
+    let low = (budget.floor() as usize).clamp(1, cols);
+    if budget >= cols as f64 {
+        return (cols, cols, 0.0);
+    }
+    let fraction = (budget - low as f64).clamp(0.0, 1.0);
+    // Python round(x, 12) rounds the original binary64 value. Scaling first
+    // can erase which side of the decimal midpoint it lies on.
+    let fraction = format!("{fraction:.12}").parse::<f64>().unwrap();
+    (low, (low + 1).min(cols), fraction)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub perm: Vec<i32>,
@@ -554,15 +565,7 @@ impl Layout {
         for &(start, stop, budget, tokens) in &blocks {
             let cols = stop - start;
             let b = budget.per_row(tokens, cols)?;
-            let low = (b.floor() as usize).clamp(1, cols);
-            let (hi, frac) = if b >= cols as f64 {
-                (cols, 0.0)
-            } else {
-                (
-                    (low + 1).min(cols),
-                    ((b - low as f64).clamp(0.0, 1.0) * 1e12).round_ties_even() / 1e12,
-                )
-            };
+            let (low, hi, frac) = split_budget(b, cols);
             splits.push((start, stop, budget, low, hi, frac));
         }
         let mut rows = Vec::with_capacity(heads * self.valid.len());
@@ -933,6 +936,20 @@ mod tests {
             assert_eq!(
                 rounded_aspect_cost(c["input"].as_f64().unwrap()),
                 us(&c["cost"]) as u64
+            );
+        }
+    }
+    #[test]
+    fn frozen_fractional_budget_keeps_python_decimal_rounding() {
+        for c in fixture()["split_budget_probes"].as_array().unwrap() {
+            let expected = &c["split"];
+            assert_eq!(
+                split_budget(c["budget"].as_f64().unwrap(), us(&c["cols"])),
+                (
+                    us(&expected[0]),
+                    us(&expected[1]),
+                    expected[2].as_f64().unwrap()
+                )
             );
         }
     }
