@@ -195,7 +195,10 @@ fn run_probe(j: &Json) -> Json {
     let world: World = parse_dist(Some(&json!({"world": j["world"]})), false, true)
         .unwrap()
         .world;
-    let mut c = on_cpu(|| MlxCollective::init(&world, "ring")).unwrap();
+    let mut c = on_cpu(|| MlxCollective::init(&world, "ring", &Default::default())).unwrap();
+    if j["probe"] == "hybrid" {
+        return hybrid_probe(j, c);
+    }
     if j["probe"] == "gather" {
         // unequal contributions: the padded ring gather must return each one exactly
         let mine: Vec<f32> = (0..3 - world.rank)
@@ -222,6 +225,40 @@ fn run_probe(j: &Json) -> Json {
         "dist": dist_error(&e).map(|d| format!("{d:?}")),
         "again": dist_error(&again).map(|d| format!("{d:?}")),
     })
+}
+
+/// The child side of the MLX-ring hybrid-sharding probe (sc-25690): a `dp_replicate 2 x dp_shard 2`
+/// mesh reduces one gradient of 3 rows (odd: the two shards hold 2 and 1 rows, so the replicate
+/// groups' all-reduce contributions differ in length across groups) through
+/// `Topology::reduce_grads`, plus a direct sub-group all-reduce of unequal-length rows.
+fn hybrid_probe(j: &Json, coll: MlxCollective) -> Json {
+    use mlx_gen_iris::train::dist::{to_host, Topology};
+    let dist = json!({"strategy": "fsdp2", "sharding": "hybrid",
+                      "mesh": {"dp_replicate": 2, "dp_shard": 2}, "world": j["world"]});
+    let plan = parse_dist(Some(&dist), false, true).unwrap();
+    let rank = plan.world.rank;
+    let key: std::rc::Rc<str> = "w".into();
+    let mut topo = Topology {
+        plan,
+        coll: Box::new(coll),
+        shapes: HashMap::from([(key.clone(), vec![3, 2])]),
+    };
+    // rank r's local gradient: (r + 1) * (row + 1) in every column
+    let g: Vec<f32> = (0..3)
+        .flat_map(|row| [((rank + 1) * (row + 1)) as f32; 2])
+        .collect();
+    let grads = HashMap::from([(key.clone(), Array::from_slice(&g, &[3, 2]))]);
+    let rows = on_cpu(|| topo.reduce_grads(grads)).unwrap();
+    let mine = on_cpu(|| to_host(&rows[&key])).unwrap();
+    // a sub-group reduction of rows whose length differs across the groups
+    let groups = Partition(vec![0, 1, 0, 1]);
+    let mut v = vec![rank as f32; if rank % 2 == 0 { 3 } else { 2 }];
+    on_cpu(|| {
+        topo.coll
+            .all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &groups)
+    })
+    .unwrap();
+    json!({"rows": mine, "sub": v})
 }
 
 /// The re-entry point of a rank process (a no-op when run as an ordinary test).
@@ -563,6 +600,58 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
 }
 
+/// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a
+/// storage rank 1 cannot see: one output directory per rank) refuse typed on every rank instead of
+/// resuming at different steps and silently averaging diverged replicas.
+#[test]
+fn ranks_that_see_different_checkpoints_refuse_to_resume() {
+    let (data, scratch) = (tmp(), tmp());
+    write_dataset(data.path());
+    let outs = [tmp(), tmp()];
+    let ddp = json!({"strategy": "ddp"});
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                Some(2),
+            )
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        assert_eq!(r["steps"], 2, "{r}");
+    }
+    assert!(latest_checkpoint(&checkpoint_root(outs[0].path(), NAME)).is_some());
+    assert!(latest_checkpoint(&checkpoint_root(outs[1].path(), NAME)).is_none());
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            let mut j = job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                None,
+            );
+            j["resume"] = json!(true);
+            j
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        let typed = r["dist"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an untyped outcome: {r}"));
+        assert!(typed.starts_with("SplitWorld"), "{typed}");
+    }
+}
+
 #[test]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let (data, scratch) = (tmp(), tmp());
@@ -780,6 +869,47 @@ fn the_mlx_ring_gather_returns_unequal_contributions_exactly() {
         .collect();
     for r in launch(jobs, scratch.path()) {
         assert_eq!(r["gathered"], json!([[0.0, 1.0, 2.0], [10.0, 11.0]]), "{r}");
+    }
+}
+
+/// Hybrid sharding over MLX's `ring` backend (sc-25690): the replicate-group all-reduce of row
+/// shards of different lengths (an odd row count over two shards) goes through the padded gather
+/// (MLX's ring all-gather needs equal rows) and reduces exactly.
+#[test]
+fn hybrid_sharding_over_the_mlx_ring_reduces_odd_row_shards() {
+    let scratch = tmp();
+    let hostfile = scratch.path().join("hostfile.json");
+    let hosts: Vec<Json> = (0..4)
+        .map(|_| json!([format!("127.0.0.1:{}", free_port())]))
+        .collect();
+    std::fs::write(&hostfile, Json::Array(hosts).to_string()).unwrap();
+    let mut world = tcp_world(4, 1);
+    world["transport"] = json!("mlx_ring");
+    world["hostfile"] = json!(hostfile);
+    let jobs: Vec<Json> = (0..4)
+        .map(|r| {
+            let mut w = world.clone();
+            w["rank"] = json!(r);
+            w["local_rank"] = json!(r);
+            json!({"probe": "hybrid", "world": w})
+        })
+        .collect();
+    let res = launch(jobs, scratch.path());
+    for (r, out) in res.iter().enumerate() {
+        // global mean = (1 + 2 + 3 + 4) / 4 * (row + 1) = 2.5 * (row + 1); shard 0 = rows 0..2,
+        // shard 1 = row 2 (shard index = rank % dp_shard)
+        let want = if r % 2 == 0 {
+            json!([2.5, 2.5, 5.0, 5.0])
+        } else {
+            json!([7.5, 7.5])
+        };
+        assert_eq!(out["rows"], want, "rank {r}: {out}");
+        let sub = if r % 2 == 0 {
+            json!([2.0, 2.0, 2.0])
+        } else {
+            json!([4.0, 4.0])
+        };
+        assert_eq!(out["sub"], sub, "rank {r}: {out}");
     }
 }
 

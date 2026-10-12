@@ -15,7 +15,7 @@
 //! [`recipe_training_config`]: candle_gen::gen_core::iris::restoration_train::recipe_training_config
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::gen_core::iris::restoration::RestorationResources;
@@ -26,6 +26,7 @@ use candle_gen::gen_core::iris::restoration_train::{
     RestoreTrainResources, TrainPair, WindowClose, CKPT_CRITIC, CKPT_CRITIC_OPTIMIZER,
     CRITIC_HEAD_WIDTH, TRAINER_ID,
 };
+use candle_gen::gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
 use candle_gen::gen_core::iris::train::{
     adapter_param_route, checkpoint_root, checkpoint_staging_dir, file_stem, full_param_route,
     latest_checkpoint, linear_paths_from_keys, lr_factor, mix_seed, prune_checkpoints,
@@ -699,6 +700,9 @@ impl Run {
             (None, true) => latest_checkpoint(&ckpt_root),
             (None, false) => None,
         };
+        // sc-25690: the checkpoints under the root that are not this run's lineage move aside
+        // before its first publish (retention and `latest` see only this run's).
+        retire_foreign_checkpoints(&ckpt_root, resume_dir.as_deref())?;
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -1060,9 +1064,6 @@ impl Run {
 
     fn export(&self, req: &TrainingRequest) -> Result<PathBuf> {
         let dir = req.output_dir.join(file_stem(&req.file_name));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::Msg(format!("iris restore export: {}: {e}", dir.display())))?;
-        write_export_sidecars(&self.export, &dir)?;
         let which = self.plan.export_weights;
         let dtype = if self.plan.export_bf16 {
             DType::BF16
@@ -1074,13 +1075,17 @@ impl Run {
             .into_iter()
             .map(|(k, v)| Ok((k, v.to_dtype(dtype)?.to_device(&Device::Cpu)?)))
             .collect::<Result<Vec<_>>>()?;
-        let path = dir.join(candle_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
-        save_safetensors_atomic(
-            &path,
-            &list,
-            &export_metadata(which, self.step, &self.base_identity),
-        )?;
-        Ok(path)
+        let meta = export_metadata(which, self.step, &self.base_identity);
+        // sc-25690: the sidecars and the merged weights appear together or not at all.
+        publish_export_dir(&dir, |stage: &Path| -> Result<()> {
+            write_export_sidecars(&self.export, stage)?;
+            save_safetensors_atomic(
+                &stage.join(candle_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
+                &list,
+                &meta,
+            )
+        })?;
+        Ok(dir.join(candle_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE))
     }
 
     fn render_preview(

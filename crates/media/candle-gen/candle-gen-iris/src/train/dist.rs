@@ -21,13 +21,17 @@ pub fn to_host(t: &Tensor) -> Result<Vec<f32>> {
     Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
 }
 
-/// The run's collective for `world`: none on one rank, else the host TCP transport.
-pub fn make_collective(world: &World) -> gen_core::Result<Box<dyn Collective>> {
+/// The run's collective for `world`: none on one rank, else the host TCP transport. The rendezvous
+/// and every later wait honour `cancel` (sc-25690).
+pub fn make_collective(
+    world: &World,
+    cancel: &gen_core::CancelFlag,
+) -> gen_core::Result<Box<dyn Collective>> {
     if world.world_size == 1 {
         return Ok(Box::new(gen_core::iris::train::dist::LocalCollective::new()));
     }
     match world.transport.as_str() {
-        "tcp" => Ok(Box::new(TcpCollective::connect(world)?)),
+        "tcp" => Ok(Box::new(TcpCollective::connect(world, cancel)?)),
         other => Err(DistError::Unsupported(format!(
             "transport {other:?} is MLX's distributed layer; the Candle trainer's transport is tcp"
         ))

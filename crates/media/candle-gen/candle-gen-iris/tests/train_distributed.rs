@@ -546,6 +546,58 @@ fn hybrid_sharding_over_four_ranks_reproduces_ddp() {
     assert!(d <= ADAMW_TOL, "hybrid: {d}");
 }
 
+/// sc-25690: ranks that resolve different resume checkpoints (here `rank0` checkpoints on a
+/// storage rank 1 cannot see: one output directory per rank) refuse typed on every rank instead of
+/// resuming at different steps and silently averaging diverged replicas.
+#[test]
+fn ranks_that_see_different_checkpoints_refuse_to_resume() {
+    let (data, scratch) = (tmp(), tmp());
+    write_dataset(data.path());
+    let outs = [tmp(), tmp()];
+    let ddp = json!({"strategy": "ddp"});
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                Some(2),
+            )
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        assert_eq!(r["steps"], 2, "{r}");
+    }
+    assert!(latest_checkpoint(&checkpoint_root(outs[0].path(), NAME)).is_some());
+    assert!(latest_checkpoint(&checkpoint_root(outs[1].path(), NAME)).is_none());
+    let world = tcp_world(2, 1);
+    let jobs = (0..2)
+        .map(|r| {
+            let mut j = job(
+                data.path(),
+                outs[r].path(),
+                r,
+                world.clone(),
+                ddp.clone(),
+                4,
+                None,
+            );
+            j["resume"] = json!(true);
+            j
+        })
+        .collect();
+    for r in launch(jobs, scratch.path()) {
+        let typed = r["dist"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an untyped outcome: {r}"));
+        assert!(typed.starts_with("SplitWorld"), "{typed}");
+    }
+}
+
 #[test]
 fn a_sharded_checkpoint_resumes_exactly_and_reshards() {
     let (data, scratch) = (tmp(), tmp());

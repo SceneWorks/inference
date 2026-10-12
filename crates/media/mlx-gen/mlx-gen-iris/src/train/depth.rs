@@ -34,6 +34,7 @@ use gen_core::iris::train::depth::{
     DepthLossPlan, DepthTrainPlan, DEPTH_TRAINER_ID, EMPTY_PROMPT_COMPONENT,
     EXPORT_BACKBONE_PREFIX, REDUCER_BIAS, REDUCER_WEIGHT,
 };
+use gen_core::iris::train::lineage::{publish_export_dir, retire_foreign_checkpoints};
 use gen_core::iris::train::{
     self as contract, backbone_identity, checkpoint_root, checkpoint_staging_dir, file_stem,
     full_param_route, latest_checkpoint, lr_factor, prune_checkpoints, publish_checkpoint,
@@ -721,6 +722,9 @@ impl Run {
             (None, true) => latest_checkpoint(&ckpt_root),
             (None, false) => None,
         };
+        // sc-25690: the checkpoints under the root that are not this run's lineage move aside
+        // before its first publish (retention and `latest` see only this run's).
+        retire_foreign_checkpoints(&ckpt_root, resume_dir.as_deref())?;
         if let Some(dir) = resume_dir {
             let saved = read_checkpoint_state(&dir)?;
             check_depth_resume(&saved, &plan, &dataset_fingerprint, &base_identity)?;
@@ -974,8 +978,6 @@ impl Run {
     /// task-identity stamps), `empty_prompt.safetensors`. Returns the weights file.
     fn export(&self, req: &TrainingRequest) -> Result<PathBuf> {
         let dir = req.output_dir.join(file_stem(&req.file_name));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| Error::Msg(format!("iris depth export: {}: {e}", dir.display())))?;
         let which = self.plan.export_weights;
         let mut list: Vec<(String, Array)> = Vec::with_capacity(self.params.len());
         for (k, v) in self.selected(which) {
@@ -987,18 +989,15 @@ impl Run {
             list.push((key, v.as_dtype(Dtype::Float32)?));
         }
         list.sort_by(|a, b| a.0.cmp(&b.0));
-        contract::atomic_write(
-            &dir.join(BACKBONE_CONFIG_FILE),
-            depth_export_config_yaml(&self.source_config_text)?.as_bytes(),
-        )?;
-        self.prompt.write(&dir.join(EMPTY_PROMPT_FILE))?;
-        let path = dir.join(BACKBONE_WEIGHTS_FILE);
-        save_safetensors_atomic(
-            &path,
-            &list,
-            &depth_export_metadata(which, self.step, &self.base_identity),
-        )?;
-        Ok(path)
+        let yaml = depth_export_config_yaml(&self.source_config_text)?;
+        let meta = depth_export_metadata(which, self.step, &self.base_identity);
+        // sc-25690: config, empty prompt and weights appear together or not at all.
+        publish_export_dir(&dir, |stage: &Path| -> Result<()> {
+            contract::atomic_write(&stage.join(BACKBONE_CONFIG_FILE), yaml.as_bytes())?;
+            self.prompt.write(&stage.join(EMPTY_PROMPT_FILE))?;
+            save_safetensors_atomic(&stage.join(BACKBONE_WEIGHTS_FILE), &list, &meta)
+        })?;
+        Ok(dir.join(BACKBONE_WEIGHTS_FILE))
     }
 
     /// Predict the first `preview.items` dataset items (center crop, no flip) from the in-progress

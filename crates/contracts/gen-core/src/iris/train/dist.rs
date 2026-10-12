@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
-use crate::{Error, Result};
+use crate::{CancelFlag, Error, Result};
 
 // =============================================================================================
 // Typed failures
@@ -329,8 +329,17 @@ pub struct World {
     pub transport: String,
     /// MLX ring/jaccl hostfile (JSON) the MLX transport hands to `mlx::distributed::init`.
     pub hostfile: Option<String>,
-    /// Bound on every transport wait.
+    /// Bound on every transport wait (without progress) once the job is running.
     pub timeout: Duration,
+    /// Bound on the rendezvous (`dist.world.rendezvous_timeout_secs`, sc-25690): accepting the
+    /// ranks, a rank's connect retries and its wait for admission. Shorter than [`Self::timeout`]
+    /// by default: a rank that never starts is reported long before the collective bound.
+    pub rendezvous_timeout: Duration,
+    /// How long a collective wait continues once the run's cancel flag is set
+    /// (`dist.world.cancel_grace_secs`, sc-25690): long enough for the peers, cancelled too, to
+    /// reach the collective cancel agreement at their next step boundary; past it the wait ends
+    /// with [`Error::Canceled`]. The rendezvous honours a cancel at once.
+    pub cancel_grace: Duration,
     /// The per-job rendezvous secret ([`DIST_TOKEN_ENV`]): every rank presents it in its hello and
     /// the coordinator drops a connection whose token differs. `None` = no secret (any peer that
     /// speaks the protocol and names a free rank joins — only safe on a trusted network).
@@ -372,6 +381,8 @@ impl World {
             transport: "tcp".into(),
             hostfile: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            rendezvous_timeout: Duration::from_secs(DEFAULT_RENDEZVOUS_TIMEOUT_SECS),
+            cancel_grace: Duration::from_secs(DEFAULT_CANCEL_GRACE_SECS),
             token: None,
             share_device: false,
         }
@@ -380,7 +391,18 @@ impl World {
     pub fn is_main(&self) -> bool {
         self.rank == 0
     }
+
+    /// The rendezvous bound: [`Self::rendezvous_timeout`], never longer than [`Self::timeout`].
+    pub fn rendezvous_bound(&self) -> Duration {
+        self.rendezvous_timeout.min(self.timeout)
+    }
 }
+
+/// The default rendezvous bound (seconds): torchrun's c10d rendezvous join timeout (600 s).
+pub const DEFAULT_RENDEZVOUS_TIMEOUT_SECS: u64 = 600;
+
+/// The default grace a pending cancel gives a collective wait (seconds).
+pub const DEFAULT_CANCEL_GRACE_SECS: u64 = 120;
 
 /// The default bound on a collective wait (seconds) — upstream's process-group timeout (5400 s),
 /// so rank-0-only work between collectives (previews, consolidated checkpoint / export writes)
@@ -818,6 +840,8 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
             "transport",
             "hostfile",
             "timeout_secs",
+            "rendezvous_timeout_secs",
+            "cancel_grace_secs",
             "share_device",
         ],
     )?;
@@ -862,6 +886,13 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
             "iris training: dist.world.timeout_secs must be >= 1".into(),
         ));
     }
+    let rendezvous = u("rendezvous_timeout_secs", DEFAULT_RENDEZVOUS_TIMEOUT_SECS)?;
+    if rendezvous == 0 {
+        return Err(Error::Msg(
+            "iris training: dist.world.rendezvous_timeout_secs must be >= 1".into(),
+        ));
+    }
+    let cancel_grace = u("cancel_grace_secs", DEFAULT_CANCEL_GRACE_SECS)?;
     Ok(World {
         rank,
         local_rank,
@@ -875,6 +906,8 @@ fn parse_world(raw: Option<&JsonValue>) -> Result<World> {
         transport,
         hostfile: str_of("hostfile")?,
         timeout: Duration::from_secs(timeout),
+        rendezvous_timeout: Duration::from_secs(rendezvous),
+        cancel_grace: Duration::from_secs(cancel_grace),
         token: std::env::var(DIST_TOKEN_ENV)
             .ok()
             .filter(|t| !t.is_empty())
@@ -1122,6 +1155,9 @@ pub struct TcpCollective {
     /// Coordinator: one stream per peer rank (index = rank, `None` at 0). Peer: the stream to 0.
     peers: Vec<Option<TcpStream>>,
     seq: u64,
+    /// Every collective wait: bounded by [`World::timeout`], interrupted by the run's cancel flag
+    /// after [`World::cancel_grace`].
+    pace: Pace,
 }
 
 fn io_lost(rank: usize, op: &str, e: impl std::fmt::Display) -> Error {
@@ -1133,61 +1169,175 @@ fn io_lost(rank: usize, op: &str, e: impl std::fmt::Display) -> Error {
     .into_error()
 }
 
-/// A transport I/O failure as [`DistError::RankLost`], naming an expired bounded wait as such.
-fn stream_lost(s: &TcpStream, peer: usize, op: &str, e: std::io::Error) -> Error {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
-    if matches!(e.kind(), WouldBlock | TimedOut) {
-        let bound = s.read_timeout().ok().flatten().unwrap_or_default();
-        return io_lost(
-            peer,
-            op,
-            format!(
-                "no answer within the {}s transport timeout",
-                bound.as_secs()
-            ),
-        );
+/// The socket timeout of one blocking read / write call: every transport wait is sliced into calls
+/// this long so it can observe its bound and the run's cancel flag between them.
+const IO_SLICE: Duration = Duration::from_millis(200);
+
+/// TCP keepalive (sc-25690): a peer that vanishes without a reset (power loss, a partitioned
+/// network) stops answering the kernel's probes, which fails the connection after about
+/// `idle + interval x probes` (~90 s) instead of the whole collective timeout. A live peer that is
+/// merely busy computing answers the probes from its kernel and is never affected.
+const KEEPALIVE_IDLE_SECS: u32 = 30;
+const KEEPALIVE_INTERVAL_SECS: u32 = 10;
+const KEEPALIVE_PROBES: u32 = 6;
+
+/// How a transport wait is bounded and interrupted.
+#[derive(Clone)]
+struct Pace {
+    /// The longest a wait may go without progress (bytes moving) before the peer is lost.
+    limit: Duration,
+    /// The run's cancel flag.
+    cancel: CancelFlag,
+    /// How long a wait may continue once a cancel is pending: zero during the rendezvous (no
+    /// training state exists yet); during training, long enough for the peers (cancelled too) to
+    /// reach the collective cancel agreement at their next step boundary, so a cooperative cancel
+    /// still ends in the coordinated durable save ([`World::cancel_grace`]).
+    grace: Duration,
+}
+
+impl std::fmt::Debug for Pace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pace")
+            .field("limit", &self.limit)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("grace", &self.grace)
+            .finish()
     }
-    io_lost(peer, op, e)
 }
 
-fn write_all(s: &mut TcpStream, buf: &[u8], peer: usize, op: &str) -> Result<()> {
-    s.write_all(buf).map_err(|e| stream_lost(s, peer, op, e))
+/// One wait's bookkeeping: an inactivity deadline (reset by progress) and when a pending cancel
+/// was first observed.
+struct Waiter<'a> {
+    pace: &'a Pace,
+    deadline: Instant,
+    cancel_seen: Option<Instant>,
 }
 
-fn read_exact(s: &mut TcpStream, buf: &mut [u8], peer: usize, op: &str) -> Result<()> {
-    s.read_exact(buf).map_err(|e| stream_lost(s, peer, op, e))
+impl<'a> Waiter<'a> {
+    fn new(pace: &'a Pace) -> Self {
+        Self {
+            pace,
+            deadline: Instant::now() + pace.limit,
+            cancel_seen: None,
+        }
+    }
+
+    fn progress(&mut self) {
+        self.deadline = Instant::now() + self.pace.limit;
+    }
+
+    /// A slice passed without progress: keep waiting, or end the wait typed: [`Error::Canceled`]
+    /// once a pending cancel outlived the grace, [`DistError::RankLost`] once the bound passed.
+    fn idle(&mut self, peer: usize, op: &str) -> Result<()> {
+        if self.pace.cancel.is_cancelled() {
+            let seen = *self.cancel_seen.get_or_insert_with(Instant::now);
+            if seen.elapsed() >= self.pace.grace {
+                return Err(Error::Canceled);
+            }
+        }
+        if Instant::now() >= self.deadline {
+            return Err(io_lost(
+                peer,
+                op,
+                format!(
+                    "no answer within the {}s transport timeout",
+                    self.pace.limit.as_secs_f64()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
+fn is_slice_expiry(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    matches!(e.kind(), WouldBlock | TimedOut)
+}
+
+fn write_all(s: &mut TcpStream, buf: &[u8], w: &mut Waiter, peer: usize, op: &str) -> Result<()> {
+    let mut sent = 0;
+    while sent < buf.len() {
+        match s.write(&buf[sent..]) {
+            Ok(0) => return Err(io_lost(peer, op, "the connection accepts no more bytes")),
+            Ok(n) => {
+                sent += n;
+                w.progress();
+            }
+            Err(e) if is_slice_expiry(&e) => w.idle(peer, op)?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_lost(peer, op, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Fill `buf` completely. Bytes that arrived before a slice expired are kept (a timed-out
+/// `read_exact` would drop them).
+fn read_exact(
+    s: &mut TcpStream,
+    buf: &mut [u8],
+    w: &mut Waiter,
+    peer: usize,
+    op: &str,
+) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match s.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io_lost(
+                    peer,
+                    op,
+                    format!("connection closed after {filled} of {} bytes", buf.len()),
+                ))
+            }
+            Ok(n) => {
+                filled += n;
+                w.progress();
+            }
+            Err(e) if is_slice_expiry(&e) => w.idle(peer, op)?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_lost(peer, op, e)),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_frame(
     s: &mut TcpStream,
+    pace: &Pace,
     kind: u8,
     seq: u64,
     payload: &[u8],
     peer: usize,
     op: &str,
 ) -> Result<()> {
+    let mut w = Waiter::new(pace);
     let mut head = Vec::with_capacity(17);
     head.push(kind);
     head.extend_from_slice(&seq.to_le_bytes());
     head.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    write_all(s, &head, peer, op)?;
-    write_all(s, payload, peer, op)?;
+    write_all(s, &head, &mut w, peer, op)?;
+    write_all(s, payload, &mut w, peer, op)?;
     s.flush().map_err(|e| io_lost(peer, op, e))
 }
 
 /// Receive one frame of `kind` / `seq` holding at most `max_len` bytes. The length prefix is
 /// checked against `max_len` before anything is read, and the payload is read incrementally (no
 /// allocation sized by the untrusted prefix).
+#[allow(clippy::too_many_arguments)]
 fn recv_frame(
     s: &mut TcpStream,
+    pace: &Pace,
     kind: u8,
     seq: u64,
     peer: usize,
     op: &str,
     max_len: usize,
 ) -> Result<Vec<u8>> {
+    let mut w = Waiter::new(pace);
     let mut head = [0u8; 17];
-    read_exact(s, &mut head, peer, op)?;
+    read_exact(s, &mut head, &mut w, peer, op)?;
     let got_kind = head[0];
     let got_seq = u64::from_le_bytes(head[1..9].try_into().expect("8"));
     let len = u64::from_le_bytes(head[9..17].try_into().expect("8"));
@@ -1208,16 +1358,27 @@ fn recv_frame(
         .into_error());
     }
     let mut payload = Vec::new();
-    let read = (&mut *s).take(len).read_to_end(&mut payload);
-    match read {
-        Err(e) => Err(stream_lost(s, peer, op, e)),
-        Ok(n) if (n as u64) < len => Err(io_lost(
-            peer,
-            op,
-            format!("connection closed after {n} of {len} bytes"),
-        )),
-        Ok(_) => Ok(payload),
+    let mut chunk = vec![0u8; (len as usize).min(1 << 16)];
+    while (payload.len() as u64) < len {
+        let want = ((len - payload.len() as u64) as usize).min(chunk.len());
+        if let Err(e) = read_exact(s, &mut chunk[..want], &mut w, peer, op) {
+            let closed = matches!(
+                dist_error(&e),
+                Some(DistError::RankLost { detail, .. }) if detail.starts_with("connection closed")
+            );
+            return Err(if closed {
+                io_lost(
+                    peer,
+                    op,
+                    format!("connection closed after {} of {len} bytes", payload.len()),
+                )
+            } else {
+                e
+            });
+        }
+        payload.extend_from_slice(&chunk[..want]);
     }
+    Ok(payload)
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -1285,17 +1446,23 @@ enum Rejection {
     /// An authenticated rank of this job whose world description disagrees: refused (it fails fast)
     /// and reported if the world never completes.
     Split(String),
+    /// The run was cancelled while the hello was awaited.
+    Canceled,
 }
 
 /// The coordinator's check of one accepted connection's hello.
 fn admit(
     s: &mut TcpStream,
+    pace: &Pace,
     world: &World,
     peers: &[Option<TcpStream>],
 ) -> std::result::Result<usize, Rejection> {
     let stranger = |m: String| Rejection::Stranger(m);
-    let payload = recv_frame(s, 0, 0, usize::MAX, "rendezvous", HELLO_MAX)
-        .map_err(|e| stranger(format!("no valid hello: {e}")))?;
+    let payload = match recv_frame(s, pace, 0, 0, usize::MAX, "rendezvous", HELLO_MAX) {
+        Ok(p) => p,
+        Err(Error::Canceled) => return Err(Rejection::Canceled),
+        Err(e) => return Err(stranger(format!("no valid hello: {e}"))),
+    };
     let v: JsonValue =
         serde_json::from_slice(&payload).map_err(|e| stranger(format!("bad hello: {e}")))?;
     if v["magic"].as_u64() != Some(MAGIC) {
@@ -1332,12 +1499,28 @@ fn admit(
 
 impl TcpCollective {
     /// Join the job described by `world`: rank 0 listens on `master_addr:master_port` and accepts
-    /// until `world_size − 1` ranks joined (dropping every connection that is not a rank of this
-    /// job — see the type docs); every other rank connects (retrying until the timeout) and
-    /// presents its world description and [`World::token`].
-    pub fn connect(world: &World) -> Result<Self> {
+    /// until `world_size - 1` ranks joined (dropping every connection that is not a rank of this
+    /// job; see the type docs); every other rank connects (retrying) and presents its world
+    /// description and [`World::token`].
+    ///
+    /// The whole rendezvous (accepting, connect retries, the admission answer) is bounded by
+    /// [`World::rendezvous_bound`] and polls `cancel` at least every [`IO_SLICE`]: a cancelled
+    /// rendezvous is [`Error::Canceled`] at once (there is no training state to save yet). The
+    /// returned collective keeps `cancel` for every later wait ([`World::cancel_grace`]).
+    pub fn connect(world: &World, cancel: &CancelFlag) -> Result<Self> {
         assert_single_world(world).map_err(DistError::into_error)?;
-        let deadline = Instant::now() + world.timeout;
+        let bound = world.rendezvous_bound();
+        let deadline = Instant::now() + bound;
+        let rendezvous = Pace {
+            limit: bound,
+            cancel: cancel.clone(),
+            grace: Duration::ZERO,
+        };
+        let pace = Pace {
+            limit: world.timeout,
+            cancel: cancel.clone(),
+            grace: world.cancel_grace,
+        };
         let mut peers: Vec<Option<TcpStream>> = (0..world.world_size).map(|_| None).collect();
         let hello = json!({
             "magic": MAGIC,
@@ -1354,6 +1537,7 @@ impl TcpCollective {
                 world: world.clone(),
                 peers,
                 seq: 0,
+                pace,
             });
         }
         if world.rank == 0 {
@@ -1363,25 +1547,31 @@ impl TcpCollective {
             listener
                 .set_nonblocking(true)
                 .map_err(|e| io_lost(0, "rendezvous", e))?;
+            let hello_pace = Pace {
+                limit: bound.min(HELLO_WAIT),
+                ..rendezvous.clone()
+            };
             let mut joined = 1usize;
             let mut dropped: Vec<String> = Vec::new();
             let mut split: Vec<String> = Vec::new();
             while joined < world.world_size {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
                 match listener.accept() {
                     Ok((mut s, from)) => {
-                        let ready = s.set_nonblocking(false).is_ok()
-                            && configure(&s, world.timeout.min(HELLO_WAIT)).is_ok();
+                        let ready = s.set_nonblocking(false).is_ok() && configure(&s).is_ok();
                         let verdict = if ready {
-                            admit(&mut s, world, &peers)
+                            admit(&mut s, &hello_pace, world, &peers)
                         } else {
                             Err(Rejection::Stranger("socket setup failed".into()))
                         };
                         match verdict {
                             Ok(r) => {
-                                configure(&s, world.timeout)?;
                                 peers[r] = Some(s);
                                 joined += 1;
                             }
+                            Err(Rejection::Canceled) => return Err(Error::Canceled),
                             Err(Rejection::Stranger(why)) => {
                                 eprintln!(
                                     "iris distributed: rendezvous dropped a connection from \
@@ -1392,7 +1582,15 @@ impl TcpCollective {
                             Err(Rejection::Split(why)) => {
                                 let mut answer = REFUSED.to_vec();
                                 answer.extend_from_slice(why.as_bytes());
-                                let _ = send_frame(&mut s, 0, 0, &answer, usize::MAX, "rendezvous");
+                                let _ = send_frame(
+                                    &mut s,
+                                    &hello_pace,
+                                    0,
+                                    0,
+                                    &answer,
+                                    usize::MAX,
+                                    "rendezvous",
+                                );
                                 eprintln!("iris distributed: rendezvous refused {from}: {why}");
                                 split.push(why);
                             }
@@ -1406,10 +1604,8 @@ impl TcpCollective {
                             let missing: Vec<usize> = (1..world.world_size)
                                 .filter(|&r| peers[r].is_none())
                                 .collect();
-                            let mut detail = format!(
-                                "ranks {missing:?} never joined within {:?}",
-                                world.timeout
-                            );
+                            let mut detail =
+                                format!("ranks {missing:?} never joined within {bound:?}");
                             if !dropped.is_empty() {
                                 detail.push_str(&format!(
                                     "; dropped {} connection(s): {}",
@@ -1432,11 +1628,14 @@ impl TcpCollective {
             // Release every peer only once the whole world joined.
             for (r, peer) in peers.iter_mut().enumerate().skip(1) {
                 let s = peer.as_mut().expect("joined");
-                send_frame(s, 0, 0, ADMITTED, r, "rendezvous")?;
+                send_frame(s, &rendezvous, 0, 0, ADMITTED, r, "rendezvous")?;
             }
         } else {
             let addr = resolve(&world.master_addr, world.master_port)?;
             let mut stream = loop {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
                 match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
                     Ok(s) => break s,
                     Err(e) => {
@@ -1447,9 +1646,25 @@ impl TcpCollective {
                     }
                 }
             };
-            configure(&stream, world.timeout)?;
-            send_frame(&mut stream, 0, 0, hello.as_bytes(), 0, "rendezvous")?;
-            let answer = recv_frame(&mut stream, 0, 0, 0, "rendezvous", HELLO_MAX)?;
+            configure(&stream)?;
+            send_frame(
+                &mut stream,
+                &rendezvous,
+                0,
+                0,
+                hello.as_bytes(),
+                0,
+                "rendezvous",
+            )?;
+            // The admission answer comes once the whole world joined: bounded by what is left of
+            // the rendezvous.
+            let left = Pace {
+                limit: deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(IO_SLICE),
+                ..rendezvous.clone()
+            };
+            let answer = recv_frame(&mut stream, &left, 0, 0, 0, "rendezvous", HELLO_MAX)?;
             if answer != ADMITTED {
                 let why = answer
                     .strip_prefix(REFUSED)
@@ -1463,6 +1678,7 @@ impl TcpCollective {
             world: world.clone(),
             peers,
             seq: 0,
+            pace,
         })
     }
 
@@ -1490,15 +1706,16 @@ impl TcpCollective {
         if self.world.world_size == 1 {
             return Ok(answer(0, &[mine]));
         }
+        let pace = &self.pace;
         if self.world.rank != 0 {
             let s = self.peers[0].as_mut().expect("connected");
-            send_frame(s, kind, seq, &mine, 0, op)?;
-            return recv_frame(s, kind, seq, 0, op, answer_max);
+            send_frame(s, pace, kind, seq, &mine, 0, op)?;
+            return recv_frame(s, pace, kind, seq, 0, op, answer_max);
         }
         let mut payloads = vec![mine];
         for r in 1..self.world.world_size {
             let s = self.peers[r].as_mut().expect("connected");
-            payloads.push(recv_frame(s, kind, seq, r, op, member_max(r))?);
+            payloads.push(recv_frame(s, pace, kind, seq, r, op, member_max(r))?);
         }
         for r in 1..self.world.world_size {
             check(r, &payloads).map_err(|got| {
@@ -1513,7 +1730,7 @@ impl TcpCollective {
         for r in 1..self.world.world_size {
             let out = answer(r, &payloads);
             let s = self.peers[r].as_mut().expect("connected");
-            send_frame(s, kind, seq, &out, r, op)?;
+            send_frame(s, &self.pace, kind, seq, &out, r, op)?;
         }
         Ok(answer(0, &payloads))
     }
@@ -1568,14 +1785,98 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| io_lost(0, "rendezvous resolve", format!("{host} has no address")))
 }
 
-fn configure(s: &TcpStream, timeout: Duration) -> Result<()> {
+/// Every transport socket: no Nagle delay, blocking calls sliced to [`IO_SLICE`] (the waits poll
+/// their bound and the cancel flag between slices), and TCP keepalive.
+fn configure(s: &TcpStream) -> Result<()> {
     s.set_nodelay(true)
         .map_err(|e| io_lost(0, "configure", e))?;
-    s.set_read_timeout(Some(timeout))
+    s.set_read_timeout(Some(IO_SLICE))
         .map_err(|e| io_lost(0, "configure", e))?;
-    s.set_write_timeout(Some(timeout))
+    s.set_write_timeout(Some(IO_SLICE))
         .map_err(|e| io_lost(0, "configure", e))?;
-    Ok(())
+    keepalive::enable(s).map_err(|e| io_lost(0, "configure keepalive", e))
+}
+
+/// `SO_KEEPALIVE` with the probe timing of [`KEEPALIVE_IDLE_SECS`] / [`KEEPALIVE_INTERVAL_SECS`] /
+/// [`KEEPALIVE_PROBES`] (std exposes none of it).
+mod keepalive {
+    use super::{KEEPALIVE_IDLE_SECS, KEEPALIVE_INTERVAL_SECS, KEEPALIVE_PROBES};
+    use std::net::TcpStream;
+
+    #[cfg(unix)]
+    pub fn enable(s: &TcpStream) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = s.as_raw_fd();
+        let set = |level: libc::c_int, name: libc::c_int, v: u32| -> std::io::Result<()> {
+            let v = v as libc::c_int;
+            // SAFETY: a valid socket descriptor and a pointer/length to one live c_int.
+            let r = unsafe {
+                libc::setsockopt(
+                    fd,
+                    level,
+                    name,
+                    (&v as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if r == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+        #[cfg(target_vendor = "apple")]
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, KEEPALIVE_IDLE_SECS)?;
+        #[cfg(not(target_vendor = "apple"))]
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
+        set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_INTERVAL_SECS,
+        )?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn enable(s: &TcpStream) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, IPPROTO_TCP, SOCKET, SOL_SOCKET, SO_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
+            TCP_KEEPINTVL,
+        };
+        let sock = s.as_raw_socket() as SOCKET;
+        let set = |level: i32, name: i32, v: u32| -> std::io::Result<()> {
+            let v = v as i32;
+            // SAFETY: a valid socket handle and a pointer/length to one live i32 (Winsock's DWORD
+            // / BOOL options).
+            let r = unsafe {
+                setsockopt(
+                    sock,
+                    level,
+                    name,
+                    (&v as *const i32).cast(),
+                    std::mem::size_of::<i32>() as i32,
+                )
+            };
+            if r == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        set(SOL_SOCKET, SO_KEEPALIVE, 1)?;
+        set(IPPROTO_TCP, TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)?;
+        set(IPPROTO_TCP, TCP_KEEPINTVL, KEEPALIVE_INTERVAL_SECS)?;
+        set(IPPROTO_TCP, TCP_KEEPCNT, KEEPALIVE_PROBES)?;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn enable(_: &TcpStream) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Collective for TcpCollective {
@@ -1787,8 +2088,19 @@ mod tests {
             transport: "tcp".into(),
             hostfile: None,
             timeout: Duration::from_secs(10),
+            rendezvous_timeout: Duration::from_secs(10),
+            cancel_grace: Duration::from_secs(2),
             token: None,
             share_device: false,
+        }
+    }
+
+    /// A raw-frame test's wait: 5 s, never cancelled.
+    fn test_pace() -> Pace {
+        Pace {
+            limit: Duration::from_secs(5),
+            cancel: CancelFlag::new(),
+            grace: Duration::ZERO,
         }
     }
 
@@ -1890,7 +2202,8 @@ mod tests {
         let handles: Vec<_> = (0..3)
             .map(|r| {
                 std::thread::spawn(move || {
-                    let mut c = TcpCollective::connect(&world(r, 3, port)).unwrap();
+                    let mut c =
+                        TcpCollective::connect(&world(r, 3, port), &CancelFlag::new()).unwrap();
                     let mut v = vec![r as f32 + 1.0, 10.0 * r as f32];
                     c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(3))
                         .unwrap();
@@ -1936,10 +2249,10 @@ mod tests {
         w1.rank = 1;
         w1.local_rank = 1;
         let peer = std::thread::spawn(move || {
-            let c = TcpCollective::connect(&w1).unwrap();
+            let c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
             drop(c); // rank 1 dies right after the rendezvous
         });
-        let mut c = TcpCollective::connect(&w0).unwrap();
+        let mut c = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap();
         peer.join().unwrap();
         let mut v = vec![1.0f32];
         let e = c
@@ -1953,7 +2266,7 @@ mod tests {
         let port = free_port();
         let mut w = world(0, 2, port);
         w.timeout = Duration::from_millis(300);
-        let e = TcpCollective::connect(&w).unwrap_err();
+        let e = TcpCollective::connect(&w, &CancelFlag::new()).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::RankLost { op, .. }) if op == "rendezvous")
         );
@@ -1992,8 +2305,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         });
         let (mut s, _) = l.accept().unwrap();
-        configure(&s, Duration::from_secs(5)).unwrap();
-        let e = recv_frame(&mut s, 0, 0, 1, "rendezvous", HELLO_MAX).unwrap_err();
+        configure(&s).unwrap();
+        let e = recv_frame(&mut s, &test_pace(), 0, 0, 1, "rendezvous", HELLO_MAX).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::Desync { got, .. }) if got.contains("18446744073709551615-byte")),
             "{e}"
@@ -2012,9 +2325,9 @@ mod tests {
             s.write_all(b"partial").unwrap();
         });
         let (mut s, _) = l.accept().unwrap();
-        configure(&s, Duration::from_secs(5)).unwrap();
+        configure(&s).unwrap();
         sender.join().unwrap();
-        let e = recv_frame(&mut s, 0, 0, 1, "x", HELLO_MAX).unwrap_err();
+        let e = recv_frame(&mut s, &test_pace(), 0, 0, 1, "x", HELLO_MAX).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::RankLost { .. })),
             "{e}"
@@ -2028,7 +2341,7 @@ mod tests {
         w.local_rank = r;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(after));
-            let mut c = TcpCollective::connect(&w).unwrap();
+            let mut c = TcpCollective::connect(&w, &CancelFlag::new()).unwrap();
             let mut v = vec![r as f32];
             c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(3))
                 .unwrap();
@@ -2049,18 +2362,38 @@ mod tests {
             g.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
             drop(dial(port));
             let mut t = dial(port);
-            send_frame(&mut t, 0, 0, &hello_of(&w_bad, 1, "guess"), 0, "x").unwrap();
-            let wrong_token_dropped = recv_frame(&mut t, 0, 0, 0, "x", HELLO_MAX).is_err();
+            send_frame(
+                &mut t,
+                &test_pace(),
+                0,
+                0,
+                &hello_of(&w_bad, 1, "guess"),
+                0,
+                "x",
+            )
+            .unwrap();
+            let wrong_token_dropped =
+                recv_frame(&mut t, &test_pace(), 0, 0, 0, "x", HELLO_MAX).is_err();
             // then, after the real rank 1 joined, a duplicate rank 1 with the right token
             std::thread::sleep(Duration::from_millis(600));
             let mut dup = dial(port);
-            send_frame(&mut dup, 0, 0, &hello_of(&w_bad, 1, "s3cret"), 0, "x").unwrap();
-            let duplicate_dropped = recv_frame(&mut dup, 0, 0, 0, "x", HELLO_MAX).is_err();
+            send_frame(
+                &mut dup,
+                &test_pace(),
+                0,
+                0,
+                &hello_of(&w_bad, 1, "s3cret"),
+                0,
+                "x",
+            )
+            .unwrap();
+            let duplicate_dropped =
+                recv_frame(&mut dup, &test_pace(), 0, 0, 0, "x", HELLO_MAX).is_err();
             (g, wrong_token_dropped, duplicate_dropped)
         });
         let one = delayed_rank(&w0, 1, 300);
         let two = delayed_rank(&w0, 2, 1200);
-        let mut c = TcpCollective::connect(&w0).unwrap();
+        let mut c = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap();
         let mut v = vec![0.0f32];
         c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &Partition::whole(3))
             .unwrap();
@@ -2087,10 +2420,11 @@ mod tests {
         impostor.token = Some(DistToken("wrong".into()));
         let mut real = impostor.clone();
         real.token = Some(DistToken("right".into()));
-        let first = std::thread::spawn(move || TcpCollective::connect(&impostor));
+        let first =
+            std::thread::spawn(move || TcpCollective::connect(&impostor, &CancelFlag::new()));
         std::thread::sleep(Duration::from_millis(300));
-        let second = std::thread::spawn(move || TcpCollective::connect(&real));
-        let c0 = TcpCollective::connect(&w0);
+        let second = std::thread::spawn(move || TcpCollective::connect(&real, &CancelFlag::new()));
+        let c0 = TcpCollective::connect(&w0, &CancelFlag::new());
         assert!(
             c0.is_ok(),
             "the real rank 1 joins after the impostor was dropped"
@@ -2110,8 +2444,8 @@ mod tests {
         impostor.rank = 1;
         impostor.local_rank = 1;
         impostor.token = None;
-        let t = std::thread::spawn(move || TcpCollective::connect(&impostor));
-        let e = TcpCollective::connect(&w0).unwrap_err();
+        let t = std::thread::spawn(move || TcpCollective::connect(&impostor, &CancelFlag::new()));
+        let e = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::RankLost { detail, .. }) if detail.contains("token")),
             "{e}"
@@ -2156,10 +2490,10 @@ mod tests {
             w1.rank = 1;
             w1.local_rank = 1;
             let peer = std::thread::spawn(move || {
-                let mut c = TcpCollective::connect(&w1).unwrap();
+                let mut c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
                 case(&mut c, 1)
             });
-            let mut c = TcpCollective::connect(&w0).unwrap();
+            let mut c = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap();
             let e = case(&mut c, 0).unwrap_err();
             assert!(
                 matches!(dist_error(&e), Some(DistError::Desync { rank: 1, .. })),
@@ -2177,10 +2511,10 @@ mod tests {
         w1.rank = 1;
         w1.local_rank = 1;
         let peer = std::thread::spawn(move || {
-            let mut c = TcpCollective::connect(&w1).unwrap();
+            let mut c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
             let _ = c.all_gather(&[1.0, 2.0], &Partition::whole(2));
         });
-        let mut c = TcpCollective::connect(&w0).unwrap();
+        let mut c = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap();
         let e = c.all_gather(&[1.0], &Partition::whole(2)).unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::Desync { rank: 1, .. })),
@@ -2195,10 +2529,10 @@ mod tests {
         w1.rank = 1;
         w1.local_rank = 1;
         let peer = std::thread::spawn(move || {
-            let mut c = TcpCollective::connect(&w1).unwrap();
+            let mut c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
             let _ = c.barrier("export");
         });
-        let mut c = TcpCollective::connect(&w0).unwrap();
+        let mut c = TcpCollective::connect(&w0, &CancelFlag::new()).unwrap();
         let e = c.barrier("checkpoint").unwrap_err();
         assert!(
             matches!(dist_error(&e), Some(DistError::Desync { .. })),
@@ -2227,7 +2561,8 @@ mod tests {
         let handles: Vec<_> = (0..4)
             .map(|r| {
                 std::thread::spawn(move || {
-                    let mut c = TcpCollective::connect(&world(r, 4, port)).unwrap();
+                    let mut c =
+                        TcpCollective::connect(&world(r, 4, port), &CancelFlag::new()).unwrap();
                     let groups = Partition(vec![0, 1, 0, 1]);
                     let mut v = vec![r as f32; if r % 2 == 0 { 3 } else { 2 }];
                     c.all_reduce(&mut v, ReduceOp::Sum, Precision::Fp32, &groups)
@@ -2240,5 +2575,221 @@ mod tests {
         assert_eq!(out[1].as_ref().unwrap(), &vec![4.0; 2]);
         assert_eq!(out[2].as_ref().unwrap(), &vec![2.0; 3]);
         assert_eq!(out[3].as_ref().unwrap(), &vec![4.0; 2]);
+    }
+
+    // ---- sc-25690: cancellable, separately bounded rendezvous; sliced waits; keepalive ----
+
+    fn cancelled() -> CancelFlag {
+        let c = CancelFlag::new();
+        c.cancel();
+        c
+    }
+
+    /// A cancelled run never sits out the rendezvous: neither the coordinator waiting for ranks
+    /// nor a rank retrying its connect. The bounds are long enough that only an honoured cancel
+    /// can end the wait as `Canceled` (an ignored one ends as `RankLost` at the bound).
+    #[test]
+    fn a_cancelled_rendezvous_is_typed_canceled_on_every_side() {
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.rendezvous_timeout = Duration::from_secs(5);
+        let e = TcpCollective::connect(&w0, &cancelled()).unwrap_err();
+        assert!(matches!(e, Error::Canceled), "coordinator: {e}");
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let e = TcpCollective::connect(&w1, &cancelled()).unwrap_err();
+        assert!(matches!(e, Error::Canceled), "connecting rank: {e}");
+        // A rank that joined and waits for the rest of the world to be admitted.
+        let port = free_port();
+        let mut w0 = world(0, 3, port);
+        w0.rendezvous_timeout = Duration::from_secs(5);
+        let coordinator = {
+            let w0 = w0.clone();
+            std::thread::spawn(move || TcpCollective::connect(&w0, &CancelFlag::new()))
+        };
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let flag = CancelFlag::new();
+        let trip = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                flag.cancel();
+            })
+        };
+        let e = TcpCollective::connect(&w1, &flag).unwrap_err();
+        assert!(matches!(e, Error::Canceled), "admitted-wait rank: {e}");
+        trip.join().unwrap();
+        // rank 2 never came: the coordinator still ends typed at its own bound
+        let e = coordinator.join().unwrap().unwrap_err();
+        assert!(dist_error(&e).is_some(), "{e}");
+    }
+
+    /// The coordinator's wait for one accepted connection's hello honours a cancel too.
+    #[test]
+    fn a_cancel_during_a_silent_hello_is_not_a_dropped_stranger() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let silent = std::thread::spawn(move || {
+            let s = dial(port);
+            std::thread::sleep(Duration::from_millis(800));
+            drop(s);
+        });
+        let (mut s, _) = l.accept().unwrap();
+        configure(&s).unwrap();
+        let pace = Pace {
+            limit: Duration::from_secs(5),
+            cancel: cancelled(),
+            grace: Duration::ZERO,
+        };
+        let w = world(0, 2, port);
+        let peers: Vec<Option<TcpStream>> = vec![None, None];
+        assert!(matches!(
+            admit(&mut s, &pace, &w, &peers),
+            Err(Rejection::Canceled)
+        ));
+        silent.join().unwrap();
+    }
+
+    /// `dist` options naming the rendezvous bound and the cancel grace (seconds).
+    fn world_options(rendezvous: u64, grace: u64) -> JsonValue {
+        json!({"world": {"rendezvous_timeout_secs": rendezvous, "cancel_grace_secs": grace}})
+    }
+
+    /// The rendezvous has its own bound: a rank that never starts is reported at
+    /// `rendezvous_timeout`, not after the (5400 s by default) collective timeout.
+    #[test]
+    fn the_rendezvous_is_bounded_separately_from_the_collective_timeout() {
+        let port = free_port();
+        let mut w = world(0, 2, port);
+        w.timeout = Duration::from_secs(3600);
+        w.rendezvous_timeout = Duration::from_millis(400);
+        let e = TcpCollective::connect(&w, &CancelFlag::new()).unwrap_err();
+        assert!(
+            matches!(dist_error(&e), Some(DistError::RankLost { op, detail, .. })
+                if op == "rendezvous" && detail.contains("400ms")),
+            "{e}"
+        );
+        // configured constants, read as their printed values (no clock is involved)
+        assert_eq!(format!("{:?}", World::single().rendezvous_timeout), "600s");
+        let cfg = world_options(30, 0);
+        let parsed = parse_dist(Some(&cfg), false, true).unwrap();
+        assert_eq!(format!("{:?}", parsed.world.rendezvous_timeout), "30s");
+        assert_eq!(format!("{:?}", parsed.world.cancel_grace), "0ns");
+        let zero = world_options(0, 120);
+        assert!(parse_dist(Some(&zero), false, true).is_err());
+    }
+
+    /// A cancel pending in a collective wait lets the peers arrive within the grace (the
+    /// cooperative cancel still completes its collective agreement), and ends a wait on a peer
+    /// that never answers as `Canceled` once the grace passed: never the 5400 s bound.
+    #[test]
+    fn a_pending_cancel_ends_a_stalled_collective_after_its_grace() {
+        // grace honoured: the peer arrives late but within it
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.timeout = Duration::from_secs(3600);
+        w0.cancel_grace = Duration::from_secs(30);
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let peer = std::thread::spawn(move || {
+            let mut c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            let mut v = [1.0f32];
+            c.all_reduce(&mut v, ReduceOp::Max, Precision::Fp32, &Partition::whole(2))
+                .map(|_| v[0])
+        });
+        let flag = CancelFlag::new();
+        let mut c = TcpCollective::connect(&w0, &flag).unwrap();
+        flag.cancel();
+        let mut v = [0.0f32];
+        c.all_reduce(&mut v, ReduceOp::Max, Precision::Fp32, &Partition::whole(2))
+            .unwrap();
+        assert_eq!(v, [1.0]);
+        assert_eq!(peer.join().unwrap().unwrap(), 1.0);
+        // grace passed: a peer that never answers
+        let port = free_port();
+        let mut w0 = world(0, 2, port);
+        w0.timeout = Duration::from_secs(3600);
+        w0.cancel_grace = Duration::from_millis(300);
+        let mut w1 = w0.clone();
+        w1.rank = 1;
+        w1.local_rank = 1;
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let c = TcpCollective::connect(&w1, &CancelFlag::new()).unwrap();
+            let _ = stop_rx.recv(); // alive, connected, silent
+            drop(c);
+        });
+        let flag = CancelFlag::new();
+        let mut c = TcpCollective::connect(&w0, &flag).unwrap();
+        flag.cancel();
+        let e = c.barrier("stalled").unwrap_err();
+        assert!(matches!(e, Error::Canceled), "{e}");
+        stop_tx.send(()).unwrap();
+        peer.join().unwrap();
+    }
+
+    /// A frame whose bytes arrive across several socket slices is reassembled whole: the sliced
+    /// wait keeps what arrived before a slice expired.
+    #[test]
+    fn a_frame_split_across_slices_is_read_whole() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut s = dial(port);
+            let mut frame = vec![OP_BARRIER];
+            frame.extend(7u64.to_le_bytes());
+            frame.extend(5u64.to_le_bytes());
+            frame.extend(b"hello");
+            for piece in [&frame[..5], &frame[5..19], &frame[19..]] {
+                s.write_all(piece).unwrap();
+                s.flush().unwrap();
+                std::thread::sleep(IO_SLICE * 3);
+            }
+        });
+        let (mut s, _) = l.accept().unwrap();
+        configure(&s).unwrap();
+        let got = recv_frame(&mut s, &test_pace(), OP_BARRIER, 7, 1, "x", 64).unwrap();
+        assert_eq!(got, b"hello");
+        sender.join().unwrap();
+    }
+
+    /// Every transport socket carries TCP keepalive, so a peer that vanishes without a reset is
+    /// detected by the kernel's probes rather than the collective timeout.
+    #[cfg(unix)]
+    #[test]
+    fn transport_sockets_carry_tcp_keepalive() {
+        use std::os::fd::AsRawFd;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        configure(&s).unwrap();
+        let get = |level: libc::c_int, name: libc::c_int| -> libc::c_int {
+            let mut v: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a valid socket and a pointer/length to one live c_int.
+            let r = unsafe {
+                libc::getsockopt(
+                    s.as_raw_fd(),
+                    level,
+                    name,
+                    (&mut v as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(r, 0);
+            v
+        };
+        assert_ne!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
+        // probe count and interval (seconds) as configured: 6 probes, 10 apart
+        let probes = (
+            get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+            get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+        );
+        assert_eq!(probes, (6, 10));
     }
 }
