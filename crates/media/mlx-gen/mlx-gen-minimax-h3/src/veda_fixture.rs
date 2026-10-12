@@ -350,8 +350,8 @@ fn native_veda_controls_preserve_carriers_and_capture_published_schedules() {
         let report = crate::veda::ReportSink::default();
         model.prepare_veda_fixture(&request, report.clone(), false);
         let video = Array::from_slice(
-            &vec![0.02f32; layout.video_indices().len() * 64],
-            &[1, layout.video_indices().len() as i32, 64],
+            &vec![0.02f32; layout.video_indices().len() * 96],
+            &[1, layout.video_indices().len() as i32, 96],
         );
         let audio = Array::from_slice(
             &vec![0.03f32; layout.audio_indices().len() * 32],

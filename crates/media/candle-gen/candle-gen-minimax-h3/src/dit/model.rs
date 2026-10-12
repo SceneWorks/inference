@@ -817,7 +817,7 @@ mod veda_controls_tests {
             return PackedLayout::build(
                 geometry,
                 [1, 2, 2],
-                &[TEXT_TAG; 6],
+                &[TEXT_TAG; 5],
                 channels,
                 &anchors,
                 &dev,
@@ -848,7 +848,7 @@ mod veda_controls_tests {
                 num_audio_latents: 3,
             },
         ];
-        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 6], channels, &refs, &dev)
+        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, &dev)
             .unwrap()
     }
     fn run(
@@ -910,7 +910,7 @@ mod veda_controls_tests {
             Some(std::path::Path::new("/managed/predictor.safetensors")),
             report.clone(),
         );
-        let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 64), &device).unwrap();
+        let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 96), &device).unwrap();
         let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
         let (outv, outa) = denoise_av(
             &mut model,

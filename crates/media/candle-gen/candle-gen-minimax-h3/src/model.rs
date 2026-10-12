@@ -2005,6 +2005,67 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn sparse_requests_preserve_native_task_tier_and_adapter_staging() {
+        use candle_gen::gen_core::{AdapterKind, VedaRequest};
+        for (bits, quant, expected) in [
+            (None, None, None),
+            (Some(4), Some(Quant::Q4), Some(crate::tier::Tier::Q4)),
+            (Some(8), Some(Quant::Q8), Some(crate::tier::Tier::Q8)),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = staged_root_with_reference(&tmp);
+            stage_component(&root, "FL2VA");
+            stage_component_at(&root.join(BASE_DIT_PARTITION), bits);
+            stage_component_at(&root.join(REFERENCE_DIT_PARTITION), bits);
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            spec.quantize = quant;
+            let missing = tmp.path().join("missing-predictor.safetensors");
+            spec.components.insert(
+                crate::veda::COMPONENT.into(),
+                WeightsSource::File(missing.clone()),
+            );
+            let turbo = tmp.path().join("turbo.safetensors");
+            let style = tmp.path().join("style.safetensors");
+            std::fs::write(&turbo, [0u8; 8]).unwrap();
+            std::fs::write(&style, [0u8; 8]).unwrap();
+            spec.adapters = vec![
+                adapter_spec(turbo, AdapterKind::Lora, None, None),
+                adapter_spec(style, AdapterKind::Lora, None, None),
+            ];
+            let model = MiniMaxH3::load(&spec).unwrap();
+            assert_eq!(model.requested_tier(), expected);
+            assert_eq!(model.veda_component.as_ref(), Some(&missing));
+            assert_eq!(model.dtype, DType::BF16);
+            assert_eq!(model.adapters.len(), spec.adapters.len());
+            for (actual, expected) in model.adapters.iter().zip(&spec.adapters) {
+                assert_eq!(actual.path, expected.path);
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.scale, expected.scale);
+                assert_eq!(actual.pass_scales, expected.pass_scales);
+                assert_eq!(actual.moe_expert, expected.moe_expert);
+            }
+            let mut request = request(1344, 768);
+            request.veda = Some(VedaRequest {
+                enabled: true,
+                ..Default::default()
+            });
+            model.validate(&request).unwrap();
+            assert_eq!(model.resolve_task(&request).unwrap().0, MiniMaxH3Task::T2va);
+            assert!(
+                !missing.exists(),
+                "offload/load must not fetch or require optional predictor"
+            );
+            assert_eq!(
+                model
+                    .veda_execution_report()
+                    .unwrap()
+                    .predictor_load_attempts,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn malformed_veda_controls_fail_at_native_request_boundary() {
         let generator = validator();
         for enabled in [false, true] {
