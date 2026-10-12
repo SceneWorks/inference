@@ -82,3 +82,11 @@ Metal admission. Native kernel self-tests and real-weight media acceptance are
 separate gates, owned by their kernel and terminal stories. No output tolerance,
 CPU compile check or shared-function identity certifies an unexecuted device
 mask test.
+
+The CUDA descriptor also belongs to the shared `candle_quant_kernels::NVRTC_SOURCES`
+registry. Its workspace-wide CPU guard lives in `candle-llm`, so a provider-only
+test run does not check that registration. After adding or changing a kernel
+descriptor, run `cargo test --locked -p candle-llm --lib nvrtc_source_tests` as
+well as its owning package tests. The existing CUDA all-kernels check then covers
+Veda's entry points; registry success alone does not establish device compilation
+or zero-local-memory acceptance.

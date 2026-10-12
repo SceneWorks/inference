@@ -104,7 +104,7 @@ pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSour
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
 /// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
-/// decode attention, the indexed MoE GEMV, and YuE2 VAE convolutions.
+/// decode attention, the indexed MoE GEMV, YuE2 VAE convolutions, and Veda sparse attention.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -117,6 +117,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     DECODE_ATTENTION_SRC,
     MOE_GEMV_SRC,
     yue2_stable_conv::YUE2_STABLE_CONV_SRC,
+    veda_int8::SOURCE,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 

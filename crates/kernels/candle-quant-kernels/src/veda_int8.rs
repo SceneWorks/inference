@@ -5,12 +5,12 @@
 use crate::nvrtc::KernelSource;
 use candle_core::{DType, Device, Result, Tensor};
 
-pub const KERNEL: &str = "cuda-veda-sage-int8-pointer-v1";
 pub const SOURCE: KernelSource = KernelSource {
-    name: KERNEL,
+    name: "cuda-veda-sage-int8-pointer-v1",
     src: include_str!("veda_int8.cu"),
     cc_floor: (8, 0),
 };
+pub const KERNEL: &str = SOURCE.name;
 pub const LOG2E: f32 = std::f32::consts::LOG2_E;
 
 /// CSR retained 64-row blocks, expanded from frozen 128-token selected tiles.
