@@ -23,10 +23,19 @@ probe() { # $1 task, $2 size, $3 ac, $4 cache
   local name="$1-$2-ac-$3-cache-$4" log free_pct free_gb
   names+=("$name")
   log="$IRIS_OUT/$name.log"
-  free_pct="$(/usr/bin/memory_pressure -Q 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')"
-  free_gb=$(( mem_bytes / 1000000000 * ${free_pct:-0} / 100 ))
+  # The previous probe's ~100 GB (a guard-stopped one especially) takes the kernel a while to
+  # reclaim, so the admission waits up to 3 minutes for the box to settle before refusing.
+  local waited=0
+  while :; do
+    free_pct="$(/usr/bin/memory_pressure -Q 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')"
+    free_gb=$(( mem_bytes / 1000000000 * ${free_pct:-0} / 100 ))
+    if [[ -n "$free_pct" && "$free_gb" -ge 120 ]] || (( waited >= 180 )); then break; fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  echo "admission for $name: ${free_gb} GB free after waiting ${waited}s"
   if [[ -z "$free_pct" || "$free_gb" -lt 120 ]]; then
-    echo "[[IRIS_MEMORY_PROBE_MLX]] $name NOT RUN: ${free_gb} GB free (< 120 GB)" | tee -a "$IRIS_OUT/summary.txt"
+    echo "[[IRIS_MEMORY_PROBE_MLX]] $name NOT RUN: ${free_gb} GB free (< 120 GB) after waiting ${waited}s" | tee -a "$IRIS_OUT/summary.txt"
     failed=1
     return
   fi
@@ -44,10 +53,11 @@ for cache in default none; do
   probe generation 1024 full "$cache"
   probe generation 1024 none "$cache"
   probe depth 1024 none "$cache"
-  probe restoration 1024 none "$cache"
   probe generation 512 none "$cache"
   probe depth 512 none "$cache"
   probe restoration 512 none "$cache"
+  # Last in each pass: the one shape the guard stops.
+  probe restoration 1024 none "$cache"
 done
 cat "$IRIS_OUT/summary.txt"
 python3.12 scripts/ci/iris_memory_probe_row.py expect --backend mlx \

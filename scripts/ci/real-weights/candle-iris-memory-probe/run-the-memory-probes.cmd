@@ -22,7 +22,7 @@ set "IRIS_PROBE_CARD="
 set "IRIS_PROBE_FREE=0"
 for /f "tokens=1,2 delims=, " %%A in ('nvidia-smi --query-gpu^=index^,memory.free --format^=csv^,noheader^,nounits') do call :consider_card %%A %%B
 if not defined IRIS_PROBE_CARD goto :no_card
-"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.pycard --inventory "%IRIS_OUT%\cuda-device-inventory-before-probes.csv" --card %IRIS_PROBE_CARD% --summary "%IRIS_SUMMARY%"
+"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.py card --inventory "%IRIS_OUT%\cuda-device-inventory-before-probes.csv" --card %IRIS_PROBE_CARD% --summary "%IRIS_SUMMARY%"
 if errorlevel 1 exit /b 1
 set "CUDA_VISIBLE_DEVICES=%IRIS_PROBE_CARD%"
 set "TMPDIR=%RUNNER_TEMP%"
@@ -37,7 +37,7 @@ call :probe generation 512 none
 call :probe depth 512 none
 call :probe restoration 512 none
 type "%IRIS_SUMMARY%"
-"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.pyexpect --backend cuda --summary "%IRIS_SUMMARY%" generation-1024-ac-full generation-1024-ac-none depth-1024-ac-none restoration-1024-ac-none generation-512-ac-none depth-512-ac-none restoration-512-ac-none
+"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.py expect --backend cuda --summary "%IRIS_SUMMARY%" generation-1024-ac-full generation-1024-ac-none depth-1024-ac-none restoration-1024-ac-none generation-512-ac-none depth-512-ac-none restoration-512-ac-none
 if errorlevel 1 set "IRIS_FAILED=1"
 exit /b %IRIS_FAILED%
 
@@ -68,6 +68,6 @@ type "%snapshot%"
 cargo test --locked --release -p candle-gen-iris --features cuda --test integration train_memory_probe::real_training_memory_probe -- --ignored --exact --nocapture --test-threads 1 > "%log%" 2>&1
 set "rc=%ERRORLEVEL%"
 type "%log%"
-"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.pycuda --name "%name%" --log "%log%" --rc %rc% --card-snapshot "%snapshot%" --card %IRIS_PROBE_CARD% --summary "%IRIS_SUMMARY%"
+"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.py cuda --name "%name%" --log "%log%" --rc %rc% --card-snapshot "%snapshot%" --card %IRIS_PROBE_CARD% --summary "%IRIS_SUMMARY%"
 if errorlevel 1 set "IRIS_FAILED=1"
 exit /b 0
