@@ -297,17 +297,18 @@ pub fn load_scheduler_config(root: &Path) -> Result<SchedulerConfig> {
     }
 }
 
-/// One optional snapshot JSON: `Ok(None)` when the file is absent, a named error when it is
-/// present and unreadable.
-fn read_optional_json(path: &Path) -> Result<Option<serde_json::Value>> {
+/// One optional snapshot JSON: `Ok(None)` when the file is absent, a named error — under the id
+/// that asked, `variant`'s — when it is present and unreadable or unparsable.
+fn read_optional_json(variant: Variant, path: &Path) -> Result<Option<serde_json::Value>> {
     if !path.is_file() {
         return Ok(None);
     }
+    let id = variant.model_id();
     let bytes = std::fs::read(path)
-        .map_err(|e| Error::Msg(format!("qwen_image_2_1: read {}: {e}", path.display())))?;
+        .map_err(|e| Error::Msg(format!("{id}: read {}: {e}", path.display())))?;
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|e| Error::Msg(format!("qwen_image_2_1: parse {}: {e}", path.display())))
+        .map_err(|e| Error::Msg(format!("{id}: parse {}: {e}", path.display())))
 }
 
 /// The Turbo schedule a snapshot carries (sc-25901): `<root>/model_index.json`'s `sample_sigmas`
@@ -316,10 +317,13 @@ fn read_optional_json(path: &Path) -> Result<Option<serde_json::Value>> {
 /// [`TurboSchedule::from_values`] raises, naming the id it does load under. An absent scheduler
 /// config reads as diffusers' own defaults, which are the static scheduler.
 pub fn load_turbo_schedule(root: &Path) -> Result<TurboSchedule> {
-    let model_index =
-        read_optional_json(&root.join("model_index.json"))?.unwrap_or(serde_json::Value::Null);
-    let scheduler = read_optional_json(&root.join("scheduler").join("scheduler_config.json"))?
-        .unwrap_or_else(|| serde_json::json!({}));
+    let model_index = read_optional_json(Variant::Turbo, &root.join("model_index.json"))?
+        .unwrap_or(serde_json::Value::Null);
+    let scheduler = read_optional_json(
+        Variant::Turbo,
+        &root.join("scheduler").join("scheduler_config.json"),
+    )?
+    .unwrap_or_else(|| serde_json::json!({}));
     TurboSchedule::from_values(&model_index, &scheduler)
 }
 
@@ -331,13 +335,17 @@ pub fn load_turbo_schedule(root: &Path) -> Result<TurboSchedule> {
 /// The discriminator is what the snapshot itself carries — `model_index.json`'s `sample_sigmas`,
 /// which only the Turbo repository saves:
 ///
-/// * [`Variant::Base`] refuses a snapshot that saves `sample_sigmas`;
+/// * [`Variant::Base`] refuses a snapshot that saves `sample_sigmas` — **any** present, non-null
+///   value, a malformed list included: a snapshot that claims a saved schedule is not a base
+///   snapshot, and validating the list is the Turbo id's job. A `model_index.json` that is present
+///   but does not parse is refused too (it cannot be shown not to be a Turbo snapshot), which is
+///   the one thing the base id reads from that file;
 /// * [`Variant::Turbo`] refuses one that does not, and one whose scheduler config contradicts the
 ///   saved list ([`load_turbo_schedule`]).
 pub fn check_snapshot_variant(variant: Variant, root: &Path) -> Result<()> {
     match variant {
         Variant::Base => {
-            let saves_sigmas = read_optional_json(&root.join("model_index.json"))?
+            let saves_sigmas = read_optional_json(Variant::Base, &root.join("model_index.json"))?
                 .is_some_and(|index| index.get("sample_sigmas").is_some_and(|v| !v.is_null()));
             if saves_sigmas {
                 return Err(Error::Unsupported(format!(

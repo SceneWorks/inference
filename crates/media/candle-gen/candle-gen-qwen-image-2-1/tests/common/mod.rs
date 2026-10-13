@@ -181,9 +181,8 @@ pub const TURBO_SAMPLE_SIGMAS: [f64; 8] = [
 /// The transformer and the tokenizer are byte copies. Dropping the returned guard deletes the
 /// tree.
 pub fn turbo_snapshot_with(sigmas: &[f64]) -> tempfile::TempDir {
-    let temp = tempfile::tempdir().expect("a temp dir for the Turbo fixture");
+    let temp = copy_of_tiny_snapshot();
     let root = temp.path();
-    copy_tree(&tiny_snapshot(), root);
 
     let index_path = root.join("model_index.json");
     let mut index = read_json(&index_path);
@@ -221,6 +220,13 @@ pub fn turbo_snapshot_with(sigmas: &[f64]) -> tempfile::TempDir {
 /// [`turbo_snapshot_with`] the released eight sigmas.
 pub fn turbo_snapshot() -> tempfile::TempDir {
     turbo_snapshot_with(&TURBO_SAMPLE_SIGMAS)
+}
+
+/// A byte copy of the committed (base) miniature snapshot in a temp dir, for tests that edit one.
+pub fn copy_of_tiny_snapshot() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("a temp dir for a snapshot copy");
+    copy_tree(&tiny_snapshot(), temp.path());
+    temp
 }
 
 fn copy_tree(from: &Path, to: &Path) {

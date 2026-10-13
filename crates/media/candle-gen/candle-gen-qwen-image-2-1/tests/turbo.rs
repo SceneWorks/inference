@@ -31,8 +31,8 @@ use candle_gen_qwen_image_2_1::{
 };
 
 use crate::common::{
-    assert_close, read_json, safetensors_files, stored_dtypes, tiny_snapshot, turbo_snapshot,
-    turbo_snapshot_with, TURBO_SAMPLE_SIGMAS,
+    assert_close, copy_of_tiny_snapshot, read_json, safetensors_files, stored_dtypes,
+    tiny_snapshot, turbo_snapshot, turbo_snapshot_with, TURBO_SAMPLE_SIGMAS,
 };
 
 const BASE: &str = "qwen_image_2_1";
@@ -65,6 +65,16 @@ const TWELVE_STEP_RESAMPLE: [f32; 13] = [
     0.276_378_67,
     0.0,
 ];
+
+/// A copy of the committed BASE miniature snapshot with one `model_index.json` key set.
+fn base_snapshot_with_model_index_key(key: &str, value: serde_json::Value) -> tempfile::TempDir {
+    let snapshot = copy_of_tiny_snapshot();
+    let path = snapshot.path().join("model_index.json");
+    let mut index = read_json(&path);
+    index[key] = value;
+    std::fs::write(&path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+    snapshot
+}
 
 fn spec(root: &std::path::Path, policy: OffloadPolicy) -> LoadSpec {
     LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
@@ -486,10 +496,30 @@ fn a_snapshot_under_the_other_id_is_a_typed_refusal_naming_the_mismatch() {
         assert!(message.contains("`qwen_image_2_1`"), "{message}");
     }
 
-    // The base trainer is not a Turbo trainer either: the schedule reader it shares with the base
-    // generator refuses the static config.
-    let err = load_scheduler_config(turbo.path()).unwrap_err().to_string();
-    assert!(err.contains("use_dynamic_shifting"), "{err}");
+    // The base TRAINER refuses a Turbo snapshot by the same typed, named refusal...
+    match registry.load_trainer(BASE, &spec(turbo.path(), OffloadPolicy::Resident)) {
+        Err(CoreError::Unsupported(message)) => {
+            assert!(message.contains("qwen_image_2_1:"), "{message}");
+            assert!(message.contains("Turbo snapshot"), "{message}");
+            assert!(message.contains("`qwen_image_2_1_turbo`"), "{message}");
+        }
+        Err(other) => panic!("the base trainer must refuse a Turbo snapshot, typed: {other:?}"),
+        Ok(_) => panic!("the base trainer must refuse a Turbo snapshot"),
+    }
+    // ...still loads its own snapshot, and there is no trainer under the Turbo id at all.
+    assert!(registry
+        .load_trainer(BASE, &spec(&base, OffloadPolicy::Resident))
+        .is_ok());
+    for root in [turbo.path(), base.as_path()] {
+        match registry.load_trainer(TURBO, &spec(root, OffloadPolicy::Resident)) {
+            Err(CoreError::Msg(message)) => assert_eq!(
+                message,
+                "no trainer registered for id 'qwen_image_2_1_turbo'"
+            ),
+            Err(other) => panic!("expected the registry's no-trainer refusal, got {other:?}"),
+            Ok(_) => panic!("there is no trainer under the Turbo id"),
+        }
+    }
 
     // Each snapshot under its OWN id still loads.
     assert!(registry
@@ -498,6 +528,124 @@ fn a_snapshot_under_the_other_id_is_a_typed_refusal_naming_the_mismatch() {
     assert!(registry
         .load(TURBO, &spec(turbo.path(), OffloadPolicy::Resident))
         .is_ok());
+}
+
+/// A snapshot that *claims* a saved schedule is not a base snapshot, however malformed the claim:
+/// under the base id a present `sample_sigmas` of any shape gets the same typed base refusal
+/// (validating the list is the Turbo id's job), while an explicit `null` is "saves none" and loads.
+///
+/// *Mutation that reds this:* making the base arm of `check_snapshot_variant` judge the list
+/// (e.g. requiring a non-empty array) instead of its presence.
+#[test]
+fn a_malformed_sample_sigmas_is_still_a_typed_base_refusal_and_null_is_absent() {
+    let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
+    for malformed in [serde_json::json!([]), serde_json::json!("1.0, 0.5")] {
+        let snapshot = base_snapshot_with_model_index_key("sample_sigmas", malformed.clone());
+        let spec = spec(snapshot.path(), OffloadPolicy::Resident);
+        let by_load = match registry.load(BASE, &spec) {
+            Ok(_) => panic!("{malformed}: the base id must refuse"),
+            Err(err) => err,
+        };
+        let by_contract = registry
+            .memory_strategy_contract(BASE, &spec)
+            .expect_err("no contract is priced for a refused load");
+        for err in [by_load, by_contract] {
+            assert!(
+                matches!(err, CoreError::Unsupported(_)),
+                "{malformed}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("qwen_image_2_1:"),
+                "{malformed}: {message}"
+            );
+            assert!(
+                message.contains("`qwen_image_2_1_turbo`"),
+                "{malformed}: {message}"
+            );
+        }
+    }
+    let null = base_snapshot_with_model_index_key("sample_sigmas", serde_json::Value::Null);
+    let spec = spec(null.path(), OffloadPolicy::Resident);
+    assert!(registry.load(BASE, &spec).is_ok(), "`null` saves no sigmas");
+    assert!(registry
+        .memory_strategy_contract(BASE, &spec)
+        .unwrap()
+        .is_some());
+}
+
+/// A `model_index.json` that is present but does not parse is refused under BOTH ids, each under
+/// its own label: the Turbo id cannot read its schedule from it, and the base id cannot show the
+/// snapshot is not a Turbo one (deliberate, and the MLX twin's behaviour — see UPSTREAM.md). A
+/// snapshot with no `model_index.json` at all is an ordinary base snapshot.
+///
+/// *Mutations that red this:* hardcoding the base label in `read_optional_json`; swallowing the
+/// parse error on the base arm of `check_snapshot_variant`.
+#[test]
+fn an_unparsable_model_index_is_refused_under_the_id_that_asked() {
+    let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
+    let corrupt = turbo_snapshot();
+    std::fs::write(corrupt.path().join("model_index.json"), "{ not json").unwrap();
+    let spec_of = |root: &std::path::Path| spec(root, OffloadPolicy::Resident);
+    for (id, label) in [
+        (TURBO, "qwen_image_2_1_turbo: parse "),
+        (BASE, "qwen_image_2_1: parse "),
+    ] {
+        let by_load = match registry.load(id, &spec_of(corrupt.path())) {
+            Ok(_) => panic!("{id} must refuse an unparsable model_index.json"),
+            Err(err) => err.to_string(),
+        };
+        let by_contract = registry
+            .memory_strategy_contract(id, &spec_of(corrupt.path()))
+            .expect_err("no contract is priced for a refused load")
+            .to_string();
+        for message in [by_load, by_contract] {
+            assert!(message.starts_with(label), "{id}: {message}");
+            assert!(message.contains("model_index.json"), "{id}: {message}");
+        }
+    }
+    // The Turbo scheduler config, corrupt, is reported under the Turbo id too.
+    let bad_scheduler = turbo_snapshot();
+    std::fs::write(
+        bad_scheduler.path().join("scheduler/scheduler_config.json"),
+        "[",
+    )
+    .unwrap();
+    let message = load_turbo_schedule(bad_scheduler.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.starts_with("qwen_image_2_1_turbo: parse "),
+        "{message}"
+    );
+    assert!(message.contains("scheduler_config.json"), "{message}");
+
+    // No model_index.json at all: nothing claims a saved schedule, so the base id loads it.
+    let bare = base_snapshot_with_model_index_key("sample_sigmas", serde_json::Value::Null);
+    std::fs::remove_file(bare.path().join("model_index.json")).unwrap();
+    assert!(registry.load(BASE, &spec_of(bare.path())).is_ok());
+}
+
+/// Errors on the memory paths both ids share carry the id that asked.
+///
+/// *Mutation that reds this:* interpolating the base `MODEL_ID` in `memory_strategy_contract`.
+#[test]
+fn memory_errors_name_the_requested_id() {
+    use candle_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract;
+    for (id, label) in [(TURBO, "qwen_image_2_1_turbo"), (BASE, "qwen_image_2_1")] {
+        let err = memory_strategy_contract(
+            id,
+            &LoadSpec::new(WeightsSource::File("/qwen/model.safetensors".into())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with(&format!(
+                "{label}: memory facts require a snapshot directory"
+            )),
+            "{id}: {err}"
+        );
+    }
 }
 
 /// **The bf16 VAE loads at the lane's compute dtype and decodes.** The file stores bf16 (checked

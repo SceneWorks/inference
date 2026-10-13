@@ -478,9 +478,15 @@ The two repositories share every tensor name and shape, so a swap would load. It
 any weight is read (`loader::check_snapshot_variant`, from `load` and from the memory
 registration), with a typed `Unsupported` naming the mismatch and the id to use instead:
 
-* a snapshot that saves `sample_sigmas` under `qwen_image_2_1`;
+* a snapshot that saves `sample_sigmas` under `qwen_image_2_1` — any present, non-null value,
+  a malformed list included (the base generator **and** the base trainer);
 * a snapshot that saves none — or saves them beside a dynamic-shift scheduler config — under
   `qwen_image_2_1_turbo`.
+
+Deliberate consequence: the base id now reads `model_index.json` (for that one key), so a base
+snapshot whose `model_index.json` is present but **unparsable** is refused where it used to load —
+it cannot be shown not to be a Turbo snapshot. The MLX twin refuses it too. A snapshot with no
+`model_index.json` loads as before.
 
 ### What is not under the Turbo id
 

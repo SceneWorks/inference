@@ -695,30 +695,31 @@ impl TurboSchedule {
                  scheduler, and a resolution shift would move every sigma off the distilled ones"
             )));
         }
-        let shift = scheduler
-            .get("shift")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0);
-        if shift != 1.0 {
+        // Absent and null are the default; anything else must be the NUMBER that leaves the saved
+        // sigmas alone. A present non-number (`"shift": "3.0"`) is refused, never read as the
+        // default.
+        let unit_or_absent = |key: &str, unit: f64| match scheduler.get(key) {
+            None | Some(Value::Null) => true,
+            Some(value) => value.as_f64() == Some(unit),
+        };
+        if !unit_or_absent("shift", 1.0) {
             return Err(Error::Unsupported(format!(
                 "{id}: {ctx}: only `shift: 1.0` is ported for the saved-sigma schedule (got \
-                 {shift}); a static shift would rescale the distilled sigmas"
+                 {}); a static shift would rescale the distilled sigmas",
+                scheduler["shift"]
             )));
         }
         // `if self.config.shift_terminal:` upstream — null, absent and 0 all mean "no stretch".
-        let terminal = scheduler
-            .get("shift_terminal")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if terminal != 0.0 {
+        if !unit_or_absent("shift_terminal", 0.0) {
             return Err(Error::Unsupported(format!(
-                "{id}: {ctx}: `shift_terminal: {terminal}` would stretch the saved sigmas; the \
-                 released Turbo scheduler sets none"
+                "{id}: {ctx}: `shift_terminal: {}` would stretch the saved sigmas; the released \
+                 Turbo scheduler sets none",
+                scheduler["shift_terminal"]
             )));
         }
         for flag in UNPORTED_SIGMA_FLAGS {
             if b_or(scheduler, flag, false) {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "{id}: {ctx}: `{flag}: true` is not the released schedule"
                 )));
             }
@@ -883,21 +884,49 @@ mod tests {
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
         assert!(err.to_string().contains("use_dynamic_shifting"), "{err}");
         // A static shift or a terminal stretch would move the saved sigmas.
-        let mut shifted = turbo_scheduler();
-        shifted["shift"] = serde_json::json!(3.0);
-        assert!(refusal(turbo_index(), shifted)
-            .to_string()
-            .contains("`shift: 1.0`"));
-        let mut stretched = turbo_scheduler();
-        stretched["shift_terminal"] = serde_json::json!(0.02);
-        assert!(refusal(turbo_index(), stretched)
-            .to_string()
-            .contains("shift_terminal"));
-        let mut karras = turbo_scheduler();
-        karras["use_karras_sigmas"] = serde_json::json!(true);
-        assert!(refusal(turbo_index(), karras)
-            .to_string()
-            .contains("use_karras_sigmas"));
+        // ...as a number OR as a present non-number, which is never read as the default.
+        for (key, value, needle) in [
+            ("shift", serde_json::json!(3.0), "`shift: 1.0`"),
+            ("shift", serde_json::json!("3.0"), "`shift: 1.0`"),
+            ("shift", serde_json::json!("1.0"), "`shift: 1.0`"),
+            ("shift_terminal", serde_json::json!(0.02), "shift_terminal"),
+            (
+                "shift_terminal",
+                serde_json::json!("0.02"),
+                "shift_terminal",
+            ),
+            ("shift_terminal", serde_json::json!(false), "shift_terminal"),
+            (
+                "use_karras_sigmas",
+                serde_json::json!(true),
+                "use_karras_sigmas",
+            ),
+            ("invert_sigmas", serde_json::json!(true), "invert_sigmas"),
+        ] {
+            let mut scheduler = turbo_scheduler();
+            scheduler[key] = value.clone();
+            let err = refusal(turbo_index(), scheduler);
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "{key} = {value}: {err:?}"
+            );
+            assert!(err.to_string().contains(needle), "{key} = {value}: {err}");
+            assert!(err.to_string().contains("qwen_image_2_1_turbo"), "{err}");
+        }
+        // The spellings of "unit shift" and "no terminal stretch" that ARE the released schedule.
+        for (key, value) in [
+            ("shift", serde_json::json!(1)),
+            ("shift", Value::Null),
+            ("shift_terminal", serde_json::json!(0.0)),
+            ("shift_terminal", Value::Null),
+        ] {
+            let mut scheduler = turbo_scheduler();
+            scheduler[key] = value.clone();
+            assert!(
+                TurboSchedule::from_values(&turbo_index(), &scheduler).is_ok(),
+                "{key} = {value}"
+            );
+        }
         // Malformed lists.
         for (sigmas, why) in [
             (serde_json::json!([]), "empty"),
