@@ -768,11 +768,12 @@ pub const QWEN_IMAGE_2_1: ComponentLicense = ComponentLicense {
     retrieved: "2026-09-22",
 };
 
-/// `Qwen/Qwen-Image-2.1-Turbo` (sc-25901) — the distilled sibling of [`QWEN_IMAGE_2_1`] (card
-/// `base_model: Qwen/Qwen-Image-2.1`): DiT, RGBA VAE and the bundled Qwen3-VL-8B text tower in
-/// one repository, under the same declaration (`license_name: qwen-research`) and the same
-/// `LICENSE` text beside the weights. A separate row because it is a separate repository; the
-/// family and the §3(c) attribution are the base row's.
+/// `Qwen/Qwen-Image-2.1-Turbo` (sc-25900) — the distilled few-step checkpoint of
+/// [`QWEN_IMAGE_2_1`], published as its own repository: DiT, RGBA VAE and the bundled Qwen3-VL-8B
+/// text tower under one declaration. The card declares the same `qwen-research` licence and the
+/// `LICENSE` beside the weights is byte-identical to the base repository's
+/// (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`), so the family and the
+/// §3(c) attribution are the base row's.
 pub const QWEN_IMAGE_2_1_TURBO: ComponentLicense = ComponentLicense {
     component: "qwen_image_2_1_turbo",
     source_url: "https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo",
@@ -1721,10 +1722,10 @@ mod tests {
         // beside `Qwen/Qwen-Image-2.1` on 2026-09-22
         // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`); sc-25679 read the
         // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
-        // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25901 read the
-        // `Qwen/Qwen-Image-2.1-Turbo` card and LICENSE on 2026-10-13 (the Turbo section of
-        // `docs/licensing/sc-24108-qwen-research-licence-evidence.md`). A row carrying any other
-        // date is a row whose provenance nobody can re-read.
+        // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25900 read the
+        // Qwen-Image-2.1-Turbo card and LICENSE on 2026-10-13
+        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`). A row carrying
+        // any other date is a row whose provenance nobody can re-read.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
             "2026-08-12",

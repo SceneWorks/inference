@@ -479,7 +479,12 @@ impl Generator for QwenImage21 {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        memory_strategy::registered_begin_request(&self.spec, &self.memory_strategy, context)
+        memory_strategy::begin_request_for(
+            self.variant.model_id(),
+            &self.spec,
+            &self.memory_strategy,
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {

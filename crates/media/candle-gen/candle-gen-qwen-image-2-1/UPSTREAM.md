@@ -527,8 +527,8 @@ crate takes the knot index and fraction from the integer product `i·K`, so a sa
 reads it back bit-for-bit). For the pinned revision, twelve steps are
 
 ```
-1.0, 0.98563534, 0.970362, 0.95418, 0.9358107, 0.9161107, 0.89508,
-0.861792, 0.79827666, 0.704534, 0.5112233, 0.27637866, 0.0
+1.0, 0.98563533, 0.970362, 0.95418, 0.9358107, 0.9161107, 0.89508,
+0.861792, 0.79827667, 0.704534, 0.5112233, 0.27637867, 0.0
 ```
 
 pinned as literals in `src/scheduler.rs` and `tests/turbo.rs`. Nothing about image quality at an

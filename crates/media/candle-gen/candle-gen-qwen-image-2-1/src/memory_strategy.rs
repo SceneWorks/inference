@@ -29,7 +29,7 @@ use candle_gen::gen_core::{
 
 use crate::config::{Variant, MAX_REFERENCE_IMAGES};
 use crate::pipeline::DECODE_OVERLAP;
-use crate::MODEL_ID;
+use crate::{MODEL_ID, TURBO_MODEL_ID};
 
 /// Content fingerprint of this contract. Distinct from the MLX twin's: the two backends never share
 /// calibration evidence, and the candle route materializes its components at different widths.
@@ -620,11 +620,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(MODEL_ID, spec, contract, context)
+}
+
+/// [`registered_begin_request`] for the Turbo id (sc-25901).
+pub(crate) fn registered_begin_turbo_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+}
+
+/// The executable admission seam both engine ids share; `provider_id` only labels the scope.
+pub(crate) fn begin_request_for(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(gen_core::Error::Unsupported(reason));
     }
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        variant_for(&contract.provider_id)?.model_id(),
+        provider_id,
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -662,17 +681,17 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
 /// [`MEMORY_REGISTRATION`] for the Turbo id (sc-25901): the same rungs and the same safety gate,
 /// priced from the Turbo snapshot under its own calibration identity.
 pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
-    provider_id: crate::TURBO_MODEL_ID,
-    contract: |spec| memory_strategy_contract(crate::TURBO_MODEL_ID, spec),
+    provider_id: TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(TURBO_MODEL_ID, spec),
     safety_check,
 };
 
 /// [`MEMORY_BEHAVIOR_REGISTRATION`] for the Turbo id.
 pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
-        provider_id: crate::TURBO_MODEL_ID,
+        provider_id: TURBO_MODEL_ID,
         valid_fixtures: registered_valid_fixture,
-        begin_request: registered_begin_request,
+        begin_request: registered_begin_turbo_request,
     };
 
 #[cfg(test)]

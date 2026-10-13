@@ -18,25 +18,6 @@ as the two sibling notes.
   `license_link: LICENSE` (same revision). `declared` is therefore `qwen-research`, verbatim.
 * Gating: the repository is public (`gated: false` from the Hub API on 2026-09-22).
 
-## Turbo: `Qwen/Qwen-Image-2.1-Turbo` (sc-25901)
-
-**PROVISIONAL — gathered by an agent on 2026-10-13, not yet signed off by a human.** The source
-behind the `qwen_image_2_1_turbo` component row. No new family: it resolves to the `qwen-research`
-family transcribed below.
-
-* Repository: <https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo> at revision
-  `fc13ba1986fcb905854dc8de2f52eee395f49b5b`; the card's front matter reads `license: other`,
-  `license_name: qwen-research`, `license_link: LICENSE`, `base_model: Qwen/Qwen-Image-2.1`.
-  `declared` is therefore `qwen-research`, verbatim.
-* Text: `LICENSE` beside the pinned weights —
-  <https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/raw/fc13ba1986fcb905854dc8de2f52eee395f49b5b/LICENSE>
-  — carries the same title ("Qwen RESEARCH LICENSE AGREEMENT"), the same "Release Date: September
-  20, 2026", the same §3(c) copyright holder (Hangzhou Tongyi Laboratory Technology Co., Ltd.) and
-  the same commercial-licence contact as the base repository's. It was read for those four
-  fields, **not** diffed byte-for-byte against the base `LICENSE`; a reviewer signing this off
-  should do that diff.
-* Gating: public (`gated: false`, `private: false` from the Hub API on 2026-10-13).
-
 ## Terms transcribed
 
 | term | clause | quote |
