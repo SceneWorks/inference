@@ -6,8 +6,8 @@
 //! 1. **Is the cached path the prefill path?** At every model evaluation of every case — text only,
 //!    one, two and three references, with and without a true-CFG negative branch — the velocity the
 //!    sampler consumes with the cache on equals the full-sequence (prefill) velocity for the same
-//!    latents and timestep. Both sides are this port on the same device, so the bound is an
-//!    absolute + relative f32 bound, not a peak-relative parity tolerance.
+//!    latents and timestep. Both sides are this port on the same device, and they are held to bit
+//!    equality, not to a tolerance.
 //! 2. **Is it upstream's cached path?** The same evaluations against the fixture the MLX twin reads
 //!    (`mlx-gen-qwen-image-2-1/tests/fixtures/qwen21_kv_cache.safetensors`, written by
 //!    `mlx-gen/tools/dump_qwen21_kv_cache.py`), which records what the frozen
@@ -129,15 +129,15 @@ mod heap {
     }
 }
 
-/// Cached vs prefill, same port, same device, f32: `|Δ| ≤ ATOL + RTOL·|want|` per element.
+/// The scale `mixed_error` measures a *wrong* decode against — `|Δ| / (ATOL + RTOL·|want|)` — in
+/// the tests that show a comparison has teeth (a cache of another branch or of other references
+/// lands 10× … 1e5× outside it).
 ///
-/// Measured on candle CPU (arm64) over all 31 comparisons this file makes (every case, branch and
-/// evaluation of the fixture, the whole denoise under euler / heun / dpmpp_sde, the synthetic
-/// geometries): worst `max|Δ|` 4.1e-6 at a peak of 3.9 (1.0e-6 × peak); the worst element sits at
-/// 0.28× this bound. The two paths are not bit-identical, and are not meant to be: a cached step's
-/// target tokens read the sampled-timestep modulation row exactly (as upstream's `where` does),
-/// while the prefill selects it through a blend that rounds in the last place (see UPSTREAM.md,
-/// *Deliberate divergences*). The mutations this file names move the velocity by 1e-2 … 1e0.
+/// It is **not** how cached is compared with prefill: those are asserted bit-identical
+/// (`assert_same_bits`). A cached step feeds the target's attention the same key/value values
+/// through the same call and reads the same modulation row, exactly, as the prefill does; the
+/// only difference is the row count of the per-token projections, which does not change any
+/// element's arithmetic.
 const ATOL: f32 = 1e-5;
 const RTOL: f32 = 1e-5;
 
@@ -258,18 +258,17 @@ fn mixed_error(got: &Tensor, want: &Tensor, atol: f32, rtol: f32) -> (f32, f32, 
     (max_abs, peak, worst)
 }
 
-/// Assert `|got − want| ≤ atol + rtol·|want|` for every element, printing the measured numbers.
-fn assert_agrees(name: &str, got: &Tensor, want: &Tensor, atol: f32, rtol: f32) {
-    let (max_abs, peak, worst) = mixed_error(got, want, atol, rtol);
-    eprintln!("{name}: max|Δ|={max_abs:.3e} peak={peak:.3e} worst/bound={worst:.3e}");
+/// Assert `got` and `want` are the same f32 values bit for bit, printing how far apart they are
+/// when they are not.
+fn assert_same_bits(name: &str, got: &Tensor, want: &Tensor) {
+    let (max_abs, peak, _) = mixed_error(got, want, ATOL, RTOL);
     assert!(
         peak > 0.0,
         "{name}: the reference is all zeros — nothing was compared"
     );
     assert!(
-        worst <= 1.0,
-        "{name}: max|Δ|={max_abs:.3e} at peak {peak:.3e} is {worst:.2}× the bound \
-         (atol {atol:.0e} + rtol {rtol:.0e}·|want|)"
+        bits(got) == bits(want),
+        "{name}: not bit-identical (max|Δ|={max_abs:.3e} at peak {peak:.3e})"
     );
 }
 
@@ -350,12 +349,10 @@ fn cached_velocity_is_the_prefill_velocity_at_every_evaluation() {
                 let (x, t) = (case.latents(&w, eval), case.sigma(&w, eval));
                 assert!(t != t0, "{tag}: a later evaluation is at another timestep");
                 let (got, trace) = model.forward_joint_cached_traced(&x, t, &cache).unwrap();
-                assert_agrees(
+                assert_same_bits(
                     &format!("{tag}/eval_{eval} cached vs prefill"),
                     &got,
                     &prefill(&model, &case, branch, &x, t),
-                    ATOL,
-                    RTOL,
                 );
                 // What the blocks actually ran on: every block stage is target-length.
                 let block_stages: Vec<_> = trace
@@ -583,7 +580,7 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
         };
         let (on, on_report) = run(KvCacheMode::On).ok();
         let (off, off_report) = run(KvCacheMode::Off).ok();
-        assert_agrees(&format!("{name}: cache on vs off"), &on, &off, ATOL, RTOL);
+        assert_same_bits(&format!("{name}: cache on vs off"), &on, &off);
         assert_cached_shape(name, &model, &case, &on_report, case.steps);
 
         assert_eq!(off_report.kv_cache, KvCachePath::Prefill, "{name}");
@@ -693,13 +690,7 @@ fn a_multi_evaluation_sampler_extracts_once_and_decodes_every_other_evaluation()
             &on_report,
             evaluations,
         );
-        assert_agrees(
-            &format!("{name}/{sampler}: cache on vs off"),
-            &on,
-            &off,
-            ATOL,
-            RTOL,
-        );
+        assert_same_bits(&format!("{name}/{sampler}: cache on vs off"), &on, &off);
     }
 }
 
@@ -729,12 +720,10 @@ fn the_negative_branch_has_its_own_cache() {
 
         let (x, t) = (case.latents(&w, 1), case.sigma(&w, 1));
         let want = prefill(&model, &case, neg, &x, t);
-        assert_agrees(
+        assert_same_bits(
             &format!("{name}: negative branch, own cache"),
             &model.forward_joint_cached(&x, t, &neg_cache).unwrap(),
             &want,
-            ATOL,
-            RTOL,
         );
         let crossed = model.forward_joint_cached(&x, t, &pos_cache).unwrap();
         let (_, _, worst) = mixed_error(&crossed, &want, ATOL, RTOL);
@@ -755,9 +744,10 @@ fn the_negative_branch_has_its_own_cache() {
 /// forward. The independent oracle for the off path is upstream's `use_kv_cache=False` output,
 /// `{case}/latents_final_prefill`, gated in `cached_denoise_matches_upstream_end_to_end`.
 ///
-/// *Mutations that red this:* any numeric change to the off path's loop — e.g. the true-CFG
-/// combine rewritten as `pos + (s − 1)·(pos − neg)` — and a switch that is ignored (always on):
-/// the cached path's latents differ from the prefill's in the last bits.
+/// *Mutation that reds this:* any numeric change to the off path's loop — e.g. the true-CFG
+/// combine rewritten as `pos + (s − 1)·(pos − neg)`. (An ignored switch is caught by the report
+/// assertions of `cached_denoise_matches_prefill_denoise_and_reports_its_path`: the cached path's
+/// latents are bit-identical to the prefill's, so bits alone could not tell.)
 #[test]
 fn cache_off_is_bit_identical_to_the_prefill_loop() {
     let w = kv_fixture();
@@ -1216,12 +1206,10 @@ fn cached_velocity_is_the_prefill_velocity_at_the_production_head_dim() {
             .forward_joint(&text, &joint_images(&refs, &x), sigma, &layout)
             .unwrap();
         let got = model.forward_joint_cached(&x, sigma, &cache).unwrap();
-        assert_agrees(
+        assert_same_bits(
             &format!("head_dim 128: cached vs prefill at sigma {sigma}"),
             &got,
             &want,
-            ATOL,
-            RTOL,
         );
         // The comparison has teeth at this geometry: the same decode against a cache extracted
         // for *other* reference latents is far outside the bound.
@@ -1333,12 +1321,10 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
         );
         // And the storage it owns is the right one: the cache still decodes.
         let x = seeded((1, height * width, cfg.in_channels), 303);
-        assert_agrees(
+        assert_same_bits(
             &format!("heads {heads}: owned cache, cached vs prefill"),
             &model.forward_joint_cached(&x, 0.4, &cache).unwrap(),
             &model.forward_joint(&text, &[&x], 0.4, &layout).unwrap(),
-            ATOL,
-            RTOL,
         );
     }
 }

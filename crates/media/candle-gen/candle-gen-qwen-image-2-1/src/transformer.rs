@@ -779,11 +779,10 @@ impl PrefixKvCache {
     /// The geometry of a cached decode: the target block alone, with its own RoPE rows and no
     /// prefix segments.
     ///
-    /// `modulation_mask[prefix_len:]` is all target tokens, so there is **no** row mask: with
-    /// `target_mask: None`, `JointGeometry::select` broadcasts row 0 — the sampled timestep — to
+    /// `modulation_mask[prefix_len:]` is all target tokens, so no token reads the `t = 0` row
+    /// (`t0_tokens: 0`): `JointGeometry::select` broadcasts row 0 — the sampled timestep — to
     /// every token unchanged, exactly as upstream's `torch.where` and the MLX twin's
-    /// `broadcast_to` do. (An all-ones mask through the prefill's blend would compute
-    /// `zero + (real − zero)`, which rounds: harmless in f32, percent-level in bf16.)
+    /// `broadcast_to` do.
     fn target_geometry(&self, inner: usize) -> JointGeometry {
         JointGeometry {
             cos: self.target_cos.clone(),
@@ -792,7 +791,7 @@ impl PrefixKvCache {
             prefix_len: 0,
             seq_len: self.target_tokens,
             target_tokens: self.target_tokens,
-            target_mask: None,
+            t0_tokens: 0,
             inner,
         }
     }
@@ -1124,16 +1123,12 @@ impl QwenImage21Transformer {
 
         let (modulation, out_rows) = self.modulation_rows(timestep, trace)?;
         // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
-        // other token the trailing `t = 0` row (see `JointGeometry::select`).
-        let target_mask = if self.cfg.causal_condition {
-            let m: Vec<f32> = layout
-                .target_mask()
-                .into_iter()
-                .map(|b| if b { 1.0 } else { 0.0 })
-                .collect();
-            Some(Tensor::from_vec(m, (1, s, 1), &self.device)?.to_dtype(dtype)?)
+        // other token — the whole prefix, since the target is the trailing block — the `t = 0`
+        // row (see `JointGeometry::select`).
+        let t0_tokens = if self.cfg.causal_condition {
+            layout.prefix_len()
         } else {
-            None
+            0
         };
         Ok(JointPrelude {
             x,
@@ -1146,7 +1141,7 @@ impl QwenImage21Transformer {
                 prefix_len: layout.prefix_len(),
                 seq_len: s,
                 target_tokens: layout.target_tokens(),
-                target_mask,
+                t0_tokens,
                 inner: self.cfg.inner_dim(),
             },
         })
@@ -1488,7 +1483,7 @@ impl QwenImage21Transformer {
 }
 
 /// The joint sequence's static geometry for one forward: the RoPE table, the block-causal segment
-/// runs, and the token mask that selects between the modulation rows. Constant across the blocks
+/// runs, and how many leading tokens read the `t = 0` modulation row. Constant across the blocks
 /// (it carries no trainable dependency).
 pub struct JointGeometry {
     cos: Tensor,
@@ -1497,8 +1492,10 @@ pub struct JointGeometry {
     prefix_len: usize,
     seq_len: usize,
     target_tokens: usize,
-    /// `[1, S, 1]` 0/1 target mask under `causal_condition`, else `None`.
-    target_mask: Option<Tensor>,
+    /// Leading tokens that modulate from the `t = 0` row: the whole prefix for a
+    /// `causal_condition` prefill, `0` when every token reads the sampled row (a model without
+    /// `causal_condition`, or a cached decode, whose sequence is the target alone).
+    t0_tokens: usize,
     inner: usize,
 }
 
@@ -1508,26 +1505,43 @@ impl JointGeometry {
         self.seq_len
     }
 
-    /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`): target tokens take
-    /// row 0 (their sample's timestep), every other token the trailing `t = 0` row → `[1, S,
-    /// inner]`. With a mask it is expressed as the blend `zero + (real − zero)·mask`, which equals
-    /// `where(mask, real, zero)` on prefix rows but **rounds** on target rows (`zero + (real −
-    /// zero)` is not `real` in floating point — see UPSTREAM.md, *Deliberate divergences*; a known
-    /// divergence under review). Without a mask every token reads row 0 unchanged.
+    /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`) → `[1, S, inner]`:
+    /// the first `t0_tokens` tokens take the trailing `t = 0` row, every
+    /// later one row 0 (its sample's timestep).
+    ///
+    /// An **exact** select — upstream's `torch.where(mask, real, zero)`: each output row is a copy
+    /// of one of the two input rows, in `rows`' own dtype. It is built as a concatenation of the
+    /// two broadcast rows rather than a per-token `where`, which is the same thing because the
+    /// target is always the trailing block of a joint layout (`JointLayout::validate`), so the
+    /// `t = 0` tokens are exactly the leading `prefix_len`; a geometry whose prefix and target do
+    /// not tile the sequence is refused rather than mis-selected. Differentiable in both rows.
     fn select(&self, rows: &Tensor, slot: usize) -> Result<Tensor> {
         let (s, width) = (self.seq_len, self.inner);
-        let real = rows
-            .narrow(0, 0, 1)?
-            .narrow(1, slot * width, width)?
-            .reshape((1, 1, width))?;
-        let Some(mask) = self.target_mask.as_ref() else {
-            return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
+        let row = |index: usize| -> Result<Tensor> {
+            Ok(rows
+                .narrow(0, index, 1)?
+                .narrow(1, slot * width, width)?
+                .reshape((1, 1, width))?)
         };
-        let zero = rows
-            .narrow(0, 1, 1)?
-            .narrow(1, slot * width, width)?
-            .reshape((1, 1, width))?;
-        Ok(zero.broadcast_add(&real.broadcast_sub(&zero)?.broadcast_mul(mask)?)?)
+        let real = row(0)?;
+        if self.t0_tokens == 0 {
+            return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
+        }
+        if self.t0_tokens + self.target_tokens != s {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the modulation select needs the target block to be the trailing \
+                 {} of {s} tokens, but {} leading tokens read the t = 0 row",
+                self.target_tokens, self.t0_tokens
+            )));
+        }
+        let zero = row(1)?;
+        Ok(Tensor::cat(
+            &[
+                zero.broadcast_as((1, self.t0_tokens, width))?,
+                real.broadcast_as((1, self.target_tokens, width))?,
+            ],
+            1,
+        )?)
     }
 
     /// The four per-token block modulations from the `[rows, 4·inner]` shared modulation.
@@ -1854,6 +1868,327 @@ mod tests {
             assert!(
                 elements < i32_max,
                 "{what} has {elements} elements, past i32::MAX"
+            );
+        }
+    }
+
+    /// The committed miniature DiT (the MLX twin's tiny snapshot), f32 on CPU.
+    fn tiny_dit() -> QwenImage21Transformer {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
+        let cfg = TransformerConfig::from_json_file(&root.join("transformer/config.json")).unwrap();
+        let vb = candle_gen::loader::component_vb(
+            &root,
+            "transformer",
+            DType::F32,
+            &Device::Cpu,
+            "select",
+        )
+        .unwrap();
+        QwenImage21Transformer::new(&cfg, vb).unwrap()
+    }
+
+    /// Text, two reference blocks and a non-square target — and the prelude the prefill forward
+    /// (`run_joint`, `run_joint_extract`) and the trainer's checkpointed pieces all start from.
+    fn edit_prelude(dit: &QwenImage21Transformer) -> (JointLayout, JointPrelude) {
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 3 },
+                Segment::Image {
+                    height: 2,
+                    width: 2,
+                },
+                Segment::Text { len: 1 },
+                Segment::Image {
+                    height: 2,
+                    width: 4,
+                },
+                Segment::Text { len: 4 },
+                Segment::Image {
+                    height: 2,
+                    width: 6,
+                },
+            ],
+        };
+        let c = dit.config();
+        let fill = |tokens: usize, width: usize, seed: usize| -> Tensor {
+            let v: Vec<f32> = (0..tokens * width)
+                .map(|i| (((i * 31 + seed * 17) % 89) as f32 / 89.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, tokens, width), &Device::Cpu).unwrap()
+        };
+        let text = fill(8, c.context_in_dim, 1);
+        let images = [
+            fill(4, c.in_channels, 2),
+            fill(8, c.in_channels, 3),
+            fill(12, c.in_channels, 4),
+        ];
+        let refs: Vec<&Tensor> = images.iter().collect();
+        let prelude = dit.train_prelude_joint(&text, &refs, 0.6, &layout).unwrap();
+        (layout, prelude)
+    }
+
+    fn f32_bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Two modulation rows (`[2, slots·inner]`) on which `zero + (real − zero)` visibly rounds in
+    /// f32 — a large `t = 0` entry absorbs a small sampled one.
+    fn rounding_rows(slots: usize, inner: usize) -> Tensor {
+        let real: Vec<f32> = (0..slots * inner).map(|i| 0.1 + i as f32 * 0.013).collect();
+        let zero: Vec<f32> = (0..slots * inner)
+            .map(|i| if i % 2 == 0 { 1.0e9 } else { -3.7e4 })
+            .collect();
+        Tensor::from_vec([real, zero].concat(), (2, slots * inner), &Device::Cpu).unwrap()
+    }
+
+    /// The prefill's per-token modulation is an **exact** select — upstream's `torch.where`: every
+    /// prefix token receives the `t = 0` row and every target token the sampled-timestep row, bit
+    /// for bit, in all four block modulation slots and in the `norm_out` select. Asked of the
+    /// tensors the blocks and the head are handed (`JointGeometry::modulation` / `select` on the
+    /// prelude's own geometry), on the model's own rows and on rows where a blend
+    /// `zero + (real − zero)·mask` rounds, in f32 and in **bf16** — the dtype production runs on
+    /// CUDA/Metal, where that blend was off by percents and which no forward on this lane reaches
+    /// (the select needs no matmul, so it does run in bf16 on CPU).
+    #[test]
+    fn the_prefill_selects_each_modulation_row_exactly() {
+        let dit = tiny_dit();
+        let (layout, prelude) = edit_prelude(&dit);
+        let inner = dit.config().inner_dim();
+        let geometry = &prelude.geometry;
+        let (prefix, total) = (layout.prefix_len(), layout.total_len());
+        assert_eq!((prefix, total, geometry.seq_len()), (20, 32, 32));
+        // The mask upstream selects with: exactly the trailing target block.
+        assert_eq!(
+            layout.target_mask(),
+            (0..total).map(|i| i >= prefix).collect::<Vec<_>>()
+        );
+
+        // `rows` → per-token `[1, S, inner]` must be row 1 on the prefix and row 0 on the target.
+        let check = |what: &str, selected: &Tensor, rows: &Tensor, slot: usize| {
+            assert_eq!(selected.dims(), &[1, total, inner], "{what}");
+            assert_eq!(
+                selected.dtype(),
+                rows.dtype(),
+                "{what}: the rows' own dtype"
+            );
+            let row = |index: usize| {
+                f32_bits(
+                    &rows
+                        .narrow(0, index, 1)
+                        .unwrap()
+                        .narrow(1, slot * inner, inner)
+                        .unwrap(),
+                )
+            };
+            let (sampled, t0) = (row(0), row(1));
+            assert_ne!(sampled, t0, "{what}: the two rows must differ");
+            let got = f32_bits(selected);
+            for token in 0..total {
+                let want = if token < prefix { &t0 } else { &sampled };
+                assert_eq!(
+                    &got[token * inner..(token + 1) * inner],
+                    &want[..],
+                    "{what}: token {token} ({})",
+                    if token < prefix { "prefix" } else { "target" }
+                );
+            }
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            for (name, modulation, out_rows) in [
+                (
+                    "model rows",
+                    prelude.modulation.to_dtype(dtype).unwrap(),
+                    prelude.out_rows.to_dtype(dtype).unwrap(),
+                ),
+                (
+                    "rounding rows",
+                    rounding_rows(4, inner).to_dtype(dtype).unwrap(),
+                    rounding_rows(1, inner).to_dtype(dtype).unwrap(),
+                ),
+            ] {
+                let m = geometry.modulation(&modulation).unwrap();
+                for (slot, selected) in [&m.scale1, &m.gate1, &m.scale2, &m.gate2]
+                    .into_iter()
+                    .enumerate()
+                {
+                    check(
+                        &format!("{dtype:?} {name} slot {slot}"),
+                        selected,
+                        &modulation,
+                        slot,
+                    );
+                }
+                check(
+                    &format!("{dtype:?} {name} norm_out"),
+                    &geometry.select(&out_rows, 0).unwrap(),
+                    &out_rows,
+                    0,
+                );
+            }
+        }
+    }
+
+    /// The select is correct only because the `t = 0` tokens are the leading prefix and the target
+    /// the trailing block. A geometry in which the two do not tile the sequence is refused, not
+    /// mis-selected.
+    #[test]
+    fn a_geometry_whose_target_is_not_the_trailing_block_is_refused() {
+        let dit = tiny_dit();
+        let (_, prelude) = edit_prelude(&dit);
+        let mut geometry = prelude.geometry;
+        geometry.t0_tokens -= 1;
+        let err = geometry
+            .select(&prelude.out_rows, 0)
+            .expect_err("19 t = 0 tokens + 12 target tokens do not tile 32");
+        assert_eq!(
+            err.to_string(),
+            "qwen_image_2_1: the modulation select needs the target block to be the trailing 12 \
+             of 32 tokens, but 19 leading tokens read the t = 0 row"
+        );
+    }
+
+    /// The select stays differentiable in **both** rows: a loss over the selected rows sends each
+    /// row exactly the gradient its tokens carry — the sampled row the target tokens', the `t = 0`
+    /// row the prefix tokens' — and nothing to the other slots. Analytic, so the comparison is to
+    /// f32 summation error.
+    #[test]
+    fn the_select_passes_each_rows_gradient_to_its_own_tokens() {
+        let dit = tiny_dit();
+        let (layout, prelude) = edit_prelude(&dit);
+        let inner = dit.config().inner_dim();
+        let (prefix, total) = (layout.prefix_len(), layout.total_len());
+        let rows = candle_core::Var::from_tensor(&prelude.modulation).unwrap();
+        let weights: Vec<f32> = (0..total * inner)
+            .map(|i| (((i * 13) % 41) as f32 / 41.0) - 0.4)
+            .collect();
+        let w = Tensor::from_vec(weights.clone(), (1, total, inner), &Device::Cpu).unwrap();
+        let slot = 2usize;
+        let loss = (prelude.geometry.select(rows.as_tensor(), slot).unwrap() * &w)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        let grad = grads
+            .get(rows.as_tensor())
+            .expect("the select must reach its rows")
+            .to_vec2::<f32>()
+            .unwrap();
+        let column_sum = |tokens: std::ops::Range<usize>, channel: usize| -> f32 {
+            tokens.map(|t| weights[t * inner + channel]).sum()
+        };
+        let mut reached = [false; 2];
+        for (row, tokens) in [(0usize, prefix..total), (1, 0..prefix)] {
+            for (column, got) in grad[row].iter().enumerate() {
+                let want = if column / inner == slot {
+                    column_sum(tokens.clone(), column % inner)
+                } else {
+                    0.0
+                };
+                reached[row] |= want.abs() > 0.1;
+                assert!(
+                    (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "row {row} column {column}: gradient {got} vs {want}"
+                );
+            }
+        }
+        assert_eq!(reached, [true; 2], "both rows carry a real gradient");
+    }
+
+    /// End to end through the trainer's checkpoint pieces: a loss on the velocity reaches the
+    /// shared modulation rows through `train_block`'s modulation input — the sampled row **and**
+    /// the `t = 0` row — and the `norm_out` rows through `train_head`, and those gradients are the
+    /// function's: each matches a central finite difference along a fixed direction.
+    #[test]
+    fn the_trainer_pieces_backpropagate_through_the_selected_rows() {
+        use candle_core::Var;
+
+        let dit = tiny_dit();
+        let (_, prelude) = edit_prelude(&dit);
+        let velocity = |modulation: &Tensor, out_rows: &Tensor| -> Tensor {
+            let mut x = prelude.x.clone();
+            for index in 0..dit.num_blocks() {
+                x = dit
+                    .train_block(index, &x, modulation, &prelude.geometry)
+                    .unwrap();
+            }
+            dit.train_head(&x, out_rows, &prelude.geometry).unwrap()
+        };
+        let probe = |v: &Tensor| -> Tensor {
+            let n = v.elem_count();
+            let w: Vec<f32> = (0..n)
+                .map(|i| (((i * 7) % 23) as f32 / 23.0) - 0.45)
+                .collect();
+            (v * Tensor::from_vec(w, v.dims(), &Device::Cpu).unwrap())
+                .unwrap()
+                .sum_all()
+                .unwrap()
+        };
+        let direction = |like: &Tensor, seed: usize| -> Tensor {
+            let n = like.elem_count();
+            let d: Vec<f32> = (0..n)
+                .map(|i| (((i * 29 + seed) % 53) as f32 / 53.0) - 0.5)
+                .collect();
+            Tensor::from_vec(d, like.dims(), &Device::Cpu).unwrap()
+        };
+        let modulation = Var::from_tensor(&prelude.modulation).unwrap();
+        let out_rows = Var::from_tensor(&prelude.out_rows).unwrap();
+        let loss = probe(&velocity(modulation.as_tensor(), out_rows.as_tensor()));
+        let grads = loss.backward().unwrap();
+        let scalar = |t: &Tensor| t.to_scalar::<f32>().unwrap();
+        let abs_sum = |t: &Tensor| scalar(&t.abs().unwrap().sum_all().unwrap());
+
+        let g_mod = grads
+            .get(modulation.as_tensor())
+            .expect("the modulation rows must receive a gradient");
+        for (row, name) in [(0usize, "sampled"), (1, "t = 0")] {
+            let mass = abs_sum(&g_mod.narrow(0, row, 1).unwrap());
+            assert!(
+                mass > 1e-3,
+                "the {name} modulation row received no gradient ({mass:e})"
+            );
+        }
+        let g_out = grads
+            .get(out_rows.as_tensor())
+            .expect("the norm_out rows must receive a gradient");
+        assert!(abs_sum(&g_out.narrow(0, 0, 1).unwrap()) > 1e-3);
+
+        let eps = 1e-2f64;
+        for (name, grad, base, seed) in [
+            ("modulation", g_mod, &prelude.modulation, 3usize),
+            ("norm_out", g_out, &prelude.out_rows, 5),
+        ] {
+            let d = direction(base, seed);
+            let analytic = scalar(&(grad * &d).unwrap().sum_all().unwrap());
+            let at = |sign: f64| -> f32 {
+                let moved = (base + (&d * (sign * eps)).unwrap()).unwrap();
+                let v = if name == "modulation" {
+                    velocity(&moved, &prelude.out_rows)
+                } else {
+                    velocity(&prelude.modulation, &moved)
+                };
+                scalar(&probe(&v))
+            };
+            let numeric = (at(1.0) - at(-1.0)) / (2.0 * eps as f32);
+            let rel = (analytic - numeric).abs() / numeric.abs().max(1e-6);
+            eprintln!(
+                "{name}: analytic {analytic:.6e} finite-difference {numeric:.6e} rel {rel:.2e}"
+            );
+            assert!(
+                numeric.abs() > 1e-3,
+                "{name}: the direction must move the loss"
+            );
+            assert!(
+                rel <= 1e-3,
+                "{name}: gradient {analytic:e} vs finite difference {numeric:e} ({rel:.2e})"
             );
         }
     }
