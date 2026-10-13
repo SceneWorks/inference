@@ -306,6 +306,9 @@ fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
         let (b_loss_ac, b_full, entered) = case(Dtype::Bfloat16, AcPolicy::Full);
         assert_eq!(entered, regions);
         assert_eq!(b_loss.to_bits(), b_loss_ac.to_bits(), "bf16 loss");
-        crate::common::assert_ac_bf16_noise_only("depth", &f_none, &b_none, &b_full);
+        let bf16 = crate::common::assert_ac_bf16_noise_only("depth", &f_none, &b_none, &b_full);
+        // MLX's checkpoint transform re-runs the block's own graph: on the CPU stream the bf16
+        // gradients are the plain bf16 graph's bit for bit.
+        assert_eq!(bf16.4, 0.0, "bf16 checkpointed vs bf16 plain max|Δ|");
     });
 }

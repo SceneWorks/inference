@@ -282,7 +282,15 @@ fn cancel_and_resume_under(ac: bool) {
         );
         let mut resumed = cfg.clone();
         resumed.resume = true;
+        // The resumed run itself is checkpointed: a resume that dropped the policy would still
+        // reproduce the weights (the gradients are the plain graph's), so count its own regions.
+        let before_resume = checkpointed_regions();
         assert_eq!(run(&items, resumed, b.path(), name, None), 8);
+        assert_eq!(
+            checkpointed_regions() > before_resume,
+            ac,
+            "the resumed run enters regions exactly when it is checkpointed"
+        );
         let (la, lb) = (
             latest_checkpoint(&checkpoint_root(a.path(), name)).unwrap(),
             latest_checkpoint(&root_b).unwrap(),

@@ -171,13 +171,21 @@ pub fn assert_ac_f32_equal(what: &str, tol: f32, plain: &Grads, checkpointed: &G
 }
 
 /// The bf16 gate (see [`AC_BF16_NOISE_FACTOR`]); `f32_plain` is the reference both are measured
-/// from. Returns `(mean e_none, mean e_full, worst e_full / e_none, worst cosine)`.
+/// from. Returns `(mean e_none, mean e_full, worst e_full / e_none, worst cosine, worst max|Δ|)` —
+/// the last is the largest element-wise distance between the checkpointed and the plain **bf16**
+/// gradient over every trained tensor (0 = the two bf16 gradients are bit-equal), which this gate
+/// measures and prints but does not bound: a caller that holds bit-equality asserts it.
 pub fn assert_ac_bf16_noise_only(
     what: &str,
     f32_plain: &Grads,
     bf16_plain: &Grads,
     bf16_checkpointed: &Grads,
-) -> (f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, f32) {
+    assert_eq!(bf16_plain.len(), bf16_checkpointed.len(), "{what}");
+    let mut worst_abs = 0f32;
+    for (k, plain) in bf16_plain {
+        worst_abs = worst_abs.max(errors(&bf16_checkpointed[k], plain).0);
+    }
     let (mut sum_none, mut sum_full, mut worst_ratio, mut worst_cos, mut n) =
         (0f64, 0f64, 0f64, 1f64, 0usize);
     for (k, reference) in f32_plain {
@@ -207,10 +215,11 @@ pub fn assert_ac_bf16_noise_only(
         sum_full / n as f64,
         worst_ratio,
         worst_cos,
+        worst_abs,
     );
     eprintln!(
-        "{what}: bf16 vs f32 over {n} tensors: mean e_none {:.3e}, mean e_full {:.3e}, worst e_full/e_none {:.3}, worst cos(full, none) {:.6}",
-        out.0, out.1, out.2, out.3
+        "{what}: bf16 vs f32 over {n} tensors: mean e_none {:.3e}, mean e_full {:.3e}, worst e_full/e_none {:.3}, worst cos(full, none) {:.6}; bf16 checkpointed vs bf16 plain: worst max|Δ| = {:.3e}",
+        out.0, out.1, out.2, out.3, out.4
     );
     out
 }

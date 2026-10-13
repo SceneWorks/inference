@@ -398,9 +398,17 @@ fn cancel_and_resume_under(ac: bool) {
     );
     let mut cfg2 = cfg.clone();
     cfg2.resume = true;
+    // The resumed run itself is checkpointed: a resume that dropped the policy would still
+    // reproduce the weights (the gradients are the plain graph's), so count its own regions.
+    let before_resume = checkpointed_regions();
     trainer()
         .train(&request(&items, cfg2, &b), &mut |_| {})
         .unwrap();
+    assert_eq!(
+        checkpointed_regions() > before_resume,
+        ac,
+        "the resumed run enters regions exactly when it is checkpointed"
+    );
     let ca = latest_checkpoint(&checkpoint_root(&a, "restorer.safetensors")).unwrap();
     let cb = latest_checkpoint(&checkpoint_root(&b, "restorer.safetensors")).unwrap();
     for f in [
@@ -503,11 +511,157 @@ fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
         b_terms_ac.map(f64::to_bits),
         "bf16 loss terms"
     );
-    crate::common::assert_ac_bf16_noise_only("restoration", &f_none, &b_none, &b_full);
+    let bf16 = crate::common::assert_ac_bf16_noise_only("restoration", &f_none, &b_none, &b_full);
+    // MLX's checkpoint transform re-runs the block's own graph: on the CPU stream the bf16
+    // gradients are the plain bf16 graph's bit for bit.
+    assert_eq!(bf16.4, 0.0, "bf16 checkpointed vs bf16 plain max|Δ|");
+}
+
+/// sc-25690: the same equality for the **adapters** (LoRA and LoKr) — a region then rebuilds its
+/// block from the frozen base plus the traced factors, and the gradients compared are the factors'.
+/// Every factor is set non-zero first (a fresh adapter's zero half gives its other half an exactly
+/// zero gradient, which would compare nothing).
+#[test]
+fn activation_checkpointing_adapter_gradients_equal_the_plain_graph() {
+    crate::common::cpu_process(
+        "restoration_train_lifecycle::activation_checkpointing_adapter_gradients_equal_the_plain_graph",
+        activation_checkpointing_adapter_gradients_equal_the_plain_graph_body,
+    );
+}
+
+fn activation_checkpointing_adapter_gradients_equal_the_plain_graph_body() {
+    use mlx_gen::gen_core::iris::restoration_train::RestoreArtifact;
+    use mlx_gen::gen_core::iris::train::{backbone_tensor_shapes, linear_paths_from_keys};
+    use mlx_gen_iris::train::model::{
+        checkpointed_regions, init_adapter, provider_dtype, AdapterKind, AdapterTarget, TrainModel,
+        Trainable,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let items = clean_items(tmp.path(), 1);
+    for network in [NetworkType::Lora, NetworkType::Lokr] {
+        let case = |dtype: &str, ac: bool| {
+            let mut cfg = config(2, json!({"degradation": mini_degradation()}));
+            cfg.train_dtype = dtype.into();
+            cfg.gradient_checkpointing = ac;
+            cfg.full_finetune = false;
+            cfg.network_type = network;
+            cfg.rank = 2;
+            cfg.alpha = 2.0;
+            let req = request(&items, cfg, tmp.path());
+            let res = resources();
+            let shapes = backbone_tensor_shapes(&res.export.config().model);
+            let paths = linear_paths_from_keys(shapes.iter().map(|(k, s)| (k.as_str(), s.len())));
+            let plan = RestoreTrainPlan::resolve(&req, &res.export, &paths, false).unwrap();
+            assert_eq!(plan.ac.active(), ac);
+            let (kind, paths) = match &plan.artifact {
+                RestoreArtifact::Lora {
+                    rank,
+                    alpha,
+                    targets,
+                } => (
+                    AdapterKind::Lora {
+                        rank: *rank,
+                        alpha: *alpha,
+                    },
+                    targets.clone(),
+                ),
+                RestoreArtifact::Lokr {
+                    rank,
+                    alpha,
+                    decompose_factor,
+                    targets,
+                } => (
+                    AdapterKind::Lokr {
+                        rank: *rank,
+                        alpha: *alpha,
+                        factor: *decompose_factor,
+                    },
+                    targets.clone(),
+                ),
+                RestoreArtifact::Full => unreachable!("an adapter request"),
+            };
+            let pair = contract::training_pair(&items[0], &plan, 1, 0).unwrap();
+            let batch = PairBatch::from_pairs(&[pair]);
+            let (full, source, frozen, head, sn) =
+                mlx_gen_iris::train::restore::miniature_parts(&res, &plan, Box::new(nets)).unwrap();
+            let targets: Vec<AdapterTarget> = paths
+                .iter()
+                .map(|p| {
+                    let w = &source[format!("{p}.weight").as_str()];
+                    AdapterTarget {
+                        path: p.clone(),
+                        out_f: w.shape()[0],
+                        in_f: w.shape()[1],
+                    }
+                })
+                .collect();
+            assert!(
+                targets.iter().any(|t| t.path.starts_with("blocks.")),
+                "the adapter targets trunk blocks"
+            );
+            let base: HashMap<String, Array> = source
+                .iter()
+                .map(|(k, a)| (k.to_string(), provider_dtype(k, a, full.compute).unwrap()))
+                .collect();
+            let mut factors = init_adapter(kind, &targets, plan.seed).unwrap();
+            let mut keys: Vec<_> = factors.keys().cloned().collect();
+            keys.sort();
+            for (i, k) in keys.iter().enumerate() {
+                let shape = factors[k].shape().to_vec();
+                let n: i32 = shape.iter().product();
+                let v: Vec<f32> = (0..n as usize)
+                    .map(|j| 0.02 * (((j * 7 + i * 13) % 11) as f32 / 11.0) - 0.011)
+                    .collect();
+                factors.insert(k.clone(), Array::from_slice(&v, &shape));
+            }
+            let model = TrainModel {
+                cfg: full.cfg.clone(),
+                compute: full.compute,
+                trainable: Trainable::Adapter {
+                    kind,
+                    targets,
+                    base,
+                },
+            };
+            let before = checkpointed_regions();
+            let (terms, grads) =
+                generator_grads(&model, &factors, &frozen, &plan, &head, &sn, &batch, 1.0).unwrap();
+            let regions = model.cfg.depth + model.cfg.pixel.depth;
+            assert_eq!(
+                checkpointed_regions() - before,
+                if ac { regions } else { 0 },
+                "{network:?}: full checkpoints every trunk and pixel block, none no region"
+            );
+            assert_eq!(grads.len(), factors.len(), "every factor has a gradient");
+            (terms, grads)
+        };
+        let what = format!("restoration {network:?}");
+        let (f_terms, f_none) = case("f32", false);
+        let (f_terms_ac, f_full) = case("f32", true);
+        assert_eq!(
+            f_terms.map(f64::to_bits),
+            f_terms_ac.map(f64::to_bits),
+            "{what}: f32 loss terms"
+        );
+        crate::common::assert_ac_f32_equal(&what, 1e-6, &f_none, &f_full);
+        let (b_terms, b_none) = case("bf16", false);
+        let (b_terms_ac, b_full) = case("bf16", true);
+        assert_eq!(
+            b_terms.map(f64::to_bits),
+            b_terms_ac.map(f64::to_bits),
+            "{what}: bf16 loss terms"
+        );
+        let bf16 = crate::common::assert_ac_bf16_noise_only(&what, &f_none, &b_none, &b_full);
+        assert_eq!(
+            bf16.4, 0.0,
+            "{what}: bf16 checkpointed vs bf16 plain max|Δ|"
+        );
+    }
 }
 
 /// sc-25690: a checkpointed restoration run is the plain run (f32), for the full fine-tune and for
-/// an adapter (a region then rebuilds its block from the frozen base plus the traced factors): the
+/// both adapters, LoRA and LoKr (a region then rebuilds its block from the frozen base plus the
+/// traced factors): the
 /// trainer wires `gradient_checkpointing` into its generator step, the export moves by rounding
 /// only, keeps its stamps and loads in the `iris_3b_restore` transform.
 #[test]
@@ -522,15 +676,16 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
     use mlx_gen_iris::train::model::checkpointed_regions;
     let data = tempfile::tempdir().unwrap();
     let items = clean_items(data.path(), 1);
-    for lora in [false, true] {
+    for network in [None, Some(NetworkType::Lora), Some(NetworkType::Lokr)] {
+        let lora = format!("{network:?}");
         let run = |ac: bool| {
             let out = tempfile::tempdir().unwrap();
             let mut cfg = config(4, json!({"degradation": mini_degradation()}));
             cfg.save_every = 0;
             cfg.gradient_checkpointing = ac;
-            if lora {
+            if let Some(network) = network {
                 cfg.full_finetune = false;
-                cfg.network_type = NetworkType::Lora;
+                cfg.network_type = network;
                 cfg.rank = 2;
                 cfg.alpha = 2.0;
             }
@@ -539,7 +694,7 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
                 .train(&request(&items, cfg, out.path()), &mut |_| {})
                 .unwrap();
             assert_eq!(res.steps, 4);
-            assert_eq!(checkpointed_regions() > before, ac, "lora={lora}");
+            assert_eq!(checkpointed_regions() > before, ac, "adapter={lora}");
             let w = Weights::from_file(&res.adapter_path).unwrap();
             assert_eq!(w.metadata("irisTask"), Some("restoration"));
             assert_eq!(w.metadata("irisArtifact"), Some("full_model"));
@@ -555,7 +710,7 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
         let base = tensors(&export_dir().join("model.safetensors"));
         assert!(
             base.iter().any(|(k, v)| checkpointed[k] != *v),
-            "lora={lora}: the checkpointed run trained"
+            "adapter={lora}: the checkpointed run trained"
         );
         let mut worst = 0f32;
         for (k, v) in &plain {
@@ -564,9 +719,9 @@ fn activation_checkpointing_leaves_the_run_unchanged_body() {
             }
         }
         eprintln!(
-            "restoration (lora={lora}): activation checkpointing vs plain: max |Δ| = {worst:.3e}"
+            "restoration (adapter={lora}): activation checkpointing vs plain: max |Δ| = {worst:.3e}"
         );
-        assert!(worst <= 1e-6, "lora={lora}: {worst}");
+        assert!(worst <= 1e-6, "adapter={lora}: {worst}");
     }
 }
 
