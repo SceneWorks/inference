@@ -323,6 +323,7 @@ impl Iris3b {
                     message,
                 })
                 .collect(),
+            prefix_kv_cache: None,
         })
     }
 

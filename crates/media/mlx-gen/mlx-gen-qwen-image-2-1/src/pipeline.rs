@@ -673,6 +673,28 @@ mod tests {
         );
     }
 
+    /// The trainer's preview render stays on the prefill path: it runs inside the trainer's
+    /// memory envelope, which prices no cache.
+    ///
+    /// **A source pin, for the trainer's one call site only.** The trainer surfaces no report of
+    /// the path its preview ran, and the two paths differ by ~1e-6 in the latents, so nothing
+    /// downstream could tell a flipped call site. The generator's switch is request-driven
+    /// (sc-25905) and held behaviourally, on the path its renders report, in
+    /// `tests/kv_admission.rs`.
+    #[test]
+    fn the_trainer_preview_sheds_the_prefix_kv_cache() {
+        let switches: Vec<&str> = include_str!("training.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("kv_cache:"))
+            .collect();
+        assert_eq!(
+            switches,
+            ["kv_cache: KvCacheMode::Off,"],
+            "the trainer's one preview denoise call"
+        );
+    }
+
     #[test]
     fn noise_is_seeded_and_shaped() {
         let a = create_noise(7, 64, 32, 8).unwrap();

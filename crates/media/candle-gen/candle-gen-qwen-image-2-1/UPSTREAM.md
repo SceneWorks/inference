@@ -572,8 +572,9 @@ are dropped when the loop returns — on success, cancellation or error — and 
 reaches the VAE decode. A cache only exists once a complete extract has returned, so there is no
 empty or partial cache to decode from.
 
-**The switch.** `DenoiseInputs::kv_cache` (`KvCacheMode::{On, Off}`); the generator (`src/lib.rs`)
-passes `On`. `Off` is the prefill loop, byte for byte. `denoise_reported` fills a `DenoiseReport`:
+**The switch.** `DenoiseInputs::kv_cache` (`KvCacheMode::{On, Off}`). The generator (`src/lib.rs`)
+drives it from the request (sc-25905, below): `On` for a request that selects
+`PrefixKvCacheMode::Cached`, `Off` otherwise. `Off` is the prefill loop, byte for byte. `denoise_reported` fills a `DenoiseReport`:
 the path that ran (`KvCachePath`), the bytes the caches held, and every transformer forward
 (`ModelEvaluation`: branch, `Prefill` / `Extract` / `Cached`, tokens the blocks ran over). The
 trainer's preview render stays on `Off`: it runs inside the trainer's memory envelope, which prices
@@ -602,10 +603,36 @@ of the sampled row), on the prefill, the extract and the trainer forward alike. 
 output in bf16 therefore changed, toward upstream, by up to those figures; f32 output changed in
 the last bits.
 
-**Not priced here.** The request's memory contract (`memory_strategy`) does not yet carry the
-cache's bytes, and the generator passes `On` unconditionally: a reference-heavy request that fit
-on the prefill path can exceed the device with the cache on. Pricing and admission-driven shedding
-to `Off` are the next story's.
+**Priced per request, selected per request (sc-25905).** Upstream's `use_kv_cache=True` is a
+default with no memory model behind it; here the cache is a **request selection** —
+`GenerationMemory::prefix_kv_cache`, a typed execution domain declared on
+`Capabilities::execution` for both engine ids (`gen_core::execution_domains`) — and it is priced:
+
+* **What it costs.** K and V for all 32 blocks over the prefix (the prompt and every reference
+  image), at the compute dtype, once per prompt branch: `2 · 32 · prefix_tokens · 4096 · width`
+  bytes — 0.5 MiB per prefix token at bf16 (CUDA, Metal), 1 MiB at f32 (the CPU lane). At bf16 a
+  256-token prompt is 0.125 GiB; each reference (fitted to 1024², 4096 tokens) adds 2.0 GiB; ten
+  references are 20.1 GiB; a negative branch doubles all of it. No tier shrinks it — it is
+  activations, not weights (`memory_strategy::prefix_kv_cache_bytes`).
+* **How a cached request is priced.** At its cache-shed demand plus those bytes plus the target
+  RoPE rows each cache keeps (`memory_strategy::prefix_kv_cache_demand_bytes`,
+  `memory_strategy::request_demand_bytes`). This crate publishes no activation table and installs
+  no allocator budget, so the cache-shed demand is whatever the caller already prices.
+* **What does not move.** The memory contract, its asset facts, its formula and both calibration
+  identities are unchanged. A request that selects nothing runs the prefill path — the deliberate
+  divergence from upstream's default, because a request admitted against a demand that never
+  priced the cache must not run above it.
+* **Who decides.** The caller that owns the budget: `PrefixKvCacheMode::select(budget, shed,
+  cache)` answers `Cached` when both fit, `Prefill` when only the shed demand fits (the request
+  is admitted and runs without the cache), and `None` when neither does (the caller refuses as it
+  always did). Nothing shrinks an image, drops a reference or changes a tier.
+* **What ran.** `Generator::generate_with_report` → `GenerationReport::prefix_kv_cache`: the path
+  the denoise loop took (`cached` / `prefill`) and the bytes its caches held, written from the
+  loop's own `DenoiseReport`.
+
+**Every cache figure above is derived — exact tensor arithmetic over the shapes the cache stores,
+held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The
+epic's terminal story measures one cached ten-reference render.
 
 ## Deliberate divergences
 
@@ -614,6 +641,9 @@ to `Off` are the next story's.
 * Prefix KV cache: extract is keyed on each branch's first model evaluation rather than loop
   index 0, and a cached step skips the prefix projections upstream computes and discards — see
   *Prefix KV cache* above.
+* Prefix KV cache default (sc-25905): upstream runs the cache unless told otherwise
+  (`use_kv_cache=True`); here a request that selects nothing runs the **prefill** path, and the
+  cache is selected per request by the caller that priced it — see *Prefix KV cache* above.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * On the **CPU parity lane** the text tower runs f32 (upstream: bf16 end to end). On CUDA/Metal
   it runs bf16 end to end **like upstream** — see *Compute dtype* below (sc-24114).

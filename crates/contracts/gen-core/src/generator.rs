@@ -7,7 +7,10 @@
 //! trait split (which breaks on multi-modal models).
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
-use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
+use crate::execution_domains::{
+    CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence, PrefixKvCacheMode,
+    PrefixKvCacheReport,
+};
 use crate::hdr::HdrColorSpace;
 use crate::media::{AudioChunk, AudioTrack, Image, RgbaImage};
 use crate::runtime::{
@@ -853,6 +856,14 @@ pub struct GenerationMemory {
     /// See [`CfgBatching`]: batched CFG doubles exactly the transients rungs 2-4
     /// exist to bound, which is why it is a planner-selectable axis.
     pub cfg_batching: Option<CfgBatching>,
+    /// Whether a block-causal denoiser keeps its prefix key/value cache for this request
+    /// (sc-25905). `None` ⇒ the provider's own default, which for this domain is
+    /// [`PrefixKvCacheMode::Prefill`] — the path that holds nothing, so a request admitted against a
+    /// budget that never priced the cache cannot run above it. A caller that has priced the cache
+    /// and found it fits selects [`PrefixKvCacheMode::Cached`]
+    /// ([`PrefixKvCacheMode::select`]). See [`PrefixKvCacheMode`]: numerically equivalent, not
+    /// bit-identical, and independent of every rung of the ladder.
+    pub prefix_kv_cache: Option<PrefixKvCacheMode>,
 
     /// Calibration-only request-local fault injection. Adopting providers may return a deterministic
     /// error at the named physical phase boundary so a conformance harness can verify cleanup and a
@@ -1043,6 +1054,11 @@ pub struct GenerationReport {
     /// Non-fatal conditions of this render (a truncated phase, a cover-check warning), in the
     /// order they were found. Empty when there is nothing to report.
     pub warnings: Vec<GenerationWarning>,
+    /// Which prefix-KV-cache path the render ran and what its caches held (sc-25905). `None` for
+    /// every provider that declares no
+    /// [`ExecutionSurface::prefix_kv_cache`](crate::ExecutionSurface::prefix_kv_cache) domain;
+    /// `Some` for one that does, on every render, whatever the request selected.
+    pub prefix_kv_cache: Option<PrefixKvCacheReport>,
 }
 
 impl GenerationReport {
@@ -1053,6 +1069,7 @@ impl GenerationReport {
             output: Some(output),
             artifacts: None,
             warnings: Vec::new(),
+            prefix_kv_cache: None,
         }
     }
 }
@@ -4553,6 +4570,8 @@ mod tests {
                 graph_eval_cadence: None,
                 ffn_chunk: None,
                 cfg_batching: None,
+                // sc-25905: unset is the prefill path — the cache is opt-in per request.
+                prefix_kv_cache: None,
                 calibration_error_phase: None,
                 calibration_fault_harness_authorized: false,
             }
@@ -4779,6 +4798,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "prefix_kv_cache",
+                GenerationMemory {
+                    prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+                    ..Default::default()
+                },
+            ),
         ] {
             let request = GenerationRequest {
                 memory: Some(memory),
@@ -4821,6 +4847,7 @@ mod tests {
                 graph_eval_cadence_blocks: ExecutionValueDomain::ANY_POSITIVE,
                 ffn_chunk_rows: ExecutionValueDomain::Candidates(vec![2048]),
                 cfg_batching: CfgBatchingDomain::Modes(vec![CfgBatching::Batched]),
+                ..ExecutionSurface::default()
             },
             ..caps()
         };

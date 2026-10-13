@@ -542,6 +542,7 @@ pub fn memory_options(
         graph_eval_cadence,
         ffn_chunk,
         cfg_batching,
+        prefix_kv_cache,
         calibration_error_phase,
         calibration_fault_harness_authorized,
     } = *memory;
@@ -562,6 +563,7 @@ pub fn memory_options(
         ("memory.graph_eval_cadence", graph_eval_cadence.is_some()),
         ("memory.ffn_chunk", ffn_chunk.is_some()),
         ("memory.cfg_batching", cfg_batching.is_some()),
+        ("memory.prefix_kv_cache", prefix_kv_cache.is_some()),
         (
             "memory.calibration_error_phase",
             calibration_error_phase.is_some() || calibration_fault_harness_authorized,
@@ -909,6 +911,7 @@ impl Generator for Yue2Generator {
             output: samples.map(audio),
             artifacts,
             warnings,
+            prefix_kv_cache: None,
         })
     }
 }

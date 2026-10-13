@@ -21,8 +21,8 @@
 
 use candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    CancelFlag, Error as CoreError, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    OffloadPolicy, Progress, WeightsSource,
+    CancelFlag, Error as CoreError, GenerationMemory, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, OffloadPolicy, PrefixKvCacheMode, Progress, WeightsSource,
 };
 use candle_gen_qwen_image_2_1::{
     create_noise, decode_rgb, denoise_reported, load_scheduler_config, load_text_encoder,
@@ -113,15 +113,21 @@ fn pixels(generator: &dyn Generator, req: &GenerationRequest) -> Vec<u8> {
 /// pieces over an **explicit** sigma list — the independent side of the schedule assertions. The
 /// generator is free to choose its schedule; this is not.
 ///
-/// It runs the prefix KV cache **on** (sc-25904), the mode the generator's one denoise call uses
-/// for both ids: on candle the cached and prefill paths agree to rounding, not bit for bit, so the
-/// pixel equalities below hold only when both sides run the same mode.
+/// It runs the prefix KV cache **off**, the path the generator runs for a request that selects
+/// nothing (sc-25905: the cache is a request selection and unset is the prefill path). On candle
+/// the cached and prefill paths agree to rounding, not bit for bit, so the pixel equalities below
+/// hold only when both sides run the same mode.
 fn render_over(root: &std::path::Path, sigmas: &[f32]) -> Vec<u8> {
-    render_reported(root, sigmas).0
+    render_reported(root, sigmas, KvCacheMode::Off).0
 }
 
-/// [`render_over`] plus the denoise loop's own account of what each model evaluation did.
-fn render_reported(root: &std::path::Path, sigmas: &[f32]) -> (Vec<u8>, DenoiseReport) {
+/// [`render_over`] with the cache switch stated, plus the denoise loop's own account of what each
+/// model evaluation did.
+fn render_reported(
+    root: &std::path::Path,
+    sigmas: &[f32],
+    kv_cache: KvCacheMode,
+) -> (Vec<u8>, DenoiseReport) {
     let device = candle_gen::default_device().unwrap();
     let tokenizer = load_tokenizer(root).unwrap();
     let encoder = load_text_encoder(root, &device).unwrap();
@@ -147,7 +153,7 @@ fn render_reported(root: &std::path::Path, sigmas: &[f32]) -> (Vec<u8>, DenoiseR
             seed,
             cancel: &cancel,
             references: None,
-            kv_cache: KvCacheMode::On,
+            kv_cache,
         },
         &mut report,
         &mut |_| {},
@@ -162,16 +168,17 @@ fn render_reported(root: &std::path::Path, sigmas: &[f32]) -> (Vec<u8>, DenoiseR
 /// The Turbo id rides the prefix KV cache (sc-25904) like the base id: over the saved-sigma
 /// schedule with the cache on, the first model evaluation extracts the prefix K/V and each of the
 /// seven later ones decodes the target tokens from it — and that run IS the Turbo generator's
-/// render, pixel for pixel.
+/// render of a request that selects the cache (sc-25905), pixel for pixel, with the generator's
+/// own report (`GenerationReport::prefix_kv_cache`) naming the same path and the same bytes.
 ///
-/// *Mutation that reds this:* the loop dropping the extracted cache instead of keeping it
+/// *Mutations that red this:* the loop dropping the extracted cache instead of keeping it
 /// (`self.cache = Some(cache)` removed in `BranchRun::evaluate`) — every evaluation then
-/// re-extracts.
+/// re-extracts; the generator ignoring a `Cached` selection (its report says `prefill`).
 #[test]
 fn the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_step() {
     let turbo = turbo_snapshot();
     let root = turbo.path();
-    let (manual, report) = render_reported(root, &SAVED_PLUS_ZERO);
+    let (manual, report) = render_reported(root, &SAVED_PLUS_ZERO, KvCacheMode::On);
     assert_eq!(report.kv_cache, KvCachePath::Cached);
     assert!(report.kv_cache_bytes > 0, "a cache was held");
     let paths: Vec<EvaluationPath> = report.evaluations.iter().map(|e| e.path).collect();
@@ -198,7 +205,21 @@ fn the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_st
         .all(|e| e.block_tokens == cached));
 
     let generator = load(TURBO, root, OffloadPolicy::Resident);
-    assert_eq!(pixels(generator.as_ref(), &request(None)), manual);
+    let cached = GenerationRequest {
+        memory: Some(GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+            ..Default::default()
+        }),
+        ..request(None)
+    };
+    assert_eq!(pixels(generator.as_ref(), &cached), manual);
+    let ran = generator
+        .generate_with_report(&cached, &mut |_| {})
+        .unwrap()
+        .prefix_kv_cache
+        .expect("the path is reported on every render");
+    assert_eq!(ran.path, PrefixKvCacheMode::Cached);
+    assert_eq!(ran.cache_bytes, report.kv_cache_bytes as u64);
 }
 
 /// The fixture is what it says it is — otherwise every claim below is about a base snapshot.

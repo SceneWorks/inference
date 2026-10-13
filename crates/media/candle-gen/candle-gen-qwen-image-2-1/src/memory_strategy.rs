@@ -8,6 +8,39 @@
 //! | 3 | [`MemoryStrategy::BoundedAttention`] | not applicable — the DiT's joint attention is block-causal per segment; the shared chunked-score kernel has no block-causal variant |
 //! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | not applicable — no block-streaming loader on this route |
 //!
+//! One lever is selectable **beside** the ladder, as a typed execution domain
+//! (`gen_core::execution_domains`), not as a rung:
+//!
+//! | domain | request field | this provider |
+//! |---|---|---|
+//! | [`PrefixKvCacheMode`] | `GenerationMemory::prefix_kv_cache` | **implemented, both modes** — `Cached` holds every block's prefix K/V for the denoise loop; `Prefill` (and an unset field) holds nothing and is the pre-cache path, byte-for-byte |
+//!
+//! # The prefix KV cache is priced per request (sc-25905)
+//!
+//! The cache ([`crate::pipeline::KvCacheMode`], sc-25904) holds K and V for every block over the
+//! block-causal **prefix** — the prompt and every reference image — at the compute dtype, once per
+//! prompt branch: [`prefix_kv_cache_bytes`]. At bf16 (CUDA, Metal) that is 0.5 MiB per prefix
+//! token — 0.125 GiB for a text-only request, 2.0 GiB more per reference image (each is fitted to
+//! 1024², [`REFERENCE_FIT_TOKENS`]), 20.1 GiB at ten references — and twice all of it on the f32
+//! CPU lane, and twice again when a negative branch runs. **No tier shrinks it**: it is
+//! activations, not weights.
+//!
+//! **Every cache figure here is derived — exact tensor arithmetic over the shapes the cache
+//! stores — and none is measured.** The epic's terminal story measures one cached ten-reference
+//! render; until then nothing here is evidence.
+//!
+//! This crate publishes no activation table and installs no allocator budget, so the cache-shed
+//! demand of a request is whatever its caller already prices, and it does not move: the contract,
+//! its asset facts, its formula and both calibration identities are unchanged. A cached request is
+//! priced at exactly that demand plus [`prefix_kv_cache_demand_bytes`] (the K/V and the target
+//! RoPE rows each cache keeps) — [`request_demand_bytes`]. A request that selects nothing runs
+//! prefill. A caller that has room selects [`PrefixKvCacheMode::Cached`]
+//! (`PrefixKvCacheMode::select` is the comparison); a request that fits only without the cache is
+//! admitted and runs prefill; a request that fits neither is refused exactly as before. The cache
+//! is independent of every rung, so a planner that wants it shed **last** tries each rung with
+//! the cache before any rung without it. Which path ran is reported on
+//! `GenerationReport::prefix_kv_cache`.
+//!
 //! # Derived, never measured
 //!
 //! The **derived** tier and activation tables are owned once, in the MLX crate's
@@ -23,8 +56,8 @@ use candle_gen::gen_core::{
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory,
-    WeightsSource,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, PrefixKvCacheMode,
+    ResidentRequestMemory, WeightsSource,
 };
 
 use crate::config::{Variant, MAX_REFERENCE_IMAGES};
@@ -114,6 +147,151 @@ pub const fn image_tokens(width: u32, height: u32) -> u64 {
     (width as u64 / PIXELS_PER_TOKEN) * (height as u64 / PIXELS_PER_TOKEN)
 }
 
+// ================================================================================================
+// The prefix KV cache as a request-selected execution domain (sc-25905).
+// ================================================================================================
+//
+// DERIVED, never measured: the exact element count of the tensors `PrefixKvCache` stores
+// (`crate::transformer`) times the width they are held at. `tests/kv_admission.rs` holds every
+// function here to the bytes a real cache reports on the tiny fixture.
+
+/// Transformer blocks of the DiT (`num_layers`): the cache stores one `(k, v)` pair per block.
+pub const DIT_BLOCKS: u64 = 32;
+/// The DiT's joint hidden width (`num_attention_heads · attention_head_dim`).
+pub const DIT_INNER: u64 = 4096;
+/// Bytes per RoPE table entry pair (`cos` + `sin`, both f32, `head_dim / 2` wide):
+/// `2 · 64 · 4`.
+pub const DIT_ROPE_BYTES_PER_TOKEN: u64 = 512;
+
+/// The prefix-KV-cache modes both engine ids implement, declared on `Capabilities::execution`
+/// so the shared request floor admits them and a planner can discover them.
+pub const PREFIX_KV_CACHE_MODES: [PrefixKvCacheMode; 2] = PrefixKvCacheMode::ALL;
+
+/// The mode one request runs: its `GenerationMemory::prefix_kv_cache`, or
+/// [`PrefixKvCacheMode::Prefill`] when the request selects nothing.
+///
+/// The unset default is the path that holds no cache, on purpose. A request with no selection was
+/// admitted — if it was admitted at all — against a demand that does not price the cache, and at
+/// ten references the cache is 20 GiB per prompt branch at bf16; running it uninvited would put a
+/// request that fitted yesterday over its budget today. The caller that owns the budget opts in.
+pub fn prefix_kv_cache_for(req: &gen_core::GenerationRequest) -> PrefixKvCacheMode {
+    req.memory
+        .and_then(|memory| memory.prefix_kv_cache)
+        .unwrap_or(PrefixKvCacheMode::Prefill)
+}
+
+/// Tokens of the block-causal **prefix** of the joint sequence: the conditioning tokens and
+/// [`REFERENCE_FIT_TOKENS`] per reference image — the joint sequence less the target image. It
+/// does not change between denoise steps, which is what makes its K/V cacheable, and it is the
+/// only length the cache scales with.
+pub const fn prefix_tokens(conditioning_tokens: u64, reference_count: u32) -> u64 {
+    conditioning_tokens + reference_count as u64 * REFERENCE_FIT_TOKENS
+}
+
+/// Bytes of the K and V tensors one prefix cache stores for a transformer of `blocks` blocks and
+/// joint width `inner`, over `prefix_tokens`, at `element_width` bytes per element: two tensors
+/// per block, each `[1, heads, prefix_tokens, head_dim]`. Exact tensor arithmetic for any model
+/// shape, which is what lets the tiny-fixture tests hold the production figure's formula to a
+/// real cache.
+pub const fn prefix_kv_cache_tensor_bytes(
+    blocks: u64,
+    inner: u64,
+    prefix_tokens: u64,
+    element_width: u64,
+) -> u64 {
+    2 * blocks * prefix_tokens * inner * element_width
+}
+
+/// Prompt branches one request evaluates: the positive one, and the negative one under true CFG.
+/// Each keeps its own cache — a different prompt is a different prefix.
+const fn prompt_branches(use_negative: bool) -> u64 {
+    if use_negative {
+        2
+    } else {
+        1
+    }
+}
+
+/// [`prefix_kv_cache_bytes`] at an explicit element `width`. The production figure is this at
+/// [`compute_width`]; the seam exists so the bf16 figure a GPU build prices can be held on the
+/// CPU lane, where the compute width is f32.
+pub const fn prefix_kv_cache_bytes_at(
+    width: u64,
+    conditioning_tokens: u64,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    prompt_branches(use_negative)
+        * prefix_kv_cache_tensor_bytes(
+            DIT_BLOCKS,
+            DIT_INNER,
+            prefix_tokens(conditioning_tokens, reference_count),
+            width,
+        )
+}
+
+/// Bytes of prefix K/V one request holds across its denoise loop with the cache on, on this
+/// build's production device: one cache per prompt branch at [`compute_width`] — bf16 on CUDA and
+/// Metal, f32 on the CPU lane. This is the figure a cached render reports
+/// (`GenerationReport::prefix_kv_cache`).
+pub fn prefix_kv_cache_bytes(
+    conditioning_tokens: u64,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    prefix_kv_cache_bytes_at(
+        compute_width(),
+        conditioning_tokens,
+        reference_count,
+        use_negative,
+    )
+}
+
+/// What a request is **priced** above its cache-shed demand when the cache is on:
+/// [`prefix_kv_cache_bytes`] plus the target block's RoPE rows each branch's cache keeps for its
+/// decodes (`cos` + `sin`, f32 on every device — [`DIT_ROPE_BYTES_PER_TOKEN`] per target token).
+///
+/// Additive on the whole request: the first evaluation of a branch runs the full joint sequence
+/// (the prefill forward the shed demand already covers) **while** building the cache.
+pub fn prefix_kv_cache_demand_bytes(
+    width: u32,
+    height: u32,
+    conditioning_tokens: u64,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    prefix_kv_cache_bytes(conditioning_tokens, reference_count, use_negative)
+        + prompt_branches(use_negative) * image_tokens(width, height) * DIT_ROPE_BYTES_PER_TOKEN
+}
+
+/// One request's incremental live demand for the prefix-KV-cache mode it runs:
+/// `shed_demand_bytes` unchanged for [`PrefixKvCacheMode::Prefill`] — whatever the caller prices
+/// the request at today — and that plus [`prefix_kv_cache_demand_bytes`] for
+/// [`PrefixKvCacheMode::Cached`].
+#[allow(clippy::too_many_arguments)]
+pub fn request_demand_bytes(
+    kv_cache: PrefixKvCacheMode,
+    shed_demand_bytes: u64,
+    width: u32,
+    height: u32,
+    conditioning_tokens: u64,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    match kv_cache {
+        PrefixKvCacheMode::Prefill => shed_demand_bytes,
+        PrefixKvCacheMode::Cached => {
+            shed_demand_bytes.saturating_add(prefix_kv_cache_demand_bytes(
+                width,
+                height,
+                conditioning_tokens,
+                reference_count,
+                use_negative,
+            ))
+        }
+    }
+}
+
 /// The route's admission envelope, derived from the frozen presets and the joint-layout limit.
 pub fn admission_geometry() -> AdmissionGeometry {
     let presets = crate::config::PRESETS;
@@ -134,9 +312,8 @@ pub fn admission_geometry() -> AdmissionGeometry {
         max_target_image_tokens: target_tokens,
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
         tokens_per_max_reference: REFERENCE_FIT_TOKENS,
-        max_joint_tokens: TABLE_CONDITIONING_TOKENS
-            + target_tokens
-            + MAX_REFERENCE_IMAGES as u64 * REFERENCE_FIT_TOKENS,
+        max_joint_tokens: prefix_tokens(TABLE_CONDITIONING_TOKENS, MAX_REFERENCE_IMAGES as u32)
+            + target_tokens,
         pixels_per_token: PIXELS_PER_TOKEN,
         max_batch: crate::descriptor().capabilities.max_count,
     }
@@ -1306,5 +1483,229 @@ mod tests {
             memory_strategy_contract(MODEL_ID, &missing).is_err(),
             "an unsizable adapter fails closed"
         );
+    }
+
+    // ── sc-25905: the prefix KV cache, priced per request ───────────────────────────────────────
+
+    /// One prompt branch's cache bytes for a request at `element_width`, derived here from the
+    /// tensors the cache stores rather than read from the function under test: K and V (2) for
+    /// every block of the production DiT, each `[1, heads, prefix_tokens, head_dim]`.
+    fn derived_branch_kv_bytes(reference_count: u32, element_width: u64) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let inner = (cfg.num_attention_heads * cfg.attention_head_dim) as u64;
+        let fitted_side = crate::config::OUTPUT_RESOLUTION as u64 / 16;
+        let prefix_tokens = 256 + reference_count as u64 * fitted_side * fitted_side;
+        2 * cfg.num_layers as u64 * prefix_tokens * inner * element_width
+    }
+
+    /// One prompt branch's target RoPE rows: `cos` and `sin` (2), `[target_tokens, head_dim / 2]`
+    /// each, f32 (4 bytes) on every device.
+    fn derived_branch_rope_bytes(width: u32, height: u32) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let target_tokens = (width as u64 / 16) * (height as u64 / 16);
+        2 * target_tokens * (cfg.attention_head_dim as u64 / 2) * 4
+    }
+
+    /// The story's first acceptance criterion on this lane: with the cache on, a `k`-reference
+    /// request's demand exceeds its cache-shed demand by exactly the derived cache bytes for that
+    /// prefix (the K/V at the lane's compute width, plus the target RoPE rows the cache keeps),
+    /// and by twice that when a negative branch runs; with the cache shed it is the caller's own
+    /// number, untouched.
+    ///
+    /// The element width follows the lane: f32 on the CPU lane this test runs on by default, bf16
+    /// under `--features cuda` / `--features metal`. Both widths are held through the `_at` seam
+    /// on every lane.
+    ///
+    /// *Mutations that red this:* dropping the cache term from the cached demand; not doubling it
+    /// under a negative branch; pricing the prefix at the target's tokens, or a reference at the
+    /// target's token count instead of the fitted 4096; hard-coding the bf16 width (the CPU lane's
+    /// cache is twice that).
+    #[test]
+    fn a_cached_request_is_priced_at_the_shed_demand_plus_its_derived_cache_bytes() {
+        let lane_width = crate::loader::compute_dtype().size_in_bytes() as u64;
+        assert_eq!(compute_width(), lane_width);
+        // Any cache-shed demand: this crate does not own that number, the caller does.
+        for shed in [0_u64, 7_585_398_784, 12_514_050_048] {
+            for (width, height) in [(2048_u32, 2048_u32), (2400, 1792)] {
+                for references in [0_u32, 1, 2, 10] {
+                    for negative in [false, true] {
+                        let tag = format!(
+                            "{width}x{height} refs={references} negative={negative} shed={shed}"
+                        );
+                        let demand = |kv_cache| {
+                            request_demand_bytes(
+                                kv_cache,
+                                shed,
+                                width,
+                                height,
+                                TABLE_CONDITIONING_TOKENS,
+                                references,
+                                negative,
+                            )
+                        };
+                        assert_eq!(demand(PrefixKvCacheMode::Prefill), shed, "{tag}");
+                        let branches = if negative { 2 } else { 1 };
+                        let kv = derived_branch_kv_bytes(references, lane_width);
+                        let rope = derived_branch_rope_bytes(width, height);
+                        assert_eq!(
+                            demand(PrefixKvCacheMode::Cached) - shed,
+                            branches * (kv + rope),
+                            "{tag}: the cached demand is the shed demand plus the derived bytes"
+                        );
+                        assert_eq!(
+                            prefix_kv_cache_bytes(TABLE_CONDITIONING_TOKENS, references, negative),
+                            branches * kv,
+                            "{tag}: the K/V figure a cached render reports"
+                        );
+                        for element_width in [2_u64, 4] {
+                            assert_eq!(
+                                prefix_kv_cache_bytes_at(
+                                    element_width,
+                                    TABLE_CONDITIONING_TOKENS,
+                                    references,
+                                    negative
+                                ),
+                                branches * derived_branch_kv_bytes(references, element_width),
+                                "{tag} at {element_width} B/element"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The figures the docs quote, at bf16: 0.5 MiB per prefix token, so 0.125 GiB for a
+        // 256-token prompt, 2 GiB more per fitted reference, 20.125 GiB at ten; f32 doubles them.
+        const MIB: u64 = 1 << 20;
+        assert_eq!(prefix_kv_cache_bytes_at(2, 256, 0, false), 128 * MIB);
+        assert_eq!(
+            prefix_kv_cache_bytes_at(2, 256, 1, false),
+            (128 + 2048) * MIB
+        );
+        assert_eq!(
+            prefix_kv_cache_bytes_at(2, 256, 10, false),
+            (128 + 20_480) * MIB
+        );
+        assert_eq!(
+            prefix_kv_cache_bytes_at(4, 256, 10, true),
+            4 * (128 + 20_480) * MIB
+        );
+        // One token accounting: the envelope's joint sequence is the prefix plus the target.
+        let g = admission_geometry();
+        assert_eq!(
+            prefix_tokens(TABLE_CONDITIONING_TOKENS, g.max_reference_images)
+                + g.max_target_image_tokens,
+            g.max_joint_tokens
+        );
+        assert_eq!(g.max_joint_tokens, 58_016);
+        let cfg = crate::config::TransformerConfig::production();
+        assert_eq!(DIT_BLOCKS as usize, cfg.num_layers);
+        assert_eq!(
+            DIT_INNER as usize,
+            cfg.num_attention_heads * cfg.attention_head_dim
+        );
+        assert_eq!(
+            DIT_ROPE_BYTES_PER_TOKEN as usize,
+            2 * (cfg.attention_head_dim / 2) * 4
+        );
+    }
+
+    /// The cache is priced per request and is **not** part of the memory contract: for both ids
+    /// the weights-free contract is the one published before sc-25905 — the same phase envelope
+    /// over the same five variables, no resident component, the same calibration identity — so
+    /// nothing a consumer reads as "minimum to run" can have moved.
+    ///
+    /// *Mutation that reds this:* declaring the cache in the contract (a resident component, a
+    /// `ComponentPhaseEnvelope`, an `OverlayBytes` variable or an overlay byte count).
+    #[test]
+    fn the_prefix_kv_cache_is_not_part_of_the_memory_contract() {
+        for (id, fingerprint) in [
+            (MODEL_ID, "qwen-image-2-1-candle-derived-2026-09-22-v1"),
+            (
+                TURBO_MODEL_ID,
+                "qwen-image-2-1-turbo-candle-derived-2026-10-13-v1",
+            ),
+        ] {
+            let contract = weights_free_memory_strategy_contract(id, &spec()).unwrap();
+            assert_eq!(
+                contract.formula,
+                MemoryFormulaKind::PhaseEnvelope {
+                    phases: vec![
+                        MemoryPhase::Conditioning,
+                        MemoryPhase::Denoise,
+                        MemoryPhase::Decode,
+                    ],
+                    variables: vec![
+                        MemoryFormulaVariable::AssetBytes,
+                        MemoryFormulaVariable::PixelCount,
+                        MemoryFormulaVariable::BatchCount,
+                        MemoryFormulaVariable::ConditioningTokenCount,
+                        MemoryFormulaVariable::DecodeTileArea,
+                    ],
+                },
+                "{id}"
+            );
+            assert!(contract.resident_components().is_empty(), "{id}");
+            assert_eq!(contract.asset_facts, MemoryAssetFacts::default(), "{id}");
+            assert_eq!(contract.total_resident_bytes(), 0, "{id}");
+            assert_eq!(
+                contract
+                    .calibration
+                    .as_ref()
+                    .map(|c| c.fingerprint.as_str()),
+                Some(fingerprint),
+                "{id}: the calibration identity names the default execution, which is unchanged"
+            );
+            assert_eq!(
+                contract.resident_request_memory,
+                ResidentRequestMemory::PreserveLoadDefaults,
+                "{id}"
+            );
+        }
+    }
+
+    /// A request that selects nothing runs prefill; a selection is read off the request's memory
+    /// block; and both engine ids declare exactly the two modes, so the shared floor admits a
+    /// selection instead of refusing it.
+    ///
+    /// *Mutations that red this:* defaulting an unset request to `Cached`; ignoring the request's
+    /// selection; declaring only one mode (the other is refused at `validate`).
+    #[test]
+    fn the_prefix_kv_cache_is_a_declared_request_selection_and_unset_is_prefill() {
+        use gen_core::{GenerationMemory, GenerationRequest};
+        let request = |memory: Option<GenerationMemory>| GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            memory,
+            ..Default::default()
+        };
+        assert_eq!(
+            prefix_kv_cache_for(&request(None)),
+            PrefixKvCacheMode::Prefill
+        );
+        assert_eq!(
+            prefix_kv_cache_for(&request(Some(GenerationMemory::default()))),
+            PrefixKvCacheMode::Prefill
+        );
+        for mode in PrefixKvCacheMode::ALL {
+            let selected = request(Some(GenerationMemory {
+                prefix_kv_cache: Some(mode),
+                ..Default::default()
+            }));
+            assert_eq!(prefix_kv_cache_for(&selected), mode);
+            for descriptor in [crate::descriptor(), crate::descriptor_turbo()] {
+                assert!(descriptor
+                    .capabilities
+                    .execution
+                    .declaration_errors()
+                    .is_empty());
+                descriptor
+                    .capabilities
+                    .validate_request(descriptor.id, &selected)
+                    .unwrap_or_else(|error| {
+                        panic!("{}: {mode:?} must be admitted: {error}", descriptor.id)
+                    });
+            }
+        }
     }
 }
