@@ -851,9 +851,6 @@ mod tests {
             "qwen_image_2512",
             "qwen_image_2512_fun_controlnet_union",
             "qwen_image_edit",
-            // sc-25900: the distilled Qwen-Image 2.1 Turbo checkpoint is registered on MLX only
-            // so far; the candle twin of that id maps this row when it registers.
-            "qwen_image_2_1_turbo",
             "flux1_dev_controlnet_union_pro_2_0",
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
