@@ -17,7 +17,7 @@ use mlx_gen::gen_core::{Error as CoreError, Progress};
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Quant, WeightsSource};
 use mlx_gen_qwen_image_2_1::convert::{
-    digest_tree, prequantize_turnkey, source_variant, CHANGES_FILE, SHA256SUMS_FILE,
+    digest_tree, prequantize_turnkey, source_variant, CHANGES_FILE, NOTICE_FILE, SHA256SUMS_FILE,
 };
 use mlx_gen_qwen_image_2_1::memory_strategy::derived;
 use mlx_gen_qwen_image_2_1::quant::{installed_tier, Tier, GROUP_SIZE};
@@ -150,7 +150,8 @@ fn safetensors_payload_bytes(path: &Path) -> u64 {
 ///
 /// *Mutations that red this:* the converter dropping `sample_sigmas` from the tier's
 /// `model_index.json`; casting the VAE on the way through; writing the base repository/revision
-/// into a Turbo tier's `CHANGES.md`; leaving a changed file out of `CHANGES.md`.
+/// into a Turbo tier's `CHANGES.md`; leaving a changed file out of `CHANGES.md`; not writing the
+/// tier's `NOTICE`, or writing it after the manifest.
 #[test]
 fn a_converted_turbo_tier_is_a_complete_standalone_turbo_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
@@ -224,6 +225,19 @@ fn a_converted_turbo_tier_is_a_complete_standalone_turbo_snapshot() {
             "{name}: LICENSE must be copied unchanged"
         );
 
+        // The §3(c) attribution travels IN the tier: a `NOTICE` file holding the licence's notice
+        // verbatim (the same text for both checkpoints — their LICENSE files are one file).
+        assert_eq!(
+            std::fs::read_to_string(out.join(NOTICE_FILE)).unwrap(),
+            format!("{}\n", mlx_gen_qwen_image_2_1::UPSTREAM_LICENSE_NOTICE),
+            "{name}: NOTICE must be the attribution notice, verbatim"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join(NOTICE_FILE)).unwrap(),
+            "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 \
+             Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.\n"
+        );
+
         // The change record names every changed file with the tier and group size, and the Turbo
         // upstream — never the base repository or its revision.
         let changes = std::fs::read_to_string(out.join(CHANGES_FILE)).unwrap();
@@ -240,6 +254,7 @@ fn a_converted_turbo_tier_is_a_complete_standalone_turbo_snapshot() {
             format!("`{}`", mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_HF_REPO),
             format!("`{}`", mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_HF_REVISION),
             format!("`{TURBO}`"),
+            "the §3(c) attribution is in the `NOTICE` file in this directory".to_owned(),
             "§3(b)".to_owned(),
             SHA256SUMS_FILE.to_owned(),
         ] {
@@ -249,6 +264,7 @@ fn a_converted_turbo_tier_is_a_complete_standalone_turbo_snapshot() {
             format!("`{}`", mlx_gen_qwen_image_2_1::UPSTREAM_HF_REPO),
             mlx_gen_qwen_image_2_1::UPSTREAM_HF_REVISION.to_owned(),
             format!("Q{}", if bits == 4 { 8 } else { 4 }),
+            "`NOTICE` of the producing crate".to_owned(),
         ] {
             assert!(
                 !changes.contains(&wrong),
@@ -287,7 +303,13 @@ fn a_converted_turbo_tier_is_a_complete_standalone_turbo_snapshot() {
             );
             listed.push(rel.to_owned());
         }
-        for rel in ["LICENSE", CHANGES_FILE, "model_index.json", vae] {
+        for rel in [
+            "LICENSE",
+            NOTICE_FILE,
+            CHANGES_FILE,
+            "model_index.json",
+            vae,
+        ] {
             assert!(
                 listed.iter().any(|l| l == rel),
                 "{name}: {rel} is not bound"
@@ -327,7 +349,8 @@ fn turbo_conversion_is_byte_reproducible_across_runs() {
 
 /// A Turbo tier differs from the base tier of the same width **only where the two snapshots do**:
 /// the saved schedule, the scheduler config, the VAE, and the change record that names the
-/// source. The packed `transformer/` and `text_encoder/` — weights and markers — are the same
+/// source — plus the `NOTICE` file only a Turbo tier carries (a base tier is written exactly as it
+/// always was, so published base tiers still reproduce). The packed `transformer/` and `text_encoder/` — weights and markers — are the same
 /// bytes, because the converter treats both checkpoints' weights identically. (The fixture's DiT
 /// and tower are the base fixture's own, as the released checkpoints' architectures are; this is
 /// what lets the Candle twin compose a Turbo tier from the committed packed components.)
@@ -340,15 +363,30 @@ fn a_turbo_tier_differs_from_the_base_tier_only_where_the_snapshots_do() {
     for tier in [Tier::Q8, Tier::Q4] {
         let turbo = digest_tree(&convert(&source, &tmp.path().join("turbo"), tier)).unwrap();
         let base = digest_tree(&convert(&tiny_snapshot(), &tmp.path().join("base"), tier)).unwrap();
-        assert_eq!(
-            turbo.keys().collect::<Vec<_>>(),
-            base.keys().collect::<Vec<_>>(),
-            "{}: the two tiers hold the same files",
+        // The one file a Turbo tier holds that a base tier does not.
+        let only_turbo: Vec<&str> = turbo
+            .keys()
+            .filter(|rel| !base.contains_key(*rel))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(only_turbo, [NOTICE_FILE], "{}", tier.dir_name());
+        assert!(
+            base.keys().all(|rel| turbo.contains_key(rel)),
+            "{}: a Turbo tier holds every file a base tier does",
+            tier.dir_name()
+        );
+        assert!(
+            !tmp.path()
+                .join("base")
+                .join(tier.dir_name())
+                .join(NOTICE_FILE)
+                .exists(),
+            "{}: the base tier is written as it always was",
             tier.dir_name()
         );
         let differing: Vec<&str> = turbo
             .iter()
-            .filter(|(rel, digest)| base[*rel] != **digest)
+            .filter(|(rel, digest)| base.get(*rel).is_some_and(|other| other != *digest))
             .map(|(rel, _)| rel.as_str())
             .collect();
         assert_eq!(

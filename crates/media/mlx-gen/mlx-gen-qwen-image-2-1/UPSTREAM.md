@@ -548,6 +548,7 @@ differences, all inherited from the snapshot rather than decided by the converte
 | `vae/` | byte-for-byte copy, **bf16** | byte-for-byte copy, f32 |
 | `text_encoder/model.safetensors` | packed from upstream's one file | packed from upstream's four shards |
 | `CHANGES.md` | names `Qwen/Qwen-Image-2.1-Turbo` at its pinned revision, and that the tier loads as `qwen_image_2_1_turbo` | names `Qwen/Qwen-Image-2.1` at its pinned revision — wording unchanged by this story |
+| `NOTICE` | the licence's §3(c) attribution notice, verbatim, bound by `SHA256SUMS`; `CHANGES.md` points at it | not written — a base tier is produced byte for byte as before, so published base tiers still reproduce; its attribution is the notice quoted in the `LICENSE` it carries |
 
 Because the schedule signals ride in files a tier copies verbatim, a tier is the same checkpoint as
 its source: a Turbo tier is refused under `qwen_image_2_1` and a base tier under
@@ -555,11 +556,17 @@ its source: a Turbo tier is refused under `qwen_image_2_1` and a base tier under
 through the memory registration. The tier/request rules (`quant::needs_load_time_quant`) are the
 base checkpoint's, unchanged, and the bf16 tier is still refused rather than copied.
 
-**Derived memory — nothing here is measured.** `memory_strategy::derived`'s `*_for(variant, …)`
-functions price the Turbo checkpoint; the un-suffixed ones remain the base checkpoint's. The two
-differ only where the bf16 autoencoder does: its resident bytes (675 480 808 against
-1 350 961 616), and the decode head's attention matrices, which run on the bf16 stream. The
-full-resolution tail's pipelined maps are not re-priced, because every `ChannelNorm` widens to f32.
+**Derived memory — nothing here is measured.** The Turbo checkpoint's **only** derived difference
+from the base one is the autoencoder's resident bytes: it ships bf16 and MLX holds it at the
+on-disk dtype (675 480 808 B against 1 350 961 616). `memory_strategy::derived`'s
+`*_for(variant, …)` functions carry that through the totals built on the resident set (resident
+total, staged floor, peak totals, tier tree); the un-suffixed ones remain the base checkpoint's.
+**Every activation and transient term — denoise, decode head and tail, reference encode, the
+request budget — is the base checkpoint's, unchanged.** A bf16 decode stream *may* be cheaper (the
+head's attention matrices would be half as wide), but every `ChannelNorm` still widens to f32, the
+bounded decode's tile term already runs low against its one f32 trace, and nothing has been
+measured on a bf16 VAE; that saving is deliberately not claimed until the terminal story measures
+it.
 
 | Turbo, derived | bf16 | q8 | q4 |
 |---|---|---|---|
@@ -568,7 +575,7 @@ full-resolution tail's pipelined maps are not re-priced, because every `ChannelN
 | VAE (bf16) | 0.63 GiB | 0.63 GiB | 0.63 GiB |
 | resident total | 27.98 GiB | 15.70 GiB | 9.15 GiB |
 | staged floor `max(tower, DiT + VAE)` — the **tower** binds | 14.10 GiB | 8.03 GiB | 4.80 GiB |
-| default-path peak at the largest-area preset | 31.56 GiB | 19.28 GiB | 12.74 GiB |
+| default-path peak at the largest-area preset (base less the VAE difference) | 34.35 GiB | 22.08 GiB | 15.53 GiB |
 | tier tree weight files (`derived::tier_tree_bytes`) | 30.21 GiB | 17.94 GiB | 11.39 GiB |
 
 The Turbo id carries its own calibration identity,

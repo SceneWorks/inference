@@ -594,8 +594,7 @@ impl QwenImage21 {
             resident_bytes.saturating_add(crate::q4_diagnostic::resident_surcharge());
         let _bounds = crate::memory_strategy::AllocatorBounds::enter(
             resident_bytes,
-            crate::memory_strategy::derived::request_transient_budget_bytes_for(
-                self.variant,
+            crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
                 req.height,
                 crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
@@ -846,7 +845,9 @@ mod tests {
 
     /// A Turbo request's allocator bounds are built on the Turbo checkpoint's resident set — its
     /// bf16 autoencoder — not on the base checkpoint's, at every tier, with the adapter overlay
-    /// on top. The base figure is the base table's, unchanged.
+    /// on top. The base figure is the base table's, unchanged. (The transient budget beside it is
+    /// `request_transient_budget_bytes`, the same for both ids: no activation term is
+    /// variant-dependent.)
     ///
     /// *Mutation that reds this:* `derived_resident_bytes` pricing every variant from the base
     /// table (`resident_weights(tier)`).

@@ -32,8 +32,10 @@
 //! Both checkpoints tier the same way (sc-25906): [`prequantize_turnkey`] reads which one its
 //! source snapshot is ([`convert::source_variant`]) and writes a q8/q4 tree that is still that
 //! checkpoint, so each id refuses the other's tiers exactly as it refuses the other's dense
-//! snapshot. The Turbo id has its own derived memory rows ([`memory_strategy::derived`]'s
-//! `*_for(variant, …)` functions) and its own calibration identity.
+//! snapshot. The Turbo id has its own derived resident rows — its bf16 autoencoder is the one
+//! derived difference from the base checkpoint ([`memory_strategy::derived`]'s
+//! `*_for(variant, …)` functions); every activation term is shared — and its own calibration
+//! identity.
 //!
 //! ## What ships in this story
 //!

@@ -9,8 +9,8 @@
 //! what the converter produces and not an approximation of it: the MLX twin's
 //! `turbo_tiers::a_turbo_tier_differs_from_the_base_tier_only_where_the_snapshots_do` holds that a
 //! converted Turbo tier and a converted base tier differ in exactly `model_index.json`,
-//! `scheduler/scheduler_config.json`, the VAE file and `CHANGES.md` — the packed components are
-//! the same bytes.
+//! `scheduler/scheduler_config.json`, the VAE file, `CHANGES.md` and the `NOTICE` attribution file
+//! only a Turbo tier carries (composed here too) — the packed components are the same bytes.
 //!
 //! Every assertion is made on the generator loaded from that directory through the provider
 //! catalog, on its render, or on the contract priced from it.
@@ -87,6 +87,14 @@ fn compose_tier(source: &Path, dir: &Path, tier: Tier) -> PathBuf {
     }
     for file in ["model_index.json", "LICENSE"] {
         std::fs::copy(source.join(file), out.join(file)).unwrap();
+    }
+    // A Turbo tier (and only a Turbo tier) carries the licence's §3(c) attribution as `NOTICE`.
+    if !read_json(&source.join("model_index.json"))["sample_sigmas"].is_null() {
+        std::fs::write(
+            out.join("NOTICE"),
+            format!("{}\n", candle_gen_qwen_image_2_1::UPSTREAM_LICENSE_NOTICE),
+        )
+        .unwrap();
     }
     out
 }

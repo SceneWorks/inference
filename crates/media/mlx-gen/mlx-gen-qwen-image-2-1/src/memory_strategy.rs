@@ -137,27 +137,25 @@ pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 384, 256];
 /// `Qwen/Qwen-Image-2.1-Turbo` ([`crate::UPSTREAM_TURBO_HF_REVISION`]) shares the base
 /// checkpoint's transformer config and shard sizes and the same Qwen3-VL tower, so every DiT and
 /// tower count below is its own too. It differs in one component: **its autoencoder ships bf16**
-/// where the base ships f32, and MLX holds a VAE at its on-disk dtype. Two things follow, and the
-/// `*_for(variant, …)` functions carry exactly those two:
+/// where the base ships f32, and MLX holds a VAE at its on-disk dtype. **Exactly one derived
+/// quantity follows the variant — the autoencoder's resident bytes** ([`derived::TURBO_VAE_BYTES`],
+/// half of [`derived::VAE_BYTES`]) — and with it the totals built on the resident set: the
+/// resident total, the staged floor (the DiT + VAE pair no longer outweighs the tower, so the
+/// **tower** binds at every Turbo tier), the peak totals and the tier tree. Those are the
+/// `*_for(variant, …)` functions: [`derived::resident_weights_for`],
+/// [`derived::default_path_peak_max_bytes_for`], [`derived::admissible_square_peak_bytes_for`],
+/// [`derived::table_for`] and [`derived::tier_tree_bytes`].
 ///
-/// * the VAE's resident bytes halve ([`derived::TURBO_VAE_BYTES`]), which moves the resident
-///   total and — because the DiT + VAE pair no longer outweighs the tower — makes the **tower**
-///   the binding term of the staged floor at every Turbo tier
-///   ([`derived::resident_weights_for`]);
-/// * the decode head's global attention runs on the bf16 stream, so its score matrices are 2 B an
-///   element instead of 4 ([`derived::vae_stream_width`],
-///   [`derived::vae_head_attention_bytes_for`]).
-///
-/// The full-resolution tail and the reference encode are **not** re-priced: every `ChannelNorm` of
-/// this crate's VAE widens its input to f32 (the widened map, its square and the quotient are all
-/// full-size f32 maps) before narrowing back, so a bf16 stream still puts f32 maps into the
-/// pipelined set, and which ops are in flight at the high-water mark is a scheduling outcome no one
-/// has traced for a bf16 VAE. The pipelined maps therefore stay priced at the widest element the
-/// decoder materializes ([`derived::VAE_ELEMENT_WIDTH`]) — the conservative end of what the
-/// forward allows, chosen by reading it, not the base checkpoint's observation carried over.
-/// **Every Turbo number is derived and unmeasured**: the traces quoted on the constants below were
-/// taken on the base checkpoint's f32 autoencoder and are not evidence for the Turbo one. The
-/// un-suffixed functions are the base checkpoint's and are unchanged.
+/// **Every activation and transient term is the base checkpoint's, unchanged, for both ids**: the
+/// denoise (the same network at the same dtype), the decode head and tail, the reference encode,
+/// and therefore the request budget the allocator bounds are built from. A bf16 decode stream
+/// *may* be cheaper than the f32 one these terms were derived (and, for two of them, checked)
+/// against — the head's attention matrices would be half as wide — but each `ChannelNorm` of this
+/// VAE still widens to f32, the bounded decode's tile term is already known to run low against
+/// its one f32 trace, and nothing has been measured on a bf16 VAE. Pricing Turbo lower on that
+/// reasoning would under-estimate in the direction admission cannot afford, so it is deliberately
+/// **not claimed** until the terminal story measures it. Every Turbo number is derived and
+/// unmeasured; the un-suffixed functions are the base checkpoint's and are unchanged.
 pub mod derived {
     use super::{Tier, GROUP_SIZE};
     use crate::config::SizePreset;
@@ -354,27 +352,26 @@ pub mod derived {
             Variant::Base => (BASE_TEXT_ENCODER_FILE_BYTES, BASE_VAE_FILE_BYTES),
             Variant::Turbo => (TURBO_TEXT_ENCODER_FILE_BYTES, TURBO_VAE_FILE_BYTES),
         };
-        match tier.transformer_bits() {
-            None => TierTree {
-                transformer: TRANSFORMER_FILE_BYTES,
-                text_encoder,
-                vae,
-            },
-            Some(bits) => TierTree {
-                transformer: packed_component_payload_bytes(
+        TierTree {
+            transformer: match tier.transformer_bits() {
+                None => TRANSFORMER_FILE_BYTES,
+                Some(bits) => packed_component_payload_bytes(
                     TRANSFORMER_FILE_BYTES,
                     DIT_LINEAR_PARAMS,
                     BF16_WIDTH,
                     bits as u32,
                 ),
-                text_encoder: packed_component_payload_bytes(
+            },
+            text_encoder: match tier.text_encoder_bits() {
+                None => text_encoder,
+                Some(bits) => packed_component_payload_bytes(
                     text_encoder,
                     LM_LINEAR_PARAMS,
                     BF16_WIDTH,
                     bits as u32,
                 ),
-                vae,
             },
+            vae,
         }
     }
 
@@ -540,28 +537,8 @@ pub mod derived {
     /// The decode head's attention transient at `width × height`:
     /// [`VAE_HEAD_ATTENTION_MATRICES`] `[tokens, tokens]` f32 matrices.
     pub const fn vae_head_attention_bytes(width: u32, height: u32) -> u64 {
-        vae_head_attention_bytes_for(Variant::Base, width, height)
-    }
-
-    /// Width of one element of `variant`'s autoencoder **stream** — its conv weights and the
-    /// residual maps between them, and so the query/key/value rows of the decode head's
-    /// attention. MLX holds the VAE at its on-disk dtype and computes in it
-    /// (`QwenImage21Vae::compute_dtype`): f32 for the base checkpoint, bf16 for Turbo.
-    pub const fn vae_stream_width(variant: Variant) -> u64 {
-        match variant {
-            Variant::Base => VAE_ELEMENT_WIDTH,
-            Variant::Turbo => BF16_WIDTH,
-        }
-    }
-
-    /// [`vae_head_attention_bytes`] for `variant`: the same [`VAE_HEAD_ATTENTION_MATRICES`]
-    /// `[tokens, tokens]` score matrices at the stream's element width ([`vae_stream_width`]) —
-    /// the attention runs straight on the stream, with no widening step between the `to_qkv` conv
-    /// and the product. **Derived** for Turbo (half the base figure, 3.0 GiB at 2048²); the
-    /// 5.55 GiB trace quoted on [`VAE_HEAD_ATTENTION_MATRICES`] is the base checkpoint's.
-    pub const fn vae_head_attention_bytes_for(variant: Variant, width: u32, height: u32) -> u64 {
         let tokens = image_tokens(width, height);
-        VAE_HEAD_ATTENTION_MATRICES * tokens * tokens * vae_stream_width(variant)
+        VAE_HEAD_ATTENTION_MATRICES * tokens * tokens * VAE_ELEMENT_WIDTH
     }
 
     const fn max(a: u64, b: u64) -> u64 {
@@ -576,15 +553,8 @@ pub mod derived {
     /// head's attention matrices and the tail's [`VAE_PIPELINED_DECODE_MAPS`] full-res maps (the
     /// tail, at every size from 512² up).
     pub const fn vae_decode_activation_bytes(width: u32, height: u32) -> u64 {
-        vae_decode_activation_bytes_for(Variant::Base, width, height)
-    }
-
-    /// [`vae_decode_activation_bytes`] for `variant`. Only the head term follows the variant
-    /// ([`vae_head_attention_bytes_for`]); the tail's pipelined maps stay at
-    /// [`VAE_ELEMENT_WIDTH`] for the reason the module docs give.
-    pub const fn vae_decode_activation_bytes_for(variant: Variant, width: u32, height: u32) -> u64 {
         max(
-            vae_head_attention_bytes_for(variant, width, height),
+            vae_head_attention_bytes(width, height),
             VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(width, height),
         )
     }
@@ -608,29 +578,10 @@ pub mod derived {
         width: u32,
         height: u32,
         tile_edge: u32,
-        overlap: u32,
-    ) -> u64 {
-        tiled_vae_decode_activation_bytes_for(Variant::Base, width, height, tile_edge, overlap)
-    }
-
-    /// [`tiled_vae_decode_activation_bytes`] for `variant`. The head term follows the variant; the
-    /// tile's pipelined maps stay at [`VAE_ELEMENT_WIDTH`], and the canvas is f32 for both (the
-    /// decode's RGBA output is cast to f32 whatever the stream is).
-    ///
-    /// With the head halved, the **tile** term is the larger one at every preset on the Turbo
-    /// checkpoint (3.52 GiB of 512² tile maps against 3.0–3.15 GiB of head attention) — the term
-    /// the base documentation above records as err-low against its one f32 trace. That trace does
-    /// not transfer: the up-block transition maps it was dominated by are stream maps, bf16 here.
-    /// The Turbo figure is a derivation with no observation behind it in either direction.
-    pub const fn tiled_vae_decode_activation_bytes_for(
-        variant: Variant,
-        width: u32,
-        height: u32,
-        tile_edge: u32,
         _overlap: u32,
     ) -> u64 {
         max(
-            vae_head_attention_bytes_for(variant, width, height),
+            vae_head_attention_bytes(width, height),
             VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(tile_edge, tile_edge),
         ) + 4 * width as u64 * height as u64 * VAE_ELEMENT_WIDTH
     }
@@ -674,34 +625,11 @@ pub mod derived {
         use_negative: bool,
         tile_edge: Option<u32>,
     ) -> u64 {
-        activation_bytes_for(
-            Variant::Base,
-            width,
-            height,
-            conditioning_tokens,
-            reference_count,
-            use_negative,
-            tile_edge,
-        )
-    }
-
-    /// [`activation_bytes`] for `variant`: the same denoise (the DiT is the same network at the
-    /// same dtype), the same reference-encode bound, and `variant`'s decode
-    /// ([`vae_decode_activation_bytes_for`] / [`tiled_vae_decode_activation_bytes_for`]).
-    pub const fn activation_bytes_for(
-        variant: Variant,
-        width: u32,
-        height: u32,
-        conditioning_tokens: u64,
-        reference_count: u32,
-        use_negative: bool,
-        tile_edge: Option<u32>,
-    ) -> u64 {
         let tokens = joint_tokens(width, height, conditioning_tokens, reference_count);
         let denoise = dit_activation_bytes(tokens);
         let decode = match tile_edge {
-            Some(edge) => tiled_vae_decode_activation_bytes_for(variant, width, height, edge, 64),
-            None => vae_decode_activation_bytes_for(variant, width, height),
+            Some(edge) => tiled_vae_decode_activation_bytes(width, height, edge, 64),
+            None => vae_decode_activation_bytes(width, height),
         };
         let encode = if reference_count > 0 {
             vae_encode_activation_bytes(
@@ -729,36 +657,10 @@ pub mod derived {
         use_negative: bool,
         forced_tile_edge: Option<u32>,
     ) -> u64 {
-        request_transient_budget_bytes_for(
-            Variant::Base,
-            width,
-            height,
-            conditioning_tokens,
-            reference_count,
-            use_negative,
-            forced_tile_edge,
-        )
-    }
-
-    /// [`request_transient_budget_bytes`] for `variant` — what a request of that engine id is
-    /// actually bounded by. The decode **policy** is not the variant's to choose
-    /// ([`super::default_decode_is_bounded`] is a property of the geometry and is the one
-    /// [`crate::pipeline::decode_tiling`] applies to both ids); only the price of the decode it
-    /// picks follows the variant.
-    pub fn request_transient_budget_bytes_for(
-        variant: Variant,
-        width: u32,
-        height: u32,
-        conditioning_tokens: u64,
-        reference_count: u32,
-        use_negative: bool,
-        forced_tile_edge: Option<u32>,
-    ) -> u64 {
         let tile_edge = forced_tile_edge.or_else(|| {
             super::default_decode_is_bounded(width, height).then_some(super::DECODE_TILE_EDGE)
         });
-        activation_bytes_for(
-            variant,
+        activation_bytes(
             width,
             height,
             conditioning_tokens,
@@ -821,13 +723,7 @@ pub mod derived {
     /// ([`TABLE_CONDITIONING_TOKENS`], no references, no negative branch): the decode the policy
     /// picks ([`super::default_decode_is_bounded`]) against the denoise.
     pub fn default_activation_bytes_at(width: u32, height: u32) -> u64 {
-        default_activation_bytes_at_for(Variant::Base, width, height)
-    }
-
-    /// [`default_activation_bytes_at`] for `variant`.
-    pub fn default_activation_bytes_at_for(variant: Variant, width: u32, height: u32) -> u64 {
-        activation_bytes_for(
-            variant,
+        activation_bytes(
             width,
             height,
             TABLE_CONDITIONING_TOKENS,
@@ -842,18 +738,9 @@ pub mod derived {
     /// (quadratic in the token count, 6.31 GiB there against 6.0 at the 2048² default) and the
     /// canvas; the denoise (linear in area, 3.16 GiB) is below it at every preset.
     pub fn default_path_peak_max_preset() -> SizePreset {
-        default_path_peak_max_preset_for(Variant::Base)
-    }
-
-    /// [`default_path_peak_max_preset`] for `variant`. Still the largest-area preset on the Turbo
-    /// checkpoint, for a different reason: the bounded decode's tile term is the same at every
-    /// preset there, so the f32 canvas (linear in area) is what orders them.
-    pub fn default_path_peak_max_preset_for(variant: Variant) -> SizePreset {
         crate::config::PRESETS
             .into_iter()
-            .max_by_key(|preset| {
-                default_activation_bytes_at_for(variant, preset.width, preset.height)
-            })
+            .max_by_key(|preset| default_activation_bytes_at(preset.width, preset.height))
             .expect("the preset table is non-empty")
     }
 
@@ -875,11 +762,14 @@ pub mod derived {
     }
 
     /// [`default_path_peak_max_bytes`] for `variant` — the number a consumer floor for that
-    /// engine id is built from. **Derived, not measured**, for the Turbo checkpoint in every term.
+    /// engine id is built from: `variant`'s resident weights plus the **same** default-path
+    /// activation. For the Turbo checkpoint that is the base figure less the autoencoder's
+    /// resident difference ([`VAE_BYTES`] − [`TURBO_VAE_BYTES`]) and nothing else. Derived, not
+    /// measured.
     pub fn default_path_peak_max_bytes_for(variant: Variant, tier: Tier) -> u64 {
-        let preset = default_path_peak_max_preset_for(variant);
+        let preset = default_path_peak_max_preset();
         resident_weights_for(variant, tier).resident_total()
-            + default_activation_bytes_at_for(variant, preset.width, preset.height)
+            + default_activation_bytes_at(preset.width, preset.height)
     }
 
     /// The default-path peak of `tier` at the largest admissible square, `max_side²` — off every
@@ -888,11 +778,11 @@ pub mod derived {
         admissible_square_peak_bytes_for(Variant::Base, tier)
     }
 
-    /// [`admissible_square_peak_bytes`] for `variant`.
+    /// [`admissible_square_peak_bytes`] for `variant`: its resident weights, the same activation.
     pub fn admissible_square_peak_bytes_for(variant: Variant, tier: Tier) -> u64 {
         let side = super::admission_geometry().max_side;
         resident_weights_for(variant, tier).resident_total()
-            + default_activation_bytes_at_for(variant, side, side)
+            + default_activation_bytes_at(side, side)
     }
 
     /// The full derived table: every tier at every upstream preset, densest tier first.
@@ -900,7 +790,8 @@ pub mod derived {
         table_for(Variant::Base)
     }
 
-    /// [`table`] for `variant`. Every Turbo row is derived and unmeasured.
+    /// [`table`] for `variant`: its resident weights and staged floor beside the same activation
+    /// columns. Every Turbo row is derived and unmeasured.
     pub fn table_for(variant: Variant) -> Vec<TableRow> {
         let mut rows = Vec::with_capacity(Tier::ALL.len() * crate::config::PRESETS.len());
         for tier in Tier::ALL {
@@ -911,8 +802,7 @@ pub mod derived {
                     preset,
                     resident_weight_bytes: weights.resident_total(),
                     sequential_weight_floor_bytes: weights.sequential_floor(),
-                    activation_bytes: activation_bytes_for(
-                        variant,
+                    activation_bytes: activation_bytes(
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -920,8 +810,7 @@ pub mod derived {
                         false,
                         None,
                     ),
-                    tiled_activation_bytes: activation_bytes_for(
-                        variant,
+                    tiled_activation_bytes: activation_bytes(
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -2623,136 +2512,77 @@ mod tests {
         );
     }
 
-    /// The Turbo activation model follows the bf16 stream only where the forward does: the decode
-    /// head's attention matrices halve, the tail's pipelined maps and the f32 canvas do not, the
-    /// denoise is the same network, and the decode **policy** is the geometry's, not the
-    /// variant's. The un-suffixed (base) functions are the `Variant::Base` case exactly.
+    /// **The Turbo checkpoint's only derived difference from the base one is the autoencoder's
+    /// resident bytes.** Every activation column of its table is the base table's, and its peak
+    /// totals are the base totals less exactly `VAE_BYTES − TURBO_VAE_BYTES` — no decode or
+    /// denoise term is priced lower on the unmeasured assumption that a bf16 stream is cheaper.
     ///
-    /// *Mutation that reds this:* `vae_stream_width(Variant::Turbo)` returning the f32 width.
+    /// *Mutations that red this:* any variant-dependent activation term (e.g. `table_for`
+    /// halving the Turbo `tiled_activation_bytes`); `default_path_peak_max_bytes_for` ignoring
+    /// the variant's resident set.
     #[test]
-    fn the_turbo_activation_model_halves_only_the_decode_head() {
+    fn the_turbo_activation_and_transient_terms_are_the_base_checkpoints() {
         use crate::model::Variant;
 
-        let mut sizes: Vec<(u32, u32)> = PRESETS.iter().map(|p| (p.width, p.height)).collect();
-        let max_side = admission_geometry().max_side;
-        sizes.extend([(512, 512), (544, 512), (1024, 1024), (max_side, max_side)]);
-        for (w, h) in sizes {
-            // Base wrappers are the Base variant.
-            assert_eq!(
-                vae_head_attention_bytes_for(Variant::Base, w, h),
-                vae_head_attention_bytes(w, h)
-            );
-            assert_eq!(
-                vae_decode_activation_bytes_for(Variant::Base, w, h),
-                vae_decode_activation_bytes(w, h)
-            );
-            assert_eq!(
-                tiled_vae_decode_activation_bytes_for(Variant::Base, w, h, DECODE_TILE_EDGE, 64),
-                tiled_vae_decode_activation_bytes(w, h, DECODE_TILE_EDGE, 64)
-            );
-            assert_eq!(
-                default_activation_bytes_at_for(Variant::Base, w, h),
-                default_activation_bytes_at(w, h)
-            );
+        let vae_saving = VAE_BYTES - TURBO_VAE_BYTES;
+        assert_eq!(vae_saving, VAE_PARAMS * (F32_WIDTH - BF16_WIDTH));
 
-            // The head: the same six matrices at the bf16 stream's width.
-            let tokens = image_tokens(w, h);
-            assert_eq!(
-                vae_head_attention_bytes_for(Variant::Turbo, w, h),
-                VAE_HEAD_ATTENTION_MATRICES * tokens * tokens * BF16_WIDTH
-            );
-            assert_eq!(
-                vae_head_attention_bytes_for(Variant::Turbo, w, h) * 2,
-                vae_head_attention_bytes(w, h)
-            );
-            // The tail's pipelined maps are not re-priced, so the untiled decode — tail-bound at
-            // every admissible size — is the same figure.
-            assert_eq!(
-                vae_decode_activation_bytes_for(Variant::Turbo, w, h),
-                VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(w, h)
-            );
-            // Bounded: never above the base figure, and the f32 canvas is still in it.
-            let tiled =
-                tiled_vae_decode_activation_bytes_for(Variant::Turbo, w, h, DECODE_TILE_EDGE, 64);
-            assert!(tiled <= tiled_vae_decode_activation_bytes(w, h, DECODE_TILE_EDGE, 64));
-            assert!(tiled >= 4 * w as u64 * h as u64 * F32_WIDTH);
-            // The policy the pipeline applies to both ids is the one the Turbo model implies.
-            assert_eq!(
-                vae_decode_activation_bytes_for(Variant::Turbo, w, h) > tiled,
-                default_decode_is_bounded(w, h),
-                "{w}x{h}"
-            );
-            // The request budget never exceeds the base checkpoint's.
-            for references in [0, 2] {
-                assert!(
-                    request_transient_budget_bytes_for(
-                        Variant::Turbo,
-                        w,
-                        h,
-                        TABLE_CONDITIONING_TOKENS,
-                        references,
-                        false,
-                        None
-                    ) <= request_transient_budget_bytes(
-                        w,
-                        h,
-                        TABLE_CONDITIONING_TOKENS,
-                        references,
-                        false,
-                        None
-                    )
-                );
-            }
-        }
-
-        // At every preset the Turbo bounded decode is the 512² tile's pipelined maps plus the
-        // canvas — the head (3.0 GiB at 2048²) is below the tile term (3.52 GiB).
-        assert_eq!(
-            vae_head_attention_bytes_for(Variant::Turbo, 2048, 2048),
-            3 << 30
-        );
-        for preset in PRESETS {
-            assert_eq!(
-                tiled_vae_decode_activation_bytes_for(
-                    Variant::Turbo,
-                    preset.width,
-                    preset.height,
-                    DECODE_TILE_EDGE,
-                    64
-                ),
-                VAE_PIPELINED_DECODE_MAPS * full_res_map_bytes(DECODE_TILE_EDGE, DECODE_TILE_EDGE)
-                    + 4 * preset.width as u64 * preset.height as u64 * F32_WIDTH,
-                "{}x{}",
-                preset.width,
-                preset.height
-            );
-        }
-
-        // The floor a Turbo consumer builds from: the largest-area preset, as on the base id.
-        assert_eq!(
-            default_path_peak_max_preset_for(Variant::Turbo),
-            default_path_peak_max_preset()
-        );
-        for (tier, gib) in [(Tier::Bf16, 31.56), (Tier::Q8, 19.28), (Tier::Q4, 12.74)] {
-            let peak = default_path_peak_max_bytes_for(Variant::Turbo, tier);
-            assert!(
-                (peak as f64 / GIB - gib).abs() < 0.01,
-                "{tier:?} Turbo default-path peak {:.3} GiB != {gib}",
-                peak as f64 / GIB
-            );
-            assert!(peak < default_path_peak_max_bytes(tier));
-            assert_eq!(default_path_peak_max_bytes_for(Variant::Base, tier), {
-                default_path_peak_max_bytes(tier)
-            });
-        }
         assert_eq!(table_for(Variant::Base), table());
         let turbo_table = table_for(Variant::Turbo);
         assert_eq!(turbo_table.len(), table().len());
         for (turbo, base) in turbo_table.iter().zip(table()) {
             assert_eq!((turbo.tier, turbo.preset), (base.tier, base.preset));
+            // Every activation column, and the decode policy, unchanged.
+            assert_eq!(turbo.activation_bytes, base.activation_bytes);
+            assert_eq!(turbo.tiled_activation_bytes, base.tiled_activation_bytes);
             assert_eq!(turbo.default_decode_bounded, base.default_decode_bounded);
-            assert!(turbo.resident_weight_bytes < base.resident_weight_bytes);
-            assert!(turbo.default_peak_bytes() < base.default_peak_bytes());
+            assert_eq!(
+                turbo.default_activation_bytes(),
+                base.default_activation_bytes()
+            );
+            // The resident columns follow the variant's weights.
+            let weights = resident_weights_for(Variant::Turbo, turbo.tier);
+            assert_eq!(turbo.resident_weight_bytes, weights.resident_total());
+            assert_eq!(
+                turbo.sequential_weight_floor_bytes,
+                weights.sequential_floor()
+            );
+            // So every peak built on the resident set differs by the VAE saving and nothing else.
+            assert_eq!(
+                base.default_peak_bytes() - turbo.default_peak_bytes(),
+                vae_saving
+            );
+            assert_eq!(
+                base.resident_peak_bytes() - turbo.resident_peak_bytes(),
+                vae_saving
+            );
+        }
+
+        for (tier, gib) in [(Tier::Bf16, 34.35), (Tier::Q8, 22.08), (Tier::Q4, 15.53)] {
+            let peak = default_path_peak_max_bytes_for(Variant::Turbo, tier);
+            assert_eq!(
+                peak,
+                default_path_peak_max_bytes(tier) - vae_saving,
+                "{tier:?}"
+            );
+            assert_eq!(
+                default_path_peak_max_bytes_for(Variant::Base, tier),
+                default_path_peak_max_bytes(tier)
+            );
+            assert!(
+                (peak as f64 / GIB - gib).abs() < 0.01,
+                "{tier:?} Turbo default-path peak {:.3} GiB != {gib}",
+                peak as f64 / GIB
+            );
+            assert_eq!(
+                admissible_square_peak_bytes_for(Variant::Turbo, tier),
+                admissible_square_peak_bytes(tier) - vae_saving,
+                "{tier:?}"
+            );
+            assert_eq!(
+                admissible_square_peak_bytes_for(Variant::Base, tier),
+                admissible_square_peak_bytes(tier)
+            );
         }
     }
 

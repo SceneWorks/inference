@@ -499,7 +499,8 @@ shared; none of them has been run on real Turbo weights by this story.
 The Turbo checkpoint tiers exactly as the base one does (*Installable tiers* above): candle loads
 the q8/q4 trees the MLX converter writes, and that converter reads which checkpoint it is
 re-packing off the source snapshot, so a Turbo tier still carries `model_index.json` with its
-`sample_sigmas`, the static scheduler config and the bf16 VAE, byte for byte. Consequences here,
+`sample_sigmas`, the static scheduler config and the bf16 VAE, byte for byte (plus a `NOTICE`
+file with the licence's attribution, which only a Turbo tier carries). Consequences here,
 all inherited rather than added — `tests/turbo_tiers.rs` holds each one:
 
 * a Turbo q8/q4 tier loads under `qwen_image_2_1_turbo` with the matching `quantize` selector and
