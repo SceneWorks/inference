@@ -61,6 +61,9 @@ mod generator_contract;
 #[path = "lib_ops.rs"]
 mod lib_ops;
 
+#[path = "memory_contract.rs"]
+mod memory_contract;
+
 #[path = "real_weights.rs"]
 mod real_weights;
 

@@ -31,6 +31,7 @@
 pub mod adapters;
 pub mod depth;
 pub mod dit;
+pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
@@ -54,7 +55,17 @@ pub use restoration::IrisRestorer;
 pub use text_encoder::{IrisTextEncoder, TextConditioning};
 
 /// Add the MLX Iris-3B generator, its generation (sc-25685) and depth (sc-25687) trainers and the
-/// restoration transform to an explicit media registry builder.
+/// restoration transform to an explicit media registry builder, with the memory-strategy contract,
+/// weights-free contract fixture and behavior seam of each of the three inference tasks
+/// (sc-25690, [`memory_strategy`]).
+///
+/// `iris_3b` is a registered generator, so its contract registers through the ordinary seam. The
+/// depth task is a provider-specific API and restoration is a transform — neither is a gen-core
+/// [`Generator`](mlx_gen::Generator) — so their contracts register as composed routes, the seam
+/// gen-core provides for a real route that no generator registration represents.
+///
+/// Deliberately registers **no** `ActivationMemoryRegistration`: that carrier publishes only real
+/// on-device measurements, and the epic's terminal campaign owns the anchors.
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
@@ -64,6 +75,15 @@ pub fn register_providers(
         .register_trainer(train::depth::REGISTRATION)
         .register_trainer(train::restore::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
+        .register_composed_memory_strategy(memory_strategy::RESTORE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_contract_fixture(memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_contract_fixture(memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_memory_behavior(memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_memory_behavior(memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Iris provider catalog.

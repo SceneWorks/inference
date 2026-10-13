@@ -45,9 +45,15 @@ pub struct IrisDepth {
     /// `[1, T, L, D]` f32 empty-prompt states and their `[T]` mask.
     embeddings: Array,
     mask: Vec<i32>,
+    /// The loaded memory contract ([`crate::memory_strategy::export_contract`] over the export on
+    /// disk) — the one [`crate::memory_strategy::DEPTH_MEMORY_REGISTRATION`] builds for this load.
+    memory_strategy: gen_core::MemoryProviderContract,
+    /// The precision this model computes in — the numeric tier its safety check binds to.
+    precision: mlx_gen::Precision,
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+    crate::memory_strategy::refuse_deferred_load_shape(DEPTH_MODEL_ID, spec)?;
     let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
         ("adapters", !spec.adapters.is_empty()),
@@ -148,7 +154,15 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
     for group in arrays.chunks(64) {
         eval(group.iter().copied())?;
     }
+    let precision = match compute {
+        Dtype::Float32 => mlx_gen::Precision::Fp32,
+        _ => mlx_gen::Precision::Bf16,
+    };
+    let memory_strategy =
+        crate::memory_strategy::export_contract(IrisTask::Depth, precision, &export)?;
     Ok(IrisDepth {
+        memory_strategy,
+        precision,
         dit,
         reducer_weight,
         reducer_bias,
@@ -221,6 +235,23 @@ impl IrisDepth {
 
     pub fn compute_dtype(&self) -> Dtype {
         self.dit.compute_dtype()
+    }
+
+    /// The loaded memory-strategy contract of this depth model (sc-25690): the resident baseline,
+    /// priced from the export's tensor headers. The depth task is a provider-specific API rather
+    /// than a registry [`mlx_gen::Generator`], so this is its `memory_strategy_contract`.
+    pub fn memory_strategy_contract(&self) -> &gen_core::MemoryProviderContract {
+        &self.memory_strategy
+    }
+
+    /// The registered depth safety check against this model's own load: the shared handshake
+    /// bound to the precision it computes in, then the depth route gate. Admit a request at
+    /// [`crate::memory_strategy::depth_memory_geometry`] of its input plan.
+    pub fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::loaded_safety_check(self.precision, &self.memory_strategy, context)
     }
 
     /// `IrisDepth.forward`: `[B, 3, H, W]` RGB in `[-1, 1]` (f32, H and W on the patch grid) →
