@@ -249,10 +249,10 @@ fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core
 /// any weight is touched.
 ///
 /// Every condition image is fitted to `output_resolution` (1024 px) whatever the target size, so
-/// ten references are ~41k prefix tokens on their own, and this port recomputes the whole
-/// block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
-/// runs the fewest steps the sampler accepts rather than a smaller target: only the step count
-/// moves its cost.
+/// ten references are ~41k prefix tokens on their own. The generator runs upstream's prefix KV
+/// cache (sc-25904 — see UPSTREAM.md), so only the first model evaluation pays for that prefix;
+/// the boundary case still runs the fewest steps the sampler accepts rather than a smaller target
+/// (it was sized when every step recomputed the whole block-causal prefix).
 ///
 /// ```sh
 /// CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT=.../snapshots/790c9263... \
