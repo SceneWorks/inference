@@ -20,9 +20,14 @@
 //! Inputs (env) — all REQUIRED, so a misspelled variable cannot silently measure another shape:
 //! * `IRIS_PROBE_TASK` — `generation` | `depth` | `restoration`.
 //! * `IRIS_PROBE_SIZE` — the square training size (px), e.g. 1024.
-//! * `IRIS_PROBE_AC` — `none` | `full` (generation only: the depth and restoration trainers refuse
-//!   activation checkpointing).
+//! * `IRIS_PROBE_AC` — `none` | `full` (generation: `activation_checkpointing`; depth and
+//!   restoration: `gradient_checkpointing`, the same trunk / pixel regions).
 //! * `IRIS_PROBE_STEPS` — optimizer steps.
+//! * `IRIS_PROBE_DTYPE` — `bf16` (the product's autocast) | `f32` (generation only: the pair that
+//!   shows activation checkpointing is exact where rounding does not enter).
+//!
+//! Every optimizer step also prints `cuda_step` — the pool's live high-water since the previous
+//! step (the marks are re-armed at each step), so a steady state is visible in the row.
 //! * `IRIS_WEIGHTS_DIR` — the `speridlabs/iris-3b` snapshot root (generation backbone + `depth/`);
 //!   `IRIS_TEXT_ENCODER_DIR` (generation); `IRIS_UPSCALER_DIR`, `IRIS_LPIPS_VGG16_DIR`,
 //!   `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (restoration).
@@ -63,6 +68,8 @@ fn env_dir(name: &str) -> PathBuf {
 #[cfg(feature = "cuda")]
 struct PoolMeter {
     pool: candle_gen::cuda_mempool::MemPool,
+    /// The largest `(used, reserved)` high-water of the laps so far.
+    seen: std::cell::Cell<(u64, u64)>,
     // Keeps the device's primary context retained (and current on this thread) for the reads.
     _device: candle_gen::candle_core::Device,
 }
@@ -85,16 +92,31 @@ impl PoolMeter {
         assert!(pool.reset_high_water(), "reset the pool high-water marks");
         Self {
             pool,
+            seen: std::cell::Cell::new((0, 0)),
             _device: device,
         }
     }
 
-    /// `(USED_MEM_HIGH, RESERVED_MEM_HIGH)` in bytes.
+    /// `(USED_MEM_HIGH, RESERVED_MEM_HIGH)` in bytes over the whole run: the largest of every
+    /// [`lap`](Self::lap) and of the marks since the last one.
     fn highs(&self) -> (u64, u64) {
+        let (used, reserved) = self.seen.get();
         (
-            self.pool.used_high().expect("USED_MEM_HIGH"),
-            self.pool.reserved_high().expect("RESERVED_MEM_HIGH"),
+            used.max(self.pool.used_high().expect("USED_MEM_HIGH")),
+            reserved.max(self.pool.reserved_high().expect("RESERVED_MEM_HIGH")),
         )
+    }
+
+    /// The live high-water since the previous lap (bytes); re-arms the marks at what is live now.
+    fn lap(&self) -> u64 {
+        let (used, reserved) = self.highs();
+        let lap = self.pool.used_high().expect("USED_MEM_HIGH");
+        self.seen.set((used, reserved));
+        assert!(
+            self.pool.reset_high_water(),
+            "re-arm the pool high-water marks"
+        );
+        lap
     }
 
     /// A completed run allocated through this pool, and a pool never reserves less than is live:
@@ -118,6 +140,10 @@ impl PoolMeter {
     }
 
     fn highs(&self) -> (u64, u64) {
+        panic!("the Candle memory probe measures a CUDA device: build with --features cuda")
+    }
+
+    fn lap(&self) -> u64 {
         panic!("the Candle memory probe measures a CUDA device: build with --features cuda")
     }
 
@@ -173,6 +199,15 @@ fn real_training_memory_probe() {
     let steps: u32 = env_req("IRIS_PROBE_STEPS")
         .parse()
         .expect("IRIS_PROBE_STEPS: a step count");
+    let dtype = env_req("IRIS_PROBE_DTYPE");
+    assert!(
+        matches!(dtype.as_str(), "bf16" | "f32"),
+        "IRIS_PROBE_DTYPE {dtype:?}: bf16 | f32"
+    );
+    assert!(
+        dtype == "bf16" || task == "generation",
+        "IRIS_PROBE_DTYPE f32 is the generation probe's"
+    );
     let work = tempfile::tempdir().unwrap();
     let data = work.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -198,7 +233,7 @@ fn real_training_memory_probe() {
                 save_every: 0,
                 seed: 3,
                 full_finetune: true,
-                train_dtype: "bf16".into(),
+                train_dtype: dtype.clone(),
                 optimizer: "adamw".into(),
                 ..Default::default()
             };
@@ -220,10 +255,6 @@ fn real_training_memory_probe() {
         "depth" => {
             use candle_gen::gen_core::iris::train::depth::ITEM_DEPTH_KEY;
             use candle_gen::gen_core::iris::train::OPTIONS_KEY;
-            assert_eq!(
-                ac, "none",
-                "the depth trainer refuses activation checkpointing"
-            );
             let rgb = data.join("d.png");
             write_rgb(&rgb, size, 0);
             let depth = data.join("d.npy");
@@ -246,6 +277,7 @@ fn real_training_memory_probe() {
                 full_finetune: true,
                 loss_type: "l1".into(),
                 train_dtype: "bf16".into(),
+                gradient_checkpointing: ac == "full",
                 ..Default::default()
             };
             config
@@ -261,10 +293,6 @@ fn real_training_memory_probe() {
                 recipe_training_config, CRITIC_TRUNK_COMPONENT, LPIPS_LIN_COMPONENT, OPTIONS_KEY,
                 VGG16_COMPONENT,
             };
-            assert_eq!(
-                ac, "none",
-                "the restoration trainer refuses activation checkpointing"
-            );
             let items = (0..2)
                 .map(|i| {
                     let p = data.join(format!("r{i}.png"));
@@ -281,6 +309,7 @@ fn real_training_memory_probe() {
             config.save_every = 0;
             config.seed = 5;
             config.train_dtype = "bf16".into();
+            config.gradient_checkpointing = ac == "full";
             config
                 .model_options
                 .insert(OPTIONS_KEY.into(), serde_json::json!({"ema_decay": 0.999}));
@@ -335,9 +364,15 @@ fn real_training_memory_probe() {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         trainer.train(&req, &mut |p| {
             if let TrainingProgress::Training { step, total, loss } = p {
+                let seconds = last.elapsed().as_secs_f32();
                 eprintln!(
-                    "[[IRIS_MEMORY_PROBE]] step {step}/{total} loss {loss:.4} ({:.1}s)",
-                    last.elapsed().as_secs_f32()
+                    "[[IRIS_MEMORY_PROBE]] step {step}/{total} loss {loss:.4} ({seconds:.1}s)"
+                );
+                // The first lap also covers the load; every later one is that step alone.
+                eprintln!(
+                    "[[IRIS_MEMORY_PROBE]] cuda_step step={step} total={total} loss={loss:.6} \
+                     seconds={seconds:.1} used_high_gb={:.2}",
+                    pool.lap() as f64 / 1e9
                 );
                 assert!(loss.is_finite(), "non-finite loss at step {step}");
                 last = std::time::Instant::now();

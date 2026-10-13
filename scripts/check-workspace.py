@@ -341,6 +341,72 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "share one fingerprint would let a record built against one backend satisfy the other's "
         "handshake, which is exactly what the identity exists to prevent."
     ),
+    ("iris", "MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, generation) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, generation): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the generation contract (sc-25690): the same "
+        "aggregate as this family's MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the generation contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
+    ),
+    ("iris", "DEPTH_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, depth) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "DEPTH_MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, depth): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "DEPTH_MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the depth contract (sc-25690): the same "
+        "aggregate as this family's DEPTH_MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "DEPTH_MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the depth contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's DEPTH_MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
+    ),
+    ("iris", "RESTORE_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-25690, restoration) — the same "
+        "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
+        "pricing its components at the width its own loader materializes them at, and a shared "
+        "fingerprint would let a record built against one backend satisfy the other's handshake."
+    ),
+    ("iris", "RESTORE_MEMORY_REGISTRATION"): (
+        "a registration aggregate, not geometry (sc-25690, restoration): each backend names its own "
+        "contract and safety-check functions — the two memory contracts were written per backend "
+        "and declare different rungs (bounded attention is Candle's only) — so the initializer "
+        "expressions cannot be spelled alike."
+    ),
+    ("iris", "RESTORE_MEMORY_CONTRACT_FIXTURE"): (
+        "the weights-free fixture registration of the restoration contract (sc-25690): the same "
+        "aggregate as this family's RESTORE_MEMORY_REGISTRATION, wired to each backend's own "
+        "weights-free contract function. Not geometry."
+    ),
+    ("iris", "RESTORE_MEMORY_BEHAVIOR_REGISTRATION"): (
+        "the behavior registration of the restoration contract (sc-25690): wired to each backend's "
+        "own fixture and begin-request functions, as this family's RESTORE_MEMORY_REGISTRATION is "
+        "to its contract. Not geometry."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."

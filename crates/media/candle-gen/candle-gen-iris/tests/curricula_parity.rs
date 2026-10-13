@@ -514,3 +514,112 @@ fn the_release_teacher_matches_upstream_on_real_weights() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// sc-25690: activation checkpointing under the bf16 policy
+// ---------------------------------------------------------------------------------------------
+
+fn mb(i: usize) -> StepBatch {
+    let g = fixture(TRAIN);
+    let get = |k: &str| g.require(&format!("mb{i}.{k}")).clone();
+    step_batch(
+        get("x0"),
+        get("noise"),
+        &host_i32(&get("t_idx")),
+        get("y"),
+        &host_i32(&get("y_mask")),
+    )
+}
+
+fn model_at(compute: DType) -> TrainModel {
+    TrainModel {
+        cfg: tiny_config().model,
+        compute,
+        device: cpu(),
+        trainable: Trainable::Full,
+    }
+}
+
+struct AcCase {
+    loss: f32,
+    grads: Tensors,
+    /// The loss of micro-batch 1 after one AdamW step on these gradients.
+    next_loss: f32,
+}
+
+fn ac_case(compute: DType, ac: AcPolicy) -> AcCase {
+    use candle_gen::gen_core::iris::train::{
+        MuonAdjustLr, OptimizerKind, OptimizerPlan, ParamRoute,
+    };
+    use candle_gen_iris::train::optim::{clip_grads, IrisOptimizer};
+    let model = model_at(compute);
+    let params = base_params();
+    let extras = TrainExtras { repa: None, ac };
+    let (loss, _, grads) =
+        loss_and_grads_ext(&model, &params, &mb(0), &objective(), &extras, None, 1.0).unwrap();
+    let plan = OptimizerPlan {
+        kind: OptimizerKind::AdamW,
+        base_lr: 1e-3,
+        lr: 1e-3,
+        betas: (0.9, 0.95),
+        weight_decay: 0.01,
+        muon_momentum: 0.95,
+        muon_nesterov: true,
+        muon_adjust_lr: MuonAdjustLr::RmsNorm,
+        auto_lr: "none".into(),
+        base_batch_size: 256,
+    };
+    let mut opt = IrisOptimizer::new(&plan, &params, |_, _| ParamRoute::AdamW).unwrap();
+    let (_, clipped) = clip_grads(grads.clone(), 0.5).unwrap();
+    opt.step(&params, &clipped, plan.lr).unwrap();
+    let (next_loss, _, _) =
+        loss_and_grads_ext(&model, &params, &mb(1), &objective(), &extras, None, 1.0).unwrap();
+    AcCase {
+        loss,
+        grads,
+        next_loss,
+    }
+}
+
+/// Activation checkpointing per compute dtype (sc-25690). f32: the checkpointed gradients are the
+/// plain graph's to 1e-6 and one optimizer step lands on the same next loss. bf16: the forward is
+/// bit-identical (the same loss), and the gradients differ from the plain ones by bf16 rounding
+/// only — no further from the f32 gradient than the plain bf16 gradient is
+/// ([`crate::common::AC_BF16_NOISE_FACTOR`]) — which AdamW's first step (±lr per weight whatever
+/// the gradient's size) turns into a next-loss gap of the order of the bf16-vs-f32 gap itself.
+#[test]
+fn activation_checkpointing_is_exact_in_f32_and_within_rounding_noise_in_bf16() {
+    let f_none = ac_case(DType::F32, AcPolicy::None);
+    let f_full = ac_case(DType::F32, AcPolicy::Full);
+    let b_none = ac_case(DType::BF16, AcPolicy::None);
+    let b_full = ac_case(DType::BF16, AcPolicy::Full);
+    eprintln!(
+        "step-1 loss: f32 none {:e} full {:e} | bf16 none {:e} full {:e}",
+        f_none.loss, f_full.loss, b_none.loss, b_full.loss
+    );
+    eprintln!(
+        "step-2 loss: f32 none {:e} full {:e} | bf16 none {:e} full {:e}",
+        f_none.next_loss, f_full.next_loss, b_none.next_loss, b_full.next_loss
+    );
+    // (i) the forward: checkpointing changes no bit of the loss under either policy
+    assert_eq!(f_none.loss.to_bits(), f_full.loss.to_bits(), "f32 loss");
+    assert_eq!(b_none.loss.to_bits(), b_full.loss.to_bits(), "bf16 loss");
+    // (ii) the gradients
+    crate::common::assert_ac_f32_equal("generation", 1e-6, &f_none.grads, &f_full.grads);
+    crate::common::assert_ac_bf16_noise_only(
+        "generation",
+        &f_none.grads,
+        &b_none.grads,
+        &b_full.grads,
+    );
+    // (iii) one AdamW step later
+    let f32_gap = (f_none.next_loss - f_full.next_loss).abs();
+    assert!(f32_gap <= 1e-6, "f32 next-loss gap {f32_gap:e}");
+    let policy_gap = (b_none.next_loss - f_none.next_loss).abs();
+    let ac_gap = (b_none.next_loss - b_full.next_loss).abs();
+    eprintln!("bf16 next-loss gap: checkpointing {ac_gap:.3e}, the policy itself {policy_gap:.3e}");
+    assert!(
+        ac_gap <= 4.0 * policy_gap,
+        "bf16 checkpointing moved the next loss by {ac_gap:e}, the bf16 policy itself by {policy_gap:e}"
+    );
+}

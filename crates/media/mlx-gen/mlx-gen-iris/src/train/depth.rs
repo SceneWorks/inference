@@ -209,6 +209,12 @@ impl IrisDepthTrainer {
         validate_edit_request(d, req)?;
         refuse_reference_control_model_options(DEPTH_TRAINER_ID, req)?;
         let plan = DepthTrainPlan::resolve(req, &self.config)?;
+        if plan.ac.active() {
+            return Err(Error::Unsupported(format!(
+                "{DEPTH_TRAINER_ID} trainer: gradient (activation) checkpointing is not \
+                 implemented for the depth task on the MLX backend"
+            )));
+        }
         if req.items.is_empty() {
             return Err(Error::Msg(format!(
                 "{DEPTH_TRAINER_ID} trainer: the dataset is empty"

@@ -74,8 +74,9 @@ fn conv(
 }
 
 /// Depthwise `k × k` stride-1 correlation with per-channel `[C, 1, k, k]` weights and zero padding
-/// `pad`, as `Σ_{i,j} w[:, i, j] · x_pad[:, :, i:i+H', j:j+W']` (compute dtype, f32 out).
-fn depthwise(x: &Tensor, w: &Tensor, pad: usize, compute: DType) -> Result<Tensor> {
+/// `pad`, as `Σ_{i,j} w[:, i, j] · x_pad[:, :, i:i+H', j:j+W']` (compute dtype, f32 out). `fold`
+/// puts the sum on the tape as one node; a caller that is itself replayed inside one passes `false`.
+fn depthwise(x: &Tensor, w: &Tensor, pad: usize, compute: DType, fold: bool) -> Result<Tensor> {
     let (_, c, h, wd) = x.dims4()?;
     let k = w.dim(2)?;
     let (oh, ow) = (h + 2 * pad + 1 - k, wd + 2 * pad + 1 - k);
@@ -84,18 +85,29 @@ fn depthwise(x: &Tensor, w: &Tensor, pad: usize, compute: DType) -> Result<Tenso
         .pad_with_zeros(2, pad, pad)?
         .pad_with_zeros(3, pad, pad)?;
     let w = w.to_dtype(compute)?.reshape((c, k * k))?;
-    let mut acc: Option<Tensor> = None;
-    for i in 0..k {
-        for j in 0..k {
-            let tap = w.narrow(1, i * k + j, 1)?.reshape((1, c, 1, 1))?;
-            let term = xp.narrow(2, i, oh)?.narrow(3, j, ow)?.broadcast_mul(&tap)?;
-            acc = Some(match acc {
-                None => term,
-                Some(a) => a.add(&term)?,
-            });
+    // One tape node (sc-25690) when the taps are constants and the padded map is this call's own:
+    // the plain chain keeps `2·k² − 1` feature maps on the tape per call.
+    let fold = fold && !w.track_op() && xp.id() != x.id();
+    let sum = move |xp: &Tensor| -> candle_gen::candle_core::Result<Tensor> {
+        let mut acc: Option<Tensor> = None;
+        for i in 0..k {
+            for j in 0..k {
+                let tap = w.narrow(1, i * k + j, 1)?.reshape((1, c, 1, 1))?;
+                let term = xp.narrow(2, i, oh)?.narrow(3, j, ow)?.broadcast_mul(&tap)?;
+                acc = Some(match acc {
+                    None => term,
+                    Some(a) => a.add(&term)?,
+                });
+            }
         }
-    }
-    Ok(acc.expect("k ≥ 1").to_dtype(DType::F32)?)
+        Ok(acc.expect("k ≥ 1"))
+    };
+    let acc = if fold {
+        crate::tape::fold1("iris-depthwise", &xp, sum)?
+    } else {
+        sum(&xp)?
+    };
+    Ok(acc.to_dtype(DType::F32)?)
 }
 
 fn gelu(x: &Tensor) -> Result<Tensor> {
@@ -106,6 +118,7 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 // The frozen trunk
 // =============================================================================================
 
+#[derive(Clone)]
 struct Block {
     dw_w: Tensor,
     dw_b: Tensor,
@@ -116,6 +129,38 @@ struct Block {
     fc2_w: Tensor,
     fc2_b: Tensor,
     gamma: Tensor,
+}
+
+impl Block {
+    /// `residual + γ · mlp(norm(dwconv(x)))` — timm's `ConvNeXtBlock` (`conv_mlp=False`), with the
+    /// block input named once per reader.
+    fn forward(&self, residual: &Tensor, x: &Tensor, eps: f64, compute: DType) -> Result<Tensor> {
+        let r = depthwise(x, &self.dw_w, 3, compute, false)?
+            .broadcast_add(&self.dw_b.reshape((1, self.dw_b.dim(0)?, 1, 1))?)?;
+        // channels-last MLP (timm `conv_mlp=False`)
+        let r = r.permute((0, 2, 3, 1))?;
+        let r = layer_norm_c(&r, &self.ln_w, &self.ln_b, eps, 3)?;
+        let r = gelu(&linear(&r, &self.fc1_w, Some(&self.fc1_b), compute)?)?;
+        let r = linear(&r, &self.fc2_w, Some(&self.fc2_b), compute)?;
+        let r = r.broadcast_mul(&self.gamma)?.permute((0, 3, 1, 2))?;
+        Ok(residual.add(&r)?)
+    }
+
+    fn frozen(&self) -> bool {
+        ![
+            &self.dw_w,
+            &self.dw_b,
+            &self.ln_w,
+            &self.ln_b,
+            &self.fc1_w,
+            &self.fc1_b,
+            &self.fc2_w,
+            &self.fc2_b,
+            &self.gamma,
+        ]
+        .iter()
+        .any(|t| t.track_op())
+    }
 }
 
 struct Stage {
@@ -252,15 +297,21 @@ impl ConvNextTrunk {
                 h = conv(&h, cw, Some(cb), 2, 0, self.compute)?;
             }
             for b in &stage.blocks {
-                let r = depthwise(&h, &b.dw_w, 3, self.compute)?
-                    .broadcast_add(&b.dw_b.reshape((1, b.dw_b.dim(0)?, 1, 1))?)?;
-                // channels-last MLP (timm `conv_mlp=False`)
-                let r = r.permute((0, 2, 3, 1))?;
-                let r = layer_norm_c(&r, &b.ln_w, &b.ln_b, eps, 3)?;
-                let r = gelu(&linear(&r, &b.fc1_w, Some(&b.fc1_b), self.compute)?)?;
-                let r = linear(&r, &b.fc2_w, Some(&b.fc2_b), self.compute)?;
-                let r = r.broadcast_mul(&b.gamma)?.permute((0, 3, 1, 2))?;
-                h = h.add(&r)?;
+                h = if b.frozen() {
+                    // One tape node per frozen block (sc-25690): a gradient to the image crosses
+                    // the trunk, and the plain chain keeps ~125 feature maps per block on the tape
+                    // for it (the depthwise sum alone 97). The block reads its input twice (the
+                    // residual sum and the convolution), so it is passed once per reader; nothing
+                    // else reads a block's input.
+                    let (block, compute) = (b.clone(), self.compute);
+                    crate::tape::fold3("iris-convnext-block", &h, &h, &b.gamma, move |r, x, _| {
+                        block
+                            .forward(r, x, eps, compute)
+                            .map_err(candle_gen::candle_core::Error::wrap)
+                    })?
+                } else {
+                    b.forward(&h, &h, eps, self.compute)?
+                };
             }
             if s < 3 {
                 maps.push(h.clone());
@@ -380,7 +431,7 @@ fn blur(x: &Tensor, pad: usize, compute: DType) -> Result<Tensor> {
         }
     }
     let k = Tensor::from_vec(taps, (c, 1, 4, 4), x.device())?;
-    depthwise(x, &k, pad, compute)
+    depthwise(x, &k, pad, compute, true)
 }
 
 fn leaky(x: &Tensor) -> Result<Tensor> {

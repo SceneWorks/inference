@@ -487,3 +487,101 @@ fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse()
         Err(candle_gen::gen_core::Error::Unsupported(_))
     ));
 }
+
+/// sc-25690: the restoration trainer's activation checkpointing (`gradient_checkpointing`) — the
+/// generation trainer's trunk / pixel regions around the generator in the generator step, the
+/// critic and LPIPS terms downstream of them. f32: the generator gradients are the plain graph's;
+/// bf16 generator (f32 critic, as the CPU backend requires): the same loss terms bit for bit and
+/// gradients within the declared bf16 bound.
+#[test]
+fn activation_checkpointing_gradients_equal_the_plain_graph() {
+    use candle_gen_iris::train::model::checkpointed_regions;
+    let tmp = tempfile::tempdir().unwrap();
+    let items = clean_items(tmp.path(), 1);
+    let case = |dtype: &str, ac: bool| {
+        let mut cfg = config(2, json!({"degradation": mini_degradation()}));
+        cfg.train_dtype = dtype.into();
+        cfg.gradient_checkpointing = ac;
+        let req = request(&items, cfg, tmp.path());
+        let res = resources();
+        let plan = RestoreTrainPlan::resolve(&req, &res.export, &[], false).unwrap();
+        assert_eq!(plan.ac.active(), ac);
+        let pair = contract::training_pair(&items[0], &plan, 1, 0).unwrap();
+        let batch = PairBatch::from_pairs(&[pair], &Device::Cpu).unwrap();
+        let (model, params, frozen, head, sn) = candle_gen_iris::train::restore::miniature_parts(
+            &res,
+            &plan,
+            Box::new(nets),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let before = checkpointed_regions();
+        let (terms, grads) = generator_grads(
+            &model,
+            &params,
+            &frozen,
+            &plan,
+            &snapshot(&head),
+            &sn,
+            &batch,
+            1.0,
+        )
+        .unwrap();
+        let entered = checkpointed_regions() - before;
+        assert_eq!(entered > 0, ac, "regions entered: {entered}");
+        (terms, grads)
+    };
+    let (f_terms, f_none) = case("f32", false);
+    let (f_terms_ac, f_full) = case("f32", true);
+    assert_eq!(
+        f_terms.map(f64::to_bits),
+        f_terms_ac.map(f64::to_bits),
+        "f32 loss terms"
+    );
+    // 1e-5, not the other tasks' 1e-6: the adversarial term is O(10²) here and its gradient to
+    // the text embedder is a difference of large partials (measured: 3.8e-6 with every term,
+    // 1.6e-8 with the L2 term alone).
+    crate::common::assert_ac_f32_equal("restoration", 1e-5, &f_none, &f_full);
+    let (b_terms, b_none) = case("bf16", false);
+    let (b_terms_ac, b_full) = case("bf16", true);
+    assert_eq!(
+        b_terms.map(f64::to_bits),
+        b_terms_ac.map(f64::to_bits),
+        "bf16 loss terms"
+    );
+    crate::common::assert_ac_bf16_noise_only("restoration", &f_none, &b_none, &b_full);
+}
+
+/// sc-25690: a checkpointed restoration run is the plain run (f32): the trainer wires
+/// `gradient_checkpointing` into its generator step and the export moves by rounding only.
+#[test]
+fn activation_checkpointing_leaves_the_run_unchanged() {
+    use candle_gen_iris::train::model::checkpointed_regions;
+    let (data, a, b) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let items = clean_items(data.path(), 1);
+    let run = |ac: bool, out: &Path| {
+        let mut cfg = config(2, json!({"degradation": mini_degradation()}));
+        cfg.save_every = 0;
+        cfg.gradient_checkpointing = ac;
+        let before = checkpointed_regions();
+        let res = trainer()
+            .train(&request(&items, cfg, out), &mut |_| {})
+            .unwrap();
+        assert_eq!(checkpointed_regions() > before, ac);
+        tensors(&res.adapter_path)
+    };
+    let (plain, checkpointed) = (run(false, a.path()), run(true, b.path()));
+    assert_eq!(plain.len(), checkpointed.len());
+    let mut worst = 0f32;
+    for (k, v) in &plain {
+        for (x, y) in v.iter().zip(&checkpointed[k]) {
+            worst = worst.max((x - y).abs());
+        }
+    }
+    eprintln!("restoration: activation checkpointing vs plain: max |Δ| = {worst:.3e}");
+    assert!(worst <= 1e-5, "{worst}");
+}

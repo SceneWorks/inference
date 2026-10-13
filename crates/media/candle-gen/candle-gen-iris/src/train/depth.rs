@@ -27,6 +27,7 @@ use candle_gen::gen_core::iris::depth::{colorize_inferno, DepthMap, DEPTH_EXTRA_
 use candle_gen::gen_core::iris::downstream::{
     parse_task_settings, EmptyPrompt, TaskExport, EMPTY_PROMPT_FILE,
 };
+use candle_gen::gen_core::iris::train::ac::AcPolicy;
 use candle_gen::gen_core::iris::train::depth::{
     assemble_batch, check_depth_resume, depth_dataset_fingerprint, depth_dataset_pass,
     depth_export_config_yaml, depth_export_metadata, depth_tensor_shapes, preview_row,
@@ -53,13 +54,13 @@ use candle_gen::gen_core::train::{
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
 use candle_gen::{CandleError as Error, Result};
 
-use super::model::save_safetensors_atomic;
+use super::model::{grads_under_ac, save_safetensors_atomic};
 use super::optim::{
     clip_grads, detached_copy, ema_update, mul_s, save_tensors, snapshot, IrisOptimizer, Params,
     Tensors,
 };
-use crate::depth::{depth_forward, DepthParts};
-use crate::dit::IrisDiT;
+use crate::depth::{depth_forward_hooked, DepthParts};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks};
 use crate::nn::{Checkpoint, Linear};
 use crate::text_encoder::IrisTextEncoder;
 
@@ -245,6 +246,8 @@ pub struct DepthModel {
     /// `[1, T, L, D]` f32 on the device and its `[T]` mask.
     pub embeddings: Tensor,
     pub mask: Vec<i32>,
+    /// Activation checkpointing of the training forward ([`loss_and_grads`]); none by default.
+    pub ac: AcPolicy,
 }
 
 impl DepthModel {
@@ -260,26 +263,54 @@ impl DepthModel {
             device: device.clone(),
             embeddings: Tensor::from_vec(prompt.embeddings.clone(), prompt.shape.to_vec(), device)?,
             mask: prompt.mask.clone(),
+            ac: AcPolicy::None,
         })
     }
 
     /// `[B, 3, H, W]` RGB → `[B, 1, H, W]` f32 prediction from `tensors` (`Var`-backed snapshots
     /// under autograd, or plain values), through the estimator's own forward.
     pub fn predict(&self, tensors: &Tensors, rgb: &Tensor) -> Result<Tensor> {
+        let (dit, _) = self.backbones(tensors, false)?;
+        self.predict_with(&dit, tensors, rgb, &mut NoHooks)
+    }
+
+    /// The widened backbone built from `tensors` and, when asked for, the same backbone off the
+    /// tape holding the first one's casts (an activation-checkpointing region's forward).
+    fn backbones(&self, tensors: &Tensors, tape_free: bool) -> Result<(IrisDiT, Option<IrisDiT>)> {
         let cfg = &self.config.model;
         let backbone: HashMap<String, Tensor> = tensors
             .iter()
             .filter(|(k, _)| k.as_str() != REDUCER_WEIGHT && k.as_str() != REDUCER_BIAS)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let channels = cfg.in_channels + DEPTH_EXTRA_INPUT_CHANNELS;
+        let build = |ckpt: &Checkpoint| {
+            IrisDiT::from_checkpoint_widened(ckpt, cfg, self.compute, &self.device, channels)
+        };
         let ckpt = Checkpoint::from_tensors(backbone, &self.device);
-        let dit = IrisDiT::from_checkpoint_widened(
-            &ckpt,
-            cfg,
-            self.compute,
-            &self.device,
-            cfg.in_channels + DEPTH_EXTRA_INPUT_CHANNELS,
-        )?;
+        let dit = build(&ckpt)?;
+        let free = if tape_free {
+            let shared = ckpt
+                .loaded()
+                .into_iter()
+                .map(|(k, v)| (k, v.detach()))
+                .collect();
+            Some(build(&Checkpoint::from_tensors(shared, &self.device))?)
+        } else {
+            None
+        };
+        Ok((dit, free))
+    }
+
+    /// The estimator's forward through an already-built backbone, `hooks` around its blocks.
+    fn predict_with(
+        &self,
+        dit: &IrisDiT,
+        tensors: &Tensors,
+        rgb: &Tensor,
+        hooks: &mut dyn ForwardHooks,
+    ) -> Result<Tensor> {
+        let cfg = &self.config.model;
         let get = |k: &str| {
             tensors
                 .get(k)
@@ -291,15 +322,16 @@ impl DepthModel {
                 .to_dtype(self.compute)?,
             Some(get(REDUCER_BIAS)?.to_dtype(self.compute)?),
         );
-        depth_forward(
+        depth_forward_hooked(
             &DepthParts {
-                dit: &dit,
+                dit,
                 reducer: &reducer,
                 embeddings: &self.embeddings,
                 mask: &self.mask,
                 num_train_timesteps: self.config.flow.num_train_timesteps,
             },
             rgb,
+            hooks,
         )
     }
 }
@@ -358,18 +390,17 @@ pub fn loss_and_grads(
     loss: &DepthLossPlan,
     grad_scale: f32,
 ) -> Result<(f32, Tensors)> {
-    let pred = model.predict(&snapshot(params), &step.rgb)?;
-    let l = depth_loss(&pred, step, loss.gradient_weight)?;
-    let store = mul_s(&l, grad_scale as f64)?.backward()?;
-    let mut grads = Tensors::new();
-    for (k, v) in params {
-        let g = match store.get(v.as_tensor()) {
-            Some(g) => g.detach(),
-            None => v.as_tensor().zeros_like()?.detach(),
-        };
-        grads.insert(k.clone(), g);
-    }
-    Ok((l.to_dtype(DType::F32)?.to_vec0::<f32>()?, grads))
+    let snap = snapshot(params);
+    let (dit, free) = model.backbones(&snap, model.ac.active())?;
+    let mut unscaled = None;
+    let grads = grads_under_ac(&dit, free.as_ref(), model.ac, params, |hooks| {
+        let pred = model.predict_with(&dit, &snap, &step.rgb, hooks)?;
+        let l = depth_loss(&pred, step, loss.gradient_weight)?;
+        let scaled = mul_s(&l, grad_scale as f64)?;
+        unscaled = Some(l.to_dtype(DType::F32)?.to_vec0::<f32>()?);
+        Ok(scaled)
+    })?;
+    Ok((unscaled.expect("the loss closure ran"), grads))
 }
 
 /// One accumulation window (the generation trainer's `Window` over the depth loss).
@@ -748,7 +779,10 @@ impl Run {
         // source was validated, so a refused resume leaves the root as it was.
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         Ok(Self {
-            model: DepthModel::new(config, compute, &prompt, &device)?,
+            model: DepthModel {
+                ac: plan.ac,
+                ..DepthModel::new(config, compute, &prompt, &device)?
+            },
             plan,
             source_config_text,
             prompt,

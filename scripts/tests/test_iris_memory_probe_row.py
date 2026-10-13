@@ -151,6 +151,23 @@ class CudaRows(unittest.TestCase):
         self.assertIn("sysmem_fallback=not-needed", text)
         self.assertNotIn("MiB", text)
 
+    def test_the_row_carries_every_step_in_order(self) -> None:
+        steps = "\n".join(
+            f"{P} cuda_step step={i} total=3 loss={loss} seconds={s} used_high_gb={gb}"
+            for i, (gb, s, loss) in enumerate(
+                [("80.10", "17.4", "0.013100"), ("82.41", "3.6", "0.031900"), ("82.40", "3.5", "0.020000")],
+                start=1,
+            )
+        )
+        _, text = row.cuda_row("g", cuda_log(tail=steps), 0, SNAPSHOT, 1)
+        self.assertIn(
+            " steps=3 step_peaks_gb=80.10/82.41/82.40 step_s=17.4/3.6/3.5"
+            " step_loss=0.013100/0.031900/0.020000",
+            text,
+        )
+        # a run that printed no step carries no trail
+        self.assertNotIn("steps=", row.cuda_row("g", cuda_log(), 0, SNAPSHOT, 1)[1])
+
     def test_a_saturated_card_is_a_lower_bound(self) -> None:
         # The first run's restoration 512² row: 101.8 + 0.3 GB of a 102.64 GB card.
         log = cuda_log(device_peak=101.8, baseline=0.3, reserved_high=101.0)

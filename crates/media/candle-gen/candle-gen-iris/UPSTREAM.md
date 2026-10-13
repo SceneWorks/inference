@@ -67,3 +67,59 @@ loader's recorded dtypes and installed residuals, registry conformance, load ref
 tests (no kernel launch exceeds its budget), and `tests/memory_strategy.rs` (a staged selection on a
 warm generator loads the two components in staged order and renders the identical image; an admitted
 budget reaches the kernels; the bf16 bound above).
+
+## The folded tape (training, sc-25690)
+
+Candle's autograd tape keeps the output of **every** primitive alive until the loss drops: each op
+node holds its operands whether its backward needs them or not. The fused inference kernels
+(`rms_norm`, `softmax_last_dim`, a grouped convolution) have no backward, so training runs the same
+math as chains of composable ops — and each chain's every link is retained. `tape::fold1` /
+`tape::fold3` put such a chain on the tape as one node: the value is computed off the tape, and the
+node's backward replays the chain for that node alone (fresh leaves at the operands, the chain, a
+backward seeded with the node's cotangent).
+
+| folded chain | where | the plain chain kept | the node keeps |
+|---|---|---|---|
+| SDPA core (scores, ·scale, +mask, softmax's −max / exp / ÷sum), whichever kernel the request scope selects — the i32-overflow guard or the bounded-attention rung, chunks included | `nn::attention` | 5–6 × `[B, heads, N, N]` | its output |
+| composable RMSNorm (x², x/rms, ·gain) | `nn::RmsNorm::forward` | 3 activations (f32) | its output |
+| a frozen ConvNeXt block of the restoration critic (depthwise 7×7 as 49 shifted slices, norm, MLP) | `train::critic::ConvNextTrunk::features` | ~125 feature maps | its output |
+| the critic head's BlurPool sum | `train::critic::depthwise` | 31 feature maps | its output |
+
+**Gradients.** The replay runs the chain's own ops in the chain's own order, and each operand's
+contributions land where the plain graph put them (an operand the chain reads twice is passed twice,
+in the order the plain backward reaches its two readers; an operand the chain never reads gets a
+zero gradient). The gradients are the plain chains' **bit for bit** — asserted on the Candle CPU
+device for generation (f32 and bf16 policy, with and without activation checkpointing), the critic's
+generator term and head step, the chunked SDPA kernel with grouped-query k / v and a per-row mask,
+and a tracked attention under a bounded score budget (`tests/train_tape_memory.rs`); the CUDA
+memory-probe lane runs the same comparison on the device at bf16, critic included
+(`folds_are_bit_identical_on_the_build_device`).
+
+**Cost.** One extra evaluation of each folded chain per backward, and one copy of its output: a
+training step is 20–30 % slower where nothing spilled before (Iris-3B on CUDA, batch 1: 512²
+generation 3.0 s → 3.6 s, 1024² fully checkpointed 6.9 s → 9.0 s). Inside an activation-checkpointed
+region a folded chain is evaluated three times per step: the region's tape-free forward, its replay
+on the tape, and the node's own replay during that replay's backward.
+
+**Also.** An activation-checkpointed step's tape-free backbone holds the tracked backbone's
+compute-dtype casts, detached (`Checkpoint::loaded`), instead of casting the f32 masters again (half
+a backbone resident for the whole step).
+
+## Activation checkpointing of the depth and restoration trainers (sc-25690)
+
+`TrainingConfig::gradient_checkpointing` selects `full` checkpointing on the Candle depth and
+restoration trainers: the generation trainer's regions (one per trunk block and per PiT pixel
+block, `train::model::grads_under_ac`) around the widened depth backbone, and around the generator
+in the restoration generator step (the LPIPS and critic terms sit downstream of the regions and
+stay on the plain tape; the critic step needs no generator gradient). Default off; a checkpointed
+run is the plain run to the bounds of the generation trainer's (f32: gradients ≤ 1e-6 of the tensor
+peak for depth, ≤ 1e-5 for restoration, whose adversarial term is O(10²) on the miniature and
+reaches the text embedder as a difference of large partials — 3.8e-6 measured, 1.6e-8 with the L2
+term alone; bf16: the same loss bit for bit and the declared noise bound of the generation row).
+A checkpointed backward drops the loss graph as soon as its plain backward has run
+(`backward_segmented` owns the loss): everything downstream of the last regions — the backbone's
+head, and here the LPIPS and critic tapes — is off the tape before the first region is replayed
+rather than resident under every replay.
+Upstream ships neither task with checkpointing; it changes memory and compute only, so it is no
+part of a run's identity. **The MLX depth and restoration trainers refuse it typed** — their
+regions are built by the generation trainer's model type and are not wired for these tasks.

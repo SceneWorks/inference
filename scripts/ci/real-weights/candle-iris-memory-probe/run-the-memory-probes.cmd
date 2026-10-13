@@ -1,5 +1,5 @@
-rem sc-25690 - the terminal CUDA memory measurement of Iris FULL fine-tuning (batch 1, 2 optimizer
-rem steps + export): one process per shape. The test prints the driver pool's continuous counters
+rem sc-25690 - the terminal CUDA memory measurement of Iris FULL fine-tuning (batch 1, the row's
+rem optimizer steps + export): one process per shape. The test prints the driver pool's continuous counters
 rem (USED_MEM_HIGH = live bytes, RESERVED_MEM_HIGH = the unit nvidia-smi reads) next to the polled
 rem device-level VramProbe peak; the iris_memory_probe_row script classifies each log into ONE
 rem summary row, every figure in decimal GB: MEASURED, AT-CARD-LIMIT (lower bound), EXCEEDS-CARD
@@ -27,17 +27,32 @@ if errorlevel 1 exit /b 1
 set "CUDA_VISIBLE_DEVICES=%IRIS_PROBE_CARD%"
 set "TMPDIR=%RUNNER_TEMP%"
 set "TEMP=%RUNNER_TEMP%"
-set "IRIS_PROBE_STEPS=2"
 set "IRIS_FAILED=0"
-call :probe generation 1024 full
-call :probe generation 1024 none
-call :probe depth 1024 none
-call :probe restoration 1024 none
-call :probe generation 512 none
-call :probe depth 512 none
-call :probe restoration 512 none
+set "IRIS_ROWS="
+rem The folds on the device itself, bf16 critic included - report-only like the rows: the line
+rem [[IRIS_FOLD_DEVICE]] carries the verdict, a failure reds the job.
+cargo test --locked --release -p candle-gen-iris --features cuda --test integration train_tape_memory::folds_are_bit_identical_on_the_build_device -- --ignored --exact --nocapture --test-threads 1 > "%IRIS_OUT%\fold-device.log" 2>&1
+if errorlevel 1 set "IRIS_FAILED=1"
+type "%IRIS_OUT%\fold-device.log"
+findstr /C:"[[IRIS_FOLD_DEVICE]]" "%IRIS_OUT%\fold-device.log" >> "%IRIS_SUMMARY%"
+rem task, size, activation checkpointing, optimizer steps, train dtype. Six steps where the shape
+rem fits the card - a steady state needs more than the first two; two where it only completes by
+rem spilling to system memory, which runs an order of magnitude slower.
+call :probe generation 512 none 6 bf16
+call :probe generation 512 full 6 bf16
+call :probe generation 512 none 6 f32
+call :probe generation 512 full 6 f32
+call :probe generation 1024 full 6 bf16
+call :probe generation 1024 none 2 bf16
+call :probe depth 512 none 6 bf16
+call :probe depth 1024 full 6 bf16
+call :probe depth 1024 none 2 bf16
+call :probe restoration 256 none 6 bf16
+call :probe restoration 512 none 6 bf16
+call :probe restoration 1024 full 6 bf16
+call :probe restoration 1024 none 2 bf16
 type "%IRIS_SUMMARY%"
-"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.py expect --backend cuda --summary "%IRIS_SUMMARY%" generation-1024-ac-full generation-1024-ac-none depth-1024-ac-none restoration-1024-ac-none generation-512-ac-none depth-512-ac-none restoration-512-ac-none
+"%REVIEWED_PYTHON%" scripts\ci\iris_memory_probe_row.py expect --backend cuda --summary "%IRIS_SUMMARY%" %IRIS_ROWS%
 if errorlevel 1 set "IRIS_FAILED=1"
 exit /b %IRIS_FAILED%
 
@@ -55,12 +70,16 @@ if %~2 GTR %IRIS_PROBE_FREE% set "IRIS_PROBE_CARD=%~1"
 if %~2 GTR %IRIS_PROBE_FREE% set "IRIS_PROBE_FREE=%~2"
 exit /b 0
 
-rem %1 task, %2 size, %3 activation checkpointing
+rem %1 task, %2 size, %3 activation checkpointing, %4 optimizer steps, %5 train dtype
 :probe
 set "IRIS_PROBE_TASK=%~1"
 set "IRIS_PROBE_SIZE=%~2"
 set "IRIS_PROBE_AC=%~3"
+set "IRIS_PROBE_STEPS=%~4"
+set "IRIS_PROBE_DTYPE=%~5"
 set "name=%~1-%~2-ac-%~3"
+if not "%~5"=="bf16" set "name=%name%-%~5"
+set "IRIS_ROWS=%IRIS_ROWS% %name%"
 set "log=%IRIS_OUT%\%name%.log"
 set "snapshot=%IRIS_OUT%\%name%-card-before.csv"
 nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free --format=csv,noheader,nounits -i %IRIS_PROBE_CARD% > "%snapshot%"

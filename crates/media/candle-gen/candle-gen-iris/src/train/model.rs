@@ -210,6 +210,53 @@ impl TrainModel {
     }
 }
 
+impl TrainModel {
+    /// [`dit`](Self::dit) on the tape plus, when `tape_free` is asked for, the same backbone off
+    /// it — the activation-checkpointing regions' forward. A full run's two backbones share one
+    /// set of compute-dtype weights (the tape-free one holds the tracked one's casts, detached):
+    /// casting the f32 masters a second time is another half backbone resident for the whole step.
+    pub fn dit_pair(
+        &self,
+        trainable: &Tensors,
+        tape_free: bool,
+    ) -> Result<(IrisDiT, Option<IrisDiT>)> {
+        if !tape_free {
+            return Ok((self.dit(trainable)?, None));
+        }
+        match &self.trainable {
+            Trainable::Full => {
+                let map: HashMap<String, Tensor> = trainable
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with(PROJECTOR_PREFIX))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let ckpt = Checkpoint::from_tensors(map, &self.device);
+                let tracked =
+                    IrisDiT::from_checkpoint(&ckpt, &self.cfg, self.compute, &self.device)?;
+                let shared = ckpt
+                    .loaded()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.detach()))
+                    .collect();
+                let free = IrisDiT::from_checkpoint(
+                    &Checkpoint::from_tensors(shared, &self.device),
+                    &self.cfg,
+                    self.compute,
+                    &self.device,
+                )?;
+                Ok((tracked, Some(free)))
+            }
+            Trainable::Adapter { .. } => {
+                let detached: Tensors = trainable
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.detach()))
+                    .collect();
+                Ok((self.dit(trainable)?, Some(self.dit(&detached)?)))
+            }
+        }
+    }
+}
+
 /// One micro-batch, assembled host-side from the data walk and the positional draws.
 pub struct StepBatch {
     /// `[B, C, H, W]` f32 in `[−1, 1]`.
@@ -653,8 +700,14 @@ fn merge_boundaries(
 /// backward to the last boundaries, then, region by region in reverse, its recompute on the tape
 /// (the region's own parameter gradients and its input cotangents) and the propagation of those
 /// cotangents into whatever produced its inputs.
+///
+/// `loss` is taken by value and dropped once the plain backward has run: everything downstream of
+/// the last boundaries (the backbone's head, the loss, a task's own loss networks) is then off the
+/// tape before the first region is replayed, instead of resident under every replay. A caller that
+/// keeps another handle on that graph (a loss term to read later) keeps it alive — read scalars
+/// first.
 fn backward_segmented(
-    loss: &Tensor,
+    loss: Tensor,
     regions: Vec<Region>,
     tracked: &IrisDiT,
     params: &Params,
@@ -665,6 +718,7 @@ fn backward_segmented(
     merge_params(&mut acc, &store, params)?;
     merge_boundaries(&mut cot, &store, &regions)?;
     drop(store);
+    drop(loss);
     for idx in (0..regions.len()).rev() {
         let (earlier, rest) = regions.split_at(idx);
         let region = &rest[0];
@@ -731,6 +785,43 @@ fn backward_segmented(
         }
     }
     Ok(acc)
+}
+
+/// The gradient over `params` of the scalar `loss(hooks)` computed through `tracked`'s hooked
+/// forward under the activation-checkpointing policy `ac` (zero for a tensor the graph never
+/// reaches) — the depth and restoration trainers' seam onto the generation trainer's regions
+/// (sc-25690). `tape_free` is the same backbone off the tape ([`TrainModel::dit_pair`]); it is
+/// required when `ac` is active. With `ac` none this is the plain backward. The closure hands the
+/// loss over: whatever it wants to report (the unscaled terms) it reads to host values itself, so
+/// no handle on the loss graph outlives the plain backward (the segmented backward drops it there).
+pub fn grads_under_ac(
+    tracked: &IrisDiT,
+    tape_free: Option<&IrisDiT>,
+    ac: AcPolicy,
+    params: &Params,
+    loss: impl FnOnce(&mut dyn ForwardHooks) -> Result<Tensor>,
+) -> Result<Tensors> {
+    if ac.active() && tape_free.is_none() {
+        return Err(Error::Msg(
+            "iris training: activation checkpointing needs the tape-free backbone".into(),
+        ));
+    }
+    let mut hooks = TrainHooks {
+        tape_free: tape_free.unwrap_or(tracked),
+        ac,
+        capture: None,
+        captured: None,
+        regions: Vec::new(),
+    };
+    let loss = loss(&mut hooks)?;
+    let regions = std::mem::take(&mut hooks.regions);
+    let mut grads = backward_segmented(loss, regions, tracked, params)?;
+    for (k, v) in params {
+        if !grads.contains_key(k) {
+            grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
+        }
+    }
+    Ok(grads)
 }
 
 /// `F.normalize(x, dim=-1)`: `x / max(‖x‖₂, 1e−12)`.
@@ -865,13 +956,7 @@ pub fn loss_and_grads_ext(
     grad_scale: f32,
 ) -> Result<(f32, Option<f32>, Tensors)> {
     let snap = super::optim::snapshot(params);
-    let tracked = model.dit(&snap)?;
-    let detached: Tensors = snap.iter().map(|(k, v)| (k.clone(), v.detach())).collect();
-    let tape_free = if extras.ac.active() {
-        Some(model.dit(&detached)?)
-    } else {
-        None
-    };
+    let (tracked, tape_free) = model.dit_pair(&snap, extras.ac.active())?;
     let dummy;
     let mut hooks = TrainHooks {
         tape_free: match &tape_free {
@@ -907,19 +992,19 @@ pub fn loss_and_grads_ext(
     };
     let scaled = mul_s(&total, grad_scale as f64)?;
     let regions = std::mem::take(&mut hooks.regions);
-    let mut grads = backward_segmented(&scaled, regions, &tracked, params)?;
+    // The reported losses are read before the backward, so the loss graph has one owner.
+    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()?) };
+    let flow_value = scalar(&flow)?;
+    let repa_value = repa_l.as_ref().map(scalar).transpose()?;
+    drop((flow, repa_l, total));
+    let mut grads = backward_segmented(scaled, regions, &tracked, params)?;
     drop(tracked);
     for (k, v) in params {
         if !grads.contains_key(k) {
             grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
         }
     }
-    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()?) };
-    Ok((
-        scalar(&flow)?,
-        repa_l.as_ref().map(scalar).transpose()?,
-        grads,
-    ))
+    Ok((flow_value, repa_value, grads))
 }
 
 /// PyTorch-default init of the REPA projector (`U(±1/√fan_in)`), from the shared host RNG keyed

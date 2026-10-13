@@ -102,3 +102,6 @@ mod train_parity;
 
 #[path = "train_real_weights.rs"]
 mod train_real_weights;
+
+#[path = "train_tape_memory.rs"]
+mod train_tape_memory;

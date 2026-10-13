@@ -214,3 +214,48 @@ fn tensor_loss_matches_the_host_reference() {
         batch.valid_count[1] = 0;
     }
 }
+
+/// sc-25690: the depth trainer's activation checkpointing (`gradient_checkpointing`) — the
+/// generation trainer's trunk / pixel regions around the widened backbone. f32: the gradients are
+/// the plain graph's; bf16: the same loss bit for bit and gradients within the declared bf16 bound.
+#[test]
+fn activation_checkpointing_gradients_equal_the_plain_graph() {
+    use candle_gen::candle_core::DType;
+    use candle_gen::gen_core::iris::train::ac::AcPolicy;
+    use candle_gen_iris::train::model::checkpointed_regions;
+    let g = fixture("iris_depth_train_golden.safetensors");
+    let batch = golden_batch(&g);
+    let loss_plan = DepthLossPlan::default();
+    let device = cpu();
+    let dir = fixtures().join("tiny-depth");
+    let export = TaskExport::from_dir(&dir, IrisTask::Depth, "test").unwrap();
+    let prompt = EmptyPrompt::read(&export.empty_prompt_path(), &export.config).unwrap();
+    let params: Params = load_export_tensors(&dir, &device)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k, Var::from_tensor(&v).unwrap()))
+        .collect();
+    let step = DepthStep::new(&batch, &loss_plan, &device).unwrap();
+    let case = |compute: DType, ac: AcPolicy| {
+        let mut model = DepthModel::new(export.config.clone(), compute, &prompt, &device).unwrap();
+        model.ac = ac;
+        let before = checkpointed_regions();
+        let out = loss_and_grads(&model, &params, &step, &loss_plan, 1.0).unwrap();
+        (out.0, out.1, checkpointed_regions() - before)
+    };
+    let (f_loss, f_none, entered) = case(DType::F32, AcPolicy::None);
+    assert_eq!(entered, 0, "none checkpoints no region");
+    let (f_loss_ac, f_full, entered) = case(DType::F32, AcPolicy::Full);
+    let cfg = &export.config.model;
+    assert_eq!(
+        entered,
+        cfg.depth + cfg.pixel.depth,
+        "full checkpoints every trunk and pixel block"
+    );
+    assert_eq!(f_loss.to_bits(), f_loss_ac.to_bits(), "f32 loss");
+    crate::common::assert_ac_f32_equal("depth", 1e-6, &f_none, &f_full);
+    let (b_loss, b_none, _) = case(DType::BF16, AcPolicy::None);
+    let (b_loss_ac, b_full, _) = case(DType::BF16, AcPolicy::Full);
+    assert_eq!(b_loss.to_bits(), b_loss_ac.to_bits(), "bf16 loss");
+    crate::common::assert_ac_bf16_noise_only("depth", &f_none, &b_none, &b_full);
+}

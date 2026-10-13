@@ -407,15 +407,21 @@ impl IrisOptimizer {
     }
 }
 
-/// `clip_grad_norm_(params, max_norm)`: the global L2 norm over every gradient (f32, accumulated
-/// in key order as the MLX twin does) and the clipped map. Returns `(total_norm, clipped)`.
-pub fn clip_grads(grads: Tensors, max_norm: f64) -> Result<(f64, Tensors)> {
+/// The global L2 norm over every gradient (f32, accumulated in key order as the MLX twin does),
+/// without building a gradient map.
+pub fn grad_norm(grads: &Tensors) -> Result<f64> {
     let mut total = 0f32;
     for g in grads.values() {
         let sq = g.to_dtype(DType::F32)?.sqr()?.sum_all()?.to_vec0::<f32>()?;
         total += sq;
     }
-    let total = total.sqrt() as f64;
+    Ok(total.sqrt() as f64)
+}
+
+/// `clip_grad_norm_(params, max_norm)`: the global L2 norm over every gradient (f32, accumulated
+/// in key order as the MLX twin does) and the clipped map. Returns `(total_norm, clipped)`.
+pub fn clip_grads(grads: Tensors, max_norm: f64) -> Result<(f64, Tensors)> {
+    let total = grad_norm(&grads)?;
     let coef = clip_coefficient(max_norm, total);
     let mut out = BTreeMap::new();
     for (k, g) in grads {
