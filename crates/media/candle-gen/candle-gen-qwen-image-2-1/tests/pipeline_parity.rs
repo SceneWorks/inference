@@ -68,6 +68,7 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
                 seed: 0,
                 cancel: &cancel,
                 references: None,
+                kv_cache: candle_gen_qwen_image_2_1::KvCacheMode::Off,
             },
             &mut |p| {
                 if let Progress::Step { current, total } = p {
@@ -112,6 +113,7 @@ fn denoise_trajectory_and_rgba_image_match_upstream() {
                     seed: 0,
                     cancel: &cancel,
                     references: None,
+                    kv_cache: candle_gen_qwen_image_2_1::KvCacheMode::Off,
                 },
                 &mut |_| {},
             )

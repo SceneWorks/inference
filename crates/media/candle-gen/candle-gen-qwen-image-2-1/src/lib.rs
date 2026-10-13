@@ -141,10 +141,11 @@ pub use loader::{
 };
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, encode_prompt,
+    create_noise, decode_rgb, decode_rgba, decode_tiling, denoise, denoise_reported, encode_prompt,
     encode_references, joint_branch, joint_images, joint_layout, missing_vision_tower,
     pack_latents, prepare_conditioning_references, rgba_to_rgb_over_white, text_rows,
-    unpack_latents, DenoiseInputs, JointBranch, ReferenceConditioning, DECODE_OVERLAP,
+    unpack_latents, DenoiseInputs, DenoiseReport, EvaluationPath, JointBranch, KvCacheMode,
+    KvCachePath, ModelEvaluation, PromptBranch, ReferenceConditioning, DECODE_OVERLAP,
     DECODE_TILE_EDGE,
 };
 pub use quant::{Tier, GROUP_SIZE};
@@ -159,7 +160,8 @@ pub use text_encoder::{
 };
 pub use training::{QwenImage21Trainer, ADAPTER_PROVENANCE, TRAINER_ID};
 pub use transformer::{
-    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+    JointLayout, PrefixKvCache, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS,
+    GLOBAL_ADAPTER_TARGETS,
 };
 pub use vae::QwenImage21Vae;
 
@@ -640,6 +642,9 @@ impl QwenImage21 {
                                 layout: &pos.layout,
                                 negative_layout: neg.as_ref().map(|neg| &neg.layout),
                             }),
+                            // Upstream's `use_kv_cache=True` default (sc-25904). The one
+                            // switch: `Off` is the prefill path, byte-for-byte.
+                            kv_cache: KvCacheMode::On,
                         },
                         on_progress,
                     )?;

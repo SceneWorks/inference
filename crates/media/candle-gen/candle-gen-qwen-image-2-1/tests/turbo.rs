@@ -25,9 +25,10 @@ use candle_gen::gen_core::{
     OffloadPolicy, Progress, WeightsSource,
 };
 use candle_gen_qwen_image_2_1::{
-    create_noise, decode_rgb, denoise, load_scheduler_config, load_text_encoder, load_tokenizer,
-    load_transformer, load_turbo_schedule, load_vae, loader, scheduler, system_prompt_drop_count,
-    DenoiseInputs,
+    create_noise, decode_rgb, denoise_reported, load_scheduler_config, load_text_encoder,
+    load_tokenizer, load_transformer, load_turbo_schedule, load_vae, loader, scheduler,
+    system_prompt_drop_count, DenoiseInputs, DenoiseReport, EvaluationPath, KvCacheMode,
+    KvCachePath, PromptBranch,
 };
 
 use crate::common::{
@@ -111,7 +112,16 @@ fn pixels(generator: &dyn Generator, req: &GenerationRequest) -> Vec<u8> {
 /// One text-to-image render of [`PROMPT`] at [`SEED`] assembled from the crate's public pipeline
 /// pieces over an **explicit** sigma list — the independent side of the schedule assertions. The
 /// generator is free to choose its schedule; this is not.
+///
+/// It runs the prefix KV cache **on** (sc-25904), the mode the generator's one denoise call uses
+/// for both ids: on candle the cached and prefill paths agree to rounding, not bit for bit, so the
+/// pixel equalities below hold only when both sides run the same mode.
 fn render_over(root: &std::path::Path, sigmas: &[f32]) -> Vec<u8> {
+    render_reported(root, sigmas).0
+}
+
+/// [`render_over`] plus the denoise loop's own account of what each model evaluation did.
+fn render_reported(root: &std::path::Path, sigmas: &[f32]) -> (Vec<u8>, DenoiseReport) {
     let device = candle_gen::default_device().unwrap();
     let tokenizer = load_tokenizer(root).unwrap();
     let encoder = load_text_encoder(root, &device).unwrap();
@@ -122,7 +132,8 @@ fn render_over(root: &std::path::Path, sigmas: &[f32]) -> Vec<u8> {
     let seed = candle_gen::image_seed(SEED, 0);
     let noise = create_noise(seed, SIZE, SIZE, transformer.config().in_channels, &device).unwrap();
     let cancel = CancelFlag::new();
-    let latents = denoise(
+    let mut report = DenoiseReport::default();
+    let latents = denoise_reported(
         DenoiseInputs {
             transformer: &transformer,
             sigmas,
@@ -136,13 +147,58 @@ fn render_over(root: &std::path::Path, sigmas: &[f32]) -> Vec<u8> {
             seed,
             cancel: &cancel,
             references: None,
+            kv_cache: KvCacheMode::On,
         },
+        &mut report,
         &mut |_| {},
     )
     .unwrap();
-    decode_rgb(&vae, &latents, SIZE, SIZE, None, Some(&cancel))
+    let pixels = decode_rgb(&vae, &latents, SIZE, SIZE, None, Some(&cancel))
         .unwrap()
-        .pixels
+        .pixels;
+    (pixels, report)
+}
+
+/// The Turbo id rides the prefix KV cache (sc-25904) like the base id: over the saved-sigma
+/// schedule with the cache on, the first model evaluation extracts the prefix K/V and each of the
+/// seven later ones decodes the target tokens from it — and that run IS the Turbo generator's
+/// render, pixel for pixel.
+///
+/// *Mutation that reds this:* the loop dropping the extracted cache instead of keeping it
+/// (`self.cache = Some(cache)` removed in `BranchRun::evaluate`) — every evaluation then
+/// re-extracts.
+#[test]
+fn the_turbo_schedule_extracts_once_and_decodes_from_the_cache_at_every_later_step() {
+    let turbo = turbo_snapshot();
+    let root = turbo.path();
+    let (manual, report) = render_reported(root, &SAVED_PLUS_ZERO);
+    assert_eq!(report.kv_cache, KvCachePath::Cached);
+    assert!(report.kv_cache_bytes > 0, "a cache was held");
+    let paths: Vec<EvaluationPath> = report.evaluations.iter().map(|e| e.path).collect();
+    let mut want = vec![EvaluationPath::Cached; SAVED_PLUS_ZERO.len() - 1];
+    want[0] = EvaluationPath::Extract;
+    assert_eq!(paths.len(), 8, "one model evaluation per saved sigma");
+    assert_eq!(paths, want);
+    assert!(report
+        .evaluations
+        .iter()
+        .all(|e| e.branch == PromptBranch::Positive));
+    // A cached step runs the blocks over the target tokens only; the extract ran the whole
+    // joint sequence.
+    let (extract, cached) = (
+        report.evaluations[0].block_tokens,
+        report.evaluations[1].block_tokens,
+    );
+    assert!(
+        cached < extract,
+        "{cached} target tokens vs {extract} joint"
+    );
+    assert!(report.evaluations[1..]
+        .iter()
+        .all(|e| e.block_tokens == cached));
+
+    let generator = load(TURBO, root, OffloadPolicy::Resident);
+    assert_eq!(pixels(generator.as_ref(), &request(None)), manual);
 }
 
 /// The fixture is what it says it is — otherwise every claim below is about a base snapshot.

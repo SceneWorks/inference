@@ -17,7 +17,7 @@ use candle_gen::{CandleError as Error, Result};
 use crate::config::VAE_SCALE_FACTOR;
 use crate::reference::{prepare_references, PreparedReference};
 use crate::text_encoder::{QwenImage21TextEncoder, TextConditioning};
-use crate::transformer::{JointLayout, QwenImage21Transformer, Segment};
+use crate::transformer::{JointLayout, PrefixKvCache, QwenImage21Transformer, Segment};
 use crate::vae::QwenImage21Vae;
 
 /// `_pack_latents`: 2.1 consumes latents unpatched, so packing is a plain spatial flatten —
@@ -283,6 +283,78 @@ pub struct ReferenceConditioning<'a> {
     pub negative_layout: Option<&'a JointLayout>,
 }
 
+/// The prefix-KV-cache switch of one denoise run — upstream's `use_kv_cache` (default `True`).
+///
+/// The cache trades memory for time: it holds `2 · blocks · prefix_tokens · inner_dim` values per
+/// prompt branch ([`PrefixKvCache::nbytes`]) for the length of the denoise loop, and in exchange
+/// every model evaluation after the first runs the blocks over the target tokens only instead of
+/// the whole joint sequence. Shedding it ([`Self::Off`]) is exactly the prefill path, unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCacheMode {
+    /// Prefill once, decode from the cache afterwards (wherever the model allows it — see
+    /// [`KvCachePath`]).
+    #[default]
+    On,
+    /// Evaluate the full block-causal joint sequence at every model evaluation.
+    Off,
+}
+
+/// Which path a denoise run took — the answer to "did the cache run?".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvCachePath {
+    /// Every model evaluation ran the full joint sequence: the cache was [`KvCacheMode::Off`], or
+    /// the model is not `causal_condition` (the only configuration the cache is valid under — as
+    /// upstream's `use_kv_cache and transformer.config.causal_condition`).
+    #[default]
+    Prefill,
+    /// The first model evaluation of each branch prefilled its cache; every later one decoded the
+    /// target tokens from it.
+    Cached,
+}
+
+/// The prompt branch of one model evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptBranch {
+    Positive,
+    /// The true-CFG unconditional branch.
+    Negative,
+}
+
+/// What one transformer forward did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationPath {
+    /// Full joint sequence, no cache involved.
+    Prefill,
+    /// Full joint sequence, and the branch's prefix K/V were captured into its cache.
+    Extract,
+    /// Target tokens only, against the branch's cached prefix K/V.
+    Cached,
+}
+
+/// One transformer forward of a denoise run, in the order they ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelEvaluation {
+    pub branch: PromptBranch,
+    pub path: EvaluationPath,
+    /// Tokens the transformer blocks ran over. For [`EvaluationPath::Extract`] and
+    /// [`EvaluationPath::Cached`] it is read off the block stack's own output; for
+    /// [`EvaluationPath::Prefill`] it is the joint layout's length.
+    pub block_tokens: usize,
+}
+
+/// What a denoise run did, filled in as it runs — so it is complete up to the point of a
+/// cancellation or an error, not only on success.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DenoiseReport {
+    /// The path the run took.
+    pub kv_cache: KvCachePath,
+    /// Bytes the run's prefix caches held (both branches), `0` on the prefill path.
+    pub kv_cache_bytes: usize,
+    /// Every transformer forward, in order. A solver that evaluates the model more than once per
+    /// step contributes one entry per evaluation and branch.
+    pub evaluations: Vec<ModelEvaluation>,
+}
+
 /// Everything one denoise run needs.
 pub struct DenoiseInputs<'a> {
     pub transformer: &'a QwenImage21Transformer,
@@ -302,36 +374,149 @@ pub struct DenoiseInputs<'a> {
     pub cancel: &'a CancelFlag,
     /// Ordered reference conditioning, or `None` for the text-to-image route.
     pub references: Option<ReferenceConditioning<'a>>,
+    /// The prefix KV cache switch. [`KvCacheMode::Off`] is the prefill path, byte-for-byte.
+    pub kv_cache: KvCacheMode,
 }
 
-/// The denoise loop: every step runs the transformer over the full joint sequence and, with a
-/// negative branch, applies `neg + s·(pos − neg)`. Returns the final packed latents (f32).
+/// One prompt branch of the velocity closure: its text rows, its reference layout (if any) and —
+/// on the cached path — the prefix cache its first evaluation fills.
+struct BranchRun<'a> {
+    kind: PromptBranch,
+    text: &'a Tensor,
+    /// `Some` on the reference route: the condition latents and this branch's joint layout.
+    conditioned: Option<(&'a [Tensor], &'a JointLayout)>,
+    /// Filled by this branch's first evaluation and by nothing else; a cache never crosses
+    /// branches (a different prompt is a different prefix).
+    cache: Option<PrefixKvCache>,
+}
+
+impl BranchRun<'_> {
+    /// One model evaluation of this branch at `sigma`.
+    ///
+    /// On the cached path the rule is per **model evaluation**, not per sampler step: whichever
+    /// evaluation comes first prefills, every other one decodes. The cache is step-independent, so
+    /// a solver that evaluates twice per step or off the schedule (Heun, DPM++ SDE) needs nothing
+    /// more. The slot is filled only by a completed extract — an evaluation that fails or is
+    /// cancelled leaves it empty, so no later evaluation can decode from a missing or partial
+    /// cache.
+    fn evaluate(
+        &mut self,
+        transformer: &QwenImage21Transformer,
+        cached: bool,
+        latents: &Tensor,
+        sigma: f32,
+        grid: (usize, usize),
+        report: &mut DenoiseReport,
+    ) -> Result<Tensor> {
+        let (h, w) = grid;
+        let (velocity, path, block_tokens) = if !cached {
+            match self.conditioned {
+                Some((reference_latents, layout)) => {
+                    let images = joint_images(reference_latents, latents);
+                    (
+                        transformer.forward_joint(self.text, &images, sigma, layout)?,
+                        EvaluationPath::Prefill,
+                        layout.total_len(),
+                    )
+                }
+                None => (
+                    transformer.forward(latents, self.text, sigma, h, w)?,
+                    EvaluationPath::Prefill,
+                    self.text.dim(1)? + h * w,
+                ),
+            }
+        } else if let Some(cache) = &self.cache {
+            let (velocity, block_tokens) = transformer.cached_counted(latents, sigma, cache)?;
+            (velocity, EvaluationPath::Cached, block_tokens)
+        } else {
+            let (velocity, cache, block_tokens) = match self.conditioned {
+                Some((reference_latents, layout)) => transformer.extract_counted(
+                    self.text,
+                    &joint_images(reference_latents, latents),
+                    sigma,
+                    layout,
+                )?,
+                None => transformer.extract_counted(
+                    self.text,
+                    &[latents],
+                    sigma,
+                    &JointLayout::text_to_image(self.text.dim(1)?, h, w),
+                )?,
+            };
+            report.kv_cache_bytes += cache.nbytes();
+            self.cache = Some(cache);
+            (velocity, EvaluationPath::Extract, block_tokens)
+        };
+        report.evaluations.push(ModelEvaluation {
+            branch: self.kind,
+            path,
+            block_tokens,
+        });
+        Ok(velocity)
+    }
+}
+
+/// The denoise loop: with a negative branch each model evaluation applies `neg + s·(pos − neg)`.
+/// Returns the final packed latents (f32). [`denoise_reported`] without the report.
 ///
 /// With [`DenoiseInputs::references`] set, the condition latents are prepended to the target
-/// latents each step (`latent_model_input = cat([*reference_latents, latents], dim=1)`) and the
+/// latents (`latent_model_input = cat([*reference_latents, latents], dim=1)`) and the
 /// transformer attends over the full interleaved layout; the velocity it returns is already
 /// sliced to the target block.
 pub fn denoise(inputs: DenoiseInputs<'_>, on_progress: &mut dyn FnMut(Progress)) -> Result<Tensor> {
-    let (h, w) = latent_grid(inputs.width, inputs.height);
+    denoise_reported(inputs, &mut DenoiseReport::default(), on_progress)
+}
+
+/// [`denoise`], recording into `report` which path ran and every transformer forward it made.
+///
+/// With [`KvCacheMode::Off`] every evaluation runs the transformer over the full joint sequence —
+/// the pre-cache loop, unchanged. With [`KvCacheMode::On`] (and a `causal_condition` model) the
+/// first evaluation of each branch prefills that branch's [`PrefixKvCache`] and every later one
+/// feeds the blocks the target tokens only. The caches live exactly as long as this call: they are
+/// owned by the velocity closure the sampler consumes, so they are dropped before it returns — on
+/// success, cancellation and error alike — and nothing of them reaches the VAE decode.
+///
+/// `report` is reset on entry and written as the loop runs, so after a cancellation it still says
+/// what ran.
+pub fn denoise_reported(
+    inputs: DenoiseInputs<'_>,
+    report: &mut DenoiseReport,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Tensor> {
+    let grid = latent_grid(inputs.width, inputs.height);
     let transformer = inputs.transformer;
-    let pos = inputs.prompt_embeds;
-    let neg = inputs.negative_embeds;
     let scale = inputs.true_cfg_scale as f64;
     let references = inputs.references.as_ref();
-    let predict = |latents: &Tensor, sigma: f32| -> Result<Tensor> {
-        let branch = |text: &Tensor, layout: Option<&JointLayout>| -> Result<Tensor> {
-            match (references, layout) {
-                (Some(conditioning), Some(layout)) => {
-                    let images = joint_images(conditioning.latents, latents);
-                    transformer.forward_joint(text, &images, sigma, layout)
-                }
-                _ => transformer.forward(latents, text, sigma, h, w),
-            }
-        };
-        let velocity = branch(pos, references.map(|c| c.layout))?;
-        match neg {
-            Some(neg) => {
-                let uncond = branch(neg, references.and_then(|c| c.negative_layout))?;
+    // `cache_enabled = use_kv_cache and self.transformer.config.causal_condition`.
+    let cached = inputs.kv_cache == KvCacheMode::On && transformer.config().causal_condition;
+    *report = DenoiseReport {
+        kv_cache: if cached {
+            KvCachePath::Cached
+        } else {
+            KvCachePath::Prefill
+        },
+        ..DenoiseReport::default()
+    };
+    let mut positive = BranchRun {
+        kind: PromptBranch::Positive,
+        text: inputs.prompt_embeds,
+        conditioned: references.map(|c| (c.latents, c.layout)),
+        cache: None,
+    };
+    let mut negative = inputs.negative_embeds.map(|text| BranchRun {
+        kind: PromptBranch::Negative,
+        text,
+        conditioned: references.and_then(|c| c.negative_layout.map(|layout| (c.latents, layout))),
+        cache: None,
+    });
+    // `move`: the closure owns both branches — and with them their caches — and the sampler
+    // consumes it, so the caches are dropped when the loop returns, whatever the outcome.
+    let predict = move |latents: &Tensor, sigma: f32| -> Result<Tensor> {
+        let velocity = positive.evaluate(transformer, cached, latents, sigma, grid, report)?;
+        match negative.as_mut() {
+            Some(negative) => {
+                let uncond =
+                    negative.evaluate(transformer, cached, latents, sigma, grid, report)?;
                 // `neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)`
                 let diff = ((&velocity - &uncond)? * scale)?;
                 Ok((&uncond + diff)?)
@@ -534,6 +719,36 @@ mod tests {
             unpack_latents(&packed, 64, 64).is_err(),
             "token count must match the grid"
         );
+    }
+
+    /// The two production callers of the loop pick opposite sides of the switch: the generator
+    /// runs upstream's default (cache on), the trainer's preview render keeps the prefill path its
+    /// memory envelope prices. Neither caller surfaces the path it ran, and on this backend the
+    /// two paths agree to f32 rounding, so nothing downstream could tell a flipped call site — the
+    /// source is the only place to hold it. This is a textual pin, and the admission story
+    /// (sc-25905), which makes the generator's switch request-driven, must replace it with an
+    /// assertion on the `DenoiseReport` the generator surfaces.
+    #[test]
+    fn the_generator_runs_the_cache_and_the_trainer_preview_sheds_it() {
+        let switches = |source: &str| -> Vec<String> {
+            source
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("kv_cache:"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            switches(include_str!("lib.rs")),
+            ["kv_cache: KvCacheMode::On,"],
+            "the generator's one denoise call"
+        );
+        assert_eq!(
+            switches(include_str!("training.rs")),
+            ["kv_cache: crate::pipeline::KvCacheMode::Off,"],
+            "the trainer's one preview denoise call"
+        );
+        assert_eq!(KvCacheMode::default(), KvCacheMode::On);
     }
 
     #[test]
