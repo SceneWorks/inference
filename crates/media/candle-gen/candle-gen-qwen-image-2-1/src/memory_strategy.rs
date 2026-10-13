@@ -27,13 +27,29 @@ use candle_gen::gen_core::{
     WeightsSource,
 };
 
-use crate::config::MAX_REFERENCE_IMAGES;
+use crate::config::{Variant, MAX_REFERENCE_IMAGES};
 use crate::pipeline::DECODE_OVERLAP;
 use crate::MODEL_ID;
 
 /// Content fingerprint of this contract. Distinct from the MLX twin's: the two backends never share
 /// calibration evidence, and the candle route materializes its components at different widths.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-candle-derived-2026-09-22-v1";
+/// The Turbo id's own calibration identity (sc-25901). The DERIVED model is the same arithmetic —
+/// `Qwen/Qwen-Image-2.1-Turbo` shares the base transformer `config.json`, so parameter counts and
+/// joint-token counts are identical — but it prices a different checkpoint, and a record built
+/// against one id must not satisfy the other's handshake (the three Anima ids' convention).
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-2-1-turbo-candle-derived-2026-10-13-v1";
+
+/// The variant registered as `provider_id`, or the typed refusal for an id this crate does not
+/// serve.
+fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
+    Variant::from_model_id(provider_id).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
+        ))
+    })
+}
 
 /// The published decode-tile domain — **derived defaults, pending the epic-end campaign**, not a
 /// measured ladder. The crate's shipped default (512) is bracketed by its neighbours at the same
@@ -266,6 +282,9 @@ pub fn memory_strategy_contract(
             "{MODEL_ID}: memory facts require a snapshot directory"
         )));
     };
+    // A contract is never priced for a snapshot the id would refuse to load (sc-25901): the same
+    // base/Turbo refusal `load` raises, reached through the memory registration too.
+    crate::loader::check_snapshot_variant(variant_for(provider_id)?, root)?;
     // Refuse a tier/request disagreement here too, so a contract is never built for a load that
     // would be served at a different tier than the one it claims.
     let tier = crate::quant::resolve_requested_tier(root, spec.quantize)?;
@@ -425,11 +444,7 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
-        )));
-    }
+    let variant = variant_for(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::CandleCuda {
@@ -445,7 +460,10 @@ pub fn weights_free_memory_strategy_contract(
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        match variant {
+            Variant::Base => MEMORY_CALIBRATION_FINGERPRINT,
+            Variant::Turbo => TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+        },
         spec.load_shape,
     ));
     contract.lifecycle = MemoryLifecycleCapabilities {
@@ -606,7 +624,7 @@ pub(crate) fn registered_begin_request(
         return Err(gen_core::Error::Unsupported(reason));
     }
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        MODEL_ID,
+        variant_for(&contract.provider_id)?.model_id(),
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -637,6 +655,22 @@ pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRe
 pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_request,
+    };
+
+/// [`MEMORY_REGISTRATION`] for the Turbo id (sc-25901): the same rungs and the same safety gate,
+/// priced from the Turbo snapshot under its own calibration identity.
+pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: crate::TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(crate::TURBO_MODEL_ID, spec),
+    safety_check,
+};
+
+/// [`MEMORY_BEHAVIOR_REGISTRATION`] for the Turbo id.
+pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: crate::TURBO_MODEL_ID,
         valid_fixtures: registered_valid_fixture,
         begin_request: registered_begin_request,
     };

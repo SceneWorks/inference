@@ -602,6 +602,14 @@ impl QwenImage21Vae {
         self.dtype
     }
 
+    /// The dtype the decoder's outermost convolution weight is actually held at on the device —
+    /// read off the tensor, not the builder. candle casts on read, so this is the lane's compute
+    /// dtype whatever the checkpoint stores: `Qwen/Qwen-Image-2.1` ships this VAE f32 and
+    /// `Qwen/Qwen-Image-2.1-Turbo` ships it bf16, and both must land on the same dtype (sc-25901).
+    pub fn weight_dtype(&self) -> DType {
+        self.decoder.conv_out.inner.weight().dtype()
+    }
+
     /// An NCHW input cast into the compute dtype, refusing any other rank.
     fn to_compute(&self, x: &Tensor) -> Result<Tensor> {
         if x.dims().len() != 4 {

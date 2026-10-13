@@ -27,6 +27,11 @@
 //!
 //! `QWEN_IMAGE_2_1_RENDER_SIZE=WxH` and `QWEN_IMAGE_2_1_RENDER_STEPS=N` override the preset for a
 //! quicker smoke.
+//!
+//! The one `turbo_`-prefixed test (sc-25901) is the Turbo twin of the default-preset render. It
+//! reads `CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT` instead and is run by its own dispatch-only
+//! profile, `qwen-image-2-1-turbo`, which provisions `Qwen/Qwen-Image-2.1-Turbo`; the
+//! `qwen-image-2-1` profile above runs every test here that is **not** `turbo_`-prefixed.
 
 #![cfg(any(feature = "cuda", feature = "metal"))]
 
@@ -169,6 +174,122 @@ fn validation_render_default_preset() {
         image::ColorType::Rgb8,
     );
     assert_not_band_corrupted("default_preset", &image.pixels, width, height);
+    eprintln!(
+        "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
+        path.display(),
+        started.elapsed().as_secs_f32(),
+        render_started.elapsed().as_secs_f32()
+    );
+}
+
+fn turbo_snapshot() -> PathBuf {
+    let p = std::env::var("CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT").unwrap_or_else(|_| {
+        panic!("set CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT to the pinned Qwen/Qwen-Image-2.1-Turbo snapshot dir; inference never self-fetches (epic 13657)")
+    });
+    PathBuf::from(p)
+}
+
+/// The Turbo twin of [`validation_render_default_preset`] (sc-25901): the released
+/// `Qwen/Qwen-Image-2.1-Turbo` snapshot, **unmodified**, loaded as `qwen_image_2_1_turbo` through
+/// the catalog path and rendered at the default 1:1 2048×2048 preset with `steps` left unset — so
+/// the step count is the one the snapshot's own `sample_sigmas` gives (eight for the pinned
+/// revision, asserted from the progress events), true CFG off, seed 42.
+///
+/// It also proves, on the real bytes, the two storage differences the tiny fixture only imitates:
+/// the bf16 `vae/` and the single-file `text_encoder/model.safetensors` both load.
+///
+/// Run by the dispatch-only `qwen-image-2-1-turbo` profile of `real-weights.yml`; the `turbo_`
+/// prefix is what that lane selects on (and what the base `qwen-image-2-1` lane leaves out — it
+/// does not provision the Turbo snapshot).
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation-sc-25901 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_render_default_preset \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_render_default_preset() {
+    let root = turbo_snapshot();
+    let (mut width, mut height) = (PRESETS[0].width, PRESETS[0].height);
+    if let Ok(size) = std::env::var("QWEN_IMAGE_2_1_RENDER_SIZE") {
+        let (w, h) = size.split_once('x').expect("WxH");
+        width = w.parse().unwrap();
+        height = h.parse().unwrap();
+    }
+    // Unset by default: the count then comes from the snapshot, which is the claim.
+    let steps: Option<u32> = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
+        .ok()
+        .map(|s| s.parse().unwrap());
+    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let saved = candle_gen_qwen_image_2_1::load_turbo_schedule(&root).unwrap();
+    eprintln!("snapshot sample_sigmas: {:?}", saved.sample_sigmas);
+    assert_eq!(
+        saved.default_steps(),
+        8,
+        "the pinned Turbo revision saves eight sigmas"
+    );
+
+    let started = Instant::now();
+    let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
+    let generator = registry
+        .load(
+            candle_gen_qwen_image_2_1::TURBO_MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(root)),
+        )
+        .unwrap();
+    eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+
+    let req = GenerationRequest {
+        prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
+            .to_owned(),
+        width,
+        height,
+        steps,
+        seed: Some(42),
+        ..Default::default()
+    };
+    let render_started = Instant::now();
+    let mut totals = Vec::new();
+    let out = generator
+        .generate(&req, &mut |p| {
+            if let Progress::Step { current, total } = p {
+                totals.push(total);
+                eprintln!(
+                    "step {current}/{total} ({:.1}s)",
+                    render_started.elapsed().as_secs_f32()
+                );
+            } else {
+                eprintln!("{p:?} ({:.1}s)", render_started.elapsed().as_secs_f32());
+            }
+        })
+        .unwrap();
+    let ran = steps.unwrap_or(saved.default_steps() as u32);
+    assert_eq!(totals, vec![ran; ran as usize], "one step per saved sigma");
+    let GenerationOutput::Images(images) = out else {
+        panic!("images expected");
+    };
+    let image = &images[0];
+    assert_eq!((image.width, image.height), (width, height));
+    assert_eq!(image.pixels.len(), (width as usize) * (height as usize) * 3);
+    let path = out_dir.join(format!(
+        "qwen_image_2_1_turbo_candle_{width}x{height}_{ran}steps_seed42.rgb"
+    ));
+    std::fs::write(&path, &image.pixels).unwrap();
+    save_png(
+        &path.with_extension("png"),
+        &image.pixels,
+        width,
+        height,
+        image::ColorType::Rgb8,
+    );
+    assert_not_band_corrupted("turbo_default_preset", &image.pixels, width, height);
     eprintln!(
         "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
         path.display(),

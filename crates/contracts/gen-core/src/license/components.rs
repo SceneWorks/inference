@@ -768,6 +768,24 @@ pub const QWEN_IMAGE_2_1: ComponentLicense = ComponentLicense {
     retrieved: "2026-09-22",
 };
 
+/// `Qwen/Qwen-Image-2.1-Turbo` (sc-25901) — the distilled sibling of [`QWEN_IMAGE_2_1`] (card
+/// `base_model: Qwen/Qwen-Image-2.1`): DiT, RGBA VAE and the bundled Qwen3-VL-8B text tower in
+/// one repository, under the same declaration (`license_name: qwen-research`) and the same
+/// `LICENSE` text beside the weights. A separate row because it is a separate repository; the
+/// family and the §3(c) attribution are the base row's.
+pub const QWEN_IMAGE_2_1_TURBO: ComponentLicense = ComponentLicense {
+    component: "qwen_image_2_1_turbo",
+    source_url: "https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo",
+    gated: false,
+    declared: "qwen-research",
+    family: "qwen-research",
+    attribution: Some(
+        "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou \
+         Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.",
+    ),
+    retrieved: "2026-10-13",
+};
+
 /// `Qwen/Qwen-Image-Edit`.
 pub const QWEN_IMAGE_EDIT: ComponentLicense = ComponentLicense {
     component: "qwen_image_edit",
@@ -1267,6 +1285,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     QWEN_IMAGE_2512,
     QWEN_IMAGE_2512_FUN_CONTROLNET_UNION,
     QWEN_IMAGE_2_1,
+    QWEN_IMAGE_2_1_TURBO,
     QWEN_IMAGE_EDIT,
     QWEN_IMAGE_EDIT_2511_LIGHTNING,
     QWEN_IMAGE_LIGHTNING,
@@ -1314,7 +1333,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 76);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 77);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1702,10 +1721,17 @@ mod tests {
         // beside `Qwen/Qwen-Image-2.1` on 2026-09-22
         // (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`); sc-25679 read the
         // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
-        // (`docs/licensing/sc-25679-iris-licence-evidence.md`). A row carrying any other date is a
-        // row whose provenance nobody can re-read.
-        const EVIDENCE_PACK_DATES: &[&str] =
-            &["2026-08-02", "2026-08-12", "2026-09-22", "2026-10-10"];
+        // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25901 read the
+        // `Qwen/Qwen-Image-2.1-Turbo` card and LICENSE on 2026-10-13 (the Turbo section of
+        // `docs/licensing/sc-24108-qwen-research-licence-evidence.md`). A row carrying any other
+        // date is a row whose provenance nobody can re-read.
+        const EVIDENCE_PACK_DATES: &[&str] = &[
+            "2026-08-02",
+            "2026-08-12",
+            "2026-09-22",
+            "2026-10-10",
+            "2026-10-13",
+        ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(
                 EVIDENCE_PACK_DATES.contains(&row.retrieved),
