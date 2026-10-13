@@ -255,15 +255,22 @@ pub fn load_scheduler_config(root: &Path) -> Result<SchedulerConfig> {
     }
 }
 
-/// `<root>/model_index.json`, or `None` when the snapshot ships none.
+/// `<root>/model_index.json`, or `None` when the snapshot ships none. A file that does not parse
+/// is refused under the base engine id — the id [`refuse_saved_sigma_snapshot`] reads it for; the
+/// Turbo reader ([`load_saved_sigma_schedule`]) reports the same failure under its own.
 pub fn load_model_index(root: &Path) -> Result<Option<serde_json::Value>> {
+    read_model_index(crate::model::MODEL_ID, root)
+}
+
+/// [`load_model_index`], with a parse failure labelled by the engine id that asked for the file.
+fn read_model_index(id: &str, root: &Path) -> Result<Option<serde_json::Value>> {
     let path = root.join("model_index.json");
     if !path.is_file() {
         return Ok(None);
     }
     serde_json::from_slice(&std::fs::read(&path)?)
         .map(Some)
-        .map_err(|e| Error::Msg(format!("qwen_image_2_1: model_index.json: {e}")))
+        .map_err(|e| Error::Msg(format!("{id}: model_index.json: {e}")))
 }
 
 /// The saved-sigma schedule of a **distilled** snapshot (`Qwen/Qwen-Image-2.1-Turbo`):
@@ -273,7 +280,8 @@ pub fn load_model_index(root: &Path) -> Result<Option<serde_json::Value>> {
 /// no scheduler config gets `FlowMatchEulerDiscreteScheduler`'s own defaults, which are the static
 /// identity shift.
 pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
-    let model_index = load_model_index(root)?.unwrap_or(serde_json::Value::Null);
+    let model_index =
+        read_model_index(crate::model::TURBO_MODEL_ID, root)?.unwrap_or(serde_json::Value::Null);
     let path = root.join("scheduler").join("scheduler_config.json");
     let scheduler_config = if path.is_file() {
         serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| {

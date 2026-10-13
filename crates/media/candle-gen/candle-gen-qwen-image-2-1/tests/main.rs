@@ -40,6 +40,9 @@ mod pre_epic_golden;
 #[path = "registration.rs"]
 mod registration;
 
+#[path = "request_surface.rs"]
+mod request_surface;
+
 #[path = "rgba_parity.rs"]
 mod rgba_parity;
 
