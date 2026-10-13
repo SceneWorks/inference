@@ -776,6 +776,27 @@ impl PrefixKvCache {
         self.layers.get(index).map(|(k, v)| (k, v))
     }
 
+    /// The geometry of a cached decode: the target block alone, with its own RoPE rows and no
+    /// prefix segments.
+    ///
+    /// `modulation_mask[prefix_len:]` is all target tokens, so there is **no** row mask: with
+    /// `target_mask: None`, `JointGeometry::select` broadcasts row 0 — the sampled timestep — to
+    /// every token unchanged, exactly as upstream's `torch.where` and the MLX twin's
+    /// `broadcast_to` do. (An all-ones mask through the prefill's blend would compute
+    /// `zero + (real − zero)`, which rounds: harmless in f32, percent-level in bf16.)
+    fn target_geometry(&self, inner: usize) -> JointGeometry {
+        JointGeometry {
+            cos: self.target_cos.clone(),
+            sin: self.target_sin.clone(),
+            prefix_segments: Vec::new(),
+            prefix_len: 0,
+            seq_len: self.target_tokens,
+            target_tokens: self.target_tokens,
+            target_mask: None,
+            inner,
+        }
+    }
+
     /// Bytes the cached K/V hold: `2 · blocks · prefix_len · inner_dim · itemsize`.
     pub fn nbytes(&self) -> usize {
         self.layers
@@ -1325,25 +1346,11 @@ impl QwenImage21Transformer {
             )));
         }
         let dtype = self.compute_dtype();
-        let tokens = cache.target_tokens;
 
         let x = self.img_in.forward(&target.to_dtype(dtype)?)?;
         trace.push("img_in_target", &x)?;
         let (modulation, out_rows) = self.modulation_rows(timestep, &mut trace)?;
-        // `modulation_mask[prefix_len:]`: every remaining token is a target token, so the mask is
-        // all ones and each token reads row 0 — the sampled timestep — through the very
-        // `JointGeometry::select` the prefill spreads its rows with, so a target token's
-        // modulation is the same arithmetic on both paths.
-        let geometry = JointGeometry {
-            cos: cache.target_cos.clone(),
-            sin: cache.target_sin.clone(),
-            prefix_segments: Vec::new(),
-            prefix_len: 0,
-            seq_len: tokens,
-            target_tokens: tokens,
-            target_mask: Some(Tensor::ones((1, tokens, 1), dtype, &self.device)?),
-            inner: self.cfg.inner_dim(),
-        };
+        let geometry = cache.target_geometry(self.cfg.inner_dim());
         let m = geometry.modulation(&modulation)?;
         let out_scale = geometry.select(&out_rows, 0)?;
         let mut x = x;
@@ -1503,8 +1510,10 @@ impl JointGeometry {
 
     /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`): target tokens take
     /// row 0 (their sample's timestep), every other token the trailing `t = 0` row → `[1, S,
-    /// inner]`. Expressed as `zero + (real − zero)·mask` for a 0/1 mask, which is exactly
-    /// `where(mask, real, zero)`.
+    /// inner]`. With a mask it is expressed as the blend `zero + (real − zero)·mask`, which equals
+    /// `where(mask, real, zero)` on prefix rows but **rounds** on target rows (`zero + (real −
+    /// zero)` is not `real` in floating point — see UPSTREAM.md, *Deliberate divergences*; a known
+    /// divergence under review). Without a mask every token reads row 0 unchanged.
     fn select(&self, rows: &Tensor, slot: usize) -> Result<Tensor> {
         let (s, width) = (self.seq_len, self.inner);
         let real = rows
@@ -1847,6 +1856,104 @@ mod tests {
                 "{what} has {elements} elements, past i32::MAX"
             );
         }
+    }
+
+    /// The modulation a cached step's target tokens receive is the sampled-timestep row **bit for
+    /// bit** — upstream's `torch.where`, the MLX twin's `broadcast_to`. The rows here are chosen so
+    /// the prefill's blend `zero + (real − zero)·1` visibly rounds in f32 (a large `t = 0` entry
+    /// absorbs a small sampled one), which is the error an all-ones mask would put on every target
+    /// token; in the released checkpoint's bf16 the same blend is off by percents.
+    #[test]
+    fn a_cached_step_reads_the_sampled_modulation_row_exactly() {
+        let dev = Device::Cpu;
+        let (inner, tokens, slots) = (4usize, 3usize, 4usize);
+        // Row 0 = sampled timestep, row 1 = `t = 0`.
+        let real: Vec<f32> = (0..slots * inner).map(|i| 0.1 + i as f32 * 0.013).collect();
+        let zero: Vec<f32> = (0..slots * inner)
+            .map(|i| if i % 2 == 0 { 1.0e9 } else { -3.7e4 })
+            .collect();
+        let rows =
+            Tensor::from_vec([real.clone(), zero].concat(), (2, slots * inner), &dev).unwrap();
+        let table = Tensor::zeros((tokens, 2), DType::F32, &dev).unwrap();
+        let cache = PrefixKvCache {
+            layers: Vec::new(),
+            target_cos: table.clone(),
+            target_sin: table,
+            prefix_len: 5,
+            target_tokens: tokens,
+        };
+        let geometry = cache.target_geometry(inner);
+        assert_eq!(geometry.seq_len(), tokens);
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for slot in 0..slots {
+            let got = geometry.select(&rows, slot).unwrap();
+            assert_eq!(got.dims(), &[1, tokens, inner]);
+            let want: Vec<u32> = (0..tokens)
+                .flat_map(|_| real[slot * inner..(slot + 1) * inner].iter())
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                bits(&got),
+                want,
+                "slot {slot}: every target token must read the sampled row unchanged"
+            );
+        }
+        let m = geometry.modulation(&rows).unwrap();
+        assert_eq!(
+            bits(&m.gate2.narrow(1, 0, 1).unwrap()),
+            real[3 * inner..]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The cache holds its entries in the tensor's own dtype — the compute dtype, bf16 on a GPU
+    /// backend — not an f32 upcast, and prepending one to a bf16 target K/V stays bf16. (candle's
+    /// CPU backend has no bf16 matmul, so no forward here can run in bf16; the copy and the `cat`
+    /// can.)
+    #[test]
+    fn a_cache_entry_keeps_the_compute_dtype() {
+        let dev = Device::Cpu;
+        let fill = |tokens: usize| -> Tensor {
+            let v: Vec<f32> = (0..2 * tokens * 8).map(|i| i as f32 * 0.25 - 3.0).collect();
+            Tensor::from_vec(v, (1, 2, tokens, 8), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let full = fill(6);
+        let owned = owned_prefix_rows(&full, 2).unwrap();
+        assert_eq!(owned.dtype(), DType::BF16);
+        assert_eq!(owned.dims(), &[1, 2, 2, 8]);
+        assert_eq!(
+            owned
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            full.narrow(2, 0, 2)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        let joined = Tensor::cat(&[&owned, &fill(4)], 2).unwrap();
+        assert_eq!(joined.dtype(), DType::BF16);
+        assert_eq!(joined.dims(), &[1, 2, 6, 8]);
     }
 
     /// A multi-image layout emits one DISTINCT trace key per image block.

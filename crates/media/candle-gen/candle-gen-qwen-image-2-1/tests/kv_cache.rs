@@ -131,12 +131,13 @@ mod heap {
 
 /// Cached vs prefill, same port, same device, f32: `|Δ| ≤ ATOL + RTOL·|want|` per element.
 ///
-/// Measured on candle CPU (arm64) over every case, branch and evaluation of the fixture and after
-/// the whole denoise: the two paths are **bit-identical** (max |Δ| = 0) — the cached step feeds
-/// the target's attention the same key/value values through the same call. The bound leaves room
-/// for a backend whose GEMM accumulates differently at a different row count (the cached step
-/// projects target rows only; the prefill the joint sequence), and nothing more: the mutations
-/// this file names move the velocity by 1e-2 … 1e0.
+/// Measured on candle CPU (arm64) over all 31 comparisons this file makes (every case, branch and
+/// evaluation of the fixture, the whole denoise under euler / heun / dpmpp_sde, the synthetic
+/// geometries): worst `max|Δ|` 4.1e-6 at a peak of 3.9 (1.0e-6 × peak); the worst element sits at
+/// 0.28× this bound. The two paths are not bit-identical, and are not meant to be: a cached step's
+/// target tokens read the sampled-timestep modulation row exactly (as upstream's `where` does),
+/// while the prefill selects it through a blend that rounds in the last place (see UPSTREAM.md,
+/// *Deliberate divergences*). The mutations this file names move the velocity by 1e-2 … 1e0.
 const ATOL: f32 = 1e-5;
 const RTOL: f32 = 1e-5;
 
@@ -754,10 +755,9 @@ fn the_negative_branch_has_its_own_cache() {
 /// forward. The independent oracle for the off path is upstream's `use_kv_cache=False` output,
 /// `{case}/latents_final_prefill`, gated in `cached_denoise_matches_upstream_end_to_end`.
 ///
-/// *Mutation that reds this:* any numeric change to the off path's loop — e.g. the true-CFG
-/// combine rewritten as `pos + (s − 1)·(pos − neg)`. (An ignored switch is caught by the report
-/// assertions of `cached_denoise_matches_prefill_denoise_and_reports_its_path`: on candle CPU the
-/// cached path's latents are bit-identical to the prefill's, so bits alone could not tell.)
+/// *Mutations that red this:* any numeric change to the off path's loop — e.g. the true-CFG
+/// combine rewritten as `pos + (s − 1)·(pos − neg)` — and a switch that is ignored (always on):
+/// the cached path's latents differ from the prefill's in the last bits.
 #[test]
 fn cache_off_is_bit_identical_to_the_prefill_loop() {
     let w = kv_fixture();

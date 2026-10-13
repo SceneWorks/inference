@@ -724,8 +724,10 @@ mod tests {
     /// The two production callers of the loop pick opposite sides of the switch: the generator
     /// runs upstream's default (cache on), the trainer's preview render keeps the prefill path its
     /// memory envelope prices. Neither caller surfaces the path it ran, and on this backend the
-    /// two paths are bit-identical, so nothing downstream could tell a flipped call site — the
-    /// source is the only place to hold it.
+    /// two paths agree to f32 rounding, so nothing downstream could tell a flipped call site — the
+    /// source is the only place to hold it. This is a textual pin, and the admission story
+    /// (sc-25905), which makes the generator's switch request-driven, must replace it with an
+    /// assertion on the `DenoiseReport` the generator surfaces.
     #[test]
     fn the_generator_runs_the_cache_and_the_trainer_preview_sheds_it() {
         let switches = |source: &str| -> Vec<String> {
