@@ -16,11 +16,14 @@ use mlx_gen::{
     ModelDescriptor, OutputChannels, Precision, Progress, Quant, Residency, Result, SizeFloor,
 };
 
-use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE};
+use crate::config::{
+    SavedSigmaSchedule, SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, SIZE_MULTIPLE,
+};
 use crate::loader;
 use crate::pipeline::{
     create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
-    prepare_conditioning_references, DenoiseInputs, JointBranch, ReferenceConditioning,
+    prepare_conditioning_references, DenoiseInputs, JointBranch, KvCacheMode,
+    ReferenceConditioning,
 };
 use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
@@ -30,10 +33,110 @@ use crate::vae::QwenImage21Vae;
 
 /// Registry id for Qwen-Image 2.1 (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "qwen_image_2_1";
+/// Registry id for the distilled Qwen-Image 2.1 **Turbo** checkpoint (sc-25900): the same
+/// architecture, presets and licence as [`MODEL_ID`], sampled over the few-step sigma list its
+/// snapshot saves instead of the resolution-shifted schedule.
+pub const TURBO_MODEL_ID: &str = "qwen_image_2_1_turbo";
 /// Descriptor family — distinct from the 2512 crate's `qwen-image`.
 pub const FAMILY: &str = "qwen-image-2-1";
 /// Smallest side upstream's pipeline can render: one vision slot (a 2×2 latent) at 16 px/token.
 pub const MIN_SIZE: u32 = 32;
+
+/// Which released checkpoint of the family an engine id serves. The two share every component
+/// architecture and differ only in how the denoise schedule is obtained ([`Schedule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// `Qwen/Qwen-Image-2.1` — [`MODEL_ID`], the resolution-shifted 40-step schedule.
+    Base,
+    /// `Qwen/Qwen-Image-2.1-Turbo` — [`TURBO_MODEL_ID`], the snapshot's saved sigmas.
+    Turbo,
+}
+
+impl Variant {
+    /// The engine id this variant registers under.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Base => MODEL_ID,
+            Self::Turbo => TURBO_MODEL_ID,
+        }
+    }
+
+    /// The variant an engine id names, or `None` for an id this crate does not serve.
+    pub fn from_id(id: &str) -> Option<Self> {
+        [Self::Base, Self::Turbo]
+            .into_iter()
+            .find(|variant| variant.id() == id)
+    }
+}
+
+/// How one loaded checkpoint obtains its denoise schedule — read from the snapshot at load.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Schedule {
+    /// The base checkpoint: `linspace` → resolution-dependent `mu` shift → terminal stretch
+    /// ([`scheduler::sigmas`]).
+    Shifted(SchedulerConfig),
+    /// The distilled checkpoint: the snapshot's saved sigmas, resampled to the requested step
+    /// count ([`scheduler::resample_saved_sigmas`]) — no shift, no stretch.
+    Saved(SavedSigmaSchedule),
+}
+
+impl Schedule {
+    /// The schedule a snapshot carries for `variant`. Each variant refuses the other's snapshot by
+    /// name instead of running the wrong schedule over it: the base id refuses a snapshot that
+    /// saves `sample_sigmas` ([`loader::refuse_saved_sigma_snapshot`]), and the Turbo id refuses
+    /// one that does not, or whose scheduler config is not the static identity shift
+    /// ([`loader::load_saved_sigma_schedule`]).
+    pub fn load(variant: Variant, root: &Path) -> Result<Self> {
+        match variant {
+            Variant::Base => {
+                loader::refuse_saved_sigma_snapshot(root)?;
+                loader::load_scheduler_config(root).map(Self::Shifted)
+            }
+            Variant::Turbo => loader::load_saved_sigma_schedule(root).map(Self::Saved),
+        }
+    }
+
+    /// The step count a request that names none runs: upstream's 40 for the base checkpoint, one
+    /// step per saved sigma for the distilled one.
+    pub fn default_steps(&self) -> u32 {
+        match self {
+            Self::Shifted(_) => DEFAULT_STEPS,
+            Self::Saved(saved) => saved.default_steps(),
+        }
+    }
+
+    /// The native schedule for one request (length `steps + 1`, trailing `0.0`) and the `mu` a
+    /// curated scheduler is built over: the resolution shift for the base checkpoint, `ln(1) = 0`
+    /// for the distilled one's static unit shift.
+    pub fn native_sigmas(&self, steps: usize, width: u32, height: u32) -> Result<(Vec<f32>, f32)> {
+        match self {
+            Self::Shifted(cfg) => {
+                let tokens = scheduler::image_tokens(width, height);
+                Ok((
+                    scheduler::sigmas(cfg, steps, tokens)?,
+                    scheduler::mu_for_tokens(cfg, tokens) as f32,
+                ))
+            }
+            Self::Saved(saved) => Ok((
+                scheduler::resample_saved_sigmas(&saved.sample_sigmas, steps)?,
+                0.0,
+            )),
+        }
+    }
+}
+
+/// The distilled Turbo checkpoint's identity + capabilities (sc-25900): [`descriptor`] under
+/// [`TURBO_MODEL_ID`]. Nothing else differs on the advertised surface — the checkpoint shares the
+/// base architecture, presets, reference/RGBA routes, adapter host and tiers, and upstream still
+/// accepts a negative prompt with `true_cfg_scale > 1` on it. Its own defaults are not descriptor
+/// fields: the step count is the number of sigmas the snapshot saves ([`Schedule::default_steps`])
+/// and true CFG is off unless asked for ([`DEFAULT_TRUE_CFG`]).
+pub fn descriptor_turbo() -> ModelDescriptor {
+    ModelDescriptor {
+        id: TURBO_MODEL_ID,
+        ..descriptor()
+    }
+}
 
 /// Qwen-Image 2.1's identity + capabilities — constructible without loading weights.
 pub fn descriptor() -> ModelDescriptor {
@@ -115,10 +218,12 @@ pub fn descriptor() -> ModelDescriptor {
 /// A loaded Qwen-Image 2.1 generator.
 pub struct QwenImage21 {
     descriptor: ModelDescriptor,
+    /// The checkpoint this generator serves — its engine id and schedule family.
+    variant: Variant,
     tokenizer: TextTokenizer,
     /// Tokens of the system-role prefix the conditioning drops, derived from the tokenizer.
     drop_count: usize,
-    scheduler: SchedulerConfig,
+    schedule: Schedule,
     residency: Residency<QwenImage21TextEncoder, Heavy>,
     /// The spec this generator was loaded from — the tier and residency policy the shared
     /// memory-strategy seam checks a request selection against (sc-24114).
@@ -157,7 +262,20 @@ pub(crate) struct Heavy {
 /// `Resident` (default) holds every component warm; `Sequential` loads the text encoder, encodes,
 /// drops it, then loads the DiT + VAE — bounding peak memory to `max(text encoder, DiT + VAE)`.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    gen_core::reject_unknown_components(spec, &[], MODEL_ID)?;
+    load_variant(Variant::Base, spec)
+}
+
+/// [`load`] for the distilled checkpoint: `spec.weights` is a `Qwen/Qwen-Image-2.1-Turbo` snapshot
+/// directory (dense or a pre-quantized tier of one), registered as [`TURBO_MODEL_ID`].
+pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(Variant::Turbo, spec)
+}
+
+/// The one load path both engine ids share. `variant` picks the id the generator answers to and
+/// the schedule family read from the snapshot ([`Schedule::load`]) — a snapshot of the other
+/// variant is a typed refusal, raised before any weight is read.
+pub fn load_variant(variant: Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    gen_core::reject_unknown_components(spec, &[], variant.id())?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(PRECISION_OVERRIDE_REFUSAL.into()));
     }
@@ -176,13 +294,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     }
     let root = loader::snapshot_root(&spec.weights)?;
+    // The schedule first: it is two small JSON reads, and it is where a snapshot of the other
+    // variant (base under the Turbo id, or the reverse) is refused by name.
+    let schedule = Schedule::load(variant, root)?;
     // Resolve the request against the tier actually on disk before anything is read, so a
     // mismatched pair fails with the actionable message rather than rendering the wrong tier.
     crate::quant::needs_load_time_quant(root, spec.quantize)?;
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
     // through the memory registration.
-    let memory_strategy = crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?;
+    let memory_strategy = crate::memory_strategy::memory_strategy_contract(variant.id(), spec)?;
     // `Resident` builds the DiT (and installs the adapters) right here; `Sequential` defers that to
     // every generate, where an unmatched adapter key would fail each request instead of the load.
     // Resolve the stack now so both policies refuse a bad key at load, by name.
@@ -191,13 +312,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     let tokenizer = loader::load_tokenizer(root)?;
     let drop_count = system_prompt_drop_count(&tokenizer)?;
-    let scheduler = loader::load_scheduler_config(root)?;
     let residency = build_residency(spec)?;
     Ok(Box::new(QwenImage21 {
-        descriptor: descriptor(),
+        descriptor: match variant {
+            Variant::Base => descriptor(),
+            Variant::Turbo => descriptor_turbo(),
+        },
+        variant,
         tokenizer,
         drop_count,
-        scheduler,
+        schedule,
         residency,
         spec: spec.clone(),
         memory_strategy,
@@ -311,8 +435,8 @@ pub(crate) fn diagnostic_first_forward(spec: &LoadSpec, req: &GenerationRequest)
     let root = loader::snapshot_root(&spec.weights)?;
     let tokenizer = loader::load_tokenizer(root)?;
     let drop = system_prompt_drop_count(&tokenizer)?;
-    let scheduler = loader::load_scheduler_config(root)?;
-    let params = resolve_run_params(&scheduler, req)?;
+    let schedule = Schedule::load(Variant::Base, root)?;
+    let params = resolve_run_params(&schedule, req)?;
     assert!(
         !params.use_negative,
         "fixed diagnostic uses the default positive branch"
@@ -368,7 +492,7 @@ impl Generator for QwenImage21 {
         crate::memory_strategy::safety_check(&self.spec, &self.memory_strategy, context)
     }
 
-    /// The registered executable seam (`crate::memory_strategy::registered_begin_request`) on
+    /// The registered executable seam (`crate::memory_strategy::begin_request_for`) on
     /// the loaded generator: the scope's `configure_request` writes the admitted
     /// `GenerationMemory` onto the request, which [`Self::generate`] then honours — staged
     /// residency through `Residency::run_request_scoped`, bounded decode through
@@ -377,11 +501,16 @@ impl Generator for QwenImage21 {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
-        crate::memory_strategy::registered_begin_request(&self.spec, &self.memory_strategy, context)
+        crate::memory_strategy::begin_request_for(
+            self.variant.id(),
+            &self.spec,
+            &self.memory_strategy,
+            context,
+        )
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request(self.variant, &self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
@@ -402,13 +531,11 @@ pub(crate) struct RunParams {
 }
 
 pub(crate) fn resolve_run_params(
-    scheduler: &SchedulerConfig,
+    schedule: &Schedule,
     req: &GenerationRequest,
 ) -> Result<RunParams> {
-    let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-    let tokens = scheduler::image_tokens(req.width, req.height);
-    let native = scheduler::sigmas(scheduler, steps, tokens)?;
-    let mu = scheduler::mu_for_tokens(scheduler, tokens) as f32;
+    let steps = req.steps.unwrap_or(schedule.default_steps()) as usize;
+    let (native, mu) = schedule.native_sigmas(steps, req.width, req.height)?;
     let sigmas = resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
     // `true_cfg_scale`: honour a caller-supplied `true_cfg`, then `guidance`, then the upstream
     // default (off). Guidance engages only with a negative prompt, as upstream's `do_true_cfg`.
@@ -432,7 +559,7 @@ impl QwenImage21 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let params = resolve_run_params(&self.scheduler, req)?;
+        let params = resolve_run_params(&self.schedule, req)?;
         let tiling = crate::pipeline::decode_tiling(req);
         // sc-24114: request-scoped allocator bounds — cache limit = the derived transient budget
         // (freed buffers above it go back to the OS instead of pooling to the device's working-set
@@ -524,6 +651,9 @@ impl QwenImage21 {
                                 layout: c.layout,
                                 negative_layout: c.negative_layout,
                             }),
+                            // Upstream's `use_kv_cache=True` default (sc-25903). The one
+                            // switch: `Off` is the prefill path, byte-for-byte.
+                            kv_cache: KvCacheMode::On,
                         },
                         on_progress,
                     )?;
@@ -617,14 +747,19 @@ pub(crate) fn assemble_reference_branches(
 }
 
 /// Capability-driven request validation: the shared floor (count, size range + 32-px grid,
-/// negative/guidance support, sampler/scheduler membership, finiteness) plus the family's own
-/// `steps >= 2` (the terminal-sigma stretch is undefined at one step).
-pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+/// negative/guidance support, sampler/scheduler membership, finiteness, `steps >= 1`) plus the base
+/// checkpoint's own `steps >= 2` (the terminal-sigma stretch is undefined at one step). The
+/// distilled checkpoint has no stretch, so one step is a real schedule there (`[σ_0, 0]`).
+pub(crate) fn validate_request(
+    variant: Variant,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
     // The reference list first, so a caller sees the actionable message (the `Mask` workaround,
     // the one-to-ten window) rather than the shared floor's generic "unsupported conditioning",
     // and so a bad count is refused before any weight is touched.
     collect_references(req)?;
-    caps.validate_request(MODEL_ID, req)?;
+    caps.validate_request(variant.id(), req)?;
     if req.prompt.trim().is_empty() && req.negative_prompt.is_none() {
         // Upstream renders an empty prompt as a single space; accept it, but a whitespace-only
         // prompt with nothing else is almost certainly a caller bug, so say so.
@@ -633,7 +768,7 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                 .into(),
         ));
     }
-    if let Some(steps) = req.steps {
+    if let (Variant::Base, Some(steps)) = (variant, req.steps) {
         if steps < 2 {
             return Err(Error::Msg(format!(
                 "qwen_image_2_1: steps must be >= 2 (got {steps}); the terminal-sigma stretch is undefined at one step"
@@ -654,6 +789,11 @@ pub(crate) fn component_footprint(spec: &LoadSpec) -> gen_core::Result<mlx_gen::
 
 mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
+    footprint = component_footprint
+}
+
+mlx_gen::register_generators! {
+    pub(crate) const TURBO_REGISTRATION = descriptor_turbo => load_turbo;
     footprint = component_footprint
 }
 
@@ -779,17 +919,17 @@ mod tests {
         let caps = descriptor().capabilities;
         for p in PRESETS {
             assert!(
-                validate_request(&caps, &req(p.width, p.height)).is_ok(),
+                validate_request(Variant::Base, &caps, &req(p.width, p.height)).is_ok(),
                 "{}",
                 p.ratio
             );
         }
-        let err = validate_request(&caps, &req(1000, 1024))
+        let err = validate_request(Variant::Base, &caps, &req(1000, 1024))
             .unwrap_err()
             .to_string();
         assert!(err.contains("32"), "{err}");
-        assert!(validate_request(&caps, &req(4096, 4096)).is_err());
-        assert!(validate_request(&caps, &req(32, 32)).is_ok());
+        assert!(validate_request(Variant::Base, &caps, &req(4096, 4096)).is_err());
+        assert!(validate_request(Variant::Base, &caps, &req(32, 32)).is_ok());
     }
 
     #[test]
@@ -797,12 +937,16 @@ mod tests {
         let caps = descriptor().capabilities;
         let mut r = req(2048, 2048);
         r.steps = Some(1);
-        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        let err = validate_request(Variant::Base, &caps, &r)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("steps must be >= 2"), "{err}");
         r.steps = Some(2);
-        assert!(validate_request(&caps, &r).is_ok());
+        assert!(validate_request(Variant::Base, &caps, &r).is_ok());
         r.prompt = "   ".into();
-        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        let err = validate_request(Variant::Base, &caps, &r)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("prompt is empty"), "{err}");
     }
 
@@ -818,20 +962,24 @@ mod tests {
         };
         let mut r = req(2048, 2048);
         assert!(
-            validate_request(&caps, &r).is_ok(),
+            validate_request(Variant::Base, &caps, &r).is_ok(),
             "no conditioning is T2I"
         );
 
         r.conditioning = vec![Conditioning::MultiReference {
             images: (0..11).map(|_| image(8)).collect(),
         }];
-        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        let err = validate_request(Variant::Base, &caps, &r)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at most 10"), "{err}");
 
         // The `Mask` refusal must be this route's actionable message, not the shared floor's
         // generic "unsupported conditioning" — which is why the reference check runs first.
         r.conditioning = vec![Conditioning::Mask { image: image(8) }];
-        let err = validate_request(&caps, &r).unwrap_err().to_string();
+        let err = validate_request(Variant::Base, &caps, &r)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no mask input"), "{err}");
         assert!(err.contains("extra reference"), "{err}");
 
@@ -839,14 +987,14 @@ mod tests {
             images: (0..10).map(|_| image(8)).collect(),
         }];
         assert!(
-            validate_request(&caps, &r).is_ok(),
+            validate_request(Variant::Base, &caps, &r).is_ok(),
             "ten references is the documented boundary"
         );
     }
 
     #[test]
     fn run_params_follow_upstream_defaults() {
-        let s = SchedulerConfig::production();
+        let s = Schedule::Shifted(SchedulerConfig::production());
         let p = resolve_run_params(&s, &req(2048, 2048)).unwrap();
         assert_eq!(p.sigmas.len(), 41, "40 default steps + the trailing 0");
         assert_eq!(p.true_cfg, 1.0);
@@ -863,6 +1011,178 @@ mod tests {
             !p.use_negative,
             "true_cfg 1.0 disables guidance even with a negative"
         );
+    }
+
+    /// The released Turbo `sample_sigmas` (`Qwen/Qwen-Image-2.1-Turbo` @ `UPSTREAM_TURBO_HF_REVISION`).
+    const TURBO_SAVED: [f64; 8] = [
+        1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568,
+    ];
+
+    fn turbo_schedule() -> Schedule {
+        Schedule::Saved(SavedSigmaSchedule {
+            sample_sigmas: TURBO_SAVED.to_vec(),
+            num_train_timesteps: 1000,
+        })
+    }
+
+    fn saved_then_zero() -> Vec<f32> {
+        TURBO_SAVED
+            .iter()
+            .map(|sigma| *sigma as f32)
+            .chain([0.0])
+            .collect()
+    }
+
+    /// The sigma list `generate` hands the sampler (`RunParams::sigmas` goes into
+    /// `DenoiseInputs::sigmas` verbatim) for the distilled checkpoint: with no step count, and
+    /// with the saved length named explicitly, it is exactly the snapshot's eight saved sigmas and
+    /// a trailing 0 — at every resolution, because there is no `mu` shift and no terminal stretch.
+    ///
+    /// *Mutations that red this:* defaulting to the base 40 steps (`DEFAULT_STEPS`); routing the
+    /// saved sigmas through `scheduler::sigmas` (shift + stretch) instead of the resample.
+    #[test]
+    fn turbo_denoises_over_the_saved_sigmas_by_default_and_at_the_saved_length() {
+        let schedule = turbo_schedule();
+        assert_eq!(schedule.default_steps(), 8);
+        for (width, height) in [(2048, 2048), (2752, 1536), (512, 512), (32, 32)] {
+            let mut r = req(width, height);
+            let default = resolve_run_params(&schedule, &r).unwrap();
+            assert_eq!(
+                default.sigmas,
+                saved_then_zero(),
+                "{width}x{height} default"
+            );
+            r.steps = Some(8);
+            let explicit = resolve_run_params(&schedule, &r).unwrap();
+            assert_eq!(
+                explicit.sigmas,
+                saved_then_zero(),
+                "{width}x{height} steps=8"
+            );
+        }
+        // True CFG is off by default and still engages on request, as upstream's pipeline allows.
+        let mut r = req(2048, 2048);
+        let p = resolve_run_params(&schedule, &r).unwrap();
+        assert_eq!(p.true_cfg, 1.0);
+        assert!(!p.use_negative);
+        r.negative_prompt = Some("blurry".into());
+        r.true_cfg = Some(2.0);
+        assert!(resolve_run_params(&schedule, &r).unwrap().use_negative);
+    }
+
+    /// Twelve steps on the distilled checkpoint is the 12-point resample of the saved curve
+    /// (`scheduler::resample_saved_sigmas`, pinned value for value in `scheduler::tests`), and the
+    /// same request on the base checkpoint is still its own resolution-shifted schedule.
+    ///
+    /// *Mutation that reds this:* ignoring `req.steps` on the saved-sigma arm (upstream's
+    /// behaviour — the steps knob would be dead).
+    #[test]
+    fn turbo_resamples_other_step_counts_and_the_base_schedule_is_unchanged() {
+        let mut r = req(2048, 2048);
+        r.steps = Some(12);
+        let turbo = resolve_run_params(&turbo_schedule(), &r).unwrap();
+        assert_eq!(
+            turbo.sigmas,
+            [
+                1.0, 0.98563533, 0.970362, 0.95418, 0.9358107, 0.9161107, 0.89508, 0.861792,
+                0.79827667, 0.704534, 0.5112233, 0.27637867, 0.0
+            ]
+        );
+
+        let cfg = SchedulerConfig::production();
+        let base = resolve_run_params(&Schedule::Shifted(cfg.clone()), &r).unwrap();
+        assert_eq!(
+            base.sigmas,
+            scheduler::sigmas_for_image(&cfg, 12, 2048, 2048).unwrap()
+        );
+        assert_eq!(base.sigmas.len(), 13);
+        assert!((base.sigmas[11] - 0.02).abs() < 1e-6, "terminal stretch");
+        assert_ne!(base.sigmas, turbo.sigmas);
+        // The base default is still upstream's 40.
+        assert_eq!(
+            Schedule::Shifted(SchedulerConfig::production()).default_steps(),
+            40
+        );
+    }
+
+    /// A curated `scheduler` name on the distilled checkpoint goes through the same shared seam
+    /// as the base one (`resolve_flow_schedule`), built over an **unshifted** flow model
+    /// (`mu = ln(shift) = 0`): it replaces the saved curve rather than re-spacing it. A name the
+    /// seam does not recognise keeps the saved sigmas (`validate` refuses such a name before it
+    /// gets here; the fallback is the seam's own never-hard-fail rule).
+    ///
+    /// *Mutation that reds this:* passing the base resolution `mu` to the curated builder.
+    #[test]
+    fn turbo_curated_schedulers_are_built_unshifted_and_native_names_keep_the_saved_sigmas() {
+        let schedule = turbo_schedule();
+        let mut r = req(2048, 2048);
+        for native in ["flow_match_euler", "not-a-scheduler"] {
+            r.scheduler = Some(native.into());
+            assert_eq!(
+                resolve_run_params(&schedule, &r).unwrap().sigmas,
+                saved_then_zero(),
+                "{native}"
+            );
+        }
+        r.scheduler = Some("simple".into());
+        let curated = resolve_run_params(&schedule, &r).unwrap().sigmas;
+        assert_eq!(
+            curated,
+            resolve_flow_schedule(Some("simple"), 0.0, 8, &saved_then_zero())
+        );
+        assert_ne!(curated, saved_then_zero());
+    }
+
+    /// One step is a real schedule on the distilled checkpoint (`[1, 0]`, no terminal stretch to
+    /// divide by) and stays refused on the base one.
+    #[test]
+    fn turbo_accepts_one_step_and_the_base_checkpoint_still_refuses_it() {
+        let caps = descriptor_turbo().capabilities;
+        let mut r = req(2048, 2048);
+        r.steps = Some(1);
+        validate_request(Variant::Turbo, &caps, &r).unwrap();
+        assert_eq!(
+            resolve_run_params(&turbo_schedule(), &r).unwrap().sigmas,
+            [1.0, 0.0]
+        );
+        let err = validate_request(Variant::Base, &descriptor().capabilities, &r)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("steps must be >= 2"), "{err}");
+        r.steps = Some(0);
+        let err = validate_request(Variant::Turbo, &caps, &r)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("qwen_image_2_1_turbo: steps must be >= 1"),
+            "{err}"
+        );
+    }
+
+    /// The Turbo descriptor is the base descriptor under its own id — nothing else on the
+    /// advertised surface moves.
+    #[test]
+    fn turbo_descriptor_mirrors_the_base_descriptor_under_its_own_id() {
+        let (base, turbo) = (descriptor(), descriptor_turbo());
+        assert_eq!(turbo.id, "qwen_image_2_1_turbo");
+        assert_eq!(base.id, "qwen_image_2_1");
+        assert_eq!(
+            format!(
+                "{:?}",
+                ModelDescriptor {
+                    id: base.id,
+                    ..turbo
+                }
+            ),
+            format!("{base:?}")
+        );
+        assert!(gen_core::registry::model_descriptor_errors(&descriptor_turbo()).is_empty());
+        assert_eq!(Variant::from_id("qwen_image_2_1"), Some(Variant::Base));
+        assert_eq!(
+            Variant::from_id("qwen_image_2_1_turbo"),
+            Some(Variant::Turbo)
+        );
+        assert_eq!(Variant::from_id("qwen_image"), None);
     }
 
     #[test]

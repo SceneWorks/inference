@@ -338,6 +338,7 @@ fn run_case_feeding(snap: &Snapshot, w: &Weights, c: &Case, feed: ReferenceFeed)
                 layout: &pos_layout,
                 negative_layout: neg_layout.as_ref(),
             }),
+            kv_cache: mlx_gen_qwen_image_2_1::KvCacheMode::Off,
         },
         &mut |p| {
             if let Progress::Step { current, total } = p {

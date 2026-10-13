@@ -146,17 +146,58 @@ fn latent_space_statistics_match_the_released_vae_config() {
 #[test]
 #[ignore]
 fn validation_render_default_preset() {
-    let root = snapshot();
+    let steps: u32 = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(mlx_gen_qwen_image_2_1::DEFAULT_STEPS);
+    validation_render(mlx_gen_qwen_image_2_1::MODEL_ID, snapshot(), Some(steps));
+}
+
+/// The distilled Turbo checkpoint's validation render (sc-25900): the same 1:1 2048×2048 preset,
+/// seed and prompt as [`validation_render_default_preset`], through the `qwen_image_2_1_turbo`
+/// id, with **no step count on the request** — so it runs the snapshot's own saved sigmas (eight
+/// on the pinned revision) and asserts the sampler reported exactly that many steps. Needs the
+/// unmodified `Qwen/Qwen-Image-2.1-Turbo` snapshot at `MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT`.
+/// `QWEN_IMAGE_2_1_RENDER_STEPS=N` names a step count instead (the resampled schedule), and every
+/// other `QWEN_IMAGE_2_1_RENDER_*` / `QWEN_IMAGE_2_1_MEMORY_TRACE` switch applies unchanged.
+///
+/// ```sh
+/// MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/render-validation-sc-25900 \
+///   cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+///   e2e_real_weights::validation_render_turbo_default -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn validation_render_turbo_default() {
+    let root = PathBuf::from(
+        std::env::var("MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT").unwrap_or_else(|_| {
+            panic!("set MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT to the pinned Qwen-Image-2.1-Turbo snapshot dir; inference never self-fetches (epic 13657)")
+        }),
+    );
+    let saved = mlx_gen_qwen_image_2_1::load_saved_sigma_schedule(&root)
+        .unwrap()
+        .default_steps();
+    let steps: Option<u32> = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
+        .ok()
+        .map(|s| s.parse().unwrap());
+    let reported = validation_render(mlx_gen_qwen_image_2_1::TURBO_MODEL_ID, root, steps);
+    assert_eq!(
+        reported,
+        steps.unwrap_or(saved),
+        "a request with no step count runs one step per saved sigma"
+    );
+}
+
+/// One bounded validation render of engine `id` from the snapshot at `root`; `steps: None` leaves
+/// the step count to the generator. Returns the step total the sampler reported.
+fn validation_render(id: &str, root: PathBuf, steps: Option<u32>) -> u32 {
     let (mut width, mut height) = (PRESETS[0].width, PRESETS[0].height);
     if let Ok(size) = std::env::var("QWEN_IMAGE_2_1_RENDER_SIZE") {
         let (w, h) = size.split_once('x').expect("WxH");
         width = w.parse().unwrap();
         height = h.parse().unwrap();
     }
-    let steps: u32 = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
-        .ok()
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(mlx_gen_qwen_image_2_1::DEFAULT_STEPS);
     let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -175,7 +216,7 @@ fn validation_render_default_preset() {
     let started = Instant::now();
     let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
     let generator = registry
-        .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
+        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
     if trace {
@@ -197,7 +238,7 @@ fn validation_render_default_preset() {
             .to_owned(),
         width,
         height,
-        steps: Some(steps),
+        steps,
         seed: Some(42),
         memory,
         ..Default::default()
@@ -211,9 +252,13 @@ fn validation_render_default_preset() {
     let render_started = Instant::now();
     let mut log = progress_logger(String::new());
     let footprint_for_progress = footprint_max.clone();
+    let mut reported_steps = None;
     let out = generator
         .generate(&req, &mut |p| {
             log(p);
+            if let Progress::Step { total, .. } = p {
+                reported_steps = Some(total);
+            }
             if trace {
                 let label = match &p {
                     Progress::Loading(phase) => format!("loading {phase:?}"),
@@ -240,9 +285,8 @@ fn validation_render_default_preset() {
     };
     let image = &images[0];
     assert_eq!((image.width, image.height), (width, height));
-    let path = out_dir.join(format!(
-        "qwen_image_2_1_{width}x{height}_{steps}steps_seed42.png"
-    ));
+    let steps = reported_steps.expect("the sampler reports every step");
+    let path = out_dir.join(format!("{id}_{width}x{height}_{steps}steps_seed42.png"));
     image::save_buffer(
         &path,
         &image.pixels,
@@ -257,6 +301,7 @@ fn validation_render_default_preset() {
         started.elapsed().as_secs_f32(),
         render_started.elapsed().as_secs_f32()
     );
+    steps
 }
 
 /// A deterministic synthetic reference, so the edit smoke needs no checked-in photographs.
@@ -373,10 +418,11 @@ fn validation_render_reference_edit() {
     // (references, width, height, steps) — the caller-shaped case, then the boundary.
     //
     // Every reference is fitted to `output_resolution` (1024 px) whatever the target size, so ten
-    // references are ~41k prefix tokens on their own, and this port recomputes the whole
-    // block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
-    // runs the fewest steps the sampler accepts rather than a smaller target: only the step count
-    // moves its cost.
+    // references are ~41k prefix tokens on their own. The boundary case's step count was set to
+    // the fewest the sampler accepts when this port recomputed the whole block-causal prefix
+    // every step; the render path now runs upstream's prefix KV cache (sc-25903, see
+    // UPSTREAM.md), under which only the first step pays for the prefix and later steps cost
+    // what a text-to-image step does. The step count is left as it was.
     //
     // `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps,…"` replaces the two cases (sc-24114's encode
     // transient measurement: `2:2048x2048:2`); `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same

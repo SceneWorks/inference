@@ -391,6 +391,7 @@ fn transparent_layer_editing_matches_upstream_end_to_end() {
                     layout: &layout,
                     negative_layout: None,
                 }),
+                kv_cache: mlx_gen_qwen_image_2_1::KvCacheMode::Off,
             },
             &mut |_: Progress| {},
         )

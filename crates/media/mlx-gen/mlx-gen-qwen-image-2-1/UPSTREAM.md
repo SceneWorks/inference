@@ -33,7 +33,8 @@ Config keys read: `transformer/config.json` (`in_channels`, `out_channels`, `num
 `out_channels`, `latents_mean`, `latents_std`, `scale_factor_spatial`, `is_residual` must be true,
 `patch_size` must be null); `scheduler/scheduler_config.json` (`base_image_seq_len`,
 `max_image_seq_len`, `base_shift`, `max_shift`, `shift_terminal`, `num_train_timesteps`,
-`use_dynamic_shifting` must be true, `time_shift_type` must be `exponential`).
+`use_dynamic_shifting` must be true, `time_shift_type` must be `exponential`). The distilled Turbo
+snapshot differs here — see *The distilled Turbo checkpoint* below.
 
 ## Production geometry (frozen values)
 
@@ -463,15 +464,153 @@ The worst-case joint sequence is therefore `256 + 16 800 + 10 × 4 096 = 58 016`
 are **priced** by the memory contract, not refused; the 1..=10 bound and every per-image geometry
 check stay request-time refusals in `reference`.
 
+## The distilled Turbo checkpoint — `qwen_image_2_1_turbo` (sc-25900)
+
+| What | Where | Revision |
+| --- | --- | --- |
+| Weights, `config.json`s, tokenizer, scheduler config, `sample_sigmas`, licence | `Qwen/Qwen-Image-2.1-Turbo` (Hugging Face) | `fc13ba1986fcb905854dc8de2f52eee395f49b5b` |
+| `QwenImage21Pipeline.config.sample_sigmas` ("Configure fixed sampling sigmas on QwenImage21Pipeline", PR 14950) | `huggingface/diffusers` (`src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py`) | `da1d3829cf08d4f329b526d89e17cc035c049d8d` |
+
+A second engine id served by this same crate. `Qwen/Qwen-Image-2.1-Turbo` is a distillation of
+Qwen-Image 2.1 with the **same** `transformer/config.json`, presets, reference/RGBA routes and
+licence (its `LICENSE` is byte-identical to the base repository's). Everything above this section
+applies to it unchanged; what differs is the snapshot, and through it the schedule.
+
+### What the Turbo snapshot carries
+
+* `model_index.json` has one extra key, `sample_sigmas`:
+  `[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]` — eight sigmas, the
+  terminal `0` excluded.
+* `scheduler/scheduler_config.json` turns every scheduler transform off: `use_dynamic_shifting:
+  false`, `shift: 1.0`, `shift_terminal: null` (the base repository has `true` / `1.0` / `0.02`).
+  The remaining keys are identical.
+* `vae/diffusion_pytorch_model.safetensors` is bf16 (base: f32), and `text_encoder/` is a single
+  `model.safetensors` (base: four shards). Neither needs loader code: the VAE computes in its
+  weight dtype and every component loads whatever `*.safetensors` its directory holds.
+
+### What upstream does with it
+
+`QwenImage21Pipeline.__call__` (at the diffusers revision above):
+
+```python
+if sigmas is None:
+    sigmas = self.config.sample_sigmas
+    if sigmas is None:
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+mu = calculate_shift(...)
+timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
+```
+
+and `FlowMatchEulerDiscreteScheduler.set_timesteps`, with dynamic shifting off, applies the static
+shift `shift·σ / (1 + (shift − 1)·σ)` — the identity at `shift: 1.0` — skips the terminal stretch
+(`shift_terminal` is null) and appends `0`. So the schedule **is** the saved list plus a trailing
+zero: `mu` is computed and ignored, and `num_inference_steps` is ignored too (the docstring:
+"Ignored when `sigmas` or the pipeline's configured `sample_sigmas` is used; the length of that
+schedule determines the number of steps"). `true_cfg_scale` still defaults to `1.0`, and a negative
+prompt with a scale above 1 still runs the second forward.
+
+### What this port does
+
+* `qwen_image_2_1_turbo` is registered beside `qwen_image_2_1` (`model::TURBO_REGISTRATION`, its
+  own memory strategy / fixture / behaviour registrations; **no** trainer — training stays on the
+  base checkpoint). `model::Variant` picks the id and `model::Schedule` the schedule family; every
+  other line of the load and render path is shared.
+* The schedule is read from the snapshot at load (`loader::load_saved_sigma_schedule` →
+  `config::SavedSigmaSchedule`), never from constants in this crate. A request with no step count
+  runs one step per saved sigma; `steps` equal to the saved length is the same list, bit for bit.
+* A snapshot of the other checkpoint is a typed refusal that names the mismatch and the id to use:
+  the base id refuses a `model_index.json` that saves `sample_sigmas`; the Turbo id refuses one
+  that does not, and refuses a scheduler config that would move the saved values
+  (`use_dynamic_shifting: true`, `shift` other than `1.0`, a non-null `shift_terminal`).
+* A curated `scheduler` name goes through the same `resolve_flow_schedule` seam as the base id,
+  built over an unshifted flow model (`mu = ln(shift) = 0`). It **replaces** the saved sigmas with
+  that scheduler's own curve at the requested step count — it is the caller leaving the distilled
+  schedule, not a re-spacing of it. The `sampler` axis integrates whichever schedule was chosen.
+* One step is accepted (`[σ₀, 0]`); the base id's `steps >= 2` floor exists only because its
+  terminal stretch divides by zero there.
+
+## Prefix KV cache (sc-25903)
+
+Upstream's `use_kv_cache=True` default is ported: `QwenImage21KVCache` → `PrefixKvCache`
+(`src/transformer.rs`), `kv_cache_mode="extract"` → `forward_joint_extract`, `"cached"` →
+`forward_joint_cached`, and the pipeline's loop → `denoise` / `denoise_reported`
+(`src/pipeline.rs`).
+
+**Why it is valid.** The joint sequence is `[prefix = text + condition-image blocks][target]`.
+Under `causal_condition` the prefix tokens modulate from the `t = 0` row, and block-causal
+attention never lets a prefix token attend to the target. So every block's prefix hidden states —
+and its prefix keys and values — are the same at every model evaluation of a request. The cache is
+refused without `causal_condition` (the transformer returns a typed `Unsupported`; the loop, as
+upstream's `use_kv_cache and transformer.config.causal_condition`, runs the prefill path and
+reports it).
+
+**What is stored.** Per block, exactly what `_qwenimage21_prepare_qkv` stores: the prefix rows of
+`key` **after** QK-norm and RoPE and of `value` (the raw `to_v` projection), as
+`[1, prefix_tokens, heads, head_dim]` in the compute dtype — plus, here, the target block's RoPE
+rows. `2 · blocks · prefix_tokens · inner_dim · itemsize` bytes per prompt branch: at the
+ten-reference boundary in bf16 (`2 · 32 · ~41 200 · 4096 · 2`) about 20 GiB per branch.
+
+**How a cached evaluation runs.** Only the target tokens go through `img_in` and the blocks;
+each block projects/norms/rotates the target's own `q`, `k`, `v`, prepends the cached prefix
+`k`/`v`, and makes one unmasked attention call (the block-causal mask degenerates to full attention
+for target rows). The modulation and `norm_out` rows are the sampled-timestep row for every token.
+Upstream still projects the whole text and image stream on a cached step and then slices it away;
+this port does not compute what it would discard (the projections are row-wise, so the target rows
+are the same).
+
+**When.** Upstream extracts at loop index 0. This port extracts at each branch's **first model
+evaluation** and decodes at every later one: the curated solver axis may evaluate the model more
+than once per step or off the schedule (`heun`, `dpmpp_sde`), and the cache does not depend on the
+step. With true CFG the negative branch has its own, independent cache.
+
+**MLX specifics.** The cache is materialized (`eval`) during the extract forward, **block by
+block** — a lazy cache would re-run the prefix graph on every step and keep it alive, and a cache
+evaluated only at the end of the forward would keep every block's full K/V alive until then (each
+entry is cut from that block's `[1, prefix + target, heads, head_dim]` K and V). Each cached
+tensor is copied into its own buffer: an MLX slice is a view, so caching the slice would pin the
+block's whole prefill K/V (upstream's "`clone()`, not `contiguous()`"). The extract step's live
+set is therefore the prefill forward's plus the cache it is building
+(`2 · blocks · prefix_tokens · inner_dim · itemsize`, and the target's RoPE rows). The
+caches are owned by the denoise loop's velocity closure and are dropped when the loop returns —
+on success, cancellation or error — so nothing of them reaches the VAE decode. A cancellation
+(the shared sampler's step gate) ends the loop, as upstream's `break`; a cache only exists once a
+complete extract has been evaluated, so there is no empty or partial cache to decode from.
+
+**The switch.** `DenoiseInputs::kv_cache` (`KvCacheMode::{On, Off}`); the render path
+(`src/model.rs`) passes `On`. `Off` is the prefill loop, bit for bit. `denoise_reported` fills a
+`DenoiseReport`: the path that ran (`KvCachePath`), the bytes the caches held, and every
+transformer forward (`ModelEvaluation`: branch, `Prefill` / `Extract` / `Cached`, tokens the
+blocks ran over). The trainer's preview render stays on `Off`: it runs inside the trainer's
+memory envelope, which prices the prefill path.
+
+**Numerics.** Upstream documents the two paths as equally valid but not bit-identical (on the tiny
+fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
+attention call consumes the same key/value values in the same kernel as the prefill's target call,
+and on Metal the two paths are **bit-identical** at every evaluation and after the whole denoise —
+on the f32 tiny fixture and on a `head_dim = 128` model in f32 and bf16 (the geometry at which MLX
+selects its fused attention kernel on Metal; the dispatch itself is not asserted by the tests).
+`tests/kv_cache.rs` holds that to an absolute +
+relative bound and gates the cached path against upstream's own
+(`tests/fixtures/qwen21_kv_cache.safetensors`, `tools/dump_qwen21_kv_cache.py`).
+
+**Not priced here.** The request's memory contract (`memory_strategy`) does not yet carry the
+cache's bytes; pricing and admission-driven shedding to `Off` are the next story's.
+
 ## Deliberate divergences
 
-* No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
-  `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
-  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
-  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
-  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
-  upstream scales with `references + steps`.
+* **Turbo: `steps` is a live knob (sc-25900).** Upstream ignores `num_inference_steps` whenever
+  the pipeline saves `sample_sigmas`, so the distilled checkpoint always runs its eight saved
+  steps. Here a step count other than the saved length `K` **resamples the saved curve**
+  (`scheduler::resample_saved_sigmas`): the knots are the saved sigmas `s_0 … s_{K−1}` followed by
+  `s_K = 0`, at `u_j = j / K`; step `i` of `N` takes the piecewise-linear interpolation at
+  `u = i / N`; a `0` is appended. In integers: `t = i·K`, `j = t div N`, `r = t mod N`,
+  `σ_i = s_j + (s_{j+1} − s_j)·(r / N)` in `f64`, rounded to `f32` at the end. `N = K` reproduces
+  the saved list exactly (upstream's schedule), `σ_0` is the first saved sigma, the list strictly
+  descends and ends on `0`. This is a SceneWorks choice with no upstream counterpart — a resampled
+  schedule is off the distillation's training grid, and the candle twin implements the same
+  arithmetic so both lanes render the same schedule for the same request.
+* Prefix KV cache: extract is keyed on the first model evaluation rather than loop index 0, and a
+  cached step skips the prefix projections upstream computes and discards — see *Prefix KV cache*.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * The text tower runs f32 activations over bf16 weights (upstream: bf16 end to end).
 * Noise is MLX-seeded (`mlx.random.normal` under `key(seed)`), not torch-seeded.

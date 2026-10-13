@@ -1003,6 +1003,8 @@ mod tests {
             // no activation anchor — the carrier is measurement-only by contract, so the consumer
             // fallback is the honest answer until the terminal story measures one.
             "qwen_image_2_1",
+            // sc-25900: the distilled Turbo id shares that derived model and is equally unmeasured.
+            "qwen_image_2_1_turbo",
             "sana_1600m",
             "anima_turbo",
             "sensenova_u1_8b_fast",
@@ -1040,8 +1042,10 @@ mod tests {
         // `iris_3b_restore` (Resident only). All three publish a contract fixture rather than a
         // resident-only witness, because each classifies a rung as structurally absent, which the
         // resident-only witness cannot express — 59/56 -> 62/59.
-        assert_eq!(registry.memory_strategy_registrations().len(), 62);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 59);
+        // sc-25900 adds `qwen_image_2_1_turbo`, the distilled checkpoint served by the same crate
+        // under the same contract as `qwen_image_2_1` — 62/59 -> 63/60.
+        assert_eq!(registry.memory_strategy_registrations().len(), 63);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 60);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1072,7 +1076,10 @@ mod tests {
         // sc-25690's three Iris-3B routes are a FOURTH narrowed shape: one dense tier (every Iris
         // loader refuses `LoadSpec::quantize`), eagerly materialized (no Iris loader has a
         // deferred load shape, and each refuses one), under both offload policies — 2 apiece.
-        assert_eq!(surfaces.len(), 52 * 12 + 6 + 3 + 2 * 3 + 3 * 2);
+        //
+        // sc-25900's `qwen_image_2_1_turbo` publishes the same full surface as `qwen_image_2_1`,
+        // so it joins the 12-apiece group — 52 -> 53.
+        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2);
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
         let composed: std::collections::BTreeSet<_> = surfaces
@@ -1905,6 +1912,7 @@ mod tests {
                 "qwen_image_control",
                 "qwen_image_edit",
                 "qwen_image_2_1",
+                "qwen_image_2_1_turbo",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -1983,8 +1991,9 @@ mod tests {
         // sc-25683 adds `iris_3b_restore` (a transform with its own complete row): 73 / 63.
         // sc-25687 adds the `iris_3b_depth` trainer (not a generator id; its own complete row):
         // 74 / 64.
-        assert_eq!(distinct.len(), 74);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 64);
+        // sc-25900 adds `qwen_image_2_1_turbo` (a generator with its own complete row): 75 / 65.
+        assert_eq!(distinct.len(), 75);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 65);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface
