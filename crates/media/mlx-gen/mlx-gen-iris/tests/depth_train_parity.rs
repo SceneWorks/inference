@@ -253,3 +253,62 @@ fn tensor_loss_matches_the_host_reference_body() {
         }
     });
 }
+
+/// sc-25690: the depth trainer's activation checkpointing (`gradient_checkpointing`) — the
+/// generation trainer's trunk / pixel regions (MLX's checkpoint transform) around the widened
+/// backbone, the reducer and Eq. 5 downstream of them. f32: the gradients are the plain graph's;
+/// bf16: the same loss bit for bit and gradients within the declared bf16 bound.
+#[test]
+fn activation_checkpointing_gradients_equal_the_plain_graph() {
+    crate::common::cpu_process(
+        "depth_train_parity::activation_checkpointing_gradients_equal_the_plain_graph",
+        activation_checkpointing_gradients_equal_the_plain_graph_body,
+    );
+}
+
+fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
+    use mlx_gen::gen_core::iris::train::ac::AcPolicy;
+    use mlx_gen_iris::train::depth::loss_and_grads;
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    on_cpu(|| {
+        let g = fixture("iris_depth_train_golden.safetensors");
+        let batch = golden_batch(&g);
+        let loss_plan = DepthLossPlan::default();
+        let (_, params) = setup();
+        let step = DepthStep::new(&batch, &loss_plan);
+        let dir = fixtures().join("tiny-depth");
+        let export = TaskExport::from_dir(&dir, IrisTask::Depth, "test").unwrap();
+        let prompt = EmptyPrompt::read(&export.empty_prompt_path(), &export.config).unwrap();
+        let case = |compute: Dtype, ac: AcPolicy| {
+            let mut model = DepthModel::new(export.config.clone(), compute, &prompt);
+            model.ac = ac;
+            let before = checkpointed_regions();
+            let (loss, grads) = loss_and_grads(&model, &params, &step, &loss_plan, 1.0).unwrap();
+            (loss, grads, checkpointed_regions() - before)
+        };
+        let cfg = &export.config.model;
+        let regions = cfg.depth + cfg.pixel.depth;
+        let (f_loss, f_none, entered) = case(Dtype::Float32, AcPolicy::None);
+        assert_eq!(entered, 0, "none checkpoints no region");
+        let (f_loss_ac, f_full, entered) = case(Dtype::Float32, AcPolicy::Full);
+        assert_eq!(
+            entered, regions,
+            "full checkpoints every trunk and pixel block"
+        );
+        assert_eq!(f_loss.to_bits(), f_loss_ac.to_bits(), "f32 loss");
+        assert_eq!(
+            f_full.len(),
+            params.len(),
+            "every trained tensor has a gradient"
+        );
+        crate::common::assert_ac_f32_equal("depth", 1e-6, &f_none, &f_full);
+        let (b_loss, b_none, _) = case(Dtype::Bfloat16, AcPolicy::None);
+        let (b_loss_ac, b_full, entered) = case(Dtype::Bfloat16, AcPolicy::Full);
+        assert_eq!(entered, regions);
+        assert_eq!(b_loss.to_bits(), b_loss_ac.to_bits(), "bf16 loss");
+        let bf16 = crate::common::assert_ac_bf16_noise_only("depth", &f_none, &b_none, &b_full);
+        // MLX's checkpoint transform re-runs the block's own graph: on the CPU stream the bf16
+        // gradients are the plain bf16 graph's bit for bit.
+        assert_eq!(bf16.4, 0.0, "bf16 checkpointed vs bf16 plain max|Δ|");
+    });
+}

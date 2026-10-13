@@ -21,8 +21,8 @@
 //! Inputs (env) — all REQUIRED, so a misspelled variable cannot silently measure another shape:
 //! * `IRIS_PROBE_TASK` — `generation` | `depth` | `restoration`.
 //! * `IRIS_PROBE_SIZE` — the square training size (px), e.g. 1024.
-//! * `IRIS_PROBE_AC` — `none` | `full` (generation only: the depth and restoration trainers refuse
-//!   activation checkpointing).
+//! * `IRIS_PROBE_AC` — `none` | `full` (generation: `activation_checkpointing`; depth and
+//!   restoration: `gradient_checkpointing`, which selects `full`).
 //! * `IRIS_PROBE_STEPS` — optimizer steps.
 //! * `IRIS_PROBE_MLX_CACHE` — `default` (MLX's own cache limit, as the product runs) | `none` (cache
 //!   limit 0).
@@ -181,10 +181,6 @@ fn real_training_memory_probe() {
         "depth" => {
             use mlx_gen::gen_core::iris::train::depth::ITEM_DEPTH_KEY;
             use mlx_gen::gen_core::iris::train::OPTIONS_KEY;
-            assert_eq!(
-                ac, "none",
-                "the depth trainer refuses activation checkpointing"
-            );
             let rgb = data.join("d.png");
             write_rgb(&rgb, size, 0);
             let depth = data.join("d.npy");
@@ -207,6 +203,7 @@ fn real_training_memory_probe() {
                 full_finetune: true,
                 loss_type: "l1".into(),
                 train_dtype: "bf16".into(),
+                gradient_checkpointing: ac == "full",
                 ..Default::default()
             };
             config
@@ -222,10 +219,6 @@ fn real_training_memory_probe() {
                 recipe_training_config, CRITIC_TRUNK_COMPONENT, LPIPS_LIN_COMPONENT, OPTIONS_KEY,
                 VGG16_COMPONENT,
             };
-            assert_eq!(
-                ac, "none",
-                "the restoration trainer refuses activation checkpointing"
-            );
             let items = (0..2)
                 .map(|i| {
                     let p = data.join(format!("r{i}.png"));
@@ -242,6 +235,7 @@ fn real_training_memory_probe() {
             config.save_every = 0;
             config.seed = 5;
             config.train_dtype = "bf16".into();
+            config.gradient_checkpointing = ac == "full";
             config
                 .model_options
                 .insert(OPTIONS_KEY.into(), serde_json::json!({"ema_decay": 0.999}));

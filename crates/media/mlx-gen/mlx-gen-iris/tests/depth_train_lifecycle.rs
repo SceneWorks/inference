@@ -221,9 +221,10 @@ fn gen_core_trainer_conformance_checks_body() {
     req.config.full_finetune = false;
     assert!(matches!(t.validate(&req), Err(CoreError::Unsupported(_))));
     req.config.full_finetune = true;
-    // sc-25690: activation checkpointing of this task is wired on Candle only; refused typed here.
+    // sc-25690: activation checkpointing (`gradient_checkpointing`) is a trained option of this
+    // task on both backends.
     req.config.gradient_checkpointing = true;
-    assert!(matches!(t.validate(&req), Err(CoreError::Unsupported(_))));
+    t.validate(&req).unwrap();
     req.config.gradient_checkpointing = false;
     req.items.clear();
     assert!(t.validate(&req).is_err());
@@ -238,11 +239,29 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run() {
 }
 
 fn cancel_and_resume_reproduce_the_uninterrupted_run_body() {
+    cancel_and_resume_under(false);
+}
+
+/// sc-25690: the same lifecycle with the step's trunk / pixel blocks activation-checkpointed —
+/// cancel → durable checkpoint → resume reproduces the uninterrupted checkpointed run bit for bit
+/// (weights, EMA, optimizer, scheduler / data position, export).
+#[test]
+fn cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing",
+        || cancel_and_resume_under(true),
+    );
+}
+
+fn cancel_and_resume_under(ac: bool) {
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    let entered = checkpointed_regions();
     on_cpu(|| {
         let data = tempfile::tempdir().unwrap();
         let items = dataset(data.path());
         let name = "depth.safetensors";
         let mut cfg = config();
+        cfg.gradient_checkpointing = ac;
         cfg.batch_size = 1;
         cfg.gradient_accumulation = 2;
         cfg.steps = 8;
@@ -263,7 +282,15 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_body() {
         );
         let mut resumed = cfg.clone();
         resumed.resume = true;
+        // The resumed run itself is checkpointed: a resume that dropped the policy would still
+        // reproduce the weights (the gradients are the plain graph's), so count its own regions.
+        let before_resume = checkpointed_regions();
         assert_eq!(run(&items, resumed, b.path(), name, None), 8);
+        assert_eq!(
+            checkpointed_regions() > before_resume,
+            ac,
+            "the resumed run enters regions exactly when it is checkpointed"
+        );
         let (la, lb) = (
             latest_checkpoint(&checkpoint_root(a.path(), name)).unwrap(),
             latest_checkpoint(&root_b).unwrap(),
@@ -313,6 +340,63 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_body() {
             .unwrap_err();
         assert!(err.to_string().contains("depth task"), "{err}");
     });
+    assert_eq!(
+        checkpointed_regions() > entered,
+        ac,
+        "regions are entered exactly when the run is checkpointed"
+    );
+}
+
+/// sc-25690: a checkpointed depth run is the plain run (f32) — the trainer wires
+/// `gradient_checkpointing` into its step, the export moves by rounding only, keeps the release's
+/// layout and stamps, and loads in the estimator.
+#[test]
+fn activation_checkpointing_leaves_the_run_unchanged() {
+    crate::common::cpu_process(
+        "depth_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+        activation_checkpointing_leaves_the_run_unchanged_body,
+    );
+}
+
+fn activation_checkpointing_leaves_the_run_unchanged_body() {
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    let (data, a, b) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let items = dataset(data.path());
+    let export = |ac: bool, out: &Path| {
+        let mut cfg = config();
+        cfg.save_every = 0;
+        cfg.gradient_checkpointing = ac;
+        let before = checkpointed_regions();
+        let res = trainer()
+            .train(&request(&items, cfg, out, "depth.safetensors"), &mut |_| {})
+            .unwrap();
+        assert_eq!(res.steps, 4);
+        assert_eq!(checkpointed_regions() > before, ac);
+        res.adapter_path
+    };
+    let (plain, checkpointed) = (export(false, a.path()), export(true, b.path()));
+    let (tp, tc) = (bytes_of(&plain), bytes_of(&checkpointed));
+    assert_eq!(tp.len(), tc.len());
+    let mut worst = 0f32;
+    for ((k, x), (k2, y)) in tp.iter().zip(&tc) {
+        assert_eq!(k, k2);
+        for (p, q) in x.iter().zip(y) {
+            worst = worst.max((p - q).abs());
+        }
+    }
+    eprintln!("depth: activation checkpointing vs plain: max |Δ| = {worst:.3e}");
+    assert!(worst <= 1e-6, "{worst}");
+    // The policy is no part of the export's identity, and the checkpointed export is a depth model.
+    let meta = |p: &Path| weights_metadata(p).unwrap().unwrap();
+    assert_eq!(meta(&plain), meta(&checkpointed));
+    let dir = checkpointed.parent().unwrap();
+    TaskExport::from_dir(dir, IrisTask::Depth, ID).unwrap();
+    let values = estimate(dir, &rgb_image(&items[0]));
+    assert!(values.iter().all(|v| v.is_finite()));
 }
 
 /// `invalid_examples`: `reject` refuses before any step naming the item; `skip` trains on the rest.

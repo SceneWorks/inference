@@ -296,7 +296,7 @@ on:
         required: false
         default: ""
       iris_memory_mlx_steady_steps:
-        description: "iris-memory-mlx only: run the steady-state pass (cache off, no restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
+        description: "iris-memory-mlx only: run the steady-state pass (cache off, no plain restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
         type: string
         required: false
         default: ""
@@ -5642,7 +5642,8 @@ jobs:
   # DISPATCH-ONLY (`iris-memory-mlx` profile; never `all`, never the schedule; nothing is gated on
   # its numbers). nax-macos-2 only (the first step FAILS on any other runner, before any build or
   # GPU work). One `train_memory_probe` process per shape — generation 1024² with and without
-  # activation checkpointing, depth and restoration at 1024², then all three at 512², each with
+  # activation checkpointing, depth and restoration at 1024², then all three at 512², then depth
+  # 1024² and restoration 512² / 1024² activation-checkpointed — each with
   # MLX's default buffer-cache limit and again with the cache disabled by the test — each under
   # the external phys_footprint guard (cap 115 GB, 10 min wall), started only when
   # `memory_pressure` reports >= 120 GB free. Rows carry MLX's own active peak next to the

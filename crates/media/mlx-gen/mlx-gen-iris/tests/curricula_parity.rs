@@ -109,11 +109,15 @@ fn base_params() -> Params {
 }
 
 fn full_model(rope_aspect: &str) -> TrainModel {
+    full_model_at(rope_aspect, Dtype::Float32)
+}
+
+fn full_model_at(rope_aspect: &str, compute: Dtype) -> TrainModel {
     let mut cfg = tiny_config().model;
     cfg.rope_aspect = rope_aspect.into();
     TrainModel {
         cfg,
-        compute: Dtype::Float32,
+        compute,
         trainable: Trainable::Full,
     }
 }
@@ -322,6 +326,51 @@ fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
             vec![full, full, strided],
             "regions entered per policy"
         );
+    });
+}
+
+/// sc-25690: the generation trainer's activation checkpointing under the **bf16** policy
+/// (`mixed_precision: bf16`, f32 masters) — the rule the Candle twin and the depth / restoration
+/// trainers carry: the same step-1 loss bit for bit, and per trained tensor a checkpointed gradient
+/// no further from the f32 gradient than the plain bf16 gradient is.
+#[test]
+fn activation_checkpointing_bf16_gradients_add_no_error_of_their_own() {
+    crate::common::cpu_process(
+        "curricula_parity::activation_checkpointing_bf16_gradients_add_no_error_of_their_own",
+        activation_checkpointing_bf16_gradients_add_no_error_of_their_own_body,
+    );
+}
+
+fn activation_checkpointing_bf16_gradients_add_no_error_of_their_own_body() {
+    on_cpu(|| {
+        let params = base_params();
+        let case = |compute: Dtype, ac: AcPolicy| {
+            let model = full_model_at("isotropic", compute);
+            let extras = TrainExtras { repa: None, ac };
+            let before = checkpointed_regions();
+            let (loss, _, grads) =
+                loss_and_grads_ext(&model, &params, &mb0(), &objective(), &extras, None, 1.0)
+                    .unwrap();
+            (loss, grads, checkpointed_regions() - before)
+        };
+        let cfg = tiny_config().model;
+        let regions = cfg.depth + cfg.pixel.depth;
+        let (_, f_none, entered) = case(Dtype::Float32, AcPolicy::None);
+        assert_eq!(entered, 0, "none checkpoints no region");
+        let (b_loss, b_none, entered) = case(Dtype::Bfloat16, AcPolicy::None);
+        assert_eq!(entered, 0, "none checkpoints no region");
+        let (b_loss_ac, b_full, entered) = case(Dtype::Bfloat16, AcPolicy::Full);
+        assert_eq!(
+            entered, regions,
+            "full checkpoints every trunk and pixel block"
+        );
+        assert_eq!(b_full.len(), params.len());
+        assert_eq!(b_loss.to_bits(), b_loss_ac.to_bits(), "bf16 step-1 loss");
+        let bf16 =
+            crate::common::assert_ac_bf16_noise_only("generation", &f_none, &b_none, &b_full);
+        // MLX's checkpoint transform re-runs the block's own graph: on the CPU stream the bf16
+        // gradients are the plain bf16 graph's bit for bit.
+        assert_eq!(bf16.4, 0.0, "bf16 checkpointed vs bf16 plain max|Δ|");
     });
 }
 

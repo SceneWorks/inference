@@ -953,8 +953,9 @@ pub struct RestoreTrainPlan {
     pub mixed_precision: MixedPrecision,
     /// Activation checkpointing of the generator's trunk / pixel blocks in the generator step
     /// (sc-25690): `TrainingConfig::gradient_checkpointing` selects `full`. It changes memory and
-    /// compute, never the update, so it is no part of a run's identity. A backend that has not
-    /// wired the regions for this task refuses an active policy typed.
+    /// compute, never the update, so it is no part of a run's identity. Both native backends run
+    /// it, for the full fine-tune and the adapters (MLX: the checkpoint transform per region;
+    /// Candle: the segmented backward).
     pub ac: AcPolicy,
     pub critic_bf16: bool,
     /// The export's one-step noise level and the model time `σ · N`.

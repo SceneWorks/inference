@@ -245,8 +245,8 @@ pub struct DepthTrainPlan {
     pub mixed_precision: MixedPrecision,
     /// Activation checkpointing of the backbone's trunk / pixel blocks (sc-25690):
     /// `TrainingConfig::gradient_checkpointing` selects `full`. It changes memory and compute,
-    /// never the update, so it is no part of a run's identity. A backend that has not wired the
-    /// regions for this task refuses an active policy typed.
+    /// never the update, so it is no part of a run's identity. Both native backends run it (MLX:
+    /// the checkpoint transform per region; Candle: the segmented backward).
     pub ac: AcPolicy,
     pub optimizer: OptimizerPlan,
     pub schedule: LrShape,
