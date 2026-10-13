@@ -295,11 +295,7 @@ pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
 /// snapshot that claims a saved schedule, so it gets this same typed refusal rather than the
 /// Turbo reader's validation error — validating the values is the Turbo id's job.
 pub fn refuse_saved_sigma_snapshot(root: &Path) -> Result<()> {
-    let Some(model_index) = load_model_index(root)? else {
-        return Ok(());
-    };
-    let saved = model_index.get(crate::config::SAMPLE_SIGMAS_KEY);
-    if saved.is_some_and(|value| !value.is_null()) {
+    if saves_sample_sigmas(root)? {
         return Err(Error::Unsupported(format!(
             "qwen_image_2_1: model_index.json saves `{}`, so this is a distilled \
              Qwen-Image-2.1-Turbo snapshot and the base resolution-shifted schedule does not apply \
@@ -308,6 +304,19 @@ pub fn refuse_saved_sigma_snapshot(root: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `<root>/model_index.json` **claims** a saved sampling schedule: the `sample_sigmas` key
+/// present and not `null`. This is the one signal that tells the two released checkpoints apart —
+/// [`refuse_saved_sigma_snapshot`] reads it for the base id, and the offline converter
+/// ([`crate::convert::source_variant`]) reads the same one to decide which checkpoint it is
+/// re-packing, so a tier can never be labelled by a flag the caller got wrong.
+pub fn saves_sample_sigmas(root: &Path) -> Result<bool> {
+    Ok(load_model_index(root)?.is_some_and(|model_index| {
+        model_index
+            .get(crate::config::SAMPLE_SIGMAS_KEY)
+            .is_some_and(|value| !value.is_null())
+    }))
 }
 
 #[cfg(test)]

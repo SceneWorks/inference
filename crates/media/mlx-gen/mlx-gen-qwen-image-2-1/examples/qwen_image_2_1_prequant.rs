@@ -1,14 +1,20 @@
-//! Offline pre-quantization of a `Qwen/Qwen-Image-2.1` snapshot into one installable tier
-//! (sc-24112).
+//! Offline pre-quantization of a `Qwen/Qwen-Image-2.1` **or** `Qwen/Qwen-Image-2.1-Turbo` snapshot
+//! into one installable tier (sc-24112, sc-25906).
 //!
 //! ```text
 //! QWEN21_SRC=<dense snapshot> QWEN21_TIER=q4 QWEN21_DST=<out root> \
 //!   cargo run --release --example qwen_image_2_1_prequant -p mlx-gen-qwen-image-2-1
 //! ```
 //!
+//! There is no variant switch: the converter reads which checkpoint `QWEN21_SRC` is from the
+//! snapshot itself (`convert::source_variant` — a `model_index.json` that saves `sample_sigmas` is
+//! the Turbo checkpoint) and this driver prints what it found before converting.
+//!
 //! `QWEN21_DST` is the **tiers root**; the tier lands in `<QWEN21_DST>/<tier>/` as a complete
-//! standalone snapshot (see `mlx_gen_qwen_image_2_1::convert`). `QWEN21_TIER` is `q8` or `q4`; the
-//! `bf16` tier is the dense source itself and is refused rather than copied.
+//! standalone snapshot (see `mlx_gen_qwen_image_2_1::convert`). When unset it defaults to a root
+//! named after the checkpoint (`qwen-image-2-1-tiers` or `qwen-image-2-1-turbo-tiers`), so the two
+//! checkpoints' tiers never land in one directory. `QWEN21_TIER` is `q8` or `q4`; the `bf16` tier
+//! is the dense source itself and is refused rather than copied.
 //!
 //! The converter itself writes the tier's `CHANGES.md` (the Qwen Research License change record)
 //! and `SHA256SUMS` (the manifest a published tier is bound to) — this driver only selects the
@@ -21,8 +27,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen_qwen_image_2_1::convert::{prequantize_turnkey, CHANGES_FILE, SHA256SUMS_FILE};
+use mlx_gen_qwen_image_2_1::convert::{
+    prequantize_turnkey, source_variant, CHANGES_FILE, SHA256SUMS_FILE,
+};
 use mlx_gen_qwen_image_2_1::quant::Tier;
+use mlx_gen_qwen_image_2_1::Variant;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
@@ -45,18 +54,29 @@ fn main() {
     let src = PathBuf::from(env_or("QWEN21_SRC", ""));
     assert!(
         src.is_dir(),
-        "set QWEN21_SRC to the dense Qwen/Qwen-Image-2.1 snapshot directory"
+        "set QWEN21_SRC to a dense Qwen/Qwen-Image-2.1 or Qwen/Qwen-Image-2.1-Turbo snapshot \
+         directory"
     );
     let tier = tier_from_env();
+    // Read off the snapshot, never asked of the caller; a source that is neither checkpoint is
+    // refused here with the loader's own message, before the tiers root is even chosen.
+    let variant = source_variant(&src).expect("QWEN21_SRC is not a snapshot this crate loads");
+    let default_root = match variant {
+        Variant::Base => "qwen-image-2-1-tiers",
+        Variant::Turbo => "qwen-image-2-1-turbo-tiers",
+    };
     let dst_root = PathBuf::from(env_or(
         "QWEN21_DST",
-        &format!("{}/SceneWorks/qwen-image-2-1-tiers", env_or("HOME", "/tmp")),
+        &format!("{}/SceneWorks/{default_root}", env_or("HOME", "/tmp")),
     ));
     let dst = dst_root.join(tier.dir_name());
 
     eprintln!(
-        "[prequant] {} -> {} tier at {}",
+        "[prequant] {} ({} @ {}, loads as `{}`) -> {} tier at {}",
         src.display(),
+        variant.upstream_hf_repo(),
+        variant.upstream_hf_revision(),
+        variant.id(),
         tier.dir_name(),
         dst.display()
     );

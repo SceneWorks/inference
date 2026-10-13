@@ -61,6 +61,22 @@ impl Variant {
         }
     }
 
+    /// The Hugging Face repository this variant's snapshot is released as.
+    pub const fn upstream_hf_repo(self) -> &'static str {
+        match self {
+            Self::Base => crate::UPSTREAM_HF_REPO,
+            Self::Turbo => crate::UPSTREAM_TURBO_HF_REPO,
+        }
+    }
+
+    /// The pinned revision of [`Self::upstream_hf_repo`] this crate is frozen against.
+    pub const fn upstream_hf_revision(self) -> &'static str {
+        match self {
+            Self::Base => crate::UPSTREAM_HF_REVISION,
+            Self::Turbo => crate::UPSTREAM_TURBO_HF_REVISION,
+        }
+    }
+
     /// The variant an engine id names, or `None` for an id this crate does not serve.
     pub fn from_id(id: &str) -> Option<Self> {
         [Self::Base, Self::Turbo]
@@ -568,12 +584,11 @@ impl QwenImage21 {
         // The resident term credits the installed adapter stack (sc-24156) — its residual factors
         // and any materialized LyCORIS deltas, exactly as the loaded contract prices them in
         // `overlay_bytes` — so an adapter load does not run under a limit sized for the bare base.
-        let resident_bytes = crate::memory_strategy::derived::resident_weights(
-            crate::quant::Tier::from_selected(self.spec.quantize)
-                .unwrap_or(crate::quant::Tier::Bf16),
-        )
-        .resident_total()
-        .saturating_add(self.memory_strategy.asset_facts.overlay_bytes);
+        let resident_bytes = derived_resident_bytes(
+            self.variant,
+            self.spec.quantize,
+            self.memory_strategy.asset_facts.overlay_bytes,
+        );
         #[cfg(test)]
         let resident_bytes =
             resident_bytes.saturating_add(crate::q4_diagnostic::resident_surcharge());
@@ -698,6 +713,23 @@ impl QwenImage21 {
     }
 }
 
+/// The derived resident set one request's allocator bounds are built on: `variant`'s resident
+/// weights at the loaded tier ([`crate::memory_strategy::derived::resident_weights_for`] — the
+/// Turbo checkpoint's bf16 autoencoder is half the base's f32 one) plus the installed adapter
+/// overlay.
+pub(crate) fn derived_resident_bytes(
+    variant: Variant,
+    quantize: Option<Quant>,
+    overlay_bytes: u64,
+) -> u64 {
+    crate::memory_strategy::derived::resident_weights_for(
+        variant,
+        crate::quant::Tier::from_selected(quantize).unwrap_or(crate::quant::Tier::Bf16),
+    )
+    .resident_total()
+    .saturating_add(overlay_bytes)
+}
+
 /// The conditioning one render carries, assembled while the text encoder is resident: the
 /// positive (and, with true CFG, negative) [`JointBranch`] and the ordered prepared references.
 pub(crate) struct ReferenceBranches {
@@ -808,6 +840,37 @@ mod tests {
             width,
             height,
             ..Default::default()
+        }
+    }
+
+    /// A Turbo request's allocator bounds are built on the Turbo checkpoint's resident set — its
+    /// bf16 autoencoder — not on the base checkpoint's, at every tier, with the adapter overlay
+    /// on top. The base figure is the base table's, unchanged. (The transient budget beside it is
+    /// `request_transient_budget_bytes`, the same for both ids: no activation term is
+    /// variant-dependent.)
+    ///
+    /// *Mutation that reds this:* `derived_resident_bytes` pricing every variant from the base
+    /// table (`resident_weights(tier)`).
+    #[test]
+    fn a_request_is_bounded_on_its_own_checkpoints_resident_set() {
+        use crate::memory_strategy::derived;
+        for (quant, tier) in [
+            (None, crate::quant::Tier::Bf16),
+            (Some(Quant::Q8), crate::quant::Tier::Q8),
+            (Some(Quant::Q4), crate::quant::Tier::Q4),
+        ] {
+            let base = derived_resident_bytes(Variant::Base, quant, 0);
+            let turbo = derived_resident_bytes(Variant::Turbo, quant, 0);
+            assert_eq!(base, derived::resident_weights(tier).resident_total());
+            assert_eq!(
+                base - turbo,
+                derived::VAE_BYTES - derived::TURBO_VAE_BYTES,
+                "{tier:?}"
+            );
+            assert_eq!(
+                derived_resident_bytes(Variant::Turbo, quant, 4096),
+                turbo + 4096
+            );
         }
     }
 

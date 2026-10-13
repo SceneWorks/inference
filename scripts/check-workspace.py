@@ -341,6 +341,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "share one fingerprint would let a record built against one backend satisfy the other's "
         "handshake, which is exactly what the identity exists to prevent."
     ),
+    ("qwen-image-2-1", "TURBO_MEMORY_CALIBRATION_FINGERPRINT"): (
+        "the distilled Turbo id's calibration identity (sc-25901 candle, sc-25906 mlx), per-backend "
+        "by construction for the same reason as this family's MEMORY_CALIBRATION_FINGERPRINT above: "
+        "each backend prices the Turbo checkpoint at the width ITS loader materializes it at — the "
+        "bf16 autoencoder is held at bf16 on mlx and at the lane's compute dtype on candle — so a "
+        "record built against one backend must not satisfy the other's handshake."
+    ),
     ("iris", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction (sc-25690, generation) — the same "
         "reason as qwen-image-2-1's entry above: both values name a DERIVED memory model, each "
