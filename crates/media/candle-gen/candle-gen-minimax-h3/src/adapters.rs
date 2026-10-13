@@ -364,15 +364,15 @@ pub fn resolve_target_alpha(in_band: Option<f32>, blob_alpha: Option<f32>, file_
 // ─── sc-19443: the ComfyUI key space ───────────────────────────────────────────────────────────
 
 /// The ComfyUI container prefix for the 50-block stack. Its diffusers spelling is
-/// `transformer_blocks.`; the token refiner keeps its name in both.
+/// `transformer_blocks.`; raw `token_refiner.blocks.` uses `token_refiner.refiner_blocks.`.
 const COMFY_BLOCK_CONTAINER: &str = "blocks.";
 
-/// Map a ComfyUI *container* path onto the diffusers one, leaving an already-diffusers path alone.
-///
-/// The order matters: `token_refiner.refiner_blocks.` and `transformer_blocks.` both *contain*
-/// `blocks.`, so they are matched first and returned unchanged. Only a bare leading `blocks.` — the
-/// ComfyUI spelling of the trunk — is rewritten.
+/// Map leading raw H3 containers to diffusers without rewriting nested or unknown containers.
+/// Canonical `transformer_blocks.` and `token_refiner.refiner_blocks.` stay unchanged.
 fn normalize_comfy_container(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("token_refiner.blocks.") {
+        return format!("token_refiner.refiner_blocks.{rest}");
+    }
     if path.starts_with("transformer_blocks.") || path.starts_with("token_refiner.") {
         return path.to_string();
     }
@@ -1177,4 +1177,76 @@ pub fn apply_minimax_h3_adapters(
 /// `networkType` stamp.
 fn has_lokr_keys(tensors: &HashMap<String, Tensor>) -> bool {
     tensors.keys().any(|k| k.contains(".lokr_w"))
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn clay_raw_refiner_header_maps_to_exact_native_targets() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../contracts/gen-core/tests/fixtures/adapters/h3_clay_refiner_header.json"
+        )))
+        .unwrap();
+        let header = fixture["header"].as_object().unwrap();
+        assert_eq!(header.len(), 16);
+        let targets = adapter_target_paths(&MiniMaxH3DitConfig::default());
+        let mut matched = BTreeSet::new();
+        for (key, entry) in header {
+            let (stem, _) = SUFFIXES
+                .iter()
+                .find_map(|(suffix, role)| key.strip_suffix(suffix).map(|stem| (stem, role)))
+                .unwrap();
+            let path = normalize_comfy_container(&normalize_minimax_h3_key(stem));
+            let (container, leaf) = split_comfy_leaf(&path).unwrap();
+            assert!(
+                container == "token_refiner.refiner_blocks.0"
+                    || container == "token_refiner.refiner_blocks.1"
+            );
+            let leaves: &[&str] = match leaf {
+                ComfyLeaf::Qkv => &["attn.to_q", "attn.to_k", "attn.to_v"],
+                ComfyLeaf::OutProj => &["attn.to_out.0"],
+                ComfyLeaf::Fc1 => &["ff.net.0.proj"],
+                ComfyLeaf::Fc2 => &["ff.net.2"],
+            };
+            for leaf in leaves {
+                let target = format!("{container}.{leaf}");
+                assert!(targets.contains(&target), "{key} -> {target}");
+                matched.insert(target);
+            }
+            assert_eq!(entry["dtype"], "F16");
+            let is_down = key.contains(".lora_A.");
+            let shape = if is_down {
+                match leaf {
+                    ComfyLeaf::OutProj => [16, 7168],
+                    ComfyLeaf::Fc2 => [16, 14336],
+                    _ => [16, 5376],
+                }
+            } else {
+                match leaf {
+                    ComfyLeaf::Qkv => [21504, 16],
+                    ComfyLeaf::Fc1 => [28672, 16],
+                    _ => [5376, 16],
+                }
+            };
+            assert_eq!(entry["shape"], serde_json::json!(shape), "{key}");
+            let canonical = normalize_minimax_h3_key(stem).replacen(
+                "token_refiner.blocks.",
+                "token_refiner.refiner_blocks.",
+                1,
+            );
+            assert_eq!(normalize_comfy_container(&canonical), canonical);
+        }
+        assert_eq!(matched.len(), 12);
+        for unknown in [
+            "unrelated.token_refiner.blocks.0.attn.out_proj",
+            "token_refiner.other.blocks.0.attn.out_proj",
+            "token_refiner.blocks_extra.0.attn.out_proj",
+        ] {
+            assert_eq!(normalize_comfy_container(unknown), unknown);
+            assert!(!targets.contains(&unknown.to_string()));
+        }
+    }
 }

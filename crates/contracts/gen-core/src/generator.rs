@@ -90,6 +90,15 @@ pub trait Generator {
         )
     }
 
+    /// Optional problem-bounded sparse residency. Disabled/absent settings return None without
+    /// loading predictors or allocating device state. Worker admission calls this per queued job.
+    fn veda_workspace_bound(
+        &self,
+        _req: crate::veda::workspace::Request<'_>,
+    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
+        Ok(None)
+    }
+
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
     /// replace its strategy, parameters, or numeric tier. Non-adopting providers accept only the
     /// resident baseline.
@@ -3538,6 +3547,11 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
+            return Err(Error::Unsupported(format!(
+                "{id}: Veda attention requires MiniMax-H3"
+            )));
+        }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
         // one here means the request renders SDR while the caller believes it asked for HDR — a

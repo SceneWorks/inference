@@ -451,6 +451,15 @@ impl DitAttention {
 
     /// `rope` is `None` for the token refiner, which runs **without** any positional embedding.
     pub fn forward(&self, x: &Tensor, rope: Option<(&MmRope, &MmRopeTables)>) -> Result<Tensor> {
+        self.forward_veda(x, rope, None)
+    }
+
+    pub(crate) fn forward_veda(
+        &self,
+        x: &Tensor,
+        rope: Option<(&MmRope, &MmRopeTables)>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+    ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
             return Err(CandleError::Msg(format!(
@@ -480,7 +489,10 @@ impl DitAttention {
         let kh = k.transpose(1, 2)?.contiguous()?;
         let vh = v.transpose(1, 2)?.contiguous()?;
         let scale = 1.0 / (d as f64).sqrt();
-        let out = sdpa(&qh, &kh, &vh, scale)?;
+        let out = match veda {
+            Some((runtime, layer, step)) => runtime.attention(layer, step, &qh, &kh, &vh, scale)?,
+            None => sdpa(&qh, &kh, &vh, scale)?,
+        };
 
         let out = out
             .transpose(1, 2)?

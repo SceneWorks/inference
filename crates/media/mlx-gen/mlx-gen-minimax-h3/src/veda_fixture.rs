@@ -225,6 +225,11 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     assert!(report.predictor_score_calls > 0);
     assert!(report.selected_token_pairs < report.dense_token_pairs);
     assert!(report.exact_plan);
+    let outcome = report.outcome_json();
+    assert_eq!(outcome["effective"], "sparse");
+    assert_eq!(outcome["planMatch"], "exact");
+    assert_eq!(outcome["executionGrid"], outcome["planGrid"]);
+    assert!(outcome["totalAttentionFraction"].as_f64().unwrap() < 1.0);
     assert!(report.fallback_reason.is_none());
     assert_eq!(report.kernel.as_deref(), Some(crate::veda::KERNEL));
     assert_ne!(
@@ -236,6 +241,9 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     let missing = generator.veda_execution_report().unwrap();
     assert_eq!(missing.sparse_calls, 0);
     assert_eq!(missing.dense_calls, 2);
+    assert_eq!(missing.outcome_json()["effective"], "dense");
+    assert_eq!(missing.outcome_json()["totalAttentionFraction"], 1.0);
+    assert!(missing.outcome_json()["kernel"].is_null());
     assert!(missing
         .fallback_reason
         .unwrap()
@@ -246,6 +254,9 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     let failed = generator.veda_execution_report().unwrap();
     assert_eq!(failed.sparse_calls, 0);
     assert_eq!(failed.dense_calls, 2);
+    assert_eq!(failed.outcome_json()["effective"], "dense");
+    assert_eq!(failed.outcome_json()["totalAttentionFraction"], 1.0);
+    assert!(failed.outcome_json()["kernel"].is_null());
     assert!(failed
         .fallback_reason
         .unwrap()
@@ -257,6 +268,12 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         .unwrap()
         .fallback_reason
         .is_none());
+    let later = generator.veda_execution_report().unwrap().outcome_json();
+    assert_eq!(later["requested"], false);
+    assert!(later["kernel"].is_null());
+    assert!(later["plan"].is_null());
+    assert!(later["fallbackReason"].is_null());
+    println!("S7 observed generator outcome: {}", outcome);
     println!("S1 native Generator: canonical1344x768/124f, 2 fixture DiT blocks, learned score calls={}, selected/dense={}/{}, dense/off identity, missing/self-test fallbacks verified",report.predictor_score_calls,report.selected_token_pairs,report.dense_token_pairs);
 }
 #[test]
@@ -274,4 +291,134 @@ fn predictor_fixture_strict_loader_and_bf16_storage() {
     assert!(proj.iter().all(|x| x.to_bits() & 0xffff == 0));
     assert_eq!(p.choose([37, 24, 42]).name, "16x9_t37");
     assert_eq!(p.choose([37, 42, 24]).name, "16x9_t37_T");
+}
+
+#[test]
+#[ignore = "requires the exclusive local Metal token"]
+fn native_veda_controls_preserve_carriers_and_capture_published_schedules() {
+    use crate::denoise::{
+        adaln_schedule, denoise_av, JointGeometry, JointSchedule, PackedLayout, TEXT_TAG,
+    };
+    use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use crate::dit::{AdaLnResidency, JointDit};
+    use crate::reference::ReferenceKind;
+    use mlx_gen::gen_core::{CancelFlag, VedaBudget};
+    // Tiny native packed inputs cover each carrier mechanism; real models and canvases are S9.
+    for (name, evals, shift, mode) in [
+        ("base", 50, 12.0, 0),
+        ("4step_768p", 4, 6.0, 1),
+        ("8step", 8, 12.0, 2),
+        ("4step_v01", 4, 12.0, 3),
+        ("ref2v_4step", 4, 12.0, 4),
+    ] {
+        let geometry = JointGeometry::new(5, 2, 2).unwrap();
+        let anchors = match mode {
+            1 => vec![KeyframeAnchor::First],
+            2 => vec![KeyframeAnchor::Last],
+            3 => vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+            _ => vec![],
+        };
+        let layout = if mode < 4 {
+            PackedLayout::build(geometry, [1, 2, 2], &[TEXT_TAG; 6], 2, &anchors).unwrap()
+        } else {
+            let refs = [
+                ReferenceLatentGeometry {
+                    kind: ReferenceKind::Image,
+                    num_latent_frames: 1,
+                    latent_height: 2,
+                    latent_width: 2,
+                    num_audio_latents: 0,
+                },
+                ReferenceLatentGeometry {
+                    kind: ReferenceKind::Video,
+                    num_latent_frames: 7,
+                    latent_height: 2,
+                    latent_width: 2,
+                    num_audio_latents: 37,
+                },
+                ReferenceLatentGeometry {
+                    kind: ReferenceKind::Audio,
+                    num_latent_frames: 0,
+                    latent_height: 0,
+                    latent_width: 0,
+                    num_audio_latents: 3,
+                },
+            ];
+            PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 6], 2, &refs).unwrap()
+        };
+        let schedule = JointSchedule::with_shifts(evals + 1, shift, 3.0).unwrap();
+        let adaln = adaln_schedule(&schedule).unwrap();
+        let mut model = JointDit::new(
+            dit().unwrap(),
+            layout.clone(),
+            &context(),
+            adaln.clone(),
+            AdaLnResidency::PrecomputeAndEvict,
+        )
+        .unwrap();
+        let request = VedaRequest {
+            enabled: true,
+            generated: VedaBudget::KeyTiles(2),
+            reference: VedaBudget::SparsityPercent(0.0),
+            full_attention_layers: vec![1],
+            full_attention_steps: vec![0, evals - 1],
+        };
+        request.validate(2, evals).unwrap();
+        let report = crate::veda::ReportSink::default();
+        model.prepare_veda_fixture(&request, report.clone(), false);
+        let video = Array::from_slice(
+            &vec![0.02f32; layout.video_indices().len() * 96],
+            &[1, layout.video_indices().len() as i32, 96],
+        );
+        let audio = Array::from_slice(
+            &vec![0.03f32; layout.audio_indices().len() * 32],
+            &[1, layout.audio_indices().len() as i32, 32],
+        );
+        let (outv, outa) = denoise_av(
+            &mut model,
+            &layout,
+            &schedule,
+            &adaln,
+            &video,
+            &audio,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(outv.shape(), video.shape(), "{name}");
+        assert_eq!(outa.shape(), audio.shape(), "{name}");
+        for (input, output, rows) in [
+            (&video, &outv, layout.num_condition_video_rows()),
+            (&audio, &outa, layout.num_condition_audio_rows()),
+        ] {
+            if rows > 0 {
+                let want = crate::tensor::slice_axis(input, 1, 0, rows)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap();
+                let got = crate::tensor::slice_axis(output, 1, 0, rows)
+                    .unwrap()
+                    .reshape(&[-1])
+                    .unwrap();
+                mlx_rs::transforms::eval([&want, &got]).unwrap();
+                assert_eq!(want.as_slice::<f32>(), got.as_slice::<f32>(), "{name}");
+            }
+        }
+        let calls = model.veda_calls();
+        assert_eq!(calls.len(), evals * 2, "{name}");
+        for (index, (layer, step, controls)) in calls.iter().enumerate() {
+            assert_eq!((*layer, *step), (index % 2, index / 2), "{name}");
+            assert_eq!(controls, &request, "{name}");
+        }
+        let r = report.borrow();
+        // layer1 is always full; first/last evaluation are full in both layers.
+        // A fake/default step0 would make every attention call dense and fail this discriminator.
+        assert_eq!(r.sparse_calls, (evals - 2) as u64, "{name}");
+        assert_eq!(r.dense_calls, (evals + 2) as u64, "{name}");
+        assert!(
+            r.fallback_reason.is_none(),
+            "{name}: {:?}",
+            r.fallback_reason
+        );
+    }
 }

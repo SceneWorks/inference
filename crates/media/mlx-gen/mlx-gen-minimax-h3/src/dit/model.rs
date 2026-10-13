@@ -427,7 +427,7 @@ impl MiniMaxH3Dit {
         norm_out: &NormOutModulation,
         bounded: BoundedAttention<'_>,
         window: Option<(&BlockPlan, &CancelFlag)>,
-        veda: Option<&crate::veda::VedaRuntime>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<(Array, Array)> {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
@@ -498,7 +498,7 @@ impl MiniMaxH3Dit {
         packed: &PackedForward<'_>,
         blocks: BlockModulation<'_>,
         bounded: BoundedAttention<'_>,
-        veda: Option<&crate::veda::VedaRuntime>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<Array> {
         match blocks {
             BlockModulation::Cached(cache) => block.forward_bounded_veda(
@@ -508,7 +508,7 @@ impl MiniMaxH3Dit {
                 &self.rope,
                 packed.tables,
                 bounded,
-                veda.map(|v| (v, layer)),
+                veda.map(|(v, step)| (v, layer, step)),
             ),
             BlockModulation::Temb(temb) => {
                 let modulation = block.modulation(temb)?;
@@ -519,7 +519,7 @@ impl MiniMaxH3Dit {
                     &self.rope,
                     packed.tables,
                     bounded,
-                    veda.map(|v| (v, layer)),
+                    veda.map(|(v, step)| (v, layer, step)),
                 )
             }
         }
@@ -542,7 +542,7 @@ impl MiniMaxH3Dit {
         bounded: BoundedAttention<'_>,
         plan: &BlockPlan,
         cancel: &CancelFlag,
-        veda: Option<&crate::veda::VedaRuntime>,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
     ) -> Result<Array> {
         let stream = self.stream.as_ref().ok_or_else(|| {
             Error::Msg(
@@ -999,6 +999,14 @@ impl JointDit {
     }
 
     /// Enable request-scoped learned attention only after the dense model is established.
+    #[cfg(test)]
+    pub(crate) fn veda_calls(&self) -> Vec<(usize, usize, mlx_gen::gen_core::VedaRequest)> {
+        self.veda
+            .as_ref()
+            .map(|v| v.calls.borrow().clone())
+            .unwrap_or_default()
+    }
+
     pub fn prepare_veda(
         &mut self,
         request: &mlx_gen::gen_core::VedaRequest,
@@ -1176,7 +1184,7 @@ impl JointVelocity for JointDit {
             self.block_window
                 .as_ref()
                 .map(|plan| (plan, &self.window_cancel)),
-            self.veda.as_ref(),
+            self.veda.as_ref().map(|v| (v, step.index)),
         )
     }
 }
