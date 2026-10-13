@@ -18,6 +18,23 @@ use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limit
 pub const KERNEL: &str = "mlx-batched-gather-sdpa-v1";
 pub const SELF_TEST_ATOL: f32 = 0.025;
 
+fn predictor_path(path: Option<&Path>) -> Result<&Path> {
+    let path = path.ok_or_else(|| {
+        Error::Msg(
+            "Veda predictor component is missing; repair/install the managed component".into(),
+        )
+    })?;
+    // Diagnose a missing managed file before layout work. This probe reads no weights and
+    // grants no load authority: the bounded loader still opens, sizes and hashes one buffer.
+    std::fs::metadata(path).map_err(|e| {
+        Error::Msg(format!(
+            "Veda predictor {}: {e}; repair/install the managed component",
+            path.display()
+        ))
+    })?;
+    Ok(path)
+}
+
 pub struct VedaRuntime {
     bundle: Bundle,
     plan: Plan,
@@ -46,12 +63,7 @@ impl VedaRuntime {
         report.borrow_mut().predictor_load_attempts += 1;
         let result = (|| {
             request.validate(layers, usize::MAX).map_err(Error::Msg)?;
-            let path = path.ok_or_else(|| {
-                Error::Msg(
-                    "Veda predictor component is missing; repair/install the managed component"
-                        .into(),
-                )
-            })?;
+            let path = predictor_path(path)?;
             let g = packed.geometry();
             let grid = [
                 g.num_latent_frames as usize,
@@ -651,6 +663,48 @@ pub fn device_self_test() -> Result<()> {
 #[cfg(test)]
 mod frozen_tests {
     use super::*;
+    #[test]
+    fn managed_component_probe_preserves_bounded_load_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("predictor.safetensors");
+        let absent = predictor_path(None).unwrap_err().to_string();
+        assert!(absent.contains("repair/install the managed component"));
+        let missing = predictor_path(Some(&path)).unwrap_err().to_string();
+        assert!(missing.contains(&path.display().to_string()));
+        assert!(missing.contains("repair/install the managed component"));
+        // A metadata probe cannot bless an oversized checkpoint or bypass workspace bounds.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(275_415_649)
+            .unwrap();
+        assert_eq!(predictor_path(Some(&path)).unwrap(), path);
+        let error = Bundle::load(&path, 50, 56, 128)
+            .err()
+            .expect("oversized component must fail its authoritative load")
+            .to_string();
+        assert!(error.contains("size mismatch"));
+        let plan = workspace::frozen_plan([37, 24, 42]).unwrap();
+        let request = VedaRequest {
+            enabled: true,
+            ..Default::default()
+        };
+        let error = workspace::bound(
+            &request,
+            Backend::Mlx,
+            &plan,
+            plan.grid,
+            &BTreeMap::new(),
+            2,
+            4,
+            128,
+            1,
+            2,
+            Limits::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("empty problem"));
+    }
     #[test]
     #[ignore = "requires exclusive coordinator admission for actual MLX allocator accounting"]
     fn full_self_test_lifetime_fits_declared_allocator_bound() {
