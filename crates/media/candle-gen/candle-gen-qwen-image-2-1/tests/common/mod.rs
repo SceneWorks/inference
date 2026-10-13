@@ -160,3 +160,124 @@ pub fn assert_close(name: &str, got: &Tensor, want: &Tensor, tol: f32) {
 pub fn device() -> Device {
     Device::Cpu
 }
+
+/// `Qwen/Qwen-Image-2.1-Turbo`'s `model_index.json` `sample_sigmas`, verbatim (terminal 0 excluded).
+pub const TURBO_SAMPLE_SIGMAS: [f64; 8] = [
+    1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568,
+];
+
+/// A **Turbo-shaped** copy of the committed miniature snapshot, built in a temp dir (sc-25901) —
+/// the four things `Qwen/Qwen-Image-2.1-Turbo` changes against the base repository, applied to
+/// the base fixture so nothing binary is committed twice:
+///
+/// * `model_index.json` gains `sample_sigmas` (`sigmas`, so a test can prove the schedule is READ
+///   rather than assumed by saving a different list);
+/// * `scheduler/scheduler_config.json` becomes the static scheduler (`use_dynamic_shifting:
+///   false`, `shift_terminal: null`; `shift: 1.0` already);
+/// * `vae/diffusion_pytorch_model.safetensors` is rewritten **bf16** (the base ships it f32);
+/// * `text_encoder/` holds one `model.safetensors` — already true of the miniature, asserted here
+///   so the fixture cannot silently stop being single-file.
+///
+/// The transformer and the tokenizer are byte copies. Dropping the returned guard deletes the
+/// tree.
+pub fn turbo_snapshot_with(sigmas: &[f64]) -> tempfile::TempDir {
+    let temp = copy_of_tiny_snapshot();
+    let root = temp.path();
+
+    let index_path = root.join("model_index.json");
+    let mut index = read_json(&index_path);
+    index["sample_sigmas"] = serde_json::json!(sigmas);
+    write_json(&index_path, &index);
+
+    let scheduler_path = root.join("scheduler").join("scheduler_config.json");
+    let mut scheduler = read_json(&scheduler_path);
+    scheduler["use_dynamic_shifting"] = serde_json::json!(false);
+    scheduler["shift_terminal"] = serde_json::Value::Null;
+    assert_eq!(scheduler["shift"], serde_json::json!(1.0));
+    write_json(&scheduler_path, &scheduler);
+
+    let vae_path = root.join("vae").join("diffusion_pytorch_model.safetensors");
+    let bf16: HashMap<String, Tensor> = candle_core::safetensors::load(&vae_path, &Device::Cpu)
+        .expect("the miniature VAE reads")
+        .into_iter()
+        .map(|(name, tensor)| {
+            let cast = tensor
+                .to_dtype(DType::BF16)
+                .unwrap_or_else(|e| panic!("{name} casts to bf16: {e}"));
+            (name, cast)
+        })
+        .collect();
+    candle_core::safetensors::save(&bf16, &vae_path).expect("the bf16 VAE writes");
+
+    assert_eq!(
+        safetensors_files(&root.join("text_encoder")),
+        ["model.safetensors"],
+        "the Turbo tower is one file"
+    );
+    temp
+}
+
+/// [`turbo_snapshot_with`] the released eight sigmas.
+pub fn turbo_snapshot() -> tempfile::TempDir {
+    turbo_snapshot_with(&TURBO_SAMPLE_SIGMAS)
+}
+
+/// A byte copy of the committed (base) miniature snapshot in a temp dir, for tests that edit one.
+pub fn copy_of_tiny_snapshot() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("a temp dir for a snapshot copy");
+    copy_tree(&tiny_snapshot(), temp.path());
+    temp
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap_or_else(|e| panic!("create {}: {e}", to.display()));
+    for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("list {}: {e}", from.display()))
+    {
+        let entry = entry.expect("a directory entry");
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        if source.is_dir() {
+            copy_tree(&source, &target);
+        } else {
+            std::fs::copy(&source, &target)
+                .unwrap_or_else(|e| panic!("copy {}: {e}", source.display()));
+        }
+    }
+}
+
+pub fn read_json(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(value).expect("JSON serialises");
+    std::fs::write(path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
+/// The `.safetensors` file names directly under `dir`, sorted.
+pub fn safetensors_files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".safetensors"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The distinct on-disk dtypes of one `.safetensors` file, read from its header — what the file
+/// STORES, independent of whatever dtype a loader then casts to.
+pub fn stored_dtypes(path: &Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let parsed = safetensors::SafeTensors::deserialize(&bytes)
+        .unwrap_or_else(|e| panic!("{} parses: {e}", path.display()));
+    let mut dtypes: Vec<String> = parsed
+        .tensors()
+        .into_iter()
+        .map(|(_, view)| format!("{:?}", view.dtype()))
+        .collect();
+    dtypes.sort();
+    dtypes.dedup();
+    dtypes
+}

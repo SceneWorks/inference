@@ -427,6 +427,73 @@ MLX twin, including that each of up to 10 reference images adds `REFERENCE_FIT_T
 than the target's own token count: `reference::prepare` fits every condition image to
 `OUTPUT_RESOLUTION` (1024²) first. References are **priced**, not refused.
 
+## Turbo: the distilled checkpoint, `qwen_image_2_1_turbo` (sc-25901)
+
+| What | Where | Revision |
+| --- | --- | --- |
+| Weights, `config.json`s, `model_index.json` (`sample_sigmas`), scheduler config, licence | `Qwen/Qwen-Image-2.1-Turbo` (Hugging Face; card `base_model: Qwen/Qwen-Image-2.1`) | `fc13ba1986fcb905854dc8de2f52eee395f49b5b` |
+| Saved-sigma semantics of `QwenImage21Pipeline.__call__` | `huggingface/diffusers` PR #14950 (`pipelines/qwenimage21/pipeline_qwenimage21.py`) | — |
+
+`src/lib.rs` carries the repository and revision as `TURBO_UPSTREAM_HF_REPO` /
+`TURBO_UPSTREAM_HF_REVISION`. The licence is the same Qwen Research License Agreement (the card
+declares `license_name: qwen-research` and ships the same `LICENSE`).
+
+One architecture, served by this crate under a second engine id. Against the base repository the
+Turbo snapshot has the **same** `transformer/config.json`, presets and licence, and differs in:
+
+| | base `Qwen/Qwen-Image-2.1` | `Qwen/Qwen-Image-2.1-Turbo` | what this port does |
+| --- | --- | --- | --- |
+| `model_index.json` | no `sample_sigmas` | `sample_sigmas: [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]` (terminal 0 excluded) | read by `loader::load_turbo_schedule`; it is also the base/Turbo discriminator |
+| `scheduler/scheduler_config.json` | `use_dynamic_shifting: true`, `shift_terminal: 0.02` | `use_dynamic_shifting: false`, `shift: 1.0`, `shift_terminal: null` | `TurboSchedule::from_values` requires exactly that static form |
+| `vae/diffusion_pytorch_model.safetensors` | f32, 1.35 GB | bf16, 0.68 GB | nothing: candle casts on read, so both land on the lane's compute dtype |
+| `text_encoder/` | four `model-0000N-of-00004.safetensors` shards | one `model.safetensors` | nothing: `candle_gen::loader::load_sorted_mmap` reads whatever shards the directory holds |
+
+### The schedule
+
+Upstream: with no call-time `sigmas`, the pipeline takes `config.sample_sigmas` and hands it to
+`FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=…)`. With dynamic shifting off the scheduler
+applies the static shift `shift·σ / (1 + (shift − 1)·σ)`, which is the identity at `shift: 1.0`;
+`shift_terminal` is null, so there is no stretch; it then appends `0`. The eight saved sigmas are
+therefore used **unchanged**: no `mu`, no terminal stretch, and nothing depends on the resolution.
+`true_cfg_scale` defaults to 1 ("Generation uses CFG=1 by default", the model card), and a negative
+prompt with a scale above 1 is still accepted.
+
+This port (`scheduler::saved_sigmas`, `resolve_turbo_run_params`):
+
+* `steps` unset, or equal to the saved length → exactly the saved list, then `0.0`. The default
+  step count is the saved list's length, read from the snapshot (eight for the pinned revision).
+* any other `steps = N ≥ 1` → the saved curve resampled — see *Deliberate divergences*.
+* `guidance` / `true_cfg` default to 1 (off), exactly as on the base id.
+* the curated `sampler` axis integrates over the same sigma list.
+* the curated `scheduler` axis goes through the same `candle_gen::resolve_flow_schedule` seam as
+  the base id, at `mu = 0` (`ln shift`): unset keeps the saved/resampled list; a curated name
+  (`normal`, `karras`, `beta`, …) **replaces** it with that scheduler's own unshifted ramp at the
+  same step count. That is off the sigmas the checkpoint was distilled over — upstream's card
+  says other schedules were not evaluated for this checkpoint — and is offered because the axis is a caller's
+  explicit choice on every other engine.
+
+### Loading the wrong snapshot is refused
+
+The two repositories share every tensor name and shape, so a swap would load. It is refused before
+any weight is read (`loader::check_snapshot_variant`, from `load` and from the memory
+registration), with a typed `Unsupported` naming the mismatch and the id to use instead:
+
+* a snapshot that saves `sample_sigmas` under `qwen_image_2_1` — any present, non-null value,
+  a malformed list included (the base generator **and** the base trainer);
+* a snapshot that saves none — or saves them beside a dynamic-shift scheduler config — under
+  `qwen_image_2_1_turbo`.
+
+Deliberate consequence: the base id now reads `model_index.json` (for that one key), so a base
+snapshot whose `model_index.json` is present but **unparsable** is refused where it used to load —
+it cannot be shown not to be a Turbo snapshot. The MLX twin refuses it too. A snapshot with no
+`model_index.json` loads as before.
+
+### What is not under the Turbo id
+
+No trainer (`TRAINER_ID` stays base-only). Reference conditioning, RGBA output and adapters are
+advertised because the descriptor is the base descriptor under a second id and the code path is
+shared; none of them has been run on real Turbo weights by this story.
+
 ## Prefix KV cache (sc-25904)
 
 Upstream's `use_kv_cache=True` default is ported, as on the MLX twin (sc-25903) and with the same
@@ -459,8 +526,7 @@ target call, through the same `sdpa_budgeted_bhsd` at `ATTN_SCORES_BUDGET`. It h
 largest preset with ten references the call's scores are `32 · 16 800 · 58 016 ≈ 3.1e10` elements,
 ~14× `i32::MAX`, so it always runs query-chunked. The per-token modulation
 and `norm_out` rows are the sampled-timestep row for every token, read directly (a broadcast of
-that row, exact — as upstream's `torch.where` and the MLX twin's `broadcast_to`), not through the
-prefill's blend (see *Deliberate divergences*). Upstream still projects the whole text and image stream on a
+that row, exact — as upstream's `torch.where` and the MLX twin's `broadcast_to`). Upstream still projects the whole text and image stream on a
 cached step and then slices it away; this port does not compute what it would discard.
 
 **When.** Upstream extracts at loop index 0. This port extracts at each branch's **first model
@@ -494,14 +560,25 @@ the prefill path.
 **Numerics.** Upstream documents the two paths as equally valid but not bit-identical (on the tiny
 fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
 attention call consumes the same key/value values through the same call as the prefill's target
-call; the two paths differ only in how a target token's modulation row is selected (exact on the
-cached step, a rounding blend on the prefill), so on candle CPU f32 they agree to rounding rather
-than bit for bit: worst `max|Δ|` 4.1e-6 at a peak of 3.9 over every evaluation and whole denoise
-the tests run. `tests/kv_cache.rs` gates that at `|Δ| ≤ 1e-5 + 1e-5·|want|` and gates the cached
+call, and reads the same modulation row, exactly, as the prefill does. The residual difference
+between the two paths is the CPU GEMM's kernel selection by row count (the cached step projects
+target rows only): bit-identical on arm64, not guaranteed on x86-64. `tests/kv_cache.rs` gates it
+at `|Δ| ≤ 1e-5 + 1e-5·|want|`; it also gates the cached
 path — and the off path, against upstream's `use_kv_cache=False` latents — on the fixture the MLX
 twin reads (`mlx-gen-qwen-image-2-1/tests/fixtures/qwen21_kv_cache.safetensors`,
 `mlx-gen/tools/dump_qwen21_kv_cache.py`). The bf16 the released checkpoint runs in on CUDA/Metal
 is not reachable from those tests (candle's CPU backend has no bf16 matmul).
+
+**History — the prefill's modulation select (2026-10-13, sc-25904).** Until this date the candle
+prefill forward selected each token's modulation and `norm_out` row with a blend,
+`zero + (real − zero)·mask`, where upstream's `_select_modulation_rows` is `torch.where`. It was
+exact on prefix rows and rounded on target rows; simulated on 1e6 N(0, 1) pairs, f32 was inexact
+on 36% of entries (max abs 2.4e-7), and bf16 — the dtype production runs on CUDA/Metal — on 36%
+with median relative error 0.6%, p99 9%, max abs 0.031 and some entries zeroed outright.
+`JointGeometry::select` is now an exact select (each token's row is a copy of the `t = 0` row or
+of the sampled row), on the prefill, the extract and the trainer forward alike. Base 2.1 candle
+output in bf16 therefore changed, toward upstream, by up to those figures; f32 output changed in
+the last bits.
 
 **Not priced here.** The request's memory contract (`memory_strategy`) does not yet carry the
 cache's bytes, and the generator passes `On` unconditionally: a reference-heavy request that fit
@@ -515,18 +592,6 @@ to `Off` are the next story's.
 * Prefix KV cache: extract is keyed on each branch's first model evaluation rather than loop
   index 0, and a cached step skips the prefix projections upstream computes and discards — see
   *Prefix KV cache* above.
-* **Known divergence, under review (candle only — the MLX twin uses a true `where`):** the
-  **prefill** forward selects each token's modulation and `norm_out` row with a blend,
-  `zero + (real − zero)·mask` (`JointGeometry::select`), where upstream's `_select_modulation_rows`
-  is `torch.where`. It is exact on prefix rows (`mask = 0`). On **target** rows (`mask = 1`) it
-  computes `zero + (real − zero)`, which is off by up to one ULP of the larger operand. Simulated
-  on 1e6 N(0, 1) pairs: f32 is inexact on 36% of entries with max abs error 2.4e-7 (harmless);
-  **bf16** — the dtype production runs on CUDA/Metal, and one no CI lane executes — is inexact on
-  36% of entries with median relative error 0.6%, p99 9%, max abs 0.031, and some entries zeroed
-  outright. This affects every prefill evaluation (the cache-off loop, the extract evaluation and
-  the trainer's forward); the cached decode reads the row exactly. It predates the prefix cache
-  and is left unchanged here because correcting it changes base-model output; it is not a design
-  choice.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * On the **CPU parity lane** the text tower runs f32 (upstream: bf16 end to end). On CUDA/Metal
   it runs bf16 end to end **like upstream** — see *Compute dtype* below (sc-24114).
@@ -535,6 +600,32 @@ to `Off` are the next story's.
 * RGB emission composites the RGBA decode over white — the `OutputChannels::Rgb` default.
   `OutputChannels::Rgba` emits the four-channel decode unflattened as `RgbaImage`
   (sc-24111); see *Native transparency* above.
+
+### On the Turbo id: off-count step requests are resampled (a SceneWorks choice)
+
+Upstream gives `num_inference_steps` no effect on the Turbo checkpoint: "Setting
+`num_inference_steps` alone does not override" the saved schedule (model card), and the only way
+to another count is an explicit call-time `sigmas` list the caller invents. SceneWorks keeps
+`steps` a live knob instead (epic 25899 E2), so a request for `N ≠ K` steps (`K` = the saved
+length) **resamples the saved curve**. This is our rule, not upstream's, and it is the same rule on
+both backends:
+
+* knots: the saved sigmas `s_0 … s_{K−1}` followed by `s_K = 0.0`, at positions `u_j = j / K`
+  for `j = 0 … K`;
+* for `i = 0 … N−1`: `σ_i` = the piecewise-linear interpolation of the knots at `u = i / N`;
+* then append `0.0`.
+
+Computed in f64 and rounded to f32 at the end. `N = K` reproduces the saved list exactly (this
+crate takes the knot index and fraction from the integer product `i·K`, so a sample on a knot
+reads it back bit-for-bit). For the pinned revision, twelve steps are
+
+```
+1.0, 0.98563533, 0.970362, 0.95418, 0.9358107, 0.9161107, 0.89508,
+0.861792, 0.79827667, 0.704534, 0.5112233, 0.27637867, 0.0
+```
+
+pinned as literals in `src/scheduler.rs` and `tests/turbo.rs`. Nothing about image quality at an
+off-count is claimed: the checkpoint was distilled over the eight saved sigmas only.
 
 ### From the MLX twin (this crate is the candle sibling)
 

@@ -879,7 +879,13 @@ mod preview_advertising {
     ///
     /// `iris_3b` left this class in sc-25681: it is wired on both backends (pixel space, so the
     /// step's predicted clean image is the frame and no latent fit exists to defer on).
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
+    ///
+    /// `qwen_image_2_1_turbo` (sc-25901) is the same descriptor over the same latent space under a
+    /// second id, so it is deferred on the same story for the same reason.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[
+        ("qwen_image_2_1", "sc-24111"),
+        ("qwen_image_2_1_turbo", "sc-24111"),
+    ];
 
     /// The epics that own the deferred routes above. An epic is a container, not the unit of work
     /// that wires a preview, so a deferred route that names one of these instead of a story has
@@ -5890,6 +5896,7 @@ mod tests {
                 "mochi_1",
                 "qwen_image",
                 "qwen_image_2_1",
+                "qwen_image_2_1_turbo",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -5952,7 +5959,8 @@ mod tests {
         // adds the `iris_3b_restore` transform with its own complete row: 63 / 53; the sc-25686
         // `iris_3b` trainer reuses the generator's row and adds no id; the sc-25687 `iris_3b_depth`
         // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
-        // trainer reuses the transform's id and row and adds no id).
+        // trainer reuses the transform's id and row and adds no id; sc-25901 adds
+        // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -5966,8 +5974,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 64);
-        assert_eq!(super::provider_components().len(), 54);
+        assert_eq!(distinct.len(), 65);
+        assert_eq!(super::provider_components().len(), 55);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

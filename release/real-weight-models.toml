@@ -537,6 +537,37 @@ expected_files = [
 ]
 
 [[models]]
+# sc-25901 — Qwen-Image 2.1 Turbo, the distilled checkpoint `candle-gen-qwen-image-2-1` serves as
+# `qwen_image_2_1_turbo` (see its UPSTREAM.md). Public, unmirrored, ~32.4 GB (text_encoder 17.5 GB
+# in ONE file + transformer 14.2 GB + a bf16 vae 0.68 GB); same transformer config, presets and
+# licence as `Qwen/Qwen-Image-2.1`. The dispatch-only `qwen-image-2-1-turbo` profile's
+# `candle-qwen-image-2-1-turbo` job materializes it on the Windows CUDA runner under
+# `CANDLE_GEN_MODELS_ROOT` and runs the `turbo_`-prefixed tests of
+# `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` (the 2048² T2I over the snapshot's own
+# eight `sample_sigmas`).
+key = "qwen-image-2-1-turbo-cuda"
+repository = "Qwen/Qwen-Image-2.1-Turbo"
+revision = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+license = "Qwen Research License Agreement"
+size_class = "very-large"
+profiles = ["qwen-image-2-1-turbo"]
+environment = ["CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT"]
+expected_files = [
+    "LICENSE",
+    "model_index.json",
+    "processor/tokenizer.json",
+    "processor/tokenizer_config.json",
+    "processor/chat_template.jinja",
+    "scheduler/scheduler_config.json",
+    "text_encoder/config.json",
+    "text_encoder/model.safetensors",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
+]
+
+[[models]]
 # sc-25680 — Iris-3B's generation backbone (the repo root: `config.yaml` + FP32 `model.safetensors`,
 # ~12 GB) for the candle real-weight lane: the dispatch-only `iris` profile's `candle-iris` job
 # materializes it on the Windows CUDA runner under `CANDLE_GEN_MODELS_ROOT` and runs
