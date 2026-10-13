@@ -33,8 +33,25 @@ if [[ -n "$steady" ]]; then
   steps="$steady"
   caches=(none)
 fi
-probe() { # $1 task, $2 size, $3 ac, $4 cache
-  local name="$1-$2-ac-$3-cache-$4" log free_pct free_gb
+# The `iris_memory_mlx_emulated_steps` dispatch input: N optimizer steps under a SMALLER Mac's MLX
+# allocator limits, cache on (as the product runs). It emulates the allocator only, never a smaller
+# machine's real memory pressure. MLX (metal/allocator.cpp): gc_limit = min(0.95 x recommended
+# working set, memory_limit); `set_memory_limit` re-derives gc_limit = min(limit, 0.95 x THIS
+# device's recommended working set), so the probe is handed the smaller machine's GC limit as both
+# memory and cache limit. The recommended working set of a 64 / 96 GiB Mac was not measured: two
+# fractions of RAM are run, 0.84 (observed here: 115.45 of 137.44 GB) and a conservative 0.75.
+#   64 GiB = 68.72 GB: GC limit 54.84 (0.84) / 48.96 (0.75)
+#   96 GiB = 103.08 GB: GC limit 82.26 (0.84) / 73.44 (0.75)
+emulated="${IRIS_PROBE_EMULATED_STEPS:-}"
+if [[ -n "$emulated" ]]; then
+  if [[ -n "$steady" || ! "$emulated" =~ ^[1-9][0-9]?$ ]]; then
+    echo "::error::iris_memory_mlx_emulated_steps must be 1-99 and excludes iris_memory_mlx_steady_steps"
+    exit 1
+  fi
+  steps="$emulated"
+fi
+probe() { # $1 task, $2 size, $3 ac, $4 cache, [$5 emulated limit GB, $6 name suffix]
+  local name="$1-$2-ac-$3-cache-$4${6:-}" log free_pct free_gb
   names+=("$name")
   log="$IRIS_OUT/$name.log"
   # The previous probe's ~100 GB (a guard-stopped one especially) takes the kernel a while to
@@ -55,7 +72,7 @@ probe() { # $1 task, $2 size, $3 ac, $4 cache
   fi
   local rc=0
   IRIS_PROBE_TASK="$1" IRIS_PROBE_SIZE="$2" IRIS_PROBE_AC="$3" IRIS_PROBE_MLX_CACHE="$4" \
-    IRIS_PROBE_STEPS="$steps" TMPDIR="$RUNNER_TEMP" \
+    IRIS_PROBE_MLX_LIMIT_GB="${5:-default}" IRIS_PROBE_STEPS="$steps" TMPDIR="$RUNNER_TEMP" \
     python3.12 scripts/ci/iris_restore_footprint_guard.py 115 600 \
     "$bin" train_memory_probe::real_training_memory_probe --ignored --exact --nocapture --test-threads 1 \
     > "$log" 2>&1 || rc=$?
@@ -63,6 +80,19 @@ probe() { # $1 task, $2 size, $3 ac, $4 cache
   python3.12 scripts/ci/iris_memory_probe_row.py mlx --name "$name" --log "$log" --rc "$rc" \
     --summary "$IRIS_OUT/summary.txt" || failed=1
 }
+if [[ -n "$emulated" ]]; then
+  caches=()
+  for assumption in "rec84 54.84 82.26" "rec75 48.96 73.44"; do
+    read -r tag gc64 gc96 <<< "$assumption"
+    probe depth 256 none default "$gc64" "-emu64-$tag"
+    probe depth 512 none default "$gc64" "-emu64-$tag"
+    probe generation 512 none default "$gc96" "-emu96-$tag"
+    probe restoration 512 none default "$gc96" "-emu96-$tag"
+    probe generation 1024 full default "$gc96" "-emu96-$tag"
+    # Needs more than a 96 GiB Mac's limit: recorded for what MLX then does.
+    probe depth 1024 none default "$gc96" "-emu96-$tag"
+  done
+fi
 for cache in "${caches[@]}"; do
   probe generation 1024 full "$cache"
   probe generation 1024 none "$cache"

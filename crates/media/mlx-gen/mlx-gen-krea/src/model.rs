@@ -3332,7 +3332,10 @@ mod tests {
             .expect("the base snapshot carries the architecture config");
         let plan = mlx_gen::logical_weights::plan_logical_weights(
             &dit,
-            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(&base_cfg),
+            &crate::native_remap::KreaNativeToDiffusersMapping::for_config(
+                crate::native_remap::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX,
+                &base_cfg,
+            ),
         )
         .expect("the rendered file compiles a codec plan");
         assert_eq!(

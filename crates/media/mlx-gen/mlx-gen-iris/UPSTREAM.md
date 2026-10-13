@@ -372,8 +372,8 @@ backends, against `iris_controls_golden.safetensors`) and the provider-level che
 | Upstream control (default) | Request field | MLX | Candle | Test | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `prompts: list[str]` | `prompt`, or `prompt_batch` (non-empty ⇒ `prompt` empty) | `pipeline::encode` per prompt → one batched `denoise` (`[B, …]` text states, per-row masks, null expanded over the batch in `cat([uncond, cond])`) | same | `batch` | `prompt_batch.len() × count ≤ 8` images; image `k = c·B + j` draws noise from seed `k` (MLX `seed + k`, Candle `image_seed(seed, k)`), so a batched image equals its single render up to batched-GEMM rounding (`a_prompt_batch_renders_one_image_per_prompt_per_count`, FP32 ≤ 1 code value) |
-| `height` / `width` (1024²) | `height` / `width` (multiples of 16, 16..=2048) | noise geometry, patch grid, 2-D RoPE grid, PiT sincos table | same | `portrait` (12×8) vs `base` (8×12) | aspect ratio is the pair; no separate aspect control upstream |
-| `steps` (100) | `steps` | `dpm_solver_plan(steps, …)` | same | every case (5 steps) | |
+| `height` / `width` (1024²) | `height` / `width` (multiples of 16, 16..=2048) | noise geometry, patch grid, 2-D RoPE grid, PiT sincos table | same | `square` (8×8), `portrait` (12×8), `landscape` (8×16) vs `base` (8×12, also landscape) | aspect ratio is the pair; no separate aspect control upstream |
+| `steps` (100) | `steps` | `dpm_solver_plan(steps, …)` | same | `steps` (8) vs every other case (5 steps) | |
 | `order` (2) | `sampler`: `dpmpp_2m` = order 2 (default), `euler` = order 1 | `GenerationParams::order` → plan | same | `order1` | order 1 is the first-order DPM-Solver++ update `x ← (t/s)·x + ((s−t)/s)·x0` on every step — exactly the flow Euler (= DDIM) step (`gen_core::iris` `the_order_one_plan_is_the_euler_step`). Upstream runs the 2M update for every `order ≥ 2`, so 3+ is not a distinct solver and has no name; any other sampler name is refused |
 | `cfg_scale` (3.0) | `guidance` | `cfg_combine`; `1.0` skips the unconditional branch and its encode | same | `negative` (4.0), `cfg_off` (1.0) | |
 | `cfg_interval` ((0, 1)) | `cfg_interval: Option<(f32, f32)>` | `GenerationParams::cfg_at` | same | `interval` (0.3, 0.8) | `0 ≤ lo < hi ≤ 1` (model time `t` ∈ (0, 1)); an interval holding none of the plan's evaluation times while guidance ≠ 1 is refused (the guidance would be accepted and never run), and any interval at guidance 1.0 is refused (CFG is off, so the interval would do nothing) |
@@ -485,7 +485,7 @@ which is also the snapshot the generator-contract test loads through the catalog
 | Solver trajectory, 7 steps, CFG, shift (`solver_parity`) | f32 | 1e-5 | 8.8e-8 | 0 (bit-identical) | identical f32 coefficients |
 | 100-step default grid | f64 | 1e-15 abs | exact | exact | f64 on both sides |
 | End to end, 6 steps, CFG 3 (`e2e_parity`) | bf16 tower + FP32 backbone | 6e-2 | 3.1e-2 | 4.0e-2 (f32 tower, see `text_parity`) | tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 4.0e-2) |
-| Every generation control, 9 cases (`controls_parity`, `tools/dump_iris_controls.py`) | bf16 tower + FP32 backbone (MLX); f32 tower + FP32 backbone vs the oracle's **fp32-tower** render (Candle) | 6e-2 (MLX) / 2e-4 (Candle) | 8.4e-3–4.5e-2 | 1.1e-5–5.8e-5 | MLX: tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 1.7e-2–7.3e-2 across the cases); every control's golden sits ≥ 0.15 from `base`, so an ignored control fails |
+| Every generation control, 12 cases (`controls_parity`, `tools/dump_iris_controls.py`) | bf16 tower + FP32 backbone (MLX); f32 tower + FP32 backbone vs the oracle's **fp32-tower** render (Candle) | 6e-2 (MLX) / 2e-4 (Candle) | 8.4e-3–4.5e-2 | 1.1e-5–5.8e-5 | MLX: tower rounding amplified by CFG (upstream's own bf16-vs-fp32 tower: 1.7e-2–7.3e-2 across the cases); every control's golden sits ≥ 0.15 from `base`, so an ignored control fails |
 | LoRA / LoKr / both on the backbone (`adapter_parity`) | FP32 | 2e-3 (MLX) / 1e-4 forward, 1e-6 delta (Candle) | 2.5e-5 / 8.8e-4 / 8.6e-4 | forwards 2.4e-5 / 3.3e-5; deltas ≤ 1.5e-8 | MLX's shared LoKr path reconstructs its factors in bf16 (PARITY-BF16); each adapter moves the output by 0.11–0.44 |
 
 The oracle renders the fp32-tower references with a **separate** null-embedding cache directory:
@@ -741,3 +741,43 @@ Full hashes, sizes and URLs: `gen_core::iris::restoration_train::TRAINING_RESOUR
   = 60 GB before activations, the critic and LPIPS — above this lane's 40 GB guard; it is exercised on
   the miniature (`restoration_train_lifecycle`).
 
+
+## Memory-strategy contract (sc-25690)
+
+Upstream ships no memory policy; this is the repo's shared ladder (`gen_core::MemoryProviderContract`)
+declared for what each MLX route actually runs. `src/memory_strategy.rs` owns all three contracts, and
+`register_providers` registers each with its weights-free fixture and behavior seam. `iris_3b` is a
+registry generator; depth (a provider-specific API) and restoration (a transform) are registered as
+composed routes.
+
+| | `iris_3b` | `iris_3b_depth` | `iris_3b_restore` |
+|---|---|---|---|
+| Memory mode key | `text_to_image` | `depth` | `restoration` |
+| Resident | implemented | implemented | implemented (one backbone forward per export tile, always) |
+| StagedResidency | implemented (text encoder → encode → drop → backbone) | not applicable (no text encoder) | not applicable (no text encoder) |
+| BoundedDecode | not applicable (pixel space) | not applicable | not applicable |
+| BoundedAttention | missing | missing | missing |
+| BoundedTransformerResidency | missing | missing | missing |
+| Calibration fingerprint | `iris-3b-mlx-derived-2026-10-12-v1` | `iris-3b-depth-mlx-derived-2026-10-12-v1` | `iris-3b-restore-mlx-derived-2026-10-12-v1` |
+| Witnessed load surfaces | `bf16:resident:eager`, `bf16:sequential:eager` | same | same |
+| Admission geometry | request width × height; batch = prompts × count | `depth_memory_geometry(plan)` (the model grid) | `restoration_memory_geometry(plan)` (the processing size); `restoration_forward_pixels(plan)` is the one-tile forward bound |
+| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, bf16) + backbone at the compute dtype + adapter overlays | `empty_prompt.safetensors` (stored f32) + backbone and reducer at the compute dtype | `empty_prompt.safetensors` + backbone at the compute dtype |
+
+Staged residency is a per-request decision on generation: the request scope writes
+`GenerationMemory::stage_residency`, and a `Sequential` load stages every request. The scope bounds
+`prompts × count` by the admitted batch (a prompt batch denoises its rows together), and
+`Iris3b::validate` refuses the controls the route has no mechanism for (`tile_vae_decode`,
+`chunk_attention`, `stream_transformer_blocks`). No loader has a deferred-materialization load
+shape: all three refuse `LoadShape::DeferredMaterialization` at load, and a deferred or quantized
+spec has no contract. The loaded models publish the same contract their registration builds and the
+registered safety check (`Generator::memory_strategy_contract` / `memory_strategy_safety_check` for
+generation; the inherent methods of the same names on `IrisDepth` and `IrisRestorer`). An adapted
+generation load prices its stack as the typed overlay components
+`iris_3b.adapters.forward_residuals` and `iris_3b.adapters.materialized_deltas`, and its behavior
+fixture carries the overlay key `lora`. Nothing numeric beyond header-priced resident bytes is published, and no activation
+anchor is registered: those are measurements the epic's terminal campaign owns.
+
+Verification: `memory_strategy` unit tests (declaration, admission gate, pricing, registry
+conformance) and `tests/memory_contract.rs` (a staged selection on a warm generator loads the two
+components in staged order and renders the identical image; the encoder-free loaders publish their
+registered contract).

@@ -26,6 +26,13 @@
 //! * `IRIS_PROBE_STEPS` — optimizer steps.
 //! * `IRIS_PROBE_MLX_CACHE` — `default` (MLX's own cache limit, as the product runs) | `none` (cache
 //!   limit 0).
+//! * `IRIS_PROBE_MLX_LIMIT_GB` — `default` (this machine's own allocator limits) | a decimal-GB
+//!   figure that becomes BOTH MLX's memory limit and its cache limit, to emulate a smaller Mac's
+//!   allocator. MLX derives `gc_limit = min(memory_limit, 0.95 x this device's recommended working
+//!   set)` inside `set_memory_limit` and offers no way to set it alone, so the figure to pass is the
+//!   smaller machine's GC limit; its (higher) memory limit is then emulated conservatively low. This
+//!   emulates the allocator's limits only — not a smaller machine's real memory pressure. Needs
+//!   `IRIS_PROBE_MLX_CACHE=default`. The wired limit is left at MLX's default (0) as on any Mac.
 //! * `IRIS_WEIGHTS_DIR` — the `speridlabs/iris-3b` snapshot root (generation backbone + `depth/`);
 //!   `IRIS_TEXT_ENCODER_DIR` (generation); `IRIS_UPSCALER_DIR`, `IRIS_LPIPS_VGG16_DIR`,
 //!   `IRIS_LPIPS_LIN_DIR`, `IRIS_CRITIC_TRUNK_DIR` (restoration).
@@ -45,7 +52,7 @@ use mlx_gen::{LoadSpec, WeightsSource};
 
 use mlx_rs::memory::{
     get_active_memory, get_cache_memory, get_memory_limit, get_peak_memory, reset_peak_memory,
-    set_cache_limit,
+    set_cache_limit, set_memory_limit,
 };
 
 fn env_req(name: &str) -> String {
@@ -112,6 +119,21 @@ fn real_training_memory_probe() {
         matches!(cache.as_str(), "default" | "none"),
         "IRIS_PROBE_MLX_CACHE {cache:?}: default | none"
     );
+    let limit = env_req("IRIS_PROBE_MLX_LIMIT_GB");
+    let emulated_limit: Option<usize> = (limit != "default").then(|| {
+        let limit_gb: f64 = limit
+            .parse()
+            .expect("IRIS_PROBE_MLX_LIMIT_GB: default | a decimal-GB figure");
+        assert!(
+            (1.0..=1024.0).contains(&limit_gb),
+            "IRIS_PROBE_MLX_LIMIT_GB {limit_gb}: 1..=1024 GB"
+        );
+        assert_eq!(
+            cache, "default",
+            "an emulated allocator limit needs IRIS_PROBE_MLX_CACHE=default"
+        );
+        (limit_gb * 1e9) as usize
+    });
     let work = tempfile::tempdir().unwrap();
     let data = work.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -248,10 +270,18 @@ fn real_training_memory_probe() {
     let cache_limit = if cache == "none" {
         0
     } else {
-        set_cache_limit(default_cache_limit);
-        default_cache_limit
+        let cache_limit = emulated_limit.unwrap_or(default_cache_limit);
+        set_cache_limit(cache_limit);
+        cache_limit
     };
+    if let Some(bytes) = emulated_limit {
+        set_memory_limit(bytes);
+    }
     let memory_limit = get_memory_limit();
+    assert!(
+        emulated_limit.is_none_or(|bytes| bytes == memory_limit),
+        "the emulated memory limit did not take: MLX reports {memory_limit} bytes"
+    );
     let recommended = mlx_gen::memory::recommended_working_set_bytes()
         .expect("Metal's recommended working set (MLX device_info)") as usize;
     // MLX's metal allocator: `gc_limit = min(0.95 * max_recommended_working_set_size, block_limit)`,
@@ -259,7 +289,7 @@ fn real_training_memory_probe() {
     // first, so an `active + cache` footprint cannot settle higher.
     let gc_limit = ((recommended as f64 * 0.95) as usize).min(memory_limit);
     eprintln!(
-        "[[IRIS_MEMORY_PROBE]] mlx_limits cache_mode={cache} cache_limit_gb={:.2} gc_limit_gb={:.2} \
+        "[[IRIS_MEMORY_PROBE]] mlx_limits cache_mode={cache} limit_mode={limit} cache_limit_gb={:.2} gc_limit_gb={:.2} \
          memory_limit_gb={:.2} recommended_working_set_gb={:.2}",
         gb(cache_limit),
         gb(gc_limit),

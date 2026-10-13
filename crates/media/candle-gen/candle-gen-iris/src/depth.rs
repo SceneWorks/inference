@@ -45,9 +45,15 @@ pub struct IrisDepth {
     /// `[1, T, L, D]` f32 empty-prompt states (on the model's device) and their `[T]` mask.
     embeddings: Tensor,
     mask: Vec<i32>,
+    /// The spec this model's memory contract is checked against (the load spec, or for a model
+    /// built from an already-resolved export the spec that export and compute dtype imply).
+    spec: LoadSpec,
+    /// The loaded memory contract ([`crate::memory_strategy::depth_contract`] over the export on
+    /// disk).
+    memory_strategy: gen_core::MemoryProviderContract,
 }
 
-fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
         ("adapters", !spec.adapters.is_empty()),
@@ -73,8 +79,14 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 /// selects upstream's CUDA bf16 autocast (default) or its FP32 CPU path.
 pub fn load_depth(spec: &LoadSpec) -> Result<IrisDepth> {
     refuse_unsupported_spec(spec)?;
+    // Priced from the export's tensor headers before any weight is read; a spec with no contract
+    // (a deferred materialization shape) is refused here.
+    let memory_strategy = crate::memory_strategy::depth_contract(spec)?;
     let export = TaskExport::from_spec(spec, IrisTask::Depth, DEPTH_MODEL_ID)?;
-    load_depth_export(export, compute_dtype(spec), &candle_gen::default_device()?)
+    let mut depth = load_depth_export(export, compute_dtype(spec), &candle_gen::default_device()?)?;
+    depth.spec = spec.clone();
+    depth.memory_strategy = memory_strategy;
+    Ok(depth)
 }
 
 /// [`load_depth`] from an already-resolved export at an explicit compute dtype and device.
@@ -123,6 +135,14 @@ pub fn load_depth_export(export: TaskExport, compute: DType, device: &Device) ->
         Some(bias.to_dtype(compute)?),
     );
 
+    // The spec this export and compute dtype are a load of, so a model built here publishes the
+    // same contract a `load_depth` of that spec would.
+    let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(export.dir.clone()));
+    spec.precision = match compute {
+        DType::F32 => gen_core::Precision::Fp32,
+        _ => gen_core::Precision::Bf16,
+    };
+    let memory_strategy = crate::memory_strategy::depth_contract(&spec)?;
     let prompt: EmptyPrompt = export.empty_prompt()?;
     let embeddings = Tensor::from_vec(prompt.embeddings, prompt.shape.to_vec(), device)?;
     Ok(IrisDepth {
@@ -131,6 +151,8 @@ pub fn load_depth_export(export: TaskExport, compute: DType, device: &Device) ->
         embeddings,
         mask: prompt.mask,
         export,
+        spec,
+        memory_strategy,
     })
 }
 
@@ -195,6 +217,20 @@ impl IrisDepth {
 
     pub fn device(&self) -> &Device {
         self.dit.device()
+    }
+
+    /// The memory contract of the spec this model was loaded from — the one
+    /// [`crate::memory_strategy::DEPTH_MEMORY_REGISTRATION`] builds for it.
+    pub fn memory_strategy_contract(&self) -> &gen_core::MemoryProviderContract {
+        &self.memory_strategy
+    }
+
+    /// The registered depth safety check against this model's own load.
+    pub fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::depth_safety_check(&self.spec, &self.memory_strategy, context)
     }
 
     /// `IrisDepth.forward`: `[B, 3, H, W]` RGB in `[-1, 1]` (H and W on the patch grid, any device)

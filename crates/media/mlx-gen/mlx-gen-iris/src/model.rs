@@ -96,6 +96,20 @@ pub struct Iris3b {
     residency: Residency<IrisTextEncoder, Heavy>,
     /// One report per installed adapter file, from the most recent backbone load.
     adapter_reports: Arc<Mutex<Vec<AdapterApplyReport>>>,
+    /// The spec this generator was loaded from: the tier and residency policy the shared
+    /// memory-strategy seam checks a request selection against (sc-25690).
+    spec: LoadSpec,
+    /// The loaded memory contract ([`crate::memory_strategy::generation_contract`] over the
+    /// resources on disk), published through [`Generator::memory_strategy_contract`].
+    memory_strategy: gen_core::MemoryProviderContract,
+}
+
+/// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
+/// (written by the memory-strategy request scope) OR a `Sequential` load policy. A request can
+/// stage a warm-loaded generator, never un-stage a sequential one.
+pub(crate) fn stage_residency_for(spec: &LoadSpec, req: &GenerationRequest) -> bool {
+    req.memory.is_some_and(|memory| memory.stage_residency)
+        || spec.offload_policy == gen_core::OffloadPolicy::Sequential
 }
 
 /// The compute dtype a load spec selects: the release's bf16 autocast by default, upstream's FP32
@@ -165,6 +179,7 @@ pub fn load_backbone_with_adapters(
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
+    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
     let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
         ("text_encoder", spec.text_encoder.is_some()),
@@ -189,7 +204,9 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 /// Construct the generator from its task resources: `spec.weights` = the backbone directory
 /// (`config.yaml` + `model.safetensors`), `spec.components["text_encoder"]` = the
 /// `Qwen/Qwen3-VL-4B-Instruct` snapshot. `Resident` (default) loads both now; `Sequential` loads
-/// the encoder, encodes, drops it, then loads the backbone, per request.
+/// the encoder, encodes, drops it, then loads the backbone, per request. A `Resident` generator
+/// runs one request the same staged way when its admitted `GenerationMemory::stage_residency` is
+/// set and rebuilds the warm pair on the next unstaged request.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     refuse_unsupported_spec(spec)?;
     let resources = GenerationResources::from_spec(spec, MODEL_ID)?;
@@ -221,11 +238,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             Ok(Heavy { dit })
         },
     )?;
+    // Priced from the resources' tensor headers after the components loaded, so a broken
+    // resource surfaces as its loader's own error.
+    let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
     Ok(Box::new(Iris3b {
         descriptor: descriptor(),
         config,
         residency,
         adapter_reports,
+        spec: spec.clone(),
+        memory_strategy,
     }))
 }
 
@@ -240,7 +262,11 @@ impl Iris3b {
         let rows = params.prompts.len() as u32;
         let total = (params.steps as u32) * req.count;
         let flow = self.config.flow.clone();
-        let (images, warnings) = self.residency.run(
+        // Staged residency is a per-request execution decision: the shared worker selects it
+        // through the memory-strategy scope, which writes `GenerationMemory` onto the request.
+        let (images, warnings) = self.residency.run_request_scoped(
+            stage_residency_for(&self.spec, req),
+            false,
             &req.cancel,
             false,
             on_progress,
@@ -305,8 +331,36 @@ impl Iris3b {
             .capabilities
             .validate_request(MODEL_ID, req)?;
         validate_generation_request(MODEL_ID, req, &self.config)?;
+        refuse_unhonored_memory(req)?;
         Ok(())
     }
+}
+
+/// Refuse the memory-ladder controls this route has no mechanism for, so none is accepted and
+/// ignored: there is no decoder to tile (pixel space), no bounded-attention path through the
+/// backbone and no block-streaming loader. Staged residency is the one control honoured
+/// ([`stage_residency_for`]), and it is the only one the route's request scope ever writes.
+fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
+    let Some(memory) = req.memory else {
+        return Ok(());
+    };
+    let refusals = [
+        ("tile_vae_decode", memory.tile_vae_decode),
+        ("chunk_attention", memory.chunk_attention),
+        (
+            "stream_transformer_blocks",
+            memory.stream_transformer_blocks,
+        ),
+    ];
+    for (control, set) in refusals {
+        if set {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: GenerationMemory::{control} is not a memory strategy of the MLX \
+                 Iris-3B generation route (it stages residency only)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Generator for Iris3b {
@@ -319,6 +373,29 @@ impl Generator for Iris3b {
             .lock()
             .map(|reports| reports.clone())
             .unwrap_or_default()
+    }
+
+    /// The registered contract, priced from the loaded resources: the same one
+    /// [`crate::memory_strategy::MEMORY_REGISTRATION`] builds for this spec.
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        crate::memory_strategy::safety_check(&self.spec, &self.memory_strategy, context)
+    }
+
+    /// The registered executable seam on the loaded generator: the scope's `configure_request`
+    /// writes the admitted `GenerationMemory` onto the request, which [`Self::generate`] honours
+    /// through `Residency::run_request_scoped`.
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        crate::memory_strategy::registered_begin_request(&self.spec, &self.memory_strategy, context)
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -374,6 +451,103 @@ mod tests {
         spec.quantize = Some(mlx_gen::Quant::Q4);
         match load(&spec) {
             Err(Error::Unsupported(m)) => assert!(m.contains("quantize"), "{m}"),
+            other => panic!("expected a typed refusal, got {:?}", other.err()),
+        }
+    }
+
+    /// A request stages when the memory-strategy scope said so OR the load policy is
+    /// `Sequential`; an explicit all-off memory block does not un-stage a sequential load.
+    ///
+    /// *Mutation that reds this:* dropping either arm of the `||` in `stage_residency_for`.
+    #[test]
+    fn stage_residency_is_the_request_selection_or_the_sequential_policy() {
+        use mlx_gen::gen_core::{GenerationMemory, OffloadPolicy};
+        let resident = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
+        let sequential = resident
+            .clone()
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let plain = GenerationRequest::default();
+        let staged = GenerationRequest {
+            memory: Some(GenerationMemory {
+                stage_residency: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unstaged = GenerationRequest {
+            memory: Some(GenerationMemory::default()),
+            ..Default::default()
+        };
+        assert!(!stage_residency_for(&resident, &plain));
+        assert!(!stage_residency_for(&resident, &unstaged));
+        assert!(stage_residency_for(&resident, &staged));
+        assert!(stage_residency_for(&sequential, &plain));
+        assert!(stage_residency_for(&sequential, &unstaged));
+        assert!(stage_residency_for(&sequential, &staged));
+    }
+
+    /// The route honours staged residency only; every other memory-ladder control is refused by
+    /// name rather than accepted and ignored.
+    ///
+    /// *Mutation that reds this:* removing any row of `refuse_unhonored_memory`'s table.
+    #[test]
+    fn unhonoured_memory_controls_are_typed_refusals() {
+        use mlx_gen::gen_core::GenerationMemory;
+        let with = |memory: GenerationMemory| GenerationRequest {
+            memory: Some(memory),
+            ..Default::default()
+        };
+        refuse_unhonored_memory(&GenerationRequest::default()).unwrap();
+        refuse_unhonored_memory(&with(GenerationMemory::default())).unwrap();
+        refuse_unhonored_memory(&with(GenerationMemory {
+            stage_residency: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        for (control, memory) in [
+            (
+                "tile_vae_decode",
+                GenerationMemory {
+                    tile_vae_decode: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "chunk_attention",
+                GenerationMemory {
+                    chunk_attention: true,
+                    attention_chunk_size: Some(1 << 26),
+                    ..Default::default()
+                },
+            ),
+            (
+                "stream_transformer_blocks",
+                GenerationMemory {
+                    stream_transformer_blocks: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            match refuse_unhonored_memory(&with(memory)) {
+                Err(Error::Unsupported(message)) => {
+                    assert!(message.contains(control), "{message}")
+                }
+                other => panic!("{control}: expected a typed refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// No Iris loader has a deferred-materialization load shape; the load refuses one by name
+    /// before reading any resource.
+    ///
+    /// *Mutation that reds this:* dropping `refuse_deferred_load_shape` from
+    /// `refuse_unsupported_spec`.
+    #[test]
+    fn a_deferred_load_shape_is_a_typed_refusal() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()))
+            .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+        match load(&spec) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("load_shape"), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),
         }
     }

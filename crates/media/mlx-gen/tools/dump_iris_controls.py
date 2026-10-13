@@ -12,6 +12,10 @@ same snapshot), once per non-default upstream control:
 * `negative`     — `negative_prompt="golden hour"` at `cfg_scale=4`.
 * `cfg_off`      — `cfg_scale=1` (no unconditional branch at all).
 * `portrait`     — a 12x8 (portrait) canvas instead of 8x12 (landscape).
+* `square`       — an 8x8 (square) canvas (sc-25690; `base` and every case above but `portrait` is
+                   the 8x12 landscape canvas).
+* `landscape`    — an 8x16 (2:1 landscape) canvas instead of `base`'s 8x12 (3:2 landscape) (sc-25690).
+* `steps`        — `steps=8` instead of 5: a different schedule length on `base`'s noise (sc-25690).
 * `batch`        — `prompts=[short, "golden hour snow"]`, one batched solve; row 0 shares `base`'s noise.
 * `prediction_x` — the checkpoint read as `flow.prediction: x` (`x0 = out`).
 
@@ -63,6 +67,9 @@ CASES = [
     dict(BASE, name="portrait", height=12, width=8),
     dict(BASE, name="batch", prompts=[SHORT, "golden hour snow"]),
     dict(BASE, name="prediction_x", prediction="x"),
+    dict(BASE, name="square", height=8, width=8),
+    dict(BASE, name="landscape", height=8, width=16),
+    dict(BASE, name="steps", steps=8),
 ]
 
 STAMPS = {"family": "iris", "baseModel": "iris_3b", "irisTask": "generation"}

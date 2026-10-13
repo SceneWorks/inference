@@ -300,6 +300,11 @@ on:
         type: string
         required: false
         default: ""
+      iris_memory_mlx_emulated_steps:
+        description: "iris-memory-mlx only: run the emulated-smaller-Mac pass (64 / 96 GiB MLX allocator limits, cache on) with this many optimizer steps instead of the default matrix"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -5656,6 +5661,7 @@ jobs:
       IRIS_LPIPS_VGG16_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--timm--vgg16.tv_in1k/snapshots/b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
       IRIS_LPIPS_LIN_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--vivym--lpips/snapshots/270571f1fb2a2c4c5f920cec96cd87838c345982
       IRIS_PROBE_STEADY_STEPS: ${{ inputs.iris_memory_mlx_steady_steps }}
+      IRIS_PROBE_EMULATED_STEPS: ${{ inputs.iris_memory_mlx_emulated_steps }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Check the host (nax-macos-2, >= 128 GB)

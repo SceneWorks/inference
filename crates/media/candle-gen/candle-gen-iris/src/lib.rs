@@ -33,6 +33,13 @@
 //! [`load_backbone_with_adapters`], so a training preview renders exactly what the exported file
 //! renders here; artifacts load across backends (`tests/train_cross_backend.rs`).
 //!
+//! ## Memory strategy (sc-25690)
+//!
+//! [`memory_strategy`] publishes one request-memory contract per inference task through the shared
+//! ladder seams. Generation stages its text encoder per request (rung 1) and bounds its attention
+//! scores (rung 3); depth and restoration are one resident backbone forward, and restoration's
+//! 50 %-overlap tiling is an unconditional part of that forward rather than a selectable rung.
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -45,6 +52,7 @@
 pub mod adapters;
 pub mod depth;
 pub mod dit;
+pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
@@ -73,12 +81,34 @@ pub use text_encoder::{IrisTextEncoder, TextConditioning};
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
+    register_memory_contract_surfaces(
+        registry
+            .register_generator(model::REGISTRATION)
+            .register_trainer(train::REGISTRATION)
+            .register_trainer(train::depth::REGISTRATION)
+            .register_trainer(train::restore::REGISTRATION)
+            .register_transform(restoration::REGISTRATION),
+    )
+}
+
+/// The shared-ladder registrations of the three inference tasks (sc-25690): strategy, weights-free
+/// contract fixture and behavior for each. Generation pairs with its registered generator; depth
+/// (an `IrisDepthEstimator`) and restoration (a `Transform`) are not gen-core generators, so they
+/// use the composed-route seam. Split out the way the sibling Candle providers do, so a catalog can
+/// append the contract surface to a registry that already carries the generator.
+pub fn register_memory_contract_surfaces(
+    registry: candle_gen::gen_core::ProviderRegistryBuilder,
+) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
-        .register_generator(model::REGISTRATION)
-        .register_trainer(train::REGISTRATION)
-        .register_trainer(train::depth::REGISTRATION)
-        .register_trainer(train::restore::REGISTRATION)
-        .register_transform(restoration::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
+        .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::DEPTH_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::DEPTH_MEMORY_BEHAVIOR_REGISTRATION)
+        .register_composed_memory_strategy(memory_strategy::RESTORE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::RESTORE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::RESTORE_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit Candle Iris provider catalog.
