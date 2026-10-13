@@ -55,6 +55,39 @@ fn out_dir() -> PathBuf {
     dir
 }
 
+/// The `(current, total)` of every `Step` event a default-sampler render of `total` steps
+/// reports: one per step, in order.
+fn every_step(total: u32) -> Vec<(u32, u32)> {
+    (1..=total).map(|current| (current, total)).collect()
+}
+
+/// Reject a render that is not a picture: a constant or near-constant RGB8 buffer (a black, white
+/// or flat-grey frame). The floor is deliberately low — sixteen luma levels of spread and more
+/// than sixteen distinct byte values — so it cannot reject a legitimately dark or soft image, only
+/// a degenerate one.
+fn assert_not_degenerate(label: &str, pixels: &[u8]) {
+    let luma = |px: &[u8]| {
+        (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000
+    };
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    let mut seen = [false; 256];
+    for px in pixels.chunks_exact(3) {
+        let l = luma(px);
+        lo = lo.min(l);
+        hi = hi.max(l);
+        for byte in px {
+            seen[usize::from(*byte)] = true;
+        }
+    }
+    let distinct = seen.iter().filter(|s| **s).count();
+    eprintln!("{label}: luma range [{lo}, {hi}], {distinct} distinct byte values");
+    assert!(
+        hi >= lo + 16 && distinct > 16,
+        "{label}: the render is a near-constant field (luma [{lo}, {hi}], {distinct} distinct \
+         byte values), not a picture"
+    );
+}
+
 /// A progress printer that reports the render clock **and** the interval since the previous
 /// event (`+Δs`). The shared sampler evaluates step `k−1`'s graph only after it has reported
 /// `Step { k }`, so the `+Δ` on the line *after* `step k` is the cost of step `k−1`'s forward,
@@ -249,8 +282,19 @@ fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32>
         width = w.parse().unwrap();
         height = h.parse().unwrap();
     }
-    let out_dir = out_dir();
+    validation_render_at(id, root, &out_dir(), (width, height), steps)
+}
 
+/// [`validation_render`] at an explicit size into an explicit directory — the body, free of the
+/// `QWEN_IMAGE_2_1_RENDER_SIZE` / `_RENDER_OUT` environment so the default-run dry run at the
+/// bottom of this file can drive it on the miniature fixture.
+fn validation_render_at(
+    id: &str,
+    root: PathBuf,
+    out_dir: &std::path::Path,
+    (width, height): (u32, u32),
+    steps: &[Option<u32>],
+) -> Vec<u32> {
     // `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints a `[mem]` line at every phase boundary (sc-24114's
     // footprint investigation); `QWEN_IMAGE_2_1_RENDER_TILED=1` asks for the bounded 512/64 decode
     // explicitly (the default already bounds every area above 512², sc-24114), and
@@ -284,6 +328,7 @@ fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32>
     let clear_before_decode =
         std::env::var_os("QWEN_IMAGE_2_1_CLEAR_CACHE_BEFORE_DECODE").is_some();
     let mut reported = Vec::with_capacity(steps.len());
+    let mut renders: Vec<(u32, Vec<u8>)> = Vec::with_capacity(steps.len());
     for steps in steps {
         let req = GenerationRequest {
             prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
@@ -302,12 +347,12 @@ fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32>
         let render_started = Instant::now();
         let mut log = progress_logger(String::new());
         let footprint_for_progress = footprint_max.clone();
-        let mut reported_steps = None;
+        let mut reported_steps = Vec::new();
         let out = generator
             .generate(&req, &mut |p| {
                 log(p);
-                if let Progress::Step { total, .. } = p {
-                    reported_steps = Some(total);
+                if let Progress::Step { current, total } = p {
+                    reported_steps.push((current, total));
                 }
                 if trace {
                     let label = match &p {
@@ -335,7 +380,15 @@ fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32>
         };
         let image = &images[0];
         assert_eq!((image.width, image.height), (width, height));
-        let ran = reported_steps.expect("the sampler reports every step");
+        let ran = reported_steps
+            .last()
+            .expect("the sampler reports every step")
+            .1;
+        assert_eq!(
+            reported_steps,
+            every_step(ran),
+            "one event per step, in order"
+        );
         let path = out_dir.join(format!("{id}_{width}x{height}_{ran}steps_seed42.png"));
         image::save_buffer(
             &path,
@@ -351,6 +404,16 @@ fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32>
             started.elapsed().as_secs_f32(),
             render_started.elapsed().as_secs_f32()
         );
+        // Evidence someone reads to pick a step count must not be a blank frame, and two step
+        // counts must not have produced the same picture (a dead `steps` knob).
+        assert_not_degenerate(&format!("{id} {ran} steps"), &image.pixels);
+        for (other, pixels) in &renders {
+            assert!(
+                *other == ran || *pixels != image.pixels,
+                "{id}: {other} and {ran} steps rendered identical pixels"
+            );
+        }
+        renders.push((ran, image.pixels.clone()));
         reported.push(ran);
     }
     reported
@@ -512,16 +575,6 @@ fn reference_edit_renders(
     default_steps: u32,
     default_cases: Vec<(usize, u32, u32, Option<u32>)>,
 ) {
-    use mlx_gen::gen_core::Conditioning;
-
-    let out_dir = out_dir();
-    let started = Instant::now();
-    let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
-    let generator = registry
-        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
-        .unwrap();
-    eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
-
     let cases: Vec<(usize, u32, u32, Option<u32>)> =
         match std::env::var("QWEN_IMAGE_2_1_EDIT_CASES") {
             Ok(spec) => spec
@@ -536,6 +589,28 @@ fn reference_edit_renders(
                 .collect(),
             Err(_) => default_cases,
         };
+    reference_edit_renders_in(id, root, &out_dir(), default_steps, cases);
+}
+
+/// [`reference_edit_renders`] over explicit cases into an explicit directory — the body, free of
+/// the `QWEN_IMAGE_2_1_EDIT_CASES` / `_RENDER_OUT` environment so the default-run dry run at the
+/// bottom of this file can drive it on the miniature fixture.
+fn reference_edit_renders_in(
+    id: &str,
+    root: PathBuf,
+    out_dir: &std::path::Path,
+    default_steps: u32,
+    cases: Vec<(usize, u32, u32, Option<u32>)>,
+) {
+    use mlx_gen::gen_core::Conditioning;
+
+    let started = Instant::now();
+    let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
+    let generator = registry
+        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
+        .unwrap();
+    eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+
     let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
     let footprint_max = footprint_sampler();
     for (count, width, height, steps) in cases {
@@ -555,12 +630,12 @@ fn reference_edit_renders(
         }
         let render_started = Instant::now();
         let mut log = progress_logger(format!("{count} refs: "));
-        let mut reported_steps = None;
+        let mut reported_steps = Vec::new();
         let out = generator
             .generate(&req, &mut |p| {
                 log(p);
-                if let Progress::Step { total, .. } = p {
-                    reported_steps = Some(total);
+                if let Progress::Step { current, total } = p {
+                    reported_steps.push((current, total));
                 }
                 if trace {
                     memory_line(&format!("{count} refs: {p:?}"), &footprint_max);
@@ -575,11 +650,11 @@ fn reference_edit_renders(
         };
         let image = &images[0];
         assert_eq!((image.width, image.height), (width, height));
-        let ran = reported_steps.expect("the sampler reports every step");
+        let ran = steps.unwrap_or(default_steps);
         assert_eq!(
-            ran,
-            steps.unwrap_or(default_steps),
-            "{count} refs: the requested step count, or the checkpoint's own"
+            reported_steps,
+            every_step(ran),
+            "{count} refs: the requested step count, or the checkpoint's own — one event per step"
         );
         let path = out_dir.join(format!(
             "{id}_edit_{count}refs_{width}x{height}_{ran}steps_seed42.png"
@@ -830,12 +905,12 @@ fn transparency_renders(
 
         let render_started = Instant::now();
         let mut log = progress_logger(format!("{label}: "));
-        let mut reported_steps = None;
+        let mut reported_steps = Vec::new();
         let out = generator
             .generate(&req, &mut |p| {
                 log(p);
-                if let Progress::Step { total, .. } = p {
-                    reported_steps = Some(total);
+                if let Progress::Step { current, total } = p {
+                    reported_steps.push((current, total));
                 }
             })
             .unwrap();
@@ -846,7 +921,15 @@ fn transparency_renders(
         image.validate().unwrap();
         assert_eq!((image.width, image.height), (1024, 1024));
         assert_eq!(image.channels(), 4);
-        let ran = reported_steps.expect("the sampler reports every step");
+        let ran = reported_steps
+            .last()
+            .unwrap_or_else(|| panic!("{label}: the sampler reports every step"))
+            .1;
+        assert_eq!(
+            reported_steps,
+            every_step(ran),
+            "{label}: one event per step, in order"
+        );
         if let Some(steps) = steps {
             assert_eq!(ran, steps, "{label}: the requested step count ran");
         }
@@ -869,4 +952,69 @@ fn transparency_renders(
         reported.push(ran);
     }
     reported
+}
+
+/// **The Turbo smoke bodies, dry-run on the miniature Turbo fixture — not ignored** (sc-25902).
+/// The `#[ignore]`d Turbo tests above compile on every lane and run on none, so a wrong step
+/// assertion or a mis-built request in them would first surface in the middle of a real-weight
+/// run. This drives the same two bodies — the step sweep ([`validation_render_at`]) and the
+/// reference edit with its ten-reference boundary and eleven-reference refusal
+/// ([`reference_edit_renders_in`]) — end to end through the `qwen_image_2_1_turbo` id at 64×64,
+/// writing into a temp dir. It proves the bodies' wiring and assertions, nothing about the released
+/// weights. (The transparency body is not dry-run: its alpha-histogram claim is about the released
+/// checkpoint and the miniature decode does not meet it.)
+///
+/// *Mutations that red this:* the Turbo generator ignoring `req.steps` (the sweep then reports
+/// eight steps for every count, and renders identical pixels); a step event dropped or repeated.
+#[test]
+fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = crate::common::turbo_snapshot(tmp.path());
+    let out = tmp.path().join("evidence");
+    std::fs::create_dir_all(&out).unwrap();
+    let id = mlx_gen_qwen_image_2_1::TURBO_MODEL_ID;
+
+    let asked = [4, 6, 12, 16];
+    let reported = validation_render_at(id, root.clone(), &out, (64, 64), &asked.map(Some));
+    assert_eq!(reported, asked);
+    for steps in asked {
+        assert!(out
+            .join(format!("{id}_64x64_{steps}steps_seed42.png"))
+            .is_file());
+    }
+    // No step count: the fixture's eight saved sigmas.
+    assert_eq!(
+        validation_render_at(id, root.clone(), &out, (64, 64), &[None]),
+        [8]
+    );
+
+    reference_edit_renders_in(
+        id,
+        root,
+        &out,
+        8,
+        vec![(2, 64, 64, None), (10, 64, 64, None)],
+    );
+    for count in [2, 10] {
+        assert!(out
+            .join(format!("{id}_edit_{count}refs_64x64_8steps_seed42.png"))
+            .is_file());
+    }
+}
+
+/// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture.
+#[test]
+fn the_degenerate_render_check_rejects_a_flat_frame_only() {
+    let flat = vec![7u8; 64 * 64 * 3];
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("flat", &flat)).is_err());
+    // Two byte values only: spread without content.
+    let two: Vec<u8> = (0..64 * 64 * 3)
+        .map(|i| if (i / 3) % 2 == 0 { 0 } else { 255 })
+        .collect();
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("two-valued", &two)).is_err());
+    // A dim ramp: 24 luma levels of spread, 24 distinct values.
+    let dim: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| [(i % 24) as u8 + 10; 3])
+        .collect();
+    assert_not_degenerate("dim ramp", &dim);
 }

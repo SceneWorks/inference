@@ -185,6 +185,52 @@ fn validation_render_default_preset() {
     );
 }
 
+/// Reject a render that is not a picture: a constant or near-constant RGB8 buffer (a black, white
+/// or flat-grey frame). The floor is deliberately low — sixteen luma levels of spread and more
+/// than sixteen distinct byte values — so it cannot reject a legitimately dark or soft image, only
+/// a degenerate one. ([`assert_not_band_corrupted`] catches the opposite failure, noise.)
+fn assert_not_degenerate(label: &str, pixels: &[u8]) {
+    let luma = |px: &[u8]| {
+        (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000
+    };
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    let mut seen = [false; 256];
+    for px in pixels.chunks_exact(3) {
+        let l = luma(px);
+        lo = lo.min(l);
+        hi = hi.max(l);
+        for byte in px {
+            seen[usize::from(*byte)] = true;
+        }
+    }
+    let distinct = seen.iter().filter(|s| **s).count();
+    eprintln!("{label}: luma range [{lo}, {hi}], {distinct} distinct byte values");
+    assert!(
+        hi >= lo + 16 && distinct > 16,
+        "{label}: the render is a near-constant field (luma [{lo}, {hi}], {distinct} distinct \
+         byte values), not a picture"
+    );
+}
+
+/// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture. Not
+/// ignored and device-free: it is the one part of the Turbo step sweep that can be exercised
+/// without the released weights.
+#[test]
+fn the_degenerate_render_check_rejects_a_flat_frame_only() {
+    let flat = vec![7u8; 64 * 64 * 3];
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("flat", &flat)).is_err());
+    // Two byte values only: spread without content.
+    let two: Vec<u8> = (0..64 * 64 * 3)
+        .map(|i| if (i / 3) % 2 == 0 { 0 } else { 255 })
+        .collect();
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("two-valued", &two)).is_err());
+    // A dim ramp: 24 luma levels of spread, 24 distinct values.
+    let dim: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| [(i % 24) as u8 + 10; 3])
+        .collect();
+    assert_not_degenerate("dim ramp", &dim);
+}
+
 fn out_dir() -> PathBuf {
     let dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
         .map(PathBuf::from)
@@ -289,6 +335,7 @@ fn turbo_validation_renders(steps: &[Option<u32>]) {
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
+    let mut renders: Vec<(u32, Vec<u8>)> = Vec::with_capacity(steps.len());
     for steps in steps {
         let req = GenerationRequest {
             prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
@@ -343,6 +390,16 @@ fn turbo_validation_renders(steps: &[Option<u32>]) {
             width,
             height,
         );
+        // Evidence someone reads to pick a step count must not be a blank frame, and two step
+        // counts must not have produced the same picture (a dead `steps` knob).
+        assert_not_degenerate(&format!("turbo_default_preset_{ran}steps"), &image.pixels);
+        for (other, pixels) in &renders {
+            assert!(
+                *other == ran || *pixels != image.pixels,
+                "{other} and {ran} steps rendered identical pixels"
+            );
+        }
+        renders.push((ran, image.pixels.clone()));
         eprintln!(
             "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
             path.display(),
@@ -567,8 +624,11 @@ fn reference_edit_renders(
             prompt: "too many".to_owned(),
             width: 512,
             height: 512,
+            // Refused at `validate`, before any image is looked at, so the eleven are synthetic
+            // whatever `QWEN_IMAGE_2_1_EDIT_REFS` holds (a ten-file dir is the boundary itself,
+            // and `references(11, …)` would panic on it instead of reaching the refusal).
             conditioning: vec![Conditioning::MultiReference {
-                images: references(11, 256, 256),
+                images: (1..=11).map(|i| synthetic_reference(i, 256, 256)).collect(),
             }],
             ..Default::default()
         })

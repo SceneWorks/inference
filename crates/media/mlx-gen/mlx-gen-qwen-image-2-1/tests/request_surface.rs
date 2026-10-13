@@ -453,6 +453,9 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
 
         // The references are load-bearing, and so is the schedule.
         assert_moved(&format!("{name} vs none"), &want.latents, &plain.latents);
+        // …in the emitted bytes too: the equality above tells the two assemblies apart only if
+        // their decodes differ, so that is asserted rather than assumed of the fixture.
+        assert_ne!(pixels, plain.rgb(), "{name}: not the text-to-image render");
         let shifted = scheduler::sigmas_for_image(
             &load_scheduler_config(&tiny_snapshot()).unwrap(),
             8,
@@ -471,6 +474,11 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
             &format!("{name}: saved vs base-shifted sigmas"),
             &want.latents,
             &over_base_schedule.latents,
+        );
+        assert_ne!(
+            want.rgb(),
+            over_base_schedule.rgb(),
+            "{name}: not the render over the base shifted schedule"
         );
     }
 }
@@ -627,6 +635,7 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
     solid.pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
 
     let mut rendered = Vec::new();
+    let mut emitted = Vec::new();
     for layer in [&transparent, &solid] {
         let req = GenerationRequest {
             conditioning: vec![Conditioning::ReferenceRgba {
@@ -650,10 +659,20 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
         );
         assert_eq!(images[0].pixels, want.rgba().pixels);
         rendered.push(want.latents);
+        emitted.push(images[0].pixels.clone());
     }
     assert_moved("transparent vs opaque layer", &rendered[0], &rendered[1]);
+    assert_ne!(
+        emitted[0], emitted[1],
+        "the transparent and the opaque layer are different emitted images"
+    );
     let none = manual(&root, &Manual::over(&sigmas));
     assert_moved("transparent layer vs none", &rendered[0], &none.latents);
+    assert_ne!(
+        emitted[0],
+        none.rgba().pixels,
+        "the layer-conditioned render is not the text-to-image one"
+    );
 }
 
 // ── (c) true CFG ────────────────────────────────────────────────────────────────────────────────
@@ -711,6 +730,7 @@ fn turbo_true_cfg_runs_the_negative_branch_with_its_own_cache() {
             &guided.latents,
             &unguided.latents,
         );
+        assert_ne!(guided_pixels, plain, "{name}: not the unguided render");
 
         // Two branches, each extracting once and decoding from its own cache afterwards.
         let report = &guided.report;

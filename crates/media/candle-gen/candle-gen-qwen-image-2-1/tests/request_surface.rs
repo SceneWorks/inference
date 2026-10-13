@@ -57,11 +57,18 @@ const EDGE: u32 = 32;
 const REFERENCE_EDGE: u32 = 64;
 
 /// Cached vs prefill on the CPU device in f32: `|Δ| ≤ ATOL + RTOL·|want|` per element — never
-/// bits, because the gemm kernel depends on the row count on x86-64. `kv_cache.rs` holds a
-/// three-step unadapted loop to `1e-5`; this is an eight-step loop through a large-amplitude LoRA
-/// (latents peak 5.7), so it gets ten times that. Measured on arm64: max |Δ| = 0. The mutation it
-/// exists for — the cached attention projecting through one un-adapted Linear — moves the latents
-/// by 1.5e-1, two hundred times the bound at the peak.
+/// bits, because the gemm kernel depends on the row count on x86-64.
+///
+/// **The x86-64 margin is unmeasured.** `kv_cache.rs` holds a three-step unadapted loop to `1e-5`
+/// and is green on the Linux lane; this is an eight-step loop through a large-amplitude LoRA
+/// (latents peak 5.7), and the only measurement behind it is arm64, where the two paths are
+/// bit-identical (max |Δ| = 0) and so say nothing about x86-64 rounding. The Linux lane cannot
+/// supply the number either: libtest captures a passing test's output, so `assert_agrees`'s
+/// printed `worst/bound` never reaches the log. Hence ten times the `kv_cache.rs` bound rather
+/// than a figure sized from evidence. It costs the claim nothing: the mutation this gate exists
+/// for — the cached attention projecting through ONE un-adapted Linear (`to_v`) — moves the
+/// latents by 1.5e-1, two hundred times the bound at the peak. Tighten to `1e-5` once an x86-64
+/// run has printed its `worst/bound` (`--nocapture`) with at least 10× headroom.
 const ATOL: f32 = 1e-4;
 const RTOL: f32 = 1e-4;
 
@@ -464,6 +471,9 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
 
         // The references are load-bearing, and so is the schedule.
         assert_moved(&format!("{name} vs none"), &want.latents, &plain.latents);
+        // …in the emitted bytes too: the equality above tells the two assemblies apart only if
+        // their decodes differ, so that is asserted rather than assumed of the fixture.
+        assert_ne!(pixels, plain.rgb(), "{name}: not the text-to-image render");
         let shifted = scheduler::sigmas_for_image(
             &load_scheduler_config(&tiny_snapshot()).unwrap(),
             8,
@@ -482,6 +492,11 @@ fn turbo_renders_one_and_two_references_over_the_saved_sigmas_from_the_prefix_ca
             &format!("{name}: saved vs base-shifted sigmas"),
             &want.latents,
             &over_base_schedule.latents,
+        );
+        assert_ne!(
+            want.rgb(),
+            over_base_schedule.rgb(),
+            "{name}: not the render over the base shifted schedule"
         );
     }
 }
@@ -638,6 +653,7 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
     solid.pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
 
     let mut rendered = Vec::new();
+    let mut emitted = Vec::new();
     for layer in [&transparent, &solid] {
         let req = GenerationRequest {
             conditioning: vec![Conditioning::ReferenceRgba {
@@ -661,10 +677,20 @@ fn turbo_accepts_an_rgba_reference_and_its_alpha_conditions_the_render() {
         );
         assert_eq!(images[0].pixels, want.rgba().pixels);
         rendered.push(want.latents);
+        emitted.push(images[0].pixels.clone());
     }
     assert_moved("transparent vs opaque layer", &rendered[0], &rendered[1]);
+    assert_ne!(
+        emitted[0], emitted[1],
+        "the transparent and the opaque layer are different emitted images"
+    );
     let none = manual(root, &Manual::over(&sigmas));
     assert_moved("transparent layer vs none", &rendered[0], &none.latents);
+    assert_ne!(
+        emitted[0],
+        none.rgba().pixels,
+        "the layer-conditioned render is not the text-to-image one"
+    );
 }
 
 // ── (c) true CFG ────────────────────────────────────────────────────────────────────────────────
@@ -722,6 +748,7 @@ fn turbo_true_cfg_runs_the_negative_branch_with_its_own_cache() {
             &guided.latents,
             &unguided.latents,
         );
+        assert_ne!(guided_pixels, plain, "{name}: not the unguided render");
 
         // Two branches, each extracting once and decoding from its own cache afterwards.
         let report = &guided.report;
