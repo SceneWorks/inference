@@ -493,9 +493,10 @@ the prefill path.
 **Numerics.** Upstream documents the two paths as equally valid but not bit-identical (on the tiny
 fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
 attention call consumes the same key/value values through the same call as the prefill's target
-call, and reads the same modulation row, exactly, as the prefill does. On candle CPU f32 the two
-paths are **bit-identical** at every evaluation and after the whole denoise, and
-`tests/kv_cache.rs` asserts it as bit equality; it also gates the cached
+call, and reads the same modulation row, exactly, as the prefill does. The residual difference
+between the two paths is the CPU GEMM's kernel selection by row count (the cached step projects
+target rows only): bit-identical on arm64, not guaranteed on x86-64. `tests/kv_cache.rs` gates it
+at `|Δ| ≤ 1e-5 + 1e-5·|want|`; it also gates the cached
 path — and the off path, against upstream's `use_kv_cache=False` latents — on the fixture the MLX
 twin reads (`mlx-gen-qwen-image-2-1/tests/fixtures/qwen21_kv_cache.safetensors`,
 `mlx-gen/tools/dump_qwen21_kv_cache.py`). The bf16 the released checkpoint runs in on CUDA/Metal

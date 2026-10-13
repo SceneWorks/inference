@@ -2106,7 +2106,10 @@ mod tests {
     /// End to end through the trainer's checkpoint pieces: a loss on the velocity reaches the
     /// shared modulation rows through `train_block`'s modulation input — the sampled row **and**
     /// the `t = 0` row — and the `norm_out` rows through `train_head`, and those gradients are the
-    /// function's: each matches a central finite difference along a fixed direction.
+    /// function's: each matches a central finite difference along a fixed direction. The
+    /// modulation rows are checked **one at a time** (the direction zeroed on the other row), so a
+    /// backward error confined to the `t = 0` row cannot hide behind the sampled row's larger
+    /// derivative.
     #[test]
     fn the_trainer_pieces_backpropagate_through_the_selected_rows() {
         use candle_core::Var;
@@ -2162,18 +2165,40 @@ mod tests {
         assert!(abs_sum(&g_out.narrow(0, 0, 1).unwrap()) > 1e-3);
 
         let eps = 1e-2f64;
-        for (name, grad, base, seed) in [
-            ("modulation", g_mod, &prelude.modulation, 3usize),
-            ("norm_out", g_out, &prelude.out_rows, 5),
+        // A direction confined to one row of a two-row tensor.
+        let only_row = |like: &Tensor, seed: usize, row: usize| -> Tensor {
+            let keep: Vec<f32> = (0..2).map(|r| if r == row { 1.0 } else { 0.0 }).collect();
+            direction(like, seed)
+                .broadcast_mul(&Tensor::from_vec(keep, (2, 1), &Device::Cpu).unwrap())
+                .unwrap()
+        };
+        for (name, grad, base, d) in [
+            (
+                "modulation sampled row",
+                g_mod,
+                &prelude.modulation,
+                only_row(&prelude.modulation, 3, 0),
+            ),
+            (
+                "modulation t = 0 row",
+                g_mod,
+                &prelude.modulation,
+                only_row(&prelude.modulation, 3, 1),
+            ),
+            (
+                "norm_out",
+                g_out,
+                &prelude.out_rows,
+                direction(&prelude.out_rows, 5),
+            ),
         ] {
-            let d = direction(base, seed);
             let analytic = scalar(&(grad * &d).unwrap().sum_all().unwrap());
             let at = |sign: f64| -> f32 {
                 let moved = (base + (&d * (sign * eps)).unwrap()).unwrap();
-                let v = if name == "modulation" {
-                    velocity(&moved, &prelude.out_rows)
-                } else {
+                let v = if name == "norm_out" {
                     velocity(&prelude.modulation, &moved)
+                } else {
+                    velocity(&moved, &prelude.out_rows)
                 };
                 scalar(&probe(&v))
             };
@@ -2186,8 +2211,11 @@ mod tests {
                 numeric.abs() > 1e-3,
                 "{name}: the direction must move the loss"
             );
+            // f32 forward: across steps 3e-3 … 2e-2 the finite difference itself wanders by
+            // 1e-4 … 7e-4 relative (round-off against truncation), so the gate sits ~7× above
+            // that. A row whose gradient is missing or mis-scaled is off by 1e-1 … 1.
             assert!(
-                rel <= 1e-3,
+                rel <= 5e-3,
                 "{name}: gradient {analytic:e} vs finite difference {numeric:e} ({rel:.2e})"
             );
         }
@@ -2195,9 +2223,10 @@ mod tests {
 
     /// The modulation a cached step's target tokens receive is the sampled-timestep row **bit for
     /// bit** — upstream's `torch.where`, the MLX twin's `broadcast_to`. The rows here are chosen so
-    /// the prefill's blend `zero + (real − zero)·1` visibly rounds in f32 (a large `t = 0` entry
-    /// absorbs a small sampled one), which is the error an all-ones mask would put on every target
-    /// token; in the released checkpoint's bf16 the same blend is off by percents.
+    /// that the blend the prefill used until sc-25904 (see UPSTREAM.md, History),
+    /// `zero + (real − zero)·1`, visibly rounds in f32 (a large `t = 0` entry absorbs a small
+    /// sampled one) — the error an all-ones mask through that blend would have put on every
+    /// target token, percent-level in the released checkpoint's bf16.
     #[test]
     fn a_cached_step_reads_the_sampled_modulation_row_exactly() {
         let dev = Device::Cpu;
