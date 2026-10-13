@@ -497,10 +497,14 @@ evaluation** and decodes at every later one: the curated solver axis may evaluat
 than once per step or off the schedule (`heun`, `dpmpp_sde`), and the cache does not depend on the
 step. With true CFG the negative branch has its own, independent cache.
 
-**MLX specifics.** The cache is materialized (`eval`) in the same evaluation that computes the
-extract step's velocity — a lazy cache would re-run the prefix graph on every step and keep it
-alive. Each cached tensor is copied into its own buffer: an MLX slice is a view, so caching the
-slice would pin the block's whole prefill K/V (upstream's "`clone()`, not `contiguous()`"). The
+**MLX specifics.** The cache is materialized (`eval`) during the extract forward, **block by
+block** — a lazy cache would re-run the prefix graph on every step and keep it alive, and a cache
+evaluated only at the end of the forward would keep every block's full K/V alive until then (each
+entry is cut from that block's `[1, prefix + target, heads, head_dim]` K and V). Each cached
+tensor is copied into its own buffer: an MLX slice is a view, so caching the slice would pin the
+block's whole prefill K/V (upstream's "`clone()`, not `contiguous()`"). The extract step's live
+set is therefore the prefill forward's plus the cache it is building
+(`2 · blocks · prefix_tokens · inner_dim · itemsize`, and the target's RoPE rows). The
 caches are owned by the denoise loop's velocity closure and are dropped when the loop returns —
 on success, cancellation or error — so nothing of them reaches the VAE decode. A cancellation
 (the shared sampler's step gate) ends the loop, as upstream's `break`; a cache only exists once a
@@ -517,8 +521,9 @@ memory envelope, which prices the prefill path.
 fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
 attention call consumes the same key/value values in the same kernel as the prefill's target call,
 and on Metal the two paths are **bit-identical** at every evaluation and after the whole denoise —
-on the f32 tiny fixture (unfused attention) and on a `head_dim = 128` model in f32 and bf16 (the
-fused `sdpa_full` kernel production takes). `tests/kv_cache.rs` holds that to an absolute +
+on the f32 tiny fixture and on a `head_dim = 128` model in f32 and bf16 (the geometry at which MLX
+selects its fused attention kernel on Metal; the dispatch itself is not asserted by the tests).
+`tests/kv_cache.rs` holds that to an absolute +
 relative bound and gates the cached path against upstream's own
 (`tests/fixtures/qwen21_kv_cache.safetensors`, `tools/dump_qwen21_kv_cache.py`).
 

@@ -17,9 +17,9 @@
 //!    prompt branch, target tokens only through the blocks, nothing cached when the switch is off
 //!    or the model is not `causal_condition`, and nothing decoded after a cancellation.
 //!
-//! The tiny snapshot's `head_dim = 16` takes MLX's unfused attention; the production head dim (128)
-//! takes the fused `sdpa_full` Metal kernel for the target call. A synthetic `head_dim = 128` model
-//! (f32 and the production bf16) repeats question 1 through that kernel.
+//! The tiny snapshot's `head_dim = 16` is not a geometry MLX has a fused attention kernel for; the
+//! production head dim (128) is. A synthetic `head_dim = 128` model (f32 and the production bf16)
+//! repeats question 1 at that geometry. Which kernel MLX dispatches is not asserted here.
 
 use std::collections::HashMap;
 
@@ -545,7 +545,14 @@ fn cached_denoise_matches_prefill_denoise_and_reports_its_path() {
 }
 
 /// Question 2 for the whole loop, on the CPU device: three Euler steps with the cache on land on
-/// upstream's `use_kv_cache=True` latents.
+/// upstream's `use_kv_cache=True` latents — and with it off on upstream's `use_kv_cache=False`
+/// latents for the same case (`latents_final_prefill`). The second is the independent oracle for
+/// the off path: the prefill forward this story refactored, against something that is not this
+/// port's own prefill code.
+///
+/// *Mutation that reds the off-path row:* a numeric change to the prefill loop or forward — e.g.
+/// the off path's true-CFG combine rewritten as `pos + (s − 1)·(pos − neg)` with the wrong scale,
+/// or `Attention::project` normalising `k` with `norm_q`.
 #[test]
 fn cached_denoise_matches_upstream_end_to_end() {
     let _cpu = CpuDevice::new();
@@ -554,15 +561,26 @@ fn cached_denoise_matches_upstream_end_to_end() {
     for name in CASES {
         let case = load_case(&w, name);
         let sigmas = case_sigmas(&case);
-        let (got, report) = Run {
-            model: &model,
-            case: &case,
-            sigmas: &sigmas,
-            init: w.require(&format!("{name}/latents_init")).unwrap(),
-            sampler: None,
-            kv_cache: KvCacheMode::On,
-        }
-        .ok();
+        let run = |kv_cache| {
+            Run {
+                model: &model,
+                case: &case,
+                sigmas: &sigmas,
+                init: w.require(&format!("{name}/latents_init")).unwrap(),
+                sampler: None,
+                kv_cache,
+            }
+            .ok()
+        };
+        let (off, off_report) = run(KvCacheMode::Off);
+        assert_eq!(off_report.kv_cache, KvCachePath::Prefill, "{name}");
+        assert_upstream(
+            &format!("{name}/latents_final_prefill (cache off)"),
+            &off,
+            w.require(&format!("{name}/latents_final_prefill")).unwrap(),
+            UPSTREAM_TOL,
+        );
+        let (got, report) = run(KvCacheMode::On);
         assert_eq!(report.kv_cache, KvCachePath::Cached, "{name}");
         assert_upstream(
             &format!("{name}/latents_final"),
@@ -662,9 +680,12 @@ fn the_negative_branch_has_its_own_cache() {
     }
 }
 
-/// With the switch off the loop **is** the pre-cache loop: the latents are bit-for-bit what the
-/// pre-story closure (`forward_joint` per branch, then the true-CFG combine, under the shared
-/// sampler) produces. The closure below is that code, verbatim.
+/// With the switch off the loop is the plain prefill loop: the latents are bit-for-bit what an
+/// equivalent closure (`forward_joint` per branch, then the true-CFG combine, under the shared
+/// sampler) produces. This pins the **loop** — no extra evaluation boundary, no cache, the same
+/// combine — against this port's own `forward_joint`; it cannot see a numeric change inside that
+/// forward. The independent oracle for the off path is upstream's `use_kv_cache=False` output,
+/// `{case}/latents_final_prefill`, gated in `cached_denoise_matches_upstream_end_to_end`.
 ///
 /// *Mutation that reds this:* any numeric change to the off path — e.g. the true-CFG combine
 /// rewritten as `pos + (s − 1)·(pos − neg)`. (An ignored switch is caught by the report assertions
@@ -978,16 +999,19 @@ fn seeded(shape: &[i32], seed: u64) -> Array {
         .unwrap()
 }
 
-/// Question 1 through the attention kernel production takes. At `head_dim` 64 / 80 / 128 with more
-/// than eight queries, MLX's Metal backend runs `scaled_dot_product_attention` as one fused
-/// `sdpa_full` kernel instead of matmul + softmax — and the cached step's only attention call is
-/// exactly such a call (target queries over `[cached prefix, target]` keys, no mask). The tiny
-/// snapshot never reaches it, so this repeats cached-vs-prefill on a `head_dim = 128` model with a
-/// two-reference interleaved layout, in f32 and in the released checkpoint's bf16.
+/// Question 1 at the production attention geometry. This is the geometry at which MLX selects its
+/// fused attention kernel on Metal — in the pinned MLX build,
+/// `ScaledDotProductAttention::use_fallback` (`mlx/backend/metal/scaled_dot_product_attention.cpp`)
+/// takes the fused `sdpa_full` path for `head_dim` 64 / 80 / 128 with more than eight queries and
+/// no mask, which is what the cached step's only attention call is (target queries over
+/// `[cached prefix, target]` keys). **The dispatch is not asserted here**: the test constructs the
+/// geometry and compares cached against prefill on whatever kernel the backend picks. The tiny
+/// snapshot (`head_dim = 16`) cannot reach that path at all, so this repeats cached-vs-prefill on
+/// a `head_dim = 128` model with a two-reference interleaved layout, in f32 and in the released
+/// checkpoint's bf16.
 ///
-/// *Mutations that red this:* the same cached-step defects as the tiny-fixture test, at the
-/// production kernel; plus a cache stored in a layout the fused kernel reads differently from the
-/// prefill's (e.g. heads and tokens swapped before the concat).
+/// *Mutations that red this:* the same cached-step defects as the tiny-fixture test, at this
+/// geometry (e.g. `k` cached before RoPE, the prefix concat skipped).
 #[test]
 fn cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel() {
     let cfg = production_head_config();
@@ -1090,8 +1114,8 @@ fn cached_velocity_is_the_prefill_velocity_through_the_fused_attention_kernel() 
 /// more). The bound is twice the owned amount.
 ///
 /// *Mutations that red this:* caching the slices themselves (`owned_copy` returning its input);
-/// evaluating only the velocity at the end of the extract (the lazy cache then keeps every block's
-/// full K/V alive); not evaluating at all (nothing is held).
+/// evaluating only each block's output and never its cache entry (the lazy cache then keeps every
+/// block's full K/V alive).
 #[test]
 fn the_cache_does_not_pin_the_prefill_keys_and_values() {
     let cfg = production_head_config();
@@ -1137,5 +1161,83 @@ fn the_cache_does_not_pin_the_prefill_keys_and_values() {
         &model.forward_joint(&text, &[&x], 0.4, &layout).unwrap(),
         ATOL,
         RTOL,
+    );
+}
+
+/// The extract step does not hold every block's K/V at once. Each block's prefix rows are cut from
+/// that block's full `[1, prefix + target, heads, head_dim]` K and V; if the copies were only
+/// evaluated at the end of the forward, every block's full K/V would stay alive until then —
+/// `blocks · 2 · (prefix + target) · inner · itemsize` on top of the prefill, ~1.5× the finished
+/// cache at ten references and far more for a small prefix. Materializing block by block, the
+/// extract costs the prefill forward plus the cache it is building.
+///
+/// The bound is derived from tensor sizes, not from this machine: the extract's peak may exceed the
+/// plain prefill forward's peak (same inputs, measured here) by the finished cache, the target's
+/// RoPE rows and **two** blocks' full K/V of slack. A forward that pins all twelve blocks' K/V
+/// exceeds it by about eleven.
+///
+/// *Mutation that reds this:* deferring the copies' evaluation to the end of the forward (keeping
+/// the captured slices alive across blocks).
+#[test]
+fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
+    let _cpu = CpuDevice::new();
+    let cfg = TransformerConfig {
+        num_layers: 12,
+        ..production_head_config()
+    };
+    let model = synthetic_model(&cfg, 80, Dtype::Float32);
+    let (height, width) = (32usize, 32usize);
+    let layout = JointLayout::text_to_image(16, height, width);
+    let text = seeded(&[1, 16, cfg.context_in_dim as i32], 401);
+    let x0 = seeded(&[1, (height * width) as i32, cfg.in_channels as i32], 402);
+    mlx_rs::transforms::eval([&text, &x0]).unwrap();
+
+    // Peak active memory above the resident baseline while `run` executes.
+    let peak_of = |run: &mut dyn FnMut()| -> usize {
+        mlx_rs::memory::clear_cache();
+        let base = mlx_rs::memory::get_active_memory();
+        mlx_rs::memory::reset_peak_memory();
+        run();
+        mlx_rs::memory::get_peak_memory().saturating_sub(base)
+    };
+    let prefill_peak = peak_of(&mut || {
+        let v = model.forward_joint(&text, &[&x0], 0.8, &layout).unwrap();
+        mlx_rs::transforms::eval([&v]).unwrap();
+    });
+    let mut cache_bytes = 0;
+    let extract_peak = peak_of(&mut || {
+        let (_, cache) = model
+            .forward_joint_extract(&text, &[&x0], 0.8, &layout)
+            .unwrap();
+        cache_bytes = cache.nbytes();
+    });
+
+    let block_full_kv = 2 * layout.total_len() * cfg.inner_dim() * 4;
+    let rope = 2 * layout.target_tokens() * (cfg.attention_head_dim / 2) * 4;
+    assert_eq!(
+        cache_bytes,
+        2 * cfg.num_layers * layout.prefix_len() * cfg.inner_dim() * 4
+    );
+    let allowed = prefill_peak + cache_bytes + rope + 2 * block_full_kv;
+    let pinned = cache_bytes + rope + (cfg.num_layers - 1) * block_full_kv;
+    eprintln!(
+        "prefill peak {prefill_peak} · extract peak {extract_peak} (Δ {}) · cache {cache_bytes} · \
+         rope {rope} · one block's full K/V {block_full_kv} · allowed Δ {} · all-blocks-pinned Δ \
+         ≈ {pinned}",
+        extract_peak as i64 - prefill_peak as i64,
+        cache_bytes + rope + 2 * block_full_kv,
+    );
+    assert!(
+        prefill_peak > block_full_kv,
+        "the prefill's own peak ({prefill_peak}) must at least hold one block's K/V — nothing was \
+         measured"
+    );
+    assert!(
+        extract_peak <= allowed,
+        "the extract step peaked {} bytes above the prefill forward; the cache it builds is \
+         {cache_bytes} and one block's full K/V is {block_full_kv} — it is holding several blocks' \
+         K/V at once (all {} pinned would be ≈ {pinned})",
+        extract_peak.saturating_sub(prefill_peak),
+        cfg.num_layers
     );
 }

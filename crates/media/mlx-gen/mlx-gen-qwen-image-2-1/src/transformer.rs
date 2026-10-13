@@ -1169,7 +1169,8 @@ impl QwenImage21Transformer {
     ///
     /// Both are **evaluated** before returning. MLX is lazy: an unevaluated cache would re-run the
     /// whole prefix graph on every later step (saving nothing) while keeping that graph alive, so
-    /// the K/V are materialized here, in the one evaluation that also computes the velocity.
+    /// the K/V are materialized here — block by block, as the forward advances, so that the
+    /// extract never holds more than the prefill forward plus the cache it is building.
     ///
     /// Refused unless the model is `causal_condition`: the cache is only valid because the prefix
     /// tokens modulate from `t = 0`, which is what makes their activations step-independent.
@@ -1245,9 +1246,10 @@ impl QwenImage21Transformer {
         crate::q4_diagnostic::assert_owner();
         self.require_causal_condition()?;
         let j = self.embed_joint(text, images, timestep, layout, &mut trace)?;
-        let mut captured: Vec<(Array, Array)> = Vec::with_capacity(self.blocks.len());
+        let mut layers: Vec<(Array, Array)> = Vec::with_capacity(self.blocks.len());
         let mut x = j.x.clone();
         for (index, block) in self.blocks.iter().enumerate() {
+            let mut captured: Vec<(Array, Array)> = Vec::with_capacity(1);
             x = block.forward_with(
                 index,
                 &x,
@@ -1261,14 +1263,26 @@ impl QwenImage21Transformer {
                 },
                 &mut trace,
             )?;
+            let (k, v) = captured.pop().ok_or_else(|| {
+                Error::Msg(format!(
+                    "qwen_image_2_1: block {index} captured no prefix K/V"
+                ))
+            })?;
+            let owned = (owned_copy(&k)?, owned_copy(&v)?);
+            drop((k, v));
+            // Materialize this block's cache entry — and the block's output — before the next
+            // block is built. A captured slice is a view of the block's full
+            // `[1, prefix + target, heads, head_dim]` K or V; evaluating only at the end of the
+            // forward would keep every block's full K/V alive until then
+            // (`blocks · 2 · (prefix + target) · inner · itemsize` on top of the prefill). After
+            // this eval the copies are plain buffers and the block's K/V are released exactly as
+            // on the prefill path.
+            mlx_rs::transforms::eval([&x, &owned.0, &owned.1])?;
+            layers.push(owned);
         }
         let block_tokens = x.shape()[1] as usize;
         let velocity = self.head(&x, &j, &mut trace)?;
 
-        let mut layers = Vec::with_capacity(captured.len());
-        for (k, v) in &captured {
-            layers.push((owned_copy(k)?, owned_copy(v)?));
-        }
         let ids = layout.position_ids();
         let (target_cos, target_sin) = self.rope_for_ids(&ids[j.prefix_len..])?;
         let cache = PrefixKvCache {
@@ -1278,17 +1292,9 @@ impl QwenImage21Transformer {
             prefix_len: j.prefix_len,
             target_tokens: j.target as usize,
         };
-        // One evaluation for the velocity and the whole cache: after it the cache is plain
-        // buffers, and nothing of this forward's graph is reachable from it.
-        let mut outputs: Vec<&Array> = Vec::with_capacity(3 + 2 * cache.layers.len());
-        outputs.push(&velocity);
-        outputs.push(&cache.target_cos);
-        outputs.push(&cache.target_sin);
-        for (k, v) in &cache.layers {
-            outputs.push(k);
-            outputs.push(v);
-        }
-        mlx_rs::transforms::eval(outputs)?;
+        // The K/V are already materialized block by block; this covers the head and the target's
+        // RoPE rows, so the returned velocity and cache are plain buffers.
+        mlx_rs::transforms::eval([&velocity, &cache.target_cos, &cache.target_sin])?;
         Ok((velocity, cache, block_tokens))
     }
 
