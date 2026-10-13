@@ -793,7 +793,7 @@ fn backward_segmented(
 /// (sc-25690). `tape_free` is the same backbone off the tape ([`TrainModel::dit_pair`]); it is
 /// required when `ac` is active. With `ac` none this is the plain backward. The closure hands the
 /// loss over: whatever it wants to report (the unscaled terms) it reads to host values itself, so
-/// no handle on the loss graph outlives the plain backward (see [`backward_segmented`]).
+/// no handle on the loss graph outlives the plain backward (the segmented backward drops it there).
 pub fn grads_under_ac(
     tracked: &IrisDiT,
     tape_free: Option<&IrisDiT>,
