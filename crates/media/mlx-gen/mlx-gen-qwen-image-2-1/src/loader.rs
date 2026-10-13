@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! <root>/
-//!   model_index.json
+//!   model_index.json                    (`sample_sigmas` on the distilled Turbo snapshot only)
 //!   processor/tokenizer.json            (+ tokenizer_config.json, chat_template.jinja, …)
 //!   scheduler/scheduler_config.json
 //!   text_encoder/config.json + model-*.safetensors   (Qwen3VLForConditionalGeneration)
@@ -38,7 +38,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 
 use crate::config::{
-    SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
+    SavedSigmaSchedule, SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig,
+    VisionConfig,
 };
 use crate::text_encoder::QwenImage21TextEncoder;
 use crate::transformer::QwenImage21Transformer;
@@ -252,6 +253,61 @@ pub fn load_scheduler_config(root: &Path) -> Result<SchedulerConfig> {
     } else {
         Ok(SchedulerConfig::production())
     }
+}
+
+/// `<root>/model_index.json`, or `None` when the snapshot ships none.
+pub fn load_model_index(root: &Path) -> Result<Option<serde_json::Value>> {
+    let path = root.join("model_index.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&std::fs::read(&path)?)
+        .map(Some)
+        .map_err(|e| Error::Msg(format!("qwen_image_2_1: model_index.json: {e}")))
+}
+
+/// The saved-sigma schedule of a **distilled** snapshot (`Qwen/Qwen-Image-2.1-Turbo`):
+/// `model_index.json`'s `sample_sigmas` under the static-shift
+/// `scheduler/scheduler_config.json`. A snapshot that saves no sigmas, or whose scheduler config
+/// would transform them, is a typed refusal ([`SavedSigmaSchedule::from_values`]). A snapshot with
+/// no scheduler config gets `FlowMatchEulerDiscreteScheduler`'s own defaults, which are the static
+/// identity shift.
+pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
+    let model_index = load_model_index(root)?.unwrap_or(serde_json::Value::Null);
+    let path = root.join("scheduler").join("scheduler_config.json");
+    let scheduler_config = if path.is_file() {
+        serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| {
+            Error::Msg(format!(
+                "qwen_image_2_1_turbo: scheduler/scheduler_config.json: {e}"
+            ))
+        })?
+    } else {
+        serde_json::json!({})
+    };
+    SavedSigmaSchedule::from_values(&model_index, &scheduler_config)
+}
+
+/// The base checkpoint's guard against a **distilled** snapshot: a `model_index.json` that saves
+/// `sample_sigmas` is a `Qwen/Qwen-Image-2.1-Turbo` snapshot, which the base engine id would
+/// otherwise denoise over its own 40-step resolution-shifted schedule and silently render wrong.
+///
+/// The key being **present** is the whole test: a malformed list (`[]`, a string) is still a
+/// snapshot that claims a saved schedule, so it gets this same typed refusal rather than the
+/// Turbo reader's validation error — validating the values is the Turbo id's job.
+pub fn refuse_saved_sigma_snapshot(root: &Path) -> Result<()> {
+    let Some(model_index) = load_model_index(root)? else {
+        return Ok(());
+    };
+    let saved = model_index.get(crate::config::SAMPLE_SIGMAS_KEY);
+    if saved.is_some_and(|value| !value.is_null()) {
+        return Err(Error::Unsupported(format!(
+            "qwen_image_2_1: model_index.json saves `{}`, so this is a distilled \
+             Qwen-Image-2.1-Turbo snapshot and the base resolution-shifted schedule does not apply \
+             to it; load it as `qwen_image_2_1_turbo`",
+            crate::config::SAMPLE_SIGMAS_KEY
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
