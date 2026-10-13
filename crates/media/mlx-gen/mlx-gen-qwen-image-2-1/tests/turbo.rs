@@ -263,6 +263,47 @@ fn each_id_refuses_the_other_checkpoints_snapshot_by_name() {
     );
     assert!(err.contains("as `qwen_image_2_1`"), "{err}");
 
+    // A base load of a snapshot whose `sample_sigmas` is present but malformed is the same typed
+    // base refusal — never the Turbo reader's validation error under the base id.
+    let malformed = tmp.path().join("malformed");
+    mlx_gen::quant::copy_dir(&tiny_snapshot(), &malformed).unwrap();
+    for bad in [serde_json::json!([]), serde_json::json!("1.0, 0.5")] {
+        let index = malformed.join("model_index.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        value["sample_sigmas"] = bad.clone();
+        std::fs::write(&index, serde_json::to_string(&value).unwrap()).unwrap();
+        let err = refusal(BASE, &malformed);
+        assert!(
+            err.starts_with("qwen_image_2_1: model_index.json saves `sample_sigmas`"),
+            "{bad}: {err}"
+        );
+        assert!(
+            err.contains("load it as `qwen_image_2_1_turbo`"),
+            "{bad}: {err}"
+        );
+    }
+    // An explicit null is "no saved schedule": the base snapshot still loads under the base id.
+    let index = malformed.join("model_index.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    value["sample_sigmas"] = serde_json::Value::Null;
+    std::fs::write(&index, serde_json::to_string(&value).unwrap()).unwrap();
+    assert!(load(BASE, &malformed, OffloadPolicy::Resident).is_ok());
+
+    // A Turbo-id load with a single-file source fails in the shared memory contract, which must
+    // name the id that was asked for.
+    let single_file = mlx_gen_qwen_image_2_1::memory_strategy::memory_strategy_contract(
+        TURBO,
+        &LoadSpec::new(WeightsSource::File(tmp.path().join("model.safetensors"))),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        single_file.starts_with("qwen_image_2_1_turbo: memory facts require a snapshot directory"),
+        "{single_file}"
+    );
+
     // A hybrid — saved sigmas beside the base's dynamic-shift scheduler config — is refused under
     // BOTH ids: the base id because the sigmas are saved, the Turbo id because the scheduler
     // would shift them.

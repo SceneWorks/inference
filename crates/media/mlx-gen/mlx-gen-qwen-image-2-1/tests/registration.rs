@@ -40,6 +40,19 @@ fn qwen_image_2_1_turbo_is_registered_next_to_the_base_id_without_a_trainer() {
         "the Turbo descriptor mirrors the base surface"
     );
 
+    // A training request that names the Turbo id fails cleanly at the registry, before any
+    // snapshot is touched.
+    let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(
+        "/qwen-image-2-1-turbo-not-on-disk".into(),
+    ));
+    match registry.load_trainer("qwen_image_2_1_turbo", &spec) {
+        Err(mlx_gen::gen_core::Error::Msg(message)) => assert_eq!(
+            message,
+            "no trainer registered for id 'qwen_image_2_1_turbo'"
+        ),
+        Err(other) => panic!("expected the registry's unknown-trainer error, got {other:?}"),
+        Ok(_) => panic!("no trainer may load under the Turbo id"),
+    }
     let trainers: Vec<_> = registry.trainers().map(|r| (r.descriptor)().id).collect();
     assert_eq!(trainers, ["qwen_image_2_1"], "the trainer stays base-only");
     let strategies: Vec<_> = registry

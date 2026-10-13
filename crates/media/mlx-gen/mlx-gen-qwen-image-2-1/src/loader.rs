@@ -290,11 +290,16 @@ pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
 /// The base checkpoint's guard against a **distilled** snapshot: a `model_index.json` that saves
 /// `sample_sigmas` is a `Qwen/Qwen-Image-2.1-Turbo` snapshot, which the base engine id would
 /// otherwise denoise over its own 40-step resolution-shifted schedule and silently render wrong.
+///
+/// The key being **present** is the whole test: a malformed list (`[]`, a string) is still a
+/// snapshot that claims a saved schedule, so it gets this same typed refusal rather than the
+/// Turbo reader's validation error — validating the values is the Turbo id's job.
 pub fn refuse_saved_sigma_snapshot(root: &Path) -> Result<()> {
     let Some(model_index) = load_model_index(root)? else {
         return Ok(());
     };
-    if crate::config::sample_sigmas(&model_index)?.is_some() {
+    let saved = model_index.get(crate::config::SAMPLE_SIGMAS_KEY);
+    if saved.is_some_and(|value| !value.is_null()) {
         return Err(Error::Unsupported(format!(
             "qwen_image_2_1: model_index.json saves `{}`, so this is a distilled \
              Qwen-Image-2.1-Turbo snapshot and the base resolution-shifted schedule does not apply \

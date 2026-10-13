@@ -1134,7 +1134,7 @@ pub fn memory_strategy_contract(
     let mut contract = weights_free_memory_strategy_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(format!(
-            "{MODEL_ID}: memory facts require a snapshot directory"
+            "{provider_id}: memory facts require a snapshot directory"
         )));
     };
     let (facts, overlays) = asset_declaration(spec, root)?;
@@ -1150,7 +1150,7 @@ pub fn memory_strategy_contract(
             }
             _ => {
                 return Err(CoreError::Msg(format!(
-                    "{MODEL_ID}: the weights-free contract no longer declares a PhaseEnvelope"
+                    "{provider_id}: the weights-free contract no longer declares a PhaseEnvelope"
                 )))
             }
         };
