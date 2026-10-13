@@ -270,6 +270,26 @@ impl CfgBatching {
 /// nothing**: a request admitted against a budget that never priced the cache must not run above
 /// it. The cache is therefore opt-in per request — a caller selects [`Cached`](Self::Cached) after
 /// pricing it ([`Self::select`]).
+///
+/// # What a caller must get right, because nothing checks it for them
+///
+/// * **Write the selection after the request scope has configured the request.**
+///   [`MemoryRequestScope::configure_request`](crate::MemoryRequestScope::configure_request)
+///   *replaces* [`GenerationRequest::memory`](crate::GenerationRequest::memory) with the block
+///   for the admitted ladder selection, and for a `Resident` selection on a provider that
+///   preserves its load defaults that block is `None`. A selection written before that call is
+///   lost and the render runs prefill, in silence — the report says so, the request does not. So:
+///   configure, then set the field, creating a default block if there is none.
+/// * **Admit the cached demand before selecting `Cached`.** A provider honours the field; it
+///   does not verify that the request was admitted against a budget that included the cache.
+///
+/// # A provider prices an upper bound, and holds a cached render to it
+///
+/// The real prefix is known only once the prompt is tokenized and the references are fitted, so
+/// a provider prices the cache over published **bounds** (text rows per branch, tokens per
+/// reference). A `Cached` request whose real caches would exceed that priced figure is run
+/// **prefill** — never cached above its price, never failed — and the render's
+/// [`PrefixKvCacheReport::overflow`] says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrefixKvCacheMode {
     /// Prefill once per prompt branch, then decode the target tokens against the cached prefix.
@@ -336,6 +356,24 @@ pub struct PrefixKvCacheReport {
     /// `0` on [`PrefixKvCacheMode::Prefill`]. A request for several images renders them one after
     /// another, each with its own caches, so this does not grow with the image count.
     pub cache_bytes: u64,
+    /// `Some` when the request selected [`PrefixKvCacheMode::Cached`] but the provider ran
+    /// [`PrefixKvCacheMode::Prefill`] because the request's real caches would have exceeded what
+    /// the provider prices for it. `None` on every other render — in particular a `Prefill` path
+    /// with `None` here is prefill **by selection** (or by an unset field).
+    pub overflow: Option<PrefixKvCacheOverflow>,
+}
+
+/// Why a `Cached` selection ran prefill ([`PrefixKvCacheReport::overflow`]): the caches this
+/// request would really have held against the figure the provider prices for it. Both are in the
+/// loaded model's own terms (its block count, width and compute dtype), so they compare directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixKvCacheOverflow {
+    /// Bytes the request's caches would have held, from its real prefix (tokenized prompt rows
+    /// plus every fitted reference grid, per prompt branch) at the model's compute dtype.
+    pub actual_bytes: u64,
+    /// Bytes the provider prices for this request: the same arithmetic over its published
+    /// per-branch text bound and per-reference bound.
+    pub priced_bytes: u64,
 }
 
 /// The production domain of

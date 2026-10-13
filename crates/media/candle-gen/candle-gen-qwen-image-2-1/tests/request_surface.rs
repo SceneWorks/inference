@@ -19,8 +19,11 @@
 //!   stated margin ([`assert_moved`]), never on a bare pixel inequality, and the evaluation paths
 //!   are read off that assembly's [`DenoiseReport`].
 //!
-//! The two sides of a pixel equality always run the same cache mode (`On`, as `generate_impl`
-//! passes for both ids) on the same device (`candle_gen::default_device()`, the one `load` uses):
+//! The two sides of a pixel equality always run the same cache mode — every request here
+//! **selects the prefix KV cache** ([`request`]; sc-25905 made it a request selection, and an
+//! unset request runs prefill), the assemblies run `KvCacheMode::On`, and [`generate`] asserts on
+//! the generator's own report that the render really ran cached — on the same device
+//! (`candle_gen::default_device()`, the one `load` uses):
 //! cached and prefill evaluate different row counts, and candle's CPU gemm picks its kernel by row
 //! count, so the two paths agree to rounding and not bit for bit. Where cached IS compared with
 //! prefill, it is on the CPU device in f32 under the mixed `atol + rtol·|want|` bound `kv_cache.rs`
@@ -30,9 +33,9 @@ use std::path::Path;
 
 use candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
-    AdapterKind, AdapterSpec, CancelFlag, Conditioning, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, ModelDescriptor, OutputChannels, Progress, RgbaImage,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, Conditioning, GenerationMemory, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, OutputChannels,
+    PrefixKvCacheMode, Progress, RgbaImage, WeightsSource,
 };
 use candle_gen_qwen_image_2_1::{
     adapters, create_noise, decode_rgb, decode_rgba, denoise_reported, encode_references,
@@ -91,12 +94,18 @@ fn turbo(root: &Path) -> Box<dyn Generator> {
     load_with(TURBO, root, Vec::new())
 }
 
+/// The base request of every test here. It **selects the prefix KV cache**: the assemblies it is
+/// compared with run the cache, and a request that selects nothing runs prefill (sc-25905).
 fn request() -> GenerationRequest {
     GenerationRequest {
         prompt: PROMPT.to_owned(),
         width: EDGE,
         height: EDGE,
         seed: Some(SEED),
+        memory: Some(GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -106,14 +115,25 @@ fn generate(
     req: &GenerationRequest,
 ) -> (GenerationOutput, Vec<(u32, u32)>) {
     let mut steps = Vec::new();
-    let out = generator
-        .generate(req, &mut |p| {
+    let report = generator
+        .generate_with_report(req, &mut |p| {
             if let Progress::Step { current, total } = p {
                 steps.push((current, total));
             }
         })
         .unwrap_or_else(|e| panic!("the render runs: {e}"));
-    (out, steps)
+    // Every render in this file is compared with a cache-on assembly, so it must have run the
+    // cache — read off what the denoise loop did, not off the request.
+    let ran = report
+        .prefix_kv_cache
+        .expect("the path is reported on every render");
+    assert_eq!(
+        (ran.path, ran.overflow),
+        (PrefixKvCacheMode::Cached, None),
+        "the request selected the cache"
+    );
+    assert!(ran.cache_bytes > 0, "a cached render holds a cache");
+    (report.output.expect("a render has an output"), steps)
 }
 
 /// The single RGB8 image of a default-channel render, and the steps it reported.

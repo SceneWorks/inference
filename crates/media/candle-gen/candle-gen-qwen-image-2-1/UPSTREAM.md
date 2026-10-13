@@ -608,27 +608,50 @@ default with no memory model behind it; here the cache is a **request selection*
 `GenerationMemory::prefix_kv_cache`, a typed execution domain declared on
 `Capabilities::execution` for both engine ids (`gen_core::execution_domains`) — and it is priced:
 
-* **What it costs.** K and V for all 32 blocks over the prefix (the prompt and every reference
-  image), at the compute dtype, once per prompt branch: `2 · 32 · prefix_tokens · 4096 · width`
-  bytes — 0.5 MiB per prefix token at bf16 (CUDA, Metal), 1 MiB at f32 (the CPU lane). At bf16 a
-  256-token prompt is 0.125 GiB; each reference (fitted to 1024², 4096 tokens) adds 2.0 GiB; ten
-  references are 20.1 GiB; a negative branch doubles all of it. No tier shrinks it — it is
-  activations, not weights (`memory_strategy::prefix_kv_cache_bytes`).
-* **How a cached request is priced.** At its cache-shed demand plus those bytes plus the target
-  RoPE rows each cache keeps (`memory_strategy::prefix_kv_cache_demand_bytes`,
-  `memory_strategy::request_demand_bytes`). This crate publishes no activation table and installs
-  no allocator budget, so the cache-shed demand is whatever the caller already prices.
-* **What does not move.** The memory contract, its asset facts, its formula and both calibration
-  identities are unchanged. A request that selects nothing runs the prefill path — the deliberate
-  divergence from upstream's default, because a request admitted against a demand that never
-  priced the cache must not run above it.
-* **Who decides.** The caller that owns the budget: `PrefixKvCacheMode::select(budget, shed,
-  cache)` answers `Cached` when both fit, `Prefill` when only the shed demand fits (the request
-  is admitted and runs without the cache), and `None` when neither does (the caller refuses as it
-  always did). Nothing shrinks an image, drops a reference or changes a tier.
+* **What it costs.** K and V for all 32 blocks over the prefix (the prompt rows and every
+  reference image), at the dtype the DiT computes in, once per prompt branch:
+  `2 · 32 · prefix_tokens · 4096 · width`. **On this backend the width follows the device, not
+  the tier**: a packed (q8 / q4) Linear dequantizes its weight to the activation's dtype
+  (`QLinear::forward`), so the hidden states and the cached K/V stay at the dtype the model was
+  loaded at — bf16 on CUDA and Metal (0.5 MiB per prefix token), f32 on a CPU device (1 MiB), on
+  every tier (observed on the miniature q8 tier by `tests/kv_admission.rs`). No tier shrinks the
+  cache. The MLX twin differs: its packed tiers compute in f32.
+* **What is priced: an upper bound.** The real prefix is known only after tokenizing and fitting,
+  so the surcharge (`memory_strategy::prefix_kv_cache_demand_bytes(width, height, references,
+  negative)`) is over two published bounds that err high: 1024 text rows per branch
+  (`PREFIX_KV_CACHE_CONDITIONING_TOKENS` — chosen, not measured) and 4920 tokens per reference
+  (`PREFIX_KV_CACHE_REFERENCE_TOKENS` — the largest grid any aspect ratio fits to: 13120×96, 20%
+  above the square 4096; derived by search over the ratios the processor accepts). At bf16:
+  0.5 GiB with no reference, 2.40 GiB more per reference, 24.5 GiB at ten; twice that at f32;
+  doubled with a negative branch; plus the target RoPE rows each cache keeps. It is priced for the
+  build's production device (`compute_width`); `prefix_kv_cache_demand_bytes_at` with
+  `compute_width_on(device)` prices a GPU build loaded onto a CPU device.
+* **A cached render is held to that price.** With the real layouts in hand the generator computes
+  what the caches would hold (`memory_strategy::prefix_kv_cache_overflow`); a request past its
+  priced figure — a prompt branch over the text bound, or a generator on a wider device than the
+  build prices — runs **prefill** instead: never cached above its price, never a failed render.
+  The report carries both byte counts (`PrefixKvCacheReport::overflow`) and a
+  `prefix_kv_cache_shed_over_priced_bound` warning.
+* **What does not move.** This crate publishes no activation table and installs no allocator
+  budget, so the cache-shed demand is whatever the caller already prices. The memory contract, its
+  asset facts, its formula, the admission envelope and both calibration identities are unchanged.
+  A request that selects nothing runs the prefill path — the deliberate divergence from
+  upstream's default, because a request admitted against a demand that never priced the cache
+  must not run above it.
+* **Who decides, and what the engine does not check.** The caller that owns the budget:
+  `PrefixKvCacheMode::select(budget, shed, cache)` answers `Cached` when both fit, `Prefill` when
+  only the shed demand fits (the request is admitted and runs without the cache), and `None` when
+  neither does (the caller refuses as it always did). Two things are the caller's alone. *Order:*
+  the request scope's `configure_request` replaces `GenerationRequest::memory` (with `None` for a
+  `Resident` selection), so the selection must be written **after** it, creating a block if there
+  is none — written before, it is lost and the render runs prefill in silence (pinned by
+  `a_selection_written_before_the_scope_configures_the_request_is_lost`). *Admission:* the engine
+  honours `Cached`; it does not verify the request was admitted against the cached demand.
 * **What ran.** `Generator::generate_with_report` → `GenerationReport::prefix_kv_cache`: the path
-  the denoise loop took (`cached` / `prefill`) and the bytes its caches held, written from the
-  loop's own `DenoiseReport`.
+  the denoise loop took (`cached` / `prefill`), the bytes its caches held, and `overflow` when a
+  cached selection was shed at the bound — written from the loop's own `DenoiseReport`.
+* **Approximations that remain.** The admission envelope still assumes 256 text rows and a square
+  4096-token reference (pre-existing; errs low for a long prompt or an extreme-aspect reference).
 
 **Every cache figure above is derived — exact tensor arithmetic over the shapes the cache stores,
 held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The

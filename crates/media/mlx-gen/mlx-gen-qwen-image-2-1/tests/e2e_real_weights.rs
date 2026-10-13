@@ -25,13 +25,30 @@
 //! `MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT`, load it as `qwen_image_2_1_turbo`, and leave the step
 //! count to the snapshot's saved sigmas unless a test says otherwise. They need only that
 //! snapshot, and honour the same `QWEN_IMAGE_2_1_*` switches as the base test they mirror.
+//!
+//! # The prefix KV cache (sc-25905)
+//!
+//! The cache is a request selection and an unset request runs prefill, so every render here
+//! **states its mode** and asserts, on the generator's own report, that that is the path that
+//! ran. Each test documents its default; `QWEN_IMAGE_2_1_PREFIX_KV_CACHE=cached|prefill` forces
+//! one mode on every render of the run. A `[kv]` line beside the `[mem]` lines prints the path,
+//! the bytes the caches held, and the budget the request was priced at (cache-shed transient +
+//! `prefix_kv_cache_demand_bytes`). Defaults:
+//!
+//! | render | default | why |
+//! |---|---|---|
+//! | base text-to-image, base ten-reference boundary | prefill | the pre-epic path the published floors were derived for |
+//! | base two-reference edit | cached | the caller-shaped request |
+//! | every Turbo render, incl. the ten-reference edit | cached | what the epic ships |
+//! | Turbo two-reference **forced-shed twin** | prefill | the epic's "one run forced to shed that produces the prefill output" |
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen::gen_core::Progress;
-use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
-use mlx_gen_qwen_image_2_1::{load_tokenizer, system_prompt_drop_count, PRESETS};
+use mlx_gen::gen_core::{GenerationMemory, PrefixKvCacheMode, Progress};
+use mlx_gen::{GenerationOutput, GenerationRequest, Generator, LoadSpec, WeightsSource};
+use mlx_gen_qwen_image_2_1::memory_strategy::derived;
+use mlx_gen_qwen_image_2_1::{load_tokenizer, system_prompt_drop_count, Tier, PRESETS};
 
 fn snapshot() -> PathBuf {
     let p = std::env::var("MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT").unwrap_or_else(|_| {
@@ -53,6 +70,103 @@ fn out_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// `QWEN_IMAGE_2_1_PREFIX_KV_CACHE=cached|prefill`: force one prefix-KV-cache mode on every
+/// render of the run. Unset, each render runs its own documented default.
+const PREFIX_KV_CACHE_ENV: &str = "QWEN_IMAGE_2_1_PREFIX_KV_CACHE";
+
+fn prefix_kv_cache_override() -> Option<PrefixKvCacheMode> {
+    let value = std::env::var(PREFIX_KV_CACHE_ENV).ok()?;
+    Some(match value.as_str() {
+        "cached" => PrefixKvCacheMode::Cached,
+        "prefill" => PrefixKvCacheMode::Prefill,
+        other => panic!("{PREFIX_KV_CACHE_ENV} must be `cached` or `prefill`, got `{other}`"),
+    })
+}
+
+/// `req` selecting the prefix-KV-cache `mode`, keeping whatever else its memory block carries.
+fn selecting(mut req: GenerationRequest, mode: PrefixKvCacheMode) -> GenerationRequest {
+    req.memory = Some(GenerationMemory {
+        prefix_kv_cache: Some(mode),
+        ..req.memory.unwrap_or_default()
+    });
+    req
+}
+
+/// One render of `req` (which must select `mode`) through `generate_with_report`, asserting that
+/// the denoise loop ran the path the request selected, and printing the `[kv]` evidence line:
+/// the path, the bytes the caches held, and what the request is priced at on the dense (bf16)
+/// tier these tests load — its cache-shed transient, plus `prefix_kv_cache_demand_bytes` when
+/// cached. Both figures are **derived**; the line is where a measured peak is compared with them.
+fn render_reporting(
+    generator: &dyn Generator,
+    req: &GenerationRequest,
+    mode: PrefixKvCacheMode,
+    label: &str,
+    on_progress: &mut dyn FnMut(Progress),
+) -> GenerationOutput {
+    const GIB: f64 = (1_u64 << 30) as f64;
+    assert_eq!(
+        req.memory.and_then(|memory| memory.prefix_kv_cache),
+        Some(mode),
+        "{label}: the request states its mode"
+    );
+    let report = generator
+        .generate_with_report(req, on_progress)
+        .unwrap_or_else(|e| panic!("{label}: the render runs: {e}"));
+    let ran = report
+        .prefix_kv_cache
+        .expect("the path is reported on every render");
+    let references = req.memory_reference_count();
+    let negative = req.negative_prompt.is_some() && req.true_cfg.is_some_and(|scale| scale > 1.0);
+    let shed = derived::request_transient_budget_bytes(
+        req.width,
+        req.height,
+        derived::TABLE_CONDITIONING_TOKENS,
+        references,
+        negative,
+        None,
+    );
+    let surcharge = match mode {
+        PrefixKvCacheMode::Cached => derived::prefix_kv_cache_demand_bytes(
+            Tier::Bf16,
+            req.width,
+            req.height,
+            references,
+            negative,
+        ),
+        PrefixKvCacheMode::Prefill => 0,
+    };
+    eprintln!(
+        "[kv] {label}: selected={} ran={} cache_bytes={} ({:.2} GiB) overflow={:?}; priced \
+         transient = shed {:.2} GiB + cache {:.2} GiB = {:.2} GiB above the resident set (derived)",
+        mode.label(),
+        ran.path.label(),
+        ran.cache_bytes,
+        ran.cache_bytes as f64 / GIB,
+        ran.overflow,
+        shed as f64 / GIB,
+        surcharge as f64 / GIB,
+        (shed + surcharge) as f64 / GIB,
+    );
+    assert_eq!(
+        (ran.path, ran.overflow),
+        (mode, None),
+        "{label}: the render ran the path it selected — a `cached` request that reports an \
+         overflow exceeded its priced prefix bound and is evidence, not noise"
+    );
+    assert_eq!(
+        ran.cache_bytes > 0,
+        mode.is_cached(),
+        "{label}: a cached render holds a cache and a prefill render holds none"
+    );
+    assert!(
+        ran.cache_bytes <= surcharge,
+        "{label}: the caches hold {} bytes against {surcharge} priced",
+        ran.cache_bytes
+    );
+    report.output.expect("a render has an output")
 }
 
 /// The `(current, total)` of every `Step` event a default-sampler render of `total` steps
@@ -204,7 +318,13 @@ fn validation_render_default_preset() {
         .ok()
         .map(|s| s.parse().unwrap())
         .unwrap_or(mlx_gen_qwen_image_2_1::DEFAULT_STEPS);
-    validation_render(mlx_gen_qwen_image_2_1::MODEL_ID, snapshot(), &[Some(steps)]);
+    // Prefill by default: this is the pre-epic render the published floors were derived for.
+    validation_render(
+        mlx_gen_qwen_image_2_1::MODEL_ID,
+        snapshot(),
+        &[Some(steps)],
+        PrefixKvCacheMode::Prefill,
+    );
 }
 
 /// The distilled Turbo checkpoint's validation render (sc-25900): the same 1:1 2048×2048 preset,
@@ -231,7 +351,13 @@ fn validation_render_turbo_default() {
     let steps: Option<u32> = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
         .ok()
         .map(|s| s.parse().unwrap());
-    let reported = validation_render(mlx_gen_qwen_image_2_1::TURBO_MODEL_ID, root, &[steps]);
+    // Cached by default, like every Turbo render here.
+    let reported = validation_render(
+        mlx_gen_qwen_image_2_1::TURBO_MODEL_ID,
+        root,
+        &[steps],
+        PrefixKvCacheMode::Cached,
+    );
     assert_eq!(
         reported,
         [steps.unwrap_or(saved)],
@@ -268,21 +394,35 @@ fn validation_render_turbo_step_sweep() {
         mlx_gen_qwen_image_2_1::TURBO_MODEL_ID,
         turbo_snapshot(),
         &asked,
+        PrefixKvCacheMode::Cached,
     );
     assert_eq!(reported, steps, "every swept step count ran as asked");
 }
 
 /// One bounded validation render of engine `id` from the snapshot at `root` per entry of `steps`,
 /// all from one loaded generator; a `None` entry leaves the step count to the generator. Returns
-/// the step total the sampler reported for each.
-fn validation_render(id: &str, root: PathBuf, steps: &[Option<u32>]) -> Vec<u32> {
+/// the step total the sampler reported for each. Every render runs the prefix-KV-cache mode
+/// `default_cache` unless `QWEN_IMAGE_2_1_PREFIX_KV_CACHE` forces one.
+fn validation_render(
+    id: &str,
+    root: PathBuf,
+    steps: &[Option<u32>],
+    default_cache: PrefixKvCacheMode,
+) -> Vec<u32> {
     let (mut width, mut height) = (PRESETS[0].width, PRESETS[0].height);
     if let Ok(size) = std::env::var("QWEN_IMAGE_2_1_RENDER_SIZE") {
         let (w, h) = size.split_once('x').expect("WxH");
         width = w.parse().unwrap();
         height = h.parse().unwrap();
     }
-    validation_render_at(id, root, &out_dir(), (width, height), steps)
+    validation_render_at(
+        id,
+        root,
+        &out_dir(),
+        (width, height),
+        steps,
+        prefix_kv_cache_override().unwrap_or(default_cache),
+    )
 }
 
 /// [`validation_render`] at an explicit size into an explicit directory — the body, free of the
@@ -294,6 +434,7 @@ fn validation_render_at(
     out_dir: &std::path::Path,
     (width, height): (u32, u32),
     steps: &[Option<u32>],
+    cache: PrefixKvCacheMode,
 ) -> Vec<u32> {
     // `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints a `[mem]` line at every phase boundary (sc-24114's
     // footprint investigation); `QWEN_IMAGE_2_1_RENDER_TILED=1` asks for the bounded 512/64 decode
@@ -340,6 +481,7 @@ fn validation_render_at(
             memory,
             ..Default::default()
         };
+        let req = selecting(req, cache);
         eprintln!(
             "decode tiling: {:?}",
             mlx_gen_qwen_image_2_1::pipeline::decode_tiling(&req)
@@ -348,8 +490,12 @@ fn validation_render_at(
         let mut log = progress_logger(String::new());
         let footprint_for_progress = footprint_max.clone();
         let mut reported_steps = Vec::new();
-        let out = generator
-            .generate(&req, &mut |p| {
+        let out = render_reporting(
+            generator.as_ref(),
+            &req,
+            cache,
+            &format!("{id} {width}x{height}"),
+            &mut |p| {
                 log(p);
                 if let Progress::Step { current, total } = p {
                     reported_steps.push((current, total));
@@ -368,8 +514,8 @@ fn validation_render_at(
                         memory_line("before decode, after clear_cache", &footprint_for_progress);
                     }
                 }
-            })
-            .unwrap();
+            },
+        );
         if trace {
             memory_line("after decode (generate returned)", &footprint_max);
             mlx_rs::memory::clear_cache();
@@ -499,10 +645,34 @@ fn references(count: usize, width: u32, height: u32) -> Vec<mlx_gen::gen_core::I
         .collect()
 }
 
+/// One reference-edit render: how many references, the target size, the step count (`None`
+/// leaves it to the generator) and the prefix-KV-cache mode it runs.
+#[derive(Clone, Copy, Debug)]
+struct EditCase {
+    references: usize,
+    width: u32,
+    height: u32,
+    steps: Option<u32>,
+    cache: PrefixKvCacheMode,
+}
+
 /// One bounded real-weight **edit** render per reference count (sc-24110): the two-reference
 /// 1024x1024 case a caller actually sends, and the ten-reference boundary at a small target so
 /// the longest joint sequence is exercised without a long render. Finishes by proving eleven
 /// references are refused at `validate`, before any weight is touched.
+///
+/// **Cache modes and the budgets they expect** (derived; bf16 tier; transient above the 28.6 GiB
+/// resident set — printed on each render's `[kv]` line):
+///
+/// * two references, 1024² — **cached**: 10.38 GiB cache-shed transient + 5.30 GiB priced cache
+///   (`prefix_kv_cache_demand_bytes`; ~4.0 GiB actually held for two square-fitted references and
+///   a short prompt);
+/// * ten references, 512² — **prefill**, deliberately: this is the pre-epic boundary render the
+///   published floors were derived for, and it stays the evidence for the cache-shed budget
+///   (10.38 GiB). It recomputes the ~41k-token prefix at each of its two steps, which is why it
+///   runs the fewest steps the base sampler accepts.
+///
+/// `QWEN_IMAGE_2_1_PREFIX_KV_CACHE=cached|prefill` forces one mode on both.
 ///
 /// Run detached under the RSS guard, exactly like [`validation_render_default_preset`]:
 ///
@@ -515,19 +685,27 @@ fn references(count: usize, width: u32, height: u32) -> Vec<mlx_gen::gen_core::I
 #[test]
 #[ignore]
 fn validation_render_reference_edit() {
-    // (references, width, height, steps) — the caller-shaped case, then the boundary.
-    //
-    // Every reference is fitted to `output_resolution` (1024 px) whatever the target size, so ten
-    // references are ~41k prefix tokens on their own. The boundary case's step count was set to
-    // the fewest the sampler accepts when this port recomputed the whole block-causal prefix
-    // every step; the render path now runs upstream's prefix KV cache (sc-25903, see
-    // UPSTREAM.md), under which only the first step pays for the prefix and later steps cost
-    // what a text-to-image step does. The step count is left as it was.
     reference_edit_renders(
         mlx_gen_qwen_image_2_1::MODEL_ID,
         snapshot(),
         mlx_gen_qwen_image_2_1::DEFAULT_STEPS,
-        vec![(2, 1024, 1024, Some(8)), (10, 512, 512, Some(2))],
+        vec![
+            EditCase {
+                references: 2,
+                width: 1024,
+                height: 1024,
+                steps: Some(8),
+                cache: PrefixKvCacheMode::Cached,
+            },
+            EditCase {
+                references: 10,
+                width: 512,
+                height: 512,
+                steps: Some(2),
+                cache: PrefixKvCacheMode::Prefill,
+            },
+        ],
+        false,
     );
 }
 
@@ -535,8 +713,28 @@ fn validation_render_reference_edit() {
 /// `qwen_image_2_1_turbo` id on the unmodified Turbo snapshot: the two-reference 1024x1024 case
 /// and the ten-reference boundary, **both with no step count on the request** — so each runs the
 /// snapshot's saved sigmas (eight on the pinned revision), asserted from the steps the sampler
-/// reported. The boundary case runs the full schedule here because the prefix KV cache makes only
-/// the first evaluation pay for the ~41k-token prefix. Finishes with the eleven-reference refusal.
+/// reported — and **both cached** (sc-25905): the ten-reference case is the epic's cached
+/// ten-reference render, paying for its ~41k-token prefix once instead of eight times. Finishes
+/// with the eleven-reference refusal.
+///
+/// Then the **forced-shed twin**: the two-reference case rendered again with the cache shed, and
+/// compared with the cached render — the epic's "one run forced to shed that produces the
+/// prefill output". The two paths are the same mathematics; the bar is a mean absolute pixel
+/// difference of at most 2 of 255 (the bar this crate's tiling parity uses), and the mean and
+/// maximum are printed. **That bar has never been run on released weights**: if the first real
+/// run exceeds it, the printed numbers are the finding.
+///
+/// **Budgets these renders expect** (derived; bf16 tier; transient above the Turbo checkpoint's
+/// 28.0 GiB resident set — printed on each `[kv]` line):
+///
+/// * two references, 1024², cached: 10.38 GiB shed + 5.30 GiB priced cache (~4.0 GiB held);
+/// * ten references, 512², cached: 10.38 GiB shed + 24.5 GiB priced cache (~20.0 GiB held for ten
+///   square-fitted references) — so about **58 GiB active at peak** (28.0 + ~10 + ~20), under a
+///   62.9 GiB memory limit. Size the RSS guard for it;
+/// * the two-reference twin, prefill: 10.38 GiB.
+///
+/// `QWEN_IMAGE_2_1_PREFIX_KV_CACHE=cached|prefill` forces one mode on every render, and then the
+/// twin is skipped (there is nothing to compare it with).
 ///
 /// ```sh
 /// MLX_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
@@ -556,51 +754,112 @@ fn validation_render_turbo_reference_edit() {
         mlx_gen_qwen_image_2_1::TURBO_MODEL_ID,
         root,
         saved,
-        vec![(2, 1024, 1024, None), (10, 512, 512, None)],
+        vec![
+            EditCase {
+                references: 2,
+                width: 1024,
+                height: 1024,
+                steps: None,
+                cache: PrefixKvCacheMode::Cached,
+            },
+            EditCase {
+                references: 10,
+                width: 512,
+                height: 512,
+                steps: None,
+                cache: PrefixKvCacheMode::Cached,
+            },
+        ],
+        true,
     );
 }
 
 /// The reference-edit smoke of engine `id` over the snapshot at `root`: one render per
-/// `(references, width, height, steps)` case — `steps: None` leaves the count to the generator,
-/// which must then run `default_steps` — then the eleven-reference refusal.
+/// [`EditCase`] — `steps: None` leaves the count to the generator, which must then run
+/// `default_steps` — then, with `forced_shed_twin`, the first cached case again with the cache
+/// shed, then the eleven-reference refusal.
 ///
-/// `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps,…"` replaces the cases (sc-24114's encode transient
-/// measurement: `2:2048x2048:2`); `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same `[mem]` phase
-/// lines as the T2I render. The reference encodes are lazy, so they materialize inside the first
+/// `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps[:cached|prefill],…"` replaces the cases (sc-24114's
+/// encode transient measurement: `2:2048x2048:2`; a case that names no mode runs **prefill**, the
+/// path that measurement was made on); `QWEN_IMAGE_2_1_PREFIX_KV_CACHE` forces one mode on every
+/// case and skips the twin; `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same `[mem]` phase lines
+/// as the T2I render. The reference encodes are lazy, so they materialize inside the first
 /// denoise step's eval: the phase that ends at `step 2 reported` is the one whose `peak_active`
-/// carries the encoder's transient.
+/// carries the encoder's transient — and, on a cached render, the prefix caches being built.
 fn reference_edit_renders(
     id: &str,
     root: PathBuf,
     default_steps: u32,
-    default_cases: Vec<(usize, u32, u32, Option<u32>)>,
+    default_cases: Vec<EditCase>,
+    forced_shed_twin: bool,
 ) {
-    let cases: Vec<(usize, u32, u32, Option<u32>)> =
-        match std::env::var("QWEN_IMAGE_2_1_EDIT_CASES") {
-            Ok(spec) => spec
-                .split(',')
-                .map(|case| {
-                    let mut parts = case.split(':');
-                    let count = parts.next().unwrap().parse().unwrap();
-                    let (w, h) = parts.next().unwrap().split_once('x').expect("WxH");
-                    let steps = parts.next().unwrap().parse().unwrap();
-                    (count, w.parse().unwrap(), h.parse().unwrap(), Some(steps))
-                })
-                .collect(),
-            Err(_) => default_cases,
-        };
-    reference_edit_renders_in(id, root, &out_dir(), default_steps, cases);
+    let mut cases: Vec<EditCase> = match std::env::var("QWEN_IMAGE_2_1_EDIT_CASES") {
+        Ok(spec) => spec
+            .split(',')
+            .map(|case| {
+                let mut parts = case.split(':');
+                let references = parts.next().unwrap().parse().unwrap();
+                let (w, h) = parts.next().unwrap().split_once('x').expect("WxH");
+                let steps = parts.next().unwrap().parse().unwrap();
+                let cache = match parts.next() {
+                    None | Some("prefill") => PrefixKvCacheMode::Prefill,
+                    Some("cached") => PrefixKvCacheMode::Cached,
+                    Some(other) => panic!("an edit case's mode is `cached` or `prefill`: {other}"),
+                };
+                EditCase {
+                    references,
+                    width: w.parse().unwrap(),
+                    height: h.parse().unwrap(),
+                    steps: Some(steps),
+                    cache,
+                }
+            })
+            .collect(),
+        Err(_) => default_cases,
+    };
+    let forced = prefix_kv_cache_override();
+    if let Some(mode) = forced {
+        for case in &mut cases {
+            case.cache = mode;
+        }
+    }
+    reference_edit_renders_in(
+        id,
+        root,
+        &out_dir(),
+        default_steps,
+        cases,
+        forced_shed_twin && forced.is_none(),
+    );
 }
 
+/// `(mean, max)` absolute difference of two RGB8 buffers, in 0..=255 levels.
+fn pixel_difference(a: &[u8], b: &[u8]) -> (f64, u8) {
+    assert_eq!(a.len(), b.len(), "the two renders are the same size");
+    let mut sum = 0_u64;
+    let mut max = 0_u8;
+    for (x, y) in a.iter().zip(b) {
+        let d = x.abs_diff(*y);
+        sum += u64::from(d);
+        max = max.max(d);
+    }
+    (sum as f64 / a.len() as f64, max)
+}
+
+/// The mean absolute pixel difference (of 255) a forced-shed twin may show against its cached
+/// render — this crate's tiling-parity bar. Not measured on released weights.
+const SHED_TWIN_MEAN_BAR: f64 = 2.0;
+
 /// [`reference_edit_renders`] over explicit cases into an explicit directory — the body, free of
-/// the `QWEN_IMAGE_2_1_EDIT_CASES` / `_RENDER_OUT` environment so the default-run dry run at the
-/// bottom of this file can drive it on the miniature fixture.
+/// the `QWEN_IMAGE_2_1_*` environment so the default-run dry run at the bottom of this file can
+/// drive it on the miniature fixture.
 fn reference_edit_renders_in(
     id: &str,
     root: PathBuf,
     out_dir: &std::path::Path,
     default_steps: u32,
-    cases: Vec<(usize, u32, u32, Option<u32>)>,
+    cases: Vec<EditCase>,
+    forced_shed_twin: bool,
 ) {
     use mlx_gen::gen_core::Conditioning;
 
@@ -613,51 +872,66 @@ fn reference_edit_renders_in(
 
     let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
     let footprint_max = footprint_sampler();
-    for (count, width, height, steps) in cases {
-        let refs = references(count, 768, 768);
-        let req = GenerationRequest {
-            prompt: "Combine the subjects of the reference images into one scene, evening light"
-                .to_owned(),
+    // One render of `case`, with the cache mode `cache` (the case's own, or the twin's).
+    let render = |case: EditCase, cache: PrefixKvCacheMode, suffix: &str| -> Vec<u8> {
+        let EditCase {
+            references: count,
             width,
             height,
             steps,
-            seed: Some(42),
-            conditioning: vec![Conditioning::MultiReference { images: refs }],
-            ..Default::default()
-        };
+            ..
+        } = case;
+        let req = selecting(
+            GenerationRequest {
+                prompt:
+                    "Combine the subjects of the reference images into one scene, evening light"
+                        .to_owned(),
+                width,
+                height,
+                steps,
+                seed: Some(42),
+                conditioning: vec![Conditioning::MultiReference {
+                    images: references(count, 768, 768),
+                }],
+                ..Default::default()
+            },
+            cache,
+        );
+        let label = format!("{count} refs {}", cache.label());
         if trace {
-            memory_line("before generate", &footprint_max);
+            memory_line(&format!("{label}: before generate"), &footprint_max);
         }
         let render_started = Instant::now();
-        let mut log = progress_logger(format!("{count} refs: "));
+        let mut log = progress_logger(format!("{label}: "));
         let mut reported_steps = Vec::new();
-        let out = generator
-            .generate(&req, &mut |p| {
-                log(p);
-                if let Progress::Step { current, total } = p {
-                    reported_steps.push((current, total));
-                }
-                if trace {
-                    memory_line(&format!("{count} refs: {p:?}"), &footprint_max);
-                }
-            })
-            .unwrap();
+        let out = render_reporting(generator.as_ref(), &req, cache, &label, &mut |p| {
+            log(p);
+            if let Progress::Step { current, total } = p {
+                reported_steps.push((current, total));
+            }
+            if trace {
+                memory_line(&format!("{label}: {p:?}"), &footprint_max);
+            }
+        });
         if trace {
-            memory_line("after decode (generate returned)", &footprint_max);
+            memory_line(
+                &format!("{label}: after decode (generate returned)"),
+                &footprint_max,
+            );
         }
-        let GenerationOutput::Images(images) = out else {
+        let GenerationOutput::Images(mut images) = out else {
             panic!("images expected");
         };
-        let image = &images[0];
+        let image = images.remove(0);
         assert_eq!((image.width, image.height), (width, height));
         let ran = steps.unwrap_or(default_steps);
         assert_eq!(
             reported_steps,
             every_step(ran),
-            "{count} refs: the requested step count, or the checkpoint's own — one event per step"
+            "{label}: the requested step count, or the checkpoint's own — one event per step"
         );
         let path = out_dir.join(format!(
-            "{id}_edit_{count}refs_{width}x{height}_{ran}steps_seed42.png"
+            "{id}_edit_{count}refs_{width}x{height}_{ran}steps_seed42{suffix}.png"
         ));
         image::save_buffer(
             &path,
@@ -672,7 +946,32 @@ fn reference_edit_renders_in(
             path.display(),
             render_started.elapsed().as_secs_f32()
         );
+        image.pixels
+    };
+
+    // The twin is rendered **immediately after** the cached render it is compared with, so no
+    // other request runs on the generator between the two sides of the comparison.
+    let mut twinned = !forced_shed_twin;
+    for case in cases {
+        let cached = render(case, case.cache, "");
+        if twinned || !case.cache.is_cached() {
+            continue;
+        }
+        twinned = true;
+        let shed = render(case, PrefixKvCacheMode::Prefill, "_prefill_twin");
+        let (mean, max) = pixel_difference(&shed, &cached);
+        eprintln!(
+            "[kv] forced-shed twin of the {}-reference case: mean |Δ| = {mean:.4}, max |Δ| = \
+             {max} (of 255) against its cached render; bar: mean <= {SHED_TWIN_MEAN_BAR}",
+            case.references
+        );
+        assert!(
+            mean <= SHED_TWIN_MEAN_BAR,
+            "the forced-shed render differs from the cached one by a mean of {mean:.4} levels \
+             (max {max}); the two paths are the same mathematics"
+        );
     }
+    assert!(twinned, "a forced-shed twin needs a cached case");
 
     let err = generator
         .validate(&GenerationRequest {
@@ -964,8 +1263,16 @@ fn transparency_renders(
 /// weights. (The transparency body is not dry-run: its alpha-histogram claim is about the released
 /// checkpoint and the miniature decode does not meet it.)
 ///
+/// It also drives the prefix-KV-cache switch of both bodies (sc-25905): every render states its
+/// mode and `render_reporting` asserts the generator's report names that path, the Turbo edit
+/// runs cached with its forced-shed twin, and the base test's cached-beside-prefill shape runs
+/// too.
+///
 /// *Mutations that red this:* the Turbo generator ignoring `req.steps` (the sweep then reports
-/// eight steps for every count, and renders identical pixels); a step event dropped or repeated.
+/// eight steps for every count, and renders identical pixels); a step event dropped or repeated;
+/// a body dropping its cache selection from the request (`render_reporting` refuses a request
+/// that does not state its mode, and a cached case then reports `prefill`); the twin rendering
+/// cached again (it asserts the `prefill` path).
 #[test]
 fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     let tmp = tempfile::tempdir().unwrap();
@@ -975,7 +1282,8 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     let id = mlx_gen_qwen_image_2_1::TURBO_MODEL_ID;
 
     let asked = [4, 6, 12, 16];
-    let reported = validation_render_at(id, root.clone(), &out, (64, 64), &asked.map(Some));
+    let cached = PrefixKvCacheMode::Cached;
+    let reported = validation_render_at(id, root.clone(), &out, (64, 64), &asked.map(Some), cached);
     assert_eq!(reported, asked);
     for steps in asked {
         assert!(out
@@ -984,22 +1292,57 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     }
     // No step count: the fixture's eight saved sigmas.
     assert_eq!(
-        validation_render_at(id, root.clone(), &out, (64, 64), &[None]),
+        validation_render_at(id, root.clone(), &out, (64, 64), &[None], cached),
         [8]
     );
-
-    reference_edit_renders_in(
-        id,
-        root,
-        &out,
-        8,
-        vec![(2, 64, 64, None), (10, 64, 64, None)],
+    // …and the same body with the cache shed, as the base renders run it.
+    assert_eq!(
+        validation_render_at(
+            id,
+            root.clone(),
+            &out,
+            (64, 64),
+            &[Some(5)],
+            PrefixKvCacheMode::Prefill
+        ),
+        [5]
     );
+
+    // The Turbo reference edit as the real-weight test runs it: two and ten references, both
+    // cached, then the two-reference forced-shed twin compared with its cached render.
+    let case = |references| EditCase {
+        references,
+        width: 64,
+        height: 64,
+        steps: None,
+        cache: cached,
+    };
+    reference_edit_renders_in(id, root.clone(), &out, 8, vec![case(2), case(10)], true);
     for count in [2, 10] {
         assert!(out
             .join(format!("{id}_edit_{count}refs_64x64_8steps_seed42.png"))
             .is_file());
     }
+    assert!(out
+        .join(format!(
+            "{id}_edit_2refs_64x64_8steps_seed42_prefill_twin.png"
+        ))
+        .is_file());
+    // …and the base test's shape: a cached case beside a prefill boundary, no twin.
+    reference_edit_renders_in(
+        id,
+        root,
+        &out,
+        8,
+        vec![
+            case(2),
+            EditCase {
+                cache: PrefixKvCacheMode::Prefill,
+                ..case(10)
+            },
+        ],
+        false,
+    );
 }
 
 /// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture.

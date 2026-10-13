@@ -651,30 +651,55 @@ default with no memory model behind it; here the cache is a **request selection*
 `GenerationMemory::prefix_kv_cache`, a typed execution domain declared on
 `Capabilities::execution` for both engine ids (`gen_core::execution_domains`) — and it is priced:
 
-* **What it costs.** K and V for all 32 blocks over the prefix (the prompt and every reference
-  image), at the compute dtype, once per prompt branch: `2 · 32 · prefix_tokens · 4096 · 2` bytes
-  in bf16, 0.5 MiB per prefix token. A 256-token prompt is 0.125 GiB; each reference (fitted to
-  1024², 4096 tokens) adds 2.0 GiB; ten references are 20.1 GiB; a negative branch doubles all of
-  it. No tier shrinks it — it is activations, not weights
-  (`memory_strategy::derived::prefix_kv_cache_bytes`).
-* **How a cached request is budgeted.** At its cache-shed budget plus those bytes plus the target
-  RoPE rows each cache keeps (`derived::prefix_kv_cache_demand_bytes`,
-  `derived::request_transient_budget_bytes_for`), which is what the generator installs as the
-  request's allocator bounds when it runs cached. The bound behind that: the extract evaluation's
-  peak is at most the prefill forward's peak plus the caches plus those RoPE rows, and every
-  later evaluation carries the target-only transient plus the caches, which is lower.
+* **What it costs.** K and V for all 32 blocks over the prefix (the prompt rows and every
+  reference image), at the width the DiT computes in, once per prompt branch:
+  `2 · 32 · prefix_tokens · 4096 · width`. **The width follows the tier, and the packed tiers are
+  the wide ones**: the bf16 tier computes in bf16 (0.5 MiB per prefix token); q8 and q4 compute in
+  **f32** (1 MiB per token), because `compute_dtype` follows `img_in`'s dense weight dtype and a
+  packed Linear has none (`memory_strategy::derived::dit_compute_width`; observed on the
+  miniature q8 / q4 tiers by `tests/kv_admission.rs`). Quantizing the weights does not shrink the
+  cache; it doubles it.
+* **What is priced: an upper bound.** The real prefix is known only after tokenizing and fitting,
+  so the surcharge (`derived::prefix_kv_cache_demand_bytes(tier, width, height, references,
+  negative)`) is over two published bounds that err high: 1024 text rows per branch
+  (`PREFIX_KV_CACHE_CONDITIONING_TOKENS` — chosen, not measured) and 4920 tokens per reference
+  (`PREFIX_KV_CACHE_REFERENCE_TOKENS` — the largest grid any aspect ratio fits to: 13120×96, 20%
+  above the square 4096; derived by search over the ratios the processor accepts). At bf16:
+  0.5 GiB with no reference, 2.40 GiB more per reference, 24.5 GiB at ten; at q8 / q4: 1.0, 4.80
+  and 49.0 GiB; doubled with a negative branch; plus the target RoPE rows each cache keeps.
+* **A cached render is held to that price.** With the real layouts in hand the generator computes
+  what the caches would hold (`memory_strategy::prefix_kv_cache_overflow`); a request past its
+  priced figure — a prompt branch over the text bound, or a checkpoint computing wider than its
+  tier is priced at — runs **prefill** instead: never cached above its price, never a failed
+  render. The report carries both byte counts (`PrefixKvCacheReport::overflow`) and a
+  `prefix_kv_cache_shed_over_priced_bound` warning.
+* **How a cached request is bounded.** Memory limit = resident + cache-shed transient + priced
+  cache; buffer-cache limit = the cache-shed transient alone (the caches are live arrays, not
+  pooled buffers) — `AllocatorBounds::enter_retaining`. The bound behind the pricing: the extract
+  evaluation's peak is at most the prefill forward's peak plus the caches plus their RoPE rows,
+  and every later evaluation carries the target-only transient plus the caches, which is lower.
 * **What does not move.** The cache-shed budget, the derived table and every floor are the
-  numbers published before the cache existed, to the byte, for both ids. A request that selects
+  numbers published before the cache existed, to the byte, for both ids (they keep 256 text rows
+  and 4096 tokens per reference; only the surcharge uses the bounds). A request that selects
   nothing runs the prefill path under that budget — the deliberate divergence from upstream's
   default, because a request admitted against a budget that never priced the cache must not run
   above it.
-* **Who decides.** The caller that owns the budget: `PrefixKvCacheMode::select(budget, shed,
-  cache)` answers `Cached` when both fit, `Prefill` when only the shed demand fits (the request
-  is admitted and runs without the cache), and `None` when neither does (the caller refuses as it
-  always did). Nothing shrinks an image, drops a reference or changes a tier.
+* **Who decides, and what the engine does not check.** The caller that owns the budget:
+  `PrefixKvCacheMode::select(budget, shed, cache)` answers `Cached` when both fit, `Prefill` when
+  only the shed demand fits (the request is admitted and runs without the cache), and `None` when
+  neither does (the caller refuses as it always did). Two things are the caller's alone. *Order:*
+  the request scope's `configure_request` replaces `GenerationRequest::memory` (with `None` for a
+  `Resident` selection), so the selection must be written **after** it, creating a block if there
+  is none — written before, it is lost and the render runs prefill in silence (pinned by
+  `a_selection_written_before_the_scope_configures_the_request_is_lost`). *Admission:* the engine
+  honours `Cached`; it does not verify the request was admitted against the cached demand.
 * **What ran.** `Generator::generate_with_report` → `GenerationReport::prefix_kv_cache`: the path
-  the denoise loop took (`cached` / `prefill`) and the bytes its caches held, written from the
-  loop's own `DenoiseReport`.
+  the denoise loop took (`cached` / `prefill`), the bytes its caches held, and `overflow` when a
+  cached selection was shed at the bound — written from the loop's own `DenoiseReport`.
+* **Approximations that remain.** The cache-shed budget still assumes 256 text rows and a square
+  4096-token reference (pre-existing; errs low for a long prompt or an extreme-aspect reference).
+  A request shed at the bound keeps the allocator bound installed for the cached figure (higher
+  than it needs, never lower).
 
 **Every cache figure above is derived — exact tensor arithmetic over the shapes the cache stores,
 held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The

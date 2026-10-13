@@ -621,14 +621,29 @@ impl QwenImage21 {
         #[cfg(test)]
         let resident_bytes =
             resident_bytes.saturating_add(crate::q4_diagnostic::resident_surcharge());
-        // sc-25905: the prefix KV cache is a request selection, and the budget installed is the
-        // budget of the mode about to run — the cache-shed figure for a prefill render, that plus
-        // the derived cache bytes for a cached one. Never a cached render under a prefill budget.
+        // sc-25905: the prefix KV cache is a request selection, and the bound installed is the
+        // bound of the mode selected — the cache-shed transient for a prefill render, and for a
+        // cached one the same transient plus the priced cache bytes as *retained* memory (live
+        // arrays the request holds, so they raise the memory limit and leave the buffer-cache
+        // limit alone). Never a cached render under a prefill bound.
         let kv_cache = crate::memory_strategy::prefix_kv_cache_for(req);
-        let _bounds = crate::memory_strategy::AllocatorBounds::enter(
+        let tier = crate::quant::Tier::from_selected(self.spec.quantize)
+            .unwrap_or(crate::quant::Tier::Bf16);
+        let priced_cache_bytes = match kv_cache {
+            PrefixKvCacheMode::Cached => {
+                crate::memory_strategy::derived::prefix_kv_cache_demand_bytes(
+                    tier,
+                    req.width,
+                    req.height,
+                    req.memory_reference_count(),
+                    params.use_negative,
+                )
+            }
+            PrefixKvCacheMode::Prefill => 0,
+        };
+        let _bounds = crate::memory_strategy::AllocatorBounds::enter_retaining(
             resident_bytes,
-            crate::memory_strategy::derived::request_transient_budget_bytes_for(
-                kv_cache,
+            crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
                 req.height,
                 crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
@@ -639,6 +654,7 @@ impl QwenImage21 {
                     .and_then(|t| t.spatial)
                     .map(|s| s.tile_px as u32),
             ),
+            priced_cache_bytes,
         );
         let drop = self.drop_count;
         // Staged residency is a per-request execution decision (sc-24114): the shared worker
@@ -649,6 +665,7 @@ impl QwenImage21 {
         let stage_residency = stage_residency_for(&self.spec, req);
         // What the denoise loops did, written as they run (one report per image; they agree).
         let mut ran: Option<PrefixKvCacheReport> = None;
+        let mut warnings = Vec::new();
         let output = self.residency.run_request_scoped(
             stage_residency,
             false,
@@ -678,6 +695,44 @@ impl QwenImage21 {
                         self.variant.id()
                     )));
                 }
+                // sc-25905: a cached render is held to what it was priced at. The real prefix is
+                // known only now (tokenized prompt rows, fitted reference grids), so the caches
+                // this request would hold are computed from the real layouts at the model's own
+                // compute dtype and compared with the priced figure — the same arithmetic over
+                // the published bounds at the tier's width. Past it, the request runs prefill:
+                // never cached above its price, never a failed render.
+                let overflow = if kv_cache.is_cached() {
+                    let mut prefixes = vec![pos.layout.prefix_len() as u64];
+                    prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
+                    crate::memory_strategy::prefix_kv_cache_overflow(
+                        heavy.transformer.config(),
+                        heavy.transformer.compute_dtype(),
+                        tier,
+                        &prefixes,
+                        req.memory_reference_count(),
+                        crate::memory_strategy::derived::image_tokens(req.width, req.height),
+                    )?
+                } else {
+                    None
+                };
+                if let Some(overflow) = overflow {
+                    warnings.push(gen_core::GenerationWarning {
+                        code: crate::memory_strategy::PREFIX_KV_CACHE_OVERFLOW_WARNING.to_owned(),
+                        message: format!(
+                            "{}: prefix_kv_cache=cached was selected, but this request's caches \
+                             would hold {} bytes against the {} bytes priced for it (the prompt \
+                             or a reference exceeds the priced prefix bound); rendering prefill",
+                            self.variant.id(),
+                            overflow.actual_bytes,
+                            overflow.priced_bytes
+                        ),
+                    });
+                }
+                let loop_mode = if kv_cache.is_cached() && overflow.is_none() {
+                    KvCacheMode::On
+                } else {
+                    KvCacheMode::Off
+                };
                 // The condition latents: both branches share one reference encode.
                 let reference_latents = encode_references(&heavy.vae, &references)?;
                 let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
@@ -717,10 +772,7 @@ impl QwenImage21 {
                             }),
                             // The one switch (sc-25903), driven by the request's selection
                             // (sc-25905): `Off` is the prefill path, byte-for-byte.
-                            kv_cache: match kv_cache {
-                                PrefixKvCacheMode::Cached => KvCacheMode::On,
-                                PrefixKvCacheMode::Prefill => KvCacheMode::Off,
-                            },
+                            kv_cache: loop_mode,
                         },
                         &mut report,
                         on_progress,
@@ -731,6 +783,7 @@ impl QwenImage21 {
                             KvCachePath::Prefill => PrefixKvCacheMode::Prefill,
                         },
                         cache_bytes: report.kv_cache_bytes as u64,
+                        overflow,
                     });
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
@@ -773,7 +826,7 @@ impl QwenImage21 {
         Ok(GenerationReport {
             output: Some(output),
             artifacts: None,
-            warnings: Vec::new(),
+            warnings,
             prefix_kv_cache: ran,
         })
     }

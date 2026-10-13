@@ -618,6 +618,7 @@ impl QwenImage21 {
         let kv_cache = memory_strategy::prefix_kv_cache_for(req);
         // What the denoise loops did, written as they run (one report per image; they agree).
         let mut ran: Option<gen_core::PrefixKvCacheReport> = None;
+        let mut warnings = Vec::new();
         let output = self.residency.run_request_scoped(
             stage_residency,
             false,
@@ -650,6 +651,42 @@ impl QwenImage21 {
                         self.descriptor.id
                     )));
                 }
+                // sc-25905: a cached render is held to what it was priced at. The real prefix is
+                // known only now (tokenized prompt rows, fitted reference grids), so the caches
+                // this request would hold are computed from the real layouts at the model's own
+                // compute dtype and compared with the priced figure — the same arithmetic over
+                // the published bounds at the build's priced width. Past it, the request runs
+                // prefill: never cached above its price, never a failed render.
+                let overflow = if kv_cache.is_cached() {
+                    let mut prefixes = vec![pos.layout.prefix_len() as u64];
+                    prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
+                    memory_strategy::prefix_kv_cache_overflow(
+                        heavy.transformer.config(),
+                        heavy.transformer.compute_dtype(),
+                        &prefixes,
+                        req.memory_reference_count(),
+                        memory_strategy::image_tokens(req.width, req.height),
+                    )
+                } else {
+                    None
+                };
+                if let Some(overflow) = overflow {
+                    warnings.push(gen_core::GenerationWarning {
+                        code: memory_strategy::PREFIX_KV_CACHE_OVERFLOW_WARNING.to_owned(),
+                        message: format!(
+                            "{}: prefix_kv_cache=cached was selected, but this request's caches \
+                             would hold {} bytes against the {} bytes priced for it (the prompt \
+                             or a reference exceeds the priced prefix bound, or the generator \
+                             runs on a wider device than was priced); rendering prefill",
+                            self.descriptor.id, overflow.actual_bytes, overflow.priced_bytes
+                        ),
+                    });
+                }
+                let loop_mode = if kv_cache.is_cached() && overflow.is_none() {
+                    KvCacheMode::On
+                } else {
+                    KvCacheMode::Off
+                };
                 // The condition latents: both branches share one reference encode, but a
                 // different prompt is a different text length, hence two layouts.
                 let reference_latents =
@@ -687,10 +724,7 @@ impl QwenImage21 {
                             }),
                             // The one switch (sc-25904), driven by the request's selection
                             // (sc-25905): `Off` is the prefill path, byte-for-byte.
-                            kv_cache: match kv_cache {
-                                gen_core::PrefixKvCacheMode::Cached => KvCacheMode::On,
-                                gen_core::PrefixKvCacheMode::Prefill => KvCacheMode::Off,
-                            },
+                            kv_cache: loop_mode,
                         },
                         &mut report,
                         on_progress,
@@ -701,6 +735,7 @@ impl QwenImage21 {
                             KvCachePath::Prefill => gen_core::PrefixKvCacheMode::Prefill,
                         },
                         cache_bytes: report.kv_cache_bytes as u64,
+                        overflow,
                     });
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
@@ -736,7 +771,7 @@ impl QwenImage21 {
         Ok(gen_core::GenerationReport {
             output: Some(output),
             artifacts: None,
-            warnings: Vec::new(),
+            warnings,
             prefix_kv_cache: ran,
         })
     }

@@ -289,11 +289,13 @@ pub struct ReferenceConditioning<'a> {
 /// prompt branch ([`PrefixKvCache::nbytes`]) for the length of the denoise loop, and in exchange
 /// every model evaluation after the first runs the blocks over the target tokens only instead of
 /// the whole joint sequence. Shedding it ([`Self::Off`]) is exactly the prefill path, unchanged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// There is deliberately **no `Default`**: the cache holds gigabytes nothing prices unless a
+/// caller asked for it (sc-25905), so every call site states the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvCacheMode {
     /// Prefill once, decode from the cache afterwards (wherever the model allows it — see
     /// [`KvCachePath`]).
-    #[default]
     On,
     /// Evaluate the full block-causal joint sequence at every model evaluation.
     Off,
