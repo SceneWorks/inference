@@ -494,6 +494,27 @@ No trainer (`TRAINER_ID` stays base-only). Reference conditioning, RGBA output a
 advertised because the descriptor is the base descriptor under a second id and the code path is
 shared; none of them has been run on real Turbo weights by this story.
 
+### Installable tiers of the Turbo checkpoint (sc-25906)
+
+The Turbo checkpoint tiers exactly as the base one does (*Installable tiers* above): candle loads
+the q8/q4 trees the MLX converter writes, and that converter reads which checkpoint it is
+re-packing off the source snapshot, so a Turbo tier still carries `model_index.json` with its
+`sample_sigmas`, the static scheduler config and the bf16 VAE, byte for byte. Consequences here,
+all inherited rather than added — `tests/turbo_tiers.rs` holds each one:
+
+* a Turbo q8/q4 tier loads under `qwen_image_2_1_turbo` with the matching `quantize` selector and
+  renders over the sigmas **its own** `model_index.json` saves;
+* each id refuses the other checkpoint's tier with the typed refusal its dense snapshot gets
+  (`loader::check_snapshot_variant`), through `load` and through the memory registration, before
+  the tier/request rule is consulted;
+* the tier/request rules are `quant::resolve_requested_tier`'s, unchanged: a **dense** Turbo
+  snapshot with a Q4/Q8 request is the same typed "no on-the-fly quantization" refusal the base id
+  raises (the MLX twin quantizes a dense snapshot at load instead — on both ids);
+* the contract prices the bf16 VAE at `memory_strategy::compute_width()`, the width candle holds
+  it at (f32 on the CPU lane, bf16 on a GPU lane), so the Turbo and base checkpoints price alike
+  on this backend — unlike MLX, which holds the VAE at its on-disk dtype — under the Turbo id's
+  own `TURBO_MEMORY_CALIBRATION_FINGERPRINT`. Nothing here is measured.
+
 ## Prefix KV cache (sc-25904)
 
 Upstream's `use_kv_cache=True` default is ported, as on the MLX twin (sc-25903) and with the same
