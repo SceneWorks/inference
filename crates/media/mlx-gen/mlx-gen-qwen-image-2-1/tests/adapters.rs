@@ -93,7 +93,7 @@ const RANK: usize = 4;
 /// A diffusers/peft LoRA (`transformer.` namespace — the SceneWorks trainer's export) over
 /// `targets`, shaped from the host. A target the host does not have (a deliberately unmatched key)
 /// is written `[32, 32]` — its shape is never read, the install refuses it by name first.
-fn peft_lora(
+pub(crate) fn peft_lora(
     dir: &Path,
     name: &str,
     host: &mut QwenImage21Transformer,
@@ -145,7 +145,12 @@ fn kohya_lora(
 
 /// A SceneWorks/peft LoKr (`networkType=lokr`, full Kronecker factors, `alpha == rank` ⇒ scale 1)
 /// over `targets`: `w1 [2, 2] ⊗ w2 [out/2, in/2]` reconstructs the `[out, in]` delta.
-fn peft_lokr(dir: &Path, host: &mut QwenImage21Transformer, targets: &[&str], amp: f32) -> PathBuf {
+pub(crate) fn peft_lokr(
+    dir: &Path,
+    host: &mut QwenImage21Transformer,
+    targets: &[&str],
+    amp: f32,
+) -> PathBuf {
     let mut entries = Vec::new();
     for target in targets {
         let (out, inp) = base_shape(host, target);
@@ -166,11 +171,11 @@ fn peft_lokr(dir: &Path, host: &mut QwenImage21Transformer, targets: &[&str], am
     path
 }
 
-fn lora(path: &Path, scale: f32) -> AdapterSpec {
+pub(crate) fn lora(path: &Path, scale: f32) -> AdapterSpec {
     AdapterSpec::new(path.to_path_buf(), scale, AdapterKind::Lora)
 }
 
-fn lokr(path: &Path, scale: f32) -> AdapterSpec {
+pub(crate) fn lokr(path: &Path, scale: f32) -> AdapterSpec {
     AdapterSpec::new(path.to_path_buf(), scale, AdapterKind::Lokr)
 }
 
@@ -191,7 +196,7 @@ fn velocity(model: &QwenImage21Transformer) -> Array {
     out
 }
 
-fn dense() -> QwenImage21Transformer {
+pub(crate) fn dense() -> QwenImage21Transformer {
     load_transformer(&tiny_snapshot()).expect("the tiny DiT loads")
 }
 
@@ -498,7 +503,7 @@ fn t2i(edge: u32) -> GenerationRequest {
 /// A large-amplitude LoRA over a block target and the output projection, so the change survives
 /// the VAE decode and u8 quantization of a 2-step miniature render. `transformer_blocks.0.img_mlp.out`
 /// is 64 wide, so it is one of the Linears the converted Q4 tier actually packs.
-fn render_lora(dir: &Path) -> PathBuf {
+pub(crate) fn render_lora(dir: &Path) -> PathBuf {
     let mut probe = dense();
     peft_lora(
         dir,
