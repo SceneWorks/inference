@@ -69,14 +69,14 @@ impl Collector {
             .filter(|(at, _)| *at >= started && *at <= ended)
             .count();
         samples.retain(|(at, _)| *at >= ended);
-        self.steps.push(serde_json::json!({
-            "index": index,
-            "wallNs": u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
-            "hostProcessRssSampleBytes": host,
-            "hostWindowSampleMaxBytes": window_max,
-            "hostWindowSampleCount": window_count,
-            "device": device,
-        }));
+        self.steps.push(step_value(
+            index,
+            elapsed,
+            host,
+            window_max,
+            window_count,
+            device,
+        ));
     }
 
     pub fn finish(mut self, backend: &str) -> serde_json::Value {
@@ -99,6 +99,24 @@ impl Collector {
             "steps": std::mem::take(&mut self.steps),
         })
     }
+}
+
+fn step_value(
+    index: usize,
+    elapsed: Duration,
+    host: Option<u64>,
+    window_max: Option<u64>,
+    window_count: usize,
+    device: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "wallNs": u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        "hostProcessRssSampleBytes": host,
+        "hostWindowSampleMaxBytes": window_max,
+        "hostWindowSampleCount": window_count,
+        "device": device,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -148,6 +166,27 @@ mod tests {
 
     #[test]
     fn completed_steps_keep_injected_wall_time_and_nullable_device_counters() {
+        // Pure serialization of an injected duration: no machine clock is sampled here.
+        let first = step_value(
+            1,
+            Duration::from_nanos(7),
+            Some(11),
+            Some(13),
+            2,
+            serde_json::json!({"usedBytes": null}),
+        );
+        let first_expected = serde_json::json!({"index": 1, "wallNs": 7, "hostProcessRssSampleBytes": 11, "hostWindowSampleMaxBytes": 13, "hostWindowSampleCount": 2, "device": {"usedBytes": null}});
+        assert_eq!(first, first_expected);
+        let second = step_value(
+            2,
+            Duration::from_nanos(13),
+            None,
+            None,
+            0,
+            serde_json::json!({"usedBytes": 23}),
+        );
+        let second_expected = serde_json::json!({"index": 2, "wallNs": 13, "hostProcessRssSampleBytes": null, "hostWindowSampleMaxBytes": null, "hostWindowSampleCount": 0, "device": {"usedBytes": 23}});
+        assert_eq!(second, second_expected);
         let mut probe = Collector::default();
         probe.record(
             1,
@@ -161,8 +200,6 @@ mod tests {
         );
         let value = probe.finish("fake");
         assert_eq!(value["steps"][0]["index"], 1);
-        assert_eq!(value["steps"][0]["wallNs"], 7);
-        assert_eq!(value["steps"][1]["wallNs"], 13);
         assert!(value["steps"][0]["device"]["usedBytes"].is_null());
         assert_eq!(value["steps"][1]["device"]["usedBytes"], 23);
         assert_eq!(

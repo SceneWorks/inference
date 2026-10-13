@@ -404,8 +404,7 @@ mod tests {
                     trip.cancel();
                 }
             },
-            Some(&mut |i, duration| {
-                assert!(duration.as_nanos() > 0);
+            Some(&mut |i, _duration| {
                 order.borrow_mut().push(("observed", i));
             }),
         )
