@@ -388,6 +388,9 @@ There is no per-component promotion, no `component_precision_floors` declaration
 | `text_encoder/` `lm_head`, `model.visual.*` | dense, **not loaded** by this route | dense | dense |
 | `vae/` (338 M) | dense f32 | dense f32 | dense f32 |
 
+(The distilled Turbo checkpoint's `vae/` ships bf16 and rides through at bf16 — see *Installable
+tiers of the Turbo checkpoint* below.)
+
 Three decisions, each deliberate:
 
 * **The text encoder is packed**, unlike the 2512 `mlx-gen-qwen-image` crate. 2512 pairs a ~20 B DiT
@@ -528,6 +531,48 @@ prompt with a scale above 1 still runs the second forward.
   schedule, not a re-spacing of it. The `sampler` axis integrates whichever schedule was chosen.
 * One step is accepted (`[σ₀, 0]`); the base id's `steps >= 2` floor exists only because its
   terminal stretch divides by zero there.
+
+### Installable tiers of the Turbo checkpoint (sc-25906)
+
+The same converter, with no variant flag: `convert::prequantize_turnkey` reads which checkpoint
+its **source snapshot** is (`convert::source_variant`) from the two signals the loader refuses the
+wrong engine id on — `model_index.json` saving `sample_sigmas`, under a static-shift scheduler
+config — and a source that is neither checkpoint is the loader's own typed refusal, raised before
+anything is written. A Turbo q8/q4 tier is the *Installable tiers* layout above with these
+differences, all inherited from the snapshot rather than decided by the converter:
+
+| in the tier | Turbo | base |
+|---|---|---|
+| `model_index.json` | byte-for-byte copy, `sample_sigmas` included | byte-for-byte copy |
+| `scheduler/scheduler_config.json` | byte-for-byte copy (static identity shift) | byte-for-byte copy (dynamic shift) |
+| `vae/` | byte-for-byte copy, **bf16** | byte-for-byte copy, f32 |
+| `text_encoder/model.safetensors` | packed from upstream's one file | packed from upstream's four shards |
+| `CHANGES.md` | names `Qwen/Qwen-Image-2.1-Turbo` at its pinned revision, and that the tier loads as `qwen_image_2_1_turbo` | names `Qwen/Qwen-Image-2.1` at its pinned revision — wording unchanged by this story |
+
+Because the schedule signals ride in files a tier copies verbatim, a tier is the same checkpoint as
+its source: a Turbo tier is refused under `qwen_image_2_1` and a base tier under
+`qwen_image_2_1_turbo` with exactly the typed refusals the dense snapshots get, through `load` and
+through the memory registration. The tier/request rules (`quant::needs_load_time_quant`) are the
+base checkpoint's, unchanged, and the bf16 tier is still refused rather than copied.
+
+**Derived memory — nothing here is measured.** `memory_strategy::derived`'s `*_for(variant, …)`
+functions price the Turbo checkpoint; the un-suffixed ones remain the base checkpoint's. The two
+differ only where the bf16 autoencoder does: its resident bytes (675 480 808 against
+1 350 961 616), and the decode head's attention matrices, which run on the bf16 stream. The
+full-resolution tail's pipelined maps are not re-priced, because every `ChannelNorm` widens to f32.
+
+| Turbo, derived | bf16 | q8 | q4 |
+|---|---|---|---|
+| tower (same as base) | 14.10 GiB | 8.03 GiB | 4.80 GiB |
+| DiT (same as base) | 13.25 GiB | 7.04 GiB | 3.73 GiB |
+| VAE (bf16) | 0.63 GiB | 0.63 GiB | 0.63 GiB |
+| resident total | 27.98 GiB | 15.70 GiB | 9.15 GiB |
+| staged floor `max(tower, DiT + VAE)` — the **tower** binds | 14.10 GiB | 8.03 GiB | 4.80 GiB |
+| default-path peak at the largest-area preset | 31.56 GiB | 19.28 GiB | 12.74 GiB |
+| tier tree weight files (`derived::tier_tree_bytes`) | 30.21 GiB | 17.94 GiB | 11.39 GiB |
+
+The Turbo id carries its own calibration identity,
+`memory_strategy::TURBO_MEMORY_CALIBRATION_FINGERPRINT`, and registers no activation anchor.
 
 ## Prefix KV cache (sc-25903)
 

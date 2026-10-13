@@ -29,6 +29,12 @@
 //! resampled when a request names another step count ([`scheduler::resample_saved_sigmas`]). Each
 //! id refuses the other checkpoint's snapshot by name. The trainer is base-only.
 //!
+//! Both checkpoints tier the same way (sc-25906): [`prequantize_turnkey`] reads which one its
+//! source snapshot is ([`convert::source_variant`]) and writes a q8/q4 tree that is still that
+//! checkpoint, so each id refuses the other's tiers exactly as it refuses the other's dense
+//! snapshot. The Turbo id has its own derived memory rows ([`memory_strategy::derived`]'s
+//! `*_for(variant, …)` functions) and its own calibration identity.
+//!
 //! ## What ships in this story
 //!
 //! Text-to-image at the seven upstream presets (any 32-px-multiple size in range), steps, seed,
