@@ -439,3 +439,50 @@ fn turbo_honours_the_curated_scheduler_and_sampler_axes() {
     assert_eq!(steps.last(), Some(&(8, 8)));
     assert_ne!(heun, native);
 }
+
+/// A `model_index.json` that is present but does not parse is refused under BOTH ids, each under
+/// its own label (sc-25902; the candle twin's test of the same name): the Turbo id cannot read its
+/// schedule from it, and the base id cannot show the snapshot is not a Turbo one. The Turbo
+/// scheduler config, corrupt, is reported under the Turbo id too, and a snapshot with no
+/// `model_index.json` at all is an ordinary base snapshot.
+///
+/// *Mutation that reds this:* labelling the parse failure with the base id whichever reader asked
+/// (`load_saved_sigma_schedule` going through `load_model_index`).
+#[test]
+fn an_unparsable_model_index_is_refused_under_the_id_that_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt = turbo_snapshot(tmp.path());
+    std::fs::write(corrupt.join("model_index.json"), "{ not json").unwrap();
+    for (id, label) in [
+        (TURBO, "qwen_image_2_1_turbo: model_index.json: "),
+        (BASE, "qwen_image_2_1: model_index.json: "),
+    ] {
+        let message = match load(id, &corrupt, OffloadPolicy::Resident) {
+            Ok(_) => panic!("{id} must refuse an unparsable model_index.json"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.starts_with(label), "{id}: {message}");
+    }
+    // The public reader is the base id's and keeps its label.
+    let message = mlx_gen_qwen_image_2_1::load_model_index(&corrupt)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.starts_with("qwen_image_2_1: model_index.json: "),
+        "{message}"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let bad_scheduler = turbo_snapshot(other.path());
+    std::fs::write(bad_scheduler.join("scheduler/scheduler_config.json"), "[").unwrap();
+    let message = mlx_gen_qwen_image_2_1::load_saved_sigma_schedule(&bad_scheduler)
+        .unwrap_err()
+        .to_string();
+    assert!(message.starts_with("qwen_image_2_1_turbo: "), "{message}");
+
+    // No model_index.json at all: nothing claims a saved schedule, so the base id loads it.
+    let bare = tmp.path().join("bare");
+    mlx_gen::quant::copy_dir(&tiny_snapshot(), &bare).unwrap();
+    std::fs::remove_file(bare.join("model_index.json")).unwrap();
+    assert!(load(BASE, &bare, OffloadPolicy::Resident).is_ok());
+}

@@ -28,10 +28,13 @@
 //! `QWEN_IMAGE_2_1_RENDER_SIZE=WxH` and `QWEN_IMAGE_2_1_RENDER_STEPS=N` override the preset for a
 //! quicker smoke.
 //!
-//! The one `turbo_`-prefixed test (sc-25901) is the Turbo twin of the default-preset render. It
-//! reads `CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT` instead and is run by its own dispatch-only
-//! profile, `qwen-image-2-1-turbo`, which provisions `Qwen/Qwen-Image-2.1-Turbo`; the
-//! `qwen-image-2-1` profile above runs every test here that is **not** `turbo_`-prefixed.
+//! The `turbo_`-prefixed tests (sc-25901, sc-25902) are the Turbo twins: the default-preset
+//! render, the reference edit, the transparency smoke, and a step sweep. They read
+//! `CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT` instead — and nothing of the base snapshot — and are
+//! run by their own dispatch-only profile, `qwen-image-2-1-turbo`, which provisions
+//! `Qwen/Qwen-Image-2.1-Turbo`; the `qwen-image-2-1` profile above runs every test here that is
+//! **not** `turbo_`-prefixed. The prefix is what partitions the two lanes
+//! (`scripts/tests/test_ci_workflow_policy.py`), so a Turbo test must carry it.
 
 #![cfg(any(feature = "cuda", feature = "metal"))]
 
@@ -182,6 +185,60 @@ fn validation_render_default_preset() {
     );
 }
 
+/// Reject a render that is not a picture: a constant or near-constant RGB8 buffer (a black, white
+/// or flat-grey frame). The floor is deliberately low — sixteen luma levels of spread and more
+/// than sixteen distinct byte values — so it cannot reject a legitimately dark or soft image, only
+/// a degenerate one. ([`assert_not_band_corrupted`] catches the opposite failure, noise.)
+fn assert_not_degenerate(label: &str, pixels: &[u8]) {
+    let luma = |px: &[u8]| {
+        (299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2])) / 1000
+    };
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    let mut seen = [false; 256];
+    for px in pixels.chunks_exact(3) {
+        let l = luma(px);
+        lo = lo.min(l);
+        hi = hi.max(l);
+        for byte in px {
+            seen[usize::from(*byte)] = true;
+        }
+    }
+    let distinct = seen.iter().filter(|s| **s).count();
+    eprintln!("{label}: luma range [{lo}, {hi}], {distinct} distinct byte values");
+    assert!(
+        hi >= lo + 16 && distinct > 16,
+        "{label}: the render is a near-constant field (luma [{lo}, {hi}], {distinct} distinct \
+         byte values), not a picture"
+    );
+}
+
+/// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture. Not
+/// ignored and device-free: it is the one part of the Turbo step sweep that can be exercised
+/// without the released weights.
+#[test]
+fn the_degenerate_render_check_rejects_a_flat_frame_only() {
+    let flat = vec![7u8; 64 * 64 * 3];
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("flat", &flat)).is_err());
+    // Two byte values only: spread without content.
+    let two: Vec<u8> = (0..64 * 64 * 3)
+        .map(|i| if (i / 3) % 2 == 0 { 0 } else { 255 })
+        .collect();
+    assert!(std::panic::catch_unwind(|| assert_not_degenerate("two-valued", &two)).is_err());
+    // A dim ramp: 24 luma levels of spread, 24 distinct values.
+    let dim: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| [(i % 24) as u8 + 10; 3])
+        .collect();
+    assert_not_degenerate("dim ramp", &dim);
+}
+
+fn out_dir() -> PathBuf {
+    let dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn turbo_snapshot() -> PathBuf {
     let p = std::env::var("CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT").unwrap_or_else(|_| {
         panic!("set CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT to the pinned Qwen/Qwen-Image-2.1-Turbo snapshot dir; inference never self-fetches (epic 13657)")
@@ -212,6 +269,45 @@ fn turbo_snapshot() -> PathBuf {
 #[test]
 #[ignore]
 fn turbo_validation_render_default_preset() {
+    // Unset by default: the count then comes from the snapshot, which is the claim.
+    let steps: Option<u32> = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
+        .ok()
+        .map(|s| s.parse().unwrap());
+    turbo_validation_renders(&[steps]);
+}
+
+/// The Turbo **step sweep** (sc-25902): the default 1:1 2048×2048 preset, the prompt and seed of
+/// [`turbo_validation_render_default_preset`], rendered at 4, 6, 12 and 16 steps — the resampled
+/// saved schedule on both sides of the checkpoint's own eight — from one loaded generator, one PNG
+/// per step count (`qwen_image_2_1_turbo_candle_2048x2048_<N>steps_seed42.png`). It asserts that
+/// every count ran as asked and that no render is band-corrupted; the PNGs are what the epic's
+/// terminal story reads to choose the manifest's minimum step count.
+/// `QWEN_IMAGE_2_1_SWEEP_STEPS=4,6,12,16` names other counts; `QWEN_IMAGE_2_1_RENDER_SIZE` applies.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation-sc-25902 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_render_step_sweep \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_render_step_sweep() {
+    let steps: Vec<Option<u32>> = match std::env::var("QWEN_IMAGE_2_1_SWEEP_STEPS") {
+        Ok(list) => list
+            .split(',')
+            .map(|steps| Some(steps.trim().parse().expect("a step count")))
+            .collect(),
+        Err(_) => vec![Some(4), Some(6), Some(12), Some(16)],
+    };
+    turbo_validation_renders(&steps);
+}
+
+/// One default-preset Turbo render per entry of `steps`, all from one loaded generator; a `None`
+/// entry leaves the step count to the snapshot's saved sigmas. Each asserts the step total the
+/// sampler reported.
+fn turbo_validation_renders(steps: &[Option<u32>]) {
     let root = turbo_snapshot();
     let (mut width, mut height) = (PRESETS[0].width, PRESETS[0].height);
     if let Ok(size) = std::env::var("QWEN_IMAGE_2_1_RENDER_SIZE") {
@@ -219,14 +315,7 @@ fn turbo_validation_render_default_preset() {
         width = w.parse().unwrap();
         height = h.parse().unwrap();
     }
-    // Unset by default: the count then comes from the snapshot, which is the claim.
-    let steps: Option<u32> = std::env::var("QWEN_IMAGE_2_1_RENDER_STEPS")
-        .ok()
-        .map(|s| s.parse().unwrap());
-    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    std::fs::create_dir_all(&out_dir).unwrap();
+    let out_dir = out_dir();
 
     let saved = candle_gen_qwen_image_2_1::load_turbo_schedule(&root).unwrap();
     eprintln!("snapshot sample_sigmas: {:?}", saved.sample_sigmas);
@@ -246,56 +335,78 @@ fn turbo_validation_render_default_preset() {
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
-    let req = GenerationRequest {
-        prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
-            .to_owned(),
-        width,
-        height,
-        steps,
-        seed: Some(42),
-        ..Default::default()
-    };
-    let render_started = Instant::now();
-    let mut totals = Vec::new();
-    let out = generator
-        .generate(&req, &mut |p| {
-            if let Progress::Step { current, total } = p {
-                totals.push(total);
-                eprintln!(
-                    "step {current}/{total} ({:.1}s)",
-                    render_started.elapsed().as_secs_f32()
-                );
-            } else {
-                eprintln!("{p:?} ({:.1}s)", render_started.elapsed().as_secs_f32());
-            }
-        })
-        .unwrap();
-    let ran = steps.unwrap_or(saved.default_steps() as u32);
-    assert_eq!(totals, vec![ran; ran as usize], "one step per saved sigma");
-    let GenerationOutput::Images(images) = out else {
-        panic!("images expected");
-    };
-    let image = &images[0];
-    assert_eq!((image.width, image.height), (width, height));
-    assert_eq!(image.pixels.len(), (width as usize) * (height as usize) * 3);
-    let path = out_dir.join(format!(
-        "qwen_image_2_1_turbo_candle_{width}x{height}_{ran}steps_seed42.rgb"
-    ));
-    std::fs::write(&path, &image.pixels).unwrap();
-    save_png(
-        &path.with_extension("png"),
-        &image.pixels,
-        width,
-        height,
-        image::ColorType::Rgb8,
-    );
-    assert_not_band_corrupted("turbo_default_preset", &image.pixels, width, height);
-    eprintln!(
-        "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
-        path.display(),
-        started.elapsed().as_secs_f32(),
-        render_started.elapsed().as_secs_f32()
-    );
+    let mut renders: Vec<(u32, Vec<u8>)> = Vec::with_capacity(steps.len());
+    for steps in steps {
+        let req = GenerationRequest {
+            prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
+                .to_owned(),
+            width,
+            height,
+            steps: *steps,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let render_started = Instant::now();
+        let mut totals = Vec::new();
+        let out = generator
+            .generate(&req, &mut |p| {
+                if let Progress::Step { current, total } = p {
+                    totals.push(total);
+                    eprintln!(
+                        "step {current}/{total} ({:.1}s)",
+                        render_started.elapsed().as_secs_f32()
+                    );
+                } else {
+                    eprintln!("{p:?} ({:.1}s)", render_started.elapsed().as_secs_f32());
+                }
+            })
+            .unwrap();
+        let ran = steps.unwrap_or(saved.default_steps() as u32);
+        assert_eq!(
+            totals,
+            vec![ran; ran as usize],
+            "the requested step count, or one step per saved sigma"
+        );
+        let GenerationOutput::Images(images) = out else {
+            panic!("images expected");
+        };
+        let image = &images[0];
+        assert_eq!((image.width, image.height), (width, height));
+        assert_eq!(image.pixels.len(), (width as usize) * (height as usize) * 3);
+        let path = out_dir.join(format!(
+            "qwen_image_2_1_turbo_candle_{width}x{height}_{ran}steps_seed42.rgb"
+        ));
+        std::fs::write(&path, &image.pixels).unwrap();
+        save_png(
+            &path.with_extension("png"),
+            &image.pixels,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
+        assert_not_band_corrupted(
+            &format!("turbo_default_preset_{ran}steps"),
+            &image.pixels,
+            width,
+            height,
+        );
+        // Evidence someone reads to pick a step count must not be a blank frame, and two step
+        // counts must not have produced the same picture (a dead `steps` knob).
+        assert_not_degenerate(&format!("turbo_default_preset_{ran}steps"), &image.pixels);
+        for (other, pixels) in &renders {
+            assert!(
+                *other == ran || *pixels != image.pixels,
+                "{other} and {ran} steps rendered identical pixels"
+            );
+        }
+        renders.push((ran, image.pixels.clone()));
+        eprintln!(
+            "wrote {} ({width}x{height} RGB8) after {:.1}s total ({:.1}s render)",
+            path.display(),
+            started.elapsed().as_secs_f32(),
+            render_started.elapsed().as_secs_f32()
+        );
+    }
 }
 
 /// A deterministic synthetic reference, so the edit smoke needs no checked-in photographs.
@@ -385,38 +496,86 @@ fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core
 #[test]
 #[ignore]
 fn validation_render_reference_edit() {
+    // (references, width, height, steps) — the caller-shaped case, then the boundary.
+    reference_edit_renders(
+        "qwen_image_2_1",
+        snapshot(),
+        "qwen_image_2_1_candle",
+        candle_gen_qwen_image_2_1::DEFAULT_STEPS,
+        [(2, 1024, 1024, Some(8)), (10, 512, 512, Some(2))],
+    );
+}
+
+/// The Turbo twin of [`validation_render_reference_edit`] (sc-25902), through the
+/// `qwen_image_2_1_turbo` id on the unmodified Turbo snapshot: the two-reference 1024x1024 case
+/// and the ten-reference boundary, **both with no step count on the request** — so each runs the
+/// snapshot's saved sigmas (eight on the pinned revision), asserted from the progress events. The
+/// boundary case runs the full schedule here because the prefix KV cache (sc-25904) makes only the
+/// first evaluation pay for the ~41k-token prefix. Finishes with the eleven-reference refusal.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation-sc-25902 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_render_reference_edit \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_render_reference_edit() {
+    let root = turbo_snapshot();
+    let saved = candle_gen_qwen_image_2_1::load_turbo_schedule(&root)
+        .unwrap()
+        .default_steps() as u32;
+    assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
+    reference_edit_renders(
+        candle_gen_qwen_image_2_1::TURBO_MODEL_ID,
+        root,
+        "qwen_image_2_1_turbo_candle",
+        saved,
+        [(2, 1024, 1024, None), (10, 512, 512, None)],
+    );
+}
+
+/// The reference-edit smoke of engine `id` over the snapshot at `root`: one render per
+/// `(references, width, height, steps)` case — `steps: None` leaves the count to the generator,
+/// which must then run `default_steps` — then the eleven-reference refusal. `stem` prefixes the
+/// evidence file names.
+fn reference_edit_renders(
+    id: &str,
+    root: PathBuf,
+    stem: &str,
+    default_steps: u32,
+    cases: [(usize, u32, u32, Option<u32>); 2],
+) {
     use candle_gen::gen_core::Conditioning;
 
-    let root = snapshot();
-    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    std::fs::create_dir_all(&out_dir).unwrap();
-
+    let out_dir = out_dir();
     let started = Instant::now();
     let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
     let generator = registry
-        .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
+        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
-    // (references, width, height, steps) — the caller-shaped case, then the boundary.
-    for (count, width, height, steps) in [(2usize, 1024u32, 1024u32, 8u32), (10, 512, 512, 2)] {
+    for (count, width, height, steps) in cases {
         let refs = references(count, 768, 768);
         let req = GenerationRequest {
             prompt: "Combine the subjects of the reference images into one scene, evening light"
                 .to_owned(),
             width,
             height,
-            steps: Some(steps),
+            steps,
             seed: Some(42),
             conditioning: vec![Conditioning::MultiReference { images: refs }],
             ..Default::default()
         };
         let render_started = Instant::now();
+        let mut totals = Vec::new();
         let out = generator
             .generate(&req, &mut |p| {
                 if let Progress::Step { current, total } = p {
+                    totals.push(total);
                     eprintln!(
                         "{count} refs: step {current}/{total} ({:.1}s)",
                         render_started.elapsed().as_secs_f32()
@@ -429,6 +588,12 @@ fn validation_render_reference_edit() {
                 }
             })
             .unwrap();
+        let ran = steps.unwrap_or(default_steps);
+        assert_eq!(
+            totals,
+            vec![ran; ran as usize],
+            "{count} refs: the requested step count, or the checkpoint's own"
+        );
         let GenerationOutput::Images(images) = out else {
             panic!("images expected");
         };
@@ -436,7 +601,7 @@ fn validation_render_reference_edit() {
         assert_eq!((image.width, image.height), (width, height));
         assert_eq!(image.pixels.len(), (width as usize) * (height as usize) * 3);
         let path = out_dir.join(format!(
-            "qwen_image_2_1_candle_edit_{count}refs_{width}x{height}_{steps}steps_seed42.rgb"
+            "{stem}_edit_{count}refs_{width}x{height}_{ran}steps_seed42.rgb"
         ));
         std::fs::write(&path, &image.pixels).unwrap();
         save_png(
@@ -459,8 +624,11 @@ fn validation_render_reference_edit() {
             prompt: "too many".to_owned(),
             width: 512,
             height: 512,
+            // Refused at `validate`, before any image is looked at, so the eleven are synthetic
+            // whatever `QWEN_IMAGE_2_1_EDIT_REFS` holds (a ten-file dir is the boundary itself,
+            // and `references(11, …)` would panic on it instead of reaching the refusal).
             conditioning: vec![Conditioning::MultiReference {
-                images: references(11, 256, 256),
+                images: (1..=11).map(|i| synthetic_reference(i, 256, 256)).collect(),
             }],
             ..Default::default()
         })
@@ -587,18 +755,65 @@ fn assert_nontrivial_alpha(
 #[test]
 #[ignore]
 fn validation_render_transparency() {
+    transparency_renders(
+        "qwen_image_2_1",
+        snapshot(),
+        "qwen_image_2_1_candle",
+        "",
+        candle_gen_qwen_image_2_1::DEFAULT_STEPS,
+        Some(8),
+    );
+}
+
+/// The Turbo twin of [`validation_render_transparency`] (sc-25902), through the
+/// `qwen_image_2_1_turbo` id on the unmodified Turbo snapshot: the transparent text-to-image and
+/// the RGBA-reference extraction at 1024×1024 with **no step count on the request** (the saved
+/// eight sigmas, asserted from the progress events), each asserting the same non-trivial alpha
+/// histogram.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation-sc-25902 \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_render_transparency \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_render_transparency() {
+    let root = turbo_snapshot();
+    let saved = candle_gen_qwen_image_2_1::load_turbo_schedule(&root)
+        .unwrap()
+        .default_steps() as u32;
+    assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
+    transparency_renders(
+        candle_gen_qwen_image_2_1::TURBO_MODEL_ID,
+        root,
+        "qwen_image_2_1_turbo_candle",
+        "turbo_",
+        saved,
+        None,
+    );
+}
+
+/// The transparency smoke of engine `id` over the snapshot at `root`; `steps: None` leaves the
+/// step count to the generator, which must then run `default_steps`. `stem` prefixes the PNG names
+/// and `report_prefix` the `<label>_alpha.txt` reports.
+fn transparency_renders(
+    id: &str,
+    root: PathBuf,
+    stem: &str,
+    report_prefix: &str,
+    default_steps: u32,
+    steps: Option<u32>,
+) {
     use candle_gen::gen_core::{Conditioning, OutputChannels};
 
-    let root = snapshot();
-    let out_dir = std::env::var("QWEN_IMAGE_2_1_RENDER_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    std::fs::create_dir_all(&out_dir).unwrap();
-
+    let out_dir = out_dir();
     let started = Instant::now();
     let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
     let generator = registry
-        .load("qwen_image_2_1", &LoadSpec::new(WeightsSource::Dir(root)))
+        .load(id, &LoadSpec::new(WeightsSource::Dir(root)))
         .unwrap();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
@@ -629,7 +844,7 @@ fn validation_render_transparency() {
             prompt,
             width: 1024,
             height: 1024,
-            steps: Some(8),
+            steps,
             seed: Some(42),
             conditioning,
             output_channels: OutputChannels::Rgba,
@@ -640,9 +855,11 @@ fn validation_render_transparency() {
             .unwrap_or_else(|e| panic!("{label}: the RGBA request was refused at validate: {e}"));
 
         let render_started = Instant::now();
+        let mut totals = Vec::new();
         let out = generator
             .generate(&req, &mut |p| {
                 if let Progress::Step { current, total } = p {
+                    totals.push(total);
                     eprintln!(
                         "{label}: step {current}/{total} ({:.1}s)",
                         render_started.elapsed().as_secs_f32()
@@ -655,6 +872,12 @@ fn validation_render_transparency() {
                 }
             })
             .unwrap();
+        let ran = steps.unwrap_or(default_steps);
+        assert_eq!(
+            totals,
+            vec![ran; ran as usize],
+            "{label}: the requested step count, or the checkpoint's own"
+        );
         let GenerationOutput::ImagesRgba(images) = out else {
             panic!("{label}: an `output_channels: Rgba` request must emit ImagesRgba");
         };
@@ -664,15 +887,13 @@ fn validation_render_transparency() {
         assert_eq!(image.channels(), 4);
 
         save_png(
-            &out_dir.join(format!(
-                "qwen_image_2_1_candle_{label}_1024x1024_8steps_seed42.png"
-            )),
+            &out_dir.join(format!("{stem}_{label}_1024x1024_{ran}steps_seed42.png")),
             &image.pixels,
             image.width,
             image.height,
             image::ColorType::Rgba8,
         );
-        assert_nontrivial_alpha(label, image, &out_dir);
+        assert_nontrivial_alpha(&format!("{report_prefix}{label}"), image, &out_dir);
         eprintln!(
             "{label}: done after {:.1}s render",
             render_started.elapsed().as_secs_f32()

@@ -4952,7 +4952,10 @@ jobs:
   #
   # Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1`. `timeout-minutes: 180`
   # is a runaway guard for a lane that has never executed: a cold `--features cuda` release build
-  # plus the one-time ~32 GB fetch, then ONE eight-step 2048² render.
+  # plus the one-time ~32 GB fetch, then the Turbo renders (sc-25901, sc-25902) — the eight-step
+  # 2048² default preset; a two- and a ten-reference edit and two RGBA renders, all over the saved
+  # eight steps; and a 4/6/12/16-step 2048² sweep. Every reference edit rides the prefix KV cache,
+  # so the ten-reference case pays for its ~41k-token prefix once. Re-size it from the first run.
   candle-qwen-image-2-1-turbo:
     name: Candle Qwen-Image 2.1 Turbo real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-turbo'

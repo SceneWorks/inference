@@ -135,7 +135,7 @@ fn write_lora(path: &Path, targets: &[(&str, usize, usize)], seed: usize) {
 }
 
 /// A PEFT LoKr over `target`: `kron(w1, w2)` reconstructs `[w1.0·w2.0, w1.1·w2.1] = [out, in]`.
-fn write_lokr(path: &Path, target: &str, w1: (usize, usize), w2: (usize, usize)) {
+pub(crate) fn write_lokr(path: &Path, target: &str, w1: (usize, usize), w2: (usize, usize)) {
     save(
         path,
         vec![
@@ -166,7 +166,7 @@ fn write_loha(path: &Path, targets: &[(&str, usize, usize)]) {
     save(path, tensors, None);
 }
 
-fn lora(path: &Path, scale: f32) -> AdapterSpec {
+pub(crate) fn lora(path: &Path, scale: f32) -> AdapterSpec {
     AdapterSpec::new(path.to_path_buf(), scale, AdapterKind::Lora)
 }
 
@@ -723,7 +723,7 @@ fn a_sequential_load_refuses_a_bad_adapter_before_any_render() {
 // ── sc-24158: every adapter format, on the dense and the packed tiers ───────────────────────────
 
 /// `[out, in]` of every adaptable projection of the tiny DiT, by dotted path.
-fn projection_shapes() -> HashMap<String, (usize, usize)> {
+pub(crate) fn projection_shapes() -> HashMap<String, (usize, usize)> {
     QwenImage21Transformer::adaptable_projections(dense_dit().config())
         .into_iter()
         .collect()
@@ -1812,7 +1812,7 @@ fn loha_and_lycoris_lokr_strength_scales_the_projection_delta() {
 /// A large-amplitude LoRA (the MLX twin's `render_lora`) over a block attention, a packable FFN
 /// projection and the output projection, so its effect survives the VAE decode and u8 quantization
 /// of a 2-step miniature render.
-fn write_render_lora(path: &Path) {
+pub(crate) fn write_render_lora(path: &Path) {
     let shapes = projection_shapes();
     let mut tensors = Vec::new();
     for (i, target) in ["transformer_blocks.0.attn.to_v", PACKED_TARGET, "proj_out"]
