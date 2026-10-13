@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda]
+        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -292,6 +292,16 @@ on:
       # (`mlx-qwen-image-2-1`). Empty skips that one test; the lane never invents an adapter.
       qwen_image_2_1_third_party_lora:
         description: "qwen-image-2-1-lora-mlx only: pinned third-party 2.1 adapter, owner/repo@<40-hex sha>:<path>.safetensors[:lokr]"
+        type: string
+        required: false
+        default: ""
+      iris_memory_mlx_steady_steps:
+        description: "iris-memory-mlx only: run the steady-state pass (cache off, no restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
+        type: string
+        required: false
+        default: ""
+      iris_memory_mlx_emulated_steps:
+        description: "iris-memory-mlx only: run the emulated-smaller-Mac pass (64 / 96 GiB MLX allocator limits, cache on) with this many optimizer steps instead of the default matrix"
         type: string
         required: false
         default: ""
@@ -5625,6 +5635,132 @@ jobs:
         with:
           name: iris-curricula-mlx-evidence
           path: ${{ runner.temp }}/iris-curricula-mlx-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25690 — the epic-25678 terminal MEMORY measurement of Iris FULL fine-tuning on MLX.
+  # DISPATCH-ONLY (`iris-memory-mlx` profile; never `all`, never the schedule; nothing is gated on
+  # its numbers). nax-macos-2 only (the first step FAILS on any other runner, before any build or
+  # GPU work). One `train_memory_probe` process per shape — generation 1024² with and without
+  # activation checkpointing, depth and restoration at 1024², then all three at 512², each with
+  # MLX's default buffer-cache limit and again with the cache disabled by the test — each under
+  # the external phys_footprint guard (cap 115 GB, 10 min wall), started only when
+  # `memory_pressure` reports >= 120 GB free. Rows carry MLX's own active peak next to the
+  # footprint and are classified by scripts/ci/iris_memory_probe_row.py (decimal GB throughout).
+  # Run-scoped CARGO_TARGET_DIR, release profile unstripped (rust-lang/rust#157750).
+  mlx-iris-memory-probe:
+    name: MLX Iris-3B full fine-tune memory probes
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-memory-mlx'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    timeout-minutes: 60
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      IRIS_WEIGHTS_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--speridlabs--iris-3b/snapshots/7445443349bc9abe3c96f01ff793e2098ca012b3
+      IRIS_TEXT_ENCODER_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+      IRIS_CRITIC_TRUNK_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup/snapshots/9f3e8ee3f383c672388d9178afe70af9e63ac9df
+      IRIS_LPIPS_VGG16_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--timm--vgg16.tv_in1k/snapshots/b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
+      IRIS_LPIPS_LIN_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--vivym--lpips/snapshots/270571f1fb2a2c4c5f920cec96cd87838c345982
+      IRIS_PROBE_STEADY_STEPS: ${{ inputs.iris_memory_mlx_steady_steps }}
+      IRIS_PROBE_EMULATED_STEPS: ${{ inputs.iris_memory_mlx_emulated_steps }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check the host (nax-macos-2, >= 128 GB)
+        run: source scripts/ci/real-weights/mlx-iris-memory-probe/check-the-host.sh
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT IRIS_WEIGHTS_DIR IRIS_TEXT_ENCODER_DIR IRIS_CRITIC_TRUNK_DIR
+          IRIS_LPIPS_VGG16_DIR IRIS_LPIPS_LIN_DIR
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT IRIS_WEIGHTS_DIR IRIS_TEXT_ENCODER_DIR IRIS_CRITIC_TRUNK_DIR
+          IRIS_LPIPS_VGG16_DIR IRIS_LPIPS_LIN_DIR
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Build the Iris MLX test binary
+        run: source scripts/ci/real-weights/mlx-iris-memory-probe/build-the-test-binary.sh
+      - name: Materialize and verify immutable snapshots
+        run: source scripts/ci/real-weights/mlx-iris-memory-probe/materialize-and-verify-immutable-snapshots.sh
+      - name: Run the guarded memory probes
+        run: source scripts/ci/real-weights/mlx-iris-memory-probe/run-the-guarded-probes.sh
+      - name: Keep the Iris MLX memory-probe evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iris-memory-probe-mlx-evidence
+          path: ${{ runner.temp }}/iris-memory-probe-mlx-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25690 — the CUDA twin (`iris-memory-cuda` profile; dispatch-only, gates nothing). Same box,
+  # labels, toolchain, Python and sccache rule as `candle-iris` (whose install / materialize helpers it
+  # reuses). It runs the same shapes on the card with the MOST free memory at the start (selected
+  # with CUDA_VISIBLE_DEVICES in PCI bus order; the card is snapshotted before every probe). The
+  # test prints the driver pool's USED/RESERVED high-water marks next to the polled device peak;
+  # rows are classified by scripts/ci/iris_memory_probe_row.py (a CUDA OOM = "exceeds this card").
+  candle-iris-memory-probe:
+    name: Candle Iris-3B full fine-tune memory probes (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'iris-memory-cuda'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 120
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      IRIS_WEIGHTS_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3
+      IRIS_TEXT_ENCODER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen3-VL-4B-Instruct\snapshots\ebb281ec70b05090aa6165b016eac8ec08e71b17
+      IRIS_UPSCALER_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--speridlabs--iris-3b\snapshots\7445443349bc9abe3c96f01ff793e2098ca012b3\upscaler
+      IRIS_CRITIC_TRUNK_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--laion--CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup\snapshots\9f3e8ee3f383c672388d9178afe70af9e63ac9df
+      IRIS_LPIPS_VGG16_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--timm--vgg16.tv_in1k\snapshots\b8d8aa2dd860af9233c8c67385a8097fd6c35d3f
+      IRIS_LPIPS_LIN_DIR: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--vivym--lpips\snapshots\270571f1fb2a2c4c5f920cec96cd87838c345982
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris-memory-probe\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # As `candle-iris`: clear the unstable sccache wrapper for this heavy Candle/CUDA lane.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris-memory-probe\require-operator-provided-models-root-and-initialize-evidence.cmd
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris-memory-probe\materialize-and-verify-immutable-snapshots.cmd
+      - name: Build the Iris CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-iris --features cuda --test integration --no-run || exit /b 1
+      - name: Run the memory probes
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-iris-memory-probe\run-the-memory-probes.cmd
+      - name: Keep the Iris CUDA memory-probe evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iris-memory-probe-cuda-evidence
+          path: ${{ runner.temp }}/iris-memory-probe-cuda-evidence
           if-no-files-found: error
           retention-days: 30
 
