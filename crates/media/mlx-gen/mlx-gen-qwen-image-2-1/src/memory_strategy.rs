@@ -88,7 +88,7 @@ use mlx_gen::gen_core::{
 use mlx_gen::{LoadSpec, WeightsSource};
 
 use crate::config::{MAX_REFERENCE_IMAGES, PRESETS};
-use crate::model::MODEL_ID;
+use crate::model::{MODEL_ID, TURBO_MODEL_ID};
 use crate::pipeline::{DECODE_OVERLAP, DECODE_TILE_EDGE};
 use crate::quant::{Tier, GROUP_SIZE};
 
@@ -1171,7 +1171,9 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
+    // Both engine ids — the base checkpoint and the distilled Turbo one (sc-25900) — share this
+    // contract: same components, same tiers, same staged phases. Only the denoise schedule differs.
+    if crate::model::Variant::from_id(provider_id).is_none() {
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: not a Qwen-Image 2.1 MLX memory provider"
         )));
@@ -1355,11 +1357,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_for(MODEL_ID, spec, contract, context)
+}
+
+/// [`registered_begin_request`] for the distilled Turbo id (sc-25900).
+pub(crate) fn registered_begin_turbo_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
+    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+}
+
+/// The executable admission seam both engine ids share; `provider_id` only labels the scope.
+pub(crate) fn begin_request_for(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> CoreResult<Option<Box<dyn MemoryRequestScope + 'static>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
     let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        MODEL_ID,
+        provider_id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
@@ -1394,6 +1415,22 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
         provider_id: MODEL_ID,
         valid_fixtures: registered_valid_fixture,
         begin_request: registered_begin_request,
+    };
+
+/// [`MEMORY_REGISTRATION`] for the distilled Turbo id (sc-25900) — the same contract, priced from
+/// the Turbo snapshot on disk.
+pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(TURBO_MODEL_ID, spec),
+    safety_check,
+};
+
+/// [`MEMORY_BEHAVIOR_REGISTRATION`] for the distilled Turbo id (sc-25900).
+pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: TURBO_MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_turbo_request,
     };
 
 #[cfg(test)]

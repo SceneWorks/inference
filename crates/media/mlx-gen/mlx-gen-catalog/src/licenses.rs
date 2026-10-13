@@ -437,6 +437,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "qwen_image_2_1",
         components: &["qwen_image_2_1"],
     },
+    // The distilled checkpoint (sc-25900) is its own repository, `Qwen/Qwen-Image-2.1-Turbo`, with
+    // the same single declaration over the same three components — so its own row, also complete.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1_turbo",
+        components: &["qwen_image_2_1_turbo"],
+    },
     // --- sana --------------------------------------------------------------------------------
     // The DC-AE tensors load from each SANA repository's own `vae/`, so the repository row covers
     // them; the Gemma-2-2B-IT caption encoder is keyed on Google's repository.
@@ -929,8 +935,9 @@ mod tests {
         // sc-25679: `iris_3b` registers with its own complete row (72 / 62).
         // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
-        assert_eq!(registered.len(), 74, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 64);
+        // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
+        assert_eq!(registered.len(), 75, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 65);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -997,10 +1004,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            25,
+            26,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
-             iris_3b_restore in sc-25683, iris_3b_depth in sc-25687)"
+             iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
+             sc-25900)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1188,7 +1196,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 64);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 65);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

@@ -58,5 +58,8 @@ mod training;
 #[path = "transformer_parity.rs"]
 mod transformer_parity;
 
+#[path = "turbo.rs"]
+mod turbo;
+
 #[path = "vae_parity.rs"]
 mod vae_parity;

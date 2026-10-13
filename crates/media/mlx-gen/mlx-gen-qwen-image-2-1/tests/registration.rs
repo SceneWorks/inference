@@ -6,7 +6,7 @@ use mlx_gen::gen_core::{ConditioningKind, Quant, SizeFloor};
 fn qwen_image_2_1_is_exported_by_provider_catalog_as_a_distinct_engine() {
     let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
     let ids: Vec<_> = registry.generators().map(|r| (r.descriptor)().id).collect();
-    assert_eq!(ids, ["qwen_image_2_1"]);
+    assert_eq!(ids, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
     let reg = registry.generators().next().unwrap();
     let d = (reg.descriptor)();
     assert_eq!(
@@ -18,6 +18,53 @@ fn qwen_image_2_1_is_exported_by_provider_catalog_as_a_distinct_engine() {
         reg.footprint.is_some(),
         "per-component footprint is published"
     );
+}
+
+/// The distilled Turbo checkpoint (sc-25900) registers next to the base one: its own generator,
+/// footprint, memory strategy and memory behaviour — and **no** trainer, which stays base-only.
+#[test]
+fn qwen_image_2_1_turbo_is_registered_next_to_the_base_id_without_a_trainer() {
+    let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
+    let turbo = registry
+        .generators()
+        .find(|r| (r.descriptor)().id == "qwen_image_2_1_turbo")
+        .expect("the Turbo generator is registered");
+    assert!(turbo.footprint.is_some());
+    let base = mlx_gen_qwen_image_2_1::descriptor();
+    let d = (turbo.descriptor)();
+    assert_eq!(d.family, base.family);
+    assert_eq!(d.backend, "mlx");
+    assert_eq!(
+        format!("{:?}", d.capabilities),
+        format!("{:?}", base.capabilities),
+        "the Turbo descriptor mirrors the base surface"
+    );
+
+    let trainers: Vec<_> = registry.trainers().map(|r| (r.descriptor)().id).collect();
+    assert_eq!(trainers, ["qwen_image_2_1"], "the trainer stays base-only");
+    let strategies: Vec<_> = registry
+        .memory_strategy_registrations()
+        .map(|r| r.provider_id)
+        .collect();
+    assert_eq!(strategies, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
+    let fixtures: Vec<_> = registry
+        .memory_contract_fixture_registrations()
+        .map(|r| r.provider_id)
+        .collect();
+    assert_eq!(fixtures, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
+    let behaviors: Vec<_> = registry
+        .memory_behavior_registrations()
+        .map(|r| r.provider_id)
+        .collect();
+    assert_eq!(behaviors, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
+    assert_eq!(
+        registry
+            .activation_memory_bytes_1024("qwen_image_2_1_turbo")
+            .unwrap(),
+        None,
+        "no measured anchor is published for the Turbo id"
+    );
+    assert!(registry.descriptor_conformance_errors().is_empty());
 }
 
 #[test]
@@ -82,6 +129,18 @@ fn frozen_upstream_revisions_are_recorded() {
         mlx_gen_qwen_image_2_1::UPSTREAM_DIFFUSERS_REVISION,
         "8b3c707ebd3ec4881f4190cf42931da07eaf3b65"
     );
+    assert_eq!(
+        mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_HF_REPO,
+        "Qwen/Qwen-Image-2.1-Turbo"
+    );
+    assert_eq!(
+        mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_HF_REVISION,
+        "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+    );
+    assert_eq!(
+        mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_DIFFUSERS_REVISION,
+        "da1d3829cf08d4f329b526d89e17cc035c049d8d"
+    );
     assert!(mlx_gen_qwen_image_2_1::UPSTREAM_LICENSE.contains("Qwen Research License"));
     let notice = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/NOTICE")).unwrap();
     assert!(notice.contains(mlx_gen_qwen_image_2_1::UPSTREAM_LICENSE_NOTICE));
@@ -91,6 +150,8 @@ fn frozen_upstream_revisions_are_recorded() {
         mlx_gen_qwen_image_2_1::UPSTREAM_HF_REVISION,
         mlx_gen_qwen_image_2_1::UPSTREAM_GITHUB_REVISION,
         mlx_gen_qwen_image_2_1::UPSTREAM_DIFFUSERS_REVISION,
+        mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_HF_REVISION,
+        mlx_gen_qwen_image_2_1::UPSTREAM_TURBO_DIFFUSERS_REVISION,
     ] {
         assert!(upstream.contains(sha), "UPSTREAM.md records {sha}");
     }

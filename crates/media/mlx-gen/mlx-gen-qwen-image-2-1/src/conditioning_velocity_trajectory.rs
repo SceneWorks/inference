@@ -153,7 +153,7 @@ fn run() -> Result<()> {
         seed: Some(24163),
         ..Default::default()
     };
-    let scheduler = crate::loader::load_scheduler_config(dense)?;
+    let scheduler = crate::model::Schedule::Shifted(crate::loader::load_scheduler_config(dense)?);
     let params = crate::model::resolve_run_params(&scheduler, &req)?;
     assert!(!params.use_negative && params.true_cfg == 1.0);
     trajectory_math::validate_schedule(&params.sigmas)?;
