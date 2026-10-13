@@ -121,5 +121,5 @@ A checkpointed backward drops the loss graph as soon as its plain backward has r
 head, and here the LPIPS and critic tapes — is off the tape before the first region is replayed
 rather than resident under every replay.
 Upstream ships neither task with checkpointing; it changes memory and compute only, so it is no
-part of a run's identity. **The MLX depth and restoration trainers refuse it typed** — their
-regions are built by the generation trainer's model type and are not wired for these tasks.
+part of a run's identity. The MLX depth and restoration trainers take the same option (MLX's
+checkpoint transform per region; see the section of the same name in the MLX crate's `UPSTREAM.md`).

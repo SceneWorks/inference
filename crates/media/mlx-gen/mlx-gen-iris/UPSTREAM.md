@@ -121,7 +121,7 @@ LyCORIS parameterizations over the frozen upstream Linears, under the same objec
 | Ranged walk (640 canonical chunks, world-portable resume state, resharding a cursor to another world) + shape batcher (`drop_last`, per-shape batches, regroup history replayed on a micro-batch change, `limit_batches`) | `data/samplers.py` | `train::shapes::{RangedSampler, ShapeBatchSampler}`, `train::pipeline::DataPipeline` | shared contract | ported; plans and resume states equal upstream's key for key |
 | `rope_aspect` square / isotropic (stage 1 trains square) | `models/dit.py` | `rope_2d_angles_aspect`, the trunk's RoPE grid | same | ported; non-square bucket step under both laws: loss 1e-5, grads 1e-4 vs upstream |
 | REPA / iREPA: frozen DINOv2 teacher (`x_norm_patchtokens`, bicubic input resize, ImageNet norm, interpolated position table; `_reg` variants antialiased), MLP (REPA) / conv (iREPA) projector on block `layer`'s tokens, bilinear token-grid resize to the smaller grid, iREPA spatial normalization, `−cos` loss × `weight` | `train/repa.py` | `train::teacher::Teacher` (hub and Hugging Face naming), `model::repa_loss`; the teacher is the provisioned `repa_teacher` component (`facebook/dinov2-base` @ f9e44c81 = the hub `dinov2_vitb14_pretrain.pth`, checked tensor for tensor), never fetched | `train::teacher::Teacher`, `train::model::repa_loss` | ported; tokens 1e-4, losses 1e-5, projector + backbone grads 1e-4 (three grid relations); the release teacher on real weights 1e-3 (`IRIS_REPA_TEACHER_DIR`). `teacher_source: hf` (DINOv3 through `transformers`) refused typed: the native teacher is the dinov2 hub family |
-| Activation checkpointing `none` / `full` / `selective_layer` (`ac_selective_every`) / `selective_op` | `models/ac.py` | `mlx_rs::transforms::checkpoint` per trunk / PiT block | segmented recompute: the region runs off the tape (`with_composable`, so it computes exactly what the replay computes), boundary `Var`s, reverse surrogate backward | ported. **f32** (`train_dtype: f32`): every policy's gradients equal the plain graph's ≤ 1e-6 and upstream's ≤ 1e-4 (upstream's own are bit-identical), and one optimizer step lands on the same next loss. **bf16** (Candle, sc-25690): the forward is bit-identical (the same loss), the gradients are not — a region's cotangent is rounded where it crosses the boundary — and what is held is that checkpointing adds no error of its own: per trained tensor the checkpointed gradient is no further from the f32 gradient than the plain bf16 gradient is (declared bound `e_full ≤ 2·e_none + 1e-3`, cosine to the plain bf16 gradient ≥ 0.999; measured on the miniature: mean relative distance from f32 3.6e-2 for both, worst ratio 1.003, worst cosine 0.99998). AdamW's first steps move every weight by ±lr whatever the gradient's size, so that rounding shows up in the next loss at the size of the bf16-vs-f32 gap itself (miniature: 4.2e-4 vs 4.3e-4) — two bf16 runs that differ only in the policy print different losses from step 2 on, as a bf16 and an f32 run do. The MLX twin's bf16 behaviour is not measured here. `selective_op` (torch SAC keeps matmul outputs) recomputes the whole block natively: same gradients, a different memory profile |
+| Activation checkpointing `none` / `full` / `selective_layer` (`ac_selective_every`) / `selective_op` | `models/ac.py` | `mlx_rs::transforms::checkpoint` per trunk / PiT block | segmented recompute: the region runs off the tape (`with_composable`, so it computes exactly what the replay computes), boundary `Var`s, reverse surrogate backward | ported. **f32** (`train_dtype: f32`): every policy's gradients equal the plain graph's ≤ 1e-6 and upstream's ≤ 1e-4 (upstream's own are bit-identical), and one optimizer step lands on the same next loss. **bf16** (Candle, sc-25690): the forward is bit-identical (the same loss), the gradients are not — a region's cotangent is rounded where it crosses the boundary — and what is held is that checkpointing adds no error of its own: per trained tensor the checkpointed gradient is no further from the f32 gradient than the plain bf16 gradient is (declared bound `e_full ≤ 2·e_none + 1e-3`, cosine to the plain bf16 gradient ≥ 0.999; measured on the miniature: mean relative distance from f32 3.6e-2 for both, worst ratio 1.003, worst cosine 0.99998). AdamW's first steps move every weight by ±lr whatever the gradient's size, so that rounding shows up in the next loss at the size of the bf16-vs-f32 gap itself (miniature: 4.2e-4 vs 4.3e-4) — two bf16 runs that differ only in the policy print different losses from step 2 on, as a bf16 and an f32 run do. **MLX** (sc-25690, measured for the depth and restoration trainers on the miniature, CPU stream — see *Activation checkpointing of the depth and restoration trainers*): the checkpoint transform re-runs the block's own graph, so f32 **and** bf16 gradients came out bit-equal to the plain graph's (max\|Δ\| 0; bf16 worst ratio 1.000, worst cosine 1.000000) under the same declared bounds; the generation trainer's MLX bf16 gradients are not measured. `selective_op` (torch SAC keeps matmul outputs) recomputes the whole block natively: same gradients, a different memory profile |
 | Holdout validation: items flagged `model_options.split = "holdout"`, the frozen `(noise, t)` grid (`VAL_GRID_SEED`, `VAL_T_STRIDE`), `val_every_steps`, `val_samples`, banded `val/loss_t0..3` | `trainer.py` `_val_loss` | `train::holdout`, `Run::validate_holdout` → `<checkpoints>/metrics.jsonl` | same | ported; grid noise exact, per-sample loss 1e-5 |
 | Metrics (`log_every`, `log_block_grad_norms`, REPA raw / weighted / total, loss scale) | `trainer.py` | `<checkpoints>/metrics.jsonl` (run header, steps, grad groups, validation) | same | ported (upload to a tracker is the product layer's) |
 | fp16 mixed precision with `GradScaler` (65536, ×2 per 2000 clean steps, ×0.5 and skip on overflow) | accelerate | `MixedPrecision::Fp16` + `GradScaler`, checkpointed | CUDA only (candle's CPU backend has no half GEMM: refused typed there) | ported |
@@ -574,6 +574,62 @@ train + checkpoint + export 230 s, VRAM peak 64.6 GB; estimator mean |pred − t
 `memory_pressure` 94% = 120 GB free at start, 80 GB phys_footprint guard; run 38136750391): losses
 0.830 → 0.355 → 0.325 → 0.219, 1.1 s/step, train + checkpoint + export 14.1 s, peak phys_footprint
 59.0 GB, 19 s test wall; estimator mean |pred − target| 0.660 (release) → 0.083 (trained).
+
+## Activation checkpointing of the depth and restoration trainers (sc-25690)
+
+`TrainingConfig::gradient_checkpointing` selects `full` checkpointing on the MLX depth and
+restoration trainers, as on Candle (the typed refusal is gone; the option is the same on both
+backends). Upstream ships neither task with checkpointing; it changes memory and compute only, so
+it is no part of a run's identity (a checkpointed export carries the plain export's stamps). Default
+off.
+
+| | Depth (`iris_3b_depth`) | Restoration (`iris_3b_restore`) |
+| --- | --- | --- |
+| Regions | the generation trainer's (`train::model::region_hooks`: one `mlx_rs::transforms::checkpoint` per trunk block and per PiT pixel block, each rebuilt from the block's own traced tensors by `TrainModel::region_source` + `IrisDiT::load_trunk_block` / `load_pixel_block`) around the **widened** backbone — the widening touches only `s_embedder.proj` and `pixel_embedder.proj`, outside every region | the same regions around the generator in the **generator** step; an adapter run rebuilds a region's block from the frozen base plus the traced LoRA / LoKr factors, as the generation trainer does |
+| Seam | `depth::depth_forward_hooked` (`depth_forward` = the same with `NoHooks`), `DepthModel::ac` | `Frozen::restore_hooked` (`restore` = the same with `NoHooks`), `RestoreTrainPlan::ac` |
+| Outside the regions | the patch / text embedders, the final layer, the 1×1 reducer, Eq. 5 | the embedders and final layer, `x̂ = x_lq − σ·v`, the L2 / LPIPS / critic terms; the critic step (no generator gradient) is never checkpointed |
+| Previews / estimator forward | plain (`DepthModel::predict`) | plain (`Frozen::restore`) |
+
+There is no explicit release of the loss graph (Candle's `backward_segmented` needs one because its
+tape holds every node until the loss drops): MLX has no tape — `keyed_value_and_grad` builds one lazy
+graph and `eval` frees each array once its last reader has run, and every reader of the LPIPS / critic
+activations is upstream of the first region's recompute in the backward. Measured, not assumed: at
+1024² the checkpointed transient above the resident set is 27.5 GB for restoration, 27.1 GB for depth
+and 27.0 GB for generation — the head terms add nothing to the peak.
+
+Gradient equality, miniature, CPU stream (`tests/depth_train_parity.rs`,
+`tests/restoration_train_lifecycle.rs`, `activation_checkpointing_gradients_equal_the_plain_graph`):
+f32 — declared ≤ 1e-6 of `max(1, tensor peak)` for both tasks (the generation trainer's bound; Candle
+needs 1e-5 for restoration), **measured 0** for both, loss terms bit-equal; bf16 — the Candle rule
+(`e_full ≤ 2·e_none + 1e-3` against the f32 gradient, cosine to the plain bf16 gradient ≥ 0.999,
+step-1 loss bit-equal): depth 175 tensors mean `e_none` = mean `e_full` = 5.694e-2, worst ratio 1.000,
+worst cosine 1.000000; restoration 173 tensors 6.664e-2 for both, worst ratio 1.000, worst cosine
+1.000000. Lifecycle (`activation_checkpointing_leaves_the_run_unchanged`, both tasks; restoration
+also as LoRA): the checkpointed run's export equals the plain run's (declared ≤ 1e-6, measured 0),
+carries the same stamps and loads in the estimator / `iris_3b_restore`; cancel → checkpoint → resume
+under checkpointing reproduces the uninterrupted checkpointed run bit for bit (weights, EMA,
+optimizer(s), critic head, data position, export). The default path is unchanged bit for bit: the same
+export, checkpoint members and step losses as the parent commit on five miniature runs (depth f32 /
+bf16, restoration f32 / bf16 / LoRA).
+
+Real weights, nax-macos-2 (dispatch-only `iris-memory-mlx`, steady pass: batch 1, full fine-tune, bf16
+over f32 masters, 6 optimizer steps, MLX cache limit 0; run 38405154244; decimal GB, MLX's own
+active-byte high-water, cumulative over the run):
+
+| Shape | Policy | Active peak after steps 1…6 (GB) | s / step | Process footprint peak (GB) | Completes under the 115 GB guard |
+| --- | --- | --- | --- | --- | --- |
+| depth 1024² | none | 68.67 / 92.58 / 92.58 / 92.58 / 92.58 / 92.58 | 5.1 | 92.40 | yes |
+| depth 1024² | **full** | 48.68 / 62.10 / 62.10 / 62.10 / 63.01 / 63.01 | 5.9 | 63.21 | yes |
+| restoration 512² | none | 62.79 / 71.57 / 71.57 / 71.57 / 71.57 / 71.57 | 9.3 | 71.87 | yes |
+| restoration 512² | **full** | 62.87 / 63.21 / 63.21 / 63.21 / 63.21 / 63.21 | 9.9 | 62.98 | yes |
+| restoration 1024² | none | — (guard stop above 115 GB, earlier runs) | — | > 115 | **no** |
+| restoration 1024² | **full** | 63.15 / 77.24 / 77.24 / 77.24 / 77.25 / 77.25 | 33.5 | 77.48 | **yes** |
+
+A restoration step is one generator window plus one critic window. The step losses of a checkpointed
+run equal the plain run's to the printed digit at both measured pairs (depth 1024²: 0.4472 → 0.0958;
+restoration 512²: 3.8255 → 3.3667). The 1024² restoration full fine-tune — which does not fit a 128 GB
+Mac plain — runs in 77.5 GB checkpointed; where both policies ran, checkpointing cost 6 % (restoration
+512²) to 16 % (depth 1024²) more time per step.
 
 ## Restoration (`iris_3b_restore`, sc-25683)
 
