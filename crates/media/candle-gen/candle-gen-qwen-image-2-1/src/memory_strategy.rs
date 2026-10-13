@@ -27,13 +27,29 @@ use candle_gen::gen_core::{
     WeightsSource,
 };
 
-use crate::config::MAX_REFERENCE_IMAGES;
+use crate::config::{Variant, MAX_REFERENCE_IMAGES};
 use crate::pipeline::DECODE_OVERLAP;
-use crate::MODEL_ID;
+use crate::{MODEL_ID, TURBO_MODEL_ID};
 
 /// Content fingerprint of this contract. Distinct from the MLX twin's: the two backends never share
 /// calibration evidence, and the candle route materializes its components at different widths.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-candle-derived-2026-09-22-v1";
+/// The Turbo id's own calibration identity (sc-25901). The DERIVED model is the same arithmetic —
+/// `Qwen/Qwen-Image-2.1-Turbo` shares the base transformer `config.json`, so parameter counts and
+/// joint-token counts are identical — but it prices a different checkpoint, and a record built
+/// against one id must not satisfy the other's handshake (the three Anima ids' convention).
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-2-1-turbo-candle-derived-2026-10-13-v1";
+
+/// The variant registered as `provider_id`, or the typed refusal for an id this crate does not
+/// serve.
+fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
+    Variant::from_model_id(provider_id).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
+        ))
+    })
+}
 
 /// The published decode-tile domain — **derived defaults, pending the epic-end campaign**, not a
 /// measured ladder. The crate's shipped default (512) is bracketed by its neighbours at the same
@@ -137,6 +153,7 @@ pub fn admission_geometry() -> AdmissionGeometry {
 /// u32 codes and its bf16 scale/bias tables price as stored. `keep` selects the tensors the loader
 /// actually opens; everything else contributes zero.
 fn component_bytes(
+    provider_id: &str,
     path: &Path,
     float_width: u64,
     keep: &dyn Fn(&str) -> bool,
@@ -151,7 +168,7 @@ fn component_bytes(
                 header.data_bytes
             };
             sum.checked_add(bytes).ok_or_else(|| {
-                gen_core::Error::Msg(format!("{MODEL_ID}: component byte sum overflow"))
+                gen_core::Error::Msg(format!("{provider_id}: component byte sum overflow"))
             })
         })
 }
@@ -180,21 +197,30 @@ pub fn compute_width() -> u64 {
 /// A packed tier's u32 code tensors are integers and therefore price at their stored width through
 /// [`component_bytes`], independent of the float width — which is what makes one function correct
 /// for all three tiers.
-fn asset_facts(root: &Path) -> gen_core::Result<MemoryAssetFacts> {
-    asset_facts_at(root, compute_width())
+fn asset_facts(provider_id: &str, root: &Path) -> gen_core::Result<MemoryAssetFacts> {
+    asset_facts_at(provider_id, root, compute_width())
 }
 
 /// `asset_facts` at an explicit float `width` (bytes per element). The production inventory is
 /// `asset_facts` at [`compute_width`]; this seam exists so the pricing rule — **every** float
 /// component at ONE width, the tower included — can be held on the CPU lane, where the compute
 /// width happens to equal the 4 B/param the tower used to be mispriced at.
-pub fn asset_facts_at(root: &Path, width: u64) -> gen_core::Result<MemoryAssetFacts> {
+///
+/// `provider_id` only labels an error: both engine ids price a snapshot the same way.
+pub fn asset_facts_at(
+    provider_id: &str,
+    root: &Path,
+    width: u64,
+) -> gen_core::Result<MemoryAssetFacts> {
     let all = |_: &str| true;
-    let transformer = component_bytes(&root.join("transformer"), width, &all)?;
-    let conditioning = component_bytes(&root.join("text_encoder"), width, &|name: &str| {
-        name.starts_with(crate::loader::TEXT_ENCODER_PREFIX)
-    })?;
-    let decoder = component_bytes(&root.join("vae"), width, &all)?;
+    let transformer = component_bytes(provider_id, &root.join("transformer"), width, &all)?;
+    let conditioning = component_bytes(
+        provider_id,
+        &root.join("text_encoder"),
+        width,
+        &|name: &str| name.starts_with(crate::loader::TEXT_ENCODER_PREFIX),
+    )?;
+    let decoder = component_bytes(provider_id, &root.join("vae"), width, &all)?;
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -263,14 +289,20 @@ pub fn memory_strategy_contract(
     let mut contract = weights_free_memory_strategy_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: memory facts require a snapshot directory"
+            "{provider_id}: memory facts require a snapshot directory"
         )));
     };
+    // A contract is never priced for a snapshot the id would refuse to load (sc-25901): the same
+    // base/Turbo refusal `load` raises, reached through the memory registration too.
+    crate::loader::check_snapshot_variant(variant_for(provider_id)?, root)?;
     // Refuse a tier/request disagreement here too, so a contract is never built for a load that
     // would be served at a different tier than the one it claims.
     let tier = crate::quant::resolve_requested_tier(root, spec.quantize)?;
-    contract.asset_facts = asset_facts(root)?;
-    price_adapter_stack(&mut contract, adapter_overlay(spec, root, tier)?);
+    contract.asset_facts = asset_facts(provider_id, root)?;
+    price_adapter_stack(
+        &mut contract,
+        adapter_overlay(provider_id, spec, root, tier)?,
+    );
     Ok(contract)
 }
 
@@ -308,6 +340,7 @@ impl AdapterOverlay {
 /// an unmatched or mis-oriented key, and an additive file with no sizable safetensors residency
 /// are all refused rather than admitted as free.
 pub fn adapter_overlay(
+    provider_id: &str,
     spec: &LoadSpec,
     root: &Path,
     tier: crate::quant::Tier,
@@ -332,7 +365,7 @@ pub fn adapter_overlay(
     )
     .ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
+            "{provider_id}: every additive adapter must have a non-zero safetensors residency"
         ))
     })?;
     // sc-24158: a LoKr (stamped or LyCORIS) keeps its two small Kronecker factors resident in f32
@@ -425,11 +458,7 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
-        )));
-    }
+    let variant = variant_for(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::CandleCuda {
@@ -445,7 +474,10 @@ pub fn weights_free_memory_strategy_contract(
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        match variant {
+            Variant::Base => MEMORY_CALIBRATION_FINGERPRINT,
+            Variant::Turbo => TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+        },
         spec.load_shape,
     ));
     contract.lifecycle = MemoryLifecycleCapabilities {
@@ -500,20 +532,24 @@ pub fn weights_free_memory_strategy_contract(
     Ok(contract)
 }
 
-fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
+fn validate_decode(
+    provider_id: &str,
+    edge: Option<u32>,
+    overlap: Option<u32>,
+) -> gen_core::Result<()> {
     let edge = edge.ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit tile edge"
+            "{provider_id}: bounded decode requires an explicit tile edge"
         ))
     })?;
     let overlap = overlap.ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit overlap"
+            "{provider_id}: bounded decode requires an explicit overlap"
         ))
     })?;
     if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode geometry {edge}/{overlap} is outside the published domain \
+            "{provider_id}: decode geometry {edge}/{overlap} is outside the published domain \
              {DECODE_TILE_EDGES:?} at overlap {DECODE_OVERLAP}"
         )));
     }
@@ -526,10 +562,11 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    let provider_id = contract.provider_id.as_str();
     let route_gate = || {
         if !matches!(context.mode, MemoryMode::TextToImage) {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: this story's route is text-to-image; got {:?}",
+                "{provider_id}: this story's route is text-to-image; got {:?}",
                 context.mode
             )));
         }
@@ -540,18 +577,19 @@ pub fn safety_check(
         // request refusal rather than becoming a memory refusal.
         if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                "{provider_id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
                  can express",
                 context.geometry.reference_count
             )));
         }
         if context.use_pid {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
+                "{provider_id}: there is no PiD decoder on this route"
             )));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
+                provider_id,
                 context.selection.parameters.decode_tile_edge,
                 context.selection.parameters.decode_overlap,
             )?;
@@ -602,11 +640,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(MODEL_ID, spec, contract, context)
+}
+
+/// [`registered_begin_request`] for the Turbo id (sc-25901).
+pub(crate) fn registered_begin_turbo_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+}
+
+/// The executable admission seam both engine ids share; `provider_id` only labels the scope.
+pub(crate) fn begin_request_for(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(gen_core::Error::Unsupported(reason));
     }
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        MODEL_ID,
+        provider_id,
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -615,10 +672,10 @@ pub(crate) fn registered_begin_request(
         move |use_pid, edge, overlap| {
             if use_pid {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "{MODEL_ID}: there is no PiD decoder on this route"
+                    "{provider_id}: there is no PiD decoder on this route"
                 )));
             }
-            validate_decode(Some(edge), Some(overlap))
+            validate_decode(provider_id, Some(edge), Some(overlap))
         },
     )?;
     Ok(Some(Box::new(
@@ -639,6 +696,22 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
         provider_id: MODEL_ID,
         valid_fixtures: registered_valid_fixture,
         begin_request: registered_begin_request,
+    };
+
+/// [`MEMORY_REGISTRATION`] for the Turbo id (sc-25901): the same rungs and the same safety gate,
+/// priced from the Turbo snapshot under its own calibration identity.
+pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(TURBO_MODEL_ID, spec),
+    safety_check,
+};
+
+/// [`MEMORY_BEHAVIOR_REGISTRATION`] for the Turbo id.
+pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: TURBO_MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_turbo_request,
     };
 
 #[cfg(test)]
@@ -948,12 +1021,14 @@ mod tests {
     fn bounded_decode_publishes_a_domain_and_refuses_everything_outside_it() {
         assert!(DECODE_TILE_EDGES.contains(&crate::pipeline::DECODE_TILE_EDGE));
         for edge in DECODE_TILE_EDGES {
-            assert!(validate_decode(Some(*edge), Some(DECODE_OVERLAP)).is_ok());
+            assert!(validate_decode(MODEL_ID, Some(*edge), Some(DECODE_OVERLAP)).is_ok());
         }
-        assert!(validate_decode(Some(1024), Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(crate::pipeline::DECODE_TILE_EDGE), Some(96)).is_err());
-        assert!(validate_decode(None, Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(crate::pipeline::DECODE_TILE_EDGE), None).is_err());
+        assert!(validate_decode(MODEL_ID, Some(1024), Some(DECODE_OVERLAP)).is_err());
+        assert!(
+            validate_decode(MODEL_ID, Some(crate::pipeline::DECODE_TILE_EDGE), Some(96)).is_err()
+        );
+        assert!(validate_decode(MODEL_ID, None, Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(crate::pipeline::DECODE_TILE_EDGE), None).is_err());
     }
 
     /// The derived tier ladder is owned by the MLX crate and is not duplicated here, but the
@@ -983,11 +1058,11 @@ mod tests {
         );
         candle_gen::candle_core::safetensors::save(&map, te.join("model.safetensors")).unwrap();
 
-        let loaded = component_bytes(&te, 4, &|name: &str| {
+        let loaded = component_bytes(MODEL_ID, &te, 4, &|name: &str| {
             name.starts_with(crate::loader::TEXT_ENCODER_PREFIX)
         })
         .unwrap();
-        let everything = component_bytes(&te, 4, &|_| true).unwrap();
+        let everything = component_bytes(MODEL_ID, &te, 4, &|_| true).unwrap();
         assert_eq!(loaded, 8 * 4 * 4, "only the language tower is materialized");
         assert!(
             loaded < everything,
@@ -1016,8 +1091,8 @@ mod tests {
         );
         candle_gen::candle_core::safetensors::save(&map, dir.join("model.safetensors")).unwrap();
 
-        let at_bf16 = component_bytes(&dir, 2, &|_| true).unwrap();
-        let at_f32 = component_bytes(&dir, 4, &|_| true).unwrap();
+        let at_bf16 = component_bytes(MODEL_ID, &dir, 2, &|_| true).unwrap();
+        let at_f32 = component_bytes(MODEL_ID, &dir, 4, &|_| true).unwrap();
         assert_eq!(at_bf16, 8 * 8 * 4 + 8 * 2, "codes u32, scales bf16");
         assert_eq!(
             at_f32,
@@ -1047,8 +1122,8 @@ mod tests {
     fn the_tower_is_priced_at_the_compute_width_like_every_other_component() {
         let tiny = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
-        let at_bf16 = asset_facts_at(&tiny, 2).unwrap();
-        let at_f32 = asset_facts_at(&tiny, 4).unwrap();
+        let at_bf16 = asset_facts_at(MODEL_ID, &tiny, 2).unwrap();
+        let at_f32 = asset_facts_at(MODEL_ID, &tiny, 4).unwrap();
         assert!(at_bf16.conditioning_bytes > 0);
         assert_eq!(
             at_bf16.conditioning_bytes * 2,
@@ -1065,7 +1140,7 @@ mod tests {
         let contract = memory_strategy_contract(MODEL_ID, &spec).unwrap();
         assert_eq!(
             contract.asset_facts,
-            asset_facts_at(&tiny, compute_width()).unwrap()
+            asset_facts_at(MODEL_ID, &tiny, compute_width()).unwrap()
         );
         assert_eq!(
             compute_width(),
@@ -1174,7 +1249,7 @@ mod tests {
             AdapterSpec::new(loha.clone(), 0.5, AdapterKind::Lora),
         ]);
         assert_eq!(
-            adapter_overlay(&stacked, &tiny, crate::quant::Tier::Bf16).unwrap(),
+            adapter_overlay(MODEL_ID, &stacked, &tiny, crate::quant::Tier::Bf16).unwrap(),
             AdapterOverlay {
                 residual_bytes: lora_bytes,
                 loha_fold_transient_bytes: fold_transient,
@@ -1212,7 +1287,7 @@ mod tests {
         assert_eq!(contract.asset_facts.overlay_bytes, fold_transient);
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(contract.evicted_component_bytes(), fold_transient);
-        match adapter_overlay(&stacked, &tiny, crate::quant::Tier::Q4) {
+        match adapter_overlay(MODEL_ID, &stacked, &tiny, crate::quant::Tier::Q4) {
             Err(gen_core::Error::Unsupported(message)) => {
                 assert!(
                     message.contains("LoHa") && message.contains("q4"),

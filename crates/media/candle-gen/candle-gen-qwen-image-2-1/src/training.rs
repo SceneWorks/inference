@@ -991,6 +991,9 @@ impl QwenImage21Trainer {
         // Shared with the MLX twin (sc-24163): one refusal, one message.
         gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
+        // sc-25901: a Turbo snapshot is not a training base. Refused by name here, rather than
+        // incidentally by the scheduler-config reader further down.
+        loader::check_snapshot_variant(crate::config::Variant::Base, &root)?;
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
             return Err(quantized_base_refusal(&format!(

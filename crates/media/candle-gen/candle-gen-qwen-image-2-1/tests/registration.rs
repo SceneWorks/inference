@@ -7,8 +7,10 @@ use candle_gen::gen_core::{ConditioningKind, Quant, SizeFloor};
 fn qwen_image_2_1_is_exported_by_provider_catalog_as_a_distinct_engine() {
     let registry = candle_gen_qwen_image_2_1::provider_registry().unwrap();
     let ids: Vec<_> = registry.generators().map(|r| (r.descriptor)().id).collect();
-    assert_eq!(ids, ["qwen_image_2_1"]);
+    // sc-25901: the distilled Turbo checkpoint is a second id from the same crate, after the base.
+    assert_eq!(ids, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
     let d = (registry.generators().next().unwrap().descriptor)();
+    assert_eq!(d.id, "qwen_image_2_1");
     assert_eq!(
         d.family, "qwen-image-2-1",
         "not an alias of the 2512 `qwen-image` family"

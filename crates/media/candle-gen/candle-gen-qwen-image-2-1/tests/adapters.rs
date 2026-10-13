@@ -1595,7 +1595,8 @@ fn a_lokr_overlay_prices_the_resident_kronecker_factors() {
         .resident_f32_bytes() as u64;
         let spec = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))
             .with_adapters(vec![AdapterSpec::new(file.clone(), 1.0, AdapterKind::Lokr)]);
-        let overlay = adapter_overlay(&spec, &tiny_snapshot(), Tier::Bf16).unwrap();
+        let overlay =
+            adapter_overlay("qwen_image_2_1", &spec, &tiny_snapshot(), Tier::Bf16).unwrap();
         let file_bytes = std::fs::metadata(&file).unwrap().len();
         assert!(
             overlay.residual_bytes >= installed,
