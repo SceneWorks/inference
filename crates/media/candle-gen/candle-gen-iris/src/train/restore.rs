@@ -335,13 +335,12 @@ pub fn generator_grads(
         let [l2, lp, gan] = generator_terms(frozen, plan, head, sn, &xhat, &batch.gt)?;
         let total = l2.add(&lp)?.add(&gan)?;
         let scaled = mul_s(&total, grad_scale as f64)?;
-        terms = Some([total, l2, lp, gan]);
+        let h =
+            |t: &Tensor| -> Result<f64> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64) };
+        terms = Some([h(&total)?, h(&l2)?, h(&lp)?, h(&gan)?]);
         Ok(scaled)
     })?;
-    drop((dit, free));
-    let [total, l2, lp, gan] = terms.expect("the loss closure ran");
-    let h = |t: &Tensor| -> Result<f64> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64) };
-    Ok(([h(&total)?, h(&l2)?, h(&lp)?, h(&gan)?], grads))
+    Ok((terms.expect("the loss closure ran"), grads))
 }
 
 /// One critic micro-batch: two power iterations (`D(y)` then `D(x̂)`), the loss, the gradient of

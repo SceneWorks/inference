@@ -700,8 +700,14 @@ fn merge_boundaries(
 /// backward to the last boundaries, then, region by region in reverse, its recompute on the tape
 /// (the region's own parameter gradients and its input cotangents) and the propagation of those
 /// cotangents into whatever produced its inputs.
+///
+/// `loss` is taken by value and dropped once the plain backward has run: everything downstream of
+/// the last boundaries (the backbone's head, the loss, a task's own loss networks) is then off the
+/// tape before the first region is replayed, instead of resident under every replay. A caller that
+/// keeps another handle on that graph (a loss term to read later) keeps it alive — read scalars
+/// first.
 fn backward_segmented(
-    loss: &Tensor,
+    loss: Tensor,
     regions: Vec<Region>,
     tracked: &IrisDiT,
     params: &Params,
@@ -712,6 +718,7 @@ fn backward_segmented(
     merge_params(&mut acc, &store, params)?;
     merge_boundaries(&mut cot, &store, &regions)?;
     drop(store);
+    drop(loss);
     for idx in (0..regions.len()).rev() {
         let (earlier, rest) = regions.split_at(idx);
         let region = &rest[0];
@@ -784,7 +791,9 @@ fn backward_segmented(
 /// forward under the activation-checkpointing policy `ac` (zero for a tensor the graph never
 /// reaches) — the depth and restoration trainers' seam onto the generation trainer's regions
 /// (sc-25690). `tape_free` is the same backbone off the tape ([`TrainModel::dit_pair`]); it is
-/// required when `ac` is active. With `ac` none this is the plain backward.
+/// required when `ac` is active. With `ac` none this is the plain backward. The closure hands the
+/// loss over: whatever it wants to report (the unscaled terms) it reads to host values itself, so
+/// no handle on the loss graph outlives the plain backward (see [`backward_segmented`]).
 pub fn grads_under_ac(
     tracked: &IrisDiT,
     tape_free: Option<&IrisDiT>,
@@ -806,7 +815,7 @@ pub fn grads_under_ac(
     };
     let loss = loss(&mut hooks)?;
     let regions = std::mem::take(&mut hooks.regions);
-    let mut grads = backward_segmented(&loss, regions, tracked, params)?;
+    let mut grads = backward_segmented(loss, regions, tracked, params)?;
     for (k, v) in params {
         if !grads.contains_key(k) {
             grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
@@ -983,19 +992,19 @@ pub fn loss_and_grads_ext(
     };
     let scaled = mul_s(&total, grad_scale as f64)?;
     let regions = std::mem::take(&mut hooks.regions);
-    let mut grads = backward_segmented(&scaled, regions, &tracked, params)?;
+    // The reported losses are read before the backward, so the loss graph has one owner.
+    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()?) };
+    let flow_value = scalar(&flow)?;
+    let repa_value = repa_l.as_ref().map(scalar).transpose()?;
+    drop((flow, repa_l, total));
+    let mut grads = backward_segmented(scaled, regions, &tracked, params)?;
     drop(tracked);
     for (k, v) in params {
         if !grads.contains_key(k) {
             grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
         }
     }
-    let scalar = |t: &Tensor| -> Result<f32> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()?) };
-    Ok((
-        scalar(&flow)?,
-        repa_l.as_ref().map(scalar).transpose()?,
-        grads,
-    ))
+    Ok((flow_value, repa_value, grads))
 }
 
 /// PyTorch-default init of the REPA projector (`U(±1/√fan_in)`), from the shared host RNG keyed

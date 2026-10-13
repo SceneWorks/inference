@@ -397,11 +397,10 @@ pub fn loss_and_grads(
         let pred = model.predict_with(&dit, &snap, &step.rgb, hooks)?;
         let l = depth_loss(&pred, step, loss.gradient_weight)?;
         let scaled = mul_s(&l, grad_scale as f64)?;
-        unscaled = Some(l);
+        unscaled = Some(l.to_dtype(DType::F32)?.to_vec0::<f32>()?);
         Ok(scaled)
     })?;
-    let l = unscaled.expect("the loss closure ran");
-    Ok((l.to_dtype(DType::F32)?.to_vec0::<f32>()?, grads))
+    Ok((unscaled.expect("the loss closure ran"), grads))
 }
 
 /// One accumulation window (the generation trainer's `Window` over the depth loss).

@@ -579,3 +579,93 @@ fn folds_are_bit_identical_on_the_build_device() {
     );
     assert_eq!(moved, 0, "folding moved {moved} tensors on this device");
 }
+
+/// An identity node that holds a token for as long as it is on a tape and, when a gradient passes
+/// through it, records how many holders `watch` still has.
+struct Witness {
+    _token: Option<std::sync::Arc<()>>,
+    watch: Option<std::sync::Weak<()>>,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl candle_gen::candle_core::CustomOp1 for Witness {
+    fn name(&self) -> &'static str {
+        "test-witness"
+    }
+    fn cpu_fwd(
+        &self,
+        storage: &CpuStorage,
+        layout: &candle_gen::candle_core::Layout,
+    ) -> candle_gen::candle_core::Result<(CpuStorage, candle_gen::candle_core::Shape)> {
+        assert!(layout.is_contiguous() && layout.start_offset() == 0);
+        Ok((storage.clone(), layout.shape().clone()))
+    }
+    fn bwd(
+        &self,
+        _: &Tensor,
+        _: &Tensor,
+        grad: &Tensor,
+    ) -> candle_gen::candle_core::Result<Option<Tensor>> {
+        if let Some(watch) = &self.watch {
+            self.seen
+                .store(watch.strong_count(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Some(grad.clone()))
+    }
+}
+
+/// A checkpointed backward releases everything downstream of the last regions (the head, the loss,
+/// a task's loss networks) once its plain backward has run — before any region is replayed, not
+/// after the last one. A witness on the patch embedding sees the gradient arrive at the very end
+/// (the propagation out of the first region); by then the witness downstream of the regions must
+/// be off the tape.
+#[test]
+fn a_checkpointed_backward_drops_the_loss_graph_before_replaying_the_regions() {
+    use candle_gen_iris::dit::TextBatch;
+    use candle_gen_iris::train::model::grads_under_ac;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    const PROBED: &str = "s_embedder.proj.weight";
+    let params = base_params();
+    let model = full_model(DType::F32);
+    let token = Arc::new(());
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut tensors = snapshot(&params);
+    let upstream = tensors[PROBED]
+        .apply_op1(Witness {
+            _token: None,
+            watch: Some(Arc::downgrade(&token)),
+            seen: seen.clone(),
+        })
+        .unwrap();
+    tensors.insert(PROBED.into(), upstream);
+    let (tracked, free) = model.dit_pair(&tensors, true).unwrap();
+    let batch = mb0();
+    let downstream = Witness {
+        _token: Some(token.clone()),
+        watch: None,
+        seen: seen.clone(),
+    };
+    let grads = grads_under_ac(&tracked, free.as_ref(), AcPolicy::Full, &params, |hooks| {
+        let out = tracked.forward_hooked(
+            &batch.x0,
+            &batch.t,
+            &TextBatch {
+                states: &batch.states,
+                mask: &batch.masks,
+            },
+            hooks,
+        )?;
+        Ok(out.sqr()?.apply_op1(downstream)?.mean_all()?)
+    })
+    .unwrap();
+    assert!(
+        bits(&grads[PROBED]).iter().any(|b| b << 1 != 0),
+        "the gradient reached the patch embedding through its witness"
+    );
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        1,
+        "holders of the downstream token when the last gradient arrived: the test alone"
+    );
+}

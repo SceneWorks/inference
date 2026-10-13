@@ -116,6 +116,10 @@ run is the plain run to the bounds of the generation trainer's (f32: gradients �
 peak for depth, ≤ 1e-5 for restoration, whose adversarial term is O(10²) on the miniature and
 reaches the text embedder as a difference of large partials — 3.8e-6 measured, 1.6e-8 with the L2
 term alone; bf16: the same loss bit for bit and the declared noise bound of the generation row).
+A checkpointed backward drops the loss graph as soon as its plain backward has run
+(`backward_segmented` owns the loss): everything downstream of the last regions — the backbone's
+head, and here the LPIPS and critic tapes — is off the tape before the first region is replayed
+rather than resident under every replay.
 Upstream ships neither task with checkpointing; it changes memory and compute only, so it is no
 part of a run's identity. **The MLX depth and restoration trainers refuse it typed** — their
 regions are built by the generation trainer's model type and are not wired for these tasks.
