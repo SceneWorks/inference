@@ -34,6 +34,7 @@ pub mod guidance;
 pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
+pub mod iris;
 pub mod json_constraint;
 pub mod latent;
 pub mod license;
@@ -135,12 +136,12 @@ pub use generator::{
     default_seed, effective_component_quant, effective_reference_image_short_edge,
     reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
     ArtifactRecord, AudioArtifacts, AudioEditMode, AudioEditRef, AudioParams, Capabilities,
-    ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
-    ConversationRole, ConversationSession, ConversationTurn, GenerationMemory, GenerationOutput,
-    GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning, Generator, HdrRequest,
-    KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter, PhaseAdapter,
-    PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover, SongCoverMode,
-    SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
+    CaptionOverflowPolicy, ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef,
+    ControlKind, ConversationRole, ConversationSession, ConversationTurn, GenerationMemory,
+    GenerationOutput, GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter,
+    PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover,
+    SongCoverMode, SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
     StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
     REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
     REFERENCE_IMAGE_SHORT_EDGE_MIN,
@@ -282,8 +283,9 @@ pub use train::{
     FaceLandmarkLossConfig, IdentityLossConfig, IdentityReferenceMode, LatentLpipsConfig,
     LatentLpipsFamily, LrSchedule, NetworkType, ResolutionBucket, SubjectMaskLoss, Trainer,
     TrainerDescriptor, TrainingConfig, TrainingItem, TrainingOutput, TrainingProgress,
-    TrainingRequest, TrainingTechniques, VaeAnchorConfig, LATENT_PERCEPTUAL_SCHEDULE,
-    MAX_RESOLUTION_BUCKETS, RESOLUTION_BUCKET_STRIDE,
+    TrainingRequest, TrainingTechniques, VaeAnchorConfig, BODY_SURFACE_SCHEDULE,
+    LATENT_PERCEPTUAL_SCHEDULE, MAX_RESOLUTION_BUCKETS, PIXEL_PERCEPTUAL_SCHEDULE,
+    RESOLUTION_BUCKET_STRIDE,
 };
 pub use transcribe::{
     TimestampGranularity, TranscribeCapabilities, TranscribeFinishReason, TranscribeOptions,
@@ -291,7 +293,8 @@ pub use transcribe::{
     TranscriptOutput, TranscriptSegment, TranscriptWord,
 };
 pub use transform::{
-    TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
+    InputBudget, InputSizing, TargetSize, Transform, TransformCapabilities, TransformDescriptor,
+    TransformRequest,
 };
 
 /// gen-core's package version, for the version-skew runtime guard (sc-4482).

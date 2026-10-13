@@ -41,6 +41,9 @@ const MAX_CONTEXT_TOKENS: usize = 8_192;
 // `IMAGE_TOKENS` is the CLIP class+patch sequence. The exact snapshot tokenizer encodes the
 // fixed decoder prompt as two IDs; load validates that fact against the real tokenizer.
 const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+/// Hard wall-time cap for one SVG decode. Sized so a decode that uses the whole context window
+/// can finish; hosts may request less.
+const MAX_WALL_TIME: Duration = Duration::from_secs(600);
 const MAX_NEW_TOKENS: u32 =
     (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
@@ -355,8 +358,7 @@ impl TextLlm for StarVector1bProvider {
         request: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> CoreResult<TextLlmOutput> {
-        let svg_request =
-            StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, Duration::from_secs(120));
+        let svg_request = StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, MAX_WALL_TIME);
         let (output, report) = self.generate_svg_inner(&svg_request, &mut |event| match event {
             StarVectorStreamEvent::Source { text, index } => {
                 on_event(StreamEvent::Token {
@@ -498,7 +500,7 @@ pub fn starvector_descriptor() -> StarVectorDescriptor {
             image_token_count: IMAGE_TOKENS as u32,
         },
         max_svg_bytes: 2 * 1024 * 1024,
-        max_wall_time: Some(Duration::from_secs(120)),
+        max_wall_time: Some(MAX_WALL_TIME),
     }
 }
 

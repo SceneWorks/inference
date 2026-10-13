@@ -49,7 +49,7 @@ use mlx_gen::{
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
-use mlx_rs::ops::{broadcast_to, subtract};
+use mlx_rs::ops::{broadcast_to, multiply, subtract};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
@@ -348,14 +348,19 @@ pub fn compute_step_loss_grads<H: SdxlFamilyHooks>(
         let aux_term = match &aux {
             Some(a) if aux_on => {
                 // x0 estimate in f32 from the ε prediction, NHWC → the decoder's NCHW.
-                let x0_hat = Parameterization::Epsilon { alpha_bar }
+                let param = Parameterization::Epsilon { alpha_bar };
+                let x0_hat = param
                     .recover_x0(&noisy_f32, &eps.as_dtype(Dtype::Float32)?)
                     .and_then(|x| nchw(&x))
                     .map_err(|e| Exception::custom(e.to_string()))?;
+                // sc-2124: undo the ε Jacobian's σ_ve amplification so an aux weight means what
+                // it means on the flow families (`Parameterization::aux_gain`).
+                let gain = Array::from_f32(param.aux_gain());
                 a.path
                     .aux_loss(a.plan, a.entry, &x0_hat)
                     .map_err(|e| Exception::custom(e.to_string()))?
-                    .map(|t| t.weighted)
+                    .map(|t| multiply(&t.weighted, &gain))
+                    .transpose()?
             }
             _ => None,
         };

@@ -238,6 +238,28 @@ pub fn resize_bicubic_u8(
     resize_u8(src, in_h, in_w, out_h, out_w, 3, 2.0, &cubic)
 }
 
+/// PIL `box_filter` (`-0.5 < x ≤ 0.5`), support 0.5.
+fn box_filter(x: f64) -> f64 {
+    if x > -0.5 && x <= 0.5 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// PIL `Image.BOX` resize of a uint8 RGB HWC image (the guided-diffusion crop helpers' power-of-two
+/// halving, used by the Iris restoration trainer's crops). Returns f32 HWC, integer-valued
+/// `[0,255]`.
+pub fn resize_box_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> crate::Result<Vec<f32>> {
+    resize_u8(src, in_h, in_w, out_h, out_w, 3, 0.5, &box_filter)
+}
+
 /// PIL `Image.BILINEAR` resize of a uint8 RGB HWC image (SAM2's preprocessing filter). Returns
 /// f32 HWC, integer-valued `[0,255]`.
 pub fn resize_bilinear_u8(

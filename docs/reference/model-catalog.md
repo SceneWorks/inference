@@ -72,6 +72,7 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | | `flux2_dev_control` | ✓ | — |
 | **ideogram** | `ideogram_4` | ✓ | ✓ |
 | | `ideogram_4_turbo` | ✓ | ✓ |
+| **iris** (Iris-3B, pixel space) | `iris_3b` | ✓ | ✓ |
 | **kolors** | `kolors` | ✓ | ✓ |
 | **krea** | `krea_2_turbo` | ✓ | ✓ |
 | | `krea_2_raw` | ✓ | ✓ |
@@ -120,6 +121,8 @@ LoRA/LoKr fine-tuning is available for a subset of generator families. Load with
 | `anima_base` | ✓ | ✓ |
 | `anima_aesthetic` | ✓ | — |
 | `anima_turbo` | ✓ | — |
+| `iris_3b` (full model or LoRA/LoKr) | ✓ | ✓ |
+| `iris_3b_depth` (depth task, full fine-tune → `depth/` export) | ✓ | ✓ |
 | `kolors` | ✓ | ✓ |
 | `krea_2_raw` | ✓ | ✓ |
 | `krea_2_control` | — | ✓ |
