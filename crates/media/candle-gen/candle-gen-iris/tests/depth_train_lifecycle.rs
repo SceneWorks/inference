@@ -446,3 +446,38 @@ fn parent_init_from_a_file_or_the_text_encoder() {
         .load_trainer(ID, &LoadSpec::new(WeightsSource::Dir(tiny_backbone())))
         .is_err());
 }
+
+/// sc-25690: a checkpointed depth run is the plain run (f32): the trainer wires
+/// `gradient_checkpointing` into its step and the export moves by rounding only.
+#[test]
+fn activation_checkpointing_leaves_the_run_unchanged() {
+    use candle_gen_iris::train::model::checkpointed_regions;
+    let (data, a, b) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let items = dataset(data.path());
+    let export = |ac: bool, out: &Path| {
+        let mut cfg = config();
+        cfg.save_every = 0;
+        cfg.gradient_checkpointing = ac;
+        let before = checkpointed_regions();
+        let res = trainer()
+            .train(&request(&items, cfg, out, "depth.safetensors"), &mut |_| {})
+            .unwrap();
+        assert_eq!(checkpointed_regions() > before, ac);
+        tensors_of(&res.adapter_path)
+    };
+    let (plain, checkpointed) = (export(false, a.path()), export(true, b.path()));
+    assert_eq!(plain.len(), checkpointed.len());
+    let mut worst = 0f32;
+    for ((k, x), (k2, y)) in plain.iter().zip(&checkpointed) {
+        assert_eq!(k, k2);
+        for (p, q) in x.iter().zip(y) {
+            worst = worst.max((p - q).abs());
+        }
+    }
+    eprintln!("depth: activation checkpointing vs plain: max |Δ| = {worst:.3e}");
+    assert!(worst <= 1e-5, "{worst}");
+}

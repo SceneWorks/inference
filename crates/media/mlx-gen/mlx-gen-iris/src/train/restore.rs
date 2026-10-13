@@ -179,12 +179,19 @@ impl IrisRestoreTrainer {
     }
 
     fn plan(&self, req: &TrainingRequest, linear_paths: &[String]) -> Result<RestoreTrainPlan> {
-        Ok(RestoreTrainPlan::resolve(
+        let plan = RestoreTrainPlan::resolve(
             req,
             &self.res.export,
             linear_paths,
             self.res.parent.is_some(),
-        )?)
+        )?;
+        if plan.ac.active() {
+            return Err(Error::Unsupported(format!(
+                "{TRAINER_ID} trainer: gradient (activation) checkpointing is not implemented \
+                 for the restoration task on the MLX backend"
+            )));
+        }
+        Ok(plan)
     }
 }
 

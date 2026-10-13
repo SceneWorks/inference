@@ -58,8 +58,17 @@ impl Folded {
             .map_err(|_| candle::Error::msg(format!("{}: poisoned value", self.name)))?
             .take()
             .ok_or_else(|| candle::Error::msg(format!("{}: forward ran twice", self.name)))?;
-        // `try_clone` copies the whole buffer: the value must own exactly its elements.
-        let value = if value.is_contiguous() && value.storage_and_layout().1.start_offset() == 0 {
+        // Every backend's `try_clone` copies the whole buffer, so the value must own exactly its
+        // elements — not a view into a larger one (a prefix `narrow` is contiguous at offset 0).
+        // Only the CPU backend exposes a buffer's length; elsewhere the value is compacted
+        // unconditionally (one more transient copy of the node's output).
+        let exact = {
+            let (storage, layout) = value.storage_and_layout();
+            layout.is_contiguous()
+                && layout.start_offset() == 0
+                && cpu_len(&storage) == Some(layout.shape().elem_count())
+        };
+        let value = if exact {
             value
         } else {
             value.force_contiguous()?
@@ -86,11 +95,19 @@ impl Folded {
             .mul(&grad.to_dtype(DType::F32)?)?
             .sum_all()?;
         let store = seeded.backward()?;
-        Ok(leaves
+        // A tracked operand the chain never read still gets a (zero) gradient: candle's backward
+        // expects one for every tracked node it visits, and nothing else may have supplied it.
+        leaves
             .iter()
             .zip(args)
-            .map(|(leaf, arg)| arg.track_op().then(|| store.get(leaf).cloned()).flatten())
-            .collect())
+            .map(|(leaf, arg)| {
+                Ok(match (arg.track_op(), store.get(leaf)) {
+                    (false, _) => None,
+                    (true, Some(g)) => Some(g.clone()),
+                    (true, None) => Some(arg.zeros_like()?.detach()),
+                })
+            })
+            .collect()
     }
 
     fn wrong_device(&self) -> candle::Error {
@@ -189,6 +206,25 @@ impl CustomOp3 for Fold3 {
         let mut g = self.0.pull(&[a, b, c], grad)?.into_iter();
         Ok((g.next().flatten(), g.next().flatten(), g.next().flatten()))
     }
+}
+
+/// The element count of a CPU buffer (`None` on a device whose storage does not expose one).
+fn cpu_len(storage: &Storage) -> Option<usize> {
+    let Storage::Cpu(cpu) = storage else {
+        return None;
+    };
+    Some(match cpu {
+        CpuStorage::U8(v) => v.len(),
+        CpuStorage::U32(v) => v.len(),
+        CpuStorage::I16(v) => v.len(),
+        CpuStorage::I32(v) => v.len(),
+        CpuStorage::I64(v) => v.len(),
+        CpuStorage::BF16(v) => v.len(),
+        CpuStorage::F16(v) => v.len(),
+        CpuStorage::F32(v) => v.len(),
+        CpuStorage::F64(v) => v.len(),
+        _ => return None,
+    })
 }
 
 fn folded(name: &'static str, body: Arc<Body>, args: &[&Tensor]) -> candle::Result<Folded> {

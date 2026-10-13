@@ -50,6 +50,7 @@ use super::degradation::{
     self, degradation_key, DegradationConfig, KernelConfig, KernelType, Planes, StageConfig,
 };
 use super::restoration::{bicubic_scale_factor, RestorationResources};
+use super::train::ac::AcPolicy;
 use super::train::{
     mix_seed, select_adapter_targets, HostRng, LrShape, MixedPrecision, ResumeDataPolicy,
     WeightsSelect,
@@ -950,6 +951,11 @@ pub struct RestoreTrainPlan {
     pub num_epochs: Option<u32>,
     pub seed: u64,
     pub mixed_precision: MixedPrecision,
+    /// Activation checkpointing of the generator's trunk / pixel blocks in the generator step
+    /// (sc-25690): `TrainingConfig::gradient_checkpointing` selects `full`. It changes memory and
+    /// compute, never the update, so it is no part of a run's identity. A backend that has not
+    /// wired the regions for this task refuses an active policy typed.
+    pub ac: AcPolicy,
     pub critic_bf16: bool,
     /// The export's one-step noise level and the model time `σ · N`.
     pub sigma: f64,
@@ -996,12 +1002,6 @@ impl RestoreTrainPlan {
         let unsupported = |what: String| -> Result<Self> {
             Err(Error::Unsupported(format!("iris restore training: {what}")))
         };
-        if cfg.gradient_checkpointing {
-            return unsupported(
-                "gradient (activation) checkpointing is not implemented by the native trainer"
-                    .into(),
-            );
-        }
         // The shared request defaults (`loss_type "mse"`, `timestep_type "sigmoid"`,
         // `timestep_bias "balanced"`) stand for "not set"; any other value names a control the
         // one-step restoration recipe does not have and is refused, never ignored. (`mse` is also
@@ -1346,6 +1346,11 @@ impl RestoreTrainPlan {
             num_epochs,
             seed: cfg.seed,
             mixed_precision,
+            ac: if cfg.gradient_checkpointing {
+                AcPolicy::Full
+            } else {
+                AcPolicy::None
+            },
             critic_bf16,
             sigma,
             model_time,

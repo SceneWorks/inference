@@ -780,6 +780,41 @@ fn backward_segmented(
     Ok(acc)
 }
 
+/// The gradient over `params` of the scalar `loss(hooks)` computed through `tracked`'s hooked
+/// forward under the activation-checkpointing policy `ac` (zero for a tensor the graph never
+/// reaches) — the depth and restoration trainers' seam onto the generation trainer's regions
+/// (sc-25690). `tape_free` is the same backbone off the tape ([`TrainModel::dit_pair`]); it is
+/// required when `ac` is active. With `ac` none this is the plain backward.
+pub fn grads_under_ac(
+    tracked: &IrisDiT,
+    tape_free: Option<&IrisDiT>,
+    ac: AcPolicy,
+    params: &Params,
+    loss: impl FnOnce(&mut dyn ForwardHooks) -> Result<Tensor>,
+) -> Result<Tensors> {
+    if ac.active() && tape_free.is_none() {
+        return Err(Error::Msg(
+            "iris training: activation checkpointing needs the tape-free backbone".into(),
+        ));
+    }
+    let mut hooks = TrainHooks {
+        tape_free: tape_free.unwrap_or(tracked),
+        ac,
+        capture: None,
+        captured: None,
+        regions: Vec::new(),
+    };
+    let loss = loss(&mut hooks)?;
+    let regions = std::mem::take(&mut hooks.regions);
+    let mut grads = backward_segmented(&loss, regions, tracked, params)?;
+    for (k, v) in params {
+        if !grads.contains_key(k) {
+            grads.insert(k.clone(), v.as_tensor().zeros_like()?.detach());
+        }
+    }
+    Ok(grads)
+}
+
 /// `F.normalize(x, dim=-1)`: `x / max(‖x‖₂, 1e−12)`.
 fn l2_normalize(x: &Tensor) -> Result<Tensor> {
     let n = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?.maximum(1e-12)?;

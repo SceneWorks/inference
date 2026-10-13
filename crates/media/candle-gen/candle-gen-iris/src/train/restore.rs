@@ -50,14 +50,14 @@ use super::critic::{
 };
 use super::lpips::Lpips;
 use super::model::{
-    fnv, init_adapter, provider_dtype, save_safetensors_atomic, AdapterKind, AdapterTarget,
-    TrainModel, Trainable,
+    fnv, grads_under_ac, init_adapter, provider_dtype, save_safetensors_atomic, AdapterKind,
+    AdapterTarget, TrainModel, Trainable,
 };
 use super::optim::{
     clip_grads, ema_update, mul_s, save_tensors, snapshot, IrisOptimizer, Params, Tensors,
 };
 use super::{check_backbone_keys, load_source, load_tensors, vars};
-use crate::dit::{IrisDiT, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 
 const BACKEND: &str = "candle";
 
@@ -250,6 +250,17 @@ impl PairBatch {
 impl Frozen {
     /// `x̂ = x_lq − σ·v(x_lq, σ·N, ∅)` (f32).
     pub fn restore(&self, dit: &IrisDiT, lq: &Tensor) -> Result<Tensor> {
+        self.restore_hooked(dit, lq, &mut NoHooks)
+    }
+
+    /// [`restore`](Self::restore) with `hooks` around the generator's trunk and pixel blocks (the
+    /// generator step's activation-checkpointing regions, sc-25690).
+    pub fn restore_hooked(
+        &self,
+        dit: &IrisDiT,
+        lq: &Tensor,
+        hooks: &mut dyn ForwardHooks,
+    ) -> Result<Tensor> {
         let b = lq.dim(0)?;
         let states = if b == 1 {
             self.states.clone()
@@ -259,13 +270,14 @@ impl Frozen {
         let masks = vec![self.mask.clone(); b];
         let t = Tensor::from_vec(vec![self.model_time; b], b, &self.device)?;
         let v = dit
-            .forward(
+            .forward_hooked(
                 lq,
                 &t,
                 &TextBatch {
                     states: &states,
                     mask: &masks,
                 },
+                hooks,
             )?
             .to_dtype(DType::F32)?;
         Ok(lq.sub(&mul_s(&v, self.sigma as f64)?)?)
@@ -316,20 +328,18 @@ pub fn generator_grads(
     batch: &PairBatch,
     grad_scale: f32,
 ) -> Result<([f64; 4], Tensors)> {
-    let dit = model.dit(&snapshot(params))?;
-    let xhat = frozen.restore(&dit, &batch.lq)?;
-    let [l2, lp, gan] = generator_terms(frozen, plan, head, sn, &xhat, &batch.gt)?;
-    let total = l2.add(&lp)?.add(&gan)?;
-    let store = mul_s(&total, grad_scale as f64)?.backward()?;
-    drop(dit);
-    let mut grads = Tensors::new();
-    for (k, v) in params {
-        let g = match store.get(v.as_tensor()) {
-            Some(g) => g.detach(),
-            None => v.as_tensor().zeros_like()?.detach(),
-        };
-        grads.insert(k.clone(), g);
-    }
+    let (dit, free) = model.dit_pair(&snapshot(params), plan.ac.active())?;
+    let mut terms = None;
+    let grads = grads_under_ac(&dit, free.as_ref(), plan.ac, params, |hooks| {
+        let xhat = frozen.restore_hooked(&dit, &batch.lq, hooks)?;
+        let [l2, lp, gan] = generator_terms(frozen, plan, head, sn, &xhat, &batch.gt)?;
+        let total = l2.add(&lp)?.add(&gan)?;
+        let scaled = mul_s(&total, grad_scale as f64)?;
+        terms = Some([total, l2, lp, gan]);
+        Ok(scaled)
+    })?;
+    drop((dit, free));
+    let [total, l2, lp, gan] = terms.expect("the loss closure ran");
     let h = |t: &Tensor| -> Result<f64> { Ok(t.to_dtype(DType::F32)?.to_vec0::<f32>()? as f64) };
     Ok(([h(&total)?, h(&l2)?, h(&lp)?, h(&gan)?], grads))
 }

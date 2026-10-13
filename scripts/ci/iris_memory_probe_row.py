@@ -73,6 +73,29 @@ def _gb(fields: dict[str, str], key: str) -> float:
     return float(fields[key])
 
 
+def _all_fields(log: str, kind: str) -> list[dict[str, str]]:
+    """The `key=value` fields of every `[[IRIS_MEMORY_PROBE]] <kind> ...` line, in order."""
+    found = []
+    for line in log.splitlines():
+        at = line.find(f"{MARKER} {kind} ")
+        if at >= 0:
+            found.append(dict(_FIELD.findall(line[at:])))
+    return found
+
+
+def cuda_steps(log: str) -> str:
+    """The per-step trail of a CUDA probe: live peak (GB), seconds and loss of every optimizer
+    step, in order (the first step's peak also covers the load). Empty when no step completed."""
+    steps = _all_fields(log, "cuda_step")
+    if not steps:
+        return ""
+    join = lambda key: "/".join(step[key] for step in steps)  # noqa: E731
+    return (
+        f" steps={len(steps)} step_peaks_gb={join('used_high_gb')}"
+        f" step_s={join('seconds')} step_loss={join('loss')}"
+    )
+
+
 def mlx_row(name: str, log: str, rc: int) -> tuple[str, str]:
     """`(class, row text)` for one MLX probe log (the guard's and the test's output together)."""
     guards = list(_GUARD.finditer(log))
@@ -163,6 +186,7 @@ def cuda_row(name: str, log: str, rc: int, snapshot: str, card: int) -> tuple[st
         f"used_high_gb={used_high:.2f} reserved_high_gb={reserved_high:.2f}"
         f" device_peak_gb={device_peak:.2f} baseline_gb={baseline:.2f}"
         f" card_fill_pct={fill * 100:.1f} sysmem_spill_gb={spill:.2f} sysmem_fallback={sysmem}"
+        f"{cuda_steps(log)}"
     )
     if passed:
         at_limit = fill >= CARD_LIMIT_FRACTION or spill > 0

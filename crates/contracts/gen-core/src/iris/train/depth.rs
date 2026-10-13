@@ -72,6 +72,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
+use super::ac::AcPolicy;
 use super::{
     batch_seed, mix_seed, scale_lr, CheckpointState, DataWalk, HostRng, LrShape, MixedPrecision,
     MuonAdjustLr, OptimizerKind, OptimizerPlan, ResumeDataPolicy, WeightsSelect, OPTIONS_KEY,
@@ -242,6 +243,11 @@ pub struct DepthTrainPlan {
     pub num_epochs: Option<u32>,
     pub seed: u64,
     pub mixed_precision: MixedPrecision,
+    /// Activation checkpointing of the backbone's trunk / pixel blocks (sc-25690):
+    /// `TrainingConfig::gradient_checkpointing` selects `full`. It changes memory and compute,
+    /// never the update, so it is no part of a run's identity. A backend that has not wired the
+    /// regions for this task refuses an active policy typed.
+    pub ac: AcPolicy,
     pub optimizer: OptimizerPlan,
     pub schedule: LrShape,
     pub warmup_steps: u64,
@@ -439,9 +445,6 @@ impl DepthTrainPlan {
                  full_finetune — LoRA / LoKr depth adapters are not a depth export"
                     .into(),
             );
-        }
-        if cfg.gradient_checkpointing {
-            return unsupported("gradient (activation) checkpointing is not implemented".into());
         }
         let loss = cfg.loss_type.trim().to_ascii_lowercase();
         if !matches!(loss.as_str(), "" | "l1" | "depth_l1") {
@@ -759,6 +762,11 @@ impl DepthTrainPlan {
             num_epochs,
             seed: cfg.seed,
             mixed_precision,
+            ac: if cfg.gradient_checkpointing {
+                AcPolicy::Full
+            } else {
+                AcPolicy::None
+            },
             optimizer,
             schedule,
             warmup_steps: cfg.lr_warmup_steps.div_ceil(accum) as u64,

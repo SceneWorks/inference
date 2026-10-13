@@ -24,7 +24,7 @@ use candle_gen::gen_core::iris::IrisTask;
 use candle_gen::gen_core::{self, LoadSpec, Progress};
 use candle_gen::{CandleError as Error, Result};
 
-use crate::dit::{IrisDiT, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 use crate::model::compute_dtype;
 use crate::nn::{expect_shape, safetensors_keys, Checkpoint, Linear};
 
@@ -173,6 +173,16 @@ pub struct DepthParts<'a> {
 /// `num_train_timesteps` on the empty prompt, the 1×1 reducer. `[B, 3, H, W]` (any device) →
 /// `[B, 1, H, W]` f32 on the model's device.
 pub fn depth_forward(parts: &DepthParts, rgb: &Tensor) -> Result<Tensor> {
+    depth_forward_hooked(parts, rgb, &mut NoHooks)
+}
+
+/// [`depth_forward`] with `hooks` around the backbone's trunk and pixel blocks (the depth
+/// trainer's activation-checkpointing regions, sc-25690).
+pub fn depth_forward_hooked(
+    parts: &DepthParts,
+    rgb: &Tensor,
+    hooks: &mut dyn ForwardHooks,
+) -> Result<Tensor> {
     let (b, _, h, w) = rgb.dims4()?;
     let device = parts.dit.device();
     let rgb = rgb.to_device(device)?.to_dtype(DType::F32)?;
@@ -183,13 +193,14 @@ pub fn depth_forward(parts: &DepthParts, rgb: &Tensor) -> Result<Tensor> {
     let (_, tl, l, d) = parts.embeddings.dims4()?;
     let states = parts.embeddings.broadcast_as((b, tl, l, d))?.contiguous()?;
     let mask = vec![parts.mask.to_vec(); b];
-    let out = parts.dit.forward(
+    let out = parts.dit.forward_hooked(
         &x,
         &t,
         &TextBatch {
             states: &states,
             mask: &mask,
         },
+        hooks,
     )?;
     // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
     // runs in the compute dtype like every other projection.

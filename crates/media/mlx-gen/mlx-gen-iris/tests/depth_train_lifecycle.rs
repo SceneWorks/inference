@@ -221,6 +221,10 @@ fn gen_core_trainer_conformance_checks_body() {
     req.config.full_finetune = false;
     assert!(matches!(t.validate(&req), Err(CoreError::Unsupported(_))));
     req.config.full_finetune = true;
+    // sc-25690: activation checkpointing of this task is wired on Candle only; refused typed here.
+    req.config.gradient_checkpointing = true;
+    assert!(matches!(t.validate(&req), Err(CoreError::Unsupported(_))));
+    req.config.gradient_checkpointing = false;
     req.items.clear();
     assert!(t.validate(&req).is_err());
 }

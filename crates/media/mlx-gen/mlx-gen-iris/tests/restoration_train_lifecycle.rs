@@ -492,4 +492,14 @@ fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_b
         GenerationResources::from_spec(&gen, "iris_3b"),
         Err(mlx_gen::gen_core::Error::Unsupported(_))
     ));
+    // sc-25690: activation checkpointing of this task is wired on Candle only; refused typed here.
+    let mut checkpointed = config(2, json!({"degradation": mini_degradation()}));
+    trainer()
+        .validate(&request(&items, checkpointed.clone(), tmp.path()))
+        .unwrap();
+    checkpointed.gradient_checkpointing = true;
+    assert!(matches!(
+        trainer().validate(&request(&items, checkpointed, tmp.path())),
+        Err(mlx_gen::gen_core::Error::Unsupported(_))
+    ));
 }
