@@ -2011,6 +2011,10 @@ fn render_sample(
             seed,
             cancel,
             references,
+            // The preview renders inside the trainer's own memory envelope, which prices the
+            // prefill path; the prefix cache is the render path's trade (sc-25904), so the
+            // preview keeps the path it is priced for.
+            kv_cache: crate::pipeline::KvCacheMode::Off,
         },
         &mut |_: Progress| {},
     )?;

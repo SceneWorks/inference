@@ -1,7 +1,8 @@
 //! The Qwen-Image 2.1 single-stream DiT — a faithful port of diffusers'
 //! `QwenImage21Transformer2DModel` (`transformer_qwenimage21.py` @
-//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]), prefill path (`QwenImage21AttnProcessor`, no KV cache).
-//! The candle twin of `mlx-gen-qwen-image-2-1`'s `src/transformer.rs`.
+//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]): the prefill path (`QwenImage21AttnProcessor`) and the
+//! prefix-KV-cached decode path (`QwenImage21KVCache`, sc-25904). The candle twin of
+//! `mlx-gen-qwen-image-2-1`'s `src/transformer.rs`.
 //!
 //! Text and image latents share **one joint sequence** ([`JointLayout`]): the projected text tokens
 //! in order, condition-image blocks substituted at the vision slots the encoder reserved for them
@@ -14,6 +15,14 @@
 //!   one unmasked call for the target over all keys.
 //! * **`causal_condition`** — the shared modulation is computed for two timestep rows, the sampled
 //!   `t` and `t = 0`; text/condition tokens read the `t = 0` row, target tokens their own.
+//!
+//! Together those two make every block's **prefix** hidden states — and so its prefix keys and
+//! values — independent of the denoise step: a prefix token never attends to the target and never
+//! reads the sampled timestep. [`PrefixKvCache`] is upstream's `QwenImage21KVCache`: the first model
+//! evaluation runs the full joint sequence and keeps each block's prefix K/V
+//! ([`QwenImage21Transformer::forward_joint_extract`]); every later one feeds the blocks the target
+//! tokens only and attends over `[cached prefix, target]`
+//! ([`QwenImage21Transformer::forward_joint_cached`]).
 //!
 //! Numerics: the model computes in the `VarBuilder`'s dtype (f32 on the CPU parity lane, bf16 on a
 //! GPU backend — [`crate::loader::compute_dtype`]); the zero-centred text norm, the affine-free
@@ -459,16 +468,16 @@ impl Attention {
         })
     }
 
-    /// Block-causal attention over the joint sequence `x` `[B, S, inner]`.
-    fn forward(
+    /// `_qwenimage21_prepare_qkv` up to the cache bookkeeping: project, split into heads, QK-norm
+    /// and rotate. Returns `(q, k, v)` as `[B, heads, S, head_dim]` with `q`/`k` post-norm **and
+    /// post-RoPE**, `v` the raw `to_v` projection.
+    fn project(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        prefix_segments: &[(usize, usize, bool)],
-        prefix_len: usize,
         ops: Ops,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, _) = x.dims3()?;
         let (h, hd) = (self.heads, self.head_dim);
         let heads = |y: Tensor| -> Result<Tensor> {
@@ -487,15 +496,33 @@ impl Attention {
         };
         let q = apply_rope(&norm(&q, &self.norm_q)?, cos, sin, ops)?;
         let k = apply_rope(&norm(&k, &self.norm_k)?, cos, sin, ops)?;
+        Ok((q, k, v))
+    }
+
+    /// The attention core both paths share: `q` `[B, heads, Sq, head_dim]` over `k`/`v`
+    /// `[B, heads, Sk, head_dim]` through [`block_causal_attention`], then the head merge and
+    /// `to_out`. This is the crate's **only** route to an SDPA call and the only place the scores
+    /// budget is supplied, so the cached decode cannot leave the budgeted path the prefill is on.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        ops: Ops,
+    ) -> Result<Tensor> {
+        let (b, _h, s, _d) = q.dims4()?;
+        let (h, hd) = (self.heads, self.head_dim);
         let scale = (hd as f64).powf(-0.5);
         let softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor> = match ops {
             Ops::Fused => &softmax_last_dim,
             Ops::Composable => &softmax_f32,
         };
         let o = block_causal_attention(
-            &q,
-            &k,
-            &v,
+            q,
+            k,
+            v,
             scale,
             prefix_segments,
             prefix_len,
@@ -505,6 +532,70 @@ impl Attention {
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
         Ok(self.to_out.forward(&o)?)
     }
+
+    /// Block-causal attention over the joint sequence `x` `[B, S, inner]` — the prefill. With
+    /// `capture`, the block's prefix `(k, v)` rows (exactly what the target's attention call
+    /// consumes for those keys) are written to it as **owned, prefix-sized copies**
+    /// ([`owned_prefix_rows`]): upstream's `kv_cache_mode == "extract"`. The copies are taken here,
+    /// while the block's full K/V are alive anyway, and nothing else of this forward escapes it —
+    /// the full K/V are released when it returns, exactly as without a capture.
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        ops: Ops,
+        capture: Option<&mut Option<(Tensor, Tensor)>>,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin, ops)?;
+        if let Some(capture) = capture {
+            *capture = Some((
+                owned_prefix_rows(&k, prefix_len)?,
+                owned_prefix_rows(&v, prefix_len)?,
+            ));
+        }
+        self.attend(&q, &k, &v, prefix_segments, prefix_len, ops)
+    }
+
+    /// The cached decode (`kv_cache_mode == "cached"`): `x` is the **target tokens only**
+    /// `[B, T, inner]`, `cos`/`sin` their RoPE rows, and the target attends — unmasked, as the
+    /// block-causal mask degenerates to for target rows — over `[cached prefix, target]` keys and
+    /// values. With no prefix segments and a zero prefix length, [`block_causal_attention`] makes
+    /// exactly its one target call: the same call, over the same keys, on the same budgeted path
+    /// as the prefill's.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cached_k: &Tensor,
+        cached_v: &Tensor,
+        ops: Ops,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin, ops)?;
+        // The prefix is never empty: a layout without text does not get through the prefill
+        // (`prelude`), so no cache can be extracted for one.
+        let k = Tensor::cat(&[cached_k, &k], 2)?;
+        let v = Tensor::cat(&[cached_v, &v], 2)?;
+        self.attend(&q, &k, &v, &[], 0, ops)
+    }
+}
+
+/// An owned, exactly-sized copy of the first `rows` tokens of `x` `[B, heads, S, head_dim]`.
+///
+/// A candle `narrow` is a **view**: it shares (and keeps alive) the storage it was cut from, so
+/// caching a block's prefix rows as a view would pin that block's whole prefill K or V — target
+/// rows included — for every later step. This is upstream's `key[:, cache_write_slice].clone()`
+/// ("`clone()`, not `contiguous()`"), and the same trap: `contiguous()` returns the view itself
+/// whenever the view already counts as contiguous (one head, or a full-length prefix).
+/// `force_contiguous` always allocates a storage of the view's own shape and copies into it. The
+/// view is detached first so the copy carries no backprop edge back to it either (a tracked
+/// tensor's copy keeps its source alive through the op graph).
+fn owned_prefix_rows(x: &Tensor, rows: usize) -> Result<Tensor> {
+    Ok(x.narrow(2, 0, rows)?.detach().force_contiguous()?)
 }
 
 struct FeedForward {
@@ -553,6 +644,18 @@ struct Modulation {
     gate2: Tensor,
 }
 
+/// How one block's attention runs: the block-causal prefill over the whole joint sequence
+/// (optionally capturing the prefix K/V), or the cached decode over the target tokens.
+enum BlockAttention<'a> {
+    Prefill {
+        capture: Option<&'a mut Option<(Tensor, Tensor)>>,
+    },
+    Cached {
+        k: &'a Tensor,
+        v: &'a Tensor,
+    },
+}
+
 struct Block {
     attn: Attention,
     mlp: FeedForward,
@@ -577,15 +680,45 @@ impl Block {
         ops: Ops,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
-        let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
-        let a = self.attn.forward(
-            &h,
-            &geometry.cos,
-            &geometry.sin,
-            &geometry.prefix_segments,
-            geometry.prefix_len,
+        self.forward_with(
+            index,
+            x,
+            m,
+            geometry,
+            BlockAttention::Prefill { capture: None },
             ops,
-        )?;
+            trace,
+        )
+    }
+
+    /// The block body, shared by the prefill and the cached decode — only the attention differs.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        index: usize,
+        x: &Tensor,
+        m: &Modulation,
+        geometry: &JointGeometry,
+        attention: BlockAttention<'_>,
+        ops: Ops,
+        trace: &mut Trace<'_>,
+    ) -> Result<Tensor> {
+        let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
+        let a = match attention {
+            BlockAttention::Prefill { capture } => self.attn.forward(
+                &h,
+                &geometry.cos,
+                &geometry.sin,
+                &geometry.prefix_segments,
+                geometry.prefix_len,
+                ops,
+                capture,
+            )?,
+            BlockAttention::Cached { k, v } => {
+                self.attn
+                    .forward_cached(&h, &geometry.cos, &geometry.sin, k, v, ops)?
+            }
+        };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = (x + m.gate1.tanh()?.broadcast_mul(&a)?)?;
         let h = scale_residual(&layer_norm(&x, self.eps)?, &m.scale2)?;
@@ -594,6 +727,64 @@ impl Block {
         let out = (&x + m.gate2.tanh()?.broadcast_mul(&f)?)?;
         trace.push(format!("block_{index}_out"), &out)?;
         Ok(out)
+    }
+}
+
+/// The prefix K/V of every block for one prompt branch — the port of upstream's
+/// `QwenImage21KVCache` (sc-25904), the candle twin of `mlx_gen_qwen_image_2_1::PrefixKvCache`.
+///
+/// Built **only** by [`QwenImage21Transformer::forward_joint_extract`], complete, and consumed by
+/// [`QwenImage21Transformer::forward_joint_cached`]; there is no way to hold an empty or partly
+/// filled one. It belongs to the branch (prompt + references + target geometry) it was extracted
+/// from: true CFG keeps one for the positive branch and an independent one for the negative
+/// branch, whose prompt is a different prefix.
+///
+/// Per block it stores `(k, v)` as `[1, heads, prefix_len, head_dim]` in the model's compute dtype
+/// — `k` post-QK-norm **and post-RoPE**, `v` the raw `to_v` projection, i.e. exactly the rows the
+/// target's attention consumes for the prefix keys. (Upstream and the MLX twin hold the same
+/// values as `[1, prefix_len, heads, head_dim]`; this crate's attention runs heads-first, and
+/// storing them that way saves a transposing copy of the whole prefix at every cached step.) Each
+/// tensor owns a storage of exactly its own size: holding a cache holds [`Self::nbytes`] plus the
+/// target block's RoPE rows, and nothing else of the forward that produced it.
+pub struct PrefixKvCache {
+    layers: Vec<(Tensor, Tensor)>,
+    /// RoPE rows of the target block (`[target_tokens, head_dim / 2]` each, f32).
+    target_cos: Tensor,
+    target_sin: Tensor,
+    prefix_len: usize,
+    target_tokens: usize,
+}
+
+impl PrefixKvCache {
+    /// Tokens of the cached prefix (text + condition-image blocks).
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    /// Tokens of the target block this cache decodes for.
+    pub fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+
+    /// Number of blocks cached — always the transformer's block count.
+    pub fn num_blocks(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Block `index`'s cached `(k, v)`, each `[1, heads, prefix_len, head_dim]`.
+    pub fn layer(&self, index: usize) -> Option<(&Tensor, &Tensor)> {
+        self.layers.get(index).map(|(k, v)| (k, v))
+    }
+
+    /// Bytes the cached K/V hold: `2 · blocks · prefix_len · inner_dim · itemsize`.
+    pub fn nbytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|(k, v)| {
+                k.elem_count() * k.dtype().size_in_bytes()
+                    + v.elem_count() * v.dtype().size_in_bytes()
+            })
+            .sum()
     }
 }
 
@@ -752,12 +943,13 @@ impl QwenImage21Transformer {
 
     /// The joint RoPE table `(cos, sin)`, each `[S, head_dim/2]` f32, for `layout`.
     pub fn rope(&self, layout: &JointLayout) -> Result<(Tensor, Tensor)> {
-        rope_sincos_from_ids(
-            &layout.position_ids(),
-            &self.cfg.axes_dims_rope,
-            ROPE_THETA,
-            &self.device,
-        )
+        self.rope_for_ids(&layout.position_ids())
+    }
+
+    /// The RoPE rows for explicit `(frame, height, width)` positions — [`Self::rope`] is this over
+    /// the whole layout, the cached decode over the target block's rows alone.
+    fn rope_for_ids(&self, ids: &[[i32; 3]]) -> Result<(Tensor, Tensor)> {
+        rope_sincos_from_ids(ids, &self.cfg.axes_dims_rope, ROPE_THETA, &self.device)
     }
 
     /// `[1, target_tokens, in_channels]` latents + `[1, text_len, context_in_dim]` text → the
@@ -909,21 +1101,7 @@ impl QwenImage21Transformer {
 
         let (cos, sin) = self.rope(layout)?;
 
-        // Timestep rows: the sampled `t` and, under `causal_condition`, an extra `t = 0` row.
-        let ts: Vec<f32> = if self.cfg.causal_condition {
-            vec![timestep * TIME_FACTOR, 0.0]
-        } else {
-            vec![timestep * TIME_FACTOR]
-        };
-        let proj = timestep_sincos(&ts, TIMESTEP_DIM, TIMESTEP_MAX_PERIOD, &self.device)?
-            .to_dtype(dtype)?;
-        let temb = self
-            .time_out
-            .forward(&silu(&self.time_in.forward(&proj)?)?)?;
-        trace.push("temb", &temb)?;
-        let silu_temb = silu(&temb)?;
-        let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
-        trace.push("modulation", &modulation)?;
+        let (modulation, out_rows) = self.modulation_rows(timestep, trace)?;
         // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
         // other token the trailing `t = 0` row (see `JointGeometry::select`).
         let target_mask = if self.cfg.causal_condition {
@@ -936,7 +1114,6 @@ impl QwenImage21Transformer {
         } else {
             None
         };
-        let out_rows = self.norm_out.forward(&silu_temb)?;
         Ok(JointPrelude {
             x,
             modulation,
@@ -952,6 +1129,240 @@ impl QwenImage21Transformer {
                 inner: self.cfg.inner_dim(),
             },
         })
+    }
+
+    /// The timestep embedding → `(modulation, norm_out)` rows, `[rows, 4·inner]` and
+    /// `[rows, inner]`: row 0 is the sampled `t`; under `causal_condition` a trailing row is `t = 0`
+    /// (the row every prefix token modulates from). Shared by the prefill and the cached decode,
+    /// which keeps the two-row shape so the sampled row is computed identically on both.
+    fn modulation_rows(&self, timestep: f32, trace: &mut Trace<'_>) -> Result<(Tensor, Tensor)> {
+        let dtype = self.compute_dtype();
+        // Timestep rows: the sampled `t` and, under `causal_condition`, an extra `t = 0` row.
+        let ts: Vec<f32> = if self.cfg.causal_condition {
+            vec![timestep * TIME_FACTOR, 0.0]
+        } else {
+            vec![timestep * TIME_FACTOR]
+        };
+        let proj = timestep_sincos(&ts, TIMESTEP_DIM, TIMESTEP_MAX_PERIOD, &self.device)?
+            .to_dtype(dtype)?;
+        let temb = self
+            .time_out
+            .forward(&silu(&self.time_in.forward(&proj)?)?)?;
+        trace.push("temb", &temb)?;
+        let silu_temb = silu(&temb)?;
+        let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
+        trace.push("modulation", &modulation)?;
+        Ok((modulation, self.norm_out.forward(&silu_temb)?))
+    }
+
+    // ── prefix KV cache (sc-25904) ──────────────────────────────────────────────────────────────
+
+    /// The first model evaluation of a cached denoise — upstream's `kv_cache_mode="extract"`:
+    /// [`Self::forward_joint`] over the full joint sequence, which also keeps every block's prefix
+    /// K/V. Returns the target's velocity and the branch's [`PrefixKvCache`].
+    ///
+    /// Each block's cache entry is copied out **as that block runs** into a storage of its own
+    /// size, so the extract never holds more than the prefill forward plus the cache it is
+    /// building: `prefill peak + 2 · blocks · prefix_tokens · inner_dim · itemsize` (and the
+    /// target's RoPE rows, `2 · target_tokens · head_dim / 2` f32).
+    ///
+    /// Refused unless the model is `causal_condition`: the cache is only valid because the prefix
+    /// tokens modulate from `t = 0`, which is what makes their activations step-independent.
+    pub fn forward_joint_extract(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<(Tensor, PrefixKvCache)> {
+        let (velocity, cache, _) =
+            self.run_joint_extract(text, images, timestep, layout, Trace(None))?;
+        Ok((velocity, cache))
+    }
+
+    /// Every later model evaluation of a cached denoise — upstream's `kv_cache_mode="cached"`: the
+    /// blocks receive **only** the target tokens `target` `[1, target_tokens, in_channels]`, and
+    /// each block's target attention reads `cache`'s prefix K/V in front of its own. Returns the
+    /// target's velocity `[1, target_tokens, out_channels]` in f32.
+    ///
+    /// Valid at any timestep and in any order — the cache does not depend on the step — so a
+    /// solver that evaluates the model more than once per step, or off the schedule, is served by
+    /// the same cache.
+    pub fn forward_joint_cached(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<Tensor> {
+        self.run_joint_cached(target, timestep, cache, Trace(None))
+            .map(|(velocity, _)| velocity)
+    }
+
+    /// [`Self::forward_joint_cached`] that also captures the named intermediates (`img_in_target`,
+    /// `temb`, `modulation`, `block_{i}_attn` / `_mlp` / `_out`, `norm_out`, `proj_out`) in forward
+    /// order. Every joint-sequence stage is `[1, target_tokens, C]`: the tensors the blocks
+    /// actually ran on.
+    pub fn forward_joint_cached_traced(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
+        let mut trace = Vec::new();
+        let (velocity, _) =
+            self.run_joint_cached(target, timestep, cache, Trace(Some(&mut trace)))?;
+        Ok((velocity, trace))
+    }
+
+    /// [`Self::forward_joint_extract`] plus the token count the block stack ran on (read off the
+    /// stack's own output), for the denoise loop's report.
+    pub(crate) fn extract_counted(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<(Tensor, PrefixKvCache, usize)> {
+        self.run_joint_extract(text, images, timestep, layout, Trace(None))
+    }
+
+    /// [`Self::forward_joint_cached`] plus the token count the block stack ran on.
+    pub(crate) fn cached_counted(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<(Tensor, usize)> {
+        self.run_joint_cached(target, timestep, cache, Trace(None))
+    }
+
+    /// The typed refusal upstream raises for `kv_cache` without `causal_condition`.
+    fn require_causal_condition(&self) -> Result<()> {
+        if self.cfg.causal_condition {
+            return Ok(());
+        }
+        Err(Error::Unsupported(
+            "qwen_image_2_1: the prefix KV cache requires `causal_condition = true` — it is only \
+             valid because text and condition-image tokens modulate from t = 0, which makes their \
+             activations independent of the denoising step"
+                .into(),
+        ))
+    }
+
+    fn run_joint_extract(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+        mut trace: Trace<'_>,
+    ) -> Result<(Tensor, PrefixKvCache, usize)> {
+        self.require_causal_condition()?;
+        let prelude = self.prelude(text, images, timestep, layout, &mut trace)?;
+        let geometry = &prelude.geometry;
+        let m = geometry.modulation(&prelude.modulation)?;
+        let out_scale = geometry.select(&prelude.out_rows, 0)?;
+        let mut layers: Vec<(Tensor, Tensor)> = Vec::with_capacity(self.blocks.len());
+        let mut x = prelude.x.clone();
+        for (index, block) in self.blocks.iter().enumerate() {
+            // The slot is filled inside the block's attention with owned, prefix-sized copies; the
+            // block's full `[1, heads, prefix + target, head_dim]` K/V never leave it.
+            let mut captured: Option<(Tensor, Tensor)> = None;
+            x = block.forward_with(
+                index,
+                &x,
+                &m,
+                geometry,
+                BlockAttention::Prefill {
+                    capture: Some(&mut captured),
+                },
+                Ops::Fused,
+                &mut trace,
+            )?;
+            layers.push(captured.ok_or_else(|| {
+                Error::Msg(format!(
+                    "qwen_image_2_1: block {index} captured no prefix K/V"
+                ))
+            })?);
+        }
+        let block_tokens = x.dim(1)?;
+        let velocity = self.head(&x, &out_scale, geometry, &mut trace)?;
+
+        // The target block's own RoPE rows, built at exactly their size rather than narrowed out
+        // of (and so pinning) the joint table.
+        let ids = layout.position_ids();
+        let (target_cos, target_sin) = self.rope_for_ids(&ids[geometry.prefix_len..])?;
+        let cache = PrefixKvCache {
+            layers,
+            target_cos,
+            target_sin,
+            prefix_len: geometry.prefix_len,
+            target_tokens: geometry.target_tokens,
+        };
+        Ok((velocity, cache, block_tokens))
+    }
+
+    fn run_joint_cached(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        mut trace: Trace<'_>,
+    ) -> Result<(Tensor, usize)> {
+        self.require_causal_condition()?;
+        if cache.layers.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: a {}-block prefix KV cache was given to a {}-block DiT",
+                cache.layers.len(),
+                self.blocks.len()
+            )));
+        }
+        if target.dim(1)? != cache.target_tokens {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the prefix KV cache was extracted for a {}-token target, got {}",
+                cache.target_tokens,
+                target.dim(1)?
+            )));
+        }
+        let dtype = self.compute_dtype();
+        let tokens = cache.target_tokens;
+
+        let x = self.img_in.forward(&target.to_dtype(dtype)?)?;
+        trace.push("img_in_target", &x)?;
+        let (modulation, out_rows) = self.modulation_rows(timestep, &mut trace)?;
+        // `modulation_mask[prefix_len:]`: every remaining token is a target token, so the mask is
+        // all ones and each token reads row 0 — the sampled timestep — through the very
+        // `JointGeometry::select` the prefill spreads its rows with, so a target token's
+        // modulation is the same arithmetic on both paths.
+        let geometry = JointGeometry {
+            cos: cache.target_cos.clone(),
+            sin: cache.target_sin.clone(),
+            prefix_segments: Vec::new(),
+            prefix_len: 0,
+            seq_len: tokens,
+            target_tokens: tokens,
+            target_mask: Some(Tensor::ones((1, tokens, 1), dtype, &self.device)?),
+            inner: self.cfg.inner_dim(),
+        };
+        let m = geometry.modulation(&modulation)?;
+        let out_scale = geometry.select(&out_rows, 0)?;
+        let mut x = x;
+        for (index, (block, (k, v))) in self.blocks.iter().zip(&cache.layers).enumerate() {
+            x = block.forward_with(
+                index,
+                &x,
+                &m,
+                &geometry,
+                BlockAttention::Cached { k, v },
+                Ops::Fused,
+                &mut trace,
+            )?;
+        }
+        let block_tokens = x.dim(1)?;
+        Ok((
+            self.head(&x, &out_scale, &geometry, &mut trace)?,
+            block_tokens,
+        ))
     }
 
     /// After the last block: the `norm_out` modulation, `proj_out`, and the target block's slice
@@ -1287,6 +1698,155 @@ mod tests {
             diff <= 1e-5,
             "the chunked branch diverged from the single pass by {diff:.3e}"
         );
+    }
+
+    /// The cached decode's attention call — target queries over `[cached prefix, target]` keys,
+    /// no segments — is the prefill's own target call: same rows out, and on the same budgeted
+    /// path, where it chunks consistently although its key axis is longer than its query axis.
+    ///
+    /// At the shipped sizes this call **always** chunks (see the arithmetic test below), and no
+    /// fixture would make it, so the budget is forced here. The cached keys are an owned copy of
+    /// the prefix rows, as the cache holds them.
+    #[test]
+    fn the_cached_attention_call_is_the_prefill_target_call_chunked_or_not() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        // Two condition blocks around text, then a 4x6 target — the edit route's shape.
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 5 },
+                Segment::Image {
+                    height: 2,
+                    width: 3,
+                },
+                Segment::Text { len: 2 },
+                Segment::Image {
+                    height: 4,
+                    width: 6,
+                },
+            ],
+        };
+        let (s, heads, head_dim) = (layout.total_len(), 4usize, 8usize);
+        let (prefix, target) = (layout.prefix_len(), layout.target_tokens());
+        let dev = Device::Cpu;
+        let fill = |seed: usize| -> Tensor {
+            let n = heads * s * head_dim;
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 37 + seed * 11) % 97) as f32 / 97.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, heads, s, head_dim), &dev).unwrap()
+        };
+        let (q, k, v) = (fill(0), fill(1), fill(2));
+        let scale = (head_dim as f64).powf(-0.5);
+        let want = block_causal_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            &layout.prefix_segments(),
+            prefix,
+            &softmax_last_dim,
+            usize::MAX,
+        )
+        .unwrap()
+        .narrow(2, prefix, target)
+        .unwrap();
+
+        let rows = |t: &Tensor| t.narrow(2, prefix, target).unwrap().contiguous().unwrap();
+        let cached_k = owned_prefix_rows(&k, prefix).unwrap();
+        let cached_v = owned_prefix_rows(&v, prefix).unwrap();
+        let k_cat = Tensor::cat(&[&cached_k, &rows(&k)], 2).unwrap();
+        let v_cat = Tensor::cat(&[&cached_v, &rows(&v)], 2).unwrap();
+        let rows_per_query = heads * s;
+        let forced = rows_per_query;
+        assert!(
+            (attention_budget_from_usize(forced)
+                .query_block_rows(rows_per_query as u64, target as u64) as usize)
+                < target,
+            "the forced budget must actually chunk the cached call's query axis"
+        );
+        for (label, budget) in [("single pass", usize::MAX), ("chunked", forced)] {
+            let got = block_causal_attention(
+                &rows(&q),
+                &k_cat,
+                &v_cat,
+                scale,
+                &[],
+                0,
+                &softmax_last_dim,
+                budget,
+            )
+            .unwrap();
+            assert_eq!(got.dims(), want.dims(), "{label}");
+            let diff = (&got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!("cached call vs prefill target rows ({label}): max|Δ|={diff:.3e}");
+            assert!(
+                diff <= 1e-5,
+                "{label}: the cached call diverged from the prefill's target rows by {diff:.3e}"
+            );
+        }
+    }
+
+    /// Every tensor the cached path adds stays inside candle's CUDA index widths at the worst
+    /// shipped request — the largest-area preset with ten references — **because** its attention
+    /// is on the budgeted path; unbudgeted, its scores alone are ~14× `i32::MAX`.
+    ///
+    /// candle's CUDA kernels index elements with `i32` (softmax, elementwise, matmul) and launch
+    /// with a `u32` element count (`LaunchConfig::for_num_elems`, the strided copy behind `cat`
+    /// and `force_contiguous`). The numbers below are the element counts of each op the cached
+    /// step and the extract's capture add; the source half of
+    /// `the_joint_attention_is_budgeted_because_the_shipped_sizes_overflow_i32` is what pins the
+    /// cached call to the budget.
+    #[test]
+    fn the_cached_path_stays_inside_cuda_index_widths_at_the_ten_reference_boundary() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        let cfg = TransformerConfig::production();
+        let geometry = crate::memory_strategy::admission_geometry();
+        let target = geometry.max_target_image_tokens as usize;
+        let joint = geometry.max_joint_tokens as usize;
+        let prefix = joint - target;
+        assert_eq!((target, prefix, joint), (16_800, 41_216, 58_016));
+        let (heads, head_dim) = (cfg.num_attention_heads, cfg.attention_head_dim);
+        let i32_max = i32::MAX as usize;
+
+        // The cached step's one attention call: target queries over prefix + target keys.
+        let scores = heads * target * joint;
+        assert!(
+            scores > 14 * i32_max && scores > u32::MAX as usize,
+            "{scores} unbudgeted score elements must overflow both index widths"
+        );
+        let rows_per_query = heads * joint;
+        let block = attention_budget_from_usize(candle_gen::ATTN_SCORES_BUDGET)
+            .query_block_rows(rows_per_query as u64, target as u64) as usize;
+        assert!(
+            (1..target).contains(&block),
+            "the cached call must chunk at this size (block {block} of {target} rows)"
+        );
+        // One chunk's scores / probs (`matmul`, `· scale`, `softmax_last_dim`).
+        assert!(block * rows_per_query <= candle_gen::ATTN_SCORES_BUDGET);
+        assert!(candle_gen::ATTN_SCORES_BUDGET < i32_max);
+
+        // `cat([cached, target], 2)` and the `kᵀ` / `v` the SDPA makes contiguous: one full-length
+        // K or V. The capture's `narrow → force_contiguous` reads from a tensor of the same size
+        // and writes the prefix rows. The cached step's modulation rows are `[1, target, inner]`.
+        for (what, elements) in [
+            ("a full-length K or V", heads * joint * head_dim),
+            ("one cached prefix K or V", heads * prefix * head_dim),
+            ("the per-token modulation", target * cfg.inner_dim()),
+        ] {
+            assert!(
+                elements < i32_max,
+                "{what} has {elements} elements, past i32::MAX"
+            );
+        }
     }
 
     /// A multi-image layout emits one DISTINCT trace key per image block.

@@ -427,17 +427,91 @@ MLX twin, including that each of up to 10 reference images adds `REFERENCE_FIT_T
 than the target's own token count: `reference::prepare` fits every condition image to
 `OUTPUT_RESOLUTION` (1024²) first. References are **priced**, not refused.
 
+## Prefix KV cache (sc-25904)
+
+Upstream's `use_kv_cache=True` default is ported, as on the MLX twin (sc-25903) and with the same
+public shape: `QwenImage21KVCache` → `PrefixKvCache` (`src/transformer.rs`),
+`kv_cache_mode="extract"` → `forward_joint_extract`, `"cached"` → `forward_joint_cached`, and the
+pipeline's loop → `denoise` / `denoise_reported` (`src/pipeline.rs`).
+
+**Why it is valid.** The joint sequence is `[prefix = text + condition-image blocks][target]`.
+Under `causal_condition` the prefix tokens modulate from the `t = 0` row, and block-causal
+attention never lets a prefix token attend to the target. So every block's prefix hidden states —
+and its prefix keys and values — are the same at every model evaluation of a request. The cache is
+refused without `causal_condition` (the transformer returns a typed `Unsupported`; the loop, as
+upstream's `use_kv_cache and transformer.config.causal_condition`, runs the prefill path and
+reports it).
+
+**What is stored.** Per block, exactly what `_qwenimage21_prepare_qkv` stores: the prefix rows of
+`key` **after** QK-norm and RoPE and of `value` (the raw `to_v` projection), in the compute dtype
+(f32 on the CPU lane, bf16 on CUDA/Metal) — plus the target block's RoPE rows. Upstream and the MLX
+twin lay them out `[1, prefix_tokens, heads, head_dim]`; this crate's attention runs heads-first,
+so they are held `[1, heads, prefix_tokens, head_dim]` (same values; it saves a transposing copy of
+the whole prefix at every cached step). `2 · blocks · prefix_tokens · inner_dim · itemsize` bytes
+per prompt branch: at the ten-reference boundary in bf16 (`2 · 32 · 41 216 · 4096 · 2`) about
+20 GiB per branch, twice that under true CFG.
+
+**How a cached evaluation runs.** Only the target tokens go through `img_in` and the blocks; each
+block projects/norms/rotates the target's own `q`, `k`, `v`, prepends the cached prefix `k`/`v`,
+and makes one unmasked attention call (the block-causal mask degenerates to full attention for
+target rows). That call is `block_causal_attention` with no prefix segments — the prefill's own
+target call, through the same `sdpa_budgeted_bhsd` at `ATTN_SCORES_BUDGET`. It has to be: at the
+largest preset with ten references the call's scores are `32 · 16 800 · 58 016 ≈ 3.1e10` elements,
+~14× `i32::MAX`, so it always runs query-chunked. The per-token modulation
+and `norm_out` rows are the sampled-timestep row for every token, selected by the same arithmetic
+the prefill uses for its target rows. Upstream still projects the whole text and image stream on a
+cached step and then slices it away; this port does not compute what it would discard.
+
+**When.** Upstream extracts at loop index 0. This port extracts at each branch's **first model
+evaluation** and decodes at every later one: the curated solver axis may evaluate the model more
+than once per step or off the schedule (`heun`, `dpmpp_sde`), and the cache does not depend on the
+step. With true CFG the negative branch has its own, independent cache.
+
+**Candle specifics.** Tensors are eager, so there is nothing to materialize — but a `narrow` is a
+view that shares its source's storage, so each cache entry is copied (`force_contiguous`, which
+always allocates; `contiguous` returns the view itself when it already counts as contiguous) into
+a storage of exactly its own size, inside the block that produced it. The block's full
+`[1, heads, prefix + target, head_dim]` K/V are released when its attention returns, as on the
+prefill path. The extract step's live set is therefore the prefill forward's plus the cache it is
+building:
+
+    extract peak = prefill peak + 2 · blocks · prefix_tokens · inner_dim · itemsize
+                   (+ the target's RoPE rows, 2 · target_tokens · head_dim/2 · 4 bytes)
+
+The caches are owned by the denoise loop's velocity closure, which the sampler consumes, so they
+are dropped when the loop returns — on success, cancellation or error — and nothing of them
+reaches the VAE decode. A cache only exists once a complete extract has returned, so there is no
+empty or partial cache to decode from.
+
+**The switch.** `DenoiseInputs::kv_cache` (`KvCacheMode::{On, Off}`); the generator (`src/lib.rs`)
+passes `On`. `Off` is the prefill loop, byte for byte. `denoise_reported` fills a `DenoiseReport`:
+the path that ran (`KvCachePath`), the bytes the caches held, and every transformer forward
+(`ModelEvaluation`: branch, `Prefill` / `Extract` / `Cached`, tokens the blocks ran over). The
+trainer's preview render stays on `Off`: it runs inside the trainer's memory envelope, which prices
+the prefill path.
+
+**Numerics.** Upstream documents the two paths as equally valid but not bit-identical (on the tiny
+fixture, torch CPU f32, they differ by ≤ 1.2e-6 after three steps). Here the cached step's
+attention call consumes the same key/value values through the same call as the prefill's target
+call, and on candle CPU f32 the two paths are **bit-identical** at every evaluation and after the
+whole denoise. `tests/kv_cache.rs` holds that to an absolute + relative bound and gates the cached
+path — and the off path, against upstream's `use_kv_cache=False` latents — on the fixture the MLX
+twin reads (`mlx-gen-qwen-image-2-1/tests/fixtures/qwen21_kv_cache.safetensors`,
+`mlx-gen/tools/dump_qwen21_kv_cache.py`). The bf16 the released checkpoint runs in on CUDA/Metal
+is not reachable from those tests (candle's CPU backend has no bf16 matmul).
+
+**Not priced here.** The request's memory contract (`memory_strategy`) does not yet carry the
+cache's bytes, and the generator passes `On` unconditionally: a reference-heavy request that fit
+on the prefill path can exceed the device with the cache on. Pricing and admission-driven shedding
+to `Off` are the next story's.
+
 ## Deliberate divergences
 
 ### From upstream (shared with the MLX twin)
 
-* No prefix KV cache: every step evaluates the full block-causal joint sequence (upstream's exact
-  `QwenImage21AttnProcessor` prefill path). Upstream documents the cached and uncached paths as
-  equally valid but not bit-identical. **On the reference route this is a real cost, not just a
-  numerical choice**: every condition image is fitted to `output_resolution` whatever the target
-  size, so ten references are ~41k prefix tokens that upstream encodes once and this port
-  re-encodes at every step. Reference-heavy requests scale with `steps × references` here where
-  upstream scales with `references + steps`.
+* Prefix KV cache: extract is keyed on each branch's first model evaluation rather than loop
+  index 0, and a cached step skips the prefix projections upstream computes and discards — see
+  *Prefix KV cache* above.
 * Latents stay f32 between Euler steps (upstream rounds to bf16 each step).
 * On the **CPU parity lane** the text tower runs f32 (upstream: bf16 end to end). On CUDA/Metal
   it runs bf16 end to end **like upstream** — see *Compute dtype* below (sc-24114).
