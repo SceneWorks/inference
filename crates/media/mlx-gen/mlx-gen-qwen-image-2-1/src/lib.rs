@@ -95,10 +95,11 @@ pub use loader::{
 };
 pub use model::{descriptor, load, QwenImage21, MODEL_ID};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_prompt, encode_references, joint_branch,
-    joint_images, joint_layout, pack_latents, prepare_conditioning_references,
-    rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs, JointBranch,
-    ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise, denoise_reported, encode_prompt,
+    encode_references, joint_branch, joint_images, joint_layout, pack_latents,
+    prepare_conditioning_references, rgba_to_rgb_over_white, text_rows, unpack_latents,
+    DenoiseInputs, DenoiseReport, EvaluationPath, JointBranch, KvCacheMode, KvCachePath,
+    ModelEvaluation, PromptBranch, ReferenceConditioning,
 };
 pub use reference::{
     calculate_dimensions, collect_references, prepare_reference, prepare_references,
@@ -110,7 +111,8 @@ pub use text_encoder::{
 };
 pub use training::{load_trainer, QwenImage21Trainer, TRAINER_ID};
 pub use transformer::{
-    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+    JointLayout, PrefixKvCache, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS,
+    GLOBAL_ADAPTER_TARGETS,
 };
 pub use vae::QwenImage21Vae;
 

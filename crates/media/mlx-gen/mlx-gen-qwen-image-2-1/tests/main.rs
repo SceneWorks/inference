@@ -28,6 +28,9 @@ mod edit_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "kv_cache.rs"]
+mod kv_cache;
+
 #[path = "lora_real_weights.rs"]
 mod lora_real_weights;
 
