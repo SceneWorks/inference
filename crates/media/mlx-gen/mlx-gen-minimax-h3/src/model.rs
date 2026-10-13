@@ -50,9 +50,9 @@ use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
     fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
-    render_latents, resolve_geometry, revert_pixel_normalization, t2va_layout, RequestGeometry,
-    MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES,
-    SPATIAL_STRIDE,
+    render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
+    RequestGeometry, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS,
+    SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -1414,7 +1414,21 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(mlx_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step =
+            |index, elapsed| {
+                if let Some(probe) = terminal_probe.as_mut() {
+                    probe.record(index, elapsed, serde_json::json!({
+                    "method": "mlx_process_allocator_cumulative_highwater_no_reset",
+                    "allocatorActiveSampleBytes": mlx_rs::memory::get_active_memory() as u64,
+                    "allocatorCacheSampleBytes": mlx_rs::memory::get_cache_memory() as u64,
+                    "allocatorPeakBytesCumulative": mlx_rs::memory::get_peak_memory() as u64,
+                }));
+                }
+            };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             &schedule,
@@ -1423,7 +1437,14 @@ impl MiniMaxH3 {
             patch,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        drop(observe_step);
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
+        }
+
         release((model, video_rows, audio_rows));
 
         // --- 3. decode ----------------------------------------------------------------------
@@ -1659,7 +1680,21 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(mlx_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step =
+            |index, elapsed| {
+                if let Some(probe) = terminal_probe.as_mut() {
+                    probe.record(index, elapsed, serde_json::json!({
+                    "method": "mlx_process_allocator_cumulative_highwater_no_reset",
+                    "allocatorActiveSampleBytes": mlx_rs::memory::get_active_memory() as u64,
+                    "allocatorCacheSampleBytes": mlx_rs::memory::get_cache_memory() as u64,
+                    "allocatorPeakBytesCumulative": mlx_rs::memory::get_peak_memory() as u64,
+                }));
+                }
+            };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             schedule,
@@ -1668,7 +1703,14 @@ impl MiniMaxH3 {
             patch,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        drop(observe_step);
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
+        }
+
         release((model, video_rows, audio_rows));
 
         // --- 4. decode --------------------------------------------------------------------------

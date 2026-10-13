@@ -195,6 +195,26 @@ pub fn denoise_av(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Tensor, Tensor)> {
+    denoise_av_with_observer(
+        model, layout, schedule, adaln, video, audio, device, cancel, on_step, None,
+    )
+}
+
+/// Optional completed-step wall-clock observation, timed from inside the loop before
+/// schedule/index work through the existing device synchronization.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_with_observer(
+    model: &mut dyn JointVelocity,
+    layout: &PackedLayout,
+    schedule: &JointSchedule,
+    adaln: &TimestepSchedule,
+    video: &Tensor,
+    audio: &Tensor,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+    mut on_observed_step: Option<&mut dyn FnMut(usize, std::time::Duration)>,
+) -> Result<(Tensor, Tensor)> {
     if adaln.num_steps() != schedule.num_evals() {
         return Err(CandleError::Msg(format!(
             "minimax-h3 denoise: the AdaLN schedule covers {} steps but the sigma schedules drive \
@@ -223,6 +243,8 @@ pub fn denoise_av(
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+
+        let step_started = on_observed_step.as_ref().map(|_| std::time::Instant::now());
 
         // The one place a stale step index is catchable.
         let adaln_indices =
@@ -261,6 +283,9 @@ pub fn denoise_av(
         // the whole of cancellation responsiveness, and it also bounds the queued work. A no-op on
         // the CPU device, where the arithmetic has already happened.
         device.synchronize()?;
+        if let (Some(started), Some(observer)) = (step_started, on_observed_step.as_mut()) {
+            observer(i + 1, started.elapsed());
+        }
         on_step(i + 1);
     }
     Ok((vlat, alat))
@@ -349,6 +374,53 @@ mod tests {
             m.batches.iter().all(|&b| b == 1),
             "batch of one: {:?}",
             m.batches
+        );
+    }
+
+    #[test]
+    fn observer_records_first_and_only_completed_steps_before_progress_or_cancel() {
+        let l = layout(&[]);
+        let s = JointSchedule::new(5).unwrap();
+        let a = adaln_schedule(&s).unwrap();
+        let cancel = CancelFlag::default();
+        let trip = cancel.clone();
+        let mut m = Counting {
+            calls: 0,
+            batches: vec![],
+            scale: 0.1,
+        };
+        let order = std::cell::RefCell::new(Vec::new());
+        let error = denoise_av_with_observer(
+            &mut m,
+            &l,
+            &s,
+            &a,
+            &rows(l.video_indices().len(), 4),
+            &rows(l.audio_indices().len(), 3),
+            &dev(),
+            &cancel,
+            &mut |i| {
+                order.borrow_mut().push(("progress", i));
+                if i == 2 {
+                    trip.cancel();
+                }
+            },
+            Some(&mut |i, duration| {
+                assert!(duration.as_nanos() > 0);
+                order.borrow_mut().push(("observed", i));
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CandleError::Canceled));
+        assert_eq!(m.calls, 2);
+        assert_eq!(
+            *order.borrow(),
+            vec![
+                ("observed", 1),
+                ("progress", 1),
+                ("observed", 2),
+                ("progress", 2)
+            ]
         );
     }
 

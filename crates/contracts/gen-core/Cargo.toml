@@ -37,17 +37,13 @@ exr = { workspace = true }
 # latent weight map in `train::subject_mask`. Pure Rust and tensor-free, so the zero-tensor invariant
 # holds; already in the lock (every backend kit links it).
 image = { workspace = true }
+libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
 # same handle metadata as candle-gen's sidecar cache so same-size replacement cannot alias a pin.
-# Win32_Networking_WinSock: TCP keepalive on the Iris training transport's sockets (sc-25690).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO"] }
-
-[target.'cfg(unix)'.dependencies]
-# TCP keepalive on the Iris training transport's sockets (`setsockopt`; std exposes none of it,
-# sc-25690). Already in the lock.
-libc = { workspace = true }
+# Iris training transport sockets plus opt-in H3 process RSS telemetry.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).

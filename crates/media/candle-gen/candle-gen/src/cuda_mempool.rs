@@ -62,6 +62,25 @@ use candle_core::cuda::cudarc::driver::sys;
 pub struct MemPool(sys::CUmemoryPool);
 
 impl MemPool {
+    /// The device's current pool, including a custom capped pool installed by the runner.
+    /// Reading the default pool would falsely report near-zero use in that configuration.
+    pub fn device_current(ordinal: i32) -> Option<Self> {
+        unsafe {
+            if sys::cuInit(0) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            let mut dev: sys::CUdevice = 0;
+            if sys::cuDeviceGet(&mut dev, ordinal) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+            if sys::cuDeviceGetMemPool(&mut pool, dev) != sys::CUresult::CUDA_SUCCESS {
+                return None;
+            }
+            Some(Self(pool))
+        }
+    }
+
     /// The **default** stream-ordered pool for logical device `ordinal`, or `None` on any driver
     /// error.
     ///

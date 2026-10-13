@@ -534,6 +534,9 @@ pub struct GenerationRequest {
     pub video_mode: Option<String>,
     /// MiniMax-H3 learned sparse attention; absent/off is the historical dense route.
     pub veda: Option<crate::VedaRequest>,
+    /// Operator-owned terminal H3 measurement. The worker must never copy this from a job payload.
+    /// Other generators ignore it; false preserves their normal execution path.
+    pub h3_terminal_telemetry: bool,
     /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
     /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
     /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
@@ -1321,6 +1324,7 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             veda: None,
+            h3_terminal_telemetry: false,
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
@@ -1599,6 +1603,7 @@ impl GenerationRequest {
             fps: _,
             video_mode: _,
             veda: _,
+            h3_terminal_telemetry: _,
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
