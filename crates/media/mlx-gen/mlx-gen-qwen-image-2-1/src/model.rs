@@ -20,7 +20,8 @@ use crate::config::{SchedulerConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, PRESETS, S
 use crate::loader;
 use crate::pipeline::{
     create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
-    prepare_conditioning_references, DenoiseInputs, JointBranch, ReferenceConditioning,
+    prepare_conditioning_references, DenoiseInputs, JointBranch, KvCacheMode,
+    ReferenceConditioning,
 };
 use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
@@ -524,6 +525,9 @@ impl QwenImage21 {
                                 layout: c.layout,
                                 negative_layout: c.negative_layout,
                             }),
+                            // Upstream's `use_kv_cache=True` default (sc-25903). The one
+                            // switch: `Off` is the prefill path, byte-for-byte.
+                            kv_cache: KvCacheMode::On,
                         },
                         on_progress,
                     )?;
