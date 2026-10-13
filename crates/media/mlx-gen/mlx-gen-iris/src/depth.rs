@@ -23,7 +23,7 @@ use mlx_rs::ops::{addmm, concatenate_axis, zeros};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-use crate::dit::{IrisDiT, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 use crate::model::compute_dtype;
 
 /// Model id of the depth task.
@@ -189,6 +189,17 @@ pub struct DepthParts<'a> {
 /// `IrisDepth.forward` over `parts`: RGB ‖ zero channel, one backbone forward at model time
 /// `num_train_timesteps` on the empty prompt, the 1×1 reducer. `[B, 3, H, W]` → `[B, 1, H, W]` f32.
 pub fn depth_forward(parts: &DepthParts, rgb: &Array) -> Result<Array> {
+    depth_forward_hooked(parts, rgb, &mut NoHooks)
+}
+
+/// [`depth_forward`] with `hooks` around every trunk and pixel block of the backbone forward — the
+/// depth trainer's seam for activation-checkpointing regions (sc-25690). With [`NoHooks`] it is
+/// exactly the estimator's forward.
+pub fn depth_forward_hooked(
+    parts: &DepthParts,
+    rgb: &Array,
+    hooks: &mut dyn ForwardHooks,
+) -> Result<Array> {
     let sh = rgb.shape();
     let (b, h, w) = (sh[0], sh[2], sh[3]);
     let x = concatenate_axis(
@@ -203,13 +214,14 @@ pub fn depth_forward(parts: &DepthParts, rgb: &Array) -> Result<Array> {
     let e = parts.embeddings.shape();
     let states = mlx_rs::ops::broadcast_to(parts.embeddings, &[b, e[1], e[2], e[3]])?;
     let mask = vec![parts.mask.to_vec(); b as usize];
-    let out = parts.dit.forward(
+    let out = parts.dit.forward_hooked(
         &x,
         &t,
         &TextBatch {
             states: &states,
             mask: &mask,
         },
+        hooks,
     )?;
     // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
     // runs in the compute dtype like every other projection.

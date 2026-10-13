@@ -126,3 +126,91 @@ pub fn assert_close(name: &str, got: &Array, want: &Array, tol: f32) {
         "{name}: max|Δ|={max_abs:.3e} exceeds {bound:.3e} (tol {tol:.0e} × peak {peak:.3e})"
     );
 }
+
+/// The declared bound of the bf16 policy's activation-checkpointed gradients (sc-25690; the Candle
+/// crate's rule, spelled alike). Under bf16 a checkpointed step rounds differently from the plain
+/// one (a region's cotangent crosses its boundary once per reader), so equality is not available;
+/// what is asserted is that checkpointing adds no error of its own: per trained tensor its distance
+/// from the f32 gradient stays within `AC_BF16_NOISE_FACTOR` of the plain bf16 gradient's own
+/// distance (plus `AC_BF16_NOISE_FLOOR` of the tensor's norm), and the two bf16 gradients point the
+/// same way.
+pub const AC_BF16_NOISE_FACTOR: f64 = 2.0;
+pub const AC_BF16_NOISE_FLOOR: f64 = 1e-3;
+pub const AC_BF16_MIN_COSINE: f64 = 0.999;
+
+fn l2(v: &[f32]) -> f64 {
+    v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt()
+}
+
+/// `(‖a − b‖ / ‖b‖, cos(a, b))`.
+pub fn rel_and_cos(a: &Array, b: &Array) -> (f64, f64) {
+    let (a, b) = (host_f32(a), host_f32(b));
+    let diff: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x - y).collect();
+    let dot: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+    (l2(&diff) / l2(&b), dot / (l2(&a) * l2(&b)))
+}
+
+type Grads = std::collections::HashMap<std::rc::Rc<str>, Array>;
+
+/// The f32 gate: every checkpointed gradient within `tol · max(1, peak)` of the plain one. Returns
+/// the worst `max|Δ| / max(1, peak)`.
+pub fn assert_ac_f32_equal(what: &str, tol: f32, plain: &Grads, checkpointed: &Grads) -> f32 {
+    assert_eq!(plain.len(), checkpointed.len(), "{what}");
+    let mut worst = 0f32;
+    for (k, want) in plain {
+        let (max_abs, peak, _) = errors(&checkpointed[k], want);
+        let rel = max_abs / peak.max(1.0);
+        assert!(
+            rel <= tol,
+            "{what}: {k}: max|Δ| {max_abs:e} of peak {peak:e}"
+        );
+        worst = worst.max(rel);
+    }
+    eprintln!("{what}: f32 checkpointed vs plain: worst max|Δ| / max(1, peak) = {worst:.3e}");
+    worst
+}
+
+/// The bf16 gate (see [`AC_BF16_NOISE_FACTOR`]); `f32_plain` is the reference both are measured
+/// from. Returns `(mean e_none, mean e_full, worst e_full / e_none, worst cosine)`.
+pub fn assert_ac_bf16_noise_only(
+    what: &str,
+    f32_plain: &Grads,
+    bf16_plain: &Grads,
+    bf16_checkpointed: &Grads,
+) -> (f64, f64, f64, f64) {
+    let (mut sum_none, mut sum_full, mut worst_ratio, mut worst_cos, mut n) =
+        (0f64, 0f64, 0f64, 1f64, 0usize);
+    for (k, reference) in f32_plain {
+        if l2(&host_f32(reference)) == 0.0 {
+            continue;
+        }
+        let (e_none, _) = rel_and_cos(&bf16_plain[k], reference);
+        let (e_full, _) = rel_and_cos(&bf16_checkpointed[k], reference);
+        let (_, cos) = rel_and_cos(&bf16_checkpointed[k], &bf16_plain[k]);
+        assert!(
+            e_full <= AC_BF16_NOISE_FACTOR * e_none + AC_BF16_NOISE_FLOOR,
+            "{what}: {k}: checkpointing adds error under bf16 (e_full {e_full:.3e} vs e_none {e_none:.3e})"
+        );
+        assert!(
+            cos >= AC_BF16_MIN_COSINE,
+            "{what}: {k}: cos(checkpointed, plain) = {cos:.6} under bf16"
+        );
+        sum_none += e_none;
+        sum_full += e_full;
+        worst_ratio = worst_ratio.max(e_full / e_none.max(1e-12));
+        worst_cos = worst_cos.min(cos);
+        n += 1;
+    }
+    assert!(n > 0, "{what}: no non-zero gradient to compare");
+    let out = (
+        sum_none / n as f64,
+        sum_full / n as f64,
+        worst_ratio,
+        worst_cos,
+    );
+    eprintln!(
+        "{what}: bf16 vs f32 over {n} tensors: mean e_none {:.3e}, mean e_full {:.3e}, worst e_full/e_none {:.3}, worst cos(full, none) {:.6}",
+        out.0, out.1, out.2, out.3
+    );
+    out
+}

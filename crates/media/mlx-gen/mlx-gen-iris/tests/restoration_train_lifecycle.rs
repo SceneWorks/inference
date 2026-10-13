@@ -354,11 +354,27 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit() {
 }
 
 fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body() {
+    cancel_and_resume_under(false);
+}
+
+/// sc-25690: the same lifecycle with the generator step's trunk / pixel blocks
+/// activation-checkpointed — cancel → durable checkpoint → resume reproduces the uninterrupted
+/// checkpointed run bit for bit (generator, EMA, both optimizers, critic head, data position,
+/// export).
+#[test]
+fn cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing() {
+    crate::common::cpu_process("restoration_train_lifecycle::cancel_and_resume_reproduce_the_uninterrupted_run_under_activation_checkpointing", || cancel_and_resume_under(true));
+}
+
+fn cancel_and_resume_under(ac: bool) {
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    let entered = checkpointed_regions();
     let tmp = tempfile::tempdir().unwrap();
     let items = clean_items(tmp.path(), 3);
     let opts = json!({"degradation": mini_degradation(), "ema_decay": 0.9});
     // uninterrupted: 4 steps (16 micro-steps with accumulation 2)
     let mut cfg = config(16, opts.clone());
+    cfg.gradient_checkpointing = ac;
     cfg.gradient_accumulation = 2;
     cfg.save_every = 8;
     let a = tmp.path().join("a");
@@ -416,6 +432,142 @@ fn cancel_and_resume_reproduce_the_uninterrupted_run_bit_for_bit_body() {
     assert!(trainer()
         .train(&request(&items, other, &b), &mut |_| {})
         .is_err());
+    assert_eq!(
+        checkpointed_regions() > entered,
+        ac,
+        "regions are entered exactly when the run is checkpointed"
+    );
+}
+
+/// sc-25690: the restoration trainer's activation checkpointing (`gradient_checkpointing`) — the
+/// generation trainer's trunk / pixel regions (MLX's checkpoint transform) around the generator in
+/// the generator step, the L2 / LPIPS / critic terms downstream of them. f32: the generator
+/// gradients are the plain graph's; bf16 generator (f32 critic, as the miniature runs): the same
+/// loss terms bit for bit and gradients within the declared bf16 bound.
+#[test]
+fn activation_checkpointing_gradients_equal_the_plain_graph() {
+    crate::common::cpu_process(
+        "restoration_train_lifecycle::activation_checkpointing_gradients_equal_the_plain_graph",
+        activation_checkpointing_gradients_equal_the_plain_graph_body,
+    );
+}
+
+fn activation_checkpointing_gradients_equal_the_plain_graph_body() {
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    let tmp = tempfile::tempdir().unwrap();
+    let items = clean_items(tmp.path(), 1);
+    let case = |dtype: &str, ac: bool| {
+        let mut cfg = config(2, json!({"degradation": mini_degradation()}));
+        cfg.train_dtype = dtype.into();
+        cfg.gradient_checkpointing = ac;
+        let req = request(&items, cfg, tmp.path());
+        let res = resources();
+        let plan = RestoreTrainPlan::resolve(&req, &res.export, &[], false).unwrap();
+        assert_eq!(plan.ac.active(), ac);
+        let pair = contract::training_pair(&items[0], &plan, 1, 0).unwrap();
+        let batch = PairBatch::from_pairs(&[pair]);
+        let (model, params, frozen, head, sn) =
+            mlx_gen_iris::train::restore::miniature_parts(&res, &plan, Box::new(nets)).unwrap();
+        let before = checkpointed_regions();
+        let (terms, grads) =
+            generator_grads(&model, &params, &frozen, &plan, &head, &sn, &batch, 1.0).unwrap();
+        let entered = checkpointed_regions() - before;
+        let regions = model.cfg.depth + model.cfg.pixel.depth;
+        assert_eq!(
+            entered,
+            if ac { regions } else { 0 },
+            "full checkpoints every trunk and pixel block, none no region"
+        );
+        assert_eq!(
+            grads.len(),
+            params.len(),
+            "every trained tensor has a gradient"
+        );
+        (terms, grads)
+    };
+    let (f_terms, f_none) = case("f32", false);
+    let (f_terms_ac, f_full) = case("f32", true);
+    assert_eq!(
+        f_terms.map(f64::to_bits),
+        f_terms_ac.map(f64::to_bits),
+        "f32 loss terms"
+    );
+    // The generation trainer's 1e-6 holds here too — the Candle twin needs 1e-5 for this task (its
+    // replay reaches the O(10²) adversarial term's gradient in another summation order). MLX's
+    // checkpoint transform re-runs the block's own graph: measured 0 (bit-equal) on the CPU stream.
+    crate::common::assert_ac_f32_equal("restoration", 1e-6, &f_none, &f_full);
+    let (b_terms, b_none) = case("bf16", false);
+    let (b_terms_ac, b_full) = case("bf16", true);
+    assert_eq!(
+        b_terms.map(f64::to_bits),
+        b_terms_ac.map(f64::to_bits),
+        "bf16 loss terms"
+    );
+    crate::common::assert_ac_bf16_noise_only("restoration", &f_none, &b_none, &b_full);
+}
+
+/// sc-25690: a checkpointed restoration run is the plain run (f32), for the full fine-tune and for
+/// an adapter (a region then rebuilds its block from the frozen base plus the traced factors): the
+/// trainer wires `gradient_checkpointing` into its generator step, the export moves by rounding
+/// only, keeps its stamps and loads in the `iris_3b_restore` transform.
+#[test]
+fn activation_checkpointing_leaves_the_run_unchanged() {
+    crate::common::cpu_process(
+        "restoration_train_lifecycle::activation_checkpointing_leaves_the_run_unchanged",
+        activation_checkpointing_leaves_the_run_unchanged_body,
+    );
+}
+
+fn activation_checkpointing_leaves_the_run_unchanged_body() {
+    use mlx_gen_iris::train::model::checkpointed_regions;
+    let data = tempfile::tempdir().unwrap();
+    let items = clean_items(data.path(), 1);
+    for lora in [false, true] {
+        let run = |ac: bool| {
+            let out = tempfile::tempdir().unwrap();
+            let mut cfg = config(4, json!({"degradation": mini_degradation()}));
+            cfg.save_every = 0;
+            cfg.gradient_checkpointing = ac;
+            if lora {
+                cfg.full_finetune = false;
+                cfg.network_type = NetworkType::Lora;
+                cfg.rank = 2;
+                cfg.alpha = 2.0;
+            }
+            let before = checkpointed_regions();
+            let res = trainer()
+                .train(&request(&items, cfg, out.path()), &mut |_| {})
+                .unwrap();
+            assert_eq!(res.steps, 4);
+            assert_eq!(checkpointed_regions() > before, ac, "lora={lora}");
+            let w = Weights::from_file(&res.adapter_path).unwrap();
+            assert_eq!(w.metadata("irisTask"), Some("restoration"));
+            assert_eq!(w.metadata("irisArtifact"), Some("full_model"));
+            let mut spec = LoadSpec::new(WeightsSource::Dir(
+                res.adapter_path.parent().unwrap().to_path_buf(),
+            ));
+            spec.precision = Precision::Fp32;
+            IrisRestorer::load(&spec).unwrap();
+            tensors(&res.adapter_path)
+        };
+        let (plain, checkpointed) = (run(false), run(true));
+        assert_eq!(plain.len(), checkpointed.len());
+        let base = tensors(&export_dir().join("model.safetensors"));
+        assert!(
+            base.iter().any(|(k, v)| checkpointed[k] != *v),
+            "lora={lora}: the checkpointed run trained"
+        );
+        let mut worst = 0f32;
+        for (k, v) in &plain {
+            for (x, y) in v.iter().zip(&checkpointed[k]) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        eprintln!(
+            "restoration (lora={lora}): activation checkpointing vs plain: max |Δ| = {worst:.3e}"
+        );
+        assert!(worst <= 1e-6, "lora={lora}: {worst}");
+    }
 }
 
 #[test]
@@ -492,14 +644,18 @@ fn the_export_is_a_restoration_model_the_transform_runs_and_other_tasks_refuse_b
         GenerationResources::from_spec(&gen, "iris_3b"),
         Err(mlx_gen::gen_core::Error::Unsupported(_))
     ));
-    // sc-25690: activation checkpointing of this task is wired on Candle only; refused typed here.
+    // sc-25690: activation checkpointing (`gradient_checkpointing`) is a trained option of this
+    // task on both backends, for the full fine-tune and the adapters.
     let mut checkpointed = config(2, json!({"degradation": mini_degradation()}));
+    checkpointed.gradient_checkpointing = true;
     trainer()
         .validate(&request(&items, checkpointed.clone(), tmp.path()))
         .unwrap();
-    checkpointed.gradient_checkpointing = true;
-    assert!(matches!(
-        trainer().validate(&request(&items, checkpointed, tmp.path())),
-        Err(mlx_gen::gen_core::Error::Unsupported(_))
-    ));
+    checkpointed.full_finetune = false;
+    checkpointed.network_type = NetworkType::Lora;
+    checkpointed.rank = 2;
+    checkpointed.alpha = 2.0;
+    trainer()
+        .validate(&request(&items, checkpointed, tmp.path()))
+        .unwrap();
 }
