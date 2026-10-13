@@ -16,8 +16,9 @@ use mlx_gen::{
 };
 use mlx_gen_qwen_image_2_1::pipeline::decode_tiling;
 use mlx_gen_qwen_image_2_1::{
-    create_noise, decode_rgb, denoise, load_text_encoder, load_tokenizer, load_transformer,
-    load_vae, system_prompt_drop_count, DenoiseInputs,
+    create_noise, decode_rgb, denoise_reported, load_text_encoder, load_tokenizer,
+    load_transformer, load_vae, system_prompt_drop_count, DenoiseInputs, DenoiseReport,
+    EvaluationPath, KvCacheMode, KvCachePath, PromptBranch,
 };
 
 use crate::common::{tiny_snapshot, turbo_snapshot, TURBO_SAMPLE_SIGMAS};
@@ -70,6 +71,17 @@ fn render(
 /// `req` rendered by hand from the snapshot's components over exactly `sigmas` — the reference a
 /// generator render must equal if (and only if) its sampler ran that schedule.
 fn render_over(root: &Path, req: &GenerationRequest, sigmas: &[f32]) -> Vec<u8> {
+    render_over_reported(root, req, sigmas).0
+}
+
+/// [`render_over`] plus what the denoise loop reported. The prefix KV cache is **on**, as it is on
+/// the generator's render path (`generate_impl` passes `KvCacheMode::On` for both engine ids), so
+/// the two sides of every pixel comparison here run the same cache mode.
+fn render_over_reported(
+    root: &Path,
+    req: &GenerationRequest,
+    sigmas: &[f32],
+) -> (Vec<u8>, DenoiseReport) {
     let tokenizer = load_tokenizer(root).unwrap();
     let encoder = load_text_encoder(root).unwrap();
     let transformer = load_transformer(root).unwrap();
@@ -80,7 +92,8 @@ fn render_over(root: &Path, req: &GenerationRequest, sigmas: &[f32]) -> Vec<u8> 
         .unwrap();
     let seed = req.seed.unwrap();
     let cancel = CancelFlag::new();
-    let latents = denoise(
+    let mut report = DenoiseReport::default();
+    let latents = denoise_reported(
         DenoiseInputs {
             transformer: &transformer,
             sigmas,
@@ -100,11 +113,13 @@ fn render_over(root: &Path, req: &GenerationRequest, sigmas: &[f32]) -> Vec<u8> 
             seed,
             cancel: &cancel,
             references: None,
+            kv_cache: KvCacheMode::On,
         },
+        &mut report,
         &mut |_| {},
     )
     .unwrap();
-    decode_rgb(
+    let pixels = decode_rgb(
         &vae,
         &latents,
         req.width,
@@ -113,7 +128,8 @@ fn render_over(root: &Path, req: &GenerationRequest, sigmas: &[f32]) -> Vec<u8> 
         None,
     )
     .unwrap()
-    .pixels
+    .pixels;
+    (pixels, report)
 }
 
 fn saved_then_zero() -> Vec<f32> {
@@ -192,6 +208,55 @@ fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
         render_over(&root, &request(None), &[1.0, 0.9, 0.6, 0.3, 0.0])
     );
     assert_ne!(rewritten, want);
+}
+
+/// The prefix KV cache (sc-25903) on the Turbo schedule: over the snapshot's eight saved sigmas the
+/// cached loop prefills once and decodes the other seven evaluations from the cache, and that
+/// render is the one the `qwen_image_2_1_turbo` generator produces.
+///
+/// `Generator::generate` does not surface the `DenoiseReport`, so the evaluation paths are
+/// asserted at the closest public seam — `denoise_reported` over the Turbo fixture's components
+/// and schedule with the cache mode the generator's one shared call site passes — and tied to the
+/// generator by pixel equality.
+///
+/// *Mutation that reds this:* the denoise loop not keeping the extracted cache (every evaluation
+/// then re-extracts instead of decoding from it).
+#[test]
+fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = turbo_snapshot(tmp.path());
+    let req = request(None);
+    let (manual, report) = render_over_reported(&root, &req, &saved_then_zero());
+
+    assert_eq!(report.kv_cache, KvCachePath::Cached);
+    assert!(
+        report.kv_cache_bytes > 0,
+        "the positive branch held a cache"
+    );
+    let paths: Vec<_> = report
+        .evaluations
+        .iter()
+        .map(|evaluation| {
+            assert_eq!(evaluation.branch, PromptBranch::Positive, "true CFG is off");
+            evaluation.path
+        })
+        .collect();
+    let mut want = vec![EvaluationPath::Extract];
+    want.extend([EvaluationPath::Cached; 7]);
+    assert_eq!(paths, want, "one evaluation per saved sigma");
+    // A cached evaluation runs the blocks over the target tokens only.
+    let (extract, cached) = (report.evaluations[0], report.evaluations[1]);
+    assert!(cached.block_tokens < extract.block_tokens);
+    assert_eq!(
+        cached.block_tokens,
+        2 * 2,
+        "a 32x32 target is a 2x2 latent grid"
+    );
+
+    let generator = load(TURBO, &root, OffloadPolicy::Resident).unwrap();
+    let (pixels, steps) = render(generator.as_ref(), &req);
+    assert_eq!(steps, every_step(8));
+    assert_eq!(pixels, manual);
 }
 
 /// Twelve steps on the Turbo id denoise over the 12-point resample of the saved curve

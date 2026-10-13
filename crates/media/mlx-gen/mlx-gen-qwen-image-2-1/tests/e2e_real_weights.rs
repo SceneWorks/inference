@@ -418,10 +418,11 @@ fn validation_render_reference_edit() {
     // (references, width, height, steps) — the caller-shaped case, then the boundary.
     //
     // Every reference is fitted to `output_resolution` (1024 px) whatever the target size, so ten
-    // references are ~41k prefix tokens on their own, and this port recomputes the whole
-    // block-causal prefix every step (no KV cache — see UPSTREAM.md). The boundary case therefore
-    // runs the fewest steps the sampler accepts rather than a smaller target: only the step count
-    // moves its cost.
+    // references are ~41k prefix tokens on their own. The boundary case's step count was set to
+    // the fewest the sampler accepts when this port recomputed the whole block-causal prefix
+    // every step; the render path now runs upstream's prefix KV cache (sc-25903, see
+    // UPSTREAM.md), under which only the first step pays for the prefix and later steps cost
+    // what a text-to-image step does. The step count is left as it was.
     //
     // `QWEN_IMAGE_2_1_EDIT_CASES="refs:WxH:steps,…"` replaces the two cases (sc-24114's encode
     // transient measurement: `2:2048x2048:2`); `QWEN_IMAGE_2_1_MEMORY_TRACE=1` prints the same
