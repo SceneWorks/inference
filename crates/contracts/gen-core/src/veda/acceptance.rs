@@ -486,6 +486,9 @@ impl Binding {
         state.closed = true;
         state.failure = Some(error.into());
     }
+    pub fn has_raw_scopes(&self) -> bool {
+        self.kind == Kind::Capture && !self.scopes.steps.is_empty()
+    }
     pub fn captures(&self, layer: usize, step: usize, head: usize) -> bool {
         self.kind == Kind::Capture
             && self.scopes.layers.contains(&layer)
@@ -786,6 +789,19 @@ pub fn capture_bound(
     )
 }
 
+pub fn capture_spans(layout: &super::contract::Layout) -> Result<serde_json::Value, String> {
+    let spans = layout
+        .capture_spans
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .ok_or("H3 acceptance actual construction spans were not retained")?;
+    Ok(serde_json::Value::Array(
+        spans
+            .iter()
+            .map(|s| serde_json::json!({"start":s.start,"grid":s.grid,"shape":s.shape.0}))
+            .collect(),
+    ))
+}
 /// Lossless float-bit transport; avoids a JSON/Python float object for every QK scalar.
 pub fn f32_capture(values: &[f32], shape: &[usize]) -> Result<serde_json::Value, String> {
     if shape.contains(&0)
@@ -866,6 +882,7 @@ mod tests {
                 "projectionQ",
                 "projectionK",
                 "predictorSha256",
+                "spans",
                 "layer",
                 "step",
                 "batch",
@@ -1042,6 +1059,38 @@ mod tests {
         let mut invalid = layout;
         invalid.video = usize::MAX;
         assert!(capture_bound(&invalid, 128).is_err());
+    }
+    #[test]
+    fn captured_spans_are_exact_ordered_production_inputs_and_required_for_raw_rebuild() {
+        use super::super::contract::{Layout, TileShape, TiledSpan};
+        let spans = vec![
+            TiledSpan {
+                start: 4,
+                grid: [1, 3, 17],
+                shape: TileShape([1, 8, 16]),
+            },
+            TiledSpan {
+                start: 60,
+                grid: [3, 5, 19],
+                shape: TileShape([2, 4, 16]),
+            },
+        ];
+        let mut layout = Layout::from_spans(&spans, 349).unwrap();
+        assert!(capture_spans(&layout).is_err());
+        layout.capture_spans = Some(spans.clone());
+        let value = capture_spans(&layout).unwrap();
+        assert_eq!(value[0]["start"], 4);
+        assert_eq!(value[1]["grid"], serde_json::json!([3, 5, 19]));
+        let rebuilt =
+            Layout::from_spans(layout.capture_spans.as_ref().unwrap(), layout.seq).unwrap();
+        assert_eq!(rebuilt.perm, layout.perm);
+        assert_eq!(rebuilt.valid, layout.valid);
+        let mut mutated = spans;
+        mutated[1].start += 1;
+        let different = Layout::from_spans(&mutated, layout.seq).unwrap();
+        assert_ne!(different.perm, layout.perm);
+        mutated.swap(0, 1);
+        assert!(Layout::from_spans(&mutated, layout.seq).is_err());
     }
     #[test]
     fn lossless_qk_capture_preserves_actual_bits_without_decimal_roundtrips() {

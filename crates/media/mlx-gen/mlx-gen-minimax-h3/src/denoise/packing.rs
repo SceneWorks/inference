@@ -529,6 +529,15 @@ impl PackedLayout {
         &self,
         shape: mlx_gen::gen_core::veda::contract::TileShape,
     ) -> Result<mlx_gen::gen_core::veda::contract::Layout> {
+        self.veda_layout_with_capture_spans(shape, false)
+    }
+
+    /// Preserve the exact native construction spans only for declared acceptance captures.
+    pub fn veda_layout_with_capture_spans(
+        &self,
+        shape: mlx_gen::gen_core::veda::contract::TileShape,
+        retain_spans: bool,
+    ) -> Result<mlx_gen::gen_core::veda::contract::Layout> {
         use mlx_gen::gen_core::veda::contract::{
             least_padding_shape, segment_grid, Layout, TiledSpan,
         };
@@ -561,7 +570,12 @@ impl PackedLayout {
             return Err(Error::Msg("Veda generated span/grid mismatch".into()));
         }
         spans.push(TiledSpan { start, grid, shape });
-        Layout::from_spans(&spans, self.seq_len as usize).map_err(|e| Error::Msg(e.to_string()))
+        let mut layout = Layout::from_spans(&spans, self.seq_len as usize)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        if retain_spans {
+            layout.capture_spans = Some(spans);
+        }
+        Ok(layout)
     }
 
     /// Rows in the packed sequence.

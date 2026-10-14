@@ -521,6 +521,15 @@ impl PackedLayout {
         &self,
         shape: candle_gen::gen_core::veda::contract::TileShape,
     ) -> Result<candle_gen::gen_core::veda::contract::Layout> {
+        self.veda_layout_with_capture_spans(shape, false)
+    }
+
+    /// Preserve the exact native construction spans only for declared acceptance captures.
+    pub fn veda_layout_with_capture_spans(
+        &self,
+        shape: candle_gen::gen_core::veda::contract::TileShape,
+        retain_spans: bool,
+    ) -> Result<candle_gen::gen_core::veda::contract::Layout> {
         use candle_gen::gen_core::veda::contract::{
             least_padding_shape, segment_grid, Layout, TiledSpan,
         };
@@ -553,7 +562,12 @@ impl PackedLayout {
             return Err(CandleError::Msg("Veda generated span/grid mismatch".into()));
         }
         spans.push(TiledSpan { start, grid, shape });
-        Layout::from_spans(&spans, self.seq_len).map_err(|e| CandleError::Msg(e.to_string()))
+        let mut layout = Layout::from_spans(&spans, self.seq_len)
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        if retain_spans {
+            layout.capture_spans = Some(spans);
+        }
+        Ok(layout)
     }
 
     /// Rows in the packed sequence.
@@ -779,7 +793,36 @@ mod tests {
             &dev(),
         )
         .unwrap();
+        let captured = packed
+            .veda_layout_with_capture_spans(TileShape([2, 4, 16]), true)
+            .unwrap();
+        let spans = captured.capture_spans.as_ref().unwrap();
+        assert_eq!(spans.len(), 3); // actual image, video, target; audio remains global
+        let rebuilt =
+            candle_gen::gen_core::veda::contract::Layout::from_spans(spans, packed.seq_len())
+                .unwrap();
+        assert_eq!(rebuilt.perm, captured.perm);
+        assert_eq!(rebuilt.valid, captured.valid);
+        assert_eq!(
+            (rebuilt.reference, rebuilt.ref_tokens, rebuilt.target_tokens),
+            (
+                captured.reference,
+                captured.ref_tokens,
+                captured.target_tokens
+            )
+        );
+        assert_eq!(spans.last().unwrap().grid, [37, 2, 3]);
+        let serialized = candle_gen::gen_core::veda::acceptance::capture_spans(&captured).unwrap();
+        assert_eq!(serialized[0]["start"], spans[0].start);
+        assert_eq!(serialized[1]["grid"], serde_json::json!(spans[1].grid));
+        let mut wrong = spans.clone();
+        wrong.swap(0, 1);
+        assert!(
+            candle_gen::gen_core::veda::contract::Layout::from_spans(&wrong, packed.seq_len())
+                .is_err()
+        );
         let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
+        assert!(tiled.capture_spans.is_none());
         assert_eq!(tiled.ref_tokens, 6 + 7 * 6);
         assert_eq!(tiled.target_tokens, 37 * 6);
         assert_eq!(tiled.valid.iter().sum::<usize>(), packed.seq_len());

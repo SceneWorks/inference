@@ -127,8 +127,16 @@ impl VedaRuntime {
         let grid = [g.num_latent_frames, g.latent_height / 2, g.latent_width / 2];
         let plan = bundle.choose(grid);
         let mut layouts = BTreeMap::new();
+        let capture = report
+            .borrow()
+            .terminal_acceptance
+            .as_ref()
+            .is_some_and(|b| b.has_raw_scopes());
         for &shape in &plan.shapes {
-            layouts.insert(shape, packed.veda_layout(shape)?);
+            layouts.insert(
+                shape,
+                packed.veda_layout_with_capture_spans(shape, capture)?,
+            );
         }
         let sizes = layouts
             .iter()
@@ -329,7 +337,7 @@ impl VedaRuntime {
                 if let Some(binding) = binding.as_ref().filter(|b| b.captures(layer, step, h)) {
                     let q_host = qt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                     let k_host = kt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    binding.record_raw(serde_json::json!({"event":"selection","captureBound":acceptance::capture_bound(layout,dim).map_err(CandleError::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(&q_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"kTiled":acceptance::f32_capture(&k_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"projectionQ":p.bundle.projection(layer,&[h as i32],true),"projectionK":p.bundle.projection(layer,&[h as i32],false),"predictorSha256":p.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":b,"heads":[h],"plan":p.plan.name,"grid":p.grid,"tileShape":p.plan.shapes[p.plan.heads[layer][h]].0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":scores,"rows":rows,"dtype":format!("{:?}",q.dtype())})).map_err(CandleError::Msg)?;
+                    binding.record_raw(serde_json::json!({"event":"selection","spans":acceptance::capture_spans(layout).map_err(CandleError::Msg)?,"captureBound":acceptance::capture_bound(layout,dim).map_err(CandleError::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(&q_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"kTiled":acceptance::f32_capture(&k_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"projectionQ":p.bundle.projection(layer,&[h as i32],true),"projectionK":p.bundle.projection(layer,&[h as i32],false),"predictorSha256":p.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":b,"heads":[h],"plan":p.plan.name,"grid":p.grid,"tileShape":p.plan.shapes[p.plan.heads[layer][h]].0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":scores,"rows":rows,"dtype":format!("{:?}",q.dtype())})).map_err(CandleError::Msg)?;
                 }
                 pairs += rows
                     .iter()

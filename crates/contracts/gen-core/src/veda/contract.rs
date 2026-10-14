@@ -433,6 +433,8 @@ fn split_budget(budget: f64, cols: usize) -> (usize, usize, f64) {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
+    /// Actual ordered construction spans, retained only for explicit acceptance capture.
+    pub capture_spans: Option<Vec<TiledSpan>>,
     pub perm: Vec<i32>,
     pub valid: Vec<usize>,
     /// Tiled reference and generated rows; trailing rows are dense globals.
@@ -528,6 +530,7 @@ impl Layout {
             }
         }
         Ok(Self {
+            capture_spans: None,
             perm,
             valid,
             video,
@@ -1110,6 +1113,7 @@ mod tests {
     fn frozen_masks_independent_fractional_ties_near_ties_empty_keys() {
         for c in fixture()["selections"].as_array().unwrap() {
             let l = Layout {
+                capture_spans: None,
                 perm: vec![],
                 valid: usize_vec(&c["valid"]),
                 video: us(&c["video"]),

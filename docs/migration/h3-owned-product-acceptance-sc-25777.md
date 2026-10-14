@@ -59,7 +59,9 @@ Each scoped selection is serialized as one actual head's raw JSON artifact,
 `<bindingSha256>-<recordIndex>.raw.json`, created new and closed/synced before
 an atomically published `.ready.json` notice. Raw `event: "selection"` records
 actual `layer`, `step`, `batch`, `heads: [head]`, `plan`, `grid`, `tileShape`,
-`dtype`, `seq`, `video`, `reference`, complete `valid`/`perm`,
+`dtype`, `seq`, `video`, `reference`, ordered actual `spans: [{start,grid,shape}]`
+from the production layout constructor (references first, target last; unprovable
+reference segments remain global), complete `valid`/`perm`,
 `refTokens`/`targetTokens`, actual `qTiled`/`kTiled` objects (`encoding: "f32_le_hex"`, `shape: [1,tiles,128,dim]`,
 `data`: exact little-endian IEEE float-bit hex, `sha256`: binary float-bit SHA),
 folded BF16 `projectionQ`/`projectionK` arrays promoted to f32 (head,3*dim,dim),

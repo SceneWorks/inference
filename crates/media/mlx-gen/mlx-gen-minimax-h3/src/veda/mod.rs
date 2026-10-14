@@ -137,8 +137,16 @@ impl VedaRuntime {
         let grid = [g.num_latent_frames as usize, grid_h, grid_w];
         let plan = bundle.choose(grid);
         let mut layouts = BTreeMap::new();
+        let capture = report
+            .borrow()
+            .terminal_acceptance
+            .as_ref()
+            .is_some_and(|b| b.has_raw_scopes());
         for &shape in &plan.shapes {
-            layouts.insert(shape, packed.veda_layout(shape)?);
+            layouts.insert(
+                shape,
+                packed.veda_layout_with_capture_spans(shape, capture)?,
+            );
         }
         let sizes = layouts
             .iter()
@@ -402,7 +410,7 @@ impl VedaRuntime {
                         mlx_rs::transforms::eval([&q_host, &k_host])?;
                         let n = layout.valid.len();
                         let logits = layout.video * layout.video;
-                        binding.record_raw(serde_json::json!({"event":"selection","captureBound":acceptance::capture_bound(layout,dim).map_err(Error::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(q_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"kTiled":acceptance::f32_capture(k_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"projectionQ":self.bundle.projection(layer,&[head],true),"projectionK":self.bundle.projection(layer,&[head],false),"predictorSha256":self.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":0,"heads":[head],"plan":self.plan.name,"grid":self.grid,"tileShape":shape.0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":&scores[local*logits..(local+1)*logits],"rows":&rows[local*n..(local+1)*n],"dtype":format!("{:?}",q.dtype())})).map_err(Error::Msg)?;
+                        binding.record_raw(serde_json::json!({"event":"selection","spans":acceptance::capture_spans(layout).map_err(Error::Msg)?,"captureBound":acceptance::capture_bound(layout,dim).map_err(Error::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(q_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"kTiled":acceptance::f32_capture(k_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"projectionQ":self.bundle.projection(layer,&[head],true),"projectionK":self.bundle.projection(layer,&[head],false),"predictorSha256":self.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":0,"heads":[head],"plan":self.plan.name,"grid":self.grid,"tileShape":shape.0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":&scores[local*logits..(local+1)*logits],"rows":&rows[local*n..(local+1)*n],"dtype":format!("{:?}",q.dtype())})).map_err(Error::Msg)?;
                     }
                 }
                 let chunk_pairs: u64 = rows
