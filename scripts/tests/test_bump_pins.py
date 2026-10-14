@@ -141,7 +141,11 @@ class VendoredGroupTests(unittest.TestCase):
         self.assertEqual(tool, {v["path"] for v in gate.VENDORED_PACKAGES.values()})
         for name, vendored in gate.VENDORED_PACKAGES.items():
             path, revision = vendored["path"], vendored["upstream_rev"]
-            _package, pinned = gate.PINNED_WORKSPACE_DEPENDENCIES[name]
+            # A vendored crate that is not itself a workspace dependency (candle-metal-kernels)
+            # is a sibling candle-core reaches at candle-core's own pinned revision.
+            _package, pinned = gate.PINNED_WORKSPACE_DEPENDENCIES.get(
+                name, gate.PINNED_WORKSPACE_DEPENDENCIES["candle-core"]
+            )
             self.assertEqual(revision, pinned, name)
             self.assertIn(revision, (ROOT / path / "VENDORED.md").read_text(encoding="utf-8"))
 

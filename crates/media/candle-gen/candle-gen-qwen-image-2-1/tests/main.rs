@@ -28,6 +28,9 @@ mod edit_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "metal_reference_latents.rs"]
+mod metal_reference_latents;
+
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
 

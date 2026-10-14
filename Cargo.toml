@@ -34,6 +34,7 @@ members = [
 exclude = [
     "crates/media/candle-gen/vendor/candle-core",
     "crates/media/candle-gen/vendor/candle-kernels",
+    "crates/media/candle-gen/vendor/candle-metal-kernels",
 ]
 
 # Internal packages are paths so a checkout has one contract package, one
@@ -126,11 +127,14 @@ cc = "1"
 [profile.dev.package."*"]
 opt-level = 3
 
-# Preserve the vendored multi-architecture CUDA kernel override, and the vendored candle-core:
+# Preserve the vendored multi-architecture CUDA kernel override, the vendored candle-core:
 # upstream 1e6aa85e plus the CUDA-graph parameter cache (#3564 + #3598) the decode graph runner
 # needs (sc-24441; provenance and the eager-behaviour argument in
-# crates/media/candle-gen/vendor/candle-core/VENDORED.md). A [patch] only applies to the top-level
-# workspace: a consumer that builds these crates by git must carry the same two entries.
+# crates/media/candle-gen/vendor/candle-core/VENDORED.md), and the vendored candle-metal-kernels:
+# upstream 1e6aa85e plus the rank > 4 strided-reduce indexing fix (#3873; its VENDORED.md). A
+# [patch] only applies to the top-level workspace: a consumer that builds these crates by git must
+# carry the same three entries.
 [patch."https://github.com/huggingface/candle"]
 candle-core = { path = "crates/media/candle-gen/vendor/candle-core" }
 candle-kernels = { path = "crates/media/candle-gen/vendor/candle-kernels" }
+candle-metal-kernels = { path = "crates/media/candle-gen/vendor/candle-metal-kernels" }
