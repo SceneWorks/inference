@@ -10,10 +10,11 @@ name: Veda A/B (CUDA)
 # and the turbo-recipe LoRA rule. Each cell's output directory is uploaded as its own artifact
 # (at most 8 cells per dispatch).
 #
-# WEIGHTS. The base snapshot and the q4/q8 tier dirs are the operator-staged REAL-FILE copies the
-# sc-20754 VRAM campaign measured against (`vars.CANDLE_MINIMAX_H3_SNAPSHOT`,
-# `vars.CANDLE_MINIMAX_H3_{Q4,Q8}_{DIT,TE}_DIR`); candle cannot memmap the hub cache's reparse-point
-# links, so they are validated by `validate_h3_vram_staging.py` before any CUDA context. The Veda
+# WEIGHTS. `vars.CANDLE_MINIMAX_H3_SNAPSHOT` and `vars.CANDLE_MINIMAX_H3_{Q4,Q8}_{DIT,TE}_DIR` name
+# hub-cache snapshots whose files are reparse-point links, which `validate_h3_vram_staging.py`
+# refuses. `scripts/release/veda_ab_stage_h3.py` hardlinks the subset the cells read (base VAEs +
+# tokenizer; the tier's transformer, transformer_ref and text_encoder) into a kept real-file tree
+# beside the cache and validates THAT before any CUDA context. The Veda
 # predictor, the four lightx2v turbo LoRAs and the claymation style LoRA are pinned rows in
 # `release/real-weight-models.toml`, materialized as plain directories beside the workspace (kept
 # across runs, so later dispatches only verify them).
@@ -104,12 +105,6 @@ jobs:
           if not defined REVIEWED_PYTHON exit /b 1
           "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
-      - name: Validate the staged real-file H3 inputs before any CUDA context
-        shell: cmd
-        run: |
-          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier bf16 --dit "%MINIMAX_H3_SNAPSHOT%\transformer" --te "%MINIMAX_H3_SNAPSHOT%\text_encoder" || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q4 --dit "%H3_Q4_DIT_DIR%" --te "%H3_Q4_TE_DIR%" || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q8 --dit "%H3_Q8_DIT_DIR%" --te "%H3_Q8_TE_DIR%" || exit /b 1
       - name: Materialize and verify the pinned Veda predictor and LoRAs
         shell: cmd
         run: |
@@ -118,6 +113,14 @@ jobs:
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-veda-predictor --snapshot "%VEDA_AB_PREDICTOR_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-turbo-loras --snapshot "%VEDA_AB_TURBO_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-claymation-lora --snapshot "%VEDA_AB_CLAY_SNAPSHOT%" || exit /b 1
+      # The H3 variables name hub-cache snapshots (reparse-point links). Hardlink the subset the cells
+      # read into a kept `real-file-staging/` tree beside the cache, export the staged paths for every
+      # later step, and run `validate_h3_vram_staging.py` on them before any CUDA context.
+      - name: Stage and validate real-file H3 inputs before any CUDA context
+        shell: cmd
+        run: |
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/veda_ab_stage_h3.py || exit /b 1
       - name: Select Git Bash
         shell: cmd
         run: |
