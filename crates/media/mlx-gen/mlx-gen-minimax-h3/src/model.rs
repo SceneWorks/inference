@@ -1440,7 +1440,6 @@ impl MiniMaxH3 {
             req.h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
-        drop(observe_step);
         if let Some(probe) = terminal_probe {
             self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
         }
@@ -1706,7 +1705,6 @@ impl MiniMaxH3 {
             req.h3_terminal_telemetry
                 .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
-        drop(observe_step);
         if let Some(probe) = terminal_probe {
             self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
         }
