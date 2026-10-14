@@ -55,6 +55,35 @@ pub enum Parameterization {
 }
 
 impl Parameterization {
+    /// The gain on a step's weighted aux term that makes a given aux-loss weight mean the same on
+    /// every parameterisation (sc-2124). The aux gradient reaching the model output is
+    /// `∂L/∂pred = (∂x0/∂pred)ᵀ · ∂L/∂x0`, and `|∂x0/∂pred|` is the per-step scalar
+    ///
+    /// - flow (either sign): `σ ∈ [0, 1]`;
+    /// - v-prediction: `√(1−ᾱ) ∈ [0, 1]`;
+    /// - ε-prediction: `σ_ve = √((1−ᾱ)/ᾱ)`, unbounded (SDXL: ≈0.03 … ≈14.6).
+    ///
+    /// Flow and v-prediction are already bounded by 1, so their gain is exactly `1` (the term is
+    /// untouched — bit-identical to the ungained path). ε-prediction gets `min(1, 1/σ_ve) =
+    /// min(1, √ᾱ/√(1−ᾱ))`, so its effective Jacobian is `min(σ_ve, 1)`: the same as flow's `σ ≈ σ_ve`
+    /// at low noise and capped at flow's `1` at high noise, instead of amplifying the aux gradient
+    /// up to ~14.6× (the real-weight A/B's adversarial SDXL faces).
+    pub fn aux_gain(&self) -> f32 {
+        match *self {
+            Self::FlowNoiseMinusX0 { .. } | Self::FlowX0MinusNoise { .. } => 1.0,
+            Self::VPrediction { .. } => 1.0,
+            Self::Epsilon { alpha_bar } => {
+                let ab = alpha_bar.clamp(0.0, 1.0);
+                let noise = (1.0 - ab).sqrt();
+                if noise <= ab.sqrt() {
+                    1.0
+                } else {
+                    ab.sqrt() / noise
+                }
+            }
+        }
+    }
+
     /// Recover the model's x0 estimate from the noisy input and its prediction (same dtype/shape).
     /// Pure tensor ops — differentiable in `pred`.
     pub fn recover_x0(&self, x_t: &Tensor, pred: &Tensor) -> Result<Tensor> {
@@ -808,6 +837,48 @@ mod tests {
         assert!(scalar(&multiscale_grad_loss(&shifted, &t, 4).unwrap()) < 1e-6);
         let other = map(6, &[1, 16, 16]);
         assert!(scalar(&multiscale_grad_loss(&other, &t, 4).unwrap()) > 0.01);
+    }
+
+    /// sc-2124: the aux gain normalises the ε Jacobian `σ_ve = √((1−ᾱ)/ᾱ)` to `min(σ_ve, 1)` —
+    /// exactly `1/σ_ve` at high noise (SDXL's last timestep, σ_ve ≈ 14.6), exactly `1` at low noise —
+    /// and is exactly `1` (no change at all) for flow and v-prediction at every noise level.
+    /// Mutations: return `1` for `Epsilon` ⇒ red; return `1/σ_ve` unclamped ⇒ the low-noise case
+    /// (gain > 1) reds; scale the flow gain by `σ` ⇒ red.
+    #[test]
+    fn aux_gain_normalises_epsilon_and_leaves_flow_alone() {
+        for ab in [0.004_7f32, 0.05, 0.2, 0.45] {
+            let sigma_ve = ((1.0 - ab) / ab).sqrt();
+            assert!(sigma_ve > 1.0);
+            let g = Parameterization::Epsilon { alpha_bar: ab }.aux_gain();
+            assert!(
+                (g - 1.0 / sigma_ve).abs() <= 1e-6,
+                "ᾱ={ab}: {g} vs {}",
+                1.0 / sigma_ve
+            );
+            assert!(g < 1.0);
+        }
+        for ab in [0.5f32, 0.8, 0.999, 1.0] {
+            assert_eq!(
+                Parameterization::Epsilon { alpha_bar: ab }.aux_gain(),
+                1.0,
+                "ᾱ={ab}"
+            );
+        }
+        assert_eq!(Parameterization::Epsilon { alpha_bar: 0.0 }.aux_gain(), 0.0);
+        for v in [0.0f32, 0.3, 0.5, 0.97, 1.0] {
+            assert_eq!(
+                Parameterization::FlowNoiseMinusX0 { sigma: v }.aux_gain(),
+                1.0
+            );
+            assert_eq!(
+                Parameterization::FlowX0MinusNoise { sigma: v }.aux_gain(),
+                1.0
+            );
+            assert_eq!(
+                Parameterization::VPrediction { alpha_bar: v }.aux_gain(),
+                1.0
+            );
+        }
     }
 
     /// Mutation: flip the sign in any `recover_x0` arm ⇒ red.

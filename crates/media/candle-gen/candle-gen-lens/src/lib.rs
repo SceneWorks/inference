@@ -35,6 +35,9 @@ pub mod training;
 pub mod transformer;
 pub mod vae;
 
+#[cfg(test)]
+mod testfix;
+
 pub use adapters::{install_additive, merge_adapters, AdditiveReport, MergeReport};
 pub use quant::QLinear;
 pub use reasoner::{LensReasoner, DEFAULT_MAX_NEW_TOKENS};

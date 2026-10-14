@@ -932,6 +932,7 @@ pub struct LoadSpec {
     /// | sensenova (fast) | `distill_lora` |
     /// | LTX-2.3 | `uncensored_enhancer` |
     /// | acestep (Cover) | `sft_cover` |
+    /// | Iris-3B (generation) | `text_encoder` |
     ///
     /// sc-13664 wired sensenova's `distill_lora` (the 8-step distill LoRA for `sensenova_u1_8b_fast`,
     /// with a co-located-in-snapshot fallback; **not** a universally-`required_components` id, because a

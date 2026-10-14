@@ -179,6 +179,9 @@ pub struct VedaExecutionReport {
     pub workspace_bytes: u64,
     /// Engine-observed reason for dense fallback; never inferred from requested settings.
     pub fallback_reason: Option<String>,
+    /// H3 producer observation only. Absent for ordinary generation. Its counters are
+    /// explicitly scoped and must not be confused with `workspace_bytes`.
+    pub terminal_telemetry: Option<serde_json::Value>,
 }
 
 impl VedaExecutionReport {
@@ -197,7 +200,7 @@ impl VedaExecutionReport {
             (false, true) => "dense",
             (false, false) => "unobserved",
         };
-        serde_json::json!({
+        let mut outcome = serde_json::json!({
             "requested": self.requested,
             "effective": effective,
             "kernel": self.kernel,
@@ -215,7 +218,11 @@ impl VedaExecutionReport {
             "predictorScoreCalls": self.predictor_score_calls,
             "workspaceBytes": self.workspace_bytes,
             "fallbackReason": self.fallback_reason,
-        })
+        });
+        if let Some(telemetry) = &self.terminal_telemetry {
+            outcome["terminalTelemetry"] = telemetry.clone();
+        }
+        outcome
     }
 }
 
@@ -270,6 +277,16 @@ mod tests {
             "unobserved"
         );
         assert!(VedaExecutionReport::default().outcome_json()["totalAttentionFraction"].is_null());
+        assert!(VedaExecutionReport::default()
+            .outcome_json()
+            .get("terminalTelemetry")
+            .is_none());
+        let observed = VedaExecutionReport {
+            terminal_telemetry: Some(serde_json::json!({"schemaVersion": 1, "steps": []})),
+            ..Default::default()
+        }
+        .outcome_json();
+        assert_eq!(observed["terminalTelemetry"]["schemaVersion"], 1);
     }
 
     #[test]

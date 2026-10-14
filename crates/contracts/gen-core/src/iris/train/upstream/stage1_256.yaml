@@ -1,0 +1,51 @@
+# Iris-3B stage 1: 256px square images, steps 0 -> 365,000.
+#
+# Only settings that differ from the defaults in src/iris3b/config.py are listed;
+# the model, text encoder, optimizer and EMA defaults are the Iris-3B recipe.
+#
+# Global batch 1024 = train.batch_size 16 per GPU x 64 GPUs (8 nodes x 8 GPUs).
+# The trainer refuses to start unless batch_size x world_size x grad_accum_steps
+# equals train.expected_global_batch; on another GPU count raise
+# train.grad_accum_steps or change train.batch_size to keep 1024.
+#
+#   NNODES=8 NODE_RANK=<0..7> MASTER_ADDR=<node 0> \
+#     scripts/launch_multinode.sh configs/iris3b/stage1_256.yaml data.data_dirs=[/path/to/wids/dataset]
+name: iris-3b-stage1-256
+work_dir: output/iris-3b/stage1_256
+wandb_project: iris
+
+model:
+  rope_aspect: square        # later stages switch to isotropic
+
+flow:
+  shift: 2.0
+
+repa:
+  weight: 0.5                # DINOv2-B/14 features aligned at block 10; stage 1 only
+
+data:
+  data_dirs: [/path/to/wids/dataset]   # one or more scripts/prepare_wids.py outputs
+  image_size: 256            # fixed square: shortest-side resize, center crop
+
+train:
+  batch_size: 16
+  expected_global_batch: 1024
+  num_epochs: 1000           # max_steps is the horizon
+  max_steps: 365000
+  dist:
+    # Hybrid sharding: each group of dp_shard GPUs (one node) holds one sharded
+    # copy of the model; the world_size / dp_shard copies stay in sync by an
+    # all-reduce of the sharded gradients. Set dp_shard to the GPUs per node.
+    strategy: fsdp2
+    sharding: hybrid
+    mesh:
+      dp_shard: 8
+  perf:
+    lazy_sync: true          # required for multi-node runs
+    foreach_ema: true
+    skip_dropped_text: true
+    compile: true
+    compile_mode: max-autotune-no-cudagraphs
+  save_every_steps: 5000
+  keep_last_checkpoints: 3
+  sample_every_steps: 5000

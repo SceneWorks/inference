@@ -149,8 +149,9 @@ use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
-    prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
-    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
+    prepend_condition_rows, render_latents_with_observer, resolve_geometry,
+    revert_pixel_normalization, t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
+    PATCH_SIZE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -564,6 +565,29 @@ pub struct MiniMaxH3 {
     adapters: Vec<AdapterSpec>,
     veda_report: crate::veda::ReportSink,
     veda_component: Option<PathBuf>,
+}
+
+#[cfg(feature = "cuda")]
+fn terminal_device_sample(device: &Device) -> serde_json::Value {
+    let pool = match device.location() {
+        candle_gen::candle_core::DeviceLocation::Cuda { gpu_id } => {
+            candle_gen::cuda_mempool::MemPool::device_current(gpu_id as i32)
+        }
+        _ => None,
+    };
+    serde_json::json!({
+        "method": "cuda_current_pool_cumulative_highwater_no_reset",
+        "poolAvailable": pool.is_some(),
+        "usedSampleBytes": pool.and_then(|p| p.used()),
+        "usedHighBytesCumulative": pool.and_then(|p| p.used_high()),
+        "reservedSampleBytes": pool.and_then(|p| p.reserved()),
+        "reservedHighBytesCumulative": pool.and_then(|p| p.reserved_high()),
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn terminal_device_sample(_device: &Device) -> serde_json::Value {
+    serde_json::json!({"method": "unavailable_without_cuda", "poolAvailable": false})
 }
 
 impl MiniMaxH3 {
@@ -1015,7 +1039,15 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step = |index, elapsed| {
+            if let Some(probe) = terminal_probe.as_mut() {
+                probe.record(index, elapsed, terminal_device_sample(&self.device));
+            }
+        };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             &schedule,
@@ -1025,7 +1057,18 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry =
+                Some(probe.finish(if self.device.is_cuda() {
+                    "candle_cuda"
+                } else {
+                    "candle_cpu"
+                }));
+        }
+
         drop(model);
         drop(video_rows);
         drop(audio_rows);
@@ -1329,7 +1372,15 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step = |index, elapsed| {
+            if let Some(probe) = terminal_probe.as_mut() {
+                probe.record(index, elapsed, terminal_device_sample(&self.device));
+            }
+        };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             schedule,
@@ -1339,7 +1390,18 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry =
+                Some(probe.finish(if self.device.is_cuda() {
+                    "candle_cuda"
+                } else {
+                    "candle_cpu"
+                }));
+        }
+
         drop(model);
         drop(video_rows);
         drop(audio_rows);

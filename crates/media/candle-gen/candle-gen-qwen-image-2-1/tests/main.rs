@@ -49,6 +49,9 @@ mod text_encoder_parity;
 #[path = "tiers.rs"]
 mod tiers;
 
+#[path = "train_peak_real_weights.rs"]
+mod train_peak_real_weights;
+
 #[path = "trainer_conformance.rs"]
 mod trainer_conformance;
 
