@@ -209,3 +209,41 @@ fn a_request_selects_the_bounded_decode_and_its_geometry() {
     let spatial = decode_tiling(&req).unwrap().spatial.expect("spatial");
     assert_eq!((spatial.tile_px, spatial.overlap_px), (256, 32));
 }
+
+/// The encode on the build's compute device (CUDA / Metal, bf16) is the CPU f32 encode, to bf16
+/// rounding (sc-25909). The encoder's spatial downsample (`AvgDown`) takes a group mean that, as
+/// first written, reduced a non-trailing axis of a rank-5 tensor — which candle's Metal backend
+/// computes over the wrong elements (O(1) errors, non-finite where it reads pooled memory), so
+/// every reference latent of a Metal render was garbage. On the CPU lane both sides are the CPU
+/// and this is an identity; it has teeth on a `--features metal` / `cuda` build.
+///
+/// Tolerance: `assert_close` at 5e-2 × max(1, peak) — the bf16 weights and activations of the
+/// device side against f32, over five encoder stages; the defect is ~1.0 × peak.
+///
+/// *Mutation that reds this (on Metal):* `AvgDown`'s mean back over the rank-5
+/// `[B, out, group, H', W']` view.
+#[test]
+fn the_encode_on_the_compute_device_matches_the_cpu_encode() {
+    let device = candle_gen::default_device().unwrap();
+    let root = tiny_snapshot();
+    let image: Vec<f32> = (0..4 * 64 * 64)
+        .map(|i| ((i * 37 % 255) as f32 / 127.5) - 1.0)
+        .collect();
+    let cpu_image = candle_core::Tensor::from_vec(image, (1, 4, 64, 64), &Device::Cpu).unwrap();
+    let want = load_vae(&root, &Device::Cpu)
+        .unwrap()
+        .encode_mode(&cpu_image)
+        .unwrap();
+    let got = load_vae(&root, &device)
+        .unwrap()
+        .encode_mode(&cpu_image.to_device(&device).unwrap())
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap();
+    assert_close(
+        "encode_mode on the compute device vs the CPU",
+        &got,
+        &want,
+        5e-2,
+    );
+}

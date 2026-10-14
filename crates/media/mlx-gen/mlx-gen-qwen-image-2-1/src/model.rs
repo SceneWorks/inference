@@ -42,6 +42,68 @@ pub const MODEL_ID: &str = "qwen_image_2_1";
 pub const TURBO_MODEL_ID: &str = "qwen_image_2_1_turbo";
 /// Descriptor family — distinct from the 2512 crate's `qwen-image`.
 pub const FAMILY: &str = "qwen-image-2-1";
+
+/// The label the family's shared code (transformer, quant, reference, adapters, memory pricing)
+/// starts its refusals with: the base engine id's.
+const BASE_LABEL: &str = "qwen_image_2_1: ";
+
+/// E3 (sc-25909) — **a refusal reached through engine id `id` names `id`**, one rule on both
+/// backends. The family's shared code labels its refusals with the base id (it serves both and
+/// is not told which); every public entry point of a Turbo-id object — the generator's load,
+/// `validate`, `generate`, `generate_with_report` and request scope, and the Turbo memory
+/// registration — rewrites a leading `qwen_image_2_1: ` to `qwen_image_2_1_turbo: ` on the way
+/// out. A base-id refusal, and a message that does not start with the base label (one that
+/// already names an id, or a backend error), passes through unchanged.
+pub(crate) fn label_message(id: &str, message: String) -> String {
+    if id == TURBO_MODEL_ID {
+        if let Some(rest) = message.strip_prefix(BASE_LABEL) {
+            return format!("{id}: {rest}");
+        }
+    }
+    message
+}
+
+/// [`label_message`] over this crate's error type.
+pub(crate) fn labelled(id: &str, error: Error) -> Error {
+    match error {
+        Error::Msg(message) => Error::Msg(label_message(id, message)),
+        Error::Unsupported(message) => Error::Unsupported(label_message(id, message)),
+        Error::GeometryRefused {
+            reason,
+            requested_width,
+            requested_height,
+            alternative,
+        } => Error::GeometryRefused {
+            reason: label_message(id, reason),
+            requested_width,
+            requested_height,
+            alternative,
+        },
+        other => other,
+    }
+}
+
+/// [`label_message`] over gen-core's error type.
+pub(crate) fn labelled_core(id: &str, error: gen_core::Error) -> gen_core::Error {
+    match error {
+        gen_core::Error::Msg(message) => gen_core::Error::Msg(label_message(id, message)),
+        gen_core::Error::Unsupported(message) => {
+            gen_core::Error::Unsupported(label_message(id, message))
+        }
+        gen_core::Error::GeometryRefused {
+            reason,
+            requested_width,
+            requested_height,
+            alternative,
+        } => gen_core::Error::GeometryRefused {
+            reason: label_message(id, reason),
+            requested_width,
+            requested_height,
+            alternative,
+        },
+        other => other,
+    }
+}
 /// Smallest side upstream's pipeline can render: one vision slot (a 2×2 latent) at 16 px/token.
 pub const MIN_SIZE: u32 = 32;
 
@@ -303,6 +365,10 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// the schedule family read from the snapshot ([`Schedule::load`]) — a snapshot of the other
 /// variant is a typed refusal, raised before any weight is read.
 pub fn load_variant(variant: Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant_unlabelled(variant, spec).map_err(|error| labelled(variant.id(), error))
+}
+
+fn load_variant_unlabelled(variant: Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     gen_core::reject_unknown_components(spec, &[], variant.id())?;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Unsupported(PRECISION_OVERRIDE_REFUSAL.into()));
@@ -483,6 +549,7 @@ pub(crate) fn diagnostic_first_forward(spec: &LoadSpec, req: &GenerationRequest)
     let _bounds = crate::memory_strategy::AllocatorBounds::enter(
         10_505_507_280 + 6_759_417,
         crate::memory_strategy::derived::request_transient_budget_bytes(
+            crate::quant::Tier::from_selected(spec.quantize).unwrap_or(crate::quant::Tier::Bf16),
             req.width,
             req.height,
             crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,
@@ -538,7 +605,8 @@ impl Generator for QwenImage21 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(self.variant, &self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request(self.variant, &self.descriptor.capabilities, req)
+            .map_err(|error| labelled(self.variant.id(), error).into())
     }
 
     fn generate(
@@ -546,7 +614,9 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let report = self.generate_impl(req, on_progress)?;
+        let report = self
+            .generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error))?;
         report.output.ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{}: the render produced no output",
@@ -563,7 +633,8 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error).into())
     }
 }
 
@@ -643,7 +714,10 @@ impl QwenImage21 {
         };
         let _bounds = crate::memory_strategy::AllocatorBounds::enter_retaining(
             resident_bytes,
+            // sc-25909: at the loaded tier — a packed tier's denoise is priced at the f32 it
+            // computes in, not at bf16.
             crate::memory_strategy::derived::request_transient_budget_bytes(
+                tier,
                 req.width,
                 req.height,
                 crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,

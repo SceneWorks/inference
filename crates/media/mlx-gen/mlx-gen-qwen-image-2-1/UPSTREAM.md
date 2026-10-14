@@ -458,6 +458,15 @@ real on-device measurements, so filing a derivation there would launder an estim
 asset-facts + generic-headroom estimate path where the estimate safety margin applies. None of it is
 copied from the 2512 route.
 
+**The DiT's activations are priced at the width it computes in on each tier** (sc-25909,
+`derived::dit_compute_width`): bf16 on the dense tier, **f32 on q8 / q4** — a packed Linear has no
+dense weight dtype for the forward to follow, so the transformer computes in f32 there. Until
+sc-25909 the denoise term was priced at bf16 on every tier, which put a packed tier's ten-reference
+2048² cache-shed budget at 11.58 GiB against the 22.12 GiB its f32 tensors need. Every bf16 figure
+and every floor is unchanged; on q8 / q4 the 2048² table row (bounded activation 6.06 → 6.10 GiB)
+and every cache-shed request budget the denoise binds move, and the published
+`activation_dtype_width` architecture fact is 4 there. The autoencoder terms are f32 on every tier.
+
 `memory_strategy::admission_geometry` reports the envelope a consumer must gate on: the largest
 preset **area** (2400×1792, which is neither the widest preset nor the square default), the 16 800
 latent tokens it contributes, and the fact that each of up to 10 reference images adds a further
@@ -532,6 +541,21 @@ prompt with a scale above 1 still runs the second forward.
 * One step is accepted (`[σ₀, 0]`); the base id's `steps >= 2` floor exists only because its
   terminal stretch divides by zero there.
 
+### What changed for the base id (sc-25900, sc-25905)
+
+Two changes reach `qwen_image_2_1` itself, beyond the Candle twin's approved prefill select (which
+does not exist on this backend — the MLX prefill already selects modulation rows exactly):
+
+* **The base snapshot's `model_index.json` is now read**, for the one discriminating key. A
+  snapshot that saves `sample_sigmas` (any present, non-null value, a malformed list included) is
+  refused under the base id — by the generator, the memory registration **and** the trainer — and
+  so is one whose `model_index.json` is present but **unparsable**, which used to load: it cannot
+  be shown not to be a Turbo snapshot. A snapshot with no `model_index.json` loads as before.
+* **The base descriptor declares a request execution domain**: `capabilities.execution` carries
+  `prefix_kv_cache: [cached, prefill]` (`gen_core::execution_domains`). A request that selects
+  nothing still runs the pre-epic prefill path, byte for byte; a request that selects `cached`
+  was refused at `validate` before this epic and is admitted now.
+
 ### Installable tiers of the Turbo checkpoint (sc-25906)
 
 The same converter, with no variant flag: `convert::prequantize_turnkey` reads which checkpoint
@@ -583,7 +607,8 @@ The Turbo id carries its own calibration identity,
 
 ## Prefix KV cache (sc-25903)
 
-Upstream's `use_kv_cache=True` default is ported: `QwenImage21KVCache` → `PrefixKvCache`
+Upstream's `use_kv_cache=True` **path** is ported — not its default: a request that selects
+nothing runs prefill here (sc-25905, *Deliberate divergences*). `QwenImage21KVCache` → `PrefixKvCache`
 (`src/transformer.rs`), `kv_cache_mode="extract"` → `forward_joint_extract`, `"cached"` →
 `forward_joint_cached`, and the pipeline's loop → `denoise` / `denoise_reported`
 (`src/pipeline.rs`).
@@ -705,6 +730,60 @@ default with no memory model behind it; here the cache is a **request selection*
 held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The
 peak bound was checked on the CPU device at fixture scale only. The epic's terminal story
 measures one cached ten-reference render.
+
+## The pre-epic golden (AT4, sc-25909)
+
+Epic 25899 refactored the base forward on this backend (`transformer.rs` project / merge /
+`forward_with`, `model.rs` `Schedule`) and is meant to leave the base id's output, with the cache
+shed, **byte for byte** what it was at the pre-epic revision `c1f594203` (the merge base of the
+feature branch). Two things hold it:
+
+* **Committed, every lane:** `kv_cache::the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates`
+  — the base generator's render of a request that selects nothing equals the explicit
+  `KvCacheMode::Off` assembly byte for byte, and that same loop lands on upstream's
+  `use_kv_cache=False` latents (`qwen21_kv_cache.safetensors` `t2i/latents_final_prefill`), on the
+  CPU device in f32. Nothing machine-dependent is committed.
+* **Real weights, once, by the terminal story:** `QWEN_IMAGE_2_1_RENDER_GOLDEN=<dir>` makes the
+  two base real-weight tests (`validation_render_default_preset`, `validation_render_reference_edit`)
+  hold every PNG they write to the PNG **of the same name** in `<dir>`, **byte-equal**, refusing a
+  cached render (the pre-epic revision had no cache). The two tests and their output names are the
+  same at `c1f594203` (`qwen_image_2_1_<W>x<H>_<N>steps_seed42.png`,
+  `qwen_image_2_1_edit_{2,10}refs_<W>x<H>_<N>steps_seed42.png`; `QWEN_IMAGE_2_1_RENDER_SIZE` /
+  `_STEPS` are read identically), so the comparison is mechanical:
+
+```sh
+BASE=…/models--Qwen--Qwen-Image-2.1/snapshots/790c92633540aa0cb11d9abf19eb46d861714758
+git -C ~/Repos/inference worktree add /tmp/qwen21-pre-epic c1f594203
+for t in validation_render_default_preset validation_render_reference_edit; do
+  (cd /tmp/qwen21-pre-epic && MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=$BASE \
+     QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/qwen21-golden-c1f594203 \
+     cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+     e2e_real_weights::$t -- --ignored --exact --nocapture)
+done
+for t in validation_render_default_preset validation_render_reference_edit; do
+  MLX_GEN_QWEN_IMAGE_2_1_SNAPSHOT=$BASE QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill \
+  QWEN_IMAGE_2_1_RENDER_GOLDEN=~/SceneWorks/qwen21-golden-c1f594203 \
+  QWEN_IMAGE_2_1_RENDER_OUT=~/SceneWorks/qwen21-golden-check \
+    cargo test --locked --release -p mlx-gen-qwen-image-2-1 --test integration \
+    e2e_real_weights::$t -- --ignored --exact --nocapture
+done
+```
+
+Each comparison prints a `[golden]` line (mean and max |Δ|); any byte off fails. The same
+`QWEN_IMAGE_2_1_RENDER_SIZE` / `QWEN_IMAGE_2_1_RENDER_STEPS` may be set on both sides for a
+quicker default-preset pair. The dry run `the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture`
+drives the comparison (pass, a changed byte, a cached render, a missing file) on the base fixture.
+
+## Cross-lane names and the one deliberate signature difference (sc-25909)
+
+The Turbo seam carries the same names on both backends: `UPSTREAM_TURBO_HF_REPO` /
+`UPSTREAM_TURBO_HF_REVISION` / `UPSTREAM_TURBO_DIFFUSERS_REVISION`, `Variant::id` / `from_id`,
+`scheduler::resample_saved_sigmas`, `SavedSigmaSchedule` / `loader::load_saved_sigma_schedule`, a
+public `Schedule`. One signature differs on purpose: the cache surcharge here is
+`derived::prefix_kv_cache_demand_bytes(tier, width, height, references, negative)` because a
+packed tier computes in f32 on this backend (its cache is twice the bf16 tier's); the candle twin's
+`memory_strategy::prefix_kv_cache_demand_bytes(width, height, references, negative)` takes no tier
+because its width follows the device, never the tier.
 
 ## Deliberate divergences
 

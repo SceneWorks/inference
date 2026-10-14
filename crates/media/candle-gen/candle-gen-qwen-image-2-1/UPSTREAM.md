@@ -432,10 +432,13 @@ than the target's own token count: `reference::prepare` fits every condition ima
 | What | Where | Revision |
 | --- | --- | --- |
 | Weights, `config.json`s, `model_index.json` (`sample_sigmas`), scheduler config, licence | `Qwen/Qwen-Image-2.1-Turbo` (Hugging Face; card `base_model: Qwen/Qwen-Image-2.1`) | `fc13ba1986fcb905854dc8de2f52eee395f49b5b` |
-| Saved-sigma semantics of `QwenImage21Pipeline.__call__` | `huggingface/diffusers` PR #14950 (`pipelines/qwenimage21/pipeline_qwenimage21.py`) | — |
+| Saved-sigma semantics of `QwenImage21Pipeline.__call__` (`config.sample_sigmas`, "Configure fixed sampling sigmas on QwenImage21Pipeline") | `huggingface/diffusers` PR #14950 (`pipelines/qwenimage21/pipeline_qwenimage21.py`) | `da1d3829cf08d4f329b526d89e17cc035c049d8d` |
 
-`src/lib.rs` carries the repository and revision as `TURBO_UPSTREAM_HF_REPO` /
-`TURBO_UPSTREAM_HF_REVISION`. The licence is the same Qwen Research License Agreement (the card
+`src/lib.rs` carries the repository and revisions as `UPSTREAM_TURBO_HF_REPO` /
+`UPSTREAM_TURBO_HF_REVISION` / `UPSTREAM_TURBO_DIFFUSERS_REVISION` — the same names and values as
+the MLX twin's (sc-25909 aligned the two crates' Turbo seam names on the MLX ones:
+`Variant::id` / `from_id`, `scheduler::resample_saved_sigmas`, `SavedSigmaSchedule`,
+`loader::load_saved_sigma_schedule`, a public `Schedule`). The licence is the same Qwen Research License Agreement (the card
 declares `license_name: qwen-research` and ships the same `LICENSE`).
 
 One architecture, served by this crate under a second engine id. Against the base repository the
@@ -443,8 +446,8 @@ Turbo snapshot has the **same** `transformer/config.json`, presets and licence, 
 
 | | base `Qwen/Qwen-Image-2.1` | `Qwen/Qwen-Image-2.1-Turbo` | what this port does |
 | --- | --- | --- | --- |
-| `model_index.json` | no `sample_sigmas` | `sample_sigmas: [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]` (terminal 0 excluded) | read by `loader::load_turbo_schedule`; it is also the base/Turbo discriminator |
-| `scheduler/scheduler_config.json` | `use_dynamic_shifting: true`, `shift_terminal: 0.02` | `use_dynamic_shifting: false`, `shift: 1.0`, `shift_terminal: null` | `TurboSchedule::from_values` requires exactly that static form |
+| `model_index.json` | no `sample_sigmas` | `sample_sigmas: [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]` (terminal 0 excluded) | read by `loader::load_saved_sigma_schedule`; it is also the base/Turbo discriminator |
+| `scheduler/scheduler_config.json` | `use_dynamic_shifting: true`, `shift_terminal: 0.02` | `use_dynamic_shifting: false`, `shift: 1.0`, `shift_terminal: null` | `SavedSigmaSchedule::from_values` requires exactly that static form |
 | `vae/diffusion_pytorch_model.safetensors` | f32, 1.35 GB | bf16, 0.68 GB | nothing: candle casts on read, so both land on the lane's compute dtype |
 | `text_encoder/` | four `model-0000N-of-00004.safetensors` shards | one `model.safetensors` | nothing: `candle_gen::loader::load_sorted_mmap` reads whatever shards the directory holds |
 
@@ -458,7 +461,7 @@ therefore used **unchanged**: no `mu`, no terminal stretch, and nothing depends 
 `true_cfg_scale` defaults to 1 ("Generation uses CFG=1 by default", the model card), and a negative
 prompt with a scale above 1 is still accepted.
 
-This port (`scheduler::saved_sigmas`, `resolve_turbo_run_params`):
+This port (`scheduler::resample_saved_sigmas`, `resolve_turbo_run_params`):
 
 * `steps` unset, or equal to the saved length → exactly the saved list, then `0.0`. The default
   step count is the saved list's length, read from the snapshot (eight for the pinned revision).
@@ -487,6 +490,12 @@ Deliberate consequence: the base id now reads `model_index.json` (for that one k
 snapshot whose `model_index.json` is present but **unparsable** is refused where it used to load —
 it cannot be shown not to be a Turbo snapshot. The MLX twin refuses it too. A snapshot with no
 `model_index.json` loads as before.
+
+The other change that reaches the base id (sc-25905): its descriptor's `capabilities.execution`
+declares `prefix_kv_cache: [cached, prefill]` (`gen_core::execution_domains`). A request that
+selects nothing still runs the prefill path; a `cached` selection, refused at `validate` before
+the epic, is admitted. Together with the approved prefill select (*History — the prefill's
+modulation select* below) these are the three base-id changes of epic 25899.
 
 ### What is not under the Turbo id
 
@@ -518,8 +527,9 @@ all inherited rather than added — `tests/turbo_tiers.rs` holds each one:
 
 ## Prefix KV cache (sc-25904)
 
-Upstream's `use_kv_cache=True` default is ported, as on the MLX twin (sc-25903) and with the same
-public shape: `QwenImage21KVCache` → `PrefixKvCache` (`src/transformer.rs`),
+Upstream's `use_kv_cache=True` **path** is ported — not its default: a request that selects
+nothing runs prefill here (sc-25905, *Deliberate divergences*) — as on the MLX twin (sc-25903) and
+with the same public shape: `QwenImage21KVCache` → `PrefixKvCache` (`src/transformer.rs`),
 `kv_cache_mode="extract"` → `forward_joint_extract`, `"cached"` → `forward_joint_cached`, and the
 pipeline's loop → `denoise` / `denoise_reported` (`src/pipeline.rs`).
 
@@ -656,6 +666,55 @@ default with no memory model behind it; here the cache is a **request selection*
 **Every cache figure above is derived — exact tensor arithmetic over the shapes the cache stores,
 held against a real cache on the miniature fixture — and none is measured on a checkpoint.** The
 epic's terminal story measures one cached ten-reference render.
+
+## The pre-epic golden (AT4, sc-25909)
+
+Epic 25899 changed one thing about the base id's output on this backend — the approved exact
+modulation select (*History — the prefill's modulation select* above) — and is meant to leave
+everything else as it was at the pre-epic revision `c1f594203` (the merge base of the feature
+branch). Two things hold it:
+
+* **Committed, every lane:** `kv_cache::the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates`
+  — the base generator's render of a request that selects nothing equals the explicit
+  `KvCacheMode::Off` assembly byte for byte, and that same loop lands on upstream's
+  `use_kv_cache=False` latents (`t2i/latents_final_prefill` of the shared KV fixture), on the CPU
+  device in f32 (where the select change moves only the last bits). Nothing machine-dependent is
+  committed.
+* **Real weights, once, by the terminal story, on the CUDA lane:** `QWEN_IMAGE_2_1_RENDER_GOLDEN=<dir>`
+  makes `validation_render_default_preset` and `validation_render_reference_edit` hold every raw
+  `.rgb` they write to the file of the same name in `<dir>` — **not** byte-equal, because the
+  approved select moves bf16 output: within a mean |Δ| of 4/255 with at most 1 % of bytes moved by
+  more than 32 levels (`GOLDEN_MEAN_BAR`, `GOLDEN_FAR_FRACTION`; the reasoning is on the
+  constants), max |Δ| printed. A cached render is refused (the pre-epic revision had no cache).
+  The two tests and their file names are the same at `c1f594203`
+  (`qwen_image_2_1_candle_<W>x<H>_<N>steps_seed42.rgb`,
+  `qwen_image_2_1_candle_edit_{2,10}refs_<W>x<H>_<N>steps_seed42.rgb`), so the procedure is
+  mechanical through the `qwen-image-2-1` profile:
+
+  1. dispatch `real-weights.yml` **at ref `c1f594203`** with `profile=qwen-image-2-1` and keep
+     its `qwen-image-2-1-cuda-evidence` artifact;
+  2. copy its three `.rgb` renders (`…_2048x2048_40steps_seed42.rgb`,
+     `…_edit_2refs_1024x1024_8steps_seed42.rgb`, `…_edit_10refs_512x512_2steps_seed42.rgb`) into
+     a directory on the CUDA runner, e.g. `E:\qwen21-golden-c1f594203`;
+  3. dispatch at the feature head with `profile=qwen-image-2-1` and
+     `qwen_image_2_1_render_golden=E:\qwen21-golden-c1f594203`. The lane's *Resolve the
+     operator-provided pre-epic golden* step checks the three files exist and exports
+     `QWEN_IMAGE_2_1_RENDER_GOLDEN` and `QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill`; each comparison
+     prints a `[golden]` line into the test's log in the evidence.
+
+  The dry run `the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture` drives the
+  comparison (pass, an inverted golden, a cached render, a missing file) on the base fixture.
+
+## Cross-lane names and the one deliberate signature difference (sc-25909)
+
+The Turbo seam carries the MLX twin's names here (it landed first): `UPSTREAM_TURBO_HF_REPO` /
+`UPSTREAM_TURBO_HF_REVISION` / `UPSTREAM_TURBO_DIFFUSERS_REVISION`, `Variant::id` / `from_id`,
+`scheduler::resample_saved_sigmas`, `SavedSigmaSchedule` / `loader::load_saved_sigma_schedule`, a
+public `Schedule`. One signature differs on purpose: this crate's cache surcharge is
+`memory_strategy::prefix_kv_cache_demand_bytes(width, height, references, negative)` — no tier,
+because a packed Linear here dequantizes to the activation dtype and the width follows the device
+— where the MLX twin's is `derived::prefix_kv_cache_demand_bytes(tier, …)`, because its packed
+tiers compute in f32. A tier-taking wrapper would ignore its argument, so none is offered.
 
 ## Deliberate divergences
 

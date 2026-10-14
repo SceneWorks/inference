@@ -58,14 +58,29 @@
 //! never cached above its price and never failed; the render's report carries the two byte counts
 //! (`PrefixKvCacheReport::overflow`) and a [`PREFIX_KV_CACHE_OVERFLOW_WARNING`] warning.
 //!
-//! ## What does not move
+//! ## What the cache did not move
 //!
 //! [`derived::activation_bytes`], [`derived::request_transient_budget_bytes`],
 //! [`derived::table_for`], [`derived::default_path_peak_max_bytes_for`] and every floor built on
-//! them are the cache-shed figures and are byte-for-byte what they were before the cache existed
-//! (they keep [`derived::TABLE_CONDITIONING_TOKENS`] and [`derived::REFERENCE_FIT_TOKENS`]; only
-//! the surcharge uses the bounds above). A request that selects nothing runs prefill under that
+//! them are the cache-shed figures; the cache adds nothing to them (they keep
+//! [`derived::TABLE_CONDITIONING_TOKENS`] and [`derived::REFERENCE_FIT_TOKENS`]; only the
+//! surcharge uses the bounds above). A request that selects nothing runs prefill under that
 //! budget.
+//!
+//! ## The packed tiers' denoise is priced at f32 (sc-25909)
+//!
+//! The same width rule holds for the DiT's activations, not only for the cache:
+//! [`derived::dit_activation_bytes`] prices every hidden tensor at [`derived::dit_compute_width`],
+//! so a q8 / q4 request's denoise is priced at f32. Until sc-25909 it was priced at bf16 on every
+//! tier — at ten references and 2048² a 10.57 GiB denoise against the 21.12 GiB the packed tiers'
+//! f32 tensors hold — and the cache-shed budget `PrefixKvCacheMode::select` compares was low by
+//! the difference. **Every bf16 figure is unchanged, to the byte**, and so is every floor and
+//! every admissible-square peak (the decode head binds at the largest-area preset on every tier).
+//! What moved, on q8 / q4 only, for both ids: the 2048² table row (6.06 → 6.10 GiB bounded
+//! activation; the f32 denoise overtakes the bounded decode there) and the cache-shed request
+//! budget wherever the denoise is the largest term — 2048² with no reference (7.06 → 7.10 GiB),
+//! three or more references at a preset (ten at 2048²: 11.58 → 22.12 GiB), six or more at 1024²
+//! or 512². The published `activation_dtype_width` architecture fact follows the same width.
 //!
 //! ## Who decides, and what the engine does not check
 //!
@@ -751,18 +766,34 @@ pub mod derived {
             + prompt_branches(use_negative) * image_tokens(width, height) * DIT_ROPE_BYTES_PER_TOKEN
     }
 
-    /// Derived DiT activation transient for a joint sequence of `tokens`, at bf16.
+    /// Derived DiT activation transient for a joint sequence of `tokens` on `tier`, at the width
+    /// the DiT computes in there ([`dit_compute_width`]: bf16 on the dense tier, **f32 on q8 /
+    /// q4**).
     ///
     /// Linear in `tokens`, hence linear in image **area** — which is the shape the MLX image lane
     /// has consistently shown above 1024². The structural [`DIT_LIVE_HIDDEN_TENSORS`] plus one
     /// `[S, inner]` output per in-flight command buffer ([`MLX_MAX_ACTIVE_TASKS`]): every
     /// per-block op at a preset writes more than `max_mb_per_buffer`, so each is its own command
     /// buffer and the pipeline keeps ten outputs allocated ahead of the GPU, plus the one it is
-    /// scheduling. The `true_cfg`
-    /// negative branch runs sequentially over the same buffers, so it does not double this; it
-    /// doubles only the resident conditioning, which [`activation_bytes`] accounts for separately.
-    pub const fn dit_activation_bytes(tokens: u64) -> u64 {
-        tokens * DIT_INNER * (DIT_LIVE_HIDDEN_TENSORS + MLX_MAX_ACTIVE_TASKS + 1) * BF16_WIDTH
+    /// scheduling. Every one of those `[S, inner]` tensors — the residual stream, the modulated
+    /// hidden state, q / k / v, the FFN halves and the four per-token modulation rows — is held at
+    /// the compute width; only the RoPE table ([`DIT_ROPE_BYTES_PER_TOKEN`]) is f32 on every tier.
+    /// The `true_cfg` negative branch runs sequentially over the same buffers, so it does not
+    /// double this; it doubles only the resident conditioning, which [`activation_bytes`] accounts
+    /// for separately.
+    ///
+    /// sc-25909: until this revision the hidden tensors were priced at bf16 on every tier, so a
+    /// packed tier's denoise was priced at half its width — at ten references and 2048², 10.57 GiB
+    /// against the 21.12 GiB the f32 tensors hold. The bf16 tier's figure is unchanged. The one
+    /// recorded observation agrees in direction: sc-24114's 2048² two-step records (SceneWorks
+    /// `docs/calibration/sc-24114/`) put the denoise transient at 3.02 GiB on bf16 and 5.28 GiB on
+    /// both q8 and q4 — above the 3.05 GiB the bf16-width model priced the packed tiers at, and
+    /// below the 6.10 GiB priced here.
+    pub const fn dit_activation_bytes(tier: Tier, tokens: u64) -> u64 {
+        tokens
+            * DIT_INNER
+            * (DIT_LIVE_HIDDEN_TENSORS + MLX_MAX_ACTIVE_TASKS + 1)
+            * dit_compute_width(tier)
             + tokens * DIT_ROPE_BYTES_PER_TOKEN
     }
 
@@ -869,8 +900,11 @@ pub mod derived {
     /// `use_negative` doubles the retained conditioning (the positive and negative embeddings are
     /// both alive for the whole denoise). `tile_edge` is the bounded-decode tile, `None` for the
     /// untiled decode; [`super::default_decode_is_bounded`] is the policy that picks between them
-    /// when a request does not force tiling.
+    /// when a request does not force tiling. `tier` sets the denoise term's width
+    /// ([`dit_activation_bytes`]); the decode and encode terms are the f32 autoencoder's on every
+    /// tier.
     pub const fn activation_bytes(
+        tier: Tier,
         width: u32,
         height: u32,
         conditioning_tokens: u64,
@@ -879,7 +913,7 @@ pub mod derived {
         tile_edge: Option<u32>,
     ) -> u64 {
         let tokens = joint_tokens(width, height, conditioning_tokens, reference_count);
-        let denoise = dit_activation_bytes(tokens);
+        let denoise = dit_activation_bytes(tier, tokens);
         let decode = match tile_edge {
             Some(edge) => tiled_vae_decode_activation_bytes(width, height, edge, 64),
             None => vae_decode_activation_bytes(width, height),
@@ -903,7 +937,12 @@ pub mod derived {
     /// the number [`super::AllocatorBounds`] hands MLX as the request's cache limit and, on top
     /// of the resident set, as its memory limit — this figure for a prefill render, this plus the
     /// cache for a cached one; the runtime is held to it rather than merely estimated by it.
+    ///
+    /// `tier` is the loaded tier: a packed tier's denoise is priced at f32
+    /// ([`dit_activation_bytes`]), so its budget is above the bf16 tier's wherever the denoise is
+    /// the largest term (ten references at a preset, or three and more at 2048²).
     pub fn request_transient_budget_bytes(
+        tier: Tier,
         width: u32,
         height: u32,
         conditioning_tokens: u64,
@@ -915,6 +954,7 @@ pub mod derived {
             super::default_decode_is_bounded(width, height).then_some(super::DECODE_TILE_EDGE)
         });
         activation_bytes(
+            tier,
             width,
             height,
             conditioning_tokens,
@@ -925,9 +965,8 @@ pub mod derived {
     }
 
     /// [`request_transient_budget_bytes`] for the prefix-KV-cache mode the request runs
-    /// (sc-25905): unchanged for [`PrefixKvCacheMode::Prefill`] — the cache-shed budget, which is
-    /// every number this module published before the cache existed — and that plus
-    /// [`prefix_kv_cache_demand_bytes`] at `tier` for [`PrefixKvCacheMode::Cached`].
+    /// (sc-25905): the cache-shed budget at `tier` for [`PrefixKvCacheMode::Prefill`], and that
+    /// plus [`prefix_kv_cache_demand_bytes`] at `tier` for [`PrefixKvCacheMode::Cached`].
     ///
     /// `conditioning_tokens` is the cache-shed model's argument and prices only the shed part;
     /// the cache surcharge always uses its own bounds.
@@ -947,6 +986,7 @@ pub mod derived {
         forced_tile_edge: Option<u32>,
     ) -> u64 {
         let shed = request_transient_budget_bytes(
+            tier,
             width,
             height,
             conditioning_tokens,
@@ -1017,11 +1057,12 @@ pub mod derived {
         }
     }
 
-    /// The default-path activation at `width × height` under the table's assumptions
+    /// The default-path activation of `tier` at `width × height` under the table's assumptions
     /// ([`TABLE_CONDITIONING_TOKENS`], no references, no negative branch): the decode the policy
-    /// picks ([`super::default_decode_is_bounded`]) against the denoise.
-    pub fn default_activation_bytes_at(width: u32, height: u32) -> u64 {
+    /// picks ([`super::default_decode_is_bounded`]) against the denoise at `tier`'s width.
+    pub fn default_activation_bytes_at(tier: Tier, width: u32, height: u32) -> u64 {
         activation_bytes(
+            tier,
             width,
             height,
             TABLE_CONDITIONING_TOKENS,
@@ -1031,14 +1072,16 @@ pub mod derived {
         )
     }
 
-    /// The preset whose default-path peak is the largest: the largest-**area** preset, 2400×1792,
-    /// because with every preset decoding bounded the peak is the decode head's attention
-    /// (quadratic in the token count, 6.31 GiB there against 6.0 at the 2048² default) and the
-    /// canvas; the denoise (linear in area, 3.16 GiB) is below it at every preset.
-    pub fn default_path_peak_max_preset() -> SizePreset {
+    /// The preset whose default-path peak is the largest on `tier`: the largest-**area** preset,
+    /// 2400×1792, on every tier, because with every preset decoding bounded the peak there is the
+    /// decode head's attention (quadratic in the token count, 6.31 GiB against 6.0 at the 2048²
+    /// default) and the canvas; the denoise (linear in area — 3.16 GiB at bf16, 6.25 GiB at the
+    /// packed tiers' f32) is below it there. (At the 2048² default a packed tier's f32 denoise,
+    /// 6.10 GiB, overtakes that preset's 6.06 GiB bounded decode, still below 2400×1792's.)
+    pub fn default_path_peak_max_preset(tier: Tier) -> SizePreset {
         crate::config::PRESETS
             .into_iter()
-            .max_by_key(|preset| default_activation_bytes_at(preset.width, preset.height))
+            .max_by_key(|preset| default_activation_bytes_at(tier, preset.width, preset.height))
             .expect("the preset table is non-empty")
     }
 
@@ -1065,9 +1108,9 @@ pub mod derived {
     /// resident difference ([`VAE_BYTES`] − [`TURBO_VAE_BYTES`]) and nothing else. Derived, not
     /// measured.
     pub fn default_path_peak_max_bytes_for(variant: Variant, tier: Tier) -> u64 {
-        let preset = default_path_peak_max_preset();
+        let preset = default_path_peak_max_preset(tier);
         resident_weights_for(variant, tier).resident_total()
-            + default_activation_bytes_at(preset.width, preset.height)
+            + default_activation_bytes_at(tier, preset.width, preset.height)
     }
 
     /// The default-path peak of `tier` at the largest admissible square, `max_side²` — off every
@@ -1080,7 +1123,7 @@ pub mod derived {
     pub fn admissible_square_peak_bytes_for(variant: Variant, tier: Tier) -> u64 {
         let side = super::admission_geometry().max_side;
         resident_weights_for(variant, tier).resident_total()
-            + default_activation_bytes_at(side, side)
+            + default_activation_bytes_at(tier, side, side)
     }
 
     /// The full derived table: every tier at every upstream preset, densest tier first.
@@ -1101,6 +1144,7 @@ pub mod derived {
                     resident_weight_bytes: weights.resident_total(),
                     sequential_weight_floor_bytes: weights.sequential_floor(),
                     activation_bytes: activation_bytes(
+                        tier,
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -1109,6 +1153,7 @@ pub mod derived {
                         None,
                     ),
                     tiled_activation_bytes: activation_bytes(
+                        tier,
                         preset.width,
                         preset.height,
                         TABLE_CONDITIONING_TOKENS,
@@ -1393,7 +1438,11 @@ pub fn admission_geometry() -> AdmissionGeometry {
 // ================================================================================================
 
 /// Architecture axes, read from this crate's frozen config types rather than re-parsed here.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+///
+/// `activation_dtype_width` is the denoise phase's width on `tier` (the axis's contract), through
+/// the one source every derived DiT term reads ([`derived::dit_compute_width`]): bf16 on the
+/// dense tier, f32 on q8 / q4 (sc-25909; it was published as bf16 on every tier).
+fn architecture_facts(tier: Tier) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     use mlx_gen::architecture_facts as af;
     let dit = crate::config::TransformerConfig::production();
     mlx_gen::gen_core::MemoryArchitectureFacts {
@@ -1406,7 +1455,10 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
         vae_spatial_scale: af::axis(derived::PIXELS_PER_TOKEN as usize),
         // Structurally absent: a still-image autoencoder with no temporal axis in this route.
         vae_temporal_scale: None,
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        activation_dtype_width: Some(match derived::dit_compute_width(tier) {
+            derived::BF16_WIDTH => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+            _ => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
+        }),
     }
 }
 
@@ -1714,6 +1766,15 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
+    // E3 (sc-25909): every refusal priced here names the id it was asked for.
+    memory_strategy_contract_unlabelled(provider_id, spec)
+        .map_err(|error| crate::model::labelled_core(provider_id, error))
+}
+
+fn memory_strategy_contract_unlabelled(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> CoreResult<MemoryProviderContract> {
     let mut contract = weights_free_memory_strategy_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Msg(format!(
@@ -1782,7 +1843,8 @@ pub fn weights_free_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts =
+        architecture_facts(Tier::from_selected(spec.quantize).unwrap_or(Tier::Bf16));
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         calibration_fingerprint(variant),
         spec.load_shape,
@@ -1846,20 +1908,18 @@ pub fn weights_free_memory_strategy_contract(
     Ok(contract)
 }
 
-fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
+fn validate_decode(id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreResult<()> {
     let edge = edge.ok_or_else(|| {
         CoreError::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit tile edge"
+            "{id}: bounded decode requires an explicit tile edge"
         ))
     })?;
     let overlap = overlap.ok_or_else(|| {
-        CoreError::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit overlap"
-        ))
+        CoreError::Unsupported(format!("{id}: bounded decode requires an explicit overlap"))
     })?;
     if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
         return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: decode geometry {edge}/{overlap} is outside the published domain \
+            "{id}: decode geometry {edge}/{overlap} is outside the published domain \
              {DECODE_TILE_EDGES:?} at overlap {DECODE_OVERLAP}"
         )));
     }
@@ -1873,10 +1933,12 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    // E3 (sc-25909): the id the contract was priced for — the base or the Turbo one.
+    let id = contract.provider_id.as_str();
     let route_gate = || {
         if !matches!(context.mode, MemoryMode::TextToImage) {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: this story's route is text-to-image; got {:?}",
+                "{id}: this story's route is text-to-image; got {:?}",
                 context.mode
             )));
         }
@@ -1888,18 +1950,19 @@ pub fn safety_check(
         // a request refusal rather than a memory refusal.
         if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                "{id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
                  can express",
                 context.geometry.reference_count
             )));
         }
         if context.use_pid {
             return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
+                "{id}: there is no PiD decoder on this route"
             )));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
+                id,
                 context.selection.parameters.decode_tile_edge,
                 context.selection.parameters.decode_overlap,
             )?;
@@ -1978,10 +2041,10 @@ pub(crate) fn begin_request_for(
         move |use_pid, edge, overlap| {
             if use_pid {
                 return Err(CoreError::Unsupported(format!(
-                    "{MODEL_ID}: there is no PiD decoder on this route"
+                    "{provider_id}: there is no PiD decoder on this route"
                 )));
             }
-            validate_decode(Some(edge), Some(overlap))
+            validate_decode(provider_id, Some(edge), Some(overlap))
         },
     )?;
     Ok(Some(Box::new(
@@ -2130,9 +2193,9 @@ mod tests {
     #[test]
     fn activation_is_linear_in_area_and_covers_every_preset() {
         // The DiT term is exactly linear in token count, hence in area.
-        let a = dit_activation_bytes(image_tokens(1024, 1024));
-        let b = dit_activation_bytes(image_tokens(2048, 1024));
-        let c = dit_activation_bytes(image_tokens(2048, 2048));
+        let a = dit_activation_bytes(Tier::Bf16, image_tokens(1024, 1024));
+        let b = dit_activation_bytes(Tier::Bf16, image_tokens(2048, 1024));
+        let c = dit_activation_bytes(Tier::Bf16, image_tokens(2048, 2048));
         assert_eq!(b, 2 * a);
         assert_eq!(c, 4 * a);
 
@@ -2152,15 +2215,35 @@ mod tests {
                 assert!(row.bounded_peak_bytes() < row.resident_peak_bytes());
             }
         }
-        // Activation is tier-independent by construction (activations stay bf16 whatever the weight
-        // tier), so only the weight terms separate the tiers.
-        let square: Vec<_> = rows
-            .iter()
-            .filter(|r| r.preset.width == 2048 && r.preset.height == 2048)
-            .collect();
-        assert!(square
-            .windows(2)
-            .all(|w| w[0].activation_bytes == w[1].activation_bytes));
+        // The tiers differ in their activation only through the DiT's compute width (sc-25909):
+        // the untiled column is the f32 decode's 25 maps on every tier, and q8 / q4 price their
+        // f32 denoise identically — so where the denoise binds (the 2048² bounded column, below)
+        // the two packed tiers agree with each other and sit above the bf16 tier.
+        for preset in PRESETS {
+            let at = |tier| {
+                *rows
+                    .iter()
+                    .find(|r| r.preset == preset && r.tier == tier)
+                    .unwrap()
+            };
+            let (bf16, q8, q4) = (at(Tier::Bf16), at(Tier::Q8), at(Tier::Q4));
+            assert_eq!(
+                bf16.activation_bytes, q8.activation_bytes,
+                "{}",
+                preset.ratio
+            );
+            assert_eq!(q8.activation_bytes, q4.activation_bytes, "{}", preset.ratio);
+            assert_eq!(
+                q8.tiled_activation_bytes, q4.tiled_activation_bytes,
+                "{}",
+                preset.ratio
+            );
+            assert!(
+                q8.tiled_activation_bytes >= bf16.tiled_activation_bytes,
+                "{}",
+                preset.ratio
+            );
+        }
     }
 
     #[test]
@@ -2191,10 +2274,13 @@ mod tests {
         assert_eq!(g.max_joint_tokens, 58_016, "256 + 16_800 + 10 x 4_096");
         // A reference adds a fixed block, so the transient grows linearly in the count at a rate
         // the target size does not change — the quantity a consumer must gate on.
-        let bare = dit_activation_bytes(joint_tokens(2048, 2048, 0, 0));
-        let one = dit_activation_bytes(joint_tokens(2048, 2048, 0, 1));
-        let ten = dit_activation_bytes(joint_tokens(2048, 2048, 0, 10));
-        assert_eq!(one - bare, dit_activation_bytes(REFERENCE_FIT_TOKENS));
+        let bare = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 0));
+        let one = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 1));
+        let ten = dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 0, 10));
+        assert_eq!(
+            one - bare,
+            dit_activation_bytes(Tier::Bf16, REFERENCE_FIT_TOKENS)
+        );
         assert_eq!(ten - bare, 10 * (one - bare));
         assert!(
             ten < 11 * bare,
@@ -2242,8 +2328,10 @@ mod tests {
             "bounded decode: derived {bounded:.2} GiB vs measured {MEASURED_BOUNDED_2048_GIB} GiB"
         );
 
-        let denoise = dit_activation_bytes(joint_tokens(2048, 2048, TABLE_CONDITIONING_TOKENS, 0))
-            as f64
+        let denoise = dit_activation_bytes(
+            Tier::Bf16,
+            joint_tokens(2048, 2048, TABLE_CONDITIONING_TOKENS, 0),
+        ) as f64
             / GIB;
         assert!((denoise - 3.05).abs() < 0.01, "{denoise}");
         assert!(
@@ -2268,7 +2356,10 @@ mod tests {
         assert!((row.resident_peak_bytes() as f64 / GIB - 84.86).abs() < 0.01);
         // The rule the consumer floors are built from: the default-path peak per tier at the
         // default preset, to 0.01 GiB.
-        for (tier, peak) in [(Tier::Bf16, 34.67), (Tier::Q8, 22.40), (Tier::Q4, 15.85)] {
+        // sc-25909: at q8 / q4 the f32 denoise (6.10 GiB) overtakes the 6.06 GiB bounded decode
+        // at this preset, so their default peaks are 0.04 GiB above the bf16-width figures
+        // (22.40 / 15.85) this test pinned before.
+        for (tier, peak) in [(Tier::Bf16, 34.67), (Tier::Q8, 22.44), (Tier::Q4, 15.89)] {
             let row = table()
                 .into_iter()
                 .find(|r| r.tier == tier && r.preset.width == 2048 && r.preset.height == 2048)
@@ -2325,33 +2416,49 @@ mod tests {
         assert!(table().iter().all(|row| row.default_decode_bounded));
 
         // The budget is the default path's transient plus the slack; a forced tile overrides it.
-        let bounded = request_transient_budget_bytes(2048, 2048, 256, 0, false, None);
+        let bounded = request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 0, false, None);
         assert_eq!(
             bounded,
-            activation_bytes(2048, 2048, 256, 0, false, Some(super::DECODE_TILE_EDGE))
-                + MLX_EVAL_SLACK_BYTES
+            activation_bytes(
+                Tier::Bf16,
+                2048,
+                2048,
+                256,
+                0,
+                false,
+                Some(super::DECODE_TILE_EDGE)
+            ) + MLX_EVAL_SLACK_BYTES
         );
-        let untiled = request_transient_budget_bytes(1024, 1024, 256, 0, false, None);
+        let untiled = request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, None);
         assert_eq!(
             untiled,
-            activation_bytes(1024, 1024, 256, 0, false, Some(super::DECODE_TILE_EDGE))
-                + MLX_EVAL_SLACK_BYTES,
+            activation_bytes(
+                Tier::Bf16,
+                1024,
+                1024,
+                256,
+                0,
+                false,
+                Some(super::DECODE_TILE_EDGE)
+            ) + MLX_EVAL_SLACK_BYTES,
             "1024² decodes bounded by default"
         );
         assert_eq!(
-            request_transient_budget_bytes(512, 512, 256, 0, false, None),
-            activation_bytes(512, 512, 256, 0, false, None) + MLX_EVAL_SLACK_BYTES,
+            request_transient_budget_bytes(Tier::Bf16, 512, 512, 256, 0, false, None),
+            activation_bytes(Tier::Bf16, 512, 512, 256, 0, false, None) + MLX_EVAL_SLACK_BYTES,
             "512² is the single pass"
         );
-        let forced = request_transient_budget_bytes(1024, 1024, 256, 0, false, Some(256));
+        let forced =
+            request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, Some(256));
         assert_eq!(
             forced,
-            activation_bytes(1024, 1024, 256, 0, false, Some(256)) + MLX_EVAL_SLACK_BYTES
+            activation_bytes(Tier::Bf16, 1024, 1024, 256, 0, false, Some(256))
+                + MLX_EVAL_SLACK_BYTES
         );
         assert!(forced < untiled);
         // Ten fitted references raise the denoise term, never the decode term.
         assert!(
-            request_transient_budget_bytes(2048, 2048, 256, 10, false, None) > bounded,
+            request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 10, false, None) > bounded,
             "references are joint tokens and price into the budget"
         );
     }
@@ -2482,12 +2589,14 @@ mod tests {
     #[test]
     fn the_default_path_peak_maximum_binds_at_the_largest_area_preset() {
         // 2400×1792 and its 3:4 twin tie by construction (same area, same token count).
-        let binding = default_path_peak_max_preset();
+        let binding = default_path_peak_max_preset(Tier::Bf16);
         assert_eq!(binding.width * binding.height, 2400 * 1792);
-        let activation = default_activation_bytes_at(2400, 1792) as f64 / GIB;
+        let activation = default_activation_bytes_at(Tier::Bf16, 2400, 1792) as f64 / GIB;
         assert!((activation - 6.37).abs() < 0.01, "{activation}");
         assert!((vae_head_attention_bytes(2400, 1792) as f64 / GIB - 6.31).abs() < 0.01);
         for (tier, expected) in [(Tier::Bf16, 34.99), (Tier::Q8, 22.71), (Tier::Q4, 16.15)] {
+            let binding = default_path_peak_max_preset(tier);
+            assert_eq!(binding.width * binding.height, 2400 * 1792, "{tier:?}");
             let max = default_path_peak_max_bytes(tier);
             assert!(
                 (max as f64 / GIB - expected).abs() < 0.01,
@@ -2508,7 +2617,7 @@ mod tests {
             // The single-pass region tops out at 512²: 3.52 GiB, below the presets' 6.37.
             assert!(
                 max > resident_weights(tier).resident_total()
-                    + default_activation_bytes_at(512, 512)
+                    + default_activation_bytes_at(tier, 512, 512)
             );
         }
         // The floors a consumer derives with its `ceil(peak GiB x 1.25)` rule.
@@ -2534,9 +2643,33 @@ mod tests {
     fn a_reference_request_is_priced_at_the_pipelined_encode_of_the_fitted_grid() {
         let encode = vae_encode_activation_bytes(1024, 1024) as f64 / GIB;
         assert!((encode - 9.375).abs() < 0.001, "{encode}");
-        let plain = activation_bytes(2048, 2048, 256, 0, false, Some(DECODE_TILE_EDGE));
-        let one = activation_bytes(2048, 2048, 256, 1, false, Some(DECODE_TILE_EDGE));
-        let ten = activation_bytes(2048, 2048, 256, 10, false, Some(DECODE_TILE_EDGE));
+        let plain = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            0,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
+        let one = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            1,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
+        let ten = activation_bytes(
+            Tier::Bf16,
+            2048,
+            2048,
+            256,
+            10,
+            false,
+            Some(DECODE_TILE_EDGE),
+        );
         assert!((plain as f64 / GIB - 6.06).abs() < 0.01);
         assert_eq!(
             one,
@@ -2548,16 +2681,19 @@ mod tests {
         // (10.58 GiB) overtakes the encode.
         assert_eq!(
             ten,
-            256 * DIT_INNER * BF16_WIDTH + dit_activation_bytes(joint_tokens(2048, 2048, 256, 10)),
+            256 * DIT_INNER * BF16_WIDTH
+                + dit_activation_bytes(Tier::Bf16, joint_tokens(2048, 2048, 256, 10)),
             "ten references: the denoise binds"
         );
         assert!(ten > one);
         assert!(
-            activation_bytes(1024, 1024, 256, 10, false, None)
+            activation_bytes(Tier::Bf16, 1024, 1024, 256, 10, false, None)
                 == 256 * DIT_INNER * BF16_WIDTH + vae_decode_activation_bytes(1024, 1024),
             "a forced single pass at 1024² still binds over ten references"
         );
-        assert!(request_transient_budget_bytes(2048, 2048, 256, 1, false, None) > plain);
+        assert!(
+            request_transient_budget_bytes(Tier::Bf16, 2048, 2048, 256, 1, false, None) > plain
+        );
     }
 
     #[test]
@@ -2779,12 +2915,12 @@ mod tests {
     fn bounded_decode_publishes_a_domain_and_refuses_everything_outside_it() {
         assert!(DECODE_TILE_EDGES.contains(&DECODE_TILE_EDGE));
         for edge in DECODE_TILE_EDGES {
-            assert!(validate_decode(Some(*edge), Some(DECODE_OVERLAP)).is_ok());
+            assert!(validate_decode(MODEL_ID, Some(*edge), Some(DECODE_OVERLAP)).is_ok());
         }
-        assert!(validate_decode(Some(1024), Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(DECODE_TILE_EDGE), Some(96)).is_err());
-        assert!(validate_decode(None, Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(DECODE_TILE_EDGE), None).is_err());
+        assert!(validate_decode(MODEL_ID, Some(1024), Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(DECODE_TILE_EDGE), Some(96)).is_err());
+        assert!(validate_decode(MODEL_ID, None, Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(DECODE_TILE_EDGE), None).is_err());
     }
 
     /// This route publishes no activation anchor. The registration carrier is measurement-only by
@@ -3098,11 +3234,43 @@ mod tests {
         2 * target_tokens * (cfg.attention_head_dim as u64 / 2) * 4
     }
 
+    /// One request's cache-shed budget, derived here from the shapes and widths — not by calling
+    /// the function under test — at `dit_width` bytes per DiT hidden element: the retained
+    /// conditioning (256 rows × 4096, bf16 as the model prices it, per branch) plus the largest
+    /// of the denoise (24 live `[S, 4096]` tensors at `dit_width` plus the f32 RoPE rows, over
+    /// 256 text + target + 4096 per reference), the bounded 512/64 decode (six `[t, t]` f32
+    /// head matrices or 25 f32 144-channel 512² tile maps, plus the RGBA f32 canvas) and, with a
+    /// reference, the encode (25 f32 96-channel 1024² maps); plus the 1 GiB slack. For geometries
+    /// above 512² (the default decode is bounded there).
+    fn derived_shed_budget(
+        width: u32,
+        height: u32,
+        refs: u32,
+        negative: bool,
+        dit_width: u64,
+    ) -> u64 {
+        let (w, h) = (width as u64, height as u64);
+        let target = (w / 16) * (h / 16);
+        let tokens = 256 + target + refs as u64 * 64 * 64;
+        let denoise = tokens * 4096 * (13 + 10 + 1) * dit_width + tokens * 2 * 64 * 4;
+        let head = 6 * target * target * 4;
+        let tile = 25 * 144 * 512 * 512 * 4;
+        let decode = head.max(tile) + 4 * w * h * 4;
+        let encode = if refs > 0 {
+            25 * 96 * 1024 * 1024 * 4
+        } else {
+            0
+        };
+        let branches = if negative { 2 } else { 1 };
+        branches * 256 * 4096 * 2 + denoise.max(decode).max(encode) + (1 << 30)
+    }
+
     /// The story's first acceptance criterion, on every tier: with the cache on, a `k`-reference
     /// request's budget exceeds its cache-shed budget by exactly the derived cache bytes for its
     /// priced prefix (the K/V at the tier's compute width, plus the target RoPE rows the cache
-    /// keeps), and by twice that when a negative branch runs; with the cache shed it is today's
-    /// number, to the byte, whatever the tier.
+    /// keeps), and by twice that when a negative branch runs; with the cache shed it is the
+    /// pre-cache number, to the byte, on the bf16 tier — and on q8 / q4 the same derivation with
+    /// the denoise at f32 (sc-25909), derived here from the shapes ([`derived_shed_budget`]).
     ///
     /// The geometries are chosen so a wrong token count cannot hide: at 2048² and 2400×1792 the
     /// target's own token count is neither bound.
@@ -3111,10 +3279,13 @@ mod tests {
     /// under a negative branch; pricing the prefix at the target's tokens, or a reference at the
     /// target's token count or at the square 4096 instead of the 4920 bound; pricing the text at
     /// the table's 256 rows; pricing a packed tier at bf16; adding the cache to
-    /// `request_transient_budget_bytes` (the shed column moves off its pinned value).
+    /// `request_transient_budget_bytes` (the shed column moves off its pinned value); pricing a
+    /// packed tier's denoise at bf16 (the q8 / q4 shed budget at ten references falls back to
+    /// the bf16 one).
     #[test]
     fn a_cached_request_is_budgeted_at_the_shed_budget_plus_its_derived_cache_bytes() {
-        // (width, height, references, negative branch, the cache-shed budget before sc-25905).
+        // (width, height, references, negative branch, the bf16 cache-shed budget before sc-25905
+        // — unchanged by sc-25909, which moved only the packed tiers).
         const SHED: [(u32, u32, u32, bool, u64); 16] = [
             (2048, 2048, 0, false, 7_585_398_784),
             (2048, 2048, 0, true, 7_587_495_936),
@@ -3136,9 +3307,18 @@ mod tests {
         let cfg = crate::config::TransformerConfig::production();
         for (tier, element_width) in TIER_WIDTHS {
             assert_eq!(dit_compute_width(tier), element_width, "{tier:?}");
-            for (width, height, references, negative, shed_before) in SHED {
+            for (width, height, references, negative, bf16_shed_before) in SHED {
                 let tag =
                     format!("{tier:?} {width}x{height} refs={references} negative={negative}");
+                // The derivation below reproduces the pinned bf16 figure exactly, so it is the
+                // same model; on a packed tier it is that model at the f32 width.
+                assert_eq!(
+                    derived_shed_budget(width, height, references, negative, 2),
+                    bf16_shed_before,
+                    "{tag}: the in-test derivation is the pinned bf16 figure"
+                );
+                let shed_before =
+                    derived_shed_budget(width, height, references, negative, element_width);
                 let budget = |kv_cache| {
                     request_transient_budget_bytes_for(
                         kv_cache,
@@ -3152,10 +3332,11 @@ mod tests {
                     )
                 };
                 let shed = budget(PrefixKvCacheMode::Prefill);
-                assert_eq!(shed, shed_before, "{tag}: the cache-shed budget moved");
+                assert_eq!(shed, shed_before, "{tag}: the cache-shed budget");
                 assert_eq!(
                     shed,
                     request_transient_budget_bytes(
+                        tier,
                         width,
                         height,
                         TABLE_CONDITIONING_TOKENS,
@@ -3236,7 +3417,7 @@ mod tests {
                 2,
                 false,
                 Some(256)
-            ) - request_transient_budget_bytes(1024, 1024, 256, 2, false, Some(256)),
+            ) - request_transient_budget_bytes(Tier::Bf16, 1024, 1024, 256, 2, false, Some(256)),
             derived_branch_kv_bytes(2, 2) + derived_branch_rope_bytes(1024, 1024)
         );
         // The shed model's prefix is the joint sequence less the target — one token accounting.
@@ -3400,7 +3581,10 @@ mod tests {
                 "{variant:?} {tier:?}"
             );
         }
-        assert_eq!(default_activation_bytes_at(2400, 1792), 6_844_669_952);
+        assert_eq!(
+            default_activation_bytes_at(Tier::Bf16, 2400, 1792),
+            6_844_669_952
+        );
         // Every table row is its resident set plus the cache-shed activation, for both ids.
         for variant in [Variant::Base, Variant::Turbo] {
             for row in table_for(variant) {
@@ -3434,6 +3618,83 @@ mod tests {
             TURBO_MEMORY_CALIBRATION_FINGERPRINT,
             "qwen-image-2-1-turbo-mlx-derived-2026-10-13-v1"
         );
+    }
+
+    /// sc-25909: the DiT's activation is priced at the width it computes in on each tier — bf16
+    /// on the dense tier, **f32 on q8 / q4** ([`dit_compute_width`], observed on a loaded packed
+    /// transformer by `tests/kv_admission.rs`). Every bf16 figure is the one published before
+    /// this change, to the byte; on the packed tiers only the figures the denoise binds move,
+    /// each to the in-test derivation at f32; and the published architecture fact follows.
+    ///
+    /// *Mutations that red this:* `dit_activation_bytes` back at `BF16_WIDTH` (every packed row
+    /// and the q8 / q4 architecture width fall back to the bf16 figures); pricing the bf16 tier
+    /// at `dit_compute_width` of a packed tier (the bf16 literals move); a constant
+    /// `activation_dtype_width`.
+    #[test]
+    fn packed_tiers_price_the_denoise_at_f32_and_no_bf16_figure_moved() {
+        use crate::model::Variant;
+        // (preset, untiled, bounded) — the activation columns before sc-25909, every tier.
+        const BEFORE: [((u32, u32), u64, u64); 4] = [
+            ((2048, 2048), 60_400_074_752, 6_511_656_960),
+            ((2400, 1792), 61_933_617_152, 6_844_669_952),
+            ((2528, 1696), 61_741_924_352, 6_802_589_056),
+            ((2752, 1536), 60_871_933_952, 6_613_237_760),
+        ];
+        // The 2048² default preset's f32 denoise plus the retained conditioning, from the
+        // shapes: (256 + 128·128) tokens × (24 · 4096 · 4 + 2 · 64 · 4) + 256 · 4096 · 2.
+        let packed_2048 = (256 + 128 * 128) * (24 * 4096 * 4 + 2 * 64 * 4) + 256 * 4096 * 2;
+        assert_eq!(packed_2048, 6_553_731_072);
+        for variant in [Variant::Base, Variant::Turbo] {
+            for row in table_for(variant) {
+                let (w, h) = (row.preset.width, row.preset.height);
+                let (_, untiled, bounded) = BEFORE
+                    .into_iter()
+                    .find(|(size, _, _)| *size == (w, h) || *size == (h, w))
+                    .unwrap();
+                let tag = format!("{variant:?} {:?} {w}x{h}", row.tier);
+                // The untiled column is the f32 decode's on every tier.
+                assert_eq!(row.activation_bytes, untiled, "{tag}");
+                let expected = match row.tier {
+                    Tier::Bf16 => bounded,
+                    // Only at 2048² does the f32 denoise exceed the bounded decode.
+                    Tier::Q8 | Tier::Q4 if (w, h) == (2048, 2048) => packed_2048,
+                    Tier::Q8 | Tier::Q4 => bounded,
+                };
+                assert_eq!(row.tiled_activation_bytes, expected, "{tag}");
+                assert_eq!(
+                    default_activation_bytes_at(row.tier, w, h),
+                    expected,
+                    "{tag}"
+                );
+            }
+        }
+        // The denoise term itself: the hidden part doubles, the f32 RoPE rows do not.
+        let tokens = joint_tokens(2048, 2048, 256, 10);
+        let rope = tokens * 2 * 64 * 4;
+        for packed in [Tier::Q8, Tier::Q4] {
+            assert_eq!(
+                dit_activation_bytes(packed, tokens) - rope,
+                2 * (dit_activation_bytes(Tier::Bf16, tokens) - rope),
+                "{packed:?}"
+            );
+        }
+        // The published denoise width, per loaded tier.
+        for (quant, width) in [
+            (None, 2),
+            (Some(mlx_gen::Quant::Q8), 4),
+            (Some(mlx_gen::Quant::Q4), 4),
+        ] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir("/qwen-image-2-1".into()));
+            spec.quantize = quant;
+            for id in [MODEL_ID, TURBO_MODEL_ID] {
+                let contract = weights_free_memory_strategy_contract(id, &spec).unwrap();
+                assert_eq!(
+                    contract.architecture_facts.activation_dtype_width,
+                    Some(width),
+                    "{id} {quant:?}"
+                );
+            }
+        }
     }
 
     /// A request that selects nothing runs prefill; a selection is read off the request's memory

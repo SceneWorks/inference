@@ -544,7 +544,10 @@ expected_files = [
 # `candle-qwen-image-2-1-turbo` job materializes it on the Windows CUDA runner under
 # `CANDLE_GEN_MODELS_ROOT` and runs the `turbo_`-prefixed tests of
 # `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` (the 2048² T2I over the snapshot's own
-# eight `sample_sigmas`).
+# eight `sample_sigmas`). The Turbo q8/q4 TIERS have no row yet (sc-25909): they are converted
+# locally (`qwen_image_2_1_prequant`) and not published, so `turbo_validation_render_installed_tiers`
+# reads an operator-provided `CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT` (the dispatch input
+# `qwen_image_2_1_turbo_tier_snapshot`). Once a pinned revision is published, add its row here.
 key = "qwen-image-2-1-turbo-cuda"
 repository = "Qwen/Qwen-Image-2.1-Turbo"
 revision = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"

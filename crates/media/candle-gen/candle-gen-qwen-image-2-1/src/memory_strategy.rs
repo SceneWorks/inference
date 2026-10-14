@@ -109,7 +109,7 @@ pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str =
 /// The variant registered as `provider_id`, or the typed refusal for an id this crate does not
 /// serve.
 fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
-    Variant::from_model_id(provider_id).ok_or_else(|| {
+    Variant::from_id(provider_id).ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
             "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
         ))
@@ -606,6 +606,15 @@ fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
 
 /// The executable contract for a real load — [`weights_free_memory_strategy_contract`] plus the on-disk inventory.
 pub fn memory_strategy_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
+    // E3 (sc-25909): every refusal priced here names the id it was asked for.
+    memory_strategy_contract_unlabelled(provider_id, spec)
+        .map_err(|error| crate::labelled(provider_id, error))
+}
+
+fn memory_strategy_contract_unlabelled(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {

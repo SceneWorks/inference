@@ -94,7 +94,7 @@ pub fn sigmas_for_image(
 /// / N⌋`, fraction `(i·K mod N) / N`), so a sample that lands on a knot reads it back bit-for-bit
 /// and `N = K` reproduces the saved list exactly rather than to a rounding error. Arithmetic is
 /// `f64`, rounded to `f32` at the end, like [`sigmas`].
-pub fn saved_sigmas(saved: &[f64], steps: usize) -> Result<Vec<f32>> {
+pub fn resample_saved_sigmas(saved: &[f64], steps: usize) -> Result<Vec<f32>> {
     let k = saved.len();
     if k == 0 {
         return Err(Error::Msg(format!(
@@ -147,7 +147,7 @@ mod tests {
     /// *Mutation that reds this:* applying any shift or stretch to the saved sigmas.
     #[test]
     fn the_saved_step_count_is_the_saved_list_then_zero() {
-        let got = saved_sigmas(&TURBO_SAVED, TURBO_SAVED.len()).unwrap();
+        let got = resample_saved_sigmas(&TURBO_SAVED, TURBO_SAVED.len()).unwrap();
         let mut want: Vec<f32> = TURBO_SAVED.iter().map(|s| *s as f32).collect();
         want.push(0.0);
         assert_eq!(got, want);
@@ -157,7 +157,7 @@ mod tests {
     /// [`saved_sigmas`]'s doc (numpy, f64, rounded to f32) — the cross-backend comparison point.
     #[test]
     fn twelve_steps_resample_the_saved_curve() {
-        let got = saved_sigmas(&TURBO_SAVED, 12).unwrap();
+        let got = resample_saved_sigmas(&TURBO_SAVED, 12).unwrap();
         let want: [f32; 13] = [
             1.0,
             0.985_635_33,
@@ -179,20 +179,20 @@ mod tests {
     #[test]
     fn resampling_holds_its_shape_at_every_step_count() {
         for steps in 1..=40 {
-            let s = saved_sigmas(&TURBO_SAVED, steps).unwrap();
+            let s = resample_saved_sigmas(&TURBO_SAVED, steps).unwrap();
             assert_eq!(s.len(), steps + 1, "{steps}");
             assert_eq!(s[0], 1.0, "{steps}: starts on the first saved sigma");
             assert_eq!(s[steps], 0.0, "{steps}");
             assert!(s.windows(2).all(|w| w[0] > w[1]), "{steps}: {s:?}");
         }
         // One step is the whole interval; a doubled count passes through every saved sigma.
-        assert_eq!(saved_sigmas(&TURBO_SAVED, 1).unwrap(), [1.0, 0.0]);
-        let doubled = saved_sigmas(&TURBO_SAVED, 16).unwrap();
+        assert_eq!(resample_saved_sigmas(&TURBO_SAVED, 1).unwrap(), [1.0, 0.0]);
+        let doubled = resample_saved_sigmas(&TURBO_SAVED, 16).unwrap();
         for (j, sigma) in TURBO_SAVED.iter().enumerate() {
             assert_eq!(doubled[2 * j], *sigma as f32, "knot {j}");
         }
-        assert!(saved_sigmas(&TURBO_SAVED, 0).is_err());
-        assert!(saved_sigmas(&[], 8).is_err());
+        assert!(resample_saved_sigmas(&TURBO_SAVED, 0).is_err());
+        assert!(resample_saved_sigmas(&[], 8).is_err());
     }
 
     #[test]

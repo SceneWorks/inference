@@ -1241,3 +1241,138 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
         cfg.num_layers
     );
 }
+
+/// AT4's committed half (sc-25909): **the base id's render with the cache shed is the prefill
+/// loop the upstream fixture gates**, through `Generator::generate` — not only through the
+/// pipeline. `generate` seeds its own noise, so it cannot be started from the fixture's
+/// `latents_init`; the claim is made in two links, both on the CPU device in f32 and both in this
+/// test:
+///
+/// 1. the base generator's pixels for a request that **selects nothing** (and for one that
+///    selects `prefill`) equal, byte for byte, the render assembled here from the public pieces
+///    with `KvCacheMode::Off` — the same `denoise_reported` and decode, the same seed and sigmas —
+///    and the generator reports the prefill path with no cache held;
+/// 2. that same `denoise_reported(KvCacheMode::Off)`, started from the fixture's `t2i` inputs,
+///    lands on upstream's `use_kv_cache=False` latents (`t2i/latents_final_prefill`) within
+///    [`UPSTREAM_TOL`].
+///
+/// Machine-independent: nothing here is a committed render, only the upstream fixture.
+///
+/// *Mutations that red this:* the base generator running cached when nothing is selected (link
+/// 1's report, and its pixels off the `Off` assembly); any numeric change to the prefill forward
+/// or loop (link 2).
+#[test]
+fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates() {
+    use mlx_gen::gen_core::{GenerationMemory, GenerationOutput, PrefixKvCacheMode};
+    use mlx_gen::{GenerationRequest, LoadSpec, WeightsSource};
+
+    let _cpu = CpuDevice::new();
+    let root = tiny_snapshot();
+    let (width, height, steps, seed) = (64_u32, 64_u32, 3_u32, 7_u64);
+    let prompt = "a red fox in the forest";
+
+    // Link 1: the generator against the explicit `Off` assembly.
+    let generator = mlx_gen_qwen_image_2_1::provider_registry()
+        .unwrap()
+        .load(
+            mlx_gen_qwen_image_2_1::MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(root.clone())),
+        )
+        .unwrap();
+    let tokenizer = mlx_gen_qwen_image_2_1::load_tokenizer(&root).unwrap();
+    let encoder = mlx_gen_qwen_image_2_1::load_text_encoder(&root).unwrap();
+    let model = load_transformer(&root).unwrap();
+    let vae = mlx_gen_qwen_image_2_1::load_vae(&root).unwrap();
+    let drop = mlx_gen_qwen_image_2_1::system_prompt_drop_count(&tokenizer).unwrap();
+    let prepared = mlx_gen_qwen_image_2_1::prepare_conditioning_references(&encoder, &[]).unwrap();
+    let conditioning = encoder
+        .encode_conditioning(&tokenizer, prompt, drop, &prepared)
+        .unwrap();
+    let branch =
+        mlx_gen_qwen_image_2_1::joint_branch(&conditioning, &prepared, width, height).unwrap();
+    let scheduler_config = load_scheduler_config(&root).unwrap();
+    let sigmas =
+        scheduler::sigmas_for_image(&scheduler_config, steps as usize, width, height).unwrap();
+    let mut report = DenoiseReport::default();
+    let latents = denoise_reported(
+        DenoiseInputs {
+            transformer: &model,
+            sigmas: &sigmas,
+            latents: mlx_gen_qwen_image_2_1::create_noise(
+                seed,
+                width,
+                height,
+                model.config().in_channels,
+            )
+            .unwrap(),
+            prompt_embeds: &branch.text,
+            negative_embeds: None,
+            true_cfg_scale: 1.0,
+            width,
+            height,
+            sampler: None,
+            seed,
+            cancel: &CancelFlag::new(),
+            references: None,
+            kv_cache: KvCacheMode::Off,
+        },
+        &mut report,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.kv_cache, KvCachePath::Prefill);
+    let want = mlx_gen_qwen_image_2_1::decode_rgb(&vae, &latents, width, height, None, None)
+        .unwrap()
+        .pixels;
+    for memory in [
+        None,
+        Some(GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Prefill),
+            ..Default::default()
+        }),
+    ] {
+        let req = GenerationRequest {
+            prompt: prompt.to_owned(),
+            width,
+            height,
+            steps: Some(steps),
+            seed: Some(seed),
+            memory,
+            ..Default::default()
+        };
+        let rendered = generator.generate_with_report(&req, &mut |_| {}).unwrap();
+        let ran = rendered.prefix_kv_cache.expect("the path is reported");
+        assert_eq!(
+            (ran.path, ran.cache_bytes, ran.overflow),
+            (PrefixKvCacheMode::Prefill, 0, None),
+            "{memory:?}: the base id sheds the cache unless it is selected"
+        );
+        let GenerationOutput::Images(mut images) = rendered.output.unwrap() else {
+            panic!("images expected");
+        };
+        assert!(
+            images.remove(0).pixels == want,
+            "{memory:?}: the generator's render is not the explicit `Off` assembly"
+        );
+    }
+
+    // Link 2: that denoise against upstream's cache-off latents for the fixture's `t2i` case.
+    let w = fixture("qwen21_kv_cache.safetensors");
+    let case = load_case(&w, "t2i");
+    let (off, off_report) = Run {
+        model: &model,
+        case: &case,
+        sigmas: &case_sigmas(&case),
+        init: w.require("t2i/latents_init").unwrap(),
+        sampler: None,
+        kv_cache: KvCacheMode::Off,
+    }
+    .ok();
+    assert_eq!(off_report.kv_cache, KvCachePath::Prefill);
+    assert_upstream(
+        "t2i/latents_final_prefill (the base id's shed path)",
+        &off,
+        w.require("t2i/latents_final_prefill").unwrap(),
+        UPSTREAM_TOL,
+    );
+}

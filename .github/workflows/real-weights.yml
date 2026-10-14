@@ -295,6 +295,22 @@ on:
         type: string
         required: false
         default: ""
+      # sc-25909 -- the Qwen-Image 2.1 Turbo q8/q4 tiers are not published yet, so no manifest row
+      # can provision them: the operator copies them onto the CUDA runner and names the directory
+      # here. Empty: `turbo_validation_render_installed_tiers` is NOT run, and the lane says so.
+      qwen_image_2_1_turbo_tier_snapshot:
+        description: "qwen-image-2-1-turbo only: absolute dir on the CUDA runner holding the converted Turbo q8/ and q4/ tiers"
+        type: string
+        required: false
+        default: ""
+      # sc-25909 (AT4) -- the base renders' pre-epic golden: the `.rgb` files the same lane wrote at
+      # c1f594203, copied onto the CUDA runner. Set: the base renders run with the cache shed and
+      # are held to them. Empty: no comparison.
+      qwen_image_2_1_render_golden:
+        description: "qwen-image-2-1 only: absolute dir on the CUDA runner holding the pre-epic (c1f594203) base .rgb renders to compare with"
+        type: string
+        required: false
+        default: ""
       iris_memory_mlx_steady_steps:
         description: "iris-memory-mlx only: run the steady-state pass (cache off, no restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
         type: string
@@ -4916,6 +4932,12 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-qwen-image-2-1\materialize-and-verify-immutable-snapshots.cmd
+      # sc-25909 (AT4): the operator-provided pre-epic golden, through env, never interpolated.
+      - name: Resolve the operator-provided pre-epic golden
+        shell: powershell
+        env:
+          QWEN21_RENDER_GOLDEN_INPUT: ${{ inputs.qwen_image_2_1_render_golden }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1/resolve-the-operator-provided-pre-epic-golden.ps1
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings,
       # rather than being folded into the first render's.
       - name: Build the Qwen-Image 2.1 CUDA test binary
@@ -4955,8 +4977,13 @@ jobs:
   # plus the one-time ~32 GB fetch, then the Turbo renders (sc-25901, sc-25902) — the eight-step
   # 2048² default preset; a two- and a ten-reference edit and two RGBA renders, all over the saved
   # eight steps; and a 4/6/12/16-step 2048² sweep. Every reference edit selects the prefix KV
-  # cache (sc-25905), so the ten-reference case pays for its ~41k-token prefix once; the two-reference
-  # case is then rendered again with the cache shed and compared with it (the forced-shed twin). Re-size it from the first run.
+  # cache (sc-25905), so the ten-reference case pays for its ~41k-token prefix once; each cached
+  # case is then rendered again with the cache shed and compared with it (the forced-shed twins,
+  # sc-25909). The test itself reads the CUDA pool's live-byte high-water around every render and
+  # writes `qwen_image_2_1_turbo_candle_prefix_kv_cache_memory.csv` into the evidence (AT5).
+  # `turbo_validation_render_installed_tiers` runs only when the dispatch names the operator-copied
+  # Turbo q8/q4 tier directory (`qwen_image_2_1_turbo_tier_snapshot`; unpublished, so no manifest
+  # row); otherwise the lane warns and leaves a NOT-RUN marker. Re-size it from the first run.
   candle-qwen-image-2-1-turbo:
     name: Candle Qwen-Image 2.1 Turbo real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-turbo'
@@ -5008,6 +5035,13 @@ jobs:
       - name: Materialize and verify the immutable snapshot
         shell: cmd
         run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\materialize-and-verify-the-immutable-snapshot.cmd
+      # sc-25909: the operator-provided Turbo tier directory, through env, never interpolated into
+      # a script; checked here and exported as CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT.
+      - name: Resolve the operator-provided Turbo tier directory
+        shell: powershell
+        env:
+          QWEN21_TURBO_TIER_INPUT: ${{ inputs.qwen_image_2_1_turbo_tier_snapshot }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1-turbo/resolve-the-operator-provided-turbo-tier-directory.ps1
       - name: Build the Qwen-Image 2.1 CUDA test binary
         shell: cmd
         run: |

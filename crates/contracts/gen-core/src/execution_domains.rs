@@ -6,18 +6,18 @@
 //! 18304's P2 planner selects them per request beside the ladder, so they ride the same
 //! [`crate::GenerationMemory`] block and are gated by the same shared request floor.
 //!
-//! # Why these three, and why they are not rungs
+//! # Why these four, and why they are not rungs
 //!
-//! Each existed already, as a per-provider ad hoc parameter with no shared vocabulary, no
-//! declaration, and therefore no way for a planner to discover it or for a caller to be told it was
-//! ignored:
+//! The first three existed already, as per-provider ad hoc parameters with no shared vocabulary, no
+//! declaration, and therefore no way for a planner to discover them or for a caller to be told one
+//! was ignored; the fourth is a new mechanism declared the same way from the start:
 //!
-//! | domain | pre-sc-18317 ad hoc form | equivalence class |
+//! | domain | prior form | equivalence class |
 //! |---|---|---|
 //! | [graph-evaluation cadence](GraphEvalCadence) | `eval_per_block` — a bool (every block, or never) — on `mlx_gen_flux2::MemoryConfig` (sc-6266) and `mlx_gen_wan::DitMemoryConfig` (sc-5681) | **bit-identical** |
 //! | [CFG batching](CfgBatching) | `mlx_gen_kolors` `cfg_conditioning`/`cfg_batch_*`, `candle_gen_kolors::common::cfg_batch_context` (an implicit `cfg > 1.0` doubling convention) | **bit-identical** |
 //! | [FFN chunking](FfnChunk) | `ffn_seq_chunk` on the same two config structs | *numerically* equivalent (see below) |
-//! | [prefix KV cache](PrefixKvCacheMode) | `KvCacheMode` — an unconditional `On` literal in the two Qwen-Image 2.1 generators (sc-25903) | *numerically* equivalent (see below) |
+//! | [prefix KV cache](PrefixKvCacheMode) | none — no prefix cache before epic 25899; its port (sc-25903, sc-25904) is selected only through this domain (sc-25905), and an unset request runs the prefill path | *numerically* equivalent (see below) |
 //!
 //! The fourth row joined in sc-25905, for the reason [`CfgBatching`] is here: it trades a
 //! request's activation high-water against its wall time, and a planner can only make that trade

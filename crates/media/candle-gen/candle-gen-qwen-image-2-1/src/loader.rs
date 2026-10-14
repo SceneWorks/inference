@@ -29,7 +29,7 @@ use candle_gen::gen_core::WeightsSource;
 use candle_gen::{CandleError as Error, Result};
 
 use crate::config::{
-    SchedulerConfig, TextEncoderConfig, TransformerConfig, TurboSchedule, VaeConfig, Variant,
+    SavedSigmaSchedule, SchedulerConfig, TextEncoderConfig, TransformerConfig, VaeConfig, Variant,
     VisionConfig,
 };
 use crate::text_encoder::QwenImage21TextEncoder;
@@ -303,7 +303,7 @@ fn read_optional_json(variant: Variant, path: &Path) -> Result<Option<serde_json
     if !path.is_file() {
         return Ok(None);
     }
-    let id = variant.model_id();
+    let id = variant.id();
     let bytes = std::fs::read(path)
         .map_err(|e| Error::Msg(format!("{id}: read {}: {e}", path.display())))?;
     serde_json::from_slice(&bytes)
@@ -314,9 +314,9 @@ fn read_optional_json(variant: Variant, path: &Path) -> Result<Option<serde_json
 /// The Turbo schedule a snapshot carries (sc-25901): `<root>/model_index.json`'s `sample_sigmas`
 /// under `<root>/scheduler/scheduler_config.json`'s static scheduler. A snapshot that saves no
 /// `sample_sigmas` — a base `Qwen/Qwen-Image-2.1` one — is the typed refusal
-/// [`TurboSchedule::from_values`] raises, naming the id it does load under. An absent scheduler
+/// [`SavedSigmaSchedule::from_values`] raises, naming the id it does load under. An absent scheduler
 /// config reads as diffusers' own defaults, which are the static scheduler.
-pub fn load_turbo_schedule(root: &Path) -> Result<TurboSchedule> {
+pub fn load_saved_sigma_schedule(root: &Path) -> Result<SavedSigmaSchedule> {
     let model_index = read_optional_json(Variant::Turbo, &root.join("model_index.json"))?
         .unwrap_or(serde_json::Value::Null);
     let scheduler = read_optional_json(
@@ -324,7 +324,7 @@ pub fn load_turbo_schedule(root: &Path) -> Result<TurboSchedule> {
         &root.join("scheduler").join("scheduler_config.json"),
     )?
     .unwrap_or_else(|| serde_json::json!({}));
-    TurboSchedule::from_values(&model_index, &scheduler)
+    SavedSigmaSchedule::from_values(&model_index, &scheduler)
 }
 
 /// Refuse a snapshot that is not the one `variant` serves (sc-25901), **before** any weight is
@@ -341,7 +341,7 @@ pub fn load_turbo_schedule(root: &Path) -> Result<TurboSchedule> {
 ///   but does not parse is refused too (it cannot be shown not to be a Turbo snapshot), which is
 ///   the one thing the base id reads from that file;
 /// * [`Variant::Turbo`] refuses one that does not, and one whose scheduler config contradicts the
-///   saved list ([`load_turbo_schedule`]).
+///   saved list ([`load_saved_sigma_schedule`]).
 pub fn check_snapshot_variant(variant: Variant, root: &Path) -> Result<()> {
     match variant {
         Variant::Base => {
@@ -352,13 +352,13 @@ pub fn check_snapshot_variant(variant: Variant, root: &Path) -> Result<()> {
                     "{}: {} is a Qwen-Image 2.1 Turbo snapshot (its model_index.json saves \
                      `sample_sigmas`); load it as `{}`, which samples over that saved list \
                      instead of the base checkpoint's resolution-shifted schedule",
-                    Variant::Base.model_id(),
+                    Variant::Base.id(),
                     root.display(),
-                    Variant::Turbo.model_id(),
+                    Variant::Turbo.id(),
                 )));
             }
             Ok(())
         }
-        Variant::Turbo => load_turbo_schedule(root).map(|_| ()),
+        Variant::Turbo => load_saved_sigma_schedule(root).map(|_| ()),
     }
 }

@@ -34,8 +34,8 @@ use candle_gen_qwen_image_2_1::memory_strategy::{
     PREFIX_KV_CACHE_CONDITIONING_TOKENS, PREFIX_KV_CACHE_OVERFLOW_WARNING,
 };
 use candle_gen_qwen_image_2_1::{
-    create_noise, decode_rgb, decode_tiling, denoise_reported, load_scheduler_config,
-    load_text_encoder, load_tokenizer, load_transformer, load_turbo_schedule, load_vae,
+    create_noise, decode_rgb, decode_tiling, denoise_reported, load_saved_sigma_schedule,
+    load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
     load_vision_config, prompt_template, reference_fit, scheduler, system_prompt_drop_count,
     DenoiseInputs, DenoiseReport, EvaluationPath, KvCacheMode, KvCachePath, PromptBranch, Tier,
 };
@@ -262,7 +262,11 @@ fn manual(fixture: &Fixture, req: &GenerationRequest, mode: KvCacheMode) -> Manu
         .as_deref()
         .map(|text| encoder.encode_prompt(&tokenizer, text, drop).unwrap());
     let sigmas = if fixture.id == TURBO {
-        scheduler::saved_sigmas(&load_turbo_schedule(root).unwrap().sample_sigmas, STEPS).unwrap()
+        scheduler::resample_saved_sigmas(
+            &load_saved_sigma_schedule(root).unwrap().sample_sigmas,
+            STEPS,
+        )
+        .unwrap()
     } else {
         scheduler::sigmas_for_image(
             &load_scheduler_config(root).unwrap(),

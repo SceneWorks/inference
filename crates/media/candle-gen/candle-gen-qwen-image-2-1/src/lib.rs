@@ -60,8 +60,8 @@
 //! Turbo (sc-25901): the distilled `Qwen/Qwen-Image-2.1-Turbo` checkpoint is a **second engine
 //! id**, [`TURBO_MODEL_ID`] (`qwen_image_2_1_turbo`), served by the same code. It shares the base
 //! transformer config, presets and licence; what differs is the schedule, which is the sigma list
-//! the snapshot itself saves (`model_index.json` `sample_sigmas`, [`TurboSchedule`]) rather than
-//! one derived from the resolution — see [`scheduler::saved_sigmas`], [`descriptor_turbo`] and
+//! the snapshot itself saves (`model_index.json` `sample_sigmas`, [`SavedSigmaSchedule`]) rather than
+//! one derived from the resolution — see [`scheduler::resample_saved_sigmas`], [`descriptor_turbo`] and
 //! `UPSTREAM.md`. Each snapshot under the other id is a typed refusal
 //! ([`loader::check_snapshot_variant`]).
 //!
@@ -130,14 +130,14 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
     Reserved.";
 
 pub use config::{
-    SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, TurboSchedule, VaeConfig,
-    Variant, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
+    SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig,
+    VaeConfig, Variant, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
     MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
     VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
 };
 pub use loader::{
-    check_snapshot_variant, load_scheduler_config, load_text_encoder, load_tokenizer,
-    load_transformer, load_turbo_schedule, load_vae, load_vision_config,
+    check_snapshot_variant, load_saved_sigma_schedule, load_scheduler_config, load_text_encoder,
+    load_tokenizer, load_transformer, load_vae, load_vision_config,
 };
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use pipeline::{
@@ -171,14 +171,59 @@ pub const MODEL_ID: &str = "qwen_image_2_1";
 /// same code over the sigma list its own snapshot saves. See [`descriptor_turbo`].
 pub const TURBO_MODEL_ID: &str = "qwen_image_2_1_turbo";
 /// Hugging Face repository the Turbo snapshot layout is frozen from.
-pub const TURBO_UPSTREAM_HF_REPO: &str = "Qwen/Qwen-Image-2.1-Turbo";
+pub const UPSTREAM_TURBO_HF_REPO: &str = "Qwen/Qwen-Image-2.1-Turbo";
 /// Pinned `Qwen/Qwen-Image-2.1-Turbo` revision. Its `transformer/config.json`, presets and licence
 /// are the base repository's; it differs in `model_index.json` (`sample_sigmas`), in
 /// `scheduler/scheduler_config.json` (static, unshifted), and in two storage details the loaders
 /// already absorb (a bf16 VAE, a single-file text tower).
-pub const TURBO_UPSTREAM_HF_REVISION: &str = "fc13ba1986fcb905854dc8de2f52eee395f49b5b";
+pub const UPSTREAM_TURBO_HF_REVISION: &str = "fc13ba1986fcb905854dc8de2f52eee395f49b5b";
+/// `huggingface/diffusers` commit that taught `QwenImage21Pipeline` to sample over a snapshot's
+/// saved `sample_sigmas` (PR 14950) — the reference for the Turbo schedule.
+pub const UPSTREAM_TURBO_DIFFUSERS_REVISION: &str = "da1d3829cf08d4f329b526d89e17cc035c049d8d";
 /// Descriptor family — distinct from the 2512 crate's `qwen-image`.
 pub const FAMILY: &str = "qwen-image-2-1";
+
+/// The label the family's shared code (transformer, quant, reference, adapters, memory pricing)
+/// starts its refusals with: the base engine id's.
+const BASE_LABEL: &str = "qwen_image_2_1: ";
+
+/// E3 (sc-25909) — **a refusal reached through engine id `id` names `id`**, one rule on both
+/// backends (the MLX twin's `model::label_message`). The family's shared code labels its refusals
+/// with the base id (it serves both and is not told which); every public entry point of a
+/// Turbo-id object — the generator's load, `validate`, `generate`, `generate_with_report` and
+/// request scope, and the Turbo memory registration's contract — rewrites a leading
+/// `qwen_image_2_1: ` to `qwen_image_2_1_turbo: ` on the way out. A base-id refusal, and a
+/// message that does not start with the base label, passes through unchanged.
+pub(crate) fn label_message(id: &str, message: String) -> String {
+    if id == TURBO_MODEL_ID {
+        if let Some(rest) = message.strip_prefix(BASE_LABEL) {
+            return format!("{id}: {rest}");
+        }
+    }
+    message
+}
+
+/// [`label_message`] over gen-core's error type.
+pub(crate) fn labelled(id: &str, error: gen_core::Error) -> gen_core::Error {
+    match error {
+        gen_core::Error::Msg(message) => gen_core::Error::Msg(label_message(id, message)),
+        gen_core::Error::Unsupported(message) => {
+            gen_core::Error::Unsupported(label_message(id, message))
+        }
+        gen_core::Error::GeometryRefused {
+            reason,
+            requested_width,
+            requested_height,
+            alternative,
+        } => gen_core::Error::GeometryRefused {
+            reason: label_message(id, reason),
+            requested_width,
+            requested_height,
+            alternative,
+        },
+        other => other,
+    }
+}
 /// Smallest side upstream's pipeline can render: one vision slot (a 2×2 latent) at 16 px/token.
 pub const MIN_SIZE: u32 = 32;
 
@@ -212,7 +257,7 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
         denoiser_output_latent_space: Some(&gen_core::QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
         control_kinds: None,
         required_components: &[],
-        id: variant.model_id(),
+        id: variant.id(),
         family: FAMILY,
         backend: "candle",
         modality: Modality::Image,
@@ -383,7 +428,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// Construct the **Turbo** generator ([`TURBO_MODEL_ID`], sc-25901) from a
 /// `Qwen/Qwen-Image-2.1-Turbo` snapshot directory. Everything [`load`] says holds; the schedule is
-/// read from the snapshot ([`loader::load_turbo_schedule`]) instead of derived from the
+/// read from the snapshot ([`loader::load_saved_sigma_schedule`]) instead of derived from the
 /// resolution.
 pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::Turbo)
@@ -391,14 +436,22 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// The denoise schedule a loaded generator runs — which of the two the snapshot carries is the
 /// whole difference between the registered ids.
-pub(crate) enum Schedule {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Schedule {
     /// Base: derived per request from the resolution ([`scheduler::sigmas`]).
     Shifted(SchedulerConfig),
-    /// Turbo: the snapshot's saved sigma list ([`scheduler::saved_sigmas`]).
-    Saved(TurboSchedule),
+    /// Turbo: the snapshot's saved sigma list ([`scheduler::resample_saved_sigmas`]).
+    Saved(SavedSigmaSchedule),
 }
 
 fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant_unlabelled(spec, variant).map_err(|error| labelled(variant.id(), error))
+}
+
+fn load_variant_unlabelled(
+    spec: &LoadSpec,
+    variant: Variant,
+) -> gen_core::Result<Box<dyn Generator>> {
     validate_load_spec(spec)?;
     let root = loader::snapshot_root(&spec.weights)?;
     // Before anything is read: a base snapshot under the Turbo id (or the reverse) is a typed
@@ -409,7 +462,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     let drop_count = system_prompt_drop_count(&tokenizer)?;
     let schedule = match variant {
         Variant::Base => Schedule::Shifted(loader::load_scheduler_config(root)?),
-        Variant::Turbo => Schedule::Saved(loader::load_turbo_schedule(root)?),
+        Variant::Turbo => Schedule::Saved(loader::load_saved_sigma_schedule(root)?),
     };
     // The loaded contract is priced from the snapshot on disk BEFORE any weight is read, so a
     // tier/request disagreement is the same refusal whether it is asked for through `load` or
@@ -420,7 +473,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
     // projection and a mis-oriented factor are refused here on EVERY offload policy — under
     // `Sequential` the DiT (and so `adapters::install`) is deferred to the first render, so without
     // this a bad adapter would pass `load` and fail mid-generate.
-    let memory_strategy = memory_strategy::memory_strategy_contract(variant.model_id(), spec)?;
+    let memory_strategy = memory_strategy::memory_strategy_contract(variant.id(), spec)?;
     let residency = build_residency(spec, &device)?;
     Ok(Box::new(QwenImage21 {
         descriptor: descriptor_for(variant),
@@ -491,7 +544,7 @@ impl Generator for QwenImage21 {
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
         memory_strategy::begin_request_for(
-            self.variant.model_id(),
+            self.variant.id(),
             &self.spec,
             &self.memory_strategy,
             context,
@@ -499,7 +552,8 @@ impl Generator for QwenImage21 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request_for(self.variant, &self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request_for(self.variant, &self.descriptor.capabilities, req)
+            .map_err(|error| labelled(self.variant.id(), error.into()))
     }
 
     fn generate(
@@ -507,7 +561,9 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        let report = self.generate_impl(req, on_progress)?;
+        let report = self
+            .generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error.into()))?;
         report.output.ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{}: the render produced no output",
@@ -524,7 +580,8 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<gen_core::GenerationReport> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        self.generate_impl(req, on_progress)
+            .map_err(|error| labelled(self.variant.id(), error.into()))
     }
 }
 
@@ -549,7 +606,7 @@ pub(crate) fn resolve_run_params(
 }
 
 /// The Turbo id's run parameters (sc-25901): the schedule comes from the snapshot's saved sigmas
-/// ([`scheduler::saved_sigmas`]) — as saved when the request omits `steps` or asks for exactly the
+/// ([`scheduler::resample_saved_sigmas`]) — as saved when the request omits `steps` or asks for exactly the
 /// saved count, resampled otherwise — with no `mu` shift and no terminal stretch.
 ///
 /// The curated `scheduler` axis stays live through the same [`candle_gen::resolve_flow_schedule`]
@@ -558,13 +615,13 @@ pub(crate) fn resolve_run_params(
 /// (`karras`, `beta`, …) **replaces** it with that scheduler's own unshifted ramp at the same step
 /// count, which is off the sigmas the checkpoint was distilled over.
 pub(crate) fn resolve_turbo_run_params(
-    schedule: &TurboSchedule,
+    schedule: &SavedSigmaSchedule,
     req: &GenerationRequest,
 ) -> Result<RunParams> {
     let steps = req
         .steps
         .map_or(schedule.default_steps(), |steps| steps as usize);
-    let native = scheduler::saved_sigmas(&schedule.sample_sigmas, steps)?;
+    let native = scheduler::resample_saved_sigmas(&schedule.sample_sigmas, steps)?;
     let sigmas = candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
     Ok(run_params_over(sigmas, req))
 }
@@ -840,7 +897,7 @@ pub(crate) fn validate_request_for(
     // the one-to-ten window) rather than the shared floor's generic "unsupported conditioning",
     // and so a bad count is refused before any weight is touched. Mirrors the MLX twin.
     crate::reference::collect_references(req)?;
-    caps.validate_request(variant.model_id(), req)?;
+    caps.validate_request(variant.id(), req)?;
     if req.prompt.trim().is_empty() && req.negative_prompt.is_none() {
         // Upstream renders an empty prompt as a single space; accept it, but a whitespace-only
         // prompt with nothing else is almost certainly a caller bug, so say so.
@@ -1022,23 +1079,29 @@ mod tests {
         let (base, turbo) = (descriptor(), descriptor_turbo());
         assert_eq!(base.id, "qwen_image_2_1");
         assert_eq!(turbo.id, "qwen_image_2_1_turbo");
-        assert_eq!(Variant::from_model_id(turbo.id), Some(Variant::Turbo));
-        assert_eq!(Variant::from_model_id(base.id), Some(Variant::Base));
-        assert_eq!(Variant::from_model_id("qwen_image"), None);
+        assert_eq!(Variant::from_id(turbo.id), Some(Variant::Turbo));
+        assert_eq!(Variant::from_id(base.id), Some(Variant::Base));
+        assert_eq!(Variant::from_id("qwen_image"), None);
         let mut renamed = turbo.clone();
         renamed.id = base.id;
         assert_eq!(format!("{renamed:?}"), format!("{base:?}"));
         assert!(gen_core::registry::model_descriptor_errors(&turbo).is_empty());
-        assert_eq!(TURBO_UPSTREAM_HF_REVISION.len(), 40);
+        for sha in [
+            UPSTREAM_TURBO_HF_REVISION,
+            UPSTREAM_TURBO_DIFFUSERS_REVISION,
+        ] {
+            assert_eq!(sha.len(), 40);
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        }
     }
 
-    fn turbo_schedule() -> TurboSchedule {
-        TurboSchedule::from_values(
+    fn turbo_schedule() -> SavedSigmaSchedule {
+        SavedSigmaSchedule::from_values(
             &serde_json::json!({
                 "_class_name": "QwenImage21Pipeline",
                 "sample_sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
             }),
-            // `Qwen/Qwen-Image-2.1-Turbo` @ TURBO_UPSTREAM_HF_REVISION, the keys that differ from
+            // `Qwen/Qwen-Image-2.1-Turbo` @ UPSTREAM_TURBO_HF_REVISION, the keys that differ from
             // the base config plus the ones the reader judges.
             &serde_json::json!({
                 "num_train_timesteps": 1000, "shift": 1.0, "shift_terminal": null,
@@ -1091,7 +1154,7 @@ mod tests {
         assert_eq!(p.sigmas.len(), 13);
         assert_eq!(
             p.sigmas,
-            scheduler::saved_sigmas(&schedule.sample_sigmas, 12).unwrap()
+            scheduler::resample_saved_sigmas(&schedule.sample_sigmas, 12).unwrap()
         );
         r.steps = Some(1);
         assert_eq!(

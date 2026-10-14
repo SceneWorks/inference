@@ -278,9 +278,16 @@ impl AvgDown {
         };
         let total = folded.dim(1)?;
         let group = total / self.out_channels;
+        // The group mean runs over a **rank-4** view (`[B, out, group, H'·W']`), never the rank-5
+        // `[B, out, group, H', W']` one: candle's Metal reduction of a non-trailing axis of a
+        // rank-5 tensor reads the wrong elements (max |Δ| ≈ 1–3 on unit-normal input, in f32 as
+        // in bf16, and non-finite where it reads pooled garbage — sc-25909 found it as NaN
+        // reference latents on the Metal lane). The rank-4 reduction is the same elements in the
+        // same order, so the CPU result is bit-identical.
         Ok(folded
-            .reshape((b, self.out_channels, group, h2, w2))?
-            .mean(2)?)
+            .reshape((b, self.out_channels, group, h2 * w2))?
+            .mean(2)?
+            .reshape((b, self.out_channels, h2, w2))?)
     }
 }
 
