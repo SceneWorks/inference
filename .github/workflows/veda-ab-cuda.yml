@@ -1,0 +1,218 @@
+name: Veda A/B (CUDA)
+
+# sc-25777 (epic sc-25140): MiniMax-H3 dense-vs-sparse A/B on the Windows CUDA host. Measurement,
+# not a gate: dispatch only, nothing here can become a required check.
+#
+# `cells` is a JSON array of `VEDA_AB_*` env maps (the request contract documented in
+# `crates/media/candle-gen/candle-gen-minimax-h3/tests/veda_ab.rs`). Every cell renders twice,
+# `VEDA_AB_VEDA=off` then `on`, sequentially, one process per render; see
+# `scripts/release/veda_ab_cuda.py` for placeholders (`{PREDICTOR}`, `{TURBO}`, `{CLAY}`, `{REPO}`)
+# and the turbo-recipe LoRA rule. Each cell's output directory is uploaded as its own artifact
+# (at most 8 cells per dispatch).
+#
+# WEIGHTS. The base snapshot and the q4/q8 tier dirs are the operator-staged REAL-FILE copies the
+# sc-20754 VRAM campaign measured against (`vars.CANDLE_MINIMAX_H3_SNAPSHOT`,
+# `vars.CANDLE_MINIMAX_H3_{Q4,Q8}_{DIT,TE}_DIR`); candle cannot memmap the hub cache's reparse-point
+# links, so they are validated by `validate_h3_vram_staging.py` before any CUDA context. The Veda
+# predictor, the four lightx2v turbo LoRAs and the claymation style LoRA are pinned rows in
+# `release/real-weight-models.toml`, materialized as plain directories beside the workspace (kept
+# across runs, so later dispatches only verify them).
+#
+# THE BOX. One physical host with two listeners. The shared `inference-real-weights-physical-host`
+# concurrency group serializes this against the other CUDA campaigns, and the driver claims one idle
+# physical GPU through the Veda CUDA guard (host-global UUID lock) and re-verifies it idle before
+# every render. It does not hold off `ci.yml`'s compile checks, so dispatch it when the box is idle.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: JSON array of VEDA_AB_* env maps; each cell runs veda off then on
+        type: string
+        required: true
+      render_timeout_minutes:
+        description: Per-render runaway guard in minutes
+        type: string
+        required: false
+        default: "180"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+jobs:
+  ab:
+    name: Veda dense-vs-sparse A/B (CUDA)
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    # A runaway guard, not a budget: a cold `--features cuda` release build plus 2 renders x up to 8
+    # cells. Size the cell list to fit; the per-render guard is `render_timeout_minutes`.
+    timeout-minutes: 1440
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      CARGO_BUILD_JOBS: "8"
+      MINIMAX_H3_SNAPSHOT: ${{ vars.CANDLE_MINIMAX_H3_SNAPSHOT }}
+      H3_Q4_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_DIT_DIR }}
+      H3_Q4_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q4_TE_DIR }}
+      H3_Q8_DIT_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_DIT_DIR }}
+      H3_Q8_TE_DIR: ${{ vars.CANDLE_MINIMAX_H3_Q8_TE_DIR }}
+      # Passed through env, never interpolated into a script body.
+      VEDA_AB_CELLS: ${{ inputs.cells }}
+      VEDA_AB_RENDER_TIMEOUT_MINUTES: ${{ inputs.render_timeout_minutes }}
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Prepare paths and require an admitted CUDA listener
+        shell: cmd
+        run: |
+          if not "%RUNNER_NAME%"=="cuda-windows" if not "%RUNNER_NAME%"=="cuda-windows-2" (
+            echo Unexpected CUDA listener %RUNNER_NAME%
+            exit /b 1
+          )
+          if "%MINIMAX_H3_SNAPSHOT%"=="" (
+            echo Missing repository variable CANDLE_MINIMAX_H3_SNAPSHOT
+            exit /b 1
+          )
+          rem Inside the workspace so each cell's directory can be selected by an upload glob; the
+          rem checkout's clean removes it on the next run.
+          for %%I in ("%GITHUB_WORKSPACE%\veda-ab-out") do set "VEDA_AB_RESULTS_DIR=%%~fI"
+          for %%I in ("%GITHUB_WORKSPACE%\..\veda-ab-target") do set "CARGO_TARGET_DIR=%%~fI"
+          for %%I in ("%GITHUB_WORKSPACE%\..\veda-ab-assets") do set "ASSETS=%%~fI"
+          mkdir "%VEDA_AB_RESULTS_DIR%" || exit /b 1
+          echo VEDA_AB_RESULTS_DIR=%VEDA_AB_RESULTS_DIR%>>"%GITHUB_ENV%"
+          echo CARGO_TARGET_DIR=%CARGO_TARGET_DIR%>>"%GITHUB_ENV%"
+          echo VEDA_AB_BUILD_LOG=%RUNNER_TEMP%\veda-ab-build.json>>"%GITHUB_ENV%"
+          echo VEDA_AB_PREDICTOR_SNAPSHOT=%ASSETS%\minimax-h3-veda-predictor>>"%GITHUB_ENV%"
+          echo VEDA_AB_TURBO_SNAPSHOT=%ASSETS%\minimax-h3-turbo-loras>>"%GITHUB_ENV%"
+          echo VEDA_AB_CLAY_SNAPSHOT=%ASSETS%\minimax-h3-claymation-lora>>"%GITHUB_ENV%"
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Validate the staged real-file H3 inputs before any CUDA context
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier bf16 --dit "%MINIMAX_H3_SNAPSHOT%\transformer" --te "%MINIMAX_H3_SNAPSHOT%\text_encoder" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q4 --dit "%H3_Q4_DIT_DIR%" --te "%H3_Q4_TE_DIR%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/ci/validate_h3_vram_staging.py --root "%MINIMAX_H3_SNAPSHOT%" --tier q8 --dit "%H3_Q8_DIT_DIR%" --te "%H3_Q8_TE_DIR%" || exit /b 1
+      - name: Materialize and verify the pinned Veda predictor and LoRAs
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-veda-predictor --snapshot "%VEDA_AB_PREDICTOR_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-turbo-loras --snapshot "%VEDA_AB_TURBO_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model minimax-h3-claymation-lora --snapshot "%VEDA_AB_CLAY_SNAPSHOT%" || exit /b 1
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # Same as the other heavy Candle/CUDA lanes: the runner's global sccache wrapper resets mid-build.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Build the candle MiniMax-H3 integration binary once
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-minimax-h3 --features cuda --test integration --no-run --message-format=json > "%VEDA_AB_BUILD_LOG%" || exit /b 1
+      - name: Run every cell, Veda off then on
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\release\veda_ab_cuda.py'
+      # One artifact per cell (the driver admits at most 8), plus the run summary. A cell index the
+      # dispatch did not use matches nothing and is skipped.
+      - name: Upload the run summary and GPU admission record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            veda-ab-out/*.json
+            veda-ab-out/*.xml
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload cell 0
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell00-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell00-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 1
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell01-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell01-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 2
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell02-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell02-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 3
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell03-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell03-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 4
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell04-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell04-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 5
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell05-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell05-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 6
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell06-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell06-*/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Upload cell 7
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-ab-cuda-cell07-${{ github.run_id }}-${{ github.run_attempt }}
+          path: veda-ab-out/cell07-*/
+          if-no-files-found: ignore
+          retention-days: 30
