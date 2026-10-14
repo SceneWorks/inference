@@ -33,6 +33,7 @@
 //! double-quant, 0.56 % mean relative RMS on the real z-image Q8 tier). See [`repack`] for the
 //! byte-level details.
 
+pub use candle_quant_kernels::veda_int8;
 pub mod repack;
 pub mod sidecar;
 

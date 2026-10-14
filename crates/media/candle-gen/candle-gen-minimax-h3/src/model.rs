@@ -149,8 +149,9 @@ use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::dit::positions::KeyframeAnchor;
 use crate::pipeline::{
     align_frames_for_duration, fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents,
-    prepend_condition_rows, render_latents, resolve_geometry, revert_pixel_normalization,
-    t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE, PATCH_SIZE, SPATIAL_STRIDE,
+    prepend_condition_rows, render_latents_with_observer, resolve_geometry,
+    revert_pixel_normalization, t2va_layout, RequestGeometry, CANVAS_SHORT_EDGE, MAX_CANVAS_EDGE,
+    PATCH_SIZE, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -221,6 +222,7 @@ const TIER_AGNOSTIC_COMPONENT_DIRS: [&str; 2] = ["vae", "audio_vae"];
 const KNOWN_COMPONENTS: &[&str] = &[
     crate::tier::DIT_COMPONENT,
     crate::tier::TEXT_ENCODER_COMPONENT,
+    crate::veda::COMPONENT,
 ];
 
 /// The component directories a given task reads, on top of [`TIER_AGNOSTIC_COMPONENT_DIRS`] and the
@@ -561,6 +563,31 @@ pub struct MiniMaxH3 {
     /// discipline the rest of this struct keeps. They are read once per render, in
     /// [`MiniMaxH3::load_task_dit`], onto the job-local DiT.
     adapters: Vec<AdapterSpec>,
+    veda_report: crate::veda::ReportSink,
+    veda_component: Option<PathBuf>,
+}
+
+#[cfg(feature = "cuda")]
+fn terminal_device_sample(device: &Device) -> serde_json::Value {
+    let pool = match device.location() {
+        candle_gen::candle_core::DeviceLocation::Cuda { gpu_id } => {
+            candle_gen::cuda_mempool::MemPool::device_current(gpu_id as i32)
+        }
+        _ => None,
+    };
+    serde_json::json!({
+        "method": "cuda_current_pool_cumulative_highwater_no_reset",
+        "poolAvailable": pool.is_some(),
+        "usedSampleBytes": pool.and_then(|p| p.used()),
+        "usedHighBytesCumulative": pool.and_then(|p| p.used_high()),
+        "reservedSampleBytes": pool.and_then(|p| p.reserved()),
+        "reservedHighBytesCumulative": pool.and_then(|p| p.reserved_high()),
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn terminal_device_sample(_device: &Device) -> serde_json::Value {
+    serde_json::json!({"method": "unavailable_without_cuda", "poolAvailable": false})
 }
 
 impl MiniMaxH3 {
@@ -630,6 +657,11 @@ impl MiniMaxH3 {
             offload: OFFLOAD_POLICY,
             contract: crate::memory_strategy::contract_for(spec)?,
             adapters: spec.adapters.clone(),
+            veda_report: Default::default(),
+            veda_component: match spec.components.get(crate::veda::COMPONENT) {
+                Some(WeightsSource::File(path)) => Some(path.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -877,6 +909,10 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
+            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            ..Default::default()
+        };
         Generator::validate(self, req)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -987,6 +1023,13 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
+        }
         drop(context);
 
         let total = schedule.num_evals() as u32;
@@ -996,7 +1039,15 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step = |index, elapsed| {
+            if let Some(probe) = terminal_probe.as_mut() {
+                probe.record(index, elapsed, terminal_device_sample(&self.device));
+            }
+        };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             &schedule,
@@ -1006,7 +1057,18 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry =
+                Some(probe.finish(if self.device.is_cuda() {
+                    "candle_cuda"
+                } else {
+                    "candle_cpu"
+                }));
+        }
+
         drop(model);
         drop(video_rows);
         drop(audio_rows);
@@ -1294,6 +1356,13 @@ impl MiniMaxH3 {
             adaln,
             AdaLnResidency::PrecomputeAndEvict,
         )?;
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
+        }
         drop(context);
 
         let total = schedule.num_evals() as u32;
@@ -1303,7 +1372,15 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(candle_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step = |index, elapsed| {
+            if let Some(probe) = terminal_probe.as_mut() {
+                probe.record(index, elapsed, terminal_device_sample(&self.device));
+            }
+        };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             schedule,
@@ -1313,7 +1390,18 @@ impl MiniMaxH3 {
             &self.device,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry =
+                Some(probe.finish(if self.device.is_cuda() {
+                    "candle_cuda"
+                } else {
+                    "candle_cpu"
+                }));
+        }
+
         drop(model);
         drop(video_rows);
         drop(audio_rows);
@@ -1718,11 +1806,19 @@ fn reference_short_edge_for(req: &GenerationRequest) -> Result<i32> {
 }
 
 impl Generator for MiniMaxH3 {
+    fn veda_execution_report(&self) -> Option<candle_gen::gen_core::VedaExecutionReport> {
+        Some(self.veda_report.borrow().clone())
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
 
     fn validate(&self, req: &GenerationRequest) -> candle_gen::gen_core::Result<()> {
+        if let Some(veda) = &req.veda {
+            veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
+                .map_err(candle_gen::gen_core::Error::Msg)?;
+        }
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -1809,6 +1905,14 @@ impl Generator for MiniMaxH3 {
             }
         }
         Ok(())
+    }
+
+    fn veda_workspace_bound(
+        &self,
+        req: candle_gen::gen_core::veda::workspace::Request<'_>,
+    ) -> candle_gen::gen_core::Result<Option<candle_gen::gen_core::veda::workspace::WorkspaceBound>>
+    {
+        crate::memory_strategy::veda_workspace_bound(req)
     }
 
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
@@ -1970,6 +2074,164 @@ candle_gen::register_generators! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_requests_preserve_native_task_tier_and_adapter_staging() {
+        use candle_gen::gen_core::{AdapterKind, VedaRequest};
+        for (bits, quant, expected) in [
+            (None, None, None),
+            (Some(4), Some(Quant::Q4), Some(crate::tier::Tier::Q4)),
+            (Some(8), Some(Quant::Q8), Some(crate::tier::Tier::Q8)),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = staged_root_with_reference(&tmp);
+            stage_component(&root, "FL2VA");
+            stage_component_at(&root.join(BASE_DIT_PARTITION), bits);
+            stage_component_at(&root.join(REFERENCE_DIT_PARTITION), bits);
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            spec.quantize = quant;
+            let missing = tmp.path().join("missing-predictor.safetensors");
+            spec.components.insert(
+                crate::veda::COMPONENT.into(),
+                WeightsSource::File(missing.clone()),
+            );
+            let turbo = tmp.path().join("turbo.safetensors");
+            let style = tmp.path().join("style.safetensors");
+            std::fs::write(&turbo, [0u8; 8]).unwrap();
+            std::fs::write(&style, [0u8; 8]).unwrap();
+            spec.adapters = vec![
+                adapter_spec(turbo, AdapterKind::Lora, None, None),
+                adapter_spec(style, AdapterKind::Lora, None, None),
+            ];
+            load(&spec).expect("native registry accepts optional sparse staging at every tier");
+            let model = MiniMaxH3::load(&spec).unwrap();
+            assert_eq!(model.requested_tier(), expected);
+            assert_eq!(model.veda_component.as_ref(), Some(&missing));
+            assert_eq!(model.dtype, DType::BF16);
+            assert_eq!(model.adapters.len(), spec.adapters.len());
+            for (actual, expected) in model.adapters.iter().zip(&spec.adapters) {
+                assert_eq!(actual.path, expected.path);
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.scale, expected.scale);
+                assert_eq!(actual.pass_scales, expected.pass_scales);
+                assert_eq!(actual.moe_expert, expected.moe_expert);
+            }
+            let mut request = request(1344, 768);
+            request.veda = Some(VedaRequest {
+                enabled: true,
+                ..Default::default()
+            });
+            model.validate(&request).unwrap();
+            assert_eq!(model.resolve_task(&request).unwrap().0, MiniMaxH3Task::T2va);
+            use candle_gen::gen_core::Conditioning;
+            for indices in [vec![0], vec![123], vec![0, 123]] {
+                request.conditioning = indices
+                    .iter()
+                    .map(|&frame_idx| Conditioning::Keyframe {
+                        image: ref_image(64, 64),
+                        frame_idx,
+                        strength: 1.0,
+                    })
+                    .collect();
+                model.validate(&request).unwrap();
+                assert_eq!(
+                    model.resolve_task(&request).unwrap().0,
+                    MiniMaxH3Task::Fl2va
+                );
+                assert_eq!(
+                    request
+                        .keyframes()
+                        .iter()
+                        .map(|k| k.frame_idx)
+                        .collect::<Vec<_>>(),
+                    indices
+                );
+            }
+            request.conditioning = vec![
+                Conditioning::ReferenceVideo {
+                    frames: vec![ref_image(64, 64); 30],
+                    fps: 30.0,
+                    audio: Some(ref_track()),
+                },
+                ref_conditioning(),
+                Conditioning::ReferenceAudio {
+                    audio: ref_track(),
+                    strength: None,
+                },
+                ref_conditioning(),
+            ];
+            model.validate(&request).unwrap();
+            let (task, references) = model.resolve_task(&request).unwrap();
+            assert_eq!(task, MiniMaxH3Task::Ref2va);
+            let refs = references.unwrap();
+            use crate::reference::ReferenceKind::{Audio, Image as I, Video};
+            assert_eq!(
+                refs.as_slice().iter().map(|r| r.kind()).collect::<Vec<_>>(),
+                [Video, I, Audio, I]
+            );
+            if let Ref2VaReference::Video(clip) = &refs.as_slice()[0] {
+                assert_eq!(clip.frames.len(), 30);
+                assert_eq!(clip.fps, 30.0);
+                assert_eq!(clip.audio.as_ref().unwrap().samples, ref_track().samples);
+            } else {
+                panic!("reference clip order must be preserved");
+            }
+            assert_eq!(model.requested_tier(), expected);
+
+            assert!(
+                !missing.exists(),
+                "offload/load must not fetch or require optional predictor"
+            );
+            assert_eq!(
+                model
+                    .veda_execution_report()
+                    .unwrap()
+                    .predictor_load_attempts,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_veda_controls_fail_at_native_request_boundary() {
+        let generator = validator();
+        for enabled in [false, true] {
+            for bad in [
+                candle_gen::gen_core::VedaBudget::KeyTiles(0),
+                candle_gen::gen_core::VedaBudget::SparsityPercent(f64::NAN),
+                candle_gen::gen_core::VedaBudget::SparsityPercent(100.0),
+            ] {
+                let mut request = request(1344, 768);
+                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                    enabled,
+                    generated: bad,
+                    ..Default::default()
+                });
+                let error = generator.validate(&request).unwrap_err().to_string();
+                assert!(error.contains("generated: Veda"), "{error}");
+            }
+            for steps in [4, 8, 50] {
+                let mut request = request(1344, 768);
+                request.steps = Some(steps);
+                request.veda = Some(candle_gen::gen_core::VedaRequest {
+                    enabled,
+                    full_attention_steps: vec![steps as usize],
+                    ..Default::default()
+                });
+                let error = generator.validate(&request).unwrap_err().to_string();
+                assert!(error.contains("zero-based index"), "{error}");
+                request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
+                request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+                assert!(generator
+                    .validate(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("full_attention_layers"));
+                request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+                generator.validate(&request).unwrap();
+            }
+        }
+    }
+
     /// Every component directory a flat (untiered) snapshot must carry — the four
     /// [`MiniMaxH3::load`] ends up requiring when nothing is staged, since an unstaged tier resolves
     /// to `root/transformer` and `root/text_encoder`.
