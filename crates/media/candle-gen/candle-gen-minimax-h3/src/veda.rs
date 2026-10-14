@@ -19,6 +19,49 @@ struct Prepared {
     grid: [usize; 3],
     layouts: BTreeMap<TileShape, Layout>,
 }
+impl Prepared {
+    fn bound(&self, request: &VedaRequest, batch: usize) -> Result<workspace::WorkspaceBound> {
+        let sizes = self
+            .layouts
+            .iter()
+            .map(|(&s, l)| (s, LayoutSize::from(l)))
+            .collect();
+        Ok(workspace::bound(
+            request,
+            Backend::Cuda,
+            &self.plan,
+            self.grid,
+            &sizes,
+            self.bundle.layers,
+            self.bundle.heads,
+            self.bundle.dim,
+            batch,
+            2,
+            Limits::for_backend(Backend::Cuda),
+        )?)
+    }
+    /// Same-shape head batches of `layer` (ascending heads), each at most the bound's batch size.
+    /// A refused shape fails before any gather.
+    fn batches(
+        &self,
+        layer: usize,
+        bound: &workspace::WorkspaceBound,
+    ) -> Result<Vec<(TileShape, Vec<usize>)>> {
+        let mut groups: BTreeMap<TileShape, Vec<usize>> = BTreeMap::new();
+        for (h, &shape) in self.plan.heads[layer].iter().enumerate() {
+            groups.entry(self.plan.shapes[shape]).or_default().push(h);
+        }
+        let mut batches = Vec::new();
+        for (shape, heads) in groups {
+            let chunk = &bound.chunks[&shape];
+            if let Some(reason) = &chunk.refusal {
+                return Err(format!("Veda {reason}").into());
+            }
+            batches.extend(heads.chunks(chunk.heads).map(|h| (shape, h.to_vec())));
+        }
+        Ok(batches)
+    }
+}
 pub struct VedaRuntime {
     request: VedaRequest,
     report: ReportSink,
@@ -90,7 +133,7 @@ impl VedaRuntime {
                 dim,
                 1,
                 2,
-                Limits::default(),
+                Limits::for_backend(Backend::Cuda),
             )?;
             report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load(path, layers, heads, dim)?;
@@ -145,7 +188,7 @@ impl VedaRuntime {
             bundle.dim,
             1,
             2,
-            Limits::default(),
+            Limits::for_backend(Backend::Cuda),
         )?;
         let mut r = report.borrow_mut();
         r.predictor = Some(bundle.identity.clone());
@@ -243,24 +286,7 @@ impl VedaRuntime {
         {
             return Err("Veda unsupported device/dtype/layout".into());
         }
-        let sizes = p
-            .layouts
-            .iter()
-            .map(|(&s, l)| (s, LayoutSize::from(l)))
-            .collect();
-        let bound = workspace::bound(
-            &self.request,
-            Backend::Cuda,
-            &p.plan,
-            p.grid,
-            &sizes,
-            p.bundle.layers,
-            heads,
-            dim,
-            batch,
-            2,
-            Limits::default(),
-        )?;
+        let bound = p.bound(&self.request, batch)?;
         {
             let mut r = self.report.borrow_mut();
             r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
@@ -279,50 +305,37 @@ impl VedaRuntime {
             (self.self_test)(q.device(), q.dtype(), dim)?;
             *self.tested.borrow_mut() = Some((q.device().clone(), q.dtype(), dim));
         }
-        let mut batches = Vec::new();
+        let batches = p.batches(layer, &bound)?;
+        // Each same-shape head batch is gathered, scored with one host readback, selected and
+        // attended with one kernel launch over all of its heads.
+        let mut samples = Vec::with_capacity(batch);
         let mut pairs = 0;
-        let mut high = 0;
         for b in 0..batch {
+            let mut order = Vec::with_capacity(heads);
             let mut outputs = Vec::new();
-            for h in 0..heads {
-                let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
+            for (shape, group) in &batches {
+                let layout = &p.layouts[shape];
+                let tiles = layout.valid.len();
                 let slots = layout.perm.len();
-                if let Some(reason) = &bound.chunks[&p.plan.shapes[p.plan.heads[layer][h]]].refusal
-                {
-                    return Err(format!("Veda {reason}").into());
-                }
-                let qt = tile(q, b, h, layout)?;
-                let kt = tile(k, b, h, layout)?;
-                let vt = tile(v, b, h, layout)?;
-                let scores = contract::learned_scores(
-                    &p.bundle,
-                    layer,
-                    &[h as i32],
-                    layout,
-                    &qt,
-                    &kt,
-                    &CandlePredictorOps,
-                )?;
+                let g = group.len();
+                let qt = tile(q, b, group, layout)?;
+                let kt = tile(k, b, group, layout)?;
+                let vt = tile(v, b, group, layout)?;
+                let rows = select(p, &self.request, layer, group, layout, &qt, &kt)?;
                 self.report.borrow_mut().predictor_score_calls += 1;
-                let rows = layout.select_with_budgets(
-                    &scores,
-                    1,
-                    budget(&self.request.generated),
-                    budget(&self.request.reference),
-                )?;
                 pairs += rows
                     .iter()
                     .enumerate()
                     .map(|(r, ks)| {
-                        layout.valid[r] as u64
+                        layout.valid[r % tiles] as u64
                             * ks.iter().map(|&c| layout.valid[c] as u64).sum::<u64>()
                     })
                     .sum::<u64>();
-                let mask = veda_int8::Mask::new(&rows, &layout.valid, 1)?;
+                let mask = veda_int8::Mask::new(&rows, &layout.valid, g)?;
                 let out = veda_int8::attend(
-                    &qt.reshape((1, slots, dim))?,
-                    &kt.reshape((1, slots, dim))?,
-                    &vt.reshape((1, slots, dim))?,
+                    &qt.reshape((g, slots, dim))?,
+                    &kt.reshape((g, slots, dim))?,
+                    &vt.reshape((g, slots, dim))?,
                     &mask,
                     scale,
                 )?;
@@ -331,22 +344,55 @@ impl VedaRuntime {
                     seq,
                     q.device(),
                 )?;
-                outputs.push(out.index_select(&inverse, 1)?.reshape((1, 1, seq, dim))?);
-                high = bound.total_bytes;
+                outputs.push(out.index_select(&inverse, 1)?);
+                order.extend_from_slice(group);
             }
-            batches.push(Tensor::cat(&outputs, 1)?);
+            samples.push(assemble(&outputs, &order)?.unsqueeze(0)?);
         }
-        let out = Tensor::cat(&batches, 0)?;
+        let out = Tensor::cat(&samples, 0)?;
         ensure_finite(&out)?;
-        Ok((out, pairs, high))
+        Ok((out, pairs, bound.total_bytes))
     }
+}
+/// Concatenates per-batch `[heads, seq, dim]` outputs, whose heads are `order`, back into head order.
+fn assemble(outputs: &[Tensor], order: &[usize]) -> Result<Tensor> {
+    let out = Tensor::cat(outputs, 0)?;
+    if order.iter().enumerate().all(|(i, &h)| i == h) {
+        return Ok(out);
+    }
+    let mut position = vec![0u32; order.len()];
+    for (i, &h) in order.iter().enumerate() {
+        position[h] = i as u32;
+    }
+    Ok(out.index_select(&Tensor::from_vec(position, order.len(), out.device())?, 0)?)
+}
+/// Learned selection for one same-shape head batch of one sample: one pooled-QK scoring pass over
+/// every head of the batch and one host readback of its `[heads, tiles, tiles]` scores. Rows are
+/// head-major, as [`veda_int8::Mask`] expects.
+fn select(
+    p: &Prepared,
+    request: &VedaRequest,
+    layer: usize,
+    heads: &[usize],
+    layout: &Layout,
+    qt: &Tensor,
+    kt: &Tensor,
+) -> Result<Vec<Vec<usize>>> {
+    let ids: Vec<i32> = heads.iter().map(|&h| h as i32).collect();
+    let scores =
+        contract::learned_scores(&p.bundle, layer, &ids, layout, qt, kt, &CandlePredictorOps)?;
+    Ok(layout.select_with_budgets(
+        &scores,
+        heads.len(),
+        budget(&request.generated),
+        budget(&request.reference),
+    )?)
 }
 /// Refuses a sparse attention output holding any NaN/Inf, so `attention` recomputes that call
 /// densely and records the reason instead of letting the poison into the hidden state (a poisoned
 /// residual decodes to a flat black clip with silent audio — the sc-25777 CUDA A/B signature).
-/// One f32 sum reduction plus a scalar readback per sparse call; every head of the call already
-/// reads its predictor scores back to the host, so this adds one sync to the dozens it has. A NaN
-/// or Inf anywhere makes the sum non-finite.
+/// One f32 sum reduction plus a scalar readback per sparse call, beside the one score readback per
+/// head batch. A NaN or Inf anywhere makes the sum non-finite.
 pub(crate) fn ensure_finite(out: &Tensor) -> Result<()> {
     let sum = out.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
     if sum.is_finite() {
@@ -361,28 +407,34 @@ fn budget(b: &VedaBudget) -> Budget {
         VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
     }
 }
-fn tile(x: &Tensor, b: usize, h: usize, l: &Layout) -> Result<Tensor> {
-    let (_, _, seq, dim) = x.dims4()?;
+/// Gathers `heads` of sample `b` into padded tile order `[heads, tiles, TILE, dim]`; padding is zero.
+fn tile(x: &Tensor, b: usize, heads: &[usize], l: &Layout) -> Result<Tensor> {
+    let (_, all, _, dim) = x.dims4()?;
+    let mut a = x.get(b)?.contiguous()?;
+    if heads.len() != all || heads.iter().enumerate().any(|(i, &h)| i != h) {
+        let ids = Tensor::from_vec(
+            heads.iter().map(|&h| h as u32).collect::<Vec<_>>(),
+            heads.len(),
+            x.device(),
+        )?;
+        a = a.index_select(&ids, 0)?;
+    }
     let perm = Tensor::from_vec(
         l.perm.iter().map(|&x| x.max(0) as u32).collect::<Vec<_>>(),
         l.perm.len(),
         x.device(),
     )?;
+    let a = a.index_select(&perm, 1)?;
     let valid = Tensor::from_vec(
         l.perm.iter().map(|&x| u8::from(x >= 0)).collect::<Vec<_>>(),
-        (l.perm.len(), 1),
+        (1, l.perm.len(), 1),
         x.device(),
     )?
-    .broadcast_as((l.perm.len(), dim))?;
-    let a = x
-        .get(b)?
-        .get(h)?
-        .reshape((seq, dim))?
-        .index_select(&perm, 0)?;
+    .broadcast_as(a.dims())?;
     let zero = Tensor::zeros(a.dims(), a.dtype(), a.device())?;
     Ok(valid
         .where_cond(&a, &zero)?
-        .reshape((1, l.valid.len(), TILE, dim))?)
+        .reshape((heads.len(), l.valid.len(), TILE, dim))?)
 }
 struct CandlePredictorOps;
 impl PredictorOps for CandlePredictorOps {
@@ -643,6 +695,32 @@ mod tests {
         .unwrap()
     }
     fn predictor(layers: usize, heads: usize, dim: usize) -> Bundle {
+        predictor_with(
+            layers,
+            heads,
+            dim,
+            &["2x4x16"],
+            vec![vec![0; heads]; layers],
+        )
+    }
+    /// Layer 0 gives head 0 `2x4x16` and head 1 `1x8x16`; same-shape batches run in shape order,
+    /// so layer 0's run out of head order and must be reassembled.
+    fn mixed_predictor() -> Bundle {
+        predictor_with(
+            2,
+            2,
+            16,
+            &["2x4x16", "1x8x16"],
+            vec![vec![0, 1], vec![1, 0]],
+        )
+    }
+    fn predictor_with(
+        layers: usize,
+        heads: usize,
+        dim: usize,
+        shapes: &[&str],
+        head_shape: Vec<Vec<usize>>,
+    ) -> Bundle {
         use serde_json::json;
         let mut metadata = serde_json::Map::new();
         for (k, v) in [
@@ -655,7 +733,7 @@ mod tests {
         ] {
             metadata.insert(k.into(), json!(v));
         }
-        metadata.insert("plans".into(),json!(json!({"fixture":{"geometry":"16x9_t2","grid":[2,8,8],"shapes":["2x4x16"],"head_shape":vec![vec![0;heads];layers]}}).to_string()));
+        metadata.insert("plans".into(),json!(json!({"fixture":{"geometry":"16x9_t2","grid":[2,8,8],"shapes":shapes,"head_shape":head_shape}}).to_string()));
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".into(), json!(metadata));
         let mut bytes = vec![];
@@ -697,11 +775,20 @@ mod tests {
         anchors: &[KeyframeAnchor],
         reference: VedaBudget,
     ) -> VedaRuntime {
+        runtime_with(dev, report, anchors, reference, predictor(2, 2, 16))
+    }
+    fn runtime_with(
+        dev: &Device,
+        report: ReportSink,
+        anchors: &[KeyframeAnchor],
+        reference: VedaBudget,
+        bundle: Bundle,
+    ) -> VedaRuntime {
         let p = packed_with(dev, anchors);
         VedaRuntime {
             prepared: Some(
                 VedaRuntime::build(
-                    predictor(2, 2, 16),
+                    bundle,
                     &VedaRequest {
                         enabled: true,
                         ..Default::default()
@@ -751,50 +838,56 @@ mod tests {
         let (qh, kh, vh) = (host(q), host(k), host(v));
         let mut out = vec![f32::NAN; qh.len()];
         let mut worst = 0f32;
+        let bound = p.bound(&r.request, batch).unwrap();
         for b in 0..batch {
-            for h in 0..heads {
-                let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
-                let base = (b * heads + h) * seq;
-                let gather = |x: &[f32]| -> Vec<f32> {
-                    layout
-                        .perm
-                        .iter()
-                        .flat_map(|&t| {
-                            (0..dim).map(move |d| {
-                                if t >= 0 {
-                                    x[(base + t as usize) * dim + d]
-                                } else {
-                                    0.
-                                }
-                            })
-                        })
-                        .collect()
-                };
-                let scores = contract::learned_scores(
-                    &p.bundle,
+            // The runtime's own head batches and learned selection; each head's slice of the
+            // batch's rows masks an independent per-head FP32 attention.
+            for (shape, group) in p.batches(layer, &bound).unwrap() {
+                let layout = &p.layouts[&shape];
+                let tiles = layout.valid.len();
+                let rows = select(
+                    p,
+                    &r.request,
                     layer,
-                    &[h as i32],
+                    &group,
                     layout,
-                    &tile(q, b, h, layout).unwrap(),
-                    &tile(k, b, h, layout).unwrap(),
-                    &CandlePredictorOps,
+                    &tile(q, b, &group, layout).unwrap(),
+                    &tile(k, b, &group, layout).unwrap(),
                 )
                 .unwrap();
-                let rows = layout
-                    .select_with_budgets(
-                        &scores,
-                        1,
-                        budget(&r.request.generated),
-                        budget(&r.request.reference),
-                    )
-                    .unwrap();
-                let mask = veda_int8::Mask::new(&rows, &layout.valid, 1).unwrap();
-                let (slots, bound) =
-                    masked_reference(&gather(&qh), &gather(&kh), &gather(&vh), dim, scale, &mask);
-                worst = worst.max(bound);
-                for t in 0..seq {
-                    let slot = layout.inverse[t] as usize;
-                    out[(base + t) * dim..][..dim].copy_from_slice(&slots[slot * dim..][..dim]);
+                for (i, &h) in group.iter().enumerate() {
+                    let base = (b * heads + h) * seq;
+                    let gather = |x: &[f32]| -> Vec<f32> {
+                        layout
+                            .perm
+                            .iter()
+                            .flat_map(|&t| {
+                                (0..dim).map(move |d| {
+                                    if t >= 0 {
+                                        x[(base + t as usize) * dim + d]
+                                    } else {
+                                        0.
+                                    }
+                                })
+                            })
+                            .collect()
+                    };
+                    let mask =
+                        veda_int8::Mask::new(&rows[i * tiles..(i + 1) * tiles], &layout.valid, 1)
+                            .unwrap();
+                    let (slots, bound) = masked_reference(
+                        &gather(&qh),
+                        &gather(&kh),
+                        &gather(&vh),
+                        dim,
+                        scale,
+                        &mask,
+                    );
+                    worst = worst.max(bound);
+                    for t in 0..seq {
+                        let slot = layout.inverse[t] as usize;
+                        out[(base + t) * dim..][..dim].copy_from_slice(&slots[slot * dim..][..dim]);
+                    }
                 }
             }
         }
@@ -839,6 +932,105 @@ mod tests {
             let (sparse, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
             assert!(sparse.iter().zip(&dense).any(|(a, b)| (a - b).abs() > 1e-3));
         }
+    }
+    #[test]
+    fn head_batches_select_and_reassemble_exactly_as_single_heads() {
+        let dev = Device::Cpu;
+        for bundle in [predictor(2, 2, 16), mixed_predictor()] {
+            let r = runtime_with(
+                &dev,
+                ReportSink::default(),
+                &[],
+                VedaBudget::SparsityPercent(0.),
+                bundle,
+            );
+            let p = r.prepared.as_ref().unwrap();
+            let n = p.layouts.values().next().unwrap().seq;
+            let (q, k) = (
+                tensor(n, &dev, DType::F32, 0),
+                tensor(n, &dev, DType::F32, 3),
+            );
+            let bound = p.bound(&r.request, 2).unwrap();
+            for layer in 0..2 {
+                let batches = p.batches(layer, &bound).unwrap();
+                let mut order: Vec<usize> = batches.iter().flat_map(|(_, g)| g.clone()).collect();
+                order.sort_unstable();
+                assert_eq!(order, vec![0, 1], "every head exactly once");
+                for b in 0..2 {
+                    for (shape, group) in &batches {
+                        let l = &p.layouts[shape];
+                        let (qt, kt) = (
+                            tile(&q, b, group, l).unwrap(),
+                            tile(&k, b, group, l).unwrap(),
+                        );
+                        let rows = select(p, &r.request, layer, group, l, &qt, &kt).unwrap();
+                        let tiles = l.valid.len();
+                        for (i, &h) in group.iter().enumerate() {
+                            let (qh, kh) =
+                                (tile(&q, b, &[h], l).unwrap(), tile(&k, b, &[h], l).unwrap());
+                            let flat =
+                                |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            assert_eq!(flat(&qt.get(i).unwrap()), flat(&qh.get(0).unwrap()));
+                            let single = select(p, &r.request, layer, &[h], l, &qh, &kh).unwrap();
+                            assert_eq!(&rows[i * tiles..(i + 1) * tiles], &single[..]);
+                        }
+                    }
+                }
+            }
+            // Single-shape plans batch every head at once; mixed plans one batch per shape, with
+            // layer 0's batches running out of head order.
+            let batches = p.batches(0, &bound).unwrap();
+            if p.plan.shapes.len() == 1 {
+                assert_eq!(batches.len(), 1);
+            } else {
+                let order: Vec<usize> = batches.iter().flat_map(|(_, g)| g.clone()).collect();
+                assert_eq!(order, vec![1, 0]);
+            }
+        }
+    }
+    #[test]
+    fn batches_follow_the_bound_and_refuse_before_gather() {
+        let r = runtime_for(
+            &Device::Cpu,
+            ReportSink::default(),
+            &[],
+            VedaBudget::SparsityPercent(0.),
+        );
+        let p = r.prepared.as_ref().unwrap();
+        let mut bound = p.bound(&r.request, 1).unwrap();
+        let shape = *bound.chunks.keys().next().unwrap();
+        bound.chunks.get_mut(&shape).unwrap().heads = 1;
+        let batches = p.batches(0, &bound).unwrap();
+        assert_eq!(batches, vec![(shape, vec![0]), (shape, vec![1])]);
+        bound.chunks.get_mut(&shape).unwrap().refusal = Some("over allowance".into());
+        assert!(p
+            .batches(0, &bound)
+            .unwrap_err()
+            .to_string()
+            .contains("over allowance"));
+    }
+    #[test]
+    fn assemble_restores_head_order() {
+        let dev = Device::Cpu;
+        let head = |h: usize| Tensor::full(h as f32, (1, 3, 2), &dev).unwrap();
+        let parts = [
+            Tensor::cat(&[head(1), head(3)], 0).unwrap(),
+            Tensor::cat(&[head(0), head(2)], 0).unwrap(),
+        ];
+        let out = assemble(&parts, &[1, 3, 0, 2]).unwrap();
+        for h in 0..4 {
+            assert_eq!(
+                out.get(h)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![h as f32; 6]
+            );
+        }
+        let identity = assemble(&[head(0), head(1)], &[0, 1]).unwrap();
+        assert_eq!(identity.dims(), &[2, 3, 2]);
     }
     #[test]
     fn dense_reference_segments_reach_the_execution_report() {
@@ -997,8 +1189,8 @@ mod tests {
         let n = p.seq_len();
         let q = tensor(n, &dev, DType::F32, 0);
         let k = tensor(n, &dev, DType::F32, 3);
-        let qt = tile(&q, 0, 0, &l).unwrap();
-        let kt = tile(&k, 0, 0, &l).unwrap();
+        let qt = tile(&q, 0, &[0], &l).unwrap();
+        let kt = tile(&k, 0, &[0], &l).unwrap();
         let bundle = predictor(2, 2, 16);
         let scores =
             contract::learned_scores(&bundle, 0, &[0], &l, &qt, &kt, &CandlePredictorOps).unwrap();
@@ -1119,6 +1311,25 @@ mod tests {
             );
             assert_eq!(fl_report.borrow().sparse_calls, 1);
             assert!(fl_report.borrow().fallback_reason.is_none());
+            // Mixed tile shapes: per-shape head batches launch out of head order and are
+            // reassembled; every head must still match its own masked dense oracle.
+            let mixed_report = ReportSink::default();
+            let mixed = runtime_with(
+                &dev,
+                mixed_report.clone(),
+                &[],
+                VedaBudget::SparsityPercent(0.),
+                mixed_predictor(),
+            );
+            let sparse = mixed.attention(0, 0, &q, &k, &v, 0.25).unwrap();
+            check(
+                "mixed",
+                sparse,
+                masked_dense_oracle(&mixed, 0, &q, &k, &v, 0.25),
+            );
+            assert_eq!(mixed_report.borrow().sparse_calls, 1);
+            assert_eq!(mixed_report.borrow().predictor_score_calls, 4);
+            assert!(mixed_report.borrow().fallback_reason.is_none());
             let unsupported_report = ReportSink::default();
             let unsupported = runtime(&dev, unsupported_report.clone());
             let (qf, kf, vf) = (

@@ -25,6 +25,21 @@ impl Default for Limits {
         }
     }
 }
+impl Limits {
+    /// Allowances a backend's runtime batches heads under. CUDA scores, selects and launches a
+    /// whole head batch at once (one score readback and one kernel launch per batch), so its
+    /// gather/scorer copy allowance admits several heads: 4 GiB, below the dense SDPA score
+    /// transient (`dense_fallback_bytes`) the sparse call replaces. MLX keeps the default.
+    pub fn for_backend(backend: Backend) -> Self {
+        match backend {
+            Backend::Mlx => Self::default(),
+            Backend::Cuda => Self {
+                copies: 4 << 30,
+                ..Self::default()
+            },
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutSize {
     pub seq: usize,
@@ -172,8 +187,8 @@ pub fn chunk(
             )?)
             .ok_or_else(|| bad("size overflow"))?;
     }
-    let head_max = if backend == Backend::Cuda { 1 } else { group };
-    let mut h = (limits.copies / copy.max(1)).min(head_max as u64).max(1) as usize;
+    // Both backends batch up to the whole same-shape head group within the copy allowance.
+    let mut h = (limits.copies / copy.max(1)).min(group as u64).max(1) as usize;
     let k = keys(request.reference, l.ref_tokens, l.reference)
         + keys(request.generated, l.target_tokens, l.video - l.reference)
         + l.slots / TILE
@@ -282,9 +297,10 @@ pub fn bound(
             16 * h * n * n + 48 * h * n + 24 * n + 8 * h * (l.video as u128).pow(2),
         )?);
         device = device.max(bytes(24 * h * d * d)?);
-        // CUDA conversion inputs/output/quant/scales and expanded CSR 64-key masks on host/device.
+        // CUDA conversion inputs/output/quant/scales and expanded CSR 64-key masks on host/device,
+        // for every head of one batched launch.
         if backend == Backend::Cuda {
-            scratch = scratch.max(bytes(20 * s * d + 32 * n * n + 32 * n + 64)?);
+            scratch = scratch.max(bytes(h * (20 * s * d + 32 * n * n + 32 * n) + 64)?);
         }
         chunks.insert(shape, c);
     }
@@ -455,7 +471,7 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
         128,
         req.count.max(1) as usize,
         2,
-        Limits::default(),
+        Limits::for_backend(backend),
     )
     .map(Some)
 }
@@ -802,6 +818,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cuda_batches_heads_within_its_copy_allowance() {
+        let cuda = for_request(&req(), Backend::Cuda).unwrap().unwrap();
+        let mlx = for_request(&req(), Backend::Mlx).unwrap().unwrap();
+        for (shape, c) in &cuda.chunks {
+            eprintln!(
+                "cuda {shape:?}: {} heads, {} bytes",
+                c.heads, c.copies_bytes
+            );
+            assert!(c.heads > 1, "{shape:?} CUDA batches several heads");
+            assert!(c.copies_bytes <= Limits::for_backend(Backend::Cuda).copies);
+            assert!(c.refusal.is_none());
+        }
+        for c in mlx.chunks.values() {
+            assert!(c.copies_bytes <= Limits::default().copies.max(c.minimum_copies_bytes));
+        }
+        // The batched launch's conversion/quant scratch is priced for every head of the batch.
+        let r = req();
+        let (plan, grid, layouts) = price_layouts(Request::from(&r)).unwrap();
+        let single = bound(
+            r.veda.as_ref().unwrap(),
+            Backend::Cuda,
+            &plan,
+            grid,
+            &layouts,
+            50,
+            56,
+            128,
+            1,
+            2,
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(single.chunks.values().all(|c| c.heads == 1));
+        let heads = cuda.chunks.values().map(|c| c.heads as u64).max().unwrap();
+        assert!(cuda.kernel_scratch_bytes > 10 * single.kernel_scratch_bytes);
+        assert!(cuda.kernel_scratch_bytes <= heads * single.kernel_scratch_bytes);
+    }
     #[test]
     fn tiny_limits_price_minimum_batch_and_refuse_before_gather() {
         let l = LayoutSize {

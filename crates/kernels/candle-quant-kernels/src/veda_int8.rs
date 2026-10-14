@@ -2,11 +2,13 @@
 //! Q/K: [heads, slots, dim], slots padded to 128. Mask rows are head-major query tiles.
 //! Q uses 128-row scales with scale*LOG2E folded in, K uses 64-row scales;
 //! softmax is FP32 exp2, P/V and each block's PV result are FP16.
+//! One launch covers every head of the mask; the attention kernel stages each retained K/V block
+//! in shared memory once per 32 query rows (rows of a query tile share their retained blocks).
 use crate::nvrtc::KernelSource;
 use candle_core::{DType, Device, Result, Tensor};
 
 pub const SOURCE: KernelSource = KernelSource {
-    name: "cuda-veda-sage-int8-pointer-v1",
+    name: "cuda-veda-sage-int8-tiled-v2",
     src: include_str!("veda_int8.cu"),
     cc_floor: (8, 0),
 };
@@ -224,6 +226,8 @@ mod cuda {
     use super::*;
     use candle_core::{cuda_backend::cudarc, op::BackpropOp, CudaStorage, Shape, Storage};
     use cudarc::driver::{LaunchConfig, PushKernelArg};
+    /// Query rows per attention CTA (`VEDA_ROWS` in the kernel); divides the 128-row query tile.
+    const ATTEND_ROWS: usize = 32;
     pub(super) fn launch(
         q: &Tensor,
         k: &Tensor,
@@ -325,7 +329,7 @@ mod cuda {
                 .arg(&mut out)
                 .arg(&n)
                 .arg(&d)
-                .launch(cfg(slots))
+                .launch(cfg(slots / ATTEND_ROWS))
                 .map_err(candle_core::Error::wrap)?;
         }
         Tensor::from_storage(

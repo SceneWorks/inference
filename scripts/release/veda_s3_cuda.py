@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.release import veda_cuda_guard as guard
 
 TEST = "veda::tests::actual_cuda_kernel_gate"
-KERNEL = "cuda-veda-sage-int8-pointer-v1"
+KERNEL = "cuda-veda-sage-int8-tiled-v2"
 SCHEMA = "sc-25771-actual-cuda-kernel-v1"
 
 
