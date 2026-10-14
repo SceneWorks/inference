@@ -374,6 +374,80 @@ impl Bundle {
     }
 }
 
+/// File identity the process-wide verified predictor is keyed on. Any change to the path,
+/// size, modification time or inode forces a fresh authoritative load (size + SHA-256).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PredictorKey {
+    path: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: (u64, u64),
+    dims: (usize, usize, usize),
+}
+impl PredictorKey {
+    fn of(path: &Path, dims: (usize, usize, usize)) -> Result<Self> {
+        let m = std::fs::metadata(path).map_err(|e| {
+            bad(format!(
+                "{}: {e}; repair/install the managed component",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        };
+        #[cfg(not(unix))]
+        let inode = (0, 0);
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: m.len(),
+            modified: m.modified().ok(),
+            inode,
+            dims,
+        })
+    }
+}
+type PredictorCache = std::sync::Mutex<Option<(PredictorKey, std::sync::Arc<Bundle>)>>;
+/// One verified, decoded predictor per process. Verification happens once per file identity
+/// rather than per request; a failed load is never cached.
+static PREDICTOR: PredictorCache = std::sync::Mutex::new(None);
+impl Bundle {
+    /// [`Bundle::load`] once per process per file identity (path, size, mtime, inode).
+    pub fn load_cached(
+        path: &Path,
+        layers: usize,
+        heads: usize,
+        dim: usize,
+    ) -> Result<std::sync::Arc<Self>> {
+        load_cached_with(&PREDICTOR, path, (layers, heads, dim), || {
+            Self::load(path, layers, heads, dim)
+        })
+    }
+}
+fn load_cached_with(
+    cache: &PredictorCache,
+    path: &Path,
+    dims: (usize, usize, usize),
+    load: impl FnOnce() -> Result<Bundle>,
+) -> Result<std::sync::Arc<Bundle>> {
+    let before = PredictorKey::of(path, dims)?;
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((key, bundle)) = cache.as_ref() {
+        if *key == before {
+            return Ok(bundle.clone());
+        }
+    }
+    // Drop the previous identity before the new authoritative load: one resident predictor.
+    *cache = None;
+    let bundle = std::sync::Arc::new(load()?);
+    // Only key the cache on an identity that did not change across the verified read.
+    if PredictorKey::of(path, dims)? == before {
+        *cache = Some((before, bundle.clone()));
+    }
+    Ok(bundle)
+}
+
 // Python round(distance, 3) rounds the original binary64 to the nearest
 // decimal, ties to even. Multiplying by 1000 and rounding can move a midpoint
 // (e.g. 1.2345), changing which temporal/padding tie-breaker gets considered.
@@ -848,6 +922,48 @@ pub fn learned_scores<M: PredictorOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verified_predictor_is_cached_per_file_identity_and_failures_are_not() {
+        let cache: PredictorCache = std::sync::Mutex::new(None);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("predictor.safetensors");
+        std::fs::write(&path, b"one").unwrap();
+        let loads = std::cell::Cell::new(0);
+        let fixture = || {
+            loads.set(loads.get() + 1);
+            Ok(Bundle {
+                identity: DIGEST.into(),
+                layers: 1,
+                heads: 1,
+                dim: 1,
+                plans: vec![],
+                q: vec![],
+                k: vec![],
+            })
+        };
+        let dims = (1, 1, 1);
+        let a = load_cached_with(&cache, &path, dims, fixture).unwrap();
+        let b = load_cached_with(&cache, &path, dims, fixture).unwrap();
+        assert_eq!(loads.get(), 1, "same file identity re-verified");
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        // A different request shape is a different identity.
+        load_cached_with(&cache, &path, (2, 1, 1), fixture).unwrap();
+        assert_eq!(loads.get(), 2);
+        load_cached_with(&cache, &path, dims, fixture).unwrap();
+        assert_eq!(loads.get(), 3);
+        // Replacing the file (size/inode/mtime) forces a fresh authoritative load.
+        std::fs::write(&path, b"replaced-bytes").unwrap();
+        load_cached_with(&cache, &path, dims, fixture).unwrap();
+        assert_eq!(loads.get(), 4);
+        // A failed verification is reported and never cached.
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(load_cached_with(&cache, &path, dims, || Err(bad("digest mismatch"))).is_err());
+        assert!(cache.lock().unwrap().is_none());
+        load_cached_with(&cache, &path, dims, fixture).unwrap();
+        assert_eq!(loads.get(), 5);
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_cached_with(&cache, &path, dims, fixture).is_err());
+    }
     struct HostOps {
         heads: usize,
         tiles: usize,

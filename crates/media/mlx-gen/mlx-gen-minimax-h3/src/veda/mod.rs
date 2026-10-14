@@ -11,7 +11,13 @@ use mlx_rs::{
     ops::{concatenate_axis, r#where},
     Array, Dtype,
 };
-use std::{cell::RefCell, collections::BTreeMap, path::Path, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    path::Path,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
 use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
@@ -35,8 +41,35 @@ fn predictor_path(path: Option<&Path>) -> Result<&Path> {
     Ok(path)
 }
 
+/// Process-wide first-use self-test outcomes keyed on (device type, device index, kernel id).
+/// A pass or a failure is decided once per actual device and kernel, not once per request.
+type SelfTestKey = (u32, i32, &'static str);
+type SelfTestCache = Mutex<BTreeMap<SelfTestKey, std::result::Result<(), String>>>;
+static SELF_TESTS: SelfTestCache = Mutex::new(BTreeMap::new());
+
+fn cached_self_test(
+    cache: &SelfTestCache,
+    key: SelfTestKey,
+    run: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(key)
+        .or_insert_with(|| run().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(Error::Msg)
+}
+
+/// The production first-use check: [`device_self_test`] once per process per default MLX
+/// device and [`KERNEL`].
+pub fn cached_device_self_test() -> Result<()> {
+    let device = mlx_rs::Device::try_default()?;
+    let key = (u32::from(device.get_type()?), device.get_index()?, KERNEL);
+    cached_self_test(&SELF_TESTS, key, device_self_test)
+}
+
 pub struct VedaRuntime {
-    bundle: Bundle,
+    bundle: Arc<Bundle>,
     plan: Plan,
     grid: [usize; 3],
     layouts: BTreeMap<TileShape, Layout>,
@@ -91,8 +124,14 @@ impl VedaRuntime {
                 Limits::default(),
             )?;
             report.borrow_mut().workspace_bytes = initial.total_bytes;
-            let bundle = Bundle::load(path, layers, heads, dim)?;
-            Self::from_bundle(bundle, request, packed, report.clone(), device_self_test)
+            let bundle = Bundle::load_cached(path, layers, heads, dim)?;
+            Self::from_bundle(
+                bundle,
+                request,
+                packed,
+                report.clone(),
+                cached_device_self_test,
+            )
         })();
         match result {
             Ok(runtime) => Some(runtime),
@@ -103,7 +142,7 @@ impl VedaRuntime {
         }
     }
     fn from_bundle(
-        bundle: Bundle,
+        bundle: Arc<Bundle>,
         request: &VedaRequest,
         packed: &PackedLayout,
         report: ReportSink,
@@ -149,8 +188,16 @@ impl VedaRuntime {
             r.exact_plan = plan.grid == grid;
             r.execution_grid = Some(grid);
             r.plan_grid = Some(plan.grid);
+            r.dense_segments = packed.veda_dense_segments();
         }
-        self_test()?;
+        if let Err(e) = self_test() {
+            // No sparse call will run under this plan; do not report it as the executed plan.
+            let mut r = report.borrow_mut();
+            r.plan = None;
+            r.plan_grid = None;
+            r.exact_plan = false;
+            return Err(e);
+        }
         Ok(Self {
             bundle,
             plan,
@@ -172,7 +219,7 @@ impl VedaRuntime {
     ) -> Option<Self> {
         report.borrow_mut().predictor_load_attempts += 1;
         let result = Self::from_bundle(
-            crate::veda_fixture::predictor(),
+            Arc::new(crate::veda_fixture::predictor()),
             request,
             packed,
             report.clone(),
@@ -373,11 +420,27 @@ impl VedaRuntime {
         }
         let out = merged.take_axis(Array::from_slice(&inverse, &[self.bundle.heads as i32]), 1)?;
         mlx_rs::transforms::eval([&out])?;
+        ensure_finite(&out)?;
         let mut report = self.report.borrow_mut();
         report.selected_token_pairs += pairs;
         report.dense_token_pairs += self.bundle.heads as u64 * seq as u64 * seq as u64;
         report.workspace_bytes = report.workspace_bytes.max(high);
         Ok(out)
+    }
+}
+/// Refuses a sparse attention output holding any NaN/Inf, so the caller recomputes that call
+/// densely and records the reason instead of letting the poison into the hidden state (a poisoned
+/// residual decodes to a flat black clip with silent audio). `out` is already materialized, so
+/// this is one f32 sum reduction plus a scalar readback per sparse call; a NaN or Inf anywhere
+/// makes the sum non-finite.
+fn ensure_finite(out: &Array) -> Result<()> {
+    let sum = out.as_dtype(Dtype::Float32)?.sum(None)?.item::<f32>();
+    if sum.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::Msg(format!(
+            "Veda sparse attention produced non-finite output (sum {sum})"
+        )))
     }
 }
 fn learned_scores(
@@ -635,21 +698,60 @@ pub fn device_self_test() -> Result<()> {
             "Veda self-test did not execute sparse selection".into(),
         ));
     }
-    let mask = Array::from_slice(&mask, &[1, heads as i32, seq as i32, seq as i32]);
-    let reference = sdpa_bounded_bhsd(
-        &q,
-        &k,
-        &v,
+    // Independent oracle: explicit f32 softmax(QK^T * scale + mask) V on the host, sharing no
+    // MLX attention kernel with the sparse path under test.
+    let host = |a: &Array| -> Result<Vec<f32>> {
+        let a = a.as_dtype(Dtype::Float32)?.reshape(&[-1])?;
+        mlx_rs::transforms::eval([&a])?;
+        Ok(a.as_slice::<f32>().to_vec())
+    };
+    let reference = host_masked_attention(
+        &host(&q)?,
+        &host(&k)?,
+        &host(&v)?,
+        &mask,
+        heads,
+        seq,
+        dim,
         1.0 / (dim as f32).sqrt(),
-        Some(&mask),
-        BoundedAttention::UNBOUNDED,
-    )?;
-    let error = sparse
-        .as_dtype(Dtype::Float32)?
-        .subtract(&reference.as_dtype(Dtype::Float32)?)?
-        .abs()?
-        .max(None)?
-        .item::<f32>();
+    );
+    let got = host(&sparse)?;
+    // The oracle must be able to tell the selected mask from unmasked dense attention,
+    // otherwise a gather that ignored the selection would pass.
+    let (qh, kh, vh) = (host(&q)?, host(&k)?, host(&v)?);
+    let unmasked = host_masked_attention(
+        &qh,
+        &kh,
+        &vh,
+        &vec![true; heads * seq * seq],
+        heads,
+        seq,
+        dim,
+        1.0 / (dim as f32).sqrt(),
+    );
+    let discrimination = reference
+        .iter()
+        .zip(&unmasked)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    #[cfg(test)]
+    println!("Veda self-test discrimination: masked-vs-dense max_abs={discrimination}");
+    if discrimination.is_nan() || discrimination <= 4.0 * SELF_TEST_ATOL {
+        return Err(Error::Msg(format!(
+            "Veda self-test cannot discriminate its mask from dense attention: {discrimination}"
+        )));
+    }
+    let error = got
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| {
+            if a.is_finite() {
+                (a - b).abs()
+            } else {
+                f32::INFINITY
+            }
+        })
+        .fold(0f32, f32::max);
     #[cfg(test)]
     println!("Veda device self-test: kernel={KERNEL}, D128 BF16, max_abs={error}, tolerance={SELF_TEST_ATOL}, selected_pairs={pairs}, dense_pairs={}",heads*seq*seq);
     if !error.is_finite() || error > SELF_TEST_ATOL {
@@ -660,9 +762,220 @@ pub fn device_self_test() -> Result<()> {
     Ok(())
 }
 
+/// Row-major `[heads, seq, dim]` f32 attention with a boolean `[heads, seq, seq]` key mask.
+/// A query row with no admitted key is zero.
+#[allow(clippy::too_many_arguments)]
+fn host_masked_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &[bool],
+    heads: usize,
+    seq: usize,
+    dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut out = vec![0f32; heads * seq * dim];
+    let mut logits = vec![0f32; seq];
+    for h in 0..heads {
+        for row in 0..seq {
+            let qrow = &q[(h * seq + row) * dim..][..dim];
+            let admitted = &mask[(h * seq + row) * seq..][..seq];
+            let mut peak = f32::NEG_INFINITY;
+            for key in 0..seq {
+                logits[key] = if admitted[key] {
+                    let krow = &k[(h * seq + key) * dim..][..dim];
+                    qrow.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * scale
+                } else {
+                    f32::NEG_INFINITY
+                };
+                peak = peak.max(logits[key]);
+            }
+            if peak == f32::NEG_INFINITY {
+                continue;
+            }
+            let mut sum = 0f32;
+            let o = &mut out[(h * seq + row) * dim..][..dim];
+            for key in (0..seq).filter(|&key| admitted[key]) {
+                let p = (logits[key] - peak).exp();
+                sum += p;
+                let vrow = &v[(h * seq + key) * dim..][..dim];
+                for (o, &x) in o.iter_mut().zip(vrow) {
+                    *o += p * x;
+                }
+            }
+            for o in o.iter_mut() {
+                *o /= sum;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod frozen_tests {
     use super::*;
+    #[test]
+    fn host_self_test_oracle_is_masked_softmax_attention() {
+        // heads=1, seq=3, dim=2. Row 0 admits keys {0, 2}; row 1 admits only key 1;
+        // row 2 admits nothing and is zero.
+        let q = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let k = [1.0, 0.0, 0.0, 1.0, 2.0, 0.0];
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mask = [true, false, true, false, true, false, false, false, false];
+        let got = host_masked_attention(&q, &k, &v, &mask, 1, 3, 2, 0.5);
+        // Row 0 logits: key0 = 0.5, key2 = 1.0.
+        let (p0, p2) = ((0.5f32 - 1.0).exp(), 1.0f32);
+        let want0 = [
+            (p0 + 5.0 * p2) / (p0 + p2),
+            (2.0 * p0 + 6.0 * p2) / (p0 + p2),
+        ];
+        for (a, b) in got[..2].iter().zip(want0) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+        assert_eq!(&got[2..4], &[3.0, 4.0]);
+        assert_eq!(&got[4..], &[0.0, 0.0]);
+    }
+    #[test]
+    fn failed_self_test_reports_no_plan_and_records_dense_segments() {
+        use crate::denoise::{JointGeometry, PackedLayout, TEXT_TAG};
+        use crate::dit::positions::ReferenceLatentGeometry;
+        use crate::reference::ReferenceKind;
+        let refs = [ReferenceLatentGeometry {
+            kind: ReferenceKind::Audio,
+            num_latent_frames: 0,
+            latent_height: 0,
+            latent_width: 0,
+            num_audio_latents: 9,
+        }];
+        let packed = PackedLayout::build_ref2va(
+            JointGeometry::new(124, 4, 6).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 5],
+            2,
+            &refs,
+        )
+        .unwrap();
+        let request = VedaRequest {
+            enabled: true,
+            ..Default::default()
+        };
+        let report = ReportSink::default();
+        assert!(VedaRuntime::prepare_fixture(&request, &packed, report.clone(), true).is_none());
+        let r = report.borrow();
+        assert!(r
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|e| e.contains("self-test forced failure")));
+        assert!(r.plan.is_none() && r.plan_grid.is_none() && !r.exact_plan);
+        assert!(r.outcome_json()["planMatch"].is_null());
+        assert_eq!(r.dense_segments, packed.veda_dense_segments());
+        assert!(r.dense_segments[0].starts_with("reference audio"));
+    }
+    /// A sparse call whose output is non-finite must not reach the hidden state: that call is
+    /// recomputed densely, it is not counted as sparse, and the reason is reported. Runs on the
+    /// MLX **CPU** device with the fixture predictor; NaN values poison only the attention output
+    /// (the predictor scores read Q/K alone), exactly the CUDA A/B failure's signature.
+    #[test]
+    fn non_finite_sparse_output_falls_back_to_dense_and_is_reported() {
+        use crate::denoise::{JointGeometry, PackedLayout, TEXT_TAG};
+        struct Cpu;
+        impl Drop for Cpu {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+            }
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let _restore = Cpu;
+        let packed = PackedLayout::build(
+            JointGeometry::new(124, 4, 6).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 5],
+            2,
+            &[],
+        )
+        .unwrap();
+        let request = VedaRequest {
+            enabled: true,
+            ..Default::default()
+        };
+        let seq = packed.seq_len();
+        let shape = [1, 4, seq, 128];
+        let n = (4 * seq * 128) as usize;
+        let ramp = |phase: f32| -> Array {
+            let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37 + phase).sin()).collect();
+            Array::from_slice(&x, &shape)
+        };
+        let (q, k, finite_v) = (ramp(0.0), ramp(1.0), ramp(2.0));
+        let poisoned_v = Array::from_slice(&vec![f32::NAN; n], &shape);
+
+        let run = |v: &Array| {
+            let report = ReportSink::default();
+            let runtime = VedaRuntime::prepare_fixture(&request, &packed, report.clone(), false)
+                .expect("fixture Veda runtime");
+            runtime
+                .attention(1, 1, &q, &k, v, BoundedAttention::UNBOUNDED)
+                .unwrap();
+            let r = report.borrow().clone();
+            r
+        };
+        let healthy = run(&finite_v);
+        assert_eq!((healthy.sparse_calls, healthy.dense_calls), (1, 0));
+        assert!(healthy.fallback_reason.is_none());
+
+        let poisoned = run(&poisoned_v);
+        assert_eq!((poisoned.sparse_calls, poisoned.dense_calls), (0, 1));
+        assert!(
+            poisoned
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|e| e.contains("non-finite output")),
+            "{:?}",
+            poisoned.fallback_reason
+        );
+        assert!(poisoned.kernel.is_none());
+    }
+    #[test]
+    fn self_test_outcome_is_cached_per_device_and_kernel() {
+        let cache: SelfTestCache = Mutex::new(BTreeMap::new());
+        let runs = std::cell::Cell::new(0);
+        let pass = || {
+            runs.set(runs.get() + 1);
+            Ok(())
+        };
+        let fail = || {
+            runs.set(runs.get() + 1);
+            Err(Error::Msg("forced self-test failure".into()))
+        };
+        let gpu = (1, 0, KERNEL);
+        cached_self_test(&cache, gpu, pass).unwrap();
+        cached_self_test(&cache, gpu, fail).unwrap();
+        assert_eq!(runs.get(), 1, "same device/kernel must not re-run");
+        // A failure is an outcome too: cached, and reported on every later request.
+        let other = (1, 1, KERNEL);
+        assert!(cached_self_test(&cache, other, fail).is_err());
+        let again = cached_self_test(&cache, other, pass)
+            .unwrap_err()
+            .to_string();
+        assert!(again.contains("forced self-test failure"));
+        assert_eq!(runs.get(), 2);
+        cached_self_test(&cache, (1, 0, "another-kernel"), pass).unwrap();
+        assert_eq!(runs.get(), 3);
+    }
+    /// The full first-use check on the MLX **CPU** device: proves the host oracle and the
+    /// sparse gather agree within the declared tolerance without admitting a Metal device.
+    #[test]
+    fn device_self_test_passes_on_the_mlx_cpu_device() {
+        struct Cpu;
+        impl Drop for Cpu {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+            }
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let _restore = Cpu;
+        device_self_test().unwrap();
+    }
     #[test]
     fn managed_component_probe_preserves_bounded_load_authority() {
         let root = tempfile::tempdir().unwrap();

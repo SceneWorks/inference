@@ -430,6 +430,8 @@ impl<'a> From<&'a GenerationRequest> for Request<'a> {
         }
     }
 }
+/// Output pixels per DiT patch edge: 16x VAE spatial compression times the 2x2 spatial patch.
+const PATCH_PIXELS: usize = 32;
 pub fn for_request(req: &GenerationRequest, backend: Backend) -> Result<Option<WorkspaceBound>> {
     for_video_request(Request::from(req), backend)
 }
@@ -441,14 +443,34 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
     let Some(r) = req.veda.filter(|r| r.enabled) else {
         return Ok(None);
     };
+    let (plan, grid, layouts) = price_layouts(req)?;
+    bound(
+        r,
+        backend,
+        &plan,
+        grid,
+        &layouts,
+        50,
+        56,
+        128,
+        req.count.max(1) as usize,
+        2,
+        Limits::default(),
+    )
+    .map(Some)
+}
+/// Upper-envelope native layout sizes for an enabled request, in DiT patch units.
+fn price_layouts(req: Request<'_>) -> Result<(Plan, [usize; 3], BTreeMap<TileShape, LayoutSize>)> {
     let frames = req.frames as usize;
     if frames < 5 || req.width == 0 || req.height == 0 {
         return Err(bad("admission requires resolved geometry"));
     }
+    // Veda tiles the DiT *patch* grid, as runtime and upstream `h3_layout.py` do: the VAE's
+    // 16x spatial latent divided by the DiT's 2x2 spatial patch, i.e. pixels / 32.
     let grid = [
         (frames - 5).div_ceil(17) * 5 + 2,
-        req.height as usize / 16,
-        req.width as usize / 16,
+        req.height as usize / PATCH_PIXELS,
+        req.width as usize / PATCH_PIXELS,
     ];
     let mut spans = vec![grid];
     let mut globals = req
@@ -462,10 +484,11 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
         }
         let edge = req.reference_image_short_edge.unwrap_or(2048) as f64;
         let scale = edge / w.min(h) as f64;
+        // Stride-32 lattice in pixels == one DiT patch per 32 pixels.
         Ok([
             1,
-            ((h as f64 * scale / 32.).round_ties_even().max(1.) as usize) * 2,
-            ((w as f64 * scale / 32.).round_ties_even().max(1.) as usize) * 2,
+            (h as f64 * scale / 32.).round_ties_even().max(1.) as usize,
+            (w as f64 * scale / 32.).round_ties_even().max(1.) as usize,
         ])
     };
     // Same factor/min/max geometry as native Qwen3-VL preprocessing. Extreme aspects
@@ -511,9 +534,9 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
                 spans.insert(spans.len() - 1, g);
                 globals = globals.saturating_add(
                     vision_tokens(
-                        g[1].checked_mul(16)
+                        g[1].checked_mul(PATCH_PIXELS)
                             .ok_or_else(|| bad("image size overflow"))?,
-                        g[2].checked_mul(16)
+                        g[2].checked_mul(PATCH_PIXELS)
                             .ok_or_else(|| bad("image size overflow"))?,
                     )? + 64,
                 );
@@ -524,9 +547,9 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
                     spans.insert(spans.len() - 1, g);
                     globals = globals.saturating_add(
                         vision_tokens(
-                            g[1].checked_mul(16)
+                            g[1].checked_mul(PATCH_PIXELS)
                                 .ok_or_else(|| bad("image size overflow"))?,
-                            g[2].checked_mul(16)
+                            g[2].checked_mul(PATCH_PIXELS)
                                 .ok_or_else(|| bad("image size overflow"))?,
                         )? + 64,
                     );
@@ -550,8 +573,8 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
                 let scale = (1_032_192. / (w * h)).sqrt();
                 let g = [
                     grid[0],
-                    (h * scale / 16.).ceil() as usize + 2,
-                    (w * scale / 16.).ceil() as usize + 2,
+                    (h * scale / PATCH_PIXELS as f64).ceil() as usize + 1,
+                    (w * scale / PATCH_PIXELS as f64).ceil() as usize + 1,
                 ];
                 spans.insert(spans.len() - 1, g);
                 // 2-fps samples of a 24-fps normalized clip, temporally merged in pairs.
@@ -559,9 +582,9 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
                 globals = globals.saturating_add(
                     blocks.saturating_mul(
                         vision_tokens(
-                            g[1].checked_mul(16)
+                            g[1].checked_mul(PATCH_PIXELS)
                                 .ok_or_else(|| bad("image size overflow"))?,
-                            g[2].checked_mul(16)
+                            g[2].checked_mul(PATCH_PIXELS)
                                 .ok_or_else(|| bad("image size overflow"))?,
                         )? + 64,
                     ),
@@ -623,20 +646,7 @@ pub fn for_video_request(req: Request<'_>, backend: Backend) -> Result<Option<Wo
             ))
         })
         .collect::<Result<_>>()?;
-    bound(
-        r,
-        backend,
-        &plan,
-        grid,
-        &layouts,
-        50,
-        56,
-        128,
-        req.count.max(1) as usize,
-        2,
-        Limits::default(),
-    )
-    .map(Some)
+    Ok((plan, grid, layouts))
 }
 
 #[cfg(test)]
@@ -653,6 +663,55 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+    fn fixture_choice(grid: [usize; 3]) -> [usize; 3] {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/veda/frozen.json")).unwrap();
+        let choice = fixture["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["grid"] == serde_json::json!(grid))
+            .expect("fixture choice for the priced grid");
+        assert_eq!(choice["exact"], true);
+        serde_json::from_value(choice["plan_grid"].clone()).unwrap()
+    }
+    #[test]
+    fn reference_and_keyframe_spans_are_priced_in_patch_units() {
+        // A 320x576 reference at the default 2048 short edge is 2048x3680 px on the
+        // stride-32 lattice: 64x115 patches, i.e. 7,360 reference tokens.
+        let base = for_request(&req(), Backend::Cuda).unwrap().unwrap();
+        let mut refs = req();
+        refs.conditioning.push(Conditioning::Reference {
+            image: crate::Image {
+                width: 320,
+                height: 576,
+                pixels: vec![],
+            },
+            strength: None,
+        });
+        let rb = for_request(&refs, Backend::Cuda).unwrap().unwrap();
+        let sizes = |r: &GenerationRequest| {
+            let (_, _, layouts) = price_layouts(Request::from(r)).unwrap();
+            *layouts.values().next().unwrap()
+        };
+        let (b, r) = (sizes(&req()), sizes(&refs));
+        assert_eq!(b.ref_tokens, 0);
+        assert_eq!(b.target_tokens, 37 * 24 * 42);
+        assert_eq!(r.ref_tokens, 115 * 64);
+        assert_eq!(r.target_tokens, b.target_tokens);
+        let mut keyframe = req();
+        keyframe.conditioning.push(Conditioning::Keyframe {
+            image: crate::Image {
+                width: 1344,
+                height: 768,
+                pixels: vec![],
+            },
+            frame_idx: 0,
+            strength: 1.0,
+        });
+        assert_eq!(sizes(&keyframe).ref_tokens, 24 * 42);
+        assert!(rb.total_bytes > base.total_bytes);
     }
     #[test]
     fn malformed_huge_request_is_refused_without_allocating_or_panicking() {
@@ -712,7 +771,11 @@ mod tests {
                 b.total_bytes
             );
             assert!(!b.plan.is_empty());
-            assert_eq!(b.execution_grid, [37, 48, 84]);
+            // Patch grid (pixels / 32), the same grid runtime packs and the frozen
+            // fixture chooses an exact plan for.
+            assert_eq!(b.execution_grid, [37, 24, 42]);
+            assert_eq!(b.plan_grid, fixture_choice([37, 24, 42]));
+            assert_eq!(b.plan, frozen_plan([37, 24, 42]).unwrap().name);
         }
     }
     #[test]

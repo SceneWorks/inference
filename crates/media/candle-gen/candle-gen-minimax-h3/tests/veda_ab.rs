@@ -588,6 +588,7 @@ fn veda_ab_render() {
         std::fs::remove_dir_all(&frames_dir).expect("remove PNG frames after mux");
     }
 
+    let degenerate = degeneracy(&frames_out, audio.as_ref().map(|a| a.samples.as_slice()));
     let veda_json = if veda_on {
         let report = report.expect("MiniMax-H3 publishes a Veda execution report");
         serde_json::json!({
@@ -599,6 +600,7 @@ fn veda_ab_render() {
     };
     let result = serde_json::json!({
         "config": config,
+        "degenerate": degenerate,
         "timings": {
             "load_s": provider_load.as_secs_f64() + pre_denoise_s,
             "denoise_s": denoise_s,
@@ -635,6 +637,12 @@ fn veda_ab_render() {
         "[veda-ab] result {}",
         serde_json::to_string(&result).unwrap()
     );
+    assert!(
+        degenerate.is_empty(),
+        "degenerate render (veda {}): {}",
+        if veda_on { "on" } else { "off" },
+        degenerate.join("; ")
+    );
 }
 
 #[test]
@@ -664,4 +672,69 @@ fn every_recipe_is_unique_and_renders_audio_at_the_engine_shift() {
     ids.dedup();
     assert_eq!(ids.len(), RECIPES.len());
     assert!(RECIPES.iter().all(|r| r.audio_shift == AUDIO_SIGMA_SHIFT));
+}
+
+/// Why a decoded render is degenerate — the signature of NaN/Inf poisoning that a VAE decode
+/// clamps into a flat (all-black) clip and a silent or non-finite soundtrack. Empty means the render
+/// is usable. Checked AFTER the outputs and `result.json` are written, so a failing cell still
+/// leaves its evidence behind, but the test fails instead of reporting a poisoned render as passed.
+fn degeneracy(frames: &[Image], audio: Option<&[f32]>) -> Vec<String> {
+    /// Pixel standard deviation (0–255 scale) below which the whole clip is one flat colour.
+    const MIN_CLIP_PIXEL_STD: f64 = 1.0;
+    let mut why = Vec::new();
+    let (mut n, mut sum, mut sum_sq) = (0f64, 0f64, 0f64);
+    for px in frames.iter().flat_map(|f| f.pixels.iter()) {
+        let v = f64::from(*px);
+        n += 1.0;
+        sum += v;
+        sum_sq += v * v;
+    }
+    let std = if n > 0.0 {
+        (sum_sq / n - (sum / n).powi(2)).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    if std < MIN_CLIP_PIXEL_STD {
+        why.push(format!(
+            "decoded clip pixel std {std:.3} < {MIN_CLIP_PIXEL_STD} (flat clip, mean {:.1})",
+            if n > 0.0 { sum / n } else { 0.0 }
+        ));
+    }
+    if let Some(samples) = audio {
+        let non_finite = samples.iter().filter(|s| !s.is_finite()).count();
+        if non_finite > 0 {
+            why.push(format!(
+                "{non_finite} of {} audio samples are non-finite",
+                samples.len()
+            ));
+        }
+        let rms = (samples
+            .iter()
+            .filter(|s| s.is_finite())
+            .map(|s| f64::from(*s).powi(2))
+            .sum::<f64>()
+            / samples.len().max(1) as f64)
+            .sqrt();
+        if rms == 0.0 {
+            why.push(format!("audio RMS is 0 over {} samples", samples.len()));
+        }
+    }
+    why
+}
+
+#[test]
+fn degeneracy_flags_flat_clips_and_silent_or_non_finite_audio() {
+    let frame = |pixels: Vec<u8>| Image {
+        width: 2,
+        height: 1,
+        pixels,
+    };
+    let black = vec![frame(vec![0; 6]), frame(vec![0; 6])];
+    let live = vec![frame(vec![0, 40, 80, 120, 160, 200]), frame(vec![9; 6])];
+    assert!(degeneracy(&live, Some(&[0.1, -0.2, 0.05])).is_empty());
+    assert!(degeneracy(&live, None).is_empty());
+    assert_eq!(degeneracy(&black, Some(&[0.1, -0.2])).len(), 1);
+    assert_eq!(degeneracy(&live, Some(&[0.0; 8])).len(), 1);
+    assert_eq!(degeneracy(&live, Some(&[0.1, f32::NAN])).len(), 1);
+    assert_eq!(degeneracy(&black, Some(&[f32::NAN; 4])).len(), 3);
 }

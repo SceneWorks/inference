@@ -98,7 +98,13 @@ impl VedaRuntime {
         })();
         let (prepared, failure) = match result {
             Ok(p) => (Some(p), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => {
+                // Setup failure is observed now, whether or not any later call is
+                // sparse-eligible: every call of this request runs dense.
+                report.borrow_mut().fallback_reason =
+                    Some(format!("{e}; dense attention executed"));
+                (None, Some(e.to_string()))
+            }
         };
         Some(Self {
             request: request.clone(),
@@ -147,6 +153,7 @@ impl VedaRuntime {
         r.exact_plan = plan.grid == grid;
         r.execution_grid = Some(grid);
         r.plan_grid = Some(plan.grid);
+        r.dense_segments = packed.veda_dense_segments();
         r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
         Ok(Prepared {
             bundle,
@@ -184,7 +191,17 @@ impl VedaRuntime {
                     r.workspace_bytes = r.workspace_bytes.max(workspace);
                     return Ok(out);
                 }
-                Err(e) => *self.failure.borrow_mut() = Some(format!("Veda execution failed: {e}")),
+                Err(e) => {
+                    *self.failure.borrow_mut() = Some(format!("Veda execution failed: {e}"));
+                    // Failed before any sparse call (e.g. the first-use self-test): no call
+                    // ever executed under the chosen plan, so none is reported.
+                    let mut r = self.report.borrow_mut();
+                    if r.sparse_calls == 0 {
+                        r.plan = None;
+                        r.plan_grid = None;
+                        r.exact_plan = false;
+                    }
+                }
             }
         }
         if !self.request.full_attention(layer, step) {
@@ -262,10 +279,6 @@ impl VedaRuntime {
             (self.self_test)(q.device(), q.dtype(), dim)?;
             *self.tested.borrow_mut() = Some((q.device().clone(), q.dtype(), dim));
         }
-        let budget = |b: &VedaBudget| match b {
-            VedaBudget::SparsityPercent(p) => Budget::Ratio(1. - p / 100.),
-            VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
-        };
         let mut batches = Vec::new();
         let mut pairs = 0;
         let mut high = 0;
@@ -323,7 +336,29 @@ impl VedaRuntime {
             }
             batches.push(Tensor::cat(&outputs, 1)?);
         }
-        Ok((Tensor::cat(&batches, 0)?, pairs, high))
+        let out = Tensor::cat(&batches, 0)?;
+        ensure_finite(&out)?;
+        Ok((out, pairs, high))
+    }
+}
+/// Refuses a sparse attention output holding any NaN/Inf, so `attention` recomputes that call
+/// densely and records the reason instead of letting the poison into the hidden state (a poisoned
+/// residual decodes to a flat black clip with silent audio — the sc-25777 CUDA A/B signature).
+/// One f32 sum reduction plus a scalar readback per sparse call; every head of the call already
+/// reads its predictor scores back to the host, so this adds one sync to the dozens it has. A NaN
+/// or Inf anywhere makes the sum non-finite.
+pub(crate) fn ensure_finite(out: &Tensor) -> Result<()> {
+    let sum = out.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+    if sum.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("Veda sparse attention produced non-finite output (sum {sum})").into())
+    }
+}
+fn budget(b: &VedaBudget) -> Budget {
+    match b {
+        VedaBudget::SparsityPercent(p) => Budget::Ratio(1. - p / 100.),
+        VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
     }
 }
 fn tile(x: &Tensor, b: usize, h: usize, l: &Layout) -> Result<Tensor> {
@@ -591,13 +626,18 @@ fn masked_reference(
 mod tests {
     use super::*;
     use crate::denoise::{JointGeometry, TEXT_TAG};
+    use crate::dit::positions::KeyframeAnchor;
     fn packed(dev: &Device) -> PackedLayout {
+        packed_with(dev, &[])
+    }
+    /// `t2va`, or `fl2va` with keyframe anchors packed as reference segments.
+    fn packed_with(dev: &Device, anchors: &[KeyframeAnchor]) -> PackedLayout {
         PackedLayout::build(
             JointGeometry::new(5, 16, 16).unwrap(),
             [1, 2, 2],
             &[TEXT_TAG; 3],
             32,
-            &[],
+            anchors,
             dev,
         )
         .unwrap()
@@ -649,7 +689,15 @@ mod tests {
     }
     #[cfg(feature = "cuda")]
     fn runtime(dev: &Device, report: ReportSink) -> VedaRuntime {
-        let p = packed(dev);
+        runtime_for(dev, report, &[], VedaBudget::SparsityPercent(0.))
+    }
+    fn runtime_for(
+        dev: &Device,
+        report: ReportSink,
+        anchors: &[KeyframeAnchor],
+        reference: VedaBudget,
+    ) -> VedaRuntime {
+        let p = packed_with(dev, anchors);
         VedaRuntime {
             prepared: Some(
                 VedaRuntime::build(
@@ -666,7 +714,7 @@ mod tests {
             request: VedaRequest {
                 enabled: true,
                 generated: VedaBudget::KeyTiles(1),
-                reference: VedaBudget::SparsityPercent(0.),
+                reference,
                 ..Default::default()
             },
             report,
@@ -675,6 +723,217 @@ mod tests {
             self_test: device_self_test,
             calls: Default::default(),
         }
+    }
+    /// Host oracle for one sparse call: token-order Q/K/V gathered into slots straight from
+    /// `layout.perm` (padding zero), the runtime's own learned selection, masked FP32 attention
+    /// over exactly the selected keys, then scattered back through `layout.inverse`. Returns the
+    /// expected output and the INT8 quantization error bound of the worst head.
+    fn masked_dense_oracle(
+        r: &VedaRuntime,
+        layer: usize,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+    ) -> (Vec<f32>, f32) {
+        let p = r.prepared.as_ref().unwrap();
+        let (batch, heads, seq, dim) = q.dims4().unwrap();
+        let host = |x: &Tensor| {
+            x.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (qh, kh, vh) = (host(q), host(k), host(v));
+        let mut out = vec![f32::NAN; qh.len()];
+        let mut worst = 0f32;
+        for b in 0..batch {
+            for h in 0..heads {
+                let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
+                let base = (b * heads + h) * seq;
+                let gather = |x: &[f32]| -> Vec<f32> {
+                    layout
+                        .perm
+                        .iter()
+                        .flat_map(|&t| {
+                            (0..dim).map(move |d| {
+                                if t >= 0 {
+                                    x[(base + t as usize) * dim + d]
+                                } else {
+                                    0.
+                                }
+                            })
+                        })
+                        .collect()
+                };
+                let scores = contract::learned_scores(
+                    &p.bundle,
+                    layer,
+                    &[h as i32],
+                    layout,
+                    &tile(q, b, h, layout).unwrap(),
+                    &tile(k, b, h, layout).unwrap(),
+                    &CandlePredictorOps,
+                )
+                .unwrap();
+                let rows = layout
+                    .select_with_budgets(
+                        &scores,
+                        1,
+                        budget(&r.request.generated),
+                        budget(&r.request.reference),
+                    )
+                    .unwrap();
+                let mask = veda_int8::Mask::new(&rows, &layout.valid, 1).unwrap();
+                let (slots, bound) =
+                    masked_reference(&gather(&qh), &gather(&kh), &gather(&vh), dim, scale, &mask);
+                worst = worst.max(bound);
+                for t in 0..seq {
+                    let slot = layout.inverse[t] as usize;
+                    out[(base + t) * dim..][..dim].copy_from_slice(&slots[slot * dim..][..dim]);
+                }
+            }
+        }
+        (out, worst)
+    }
+    #[test]
+    fn masked_dense_oracle_is_dense_attention_when_every_key_is_kept() {
+        // Guards the CUDA gate's oracle: gather, selection, masking and inverse scatter.
+        let dev = Device::Cpu;
+        for anchors in [vec![], vec![KeyframeAnchor::First, KeyframeAnchor::Last]] {
+            let mut r = runtime_for(
+                &dev,
+                ReportSink::default(),
+                &anchors,
+                VedaBudget::SparsityPercent(0.),
+            );
+            r.request.generated = VedaBudget::SparsityPercent(0.);
+            let layout = r
+                .prepared
+                .as_ref()
+                .unwrap()
+                .layouts
+                .values()
+                .next()
+                .unwrap();
+            // FL2VA keyframe anchors are tiled reference segments, as the CUDA gate requires.
+            assert_eq!(layout.reference > 0, !anchors.is_empty());
+            let n = layout.seq;
+            let (q, k, v) = (
+                tensor(n, &dev, DType::F32, 0),
+                tensor(n, &dev, DType::F32, 3),
+                tensor(n, &dev, DType::F32, 7),
+            );
+            let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let dense = flat(crate::nn::sdpa(&q, &k, &v, 0.25).unwrap());
+            let (want, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
+            for (i, (&a, &b)) in want.iter().zip(&dense).enumerate() {
+                assert!((a - b).abs() < 1e-4, "{anchors:?} {i}: {a} vs {b}");
+            }
+            // A one-tile generated budget really masks keys.
+            r.request.generated = VedaBudget::KeyTiles(1);
+            let (sparse, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
+            assert!(sparse.iter().zip(&dense).any(|(a, b)| (a - b).abs() > 1e-3));
+        }
+    }
+    #[test]
+    fn dense_reference_segments_reach_the_execution_report() {
+        use crate::dit::positions::ReferenceLatentGeometry;
+        use crate::reference::ReferenceKind;
+        let refs = [
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 4,
+                latent_width: 6,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 9,
+            },
+        ];
+        let p = PackedLayout::build_ref2va(
+            JointGeometry::new(5, 16, 16).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 3],
+            2,
+            &refs,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let report = ReportSink::default();
+        VedaRuntime::build(
+            predictor(2, 2, 16),
+            &VedaRequest {
+                enabled: true,
+                ..Default::default()
+            },
+            &p,
+            &report,
+        )
+        .unwrap();
+        let segments = report.borrow().dense_segments.clone();
+        assert_eq!(segments, p.veda_dense_segments());
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].starts_with("reference audio"));
+        assert_eq!(
+            report.borrow().outcome_json()["denseSegments"],
+            serde_json::json!(segments)
+        );
+    }
+    #[test]
+    fn setup_failure_is_reported_without_a_sparse_eligible_call() {
+        let p = packed(&Device::Cpu);
+        let report = ReportSink::default();
+        // Every layer forced dense: no call is ever sparse-eligible.
+        let req = VedaRequest {
+            enabled: true,
+            full_attention_layers: vec![0, 1],
+            ..Default::default()
+        };
+        let r =
+            VedaRuntime::prepare(&req, None, &p, 2, 2, 16, &Device::Cpu, report.clone()).unwrap();
+        let reason = report.borrow().fallback_reason.clone();
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("missing")),
+            "{reason:?}"
+        );
+        let q = tensor(p.seq_len(), &Device::Cpu, DType::F32, 0);
+        r.attention(0, 0, &q, &q, &q, 0.25).unwrap();
+        assert_eq!(report.borrow().fallback_reason, reason);
+        assert_eq!(report.borrow().dense_calls, 1);
+    }
+    #[test]
+    fn failure_before_any_sparse_call_reports_no_executed_plan() {
+        let dev = Device::Cpu;
+        let report = ReportSink::default();
+        let r = runtime_for(&dev, report.clone(), &[], VedaBudget::SparsityPercent(0.));
+        assert!(report.borrow().plan.is_some() && report.borrow().plan_grid.is_some());
+        let n = r
+            .prepared
+            .as_ref()
+            .unwrap()
+            .layouts
+            .values()
+            .next()
+            .unwrap()
+            .seq;
+        let q = tensor(n, &dev, DType::F32, 0);
+        // Sparse-eligible, but CPU/F32 is refused before the first-use self-test.
+        r.attention(0, 0, &q, &q, &q, 0.25).unwrap();
+        let rep = report.borrow();
+        assert_eq!(rep.sparse_calls, 0);
+        assert!(rep.fallback_reason.is_some());
+        assert!(rep.plan.is_none() && rep.plan_grid.is_none() && !rep.exact_plan);
+        assert!(rep.outcome_json()["planMatch"].is_null());
     }
     fn tensor(n: usize, dev: &Device, dtype: DType, phase: usize) -> Tensor {
         Tensor::from_vec(
@@ -792,15 +1051,6 @@ mod tests {
             let q = tensor(n, &dev, dtype, 0);
             let k = tensor(n, &dev, dtype, 3);
             let v = tensor(n, &dev, dtype, 7);
-            r.attention(0, 0, &q, &k, &v, 0.25).unwrap();
-            assert_eq!(report.borrow().sparse_calls, 1);
-            assert!(report.borrow().predictor_score_calls > 0);
-            assert!(report.borrow().selected_token_pairs < report.borrow().dense_token_pairs);
-            assert_eq!(report.borrow().kernel.as_deref(), Some(KERNEL));
-            assert!(r.tested.borrow().is_some());
-            r.request.full_attention_steps = vec![1];
-            let full = r.attention(0, 1, &q, &k, &v, 0.25).unwrap();
-            let dense = crate::nn::sdpa(&q, &k, &v, 0.25).unwrap();
             let host = |t: Tensor| {
                 t.to_dtype(DType::F32)
                     .unwrap()
@@ -809,7 +1059,66 @@ mod tests {
                     .to_vec1::<f32>()
                     .unwrap()
             };
+            // Same tolerance shape as the first-use self-test: INT8 quantization bound plus
+            // two output ULPs and FP32 reduction roundoff.
+            let ulp = if dtype == DType::BF16 {
+                1. / 128.
+            } else {
+                1. / 1024.
+            };
+            let check = |label: &str, got: Tensor, (want, bound): (Vec<f32>, f32)| {
+                let got = host(got);
+                assert_eq!(got.len(), want.len());
+                for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        a.is_finite() && (a - b).abs() <= bound + 2. * ulp * b.abs() + 2e-4,
+                        "{label} {dtype:?} {i}: sparse {a} vs masked dense {b} (bound {bound})"
+                    );
+                }
+            };
+            let sparse = r.attention(0, 0, &q, &k, &v, 0.25).unwrap();
+            check("t2va", sparse, masked_dense_oracle(&r, 0, &q, &k, &v, 0.25));
+            assert_eq!(report.borrow().sparse_calls, 1);
+            assert!(report.borrow().predictor_score_calls > 0);
+            assert!(report.borrow().selected_token_pairs < report.borrow().dense_token_pairs);
+            assert_eq!(report.borrow().kernel.as_deref(), Some(KERNEL));
+            assert!(r.tested.borrow().is_some());
+            r.request.full_attention_steps = vec![1];
+            let full = r.attention(0, 1, &q, &k, &v, 0.25).unwrap();
+            let dense = crate::nn::sdpa(&q, &k, &v, 0.25).unwrap();
             assert_eq!(host(full), host(dense));
+            // FL2VA: keyframe anchors packed as reference segments, with a nonzero reference
+            // budget so reference tiles go through learned selection too.
+            let fl_report = ReportSink::default();
+            let fl = runtime_for(
+                &dev,
+                fl_report.clone(),
+                &[KeyframeAnchor::First, KeyframeAnchor::Last],
+                VedaBudget::KeyTiles(1),
+            );
+            let layout = fl
+                .prepared
+                .as_ref()
+                .unwrap()
+                .layouts
+                .values()
+                .next()
+                .unwrap();
+            assert!(layout.reference > 0);
+            let n = layout.seq;
+            let (fq, fk, fv) = (
+                tensor(n, &dev, dtype, 1),
+                tensor(n, &dev, dtype, 5),
+                tensor(n, &dev, dtype, 9),
+            );
+            let sparse = fl.attention(1, 0, &fq, &fk, &fv, 0.25).unwrap();
+            check(
+                "fl2va",
+                sparse,
+                masked_dense_oracle(&fl, 1, &fq, &fk, &fv, 0.25),
+            );
+            assert_eq!(fl_report.borrow().sparse_calls, 1);
+            assert!(fl_report.borrow().fallback_reason.is_none());
             let unsupported_report = ReportSink::default();
             let unsupported = runtime(&dev, unsupported_report.clone());
             let (qf, kf, vf) = (
@@ -845,6 +1154,20 @@ mod tests {
             assert!(failed.tested.borrow().is_none());
             let _ = failed.attention(0, 2, &q, &k, &v, 0.25).unwrap();
             assert_eq!(failed_report.borrow().dense_calls, 2);
+            // A non-finite sparse output (NaN V: the scores read Q/K only) is recomputed densely
+            // and reported, never returned into the hidden state.
+            let nan_report = ReportSink::default();
+            let nan = runtime(&dev, nan_report.clone());
+            let nan_v = (v.ones_like().unwrap() * f64::NAN).unwrap();
+            let _ = nan.attention(0, 0, &q, &k, &nan_v, 0.25).unwrap();
+            assert_eq!(nan_report.borrow().sparse_calls, 0);
+            assert_eq!(nan_report.borrow().dense_calls, 1);
+            assert!(nan_report
+                .borrow()
+                .fallback_reason
+                .as_ref()
+                .unwrap()
+                .contains("non-finite output"));
             let Device::Cuda(cuda) = &dev else {
                 unreachable!()
             };
@@ -938,6 +1261,24 @@ mod tests {
             report.total_attention_fraction(),
             Some((pairs + 2 * 161 * 161) as f64 / (3 * 161 * 161) as f64)
         );
+    }
+    #[test]
+    fn ensure_finite_refuses_nan_and_inf_attention_outputs() {
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let ok = Tensor::new(&[[0.5f32, -2.0], [3.0, 0.0]], &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            ensure_finite(&ok).unwrap();
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let t = Tensor::new(&[[0.5f32, bad], [3.0, 0.0]], &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let e = ensure_finite(&t).unwrap_err().to_string();
+                assert!(e.contains("non-finite output"), "{dtype:?} {bad}: {e}");
+            }
+        }
     }
     #[test]
     fn actual_device_self_test_cannot_pass_on_cpu() {

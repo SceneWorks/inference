@@ -523,6 +523,29 @@ impl PackedLayout {
         )
     }
 
+    /// Packed conditioning segments [`Self::veda_layout`] leaves as dense globals, each with
+    /// the engine-observed reason, so an execution report can say why they were not tiled.
+    pub fn veda_dense_segments(&self) -> Vec<String> {
+        use mlx_gen::gen_core::veda::contract::segment_grid;
+        let mut reasons = Vec::new();
+        let audio = self.num_condition_audio_rows as usize;
+        if audio > 0 {
+            reasons.push(format!(
+                "reference audio ({audio} rows): no video tile grid; dense global attention"
+            ));
+        }
+        for (i, range) in self.condition_spans.iter().enumerate() {
+            if segment_grid(&self.position_rows[range.clone()]).is_none() {
+                reasons.push(format!(
+                    "reference segment {i} (rows {}..{}): positions do not form a T/H/W \
+                     grid; dense global attention",
+                    range.start, range.end
+                ));
+            }
+        }
+        reasons
+    }
+
     /// Map actual packed reference/generated rows into the shared frozen Veda contract.
     /// Reference segments whose positions cannot prove a T/H/W row-major grid stay global.
     pub fn veda_layout(
@@ -733,6 +756,65 @@ mod tests {
     fn layout(anchors: &[KeyframeAnchor]) -> PackedLayout {
         let geometry = JointGeometry::new(TEST_FRAMES, 4, 6).unwrap();
         PackedLayout::build(geometry, [1, 2, 2], &[TEXT_TAG; 5], 2, anchors).unwrap()
+    }
+
+    #[test]
+    fn veda_dense_reference_segments_carry_a_visible_reason() {
+        use crate::reference::ReferenceKind;
+        use mlx_gen::gen_core::veda::contract::TileShape;
+        let refs = [
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 4,
+                latent_width: 6,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: 7,
+                latent_height: 6,
+                latent_width: 4,
+                num_audio_latents: 11,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 9,
+            },
+        ];
+        let packed = PackedLayout::build_ref2va(
+            JointGeometry::new(TEST_FRAMES, 4, 6).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 5],
+            2,
+            &refs,
+        )
+        .unwrap();
+        let tiled = packed.veda_layout(TileShape([2, 4, 16])).unwrap();
+        assert_eq!(tiled.reference, 2);
+        let audio = format!("reference audio ({} rows)", packed.num_condition_audio_rows);
+        let reasons = packed.veda_dense_segments();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].starts_with(&audio), "{reasons:?}");
+        let mut reordered = packed.clone();
+        let range = reordered.condition_spans[0].clone();
+        reordered.position_rows.swap(range.start, range.start + 1);
+        assert_eq!(
+            reordered
+                .veda_layout(TileShape([2, 4, 16]))
+                .unwrap()
+                .reference,
+            1
+        );
+        let reasons = reordered.veda_dense_segments();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[1].starts_with(&format!(
+            "reference segment 0 (rows {}..{})",
+            range.start, range.end
+        )));
     }
 
     #[test]
