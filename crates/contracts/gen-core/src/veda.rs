@@ -182,6 +182,8 @@ pub struct VedaExecutionReport {
     /// H3 producer observation only. Absent for ordinary generation. Its counters are
     /// explicitly scoped and must not be confused with `workspace_bytes`.
     pub terminal_telemetry: Option<serde_json::Value>,
+    /// Private request-bound native acceptance carrier; absent in ordinary generation.
+    pub terminal_acceptance: Option<acceptance::Binding>,
 }
 
 impl VedaExecutionReport {
@@ -221,6 +223,9 @@ impl VedaExecutionReport {
         });
         if let Some(telemetry) = &self.terminal_telemetry {
             outcome["terminalTelemetry"] = telemetry.clone();
+        }
+        if let Some(binding) = &self.terminal_acceptance {
+            outcome["acceptanceProof"] = binding.receipt();
         }
         outcome
     }
@@ -400,6 +405,7 @@ mod tests {
 }
 
 /// Frozen tensor-neutral tiling, predictor and selection contract.
+pub mod acceptance;
 pub mod contract;
 mod topk;
 pub mod workspace;

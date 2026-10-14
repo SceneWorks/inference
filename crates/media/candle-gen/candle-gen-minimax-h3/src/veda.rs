@@ -11,6 +11,12 @@ use contract::{Budget, Bundle, Layout, Plan, PredictorOps, TileShape, TILE};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 pub const COMPONENT: &str = "veda_predictor";
 pub use candle_gen::quant::veda_int8::KERNEL;
+
+use candle_gen::gen_core::veda::acceptance::{self, Binding, Kind};
+pub fn acceptance_source() -> serde_json::Value {
+    serde_json::json!({"acceptanceSha256":acceptance::sha256(include_bytes!("../../../../contracts/gen-core/src/veda/acceptance.rs")),"pipelineSha256":acceptance::sha256(include_bytes!("pipeline.rs")),"packingSha256":acceptance::sha256(include_bytes!("denoise/packing.rs")),"provider":"candle","vedaSha256":acceptance::sha256(include_bytes!("veda.rs")),"modelSha256":acceptance::sha256(include_bytes!("model.rs")),"ditSha256":acceptance::sha256(include_bytes!("dit/model.rs")),"selectorSha256":acceptance::sha256(include_bytes!("../../../../contracts/gen-core/src/veda/contract.rs"))})
+}
+
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
 use candle_gen::gen_core::veda::workspace::{self, Backend, LayoutSize, Limits};
 struct Prepared {
@@ -173,7 +179,7 @@ impl VedaRuntime {
             shape: q.dims().to_vec(),
         });
         if !self.request.full_attention(layer, step) && self.failure.borrow().is_none() {
-            match self.execute(layer, q, k, v, scale as f32) {
+            match self.execute(layer, step, q, k, v, scale as f32) {
                 Ok((out, pairs, workspace)) => {
                     let (b, h, n, _) = q.dims4()?;
                     let mut r = self.report.borrow_mut();
@@ -182,6 +188,9 @@ impl VedaRuntime {
                     r.selected_token_pairs += pairs;
                     r.dense_token_pairs += b as u64 * h as u64 * n as u64 * n as u64;
                     r.workspace_bytes = r.workspace_bytes.max(workspace);
+                    if let Some(binding) = &r.terminal_acceptance {
+                        binding.record(serde_json::json!({"event":"attention_call","route":"sparse","layer":layer,"step":step,"shape":q.dims(),"kernel":KERNEL})).map_err(CandleError::Msg)?;
+                    }
                     return Ok(out);
                 }
                 Err(e) => *self.failure.borrow_mut() = Some(format!("Veda execution failed: {e}")),
@@ -200,11 +209,15 @@ impl VedaRuntime {
         r.dense_calls += 1;
         r.selected_token_pairs += pairs;
         r.dense_token_pairs += pairs;
+        if let Some(binding) = &r.terminal_acceptance {
+            binding.record(serde_json::json!({"event":"dense_attention","layer":layer,"step":step,"fullAttention":self.request.full_attention(layer,step),"shape":out.dims(),"dtype":format!("{:?}",out.dtype())})).map_err(CandleError::Msg)?;
+        }
         Ok(out)
     }
     fn execute(
         &self,
         layer: usize,
+        step: usize,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
@@ -215,15 +228,27 @@ impl VedaRuntime {
             .as_ref()
             .ok_or_else(|| CandleError::Msg("Veda predictor/layout unavailable".into()))?;
         let (batch, heads, seq, dim) = q.dims4()?;
+        let binding = self.report.borrow().terminal_acceptance.clone();
+        let probe_dtype = if binding
+            .as_ref()
+            .is_some_and(|b| b.kind() == Kind::UnsupportedCapability)
+        {
+            DType::F32
+        } else {
+            q.dtype()
+        };
         if heads != p.bundle.heads
             || dim != p.bundle.dim
             || seq != p.layouts.values().next().unwrap().seq
             || layer >= p.bundle.layers
             || k.dims() != q.dims()
             || v.dims() != q.dims()
-            || !matches!(q.dtype(), DType::BF16 | DType::F16)
+            || !matches!(probe_dtype, DType::BF16 | DType::F16)
             || !matches!(q.device(), Device::Cuda(_))
         {
+            if let Some(binding) = &binding {
+                binding.record(serde_json::json!({"event":"capability_guard","guard":"native_device_dtype_layout","applied":probe_dtype != q.dtype(),"rejected":true,"actualDtype":format!("{:?}",q.dtype()),"probeDtype":format!("{probe_dtype:?}"),"layer":layer,"step":step,"error":"Veda unsupported device/dtype/layout","sparseWorkStarted":false})).map_err(CandleError::Msg)?;
+            }
             return Err("Veda unsupported device/dtype/layout".into());
         }
         let sizes = p
@@ -259,7 +284,11 @@ impl VedaRuntime {
                 .workspace_bytes
                 .max(p.bundle.host_bytes() + self_test_workspace_bytes(dim));
             drop(report);
-            (self.self_test)(q.device(), q.dtype(), dim)?;
+            if let Some(binding) = &binding {
+                device_self_test_bound(q.device(), q.dtype(), dim, Some(binding))?;
+            } else {
+                (self.self_test)(q.device(), q.dtype(), dim)?;
+            }
             *self.tested.borrow_mut() = Some((q.device().clone(), q.dtype(), dim));
         }
         let budget = |b: &VedaBudget| match b {
@@ -297,6 +326,11 @@ impl VedaRuntime {
                     budget(&self.request.generated),
                     budget(&self.request.reference),
                 )?;
+                if let Some(binding) = binding.as_ref().filter(|b| b.captures(layer, step, h)) {
+                    let q_host = qt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let k_host = kt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    binding.record_raw(serde_json::json!({"event":"selection","captureBound":acceptance::capture_bound(layout,dim).map_err(CandleError::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(&q_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"kTiled":acceptance::f32_capture(&k_host,&[1,layout.valid.len(),TILE,dim]).map_err(CandleError::Msg)?,"projectionQ":p.bundle.projection(layer,&[h as i32],true),"projectionK":p.bundle.projection(layer,&[h as i32],false),"predictorSha256":p.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":b,"heads":[h],"plan":p.plan.name,"grid":p.grid,"tileShape":p.plan.shapes[p.plan.heads[layer][h]].0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":scores,"rows":rows,"dtype":format!("{:?}",q.dtype())})).map_err(CandleError::Msg)?;
+                }
                 pairs += rows
                     .iter()
                     .enumerate()
@@ -419,6 +453,14 @@ pub fn self_test_workspace_bytes(dim: usize) -> u64 {
 }
 /// Require actual CUDA; there is no skip-success path. Uses the same production kernel.
 pub fn device_self_test(device: &Device, dtype: DType, dim: usize) -> Result<()> {
+    device_self_test_bound(device, dtype, dim, None)
+}
+fn device_self_test_bound(
+    device: &Device,
+    dtype: DType,
+    dim: usize,
+    binding: Option<&Binding>,
+) -> Result<()> {
     if !matches!(device, Device::Cuda(_)) {
         return Err("Veda actual-device self-test requires CUDA".into());
     }
@@ -449,7 +491,14 @@ pub fn device_self_test(device: &Device, dtype: DType, dim: usize) -> Result<()>
     };
     let (qh, kh, vh) = (host(&q)?, host(&k)?, host(&v)?);
     let scale = 1. / (dim as f32).sqrt();
-    let got = host(&veda_int8::attend(&q, &k, &v, &mask, scale)?)?;
+    let sparse = veda_int8::attend(&q, &k, &v, &mask, scale)?;
+    let got = if binding.is_some_and(|b| b.kind() == Kind::SelfTestOutputFault) {
+        // Observe the actual kernel output before perturbing that device tensor.
+        let _ = host(&sparse)?;
+        host(&sparse.affine(1.0, 1.0)?)?
+    } else {
+        host(&sparse)?
+    };
     let oracle = veda_int8::reference(&qh, &kh, &vh, dim, scale, &mask)?;
     // Same arithmetic: two output ULPs plus FP32 reduction roundoff. This is not a
     // tolerance for changing masks/INT8 scales. BF16 2^-7, F16 2^-10.
@@ -458,6 +507,13 @@ pub fn device_self_test(device: &Device, dtype: DType, dim: usize) -> Result<()>
     } else {
         1. / 1024.
     };
+    if let Some(binding) = binding {
+        let mismatch =
+            got.iter().zip(&oracle).enumerate().find(|(_, (a, b))| {
+                !a.is_finite() || (**a - **b).abs() > 2. * ulp * b.abs() + 2e-4
+            });
+        binding.record(serde_json::json!({"event":"self_test","verifier":"candle_frozen_arithmetic_existing_two_ulp_plus_2e-4","applied":binding.kind()==Kind::SelfTestOutputFault,"sparseDeviceComputeCompleted":true,"rejected":mismatch.is_some(),"mismatchIndex":mismatch.map(|(i,_)|i),"actual":mismatch.map(|(_,(&a,_))|a),"reference":mismatch.map(|(_,(_, &b))|b),"ulp":ulp,"absoluteRoundoff":2e-4,"errorMaxAbs":got.iter().zip(&oracle).map(|(&a,&b)|(a-b).abs()).fold(0f32,f32::max)})).map_err(CandleError::Msg)?;
+    }
     for (i, (&a, &b)) in got.iter().zip(&oracle).enumerate() {
         if !a.is_finite() || (a - b).abs() > 2. * ulp * b.abs() + 2e-4 {
             return Err(

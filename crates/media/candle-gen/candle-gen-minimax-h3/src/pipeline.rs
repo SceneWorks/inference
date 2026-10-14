@@ -817,6 +817,30 @@ fn prepend_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_acceptance_product_grid_uses_actual_vae_ratio_and_patch() {
+        for (width, height) in [(576, 320), (320, 576), (768, 768), (1024, 768)] {
+            for (frames, t) in [(124, 37), (243, 72), (345, 102), (141, 42)] {
+                let geometry = resolve_geometry(width, height, frames).unwrap();
+                assert_eq!(geometry.joint.num_latent_frames, t);
+                assert_eq!(
+                    geometry.joint.latent_height / PATCH_SIZE[1],
+                    height as usize / 32
+                );
+                assert_eq!(
+                    geometry.joint.latent_width / PATCH_SIZE[2],
+                    width as usize / 32
+                );
+            }
+        }
+        let s0 = resolve_geometry(576, 320, 124).unwrap();
+        assert_eq!(
+            s0.joint.num_latent_frames * (s0.joint.latent_height / 2) * (s0.joint.latent_width / 2),
+            6660
+        );
+        assert_eq!(s0.joint.num_audio_latents * 2, 414);
+        assert_eq!(6660 + 414 + 512, 7586);
+    }
 
     fn dev() -> Device {
         Device::Cpu

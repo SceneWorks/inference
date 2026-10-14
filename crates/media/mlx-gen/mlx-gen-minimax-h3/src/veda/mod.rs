@@ -13,6 +13,11 @@ use mlx_rs::{
 };
 use std::{cell::RefCell, collections::BTreeMap, path::Path, rc::Rc};
 
+use mlx_gen::gen_core::veda::acceptance::{self, Binding, Kind};
+pub fn acceptance_source() -> serde_json::Value {
+    serde_json::json!({"acceptanceSha256":acceptance::sha256(include_bytes!("../../../../../contracts/gen-core/src/veda/acceptance.rs")),"pipelineSha256":acceptance::sha256(include_bytes!("../pipeline.rs")),"packingSha256":acceptance::sha256(include_bytes!("../denoise/packing.rs")),"provider":"mlx","vedaSha256":acceptance::sha256(include_bytes!("mod.rs")),"modelSha256":acceptance::sha256(include_bytes!("../model.rs")),"ditSha256":acceptance::sha256(include_bytes!("../dit/model.rs")),"selectorSha256":acceptance::sha256(include_bytes!("../../../../../contracts/gen-core/src/veda/contract.rs"))})
+}
+
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
 use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
 pub const KERNEL: &str = "mlx-batched-gather-sdpa-v1";
@@ -92,7 +97,19 @@ impl VedaRuntime {
             )?;
             report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load(path, layers, heads, dim)?;
-            Self::from_bundle(bundle, request, packed, report.clone(), device_self_test)
+            Self::from_bundle(bundle, request, packed, report.clone(), || {
+                let binding = report.borrow().terminal_acceptance.clone();
+                // An acceptance capability probe must hit the actual QKV guard before any
+                // sparse device work. It cannot reach sparse execution or grant a self-test pass.
+                if binding
+                    .as_ref()
+                    .is_some_and(|b| b.kind() == Kind::UnsupportedCapability)
+                {
+                    Ok(())
+                } else {
+                    device_self_test_bound(binding.as_ref())
+                }
+            })
         })();
         match result {
             Ok(runtime) => Some(runtime),
@@ -209,21 +226,26 @@ impl VedaRuntime {
             .push((layer, step, self.request.clone()));
         if *self.failed.borrow() || self.request.full_attention(layer, step) {
             self.record_dense(q);
-            return sdpa_bounded_bhsd(
+            let out = sdpa_bounded_bhsd(
                 q,
                 k,
                 v,
                 1.0 / (self.bundle.dim as f32).sqrt(),
                 None,
                 bounded,
-            );
+            )?;
+            self.capture_dense(layer, step, &out)?;
+            return Ok(out);
         }
-        let result = self.execute(layer, q, k, v);
+        let result = self.execute(layer, step, q, k, v);
         match result {
             Ok(out) => {
                 let mut report = self.report.borrow_mut();
                 report.sparse_calls += 1;
                 report.kernel = Some(KERNEL.into());
+                if let Some(binding) = &report.terminal_acceptance {
+                    binding.record(serde_json::json!({"event":"attention_call","route":"sparse","layer":layer,"step":step,"shape":q.shape(),"kernel":KERNEL})).map_err(Error::Msg)?;
+                }
                 Ok(out)
             }
             Err(e) => {
@@ -234,16 +256,24 @@ impl VedaRuntime {
                 ));
                 drop(r);
                 self.record_dense(q);
-                sdpa_bounded_bhsd(
+                let out = sdpa_bounded_bhsd(
                     q,
                     k,
                     v,
                     1.0 / (self.bundle.dim as f32).sqrt(),
                     None,
                     bounded,
-                )
+                )?;
+                self.capture_dense(layer, step, &out)?;
+                Ok(out)
             }
         }
+    }
+    fn capture_dense(&self, layer: usize, step: usize, out: &Array) -> Result<()> {
+        if let Some(binding) = &self.report.borrow().terminal_acceptance {
+            binding.record(serde_json::json!({"event":"dense_attention","layer":layer,"step":step,"fullAttention":self.request.full_attention(layer,step),"shape":out.shape(),"dtype":format!("{:?}",out.dtype())})).map_err(Error::Msg)?;
+        }
+        Ok(())
     }
     fn record_dense(&self, q: &Array) {
         let mut r = self.report.borrow_mut();
@@ -254,7 +284,7 @@ impl VedaRuntime {
         r.dense_token_pairs += pairs;
     }
 
-    fn execute(&self, layer: usize, q: &Array, k: &Array, v: &Array) -> Result<Array> {
+    fn execute(&self, layer: usize, step: usize, q: &Array, k: &Array, v: &Array) -> Result<Array> {
         if q.shape().len() != 4
             || q.shape()[0] != 1
             || q.shape()[1] != self.bundle.heads as i32
@@ -267,10 +297,24 @@ impl VedaRuntime {
         }
         let dim = self.bundle.dim;
         let seq = q.shape()[2] as usize;
-        let bytes = match q.dtype() {
+        let binding = self.report.borrow().terminal_acceptance.clone();
+        let probe_dtype = if binding
+            .as_ref()
+            .is_some_and(|b| b.kind() == Kind::UnsupportedCapability)
+        {
+            Dtype::Int8
+        } else {
+            q.dtype()
+        };
+        let bytes = match probe_dtype {
             Dtype::Bfloat16 | Dtype::Float16 => 2,
             Dtype::Float32 => 4,
-            _ => return Err(Error::Msg("Veda unsupported compute dtype".into())),
+            _ => {
+                if let Some(binding) = &binding {
+                    binding.record(serde_json::json!({"event":"capability_guard","guard":"native_compute_dtype","applied":probe_dtype != q.dtype(),"rejected":true,"actualDtype":format!("{:?}",q.dtype()),"probeDtype":format!("{probe_dtype:?}"),"layer":layer,"step":step,"error":"Veda unsupported compute dtype","sparseWorkStarted":false})).map_err(Error::Msg)?;
+                }
+                return Err(Error::Msg("Veda unsupported compute dtype".into()));
+            }
         };
         let sizes = self
             .layouts
@@ -346,6 +390,21 @@ impl VedaRuntime {
                     budget(&self.request.generated),
                     budget(&self.request.reference),
                 )?;
+                if let Some(binding) = &binding {
+                    for (local, &head) in chunk.iter().enumerate() {
+                        if !binding.captures(layer, step, head as usize) {
+                            continue;
+                        }
+                        let q_head = slice_axis(&qt, 0, local as i32, local as i32 + 1)?;
+                        let k_head = slice_axis(&kt, 0, local as i32, local as i32 + 1)?;
+                        let q_host = q_head.as_dtype(Dtype::Float32)?.reshape(&[-1])?;
+                        let k_host = k_head.as_dtype(Dtype::Float32)?.reshape(&[-1])?;
+                        mlx_rs::transforms::eval([&q_host, &k_host])?;
+                        let n = layout.valid.len();
+                        let logits = layout.video * layout.video;
+                        binding.record_raw(serde_json::json!({"event":"selection","captureBound":acceptance::capture_bound(layout,dim).map_err(Error::Msg)?,"dim":dim,"qTiled":acceptance::f32_capture(q_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"kTiled":acceptance::f32_capture(k_host.as_slice::<f32>(),&[1,layout.valid.len(),TILE,dim]).map_err(Error::Msg)?,"projectionQ":self.bundle.projection(layer,&[head],true),"projectionK":self.bundle.projection(layer,&[head],false),"predictorSha256":self.bundle.identity,"generatedBudget":acceptance::budget_value(self.request.generated),"referenceBudget":acceptance::budget_value(self.request.reference),"layer":layer,"step":step,"batch":0,"heads":[head],"plan":self.plan.name,"grid":self.grid,"tileShape":shape.0,"seq":layout.seq,"video":layout.video,"reference":layout.reference,"valid":layout.valid,"perm":layout.perm,"refTokens":layout.ref_tokens,"targetTokens":layout.target_tokens,"scores":&scores[local*logits..(local+1)*logits],"rows":&rows[local*n..(local+1)*n],"dtype":format!("{:?}",q.dtype())})).map_err(Error::Msg)?;
+                    }
+                }
                 let chunk_pairs: u64 = rows
                     .iter()
                     .enumerate()
@@ -551,6 +610,9 @@ fn gather_attention(
 }
 /// Bounded actual-device oracle, including partial video tiles, global rows, and a non-dense mask.
 pub fn device_self_test() -> Result<()> {
+    device_self_test_bound(None)
+}
+fn device_self_test_bound(binding: Option<&Binding>) -> Result<()> {
     let l = Layout::t2va(17, [2, 9, 17], TileShape([2, 8, 8]), 323)?;
     let heads = 2usize;
     let dim = 128usize;
@@ -615,6 +677,13 @@ pub fn device_self_test() -> Result<()> {
     )?
     .0
     .reshape(&[1, heads as i32, seq as i32, dim as i32])?;
+    // Materialize the real sparse device result before applying the acceptance perturbation.
+    let sparse = if binding.is_some_and(|b| b.kind() == Kind::SelfTestOutputFault) {
+        mlx_rs::transforms::eval([&sparse])?;
+        sparse.add(&Array::from_f32(1.0).as_dtype(sparse.dtype())?)?
+    } else {
+        sparse
+    };
     let mut mask = vec![false; heads * seq * seq];
     let mut pairs = 0usize;
     for head in 0..heads {
@@ -652,6 +721,9 @@ pub fn device_self_test() -> Result<()> {
         .item::<f32>();
     #[cfg(test)]
     println!("Veda device self-test: kernel={KERNEL}, D128 BF16, max_abs={error}, tolerance={SELF_TEST_ATOL}, selected_pairs={pairs}, dense_pairs={}",heads*seq*seq);
+    if let Some(binding) = binding {
+        binding.record(serde_json::json!({"event":"self_test","verifier":"mlx_max_abs_existing_atol","applied":binding.kind()==Kind::SelfTestOutputFault,"sparseDeviceComputeCompleted":true,"errorMaxAbs":error,"tolerance":SELF_TEST_ATOL,"rejected":!error.is_finite() || error > SELF_TEST_ATOL,"selectedPairs":pairs,"densePairs":heads*seq*seq})).map_err(Error::Msg)?;
+    }
     if !error.is_finite() || error > SELF_TEST_ATOL {
         return Err(Error::Msg(format!(
             "Veda {KERNEL} actual-device self-test failed: {error} > {SELF_TEST_ATOL}"

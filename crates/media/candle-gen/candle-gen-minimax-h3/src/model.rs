@@ -909,10 +909,6 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
-            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
-            ..Default::default()
-        };
         Generator::validate(self, req)?;
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
@@ -1924,7 +1920,35 @@ impl Generator for MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> candle_gen::gen_core::Result<GenerationOutput> {
-        Ok(self.generate_impl(req, on_progress)?)
+        *self.veda_report.borrow_mut() = candle_gen::gen_core::VedaExecutionReport {
+            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            terminal_acceptance: None,
+            ..Default::default()
+        };
+        let result: candle_gen::gen_core::Result<GenerationOutput> = (|| {
+            if let Some(binding) = &req.h3_terminal_acceptance {
+                binding
+                    .begin(crate::veda::acceptance_source())
+                    .map_err(candle_gen::gen_core::Error::Msg)?;
+                self.veda_report.borrow_mut().terminal_acceptance = Some(binding.clone());
+            }
+            let output = self
+                .generate_impl(req, on_progress)
+                .map_err(candle_gen::gen_core::Error::from)?;
+            if let Some(binding) = &req.h3_terminal_acceptance {
+                binding
+                    .record(candle_gen::gen_core::veda::acceptance::output_record(
+                        &output,
+                    ))
+                    .map_err(candle_gen::gen_core::Error::Msg)?;
+                binding.finish().map_err(candle_gen::gen_core::Error::Msg)?;
+            }
+            Ok(output)
+        })();
+        if let (Some(binding), Err(error)) = (&req.h3_terminal_acceptance, &result) {
+            binding.abort(&error.to_string());
+        }
+        result
     }
 }
 

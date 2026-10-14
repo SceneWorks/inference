@@ -848,6 +848,52 @@ pub fn learned_scores<M: PredictorOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actual_product_proof_grids_choose_all_twelve_original_plans_before_transposes() {
+        let value: Value = serde_json::from_str(include_str!("frozen-plans.json")).unwrap();
+        let bundle = Bundle {
+            identity: "chooser_only_no_weights_or_device".into(),
+            layers: 50,
+            heads: 56,
+            dim: 128,
+            plans: value
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|v| Plan::parse(v, 50, 56).unwrap())
+                .collect(),
+            q: vec![],
+            k: vec![],
+        };
+        let mut observed = BTreeSet::new();
+        for (grid_hw, name) in [
+            ([10, 18], "16x9"),
+            ([18, 10], "9x16"),
+            ([24, 24], "1x1"),
+            ([24, 32], "4x3"),
+        ] {
+            for t in [37, 72, 102] {
+                let grid = [t, grid_hw[0], grid_hw[1]];
+                let plan = bundle.choose(grid);
+                assert_eq!(plan.name, format!("{name}_t{t}"));
+                assert_eq!(plan.heads.len(), 50);
+                assert!(plan.heads.iter().all(|h| h.len() == 56));
+                println!(
+                    "H3_NATIVE_CHOOSER grid={grid:?} plan={} layers={} heads={} exact={}",
+                    plan.name,
+                    plan.heads.len(),
+                    plan.heads[0].len(),
+                    plan.grid == grid
+                );
+                observed.insert(plan.name);
+            }
+        }
+        assert_eq!(
+            observed,
+            value.as_object().unwrap().keys().cloned().collect()
+        );
+        assert_eq!(bundle.choose([42, 10, 18]).name, "16x9_t37");
+    }
     struct HostOps {
         heads: usize,
         tiles: usize,

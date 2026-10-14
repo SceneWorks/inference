@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "kind": "h3_owned_product_acceptance_contract",
+  "defaultOff": true,
+  "realVerifier": true,
+  "realCapabilityGuard": true,
+  "requestPrivate": true,
+  "backends": [
+    "mlx",
+    "candle_cuda"
+  ],
+  "features": [
+    "self_test_output_fault",
+    "unsupported_capability",
+    "capture",
+    "exact_frozen_masks_all_sections"
+  ],
+  "authoritySchema": "gen_core::veda::acceptance::Binding::from_json",
+  "captureSchema": "h3-native-product-jsonl-v1",
+  "fallbackReasons": {
+    "mlx": {
+      "self_test_output_fault": "actual-device self-test failed",
+      "unsupported_capability": "unsupported compute dtype"
+    },
+    "candle_cuda": {
+      "self_test_output_fault": "self-test frozen arithmetic mismatch",
+      "unsupported_capability": "unsupported device/dtype/layout"
+    }
+  },
+  "captureScope": "Explicit declared steps/layers/heads; every actual declared head/batch with complete QK/projection/layout/logits/mask inputs. Compact actual-call and full decoded-output identity receipts. No synthetic replacement or silent sample/drop.",
+  "captureOverhead": "Designated proofs only: one head raw artifact pending, synchronous readback/serialization and admitted independent CPU oracle acknowledgement. Raw deleted only after bound verified ACK and sealed ledger; compact capture/hash ledger retained. capture_bound reports conservative one-head native transient bound; oracle RAM separately admitted. All ordinary E9 baselines are capture-off.",
+  "captureTransport": "spool_ack_v1",
+  "qkEncoding": "f32_le_hex"
+}

@@ -537,6 +537,8 @@ pub struct GenerationRequest {
     /// Operator-owned terminal H3 measurement. The worker must never copy this from a job payload.
     /// Other generators ignore it; false preserves their normal execution path.
     pub h3_terminal_telemetry: bool,
+    /// Verified operator authority, never copied from an authored job payload.
+    pub h3_terminal_acceptance: Option<crate::veda::acceptance::Binding>,
     /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
     /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
     /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
@@ -1325,6 +1327,7 @@ impl Default for GenerationRequest {
             video_mode: None,
             veda: None,
             h3_terminal_telemetry: false,
+            h3_terminal_acceptance: None,
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
@@ -1604,6 +1607,7 @@ impl GenerationRequest {
             video_mode: _,
             veda: _,
             h3_terminal_telemetry: _,
+            h3_terminal_acceptance: _,
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
