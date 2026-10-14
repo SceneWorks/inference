@@ -51,7 +51,8 @@ evidence.
    value upstream's root manifest at `1e6aa85e` declares; the three sibling crates upstream
    reaches by path (`candle-kernels`, `candle-metal-kernels`, `candle-ug`) are the same crates at
    the same git revision the pin resolved before, so `Cargo.lock` changes by one line (the
-   `source` of `candle-core`). Features, targets, dev-dependencies, benches and examples are
+   `source` of `candle-core`). The root `[patch]` then redirects `candle-kernels` and
+   `candle-metal-kernels` to their own vendored copies (each with its own `VENDORED.md`). Features, targets, dev-dependencies, benches and examples are
    upstream's.
 3. `src/quantized/cuda.rs` — one local fix, not upstream (sc-24446; upstream `main` still has
    the defect as of 2026-10): the four `QCudaStorage` quantizers (`quantize`, `quantize_imatrix`,
@@ -219,5 +220,5 @@ candle-core = { git = "https://github.com/SceneWorks/inference", rev = "<the pin
    dropped.
 3. Re-derive `Cargo.toml` from the new upstream workspace manifest as described above.
 4. Move every pin (`Cargo.toml`, `scripts/check-workspace.py` `PINNED_WORKSPACE_DEPENDENCIES` and
-   `VENDORED_PACKAGES`), re-vendor `candle-kernels` (its own `VENDORED.md`), regenerate the lock,
-   and run the CUDA lane (`gh workflow run ci.yml -f lanes=windows-cuda`).
+   `VENDORED_PACKAGES`), re-vendor `candle-kernels` and `candle-metal-kernels` (their own
+   `VENDORED.md`), regenerate the lock, and run the CUDA lane (`gh workflow run ci.yml -f lanes=windows-cuda`).

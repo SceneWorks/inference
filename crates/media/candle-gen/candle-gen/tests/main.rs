@@ -28,6 +28,9 @@ mod cuda_quant_smoke;
 #[path = "int8_per_channel_numerics.rs"]
 mod int8_per_channel_numerics;
 
+#[path = "metal_strided_reduce.rs"]
+mod metal_strided_reduce;
+
 #[path = "mlx_repack_real_weights.rs"]
 mod mlx_repack_real_weights;
 

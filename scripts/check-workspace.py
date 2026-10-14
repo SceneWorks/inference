@@ -51,6 +51,15 @@ VENDORED_PACKAGES = {
         "path": "crates/media/candle-gen/vendor/candle-core",
         "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
     },
+    # The same upstream revision plus the rank > 4 strided-reduce indexing fix (upstream #3873).
+    # candle-core reaches it only under its `metal` feature, so it is absent from the
+    # default-feature `cargo metadata` graph and is checked through Cargo.lock and the root
+    # [patch] instead.
+    "candle-metal-kernels": {
+        "path": "crates/media/candle-gen/vendor/candle-metal-kernels",
+        "upstream_rev": "1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d",
+        "feature_gated": True,
+    },
 }
 DEFAULT_GRAPH_PINNED_PACKAGES = {
     package_name: revision
@@ -1099,8 +1108,24 @@ def check_graph(metadata: dict) -> None:
         if not source.endswith(f"#{revision}"):
             fail(f"{name} does not resolve at {revision}: {source}")
 
+    lock = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
+    candle_patch = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["patch"][
+        "https://github.com/huggingface/candle"
+    ]
     for name, vendored in VENDORED_PACKAGES.items():
         vendor_dir, revision = vendored["path"], vendored["upstream_rev"]
+        if candle_patch.get(name, {}).get("path") != vendor_dir:
+            fail(f"the root [patch] must redirect {name} to {vendor_dir}: {candle_patch.get(name)}")
+        if vendored.get("feature_gated"):
+            locked = [package for package in lock["package"] if package["name"] == name]
+            if len(locked) != 1:
+                fail(f"expected one locked {name}, found {len(locked)}")
+            if "source" in locked[0]:
+                fail(f"{name} must lock to the vendored copy, not {locked[0]['source']}")
+            provenance = ROOT / vendor_dir / "VENDORED.md"
+            if not provenance.is_file() or revision not in provenance.read_text(encoding="utf-8"):
+                fail(f"{vendor_dir}/VENDORED.md must record the upstream revision {revision}")
+            continue
         matches = [package for package in packages if package["name"] == name]
         if len(matches) != 1:
             fail(f"expected one {name} resolution, found {len(matches)}")
