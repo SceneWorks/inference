@@ -75,3 +75,6 @@ mod turbo_tiers;
 
 #[path = "vae_parity.rs"]
 mod vae_parity;
+
+#[path = "metal_repro.rs"]
+mod metal_repro;

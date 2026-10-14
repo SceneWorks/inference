@@ -278,9 +278,13 @@ impl AvgDown {
         };
         let total = folded.dim(1)?;
         let group = total / self.out_channels;
+        // Reduce over a 4-D view: candle-metal's strided reduction mis-indexes sources of rank > 4
+        // (`get_strided_idx_fallback` in candle-metal-kernels' `reduce.metal`), reading out of
+        // bounds, so a 5-D `[B, C, group, H', W']` mean is wrong on Metal (sc-25909).
         Ok(folded
-            .reshape((b, self.out_channels, group, h2, w2))?
-            .mean(2)?)
+            .reshape((b, self.out_channels, group, h2 * w2))?
+            .mean(2)?
+            .reshape((b, self.out_channels, h2, w2))?)
     }
 }
 
