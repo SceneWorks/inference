@@ -45,6 +45,10 @@ There are **three** changes vs upstream:
    state retained on purpose: for every arch this build targets (sm_80+ SASS, compute_80+ PTX) both
    guards compile to the same thing, and downgrading would drop the Turing fix for nothing.
 
+The licence texts are not a code change: `LICENSE-MIT` and `LICENSE-APACHE` are upstream's
+repository-root files at `1e6aa85e`, copied unmodified, because the crate is `MIT OR Apache-2.0` and
+upstream ships them only at the repository root.
+
 Everything else — every other `.cu`/`.cuh` source, `lib.rs`, `ffi.rs`, `Cargo.toml` — is byte-for-byte
 upstream, so candle-core links an otherwise-identical Rust/symbol surface (a fatter `libmoe.a` + the new
 `cast_i32_*` PTX symbols). Diff against the upstream rev to confirm these are the sole deltas.
@@ -86,7 +90,8 @@ The `[patch]` forces **these** kernel sources onto whatever `candle-core` rev th
 match only as long as this copy is from the **same** candle rev. **When the candle pin bumps**
 (`candle-core`/`candle-nn`/`candle-transformers` rev in the workspace `Cargo.toml`):
 
-1. Re-copy `candle-kernels/` from the new rev's checkout over `vendor/candle-kernels/`.
+1. Re-copy `candle-kernels/` from the new rev's checkout over `vendor/candle-kernels/`, and the
+   repository-root `LICENSE-MIT` / `LICENSE-APACHE` from the same rev.
 2. Re-apply the `build.rs` `-gencode` block above (search for `sc-7544`).
 3. Re-apply the `src/cast.cu` `int32_t` cast block (search for `sc-9601`) unless upstream has added it.
 4. Keep the `src/compatibility.cuh` `__CUDA_ARCH__ < 800` fallback guard (upstream #3558) unless the

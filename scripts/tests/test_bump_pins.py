@@ -125,6 +125,11 @@ class DriftGuardTests(unittest.TestCase):
                 self.assertEqual(gate_package, package, dep)
 
 
+# Vendored crates that are not workspace dependencies themselves, mapped to the pinned crate that
+# reaches them at its own revision (candle-core depends on candle-metal-kernels by path upstream).
+VENDORED_SIBLING_PINS = {"candle-metal-kernels": "candle-core"}
+
+
 class VendoredGroupTests(unittest.TestCase):
     """A backend with an in-tree vendored crate is never bumped mechanically (sc-24441)."""
 
@@ -141,11 +146,11 @@ class VendoredGroupTests(unittest.TestCase):
         self.assertEqual(tool, {v["path"] for v in gate.VENDORED_PACKAGES.values()})
         for name, vendored in gate.VENDORED_PACKAGES.items():
             path, revision = vendored["path"], vendored["upstream_rev"]
-            # A vendored crate that is not itself a workspace dependency (candle-metal-kernels)
-            # is a sibling candle-core reaches at candle-core's own pinned revision.
-            _package, pinned = gate.PINNED_WORKSPACE_DEPENDENCIES.get(
-                name, gate.PINNED_WORKSPACE_DEPENDENCIES["candle-core"]
-            )
+            # A vendored crate that is not itself a workspace dependency is pinned through the
+            # crate that reaches it; any other unpinned vendored crate stays a KeyError.
+            _package, pinned = gate.PINNED_WORKSPACE_DEPENDENCIES[
+                VENDORED_SIBLING_PINS.get(name, name)
+            ]
             self.assertEqual(revision, pinned, name)
             self.assertIn(revision, (ROOT / path / "VENDORED.md").read_text(encoding="utf-8"))
 

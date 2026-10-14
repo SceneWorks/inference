@@ -46,7 +46,10 @@ backends have their own indexers and are unaffected.
    on a different upstream branch line), so it is applied by hand; its other half, an
    `expand_grad` case in `candle-core/tests/grad_tests.rs`, is not taken — `vendor/candle-core` stays
    as its own `VENDORED.md` describes, and the CI-buildable pins below cover the same path.
-2. `VENDORED.md` — this file.
+2. `LICENSE-MIT`, `LICENSE-APACHE` — upstream's repository-root licence texts at `1e6aa85e`, copied
+   unmodified. The crate is `MIT OR Apache-2.0` and upstream ships these only at the repository root,
+   so a crate-directory copy would otherwise redistribute the source without its licence.
+3. `VENDORED.md` — this file.
 
 Everything else (`src/**`, `examples/**`, `Cargo.toml`, `README.md`) is byte-for-byte upstream;
 upstream's `Cargo.toml` for this crate inherits nothing from its workspace, so it needed no
@@ -60,9 +63,11 @@ re-derivation. Diff against an upstream checkout to confirm these are the sole d
 * `candle-gen-qwen-image-2-1` `tests/metal_reference_latents.rs` — the production victim: reference
   latents encoded on Metal after the reference text conditioning match the CPU's.
 
-Both are `#[cfg(feature = "metal")]`; **no CI lane runs Candle tests on Metal** (`macos-metal`
-Clippies candle with `--features metal` but does not test it), so they run only on a developer Mac:
-`cargo test -p candle-gen --features metal --test integration -- metal_strided_reduce::`.
+Both are `#[cfg(feature = "metal")]` and are the only Candle tests CI runs on a Metal device: the
+`macos-metal` job's *Test Candle Metal reduce pins* step (`.github/workflows/ci.yml`; selected for
+any change under `crates/media/candle-gen`, which includes this directory). Locally:
+`cargo test -p candle-gen -p candle-gen-qwen-image-2-1 --features metal --test integration --
+metal_strided_reduce:: metal_reference_latents::`.
 
 ## Consumers
 
@@ -80,7 +85,8 @@ candle-metal-kernels = { git = "https://github.com/SceneWorks/inference", rev = 
 
 `scripts/bump_pins.py` refuses a candle bump while this copy exists. To bump:
 
-1. Re-copy `candle-metal-kernels/` from the new revision over this directory (keep this file).
+1. Re-copy `candle-metal-kernels/` from the new revision over this directory (keep this file), and
+   the repository-root `LICENSE-MIT` / `LICENSE-APACHE` from the same revision.
 2. Re-apply `2395577a` unless the new revision contains it (upstream `main` after 2026-08-13 does) —
    once it does, drop this vendor, its `[patch]` entry, its workspace `exclude`, and its
    `scripts/check-workspace.py` `VENDORED_PACKAGES` / `scripts/bump_pins.py` `vendored` entries.
