@@ -2772,6 +2772,57 @@ expected_files = [
   "q4/transformer_ref/diffusion_pytorch_model.safetensors.index.json",
 ]
 
+# ── MiniMax-H3 Veda dense-vs-sparse A/B inputs (epic sc-25140, sc-25777) ─────────────────────────
+#
+# Dispatch-only `.github/workflows/veda-ab-cuda.yml` materializes these as plain directories (real
+# files, never the hub cache — candle cannot memmap Windows reparse-point links) beside the runner
+# workspace. Revisions are the SceneWorks catalog pins (`builtin.models.jsonc` `veda_predictor`
+# component, `builtin.loras.jsonc` turbo entries) and, for the third-party style LoRA, the revision
+# the committed `gen-core` header fixture `h3_clay_refiner_header.json` was taken from. The A/B
+# driver additionally checks the two published SHA-256 values it knows (predictor, clay LoRA).
+[[models]]
+key = "minimax-h3-veda-predictor"
+repository = "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview"
+revision = "9a1fd3a41b4a754a7886e64e82edbddf599fd1bd"
+license = "MiniMax H3 Community License Agreement (Model Derivative)"
+size_class = "small"
+profiles = ["veda-ab-cuda"]
+environment = ["VEDA_AB_PREDICTOR_SNAPSHOT"]
+download_files = ["minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"]
+expected_files = ["minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"]
+
+[[models]]
+key = "minimax-h3-turbo-loras"
+repository = "lightx2v/Minimax-h3-Turbo"
+revision = "5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1"
+license = "MiniMax H3 Community License Agreement (Model Derivative)"
+size_class = "medium"
+profiles = ["veda-ab-cuda"]
+environment = ["VEDA_AB_TURBO_SNAPSHOT"]
+download_files = [
+  "minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+  "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+  "minimax_h3_fl2v_turbo_4step_v0.1.safetensors",
+  "minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors",
+]
+expected_files = [
+  "minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors",
+  "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+  "minimax_h3_fl2v_turbo_4step_v0.1.safetensors",
+  "minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors",
+]
+
+[[models]]
+key = "minimax-h3-claymation-lora"
+repository = "akhaliq/MiniMax-H3-Claymation-Style-LoRA"
+revision = "991e08146a349e00b1837e77f81f415586b19063"
+license = "MiniMax H3 Community License Agreement (Model Derivative)"
+size_class = "small"
+profiles = ["veda-ab-cuda"]
+environment = ["VEDA_AB_CLAY_SNAPSHOT"]
+download_files = ["checkpoints/full_claymation_h3_v1_claymation_h3_v1.safetensors"]
+expected_files = ["checkpoints/full_claymation_h3_v1_claymation_h3_v1.safetensors"]
+
 # SC-23935: explicit terminal profile only; not the scheduled LLM sweep.
 
 [[models]]
