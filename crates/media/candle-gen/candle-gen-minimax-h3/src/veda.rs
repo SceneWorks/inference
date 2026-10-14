@@ -381,12 +381,34 @@ fn select(
     let ids: Vec<i32> = heads.iter().map(|&h| h as i32).collect();
     let scores =
         contract::learned_scores(&p.bundle, layer, &ids, layout, qt, kt, &CandlePredictorOps)?;
-    Ok(layout.select_with_budgets(
-        &scores,
-        heads.len(),
-        budget(&request.generated),
-        budget(&request.reference),
-    )?)
+    let (generated, reference) = (budget(&request.generated), budget(&request.reference));
+    // Heads select independently (head h reads only its own `[tiles, tiles]` scores), so the
+    // frozen host selection runs on contiguous head ranges in parallel and concatenates them in
+    // head order: the rows are identical to one `select_with_budgets` over every head.
+    let per_head = layout.video * layout.video;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let span = heads.len().div_ceil(workers.clamp(1, heads.len().max(1)));
+    if per_head == 0 || scores.len() != heads.len() * per_head || span >= heads.len() {
+        return Ok(layout.select_with_budgets(&scores, heads.len(), generated, reference)?);
+    }
+    let parts = std::thread::scope(|scope| {
+        let jobs: Vec<_> = scores
+            .chunks(span * per_head)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    layout.select_with_budgets(chunk, chunk.len() / per_head, generated, reference)
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().expect("Veda selection worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut rows = Vec::with_capacity(heads.len() * layout.valid.len());
+    for part in parts {
+        rows.extend(part?);
+    }
+    Ok(rows)
 }
 /// Refuses a sparse attention output holding any NaN/Inf, so `attention` recomputes that call
 /// densely and records the reason instead of letting the poison into the hidden state (a poisoned
