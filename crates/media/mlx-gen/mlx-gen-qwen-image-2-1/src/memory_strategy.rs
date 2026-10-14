@@ -561,6 +561,17 @@ pub mod derived {
 
     /// Conditioning tokens the published table assumes — a full 256-token prompt through the T2I
     /// template. The request-time estimate takes the real count.
+    ///
+    /// **The generator's own budget uses this bound too**, while the engine admits up to 1024 text
+    /// rows under the cache's priced bound and 4096 in general. Where the denoise binds (ten
+    /// references at a preset), each row past 256 adds one joint token (197 120 B at bf16,
+    /// 393 728 B at the packed tiers' f32) plus its retained conditioning (16 384 B per row at
+    /// the f32 it is held in, against the 2 MiB the 256 bf16-priced rows carry), so a long
+    /// prompt's cache-shed budget is low by — derived, sc-25909 —
+    /// 158.4 MiB at bf16 / 302.4 MiB at q8·q4 for 1024 rows (inside the 1 GiB
+    /// `MLX_EVAL_SLACK_BYTES`), and 783.9 MiB at bf16 / 1 503.9 MiB at q8·q4 for 4096 rows (bf16
+    /// inside the slack; **q8 / q4 outside it, by 0.47 GiB**); a negative branch adds 14 / 62 MiB.
+    /// Pre-existing and recorded, not changed here: moving it would move every published figure.
     pub const TABLE_CONDITIONING_TOKENS: u64 = 256;
 
     /// Latent tokens **one reference image** contributes to the joint sequence.
@@ -927,6 +938,12 @@ pub mod derived {
             0
         };
         let branches = if use_negative { 2 } else { 1 };
+        // Known, deliberate err-low (sc-25909): the retained conditioning is the text tower's
+        // **f32** output on every tier, priced here at bf16 — `rows · 4096 · 2` bytes short per
+        // branch: 2 MiB at the 256-row table bound, 8 MiB at the 1024-row cache bound, doubled
+        // with a negative branch. At most 16 MiB, under 1.6 % of `MLX_EVAL_SLACK_BYTES`; widening
+        // it would move every bf16 figure this module publishes, so it is recorded, not changed.
+        // The larger approximation is the 256-row assumption itself (see `TABLE_CONDITIONING_TOKENS`).
         let retained = branches * conditioning_tokens * DIT_INNER * BF16_WIDTH;
         retained + max(max(denoise, decode), encode)
     }
@@ -1325,6 +1342,7 @@ pub const PREFIX_KV_CACHE_OVERFLOW_WARNING: &str = "prefix_kv_cache_shed_over_pr
 /// whose fitted reference grid exceeds [`derived::PREFIX_KV_CACHE_REFERENCE_TOKENS`], and a
 /// checkpoint that computes wider than its tier is priced at.
 pub fn prefix_kv_cache_overflow(
+    provider_id: &str,
     config: &crate::config::TransformerConfig,
     compute_dtype: mlx_rs::Dtype,
     tier: Tier,
@@ -1337,7 +1355,7 @@ pub fn prefix_kv_cache_overflow(
         mlx_rs::Dtype::Bfloat16 | mlx_rs::Dtype::Float16 => derived::BF16_WIDTH,
         other => {
             return Err(mlx_gen::Error::Msg(format!(
-                "{MODEL_ID}: the prefix KV cache cannot be priced at compute dtype {other:?}"
+                "{provider_id}: the prefix KV cache cannot be priced at compute dtype {other:?}"
             )))
         }
     };
@@ -3502,7 +3520,8 @@ mod tests {
         let cfg = crate::config::TransformerConfig::production();
         let target = image_tokens(2048, 2048);
         let check = |dtype, tier, prefixes: &[u64], references| {
-            prefix_kv_cache_overflow(&cfg, dtype, tier, prefixes, references, target).unwrap()
+            prefix_kv_cache_overflow(MODEL_ID, &cfg, dtype, tier, prefixes, references, target)
+                .unwrap()
         };
         let per_token = |width: u64| 2 * 32 * 4096 * width;
         let rope = derived_branch_rope_bytes(2048, 2048);
@@ -3548,7 +3567,16 @@ mod tests {
             })
         );
         // A dtype nothing prices is an error, never a silent zero.
-        assert!(prefix_kv_cache_overflow(&cfg, Dtype::Int32, Tier::Bf16, &[1], 0, target).is_err());
+        // …naming the id that asked (E3, sc-25909).
+        for id in [MODEL_ID, TURBO_MODEL_ID] {
+            let err = prefix_kv_cache_overflow(id, &cfg, Dtype::Int32, Tier::Bf16, &[1], 0, target)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!("{id}: the prefix KV cache cannot be priced")),
+                "{err}"
+            );
+        }
     }
 
     /// Floors and the published table are computed with the cache shed, and did not move: every

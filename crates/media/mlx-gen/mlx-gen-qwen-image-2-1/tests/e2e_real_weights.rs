@@ -307,20 +307,22 @@ fn render_golden() -> Option<PathBuf> {
     std::env::var_os(RENDER_GOLDEN_ENV).map(PathBuf::from)
 }
 
-/// Hold the render just written as `file_name` to its pre-epic golden, **byte for byte** on this
-/// backend (the MLX base forward was refactored by epic 25899 to be bit-identical; nothing else
-/// moved). Only a cache-shed render is comparable — the pre-epic revision had no cache — so a
-/// golden with a cached render is a usage error, not a skip. A golden directory missing the file
-/// is a failure too.
+/// Compare the render just written as `file_name` with its pre-epic golden, **byte for byte** on
+/// this backend (the MLX base forward was refactored by epic 25899 to be bit-identical; nothing
+/// else moved), print the `[golden]` line, append it to `<out_dir>/golden_report.txt`, and
+/// **return** the failure (a mismatch, a geometry change or a missing golden file) instead of
+/// panicking — so one case's mismatch cannot cost the comparison of the cases after it; the body
+/// asserts every result at once with [`assert_golden_clean`] after its last render. Only a
+/// cache-shed render is comparable — the pre-epic revision had no cache — so a golden with a
+/// cached render is a usage error and panics at once.
 fn compare_with_golden(
     golden: Option<&Path>,
+    out_dir: &Path,
     file_name: &str,
     image: &mlx_gen::gen_core::Image,
     mode: PrefixKvCacheMode,
-) {
-    let Some(golden) = golden else {
-        return;
-    };
+) -> Option<String> {
+    let golden = golden?;
     assert_eq!(
         mode,
         PrefixKvCacheMode::Prefill,
@@ -328,29 +330,70 @@ fn compare_with_golden(
          run with QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill"
     );
     let path = golden.join(file_name);
-    let want = image::open(&path)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",
+    let (line, failure) = match image::open(&path) {
+        Err(e) => {
+            let failure = format!(
+                "{file_name}: {RENDER_GOLDEN_ENV}: {} is the golden for this render: {e}",
                 path.display()
-            )
-        })
-        .to_rgb8();
-    assert_eq!(
-        (want.width(), want.height()),
-        (image.width, image.height),
-        "{file_name}: golden geometry"
-    );
-    let (mean, max) = pixel_difference(&image.pixels, want.as_raw());
-    eprintln!(
-        "[golden] {file_name}: mean |Δ| = {mean:.4}, max |Δ| = {max} (of 255) against {}; bar: \
-         byte-equal",
-        path.display()
-    );
+            );
+            (format!("[golden] {failure}"), Some(failure))
+        }
+        Ok(want) => {
+            let want = want.to_rgb8();
+            if (want.width(), want.height()) != (image.width, image.height) {
+                let failure = format!(
+                    "{file_name}: golden geometry {}x{} against the render's {}x{}",
+                    want.width(),
+                    want.height(),
+                    image.width,
+                    image.height
+                );
+                (format!("[golden] {failure}"), Some(failure))
+            } else {
+                let (mean, max) = pixel_difference(&image.pixels, want.as_raw());
+                let equal = image.pixels == *want.as_raw();
+                (
+                    format!(
+                        "[golden] {file_name}: mean |Δ| = {mean:.4}, max |Δ| = {max} (of 255) \
+                         against {}; bar: byte-equal; {}",
+                        path.display(),
+                        if equal { "PASS" } else { "FAIL" }
+                    ),
+                    (!equal).then(|| {
+                        format!(
+                            "{file_name}: the cache-shed render is not the pre-epic render byte \
+                             for byte (mean |Δ| {mean:.4}, max {max})"
+                        )
+                    }),
+                )
+            }
+        }
+    };
+    eprintln!("{line}");
+    record_golden_line(out_dir, &line);
+    failure
+}
+
+/// Append one `[golden]` line to `<out_dir>/golden_report.txt` — the evidence a reviewer reads
+/// for every compared render, written before any assertion.
+fn record_golden_line(out_dir: &Path, line: &str) {
+    use std::io::Write;
+    let mut report = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_dir.join("golden_report.txt"))
+        .unwrap();
+    writeln!(report, "{line}").unwrap();
+}
+
+/// The one AT4 assertion of a render body: every [`compare_with_golden`] result it collected,
+/// after its last render.
+fn assert_golden_clean(failures: &[String]) {
     assert!(
-        image.pixels == *want.as_raw(),
-        "{file_name}: the cache-shed render is not the pre-epic render byte for byte (mean |Δ| \
-         {mean:.4}, max {max})"
+        failures.is_empty(),
+        "{} render(s) differ from their pre-epic golden:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }
 
@@ -701,6 +744,7 @@ fn validation_render_at(
         std::env::var_os("QWEN_IMAGE_2_1_CLEAR_CACHE_BEFORE_DECODE").is_some();
     let mut reported = Vec::with_capacity(steps.len());
     let mut renders: Vec<(u32, Vec<u8>)> = Vec::with_capacity(steps.len());
+    let mut golden_failures = Vec::new();
     for steps in steps {
         let req = GenerationRequest {
             prompt: "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement"
@@ -783,7 +827,9 @@ fn validation_render_at(
             started.elapsed().as_secs_f32(),
             render_started.elapsed().as_secs_f32()
         );
-        compare_with_golden(golden, &file_name, image, cache);
+        golden_failures.extend(compare_with_golden(
+            golden, out_dir, &file_name, image, cache,
+        ));
         // Evidence someone reads to pick a step count must not be a blank frame, and two step
         // counts must not have produced the same picture (a dead `steps` knob).
         assert_not_degenerate(&format!("{} {ran} steps", target.stem), &image.pixels);
@@ -796,6 +842,7 @@ fn validation_render_at(
         renders.push((ran, image.pixels.clone()));
         reported.push(ran);
     }
+    assert_golden_clean(&golden_failures);
     reported
 }
 
@@ -1147,7 +1194,10 @@ fn reference_edit_renders_with(
     let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
     let footprint_max = footprint_sampler();
     // One render of `case`, with the cache mode `cache` (the case's own, or the twin's).
-    let render = |case: EditCase, cache: PrefixKvCacheMode, suffix: &str| -> (Vec<u8>, Observed) {
+    let render = |case: EditCase,
+                  cache: PrefixKvCacheMode,
+                  suffix: &str|
+     -> (Vec<u8>, Observed, Option<String>) {
         let EditCase {
             references: count,
             width,
@@ -1227,8 +1277,8 @@ fn reference_edit_renders_with(
             path.display(),
             render_started.elapsed().as_secs_f32()
         );
-        compare_with_golden(golden, &file_name, &image, cache);
-        (image.pixels, observed)
+        let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image, cache);
+        (image.pixels, observed, golden_failure)
     };
 
     // Each twin is rendered **immediately after** the cached render it is compared with, so no
@@ -1239,13 +1289,17 @@ fn reference_edit_renders_with(
             .to_owned(),
     ];
     let mut twins = 0;
+    let mut golden_failures = Vec::new();
     for case in cases {
-        let (cached, cached_report) = render(case, case.cache, "");
+        let (cached, cached_report, failure) = render(case, case.cache, "");
+        golden_failures.extend(failure);
         if !forced_shed_twin || !case.cache.is_cached() {
             continue;
         }
         twins += 1;
-        let (shed, shed_report) = render(case, PrefixKvCacheMode::Prefill, "_prefill_twin");
+        let (shed, shed_report, failure) =
+            render(case, PrefixKvCacheMode::Prefill, "_prefill_twin");
+        golden_failures.extend(failure);
         let (mean, max) = pixel_difference(&shed, &cached);
         eprintln!(
             "[kv] {stem} forced-shed twin of the {}-reference case: mean |Δ| = {mean:.4}, max |Δ| = \
@@ -1291,6 +1345,8 @@ fn reference_edit_renders_with(
         !forced_shed_twin || twins > 0,
         "a forced-shed twin needs a cached case"
     );
+    // After every case has rendered, written its PNG and its `[golden]` line.
+    assert_golden_clean(&golden_failures);
 
     let err = generator
         .validate(&GenerationRequest {
@@ -1870,6 +1926,38 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         render_against(&tmp.path().join("evidence"), prefill).is_err(),
         "a golden directory without the file"
     );
+    // A mismatch on the FIRST edit case still lets the second render, write its PNG and be
+    // compared: the body asserts once, after its last case.
+    let first_off = tmp.path().join("first-case-off");
+    mlx_gen::quant::copy_dir(&golden, &first_off).unwrap();
+    let two_refs = "qwen_image_2_1_edit_2refs_64x64_2steps_seed42.png";
+    let mut changed = image::open(first_off.join(two_refs)).unwrap().to_rgb8();
+    changed.as_mut()[0] ^= 1;
+    changed.save(first_off.join(two_refs)).unwrap();
+    let rechecked = tmp.path().join("rechecked");
+    std::fs::create_dir_all(&rechecked).unwrap();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            reference_edit_renders_in(&base, &rechecked, 40, edit_cases(), false, Some(&first_off));
+        }))
+        .is_err(),
+        "a first-case mismatch fails the body"
+    );
+    let report = std::fs::read_to_string(rechecked.join("golden_report.txt")).unwrap();
+    let ten_refs = "qwen_image_2_1_edit_10refs_64x64_2steps_seed42.png";
+    assert!(
+        report
+            .lines()
+            .any(|line| line.contains(two_refs) && line.ends_with("FAIL")),
+        "{report}"
+    );
+    assert!(
+        report
+            .lines()
+            .any(|line| line.contains(ten_refs) && line.ends_with("PASS")),
+        "the second case was still compared:\n{report}"
+    );
+    assert!(rechecked.join(ten_refs).is_file(), "and its PNG written");
 }
 
 /// [`assert_not_degenerate`] rejects a blank frame and accepts a dark, low-contrast picture.

@@ -779,6 +779,7 @@ impl QwenImage21 {
                     let mut prefixes = vec![pos.layout.prefix_len() as u64];
                     prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
                     crate::memory_strategy::prefix_kv_cache_overflow(
+                        self.variant.id(),
                         heavy.transformer.config(),
                         heavy.transformer.compute_dtype(),
                         tier,

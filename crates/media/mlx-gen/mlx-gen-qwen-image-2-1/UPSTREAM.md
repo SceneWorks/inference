@@ -467,6 +467,19 @@ and every floor is unchanged; on q8 / q4 the 2048² table row (bounded activatio
 and every cache-shed request budget the denoise binds move, and the published
 `activation_dtype_width` architecture fact is 4 there. The autoencoder terms are f32 on every tier.
 
+Two known err-low approximations remain, recorded rather than changed because either fix moves
+every bf16 figure. (1) The retained text conditioning is the tower's **f32** output on every tier
+but is priced at bf16: `rows · 4096 · 2` bytes short per branch — 2 MiB at the 256-row table
+bound, 8 MiB at the 1024-row cache bound, doubled with a negative branch, so at most 16 MiB, under
+1.6 % of the 1 GiB eval slack. (2) The cache-shed budget (the generator's too) assumes 256 text
+rows (`TABLE_CONDITIONING_TOKENS`), while the engine admits 1024 under the cache bound and 4096 in
+general. Where the denoise binds (ten references at a preset) a long prompt's budget is low by
+158.4 MiB at bf16 / 302.4 MiB at q8·q4 for 1024 rows — inside the slack — and by 783.9 MiB at
+bf16 / 1 503.9 MiB at q8·q4 for 4096 rows: bf16 inside the slack, **q8 / q4 outside it by
+0.47 GiB**. A negative branch adds 14 / 62 MiB. All derived: one joint token per row (197 120 B
+at bf16, 393 728 B at f32) plus 16 384 B of f32 conditioning per row, against the 2 MiB the 256
+bf16-priced rows carry.
+
 `memory_strategy::admission_geometry` reports the envelope a consumer must gate on: the largest
 preset **area** (2400×1792, which is neither the widest preset nor the square default), the 16 800
 latent tokens it contributes, and the fact that each of up to 10 reference images adds a further
