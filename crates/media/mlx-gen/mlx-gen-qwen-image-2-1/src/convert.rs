@@ -1,5 +1,6 @@
-//! Offline pre-quantization: read the dense `Qwen/Qwen-Image-2.1` snapshot and write a packed
-//! per-tier snapshot that [`crate::load`] consumes with no dense transient (sc-24112).
+//! Offline pre-quantization: read a dense released snapshot — `Qwen/Qwen-Image-2.1`, or the
+//! distilled `Qwen/Qwen-Image-2.1-Turbo` (sc-25906) — and write a packed per-tier snapshot that
+//! [`crate::load`] / [`crate::load_turbo`] consumes with no dense transient (sc-24112).
 //!
 //! This is the producer side of [`crate::quant`]; read that module's table first — it owns the
 //! per-component tiering decision and the reasons it is **not** the 2512 `mlx_gen_qwen_image` table.
@@ -13,6 +14,7 @@
 //! <dst_root>/
 //!   model_index.json            copied
 //!   LICENSE / README.md         copied (Qwen Research License — F-045)
+//!   NOTICE                      Turbo tiers only: the licence's §3(c) attribution notice
 //!   CHANGES.md                  the licence's §3(b) change record: what was re-packed, at what
 //!                               width, from which upstream revision, by which converter
 //!   SHA256SUMS                  `sha256sum` manifest over every other file (the binding digest)
@@ -24,6 +26,21 @@
 //!     model.safetensors         packed language-tower decoder Linears; everything else verbatim
 //!   vae/ processor/ scheduler/  copied verbatim (dense)
 //! ```
+//!
+//! # Which checkpoint is being converted
+//!
+//! The converter takes no variant flag. [`source_variant`] reads it off the **source snapshot**,
+//! from the same two signals the loader uses to tell the checkpoints apart
+//! ([`crate::model::Schedule::load`]): a `model_index.json` that saves `sample_sigmas` under a
+//! static-shift `scheduler/scheduler_config.json` is the distilled Turbo checkpoint, one that saves
+//! none is the base checkpoint, and anything in between is the loader's own typed refusal — raised
+//! before a byte is written. Both signals live in files a tier copies verbatim (`model_index.json`,
+//! `scheduler/`), so a converted tier is the same variant as its source by construction, and
+//! [`prequantize_turnkey`] re-reads the written tree to hold that. The variant decides only what
+//! `CHANGES.md` says: which upstream repository and revision the tier is a modified copy of, and
+//! which engine id it loads under. The weights are handled identically — the Turbo snapshot's
+//! one-file text encoder goes through the same shard-agnostic reader as the base's four shards, and
+//! its bf16 VAE is copied through like the base's f32 one, never cast.
 //!
 //! Both packed components carry the **same** `bits`: a tier is a whole-pipeline contract, so
 //! `text_encoder/`'s marker is the tier the caller selected. Writing a different width in either
@@ -63,6 +80,7 @@ use mlx_gen::quant::{
 use mlx_gen::{Error, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig};
+use crate::model::{Schedule, Variant};
 use crate::quant::{Tier, DENSE_COMPONENTS, GROUP_SIZE};
 
 // ============================================================================================
@@ -162,8 +180,26 @@ fn pack_component(
 // Turnkey assembly.
 // ============================================================================================
 
-/// Assemble the complete `tier` snapshot for `src_root` (the dense released snapshot) under
-/// `dst_root`.
+/// Which released checkpoint the snapshot at `root` is, read from what the snapshot carries — the
+/// signals [`Schedule::load`] refuses the wrong engine id on, not a flag a caller could get wrong.
+///
+/// A `model_index.json` that saves `sample_sigmas` ([`crate::loader::saves_sample_sigmas`]) claims
+/// to be the distilled Turbo checkpoint; one that does not is the base checkpoint. The claim is
+/// then held to the loader's own acceptance test for that variant, so a snapshot neither id would
+/// load (saved sigmas beside a dynamic-shift scheduler config, a malformed sigma list) is that
+/// same typed refusal here instead of a tier nothing can load.
+pub fn source_variant(root: &Path) -> Result<Variant> {
+    let variant = if crate::loader::saves_sample_sigmas(root)? {
+        Variant::Turbo
+    } else {
+        Variant::Base
+    };
+    Schedule::load(variant, root)?;
+    Ok(variant)
+}
+
+/// Assemble the complete `tier` snapshot for `src_root` (a dense released snapshot of either
+/// checkpoint — see [`source_variant`]) under `dst_root`.
 ///
 /// [`Tier::Bf16`] is refused: the dense tier **is** the source snapshot, and copying 31 GB to call
 /// it a conversion would produce a second artefact to keep in sync for no benefit. Mirror the source
@@ -177,6 +213,22 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
             tier.dir_name()
         )));
     };
+    // Before anything is written: which checkpoint this is, or the loader's refusal of a source
+    // that is neither.
+    let variant = source_variant(src_root)?;
+    // …and the Agreement the tier must carry (sc-25909). `copy_turnkey_assets` is shared with
+    // every other converter and copies `LICENSE` only when the source has one; a Qwen tier
+    // without it would be signed and distributed without the licence text, so the refusal lives
+    // here, for this converter alone. A source that carries it converts exactly as before.
+    if !src_root.join(LICENSE_FILE).is_file() {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1 convert: {} has no `{LICENSE_FILE}`; a converted tier must carry the \
+             Qwen Research License Agreement it is distributed under, so convert from the \
+             unmodified released snapshot",
+            src_root.display()
+        )));
+    }
+    let created = !dst_root.exists();
     std::fs::create_dir_all(dst_root)?;
     quantize_transformer(
         &src_root.join("transformer"),
@@ -195,10 +247,18 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
         }
     }
     copy_turnkey_assets(src_root, dst_root)?;
+    // The tier must be the checkpoint its source is: the schedule signals ride in files copied
+    // above, and a tier that lost them (a Turbo tier without its `sample_sigmas` would load as the
+    // base checkpoint and render 40 shifted steps over distilled weights) must not leave here with
+    // a change record and a manifest that make it look publishable.
+    verify_written_variant(dst_root, variant, created)?;
+    // The §3(c) attribution, in the tier itself (Turbo only — see `write_attribution_notice`).
+    // Before the manifest, so `SHA256SUMS` binds it.
+    write_attribution_notice(dst_root, variant)?;
     // The two files a *distributed* tier must carry beyond the weights (sc-24114): the licence's
     // change record, and the manifest that binds the artefact to its bytes. Written by the
     // converter itself — not by a driver around it — so no tier can leave here without them.
-    write_change_record(dst_root, tier)?;
+    write_change_record(dst_root, variant, tier)?;
     write_sha256sums(dst_root)
 }
 
@@ -206,18 +266,82 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
 // The distributed tier's change record and manifest.
 // ============================================================================================
 
+/// File name of the licence every converted tier carries, copied verbatim from its source.
+pub const LICENSE_FILE: &str = "LICENSE";
 /// File name of the change record every converted tier carries.
 pub const CHANGES_FILE: &str = "CHANGES.md";
 /// File name of the SHA-256 manifest every converted tier carries.
 pub const SHA256SUMS_FILE: &str = "SHA256SUMS";
+/// File name of the attribution notice a converted **Turbo** tier carries.
+pub const NOTICE_FILE: &str = "NOTICE";
+
+/// The contents of a Turbo tier's `NOTICE`: the attribution the Qwen Research License Agreement
+/// §3(c) requires "within a \"Notice\" text file distributed as a part of such copies" —
+/// [`crate::UPSTREAM_LICENSE_NOTICE`] verbatim, one line. The Turbo repository's `LICENSE` is
+/// byte-identical to the base repository's, so it is the same notice.
+pub fn attribution_notice() -> String {
+    format!("{}\n", crate::UPSTREAM_LICENSE_NOTICE)
+}
+
+/// Write the §3(c) attribution into the tier itself — for the **Turbo** checkpoint only.
+///
+/// A base tier is deliberately left as it has always been written (its attribution is the notice
+/// quoted in the `LICENSE` it carries, and its `CHANGES.md` points at this crate's `NOTICE`):
+/// adding a file there would change `SHA256SUMS` and make every already-published base tier
+/// irreproducible from its own source. That asymmetry is a compatibility constraint, not a
+/// judgement that the base tier needs the file less.
+pub fn write_attribution_notice(dst_root: &Path, variant: Variant) -> Result<()> {
+    if variant == Variant::Turbo {
+        std::fs::write(dst_root.join(NOTICE_FILE), attribution_notice())?;
+    }
+    Ok(())
+}
+
+/// Hold a freshly written tier to the checkpoint its source is: re-read the schedule signals from
+/// `dst_root` ([`source_variant`]) and refuse a tree that reads as anything but `variant`.
+///
+/// On a refusal the weights are already on disk. When this conversion **created** `dst_root`
+/// (`created`), the whole tree is removed, so a refused conversion leaves nothing a loader could
+/// pick up; a destination that already existed is not this call's to delete and is left in place
+/// **unsigned** — no `CHANGES.md`, no `SHA256SUMS` — which the error says.
+fn verify_written_variant(dst_root: &Path, variant: Variant, created: bool) -> Result<()> {
+    let found = match source_variant(dst_root) {
+        Ok(written) if written == variant => return Ok(()),
+        Ok(written) => format!("reads as `{}`", written.id()),
+        Err(refusal) => format!("is not a snapshot either engine id loads ({refusal})"),
+    };
+    let left = if created {
+        match std::fs::remove_dir_all(dst_root) {
+            Ok(()) => "the tier it had written was removed".to_owned(),
+            Err(e) => format!("removing the tier it had written failed ({e}); it is unsigned"),
+        }
+    } else {
+        "the destination existed before this conversion and was left in place, unsigned (no \
+         CHANGES.md, no SHA256SUMS)"
+            .to_owned()
+    };
+    Err(Error::Msg(format!(
+        "qwen_image_2_1 convert: the source is a `{}` snapshot but the tier written to {} {found}; \
+         the schedule signals in model_index.json / scheduler/ did not survive the copy; {left}",
+        variant.id(),
+        dst_root.display(),
+    )))
+}
 
 /// The Qwen Research License §3(b) change record for one converted tier: which components were
 /// re-packed and at what width, which ride through verbatim, the upstream snapshot and revision
 /// the tier was derived from, and the converter that produced it.
 ///
+/// `variant` is the checkpoint the tier was derived from ([`source_variant`]): it selects the
+/// upstream repository and revision named as the source, and for the distilled checkpoint adds the
+/// statement that the saved schedule rode through and which engine id the tier loads under. The
+/// base checkpoint's record is byte-for-byte what it was before the Turbo checkpoint existed
+/// (`the_base_change_record_is_byte_stable` pins it), so already-published base tiers still
+/// reproduce their manifests.
+///
 /// Deterministic by construction — no timestamp, no host name — so the record is part of the
 /// byte-reproducible artefact rather than the one file that makes two conversions differ.
-pub fn change_record(tier: Tier) -> Result<String> {
+pub fn change_record(variant: Variant, tier: Tier) -> Result<String> {
     let (Some(dit_bits), Some(te_bits)) = (tier.transformer_bits(), tier.text_encoder_bits())
     else {
         return Err(Error::Msg(format!(
@@ -230,15 +354,38 @@ pub fn change_record(tier: Tier) -> Result<String> {
         .iter()
         .map(|component| format!("`{component}/`"))
         .collect();
+    // The four places the two checkpoints' records differ. The base arms are the literal text the
+    // record always carried.
+    let (model, attribution, tower_files, schedule) = match variant {
+        Variant::Base => (
+            "Qwen-Image 2.1",
+            "in `NOTICE` of the producing crate",
+            "the sharded upstream files are consolidated into one",
+            String::new(),
+        ),
+        Variant::Turbo => (
+            "Qwen-Image 2.1 Turbo",
+            "in the `NOTICE` file in this directory",
+            "upstream ships this component as one file, and it is re-written as one",
+            format!(
+                " That includes the `sample_sigmas` list `model_index.json` saves and the \
+                 static-shift `scheduler/scheduler_config.json` — the few-step schedule this \
+                 distilled checkpoint samples over — and the `vae/` weights at the bf16 they are \
+                 released in. The tier therefore loads as `{}`, never as `{}`.",
+                Variant::Turbo.id(),
+                Variant::Base.id()
+            ),
+        ),
+    };
     Ok(format!(
-        "# Qwen-Image 2.1 — `{tier}` tier: change record\n\
+        "# {model} — `{tier}` tier: change record\n\
          \n\
          This directory is a **modified copy** of the `{repo}` snapshot at revision\n\
          `{revision}`, re-packed offline into the `{tier}` installable tier by\n\
          `{converter}` {version} (`mlx_gen_qwen_image_2_1::convert::prequantize_turnkey`).\n\
          This file is the notice of those changes the Qwen Research License Agreement §3(b)\n\
          requires; the licence itself (`LICENSE`) and the upstream `README.md` are carried\n\
-         verbatim, and the §3(c) attribution is in `NOTICE` of the producing crate.\n\
+         verbatim, and the §3(c) attribution is {attribution}.\n\
          \n\
          ## Files that were changed\n\
          \n\
@@ -252,7 +399,7 @@ pub fn change_record(tier: Tier) -> Result<String> {
          | `text_encoder/model.safetensors` | the `model.language_model.layers.*` decoder \
          projections (q/k/v/o, gate/up/down) affine-quantized to **Q{te_bits}, group size \
          {group}**; token embedding, norms, `lm_head` and the whole `model.visual.*` vision tower \
-         dense and unchanged; the sharded upstream files are consolidated into one |\n\
+         dense and unchanged; {tower_files} |\n\
          | `text_encoder/config.json` | upstream config plus `\"quantization\": {{\"bits\": \
          {te_bits}, \"group_size\": {group}}}` |\n\
          \n\
@@ -261,7 +408,7 @@ pub fn change_record(tier: Tier) -> Result<String> {
          ## Files that were not changed\n\
          \n\
          {dense}, `model_index.json`, `LICENSE` and `README.md` are byte-for-byte copies of \
-         the upstream snapshot.\n\
+         the upstream snapshot.{schedule}\n\
          \n\
          ## Integrity\n\
          \n\
@@ -269,8 +416,8 @@ pub fn change_record(tier: Tier) -> Result<String> {
          conversion is byte-reproducible, so a re-run from the same upstream revision \
          reproduces every digest.\n",
         tier = tier.dir_name(),
-        repo = crate::UPSTREAM_HF_REPO,
-        revision = crate::UPSTREAM_HF_REVISION,
+        repo = variant.upstream_hf_repo(),
+        revision = variant.upstream_hf_revision(),
         converter = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         group = GROUP_SIZE,
@@ -280,8 +427,8 @@ pub fn change_record(tier: Tier) -> Result<String> {
 }
 
 /// Write [`change_record`] as `<dst_root>/CHANGES.md`.
-pub fn write_change_record(dst_root: &Path, tier: Tier) -> Result<()> {
-    std::fs::write(dst_root.join(CHANGES_FILE), change_record(tier)?)?;
+pub fn write_change_record(dst_root: &Path, variant: Variant, tier: Tier) -> Result<()> {
+    std::fs::write(dst_root.join(CHANGES_FILE), change_record(variant, tier)?)?;
     Ok(())
 }
 
@@ -538,7 +685,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("mirror it"), "{err}");
-        assert!(change_record(Tier::Bf16).is_err());
+        for variant in [Variant::Base, Variant::Turbo] {
+            assert!(change_record(variant, Tier::Bf16).is_err());
+        }
     }
 
     fn tiny_snapshot() -> std::path::PathBuf {
@@ -564,7 +713,7 @@ mod tests {
 
             // The change record: the licence's notice of what was changed, and nothing vague.
             let changes = std::fs::read_to_string(out.join(CHANGES_FILE)).unwrap();
-            assert_eq!(changes, change_record(tier).unwrap());
+            assert_eq!(changes, change_record(Variant::Base, tier).unwrap());
             for needle in [
                 &format!("`{}` tier", tier.dir_name()),
                 &format!("Q{bits}, group size {GROUP_SIZE}"),
@@ -628,6 +777,164 @@ mod tests {
                 digest_tree(&out).unwrap().len(),
                 "every regular file but the manifest is listed"
             );
+        }
+    }
+
+    /// **The base checkpoint's change record did not move** when the converter learned the Turbo
+    /// checkpoint (sc-25906). A converted tier is byte-reproducible and its `SHA256SUMS` binds
+    /// `CHANGES.md`, so a reworded base record would make every already-published base tier
+    /// irreproducible from its own source. The digests are of the record as written before the
+    /// Turbo arms existed, with the crate version (which legitimately moves) masked.
+    ///
+    /// *Mutation that reds this:* any edit to the base wording — including routing the base
+    /// record through the Turbo arm's extra sentence.
+    #[test]
+    fn the_base_change_record_is_byte_stable() {
+        use sha2::{Digest, Sha256};
+        for (tier, want) in [
+            (
+                Tier::Q8,
+                "5dc221e54688cfb02243c41ab477d12adba8b104adb73f650c7911a504461c39",
+            ),
+            (
+                Tier::Q4,
+                "c16990b493b2c5a786a6aa25747ab02427eb53e038b5a5004a1cfe2ae0571681",
+            ),
+        ] {
+            let record = change_record(Variant::Base, tier)
+                .unwrap()
+                .replace(env!("CARGO_PKG_VERSION"), "{version}");
+            assert_eq!(
+                format!("{:x}", Sha256::digest(record.as_bytes())),
+                want,
+                "{}:\n{record}",
+                tier.dir_name()
+            );
+        }
+    }
+
+    /// The Turbo record names the Turbo upstream and never the base one, differs from the base
+    /// record of the same tier, and stays timestamp-free (two calls are identical).
+    #[test]
+    fn the_turbo_change_record_names_the_turbo_upstream() {
+        for tier in [Tier::Q8, Tier::Q4] {
+            let turbo = change_record(Variant::Turbo, tier).unwrap();
+            assert_eq!(turbo, change_record(Variant::Turbo, tier).unwrap());
+            assert_ne!(turbo, change_record(Variant::Base, tier).unwrap());
+            assert!(turbo.starts_with("# Qwen-Image 2.1 Turbo — `"), "{turbo}");
+            assert!(turbo.contains(&format!("`{}`", crate::UPSTREAM_TURBO_HF_REPO)));
+            assert!(turbo.contains(&format!("`{}`", crate::UPSTREAM_TURBO_HF_REVISION)));
+            assert!(!turbo.contains(&format!("`{}`", crate::UPSTREAM_HF_REPO)));
+            assert!(!turbo.contains(crate::UPSTREAM_HF_REVISION));
+            assert!(turbo.contains("`qwen_image_2_1_turbo`, never as `qwen_image_2_1`"));
+        }
+    }
+
+    /// The variant comes from the snapshot: the committed base fixture reads as the base
+    /// checkpoint, and saving `sample_sigmas` into a copy of its `model_index.json` (beside a
+    /// static-shift scheduler config) is what makes it the Turbo one — there is no flag.
+    #[test]
+    fn the_source_variant_is_read_from_the_snapshot() {
+        assert_eq!(source_variant(&tiny_snapshot()).unwrap(), Variant::Base);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("snapshot");
+        copy_dir(&tiny_snapshot(), &root).unwrap();
+        let edit = |rel: &str, apply: &dyn Fn(&mut serde_json::Value)| {
+            let path = root.join(rel);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            apply(&mut value);
+            std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        };
+        // Saved sigmas beside the base's dynamic-shift scheduler: neither checkpoint.
+        edit("model_index.json", &|index| {
+            index["sample_sigmas"] = serde_json::json!([1.0, 0.75, 0.5]);
+        });
+        let err = source_variant(&root).unwrap_err().to_string();
+        assert!(err.contains("`use_dynamic_shifting: true`"), "{err}");
+        // With the static identity shift it is the distilled checkpoint.
+        edit("scheduler/scheduler_config.json", &|config| {
+            config["use_dynamic_shifting"] = serde_json::json!(false);
+            config["shift_terminal"] = serde_json::Value::Null;
+        });
+        assert_eq!(source_variant(&root).unwrap(), Variant::Turbo);
+        // An explicit null is "no saved schedule", so the claim is the base checkpoint — which the
+        // base reader then refuses over the static-shift scheduler config: neither checkpoint.
+        edit("model_index.json", &|index| {
+            index["sample_sigmas"] = serde_json::Value::Null;
+        });
+        let err = source_variant(&root).unwrap_err().to_string();
+        assert!(err.contains("only `use_dynamic_shifting: true`"), "{err}");
+    }
+
+    /// A tier whose written tree is not the checkpoint its source is gets refused **and removed**
+    /// when this conversion created the directory; a directory that was already there is left in
+    /// place and the error says it is unsigned.
+    ///
+    /// *Mutation that reds this:* dropping the `remove_dir_all` (the refused tree, complete and
+    /// loadable, stays on disk).
+    #[test]
+    fn a_tier_that_lost_its_variant_is_refused_and_removed_only_if_this_call_created_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The committed base snapshot stands in for "a tree that reads as the base checkpoint".
+        for created in [true, false] {
+            let root = tmp.path().join(format!("tier-{created}"));
+            copy_dir(&tiny_snapshot(), &root).unwrap();
+            verify_written_variant(&root, Variant::Base, created).unwrap();
+            assert!(
+                root.join("model_index.json").is_file(),
+                "a match touches nothing"
+            );
+
+            let err = verify_written_variant(&root, Variant::Turbo, created)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reads as `qwen_image_2_1`"), "{err}");
+            if created {
+                assert!(!root.exists(), "a tree this call created is removed");
+                assert!(err.contains("was removed"), "{err}");
+            } else {
+                assert!(
+                    root.join("model_index.json").is_file(),
+                    "a destination that pre-existed is not this call's to delete"
+                );
+                assert!(err.contains("left in place, unsigned"), "{err}");
+            }
+        }
+    }
+
+    /// The notice a Turbo tier carries is the licence's §3(c) attribution verbatim, and the record
+    /// points at the tier's own copy; the base record still points at the producing crate's.
+    #[test]
+    fn the_turbo_tier_carries_the_attribution_notice_and_the_base_tier_is_untouched() {
+        assert_eq!(
+            attribution_notice(),
+            "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 \
+             Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.\n"
+        );
+        // (Checked against the released `LICENSE` §3(c) of both repositories at their pinned
+        // revisions, which are one byte-identical file; the fixture's LICENSE is a placeholder, so
+        // that check cannot live here.)
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_attribution_notice(tmp.path(), Variant::Base).unwrap();
+        assert!(
+            !tmp.path().join(NOTICE_FILE).exists(),
+            "base tiers gain no file"
+        );
+        write_attribution_notice(tmp.path(), Variant::Turbo).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(NOTICE_FILE)).unwrap(),
+            attribution_notice()
+        );
+        for tier in [Tier::Q8, Tier::Q4] {
+            assert!(change_record(Variant::Turbo, tier)
+                .unwrap()
+                .contains("the §3(c) attribution is in the `NOTICE` file in this directory."));
+            assert!(change_record(Variant::Base, tier)
+                .unwrap()
+                .contains("the §3(c) attribution is in `NOTICE` of the producing crate."));
         }
     }
 }

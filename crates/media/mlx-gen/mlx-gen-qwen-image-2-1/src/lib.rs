@@ -19,6 +19,24 @@
 //! **Qwen Research License** (research/evaluation only) — [`UPSTREAM_LICENSE_NOTICE`] is the
 //! attribution the licence requires every derived bundle to carry (`NOTICE`).
 //!
+//! ## Two checkpoints, one crate
+//!
+//! The crate serves two engine ids over the same components ([`Variant`]): [`MODEL_ID`]
+//! (`qwen_image_2_1`, the base checkpoint) and [`TURBO_MODEL_ID`] (`qwen_image_2_1_turbo`, the
+//! distilled `Qwen/Qwen-Image-2.1-Turbo`, sc-25900). They differ only in the denoise schedule
+//! ([`Schedule`]): the base checkpoint's resolution-shifted 40-step schedule, or the few-step sigma
+//! list the Turbo snapshot saves in its `model_index.json` — read from the snapshot at load, and
+//! resampled when a request names another step count ([`scheduler::resample_saved_sigmas`]). Each
+//! id refuses the other checkpoint's snapshot by name. The trainer is base-only.
+//!
+//! Both checkpoints tier the same way (sc-25906): [`prequantize_turnkey`] reads which one its
+//! source snapshot is ([`convert::source_variant`]) and writes a q8/q4 tree that is still that
+//! checkpoint, so each id refuses the other's tiers exactly as it refuses the other's dense
+//! snapshot. The Turbo id has its own derived resident rows — its bf16 autoencoder is the one
+//! derived difference from the base checkpoint ([`memory_strategy::derived`]'s
+//! `*_for(variant, …)` functions); every activation term is shared — and its own calibration
+//! identity.
+//!
 //! ## What ships in this story
 //!
 //! Text-to-image at the seven upstream presets (any 32-px-multiple size in range), steps, seed,
@@ -75,6 +93,14 @@ pub const UPSTREAM_GITHUB_REVISION: &str = "fb7ae1d1f9611cd91524d03c53c5246b36ac
 /// `QwenImage21Transformer2DModel`, `AutoencoderKLQwenImage21` and
 /// `FlowMatchEulerDiscreteScheduler` are the numeric reference for every port here.
 pub const UPSTREAM_DIFFUSERS_REVISION: &str = "8b3c707ebd3ec4881f4190cf42931da07eaf3b65";
+/// Hugging Face repository of the distilled Turbo checkpoint ([`TURBO_MODEL_ID`], sc-25900).
+pub const UPSTREAM_TURBO_HF_REPO: &str = "Qwen/Qwen-Image-2.1-Turbo";
+/// Pinned `Qwen/Qwen-Image-2.1-Turbo` revision: the snapshot whose `model_index.json` saves the
+/// eight `sample_sigmas` and whose scheduler config is the static identity shift.
+pub const UPSTREAM_TURBO_HF_REVISION: &str = "fc13ba1986fcb905854dc8de2f52eee395f49b5b";
+/// `huggingface/diffusers` commit that taught `QwenImage21Pipeline` to sample over a snapshot's
+/// saved `sample_sigmas` (PR 14950) — the reference for the Turbo schedule.
+pub const UPSTREAM_TURBO_DIFFUSERS_REVISION: &str = "da1d3829cf08d4f329b526d89e17cc035c049d8d";
 /// Licence the pinned weights are distributed under.
 pub const UPSTREAM_LICENSE: &str = "Qwen Research License Agreement (research/evaluation only)";
 /// The attribution notice the Qwen Research License §3(c) requires in every distributed copy.
@@ -84,21 +110,25 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
 
 pub use adapters::apply_qwen_image_2_1_adapters;
 pub use config::{
-    SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
-    DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES,
-    OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT, VAE_SCALE_FACTOR, VISION_MERGE_SIZE,
-    VISION_PATCH_SIZE,
+    SavedSigmaSchedule, SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig,
+    VaeConfig, VisionConfig, DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT,
+    MAX_REFERENCE_IMAGES, OUTPUT_RESOLUTION, PRESETS, SIZE_MULTIPLE, SYSTEM_PROMPT,
+    VAE_SCALE_FACTOR, VISION_MERGE_SIZE, VISION_PATCH_SIZE,
 };
 pub use loader::{
-    load_scheduler_config, load_text_encoder, load_tokenizer, load_transformer, load_vae,
-    load_vision_config,
+    load_model_index, load_saved_sigma_schedule, load_scheduler_config, load_text_encoder,
+    load_tokenizer, load_transformer, load_vae, load_vision_config,
 };
-pub use model::{descriptor, load, QwenImage21, MODEL_ID};
+pub use model::{
+    descriptor, descriptor_turbo, load, load_turbo, load_variant, QwenImage21, Schedule, Variant,
+    MODEL_ID, TURBO_MODEL_ID,
+};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_prompt, encode_references, joint_branch,
-    joint_images, joint_layout, pack_latents, prepare_conditioning_references,
-    rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs, JointBranch,
-    ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise, denoise_reported, encode_prompt,
+    encode_references, joint_branch, joint_images, joint_layout, pack_latents,
+    prepare_conditioning_references, rgba_to_rgb_over_white, text_rows, unpack_latents,
+    DenoiseInputs, DenoiseReport, EvaluationPath, JointBranch, KvCacheMode, KvCachePath,
+    ModelEvaluation, PromptBranch, ReferenceConditioning,
 };
 pub use reference::{
     calculate_dimensions, collect_references, prepare_reference, prepare_references,
@@ -110,7 +140,8 @@ pub use text_encoder::{
 };
 pub use training::{load_trainer, QwenImage21Trainer, TRAINER_ID};
 pub use transformer::{
-    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+    JointLayout, PrefixKvCache, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS,
+    GLOBAL_ADAPTER_TARGETS,
 };
 pub use vae::QwenImage21Vae;
 
@@ -118,7 +149,8 @@ pub use convert::prequantize_turnkey;
 pub use memory_strategy::{admission_geometry, AdmissionGeometry};
 pub use quant::{Tier, GROUP_SIZE};
 
-/// Add the MLX Qwen-Image 2.1 generator to an explicit media registry builder.
+/// Add the MLX Qwen-Image 2.1 generators — the base checkpoint ([`MODEL_ID`]) and the distilled
+/// Turbo checkpoint ([`TURBO_MODEL_ID`]) — to an explicit media registry builder.
 ///
 /// Deliberately registers **no** [`ActivationMemoryRegistration`]: that carrier publishes only real
 /// on-device measurements, and this route's memory model is derived (see [`memory_strategy`]). The
@@ -141,6 +173,18 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
+        // The distilled Turbo checkpoint (sc-25900): the same generator and memory contract under
+        // its own id. No trainer — training stays on the base checkpoint.
+        .register_generator(model::TURBO_REGISTRATION)
+        .register_memory_strategy(memory_strategy::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: model::TURBO_MODEL_ID,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(model::TURBO_MODEL_ID, spec)
+            },
+        })
+        .register_memory_behavior(memory_strategy::TURBO_MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Qwen-Image 2.1 provider catalog.
@@ -156,6 +200,8 @@ mod tests {
             super::UPSTREAM_HF_REVISION,
             super::UPSTREAM_GITHUB_REVISION,
             super::UPSTREAM_DIFFUSERS_REVISION,
+            super::UPSTREAM_TURBO_HF_REVISION,
+            super::UPSTREAM_TURBO_DIFFUSERS_REVISION,
         ] {
             assert_eq!(sha.len(), 40);
             assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
@@ -170,7 +216,7 @@ mod tests {
             .generators()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(ids, ["qwen_image_2_1"]);
+        assert_eq!(ids, ["qwen_image_2_1", "qwen_image_2_1_turbo"]);
         let trainers: Vec<_> = registry
             .trainers()
             .map(|registration| (registration.descriptor)().id)

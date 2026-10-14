@@ -546,26 +546,8 @@ impl SchedulerConfig {
                 "qwen_image_2_1: {ctx}: only `use_dynamic_shifting: true` (resolution-shifted) schedules are ported"
             )));
         }
-        if v.get("time_shift_type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| t != "exponential")
-        {
-            return Err(Error::Msg(format!(
-                "qwen_image_2_1: {ctx}: only the exponential time shift is ported"
-            )));
-        }
-        for flag in [
-            "use_karras_sigmas",
-            "use_exponential_sigmas",
-            "use_beta_sigmas",
-            "invert_sigmas",
-            "stochastic_sampling",
-        ] {
-            if b_or(v, flag, false) {
-                return Err(Error::Msg(format!(
-                    "qwen_image_2_1: {ctx}: `{flag}: true` is not the released schedule"
-                )));
-            }
+        if let Some(why) = unported_scheduler_flag(v) {
+            return Err(Error::Msg(format!("qwen_image_2_1: {ctx}: {why}")));
         }
         let terminal = f_or(v, "shift_terminal", 0.0);
         Ok(Self {
@@ -576,6 +558,142 @@ impl SchedulerConfig {
             base_shift: f_or(v, "base_shift", 0.5),
             max_shift: f_or(v, "max_shift", 1.15),
             shift_terminal: (terminal != 0.0).then_some(terminal),
+            num_train_timesteps: u_or(v, "num_train_timesteps", 1000),
+        })
+    }
+}
+
+/// The `FlowMatchEulerDiscreteScheduler` switch a scheduler config sets that neither released
+/// checkpoint does, as the reason it is refused — `None` when it sets none. Both readers refuse the
+/// same switches; each raises the refusal under **its own** engine id and in its own error class:
+/// the resolution-shifted reader ([`SchedulerConfig`]) as it always has, the saved-sigma reader
+/// ([`SavedSigmaSchedule`]) as the typed `Unsupported` every other "this snapshot is not
+/// Turbo-shaped" refusal is.
+fn unported_scheduler_flag(v: &Value) -> Option<String> {
+    if v.get("time_shift_type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "exponential")
+    {
+        return Some("only the exponential time shift is ported".to_owned());
+    }
+    [
+        "use_karras_sigmas",
+        "use_exponential_sigmas",
+        "use_beta_sigmas",
+        "invert_sigmas",
+        "stochastic_sampling",
+    ]
+    .into_iter()
+    .find(|flag| b_or(v, flag, false))
+    .map(|flag| format!("`{flag}: true` is not the released schedule"))
+}
+
+/// `model_index.json` key under which a distilled checkpoint saves its sampling sigmas
+/// (`QwenImage21Pipeline.config.sample_sigmas`, diffusers PR 14950).
+pub const SAMPLE_SIGMAS_KEY: &str = "sample_sigmas";
+
+/// The saved sampling sigmas of a `model_index.json`, terminal `0` excluded, exactly as parsed
+/// (`f64`). `Ok(None)` when the key is absent or `null` — the base checkpoint, which has no saved
+/// schedule. A key that is **present** is validated rather than tolerated: a non-empty list of
+/// finite numbers in `(0, 1]`, strictly descending. Anything else is a typed refusal, because a
+/// silently dropped entry would shorten the distilled schedule and still render.
+pub fn sample_sigmas(model_index: &Value) -> Result<Option<Vec<f64>>> {
+    let ctx = "model_index.json";
+    let refuse = |why: &str| {
+        Error::Msg(format!(
+            "qwen_image_2_1_turbo: {ctx}: `{SAMPLE_SIGMAS_KEY}` is invalid ({why}); it must be a \
+             non-empty, strictly descending list of sigmas in (0, 1] without the terminal 0"
+        ))
+    };
+    let list = match model_index.get(SAMPLE_SIGMAS_KEY) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(list) => list.as_array().ok_or_else(|| refuse("not a list"))?,
+    };
+    if list.is_empty() {
+        return Err(refuse("empty"));
+    }
+    let mut sigmas = Vec::with_capacity(list.len());
+    for item in list {
+        let sigma = item.as_f64().ok_or_else(|| refuse("a non-numeric entry"))?;
+        if !(sigma > 0.0 && sigma <= 1.0) {
+            return Err(refuse("an entry outside (0, 1]"));
+        }
+        if sigmas.last().is_some_and(|previous| sigma >= *previous) {
+            return Err(refuse("not strictly descending"));
+        }
+        sigmas.push(sigma);
+    }
+    Ok(Some(sigmas))
+}
+
+/// The schedule of a **distilled** snapshot (`Qwen/Qwen-Image-2.1-Turbo`): the sampling sigmas its
+/// `model_index.json` saves, used unchanged because its `scheduler/scheduler_config.json` turns
+/// every scheduler transform off — `use_dynamic_shifting: false` (no resolution-dependent `mu`
+/// shift), `shift: 1.0` (the static shift `shift·σ / (1 + (shift − 1)·σ)` is the identity) and
+/// `shift_terminal: null` (no terminal stretch).
+///
+/// A separate type from [`SchedulerConfig`] on purpose: the two checkpoints share no schedule
+/// arithmetic, so a saved-sigma snapshot cannot reach the `mu`-shift formula (or the reverse) by
+/// construction. [`crate::scheduler::resample_saved_sigmas`] turns it into the per-request list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedSigmaSchedule {
+    /// `model_index.json` → `sample_sigmas`: descending, terminal `0` excluded, as parsed.
+    pub sample_sigmas: Vec<f64>,
+    pub num_train_timesteps: usize,
+}
+
+impl SavedSigmaSchedule {
+    /// The checkpoint's own step count — one denoising step per saved sigma.
+    pub fn default_steps(&self) -> u32 {
+        self.sample_sigmas.len() as u32
+    }
+
+    /// From a snapshot's `model_index.json` and `scheduler/scheduler_config.json`. Refuses, naming
+    /// the mismatch, a snapshot that saves no sigmas (a base checkpoint) and a scheduler config
+    /// that would transform them (dynamic shifting, a non-unit static shift, a terminal stretch).
+    pub fn from_values(model_index: &Value, scheduler_config: &Value) -> Result<Self> {
+        let ctx = "scheduler/scheduler_config.json";
+        let sample_sigmas = sample_sigmas(model_index)?.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "qwen_image_2_1_turbo: model_index.json carries no `{SAMPLE_SIGMAS_KEY}`, so this \
+                 is not a distilled Qwen-Image-2.1-Turbo snapshot; load a base Qwen-Image 2.1 \
+                 snapshot as `qwen_image_2_1`"
+            ))
+        })?;
+        let v = scheduler_config;
+        if b_or(v, "use_dynamic_shifting", false) {
+            return Err(Error::Unsupported(format!(
+                "qwen_image_2_1_turbo: {ctx}: `use_dynamic_shifting: true` is the base Qwen-Image \
+                 2.1 resolution-shifted schedule, but model_index.json saves `{SAMPLE_SIGMAS_KEY}`; \
+                 the saved sigmas are only ported with the static shift (`use_dynamic_shifting: \
+                 false`)"
+            )));
+        }
+        if let Some(why) = unported_scheduler_flag(v) {
+            return Err(Error::Unsupported(format!(
+                "qwen_image_2_1_turbo: {ctx}: {why}"
+            )));
+        }
+        let unit_or_absent = |key: &str, unit: f64| match v.get(key) {
+            None | Some(Value::Null) => true,
+            Some(value) => value.as_f64() == Some(unit),
+        };
+        if !unit_or_absent("shift", 1.0) {
+            return Err(Error::Unsupported(format!(
+                "qwen_image_2_1_turbo: {ctx}: only `shift: 1.0` is ported for a saved-sigma \
+                 schedule (got {}); any other static shift would move the saved sigmas",
+                v["shift"]
+            )));
+        }
+        if !unit_or_absent("shift_terminal", 0.0) {
+            return Err(Error::Unsupported(format!(
+                "qwen_image_2_1_turbo: {ctx}: `shift_terminal` must be null for a saved-sigma \
+                 schedule (got {}); a terminal stretch would move the saved sigmas",
+                v["shift_terminal"]
+            )));
+        }
+        Ok(Self {
+            sample_sigmas,
             num_train_timesteps: u_or(v, "num_train_timesteps", 1000),
         })
     }
@@ -657,6 +775,249 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("spatial compression"), "{err}");
+    }
+
+    /// `Qwen/Qwen-Image-2.1-Turbo` @ `UPSTREAM_TURBO_HF_REVISION`: `model_index.json`'s saved
+    /// sigmas and `scheduler/scheduler_config.json`, verbatim.
+    fn turbo_model_index() -> Value {
+        serde_json::json!({
+            "_class_name": "QwenImage21Pipeline",
+            "sample_sigmas": [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+        })
+    }
+
+    fn turbo_scheduler_config() -> Value {
+        serde_json::json!({
+            "_class_name": "FlowMatchEulerDiscreteScheduler",
+            "base_image_seq_len": 256, "base_shift": 0.5, "invert_sigmas": false,
+            "max_image_seq_len": 8192, "max_shift": 0.9, "num_train_timesteps": 1000,
+            "shift": 1.0, "shift_terminal": null, "stochastic_sampling": false,
+            "time_shift_type": "exponential", "use_beta_sigmas": false,
+            "use_dynamic_shifting": false, "use_exponential_sigmas": false,
+            "use_karras_sigmas": false
+        })
+    }
+
+    /// The released Turbo pair parses to its eight saved sigmas — and the base reader still
+    /// refuses that same scheduler config, so the base checkpoint's contract is unchanged.
+    ///
+    /// *Mutation that reds this:* dropping an entry while parsing (`filter_map`), or reading the
+    /// list from `scheduler_config.json` instead of `model_index.json`.
+    #[test]
+    fn the_released_turbo_snapshot_parses_to_its_eight_saved_sigmas() {
+        let saved =
+            SavedSigmaSchedule::from_values(&turbo_model_index(), &turbo_scheduler_config())
+                .unwrap();
+        assert_eq!(
+            saved.sample_sigmas,
+            [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+        );
+        assert_eq!(saved.default_steps(), 8);
+        assert_eq!(saved.num_train_timesteps, 1000);
+        // A scheduler config with no keys is `FlowMatchEulerDiscreteScheduler`'s defaults: static,
+        // unit shift, no terminal.
+        assert_eq!(
+            SavedSigmaSchedule::from_values(&turbo_model_index(), &serde_json::json!({})).unwrap(),
+            saved
+        );
+
+        let err = SchedulerConfig::from_value(&turbo_scheduler_config())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "qwen_image_2_1: scheduler/scheduler_config.json: only `use_dynamic_shifting: true` \
+             (resolution-shifted) schedules are ported"
+        );
+    }
+
+    /// A saved-sigma schedule refuses, by name, every snapshot shape that would not use the saved
+    /// sigmas unchanged.
+    ///
+    /// *Mutations that red this:* accepting a missing `sample_sigmas` (the base snapshot under the
+    /// Turbo id), or dropping any one of the dynamic-shift / `shift` / `shift_terminal` guards.
+    #[test]
+    fn a_saved_sigma_schedule_refuses_snapshots_that_would_transform_or_lack_the_sigmas() {
+        let with = |key: &str, value: Value| {
+            let mut config = turbo_scheduler_config();
+            config[key] = value;
+            SavedSigmaSchedule::from_values(&turbo_model_index(), &config)
+        };
+        // The base snapshot: no saved sigmas at all (absent, or an explicit null).
+        for index in [
+            serde_json::json!({"_class_name": "QwenImage21Pipeline"}),
+            serde_json::json!({"sample_sigmas": null}),
+            Value::Null,
+        ] {
+            match SavedSigmaSchedule::from_values(&index, &turbo_scheduler_config()) {
+                Err(Error::Unsupported(err)) => {
+                    assert!(err.contains("carries no `sample_sigmas`"), "{err}");
+                    assert!(err.contains("`qwen_image_2_1`"), "{err}");
+                }
+                other => panic!("a snapshot without saved sigmas must be refused: {other:?}"),
+            }
+        }
+        for (key, value, needle) in [
+            (
+                "use_dynamic_shifting",
+                serde_json::json!(true),
+                "`use_dynamic_shifting: true`",
+            ),
+            ("shift", serde_json::json!(3.0), "only `shift: 1.0`"),
+            ("shift", serde_json::json!("1.0"), "only `shift: 1.0`"),
+            (
+                "shift_terminal",
+                serde_json::json!(0.02),
+                "`shift_terminal` must be null",
+            ),
+        ] {
+            match with(key, value.clone()) {
+                Err(Error::Unsupported(err)) => assert!(err.contains(needle), "{key}: {err}"),
+                other => panic!("{key} = {value} must be a typed refusal: {other:?}"),
+            }
+        }
+        let err = with("use_karras_sigmas", serde_json::json!(true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`use_karras_sigmas: true`"), "{err}");
+        // The two spellings of "no terminal stretch" and of the unit shift are accepted.
+        assert!(with("shift_terminal", serde_json::json!(0.0)).is_ok());
+        assert!(with("shift", serde_json::json!(1)).is_ok());
+    }
+
+    /// Every way a snapshot can fail to be a Turbo snapshot is the **typed** refusal, raised under
+    /// the Turbo id — the scheduler switches neither checkpoint sets included (sc-25902; the
+    /// candle twin's test of the same name). The base reader keeps its own label and error class
+    /// for those same switches.
+    ///
+    /// *Mutations that red this:* raising the unported-switch refusal as `Error::Msg`, or under
+    /// the base `qwen_image_2_1:` label, from the saved-sigma reader.
+    #[test]
+    fn a_snapshot_that_is_not_turbo_shaped_is_refused_by_name() {
+        let refusal = |index: Value, scheduler: Value| match SavedSigmaSchedule::from_values(
+            &index, &scheduler,
+        ) {
+            Err(Error::Unsupported(message)) => message,
+            other => panic!("expected a typed Unsupported refusal, got {other:?}"),
+        };
+        for index in [
+            Value::Null,
+            serde_json::json!({"_class_name": "QwenImage21Pipeline"}),
+            serde_json::json!({"sample_sigmas": null}),
+        ] {
+            let text = refusal(index, turbo_scheduler_config());
+            assert!(text.starts_with("qwen_image_2_1_turbo: "), "{text}");
+            assert!(text.contains("no `sample_sigmas`"), "{text}");
+            assert!(text.contains("`qwen_image_2_1`"), "{text}");
+        }
+        for (key, value, needle) in [
+            (
+                "use_dynamic_shifting",
+                serde_json::json!(true),
+                "use_dynamic_shifting",
+            ),
+            ("shift", serde_json::json!(3.0), "`shift: 1.0`"),
+            ("shift", serde_json::json!("3.0"), "`shift: 1.0`"),
+            ("shift_terminal", serde_json::json!(0.02), "shift_terminal"),
+            ("shift_terminal", serde_json::json!(false), "shift_terminal"),
+            (
+                "use_karras_sigmas",
+                serde_json::json!(true),
+                "`use_karras_sigmas: true` is not the released schedule",
+            ),
+            (
+                "use_exponential_sigmas",
+                serde_json::json!(true),
+                "`use_exponential_sigmas: true`",
+            ),
+            (
+                "use_beta_sigmas",
+                serde_json::json!(true),
+                "`use_beta_sigmas: true`",
+            ),
+            (
+                "invert_sigmas",
+                serde_json::json!(true),
+                "`invert_sigmas: true`",
+            ),
+            (
+                "stochastic_sampling",
+                serde_json::json!(true),
+                "`stochastic_sampling: true`",
+            ),
+            (
+                "time_shift_type",
+                serde_json::json!("linear"),
+                "only the exponential time shift is ported",
+            ),
+        ] {
+            let mut scheduler = turbo_scheduler_config();
+            scheduler[key] = value.clone();
+            let text = refusal(turbo_model_index(), scheduler.clone());
+            assert!(
+                text.starts_with("qwen_image_2_1_turbo: scheduler/scheduler_config.json: "),
+                "{key} = {value}: {text}"
+            );
+            assert!(text.contains(needle), "{key} = {value}: {text}");
+        }
+
+        // The base reader's refusal of the same switches is unchanged: its own id, `Error::Msg`.
+        for (key, value, want) in [
+            (
+                "use_karras_sigmas",
+                serde_json::json!(true),
+                "qwen_image_2_1: scheduler/scheduler_config.json: `use_karras_sigmas: true` is \
+                 not the released schedule",
+            ),
+            (
+                "time_shift_type",
+                serde_json::json!("linear"),
+                "qwen_image_2_1: scheduler/scheduler_config.json: only the exponential time \
+                 shift is ported",
+            ),
+        ] {
+            let mut scheduler = turbo_scheduler_config();
+            scheduler["use_dynamic_shifting"] = serde_json::json!(true);
+            scheduler[key] = value;
+            match SchedulerConfig::from_value(&scheduler) {
+                Err(Error::Msg(message)) => assert_eq!(message, want),
+                other => panic!("{key}: the base reader's refusal changed: {other:?}"),
+            }
+        }
+    }
+
+    /// A present `sample_sigmas` is validated, never silently repaired.
+    ///
+    /// *Mutation that reds this:* collecting with `filter_map(Value::as_f64)` — the non-numeric
+    /// case would then load as a seven-step schedule.
+    #[test]
+    fn present_sample_sigmas_are_validated() {
+        assert_eq!(sample_sigmas(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            sample_sigmas(&serde_json::json!({"sample_sigmas": [1.0, 0.5]})).unwrap(),
+            Some(vec![1.0, 0.5])
+        );
+        for (list, why) in [
+            (serde_json::json!([]), "empty"),
+            (serde_json::json!("1.0, 0.5"), "not a list"),
+            (serde_json::json!([1.0, "0.9", 0.5]), "a non-numeric entry"),
+            (
+                serde_json::json!([1.0, 0.5, 0.0]),
+                "an entry outside (0, 1]",
+            ),
+            (serde_json::json!([1.5, 0.5]), "an entry outside (0, 1]"),
+            (
+                serde_json::json!([1.0, 0.5, 0.5]),
+                "not strictly descending",
+            ),
+            (serde_json::json!([0.5, 1.0]), "not strictly descending"),
+        ] {
+            let err = sample_sigmas(&serde_json::json!({"sample_sigmas": list}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`sample_sigmas`"), "{list}: {err}");
+            assert!(err.contains(why), "{list}: expected `{why}` in {err}");
+        }
     }
 
     /// One `text_config` with `rope_scaling` replaced by `rope`.

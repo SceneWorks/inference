@@ -1,11 +1,14 @@
 //! Reference latents encoded on Candle-Metal match the CPU's.
 //!
-//! The VAE encoder's `AvgDown` shortcut averages a 5-D `[B, C, group, H', W']` view over dim 2. At
-//! the pinned candle revision that reduction took candle-metal-kernels' rank > 4 strided-index
-//! fallback, which decoded the wrong dims and read past the source buffer, so every reference /
-//! edit render on Metal conditioned on wrong — and, once the text encoder's vision tower had left
-//! NaN-bearing buffers in the pool, non-finite — reference latents (sc-25909; fix and provenance in
-//! `crates/media/candle-gen/vendor/candle-metal-kernels/VENDORED.md`). This runs the production
+//! The VAE encoder's `AvgDown` shortcut used to average a 5-D `[B, C, group, H', W']` view over
+//! dim 2. At the pinned candle revision that reduction took candle-metal-kernels' rank > 4
+//! strided-index fallback, which decoded the wrong dims and read past the source buffer, so every
+//! reference / edit render on Metal conditioned on wrong — and, once the text encoder's vision
+//! tower had left NaN-bearing buffers in the pool, non-finite — reference latents (sc-25909; fix
+//! and provenance in `crates/media/candle-gen/vendor/candle-metal-kernels/VENDORED.md`). It now
+//! averages a rank-4 `[B, C, group, H'·W']` view (a defensive second guard; the kernel fix is
+//! pinned by `candle-gen`'s `metal_strided_reduce`), so this is the **pipeline-level** pin: any
+//! device-specific defect in the reference encode, whichever op causes it. It runs the production
 //! order — reference text conditioning first, then the VAE encode — on both devices.
 //!
 //! Metal-only: on a CPU-only build there is no second device to compare.

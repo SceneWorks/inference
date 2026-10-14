@@ -1,7 +1,8 @@
 //! The Qwen-Image 2.1 single-stream DiT — a faithful port of diffusers'
 //! `QwenImage21Transformer2DModel` (`transformer_qwenimage21.py` @
-//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]), prefill path (`QwenImage21AttnProcessor`, no KV cache).
-//! The candle twin of `mlx-gen-qwen-image-2-1`'s `src/transformer.rs`.
+//! [`crate::UPSTREAM_DIFFUSERS_REVISION`]): the prefill path (`QwenImage21AttnProcessor`) and the
+//! prefix-KV-cached decode path (`QwenImage21KVCache`, sc-25904). The candle twin of
+//! `mlx-gen-qwen-image-2-1`'s `src/transformer.rs`.
 //!
 //! Text and image latents share **one joint sequence** ([`JointLayout`]): the projected text tokens
 //! in order, condition-image blocks substituted at the vision slots the encoder reserved for them
@@ -14,6 +15,14 @@
 //!   one unmasked call for the target over all keys.
 //! * **`causal_condition`** — the shared modulation is computed for two timestep rows, the sampled
 //!   `t` and `t = 0`; text/condition tokens read the `t = 0` row, target tokens their own.
+//!
+//! Together those two make every block's **prefix** hidden states — and so its prefix keys and
+//! values — independent of the denoise step: a prefix token never attends to the target and never
+//! reads the sampled timestep. [`PrefixKvCache`] is upstream's `QwenImage21KVCache`: the first model
+//! evaluation runs the full joint sequence and keeps each block's prefix K/V
+//! ([`QwenImage21Transformer::forward_joint_extract`]); every later one feeds the blocks the target
+//! tokens only and attends over `[cached prefix, target]`
+//! ([`QwenImage21Transformer::forward_joint_cached`]).
 //!
 //! Numerics: the model computes in the `VarBuilder`'s dtype (f32 on the CPU parity lane, bf16 on a
 //! GPU backend — [`crate::loader::compute_dtype`]); the zero-centred text norm, the affine-free
@@ -459,16 +468,16 @@ impl Attention {
         })
     }
 
-    /// Block-causal attention over the joint sequence `x` `[B, S, inner]`.
-    fn forward(
+    /// `_qwenimage21_prepare_qkv` up to the cache bookkeeping: project, split into heads, QK-norm
+    /// and rotate. Returns `(q, k, v)` as `[B, heads, S, head_dim]` with `q`/`k` post-norm **and
+    /// post-RoPE**, `v` the raw `to_v` projection.
+    fn project(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        prefix_segments: &[(usize, usize, bool)],
-        prefix_len: usize,
         ops: Ops,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, s, _) = x.dims3()?;
         let (h, hd) = (self.heads, self.head_dim);
         let heads = |y: Tensor| -> Result<Tensor> {
@@ -487,15 +496,33 @@ impl Attention {
         };
         let q = apply_rope(&norm(&q, &self.norm_q)?, cos, sin, ops)?;
         let k = apply_rope(&norm(&k, &self.norm_k)?, cos, sin, ops)?;
+        Ok((q, k, v))
+    }
+
+    /// The attention core both paths share: `q` `[B, heads, Sq, head_dim]` over `k`/`v`
+    /// `[B, heads, Sk, head_dim]` through [`block_causal_attention`], then the head merge and
+    /// `to_out`. This is the crate's **only** route to an SDPA call and the only place the scores
+    /// budget is supplied, so the cached decode cannot leave the budgeted path the prefill is on.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        ops: Ops,
+    ) -> Result<Tensor> {
+        let (b, _h, s, _d) = q.dims4()?;
+        let (h, hd) = (self.heads, self.head_dim);
         let scale = (hd as f64).powf(-0.5);
         let softmax: &dyn Fn(&Tensor) -> candle_core::Result<Tensor> = match ops {
             Ops::Fused => &softmax_last_dim,
             Ops::Composable => &softmax_f32,
         };
         let o = block_causal_attention(
-            &q,
-            &k,
-            &v,
+            q,
+            k,
+            v,
             scale,
             prefix_segments,
             prefix_len,
@@ -505,6 +532,70 @@ impl Attention {
         let o = o.transpose(1, 2)?.reshape((b, s, h * hd))?;
         Ok(self.to_out.forward(&o)?)
     }
+
+    /// Block-causal attention over the joint sequence `x` `[B, S, inner]` — the prefill. With
+    /// `capture`, the block's prefix `(k, v)` rows (exactly what the target's attention call
+    /// consumes for those keys) are written to it as **owned, prefix-sized copies**
+    /// ([`owned_prefix_rows`]): upstream's `kv_cache_mode == "extract"`. The copies are taken here,
+    /// while the block's full K/V are alive anyway, and nothing else of this forward escapes it —
+    /// the full K/V are released when it returns, exactly as without a capture.
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        prefix_segments: &[(usize, usize, bool)],
+        prefix_len: usize,
+        ops: Ops,
+        capture: Option<&mut Option<(Tensor, Tensor)>>,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin, ops)?;
+        if let Some(capture) = capture {
+            *capture = Some((
+                owned_prefix_rows(&k, prefix_len)?,
+                owned_prefix_rows(&v, prefix_len)?,
+            ));
+        }
+        self.attend(&q, &k, &v, prefix_segments, prefix_len, ops)
+    }
+
+    /// The cached decode (`kv_cache_mode == "cached"`): `x` is the **target tokens only**
+    /// `[B, T, inner]`, `cos`/`sin` their RoPE rows, and the target attends — unmasked, as the
+    /// block-causal mask degenerates to for target rows — over `[cached prefix, target]` keys and
+    /// values. With no prefix segments and a zero prefix length, [`block_causal_attention`] makes
+    /// exactly its one target call: the same call, over the same keys, on the same budgeted path
+    /// as the prefill's.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cached_k: &Tensor,
+        cached_v: &Tensor,
+        ops: Ops,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.project(x, cos, sin, ops)?;
+        // The prefix is never empty: a layout without text does not get through the prefill
+        // (`prelude`), so no cache can be extracted for one.
+        let k = Tensor::cat(&[cached_k, &k], 2)?;
+        let v = Tensor::cat(&[cached_v, &v], 2)?;
+        self.attend(&q, &k, &v, &[], 0, ops)
+    }
+}
+
+/// An owned, exactly-sized copy of the first `rows` tokens of `x` `[B, heads, S, head_dim]`.
+///
+/// A candle `narrow` is a **view**: it shares (and keeps alive) the storage it was cut from, so
+/// caching a block's prefix rows as a view would pin that block's whole prefill K or V — target
+/// rows included — for every later step. This is upstream's `key[:, cache_write_slice].clone()`
+/// ("`clone()`, not `contiguous()`"), and the same trap: `contiguous()` returns the view itself
+/// whenever the view already counts as contiguous (one head, or a full-length prefix).
+/// `force_contiguous` always allocates a storage of the view's own shape and copies into it. The
+/// view is detached first so the copy carries no backprop edge back to it either (a tracked
+/// tensor's copy keeps its source alive through the op graph).
+fn owned_prefix_rows(x: &Tensor, rows: usize) -> Result<Tensor> {
+    Ok(x.narrow(2, 0, rows)?.detach().force_contiguous()?)
 }
 
 struct FeedForward {
@@ -553,6 +644,18 @@ struct Modulation {
     gate2: Tensor,
 }
 
+/// How one block's attention runs: the block-causal prefill over the whole joint sequence
+/// (optionally capturing the prefix K/V), or the cached decode over the target tokens.
+enum BlockAttention<'a> {
+    Prefill {
+        capture: Option<&'a mut Option<(Tensor, Tensor)>>,
+    },
+    Cached {
+        k: &'a Tensor,
+        v: &'a Tensor,
+    },
+}
+
 struct Block {
     attn: Attention,
     mlp: FeedForward,
@@ -577,15 +680,45 @@ impl Block {
         ops: Ops,
         trace: &mut Trace<'_>,
     ) -> Result<Tensor> {
-        let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
-        let a = self.attn.forward(
-            &h,
-            &geometry.cos,
-            &geometry.sin,
-            &geometry.prefix_segments,
-            geometry.prefix_len,
+        self.forward_with(
+            index,
+            x,
+            m,
+            geometry,
+            BlockAttention::Prefill { capture: None },
             ops,
-        )?;
+            trace,
+        )
+    }
+
+    /// The block body, shared by the prefill and the cached decode — only the attention differs.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        index: usize,
+        x: &Tensor,
+        m: &Modulation,
+        geometry: &JointGeometry,
+        attention: BlockAttention<'_>,
+        ops: Ops,
+        trace: &mut Trace<'_>,
+    ) -> Result<Tensor> {
+        let h = scale_residual(&layer_norm(x, self.eps)?, &m.scale1)?;
+        let a = match attention {
+            BlockAttention::Prefill { capture } => self.attn.forward(
+                &h,
+                &geometry.cos,
+                &geometry.sin,
+                &geometry.prefix_segments,
+                geometry.prefix_len,
+                ops,
+                capture,
+            )?,
+            BlockAttention::Cached { k, v } => {
+                self.attn
+                    .forward_cached(&h, &geometry.cos, &geometry.sin, k, v, ops)?
+            }
+        };
         trace.push(format!("block_{index}_attn"), &a)?;
         let x = (x + m.gate1.tanh()?.broadcast_mul(&a)?)?;
         let h = scale_residual(&layer_norm(&x, self.eps)?, &m.scale2)?;
@@ -594,6 +727,84 @@ impl Block {
         let out = (&x + m.gate2.tanh()?.broadcast_mul(&f)?)?;
         trace.push(format!("block_{index}_out"), &out)?;
         Ok(out)
+    }
+}
+
+/// The prefix K/V of every block for one prompt branch — the port of upstream's
+/// `QwenImage21KVCache` (sc-25904), the candle twin of `mlx_gen_qwen_image_2_1::PrefixKvCache`.
+///
+/// Built **only** by [`QwenImage21Transformer::forward_joint_extract`], complete, and consumed by
+/// [`QwenImage21Transformer::forward_joint_cached`]; there is no way to hold an empty or partly
+/// filled one. It belongs to the branch (prompt + references + target geometry) it was extracted
+/// from: true CFG keeps one for the positive branch and an independent one for the negative
+/// branch, whose prompt is a different prefix.
+///
+/// Per block it stores `(k, v)` as `[1, heads, prefix_len, head_dim]` in the model's compute dtype
+/// — `k` post-QK-norm **and post-RoPE**, `v` the raw `to_v` projection, i.e. exactly the rows the
+/// target's attention consumes for the prefix keys. (Upstream and the MLX twin hold the same
+/// values as `[1, prefix_len, heads, head_dim]`; this crate's attention runs heads-first, and
+/// storing them that way saves a transposing copy of the whole prefix at every cached step.) Each
+/// tensor owns a storage of exactly its own size: holding a cache holds [`Self::nbytes`] plus the
+/// target block's RoPE rows, and nothing else of the forward that produced it.
+pub struct PrefixKvCache {
+    layers: Vec<(Tensor, Tensor)>,
+    /// RoPE rows of the target block (`[target_tokens, head_dim / 2]` each, f32).
+    target_cos: Tensor,
+    target_sin: Tensor,
+    prefix_len: usize,
+    target_tokens: usize,
+}
+
+impl PrefixKvCache {
+    /// Tokens of the cached prefix (text + condition-image blocks).
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    /// Tokens of the target block this cache decodes for.
+    pub fn target_tokens(&self) -> usize {
+        self.target_tokens
+    }
+
+    /// Number of blocks cached — always the transformer's block count.
+    pub fn num_blocks(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Block `index`'s cached `(k, v)`, each `[1, heads, prefix_len, head_dim]`.
+    pub fn layer(&self, index: usize) -> Option<(&Tensor, &Tensor)> {
+        self.layers.get(index).map(|(k, v)| (k, v))
+    }
+
+    /// The geometry of a cached decode: the target block alone, with its own RoPE rows and no
+    /// prefix segments.
+    ///
+    /// `modulation_mask[prefix_len:]` is all target tokens, so no token reads the `t = 0` row
+    /// (`t0_tokens: 0`): `JointGeometry::select` broadcasts row 0 — the sampled timestep — to
+    /// every token unchanged, exactly as upstream's `torch.where` and the MLX twin's
+    /// `broadcast_to` do.
+    fn target_geometry(&self, inner: usize) -> JointGeometry {
+        JointGeometry {
+            cos: self.target_cos.clone(),
+            sin: self.target_sin.clone(),
+            prefix_segments: Vec::new(),
+            prefix_len: 0,
+            seq_len: self.target_tokens,
+            target_tokens: self.target_tokens,
+            t0_tokens: 0,
+            inner,
+        }
+    }
+
+    /// Bytes the cached K/V hold: `2 · blocks · prefix_len · inner_dim · itemsize`.
+    pub fn nbytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|(k, v)| {
+                k.elem_count() * k.dtype().size_in_bytes()
+                    + v.elem_count() * v.dtype().size_in_bytes()
+            })
+            .sum()
     }
 }
 
@@ -752,12 +963,13 @@ impl QwenImage21Transformer {
 
     /// The joint RoPE table `(cos, sin)`, each `[S, head_dim/2]` f32, for `layout`.
     pub fn rope(&self, layout: &JointLayout) -> Result<(Tensor, Tensor)> {
-        rope_sincos_from_ids(
-            &layout.position_ids(),
-            &self.cfg.axes_dims_rope,
-            ROPE_THETA,
-            &self.device,
-        )
+        self.rope_for_ids(&layout.position_ids())
+    }
+
+    /// The RoPE rows for explicit `(frame, height, width)` positions — [`Self::rope`] is this over
+    /// the whole layout, the cached decode over the target block's rows alone.
+    fn rope_for_ids(&self, ids: &[[i32; 3]]) -> Result<(Tensor, Tensor)> {
+        rope_sincos_from_ids(ids, &self.cfg.axes_dims_rope, ROPE_THETA, &self.device)
     }
 
     /// `[1, target_tokens, in_channels]` latents + `[1, text_len, context_in_dim]` text → the
@@ -909,6 +1121,38 @@ impl QwenImage21Transformer {
 
         let (cos, sin) = self.rope(layout)?;
 
+        let (modulation, out_rows) = self.modulation_rows(timestep, trace)?;
+        // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
+        // other token — the whole prefix, since the target is the trailing block — the `t = 0`
+        // row (see `JointGeometry::select`).
+        let t0_tokens = if self.cfg.causal_condition {
+            layout.prefix_len()
+        } else {
+            0
+        };
+        Ok(JointPrelude {
+            x,
+            modulation,
+            out_rows,
+            geometry: JointGeometry {
+                cos,
+                sin,
+                prefix_segments: layout.prefix_segments(),
+                prefix_len: layout.prefix_len(),
+                seq_len: s,
+                target_tokens: layout.target_tokens(),
+                t0_tokens,
+                inner: self.cfg.inner_dim(),
+            },
+        })
+    }
+
+    /// The timestep embedding → `(modulation, norm_out)` rows, `[rows, 4·inner]` and
+    /// `[rows, inner]`: row 0 is the sampled `t`; under `causal_condition` a trailing row is `t = 0`
+    /// (the row every prefix token modulates from). Shared by the prefill and the cached decode,
+    /// which keeps the two-row shape so the sampled row is computed identically on both.
+    fn modulation_rows(&self, timestep: f32, trace: &mut Trace<'_>) -> Result<(Tensor, Tensor)> {
+        let dtype = self.compute_dtype();
         // Timestep rows: the sampled `t` and, under `causal_condition`, an extra `t = 0` row.
         let ts: Vec<f32> = if self.cfg.causal_condition {
             vec![timestep * TIME_FACTOR, 0.0]
@@ -924,34 +1168,203 @@ impl QwenImage21Transformer {
         let silu_temb = silu(&temb)?;
         let modulation = self.modulation.forward(&silu_temb)?; // [rows, 4·inner]
         trace.push("modulation", &modulation)?;
-        // `_select_modulation_rows`: target tokens take row 0 (their sample's timestep), every
-        // other token the trailing `t = 0` row (see `JointGeometry::select`).
-        let target_mask = if self.cfg.causal_condition {
-            let m: Vec<f32> = layout
-                .target_mask()
-                .into_iter()
-                .map(|b| if b { 1.0 } else { 0.0 })
-                .collect();
-            Some(Tensor::from_vec(m, (1, s, 1), &self.device)?.to_dtype(dtype)?)
-        } else {
-            None
+        Ok((modulation, self.norm_out.forward(&silu_temb)?))
+    }
+
+    // ── prefix KV cache (sc-25904) ──────────────────────────────────────────────────────────────
+
+    /// The first model evaluation of a cached denoise — upstream's `kv_cache_mode="extract"`:
+    /// [`Self::forward_joint`] over the full joint sequence, which also keeps every block's prefix
+    /// K/V. Returns the target's velocity and the branch's [`PrefixKvCache`].
+    ///
+    /// Each block's cache entry is copied out **as that block runs** into a storage of its own
+    /// size, so the extract never holds more than the prefill forward plus the cache it is
+    /// building: `prefill peak + 2 · blocks · prefix_tokens · inner_dim · itemsize` (and the
+    /// target's RoPE rows, `2 · target_tokens · head_dim / 2` f32).
+    ///
+    /// Refused unless the model is `causal_condition`: the cache is only valid because the prefix
+    /// tokens modulate from `t = 0`, which is what makes their activations step-independent.
+    pub fn forward_joint_extract(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<(Tensor, PrefixKvCache)> {
+        let (velocity, cache, _) =
+            self.run_joint_extract(text, images, timestep, layout, Trace(None))?;
+        Ok((velocity, cache))
+    }
+
+    /// Every later model evaluation of a cached denoise — upstream's `kv_cache_mode="cached"`: the
+    /// blocks receive **only** the target tokens `target` `[1, target_tokens, in_channels]`, and
+    /// each block's target attention reads `cache`'s prefix K/V in front of its own. Returns the
+    /// target's velocity `[1, target_tokens, out_channels]` in f32.
+    ///
+    /// Valid at any timestep and in any order — the cache does not depend on the step — so a
+    /// solver that evaluates the model more than once per step, or off the schedule, is served by
+    /// the same cache.
+    pub fn forward_joint_cached(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<Tensor> {
+        self.run_joint_cached(target, timestep, cache, Trace(None))
+            .map(|(velocity, _)| velocity)
+    }
+
+    /// [`Self::forward_joint_cached`] that also captures the named intermediates (`img_in_target`,
+    /// `temb`, `modulation`, `block_{i}_attn` / `_mlp` / `_out`, `norm_out`, `proj_out`) in forward
+    /// order. Every joint-sequence stage is `[1, target_tokens, C]`: the tensors the blocks
+    /// actually ran on.
+    pub fn forward_joint_cached_traced(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<(Tensor, Vec<(String, Tensor)>)> {
+        let mut trace = Vec::new();
+        let (velocity, _) =
+            self.run_joint_cached(target, timestep, cache, Trace(Some(&mut trace)))?;
+        Ok((velocity, trace))
+    }
+
+    /// [`Self::forward_joint_extract`] plus the token count the block stack ran on (read off the
+    /// stack's own output), for the denoise loop's report.
+    pub(crate) fn extract_counted(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+    ) -> Result<(Tensor, PrefixKvCache, usize)> {
+        self.run_joint_extract(text, images, timestep, layout, Trace(None))
+    }
+
+    /// [`Self::forward_joint_cached`] plus the token count the block stack ran on.
+    pub(crate) fn cached_counted(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+    ) -> Result<(Tensor, usize)> {
+        self.run_joint_cached(target, timestep, cache, Trace(None))
+    }
+
+    /// The typed refusal upstream raises for `kv_cache` without `causal_condition`.
+    fn require_causal_condition(&self) -> Result<()> {
+        if self.cfg.causal_condition {
+            return Ok(());
+        }
+        Err(Error::Unsupported(
+            "qwen_image_2_1: the prefix KV cache requires `causal_condition = true` — it is only \
+             valid because text and condition-image tokens modulate from t = 0, which makes their \
+             activations independent of the denoising step"
+                .into(),
+        ))
+    }
+
+    fn run_joint_extract(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+        mut trace: Trace<'_>,
+    ) -> Result<(Tensor, PrefixKvCache, usize)> {
+        self.require_causal_condition()?;
+        let prelude = self.prelude(text, images, timestep, layout, &mut trace)?;
+        let geometry = &prelude.geometry;
+        let m = geometry.modulation(&prelude.modulation)?;
+        let out_scale = geometry.select(&prelude.out_rows, 0)?;
+        let mut layers: Vec<(Tensor, Tensor)> = Vec::with_capacity(self.blocks.len());
+        let mut x = prelude.x.clone();
+        for (index, block) in self.blocks.iter().enumerate() {
+            // The slot is filled inside the block's attention with owned, prefix-sized copies; the
+            // block's full `[1, heads, prefix + target, head_dim]` K/V never leave it.
+            let mut captured: Option<(Tensor, Tensor)> = None;
+            x = block.forward_with(
+                index,
+                &x,
+                &m,
+                geometry,
+                BlockAttention::Prefill {
+                    capture: Some(&mut captured),
+                },
+                Ops::Fused,
+                &mut trace,
+            )?;
+            layers.push(captured.ok_or_else(|| {
+                Error::Msg(format!(
+                    "qwen_image_2_1: block {index} captured no prefix K/V"
+                ))
+            })?);
+        }
+        let block_tokens = x.dim(1)?;
+        let velocity = self.head(&x, &out_scale, geometry, &mut trace)?;
+
+        // The target block's own RoPE rows, built at exactly their size rather than narrowed out
+        // of (and so pinning) the joint table.
+        let ids = layout.position_ids();
+        let (target_cos, target_sin) = self.rope_for_ids(&ids[geometry.prefix_len..])?;
+        let cache = PrefixKvCache {
+            layers,
+            target_cos,
+            target_sin,
+            prefix_len: geometry.prefix_len,
+            target_tokens: geometry.target_tokens,
         };
-        let out_rows = self.norm_out.forward(&silu_temb)?;
-        Ok(JointPrelude {
-            x,
-            modulation,
-            out_rows,
-            geometry: JointGeometry {
-                cos,
-                sin,
-                prefix_segments: layout.prefix_segments(),
-                prefix_len: layout.prefix_len(),
-                seq_len: s,
-                target_tokens: layout.target_tokens(),
-                target_mask,
-                inner: self.cfg.inner_dim(),
-            },
-        })
+        Ok((velocity, cache, block_tokens))
+    }
+
+    fn run_joint_cached(
+        &self,
+        target: &Tensor,
+        timestep: f32,
+        cache: &PrefixKvCache,
+        mut trace: Trace<'_>,
+    ) -> Result<(Tensor, usize)> {
+        self.require_causal_condition()?;
+        if cache.layers.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: a {}-block prefix KV cache was given to a {}-block DiT",
+                cache.layers.len(),
+                self.blocks.len()
+            )));
+        }
+        if target.dim(1)? != cache.target_tokens {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the prefix KV cache was extracted for a {}-token target, got {}",
+                cache.target_tokens,
+                target.dim(1)?
+            )));
+        }
+        let dtype = self.compute_dtype();
+
+        let x = self.img_in.forward(&target.to_dtype(dtype)?)?;
+        trace.push("img_in_target", &x)?;
+        let (modulation, out_rows) = self.modulation_rows(timestep, &mut trace)?;
+        let geometry = cache.target_geometry(self.cfg.inner_dim());
+        let m = geometry.modulation(&modulation)?;
+        let out_scale = geometry.select(&out_rows, 0)?;
+        let mut x = x;
+        for (index, (block, (k, v))) in self.blocks.iter().zip(&cache.layers).enumerate() {
+            x = block.forward_with(
+                index,
+                &x,
+                &m,
+                &geometry,
+                BlockAttention::Cached { k, v },
+                Ops::Fused,
+                &mut trace,
+            )?;
+        }
+        let block_tokens = x.dim(1)?;
+        Ok((
+            self.head(&x, &out_scale, &geometry, &mut trace)?,
+            block_tokens,
+        ))
     }
 
     /// After the last block: the `norm_out` modulation, `proj_out`, and the target block's slice
@@ -1070,7 +1483,7 @@ impl QwenImage21Transformer {
 }
 
 /// The joint sequence's static geometry for one forward: the RoPE table, the block-causal segment
-/// runs, and the token mask that selects between the modulation rows. Constant across the blocks
+/// runs, and how many leading tokens read the `t = 0` modulation row. Constant across the blocks
 /// (it carries no trainable dependency).
 pub struct JointGeometry {
     cos: Tensor,
@@ -1079,8 +1492,10 @@ pub struct JointGeometry {
     prefix_len: usize,
     seq_len: usize,
     target_tokens: usize,
-    /// `[1, S, 1]` 0/1 target mask under `causal_condition`, else `None`.
-    target_mask: Option<Tensor>,
+    /// Leading tokens that modulate from the `t = 0` row: the whole prefix for a
+    /// `causal_condition` prefill, `0` when every token reads the sampled row (a model without
+    /// `causal_condition`, or a cached decode, whose sequence is the target alone).
+    t0_tokens: usize,
     inner: usize,
 }
 
@@ -1090,24 +1505,43 @@ impl JointGeometry {
         self.seq_len
     }
 
-    /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`): target tokens take
-    /// row 0 (their sample's timestep), every other token the trailing `t = 0` row → `[1, S,
-    /// inner]`. Expressed as `zero + (real − zero)·mask` for a 0/1 mask, which is exactly
-    /// `where(mask, real, zero)`.
+    /// `_select_modulation_rows` for slot `slot` of `rows` (`[rows, k·inner]`) → `[1, S, inner]`:
+    /// the first `t0_tokens` tokens take the trailing `t = 0` row, every
+    /// later one row 0 (its sample's timestep).
+    ///
+    /// An **exact** select — upstream's `torch.where(mask, real, zero)`: each output row is a copy
+    /// of one of the two input rows, in `rows`' own dtype. It is built as a concatenation of the
+    /// two broadcast rows rather than a per-token `where`, which is the same thing because the
+    /// target is always the trailing block of a joint layout (`JointLayout::validate`), so the
+    /// `t = 0` tokens are exactly the leading `prefix_len`; a geometry whose prefix and target do
+    /// not tile the sequence is refused rather than mis-selected. Differentiable in both rows.
     fn select(&self, rows: &Tensor, slot: usize) -> Result<Tensor> {
         let (s, width) = (self.seq_len, self.inner);
-        let real = rows
-            .narrow(0, 0, 1)?
-            .narrow(1, slot * width, width)?
-            .reshape((1, 1, width))?;
-        let Some(mask) = self.target_mask.as_ref() else {
-            return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
+        let row = |index: usize| -> Result<Tensor> {
+            Ok(rows
+                .narrow(0, index, 1)?
+                .narrow(1, slot * width, width)?
+                .reshape((1, 1, width))?)
         };
-        let zero = rows
-            .narrow(0, 1, 1)?
-            .narrow(1, slot * width, width)?
-            .reshape((1, 1, width))?;
-        Ok(zero.broadcast_add(&real.broadcast_sub(&zero)?.broadcast_mul(mask)?)?)
+        let real = row(0)?;
+        if self.t0_tokens == 0 {
+            return Ok(real.broadcast_as((1, s, width))?.contiguous()?);
+        }
+        if self.t0_tokens + self.target_tokens != s {
+            return Err(Error::Msg(format!(
+                "qwen_image_2_1: the modulation select needs the target block to be the trailing \
+                 {} of {s} tokens, but {} leading tokens read the t = 0 row",
+                self.target_tokens, self.t0_tokens
+            )));
+        }
+        let zero = row(1)?;
+        Ok(Tensor::cat(
+            &[
+                zero.broadcast_as((1, self.t0_tokens, width))?,
+                real.broadcast_as((1, self.target_tokens, width))?,
+            ],
+            1,
+        )?)
     }
 
     /// The four per-token block modulations from the `[rows, 4·inner]` shared modulation.
@@ -1287,6 +1721,603 @@ mod tests {
             diff <= 1e-5,
             "the chunked branch diverged from the single pass by {diff:.3e}"
         );
+    }
+
+    /// The cached decode's attention call — target queries over `[cached prefix, target]` keys,
+    /// no segments — is the prefill's own target call: same rows out, and on the same budgeted
+    /// path, where it chunks consistently although its key axis is longer than its query axis.
+    ///
+    /// At the shipped sizes this call **always** chunks (see the arithmetic test below), and no
+    /// fixture would make it, so the budget is forced here. The cached keys are an owned copy of
+    /// the prefix rows, as the cache holds them.
+    #[test]
+    fn the_cached_attention_call_is_the_prefill_target_call_chunked_or_not() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        // Two condition blocks around text, then a 4x6 target — the edit route's shape.
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 5 },
+                Segment::Image {
+                    height: 2,
+                    width: 3,
+                },
+                Segment::Text { len: 2 },
+                Segment::Image {
+                    height: 4,
+                    width: 6,
+                },
+            ],
+        };
+        let (s, heads, head_dim) = (layout.total_len(), 4usize, 8usize);
+        let (prefix, target) = (layout.prefix_len(), layout.target_tokens());
+        let dev = Device::Cpu;
+        let fill = |seed: usize| -> Tensor {
+            let n = heads * s * head_dim;
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 37 + seed * 11) % 97) as f32 / 97.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, heads, s, head_dim), &dev).unwrap()
+        };
+        let (q, k, v) = (fill(0), fill(1), fill(2));
+        let scale = (head_dim as f64).powf(-0.5);
+        let want = block_causal_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            &layout.prefix_segments(),
+            prefix,
+            &softmax_last_dim,
+            usize::MAX,
+        )
+        .unwrap()
+        .narrow(2, prefix, target)
+        .unwrap();
+
+        let rows = |t: &Tensor| t.narrow(2, prefix, target).unwrap().contiguous().unwrap();
+        let cached_k = owned_prefix_rows(&k, prefix).unwrap();
+        let cached_v = owned_prefix_rows(&v, prefix).unwrap();
+        let k_cat = Tensor::cat(&[&cached_k, &rows(&k)], 2).unwrap();
+        let v_cat = Tensor::cat(&[&cached_v, &rows(&v)], 2).unwrap();
+        let rows_per_query = heads * s;
+        let forced = rows_per_query;
+        assert!(
+            (attention_budget_from_usize(forced)
+                .query_block_rows(rows_per_query as u64, target as u64) as usize)
+                < target,
+            "the forced budget must actually chunk the cached call's query axis"
+        );
+        for (label, budget) in [("single pass", usize::MAX), ("chunked", forced)] {
+            let got = block_causal_attention(
+                &rows(&q),
+                &k_cat,
+                &v_cat,
+                scale,
+                &[],
+                0,
+                &softmax_last_dim,
+                budget,
+            )
+            .unwrap();
+            assert_eq!(got.dims(), want.dims(), "{label}");
+            let diff = (&got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!("cached call vs prefill target rows ({label}): max|Δ|={diff:.3e}");
+            assert!(
+                diff <= 1e-5,
+                "{label}: the cached call diverged from the prefill's target rows by {diff:.3e}"
+            );
+        }
+    }
+
+    /// Every tensor the cached path adds stays inside candle's CUDA index widths at the worst
+    /// shipped request — the largest-area preset with ten references — **because** its attention
+    /// is on the budgeted path; unbudgeted, its scores alone are ~14× `i32::MAX`.
+    ///
+    /// candle's CUDA kernels index elements with `i32` (softmax, elementwise, matmul) and launch
+    /// with a `u32` element count (`LaunchConfig::for_num_elems`, the strided copy behind `cat`
+    /// and `force_contiguous`). The numbers below are the element counts of each op the cached
+    /// step and the extract's capture add; the source half of
+    /// `the_joint_attention_is_budgeted_because_the_shipped_sizes_overflow_i32` is what pins the
+    /// cached call to the budget.
+    #[test]
+    fn the_cached_path_stays_inside_cuda_index_widths_at_the_ten_reference_boundary() {
+        use candle_gen::attention::attention_budget_from_usize;
+
+        let cfg = TransformerConfig::production();
+        let geometry = crate::memory_strategy::admission_geometry();
+        let target = geometry.max_target_image_tokens as usize;
+        let joint = geometry.max_joint_tokens as usize;
+        let prefix = joint - target;
+        assert_eq!((target, prefix, joint), (16_800, 41_216, 58_016));
+        let (heads, head_dim) = (cfg.num_attention_heads, cfg.attention_head_dim);
+        let i32_max = i32::MAX as usize;
+
+        // The cached step's one attention call: target queries over prefix + target keys.
+        let scores = heads * target * joint;
+        assert!(
+            scores > 14 * i32_max && scores > u32::MAX as usize,
+            "{scores} unbudgeted score elements must overflow both index widths"
+        );
+        let rows_per_query = heads * joint;
+        let block = attention_budget_from_usize(candle_gen::ATTN_SCORES_BUDGET)
+            .query_block_rows(rows_per_query as u64, target as u64) as usize;
+        assert!(
+            (1..target).contains(&block),
+            "the cached call must chunk at this size (block {block} of {target} rows)"
+        );
+        // One chunk's scores / probs (`matmul`, `· scale`, `softmax_last_dim`).
+        assert!(block * rows_per_query <= candle_gen::ATTN_SCORES_BUDGET);
+        assert!(candle_gen::ATTN_SCORES_BUDGET < i32_max);
+
+        // `cat([cached, target], 2)` and the `kᵀ` / `v` the SDPA makes contiguous: one full-length
+        // K or V. The capture's `narrow → force_contiguous` reads from a tensor of the same size
+        // and writes the prefix rows. The cached step's modulation rows are `[1, target, inner]`.
+        for (what, elements) in [
+            ("a full-length K or V", heads * joint * head_dim),
+            ("one cached prefix K or V", heads * prefix * head_dim),
+            ("the per-token modulation", target * cfg.inner_dim()),
+        ] {
+            assert!(
+                elements < i32_max,
+                "{what} has {elements} elements, past i32::MAX"
+            );
+        }
+    }
+
+    /// The committed miniature DiT (the MLX twin's tiny snapshot), f32 on CPU.
+    fn tiny_dit() -> QwenImage21Transformer {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
+        let cfg = TransformerConfig::from_json_file(&root.join("transformer/config.json")).unwrap();
+        let vb = candle_gen::loader::component_vb(
+            &root,
+            "transformer",
+            DType::F32,
+            &Device::Cpu,
+            "select",
+        )
+        .unwrap();
+        QwenImage21Transformer::new(&cfg, vb).unwrap()
+    }
+
+    /// Text, two reference blocks and a non-square target — and the prelude the prefill forward
+    /// (`run_joint`, `run_joint_extract`) and the trainer's checkpointed pieces all start from.
+    fn edit_prelude(dit: &QwenImage21Transformer) -> (JointLayout, JointPrelude) {
+        let layout = JointLayout {
+            segments: vec![
+                Segment::Text { len: 3 },
+                Segment::Image {
+                    height: 2,
+                    width: 2,
+                },
+                Segment::Text { len: 1 },
+                Segment::Image {
+                    height: 2,
+                    width: 4,
+                },
+                Segment::Text { len: 4 },
+                Segment::Image {
+                    height: 2,
+                    width: 6,
+                },
+            ],
+        };
+        let c = dit.config();
+        let fill = |tokens: usize, width: usize, seed: usize| -> Tensor {
+            let v: Vec<f32> = (0..tokens * width)
+                .map(|i| (((i * 31 + seed * 17) % 89) as f32 / 89.0) - 0.5)
+                .collect();
+            Tensor::from_vec(v, (1, tokens, width), &Device::Cpu).unwrap()
+        };
+        let text = fill(8, c.context_in_dim, 1);
+        let images = [
+            fill(4, c.in_channels, 2),
+            fill(8, c.in_channels, 3),
+            fill(12, c.in_channels, 4),
+        ];
+        let refs: Vec<&Tensor> = images.iter().collect();
+        let prelude = dit.train_prelude_joint(&text, &refs, 0.6, &layout).unwrap();
+        (layout, prelude)
+    }
+
+    fn f32_bits(t: &Tensor) -> Vec<u32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Two modulation rows (`[2, slots·inner]`) on which `zero + (real − zero)` visibly rounds in
+    /// f32 — a large `t = 0` entry absorbs a small sampled one.
+    fn rounding_rows(slots: usize, inner: usize) -> Tensor {
+        let real: Vec<f32> = (0..slots * inner).map(|i| 0.1 + i as f32 * 0.013).collect();
+        let zero: Vec<f32> = (0..slots * inner)
+            .map(|i| if i % 2 == 0 { 1.0e9 } else { -3.7e4 })
+            .collect();
+        Tensor::from_vec([real, zero].concat(), (2, slots * inner), &Device::Cpu).unwrap()
+    }
+
+    /// The prefill's per-token modulation is an **exact** select — upstream's `torch.where`: every
+    /// prefix token receives the `t = 0` row and every target token the sampled-timestep row, bit
+    /// for bit, in all four block modulation slots and in the `norm_out` select. Asked of the
+    /// tensors the blocks and the head are handed (`JointGeometry::modulation` / `select` on the
+    /// prelude's own geometry), on the model's own rows and on rows where a blend
+    /// `zero + (real − zero)·mask` rounds, in f32 and in **bf16** — the dtype production runs on
+    /// CUDA/Metal, where that blend was off by percents and which no forward on this lane reaches
+    /// (the select needs no matmul, so it does run in bf16 on CPU).
+    #[test]
+    fn the_prefill_selects_each_modulation_row_exactly() {
+        let dit = tiny_dit();
+        let (layout, prelude) = edit_prelude(&dit);
+        let inner = dit.config().inner_dim();
+        let geometry = &prelude.geometry;
+        let (prefix, total) = (layout.prefix_len(), layout.total_len());
+        assert_eq!((prefix, total, geometry.seq_len()), (20, 32, 32));
+        // The mask upstream selects with: exactly the trailing target block.
+        assert_eq!(
+            layout.target_mask(),
+            (0..total).map(|i| i >= prefix).collect::<Vec<_>>()
+        );
+
+        // `rows` → per-token `[1, S, inner]` must be row 1 on the prefix and row 0 on the target.
+        let check = |what: &str, selected: &Tensor, rows: &Tensor, slot: usize| {
+            assert_eq!(selected.dims(), &[1, total, inner], "{what}");
+            assert_eq!(
+                selected.dtype(),
+                rows.dtype(),
+                "{what}: the rows' own dtype"
+            );
+            let row = |index: usize| {
+                f32_bits(
+                    &rows
+                        .narrow(0, index, 1)
+                        .unwrap()
+                        .narrow(1, slot * inner, inner)
+                        .unwrap(),
+                )
+            };
+            let (sampled, t0) = (row(0), row(1));
+            assert_ne!(sampled, t0, "{what}: the two rows must differ");
+            let got = f32_bits(selected);
+            for token in 0..total {
+                let want = if token < prefix { &t0 } else { &sampled };
+                assert_eq!(
+                    &got[token * inner..(token + 1) * inner],
+                    &want[..],
+                    "{what}: token {token} ({})",
+                    if token < prefix { "prefix" } else { "target" }
+                );
+            }
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            for (name, modulation, out_rows) in [
+                (
+                    "model rows",
+                    prelude.modulation.to_dtype(dtype).unwrap(),
+                    prelude.out_rows.to_dtype(dtype).unwrap(),
+                ),
+                (
+                    "rounding rows",
+                    rounding_rows(4, inner).to_dtype(dtype).unwrap(),
+                    rounding_rows(1, inner).to_dtype(dtype).unwrap(),
+                ),
+            ] {
+                let m = geometry.modulation(&modulation).unwrap();
+                for (slot, selected) in [&m.scale1, &m.gate1, &m.scale2, &m.gate2]
+                    .into_iter()
+                    .enumerate()
+                {
+                    check(
+                        &format!("{dtype:?} {name} slot {slot}"),
+                        selected,
+                        &modulation,
+                        slot,
+                    );
+                }
+                check(
+                    &format!("{dtype:?} {name} norm_out"),
+                    &geometry.select(&out_rows, 0).unwrap(),
+                    &out_rows,
+                    0,
+                );
+            }
+        }
+    }
+
+    /// The select is correct only because the `t = 0` tokens are the leading prefix and the target
+    /// the trailing block. A geometry in which the two do not tile the sequence is refused, not
+    /// mis-selected.
+    #[test]
+    fn a_geometry_whose_target_is_not_the_trailing_block_is_refused() {
+        let dit = tiny_dit();
+        let (_, prelude) = edit_prelude(&dit);
+        let mut geometry = prelude.geometry;
+        geometry.t0_tokens -= 1;
+        let err = geometry
+            .select(&prelude.out_rows, 0)
+            .expect_err("19 t = 0 tokens + 12 target tokens do not tile 32");
+        assert_eq!(
+            err.to_string(),
+            "qwen_image_2_1: the modulation select needs the target block to be the trailing 12 \
+             of 32 tokens, but 19 leading tokens read the t = 0 row"
+        );
+    }
+
+    /// The select stays differentiable in **both** rows: a loss over the selected rows sends each
+    /// row exactly the gradient its tokens carry — the sampled row the target tokens', the `t = 0`
+    /// row the prefix tokens' — and nothing to the other slots. Analytic, so the comparison is to
+    /// f32 summation error.
+    #[test]
+    fn the_select_passes_each_rows_gradient_to_its_own_tokens() {
+        let dit = tiny_dit();
+        let (layout, prelude) = edit_prelude(&dit);
+        let inner = dit.config().inner_dim();
+        let (prefix, total) = (layout.prefix_len(), layout.total_len());
+        let rows = candle_core::Var::from_tensor(&prelude.modulation).unwrap();
+        let weights: Vec<f32> = (0..total * inner)
+            .map(|i| (((i * 13) % 41) as f32 / 41.0) - 0.4)
+            .collect();
+        let w = Tensor::from_vec(weights.clone(), (1, total, inner), &Device::Cpu).unwrap();
+        let slot = 2usize;
+        let loss = (prelude.geometry.select(rows.as_tensor(), slot).unwrap() * &w)
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        let grad = grads
+            .get(rows.as_tensor())
+            .expect("the select must reach its rows")
+            .to_vec2::<f32>()
+            .unwrap();
+        let column_sum = |tokens: std::ops::Range<usize>, channel: usize| -> f32 {
+            tokens.map(|t| weights[t * inner + channel]).sum()
+        };
+        let mut reached = [false; 2];
+        for (row, tokens) in [(0usize, prefix..total), (1, 0..prefix)] {
+            for (column, got) in grad[row].iter().enumerate() {
+                let want = if column / inner == slot {
+                    column_sum(tokens.clone(), column % inner)
+                } else {
+                    0.0
+                };
+                reached[row] |= want.abs() > 0.1;
+                assert!(
+                    (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "row {row} column {column}: gradient {got} vs {want}"
+                );
+            }
+        }
+        assert_eq!(reached, [true; 2], "both rows carry a real gradient");
+    }
+
+    /// End to end through the trainer's checkpoint pieces: a loss on the velocity reaches the
+    /// shared modulation rows through `train_block`'s modulation input — the sampled row **and**
+    /// the `t = 0` row — and the `norm_out` rows through `train_head`, and those gradients are the
+    /// function's: each matches a central finite difference along a fixed direction. The
+    /// modulation rows are checked **one at a time** (the direction zeroed on the other row), so a
+    /// backward error confined to the `t = 0` row cannot hide behind the sampled row's larger
+    /// derivative.
+    #[test]
+    fn the_trainer_pieces_backpropagate_through_the_selected_rows() {
+        use candle_core::Var;
+
+        let dit = tiny_dit();
+        let (_, prelude) = edit_prelude(&dit);
+        let velocity = |modulation: &Tensor, out_rows: &Tensor| -> Tensor {
+            let mut x = prelude.x.clone();
+            for index in 0..dit.num_blocks() {
+                x = dit
+                    .train_block(index, &x, modulation, &prelude.geometry)
+                    .unwrap();
+            }
+            dit.train_head(&x, out_rows, &prelude.geometry).unwrap()
+        };
+        let probe = |v: &Tensor| -> Tensor {
+            let n = v.elem_count();
+            let w: Vec<f32> = (0..n)
+                .map(|i| (((i * 7) % 23) as f32 / 23.0) - 0.45)
+                .collect();
+            (v * Tensor::from_vec(w, v.dims(), &Device::Cpu).unwrap())
+                .unwrap()
+                .sum_all()
+                .unwrap()
+        };
+        let direction = |like: &Tensor, seed: usize| -> Tensor {
+            let n = like.elem_count();
+            let d: Vec<f32> = (0..n)
+                .map(|i| (((i * 29 + seed) % 53) as f32 / 53.0) - 0.5)
+                .collect();
+            Tensor::from_vec(d, like.dims(), &Device::Cpu).unwrap()
+        };
+        let modulation = Var::from_tensor(&prelude.modulation).unwrap();
+        let out_rows = Var::from_tensor(&prelude.out_rows).unwrap();
+        let loss = probe(&velocity(modulation.as_tensor(), out_rows.as_tensor()));
+        let grads = loss.backward().unwrap();
+        let scalar = |t: &Tensor| t.to_scalar::<f32>().unwrap();
+        let abs_sum = |t: &Tensor| scalar(&t.abs().unwrap().sum_all().unwrap());
+
+        let g_mod = grads
+            .get(modulation.as_tensor())
+            .expect("the modulation rows must receive a gradient");
+        for (row, name) in [(0usize, "sampled"), (1, "t = 0")] {
+            let mass = abs_sum(&g_mod.narrow(0, row, 1).unwrap());
+            assert!(
+                mass > 1e-3,
+                "the {name} modulation row received no gradient ({mass:e})"
+            );
+        }
+        let g_out = grads
+            .get(out_rows.as_tensor())
+            .expect("the norm_out rows must receive a gradient");
+        assert!(abs_sum(&g_out.narrow(0, 0, 1).unwrap()) > 1e-3);
+
+        let eps = 1e-2f64;
+        // A direction confined to one row of a two-row tensor.
+        let only_row = |like: &Tensor, seed: usize, row: usize| -> Tensor {
+            let keep: Vec<f32> = (0..2).map(|r| if r == row { 1.0 } else { 0.0 }).collect();
+            direction(like, seed)
+                .broadcast_mul(&Tensor::from_vec(keep, (2, 1), &Device::Cpu).unwrap())
+                .unwrap()
+        };
+        for (name, grad, base, d) in [
+            (
+                "modulation sampled row",
+                g_mod,
+                &prelude.modulation,
+                only_row(&prelude.modulation, 3, 0),
+            ),
+            (
+                "modulation t = 0 row",
+                g_mod,
+                &prelude.modulation,
+                only_row(&prelude.modulation, 3, 1),
+            ),
+            (
+                "norm_out",
+                g_out,
+                &prelude.out_rows,
+                direction(&prelude.out_rows, 5),
+            ),
+        ] {
+            let analytic = scalar(&(grad * &d).unwrap().sum_all().unwrap());
+            let at = |sign: f64| -> f32 {
+                let moved = (base + (&d * (sign * eps)).unwrap()).unwrap();
+                let v = if name == "norm_out" {
+                    velocity(&prelude.modulation, &moved)
+                } else {
+                    velocity(&moved, &prelude.out_rows)
+                };
+                scalar(&probe(&v))
+            };
+            let numeric = (at(1.0) - at(-1.0)) / (2.0 * eps as f32);
+            let rel = (analytic - numeric).abs() / numeric.abs().max(1e-6);
+            eprintln!(
+                "{name}: analytic {analytic:.6e} finite-difference {numeric:.6e} rel {rel:.2e}"
+            );
+            assert!(
+                numeric.abs() > 1e-3,
+                "{name}: the direction must move the loss"
+            );
+            // f32 forward: across steps 3e-3 … 2e-2 the finite difference itself wanders by
+            // 1e-4 … 7e-4 relative (round-off against truncation), so the gate sits ~7× above
+            // that. A row whose gradient is missing or mis-scaled is off by 1e-1 … 1.
+            assert!(
+                rel <= 5e-3,
+                "{name}: gradient {analytic:e} vs finite difference {numeric:e} ({rel:.2e})"
+            );
+        }
+    }
+
+    /// The modulation a cached step's target tokens receive is the sampled-timestep row **bit for
+    /// bit** — upstream's `torch.where`, the MLX twin's `broadcast_to`. The rows here are chosen so
+    /// that the blend the prefill used until sc-25904 (see UPSTREAM.md, History),
+    /// `zero + (real − zero)·1`, visibly rounds in f32 (a large `t = 0` entry absorbs a small
+    /// sampled one) — the error an all-ones mask through that blend would have put on every
+    /// target token, percent-level in the released checkpoint's bf16.
+    #[test]
+    fn a_cached_step_reads_the_sampled_modulation_row_exactly() {
+        let dev = Device::Cpu;
+        let (inner, tokens, slots) = (4usize, 3usize, 4usize);
+        // Row 0 = sampled timestep, row 1 = `t = 0`.
+        let real: Vec<f32> = (0..slots * inner).map(|i| 0.1 + i as f32 * 0.013).collect();
+        let zero: Vec<f32> = (0..slots * inner)
+            .map(|i| if i % 2 == 0 { 1.0e9 } else { -3.7e4 })
+            .collect();
+        let rows =
+            Tensor::from_vec([real.clone(), zero].concat(), (2, slots * inner), &dev).unwrap();
+        let table = Tensor::zeros((tokens, 2), DType::F32, &dev).unwrap();
+        let cache = PrefixKvCache {
+            layers: Vec::new(),
+            target_cos: table.clone(),
+            target_sin: table,
+            prefix_len: 5,
+            target_tokens: tokens,
+        };
+        let geometry = cache.target_geometry(inner);
+        assert_eq!(geometry.seq_len(), tokens);
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for slot in 0..slots {
+            let got = geometry.select(&rows, slot).unwrap();
+            assert_eq!(got.dims(), &[1, tokens, inner]);
+            let want: Vec<u32> = (0..tokens)
+                .flat_map(|_| real[slot * inner..(slot + 1) * inner].iter())
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(
+                bits(&got),
+                want,
+                "slot {slot}: every target token must read the sampled row unchanged"
+            );
+        }
+        let m = geometry.modulation(&rows).unwrap();
+        assert_eq!(
+            bits(&m.gate2.narrow(1, 0, 1).unwrap()),
+            real[3 * inner..]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The cache holds its entries in the tensor's own dtype — the compute dtype, bf16 on a GPU
+    /// backend — not an f32 upcast, and prepending one to a bf16 target K/V stays bf16. (candle's
+    /// CPU backend has no bf16 matmul, so no forward here can run in bf16; the copy and the `cat`
+    /// can.)
+    #[test]
+    fn a_cache_entry_keeps_the_compute_dtype() {
+        let dev = Device::Cpu;
+        let fill = |tokens: usize| -> Tensor {
+            let v: Vec<f32> = (0..2 * tokens * 8).map(|i| i as f32 * 0.25 - 3.0).collect();
+            Tensor::from_vec(v, (1, 2, tokens, 8), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let full = fill(6);
+        let owned = owned_prefix_rows(&full, 2).unwrap();
+        assert_eq!(owned.dtype(), DType::BF16);
+        assert_eq!(owned.dims(), &[1, 2, 2, 8]);
+        assert_eq!(
+            owned
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            full.narrow(2, 0, 2)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        let joined = Tensor::cat(&[&owned, &fill(4)], 2).unwrap();
+        assert_eq!(joined.dtype(), DType::BF16);
+        assert_eq!(joined.dims(), &[1, 2, 6, 8]);
     }
 
     /// A multi-image layout emits one DISTINCT trace key per image block.

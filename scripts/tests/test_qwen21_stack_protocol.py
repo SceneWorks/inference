@@ -17,7 +17,8 @@ def protocol_errors(source):
         'stack_protocol::reference_receipt(&references,&fitted_sizes)',
         'assert_eq!(request.memory_reference_count(),2)',
         'fitted_sizes.iter().all(|size|*size==(1024,1024))',
-        'request_transient_budget_bytes(request.width,request.height,',
+        # sc-25909: the derived budget takes the loaded tier (this stack renders the bf16 tier).
+        'request_transient_budget_bytes(mlx_gen_qwen_image_2_1::Tier::Bf16,request.width,request.height,',
         'request.memory_reference_count(),false,tile_edge,)',
         'letstacks:[(&str,Vec<AdapterSpec>);6]',
         '"renderCount":6', '"stackMovementFloor":STACK_MOVES_FLOOR',

@@ -8,14 +8,79 @@
 //! | 3 | [`MemoryStrategy::BoundedAttention`] | not applicable — the DiT's joint attention is block-causal per segment; the shared chunked-score kernel has no block-causal variant |
 //! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | not applicable — no block-streaming loader on this route |
 //!
-//! # Derived, never measured
+//! One lever is selectable **beside** the ladder, as a typed execution domain
+//! (`gen_core::execution_domains`), not as a rung:
 //!
-//! The **derived** tier and activation tables are owned once, in the MLX crate's
-//! `memory_strategy::derived` module, and are not duplicated here: parameter counts and joint-token
-//! arithmetic are properties of the model, not of the backend. What *is* backend-specific is the
-//! byte width each component is materialized at, and that is priced from the snapshot's own tensor
-//! headers in `asset_facts`. As on MLX, nothing here is an on-device observation.
-
+//! | domain | request field | this provider |
+//! |---|---|---|
+//! | [`PrefixKvCacheMode`] | `GenerationMemory::prefix_kv_cache` | **implemented, both modes** — `Cached` holds every block's prefix K/V for the denoise loop; `Prefill` (and an unset field) holds nothing and is the pre-cache path, byte-for-byte |
+//!
+//! # The prefix KV cache is priced per request and selected per request (sc-25905)
+//!
+//! The cache ([`crate::pipeline::KvCacheMode`], sc-25904) holds K and V for every block over the
+//! block-causal **prefix** — the prompt rows and every reference image — at the dtype the DiT
+//! computes in, once per prompt branch. **On this backend the width follows the device, not the
+//! tier**: a packed (q8 / q4) Linear dequantizes its weight to the activation's dtype, so the
+//! hidden states and the cached K/V stay at the dtype the model was loaded at — bf16 on CUDA and
+//! Metal (0.5 MiB per prefix token), f32 on a CPU device (1 MiB), on every tier. The cache is
+//! activations, not weights: no tier shrinks it. (The MLX twin differs — its packed tiers compute
+//! in f32.)
+//!
+//! **Every cache figure here is derived — exact tensor arithmetic over the shapes the cache
+//! stores — and none is measured.** The epic's terminal story measures one cached ten-reference
+//! render; until then nothing here is evidence.
+//!
+//! ## What is priced: an upper bound
+//!
+//! The real prefix is known only once the prompt is tokenized and the references are fitted, so
+//! the surcharge ([`prefix_kv_cache_demand_bytes`]) is priced over two published bounds, both of
+//! which err **high**: [`PREFIX_KV_CACHE_CONDITIONING_TOKENS`] (1024) text rows per branch —
+//! chosen, not measured — and [`PREFIX_KV_CACHE_REFERENCE_TOKENS`] (4920) per reference, the
+//! largest grid any aspect ratio fits to (20% above the square 4096). At bf16 that is 0.5 GiB with
+//! no reference, 2.40 GiB more per reference and 24.5 GiB at ten; twice that at f32; doubled when
+//! a negative branch runs; plus the target RoPE rows.
+//!
+//! The generator **holds a cached render to that price** ([`prefix_kv_cache_overflow`]): with the
+//! real layouts in hand it computes what the caches would hold, and a request past its priced
+//! figure — a prompt branch over the text bound, or a generator loaded onto a wider device than
+//! the build prices — runs **prefill** instead. It is never cached above its price and never
+//! failed; the render's report carries the two byte counts (`PrefixKvCacheReport::overflow`) and
+//! a [`PREFIX_KV_CACHE_OVERFLOW_WARNING`] warning.
+//!
+//! ## What does not move
+//!
+//! This crate publishes no activation table and installs no allocator budget, so the cache-shed
+//! demand of a request is whatever its caller already prices, and it does not move: the contract,
+//! its asset facts, its formula, the admission envelope and both calibration identities are
+//! unchanged. A cached request is priced at exactly that demand plus the surcharge
+//! ([`request_demand_bytes`]). A request that selects nothing runs prefill.
+//!
+//! ## Who decides, and what the engine does not check
+//!
+//! A caller that has room selects [`PrefixKvCacheMode::Cached`] (`PrefixKvCacheMode::select` is
+//! the comparison); a request that fits only without the cache is admitted and runs prefill; a
+//! request that fits neither is refused exactly as before. The cache is independent of every
+//! rung, so a planner that wants it shed **last** tries each rung with the cache before any rung
+//! without it. Which path ran is reported on `GenerationReport::prefix_kv_cache`.
+//!
+//! Two things are the caller's and nothing here verifies them:
+//!
+//! * **Order.** The request scope's `configure_request` *replaces* `GenerationRequest::memory`
+//!   (with `None` for a `Resident` selection), so the selection must be written **after** it,
+//!   creating a default block if there is none. A selection written before it is lost and the
+//!   render runs prefill in silence — only the report says so.
+//! * **Admission.** The engine honours `Cached`; it does not check that the request was admitted
+//!   against the cached demand.
+//!
+//! ## Approximations that remain, and their direction
+//!
+//! * The surcharge is priced for the build's production device ([`compute_width`]). A GPU build
+//!   loaded onto a CPU device holds twice it; price that with [`compute_width_on`], or rely on
+//!   the shed above.
+//! * The admission envelope still assumes [`TABLE_CONDITIONING_TOKENS`] (256) text rows and a
+//!   square [`REFERENCE_FIT_TOKENS`] (4096) per reference — pre-existing, errs **low** for a long
+//!   prompt or an extreme-aspect reference, and untouched here.
+//!
 use std::path::Path;
 
 use candle_gen::gen_core::{
@@ -23,17 +88,33 @@ use candle_gen::gen_core::{
     MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
     MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, ResidentRequestMemory,
-    WeightsSource,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, PrefixKvCacheMode,
+    ResidentRequestMemory, WeightsSource,
 };
 
-use crate::config::MAX_REFERENCE_IMAGES;
+use crate::config::{Variant, MAX_REFERENCE_IMAGES};
 use crate::pipeline::DECODE_OVERLAP;
-use crate::MODEL_ID;
+use crate::{MODEL_ID, TURBO_MODEL_ID};
 
 /// Content fingerprint of this contract. Distinct from the MLX twin's: the two backends never share
 /// calibration evidence, and the candle route materializes its components at different widths.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "qwen-image-2-1-candle-derived-2026-09-22-v1";
+/// The Turbo id's own calibration identity (sc-25901). The DERIVED model is the same arithmetic —
+/// `Qwen/Qwen-Image-2.1-Turbo` shares the base transformer `config.json`, so parameter counts and
+/// joint-token counts are identical — but it prices a different checkpoint, and a record built
+/// against one id must not satisfy the other's handshake (the three Anima ids' convention).
+pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str =
+    "qwen-image-2-1-turbo-candle-derived-2026-10-13-v1";
+
+/// The variant registered as `provider_id`, or the typed refusal for an id this crate does not
+/// serve.
+fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
+    Variant::from_id(provider_id).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
+        ))
+    })
+}
 
 /// The published decode-tile domain — **derived defaults, pending the epic-end campaign**, not a
 /// measured ladder. The crate's shipped default (512) is bracketed by its neighbours at the same
@@ -98,6 +179,257 @@ pub const fn image_tokens(width: u32, height: u32) -> u64 {
     (width as u64 / PIXELS_PER_TOKEN) * (height as u64 / PIXELS_PER_TOKEN)
 }
 
+// ================================================================================================
+// The prefix KV cache as a request-selected execution domain (sc-25905).
+// ================================================================================================
+//
+// DERIVED, never measured: the exact element count of the tensors `PrefixKvCache` stores
+// (`crate::transformer`) times the width they are held at. `tests/kv_admission.rs` holds every
+// function here to the bytes a real cache reports on the tiny fixture.
+
+/// Transformer blocks of the DiT (`num_layers`): the cache stores one `(k, v)` pair per block.
+pub const DIT_BLOCKS: u64 = 32;
+/// The DiT's joint hidden width (`num_attention_heads · attention_head_dim`).
+pub const DIT_INNER: u64 = 4096;
+/// Bytes per RoPE table entry pair (`cos` + `sin`, both f32, `head_dim / 2` wide):
+/// `2 · 64 · 4`.
+pub const DIT_ROPE_BYTES_PER_TOKEN: u64 = 512;
+
+/// The prefix-KV-cache modes both engine ids implement, declared on `Capabilities::execution`
+/// so the shared request floor admits them and a planner can discover them.
+pub const PREFIX_KV_CACHE_MODES: [PrefixKvCacheMode; 2] = PrefixKvCacheMode::ALL;
+
+/// `GenerationWarning::code` of the warning a render carries when a `Cached` selection ran
+/// prefill because its real caches exceeded the priced bound (`PrefixKvCacheReport::overflow`).
+pub const PREFIX_KV_CACHE_OVERFLOW_WARNING: &str = "prefix_kv_cache_shed_over_priced_bound";
+
+/// **Priced** text rows per prompt branch: an upper bound, not an estimate.
+///
+/// The cache covers the real text rows of each branch — the chat wrapper, one
+/// `<imageN><|vision_start|>…<|vision_end|>` group per reference (the pad slots themselves are
+/// replaced by the reference's latents and counted there), and the prompt — and nothing caps
+/// those below the tokenizer's 4096. 1024 is the bound priced: about 700 English words after the
+/// wrapper and ten reference groups. **Chosen, not measured** — the released tokenizer is not in
+/// this repository, so no prompt corpus was tokenized against it. A branch past the bound is not
+/// refused and not under-priced: the request runs prefill (`PrefixKvCacheReport::overflow`).
+///
+/// Deliberately not [`TABLE_CONDITIONING_TOKENS`]: that 256 is the cache-shed envelope's
+/// assumption and stays what it was.
+pub const PREFIX_KV_CACHE_CONDITIONING_TOKENS: u64 = 1024;
+
+/// **Priced** latent tokens per reference image: the largest grid `reference::prepare` can fit
+/// one to on the released checkpoints — not the square [`REFERENCE_FIT_TOKENS`].
+///
+/// A reference of ratio `r` is fitted to `(32·round(32·√r), 32·round(32/√r))` px
+/// (`calculate_dimensions` at 1024², each side rounded half-to-even onto the 32-px grid), i.e.
+/// `4·m·n` tokens with `m·n` near 1024 but not equal to it: rounding the short side **up** adds
+/// up to half a 32-px row along the whole long side. The Qwen3-VL processor then refuses a fit
+/// whose sides are more than 200:1 (and one outside its `[256², 4096²]` pixel budget, which never
+/// binds here). The maximum over every remaining ratio is the 13120×96 fit (`m = 410`, `n = 3`,
+/// reached just past `32/√r = 2.5`, e.g. an 819×5 source): `820 · 6 = 4920` tokens, 20% above the
+/// square fit. `memory_strategy::tests::the_priced_reference_bound_is_the_largest_fitted_grid`
+/// searches the ratios and holds this constant to the result.
+pub const PREFIX_KV_CACHE_REFERENCE_TOKENS: u64 = 4920;
+
+/// The mode one request runs: its `GenerationMemory::prefix_kv_cache`, or
+/// [`PrefixKvCacheMode::Prefill`] when the request selects nothing.
+///
+/// The unset default is the path that holds no cache, on purpose. A request with no selection was
+/// admitted — if it was admitted at all — against a demand that does not price the cache, and at
+/// ten references the cache is 24 GiB per prompt branch at bf16; running it uninvited would put a
+/// request that fitted yesterday over its budget today. The caller that owns the budget opts in.
+pub fn prefix_kv_cache_for(req: &gen_core::GenerationRequest) -> PrefixKvCacheMode {
+    req.memory
+        .and_then(|memory| memory.prefix_kv_cache)
+        .unwrap_or(PrefixKvCacheMode::Prefill)
+}
+
+/// Tokens of the block-causal **prefix** of the cache-shed envelope's joint sequence: the
+/// conditioning tokens and [`REFERENCE_FIT_TOKENS`] per reference image — the joint sequence less
+/// the target image.
+pub const fn prefix_tokens(conditioning_tokens: u64, reference_count: u32) -> u64 {
+    conditioning_tokens + reference_count as u64 * REFERENCE_FIT_TOKENS
+}
+
+/// The prefix length one prompt branch is **priced** at for `reference_count` references:
+/// [`PREFIX_KV_CACHE_CONDITIONING_TOKENS`] plus [`PREFIX_KV_CACHE_REFERENCE_TOKENS`] each.
+pub const fn prefix_kv_cache_priced_prefix_tokens(reference_count: u32) -> u64 {
+    PREFIX_KV_CACHE_CONDITIONING_TOKENS + reference_count as u64 * PREFIX_KV_CACHE_REFERENCE_TOKENS
+}
+
+/// Bytes of the K and V tensors one prefix cache stores for a transformer of `blocks` blocks and
+/// joint width `inner`, over `prefix_tokens`, at `element_width` bytes per element: two tensors
+/// per block, each `[1, heads, prefix_tokens, head_dim]`. Exact tensor arithmetic for any model
+/// shape.
+pub const fn prefix_kv_cache_tensor_bytes(
+    blocks: u64,
+    inner: u64,
+    prefix_tokens: u64,
+    element_width: u64,
+) -> u64 {
+    2 * blocks * prefix_tokens * inner * element_width
+}
+
+/// Prompt branches one request evaluates: the positive one, and the negative one under true CFG.
+/// Each keeps its own cache — a different prompt is a different prefix.
+const fn prompt_branches(use_negative: bool) -> u64 {
+    if use_negative {
+        2
+    } else {
+        1
+    }
+}
+
+/// Everything the caches of one request hold, for **any** model shape: per prompt branch, the
+/// K/V over that branch's prefix ([`prefix_kv_cache_tensor_bytes`]) plus the target block's RoPE
+/// rows the cache keeps for its decodes (`cos` + `sin`, f32 on every device,
+/// `[target_tokens, head_dim / 2]` each). `branch_prefix_tokens` has one entry per branch.
+///
+/// The one arithmetic behind both sides of the generator's check ([`prefix_kv_cache_overflow`]).
+pub fn prefix_kv_cache_model_bytes(
+    blocks: u64,
+    inner: u64,
+    head_dim: u64,
+    element_width: u64,
+    branch_prefix_tokens: &[u64],
+    target_tokens: u64,
+) -> u64 {
+    let rope = 2 * target_tokens * (head_dim / 2) * F32_WIDTH;
+    branch_prefix_tokens.iter().fold(0, |total, prefix_tokens| {
+        total + prefix_kv_cache_tensor_bytes(blocks, inner, *prefix_tokens, element_width) + rope
+    })
+}
+
+/// [`prefix_kv_cache_bytes`] at an explicit element `width` — for a caller pricing a device
+/// other than this build's production one ([`compute_width_on`]), and so the bf16 figure a GPU
+/// build prices can be held on the CPU lane.
+pub const fn prefix_kv_cache_bytes_at(width: u64, reference_count: u32, use_negative: bool) -> u64 {
+    prompt_branches(use_negative)
+        * prefix_kv_cache_tensor_bytes(
+            DIT_BLOCKS,
+            DIT_INNER,
+            prefix_kv_cache_priced_prefix_tokens(reference_count),
+            width,
+        )
+}
+
+/// **Priced** bytes of prefix K/V one request holds across its denoise loop with the cache on, on
+/// this build's production device: one cache per prompt branch over
+/// [`prefix_kv_cache_priced_prefix_tokens`], at [`compute_width`]. An upper bound on what a
+/// cached render reports (`GenerationReport::prefix_kv_cache`).
+///
+/// **The width follows the device, not the tier**: on this backend a packed (q8 / q4) Linear
+/// dequantizes its weight to the *activation's* dtype, so the DiT's hidden states — and every
+/// cached K and V — stay at the dtype the model was loaded at: bf16 on CUDA and Metal, f32 on a
+/// CPU device, on every tier. (The MLX twin differs: its packed tiers compute in f32.)
+///
+/// Per prefix token 0.5 MiB at bf16, 1 MiB at f32. At bf16: 0.5 GiB for the text bound, 2.40 GiB
+/// more per reference, 24.5 GiB at ten references; all doubled at f32, and doubled again when
+/// `use_negative`.
+pub fn prefix_kv_cache_bytes(reference_count: u32, use_negative: bool) -> u64 {
+    prefix_kv_cache_bytes_at(compute_width(), reference_count, use_negative)
+}
+
+/// [`prefix_kv_cache_demand_bytes`] at an explicit element `width`.
+pub const fn prefix_kv_cache_demand_bytes_at(
+    element_width: u64,
+    width: u32,
+    height: u32,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    prefix_kv_cache_bytes_at(element_width, reference_count, use_negative)
+        + prompt_branches(use_negative) * image_tokens(width, height) * DIT_ROPE_BYTES_PER_TOKEN
+}
+
+/// What a request is **priced** above its cache-shed demand when the cache is on:
+/// [`prefix_kv_cache_bytes`] plus the target block's RoPE rows each branch's cache keeps for its
+/// decodes (`cos` + `sin`, f32 on every device — [`DIT_ROPE_BYTES_PER_TOKEN`] per target token).
+/// The number a consumer adds to a request's cache-shed demand, and the number the generator
+/// holds a cached render to.
+///
+/// Priced for **this build's production device** ([`compute_width`]). A CUDA or Metal build
+/// whose generator is loaded onto a CPU device computes in f32 and holds twice this; price that
+/// load with [`prefix_kv_cache_demand_bytes_at`] at [`compute_width_on`]. A caller that does not
+/// is not over-run: the generator sheds a cached request whose real bytes exceed this figure.
+///
+/// Additive on the whole request: the first evaluation of a branch runs the full joint sequence
+/// (the prefill forward the shed demand already covers) **while** building the cache.
+pub fn prefix_kv_cache_demand_bytes(
+    width: u32,
+    height: u32,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    prefix_kv_cache_demand_bytes_at(
+        compute_width(),
+        width,
+        height,
+        reference_count,
+        use_negative,
+    )
+}
+
+/// One request's incremental live demand for the prefix-KV-cache mode it runs:
+/// `shed_demand_bytes` unchanged for [`PrefixKvCacheMode::Prefill`] — whatever the caller prices
+/// the request at today — and that plus [`prefix_kv_cache_demand_bytes`] for
+/// [`PrefixKvCacheMode::Cached`].
+pub fn request_demand_bytes(
+    kv_cache: PrefixKvCacheMode,
+    shed_demand_bytes: u64,
+    width: u32,
+    height: u32,
+    reference_count: u32,
+    use_negative: bool,
+) -> u64 {
+    match kv_cache {
+        PrefixKvCacheMode::Prefill => shed_demand_bytes,
+        PrefixKvCacheMode::Cached => shed_demand_bytes.saturating_add(
+            prefix_kv_cache_demand_bytes(width, height, reference_count, use_negative),
+        ),
+    }
+}
+
+/// Whether a `Cached` request's real caches exceed what it was priced at — `Some` means the
+/// generator must run prefill.
+///
+/// Both sides are [`prefix_kv_cache_model_bytes`] over the **loaded** transformer's own shape, so
+/// they compare directly whatever the checkpoint's size: `actual` from each branch's real prefix
+/// length at the transformer's own compute dtype, `priced` from
+/// [`prefix_kv_cache_priced_prefix_tokens`] at [`compute_width`]. On the released checkpoints
+/// `priced` is exactly [`prefix_kv_cache_demand_bytes`] — the number the consumer admitted.
+///
+/// Three things can put a request past its price, and all three shed rather than fail: a prompt
+/// branch with more text rows than [`PREFIX_KV_CACHE_CONDITIONING_TOKENS`], a checkpoint whose
+/// fitted reference grid exceeds [`PREFIX_KV_CACHE_REFERENCE_TOKENS`], and a generator loaded
+/// onto a wider device than the build prices (a GPU build on a CPU device).
+pub fn prefix_kv_cache_overflow(
+    config: &crate::config::TransformerConfig,
+    compute_dtype: candle_core::DType,
+    branch_prefix_tokens: &[u64],
+    reference_count: u32,
+    target_tokens: u64,
+) -> Option<gen_core::PrefixKvCacheOverflow> {
+    let bytes = |width: u64, prefixes: &[u64]| {
+        prefix_kv_cache_model_bytes(
+            config.num_layers as u64,
+            (config.num_attention_heads * config.attention_head_dim) as u64,
+            config.attention_head_dim as u64,
+            width,
+            prefixes,
+            target_tokens,
+        )
+    };
+    let actual_bytes = bytes(compute_dtype.size_in_bytes() as u64, branch_prefix_tokens);
+    let priced_prefixes =
+        vec![prefix_kv_cache_priced_prefix_tokens(reference_count); branch_prefix_tokens.len()];
+    let priced_bytes = bytes(compute_width(), &priced_prefixes);
+    (actual_bytes > priced_bytes).then_some(gen_core::PrefixKvCacheOverflow {
+        actual_bytes,
+        priced_bytes,
+    })
+}
+
 /// The route's admission envelope, derived from the frozen presets and the joint-layout limit.
 pub fn admission_geometry() -> AdmissionGeometry {
     let presets = crate::config::PRESETS;
@@ -118,9 +450,8 @@ pub fn admission_geometry() -> AdmissionGeometry {
         max_target_image_tokens: target_tokens,
         max_reference_images: MAX_REFERENCE_IMAGES as u32,
         tokens_per_max_reference: REFERENCE_FIT_TOKENS,
-        max_joint_tokens: TABLE_CONDITIONING_TOKENS
-            + target_tokens
-            + MAX_REFERENCE_IMAGES as u64 * REFERENCE_FIT_TOKENS,
+        max_joint_tokens: prefix_tokens(TABLE_CONDITIONING_TOKENS, MAX_REFERENCE_IMAGES as u32)
+            + target_tokens,
         pixels_per_token: PIXELS_PER_TOKEN,
         max_batch: crate::descriptor().capabilities.max_count,
     }
@@ -137,6 +468,7 @@ pub fn admission_geometry() -> AdmissionGeometry {
 /// u32 codes and its bf16 scale/bias tables price as stored. `keep` selects the tensors the loader
 /// actually opens; everything else contributes zero.
 fn component_bytes(
+    provider_id: &str,
     path: &Path,
     float_width: u64,
     keep: &dyn Fn(&str) -> bool,
@@ -151,7 +483,7 @@ fn component_bytes(
                 header.data_bytes
             };
             sum.checked_add(bytes).ok_or_else(|| {
-                gen_core::Error::Msg(format!("{MODEL_ID}: component byte sum overflow"))
+                gen_core::Error::Msg(format!("{provider_id}: component byte sum overflow"))
             })
         })
 }
@@ -161,6 +493,14 @@ fn component_bytes(
 /// Public so a test can hold the priced width to the loaded tower's dtype.
 pub fn compute_width() -> u64 {
     crate::loader::compute_dtype().size_in_bytes() as u64
+}
+
+/// Width every float component is materialized at on `device`
+/// (`loader::compute_dtype_on`): [`compute_width`] on a GPU device, and f32 on a CPU device
+/// **on every build** — candle's CPU backend has no bf16 matmul, so a CUDA or Metal build loaded
+/// onto the CPU runs f32.
+pub fn compute_width_on(device: &candle_core::Device) -> u64 {
+    crate::loader::compute_dtype_on(device).size_in_bytes() as u64
 }
 
 /// The load-exact component inventory.
@@ -180,21 +520,30 @@ pub fn compute_width() -> u64 {
 /// A packed tier's u32 code tensors are integers and therefore price at their stored width through
 /// [`component_bytes`], independent of the float width — which is what makes one function correct
 /// for all three tiers.
-fn asset_facts(root: &Path) -> gen_core::Result<MemoryAssetFacts> {
-    asset_facts_at(root, compute_width())
+fn asset_facts(provider_id: &str, root: &Path) -> gen_core::Result<MemoryAssetFacts> {
+    asset_facts_at(provider_id, root, compute_width())
 }
 
 /// `asset_facts` at an explicit float `width` (bytes per element). The production inventory is
 /// `asset_facts` at [`compute_width`]; this seam exists so the pricing rule — **every** float
 /// component at ONE width, the tower included — can be held on the CPU lane, where the compute
 /// width happens to equal the 4 B/param the tower used to be mispriced at.
-pub fn asset_facts_at(root: &Path, width: u64) -> gen_core::Result<MemoryAssetFacts> {
+///
+/// `provider_id` only labels an error: both engine ids price a snapshot the same way.
+pub fn asset_facts_at(
+    provider_id: &str,
+    root: &Path,
+    width: u64,
+) -> gen_core::Result<MemoryAssetFacts> {
     let all = |_: &str| true;
-    let transformer = component_bytes(&root.join("transformer"), width, &all)?;
-    let conditioning = component_bytes(&root.join("text_encoder"), width, &|name: &str| {
-        name.starts_with(crate::loader::TEXT_ENCODER_PREFIX)
-    })?;
-    let decoder = component_bytes(&root.join("vae"), width, &all)?;
+    let transformer = component_bytes(provider_id, &root.join("transformer"), width, &all)?;
+    let conditioning = component_bytes(
+        provider_id,
+        &root.join("text_encoder"),
+        width,
+        &|name: &str| name.starts_with(crate::loader::TEXT_ENCODER_PREFIX),
+    )?;
+    let decoder = component_bytes(provider_id, &root.join("vae"), width, &all)?;
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -260,17 +609,32 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
+    // E3 (sc-25909): every refusal priced here names the id it was asked for.
+    memory_strategy_contract_unlabelled(provider_id, spec)
+        .map_err(|error| crate::labelled(provider_id, error))
+}
+
+fn memory_strategy_contract_unlabelled(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryProviderContract> {
     let mut contract = weights_free_memory_strategy_contract(provider_id, spec)?;
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(gen_core::Error::Msg(format!(
-            "{MODEL_ID}: memory facts require a snapshot directory"
+            "{provider_id}: memory facts require a snapshot directory"
         )));
     };
+    // A contract is never priced for a snapshot the id would refuse to load (sc-25901): the same
+    // base/Turbo refusal `load` raises, reached through the memory registration too.
+    crate::loader::check_snapshot_variant(variant_for(provider_id)?, root)?;
     // Refuse a tier/request disagreement here too, so a contract is never built for a load that
     // would be served at a different tier than the one it claims.
     let tier = crate::quant::resolve_requested_tier(root, spec.quantize)?;
-    contract.asset_facts = asset_facts(root)?;
-    price_adapter_stack(&mut contract, adapter_overlay(spec, root, tier)?);
+    contract.asset_facts = asset_facts(provider_id, root)?;
+    price_adapter_stack(
+        &mut contract,
+        adapter_overlay(provider_id, spec, root, tier)?,
+    );
     Ok(contract)
 }
 
@@ -308,6 +672,7 @@ impl AdapterOverlay {
 /// an unmatched or mis-oriented key, and an additive file with no sizable safetensors residency
 /// are all refused rather than admitted as free.
 pub fn adapter_overlay(
+    provider_id: &str,
     spec: &LoadSpec,
     root: &Path,
     tier: crate::quant::Tier,
@@ -332,7 +697,7 @@ pub fn adapter_overlay(
     )
     .ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: every additive adapter must have a non-zero safetensors residency"
+            "{provider_id}: every additive adapter must have a non-zero safetensors residency"
         ))
     })?;
     // sc-24158: a LoKr (stamped or LyCORIS) keeps its two small Kronecker factors resident in f32
@@ -425,11 +790,7 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{provider_id}: not a Qwen-Image 2.1 Candle memory provider"
-        )));
-    }
+    let variant = variant_for(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::CandleCuda {
@@ -445,7 +806,10 @@ pub fn weights_free_memory_strategy_contract(
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        match variant {
+            Variant::Base => MEMORY_CALIBRATION_FINGERPRINT,
+            Variant::Turbo => TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+        },
         spec.load_shape,
     ));
     contract.lifecycle = MemoryLifecycleCapabilities {
@@ -500,20 +864,24 @@ pub fn weights_free_memory_strategy_contract(
     Ok(contract)
 }
 
-fn validate_decode(edge: Option<u32>, overlap: Option<u32>) -> gen_core::Result<()> {
+fn validate_decode(
+    provider_id: &str,
+    edge: Option<u32>,
+    overlap: Option<u32>,
+) -> gen_core::Result<()> {
     let edge = edge.ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit tile edge"
+            "{provider_id}: bounded decode requires an explicit tile edge"
         ))
     })?;
     let overlap = overlap.ok_or_else(|| {
         gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: bounded decode requires an explicit overlap"
+            "{provider_id}: bounded decode requires an explicit overlap"
         ))
     })?;
     if !DECODE_TILE_EDGES.contains(&edge) || overlap != DECODE_OVERLAP {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: decode geometry {edge}/{overlap} is outside the published domain \
+            "{provider_id}: decode geometry {edge}/{overlap} is outside the published domain \
              {DECODE_TILE_EDGES:?} at overlap {DECODE_OVERLAP}"
         )));
     }
@@ -526,10 +894,11 @@ pub fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    let provider_id = contract.provider_id.as_str();
     let route_gate = || {
         if !matches!(context.mode, MemoryMode::TextToImage) {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: this story's route is text-to-image; got {:?}",
+                "{provider_id}: this story's route is text-to-image; got {:?}",
                 context.mode
             )));
         }
@@ -540,18 +909,19 @@ pub fn safety_check(
         // request refusal rather than becoming a memory refusal.
         if context.geometry.reference_count as usize > MAX_REFERENCE_IMAGES {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
+                "{provider_id}: {} reference images exceed the {MAX_REFERENCE_IMAGES} the joint layout \
                  can express",
                 context.geometry.reference_count
             )));
         }
         if context.use_pid {
             return Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_ID}: there is no PiD decoder on this route"
+                "{provider_id}: there is no PiD decoder on this route"
             )));
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedDecode) {
             validate_decode(
+                provider_id,
                 context.selection.parameters.decode_tile_edge,
                 context.selection.parameters.decode_overlap,
             )?;
@@ -602,11 +972,30 @@ pub(crate) fn registered_begin_request(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(MODEL_ID, spec, contract, context)
+}
+
+/// [`registered_begin_request`] for the Turbo id (sc-25901).
+pub(crate) fn registered_begin_turbo_request(
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    begin_request_for(TURBO_MODEL_ID, spec, contract, context)
+}
+
+/// The executable admission seam both engine ids share; `provider_id` only labels the scope.
+pub(crate) fn begin_request_for(
+    provider_id: &'static str,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(gen_core::Error::Unsupported(reason));
     }
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        MODEL_ID,
+        provider_id,
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -615,10 +1004,10 @@ pub(crate) fn registered_begin_request(
         move |use_pid, edge, overlap| {
             if use_pid {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "{MODEL_ID}: there is no PiD decoder on this route"
+                    "{provider_id}: there is no PiD decoder on this route"
                 )));
             }
-            validate_decode(Some(edge), Some(overlap))
+            validate_decode(provider_id, Some(edge), Some(overlap))
         },
     )?;
     Ok(Some(Box::new(
@@ -639,6 +1028,22 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
         provider_id: MODEL_ID,
         valid_fixtures: registered_valid_fixture,
         begin_request: registered_begin_request,
+    };
+
+/// [`MEMORY_REGISTRATION`] for the Turbo id (sc-25901): the same rungs and the same safety gate,
+/// priced from the Turbo snapshot under its own calibration identity.
+pub const TURBO_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: TURBO_MODEL_ID,
+    contract: |spec| memory_strategy_contract(TURBO_MODEL_ID, spec),
+    safety_check,
+};
+
+/// [`MEMORY_BEHAVIOR_REGISTRATION`] for the Turbo id.
+pub const TURBO_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: TURBO_MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_turbo_request,
     };
 
 #[cfg(test)]
@@ -948,12 +1353,14 @@ mod tests {
     fn bounded_decode_publishes_a_domain_and_refuses_everything_outside_it() {
         assert!(DECODE_TILE_EDGES.contains(&crate::pipeline::DECODE_TILE_EDGE));
         for edge in DECODE_TILE_EDGES {
-            assert!(validate_decode(Some(*edge), Some(DECODE_OVERLAP)).is_ok());
+            assert!(validate_decode(MODEL_ID, Some(*edge), Some(DECODE_OVERLAP)).is_ok());
         }
-        assert!(validate_decode(Some(1024), Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(crate::pipeline::DECODE_TILE_EDGE), Some(96)).is_err());
-        assert!(validate_decode(None, Some(DECODE_OVERLAP)).is_err());
-        assert!(validate_decode(Some(crate::pipeline::DECODE_TILE_EDGE), None).is_err());
+        assert!(validate_decode(MODEL_ID, Some(1024), Some(DECODE_OVERLAP)).is_err());
+        assert!(
+            validate_decode(MODEL_ID, Some(crate::pipeline::DECODE_TILE_EDGE), Some(96)).is_err()
+        );
+        assert!(validate_decode(MODEL_ID, None, Some(DECODE_OVERLAP)).is_err());
+        assert!(validate_decode(MODEL_ID, Some(crate::pipeline::DECODE_TILE_EDGE), None).is_err());
     }
 
     /// The derived tier ladder is owned by the MLX crate and is not duplicated here, but the
@@ -983,11 +1390,11 @@ mod tests {
         );
         candle_gen::candle_core::safetensors::save(&map, te.join("model.safetensors")).unwrap();
 
-        let loaded = component_bytes(&te, 4, &|name: &str| {
+        let loaded = component_bytes(MODEL_ID, &te, 4, &|name: &str| {
             name.starts_with(crate::loader::TEXT_ENCODER_PREFIX)
         })
         .unwrap();
-        let everything = component_bytes(&te, 4, &|_| true).unwrap();
+        let everything = component_bytes(MODEL_ID, &te, 4, &|_| true).unwrap();
         assert_eq!(loaded, 8 * 4 * 4, "only the language tower is materialized");
         assert!(
             loaded < everything,
@@ -1016,8 +1423,8 @@ mod tests {
         );
         candle_gen::candle_core::safetensors::save(&map, dir.join("model.safetensors")).unwrap();
 
-        let at_bf16 = component_bytes(&dir, 2, &|_| true).unwrap();
-        let at_f32 = component_bytes(&dir, 4, &|_| true).unwrap();
+        let at_bf16 = component_bytes(MODEL_ID, &dir, 2, &|_| true).unwrap();
+        let at_f32 = component_bytes(MODEL_ID, &dir, 4, &|_| true).unwrap();
         assert_eq!(at_bf16, 8 * 8 * 4 + 8 * 2, "codes u32, scales bf16");
         assert_eq!(
             at_f32,
@@ -1047,8 +1454,8 @@ mod tests {
     fn the_tower_is_priced_at_the_compute_width_like_every_other_component() {
         let tiny = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../mlx-gen/mlx-gen-qwen-image-2-1/tests/fixtures/tiny-snapshot");
-        let at_bf16 = asset_facts_at(&tiny, 2).unwrap();
-        let at_f32 = asset_facts_at(&tiny, 4).unwrap();
+        let at_bf16 = asset_facts_at(MODEL_ID, &tiny, 2).unwrap();
+        let at_f32 = asset_facts_at(MODEL_ID, &tiny, 4).unwrap();
         assert!(at_bf16.conditioning_bytes > 0);
         assert_eq!(
             at_bf16.conditioning_bytes * 2,
@@ -1065,7 +1472,7 @@ mod tests {
         let contract = memory_strategy_contract(MODEL_ID, &spec).unwrap();
         assert_eq!(
             contract.asset_facts,
-            asset_facts_at(&tiny, compute_width()).unwrap()
+            asset_facts_at(MODEL_ID, &tiny, compute_width()).unwrap()
         );
         assert_eq!(
             compute_width(),
@@ -1174,7 +1581,7 @@ mod tests {
             AdapterSpec::new(loha.clone(), 0.5, AdapterKind::Lora),
         ]);
         assert_eq!(
-            adapter_overlay(&stacked, &tiny, crate::quant::Tier::Bf16).unwrap(),
+            adapter_overlay(MODEL_ID, &stacked, &tiny, crate::quant::Tier::Bf16).unwrap(),
             AdapterOverlay {
                 residual_bytes: lora_bytes,
                 loha_fold_transient_bytes: fold_transient,
@@ -1212,7 +1619,7 @@ mod tests {
         assert_eq!(contract.asset_facts.overlay_bytes, fold_transient);
         assert!(contract.conformance_errors().is_empty());
         assert_eq!(contract.evicted_component_bytes(), fold_transient);
-        match adapter_overlay(&stacked, &tiny, crate::quant::Tier::Q4) {
+        match adapter_overlay(MODEL_ID, &stacked, &tiny, crate::quant::Tier::Q4) {
             Err(gen_core::Error::Unsupported(message)) => {
                 assert!(
                     message.contains("LoHa") && message.contains("q4"),
@@ -1231,5 +1638,359 @@ mod tests {
             memory_strategy_contract(MODEL_ID, &missing).is_err(),
             "an unsizable adapter fails closed"
         );
+    }
+
+    // ── sc-25905: the prefix KV cache, priced per request ───────────────────────────────────────
+
+    /// One prompt branch's **priced** cache bytes at `element_width`, derived here from the
+    /// tensors the cache stores rather than read from the function under test: K and V (2) for
+    /// every block of the production DiT, each `[1, heads, prefix_tokens, head_dim]`, over the
+    /// priced prefix — 1024 text rows plus 4920 tokens per reference.
+    fn derived_branch_kv_bytes(reference_count: u32, element_width: u64) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let inner = (cfg.num_attention_heads * cfg.attention_head_dim) as u64;
+        let prefix_tokens = 1024 + reference_count as u64 * 4920;
+        2 * cfg.num_layers as u64 * prefix_tokens * inner * element_width
+    }
+
+    /// One prompt branch's target RoPE rows: `cos` and `sin` (2), `[target_tokens, head_dim / 2]`
+    /// each, f32 (4 bytes) on every device.
+    fn derived_branch_rope_bytes(width: u32, height: u32) -> u64 {
+        let cfg = crate::config::TransformerConfig::production();
+        let target_tokens = (width as u64 / 16) * (height as u64 / 16);
+        2 * target_tokens * (cfg.attention_head_dim as u64 / 2) * 4
+    }
+
+    /// The story's first acceptance criterion on this lane: with the cache on, a `k`-reference
+    /// request's demand exceeds its cache-shed demand by exactly the derived cache bytes for its
+    /// priced prefix (the K/V at the lane's compute width, plus the target RoPE rows the cache
+    /// keeps), and by twice that when a negative branch runs; with the cache shed it is the
+    /// caller's own number, untouched.
+    ///
+    /// The element width follows the lane: f32 on the CPU lane this test runs on by default, bf16
+    /// under `--features cuda` / `--features metal`. Both widths are held through the `_at` seam
+    /// on every lane.
+    ///
+    /// *Mutations that red this:* dropping the cache term from the cached demand; not doubling it
+    /// under a negative branch; pricing the prefix at the target's tokens, or a reference at the
+    /// target's token count or at the square 4096 instead of the 4920 bound; pricing the text at
+    /// the envelope's 256 rows; hard-coding the bf16 width (the CPU lane's cache is twice that).
+    #[test]
+    fn a_cached_request_is_priced_at_the_shed_demand_plus_its_derived_cache_bytes() {
+        let lane_width = crate::loader::compute_dtype().size_in_bytes() as u64;
+        assert_eq!(compute_width(), lane_width);
+        assert_eq!(compute_width_on(&candle_core::Device::Cpu), 4);
+        let cfg = crate::config::TransformerConfig::production();
+        // Any cache-shed demand: this crate does not own that number, the caller does.
+        for shed in [0_u64, 7_585_398_784, 12_514_050_048] {
+            for (width, height) in [(2048_u32, 2048_u32), (2400, 1792)] {
+                for references in [0_u32, 1, 2, 10] {
+                    for negative in [false, true] {
+                        let tag = format!(
+                            "{width}x{height} refs={references} negative={negative} shed={shed}"
+                        );
+                        let demand = |kv_cache| {
+                            request_demand_bytes(
+                                kv_cache, shed, width, height, references, negative,
+                            )
+                        };
+                        assert_eq!(demand(PrefixKvCacheMode::Prefill), shed, "{tag}");
+                        let branches = if negative { 2 } else { 1 };
+                        let kv = derived_branch_kv_bytes(references, lane_width);
+                        let rope = derived_branch_rope_bytes(width, height);
+                        assert_eq!(
+                            demand(PrefixKvCacheMode::Cached) - shed,
+                            branches * (kv + rope),
+                            "{tag}: the cached demand is the shed demand plus the derived bytes"
+                        );
+                        assert_eq!(
+                            prefix_kv_cache_bytes(references, negative),
+                            branches * kv,
+                            "{tag}: the priced K/V figure"
+                        );
+                        for element_width in [2_u64, 4] {
+                            let kv = derived_branch_kv_bytes(references, element_width);
+                            assert_eq!(
+                                prefix_kv_cache_bytes_at(element_width, references, negative),
+                                branches * kv,
+                                "{tag} at {element_width} B/element"
+                            );
+                            assert_eq!(
+                                prefix_kv_cache_demand_bytes_at(
+                                    element_width,
+                                    width,
+                                    height,
+                                    references,
+                                    negative
+                                ),
+                                branches * (kv + rope),
+                                "{tag} at {element_width} B/element"
+                            );
+                            // The figure the generator holds a cached render to is this same
+                            // number on the released checkpoints' shape.
+                            assert_eq!(
+                                prefix_kv_cache_model_bytes(
+                                    cfg.num_layers as u64,
+                                    (cfg.num_attention_heads * cfg.attention_head_dim) as u64,
+                                    cfg.attention_head_dim as u64,
+                                    element_width,
+                                    &vec![1024 + references as u64 * 4920; branches as usize],
+                                    (width as u64 / 16) * (height as u64 / 16),
+                                ),
+                                branches * (kv + rope),
+                                "{tag} at {element_width} B/element"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The figures the docs quote, at bf16: 0.5 MiB per prefix token, so 0.5 GiB for the
+        // 1024-row text bound, 2.40 GiB more per reference, 24.5 GiB at ten; f32 doubles them.
+        const MIB: u64 = 1 << 20;
+        assert_eq!(prefix_kv_cache_bytes_at(2, 0, false), 512 * MIB);
+        assert_eq!(prefix_kv_cache_bytes_at(2, 1, false), (512 + 2460) * MIB);
+        assert_eq!(prefix_kv_cache_bytes_at(2, 10, false), (512 + 24_600) * MIB);
+        assert_eq!(
+            prefix_kv_cache_bytes_at(4, 10, true),
+            4 * (512 + 24_600) * MIB
+        );
+        // The envelope's token accounting is untouched: prefix plus target, at 256 and 4096.
+        let g = admission_geometry();
+        assert_eq!(
+            prefix_tokens(TABLE_CONDITIONING_TOKENS, g.max_reference_images)
+                + g.max_target_image_tokens,
+            g.max_joint_tokens
+        );
+        assert_eq!(g.max_joint_tokens, 58_016);
+        assert_eq!(g.tokens_per_max_reference, 4096);
+        assert_eq!(DIT_BLOCKS as usize, cfg.num_layers);
+        assert_eq!(
+            DIT_INNER as usize,
+            cfg.num_attention_heads * cfg.attention_head_dim
+        );
+        assert_eq!(
+            DIT_ROPE_BYTES_PER_TOKEN as usize,
+            2 * (cfg.attention_head_dim / 2) * 4
+        );
+        // The bounds are bounds: never below what the envelope assumes.
+        const { assert!(PREFIX_KV_CACHE_CONDITIONING_TOKENS >= TABLE_CONDITIONING_TOKENS) };
+        const { assert!(PREFIX_KV_CACHE_REFERENCE_TOKENS >= REFERENCE_FIT_TOKENS) };
+    }
+
+    /// The per-reference bound is derived, not guessed: over every source aspect ratio the fit
+    /// can be asked for, the largest latent grid `reference_target_size` produces **that the
+    /// released Qwen3-VL processor accepts unchanged** (`reference_fit`'s refusal rule: the
+    /// processor's `smart_resize` must not rebind it — sides within 200:1, pixels within
+    /// `[256², 4096²]`) is 4920 tokens, at the 13120×96 fit.
+    ///
+    /// *Mutations that red this:* pricing a reference at the square 4096; any constant below the
+    /// searched maximum.
+    #[test]
+    fn the_priced_reference_bound_is_the_largest_fitted_grid() {
+        let processor = candle_llm::image::Qwen35ImageProcessor::default();
+        assert_eq!(
+            (processor.min_pixels, processor.max_pixels),
+            (256 * 256, 4096 * 4096),
+            "the released processor's pixel budget"
+        );
+        let fitted_tokens = |width: u32, height: u32| -> Option<u64> {
+            let (fit_w, fit_h) = crate::reference::reference_target_size(
+                (width, height),
+                crate::config::OUTPUT_RESOLUTION,
+            )
+            .ok()?;
+            let unchanged = processor
+                .smart_resize(fit_h as usize, fit_w as usize)
+                .is_ok_and(|resized| resized == (fit_h as usize, fit_w as usize));
+            unchanged.then(|| image_tokens(fit_w, fit_h))
+        };
+        // Every ratio w/h with h <= 128 up to past the processor's 200:1 limit, both orientations
+        // (the fit is symmetric, so the transposed scan must agree).
+        let (mut best, mut witness) = (0, (0, 0));
+        for short in 1..=128_u32 {
+            for long in short..=short * 201 {
+                for (width, height) in [(long, short), (short, long)] {
+                    if let Some(tokens) = fitted_tokens(width, height) {
+                        if tokens > best {
+                            (best, witness) = (tokens, (width, height));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            best, PREFIX_KV_CACHE_REFERENCE_TOKENS,
+            "witness {witness:?}"
+        );
+        assert_eq!(best, 4920);
+        assert_eq!(
+            crate::reference::reference_target_size((819, 5), 1024).unwrap(),
+            (13_120, 96)
+        );
+        assert_eq!(fitted_tokens(819, 5), Some(4920));
+        assert_eq!(fitted_tokens(1024, 1024), Some(REFERENCE_FIT_TOKENS));
+        assert_eq!(fitted_tokens(16, 9), Some(4128));
+        // Past 200:1 the processor refuses the fit, so no reference reaches the DiT there.
+        assert_eq!(fitted_tokens(40_000, 100), None);
+    }
+
+    /// A cached request is held to its price, on its boundaries: at the priced prefix it is
+    /// within bound, one token past it it is not, and a generator that computes wider than the
+    /// build prices is over as soon as its real bytes exceed the priced ones.
+    ///
+    /// *Mutations that red this:* comparing with `>=` (the at-bound request sheds); checking only
+    /// the positive branch; pricing the comparison at the model's own compute width instead of
+    /// the build's (the wide load is never caught); ignoring the reference bound.
+    #[test]
+    fn a_cached_request_past_its_priced_prefix_is_an_overflow() {
+        use candle_core::DType;
+        let cfg = crate::config::TransformerConfig::production();
+        let target = image_tokens(2048, 2048);
+        let lane = crate::loader::compute_dtype();
+        let lane_width = lane.size_in_bytes() as u64;
+        let check = |dtype, prefixes: &[u64], references| {
+            prefix_kv_cache_overflow(&cfg, dtype, prefixes, references, target)
+        };
+        let per_token = |width: u64| 2 * 32 * 4096 * width;
+        let rope = derived_branch_rope_bytes(2048, 2048);
+
+        // Text-to-image at the lane's own dtype: the bound is the 1024 text rows.
+        assert_eq!(check(lane, &[1024], 0), None);
+        assert_eq!(check(lane, &[12], 0), None);
+        assert_eq!(
+            check(lane, &[1025], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: 1025 * per_token(lane_width) + rope,
+                priced_bytes: 1024 * per_token(lane_width) + rope,
+            })
+        );
+        // Two branches: the sum is what is held.
+        assert_eq!(check(lane, &[1025, 1023], 0), None);
+        assert_eq!(
+            check(lane, &[1024, 1025], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: 2049 * per_token(lane_width) + 2 * rope,
+                priced_bytes: 2048 * per_token(lane_width) + 2 * rope,
+            })
+        );
+        // References: each is priced at 4920 tokens.
+        assert_eq!(check(lane, &[1024 + 2 * 4920], 2), None);
+        assert!(check(lane, &[1025 + 2 * 4920], 2).is_some());
+        assert!(check(lane, &[1024 + 2 * 4920], 1).is_some());
+        // A model computing at a dtype other than the build's priced one is compared in bytes:
+        // an f32 model on a bf16-priced build is over from half the priced prefix, and a bf16
+        // model on an f32-priced build has twice the room.
+        let (narrow_at, wide_at) = (1024 * lane_width / 2, 1024 * lane_width / 4);
+        assert_eq!(check(DType::BF16, &[narrow_at], 0), None);
+        assert!(check(DType::BF16, &[narrow_at + 1], 0).is_some());
+        assert_eq!(check(DType::F32, &[wide_at], 0), None);
+        assert_eq!(
+            check(DType::F32, &[wide_at + 1], 0),
+            Some(gen_core::PrefixKvCacheOverflow {
+                actual_bytes: (wide_at + 1) * per_token(4) + rope,
+                priced_bytes: 1024 * per_token(lane_width) + rope,
+            })
+        );
+    }
+
+    /// The cache is priced per request and is **not** part of the memory contract: for both ids
+    /// the weights-free contract is the one published before sc-25905 — the same phase envelope
+    /// over the same five variables, no resident component, the same calibration identity — so
+    /// nothing a consumer reads as "minimum to run" can have moved.
+    ///
+    /// *Mutation that reds this:* declaring the cache in the contract (a resident component, a
+    /// `ComponentPhaseEnvelope`, an `OverlayBytes` variable or an overlay byte count).
+    #[test]
+    fn the_prefix_kv_cache_is_not_part_of_the_memory_contract() {
+        for (id, fingerprint) in [
+            (MODEL_ID, "qwen-image-2-1-candle-derived-2026-09-22-v1"),
+            (
+                TURBO_MODEL_ID,
+                "qwen-image-2-1-turbo-candle-derived-2026-10-13-v1",
+            ),
+        ] {
+            let contract = weights_free_memory_strategy_contract(id, &spec()).unwrap();
+            assert_eq!(
+                contract.formula,
+                MemoryFormulaKind::PhaseEnvelope {
+                    phases: vec![
+                        MemoryPhase::Conditioning,
+                        MemoryPhase::Denoise,
+                        MemoryPhase::Decode,
+                    ],
+                    variables: vec![
+                        MemoryFormulaVariable::AssetBytes,
+                        MemoryFormulaVariable::PixelCount,
+                        MemoryFormulaVariable::BatchCount,
+                        MemoryFormulaVariable::ConditioningTokenCount,
+                        MemoryFormulaVariable::DecodeTileArea,
+                    ],
+                },
+                "{id}"
+            );
+            assert!(contract.resident_components().is_empty(), "{id}");
+            assert_eq!(contract.asset_facts, MemoryAssetFacts::default(), "{id}");
+            assert_eq!(contract.total_resident_bytes(), 0, "{id}");
+            assert_eq!(
+                contract
+                    .calibration
+                    .as_ref()
+                    .map(|c| c.fingerprint.as_str()),
+                Some(fingerprint),
+                "{id}: the calibration identity names the default execution, which is unchanged"
+            );
+            assert_eq!(
+                contract.resident_request_memory,
+                ResidentRequestMemory::PreserveLoadDefaults,
+                "{id}"
+            );
+        }
+    }
+
+    /// A request that selects nothing runs prefill; a selection is read off the request's memory
+    /// block; and both engine ids declare exactly the two modes, so the shared floor admits a
+    /// selection instead of refusing it.
+    ///
+    /// *Mutations that red this:* defaulting an unset request to `Cached`; ignoring the request's
+    /// selection; declaring only one mode (the other is refused at `validate`).
+    #[test]
+    fn the_prefix_kv_cache_is_a_declared_request_selection_and_unset_is_prefill() {
+        use gen_core::{GenerationMemory, GenerationRequest};
+        let request = |memory: Option<GenerationMemory>| GenerationRequest {
+            prompt: "a red fox".into(),
+            width: 1024,
+            height: 1024,
+            memory,
+            ..Default::default()
+        };
+        assert_eq!(
+            prefix_kv_cache_for(&request(None)),
+            PrefixKvCacheMode::Prefill
+        );
+        assert_eq!(
+            prefix_kv_cache_for(&request(Some(GenerationMemory::default()))),
+            PrefixKvCacheMode::Prefill
+        );
+        for mode in PrefixKvCacheMode::ALL {
+            let selected = request(Some(GenerationMemory {
+                prefix_kv_cache: Some(mode),
+                ..Default::default()
+            }));
+            assert_eq!(prefix_kv_cache_for(&selected), mode);
+            for descriptor in [crate::descriptor(), crate::descriptor_turbo()] {
+                assert!(descriptor
+                    .capabilities
+                    .execution
+                    .declaration_errors()
+                    .is_empty());
+                descriptor
+                    .capabilities
+                    .validate_request(descriptor.id, &selected)
+                    .unwrap_or_else(|error| {
+                        panic!("{}: {mode:?} must be admitted: {error}", descriptor.id)
+                    });
+            }
+        }
     }
 }

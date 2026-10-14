@@ -88,6 +88,8 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | **qwen-image** (Qwen-Image) | `qwen_image` | ✓ | ✓ |
 | | `qwen_image_control` | ✓ | — |
 | | `qwen_image_edit` | ✓ | — |
+| **qwen-image-2-1** (Qwen-Image 2.1, unified T2I / edit / RGBA) | `qwen_image_2_1` | ✓ | ✓ |
+| | `qwen_image_2_1_turbo` | ✓ | ✓ |
 | **sana** (SANA) | `sana_1600m` | ✓ | ✓ |
 | | `sana_sprint_1600m` | ✓ | — |
 | **scail2** | `scail2_14b` | ✓ | ✓ |

@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -292,6 +292,22 @@ on:
       # (`mlx-qwen-image-2-1`). Empty skips that one test; the lane never invents an adapter.
       qwen_image_2_1_third_party_lora:
         description: "qwen-image-2-1-lora-mlx only: pinned third-party 2.1 adapter, owner/repo@<40-hex sha>:<path>.safetensors[:lokr]"
+        type: string
+        required: false
+        default: ""
+      # sc-25909 -- the Qwen-Image 2.1 Turbo q8/q4 tiers are not published yet, so no manifest row
+      # can provision them: the operator copies them onto the CUDA runner and names the directory
+      # here. Empty: `turbo_validation_render_installed_tiers` is NOT run, and the lane says so.
+      qwen_image_2_1_turbo_tier_snapshot:
+        description: "qwen-image-2-1-turbo only: absolute dir on the CUDA runner holding the converted Turbo q8/ and q4/ tiers"
+        type: string
+        required: false
+        default: ""
+      # sc-25909 (AT4) -- the base renders' pre-epic golden: the `.rgb` files the same lane wrote at
+      # c1f594203, copied onto the CUDA runner. Set: the base renders run with the cache shed and
+      # are held to them. Empty: no comparison.
+      qwen_image_2_1_render_golden:
+        description: "qwen-image-2-1 only: absolute dir on the CUDA runner holding the pre-epic (c1f594203) base .rgb renders to compare with"
         type: string
         required: false
         default: ""
@@ -4831,7 +4847,9 @@ jobs:
   #   * `qwen-image-2-1-cuda`  Qwen/Qwen-Image-2.1 @ 790c9263…            bf16, ~33 GB
   #   * `qwen-image-2-1-mlx`   SceneWorks/qwen-image-2-1-mlx @ 1691de01…  q8/ + q4/, ~33 GB
   #
-  # WHAT IT RUNS. Every `#[ignore]`d test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs`,
+  # WHAT IT RUNS. Every `#[ignore]`d test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs`
+  # that is not `turbo_`-prefixed (those need the Turbo snapshot and run on
+  # `candle-qwen-image-2-1-turbo` below, sc-25901),
   # one `cargo test` per name with `--exact` AFTER the `--` and a run-count assertion (a rename is a
   # red, not "0 passed; N filtered out" + exit 0). A failing test does not stop the rest: the lane
   # collects all five verdicts and all their evidence, then reds at the end.
@@ -4914,6 +4932,12 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-qwen-image-2-1\materialize-and-verify-immutable-snapshots.cmd
+      # sc-25909 (AT4): the operator-provided pre-epic golden, through env, never interpolated.
+      - name: Resolve the operator-provided pre-epic golden
+        shell: powershell
+        env:
+          QWEN21_RENDER_GOLDEN_INPUT: ${{ inputs.qwen_image_2_1_render_golden }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1/resolve-the-operator-provided-pre-epic-golden.ps1
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings,
       # rather than being folded into the first render's.
       - name: Build the Qwen-Image 2.1 CUDA test binary
@@ -4930,6 +4954,108 @@ jobs:
         with:
           name: qwen-image-2-1-cuda-evidence
           path: ${{ runner.temp }}/qwen-image-2-1-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-25901 — Qwen-Image 2.1 **Turbo** real-weight evidence on candle/CUDA. DISPATCH-ONLY
+  # (`qwen-image-2-1-turbo` profile; never `all`, never the schedule), for the same reason as
+  # `candle-qwen-image-2-1` above: a 2048² render over a ~32 GB snapshot is not a weekly-sweep job.
+  #
+  # WHAT IT PROVISIONS. One pinned snapshot through `ensure_model_snapshot.py`, into the runner's
+  # persistent hub cache (`vars.CANDLE_GEN_MODELS_ROOT`):
+  #   * `qwen-image-2-1-turbo-cuda`  Qwen/Qwen-Image-2.1-Turbo @ fc13ba19…  bf16, ~32.4 GB
+  # It is the UNMODIFIED upstream repository: `model_index.json` carries `sample_sigmas`, the
+  # scheduler config is static, `vae/` is bf16 and `text_encoder/` is one `model.safetensors`.
+  #
+  # WHAT IT RUNS. Every `#[ignore]`d test in `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs`
+  # whose name starts `turbo_` — the complement of what `candle-qwen-image-2-1` selects, so the two
+  # lanes partition the file and a test added there cannot run nowhere. One `cargo test` per name
+  # with `--exact` and a run-count assertion, exactly as on the base lane.
+  #
+  # Same box, labels, toolchain and sccache rule as `candle-qwen-image-2-1`. `timeout-minutes: 180`
+  # is a runaway guard for a lane that has never executed: a cold `--features cuda` release build
+  # plus the one-time ~32 GB fetch, then the Turbo renders (sc-25901, sc-25902) — the eight-step
+  # 2048² default preset; a two- and a ten-reference edit and two RGBA renders, all over the saved
+  # eight steps; and a 4/6/12/16-step 2048² sweep. Every reference edit selects the prefix KV
+  # cache (sc-25905), so the ten-reference case pays for its ~41k-token prefix once; each cached
+  # case is then rendered again with the cache shed and compared with it (the forced-shed twins,
+  # sc-25909). The test itself reads the CUDA pool's live-byte high-water around every render and
+  # writes `qwen_image_2_1_turbo_candle_prefix_kv_cache_memory.csv` into the evidence (AT5).
+  # `turbo_validation_render_installed_tiers` runs only when the dispatch names the operator-copied
+  # Turbo q8/q4 tier directory (`qwen_image_2_1_turbo_tier_snapshot`; unpublished, so no manifest
+  # row); otherwise the lane warns and leaves a NOT-RUN marker. Re-size it from the first run.
+  candle-qwen-image-2-1-turbo:
+    name: Candle Qwen-Image 2.1 Turbo real weights (CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-turbo'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 180
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--Qwen--Qwen-Image-2.1-Turbo\snapshots\fc13ba1986fcb905854dc8de2f52eee395f49b5b
+      # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\install-reviewed-cpython-3-12.cmd
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service exports RUSTC_WRAPPER=sccache globally; its daemon resets mid-build on heavy
+      # Candle/CUDA graphs — see `candle-qwen-image-2-1`. Clear it for this job only.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\require-operator-provided-models-root-and-initialize-evidenc.cmd
+      # Report-only, like the same step on `candle-qwen-image-2-1`.
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%QWEN_IMAGE_2_1_RENDER_OUT%\cuda-device-inventory.csv"
+          type "%QWEN_IMAGE_2_1_RENDER_OUT%\cuda-device-inventory.csv"
+      - name: Materialize and verify the immutable snapshot
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\materialize-and-verify-the-immutable-snapshot.cmd
+      # sc-25909: the operator-provided Turbo tier directory, through env, never interpolated into
+      # a script; checked here and exported as CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT.
+      - name: Resolve the operator-provided Turbo tier directory
+        shell: powershell
+        env:
+          QWEN21_TURBO_TIER_INPUT: ${{ inputs.qwen_image_2_1_turbo_tier_snapshot }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1-turbo/resolve-the-operator-provided-turbo-tier-directory.ps1
+      - name: Build the Qwen-Image 2.1 CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda --test integration --no-run || exit /b 1
+      - name: Run the Qwen-Image 2.1 Turbo real-weight renders
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\run-the-qwen-image-2-1-turbo-real-weight-renders.cmd
+      - name: Keep the Qwen-Image 2.1 Turbo CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen-image-2-1-turbo-cuda-evidence
+          path: ${{ runner.temp }}/qwen-image-2-1-turbo-cuda-evidence
           if-no-files-found: error
           retention-days: 30
 

@@ -128,7 +128,8 @@ pub use encoder_contract::{
 pub use error::{Error, Result};
 pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
-    GraphEvalCadence,
+    GraphEvalCadence, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheOverflow,
+    PrefixKvCacheReport,
 };
 pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};

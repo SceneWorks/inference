@@ -70,7 +70,7 @@ fn composed_marker_config(component: &str, bits: i64) -> String {
 /// A complete `tier` snapshot under `dir`: the committed packed `model.safetensors` of
 /// `transformer/` + `text_encoder/` with a composed marker config, plus the dense `vae/`,
 /// `processor/`, `scheduler/` and `model_index.json` the converter copies through unchanged.
-fn compose_tier(dir: &Path, tier: Tier) -> PathBuf {
+pub(crate) fn compose_tier(dir: &Path, tier: Tier) -> PathBuf {
     let out = dir.join(tier.dir_name());
     std::fs::create_dir_all(&out).unwrap();
     let packed = fixtures().join("tiers").join(tier.dir_name());

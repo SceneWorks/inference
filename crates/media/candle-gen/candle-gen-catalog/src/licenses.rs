@@ -326,6 +326,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "qwen_image_2_1",
         components: &["qwen_image_2_1"],
     },
+    // The distilled checkpoint (sc-25901) is its own repository, `Qwen/Qwen-Image-2.1-Turbo`,
+    // shipping the same three components under the same licence — so its own complete row, not
+    // the base repository's.
+    ProviderComponents {
+        provider_id: "qwen_image_2_1_turbo",
+        components: &["qwen_image_2_1_turbo"],
+    },
     // --- sana -------------------------------------------------------------------------------
     // Each SANA repository ships its own DC-AE autoencoder, so the VAE rides the DiT row; the
     // Gemma-2-2B-IT caption encoder is a separate snapshot.
@@ -581,7 +588,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 54);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 55);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -613,8 +620,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            64,
-            "64 distinct Candle provider ids: 57 generators + 19 trainers (15 of them also \
+            65,
+            "65 distinct Candle provider ids: 58 generators (qwen_image_2_1_turbo joined in \
+             sc-25901) + 19 trainers (15 of them also \
              generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -776,6 +784,7 @@ mod tests {
                 "minimax_h3",
                 "mochi_1",
                 "qwen_image_2_1",
+                "qwen_image_2_1_turbo",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "seedvr2",
