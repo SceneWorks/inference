@@ -515,6 +515,29 @@ impl PackedLayout {
         )
     }
 
+    /// Packed conditioning segments [`Self::veda_layout`] leaves as dense globals, each with
+    /// the engine-observed reason, so an execution report can say why they were not tiled.
+    pub fn veda_dense_segments(&self) -> Vec<String> {
+        use candle_gen::gen_core::veda::contract::segment_grid;
+        let mut reasons = Vec::new();
+        let audio = self.num_condition_audio_rows;
+        if audio > 0 {
+            reasons.push(format!(
+                "reference audio ({audio} rows): no video tile grid; dense global attention"
+            ));
+        }
+        for (i, range) in self.condition_spans.iter().enumerate() {
+            if segment_grid(&self.position_rows[range.clone()]).is_none() {
+                reasons.push(format!(
+                    "reference segment {i} (rows {}..{}): positions do not form a T/H/W \
+                     grid; dense global attention",
+                    range.start, range.end
+                ));
+            }
+        }
+        reasons
+    }
+
     /// Map actual packed reference/generated rows into the shared frozen Veda contract.
     /// Reference segments whose positions cannot prove a T/H/W row-major grid stay global.
     pub fn veda_layout(
@@ -801,6 +824,17 @@ mod tests {
         let fallback = reordered.veda_layout(TileShape([2, 4, 16])).unwrap();
         assert_eq!(fallback.ref_tokens, 7 * 6);
         assert_eq!(fallback.reference, 1);
+        // Every dense-global conditioning segment carries a visible reason.
+        let audio = format!("reference audio ({} rows)", packed.num_condition_audio_rows);
+        let reasons = packed.veda_dense_segments();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].starts_with(&audio), "{reasons:?}");
+        let reasons = reordered.veda_dense_segments();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[1].starts_with(&format!(
+            "reference segment 0 (rows {}..{})",
+            range.start, range.end
+        )));
     }
 
     #[test]

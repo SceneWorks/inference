@@ -13,7 +13,15 @@ vision processor's snapped merged-image geometry and every temporal clip vision 
 short edge with stride rounding, each reference clip's own aspect at the generated
 duration, soundtracks and standalone reference audio. It does not substitute a
 reference count or nearest trained size for the requested workload. Invalid or
-unrepresentable shapes fail closed.
+unrepresentable shapes fail closed. Every grid it prices (target, reference image,
+keyframe and clip spans) is in DiT patch units — the 16x VAE latent divided by the
+2x2 spatial patch, i.e. pixels / 32 — the same grid the runtimes pack and upstream
+`h3_layout.py` tiles (1344x768 at 124 frames prices `[37, 24, 42]`).
+
+The verified, decoded predictor is retained once per process (`Bundle::load_cached`),
+keyed on path, size, modification time and inode; a changed file is re-read and
+re-hashed, a failed load is never cached. The MLX first-use self-test outcome is
+cached per (device, kernel id). The per-request bound still charges the predictor.
 
 The total sums these owned lifetimes conservatively (it may exceed the temporal
 peak because initialization, scoring, self-test and fallback do not all overlap):

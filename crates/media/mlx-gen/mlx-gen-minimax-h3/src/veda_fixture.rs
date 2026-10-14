@@ -261,6 +261,8 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
         .fallback_reason
         .unwrap()
         .contains("self-test forced failure"));
+    // No sparse call ran under the chosen plan, so none is reported as executed.
+    assert!(failed.plan.is_none() && failed.plan_grid.is_none());
     request.veda = None;
     assert_eq!(run(&generator, &request), dense);
     assert!(generator
@@ -359,7 +361,9 @@ fn native_veda_controls_preserve_carriers_and_capture_published_schedules() {
         let request = VedaRequest {
             enabled: true,
             generated: VedaBudget::KeyTiles(2),
-            reference: VedaBudget::SparsityPercent(0.0),
+            // Nonzero reference budget: reference key tiles go through learned selection
+            // rather than the 0% (keep-all) dense shortcut.
+            reference: VedaBudget::KeyTiles(1),
             full_attention_layers: vec![1],
             full_attention_steps: vec![0, evals - 1],
         };

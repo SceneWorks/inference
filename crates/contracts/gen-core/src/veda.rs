@@ -179,6 +179,9 @@ pub struct VedaExecutionReport {
     pub workspace_bytes: u64,
     /// Engine-observed reason for dense fallback; never inferred from requested settings.
     pub fallback_reason: Option<String>,
+    /// Engine-observed packed segments that always attend densely as globals (for example
+    /// reference audio, or a reference whose positions do not form a T/H/W grid), with why.
+    pub dense_segments: Vec<String>,
     /// H3 producer observation only. Absent for ordinary generation. Its counters are
     /// explicitly scoped and must not be confused with `workspace_bytes`.
     pub terminal_telemetry: Option<serde_json::Value>,
@@ -219,6 +222,9 @@ impl VedaExecutionReport {
             "workspaceBytes": self.workspace_bytes,
             "fallbackReason": self.fallback_reason,
         });
+        if !self.dense_segments.is_empty() {
+            outcome["denseSegments"] = serde_json::json!(self.dense_segments);
+        }
         if let Some(telemetry) = &self.terminal_telemetry {
             outcome["terminalTelemetry"] = telemetry.clone();
         }
@@ -287,6 +293,20 @@ mod tests {
         }
         .outcome_json();
         assert_eq!(observed["terminalTelemetry"]["schemaVersion"], 1);
+        // Dense-global conditioning segments are observed per segment, with their reason.
+        assert!(VedaExecutionReport::default()
+            .outcome_json()
+            .get("denseSegments")
+            .is_none());
+        let segments = VedaExecutionReport {
+            dense_segments: vec!["reference audio (18 rows): no video tile grid".into()],
+            ..Default::default()
+        }
+        .outcome_json();
+        assert_eq!(
+            segments["denseSegments"],
+            serde_json::json!(["reference audio (18 rows): no video tile grid"])
+        );
     }
 
     #[test]

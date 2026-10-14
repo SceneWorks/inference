@@ -58,7 +58,11 @@ extern "C" __global__ void veda_attend(const signed char* q,const signed char* k
             if(tid<stride) logits[tid]=fmaxf(logits[tid],logits[tid+stride]);
             __syncthreads();
         }
-        float next=fmaxf(m,logits[0]), alpha=exp2f(m-next);
+        // Every thread reads the block max into a register, then barriers before any
+        // thread overwrites logits[] below (thread 0 rewrites logits[0]).
+        float block_max=logits[0];
+        __syncthreads();
+        float next=fmaxf(m,block_max), alpha=exp2f(m-next);
         if(tid<64) {
             float z=(tid<valid[block])?exp2f(row_logits[tid]-next):0;
             probabilities[tid]=half_round(z); logits[tid]=z;
@@ -68,7 +72,7 @@ extern "C" __global__ void veda_attend(const signed char* q,const signed char* k
             if(tid<stride) logits[tid]+=logits[tid+stride];
             __syncthreads();
         }
-        l=l*alpha+logits[0];
+        l=l*alpha+logits[0];  // next write to logits[] is after the barrier ending this iteration
         if(tid<dim) {
             float pv=0;
             for(int n=0;n<64;n++) {
