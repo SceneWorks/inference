@@ -278,12 +278,14 @@ impl AvgDown {
         };
         let total = folded.dim(1)?;
         let group = total / self.out_channels;
-        // The group mean runs over a **rank-4** view (`[B, out, group, H'·W']`), never the rank-5
-        // `[B, out, group, H', W']` one: candle's Metal reduction of a non-trailing axis of a
-        // rank-5 tensor reads the wrong elements (max |Δ| ≈ 1–3 on unit-normal input, in f32 as
-        // in bf16, and non-finite where it reads pooled garbage — sc-25909 found it as NaN
-        // reference latents on the Metal lane). The rank-4 reduction is the same elements in the
-        // same order, so the CPU result is bit-identical.
+        // The group mean runs over a **rank-4** view (`[B, out, group, H'·W']`) rather than the
+        // rank-5 `[B, out, group, H', W']` one. Defensive only: candle-metal-kernels' rank > 4
+        // strided-index fallback read the wrong elements for that reduction (sc-25909 found it
+        // as NaN reference latents on the Metal lane), and the root fix is the vendored
+        // `crates/media/candle-gen/vendor/candle-metal-kernels/src/metal_src/reduce.metal`
+        // (provenance in that crate's `VENDORED.md`). The rank-4 reduction is the same elements
+        // in the same order, so the CPU result is bit-identical; it keeps this encode off the
+        // rank > 4 path should the vendored fix ever be dropped.
         Ok(folded
             .reshape((b, self.out_channels, group, h2 * w2))?
             .mean(2)?

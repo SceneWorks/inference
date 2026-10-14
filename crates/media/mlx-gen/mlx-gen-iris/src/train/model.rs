@@ -564,6 +564,27 @@ struct TrainHooks<'a> {
     captured: Option<Array>,
 }
 
+/// The activation-checkpointing hooks of a **task** trainer's forward (sc-25690): the generation
+/// trainer's regions — one per trunk block and per PiT block that `ac` selects, each MLX's own
+/// checkpoint transform over the block's trainable tensors and input activations — around a
+/// backbone the task builds itself (depth's widened one, restoration's generator). `model` names
+/// what a region rebuilds its block from and `p` holds the traced tensors of the step; whatever the
+/// task computes downstream of the backbone (the depth reducer and Eq. 5, restoration's L2 / LPIPS
+/// / critic terms) stays outside every region.
+pub(crate) fn region_hooks<'a>(
+    model: &'a TrainModel,
+    p: &'a HashMap<Rc<str>, Array>,
+    ac: AcPolicy,
+) -> impl ForwardHooks + 'a {
+    TrainHooks {
+        model,
+        p,
+        ac,
+        capture: None,
+        captured: None,
+    }
+}
+
 impl<'a> ForwardHooks for TrainHooks<'a> {
     fn trunk_block(
         &mut self,

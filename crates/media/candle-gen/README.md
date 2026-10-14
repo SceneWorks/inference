@@ -112,6 +112,7 @@ candle-gen/                 # workspace root
   candle-gen-pid/           # NVIDIA PiD pixel-diffusion latent→pixel decoder seam
   vendor/
     candle-kernels/         # local fork: multi-arch fatbin for the CUDA quant path (sc-7544; see Packaging)
+    candle-metal-kernels/   # upstream #3873: rank > 4 strided-reduce indexing fix (see its VENDORED.md)
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)

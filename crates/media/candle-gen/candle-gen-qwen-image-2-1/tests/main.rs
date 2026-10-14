@@ -34,6 +34,9 @@ mod kv_admission;
 #[path = "kv_cache.rs"]
 mod kv_cache;
 
+#[path = "metal_reference_latents.rs"]
+mod metal_reference_latents;
+
 #[path = "pipeline_parity.rs"]
 mod pipeline_parity;
 

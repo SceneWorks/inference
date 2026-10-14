@@ -355,3 +355,8 @@ mod tests {
         assert_eq!(5 * AUDIO_TOKEN_RATE_HZ, 200);
     }
 }
+
+pub mod veda;
+
+#[cfg(test)]
+mod veda_fixture;

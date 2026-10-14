@@ -65,12 +65,12 @@ use super::critic::{
 };
 use super::lpips::Lpips;
 use super::model::{
-    init_adapter, provider_dtype, save_safetensors_atomic, AdapterKind, AdapterTarget, TrainModel,
-    Trainable,
+    init_adapter, provider_dtype, region_hooks, save_safetensors_atomic, AdapterKind,
+    AdapterTarget, TrainModel, Trainable,
 };
 use super::optim::{clip_grads, ema_update, IrisOptimizer, Params};
 use super::{check_backbone_keys, load_source, load_tensors, rc_map, save_params};
-use crate::dit::{IrisDiT, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
 
 /// Identity + capabilities of the MLX Iris restoration trainer.
 pub fn trainer_descriptor() -> TrainerDescriptor {
@@ -179,19 +179,12 @@ impl IrisRestoreTrainer {
     }
 
     fn plan(&self, req: &TrainingRequest, linear_paths: &[String]) -> Result<RestoreTrainPlan> {
-        let plan = RestoreTrainPlan::resolve(
+        Ok(RestoreTrainPlan::resolve(
             req,
             &self.res.export,
             linear_paths,
             self.res.parent.is_some(),
-        )?;
-        if plan.ac.active() {
-            return Err(Error::Unsupported(format!(
-                "{TRAINER_ID} trainer: gradient (activation) checkpointing is not implemented \
-                 for the restoration task on the MLX backend"
-            )));
-        }
-        Ok(plan)
+        )?)
     }
 }
 
@@ -274,6 +267,18 @@ impl PairBatch {
 impl Frozen {
     /// `x̂ = x_lq − σ·v(x_lq, σ·N, ∅)` (f32) — exactly the restorer's per-tile forward.
     pub fn restore(&self, dit: &IrisDiT, lq: &Array) -> Result<Array> {
+        self.restore_hooked(dit, lq, &mut NoHooks)
+    }
+
+    /// [`Self::restore`] with `hooks` around every trunk and pixel block of the generator forward —
+    /// the generator step's seam for activation-checkpointing regions (sc-25690). With [`NoHooks`]
+    /// it is exactly the restorer's forward.
+    pub fn restore_hooked(
+        &self,
+        dit: &IrisDiT,
+        lq: &Array,
+        hooks: &mut dyn ForwardHooks,
+    ) -> Result<Array> {
         let b = lq.shape()[0];
         let states = if b == 1 {
             self.states.clone()
@@ -283,13 +288,14 @@ impl Frozen {
         let masks = vec![self.mask.clone(); b as usize];
         let t = Array::from_slice(&vec![self.model_time; b as usize], &[b]);
         let v = dit
-            .forward(
+            .forward_hooked(
                 lq,
                 &t,
                 &TextBatch {
                     states: &states,
                     mask: &masks,
                 },
+                hooks,
             )?
             .as_dtype(Dtype::Float32)?;
         Ok(lq.subtract(&v.multiply(Array::from_f32(self.sigma))?)?)
@@ -342,7 +348,10 @@ pub fn generator_terms(
 }
 
 /// One generator micro-batch: the loss terms (unscaled, host) and the gradient of
-/// `total · grad_scale` over the trainable tensors.
+/// `total · grad_scale` over the trainable tensors. Under [`RestoreTrainPlan::ac`] the generator's
+/// trunk / pixel blocks are activation-checkpointed regions (MLX's checkpoint transform, sc-25690):
+/// the same gradient, the block interiors recomputed in the backward instead of held through the
+/// forward. The L2 / LPIPS / critic terms read `x̂` downstream of every region.
 #[allow(clippy::too_many_arguments)]
 pub fn generator_grads(
     model: &TrainModel,
@@ -356,7 +365,13 @@ pub fn generator_grads(
 ) -> Result<([f64; 4], Params)> {
     let loss_fn = |p: HashMap<Rc<str>, Array>, _: i32| -> mlx_rs::error::Result<Vec<Array>> {
         let dit = model.dit(&p).map_err(to_exc)?;
-        let xhat = frozen.restore(&dit, &batch.lq).map_err(to_exc)?;
+        let xhat = if plan.ac.active() {
+            let mut hooks = region_hooks(model, &p, plan.ac);
+            frozen.restore_hooked(&dit, &batch.lq, &mut hooks)
+        } else {
+            frozen.restore(&dit, &batch.lq)
+        }
+        .map_err(to_exc)?;
         let t = generator_terms(frozen, plan, head, sn, &xhat, &batch.gt).map_err(to_exc)?;
         let total = t.l2.add(&t.lpips)?.add(&t.gan)?;
         let scaled = total.multiply(Array::from_f32(grad_scale))?;

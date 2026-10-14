@@ -1035,6 +1035,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
         return shell
 
+    # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
+    # each libtest filter must select an integration module of. libtest passes on zero matches,
+    # so a renamed or dropped module would otherwise leave a green step that tests nothing.
+    CANDLE_METAL_PINS = {
+        "metal_strided_reduce": "crates/media/candle-gen/candle-gen",
+        "metal_reference_latents": "crates/media/candle-gen/candle-gen-qwen-image-2-1",
+    }
+
+    def assert_candle_metal_pins_select_real_modules(self, run: str) -> None:
+        command = " ".join(run.split())
+        self.assertIn("--features metal --test integration --", command)
+        filters = command.split(" -- ", 1)[1].split()
+        self.assertEqual(sorted(filters), sorted(f"{name}::" for name in self.CANDLE_METAL_PINS))
+        root = WORKFLOW.parents[2]
+        for name, crate in self.CANDLE_METAL_PINS.items():
+            package = tomllib.loads((root / crate / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn(f"-p {package['package']['name']} ", command, name)
+            main = (root / crate / "tests" / "main.rs").read_text(encoding="utf-8")
+            self.assertIn(f'#[path = "{name}.rs"]\nmod {name};', main, name)
+            source = (root / crate / "tests" / f"{name}.rs").read_text(encoding="utf-8")
+            self.assertIn('#![cfg(feature = "metal")]', source, name)
+            self.assertIn("#[test]", source, name)
+
     def test_macos_metal_builds_one_target_generation_without_cargo_clean(self) -> None:
         # Until 2026-08-23 this lane ran `cargo clean` twice mid-job because the full-debuginfo test
         # graph grew `target/` to 35 GB. Each clean discarded the cache-restored `pmetal-mlx-sys`
@@ -1074,9 +1097,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "Test LLM-only macOS bundle",
             "Test LLM+audio macOS bundle",
             "Clippy Candle Metal packages",
+            "Test Candle Metal reduce pins",
         ]
         indices = [names.index(name) for name in order]
         self.assertEqual(indices, sorted(indices))
+        self.assert_candle_metal_pins_select_real_modules(steps[names.index(order[-1])]["run"])
         # The image-payload prune still runs, but in the background: inline it was 3.6 minutes on
         # the critical path. It must start before the cache restore so the I/O overlaps the build.
         reclaim = "Reclaim runner disk (background)"

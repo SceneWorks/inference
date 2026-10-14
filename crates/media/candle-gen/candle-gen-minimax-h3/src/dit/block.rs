@@ -416,6 +416,19 @@ impl DitBlock {
         rope: &MmRope,
         tables: &MmRopeTables,
     ) -> Result<Tensor> {
+        self.forward_veda(x, modulation, adaln_indices, rope, tables, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_veda(
+        &self,
+        x: &Tensor,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Tensor,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+    ) -> Result<Tensor> {
         let s = x.dims();
         if s.len() != 3 {
             return Err(CandleError::Msg(format!(
@@ -441,7 +454,9 @@ impl DitBlock {
             &modulation.shift_msa,
             &idx,
         )?;
-        let attn = self.attn.forward(&normed, Some((rope, tables)))?;
+        let attn = self
+            .attn
+            .forward_veda(&normed, Some((rope, tables)), veda)?;
         let gate = gate_rows(&modulation.gate_msa, &idx, rows, x.dtype())?;
         let x = x.add(&gate.broadcast_mul(&attn)?)?;
 

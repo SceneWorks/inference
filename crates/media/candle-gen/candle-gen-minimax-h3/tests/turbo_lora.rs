@@ -2589,3 +2589,115 @@ fn manual_cuda_exact_h3_trainer_runtime_receipt() {
         probe, residual_correctness_rel_max, SC21028_RUNTIME_RESIDUAL_REL_MAX
     );
 }
+
+/// Exact public Clay header geometry, with deterministic factors and no downloaded tensor bytes.
+#[test]
+fn clay_raw_refiner_header_conversion_preserves_factors_alpha_and_strict_unknowns() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../contracts/gen-core/tests/fixtures/adapters/h3_clay_refiner_header.json"
+    )))
+    .unwrap();
+    let mut raw = HashMap::new();
+    for (key, value) in fixture["header"].as_object().unwrap() {
+        let shape: Vec<usize> = value["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap() as usize)
+            .collect();
+        let values: Vec<f32> = (0..shape.iter().product())
+            .map(|i| ((i % 29) as f32 - 14.) / 32.)
+            .collect();
+        raw.insert(
+            key.clone(),
+            Tensor::from_vec(values, shape.as_slice(), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap(),
+        );
+    }
+    let canonical = raw
+        .iter()
+        .map(|(key, tensor)| {
+            (
+                key.replacen("token_refiner.blocks.", "token_refiner.refiner_blocks.", 1),
+                tensor.clone(),
+            )
+        })
+        .collect();
+    let converted = convert_comfyui_key_space(&raw, &HashMap::new()).unwrap();
+    let control = convert_comfyui_key_space(&canonical, &HashMap::new()).unwrap();
+    let targets = adapter_target_paths(&MiniMaxH3DitConfig::default());
+    let values = |t: &Tensor| {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    assert_eq!(converted.len(), 30); // 12 A/B pairs and six explicit Q/K/V alphas.
+    assert_eq!(converted.len(), control.len());
+    for (key, tensor) in &converted {
+        assert_eq!(tensor.dims(), control[key].dims(), "{key}");
+        assert_eq!(values(tensor), values(&control[key]), "{key}");
+        let (target, _) = candle_gen_minimax_h3::adapters::classify_key(key).unwrap();
+        assert!(targets.contains(&target), "unmatched Clay target {target}");
+    }
+    for block in 0..2 {
+        let source = format!("diffusion_model.token_refiner.blocks.{block}");
+        let target = format!("token_refiner.refiner_blocks.{block}");
+        for (projection, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let key = format!("{target}.attn.{name}.lora_B.weight");
+            let expected = raw[&format!("{source}.attn.qkv_proj.lora_B.weight")]
+                .narrow(0, projection * 7168, 7168)
+                .unwrap();
+            assert_eq!(values(&converted[&key]), values(&expected), "{key}");
+            assert_eq!(
+                values(&converted[&format!("{target}.attn.{name}.alpha")]),
+                vec![8.]
+            );
+        }
+        let source = &raw[&format!("{source}.mlp.fc1.lora_B.weight")];
+        let expected = Tensor::cat(
+            &[
+                &source.narrow(0, 14336, 14336).unwrap(),
+                &source.narrow(0, 0, 14336).unwrap(),
+            ],
+            0,
+        )
+        .unwrap();
+        let actual = &converted[&format!("{target}.ff.net.0.proj.lora_B.weight")];
+        assert_eq!(actual.dtype(), DType::F16);
+        assert_eq!(values(actual), values(&expected));
+    }
+    let cfg = dit_fixture_config();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unrelated_refiner.safetensors");
+    let (out, inn) = target_shape(&cfg, PROBE);
+    write_safetensors(
+        &path,
+        &[
+            (format!("{PROBE}.lora_A.weight"), tensor(&[16, inn], 1.)),
+            (format!("{PROBE}.lora_B.weight"), tensor(&[out, 16], 2.)),
+            (
+                "unrelated.token_refiner.blocks.0.attn.out_proj.lora_A.weight".into(),
+                tensor(&[16, out], 3.),
+            ),
+            (
+                "unrelated.token_refiner.blocks.0.attn.out_proj.lora_B.weight".into(),
+                tensor(&[inn, 16], 4.),
+            ),
+        ],
+        &[],
+    );
+    let error = apply_minimax_h3_adapters(&mut tiny_dit(&cfg), &[spec(path, 1.)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("matched no module"), "{error}");
+    assert!(
+        error.contains("unrelated.token_refiner.blocks.0.attn.to_out.0"),
+        "{error}"
+    );
+}
