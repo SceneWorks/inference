@@ -9,6 +9,9 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core::{
+    ExecutionSurface, GenerationReport, PrefixKvCacheDomain, PrefixKvCacheMode, PrefixKvCacheReport,
+};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, gen_core, resolve_flow_schedule,
@@ -21,9 +24,9 @@ use crate::config::{
 };
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_references, joint_branch,
-    prepare_conditioning_references, DenoiseInputs, JointBranch, KvCacheMode,
-    ReferenceConditioning,
+    create_noise, decode_rgb, decode_rgba, denoise_reported, encode_references, joint_branch,
+    prepare_conditioning_references, DenoiseInputs, DenoiseReport, JointBranch, KvCacheMode,
+    KvCachePath, ReferenceConditioning,
 };
 use crate::reference::{collect_references, PreparedReference};
 use crate::scheduler;
@@ -225,6 +228,15 @@ pub fn descriptor() -> ModelDescriptor {
             // Both sides must be multiples of 32 px (16× VAE × 2×2 vision slot).
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
+            },
+            // The prefix KV cache (sc-25905) is a request-selected execution domain: both modes
+            // are implemented, an unset field is the prefill path, and the shared floor refuses
+            // nothing this declares.
+            execution: ExecutionSurface {
+                prefix_kv_cache: PrefixKvCacheDomain::Modes(
+                    crate::memory_strategy::PREFIX_KV_CACHE_MODES.to_vec(),
+                ),
+                ..ExecutionSurface::default()
             },
             ..Default::default()
         },
@@ -534,6 +546,23 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let report = self.generate_impl(req, on_progress)?;
+        report.output.ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{}: the render produced no output",
+                self.variant.id()
+            ))
+        })
+    }
+
+    /// The render plus which prefix-KV-cache path it ran and the bytes its caches held
+    /// (`GenerationReport::prefix_kv_cache`, sc-25905) — the primary implementation;
+    /// [`Self::generate`] is this without the report.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -573,7 +602,7 @@ impl QwenImage21 {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<GenerationReport> {
         self.validate(req)?;
         let params = resolve_run_params(&self.schedule, req)?;
         let tiling = crate::pipeline::decode_tiling(req);
@@ -592,7 +621,27 @@ impl QwenImage21 {
         #[cfg(test)]
         let resident_bytes =
             resident_bytes.saturating_add(crate::q4_diagnostic::resident_surcharge());
-        let _bounds = crate::memory_strategy::AllocatorBounds::enter(
+        // sc-25905: the prefix KV cache is a request selection, and the bound installed is the
+        // bound of the mode selected — the cache-shed transient for a prefill render, and for a
+        // cached one the same transient plus the priced cache bytes as *retained* memory (live
+        // arrays the request holds, so they raise the memory limit and leave the buffer-cache
+        // limit alone). Never a cached render under a prefill bound.
+        let kv_cache = crate::memory_strategy::prefix_kv_cache_for(req);
+        let tier = crate::quant::Tier::from_selected(self.spec.quantize)
+            .unwrap_or(crate::quant::Tier::Bf16);
+        let priced_cache_bytes = match kv_cache {
+            PrefixKvCacheMode::Cached => {
+                crate::memory_strategy::derived::prefix_kv_cache_demand_bytes(
+                    tier,
+                    req.width,
+                    req.height,
+                    req.memory_reference_count(),
+                    params.use_negative,
+                )
+            }
+            PrefixKvCacheMode::Prefill => 0,
+        };
+        let _bounds = crate::memory_strategy::AllocatorBounds::enter_retaining(
             resident_bytes,
             crate::memory_strategy::derived::request_transient_budget_bytes(
                 req.width,
@@ -605,6 +654,7 @@ impl QwenImage21 {
                     .and_then(|t| t.spatial)
                     .map(|s| s.tile_px as u32),
             ),
+            priced_cache_bytes,
         );
         let drop = self.drop_count;
         // Staged residency is a per-request execution decision (sc-24114): the shared worker
@@ -613,7 +663,10 @@ impl QwenImage21 {
         // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
         // sequential one.
         let stage_residency = stage_residency_for(&self.spec, req);
-        self.residency.run_request_scoped(
+        // What the denoise loops did, written as they run (one report per image; they agree).
+        let mut ran: Option<PrefixKvCacheReport> = None;
+        let mut warnings = Vec::new();
+        let output = self.residency.run_request_scoped(
             stage_residency,
             false,
             &req.cancel,
@@ -630,6 +683,56 @@ impl QwenImage21 {
                     references,
                 } = branches;
                 let channels = heavy.transformer.config().in_channels;
+                // A selection this checkpoint cannot honour is refused, never run as the other
+                // mode: the cache is only valid on a `causal_condition` model (both released
+                // checkpoints are), and a caller that priced a cached render must not be handed a
+                // prefill one in silence.
+                if kv_cache.is_cached() && !heavy.transformer.config().causal_condition {
+                    return Err(Error::Unsupported(format!(
+                        "{}: prefix_kv_cache=cached was selected, but this checkpoint is not \
+                         `causal_condition` and has no prefix to cache. Select prefill, or leave \
+                         memory.prefix_kv_cache unset.",
+                        self.variant.id()
+                    )));
+                }
+                // sc-25905: a cached render is held to what it was priced at. The real prefix is
+                // known only now (tokenized prompt rows, fitted reference grids), so the caches
+                // this request would hold are computed from the real layouts at the model's own
+                // compute dtype and compared with the priced figure — the same arithmetic over
+                // the published bounds at the tier's width. Past it, the request runs prefill:
+                // never cached above its price, never a failed render.
+                let overflow = if kv_cache.is_cached() {
+                    let mut prefixes = vec![pos.layout.prefix_len() as u64];
+                    prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
+                    crate::memory_strategy::prefix_kv_cache_overflow(
+                        heavy.transformer.config(),
+                        heavy.transformer.compute_dtype(),
+                        tier,
+                        &prefixes,
+                        req.memory_reference_count(),
+                        crate::memory_strategy::derived::image_tokens(req.width, req.height),
+                    )?
+                } else {
+                    None
+                };
+                if let Some(overflow) = overflow {
+                    warnings.push(gen_core::GenerationWarning {
+                        code: crate::memory_strategy::PREFIX_KV_CACHE_OVERFLOW_WARNING.to_owned(),
+                        message: format!(
+                            "{}: prefix_kv_cache=cached was selected, but this request's caches \
+                             would hold {} bytes against the {} bytes priced for it (the prompt \
+                             or a reference exceeds the priced prefix bound); rendering prefill",
+                            self.variant.id(),
+                            overflow.actual_bytes,
+                            overflow.priced_bytes
+                        ),
+                    });
+                }
+                let loop_mode = if kv_cache.is_cached() && overflow.is_none() {
+                    KvCacheMode::On
+                } else {
+                    KvCacheMode::Off
+                };
                 // The condition latents: both branches share one reference encode.
                 let reference_latents = encode_references(&heavy.vae, &references)?;
                 let conditioning = (!references.is_empty()).then(|| ReferenceConditioning {
@@ -648,7 +751,8 @@ impl QwenImage21 {
                 for i in 0..req.count {
                     let seed = params.base_seed.wrapping_add(i as u64);
                     let latents = create_noise(seed, req.width, req.height, channels)?;
-                    let latents = denoise(
+                    let mut report = DenoiseReport::default();
+                    let latents = denoise_reported(
                         DenoiseInputs {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
@@ -666,12 +770,21 @@ impl QwenImage21 {
                                 layout: c.layout,
                                 negative_layout: c.negative_layout,
                             }),
-                            // Upstream's `use_kv_cache=True` default (sc-25903). The one
-                            // switch: `Off` is the prefill path, byte-for-byte.
-                            kv_cache: KvCacheMode::On,
+                            // The one switch (sc-25903), driven by the request's selection
+                            // (sc-25905): `Off` is the prefill path, byte-for-byte.
+                            kv_cache: loop_mode,
                         },
+                        &mut report,
                         on_progress,
                     )?;
+                    ran = Some(PrefixKvCacheReport {
+                        path: match report.kv_cache {
+                            KvCachePath::Cached => PrefixKvCacheMode::Cached,
+                            KvCachePath::Prefill => PrefixKvCacheMode::Prefill,
+                        },
+                        cache_bytes: report.kv_cache_bytes as u64,
+                        overflow,
+                    });
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
@@ -709,7 +822,13 @@ impl QwenImage21 {
                     Ok(GenerationOutput::Images(images))
                 }
             },
-        )
+        )?;
+        Ok(GenerationReport {
+            output: Some(output),
+            artifacts: None,
+            warnings,
+            prefix_kv_cache: ran,
+        })
     }
 }
 

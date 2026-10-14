@@ -268,6 +268,15 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            // The prefix KV cache (sc-25905) is a request-selected execution domain: both modes
+            // are implemented, an unset field is the prefill path, and the shared floor refuses
+            // nothing this declares.
+            execution: gen_core::ExecutionSurface {
+                prefix_kv_cache: gen_core::PrefixKvCacheDomain::Modes(
+                    memory_strategy::PREFIX_KV_CACHE_MODES.to_vec(),
+                ),
+                ..gen_core::ExecutionSurface::default()
+            },
             ..Default::default()
         },
     }
@@ -498,6 +507,23 @@ impl Generator for QwenImage21 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        let report = self.generate_impl(req, on_progress)?;
+        report.output.ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{}: the render produced no output",
+                self.descriptor.id
+            ))
+        })
+    }
+
+    /// The render plus which prefix-KV-cache path it ran and the bytes its caches held
+    /// (`GenerationReport::prefix_kv_cache`, sc-25905) — the primary implementation;
+    /// [`Self::generate`] is this without the report.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<gen_core::GenerationReport> {
         self.generate_impl(req, on_progress).map_err(Into::into)
     }
 }
@@ -572,7 +598,7 @@ impl QwenImage21 {
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
+    ) -> Result<gen_core::GenerationReport> {
         self.validate(req)?;
         let params = match &self.schedule {
             Schedule::Shifted(scheduler) => resolve_run_params(scheduler, req)?,
@@ -588,7 +614,12 @@ impl QwenImage21 {
         // the two are OR'd — a request can stage a warm-loaded generator, never un-stage a
         // sequential one.
         let stage_residency = stage_residency_for(&self.spec, req);
-        self.residency.run_request_scoped(
+        // sc-25905: the prefix KV cache is a request selection; unset is the prefill path.
+        let kv_cache = memory_strategy::prefix_kv_cache_for(req);
+        // What the denoise loops did, written as they run (one report per image; they agree).
+        let mut ran: Option<gen_core::PrefixKvCacheReport> = None;
+        let mut warnings = Vec::new();
+        let output = self.residency.run_request_scoped(
             stage_residency,
             false,
             &req.cancel,
@@ -608,6 +639,54 @@ impl QwenImage21 {
                     references,
                 } = branches;
                 let channels = heavy.transformer.config().in_channels;
+                // A selection this checkpoint cannot honour is refused, never run as the other
+                // mode: the cache is only valid on a `causal_condition` model (both released
+                // checkpoints are), and a caller that priced a cached render must not be handed a
+                // prefill one in silence.
+                if kv_cache.is_cached() && !heavy.transformer.config().causal_condition {
+                    return Err(Error::Unsupported(format!(
+                        "{}: prefix_kv_cache=cached was selected, but this checkpoint is not \
+                         `causal_condition` and has no prefix to cache. Select prefill, or leave \
+                         memory.prefix_kv_cache unset.",
+                        self.descriptor.id
+                    )));
+                }
+                // sc-25905: a cached render is held to what it was priced at. The real prefix is
+                // known only now (tokenized prompt rows, fitted reference grids), so the caches
+                // this request would hold are computed from the real layouts at the model's own
+                // compute dtype and compared with the priced figure — the same arithmetic over
+                // the published bounds at the build's priced width. Past it, the request runs
+                // prefill: never cached above its price, never a failed render.
+                let overflow = if kv_cache.is_cached() {
+                    let mut prefixes = vec![pos.layout.prefix_len() as u64];
+                    prefixes.extend(neg.as_ref().map(|neg| neg.layout.prefix_len() as u64));
+                    memory_strategy::prefix_kv_cache_overflow(
+                        heavy.transformer.config(),
+                        heavy.transformer.compute_dtype(),
+                        &prefixes,
+                        req.memory_reference_count(),
+                        memory_strategy::image_tokens(req.width, req.height),
+                    )
+                } else {
+                    None
+                };
+                if let Some(overflow) = overflow {
+                    warnings.push(gen_core::GenerationWarning {
+                        code: memory_strategy::PREFIX_KV_CACHE_OVERFLOW_WARNING.to_owned(),
+                        message: format!(
+                            "{}: prefix_kv_cache=cached was selected, but this request's caches \
+                             would hold {} bytes against the {} bytes priced for it (the prompt \
+                             or a reference exceeds the priced prefix bound, or the generator \
+                             runs on a wider device than was priced); rendering prefill",
+                            self.descriptor.id, overflow.actual_bytes, overflow.priced_bytes
+                        ),
+                    });
+                }
+                let loop_mode = if kv_cache.is_cached() && overflow.is_none() {
+                    KvCacheMode::On
+                } else {
+                    KvCacheMode::Off
+                };
                 // The condition latents: both branches share one reference encode, but a
                 // different prompt is a different text length, hence two layouts.
                 let reference_latents =
@@ -624,7 +703,8 @@ impl QwenImage21 {
                 for i in 0..req.count {
                     let seed = candle_gen::image_seed(params.base_seed, i);
                     let latents = create_noise(seed, req.width, req.height, channels, &device)?;
-                    let latents = denoise(
+                    let mut report = DenoiseReport::default();
+                    let latents = denoise_reported(
                         DenoiseInputs {
                             transformer: &heavy.transformer,
                             sigmas: &params.sigmas,
@@ -642,12 +722,21 @@ impl QwenImage21 {
                                 layout: &pos.layout,
                                 negative_layout: neg.as_ref().map(|neg| &neg.layout),
                             }),
-                            // Upstream's `use_kv_cache=True` default (sc-25904). The one
-                            // switch: `Off` is the prefill path, byte-for-byte.
-                            kv_cache: KvCacheMode::On,
+                            // The one switch (sc-25904), driven by the request's selection
+                            // (sc-25905): `Off` is the prefill path, byte-for-byte.
+                            kv_cache: loop_mode,
                         },
+                        &mut report,
                         on_progress,
                     )?;
+                    ran = Some(gen_core::PrefixKvCacheReport {
+                        path: match report.kv_cache {
+                            KvCachePath::Cached => gen_core::PrefixKvCacheMode::Cached,
+                            KvCachePath::Prefill => gen_core::PrefixKvCacheMode::Prefill,
+                        },
+                        cache_bytes: report.kv_cache_bytes as u64,
+                        overflow,
+                    });
                     on_progress(Progress::Decoding);
                     if req.cancel.is_cancelled() {
                         return Err(Error::Canceled);
@@ -678,7 +767,13 @@ impl QwenImage21 {
                     Ok(GenerationOutput::Images(images))
                 }
             },
-        )
+        )?;
+        Ok(gen_core::GenerationReport {
+            output: Some(output),
+            artifacts: None,
+            warnings,
+            prefix_kv_cache: ran,
+        })
     }
 }
 

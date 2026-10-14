@@ -289,11 +289,13 @@ pub struct ReferenceConditioning<'a> {
 /// prompt branch ([`PrefixKvCache::nbytes`]) for the length of the denoise loop, and in exchange
 /// every model evaluation after the first runs the blocks over the target tokens only instead of
 /// the whole joint sequence. Shedding it ([`Self::Off`]) is exactly the prefill path, unchanged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// There is deliberately **no `Default`**: the cache holds gigabytes nothing prices unless a
+/// caller asked for it (sc-25905), so every call site states the mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvCacheMode {
     /// Prefill once, decode from the cache afterwards (wherever the model allows it — see
     /// [`KvCachePath`]).
-    #[default]
     On,
     /// Evaluate the full block-causal joint sequence at every model evaluation.
     Off,
@@ -721,34 +723,26 @@ mod tests {
         );
     }
 
-    /// The two production callers of the loop pick opposite sides of the switch: the generator
-    /// runs upstream's default (cache on), the trainer's preview render keeps the prefill path its
-    /// memory envelope prices. Neither caller surfaces the path it ran, and on this backend the
-    /// two paths agree to f32 rounding, so nothing downstream could tell a flipped call site — the
-    /// source is the only place to hold it. This is a textual pin, and the admission story
-    /// (sc-25905), which makes the generator's switch request-driven, must replace it with an
-    /// assertion on the `DenoiseReport` the generator surfaces.
+    /// The trainer's preview render stays on the prefill path: it runs inside the trainer's
+    /// memory envelope, which prices no cache.
+    ///
+    /// **A source pin, for the trainer's one call site only.** The trainer surfaces no report of
+    /// the path its preview ran and, on this backend, the two paths agree to f32 rounding, so
+    /// nothing downstream could tell a flipped call site. The generator's switch is no longer
+    /// pinned here: it is request-driven (sc-25905) and held behaviourally, on the path its
+    /// renders report, in `tests/kv_admission.rs`.
     #[test]
-    fn the_generator_runs_the_cache_and_the_trainer_preview_sheds_it() {
-        let switches = |source: &str| -> Vec<String> {
-            source
-                .lines()
-                .map(str::trim)
-                .filter(|line| line.starts_with("kv_cache:"))
-                .map(str::to_owned)
-                .collect()
-        };
+    fn the_trainer_preview_sheds_the_prefix_kv_cache() {
+        let switches: Vec<&str> = include_str!("training.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("kv_cache:"))
+            .collect();
         assert_eq!(
-            switches(include_str!("lib.rs")),
-            ["kv_cache: KvCacheMode::On,"],
-            "the generator's one denoise call"
-        );
-        assert_eq!(
-            switches(include_str!("training.rs")),
+            switches,
             ["kv_cache: crate::pipeline::KvCacheMode::Off,"],
             "the trainer's one preview denoise call"
         );
-        assert_eq!(KvCacheMode::default(), KvCacheMode::On);
     }
 
     #[test]

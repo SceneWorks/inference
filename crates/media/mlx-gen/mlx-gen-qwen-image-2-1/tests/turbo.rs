@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use mlx_gen::gen_core::{Error as CoreError, Progress};
+use mlx_gen::gen_core::{Error as CoreError, GenerationMemory, PrefixKvCacheMode, Progress};
 use mlx_gen::{
     CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, WeightsSource,
 };
@@ -70,17 +70,20 @@ fn render(
 
 /// `req` rendered by hand from the snapshot's components over exactly `sigmas` — the reference a
 /// generator render must equal if (and only if) its sampler ran that schedule.
+///
+/// The prefix KV cache is **off**, as it is on the generator's render path for a request that
+/// selects nothing (sc-25905: the cache is a request selection and unset is the prefill path), so
+/// the two sides of every pixel comparison here run the same path.
 fn render_over(root: &Path, req: &GenerationRequest, sigmas: &[f32]) -> Vec<u8> {
-    render_over_reported(root, req, sigmas).0
+    render_over_reported(root, req, sigmas, KvCacheMode::Off).0
 }
 
-/// [`render_over`] plus what the denoise loop reported. The prefix KV cache is **on**, as it is on
-/// the generator's render path (`generate_impl` passes `KvCacheMode::On` for both engine ids), so
-/// the two sides of every pixel comparison here run the same cache mode.
+/// [`render_over`] with the cache switch stated, plus what the denoise loop reported.
 fn render_over_reported(
     root: &Path,
     req: &GenerationRequest,
     sigmas: &[f32],
+    kv_cache: KvCacheMode,
 ) -> (Vec<u8>, DenoiseReport) {
     let tokenizer = load_tokenizer(root).unwrap();
     let encoder = load_text_encoder(root).unwrap();
@@ -113,7 +116,7 @@ fn render_over_reported(
             seed,
             cancel: &cancel,
             references: None,
-            kv_cache: KvCacheMode::On,
+            kv_cache,
         },
         &mut report,
         &mut |_| {},
@@ -214,19 +217,27 @@ fn turbo_default_and_eight_steps_render_over_the_snapshots_saved_sigmas() {
 /// cached loop prefills once and decodes the other seven evaluations from the cache, and that
 /// render is the one the `qwen_image_2_1_turbo` generator produces.
 ///
-/// `Generator::generate` does not surface the `DenoiseReport`, so the evaluation paths are
-/// asserted at the closest public seam — `denoise_reported` over the Turbo fixture's components
-/// and schedule with the cache mode the generator's one shared call site passes — and tied to the
-/// generator by pixel equality.
+/// The request selects the cache (sc-25905: unset is the prefill path). The per-evaluation paths
+/// are asserted on `denoise_reported` over the Turbo fixture's components and schedule, tied to
+/// the generator by pixel equality **and** by the generator's own report
+/// (`GenerationReport::prefix_kv_cache`): the same path, the same cache bytes.
 ///
-/// *Mutation that reds this:* the denoise loop not keeping the extracted cache (every evaluation
-/// then re-extracts instead of decoding from it).
+/// *Mutations that red this:* the denoise loop not keeping the extracted cache (every evaluation
+/// then re-extracts instead of decoding from it); the generator ignoring a `Cached` selection
+/// (its report says `prefill`).
 #[test]
 fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
     let tmp = tempfile::tempdir().unwrap();
     let root = turbo_snapshot(tmp.path());
-    let req = request(None);
-    let (manual, report) = render_over_reported(&root, &req, &saved_then_zero());
+    // The request selects the cache (sc-25905); the hand-assembled side runs it too.
+    let req = GenerationRequest {
+        memory: Some(GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Cached),
+            ..Default::default()
+        }),
+        ..request(None)
+    };
+    let (manual, report) = render_over_reported(&root, &req, &saved_then_zero(), KvCacheMode::On);
 
     assert_eq!(report.kv_cache, KvCachePath::Cached);
     assert!(
@@ -257,6 +268,14 @@ fn turbo_saved_sigma_render_extracts_once_then_decodes_from_the_prefix_cache() {
     let (pixels, steps) = render(generator.as_ref(), &req);
     assert_eq!(steps, every_step(8));
     assert_eq!(pixels, manual);
+    // …and the generator says so itself: the same path and the same cache bytes.
+    let ran = generator
+        .generate_with_report(&req, &mut |_| {})
+        .unwrap()
+        .prefix_kv_cache
+        .expect("the path is reported on every render");
+    assert_eq!(ran.path, PrefixKvCacheMode::Cached);
+    assert_eq!(ran.cache_bytes, report.kv_cache_bytes as u64);
 }
 
 /// Twelve steps on the Turbo id denoise over the 12-point resample of the saved curve

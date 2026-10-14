@@ -28,6 +28,9 @@ mod edit_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "kv_admission.rs"]
+mod kv_admission;
+
 #[path = "kv_cache.rs"]
 mod kv_cache;
 

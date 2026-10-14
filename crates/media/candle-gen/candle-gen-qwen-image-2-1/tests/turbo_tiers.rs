@@ -156,9 +156,10 @@ fn render(generator: &dyn Generator, req: &GenerationRequest) -> (Vec<u8>, Vec<(
 }
 
 /// One render of [`PROMPT`] at [`SEED`] assembled from the crate's public pipeline pieces over the
-/// components of `root` and an **explicit** sigma list, with the prefix KV cache on — the mode the
-/// generator's one denoise call uses for both ids. The independent side of the schedule
-/// assertions: the generator chooses its schedule, this does not.
+/// components of `root` and an **explicit** sigma list, with the prefix KV cache off — the path
+/// the generator runs for a request that selects nothing (sc-25905: the cache is a request
+/// selection and unset is the prefill path). The independent side of the schedule assertions:
+/// the generator chooses its schedule, this does not.
 fn render_over(root: &Path, sigmas: &[f32]) -> Vec<u8> {
     let device = candle_gen::default_device().unwrap();
     let tokenizer = load_tokenizer(root).unwrap();
@@ -185,7 +186,7 @@ fn render_over(root: &Path, sigmas: &[f32]) -> Vec<u8> {
             seed,
             cancel: &cancel,
             references: None,
-            kv_cache: KvCacheMode::On,
+            kv_cache: KvCacheMode::Off,
         },
         &mut report,
         &mut |_| {},
