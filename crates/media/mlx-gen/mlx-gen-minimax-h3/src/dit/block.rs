@@ -427,6 +427,20 @@ impl DitBlock {
         tables: &MmRopeTables,
         bounded: BoundedAttention<'_>,
     ) -> Result<Array> {
+        self.forward_bounded_veda(x, modulation, adaln_indices, rope, tables, bounded, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_bounded_veda(
+        &self,
+        x: &Array,
+        modulation: &AdaLnModulation,
+        adaln_indices: &Array,
+        rope: &MmRope,
+        tables: &MmRopeTables,
+        bounded: BoundedAttention<'_>,
+        veda: Option<(&crate::veda::VedaRuntime, usize, usize)>,
+    ) -> Result<Array> {
         let s = x.shape();
         if s.len() != 3 {
             return Err(Error::Msg(format!(
@@ -450,7 +464,7 @@ impl DitBlock {
         )?;
         let attn = self
             .attn
-            .forward_bounded(&normed, Some((rope, tables)), bounded)?;
+            .forward_bounded_veda(&normed, Some((rope, tables)), bounded, veda)?;
         let gate = modulation.gate_msa.take_axis(adaln_indices, 0)?;
         let x = add(x, &multiply(&gate, &attn)?)?;
 

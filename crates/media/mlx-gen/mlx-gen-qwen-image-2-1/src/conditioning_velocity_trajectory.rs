@@ -91,7 +91,11 @@ fn run() -> Result<()> {
     // The complete prior dense overlay/construction/VAE closure remains reserved.
     // Add the production request transient (denoise, reference encode and bounded decode),
     // sampler/copy workspace and fixed CPU scratch before any native construction.
+    // At the q4 tier the native construction renders on: its denoise is priced at f32
+    // (sc-25909). At this geometry the reference encode binds on every tier, so the figure is
+    // the one this diagnostic always reserved.
     let request_transient = crate::memory_strategy::derived::request_transient_budget_bytes(
+        crate::quant::Tier::Q4,
         768,
         768,
         crate::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,

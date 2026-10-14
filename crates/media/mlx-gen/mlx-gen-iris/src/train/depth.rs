@@ -59,11 +59,12 @@ use mlx_rs::ops::{abs, concatenate_axis, sum_axes, zeros};
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{Array, Dtype};
 
-use super::model::save_safetensors_atomic;
+use super::model::{region_hooks, save_safetensors_atomic, TrainModel, Trainable};
 use super::optim::{clip_grads, ema_update, IrisOptimizer, Params};
-use crate::depth::{depth_forward, DepthParts};
+use crate::depth::{depth_forward, depth_forward_hooked, DepthParts};
 use crate::dit::IrisDiT;
 use crate::text_encoder::IrisTextEncoder;
+use gen_core::iris::train::ac::AcPolicy;
 
 /// Identity + capabilities of the MLX Iris depth trainer: a full fine-tune, no adapters.
 pub fn trainer_descriptor() -> TrainerDescriptor {
@@ -209,12 +210,6 @@ impl IrisDepthTrainer {
         validate_edit_request(d, req)?;
         refuse_reference_control_model_options(DEPTH_TRAINER_ID, req)?;
         let plan = DepthTrainPlan::resolve(req, &self.config)?;
-        if plan.ac.active() {
-            return Err(Error::Unsupported(format!(
-                "{DEPTH_TRAINER_ID} trainer: gradient (activation) checkpointing is not \
-                 implemented for the depth task on the MLX backend"
-            )));
-        }
         if req.items.is_empty() {
             return Err(Error::Msg(format!(
                 "{DEPTH_TRAINER_ID} trainer: the dataset is empty"
@@ -258,22 +253,47 @@ pub struct DepthModel {
     /// `[1, T, L, D]` f32 and its `[T]` mask.
     pub embeddings: Array,
     pub mask: Vec<i32>,
+    /// Activation checkpointing of the training step's trunk / pixel blocks (sc-25690; the plan's
+    /// [`DepthTrainPlan::ac`]). [`Self::new`] starts at `none`; it never touches
+    /// [`Self::predict`].
+    pub ac: AcPolicy,
+    /// What a checkpointed region rebuilds its block from: the widening touches only the two input
+    /// projections, so a trunk / pixel block of the depth backbone is the generation trainer's.
+    regions: TrainModel,
 }
 
 impl DepthModel {
     pub fn new(config: IrisConfig, compute: Dtype, prompt: &EmptyPrompt) -> Self {
         let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
+        let regions = TrainModel {
+            cfg: config.model.clone(),
+            compute,
+            trainable: Trainable::Full,
+        };
         Self {
             config,
             compute,
             embeddings: Array::from_slice(&prompt.embeddings, &shape),
             mask: prompt.mask.clone(),
+            ac: AcPolicy::None,
+            regions,
         }
     }
 
     /// `[B, 3, H, W]` RGB → `[B, 1, H, W]` f32 prediction from `params` (traced or plain), through
     /// the estimator's own forward.
     pub fn predict(&self, params: &HashMap<Rc<str>, Array>, rgb: &Array) -> Result<Array> {
+        self.predict_under(params, rgb, AcPolicy::None)
+    }
+
+    /// [`Self::predict`] with the trunk / pixel blocks `ac` selects run as activation-checkpointed
+    /// regions (sc-25690) — the training step's forward. `none` is [`Self::predict`]'s graph.
+    fn predict_under(
+        &self,
+        params: &HashMap<Rc<str>, Array>,
+        rgb: &Array,
+        ac: AcPolicy,
+    ) -> Result<Array> {
         let cfg = &self.config.model;
         let mut backbone = HashMap::with_capacity(params.len());
         for (k, v) in params {
@@ -296,17 +316,21 @@ impl DepthModel {
             .reshape(&[1, cfg.in_channels as i32])?
             .as_dtype(self.compute)?;
         let bias = get(REDUCER_BIAS)?.as_dtype(self.compute)?;
-        depth_forward(
-            &DepthParts {
-                dit: &dit,
-                reducer_weight: &weight,
-                reducer_bias: &bias,
-                embeddings: &self.embeddings,
-                mask: &self.mask,
-                num_train_timesteps: self.config.flow.num_train_timesteps,
-            },
-            rgb,
-        )
+        let parts = DepthParts {
+            dit: &dit,
+            reducer_weight: &weight,
+            reducer_bias: &bias,
+            embeddings: &self.embeddings,
+            mask: &self.mask,
+            num_train_timesteps: self.config.flow.num_train_timesteps,
+        };
+        if !ac.active() {
+            return depth_forward(&parts, rgb);
+        }
+        // The reducer and the loss sit downstream of the regions; the two reducer tensors match no
+        // block prefix, so no region takes them as an input.
+        let mut hooks = region_hooks(&self.regions, params, ac);
+        depth_forward_hooked(&parts, rgb, &mut hooks)
     }
 }
 
@@ -369,7 +393,9 @@ fn to_exc(e: impl std::fmt::Display) -> Exception {
 }
 
 /// The loss of one micro-batch and its gradient over every trained tensor; the gradient is of
-/// `loss · grad_scale`, the returned loss unscaled.
+/// `loss · grad_scale`, the returned loss unscaled. Under [`DepthModel::ac`] the backbone's trunk /
+/// pixel blocks are activation-checkpointed regions (MLX's checkpoint transform): the same
+/// gradient, the block interiors recomputed in the backward instead of held through the forward.
 pub fn loss_and_grads(
     model: &DepthModel,
     params: &Params,
@@ -378,7 +404,9 @@ pub fn loss_and_grads(
     grad_scale: f32,
 ) -> Result<(f32, Params)> {
     let loss_fn = |p: HashMap<Rc<str>, Array>, _: i32| -> mlx_rs::error::Result<Vec<Array>> {
-        let pred = model.predict(&p, &step.rgb).map_err(to_exc)?;
+        let pred = model
+            .predict_under(&p, &step.rgb, model.ac)
+            .map_err(to_exc)?;
         let l = depth_loss(&pred, step, loss.gradient_weight).map_err(to_exc)?;
         let scaled = l.multiply(Array::from_f32(grad_scale))?;
         Ok(vec![scaled, l])
@@ -766,7 +794,10 @@ impl Run {
         // source was validated, so a refused resume leaves the root as it was.
         retire_foreign_checkpoints(&ckpt_root, resume_src.as_deref())?;
         Ok(Self {
-            model: DepthModel::new(config, compute, &prompt),
+            model: DepthModel {
+                ac: plan.ac,
+                ..DepthModel::new(config, compute, &prompt)
+            },
             plan,
             source_config_text,
             prompt,

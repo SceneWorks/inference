@@ -29,13 +29,13 @@ pub enum Variant {
     /// `Qwen/Qwen-Image-2.1`: the resolution-shifted schedule ([`SchedulerConfig`]), 40 steps.
     Base,
     /// `Qwen/Qwen-Image-2.1-Turbo`: the distilled checkpoint, sampled over the sigma list its own
-    /// snapshot saves ([`TurboSchedule`]).
+    /// snapshot saves ([`SavedSigmaSchedule`]).
     Turbo,
 }
 
 impl Variant {
     /// The registry id this variant is served under.
-    pub const fn model_id(self) -> &'static str {
+    pub const fn id(self) -> &'static str {
         match self {
             Self::Base => crate::MODEL_ID,
             Self::Turbo => crate::TURBO_MODEL_ID,
@@ -43,10 +43,10 @@ impl Variant {
     }
 
     /// The variant registered as `id`, if any.
-    pub fn from_model_id(id: &str) -> Option<Self> {
+    pub fn from_id(id: &str) -> Option<Self> {
         [Self::Base, Self::Turbo]
             .into_iter()
-            .find(|variant| variant.model_id() == id)
+            .find(|variant| variant.id() == id)
     }
 }
 
@@ -630,13 +630,13 @@ const UNPORTED_SIGMA_FLAGS: [&str; 5] = [
 /// — dynamic shifting off and `shift` 1.0 — uses them unchanged and appends `0`. There is no `mu`
 /// and no stretch on this path, so none of [`SchedulerConfig`]'s shift fields exist here.
 #[derive(Clone, Debug, PartialEq)]
-pub struct TurboSchedule {
+pub struct SavedSigmaSchedule {
     /// The saved sigmas, strictly descending in `(0, 1]`, exactly as the snapshot writes them.
     pub sample_sigmas: Vec<f64>,
     pub num_train_timesteps: usize,
 }
 
-impl TurboSchedule {
+impl SavedSigmaSchedule {
     /// The step count a request omitting `steps` gets: one per saved sigma.
     pub fn default_steps(&self) -> usize {
         self.sample_sigmas.len()
@@ -832,7 +832,7 @@ mod tests {
     /// the same scheduler config — the two ids never read each other's schedule.
     #[test]
     fn the_turbo_schedule_is_read_from_the_snapshot() {
-        let schedule = TurboSchedule::from_values(&turbo_index(), &turbo_scheduler()).unwrap();
+        let schedule = SavedSigmaSchedule::from_values(&turbo_index(), &turbo_scheduler()).unwrap();
         assert_eq!(
             schedule.sample_sigmas,
             [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(schedule.default_steps(), 8);
         assert_eq!(schedule.num_train_timesteps, 1000);
         // A different saved list is a different schedule and a different default step count.
-        let five = TurboSchedule::from_values(
+        let five = SavedSigmaSchedule::from_values(
             &serde_json::json!({"sample_sigmas": [1.0, 0.9, 0.7, 0.4, 0.1]}),
             &serde_json::json!({}),
         )
@@ -857,12 +857,12 @@ mod tests {
     /// Every way a snapshot can fail to be a Turbo snapshot is a refusal naming what is wrong —
     /// none of them falls back to a schedule the checkpoint was not distilled over.
     ///
-    /// *Mutation that reds this:* dropping any one guard in `TurboSchedule::from_values`
+    /// *Mutation that reds this:* dropping any one guard in `SavedSigmaSchedule::from_values`
     /// (`filter_map`-ing bad entries away, accepting a dynamic or shifted scheduler).
     #[test]
     fn a_snapshot_that_is_not_turbo_shaped_is_refused_by_name() {
         let refusal = |index: Value, scheduler: Value| {
-            TurboSchedule::from_values(&index, &scheduler).unwrap_err()
+            SavedSigmaSchedule::from_values(&index, &scheduler).unwrap_err()
         };
         // A base snapshot: no saved sigmas. Typed, and it names the id that does load it.
         for index in [
@@ -923,7 +923,7 @@ mod tests {
             let mut scheduler = turbo_scheduler();
             scheduler[key] = value.clone();
             assert!(
-                TurboSchedule::from_values(&turbo_index(), &scheduler).is_ok(),
+                SavedSigmaSchedule::from_values(&turbo_index(), &scheduler).is_ok(),
                 "{key} = {value}"
             );
         }

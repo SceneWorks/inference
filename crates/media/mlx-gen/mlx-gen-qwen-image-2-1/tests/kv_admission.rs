@@ -666,6 +666,7 @@ fn demands(fixture: &Fixture, req: &GenerationRequest) -> (u64, u64) {
     let negative = uses_negative(req);
     (
         derived::request_transient_budget_bytes(
+            fixture.tier,
             req.width,
             req.height,
             derived::TABLE_CONDITIONING_TOKENS,

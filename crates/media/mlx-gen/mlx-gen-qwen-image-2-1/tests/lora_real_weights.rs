@@ -1752,6 +1752,7 @@ fn stacked_adapters_apply_with_independent_weights() {
     // physical admission or a measurement; the existing physical watchdog remains in force.
     let transient =
         mlx_gen_qwen_image_2_1::memory_strategy::derived::request_transient_budget_bytes(
+            mlx_gen_qwen_image_2_1::Tier::Bf16,
             request.width,
             request.height,
             mlx_gen_qwen_image_2_1::memory_strategy::derived::TABLE_CONDITIONING_TOKENS,

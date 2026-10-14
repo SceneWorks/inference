@@ -25,8 +25,8 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, OffloadPolicy, PrefixKvCacheMode, Progress, WeightsSource,
 };
 use candle_gen_qwen_image_2_1::{
-    create_noise, decode_rgb, denoise_reported, load_scheduler_config, load_text_encoder,
-    load_tokenizer, load_transformer, load_turbo_schedule, load_vae, loader, scheduler,
+    create_noise, decode_rgb, denoise_reported, load_saved_sigma_schedule, load_scheduler_config,
+    load_text_encoder, load_tokenizer, load_transformer, load_vae, loader, scheduler,
     system_prompt_drop_count, DenoiseInputs, DenoiseReport, EvaluationPath, KvCacheMode,
     KvCachePath, PromptBranch,
 };
@@ -437,7 +437,7 @@ fn eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero() {
 
     // And the loader hands back the saved list unrounded.
     assert_eq!(
-        load_turbo_schedule(root).unwrap().sample_sigmas,
+        load_saved_sigma_schedule(root).unwrap().sample_sigmas,
         TURBO_SAMPLE_SIGMAS
     );
 }
@@ -451,11 +451,11 @@ fn eight_steps_denoise_over_exactly_the_saved_sigmas_then_zero() {
 #[test]
 fn twelve_steps_denoise_over_the_pinned_resample() {
     assert_eq!(
-        scheduler::saved_sigmas(&TURBO_SAMPLE_SIGMAS, 12).unwrap(),
+        scheduler::resample_saved_sigmas(&TURBO_SAMPLE_SIGMAS, 12).unwrap(),
         TWELVE_STEP_RESAMPLE
     );
     assert_eq!(
-        scheduler::saved_sigmas(&TURBO_SAMPLE_SIGMAS, 8).unwrap(),
+        scheduler::resample_saved_sigmas(&TURBO_SAMPLE_SIGMAS, 8).unwrap(),
         SAVED_PLUS_ZERO
     );
 
@@ -688,7 +688,7 @@ fn an_unparsable_model_index_is_refused_under_the_id_that_asked() {
         "[",
     )
     .unwrap();
-    let message = load_turbo_schedule(bad_scheduler.path())
+    let message = load_saved_sigma_schedule(bad_scheduler.path())
         .unwrap_err()
         .to_string();
     assert!(
@@ -779,4 +779,56 @@ fn the_bf16_vae_loads_at_the_lane_compute_dtype_and_decodes() {
         .iter()
         .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
     assert!(hi - lo > 1e-2, "the decode is a picture, not a constant");
+}
+
+/// E3 (sc-25909): a refusal raised by the family's shared code names the engine id it was reached
+/// through — under the Turbo id the base label `qwen_image_2_1:` becomes `qwen_image_2_1_turbo:`
+/// and nothing else changes; under the base id the message is the base message, unchanged. Asked
+/// of the reference collector's empty-`MultiReference` refusal at `validate` and at `generate`;
+/// the load path's tier refusals are held to the same rule in
+/// `turbo_tiers::turbo_keeps_the_base_tier_refusals`.
+///
+/// *Mutation that reds this:* dropping `labelled` from `QwenImage21::validate` or
+/// `generate` (the Turbo message keeps the base label).
+#[test]
+fn a_shared_refusal_names_the_engine_id_it_was_reached_through() {
+    use candle_gen::gen_core::Conditioning;
+    let turbo = turbo_snapshot();
+    let base = tiny_snapshot();
+    let req = GenerationRequest {
+        conditioning: vec![Conditioning::MultiReference { images: Vec::new() }],
+        ..request(Some(2))
+    };
+    let base_generator = load(BASE, &base, OffloadPolicy::Resident);
+    let turbo_generator = load(TURBO, turbo.path(), OffloadPolicy::Resident);
+    let base_validate = base_generator.validate(&req).unwrap_err().to_string();
+    let turbo_validate = turbo_generator.validate(&req).unwrap_err().to_string();
+    let turbo_generate = turbo_generator
+        .generate(&req, &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    for (label, message) in [
+        ("base validate", &base_validate),
+        ("turbo validate", &turbo_validate),
+        ("turbo generate", &turbo_generate),
+    ] {
+        assert!(
+            message.contains("empty MultiReference"),
+            "{label}: {message}"
+        );
+    }
+    let base_message = base_validate
+        .split_once("qwen_image_2_1: ")
+        .unwrap_or_else(|| panic!("the base refusal keeps the base label: {base_validate}"))
+        .1;
+    for message in [&turbo_validate, &turbo_generate] {
+        assert!(!message.contains("qwen_image_2_1: "), "{message}");
+        assert_eq!(
+            message
+                .split_once("qwen_image_2_1_turbo: ")
+                .map(|(_, rest)| rest),
+            Some(base_message),
+            "the Turbo refusal is the base one under the Turbo label: {message}"
+        );
+    }
 }

@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -295,8 +295,24 @@ on:
         type: string
         required: false
         default: ""
+      # sc-25909 -- the Qwen-Image 2.1 Turbo q8/q4 tiers are not published yet, so no manifest row
+      # can provision them: the operator copies them onto the CUDA runner and names the directory
+      # here. Empty: `turbo_validation_render_installed_tiers` is NOT run, and the lane says so.
+      qwen_image_2_1_turbo_tier_snapshot:
+        description: "qwen-image-2-1-turbo only: absolute dir on the CUDA runner holding the converted Turbo q8/ and q4/ tiers"
+        type: string
+        required: false
+        default: ""
+      # sc-25909 (AT4) -- the base renders' pre-epic golden: the `.rgb` files the same lane wrote at
+      # c1f594203, copied onto the CUDA runner. Set: the base renders run with the cache shed and
+      # are held to them. Empty: no comparison.
+      qwen_image_2_1_render_golden:
+        description: "qwen-image-2-1 only: absolute dir on the CUDA runner holding the pre-epic (c1f594203) base .rgb renders to compare with"
+        type: string
+        required: false
+        default: ""
       iris_memory_mlx_steady_steps:
-        description: "iris-memory-mlx only: run the steady-state pass (cache off, no restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
+        description: "iris-memory-mlx only: run the steady-state pass (cache off, no plain restoration 1024) with this many optimizer steps instead of the default 2-step matrix"
         type: string
         required: false
         default: ""
@@ -4916,6 +4932,12 @@ jobs:
       - name: Materialize and verify immutable snapshots
         shell: cmd
         run: call scripts\ci\real-weights\candle-qwen-image-2-1\materialize-and-verify-immutable-snapshots.cmd
+      # sc-25909 (AT4): the operator-provided pre-epic golden, through env, never interpolated.
+      - name: Resolve the operator-provided pre-epic golden
+        shell: powershell
+        env:
+          QWEN21_RENDER_GOLDEN_INPUT: ${{ inputs.qwen_image_2_1_render_golden }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1/resolve-the-operator-provided-pre-epic-golden.ps1
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings,
       # rather than being folded into the first render's.
       - name: Build the Qwen-Image 2.1 CUDA test binary
@@ -4955,8 +4977,13 @@ jobs:
   # plus the one-time ~32 GB fetch, then the Turbo renders (sc-25901, sc-25902) — the eight-step
   # 2048² default preset; a two- and a ten-reference edit and two RGBA renders, all over the saved
   # eight steps; and a 4/6/12/16-step 2048² sweep. Every reference edit selects the prefix KV
-  # cache (sc-25905), so the ten-reference case pays for its ~41k-token prefix once; the two-reference
-  # case is then rendered again with the cache shed and compared with it (the forced-shed twin). Re-size it from the first run.
+  # cache (sc-25905), so the ten-reference case pays for its ~41k-token prefix once; each cached
+  # case is then rendered again with the cache shed and compared with it (the forced-shed twins,
+  # sc-25909). The test itself reads the CUDA pool's live-byte high-water around every render and
+  # writes `qwen_image_2_1_turbo_candle_prefix_kv_cache_memory.csv` into the evidence (AT5).
+  # `turbo_validation_render_installed_tiers` runs only when the dispatch names the operator-copied
+  # Turbo q8/q4 tier directory (`qwen_image_2_1_turbo_tier_snapshot`; unpublished, so no manifest
+  # row); otherwise the lane warns and leaves a NOT-RUN marker. Re-size it from the first run.
   candle-qwen-image-2-1-turbo:
     name: Candle Qwen-Image 2.1 Turbo real weights (CUDA)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1-turbo'
@@ -5008,6 +5035,13 @@ jobs:
       - name: Materialize and verify the immutable snapshot
         shell: cmd
         run: call scripts\ci\real-weights\candle-qwen-image-2-1-turbo\materialize-and-verify-the-immutable-snapshot.cmd
+      # sc-25909: the operator-provided Turbo tier directory, through env, never interpolated into
+      # a script; checked here and exported as CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT.
+      - name: Resolve the operator-provided Turbo tier directory
+        shell: powershell
+        env:
+          QWEN21_TURBO_TIER_INPUT: ${{ inputs.qwen_image_2_1_turbo_tier_snapshot }}
+        run: . ./scripts/ci/real-weights/candle-qwen-image-2-1-turbo/resolve-the-operator-provided-turbo-tier-directory.ps1
       - name: Build the Qwen-Image 2.1 CUDA test binary
         shell: cmd
         run: |
@@ -5734,7 +5768,8 @@ jobs:
   # DISPATCH-ONLY (`iris-memory-mlx` profile; never `all`, never the schedule; nothing is gated on
   # its numbers). nax-macos-2 only (the first step FAILS on any other runner, before any build or
   # GPU work). One `train_memory_probe` process per shape — generation 1024² with and without
-  # activation checkpointing, depth and restoration at 1024², then all three at 512², each with
+  # activation checkpointing, depth and restoration at 1024², then all three at 512², then depth
+  # 1024² and restoration 512² / 1024² activation-checkpointed — each with
   # MLX's default buffer-cache limit and again with the cache disabled by the test — each under
   # the external phys_footprint guard (cap 115 GB, 10 min wall), started only when
   # `memory_pressure` reports >= 120 GB free. Rows carry MLX's own active peak next to the
@@ -5944,3 +5979,57 @@ jobs:
           path: ${{ runner.temp }}/iris-curricula-cuda-evidence
           if-no-files-found: error
           retention-days: 30
+
+  veda-s3-cuda:
+    name: Veda S3 bounded native kernel validation (CUDA only)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-s3-cuda'
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights]
+    # The owned build/lint/self-test has a hard one-hour deadline; reserve setup and artifact time.
+    timeout-minutes: 75
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Prepare normalized evidence paths and require admitted CUDA listener
+        shell: cmd
+        run: |
+          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "S3_OUTPUT_DIR=%%~fI"
+          for %%I in ("%RUNNER_TEMP%\veda-s3-cuda-target-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%") do set "CARGO_TARGET_DIR=%%~fI"
+          mkdir "%S3_OUTPUT_DIR%" || exit /b 1
+          echo S3_OUTPUT_DIR=%S3_OUTPUT_DIR%>>"%GITHUB_ENV%"
+          echo CARGO_TARGET_DIR=%CARGO_TARGET_DIR%>>"%GITHUB_ENV%"
+          >"%S3_OUTPUT_DIR%\preflight.json" echo {"instrument":"veda_s3_cuda","complete":false,"status":"tooling_not_yet_checked","runner":"%RUNNER_NAME%","host":"%COMPUTERNAME%","source_commit":"%GITHUB_SHA%","gpu_started":false,"device_test_started":false}
+          if not "%RUNNER_NAME%"=="cuda-windows" if not "%RUNNER_NAME%"=="cuda-windows-2" (
+            echo Unexpected CUDA listener %RUNNER_NAME%
+            exit /b 1
+          )
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: call scripts\ci\real-weights\veda-s3-cuda\install-reviewed-cpython-3-12.cmd
+      - name: Select existing Git Bash for toolchain action
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+          components: clippy
+      - name: Claim idle physical GPU, build/lint exact source, and execute bounded S3 gates
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" scripts\release\veda_s3_cuda.py'
+      - name: Preserve CUDA S3 evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-s3-cuda-${{ github.sha }}
+          path: ${{ runner.temp }}/veda-s3-cuda-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error

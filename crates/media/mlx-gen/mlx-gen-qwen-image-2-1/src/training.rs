@@ -867,6 +867,10 @@ impl QwenImage21Trainer {
         // Shared with the candle twin (sc-24163): one refusal, one message.
         gen_core::train::refuse_trainer_load_overlays(&format!("{TRAINER_ID} trainer"), spec)?;
         let root = loader::snapshot_root(&spec.weights)?.to_path_buf();
+        // sc-25909 (the candle twin's sc-25901 rule): a Turbo snapshot is not a training base.
+        // Refused by name here, before anything else is read — not incidentally by the scheduler
+        // config reader, which a Turbo-shaped tree without `scheduler/` would get past.
+        loader::refuse_saved_sigma_snapshot(&root)?;
         let tier = installed_tier(&root)?;
         if tier != Tier::Bf16 {
             return Err(quantized_base_refusal(&format!(

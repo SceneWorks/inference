@@ -12,9 +12,10 @@
 # row is classified by scripts/ci/iris_memory_probe_row.py (all figures decimal GB): MEASURED,
 # CACHE-SATURATED (the footprint is the allocator ceiling, not the shape), GUARD-STOP (lower bound:
 # the footprint crossed 115 GB) or FAILED. Order: the 1024² shapes the product floors are declared
-# for first, then 512² (the largest-that-fits basis). The depth and restoration trainers refuse
-# activation checkpointing, so only generation has an `ac=full` row. Report-only: nothing is gated on
-# a number; the job is red only for a FAILED / NOT RUN / missing row.
+# for first, then 512² (the largest-that-fits basis), then the activation-checkpointed depth and
+# restoration shapes (`ac=full`: `gradient_checkpointing`, sc-25690) next to the `ac=none` rows they
+# compare with. Report-only: nothing is gated on a number; the job is red only for a FAILED / NOT
+# RUN / missing row.
 bin="$(cat "$RUNNER_TEMP/iris-memory-probe-test-binary")"
 mem_bytes="$(sysctl -n hw.memsize)"
 failed=0
@@ -100,7 +101,11 @@ for cache in "${caches[@]}"; do
   probe generation 512 none "$cache"
   probe depth 512 none "$cache"
   probe restoration 512 none "$cache"
-  # Last in each pass: the one shape the guard stops.
+  probe depth 1024 full "$cache"
+  probe restoration 512 full "$cache"
+  # The 1024² restoration full fine-tune: checkpointed it fits the 115 GB guard ...
+  probe restoration 1024 full "$cache"
+  # ... and plain it is the one shape the guard stops (last in each pass).
   [[ -n "$steady" ]] || probe restoration 1024 none "$cache"
 done
 cat "$IRIS_OUT/summary.txt"

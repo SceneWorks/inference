@@ -291,6 +291,16 @@ impl MiniMaxH3Dit {
         blocks: BlockModulation<'_>,
         norm_out: &NormOutModulation,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_packed_veda(packed, blocks, norm_out, None)
+    }
+
+    fn forward_packed_veda(
+        &self,
+        packed: &PackedForward<'_>,
+        blocks: BlockModulation<'_>,
+        norm_out: &NormOutModulation,
+        veda: Option<(&crate::veda::VedaRuntime, usize)>,
+    ) -> Result<(Tensor, Tensor)> {
         // 1. Per-modality input projections. The two patch projections are float32 in the published
         //    checkpoint; the text stream sets the packed sequence's dtype, as in the reference.
         let stream = packed.text_rows.dtype();
@@ -326,19 +336,21 @@ impl MiniMaxH3Dit {
         crate::dit::block::check_adaln_indices(packed.adaln_indices, modulation_rows)?;
         for (layer, block) in self.blocks.iter().enumerate() {
             x = match blocks {
-                BlockModulation::Cached(cache) => block.forward(
+                BlockModulation::Cached(cache) => block.forward_veda(
                     &x,
                     cache.modulation(layer)?,
                     packed.adaln_indices,
                     &self.rope,
                     packed.tables,
+                    veda.map(|(runtime, step)| (runtime, layer, step)),
                 )?,
-                BlockModulation::Temb(temb) => block.forward_with_temb(
+                BlockModulation::Temb(temb) => block.forward_veda(
                     &x,
-                    temb,
+                    &block.modulation(temb)?,
                     packed.adaln_indices,
                     &self.rope,
                     packed.tables,
+                    veda.map(|(runtime, step)| (runtime, layer, step)),
                 )?,
             };
         }
@@ -492,6 +504,7 @@ pub struct JointDit {
     /// Bytes of `adaln_proj` weight released by the eviction, 0 when resident.
     released_bytes: usize,
     forwards: usize,
+    veda: Option<crate::veda::VedaRuntime>,
 }
 
 impl JointDit {
@@ -593,7 +606,27 @@ impl JointDit {
             resident_timestep_indices: resident_ts,
             released_bytes,
             forwards: 0,
+            veda: None,
         })
+    }
+
+    pub fn prepare_veda(
+        &mut self,
+        request: &candle_gen::gen_core::VedaRequest,
+        predictor: Option<&std::path::Path>,
+        report: crate::veda::ReportSink,
+    ) {
+        let cfg = self.dit.config();
+        self.veda = crate::veda::VedaRuntime::prepare(
+            request,
+            predictor,
+            &self.layout,
+            cfg.num_layers,
+            cfg.num_attention_heads,
+            cfg.attention_head_dim,
+            &self.dit.device,
+            report,
+        );
     }
 
     /// Bytes of `adaln_proj` weight the eviction released — 0 under [`AdaLnResidency::Resident`].
@@ -682,7 +715,12 @@ impl JointVelocity for JointDit {
                 ))
             }
         };
-        self.dit.forward_packed(&packed, blocks, &norm_out)
+        self.dit.forward_packed_veda(
+            &packed,
+            blocks,
+            &norm_out,
+            self.veda.as_ref().map(|v| (v, step.index)),
+        )
     }
 }
 
@@ -715,5 +753,276 @@ mod tests {
             .filter(|n| n.starts_with("transformer_blocks."))
             .count();
         assert_eq!((top, refiner, blocks), (17, 21, 600));
+    }
+}
+
+#[cfg(test)]
+mod veda_controls_tests {
+    use super::*;
+    use crate::denoise::{
+        adaln_schedule, denoise_av, JointGeometry, JointSchedule, NUM_ROW_CLASSES, TEXT_TAG,
+    };
+    use crate::dit::positions::{KeyframeAnchor, ReferenceLatentGeometry};
+    use crate::reference::ReferenceKind;
+    use candle_gen::gen_core::{CancelFlag, VedaBudget, VedaRequest};
+
+    fn config() -> MiniMaxH3DitConfig {
+        MiniMaxH3DitConfig {
+            num_attention_heads: 4,
+            attention_head_dim: 24,
+            hidden_size: 64,
+            num_layers: 2,
+            num_refiner_layers: 2,
+            ffn_dim: 32,
+            text_dim: 40,
+            freq_dim: 16,
+            time_embed_hidden_dim: 64,
+            time_embed_dim: 48,
+            rope_freq_dim: 2,
+            ..Default::default()
+        }
+    }
+    fn weights(bits: Option<usize>) -> Weights {
+        let device = Device::Cpu;
+        let mut map = candle_gen::candle_core::safetensors::load(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/dit_block.safetensors"
+            ),
+            &device,
+        )
+        .unwrap();
+        if let Some(bits) = bits {
+            // Native q4/q8 attention projection loaders, not a fake enum standing in for a tier.
+            let lanes = 32 / bits;
+            let mask = (1u32 << bits) - 1;
+            let codes: Vec<u32> = (0..96 * 64 / lanes)
+                .map(|i| (0..lanes).fold(0, |w, j| w | (((i + j) as u32 & mask) << (j * bits))))
+                .collect();
+            map.insert(
+                "transformer_blocks.0.attn.to_q.weight".into(),
+                Tensor::from_vec(codes, (96, 64 / lanes), &device).unwrap(),
+            );
+            map.insert(
+                "transformer_blocks.0.attn.to_q.scales".into(),
+                Tensor::full(0.002f32, (96, 1), &device).unwrap(),
+            );
+            map.insert(
+                "transformer_blocks.0.attn.to_q.biases".into(),
+                Tensor::full(-0.01f32, (96, 1), &device).unwrap(),
+            );
+        }
+        Weights::from_map(map)
+    }
+    fn layout(mode: usize, channels: usize) -> PackedLayout {
+        let geometry = JointGeometry::new(5, 2, 2).unwrap();
+        let dev = Device::Cpu;
+        let anchors = match mode {
+            1 => vec![KeyframeAnchor::First],
+            2 => vec![KeyframeAnchor::Last],
+            3 => vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+            _ => vec![],
+        };
+        if mode < 4 {
+            return PackedLayout::build(
+                geometry,
+                [1, 2, 2],
+                &[TEXT_TAG; 5],
+                channels,
+                &anchors,
+                &dev,
+            )
+            .unwrap();
+        }
+        // Image + clip with soundtrack + standalone audio: the normal R2VA packing mechanisms.
+        let refs = [
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Image,
+                num_latent_frames: 1,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 0,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Video,
+                num_latent_frames: 7,
+                latent_height: 2,
+                latent_width: 2,
+                num_audio_latents: 37,
+            },
+            ReferenceLatentGeometry {
+                kind: ReferenceKind::Audio,
+                num_latent_frames: 0,
+                latent_height: 0,
+                latent_width: 0,
+                num_audio_latents: 3,
+            },
+        ];
+        PackedLayout::build_ref2va(geometry, [1, 2, 2], &[TEXT_TAG; 5], channels, &refs, &dev)
+            .unwrap()
+    }
+    fn run(
+        mode: usize,
+        channels: usize,
+        bits: Option<usize>,
+        evals: usize,
+        shift: f32,
+        enabled: bool,
+    ) -> (
+        Vec<u32>,
+        Vec<crate::veda::AttentionCall>,
+        candle_gen::gen_core::VedaExecutionReport,
+    ) {
+        let device = Device::Cpu;
+        let w = weights(bits);
+        // CPU Candle does not implement BF16 matmul; dense fixture arithmetic is F32.
+        // BF16 request/tier admission is tested at the native loader; device numerics stay gated.
+        let mut dit = MiniMaxH3Dit::from_weights(&w, &config(), &device, DType::F32).unwrap();
+        // Turbo then style: two additive factors on the actual native adaptable projection.
+        let projection = dit
+            .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
+            .unwrap();
+        assert_eq!(projection.is_packed(), bits.is_some());
+        for strength in [0.0625, 0.5] {
+            projection
+                .push_lora(
+                    Tensor::full(0.01f32, (64, 2), &device).unwrap(),
+                    Tensor::full(0.02f32, (2, 96), &device).unwrap(),
+                    strength,
+                )
+                .unwrap();
+        }
+        assert_eq!(projection.adapters().len(), 2);
+        let layout = layout(mode, channels);
+        let schedule = JointSchedule::with_shifts(evals + 1, shift, 3.0).unwrap();
+        let adaln = adaln_schedule(&schedule).unwrap();
+        assert_eq!(adaln.num_row_classes(), NUM_ROW_CLASSES);
+        let context = w.require("in.refiner.context").unwrap();
+        let mut model = JointDit::new(
+            dit,
+            layout.clone(),
+            &context,
+            adaln.clone(),
+            AdaLnResidency::PrecomputeAndEvict,
+        )
+        .unwrap();
+        let controls = VedaRequest {
+            enabled,
+            generated: VedaBudget::KeyTiles(2),
+            reference: VedaBudget::SparsityPercent(0.0),
+            full_attention_layers: vec![1],
+            full_attention_steps: vec![0, evals - 1],
+        };
+        controls.validate(2, evals).unwrap();
+        let report = crate::veda::ReportSink::default();
+        model.prepare_veda(
+            &controls,
+            Some(std::path::Path::new("/managed/predictor.safetensors")),
+            report.clone(),
+        );
+        let video = Tensor::full(0.02f32, (1, layout.video_indices().len(), 96), &device).unwrap();
+        let audio = Tensor::full(0.03f32, (1, layout.audio_indices().len(), 32), &device).unwrap();
+        let (outv, outa) = denoise_av(
+            &mut model,
+            &layout,
+            &schedule,
+            &adaln,
+            &video,
+            &audio,
+            &device,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(outv.dims(), video.dims());
+        assert_eq!(outa.dims(), audio.dims());
+        for (input, output, rows) in [
+            (&video, &outv, layout.num_condition_video_rows()),
+            (&audio, &outa, layout.num_condition_audio_rows()),
+        ] {
+            if rows > 0 {
+                assert_eq!(
+                    input
+                        .narrow(1, 0, rows)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                    output
+                        .narrow(1, 0, rows)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                );
+            }
+        }
+        let bits = Tensor::cat(
+            &[outv.flatten_all().unwrap(), outa.flatten_all().unwrap()],
+            0,
+        )
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect();
+        let calls = model
+            .veda
+            .as_ref()
+            .map(|v| v.calls.borrow().clone())
+            .unwrap_or_default();
+        let observed = report.borrow().clone();
+        if enabled {
+            assert_eq!(calls.len(), evals * 2);
+            for (index, call) in calls.iter().enumerate() {
+                assert_eq!((call.layer, call.step), (index % 2, index / 2));
+                assert_eq!(call.request, controls);
+                assert_eq!(
+                    call.full_attention,
+                    call.layer == 1 || call.step == 0 || call.step == evals - 1
+                );
+                assert_eq!(call.shape, [1, 4, layout.seq_len(), 24]);
+            }
+            assert_eq!(observed.sparse_calls, 0);
+            assert_eq!(observed.dense_calls, (evals * 2) as u64);
+            assert_eq!(observed.selected_token_pairs, observed.dense_token_pairs);
+            assert!(observed
+                .fallback_reason
+                .as_deref()
+                .unwrap()
+                .contains("unavailable"));
+        } else {
+            assert!(model.veda.is_none());
+            assert_eq!(observed, Default::default());
+        }
+        (bits, calls, observed)
+    }
+    #[test]
+    fn native_controls_capture_every_mode_packed_tier_and_adapter_stack() {
+        for mode in 0..5 {
+            for tier in [None, Some(4), Some(8)] {
+                for channels in [1, 2] {
+                    let off = run(mode, channels, tier, 4, 12.0, false);
+                    let on = run(mode, channels, tier, 4, 12.0, true);
+                    assert_eq!(on.0, off.0, "unavailable sparse must preserve dense output: mode={mode} tier={tier:?} channels={channels}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_base_and_all_published_turbo_steps_reach_attention() {
+        for (name, steps, shift, mode) in [
+            ("base", 50, 12.0, 0),
+            ("4step_768p", 4, 6.0, 1),
+            ("8step", 8, 12.0, 2),
+            ("4step_v01", 4, 12.0, 3),
+            ("ref2v_4step", 4, 12.0, 4),
+        ] {
+            let (_, calls, _) = run(mode, 2, None, steps, shift, true);
+            assert_eq!(calls.last().unwrap().step, steps - 1, "{name}");
+        }
     }
 }

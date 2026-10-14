@@ -1035,6 +1035,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
         return shell
 
+    # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
+    # each libtest filter must select an integration module of. libtest passes on zero matches,
+    # so a renamed or dropped module would otherwise leave a green step that tests nothing.
+    CANDLE_METAL_PINS = {
+        "metal_strided_reduce": "crates/media/candle-gen/candle-gen",
+        "metal_reference_latents": "crates/media/candle-gen/candle-gen-qwen-image-2-1",
+    }
+
+    def assert_candle_metal_pins_select_real_modules(self, run: str) -> None:
+        command = " ".join(run.split())
+        self.assertIn("--features metal --test integration --", command)
+        filters = command.split(" -- ", 1)[1].split()
+        self.assertEqual(sorted(filters), sorted(f"{name}::" for name in self.CANDLE_METAL_PINS))
+        root = WORKFLOW.parents[2]
+        for name, crate in self.CANDLE_METAL_PINS.items():
+            package = tomllib.loads((root / crate / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn(f"-p {package['package']['name']} ", command, name)
+            main = (root / crate / "tests" / "main.rs").read_text(encoding="utf-8")
+            self.assertIn(f'#[path = "{name}.rs"]\nmod {name};', main, name)
+            source = (root / crate / "tests" / f"{name}.rs").read_text(encoding="utf-8")
+            self.assertIn('#![cfg(feature = "metal")]', source, name)
+            self.assertIn("#[test]", source, name)
+
     def test_macos_metal_builds_one_target_generation_without_cargo_clean(self) -> None:
         # Until 2026-08-23 this lane ran `cargo clean` twice mid-job because the full-debuginfo test
         # graph grew `target/` to 35 GB. Each clean discarded the cache-restored `pmetal-mlx-sys`
@@ -1074,9 +1097,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             "Test LLM-only macOS bundle",
             "Test LLM+audio macOS bundle",
             "Clippy Candle Metal packages",
+            "Test Candle Metal reduce pins",
         ]
         indices = [names.index(name) for name in order]
         self.assertEqual(indices, sorted(indices))
+        self.assert_candle_metal_pins_select_real_modules(steps[names.index(order[-1])]["run"])
         # The image-payload prune still runs, but in the background: inline it was 3.6 minutes on
         # the critical path. It must start before the cache restore so the I/O overlaps the build.
         reclaim = "Reclaim runner disk (background)"
@@ -4254,6 +4279,35 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if run.count(fragment) != 1:
                 errors.append(f"the render step must carry exactly one {fragment!r}")
 
+        # sc-25909 (AT4): the operator-provided pre-epic golden reaches the renders only through
+        # the resolve step's env, which arms the comparison and sheds the cache together.
+        golden = workflow[True]["workflow_dispatch"]["inputs"].get("qwen_image_2_1_render_golden", {})
+        if (golden.get("type"), golden.get("default")) != ("string", ""):
+            errors.append("no optional string `qwen_image_2_1_render_golden` dispatch input")
+        expression = "${{ inputs.qwen_image_2_1_render_golden }}"
+        resolve_name = "Resolve the operator-provided pre-epic golden"
+        resolve = steps.get(resolve_name, {})
+        if resolve.get("env", {}).get("QWEN21_RENDER_GOLDEN_INPUT") != expression:
+            errors.append("the golden must reach the job only through the resolve step's env")
+        for fragment in (
+            "QWEN_IMAGE_2_1_RENDER_GOLDEN=$golden",
+            "QWEN_IMAGE_2_1_PREFIX_KV_CACHE=prefill",
+            "IsPathRooted",
+            "qwen_image_2_1_candle_2048x2048_40steps_seed42.rgb",
+            "qwen_image_2_1_candle_edit_2refs_1024x1024_8steps_seed42.rgb",
+            "qwen_image_2_1_candle_edit_10refs_512x512_2steps_seed42.rgb",
+        ):
+            if fragment not in resolve.get("run", ""):
+                errors.append(f"the golden resolve step must carry {fragment!r}")
+        if any(expression in step.get("run", "") for step in job["steps"]):
+            errors.append("the golden input is interpolated into a script")
+        names = [step.get("name") for step in job["steps"]]
+        render_name = "Run the Qwen-Image 2.1 real-weight renders"
+        if resolve_name not in names or render_name not in names or names.index(
+            resolve_name
+        ) > names.index(render_name):
+            errors.append("the golden must be resolved before the renders run")
+
         upload = steps.get("Keep the Qwen-Image 2.1 CUDA evidence", {})
         if upload.get("with", {}).get("name") != "qwen-image-2-1-cuda-evidence":
             errors.append("the evidence artifact is not `qwen-image-2-1-cuda-evidence`")
@@ -4292,6 +4346,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 {"CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "E:\\somewhere\\else"}
             ),
             lambda job: job["steps"][-1].pop("if"),
+            # sc-25909 (AT4): the pre-epic golden.
+            lambda job: next(
+                step for step in job["steps"] if step.get("name") == "Resolve the operator-provided pre-epic golden"
+            )["env"].update({"QWEN21_RENDER_GOLDEN_INPUT": "E:\\golden"}),
+            lambda job: next(
+                step for step in job["steps"] if step.get("name") == "Resolve the operator-provided pre-epic golden"
+            ).update({"run": "Add-Content -Path $env:GITHUB_ENV -Value \"QWEN_IMAGE_2_1_RENDER_GOLDEN=$golden\""}),
+            lambda job: job["steps"].remove(
+                next(
+                    step
+                    for step in job["steps"]
+                    if step.get("name") == "Resolve the operator-provided pre-epic golden"
+                )
+            ),
         ):
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"]["candle-qwen-image-2-1"])
@@ -4370,6 +4438,51 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         if "RUSTC_WRAPPER=" not in wrapper.get("run", ""):
             errors.append("the heavy Candle lane must clear RUSTC_WRAPPER")
 
+        # sc-25909: the Turbo installed tiers are unpublished, so their test runs only on an
+        # operator-provided directory — passed through env, checked, and never skip-as-pass.
+        tier_input = workflow[True]["workflow_dispatch"]["inputs"].get(
+            "qwen_image_2_1_turbo_tier_snapshot", {}
+        )
+        if (tier_input.get("type"), tier_input.get("default")) != ("string", ""):
+            errors.append("no optional string `qwen_image_2_1_turbo_tier_snapshot` dispatch input")
+        expression = "${{ inputs.qwen_image_2_1_turbo_tier_snapshot }}"
+        names = [step.get("name") for step in job["steps"]]
+        resolve_name = "Resolve the operator-provided Turbo tier directory"
+        resolve = steps.get(resolve_name, {})
+        if resolve.get("env", {}).get("QWEN21_TURBO_TIER_INPUT") != expression:
+            errors.append("the tier directory must reach the job only through the resolve step's env")
+        resolve_run = resolve.get("run", "")
+        for fragment in (
+            "QWEN21_TURBO_TIERS=0",
+            "QWEN21_TURBO_TIERS=1",
+            "CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT=$tiers",
+            "IsPathRooted",
+        ):
+            if fragment not in resolve_run:
+                errors.append(f"the resolve step must carry {fragment!r}")
+        if any(expression in step.get("run", "") for step in job["steps"]):
+            errors.append("the tier directory input is interpolated into a script")
+        if "CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT" in job["env"]:
+            errors.append("the tier directory must come from the resolve step, not the job env")
+        render_name = "Run the Qwen-Image 2.1 Turbo real-weight renders"
+        if resolve_name not in names or render_name not in names or names.index(
+            resolve_name
+        ) > names.index(render_name):
+            errors.append("the tier directory must be resolved before the renders run")
+        guarded = (
+            'if "%QWEN21_TURBO_TIERS%"=="1" (\n'
+            "  call :run_one turbo_validation_render_installed_tiers || set \"QWEN21_FAILED=1\"\n"
+            ") else (\n"
+        )
+        if run.count(guarded) != 1:
+            errors.append("the installed-tier test must run exactly when the tier directory is given")
+        for fragment in (
+            "echo ::warning::turbo_validation_render_installed_tiers NOT RUN",
+            "turbo_validation_render_installed_tiers.NOT-RUN.txt",
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"an unrun installed-tier test must say so: {fragment!r}")
+
         upload = steps.get("Keep the Qwen-Image 2.1 Turbo CUDA evidence", {})
         if upload.get("with", {}).get("name") != "qwen-image-2-1-turbo-cuda-evidence":
             errors.append("the evidence artifact is not `qwen-image-2-1-turbo-cuda-evidence`")
@@ -4424,11 +4537,58 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 }
             ),
             lambda job: job["steps"][-1].pop("if"),
+            # sc-25909: the operator-provided tier directory.
+            lambda job: job["env"].update(
+                {
+                    "CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_TIER_SNAPSHOT": (
+                        "${{ inputs.qwen_image_2_1_turbo_tier_snapshot }}"
+                    )
+                }
+            ),
+            lambda job: next(
+                step for step in job["steps"] if step.get("name") == "Resolve the operator-provided Turbo tier directory"
+            )["env"].update({"QWEN21_TURBO_TIER_INPUT": "E:\\tiers"}),
+            lambda job: next(
+                step for step in job["steps"] if step.get("name") == "Resolve the operator-provided Turbo tier directory"
+            ).update({"run": "Add-Content -Path $env:GITHUB_ENV -Value 'QWEN21_TURBO_TIERS=1'"}),
+            lambda job: job["steps"].remove(
+                next(
+                    step
+                    for step in job["steps"]
+                    if step.get("name") == "Resolve the operator-provided Turbo tier directory"
+                )
+            ),
+            lambda job: [
+                step.update(
+                    {
+                        "run": step["run"].replace(
+                            'if "%QWEN21_TURBO_TIERS%"=="1" (', 'if "1"=="1" ('
+                        )
+                    }
+                )
+                for step in job["steps"]
+                if step.get("name") == "Run the Qwen-Image 2.1 Turbo real-weight renders"
+            ],
+            lambda job: [
+                step.update(
+                    {
+                        "run": step["run"].replace(
+                            "turbo_validation_render_installed_tiers.NOT-RUN.txt", "nul"
+                        )
+                    }
+                )
+                for step in job["steps"]
+                if step.get("name") == "Run the Qwen-Image 2.1 Turbo real-weight renders"
+            ],
         ):
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"]["candle-qwen-image-2-1-turbo"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.qwen_image_2_1_turbo_lane_errors(mutated, source))
+        # …and the dispatch input itself.
+        mutated = copy.deepcopy(workflow)
+        mutated[True]["workflow_dispatch"]["inputs"].pop("qwen_image_2_1_turbo_tier_snapshot")
+        self.assertTrue(self.qwen_image_2_1_turbo_lane_errors(mutated, source))
 
     def decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
         """Everything `test_decode_speedups_bench_…` below binds, as a list of findings."""

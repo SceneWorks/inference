@@ -486,3 +486,105 @@ fn an_unparsable_model_index_is_refused_under_the_id_that_asked() {
     std::fs::remove_file(bare.join("model_index.json")).unwrap();
     assert!(load(BASE, &bare, OffloadPolicy::Resident).is_ok());
 }
+
+/// The base **trainer** refuses a Turbo snapshot by the same typed, named refusal the base
+/// generator raises (sc-25909; the candle twin's sc-25901 rule) — also when the Turbo-shaped tree
+/// carries no `scheduler/scheduler_config.json`, the shape the scheduler-config reader alone let
+/// through to training. The base snapshot still loads as a trainer, and there is no trainer under
+/// the Turbo id.
+///
+/// *Mutation that reds this:* dropping `loader::refuse_saved_sigma_snapshot` from
+/// `QwenImage21Trainer::load` (the scheduler-less Turbo tree then loads as a trainer, and the
+/// full one fails untyped in the scheduler reader).
+#[test]
+fn the_base_trainer_refuses_a_turbo_snapshot_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let turbo_root = turbo_snapshot(tmp.path());
+    let no_scheduler = tmp.path().join("no-scheduler");
+    mlx_gen::quant::copy_dir(&turbo_root, &no_scheduler).unwrap();
+    std::fs::remove_dir_all(no_scheduler.join("scheduler")).unwrap();
+    let registry = mlx_gen_qwen_image_2_1::provider_registry().unwrap();
+    let spec = |root: &Path| LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+
+    for root in [turbo_root.as_path(), no_scheduler.as_path()] {
+        match registry.load_trainer(BASE, &spec(root)) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(
+                    message.starts_with("qwen_image_2_1: model_index.json saves `sample_sigmas`"),
+                    "{}: {message}",
+                    root.display()
+                );
+                assert!(
+                    message.contains("load it as `qwen_image_2_1_turbo`"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!(
+                "{}: the base trainer must refuse a Turbo snapshot, typed: {other:?}",
+                root.display()
+            ),
+            Ok(_) => panic!(
+                "{}: the base trainer must refuse a Turbo snapshot",
+                root.display()
+            ),
+        }
+    }
+    assert!(registry.load_trainer(BASE, &spec(&tiny_snapshot())).is_ok());
+    match registry.load_trainer(TURBO, &spec(&turbo_root)) {
+        Err(CoreError::Msg(message)) => assert_eq!(
+            message,
+            "no trainer registered for id 'qwen_image_2_1_turbo'"
+        ),
+        Err(other) => panic!("expected the registry's no-trainer refusal, got {other:?}"),
+        Ok(_) => panic!("there is no trainer under the Turbo id"),
+    }
+}
+
+/// E3 (sc-25909): a refusal raised by the family's shared code names the engine id it was reached
+/// through — under the Turbo id the base label `qwen_image_2_1:` becomes `qwen_image_2_1_turbo:`
+/// and nothing else changes; under the base id the message is the base message, unchanged. Asked
+/// of the reference collector's empty-`MultiReference` refusal at `validate` and at `generate`;
+/// the load path's tier refusals are held to the same rule in
+/// `turbo_tiers::turbo_keeps_the_base_tier_refusals`.
+///
+/// *Mutation that reds this:* dropping `labelled` from `QwenImage21::validate` or `generate`
+/// (the Turbo message keeps the base label).
+#[test]
+fn a_shared_refusal_names_the_engine_id_it_was_reached_through() {
+    use mlx_gen::gen_core::Conditioning;
+    let tmp = tempfile::tempdir().unwrap();
+    let turbo_root = turbo_snapshot(tmp.path());
+    let req = GenerationRequest {
+        conditioning: vec![Conditioning::MultiReference { images: Vec::new() }],
+        ..request(Some(2))
+    };
+    let base = load(BASE, &tiny_snapshot(), OffloadPolicy::Resident).unwrap();
+    let turbo = load(TURBO, &turbo_root, OffloadPolicy::Resident).unwrap();
+    let base_validate = base.validate(&req).unwrap_err().to_string();
+    let turbo_validate = turbo.validate(&req).unwrap_err().to_string();
+    let turbo_generate = turbo.generate(&req, &mut |_| {}).unwrap_err().to_string();
+    for (label, message) in [
+        ("base validate", &base_validate),
+        ("turbo validate", &turbo_validate),
+        ("turbo generate", &turbo_generate),
+    ] {
+        assert!(
+            message.contains("empty MultiReference"),
+            "{label}: {message}"
+        );
+    }
+    let base_message = base_validate
+        .split_once("qwen_image_2_1: ")
+        .unwrap_or_else(|| panic!("the base refusal keeps the base label: {base_validate}"))
+        .1;
+    for message in [&turbo_validate, &turbo_generate] {
+        assert!(!message.contains("qwen_image_2_1: "), "{message}");
+        assert_eq!(
+            message
+                .split_once("qwen_image_2_1_turbo: ")
+                .map(|(_, rest)| rest),
+            Some(base_message),
+            "the Turbo refusal is the base one under the Turbo label: {message}"
+        );
+    }
+}

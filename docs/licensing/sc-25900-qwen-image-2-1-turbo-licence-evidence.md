@@ -3,8 +3,10 @@
 Companion to `docs/licensing/sc-24108-qwen-research-licence-evidence.md`: the primary-source read
 behind the `qwen_image_2_1_turbo` component row
 (`crates/contracts/gen-core/src/license/components.rs`) that the `qwen_image_2_1_turbo` engine id
-of the Qwen-Image 2.1 MLX provider (`mlx-gen-qwen-image-2-1`) introduced. The row lands in the
-existing `qwen-research` family; no family is added and no term is transcribed anew.
+introduced on both Qwen-Image 2.1 providers — MLX (`mlx-gen-qwen-image-2-1`, sc-25900) and Candle
+(`candle-gen-qwen-image-2-1`, sc-25901), each mapping it in its catalog's licence table
+(`mlx-gen-catalog` / `candle-gen-catalog` `src/licenses.rs`). The row lands in the existing
+`qwen-research` family; no family is added and no term is transcribed anew.
 
 **PROVISIONAL — gathered by an agent on 2026-10-13, not yet signed off by a human.** Same status
 as the sibling notes.

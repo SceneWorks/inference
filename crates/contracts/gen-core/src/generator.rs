@@ -30,6 +30,11 @@ pub trait Generator {
     /// Identity + capabilities + modality (drives `validate` and consumer UI introspection).
     fn descriptor(&self) -> &ModelDescriptor;
 
+    /// Observed sparse-attention outcome of the most recent request, when adopted.
+    fn veda_execution_report(&self) -> Option<crate::VedaExecutionReport> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
@@ -86,6 +91,15 @@ pub trait Generator {
             MemoryPeakBreakdown::from_unattributed(base_predicted_peak_bytes),
             |contract| contract.predicted_peak_from_base(base_predicted_peak_bytes),
         )
+    }
+
+    /// Optional problem-bounded sparse residency. Disabled/absent settings return None without
+    /// loading predictors or allocating device state. Worker admission calls this per queued job.
+    fn veda_workspace_bound(
+        &self,
+        _req: crate::veda::workspace::Request<'_>,
+    ) -> Result<Option<crate::veda::workspace::WorkspaceBound>> {
+        Ok(None)
     }
 
     /// Provider safety defense in depth. This can reject a shared worker selection but cannot
@@ -521,6 +535,11 @@ pub struct GenerationRequest {
     pub fps: Option<u32>,
     pub duration: Option<f32>,
     pub video_mode: Option<String>,
+    /// MiniMax-H3 learned sparse attention; absent/off is the historical dense route.
+    pub veda: Option<crate::VedaRequest>,
+    /// Operator-owned terminal H3 measurement. The worker must never copy this from a job payload.
+    /// Other generators ignore it; false preserves their normal execution path.
+    pub h3_terminal_telemetry: bool,
     /// Generate this many extra leading temporal chunks (each = `vae_stride_t` latent frames) and
     /// discard them after decode, so the first *kept* frame has a full temporal receptive field of
     /// real (non-zero-padded) data — mitigates first-frame VAE/causal-conv artifacts. `None`/0 = off
@@ -1321,6 +1340,8 @@ impl Default for GenerationRequest {
             fps: None,
             duration: None,
             video_mode: None,
+            veda: None,
+            h3_terminal_telemetry: false,
             trim_first_frames: None,
             num_generated_keyframes: None,
             reference_image_short_edge: None,
@@ -1598,6 +1619,8 @@ impl GenerationRequest {
             frames: _,
             fps: _,
             video_mode: _,
+            veda: _,
+            h3_terminal_telemetry: _,
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
@@ -3621,6 +3644,11 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
+            return Err(Error::Unsupported(format!(
+                "{id}: Veda attention requires MiniMax-H3"
+            )));
+        }
         // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
         // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
         // one here means the request renders SDR while the caller believes it asked for HDR — a

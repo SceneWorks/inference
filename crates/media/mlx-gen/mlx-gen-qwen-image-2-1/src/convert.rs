@@ -216,6 +216,18 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
     // Before anything is written: which checkpoint this is, or the loader's refusal of a source
     // that is neither.
     let variant = source_variant(src_root)?;
+    // …and the Agreement the tier must carry (sc-25909). `copy_turnkey_assets` is shared with
+    // every other converter and copies `LICENSE` only when the source has one; a Qwen tier
+    // without it would be signed and distributed without the licence text, so the refusal lives
+    // here, for this converter alone. A source that carries it converts exactly as before.
+    if !src_root.join(LICENSE_FILE).is_file() {
+        return Err(Error::Msg(format!(
+            "qwen_image_2_1 convert: {} has no `{LICENSE_FILE}`; a converted tier must carry the \
+             Qwen Research License Agreement it is distributed under, so convert from the \
+             unmodified released snapshot",
+            src_root.display()
+        )));
+    }
     let created = !dst_root.exists();
     std::fs::create_dir_all(dst_root)?;
     quantize_transformer(
@@ -254,6 +266,8 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, tier: Tier) -> Resu
 // The distributed tier's change record and manifest.
 // ============================================================================================
 
+/// File name of the licence every converted tier carries, copied verbatim from its source.
+pub const LICENSE_FILE: &str = "LICENSE";
 /// File name of the change record every converted tier carries.
 pub const CHANGES_FILE: &str = "CHANGES.md";
 /// File name of the SHA-256 manifest every converted tier carries.

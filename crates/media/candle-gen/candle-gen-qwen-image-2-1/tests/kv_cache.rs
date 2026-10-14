@@ -1411,3 +1411,145 @@ fn the_extract_step_peaks_at_the_prefill_plus_the_cache() {
         cfg.num_layers
     );
 }
+
+/// AT4's committed half (sc-25909) on this backend: **the base id's render with the cache shed is
+/// the prefill loop the upstream fixture gates**, through `Generator::generate`. `generate` seeds
+/// its own noise, so it cannot start from the fixture's `latents_init`; the claim is made in two
+/// links, both in this test — link 1 on the generator's own device (the CPU on the default lane;
+/// one path per side at the same row counts, so bit equality is a fair ask), link 2 on the CPU in
+/// f32:
+///
+/// 1. the base generator's pixels for a request that **selects nothing** (and for one that selects
+///    `prefill`) equal, byte for byte, the render assembled here from the public pieces with
+///    `KvCacheMode::Off` — the same `denoise_reported` and decode, seed and sigmas — and the
+///    generator reports the prefill path with no cache held;
+/// 2. that same `denoise_reported(KvCacheMode::Off)`, started from the fixture's `t2i` inputs,
+///    lands on upstream's `use_kv_cache=False` latents (`t2i/latents_final_prefill`) within
+///    [`UPSTREAM_TOL`].
+///
+/// *Mutations that red this:* the base generator running cached when nothing is selected (link
+/// 1); any numeric change to the prefill forward or loop (link 2).
+#[test]
+fn the_base_ids_unselected_render_is_the_prefill_loop_the_upstream_fixture_gates() {
+    use candle_gen::gen_core::{
+        GenerationMemory, GenerationOutput, GenerationRequest, LoadSpec, PrefixKvCacheMode,
+        WeightsSource,
+    };
+
+    let root = tiny_snapshot();
+    // Link 1 runs on the generator's own device (the CPU here; the GPU on a `metal` / `cuda`
+    // build, where both sides are then that device's same path); link 2 on the CPU, where the
+    // upstream fixture's f32 tolerance is defined.
+    let dev = candle_gen::default_device().unwrap();
+    let (width, height, steps, seed) = (64_u32, 64_u32, 3_u32, 7_u64);
+    let prompt = "a red fox in the forest";
+
+    // Link 1: the generator against the explicit `Off` assembly.
+    let generator = candle_gen_qwen_image_2_1::provider_registry()
+        .unwrap()
+        .load(
+            candle_gen_qwen_image_2_1::MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(root.clone())),
+        )
+        .unwrap();
+    let tokenizer = candle_gen_qwen_image_2_1::load_tokenizer(&root).unwrap();
+    let encoder = candle_gen_qwen_image_2_1::load_text_encoder(&root, &dev).unwrap();
+    let model = load_transformer(&root, &dev).unwrap();
+    let vae = candle_gen_qwen_image_2_1::load_vae(&root, &dev).unwrap();
+    let drop = candle_gen_qwen_image_2_1::system_prompt_drop_count(&tokenizer).unwrap();
+    let prepared =
+        candle_gen_qwen_image_2_1::prepare_conditioning_references(&encoder, &[]).unwrap();
+    let conditioning = encoder
+        .encode_conditioning(&tokenizer, prompt, drop, &prepared)
+        .unwrap();
+    let branch =
+        candle_gen_qwen_image_2_1::joint_branch(&conditioning, &prepared, width, height).unwrap();
+    let scheduler_config = load_scheduler_config(&root).unwrap();
+    let sigmas =
+        scheduler::sigmas_for_image(&scheduler_config, steps as usize, width, height).unwrap();
+    let mut report = DenoiseReport::default();
+    let latents = denoise_reported(
+        DenoiseInputs {
+            transformer: &model,
+            sigmas: &sigmas,
+            latents: candle_gen_qwen_image_2_1::create_noise(
+                candle_gen::image_seed(seed, 0),
+                width,
+                height,
+                model.config().in_channels,
+                &dev,
+            )
+            .unwrap(),
+            prompt_embeds: &branch.text,
+            negative_embeds: None,
+            true_cfg_scale: 1.0,
+            width,
+            height,
+            sampler: None,
+            seed: candle_gen::image_seed(seed, 0),
+            cancel: &CancelFlag::new(),
+            references: None,
+            kv_cache: KvCacheMode::Off,
+        },
+        &mut report,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.kv_cache, KvCachePath::Prefill);
+    let want = candle_gen_qwen_image_2_1::decode_rgb(&vae, &latents, width, height, None, None)
+        .unwrap()
+        .pixels;
+    for memory in [
+        None,
+        Some(GenerationMemory {
+            prefix_kv_cache: Some(PrefixKvCacheMode::Prefill),
+            ..Default::default()
+        }),
+    ] {
+        let req = GenerationRequest {
+            prompt: prompt.to_owned(),
+            width,
+            height,
+            steps: Some(steps),
+            seed: Some(seed),
+            memory,
+            ..Default::default()
+        };
+        let rendered = generator.generate_with_report(&req, &mut |_| {}).unwrap();
+        let ran = rendered.prefix_kv_cache.expect("the path is reported");
+        assert_eq!(
+            (ran.path, ran.cache_bytes, ran.overflow),
+            (PrefixKvCacheMode::Prefill, 0, None),
+            "{memory:?}: the base id sheds the cache unless it is selected"
+        );
+        let GenerationOutput::Images(mut images) = rendered.output.unwrap() else {
+            panic!("images expected");
+        };
+        assert!(
+            images.remove(0).pixels == want,
+            "{memory:?}: the generator's render is not the explicit `Off` assembly"
+        );
+    }
+
+    // Link 2: that denoise against upstream's cache-off latents for the fixture's `t2i` case.
+    let model = load_transformer(&root, &device()).unwrap();
+    let w = kv_fixture();
+    let case = load_case(&w, "t2i");
+    let init = w.tensor("t2i/latents_init");
+    let (off, off_report) = Run {
+        model: &model,
+        case: &case,
+        sigmas: &case_sigmas(&case),
+        init: &init,
+        sampler: None,
+        kv_cache: KvCacheMode::Off,
+    }
+    .ok();
+    assert_eq!(off_report.kv_cache, KvCachePath::Prefill);
+    assert_close(
+        "t2i/latents_final_prefill (the base id's shed path)",
+        &off,
+        &w.tensor("t2i/latents_final_prefill"),
+        UPSTREAM_TOL,
+    );
+}

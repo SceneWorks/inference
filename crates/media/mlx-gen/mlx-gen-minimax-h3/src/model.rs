@@ -50,9 +50,9 @@ use crate::dit::adaln::AdaLnResidency;
 use crate::dit::model::{JointDit, MiniMaxH3Dit};
 use crate::pipeline::{
     fit_audio_to_video, fl2va_layout, frames_to_images, initial_latents, prepend_condition_rows,
-    render_latents, resolve_geometry, revert_pixel_normalization, t2va_layout, RequestGeometry,
-    MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS, SMALLEST_LEGAL_FRAMES,
-    SPATIAL_STRIDE,
+    render_latents_with_observer, resolve_geometry, revert_pixel_normalization, t2va_layout,
+    RequestGeometry, MAX_CANVAS_EDGE, MAX_DURATION_SECONDS, MIN_DURATION_SECONDS,
+    SMALLEST_LEGAL_FRAMES, SPATIAL_STRIDE,
 };
 use crate::reference::{Ref2VaReference, Ref2VaReferences, VideoReference};
 use crate::text_encoder::{
@@ -271,6 +271,10 @@ impl MiniMaxH3Task {
 
 /// The loaded generator — paths and precision, deliberately no tensors. See the module docs.
 pub struct MiniMaxH3 {
+    #[cfg(test)]
+    pub(crate) fixture: Option<crate::veda_fixture::Fixture>,
+    pub(crate) veda_component: Option<PathBuf>,
+    veda_report: crate::veda::ReportSink,
     descriptor: ModelDescriptor,
     root: PathBuf,
     /// The directory holding the DiT's `config.json` and shards — `root.join("transformer")` in the
@@ -435,6 +439,10 @@ fn reconcile_tier(dit_dir: &Path, requested: Option<mlx_gen::gen_core::Quant>) -
 
 /// Reject a request this model cannot serve, before any weight is read.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    if let Some(veda) = &req.veda {
+        veda.validate(50, req.steps.unwrap_or(DEFAULT_STEPS) as usize)
+            .map_err(Error::Msg)?;
+    }
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{MODEL_ID}: prompt must not be empty")));
     }
@@ -745,7 +753,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    reject_unknown_components(spec, &[DIT_COMPONENT, TEXT_ENCODER_COMPONENT], MODEL_ID)?;
+    reject_unknown_components(
+        spec,
+        &[
+            DIT_COMPONENT,
+            TEXT_ENCODER_COMPONENT,
+            crate::veda::contract::COMPONENT,
+        ],
+        MODEL_ID,
+    )?;
     // Adapter paths are probed at load so a mistyped one fails here rather than 20 minutes into a
     // render, after the DiT is mapped. The factors themselves are read and installed per render,
     // onto the task's own DiT (sc-18724) — `t2va`/`fl2va` and `ref2va` are different checkpoints.
@@ -851,6 +867,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let memory_tier = crate::memory_strategy::numeric_tier(spec);
     Ok(Box::new(MiniMaxH3 {
         descriptor: descriptor(),
+        #[cfg(test)]
+        fixture: None,
+        veda_component: match spec.components.get(crate::veda::contract::COMPONENT) {
+            Some(WeightsSource::File(path)) => Some(path.clone()),
+            _ => None,
+        },
+        veda_report: Default::default(),
         root,
         dit_dir,
         text_encoder_dir,
@@ -922,6 +945,10 @@ impl MiniMaxH3 {
     /// fails the render here rather than producing a plausible one the LoRA barely touched. The
     /// returned report can therefore carry nothing a caller has to act on, and is dropped.
     fn load_task_dit(&self, task: MiniMaxH3Task) -> Result<MiniMaxH3Dit> {
+        #[cfg(test)]
+        if self.fixture.is_some() {
+            return crate::veda_fixture::dit();
+        }
         let mut dit = MiniMaxH3Dit::load_dir(self.task_dit_dir(task), self.dtype)?;
         if !self.adapters.is_empty() {
             crate::adapters::apply_minimax_h3_adapters(&mut dit, &self.adapters)?;
@@ -1071,6 +1098,10 @@ impl MiniMaxH3 {
         window: Option<u32>,
         cancel: &mlx_gen::gen_core::CancelFlag,
     ) -> Result<mlx_rs::Array> {
+        #[cfg(test)]
+        if self.fixture.is_some() {
+            return Ok(crate::veda_fixture::context());
+        }
         let tok = MiniMaxH3Tokenizer::from_snapshot(&self.root)?;
         let (ids, mask) = tok.encode_prompt(prompt)?;
 
@@ -1171,6 +1202,10 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        *self.veda_report.borrow_mut() = mlx_gen::gen_core::VedaExecutionReport {
+            requested: req.veda.as_ref().is_some_and(|v| v.enabled),
+            ..Default::default()
+        };
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1340,6 +1375,36 @@ impl MiniMaxH3 {
                 req.cancel.clone(),
             )?,
         };
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            #[cfg(test)]
+            if let Some(fixture) = &self.fixture {
+                if fixture.predictor {
+                    model.prepare_veda_fixture(
+                        request,
+                        self.veda_report.clone(),
+                        fixture.fail_self_test,
+                    );
+                } else {
+                    model.prepare_veda(
+                        request,
+                        self.veda_component.as_deref(),
+                        self.veda_report.clone(),
+                    );
+                }
+            } else {
+                model.prepare_veda(
+                    request,
+                    self.veda_component.as_deref(),
+                    self.veda_report.clone(),
+                );
+            }
+            #[cfg(not(test))]
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
+        }
         release(context);
 
         let total = schedule.num_evals() as u32;
@@ -1349,7 +1414,21 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(mlx_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step =
+            |index, elapsed| {
+                if let Some(probe) = terminal_probe.as_mut() {
+                    probe.record(index, elapsed, serde_json::json!({
+                    "method": "mlx_process_allocator_cumulative_highwater_no_reset",
+                    "allocatorActiveSampleBytes": mlx_rs::memory::get_active_memory() as u64,
+                    "allocatorCacheSampleBytes": mlx_rs::memory::get_cache_memory() as u64,
+                    "allocatorPeakBytesCumulative": mlx_rs::memory::get_peak_memory() as u64,
+                }));
+                }
+            };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             &schedule,
@@ -1358,7 +1437,13 @@ impl MiniMaxH3 {
             patch,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
+        }
+
         release((model, video_rows, audio_rows));
 
         // --- 3. decode ----------------------------------------------------------------------
@@ -1578,6 +1663,13 @@ impl MiniMaxH3 {
                 req.cancel.clone(),
             )?,
         };
+        if let Some(request) = req.veda.as_ref().filter(|v| v.enabled) {
+            model.prepare_veda(
+                request,
+                self.veda_component.as_deref(),
+                self.veda_report.clone(),
+            );
+        }
         release(context);
 
         let total = schedule.num_evals() as u32;
@@ -1587,7 +1679,21 @@ impl MiniMaxH3 {
                 total,
             });
         };
-        let rendered = render_latents(
+        let mut terminal_probe = req
+            .h3_terminal_telemetry
+            .then(mlx_gen::gen_core::h3_terminal_telemetry::Collector::default);
+        let mut observe_step =
+            |index, elapsed| {
+                if let Some(probe) = terminal_probe.as_mut() {
+                    probe.record(index, elapsed, serde_json::json!({
+                    "method": "mlx_process_allocator_cumulative_highwater_no_reset",
+                    "allocatorActiveSampleBytes": mlx_rs::memory::get_active_memory() as u64,
+                    "allocatorCacheSampleBytes": mlx_rs::memory::get_cache_memory() as u64,
+                    "allocatorPeakBytesCumulative": mlx_rs::memory::get_peak_memory() as u64,
+                }));
+                }
+            };
+        let rendered = render_latents_with_observer(
             &mut model,
             &layout,
             schedule,
@@ -1596,7 +1702,13 @@ impl MiniMaxH3 {
             patch,
             &req.cancel,
             &mut on_step,
+            req.h3_terminal_telemetry
+                .then_some(&mut observe_step as &mut dyn FnMut(usize, std::time::Duration)),
         )?;
+        if let Some(probe) = terminal_probe {
+            self.veda_report.borrow_mut().terminal_telemetry = Some(probe.finish("mlx"));
+        }
+
         release((model, video_rows, audio_rows));
 
         // --- 4. decode --------------------------------------------------------------------------
@@ -1786,6 +1898,10 @@ impl MiniMaxH3 {
         req: &GenerationRequest,
         latents: &mlx_rs::Array,
     ) -> Result<Vec<mlx_gen::media::Image>> {
+        #[cfg(test)]
+        if self.fixture.is_some() {
+            return crate::veda_fixture::decode_video(req, latents);
+        }
         let tiling = crate::pipeline::decode_tiling_for(req)?;
         let vae = MiniMaxH3VideoVae::load(&self.root, self.dtype)?.with_tiling(tiling);
         let decoded = vae.decode(latents)?;
@@ -1796,6 +1912,10 @@ impl MiniMaxH3 {
     }
 
     fn decode_audio(&self, latents: &mlx_rs::Array) -> Result<mlx_gen::media::AudioTrack> {
+        #[cfg(test)]
+        if self.fixture.is_some() {
+            return crate::veda_fixture::decode_audio(latents);
+        }
         // The geometry comes from the three FL2VA source documents the reference's own
         // `from_pretrained` reads — parsed, not defaulted, so a variant snapshot cannot silently
         // run at this one's numbers. The weights come from the repackaged `audio_vae/`, which ships
@@ -1855,6 +1975,10 @@ const _: () = {
 /// [`crate::memory_strategy`], whose `strategies()` is the single declaration and whose
 /// `route_gate` is the single geometry predicate.
 impl Generator for MiniMaxH3 {
+    fn veda_execution_report(&self) -> Option<mlx_gen::gen_core::VedaExecutionReport> {
+        Some(self.veda_report.borrow().clone())
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -1869,6 +1993,13 @@ impl Generator for MiniMaxH3 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
         self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+
+    fn veda_workspace_bound(
+        &self,
+        req: mlx_gen::gen_core::veda::workspace::Request<'_>,
+    ) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::veda::workspace::WorkspaceBound>> {
+        crate::memory_strategy::veda_workspace_bound(req)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1914,7 +2045,50 @@ mlx_gen::register_generators! {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[test]
+    fn malformed_veda_controls_fail_at_native_request_boundary() {
+        for enabled in [false, true] {
+            for bad in [
+                mlx_gen::gen_core::VedaBudget::KeyTiles(0),
+                mlx_gen::gen_core::VedaBudget::SparsityPercent(f64::NAN),
+                mlx_gen::gen_core::VedaBudget::SparsityPercent(100.0),
+            ] {
+                let mut request = request(1344, 768);
+                request.veda = Some(mlx_gen::gen_core::VedaRequest {
+                    enabled,
+                    generated: bad,
+                    ..Default::default()
+                });
+                let error = validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("generated: Veda"), "{error}");
+            }
+            for steps in [4, 8, 50] {
+                let mut request = request(1344, 768);
+                request.steps = Some(steps);
+                request.veda = Some(mlx_gen::gen_core::VedaRequest {
+                    enabled,
+                    full_attention_steps: vec![steps as usize],
+                    ..Default::default()
+                });
+                let error = validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("zero-based index"), "{error}");
+                request.veda.as_mut().unwrap().full_attention_steps = vec![steps as usize - 1];
+                request.veda.as_mut().unwrap().full_attention_layers = vec![50];
+                assert!(validate_request(&descriptor().capabilities, &request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("full_attention_layers"));
+                request.veda.as_mut().unwrap().full_attention_layers = vec![49];
+                validate_request(&descriptor().capabilities, &request).unwrap();
+            }
+        }
+    }
+
     use super::*;
     use mlx_gen::gen_core::CancelFlag;
     use mlx_gen::runtime::{AdapterKind, MoeExpert};
@@ -1978,10 +2152,16 @@ mod tests {
     /// The contract is resolved from a spec carrying **that same shape** rather than being pinned
     /// here, because `load` resolves the two from one `LoadSpec` and a fixture that let them
     /// disagree would be testing a state the loader cannot produce (sc-18650).
-    fn generator_with(dit_dir: &str, load_shape: mlx_gen::gen_core::LoadShape) -> MiniMaxH3 {
+    pub(crate) fn generator_with(
+        dit_dir: &str,
+        load_shape: mlx_gen::gen_core::LoadShape,
+    ) -> MiniMaxH3 {
         let spec =
             LoadSpec::new(WeightsSource::Dir(PathBuf::from("/snap"))).with_load_shape(load_shape);
         MiniMaxH3 {
+            fixture: None,
+            veda_component: None,
+            veda_report: Default::default(),
             descriptor: descriptor(),
             root: PathBuf::from("/snap"),
             dit_dir: PathBuf::from(dit_dir),

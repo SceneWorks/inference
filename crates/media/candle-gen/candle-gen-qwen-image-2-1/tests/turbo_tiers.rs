@@ -60,7 +60,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// The `tier` snapshot the converter writes for the dense snapshot at `source`: the committed
 /// packed components with `source`'s component config plus the quantization marker, and
 /// everything the converter copies through verbatim taken from `source` itself.
-fn compose_tier(source: &Path, dir: &Path, tier: Tier) -> PathBuf {
+pub(crate) fn compose_tier(source: &Path, dir: &Path, tier: Tier) -> PathBuf {
     let out = dir.join(tier.dir_name());
     let packed = fixtures().join("tiers").join(tier.dir_name());
     for (component, bits) in [
@@ -329,6 +329,12 @@ fn a_turbo_tier_renders_over_the_sigmas_its_own_model_index_saves() {
 
 // ── refusals ─────────────────────────────────────────────────────────────────────────────────────
 
+/// A base-id refusal as the Turbo id reports it (E3, sc-25909): the base label replaced by the
+/// Turbo one, nothing else.
+fn turbo_labelled(base: &str) -> String {
+    base.replacen("qwen_image_2_1: ", "qwen_image_2_1_turbo: ", 1)
+}
+
 /// The typed `Unsupported` refusal of `id` for the snapshot at `root`, through `load` and through
 /// the memory registration, with the snapshot path masked so a tier's refusal can be compared with
 /// its dense source's.
@@ -395,8 +401,12 @@ fn each_id_refuses_the_other_checkpoints_tier_like_its_dense_snapshot() {
 
 /// The tier/request rules are the base checkpoint's, unchanged, under the Turbo id. On this
 /// backend a **dense** snapshot with a Q4/Q8 request is the typed "no on-the-fly quantization"
-/// refusal — the same one, word for word, on both ids — and a request that disagrees with a packed
-/// tier, or none against one, is refused as it is for a base tier.
+/// refusal — the same one, word for word, on both ids except the id it names (E3, sc-25909:
+/// `qwen_image_2_1_turbo:` under the Turbo id) — and a request that disagrees with a packed tier,
+/// or none against one, is refused as it is for a base tier, under the same rule.
+///
+/// *Mutation that reds this:* dropping `labelled` from `load_variant` (the Turbo refusal keeps the
+/// base label).
 #[test]
 fn turbo_keeps_the_base_tier_refusals() {
     let source = turbo_snapshot();
@@ -429,17 +439,19 @@ fn turbo_keeps_the_base_tier_refusals() {
         );
         assert_eq!(
             turbo,
-            dense_refusal(BASE, &tiny_snapshot(), quant),
-            "{quant:?}: the base id's refusal, word for word"
+            turbo_labelled(&dense_refusal(BASE, &tiny_snapshot(), quant)),
+            "{quant:?}: the base id's refusal, word for word, under the Turbo id"
         );
     }
 
     let turbo_q8 = compose_tier(source.path(), turbo_tiers.path(), Tier::Q8);
     let base_q8 = compose_tier(&tiny_snapshot(), base_tiers.path(), Tier::Q8);
     for quant in [Some(Quant::Q4), None] {
+        let (kind, message) = error(BASE, &base_q8, quant);
+        assert!(message.contains("qwen_image_2_1: "), "{message}");
         assert_eq!(
             error(TURBO, &turbo_q8, quant),
-            error(BASE, &base_q8, quant),
+            (kind, turbo_labelled(&message)),
             "{quant:?} against a q8 tier"
         );
     }

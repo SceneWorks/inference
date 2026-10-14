@@ -573,8 +573,12 @@ fn each_id_refuses_the_other_checkpoints_tier_like_its_dense_snapshot() {
 /// request, a request that disagrees with a packed tier is refused, and the converter still
 /// refuses to emit a bf16 tier.
 ///
-/// *Mutation that reds this:* removing the bf16 refusal from `prequantize_turnkey` (it would write
-/// a "bf16 tier" directory).
+/// Every refusal reached through the Turbo id names it (E3, sc-25909): the Turbo message is the
+/// base one with `qwen_image_2_1:` replaced by `qwen_image_2_1_turbo:`, nothing else.
+///
+/// *Mutations that red this:* removing the bf16 refusal from `prequantize_turnkey` (it would write
+/// a "bf16 tier" directory); dropping `labelled` from `load_variant` (the Turbo refusal keeps the
+/// base label).
 #[test]
 fn turbo_keeps_the_base_tier_refusals() {
     let tmp = tempfile::tempdir().unwrap();
@@ -585,11 +589,20 @@ fn turbo_keeps_the_base_tier_refusals() {
         Err(err) => (std::mem::discriminant(&err), err.to_string()),
     };
 
-    // Dense snapshot + quantize request: the same typed refusal on both ids, request for request.
+    // Dense snapshot + quantize request: the same typed refusal on both ids, request for request,
+    // each under its own id.
     for quant in [Quant::Q8, Quant::Q4, Quant::Nvfp4] {
         let turbo = error(load(TURBO, &source, Some(quant), resident));
-        let base = error(load(BASE, &tiny_snapshot(), Some(quant), resident));
-        assert_eq!(turbo, base, "{quant:?}");
+        let (kind, base) = error(load(BASE, &tiny_snapshot(), Some(quant), resident));
+        assert!(base.contains("qwen_image_2_1: "), "{quant:?}: {base}");
+        assert_eq!(
+            turbo,
+            (
+                kind,
+                base.replacen("qwen_image_2_1: ", "qwen_image_2_1_turbo: ", 1)
+            ),
+            "{quant:?}"
+        );
     }
     let (_, tower) = error(load(TURBO, &source, Some(Quant::Q8), resident));
     assert!(tower.contains("would leave the tower dense"), "{tower}");
@@ -603,6 +616,12 @@ fn turbo_keeps_the_base_tier_refusals() {
         unrequested.contains("no quantization was requested"),
         "{unrequested}"
     );
+    for message in [&crossed, &unrequested] {
+        assert!(
+            message.contains("qwen_image_2_1_turbo: ") && !message.contains("qwen_image_2_1: "),
+            "the Turbo id's tier refusal names the Turbo id: {message}"
+        );
+    }
 
     // The dense tier is the source snapshot itself: refused, and nothing is written.
     let bf16 = tmp.path().join("bf16");
