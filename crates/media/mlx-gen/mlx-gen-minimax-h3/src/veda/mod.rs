@@ -420,11 +420,27 @@ impl VedaRuntime {
         }
         let out = merged.take_axis(Array::from_slice(&inverse, &[self.bundle.heads as i32]), 1)?;
         mlx_rs::transforms::eval([&out])?;
+        ensure_finite(&out)?;
         let mut report = self.report.borrow_mut();
         report.selected_token_pairs += pairs;
         report.dense_token_pairs += self.bundle.heads as u64 * seq as u64 * seq as u64;
         report.workspace_bytes = report.workspace_bytes.max(high);
         Ok(out)
+    }
+}
+/// Refuses a sparse attention output holding any NaN/Inf, so the caller recomputes that call
+/// densely and records the reason instead of letting the poison into the hidden state (a poisoned
+/// residual decodes to a flat black clip with silent audio). `out` is already materialized, so
+/// this is one f32 sum reduction plus a scalar readback per sparse call; a NaN or Inf anywhere
+/// makes the sum non-finite.
+fn ensure_finite(out: &Array) -> Result<()> {
+    let sum = out.as_dtype(Dtype::Float32)?.sum(None)?.item::<f32>();
+    if sum.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::Msg(format!(
+            "Veda sparse attention produced non-finite output (sum {sum})"
+        )))
     }
 }
 fn learned_scores(
@@ -855,6 +871,69 @@ mod frozen_tests {
         assert!(r.outcome_json()["planMatch"].is_null());
         assert_eq!(r.dense_segments, packed.veda_dense_segments());
         assert!(r.dense_segments[0].starts_with("reference audio"));
+    }
+    /// A sparse call whose output is non-finite must not reach the hidden state: that call is
+    /// recomputed densely, it is not counted as sparse, and the reason is reported. Runs on the
+    /// MLX **CPU** device with the fixture predictor; NaN values poison only the attention output
+    /// (the predictor scores read Q/K alone), exactly the CUDA A/B failure's signature.
+    #[test]
+    fn non_finite_sparse_output_falls_back_to_dense_and_is_reported() {
+        use crate::denoise::{JointGeometry, PackedLayout, TEXT_TAG};
+        struct Cpu;
+        impl Drop for Cpu {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+            }
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let _restore = Cpu;
+        let packed = PackedLayout::build(
+            JointGeometry::new(124, 4, 6).unwrap(),
+            [1, 2, 2],
+            &[TEXT_TAG; 5],
+            2,
+            &[],
+        )
+        .unwrap();
+        let request = VedaRequest {
+            enabled: true,
+            ..Default::default()
+        };
+        let seq = packed.seq_len();
+        let shape = [1, 4, seq, 128];
+        let n = (4 * seq * 128) as usize;
+        let ramp = |phase: f32| -> Array {
+            let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37 + phase).sin()).collect();
+            Array::from_slice(&x, &shape)
+        };
+        let (q, k, finite_v) = (ramp(0.0), ramp(1.0), ramp(2.0));
+        let poisoned_v = Array::from_slice(&vec![f32::NAN; n], &shape);
+
+        let run = |v: &Array| {
+            let report = ReportSink::default();
+            let runtime = VedaRuntime::prepare_fixture(&request, &packed, report.clone(), false)
+                .expect("fixture Veda runtime");
+            runtime
+                .attention(1, 1, &q, &k, v, BoundedAttention::UNBOUNDED)
+                .unwrap();
+            let r = report.borrow().clone();
+            r
+        };
+        let healthy = run(&finite_v);
+        assert_eq!((healthy.sparse_calls, healthy.dense_calls), (1, 0));
+        assert!(healthy.fallback_reason.is_none());
+
+        let poisoned = run(&poisoned_v);
+        assert_eq!((poisoned.sparse_calls, poisoned.dense_calls), (0, 1));
+        assert!(
+            poisoned
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|e| e.contains("non-finite output")),
+            "{:?}",
+            poisoned.fallback_reason
+        );
+        assert!(poisoned.kernel.is_none());
     }
     #[test]
     fn self_test_outcome_is_cached_per_device_and_kernel() {

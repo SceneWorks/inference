@@ -336,7 +336,23 @@ impl VedaRuntime {
             }
             batches.push(Tensor::cat(&outputs, 1)?);
         }
-        Ok((Tensor::cat(&batches, 0)?, pairs, high))
+        let out = Tensor::cat(&batches, 0)?;
+        ensure_finite(&out)?;
+        Ok((out, pairs, high))
+    }
+}
+/// Refuses a sparse attention output holding any NaN/Inf, so `attention` recomputes that call
+/// densely and records the reason instead of letting the poison into the hidden state (a poisoned
+/// residual decodes to a flat black clip with silent audio — the sc-25777 CUDA A/B signature).
+/// One f32 sum reduction plus a scalar readback per sparse call; every head of the call already
+/// reads its predictor scores back to the host, so this adds one sync to the dozens it has. A NaN
+/// or Inf anywhere makes the sum non-finite.
+pub(crate) fn ensure_finite(out: &Tensor) -> Result<()> {
+    let sum = out.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+    if sum.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("Veda sparse attention produced non-finite output (sum {sum})").into())
     }
 }
 fn budget(b: &VedaBudget) -> Budget {
@@ -1138,6 +1154,20 @@ mod tests {
             assert!(failed.tested.borrow().is_none());
             let _ = failed.attention(0, 2, &q, &k, &v, 0.25).unwrap();
             assert_eq!(failed_report.borrow().dense_calls, 2);
+            // A non-finite sparse output (NaN V: the scores read Q/K only) is recomputed densely
+            // and reported, never returned into the hidden state.
+            let nan_report = ReportSink::default();
+            let nan = runtime(&dev, nan_report.clone());
+            let nan_v = (v.ones_like().unwrap() * f64::NAN).unwrap();
+            let _ = nan.attention(0, 0, &q, &k, &nan_v, 0.25).unwrap();
+            assert_eq!(nan_report.borrow().sparse_calls, 0);
+            assert_eq!(nan_report.borrow().dense_calls, 1);
+            assert!(nan_report
+                .borrow()
+                .fallback_reason
+                .as_ref()
+                .unwrap()
+                .contains("non-finite output"));
             let Device::Cuda(cuda) = &dev else {
                 unreachable!()
             };
@@ -1231,6 +1261,24 @@ mod tests {
             report.total_attention_fraction(),
             Some((pairs + 2 * 161 * 161) as f64 / (3 * 161 * 161) as f64)
         );
+    }
+    #[test]
+    fn ensure_finite_refuses_nan_and_inf_attention_outputs() {
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let ok = Tensor::new(&[[0.5f32, -2.0], [3.0, 0.0]], &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            ensure_finite(&ok).unwrap();
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let t = Tensor::new(&[[0.5f32, bad], [3.0, 0.0]], &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let e = ensure_finite(&t).unwrap_err().to_string();
+                assert!(e.contains("non-finite output"), "{dtype:?} {bad}: {e}");
+            }
+        }
     }
     #[test]
     fn actual_device_self_test_cannot_pass_on_cpu() {
