@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[2]
 def device_rows():
     return [dict(schema=s3.SCHEMA,kernel=s3.KERNEL,device_ordinal=0,dtype=d,
                  self_test_dimensions=[16,128],native_batch=2,native_heads=2,
-                 sparse_calls=1,predictor_score_calls=4,forced_failure_dense=True,
+                 sparse_calls=1,predictor_score_calls=2,forced_failure_dense=True,
                  unsupported_dtype_dense=True,intentional_dense_identity=True)
             for d in ("BF16","F16")]
 

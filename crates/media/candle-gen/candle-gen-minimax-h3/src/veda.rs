@@ -1271,7 +1271,8 @@ mod tests {
             let sparse = r.attention(0, 0, &q, &k, &v, 0.25).unwrap();
             check("t2va", sparse, masked_dense_oracle(&r, 0, &q, &k, &v, 0.25));
             assert_eq!(report.borrow().sparse_calls, 1);
-            assert!(report.borrow().predictor_score_calls > 0);
+            // One batched scoring pass per sample: both heads share the fixture's single shape.
+            assert_eq!(report.borrow().predictor_score_calls, 2);
             assert!(report.borrow().selected_token_pairs < report.borrow().dense_token_pairs);
             assert_eq!(report.borrow().kernel.as_deref(), Some(KERNEL));
             assert!(r.tested.borrow().is_some());

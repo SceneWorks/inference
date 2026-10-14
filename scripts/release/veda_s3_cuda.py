@@ -80,7 +80,7 @@ def verify_test_output(out: Path, phase: str, result: dict, absent: bool) -> lis
         if (row.get("kernel") != KERNEL or row.get("device_ordinal") != 0
                 or row.get("self_test_dimensions") != [16, 128]
                 or row.get("native_batch") != 2 or row.get("native_heads") != 2
-                or row.get("sparse_calls") != 1 or row.get("predictor_score_calls") != 4
+                or row.get("sparse_calls") != 1 or row.get("predictor_score_calls") != 2
                 or row.get("forced_failure_dense") is not True
                 or row.get("unsupported_dtype_dense") is not True
                 or row.get("intentional_dense_identity") is not True):
