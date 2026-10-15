@@ -1366,8 +1366,12 @@ fn turbo_validation_render_reference_edit() {
 ///   visibly shifted (pixels mean 7.8, 16-grid 3.5).
 ///
 /// So the cached decode is the prefill to bf16 rounding — its divergence is the size of any
-/// one-ulp change — and not a defect: a wrong cache row, RoPE row or modulation row is an O(1)
-/// velocity error, tens of times the control.
+/// one-ulp change — and not a defect. What a defect looks like was measured too (mutation run
+/// 38674397097, never merged): the cached decode's target RoPE rows shifted one position along
+/// the width — a subtle defect whose renders stay the same scene (16-grid 2.8–4.0, inside the
+/// twin bar) — sits **4.5× (ten references) and 4.8× (two references)** the control at its worst
+/// step, against the real path's 1.44× and 0×. That is what [`CACHED_GAP_CONTROL_RATIO_BAR`] is
+/// placed between, and why this test, not the twin, is the cached path's correctness check.
 ///
 /// ```sh
 /// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
@@ -1627,11 +1631,13 @@ fn turbo_validation_prefix_kv_cache_velocity() {
 
 /// How many times the one-ulp control's gap a cached evaluation's velocity may sit from the
 /// prefill one on the same latent and timestep ([`turbo_validation_prefix_kv_cache_velocity`]).
-/// Measured on CUDA: at most 1.44× (ten references; two references: 0×). The bar is a ratio to a
-/// control measured on the same device, step and input, so it carries no device's absolute
-/// numbers; 4 leaves 2.8× headroom over the worst measured step and sits far below a defect's
-/// O(1) gap (≳ 20× a control of ≤ 5.5e-2).
-const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 4.0;
+/// Measured on CUDA, worst step: the real cached path 1.44× (ten references; two references 0×,
+/// bit-identical), reproduced bit for bit across runs 38668492569 and 38671361727; a one-position
+/// RoPE shift of the cached target rows 4.52× and 4.82× (mutation run 38674397097). 2.5 is the
+/// geometric middle: 1.7× headroom over the real path and 1.8× under the subtle defect. The bar is
+/// a ratio to a control measured on the same device, step and input, so it carries no device's
+/// absolute numbers.
+const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 2.5;
 
 /// `x` with every element scaled by `1 ± 2⁻⁸` (a fixed pseudo-random sign per element): about
 /// half a bf16 ulp on average, so once the DiT casts its input to bf16 roughly half the elements
@@ -1913,7 +1919,10 @@ fn grid_difference(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
 /// * two different pictures (the ten- against the two-reference edit; this run's ten-reference
 ///   edit against the synthetic-reference one of run 38664658356) 58.6–60.6.
 ///
-/// 15 is three times the same-scene spread and four times under a different picture.
+/// 15 is three times the same-scene spread and four times under a different picture. It catches
+/// a cached path that renders something else; a subtle cached-path defect can still render the
+/// same scene (a one-position RoPE shift measured 2.8–4.0), and is
+/// [`turbo_validation_prefix_kv_cache_velocity`]'s to catch.
 const TWIN_SAME_PICTURE_BAR: f64 = 15.0;
 
 /// [`grid_difference`] passes a picture against itself shifted by a few pixels and fails it
