@@ -1555,7 +1555,26 @@ fn validation_render_turbo_prefix_kv_cache_velocity() {
                         )
                         .unwrap();
                     let block0 = block0_target_gaps(&prefill_trace, &cached_trace, target);
-                    drop((prefill_trace, cached_trace));
+                    drop(cached_trace);
+                    // Block 0's own one-ulp control, printed beside it: the prefill's block 0 on
+                    // the nudged input against the prefill's block 0 — the size of any one-ulp
+                    // difference at this depth, on this device.
+                    let nudged_trace = transformer
+                        .forward_joint_traced_through(
+                            text,
+                            &joint_images(&reference_latents, &ulp_nudged(&x_prefill)),
+                            sigma,
+                            layout,
+                            0,
+                        )
+                        .unwrap();
+                    let nudged_rows: Vec<_> = prefill_trace
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("block_0_"))
+                        .map(|(name, full)| (name.clone(), target_rows(full, target)))
+                        .collect();
+                    let block0_control = block0_target_gaps(&nudged_trace, &nudged_rows, target);
+                    drop((prefill_trace, nudged_trace, nudged_rows));
                     let rms = rms(&v_prefill);
                     eprintln!(
                         "[kv-velocity] {label}: step {} cached vs prefill on the same input: rel \
@@ -1564,11 +1583,14 @@ fn validation_render_turbo_prefix_kv_cache_velocity() {
                          {ratio:.2}",
                         i + 1
                     );
-                    for (stage, rel, max_abs, differing) in &block0 {
+                    for ((stage, rel, max_abs, differing), (_, control_rel, _, _)) in
+                        block0.iter().zip(&block0_control)
+                    {
                         eprintln!(
                             "[kv-velocity] {label}: step {} {stage} target rows cached vs \
                              prefill: rel {rel:.3e}, max |Δ| {max_abs:.3e}, {differing} elements \
-                             differ (bar rel {CACHED_BLOCK0_REL_BAR:.1e})",
+                             differ (bar rel {CACHED_BLOCK0_REL_BAR:.1e}); one-ulp input control \
+                             rel {control_rel:.3e}",
                             i + 1
                         );
                     }
@@ -1768,6 +1790,12 @@ fn gemm_row_probe(label: &str, total: usize, target: usize, inner: usize, hidden
     }
 }
 
+/// The last `target` rows of a `[1, S, C]` joint-sequence stage — the target block's.
+fn target_rows(full: &mlx_rs::Array, target: usize) -> mlx_rs::Array {
+    let rows = full.shape()[1];
+    full.index((.., rows - target as i32..rows, ..))
+}
+
 /// The rows a block-0 comparison reads: each of `block_0_attn`, `block_0_mlp` and `block_0_out`,
 /// the prefill trace's **target** rows (the last `target` of its `[1, S, inner]`) against the
 /// cached trace's `[1, target, inner]` — `(stage, relative L2, max |Δ|, elements that differ)`.
@@ -1787,9 +1815,7 @@ fn block0_target_gaps(
     ["block_0_attn", "block_0_mlp", "block_0_out"]
         .into_iter()
         .map(|stage| {
-            let full = find(prefill, stage);
-            let rows = full.shape()[1];
-            let prefill_rows = full.index((.., rows - target as i32..rows, ..));
+            let prefill_rows = target_rows(&find(prefill, stage), target);
             let (rel, max_abs, differing) = velocity_gap(&find(cached, stage), &prefill_rows);
             (stage.to_owned(), rel, max_abs, differing)
         })
