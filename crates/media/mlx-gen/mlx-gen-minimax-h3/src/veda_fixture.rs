@@ -231,7 +231,10 @@ fn native_generator_learned_sparse_off_and_failure_paths() {
     assert_eq!(outcome["executionGrid"], outcome["planGrid"]);
     assert!(outcome["totalAttentionFraction"].as_f64().unwrap() < 1.0);
     assert!(report.fallback_reason.is_none());
-    assert_eq!(report.kernel.as_deref(), Some(crate::veda::KERNEL));
+    assert_eq!(
+        report.kernel.as_deref(),
+        Some(crate::veda::kernel_id().unwrap())
+    );
     assert_ne!(
         sparse, dense,
         "learned sparse path must affect output assembly"

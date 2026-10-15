@@ -169,7 +169,7 @@ fn run_layer(rt: &VedaRuntime, layer: usize, [q, k, v]: &[Array; 3]) -> Array {
     mlx_rs::transforms::eval([&out]).unwrap();
     let r = rt.report.borrow();
     assert!(r.fallback_reason.is_none(), "{:?}", r.fallback_reason);
-    assert_eq!(r.kernel.as_deref(), Some(KERNEL));
+    assert_eq!(r.kernel.as_deref(), Some(kernel_id().unwrap()));
     out
 }
 
@@ -588,6 +588,44 @@ fn metal_sparse_attention_matches_the_host_oracle() {
             l.valid.len()
         );
         assert!(err.is_finite() && err <= SELF_TEST_ATOL, "{err}");
+        // Both Metal kernels on their video query rows, whichever one this device routes to.
+        let routes: &[bool] = if metal::nax_available() {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &nax in routes {
+            let tiled = metal::attend_route(
+                &metal::DeviceLayout::new(&l),
+                &native(&q),
+                &native(&k),
+                &native(&v),
+                &ids,
+                &rows,
+                nax,
+            )
+            .unwrap();
+            let tiled = host(&tiled);
+            let mut worst = 0f32;
+            for h in 0..heads {
+                for slot in 0..l.video * TILE {
+                    let row = l.perm[slot];
+                    for d in 0..DIM {
+                        let got = tiled[(h * l.video * TILE + slot) * DIM + d];
+                        if row < 0 {
+                            assert_eq!(got, 0.0, "padding rows are zero");
+                            continue;
+                        }
+                        worst = worst.max((got - want[(h * seq + row as usize) * DIM + d]).abs());
+                    }
+                }
+            }
+            println!("VEDA_GATE attend_route nax={nax} seq={seq} max_abs={worst}");
+            assert!(
+                worst.is_finite() && worst <= SELF_TEST_ATOL,
+                "nax={nax}: {worst}"
+            );
+        }
     }
 }
 

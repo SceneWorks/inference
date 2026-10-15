@@ -239,11 +239,218 @@ const ATTEND: &str = r#"
     }
 "#;
 
+/// NAX header: MLX's `BaseNAXFrag` fragment layout and one `matmul2d` product on the GPU's
+/// neural accelerators (MetalPerformancePrimitives), as inference's packed-KV NAX attention uses.
+const NAX_HEADER: &str = r#"
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// (column, row) of this lane's first element of a 16x16 fragment; the lane holds rows `fm` and
+// `fm + 8`, columns `fn..fn+3`.
+inline __attribute__((always_inline)) short2 veda_nax_coord(uint lane) {
+    const short qid = short(lane >> 2);
+    const short fm = (qid & 4) | short((lane >> 1) & 3u);
+    const short fn = ((qid & 2) | short(lane & 1u)) * 4;
+    return short2(fn, fm);
+}
+
+// C[16x32] += A[16x16] . B[16x32], B given as two 16x16 fragments (rows of B^T when `TB`).
+template <bool TB, typename AT, typename BT>
+inline __attribute__((always_inline)) void veda_nax_mma(thread vec<float, 8>& c0, thread vec<float, 8>& c1,
+                            thread const vec<AT, 8>& a, thread const vec<BT, 8>& b0,
+                            thread const vec<BT, 8>& b1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, TB, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<AT, BT, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<AT, BT, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 8; ++i) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 8; ++i) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+template <typename T, int LD>
+inline __attribute__((always_inline)) vec<T, 8> veda_nax_frag(const threadgroup T* tile, short2 coord, uint row0, uint col0) {
+    const threadgroup T* base = tile + (row0 + coord.y) * LD + col0 + coord.x;
+    const vec<T, 4> lo = *(const threadgroup vec<T, 4>*)(base);
+    const vec<T, 4> hi = *(const threadgroup vec<T, 4>*)(base + 8 * LD);
+    return vec<T, 8>(lo, hi);
+}
+"#;
+
+/// The block-sparse attention on the neural accelerators: one threadgroup of eight SIMD groups
+/// owns a whole 128-row query tile of one head (16 rows per SIMD group) and streams each selected
+/// key tile in 32-token blocks through 16-bit threadgroup tiles; `Q.K^T` and `P.V` run as
+/// `matmul2d` products with FP32 accumulation and an FP32 log2-domain online softmax.
+const ATTEND_NAX: &str = r#"
+    // params: heads_total, video, kmax
+    constexpr int D = 128;
+    constexpr int BK = 32;
+    constexpr int LD = D + 8;
+    constexpr int DT = D / 16;
+    constexpr int KF = BK / 16;
+    constexpr uint TSTEP = 256u / uint(D / 4);
+    using T = metal::remove_cv_t<typename veda_element<decltype(q)>::type>;
+    threadgroup T k_tile[BK * LD];
+    threadgroup T v_tile[BK * LD];
+
+    const uint H = uint(params[0]);
+    const uint video = uint(params[1]);
+    const uint kmax = uint(params[2]);
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint qtile = threadgroup_position_in_grid.x;
+    const uint g = threadgroup_position_in_grid.y;
+    const uint head = uint(heads[g]);
+    const short2 coord = veda_nax_coord(lane);
+    const uint c_quad = (tid % uint(D / 4)) * 4u;
+    const uint t_row = tid / uint(D / 4);
+    const uint qvalid = valid[qtile];
+    uint local[2];
+    bool live[2];
+    const device T* q_row[2];
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; ++i) {
+        local[i] = sg * 16u + uint(coord.y) + 8u * uint(i);
+        live[i] = local[i] < qvalid;
+        const int row = live[i] ? perm[qtile * 128u + local[i]] : perm[qtile * 128u];
+        q_row[i] = q + (uint(row) * H + head) * uint(D) + uint(coord.x);
+    }
+    const float scale2 = rsqrt(float(D)) * M_LOG2E_F;
+    vec<float, 8> o[DT];
+#pragma clang loop unroll(full)
+    for (int d = 0; d < DT; ++d) o[d] = vec<float, 8>(0.0f);
+    float run_max[2] = {-INFINITY, -INFINITY};
+    float run_sum[2] = {0.0f, 0.0f};
+
+    const uint list = g * video + qtile;
+    const uint n = counts[list];
+    for (uint i = 0; i < n; ++i) {
+        const uint kt = uint(keys[list * kmax + i]);
+        const uint kv = valid[kt];
+        for (uint t0 = 0; t0 < kv; t0 += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+            for (uint r = 0; r < uint(BK) / TSTEP; ++r) {
+                const uint tt = t_row + r * TSTEP;
+                vec<T, 4> kq = vec<T, 4>(0);
+                vec<T, 4> vq = vec<T, 4>(0);
+                if (t0 + tt < kv) {
+                    const uint row = uint(perm[kt * 128u + t0 + tt]);
+                    const uint at = (row * H + head) * uint(D) + c_quad;
+                    kq = *(const device vec<T, 4>*)(k + at);
+                    vq = *(const device vec<T, 4>*)(v + at);
+                }
+                *(threadgroup vec<T, 4>*)(k_tile + tt * LD + c_quad) = kq;
+                *(threadgroup vec<T, 4>*)(v_tile + tt * LD + c_quad) = vq;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            vec<float, 8> s[KF];
+#pragma clang loop unroll(full)
+            for (int f = 0; f < KF; ++f) s[f] = vec<float, 8>(0.0f);
+#pragma clang loop unroll(full)
+            for (int f = 0; f < KF; f += 2) {
+#pragma clang loop unroll(full)
+                for (int d = 0; d < DT; ++d) {
+                    const vec<T, 8> qd = vec<T, 8>(*(const device vec<T, 4>*)(q_row[0] + d * 16),
+                                                   *(const device vec<T, 4>*)(q_row[1] + d * 16));
+                    const vec<T, 8> k0 = veda_nax_frag<T, LD>(k_tile, coord, f * 16, d * 16);
+                    const vec<T, 8> k1 = veda_nax_frag<T, LD>(k_tile, coord, f * 16 + 16, d * 16);
+                    veda_nax_mma<true>(s[f], s[f + 1], qd, k0, k1);
+                }
+            }
+            const bool full = t0 + uint(BK) <= kv;
+            float block_max[2] = {-INFINITY, -INFINITY};
+#pragma clang loop unroll(full)
+            for (int f = 0; f < KF; ++f) {
+#pragma clang loop unroll(full)
+                for (short a = 0; a < 2; ++a) {
+#pragma clang loop unroll(full)
+                    for (short j = 0; j < 4; ++j) {
+                        float x = s[f][4 * a + j] * scale2;
+                        if (!full && t0 + uint(f * 16 + coord.x + j) >= kv) x = -INFINITY;
+                        s[f][4 * a + j] = x;
+                        block_max[a] = max(block_max[a], x);
+                    }
+                }
+            }
+            float factor[2];
+#pragma clang loop unroll(full)
+            for (short a = 0; a < 2; ++a) {
+                block_max[a] = max(block_max[a], simd_shuffle_xor(block_max[a], 1));
+                block_max[a] = max(block_max[a], simd_shuffle_xor(block_max[a], 8));
+                const float next_max = max(run_max[a], block_max[a]);
+                factor[a] = run_max[a] == -INFINITY ? 0.0f : fast::exp2(run_max[a] - next_max);
+                float block_sum = 0.0f;
+#pragma clang loop unroll(full)
+                for (int f = 0; f < KF; ++f) {
+#pragma clang loop unroll(full)
+                    for (short j = 0; j < 4; ++j) {
+                        const float x = s[f][4 * a + j];
+                        const float p = x == -INFINITY ? 0.0f : fast::exp2(x - next_max);
+                        s[f][4 * a + j] = p;
+                        block_sum += p;
+                    }
+                }
+                block_sum += simd_shuffle_xor(block_sum, 1);
+                block_sum += simd_shuffle_xor(block_sum, 8);
+                run_sum[a] = run_sum[a] * factor[a] + block_sum;
+                run_max[a] = next_max;
+            }
+#pragma clang loop unroll(full)
+            for (int d = 0; d < DT; ++d) {
+#pragma clang loop unroll(full)
+                for (short j = 0; j < 4; ++j) {
+                    o[d][j] *= factor[0];
+                    o[d][4 + j] *= factor[1];
+                }
+            }
+#pragma clang loop unroll(full)
+            for (int d = 0; d < DT; d += 2) {
+#pragma clang loop unroll(full)
+                for (int f = 0; f < KF; ++f) {
+                    const vec<T, 8> v0 = veda_nax_frag<T, LD>(v_tile, coord, f * 16, d * 16);
+                    const vec<T, 8> v1 = veda_nax_frag<T, LD>(v_tile, coord, f * 16, d * 16 + 16);
+                    veda_nax_mma<false>(o[d], o[d + 1], s[f], v0, v1);
+                }
+            }
+        }
+    }
+    // Tiled output `[g, video * 128, D]`; padding rows are written as zero.
+#pragma clang loop unroll(full)
+    for (short a = 0; a < 2; ++a) {
+        const uint base = ((g * video + qtile) * 128u + local[a]) * uint(D);
+#pragma clang loop unroll(full)
+        for (int d = 0; d < DT; ++d) {
+#pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+                const float x = live[a] && run_sum[a] > 0.0f ? o[d][4 * a + j] / run_sum[a] : 0.0f;
+                out[base + uint(d * 16 + coord.x + j)] = static_cast<T>(x);
+            }
+        }
+    }
+"#;
+
 struct Kernels {
     pool: MetalKernel,
     project: MetalKernel,
     logits: MetalKernel,
     attend: MetalKernel,
+    attend_nax: MetalKernel,
 }
 // MLX kernel handles are immutable descriptions (source + names); MLX compiles and caches the
 // pipelines itself, keyed on name/source/template arguments, behind its own device lock.
@@ -254,18 +461,25 @@ fn kernels() -> Result<&'static Kernels> {
     static KERNELS: OnceLock<std::result::Result<Kernels, String>> = OnceLock::new();
     KERNELS
         .get_or_init(|| {
-            let make = |name: &str, inputs: &[&str], outputs: &[&str], body: &str| {
+            let nax_header = format!("{HEADER}{NAX_HEADER}");
+            let with = |name: &str, inputs: &[&str], outputs: &[&str], body: &str, header: &str| {
                 MetalKernel::with_options(
                     &format!("sc26214_veda_{name}"),
                     inputs,
                     outputs,
                     body,
-                    HEADER,
+                    header,
                     true,
                     false,
                 )
                 .map_err(|e| e.to_string())
             };
+            let make = |name: &str, inputs: &[&str], outputs: &[&str], body: &str| {
+                with(name, inputs, outputs, body, HEADER)
+            };
+            const ATTEND_INPUTS: [&str; 9] = [
+                "q", "k", "v", "perm", "valid", "heads", "keys", "counts", "params",
+            ];
             Ok(Kernels {
                 pool: make(
                     "pool",
@@ -280,13 +494,15 @@ fn kernels() -> Result<&'static Kernels> {
                     PROJECT,
                 )?,
                 logits: make("logits", &["q", "k", "divisor", "params"], &["s"], LOGITS)?,
-                attend: make(
-                    "attend",
-                    &[
-                        "q", "k", "v", "perm", "valid", "heads", "keys", "counts", "params",
-                    ],
+                attend: make("attend", &ATTEND_INPUTS, &["out"], ATTEND)?,
+                // Compiled on first dispatch only, so a GPU without the neural accelerators
+                // (whose Metal compiler may lack MetalPerformancePrimitives) never builds it.
+                attend_nax: with(
+                    "attend_nax",
+                    &ATTEND_INPUTS,
                     &["out"],
-                    ATTEND,
+                    ATTEND_NAX,
+                    &nax_header,
                 )?,
             })
         })
@@ -417,6 +633,18 @@ pub fn attend(
     heads: &[i32],
     rows: &[Vec<usize>],
 ) -> Result<Array> {
+    attend_route(layout, q, k, v, heads, rows, nax_available())
+}
+/// [`attend`] on an explicit route: `nax` selects the neural-accelerator kernel.
+pub(crate) fn attend_route(
+    layout: &DeviceLayout,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    heads: &[i32],
+    rows: &[Vec<usize>],
+    nax: bool,
+) -> Result<Array> {
     let kernels = kernels()?;
     let total = q.shape()[1];
     let (g, tiles, video) = (heads.len(), layout.tiles, layout.video);
@@ -444,13 +672,28 @@ pub fn attend(
     }
     let keys = Array::from_slice(&keys, &[keys.len() as i32]);
     let counts = Array::from_slice(&counts, &[counts.len() as i32]);
-    Ok(kernels
-        .attend
+    // NAX: one 256-thread threadgroup per 128-row query tile; otherwise four 128-thread quarters.
+    // The NAX products are 16-bit, so on a NAX device FP32 operands (fixtures only; the product
+    // DiT runs BF16) are rounded to BF16: one route per device, never a dtype-chosen second one.
+    let narrow = |a: &Array| -> Result<Array> {
+        Ok(if nax && a.dtype() == Dtype::Float32 {
+            a.as_dtype(Dtype::Bfloat16)?
+        } else {
+            a.clone()
+        })
+    };
+    let (q16, k16, v16) = (narrow(q)?, narrow(k)?, narrow(v)?);
+    let (kernel, per_tile, threads) = if nax {
+        (&kernels.attend_nax, 1, 256)
+    } else {
+        (&kernels.attend, 4, 32 * SIMD_GROUPS)
+    };
+    let out = kernel
         .apply()
         .inputs([
-            q,
-            k,
-            v,
+            &q16,
+            &k16,
+            &v16,
             &layout.perm,
             &layout.valid,
             &ints(heads),
@@ -460,10 +703,33 @@ pub fn attend(
         ])
         .output_shape(
             vec![g as i32, (video * 128) as i32, HEAD_DIM as i32],
-            q.dtype(),
+            q16.dtype(),
         )
-        .grid(32 * SIMD_GROUPS * 4 * video as i32, g as i32, 1)
-        .thread_group(32 * SIMD_GROUPS, 1, 1)
+        .grid(threads * per_tile * video as i32, g as i32, 1)
+        .thread_group(threads, 1, 1)
         .run()?
-        .remove(0))
+        .remove(0);
+    Ok(if out.dtype() == q.dtype() {
+        out
+    } else {
+        out.as_dtype(q.dtype())?
+    })
+}
+
+/// Whether MLX runs its neural-accelerator (NAX) kernels on this device — MLX's own predicate,
+/// over the already-created Metal device.
+pub fn nax_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            #[link_name = "_ZN3mlx4core5metal16is_nax_availableEv"]
+            fn mlx_metal_is_nax_available() -> bool;
+        }
+        // SAFETY: a no-argument predicate whose result MLX caches in a function-local static.
+        unsafe { mlx_metal_is_nax_available() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }

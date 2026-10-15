@@ -29,7 +29,10 @@ pub(crate) type ExecutedMask = (usize, usize, Vec<Vec<usize>>);
 use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
 /// Metal execution (sc-26214): the exact device tile scorer plus [`metal::attend`]'s block-sparse
 /// attention over selected key tiles read in place, and one dense call for the global query rows.
+/// FP32 `simdgroup_matrix` products, on a GPU without MLX's neural-accelerator kernels.
 pub const KERNEL: &str = "mlx-tile-sparse-metal-v2";
+/// The same route with `matmul2d` products on the GPU's neural accelerators (16-bit Q/K/V).
+pub const NAX_KERNEL: &str = "mlx-tile-sparse-nax-v2";
 /// MLX CPU device execution (tests, no Metal): the host scorer contract and gather + SDPA.
 pub const CPU_KERNEL: &str = "mlx-batched-gather-sdpa-v1";
 
@@ -39,8 +42,15 @@ fn on_gpu() -> Result<bool> {
         mlx_rs::DeviceType::Gpu
     ))
 }
-fn kernel_id() -> Result<&'static str> {
-    Ok(if on_gpu()? { KERNEL } else { CPU_KERNEL })
+/// The one sparse kernel route of the current device (E4): its self-test cache key and report id.
+pub(crate) fn kernel_id() -> Result<&'static str> {
+    Ok(if !on_gpu()? {
+        CPU_KERNEL
+    } else if metal::nax_available() {
+        NAX_KERNEL
+    } else {
+        KERNEL
+    })
 }
 pub const SELF_TEST_ATOL: f32 = 0.025;
 
