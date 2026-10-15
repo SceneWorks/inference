@@ -759,3 +759,39 @@ fn full_self_test_lifetime_fits_declared_allocator_bound() {
     assert!(peak <= bound.total_bytes);
     println!("Veda allocator receipt: self_test_peak_bytes={peak}, self_test_bound_bytes={}, total_lifetime_bound_bytes={}",bound.self_test_bytes,bound.total_bytes);
 }
+
+/// Fifty consecutive sparse layers (one denoise step) at the fl2va production layout must reach a
+/// steady allocator state: MLX's live bytes plus its buffer cache may not keep growing once the
+/// first layers have warmed the cache. A route whose allocation sizes never repeat grows the cache
+/// to MLX's GC limit (~100 GB on a 128 GB Mac) even with a small live peak.
+#[test]
+#[ignore = "requires a Metal device and VEDA_PREDICTOR"]
+fn memory_reaches_a_steady_state_across_layers() {
+    gpu();
+    let packed = production(Mode::Fl2va);
+    let inputs = qkv(packed.seq_len() as usize, 5);
+    let rt = runtime(bundle(), &packed);
+    let gb = |b: usize| b as f64 / 1e9;
+    let mut held = Vec::new();
+    for layer in 0..LAYERS {
+        run_layer(&rt, layer, &inputs);
+        let (active, cache) = (
+            mlx_rs::memory::get_active_memory(),
+            mlx_rs::memory::get_cache_memory(),
+        );
+        println!(
+            "VEDA_MEM layer={layer} active_gb={:.2} cache_gb={:.2} peak_gb={:.2}",
+            gb(active),
+            gb(cache),
+            gb(mlx_rs::memory::get_peak_memory())
+        );
+        held.push(active + cache);
+    }
+    let (warm, last) = (held[9], *held.last().unwrap());
+    assert!(
+        last <= warm + 2_000_000_000,
+        "allocator held {:.2} GB after layer 9 but {:.2} GB after layer 49",
+        gb(warm),
+        gb(last)
+    );
+}
