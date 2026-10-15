@@ -1022,6 +1022,31 @@ impl QwenImage21Transformer {
         Ok((velocity, trace))
     }
 
+    /// [`Self::forward_joint_traced`] stopped after block `last`: the trace of the joint
+    /// sequence's projections and of blocks `0..=last` only, with no head and no velocity. The
+    /// prefill side of the real-weight suite's cached-vs-prefill block comparison — the whole
+    /// trace of a ten-reference (~42k-token) joint sequence holds every block's `[1, S, inner]`
+    /// f32 intermediates, tens of GiB, where this holds `last + 1` blocks' worth.
+    pub fn forward_joint_traced_through(
+        &self,
+        text: &Tensor,
+        images: &[&Tensor],
+        timestep: f32,
+        layout: &JointLayout,
+        last: usize,
+    ) -> Result<Vec<(String, Tensor)>> {
+        let mut sink = Vec::new();
+        let mut trace = Trace(Some(&mut sink));
+        let prelude = self.prelude(text, images, timestep, layout, &mut trace)?;
+        let geometry = &prelude.geometry;
+        let m = geometry.modulation(&prelude.modulation)?;
+        let mut x = prelude.x.clone();
+        for (index, block) in self.blocks.iter().enumerate().take(last + 1) {
+            x = block.forward(index, &x, &m, geometry, Ops::Fused, &mut trace)?;
+        }
+        Ok(sink)
+    }
+
     fn run_joint(
         &self,
         text: &Tensor,
