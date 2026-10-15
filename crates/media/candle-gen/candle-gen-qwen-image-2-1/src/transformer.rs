@@ -1307,14 +1307,7 @@ impl QwenImage21Transformer {
         // The target block's own RoPE rows, built at exactly their size rather than narrowed out
         // of (and so pinning) the joint table.
         let ids = layout.position_ids();
-        // TEMPORARY MUTANT (never merged): the target RoPE rows one position off along width.
-        let mut target_ids = ids[geometry.prefix_len..].to_vec();
-        if std::env::var_os("QWEN21_CACHED_ROPE_MUTANT").is_some() {
-            for id in &mut target_ids {
-                id[2] += 1;
-            }
-        }
-        let (target_cos, target_sin) = self.rope_for_ids(&target_ids)?;
+        let (target_cos, target_sin) = self.rope_for_ids(&ids[geometry.prefix_len..])?;
         let cache = PrefixKvCache {
             layers,
             target_cos,

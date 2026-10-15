@@ -1386,8 +1386,6 @@ fn turbo_validation_prefix_kv_cache_velocity() {
         prepare_conditioning_references, scheduler::resample_saved_sigmas,
     };
 
-    // TEMPORARY MUTATION RUN (never merged): arm the cached-decode RoPE mutant in this process.
-    std::env::set_var("QWEN21_CACHED_ROPE_MUTANT", "1");
     let root = turbo_snapshot();
     let out_dir = out_dir();
     let stem = "qwen_image_2_1_turbo_candle";
