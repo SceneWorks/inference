@@ -29,8 +29,8 @@ fn load(policy: OffloadPolicy) -> Box<dyn mlx_gen::Generator> {
 fn profile() -> gen_core_testkit::Profile {
     gen_core_testkit::Profile {
         prompt: "a red fox in the snow".to_owned(),
-        width: 48,
-        height: 32,
+        width: 80,
+        height: 64,
         steps: 3,
         seed: 42,
         cancel_steps: 6,
@@ -40,8 +40,8 @@ fn profile() -> gen_core_testkit::Profile {
 fn request() -> GenerationRequest {
     GenerationRequest {
         prompt: "a red fox in the snow".to_owned(),
-        width: 48,
-        height: 32,
+        width: 80,
+        height: 64,
         steps: Some(3),
         seed: Some(42),
         ..Default::default()
@@ -98,8 +98,8 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8_body() {
     match out {
         GenerationOutput::Images(images) => {
             assert_eq!(images.len(), 1);
-            assert_eq!((images[0].width, images[0].height), (48, 32));
-            assert_eq!(images[0].pixels.len(), 48 * 32 * 3);
+            assert_eq!((images[0].width, images[0].height), (80, 64));
+            assert_eq!(images[0].pixels.len(), 80 * 64 * 3);
         }
         other => panic!("expected images, got {other:?}"),
     }
@@ -192,6 +192,15 @@ fn unhonourable_controls_are_refused_at_validation_body() {
                 ..request()
             },
         ),
+        // The descriptor advertises no guidance axis at all: 1.0 is refused like any other value,
+        // by `Capabilities::validate_request` and by `GenerationParams::resolve` alike.
+        (
+            "guidance 1.0",
+            GenerationRequest {
+                guidance: Some(1.0),
+                ..request()
+            },
+        ),
         (
             "negative prompt",
             GenerationRequest {
@@ -202,7 +211,14 @@ fn unhonourable_controls_are_refused_at_validation_body() {
         (
             "off-grid size",
             GenerationRequest {
-                width: 40,
+                width: 72,
+                ..request()
+            },
+        ),
+        (
+            "size under the 64-px floor",
+            GenerationRequest {
+                width: 48,
                 ..request()
             },
         ),

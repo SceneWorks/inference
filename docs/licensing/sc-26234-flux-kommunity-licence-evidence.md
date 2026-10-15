@@ -25,9 +25,17 @@ as the sibling notes.
 * The bundled `text_encoder/` is **not** this row. Its two shards carry the same LFS sha256 as
   `Qwen/Qwen3-VL-4B-Instruct` @ `ebb281ec70b05090aa6165b016eac8ec08e71b17`
   (`30a01a0556622645a3cce87b655bbbbbc1f170c196099f1b666c93202c3339a9`,
-  `046296a2a387efb43b0c997d5833c789604d168834f6e0d3064bf7bb13d002a6`), with the same
-  `config.json`, `tokenizer.json` and `tokenizer_config.json` byte sizes, and the bundled
-  `text_encoder/LICENSE` is the Apache License 2.0 text. The provider therefore maps the existing
+  `046296a2a387efb43b0c997d5833c789604d168834f6e0d3064bf7bb13d002a6`), and every non-LFS
+  file has the same git blob oid as that revision's tree (Hub `/tree` API vs the local
+  `blob <size>\0` SHA-1, 2026-10-15): `config.json` `22be8bb79043d39840ca5e70d7a2dab80311602c`,
+  `tokenizer.json` `c6cc1014128b19d1fc46b1d30a23e3b1d35db421`, `tokenizer_config.json`
+  `d3d3763207692c78780f4bf42d4dadf49a5c8012`, `chat_template.json`
+  `e49e75bdda104c8de941eb20e0b3765184fb27bc`, `generation_config.json` `e116347d…`,
+  `merges.txt` `20024bfe…`, `vocab.json` `4783fe10…`, `model.safetensors.index.json`
+  `3b52de97…`, `preprocessor_config.json` `2ea84a43…`, `video_preprocessor_config.json`
+  `3ba673a5…`, `README.md` `54241709…`. The one file without a twin is the bundled
+  `text_encoder/LICENSE` (the Apache License 2.0 text; the Qwen tree carries its licence at
+  the repository root). The provider therefore maps the existing
   `qwen3_vl_4b_instruct` row (sc-25679) for it.
 
 ## The family — transcribed terms, each with its clause

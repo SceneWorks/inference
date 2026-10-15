@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlx_gen::gen_core::flux3::{text_ids, Flux3Config, GenerationParams};
+use mlx_gen::gen_core::flux3::{
+    text_ids, Flux3Config, GenerationParams, DISTILLED_AUTOENCODER_SHA256, DISTILLED_DIT_SHA256,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
 use mlx_gen_flux3::{denoise_flow_map, load_autoencoder, load_dit, Flux3TextEncoder, SampleTokens};
@@ -31,6 +33,23 @@ fn env_dir(name: &str) -> PathBuf {
 
 fn package() -> PathBuf {
     env_dir("FLUX3_PACKAGE_DIR")
+}
+
+/// Lower-case hex SHA-256 of a file, streamed.
+fn sha256_hex(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = file.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn golden() -> Weights {
@@ -62,7 +81,8 @@ fn ids_of(a: &Array) -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// The pinned package parses, validates and agrees with the source constants.
+/// The pinned package parses, validates and agrees with the source constants, and its two
+/// weight files ARE the pinned revision's (the sha256 pins of `gen_core::flux3`).
 #[test]
 #[ignore = "needs the pinned package (FLUX3_PACKAGE_DIR)"]
 fn real_package_config_is_the_release() {
@@ -74,6 +94,16 @@ fn real_package_config_is_the_release() {
     assert!(config.dit.flow_map);
     assert_eq!(config.text_encoder.window_max_length(), 4096);
     assert_eq!(config.sampler.steps, 16);
+    assert_eq!(
+        sha256_hex(&package().join("model.safetensors")),
+        DISTILLED_DIT_SHA256,
+        "model.safetensors is not the pinned revision's"
+    );
+    assert_eq!(
+        sha256_hex(&package().join("ae.safetensors")),
+        DISTILLED_AUTOENCODER_SHA256,
+        "ae.safetensors is not the pinned revision's"
+    );
 }
 
 /// The pinned tokenizer + the bf16 tower reproduce upstream's window and conditioning. The window

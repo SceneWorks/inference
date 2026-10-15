@@ -554,21 +554,6 @@ pub const CIRCLESTONE_LABS_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
     ],
 };
 
-/// Gemma Terms of Use.
-///
-/// Text read at <https://ai.google.dev/gemma/terms> on 2026-08-02.
-///
-/// # Open item U11 — one clause, one term or two?
-///
-/// [`LicenseTerm::AttributionRequired`] is deliberately **not** transcribed here. §3.1's `"Notice"`
-/// string is the only attribution-shaped obligation the text states, and recording one clause as
-/// two terms is a modelling choice rather than a transcription. [`NVIDIA_OPEN_MODEL`] takes the
-/// opposite course on its own §3, and [`KREA_2_COMMUNITY`] records a third shape again — the three
-/// are held together, undecided, as open item **U11** in
-/// `docs/licensing/sc-16662-licence-family-evidence.md`. The candidate distinguisher is textual:
-/// NVIDIA's clause names "the following **attribution** notice", Gemma's names a `"Notice"` text
-/// file and no attribution. Whether that difference is enough to justify the different treatment is
-/// what U11 asks; nothing in this module argues it either way.
 /// FLUX Kommunity License v1.0 — the FLUX 3 Image Klein weights.
 ///
 /// Text read at `LICENSE.md` of `black-forest-labs/flux-3-image-klein` @
@@ -641,6 +626,21 @@ pub const FLUX_KOMMUNITY_V1_0: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// Gemma Terms of Use.
+///
+/// Text read at <https://ai.google.dev/gemma/terms> on 2026-08-02.
+///
+/// # Open item U11 — one clause, one term or two?
+///
+/// [`LicenseTerm::AttributionRequired`] is deliberately **not** transcribed here. §3.1's `"Notice"`
+/// string is the only attribution-shaped obligation the text states, and recording one clause as
+/// two terms is a modelling choice rather than a transcription. [`NVIDIA_OPEN_MODEL`] takes the
+/// opposite course on its own §3, and [`KREA_2_COMMUNITY`] records a third shape again — the three
+/// are held together, undecided, as open item **U11** in
+/// `docs/licensing/sc-16662-licence-family-evidence.md`. The candidate distinguisher is textual:
+/// NVIDIA's clause names "the following **attribution** notice", Gemma's names a `"Notice"` text
+/// file and no attribution. Whether that difference is enough to justify the different treatment is
+/// what U11 asks; nothing in this module argues it either way.
 pub const GEMMA_TERMS: LicenseFamily = LicenseFamily {
     id: "gemma-terms",
     spdx_id: "LicenseRef-Gemma-Terms",

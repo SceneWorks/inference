@@ -7,6 +7,11 @@
 //! there (see `text_parity`), which flows through four network evaluations. The bound on the
 //! packed tokens and the decoded image is 5e-2 of peak; the RGB8 conversion is exact up to the
 //! one-level truncation boundary (±1).
+//!
+//! The second case runs the same loop at `Precision::Bf16` — the release's sampling policy (bf16
+//! DiT, `dt · velocity` rounded to bf16 per step) — against the oracle's own bf16-autocast loop.
+//! Its bound is the larger of 5e-2 and 1.5× the oracle's recorded bf16-vs-f32 distance: two
+//! bf16 implementations of one loop may not agree more closely than bf16 agrees with f32.
 
 use mlx_gen::CancelFlag;
 use mlx_gen_flux3::{
@@ -16,8 +21,8 @@ use mlx_gen_flux3::{
 use mlx_rs::Dtype;
 
 use crate::common::{
-    assert_close, cpu_process, fixture, host_f32, nchw_to_nhwc, nhwc_to_nchw, tiny_autoencoder,
-    tiny_config, tiny_package, tiny_text_encoder,
+    assert_close, cpu_process, errors, fixture, host_f32, nchw_to_nhwc, nhwc_to_nchw,
+    tiny_autoencoder, tiny_config, tiny_package, tiny_text_encoder,
 };
 
 #[test]
@@ -25,6 +30,73 @@ fn generate_matches_upstream_from_injected_noise() {
     cpu_process(
         "e2e_parity::generate_matches_upstream_from_injected_noise",
         run,
+    );
+}
+
+/// The release's bf16 sampling policy vs upstream's bf16-autocast loop on the same noise.
+#[test]
+fn bf16_release_policy_matches_upstream_autocast_loop() {
+    cpu_process(
+        "e2e_parity::bf16_release_policy_matches_upstream_autocast_loop",
+        run_bf16,
+    );
+}
+
+fn run_bf16() {
+    let config = tiny_config();
+    let te = Flux3TextEncoder::load(
+        &tiny_text_encoder(),
+        &config.text_encoder,
+        config.dit.text_in_channels,
+    )
+    .unwrap();
+    let dit = load_dit(
+        &tiny_package().join("model.safetensors"),
+        &config,
+        Dtype::Bfloat16,
+    )
+    .unwrap();
+    let golden = fixture("flux3_e2e_golden.safetensors");
+    let text = te.encode("a red fox in the snow").unwrap();
+    let (h, w) = (2usize, 3usize);
+    let ids = image_ids(h, w, config.dit.image_rope_scale as f32);
+    let schedule = host_f32(golden.require("schedule").unwrap());
+    let tokens = denoise_flow_map(
+        &dit,
+        &text,
+        golden.require("noise").unwrap(),
+        &ids,
+        &schedule,
+        &CancelFlag::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(tokens.dtype(), Dtype::Float32, "the Euler state is f32");
+    let want_bf16 = golden.require("tokens_bf16").unwrap();
+    let want_f32 = golden.require("tokens").unwrap();
+    let oracle_distance: f32 = golden
+        .metadata("e2e_bf16_distance")
+        .expect("the golden records the oracle's bf16-vs-f32 distance")
+        .parse()
+        .unwrap();
+    let (max_abs, peak, _) = errors(want_bf16, want_f32);
+    assert!(
+        (max_abs / peak.max(1.0) - oracle_distance).abs() < 1e-6,
+        "metadata agrees with the stored tensors ({max_abs:.3e} / {peak:.3e} vs {oracle_distance:.3e})"
+    );
+    assert!(
+        oracle_distance > 1e-4,
+        "bf16 autocast is not a no-op on the oracle"
+    );
+    let bound = (1.5 * oracle_distance).max(5e-2);
+    assert_close("tokens (bf16 policy)", &tokens, want_bf16, bound);
+    // And no closer to the f32 oracle than to the bf16 one would be suspicious only if it were
+    // exact; what is required is that the bf16 run stays within the same bound of the f32 truth.
+    assert_close(
+        "tokens (bf16 policy vs f32 oracle)",
+        &tokens,
+        want_f32,
+        bound,
     );
 }
 

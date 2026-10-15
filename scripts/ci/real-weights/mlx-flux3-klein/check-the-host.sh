@@ -1,6 +1,5 @@
 # sc-26234: the distilled FLUX 3 Image Klein MLX evidence (text-to-image through the catalog +
-# the component parity cases) runs on whichever Mac the dispatch input selected (`rw-mage` =
-# nax-macos-2, `rw-starvector` = the primary). The bf16 package is ~20 GB resident (11 GB DiT +
+# the component parity cases) runs on the `rw-mage` weight set (nax-macos-2). The bf16 package is ~20 GB resident (11 GB DiT +
 # 8 GB Qwen3-VL tower + 0.3 GB autoencoder) plus the 1024-squared activations, so the host needs
 # >= 48 GB of unified memory and no heavy memory pressure; anywhere else it records why and skips
 # (FLUX3_SKIP=1), it never queues work onto a busy box. The size / steps dispatch inputs are

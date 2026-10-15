@@ -29,6 +29,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
@@ -55,8 +57,12 @@ pub const DISTILLED_AUTOENCODER_SHA256: &str =
 /// The upstream repository the bundled `text_encoder/` is a byte-identical copy of.
 pub const TEXT_ENCODER_UPSTREAM_REPO: &str = "Qwen/Qwen3-VL-4B-Instruct";
 /// Its revision: the pinned package's `text_encoder/model-0000N-of-00002.safetensors` carry the
-/// same LFS sha256 as this revision's shards
-/// (`30a01a05…3339a9` and `046296a2…002a6`), with the same tokenizer and config.
+/// same LFS sha256 as this revision's shards (`30a01a05…3339a9` and `046296a2…002a6`), and
+/// every non-LFS file has the same git blob oid as this revision's tree (`config.json`
+/// `22be8bb7…`, `tokenizer.json` `c6cc1014…`, `tokenizer_config.json` `d3d37632…`,
+/// `chat_template.json` `e49e75bd…`, `merges.txt`, `vocab.json`, `generation_config.json`,
+/// `model.safetensors.index.json`, both preprocessor configs) — evidence in
+/// `docs/licensing/sc-26234-flux-kommunity-licence-evidence.md`.
 pub const TEXT_ENCODER_UPSTREAM_REVISION: &str = "ebb281ec70b05090aa6165b016eac8ec08e71b17";
 
 /// Registry id of the distilled text-to-image route (the SceneWorks worker's `payload.model`).
@@ -826,10 +832,21 @@ pub struct GenerationParams {
     pub height: u32,
 }
 
+/// Upstream `generate.py`'s seed for a request that carries none:
+/// `int(hashlib.sha256(caption.encode()).hexdigest(), 16) % 2**32`, i.e. the low 32 bits of
+/// the prompt's SHA-256 read big-endian — an unseeded request reproduces per prompt.
+pub fn prompt_seed(prompt: &str) -> u64 {
+    let digest = Sha256::digest(prompt.as_bytes());
+    u64::from(u32::from_be_bytes([
+        digest[28], digest[29], digest[30], digest[31],
+    ]))
+}
+
 impl GenerationParams {
     /// Resolve a request against the loaded package. The distilled checkpoint is a flow map:
-    /// a guidance other than `None` / `1.0` is refused (upstream `generate`: "samples without CFG;
-    /// drop the guidance"), as is a negative prompt (nothing would consume it); the sampler is
+    /// any guidance is refused (upstream `generate`: "samples without CFG; drop the guidance"; the
+    /// descriptor advertises no guidance axis, so `1.0` is not a special case), as is a negative
+    /// prompt (nothing would consume it); the sampler is
     /// the flow-map Euler step and the schedule's `alpha` is the release constant.
     pub fn resolve(
         req: &GenerationRequest,
@@ -843,15 +860,10 @@ impl GenerationParams {
                 config.model
             )));
         }
-        match req.guidance {
-            None => {}
-            Some(1.0) => {}
-            Some(g) => {
-                return Err(Error::Unsupported(format!(
-                    "flux3: the distilled checkpoint samples without CFG; drop the guidance \
-                     (got {g})"
-                )))
-            }
+        if let Some(g) = req.guidance {
+            return Err(Error::Unsupported(format!(
+                "flux3: the distilled checkpoint samples without CFG; drop the guidance (got {g})"
+            )));
         }
         if req
             .negative_prompt
@@ -1197,12 +1209,25 @@ mod tests {
         let explicit = GenerationRequest {
             steps: Some(4),
             seed: Some(3),
-            guidance: Some(1.0),
             sampler: Some("euler".into()),
             ..request()
         };
         let p = GenerationParams::resolve(&explicit, 7, &release()).unwrap();
         assert_eq!((p.steps, p.seed), (4, 3));
+    }
+
+    /// Upstream `generate.py`: `int(sha256(caption).hexdigest(), 16) % 2**32`, checked against
+    /// `hashlib` for three captions. *Mutation that reds this:* little-endian bytes, or any
+    /// other 4 bytes of the digest.
+    #[test]
+    fn prompt_seed_is_upstreams_sha256_low_32_bits() {
+        assert_eq!(prompt_seed("a red fox in the snow"), 2_515_539_735);
+        assert_eq!(prompt_seed(""), 2_018_687_061);
+        assert_eq!(
+            prompt_seed("a red fox sitting in fresh snow at golden hour, soft light, photograph"),
+            2_007_615_934
+        );
+        assert!(prompt_seed("anything") <= u64::from(u32::MAX));
     }
 
     /// *Mutation that reds this:* dropping any refusal arm of `resolve`.
@@ -1213,6 +1238,13 @@ mod tests {
                 "guidance",
                 GenerationRequest {
                     guidance: Some(3.5),
+                    ..request()
+                },
+            ),
+            (
+                "guidance 1.0 (no guidance axis exists; the descriptor says so too)",
+                GenerationRequest {
+                    guidance: Some(1.0),
                     ..request()
                 },
             ),

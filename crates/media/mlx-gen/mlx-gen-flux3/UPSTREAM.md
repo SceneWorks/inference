@@ -67,6 +67,7 @@ typed refusal until sc-26241.
 | Flow-map Euler: `x += dt · dit(x, t, t_ref = schedule[i+1])` over `timesteps(steps, 6.93)`; bf16-valued f32 noise, f32 state | `sampling.py`, `pipeline.generate` | `pipeline.rs` | S1 |
 | Noise `torch.randn(...).to(bf16).float()` | `pipeline.generate` | seeded MLX normal, rounded through bf16 (not bit-reproducible with torch; parity uses injected noise) | S1 |
 | Output `clamp(−1, 1)` → RGB8 | `pipeline.to_pil` | `mlx_gen::image::decoded_to_image` | S1 |
+| Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core::flux3::prompt_seed` | S1 |
 | CFG sampling (base checkpoint) | `sampling.denoise` | — | sc-26239 |
 | Reference images (`image_cond`), boxes, upsampler, quantized variants, LoRA | `pipeline.encode_references`, `bbox.py`, `pup.py`, `fp8.py`/`nvfp4.py` | — | sc-26236/7/8, sc-26241, sc-26239 |
 
@@ -74,7 +75,8 @@ typed refusal until sc-26241.
 
 Upstream runs the DiT under CUDA autocast(bf16) over bf16 weights: linears, attention and the
 residual streams are bf16; `F.layer_norm` and the q/k RMSNorm + RoPE run in f32; the Euler state is
-f32 with `dt · velocity` rounded to bf16 before the add; the timestep `1000·t` is formed in bf16.
+f32 (the noise is `.float()`) with `dt · velocity` multiplied at f32 opmath and its product
+rounded to bf16 before the add (the Python-float `dt` itself is never rounded); the timestep `1000·t` is formed in bf16.
 The port mirrors this at `Precision::Bf16` (the default) and runs everything in f32 at
 `Precision::Fp32` (the oracle's CPU path, which has no autocast). The autoencoder is f32 on both.
 

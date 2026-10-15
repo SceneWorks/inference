@@ -22,6 +22,8 @@ name: Real-weight validation
 #               FLUX.1-dev, two lightx2v Lightning LoRAs  (sc-17284)
 #   rw-mage     Qwen-Image-2.1 bf16 + the q8/q4 re-host            ~66 GB    nax-macos-2
 #               (dispatch-only `mlx-qwen-image-2-1`; estimated, unmeasured)  (sc-24163)
+#   rw-mage     FLUX 3 Image Klein distilled package (gated;          ~20 GB    nax-macos-2
+#               dispatch-only `mlx-flux3-klein`, materialized per run)  (sc-26234)
 #   rw-mage     MiniMax-H3 upstream slice: vae/ + audio_vae/ +        ~10.8 GiB BOTH boxes
 #               FL2VA/audio_vae/ + tokenizer/ + the TE shard index,
 #               PLUS the ~840 KB operator diffusers VAE reference
@@ -321,14 +323,8 @@ on:
         type: string
         required: false
         default: ""
-      # sc-26234 -- `flux3-klein-mlx` only: which Mac renders, and the render geometry of the one
-      # catalog text-to-image case (the component parity cases are fixed at 64²).
-      flux3_mlx_runner:
-        description: "flux3-klein-mlx only: rw-mage (second Mac) or rw-starvector (primary Mac)"
-        type: choice
-        required: false
-        default: rw-mage
-        options: [rw-mage, rw-starvector]
+      # sc-26234 -- `flux3-klein-mlx` only: the render geometry of the one catalog text-to-image
+      # case (the component parity cases are fixed at 64²).
       flux3_mlx_size:
         description: "flux3-klein-mlx only: output side of the catalog render (multiple of 16, 64..=2048)"
         type: string
@@ -5930,9 +5926,9 @@ jobs:
   # the pinned package at 64²) and ONE text-to-image render through the ordinary catalog route
   # (`provider_registry().load("flux3_klein")`, 1024² / 16 steps by default). DISPATCH-ONLY
   # (`flux3-klein-mlx` profile; never `all`, never the schedule; nothing is gated on its numbers).
-  # The host is the dispatch input's Mac (`rw-mage` = nax-macos-2, `rw-starvector` = the primary);
-  # the first step SKIPS with the reason when it has < 48 GB of unified memory or heavy memory
-  # pressure. The GATED package (FLUX Kommunity License) is materialized into the box's task-owned
+  # The host is the `rw-mage` weight set (nax-macos-2, which already stores the Qwen3-VL-4B
+  # snapshot the package's text encoder duplicates); the first step SKIPS with the reason when it
+  # has < 48 GB of unified memory or heavy memory pressure. The GATED package (FLUX Kommunity License) is materialized into the box's task-owned
   # hub through the runner's own Hugging Face credential (`requires_auth = true` on the manifest
   # row); each case runs under the external phys_footprint guard (cap 64 GB, 30 min). The PNG, its
   # JSON record and every case log go in the evidence artifact. Run-scoped CARGO_TARGET_DIR,
@@ -5940,7 +5936,7 @@ jobs:
   mlx-flux3-klein:
     name: MLX FLUX 3 Image Klein distilled text-to-image (real weights)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-mlx'
-    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.flux3_mlx_runner || 'rw-mage' }}"]
+    runs-on: [self-hosted, macOS, ARM64, rw-mage]
     timeout-minutes: 240
     env:
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}

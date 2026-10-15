@@ -5,14 +5,14 @@
 use std::path::Path;
 
 use gen_core::flux3::{
-    validate_generation_request, Flux3Config, GenerationParams, GenerationResources, FAMILY,
-    SAMPLERS,
+    prompt_seed, validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
+    FAMILY, SAMPLERS,
 };
 use gen_core::GenerationReport;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Residency, Result, SizeFloor,
+    gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Precision, Progress, Residency, Result, SizeFloor,
 };
 use mlx_rs::transforms::eval;
 use mlx_rs::Dtype;
@@ -254,7 +254,8 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
+        // Upstream `generate.py`: an unseeded request is seeded from its caption.
+        let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
         let total = params.steps * req.count;
         let images = self.residency.run_request_scoped(
             stage_residency_for(&self.spec, req),

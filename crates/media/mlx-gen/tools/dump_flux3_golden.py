@@ -26,7 +26,9 @@ Writes `mlx-gen-flux3/tests/fixtures/`:
 * `flux3_dit_golden.safetensors` — one single-sample and one two-sample flow-map forward in f32,
   and the single-sample forward under bf16 autocast.
 * `flux3_e2e_golden.safetensors` — `denoise_flow_map` end to end from injected noise (4 steps),
-  the decoded image and its RGB8 conversion, through the shared miniature autoencoder.
+  the decoded image and its RGB8 conversion, through the shared miniature autoencoder; plus the
+  same loop under bf16 autocast (`tokens_bf16`, the release's sampling policy) with the oracle's
+  own bf16-vs-f32 distance in the metadata (`e2e_bf16_distance`, relative to peak).
 
 Inputs: `FLUX3_SRC` (the frozen source tree) and `FLUX3_PACKAGE` (the pinned HF package snapshot
 directory — only its `text_encoder/chat_template.json` and `config.json` are read, sha256-verified).
@@ -399,13 +401,25 @@ def dump_e2e(dit_module, checkpoint_module, pipeline_module, sampling_module, au
     rgb8 = torch.from_numpy(__import__("numpy").asarray(pipeline_module.to_pil(image)))
     print(f"e2e: tokens {tuple(tokens.shape)} image {tuple(image.shape)} rgb8 {tuple(rgb8.shape)} "
           f"|image| max {image.abs().max().item():.4f}")
+    # --- the same loop under bf16 autocast over bf16 weights: the release's sampling policy
+    # (`packed.data["image"]` stays f32 from the `.float()` noise; the DiT runs bf16 and
+    # `dt * velocity` rounds its product to bf16, as on CUDA).
+    dit_bf16 = load_dit(dit_module, checkpoint_module, torch.bfloat16)
+    packed_bf16, _ = pack_t2i(pipeline_module, text, noise.clone(), h, w)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        tokens_bf16 = sampling_module.denoise_flow_map(dit_bf16, packed_bf16, schedule)
+    assert tokens_bf16.dtype == torch.float32, tokens_bf16.dtype
+    peak = tokens.abs().max().item()
+    distance = (tokens_bf16 - tokens).abs().max().item() / max(peak, 1.0)
+    print(f"e2e bf16 autocast vs f32: distance {distance:.6e} of peak {peak:.3e}")
     return {
         "noise": noise,
         "schedule": schedule,
         "tokens": tokens.float(),
+        "tokens_bf16": tokens_bf16.float(),
         "image": image.float(),
         "rgb8": rgb8.to(torch.uint8),
-    }
+    }, {"e2e_bf16_distance": f"{distance:.6e}"}
 
 
 def main() -> None:
@@ -431,11 +445,8 @@ def main() -> None:
     text, encodings = dump_text(text_encoder_module)
     save_safetensors(FIXTURE_DIR / "flux3_text_golden.safetensors", text, {**meta, "max_length": MAX_LENGTH, "pad_multiple": PAD_MULTIPLE})
     save_safetensors(FIXTURE_DIR / "flux3_dit_golden.safetensors", dump_dit(dit_module, checkpoint_module, pipeline_module, encodings), meta)
-    save_safetensors(
-        FIXTURE_DIR / "flux3_e2e_golden.safetensors",
-        dump_e2e(dit_module, checkpoint_module, pipeline_module, sampling_module, autoencoder_module, encodings),
-        meta,
-    )
+    e2e, e2e_meta = dump_e2e(dit_module, checkpoint_module, pipeline_module, sampling_module, autoencoder_module, encodings)
+    save_safetensors(FIXTURE_DIR / "flux3_e2e_golden.safetensors", e2e, {**meta, **e2e_meta})
 
 
 if __name__ == "__main__":

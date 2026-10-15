@@ -185,7 +185,7 @@ impl Flux3TextEncoder {
             .tokenizer
             .encode_ids(&chat_text(prompt), false)
             .map_err(Error::from)?;
-        assemble_window(&ids, self.pad_id, self.pad_multiple, self.max_length)
+        assemble_window(&ids, self.pad_id, self.pad_multiple, self.max_length).map_err(Error::from)
     }
 
     /// `TextEncoder.encode(prompt)`.

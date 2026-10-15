@@ -25,10 +25,12 @@ pub fn noise(seed: u64, h: usize, w: usize, channels: usize) -> Result<Array> {
 
 /// `denoise_flow_map(dit, packed, schedule)` for one text-to-image sample: from `noise`
 /// (`[h·w, C]` f32) over `schedule` (the `steps + 1` points), `x ← x + dt · dit(x, t, t_ref)`
-/// with `dt · velocity` formed in the DiT's compute dtype before the f32 add, exactly as
-/// upstream's `packed.data["image"] + dt * dit(...)` (a Python float times a bf16 tensor stays
-/// bf16). `on_step(i)` fires after step `i` (1-based). Cancellation is checked before every
-/// network evaluation and surfaces as [`Error::Canceled`] — the partial state is dropped.
+/// with `dt · velocity` multiplied at f32 and its PRODUCT rounded to the DiT's compute dtype
+/// before the f32 add, as torch forms upstream's `packed.data["image"] + dt * dit(...)` (a
+/// Python float times a bf16 tensor: f32 opmath, bf16 result; the state stays f32 because the
+/// noise is `.float()`). `on_step(i)` fires after step `i` (1-based). Cancellation is checked
+/// before every network evaluation and surfaces as [`Error::Canceled`] — the partial state is
+/// dropped.
 pub fn denoise_flow_map(
     dit: &Flux3Dit,
     text: &TextConditioning,
@@ -69,7 +71,12 @@ pub fn denoise_flow_map(
             timestep: t,
             target_timestep: Some(target),
         }])?;
-        let scaled = velocity.multiply(&Array::from_f32(dt).as_dtype(compute)?)?;
+        // torch: the Python-float `dt` is NOT rounded to bf16 first; the multiply runs at f32
+        // opmath and only the product takes the velocity's dtype.
+        let scaled = velocity
+            .as_dtype(Dtype::Float32)?
+            .multiply(&Array::from_f32(dt))?
+            .as_dtype(compute)?;
         x = x.add(&scaled)?.as_dtype(Dtype::Float32)?;
         eval([&x])?;
         on_step(step + 1);

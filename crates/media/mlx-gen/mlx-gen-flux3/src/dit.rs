@@ -143,6 +143,9 @@ impl Block {
 
     /// `x` `[N, hidden]` (compute dtype); `cos`/`sin` `[N, head_dim/2]`; `bounds` the per-sample
     /// token spans of this run.
+    // The block's inputs are upstream's `Block.forward(x, pe, bounds, mod)` plus the two
+    // model-wide scalars; a parameter struct would only rename the same seven values.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: &Array,
@@ -270,13 +273,31 @@ pub struct Flux3Dit {
     final_layer: LastLayer,
 }
 
-/// The modulation key of a mode (`"txt"` for `"text"`, else the mode name).
-fn mod_key(mode: &str) -> &str {
-    if mode == "text" {
-        "txt"
-    } else {
-        mode
+/// Append one sample's tokens of `mode` to the per-mode pack and record its `(start, end)` run
+/// (an empty run for `None`). A free function: the token borrows (`'a`, the pack's lifetime) and
+/// the id slices are independent lifetimes, which a closure's annotation cannot express.
+fn push_mode<'a>(
+    mode: usize,
+    data: &mut [Vec<&'a Array>; 3],
+    ids: &mut [Vec<[f32; 4]>; 3],
+    bounds: &mut [Vec<(i32, i32)>; 3],
+    tokens: Option<(&'a Array, &[[f32; 4]])>,
+) -> Result<()> {
+    let start = ids[mode].len() as i32;
+    if let Some((t, i)) = tokens {
+        if t.shape()[0] as usize != i.len() {
+            return Err(Error::Msg(format!(
+                "flux3: {} ids for {} {} tokens",
+                i.len(),
+                t.shape()[0],
+                MODES[mode]
+            )));
+        }
+        data[mode].push(t);
+        ids[mode].extend_from_slice(i);
     }
+    bounds[mode].push((start, ids[mode].len() as i32));
+    Ok(())
 }
 
 impl Flux3Dit {
@@ -482,37 +503,15 @@ impl Flux3Dit {
                     self.cfg.text_in_channels
                 )));
             }
-            let push = |mode: usize,
-                        data: &mut [Vec<&Array>; 3],
-                        ids: &mut [Vec<[f32; 4]>; 3],
-                        bounds: &mut [Vec<(i32, i32)>; 3],
-                        tokens: Option<(&'_ Array, &[[f32; 4]])>|
-             -> Result<()> {
-                let start = ids[mode].len() as i32;
-                if let Some((t, i)) = tokens {
-                    if t.shape()[0] as usize != i.len() {
-                        return Err(Error::Msg(format!(
-                            "flux3: {} ids for {} {} tokens",
-                            i.len(),
-                            t.shape()[0],
-                            MODES[mode]
-                        )));
-                    }
-                    data[mode].push(t);
-                    ids[mode].extend_from_slice(i);
-                }
-                bounds[mode].push((start, ids[mode].len() as i32));
-                Ok(())
-            };
-            push(
+            push_mode(
                 0,
                 &mut data,
                 &mut ids,
                 &mut bounds,
                 Some((s.image, s.image_ids)),
             )?;
-            push(1, &mut data, &mut ids, &mut bounds, s.image_cond)?;
-            push(
+            push_mode(1, &mut data, &mut ids, &mut bounds, s.image_cond)?;
+            push_mode(
                 2,
                 &mut data,
                 &mut ids,
