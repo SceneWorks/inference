@@ -1699,20 +1699,25 @@ fn validation_render_turbo_prefix_kv_cache_velocity() {
 const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 2.5;
 
 /// The relative L2 gap block 0's target rows may show, cached against prefill on the same input
-/// ([`block0_target_gaps`]; worst of `block_0_attn`, `_mlp`, `_out`, any evaluation).
+/// ([`block0_target_gaps`]; worst of `block_0_attn`, `_mlp`, `_out`, at any one evaluation).
+/// Measured on CUDA (RTX PRO 6000 Blackwell, inference run 38683212858):
 ///
-/// **PROVISIONAL — not yet calibrated on real weights.** The calibration run (inference
-/// 38683212858: this test's real path and, in a temporary never-merged commit, the cached-decode
-/// RoPE-shift mutant, both printing `[kv-velocity] … block_0_*` lines beside a block-0 one-ulp
-/// control) had not run when this bar was committed; the run before it (38680706827) lost its
-/// self-hosted runner mid-test and left no log. Until that measurement replaces it, the bar is
-/// placed from what is already measured: one bf16 ulp is a relative step of 2⁻⁸ ≈ 3.9e-3, and the
-/// only projection CUDA measured as row-dependent at these shapes (`hidden → inner`, ten
-/// references) differs by relative 2.1e-3 (≤ 4 ulps on 27 % of its outputs). 1e-2 is ~2.5 ulps:
-/// about 5× that projection's own gap. Where a mis-rotated attention lands is exactly what the
-/// calibration run measures; it is expected far above (unmeasured). The block-0 control
-/// printed beside every reading is the number to set it from.
-const CACHED_BLOCK0_REL_BAR: f64 = 1e-2;
+/// * the real cached path — two references: every stage of every evaluation **bit-identical**;
+///   ten references: `block_0_attn` bit-identical, `block_0_mlp` 1.99e-3–2.16e-3 (its
+///   `hidden → inner` projection is the one row-dependent GEMM, measured beside it at 2.15e-3),
+///   `block_0_out` 3.3e-4–7.1e-4. Worst **2.16e-3**;
+/// * the cached-decode RoPE-shift mutant (same run, a temporary reverted commit): worst
+///   **2.15e-2** (two references) and **3.01e-2** (ten), both `block_0_mlp` at step 2; the gap
+///   shrinks with the noise level (3.2e-3 / 3.8e-3 at step 8), but every evaluation is judged on
+///   its own and steps 2–6 are over the bar in both cases.
+///
+/// 7e-3 is near the geometric middle (6.8e-3) of the real path's worst and the mutant's: 3.2×
+/// headroom over the real path, 3.1× under the mutant. The block-0 one-ulp control is printed
+/// beside each reading (1.3e-3–1.5e-2 by stage and step).
+///
+/// The candle twin's bar; **not yet measured on MLX** — the first MLX run at the epic-end campaign
+/// is where it is checked.
+const CACHED_BLOCK0_REL_BAR: f64 = 7e-3;
 
 /// `x` with every element scaled by `1 ± 2⁻⁸` (a fixed pseudo-random sign per element): about
 /// half a bf16 ulp on average, so once the DiT casts its input to bf16 roughly half the elements
