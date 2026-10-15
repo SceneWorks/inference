@@ -227,8 +227,8 @@ const ATTEND: &str = r#"
             }
         }
     }
-    // Tiled output `[g, video * 128, D]`; padding rows are written as zero.
-    const uint base = ((g * video + qtile) * 128u + local) * uint(D) + frag.y;
+    // Tiled output `[heads_total, video * 128, D]` at this head; padding rows are written as zero.
+    const uint base = ((head * video + qtile) * 128u + local) * uint(D) + frag.y;
 #pragma clang loop unroll(full)
     for (int d = 0; d < DT; ++d) {
 #pragma clang loop unroll(full)
@@ -430,10 +430,10 @@ const ATTEND_NAX: &str = r#"
             }
         }
     }
-    // Tiled output `[g, video * 128, D]`; padding rows are written as zero.
+    // Tiled output `[heads_total, video * 128, D]` at this head; padding rows are written as zero.
 #pragma clang loop unroll(full)
     for (short a = 0; a < 2; ++a) {
-        const uint base = ((g * video + qtile) * 128u + local[a]) * uint(D);
+        const uint base = ((head * video + qtile) * 128u + local[a]) * uint(D);
 #pragma clang loop unroll(full)
         for (int d = 0; d < DT; ++d) {
 #pragma clang loop unroll(full)
@@ -623,9 +623,15 @@ pub fn scores(
     Ok(s.as_slice::<f32>().to_vec())
 }
 
-/// Sparse attention of every video query tile of one head batch over its selected key tiles,
-/// returned in tiled order `[heads, video * 128, dim]` (padding rows zero). `rows` are the
-/// batch's head-major selected rows (`heads * tiles` entries, ascending key tiles).
+/// Sparse attention of every video query tile of `heads` (all heads of one tile shape) over
+/// their selected key tiles, returned in tiled order `[total_heads, video * 128, dim]` with
+/// padding rows zero. Only the listed heads' rows are written; every other head's rows are left
+/// unspecified for the caller to mask. `rows` are the heads' head-major selected rows
+/// (`heads * tiles` entries, ascending key tiles), each at most `kmax` key tiles.
+///
+/// Every buffer this allocates is sized by the layer-invariant `total_heads` and `kmax`, never by
+/// how many heads the plan gives this shape in this layer, so MLX's buffer cache reuses them
+/// across layers instead of accumulating a distinct size per layer.
 pub fn attend(
     layout: &DeviceLayout,
     q: &Array,
@@ -633,10 +639,12 @@ pub fn attend(
     v: &Array,
     heads: &[i32],
     rows: &[Vec<usize>],
+    kmax: usize,
 ) -> Result<Array> {
-    attend_route(layout, q, k, v, heads, rows, nax_available())
+    attend_route(layout, q, k, v, heads, rows, kmax, nax_available())
 }
 /// [`attend`] on an explicit route: `nax` selects the neural-accelerator kernel.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attend_route(
     layout: &DeviceLayout,
     q: &Array,
@@ -644,23 +652,34 @@ pub(crate) fn attend_route(
     v: &Array,
     heads: &[i32],
     rows: &[Vec<usize>],
+    kmax: usize,
     nax: bool,
 ) -> Result<Array> {
     let kernels = kernels()?;
     let total = q.shape()[1];
     let (g, tiles, video) = (heads.len(), layout.tiles, layout.video);
-    if rows.len() != g * tiles || q.shape()[2] != HEAD_DIM as i32 {
+    if g == 0
+        || g > total as usize
+        || rows.len() != g * tiles
+        || q.shape()[2] != HEAD_DIM as i32
+        || heads.iter().any(|&h| h < 0 || h >= total)
+    {
         return Err(Error::Msg("Veda attention operand mismatch".into()));
     }
-    let kmax = (0..g)
+    let longest = (0..g)
         .flat_map(|h| rows[h * tiles..h * tiles + video].iter().map(Vec::len))
         .max()
         .unwrap_or(0);
-    if kmax == 0 {
+    if longest == 0 {
         return Err(Error::Msg("Veda empty selection".into()));
     }
-    let mut keys = vec![0i32; g * video * kmax];
-    let mut counts = vec![0u32; g * video];
+    if longest > kmax {
+        return Err(Error::Msg(
+            "Veda selection exceeds admitted gather bound".into(),
+        ));
+    }
+    let mut keys = vec![0i32; total as usize * video * kmax];
+    let mut counts = vec![0u32; total as usize * video];
     for h in 0..g {
         for r in 0..video {
             let selected = &rows[h * tiles + r];
@@ -703,7 +722,7 @@ pub(crate) fn attend_route(
             &ints(&[total, video as i32, kmax as i32]),
         ])
         .output_shape(
-            vec![g as i32, (video * 128) as i32, HEAD_DIM as i32],
+            vec![total, (video * 128) as i32, HEAD_DIM as i32],
             q16.dtype(),
         )
         .grid(threads * per_tile * video as i32, g as i32, 1)

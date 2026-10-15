@@ -541,10 +541,8 @@ fn metal_sparse_attention_matches_the_host_oracle() {
         };
         let got = metal_batch(
             &metal::DeviceLayout::new(&l),
-            &ids,
             &rows,
             [&q, &k, &v],
-            [&native(&q), &native(&k), &native(&v)],
             DIM,
             BoundedAttention::UNBOUNDED,
         )
@@ -595,17 +593,41 @@ fn metal_sparse_attention_matches_the_host_oracle() {
             &[false]
         };
         for &nax in routes {
-            let tiled = metal::attend_route(
+            let kmax = rows.iter().map(Vec::len).max().unwrap();
+            let tiles = l.valid.len();
+            // Every head at once, and the last head alone (a strict subset written by head id
+            // into the layer-sized output, its key lists at list position 0).
+            let all = metal::attend_route(
                 &metal::DeviceLayout::new(&l),
                 &native(&q),
                 &native(&k),
                 &native(&v),
                 &ids,
                 &rows,
+                kmax,
                 nax,
             )
             .unwrap();
-            let tiled = host(&tiled);
+            let last = (heads - 1) as i32;
+            let one = metal::attend_route(
+                &metal::DeviceLayout::new(&l),
+                &native(&q),
+                &native(&k),
+                &native(&v),
+                &[last],
+                &rows[(heads - 1) * tiles..],
+                kmax,
+                nax,
+            )
+            .unwrap();
+            let one = host(&one);
+            let tiled = host(&all);
+            let span = l.video * TILE * DIM;
+            assert_eq!(
+                &one[(heads - 1) * span..heads * span],
+                &tiled[(heads - 1) * span..heads * span],
+                "nax={nax}: a single-head launch differs from the same head in an all-heads launch"
+            );
             let mut worst = 0f32;
             for h in 0..heads {
                 for slot in 0..l.video * TILE {

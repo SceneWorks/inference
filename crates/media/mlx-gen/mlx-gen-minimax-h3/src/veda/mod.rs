@@ -490,8 +490,6 @@ impl VedaRuntime {
             budget(&self.request.generated),
             budget(&self.request.reference),
         );
-        let mut pieces = Vec::with_capacity(batches.len());
-        let mut head_order: Vec<i32> = Vec::with_capacity(heads);
         let mut pairs = 0u64;
         #[cfg(test)]
         let lap = |name: &'static str, from: std::time::Instant| {
@@ -499,24 +497,32 @@ impl VedaRuntime {
             std::time::Instant::now()
         };
         #[cfg(test)]
-        let mut at = std::time::Instant::now();
-        for (shape, group) in &batches {
+        let at = std::cell::Cell::new(std::time::Instant::now());
+        let mut score = |shape: &TileShape, group: &[i32]| -> Result<Vec<Vec<usize>>> {
             let layout = &self.layouts[shape];
             let scores = match &natives {
                 Some((nq, nk, _, (pq, pk))) => {
-                    metal::scores(&self.device[shape], nq, nk, pq, pk, group, 0, dim)?
+                    // Padded to the bound's fixed batch (repeating the last head), so the scorer
+                    // allocates the same sizes in every layer; the padding's logits are dropped.
+                    let width = bound.chunks[shape].heads.max(group.len());
+                    let mut padded = group.to_vec();
+                    padded.resize(width, *group.last().unwrap());
+                    let mut s =
+                        metal::scores(&self.device[shape], nq, nk, pq, pk, &padded, 0, dim)?;
+                    s.truncate(group.len() * layout.video * layout.video);
+                    s
                 }
                 None => host_scores(&self.bundle, layer, group, layout, q, k)?,
             };
             self.report.borrow_mut().predictor_score_calls += 1;
             #[cfg(test)]
             {
-                at = lap("score", at);
+                at.set(lap("score", at.get()));
             }
             let rows = select(layout, &scores, group.len(), budgets)?;
             #[cfg(test)]
             {
-                at = lap("select", at);
+                at.set(lap("select", at.get()));
             }
             #[cfg(test)]
             self.masks.borrow_mut().extend(
@@ -533,44 +539,86 @@ impl VedaRuntime {
                         * keys.iter().map(|&k| layout.valid[k] as u64).sum::<u64>()
                 })
                 .sum::<u64>();
-            let out = match &natives {
-                Some((nq, nk, nv, _)) => metal_batch(
-                    &self.device[shape],
-                    group,
-                    &rows,
-                    [q, k, v],
-                    [nq, nk, nv],
-                    dim,
-                    bounded,
-                )?,
-                None => cpu_batch(
-                    layout,
-                    group,
-                    &rows,
-                    [q, k, v],
-                    dim,
-                    bytes,
-                    &bound.chunks[shape],
-                )?,
-            };
-            // Materialize each bounded batch output before the next batch's scorer graph (E8).
-            mlx_rs::transforms::eval([&out])?;
-            #[cfg(test)]
-            {
-                at = lap("attend", at);
+            Ok(rows)
+        };
+        let out = match &natives {
+            Some((nq, nk, nv, _)) => {
+                // Dense global query rows, once per layer for every head (the global rows are the
+                // same uncovered rows under every tile shape).
+                let first = self.device.values().next().unwrap();
+                let globals = metal_globals(first, q, k, v, dim, bounded)?;
+                let mut by_shape: BTreeMap<TileShape, Vec<i32>> = BTreeMap::new();
+                for (shape, group) in &batches {
+                    by_shape.entry(*shape).or_default().extend(group);
+                }
+                let mut acc: Option<Array> = None;
+                for (shape, group) in &by_shape {
+                    let mut rows =
+                        Vec::with_capacity(group.len() * self.layouts[shape].valid.len());
+                    for batch in group.chunks(bound.chunks[shape].heads) {
+                        rows.extend(score(shape, batch)?);
+                    }
+                    let full = metal_shape(
+                        &self.device[shape],
+                        [nq, nk, nv],
+                        group,
+                        &rows,
+                        bound.chunks[shape].selected_keys,
+                        globals.as_ref(),
+                    )?;
+                    acc = Some(match acc {
+                        None => full,
+                        Some(prev) => {
+                            let mut mask = vec![false; heads];
+                            for &h in group {
+                                mask[h as usize] = true;
+                            }
+                            r#where(
+                                Array::from_slice(&mask, &[heads as i32, 1, 1]),
+                                &full,
+                                &prev,
+                            )?
+                        }
+                    });
+                    // Materialize each shape's output before the next shape's scorer graph (E8).
+                    mlx_rs::transforms::eval([acc.as_ref().unwrap()])?;
+                    #[cfg(test)]
+                    {
+                        at.set(lap("attend", at.get()));
+                    }
+                }
+                acc.unwrap()
             }
-            pieces.push(out);
-            head_order.extend(group);
-        }
-        let refs: Vec<&Array> = pieces.iter().collect();
-        let mut out = concatenate_axis(&refs, 0)?;
-        if head_order.iter().enumerate().any(|(i, &h)| i as i32 != h) {
-            let mut inverse = vec![0i32; heads];
-            for (i, &h) in head_order.iter().enumerate() {
-                inverse[h as usize] = i as i32;
+            None => {
+                let mut pieces = Vec::with_capacity(batches.len());
+                let mut head_order: Vec<i32> = Vec::with_capacity(heads);
+                for (shape, group) in &batches {
+                    let rows = score(shape, group)?;
+                    let out = cpu_batch(
+                        &self.layouts[shape],
+                        group,
+                        &rows,
+                        [q, k, v],
+                        dim,
+                        bytes,
+                        &bound.chunks[shape],
+                    )?;
+                    mlx_rs::transforms::eval([&out])?;
+                    pieces.push(out);
+                    head_order.extend(group);
+                }
+                let refs: Vec<&Array> = pieces.iter().collect();
+                let mut out = concatenate_axis(&refs, 0)?;
+                if head_order.iter().enumerate().any(|(i, &h)| i as i32 != h) {
+                    let mut inverse = vec![0i32; heads];
+                    for (i, &h) in head_order.iter().enumerate() {
+                        inverse[h as usize] = i as i32;
+                    }
+                    out = out.take_axis(Array::from_slice(&inverse, &[heads as i32]), 0)?;
+                }
+                out
             }
-            out = out.take_axis(Array::from_slice(&inverse, &[heads as i32]), 0)?;
-        }
+        };
         let out = out.reshape(&[1, heads as i32, seq as i32, dim as i32])?;
         mlx_rs::transforms::eval([&out])?;
         ensure_finite(&out)?;
@@ -620,41 +668,69 @@ fn select(
     }
     Ok(rows)
 }
-/// One batch on Metal: video query tiles through [`metal::attend`], the global query rows as one
-/// dense attention over every real key (frozen dense globals), assembled to `[heads, seq, dim]`.
-fn metal_batch(
+/// The frozen dense global query rows on Metal: every real key, once per layer for every head,
+/// `[heads, globals, dim]` (`None` when the layout has no global rows).
+fn metal_globals(
     dev: &metal::DeviceLayout,
-    heads: &[i32],
-    rows: &[Vec<usize>],
-    [q, k, v]: [&Array; 3],
-    [nq, nk, nv]: [&Array; 3],
+    q: &Array,
+    k: &Array,
+    v: &Array,
     dim: usize,
     bounded: BoundedAttention<'_>,
+) -> Result<Option<Array>> {
+    let Some(globals) = &dev.globals else {
+        return Ok(None);
+    };
+    let query = q.take_axis(globals, 2)?;
+    let out = sdpa_bounded_bhsd(&query, k, v, 1.0 / (dim as f32).sqrt(), None, bounded)?;
+    Ok(Some(out.reshape(&[
+        q.shape()[1],
+        globals.shape()[0],
+        dim as i32,
+    ])?))
+}
+/// One tile shape on Metal: [`metal::attend`] over its heads' video query tiles, joined with the
+/// global rows and returned in native row order `[total_heads, seq, dim]`. Heads outside `heads`
+/// are unspecified; the caller masks them.
+fn metal_shape(
+    dev: &metal::DeviceLayout,
+    [nq, nk, nv]: [&Array; 3],
+    heads: &[i32],
+    rows: &[Vec<usize>],
+    kmax: usize,
+    globals: Option<&Array>,
 ) -> Result<Array> {
-    let tiled = metal::attend(dev, nq, nk, nv, heads, rows)?;
-    let combined = match &dev.globals {
-        Some(globals) => {
-            let all = heads.len() == q.shape()[1] as usize
-                && heads.iter().enumerate().all(|(i, &h)| i as i32 == h);
-            let ids = Array::from_slice(heads, &[heads.len() as i32]);
-            let pick = |a: &Array| -> Result<Array> {
-                Ok(if all {
-                    a.clone()
-                } else {
-                    a.take_axis(&ids, 1)?
-                })
-            };
-            let (qb, kb, vb) = (pick(q)?, pick(k)?, pick(v)?);
-            let query = qb.take_axis(globals, 2)?;
-            let rows = globals.shape()[0];
-            let out =
-                sdpa_bounded_bhsd(&query, &kb, &vb, 1.0 / (dim as f32).sqrt(), None, bounded)?
-                    .reshape(&[heads.len() as i32, rows, dim as i32])?;
-            concatenate_axis(&[&tiled, &out], 1)?
-        }
+    let tiled = metal::attend(dev, nq, nk, nv, heads, rows, kmax)?;
+    let combined = match globals {
+        Some(g) => concatenate_axis(&[&tiled, g], 1)?,
         None => tiled,
     };
     Ok(combined.take_axis(&dev.compact, 1)?)
+}
+/// Every head of a single-shape problem on Metal (first-use self-test and device gate).
+fn metal_batch(
+    dev: &metal::DeviceLayout,
+    rows: &[Vec<usize>],
+    [q, k, v]: [&Array; 3],
+    dim: usize,
+    bounded: BoundedAttention<'_>,
+) -> Result<Array> {
+    let (heads, seq) = (q.shape()[1], q.shape()[2]);
+    let native = |a: &Array| -> Result<Array> {
+        Ok(a.transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[seq, heads, dim as i32])?)
+    };
+    let ids: Vec<i32> = (0..heads).collect();
+    let kmax = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let globals = metal_globals(dev, q, k, v, dim, bounded)?;
+    metal_shape(
+        dev,
+        [&native(q)?, &native(k)?, &native(v)?],
+        &ids,
+        rows,
+        kmax,
+        globals.as_ref(),
+    )
 }
 /// One batch on the MLX CPU device: padded tile gathers and the gather + SDPA reference route.
 #[allow(clippy::too_many_arguments)]
@@ -888,16 +964,10 @@ pub fn device_self_test() -> Result<()> {
         scorer_self_test(&l, &q, &k, heads, dim)?;
     }
     let sparse = if gpu {
-        let native = |a: &Array| -> Result<Array> {
-            Ok(a.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[seq as i32, heads as i32, dim as i32])?)
-        };
         metal_batch(
             &metal::DeviceLayout::new(&l),
-            &ids,
             &rows,
             [&q, &k, &v],
-            [&native(&q)?, &native(&k)?, &native(&v)?],
             dim,
             BoundedAttention::UNBOUNDED,
         )?
