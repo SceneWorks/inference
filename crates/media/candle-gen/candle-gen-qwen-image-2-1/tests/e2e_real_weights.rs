@@ -1494,197 +1494,43 @@ fn turbo_validation_prefix_kv_cache_velocity() {
     let cfg = transformer.config().clone();
     let inner = cfg.inner_dim();
 
-    // TEMPORARY MEASUREMENT RUN (never merged): the real path, then the cached-decode RoPE mutant.
-    for mutant in [false, true] {
-        if mutant {
-            std::env::set_var("QWEN21_CACHED_ROPE_MUTANT", "1");
-        }
-        for (&(count, width, height), (prepared, branch)) in cases.iter().zip(&branches) {
-            let label = format!(
-                "{}{stem} {count} refs {width}x{height}",
-                if mutant { "[MUTANT] " } else { "" }
-            );
-            let (total, target) = (branch.layout.total_len(), branch.layout.target_tokens());
-            eprintln!(
-                "[kv-velocity] {label}: joint S = {total} rows (prefix {}), target {target} rows",
-                branch.layout.prefix_len()
-            );
-            gemm_row_probe(&label, &device, total, target, inner, inner * cfg.mlp_ratio);
-            strict_cublas_reductions(&device, || {
-                gemm_row_probe(
-                    &format!("{label} [no reduced-precision reductions]"),
-                    &device,
-                    total,
-                    target,
-                    inner,
-                    inner * cfg.mlp_ratio,
-                )
-            });
+    for (&(count, width, height), (prepared, branch)) in cases.iter().zip(&branches) {
+        let label = format!("{stem} {count} refs {width}x{height}");
+        let (total, target) = (branch.layout.total_len(), branch.layout.target_tokens());
+        eprintln!(
+            "[kv-velocity] {label}: joint S = {total} rows (prefix {}), target {target} rows",
+            branch.layout.prefix_len()
+        );
+        gemm_row_probe(&label, &device, total, target, inner, inner * cfg.mlp_ratio);
+        strict_cublas_reductions(&device, || {
+            gemm_row_probe(
+                &format!("{label} [no reduced-precision reductions]"),
+                &device,
+                total,
+                target,
+                inner,
+                inner * cfg.mlp_ratio,
+            )
+        });
 
-            let reference_latents = encode_references(&vae, prepared).unwrap();
-            let text = &branch.text;
-            let layout = &branch.layout;
-            let prefill = |x: &Tensor, sigma: f32| {
-                transformer
-                    .forward_joint(text, &joint_images(&reference_latents, x), sigma, layout)
-                    .unwrap()
-            };
-            let mut x_prefill = create_noise(42, width, height, cfg.in_channels, &device).unwrap();
-            let mut x_cached = x_prefill.clone();
-            let mut cache = None;
-            let (mut worst_gap, mut worst_ratio, mut worst_block0) = (0f64, 0f64, 0f64);
-            for i in 0..steps {
-                let (sigma, dt) = (sigmas[i], sigmas[i + 1] - sigmas[i]);
-                let v_prefill = prefill(&x_prefill, sigma);
-                let v_cached = match &cache {
-                    None => {
-                        let (v_extract, extracted) = transformer
-                            .forward_joint_extract(
-                                text,
-                                &joint_images(&reference_latents, &x_prefill),
-                                sigma,
-                                layout,
-                            )
-                            .unwrap();
-                        let (gap, max_abs, differing) = velocity_gap(&v_extract, &v_prefill);
-                        eprintln!(
-                            "[kv-velocity] {label}: step 1 extract vs prefill: rel {gap:.3e}, max \
-                         |Δ| {max_abs:.3e}, {differing} elements differ"
-                        );
-                        if differing != 0 {
-                            failures.push(format!(
-                            "{label}: the extract evaluation is not bit-identical to the prefill \
-                             ({differing} elements differ, rel {gap:.3e})"
-                        ));
-                        }
-                        cache = Some(extracted);
-                        v_extract
-                    }
-                    Some(cache) => {
-                        // The cached evaluation on the prefill's own input, traced, so its block 0
-                        // can be held against the prefill's block 0 below.
-                        let (same_input, cached_trace) = transformer
-                            .forward_joint_cached_traced(&x_prefill, sigma, cache)
-                            .unwrap();
-                        let (gap, max_abs, differing) = velocity_gap(&same_input, &v_prefill);
-                        // The control: the prefill path's own response to an input perturbation of
-                        // bf16-rounding size — what any one-ulp difference does to this velocity.
-                        let (control, _, _) =
-                            velocity_gap(&prefill(&ulp_nudged(&x_prefill), sigma), &v_prefill);
-                        let ratio = gap / control.max(f64::MIN_POSITIVE);
-                        // Block 0's target rows, cached against prefill on the same input: before
-                        // any `M`-dependent rounding has had 31 blocks to compound, so a defect in
-                        // what the cached decode feeds its first attention (its RoPE rows, its
-                        // prefix K/V, its modulation row) stands out at ulp scale here.
-                        let prefill_trace = transformer
-                            .forward_joint_traced_through(
-                                text,
-                                &joint_images(&reference_latents, &x_prefill),
-                                sigma,
-                                layout,
-                                0,
-                            )
-                            .unwrap();
-                        let block0 = block0_target_gaps(&prefill_trace, &cached_trace, target);
-                        drop(cached_trace);
-                        // Block 0's own one-ulp control, printed beside it: the prefill's block 0 on
-                        // the nudged input against the prefill's block 0 — the size of any one-ulp
-                        // difference at this depth, on this device.
-                        let nudged_trace = transformer
-                            .forward_joint_traced_through(
-                                text,
-                                &joint_images(&reference_latents, &ulp_nudged(&x_prefill)),
-                                sigma,
-                                layout,
-                                0,
-                            )
-                            .unwrap();
-                        let nudged_rows: Vec<_> = prefill_trace
-                            .iter()
-                            .filter(|(name, _)| name.starts_with("block_0_"))
-                            .map(|(name, full)| (name.clone(), target_rows(full, target)))
-                            .collect();
-                        let block0_control =
-                            block0_target_gaps(&nudged_trace, &nudged_rows, target);
-                        drop((prefill_trace, nudged_trace, nudged_rows));
-                        let rms = rms(&v_prefill);
-                        eprintln!(
-                        "[kv-velocity] {label}: step {} cached vs prefill on the same input: rel \
-                         {gap:.3e}, max |Δ| {max_abs:.3e} (velocity rms {rms:.3e}), {differing} \
-                         elements differ; one-ulp input control rel {control:.3e}; ratio \
-                         {ratio:.2}",
-                        i + 1
-                    );
-                        for ((stage, rel, max_abs, differing), (_, control_rel, _, _)) in
-                            block0.iter().zip(&block0_control)
-                        {
-                            eprintln!(
-                                "[kv-velocity] {label}: step {} {stage} target rows cached vs \
-                             prefill: rel {rel:.3e}, max |Δ| {max_abs:.3e}, {differing} elements \
-                             differ (bar rel {CACHED_BLOCK0_REL_BAR:.1e}); one-ulp input control \
-                             rel {control_rel:.3e}",
-                                i + 1
-                            );
-                        }
-                        let block0: Vec<(String, f64)> = block0
-                            .into_iter()
-                            .map(|(stage, rel, _, _)| (stage, rel))
-                            .collect();
-                        failures.extend(cached_evaluation_failures(
-                            &label,
-                            i + 1,
-                            gap,
-                            control,
-                            &block0,
-                        ));
-                        raise_worst(&mut worst_gap, gap);
-                        raise_worst(&mut worst_ratio, ratio);
-                        for (_, rel) in &block0 {
-                            raise_worst(&mut worst_block0, *rel);
-                        }
-                        // The mechanism, at the first cached evaluation and the last: the same pair
-                        // with cuBLAS forbidden to reduce split-K partials in bf16.
-                        let strict = (i == 1 || i + 1 == steps)
-                            .then(|| {
-                                strict_cublas_reductions(&device, || {
-                                    let strict_prefill = prefill(&x_prefill, sigma);
-                                    let strict_cached = transformer
-                                        .forward_joint_cached(&x_prefill, sigma, cache)
-                                        .unwrap();
-                                    (strict_prefill, strict_cached)
-                                })
-                            })
-                            .flatten();
-                        if let Some((strict_prefill, strict_cached)) = strict {
-                            let (strict_gap, strict_max, strict_differing) =
-                                velocity_gap(&strict_cached, &strict_prefill);
-                            let (_, _, prefill_moved) = velocity_gap(&strict_prefill, &v_prefill);
-                            eprintln!(
-                                "[kv-velocity] {label}: step {} [no reduced-precision \
-                                 reductions] cached vs prefill: rel {strict_gap:.3e}, max |Δ| \
-                                 {strict_max:.3e}, {strict_differing} elements differ (the \
-                                 prefill itself moved in {prefill_moved} elements)",
-                                i + 1
-                            );
-                        }
-                        transformer
-                            .forward_joint_cached(&x_cached, sigma, cache)
-                            .unwrap()
-                    }
-                };
-                if i + 1 == steps {
-                    // The cache's step-independence, on this step's (different) latent and timestep.
-                    let first = cache.take().unwrap();
-                    let probe = [0, first.num_blocks() / 2, first.num_blocks() - 1];
-                    let host: Vec<_> = probe
-                        .iter()
-                        .map(|&b| {
-                            let (k, v) = first.layer(b).unwrap();
-                            (host_bits(k), host_bits(v))
-                        })
-                        .collect();
-                    drop(first);
-                    let (_, again) = transformer
+        let reference_latents = encode_references(&vae, prepared).unwrap();
+        let text = &branch.text;
+        let layout = &branch.layout;
+        let prefill = |x: &Tensor, sigma: f32| {
+            transformer
+                .forward_joint(text, &joint_images(&reference_latents, x), sigma, layout)
+                .unwrap()
+        };
+        let mut x_prefill = create_noise(42, width, height, cfg.in_channels, &device).unwrap();
+        let mut x_cached = x_prefill.clone();
+        let mut cache = None;
+        let (mut worst_gap, mut worst_ratio, mut worst_block0) = (0f64, 0f64, 0f64);
+        for i in 0..steps {
+            let (sigma, dt) = (sigmas[i], sigmas[i + 1] - sigmas[i]);
+            let v_prefill = prefill(&x_prefill, sigma);
+            let v_cached = match &cache {
+                None => {
+                    let (v_extract, extracted) = transformer
                         .forward_joint_extract(
                             text,
                             &joint_images(&reference_latents, &x_prefill),
@@ -1692,55 +1538,199 @@ fn turbo_validation_prefix_kv_cache_velocity() {
                             layout,
                         )
                         .unwrap();
-                    for (&b, (k, v)) in probe.iter().zip(&host) {
-                        let (k2, v2) = again.layer(b).unwrap();
-                        let same = *k == host_bits(k2) && *v == host_bits(v2);
+                    let (gap, max_abs, differing) = velocity_gap(&v_extract, &v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step 1 extract vs prefill: rel {gap:.3e}, max \
+                         |Δ| {max_abs:.3e}, {differing} elements differ"
+                    );
+                    if differing != 0 {
+                        failures.push(format!(
+                            "{label}: the extract evaluation is not bit-identical to the prefill \
+                             ({differing} elements differ, rel {gap:.3e})"
+                        ));
+                    }
+                    cache = Some(extracted);
+                    v_extract
+                }
+                Some(cache) => {
+                    // The cached evaluation on the prefill's own input, traced, so its block 0
+                    // can be held against the prefill's block 0 below.
+                    let (same_input, cached_trace) = transformer
+                        .forward_joint_cached_traced(&x_prefill, sigma, cache)
+                        .unwrap();
+                    let (gap, max_abs, differing) = velocity_gap(&same_input, &v_prefill);
+                    // The control: the prefill path's own response to an input perturbation of
+                    // bf16-rounding size — what any one-ulp difference does to this velocity.
+                    let (control, _, _) =
+                        velocity_gap(&prefill(&ulp_nudged(&x_prefill), sigma), &v_prefill);
+                    let ratio = gap / control.max(f64::MIN_POSITIVE);
+                    // Block 0's target rows, cached against prefill on the same input: before
+                    // any `M`-dependent rounding has had 31 blocks to compound, so a defect in
+                    // what the cached decode feeds its first attention (its RoPE rows, its
+                    // prefix K/V, its modulation row) stands out at ulp scale here.
+                    let prefill_trace = transformer
+                        .forward_joint_traced_through(
+                            text,
+                            &joint_images(&reference_latents, &x_prefill),
+                            sigma,
+                            layout,
+                            0,
+                        )
+                        .unwrap();
+                    let block0 = block0_target_gaps(&prefill_trace, &cached_trace, target);
+                    drop(cached_trace);
+                    // Block 0's own one-ulp control, printed beside it: the prefill's block 0 on
+                    // the nudged input against the prefill's block 0 — the size of any one-ulp
+                    // difference at this depth, on this device.
+                    let nudged_trace = transformer
+                        .forward_joint_traced_through(
+                            text,
+                            &joint_images(&reference_latents, &ulp_nudged(&x_prefill)),
+                            sigma,
+                            layout,
+                            0,
+                        )
+                        .unwrap();
+                    let nudged_rows: Vec<_> = prefill_trace
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("block_0_"))
+                        .map(|(name, full)| (name.clone(), target_rows(full, target)))
+                        .collect();
+                    let block0_control = block0_target_gaps(&nudged_trace, &nudged_rows, target);
+                    drop((prefill_trace, nudged_trace, nudged_rows));
+                    let rms = rms(&v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step {} cached vs prefill on the same input: rel \
+                         {gap:.3e}, max |Δ| {max_abs:.3e} (velocity rms {rms:.3e}), {differing} \
+                         elements differ; one-ulp input control rel {control:.3e}; ratio \
+                         {ratio:.2}",
+                        i + 1
+                    );
+                    for ((stage, rel, max_abs, differing), (_, control_rel, _, _)) in
+                        block0.iter().zip(&block0_control)
+                    {
                         eprintln!(
+                            "[kv-velocity] {label}: step {} {stage} target rows cached vs \
+                             prefill: rel {rel:.3e}, max |Δ| {max_abs:.3e}, {differing} elements \
+                             differ (bar rel {CACHED_BLOCK0_REL_BAR:.1e}); one-ulp input control \
+                             rel {control_rel:.3e}",
+                            i + 1
+                        );
+                    }
+                    let block0: Vec<(String, f64)> = block0
+                        .into_iter()
+                        .map(|(stage, rel, _, _)| (stage, rel))
+                        .collect();
+                    failures.extend(cached_evaluation_failures(
+                        &label,
+                        i + 1,
+                        gap,
+                        control,
+                        &block0,
+                    ));
+                    raise_worst(&mut worst_gap, gap);
+                    raise_worst(&mut worst_ratio, ratio);
+                    for (_, rel) in &block0 {
+                        raise_worst(&mut worst_block0, *rel);
+                    }
+                    // The mechanism, at the first cached evaluation and the last: the same pair
+                    // with cuBLAS forbidden to reduce split-K partials in bf16.
+                    let strict = (i == 1 || i + 1 == steps)
+                        .then(|| {
+                            strict_cublas_reductions(&device, || {
+                                let strict_prefill = prefill(&x_prefill, sigma);
+                                let strict_cached = transformer
+                                    .forward_joint_cached(&x_prefill, sigma, cache)
+                                    .unwrap();
+                                (strict_prefill, strict_cached)
+                            })
+                        })
+                        .flatten();
+                    if let Some((strict_prefill, strict_cached)) = strict {
+                        let (strict_gap, strict_max, strict_differing) =
+                            velocity_gap(&strict_cached, &strict_prefill);
+                        let (_, _, prefill_moved) = velocity_gap(&strict_prefill, &v_prefill);
+                        eprintln!(
+                            "[kv-velocity] {label}: step {} [no reduced-precision \
+                                 reductions] cached vs prefill: rel {strict_gap:.3e}, max |Δ| \
+                                 {strict_max:.3e}, {strict_differing} elements differ (the \
+                                 prefill itself moved in {prefill_moved} elements)",
+                            i + 1
+                        );
+                    }
+                    transformer
+                        .forward_joint_cached(&x_cached, sigma, cache)
+                        .unwrap()
+                }
+            };
+            if i + 1 == steps {
+                // The cache's step-independence, on this step's (different) latent and timestep.
+                let first = cache.take().unwrap();
+                let probe = [0, first.num_blocks() / 2, first.num_blocks() - 1];
+                let host: Vec<_> = probe
+                    .iter()
+                    .map(|&b| {
+                        let (k, v) = first.layer(b).unwrap();
+                        (host_bits(k), host_bits(v))
+                    })
+                    .collect();
+                drop(first);
+                let (_, again) = transformer
+                    .forward_joint_extract(
+                        text,
+                        &joint_images(&reference_latents, &x_prefill),
+                        sigma,
+                        layout,
+                    )
+                    .unwrap();
+                for (&b, (k, v)) in probe.iter().zip(&host) {
+                    let (k2, v2) = again.layer(b).unwrap();
+                    let same = *k == host_bits(k2) && *v == host_bits(v2);
+                    eprintln!(
                         "[kv-velocity] {label}: block {b} prefix K/V re-extracted at step {}: {}",
                         i + 1,
                         if same { "bit-identical" } else { "DIFFERENT" }
                     );
-                        if !same {
-                            failures.push(format!(
+                    if !same {
+                        failures.push(format!(
                             "{label}: block {b}'s prefix K/V changed between extracts at step 1 \
                              and step {}",
                             i + 1
                         ));
-                        }
                     }
                 }
-                x_prefill = (&x_prefill + (&v_prefill * f64::from(dt)).unwrap()).unwrap();
-                x_cached = (&x_cached + (&v_cached * f64::from(dt)).unwrap()).unwrap();
-                let (traj, _, _) = velocity_gap(&x_cached, &x_prefill);
-                eprintln!(
-                    "[kv-velocity] {label}: after step {}: trajectory latent gap rel {traj:.3e}",
-                    i + 1
-                );
             }
-            let decode = |x: &Tensor| {
-                decode_rgb(&vae, x, width, height, None, None)
-                    .unwrap()
-                    .pixels
-            };
-            let (pixels_prefill, pixels_cached) = (decode(&x_prefill), decode(&x_cached));
-            let (mean, max) = pixel_difference(&pixels_cached, &pixels_prefill);
+            x_prefill = (&x_prefill + (&v_prefill * f64::from(dt)).unwrap()).unwrap();
+            x_cached = (&x_cached + (&v_cached * f64::from(dt)).unwrap()).unwrap();
+            let (traj, _, _) = velocity_gap(&x_cached, &x_prefill);
             eprintln!(
+                "[kv-velocity] {label}: after step {}: trajectory latent gap rel {traj:.3e}",
+                i + 1
+            );
+        }
+        let decode = |x: &Tensor| {
+            decode_rgb(&vae, x, width, height, None, None)
+                .unwrap()
+                .pixels
+        };
+        let (pixels_prefill, pixels_cached) = (decode(&x_prefill), decode(&x_cached));
+        let (mean, max) = pixel_difference(&pixels_cached, &pixels_prefill);
+        eprintln!(
             "[kv-velocity] {label}: pixels cached vs prefill trajectory: mean |Δ| {mean:.4}, max \
              {max}, 16-grid {:.2}; worst per-evaluation velocity gap rel {worst_gap:.3e}, \
              {worst_ratio:.2}× the one-ulp control (bar {CACHED_GAP_CONTROL_RATIO_BAR}); worst \
              block-0 target-row gap rel {worst_block0:.3e} (bar {CACHED_BLOCK0_REL_BAR:.1e})",
             grid_difference(&pixels_cached, &pixels_prefill, width, height)
         );
-            save_png(
-                &out_dir.join(format!(
-                    "{stem}_velocity_{count}refs_{width}x{height}_{steps}steps_prefill.png"
-                )),
-                &pixels_prefill,
-                width,
-                height,
-                image::ColorType::Rgb8,
-            );
-        }
+        save_png(
+            &out_dir.join(format!(
+                "{stem}_velocity_{count}refs_{width}x{height}_{steps}steps_prefill.png"
+            )),
+            &pixels_prefill,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
