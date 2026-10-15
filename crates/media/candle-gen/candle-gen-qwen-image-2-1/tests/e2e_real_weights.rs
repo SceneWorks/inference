@@ -1747,7 +1747,18 @@ const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 2.5;
 
 /// The relative L2 gap block 0's target rows may show, cached against prefill on the same input
 /// ([`block0_target_gaps`]; worst of `block_0_attn`, `_mlp`, `_out`, any evaluation).
-/// PROVISIONAL — set from the CUDA measurement.
+///
+/// **PROVISIONAL — not yet calibrated on real weights.** The calibration run (inference
+/// 38683212858: this test's real path and, in a temporary never-merged commit, the cached-decode
+/// RoPE-shift mutant, both printing `[kv-velocity] … block_0_*` lines beside a block-0 one-ulp
+/// control) had not run when this bar was committed; the run before it (38680706827) lost its
+/// self-hosted runner mid-test and left no log. Until that measurement replaces it, the bar is
+/// placed from what is already measured: one bf16 ulp is a relative step of 2⁻⁸ ≈ 3.9e-3, and the
+/// only projection CUDA measured as row-dependent at these shapes (`hidden → inner`, ten
+/// references) differs by relative 2.1e-3 (≤ 4 ulps on 27 % of its outputs). 1e-2 is ~2.5 ulps:
+/// about 5× that projection's own gap. Where a mis-rotated attention lands is exactly what the
+/// calibration run measures; it is expected far above (unmeasured). The block-0 control
+/// printed beside every reading is the number to set it from.
 const CACHED_BLOCK0_REL_BAR: f64 = 1e-2;
 
 /// `x` with every element scaled by `1 ± 2⁻⁸` (a fixed pseudo-random sign per element): about
