@@ -40,6 +40,19 @@
 //! scores (rung 3); depth and restoration are one resident backbone forward, and restoration's
 //! 50 %-overlap tiling is an unconditional part of that forward rather than a selectable rung.
 //!
+//! ## Quantized tiers (sc-26266)
+//!
+//! `iris_3b` loads at bf16 (the release's autocast policy) and at the `q8` / `q4` tiers, quantized
+//! **at load** from the same dense release — there is no converted artifact. A tier is a
+//! whole-pipeline contract with the MLX twin's packing rule: every backbone projection at least one
+//! 64-wide group wide ([`load_backbone_quantized`], [`nn::ProjectionLayout`]; the 6826-wide SwiGLU
+//! down projections zero-padded to 6848, kept dense under adapters) and every attention/MLP
+//! projection of the Qwen3-VL tower ([`IrisTextEncoder::load_quantized`]) are held as GGML
+//! `Q8_0` / `Q4_0` (`Q4_K` on the tower where its 256-wide super-block divides) and dequantized per
+//! forward, so no activation is ever quantized. Embeddings, norms, the text position table and the
+//! sub-group-wide pixel heads stay dense. The depth and restoration tasks and every trainer ship the
+//! dense tier only.
+//!
 //! ## Deliberate differences from the MLX twin
 //!
 //! * `backend = "candle"`, `mac_only = false`.
@@ -68,13 +81,17 @@ pub use candle_gen::gen_core::iris::{
 };
 pub use dit::{IrisDiT, TextBatch};
 pub use model::{
-    compute_dtype, descriptor, load, load_backbone, load_backbone_with_adapters, Iris3b, MODEL_ID,
+    compute_dtype, descriptor, load, load_backbone, load_backbone_quantized,
+    load_backbone_with_adapters, Iris3b, MODEL_ID,
 };
+pub use nn::{BackboneQuant, ProjectionLayout, QUANT_GROUP_SIZE};
 pub use pipeline::{
     denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
 };
 pub use restoration::IrisRestorer;
-pub use text_encoder::{IrisTextEncoder, TextConditioning};
+pub use text_encoder::{
+    text_encoder_quant_spec, IrisTextEncoder, TextConditioning, TEXT_ENCODER_QUANT_BLOCK,
+};
 
 /// Add the Candle Iris-3B generator, its generation (sc-25686) and depth (sc-25687) trainers and the
 /// restoration transform to an explicit media registry builder.

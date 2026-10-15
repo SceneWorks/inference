@@ -34,9 +34,10 @@ use candle_gen::gen_core::safetensors_shards::{
     resolve_indexed_safetensors_shards, snapshot_shard_roots,
 };
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::CaptionOverflowPolicy;
+use candle_gen::gen_core::{CaptionOverflowPolicy, Quant};
 use candle_gen::{CandleError as Error, Result};
 use candle_llm::models::CausalLm;
+use candle_llm::primitives::projection::QuantSpec;
 use candle_llm::primitives::weights::Weights as LlmWeights;
 use candle_llm::ModelConfig;
 
@@ -120,11 +121,70 @@ pub fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The GGML block every quantized tower projection's input width must divide (sc-26266): Q8_0's
+/// and Q4_0's 32 (`QuantSpec::q4`'s Q4_K takes a 256-wide super-block where the width allows it
+/// and falls back to Q4_0 otherwise — the same 4.5 bits per weight).
+pub const TEXT_ENCODER_QUANT_BLOCK: usize = 32;
+
+/// The load-time quantization of the text tower at `quant` (`None` is the dense tier): the shared
+/// decoder's GGML spec for the tier ([`QuantSpec::q8`] / [`QuantSpec::q4`]) served **weight-only**
+/// ([`QuantSpec::with_dequantized_forward`]) — the hidden states this route reads are the
+/// conditioning itself, so the activations are never quantized, as on the MLX twin. Refused when a
+/// projection input width (`hidden_size` for q/k/v/gate/up, `heads · head_dim` for o, the MLP width
+/// for down) is not a multiple of [`TEXT_ENCODER_QUANT_BLOCK`]: such a tower has no quantized tier.
+pub fn text_encoder_quant_spec(
+    cfg: &ModelConfig,
+    quant: Option<Quant>,
+) -> Result<Option<QuantSpec>> {
+    let spec = match quant {
+        None => return Ok(None),
+        Some(Quant::Q4) => QuantSpec::q4(),
+        Some(Quant::Q8) => QuantSpec::q8(),
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "iris: the Qwen3-VL text tower has the q8 and q4 tiers; {other:?} is not one of \
+                 them"
+            )))
+        }
+    };
+    let widths = [
+        cfg.hidden_size as usize,
+        (cfg.num_heads * cfg.head_dim) as usize,
+        cfg.intermediate_size as usize,
+    ];
+    if widths
+        .iter()
+        .any(|width| *width == 0 || width % TEXT_ENCODER_QUANT_BLOCK != 0)
+    {
+        return Err(Error::Unsupported(format!(
+            "iris: the text tower's projection widths (hidden {}, attention {}, MLP {}) are not \
+             all multiples of the {TEXT_ENCODER_QUANT_BLOCK}-wide GGML block size, so it has no \
+             quantized tier",
+            widths[0], widths[1], widths[2]
+        )));
+    }
+    Ok(Some(spec.with_dequantized_forward()))
+}
+
 impl IrisTextEncoder {
     /// Load from a `Qwen/Qwen3-VL-4B-Instruct` snapshot directory under the backbone's
     /// `text_encoder` config section, onto `device`. Only the language tower's tensors reach the
     /// device; the vision tower (`model.visual.*`) is dropped on the host, one shard at a time.
     pub fn load(dir: &Path, cfg: &TextEncoderConfig, device: &Device) -> Result<Self> {
+        Self::load_quantized(dir, cfg, device, None)
+    }
+
+    /// [`load`](Self::load) at a quantization tier (sc-26266): `quant` packs every attention and
+    /// MLP projection of the language tower at load ([`text_encoder_quant_spec`]); the token
+    /// embedding (tied to the head), the head and the norms stay in the tower dtype, as the shared
+    /// decoder keeps them. A quantized tower is staged on the host and installed on `device` one
+    /// tensor at a time, so the dense tower never occupies the device beside the packed one.
+    pub fn load_quantized(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        device: &Device,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
         let model_cfg = ModelConfig::from_dir(dir).map_err(from_llm)?;
         if !model_cfg.architecture.is_qwen3_vl() {
             return Err(Error::Unsupported(format!(
@@ -151,6 +211,13 @@ impl IrisTextEncoder {
             )));
         }
         let dtype = tower_dtype(cfg, device)?;
+        let quant = text_encoder_quant_spec(&model_cfg, quant)?;
+        // The dense tower goes straight to the device; a quantized one is staged on the host.
+        let staging = if quant.is_some() {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
 
         let mut tensors = HashMap::new();
         for file in shard_files(dir)? {
@@ -165,12 +232,17 @@ impl IrisTextEncoder {
                 if key.starts_with("model.visual.") {
                     continue;
                 }
-                tensors.insert(key, tensor.to_device(device)?);
+                tensors.insert(key, tensor.to_device(&staging)?);
             }
         }
-        let weights = LlmWeights::from_map(tensors, device.clone());
-        let lm =
-            CausalLm::from_weights_dtype(&weights, "", model_cfg, None, dtype).map_err(from_llm)?;
+        let weights = LlmWeights::from_map(tensors, staging);
+        let lm = match quant {
+            None => CausalLm::from_weights_dtype(&weights, "", model_cfg, None, dtype),
+            Some(_) => CausalLm::from_weights_on_device_dtype(
+                &weights, "", model_cfg, quant, dtype, device,
+            ),
+        }
+        .map_err(from_llm)?;
         drop(weights);
 
         let tokenizer = TextTokenizer::from_file(
@@ -207,6 +279,18 @@ impl IrisTextEncoder {
                 },
             )?,
         })
+    }
+
+    /// Bytes the loaded tower holds — every resident weight of the decoder (packed projections at
+    /// their GGML storage size, a tied head counted once), measured from the model, not priced
+    /// from the checkpoint.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        self.lm.weight_census().total().resident_bytes
+    }
+
+    /// Whether the tower's projections are GGML-packed.
+    pub fn is_quantized(&self) -> bool {
+        self.lm.is_quantized()
     }
 
     pub fn prefix_ids(&self) -> &[i32] {

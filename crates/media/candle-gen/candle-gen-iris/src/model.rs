@@ -13,13 +13,13 @@ use candle_gen::gen_core::iris::{
 use candle_gen::gen_core::{
     self, default_seed, AdapterApplyReport, AdapterSpec, Capabilities, GenerationOutput,
     GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, SizeFloor,
+    ModelDescriptor, Precision, Progress, Quant, SizeFloor,
 };
 use candle_gen::residency::Residency;
 use candle_gen::{CandleError as Error, Result};
 
 use crate::dit::IrisDiT;
-use crate::nn::{safetensors_shapes, Checkpoint};
+use crate::nn::{safetensors_shapes, BackboneQuant, Checkpoint};
 use crate::pipeline::{denoise, encode, noise_batch, to_device, to_images, Conditioning};
 use crate::text_encoder::IrisTextEncoder;
 
@@ -75,7 +75,12 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: MAX_SIZE,
             max_count: MAX_COUNT,
             mac_only: false,
-            supported_quants: &[],
+            // sc-26266: q8 / q4, quantized at load from the dense release (GGML Q8_0 / Q4_0,
+            // dequantized per forward) — the backbone's projections (the SwiGLU down projections
+            // zero-padded to a group multiple) and the Qwen3-VL tower's attention/MLP projections.
+            // Embeddings, norms, the text position table and the sub-group-wide pixel heads stay
+            // dense; the same tiers and the same packing rule as the MLX twin.
+            supported_quants: &[Quant::Q8, Quant::Q4],
             supports_sequential_offload: true,
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
@@ -148,6 +153,28 @@ pub fn load_backbone_with_adapters(
     task: IrisTask,
     base_model: &str,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
+    load_backbone_quantized(
+        dir, config, compute, device, adapters, task, base_model, None,
+    )
+}
+
+/// [`load_backbone_with_adapters`] at a quantization tier (sc-26266): `quant` packs every
+/// projection [`crate::nn::ProjectionLayout::of`] selects to GGML Q8_0 / Q4_0 at load, straight
+/// from the checkpoint's stored values; `None` is the dense tier. Adapters stay forward-time
+/// residuals over the packed base, and an adapted load keeps the unaligned projections dense
+/// ([`BackboneQuant::for_load`]).
+#[allow(clippy::too_many_arguments)]
+pub fn load_backbone_quantized(
+    dir: &Path,
+    config: &IrisConfig,
+    compute: DType,
+    device: &Device,
+    adapters: &[AdapterSpec],
+    task: IrisTask,
+    base_model: &str,
+    quant: Option<Quant>,
+) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
+    let quant = BackboneQuant::for_load(quant, !adapters.is_empty())?;
     let path = dir.join(BACKBONE_WEIGHTS_FILE);
     let checkpoint = Checkpoint::open(&path, device)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
@@ -162,13 +189,14 @@ pub fn load_backbone_with_adapters(
         )?;
         (checkpoint.with_residuals(merged.residuals)?, merged.reports)
     };
-    let dit = IrisDiT::from_checkpoint(&checkpoint, &config.model, compute, device)?;
+    let dit =
+        IrisDiT::from_checkpoint_quantized(&checkpoint, &config.model, compute, device, quant)?;
     Ok((dit, reports))
 }
 
 pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    let refusals: [(&str, bool); 7] = [
-        ("quantize", spec.quantize.is_some()),
+    crate::memory_strategy::refuse_unloadable_quant(MODEL_ID, spec)?;
+    let refusals: [(&str, bool); 6] = [
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -216,13 +244,15 @@ fn load_inner(spec: &LoadSpec) -> Result<Iris3b> {
     let bb_cfg = config.clone();
     let bb_device = device.clone();
     let adapters = spec.adapters.clone();
+    // One tier for the whole pipeline: the text tower and the backbone load at the same width.
+    let quant = spec.quantize;
     let adapter_reports = Arc::new(Mutex::new(Vec::new()));
     let reports_sink = Arc::clone(&adapter_reports);
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || IrisTextEncoder::load(&te_dir, &te_cfg, &te_device),
+        move || IrisTextEncoder::load_quantized(&te_dir, &te_cfg, &te_device, quant),
         move |_use_pid| {
-            let (dit, reports) = load_backbone_with_adapters(
+            let (dit, reports) = load_backbone_quantized(
                 &bb_dir,
                 &bb_cfg,
                 compute,
@@ -230,6 +260,7 @@ fn load_inner(spec: &LoadSpec) -> Result<Iris3b> {
                 &adapters,
                 IrisTask::Generation,
                 MODEL_ID,
+                quant,
             )?;
             if let Ok(mut sink) = reports_sink.lock() {
                 *sink = reports;
@@ -467,14 +498,46 @@ mod tests {
         assert_eq!(d.required_components, ["text_encoder"]);
     }
 
+    /// The tiers the route cannot load are refused by name before any resource is read: NVFP4
+    /// (no GGML block form on this route) and a quantized tier under FP32 compute (the dense
+    /// reference path only). Q4/Q8 at bf16 get past the spec gate and fail only on the missing
+    /// resource.
+    ///
+    /// *Mutation that reds this:* dropping `refuse_unloadable_quant` from
+    /// `refuse_unsupported_spec`, or either arm of it.
     #[test]
     fn unsupported_spec_fields_are_typed_refusals() {
-        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
-        spec.quantize = Some(gen_core::Quant::Q4);
-        match load(&spec) {
-            Err(gen_core::Error::Unsupported(m)) => assert!(m.contains("quantize"), "{m}"),
+        let sentinel = || LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
+        let refused = |spec: &LoadSpec, field: &str| match load(spec) {
+            Err(gen_core::Error::Unsupported(m)) => assert!(m.contains(field), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),
+        };
+        refused(&sentinel().with_quant(Quant::Nvfp4), "quantize");
+        let mut fp32 = sentinel().with_quant(Quant::Q4);
+        fp32.precision = Precision::Fp32;
+        refused(&fp32, "precision");
+        for quant in [Quant::Q4, Quant::Q8] {
+            let err = load(&sentinel().with_quant(quant))
+                .err()
+                .expect("nothing is on disk");
+            let message = err.to_string();
+            assert!(
+                !message.contains("quantize") && !message.contains("precision"),
+                "{quant:?} must pass the spec gate, got {message}"
+            );
         }
+        let mut te = sentinel();
+        te.text_encoder = Some(WeightsSource::Dir("/te".into()));
+        refused(&te, "text_encoder");
+    }
+
+    /// The descriptor advertises exactly the tiers the loader accepts — the MLX twin's.
+    #[test]
+    fn the_descriptor_advertises_the_q8_and_q4_tiers() {
+        assert_eq!(
+            descriptor().capabilities.supported_quants,
+            [Quant::Q8, Quant::Q4]
+        );
     }
 
     #[test]

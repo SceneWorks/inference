@@ -20,12 +20,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use candle_gen::attention::AttentionPlan;
+use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::{softmax, softmax_last_dim};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::iris;
-use candle_gen::gen_core::CancelFlag;
-use candle_gen::quant::LokrFactors;
+use candle_gen::gen_core::{CancelFlag, Quant};
+use candle_gen::quant::{LokrFactors, QLinear};
 use candle_gen::{CandleError as Error, Result};
 
 /// The dtype two operands meet at: themselves when they agree, f32 otherwise (the only two dtypes
@@ -123,6 +124,10 @@ pub struct Checkpoint {
     /// Every tensor a [`Loader`] built from an in-memory map, at the dtype it was built in
     /// ([`loaded`](Self::loaded)).
     loaded: RefCell<HashMap<String, Tensor>>,
+    /// Bytes of every parameter a [`Loader`] handed a module, as the module holds it — dense
+    /// tensors at their dtype, packed projections at their GGML storage size
+    /// ([`resident_bytes`](Self::resident_bytes)).
+    resident: std::cell::Cell<u64>,
 }
 
 thread_local! {
@@ -159,6 +164,7 @@ impl Checkpoint {
             stored: RefCell::new(BTreeMap::new()),
             residuals: RefCell::new(BTreeMap::new()),
             loaded: RefCell::new(HashMap::new()),
+            resident: std::cell::Cell::new(0),
         })
     }
 
@@ -175,6 +181,7 @@ impl Checkpoint {
             stored: RefCell::new(BTreeMap::new()),
             residuals: RefCell::new(BTreeMap::new()),
             loaded: RefCell::new(HashMap::new()),
+            resident: std::cell::Cell::new(0),
         }
     }
 
@@ -213,7 +220,14 @@ impl Checkpoint {
     /// [`take`](Self::take) at `dtype`, as the modules hold it.
     fn take_as(&self, key: &str, dtype: DType) -> Result<Tensor> {
         let stored = self.take(key)?;
+        self.held_as(key, stored, dtype)
+    }
+
+    /// The tensor `key` (already [`take`](Self::take)n as `stored`) as a module holds it at
+    /// `dtype`.
+    fn held_as(&self, key: &str, stored: Tensor, dtype: DType) -> Result<Tensor> {
         let cast = to(&stored, dtype)?;
+        self.hold((cast.elem_count() * dtype.size_in_bytes()) as u64);
         if stored.dtype() != dtype {
             let bytes = cast.elem_count() * dtype.size_in_bytes();
             LOADER_CAST_BYTES.with(|c| c.set(c.get() + bytes));
@@ -239,6 +253,19 @@ impl Checkpoint {
                 .map(|(k, v)| (k.clone(), loaded.get(k).unwrap_or(v).clone()))
                 .collect(),
         }
+    }
+
+    /// Count `bytes` a module now holds.
+    fn hold(&self, bytes: u64) {
+        self.resident.set(self.resident.get() + bytes);
+    }
+
+    /// Bytes of every parameter the modules built from this checkpoint hold, as they hold them:
+    /// the dense tensors at their dtype and each packed projection at its GGML storage size,
+    /// summed from the tensors themselves as they were built (adapter residuals excluded — they
+    /// are an overlay).
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident.get()
     }
 
     /// Record the dtype `key` is held in by the module built from it.
@@ -328,10 +355,105 @@ pub fn safetensors_shapes(file: &Path) -> Result<BTreeMap<String, Vec<usize>>> {
         .collect()
 }
 
+/// The eligibility and padding granularity of a quantized backbone projection (sc-26266): the MLX
+/// twin's affine group size, so the two backends pack the same projections over the same padded
+/// widths. The GGML blocks this backend stores them in (32 wide, [`GgmlDType::Q4_0`] /
+/// [`GgmlDType::Q8_0`]) divide it, and cost the same 4.5 / 8.5 bits per weight as MLX's group-64
+/// affine scales and biases.
+pub const QUANT_GROUP_SIZE: usize = candle_gen::quant::MLX_GROUP_SIZE;
+
+/// The load-time quantization of one backbone build (sc-26266) — the Candle twin of
+/// `mlx_gen_iris::nn::BackboneQuant`: the tier, and what happens to a projection whose input width
+/// is not a multiple of [`QUANT_GROUP_SIZE`].
+///
+/// The release has exactly one such family — the SwiGLU down projections (`*.mlp.w2`,
+/// `[2560, 6826]`). Zero-padding their input to the next group multiple is exact
+/// (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like every other projection. A load that
+/// installs adapters keeps those projections dense instead, as the MLX twin does, so one adapted
+/// spec prices and holds the same bytes on both backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackboneQuant {
+    /// The tier ([`Quant::Q4`] or [`Quant::Q8`]).
+    pub quant: Quant,
+    /// Zero-pad an unaligned projection's input and quantize it (`true`), or keep it dense.
+    pub pad_unaligned: bool,
+}
+
+impl BackboneQuant {
+    /// The quantization a load with `quant` and (`adapted`) an adapter stack applies: `None` is
+    /// the dense tier. Only the q8 / q4 tiers exist on this route; NVFP4 is a typed refusal.
+    pub fn for_load(quant: Option<Quant>, adapted: bool) -> Result<Option<Self>> {
+        match quant {
+            None => Ok(None),
+            Some(quant @ (Quant::Q4 | Quant::Q8)) => Ok(Some(Self {
+                quant,
+                pad_unaligned: !adapted,
+            })),
+            Some(other) => Err(Error::Unsupported(format!(
+                "iris: LoadSpec::quantize {other:?} is not a tier of the Candle Iris-3B route; it \
+                 packs the q8 and q4 tiers"
+            ))),
+        }
+    }
+
+    /// The GGML block type the tier's projections are stored in.
+    pub fn ggml_dtype(self) -> GgmlDType {
+        match self.quant {
+            Quant::Q8 => GgmlDType::Q8_0,
+            _ => GgmlDType::Q4_0,
+        }
+    }
+}
+
+/// How one `[out, in]` projection is held under a [`BackboneQuant`] — the single rule
+/// [`Loader::linear`] applies and the memory contract prices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionLayout {
+    /// Stored in the compute dtype.
+    Dense,
+    /// GGML-packed as `dtype` over an input zero-padded to `padded_in` (`== in` when aligned).
+    Quantized { dtype: GgmlDType, padded_in: usize },
+}
+
+impl ProjectionLayout {
+    /// The layout of a projection with `in_features` inputs. A projection narrower than one group
+    /// (the release's 3-, 12- and 16-wide pixel and pooling heads, a few KB in all) stays dense.
+    pub fn of(in_features: usize, quant: Option<BackboneQuant>) -> Self {
+        let Some(quant) = quant else {
+            return Self::Dense;
+        };
+        if in_features < QUANT_GROUP_SIZE {
+            return Self::Dense;
+        }
+        let padded_in = in_features.div_ceil(QUANT_GROUP_SIZE) * QUANT_GROUP_SIZE;
+        if padded_in != in_features && !quant.pad_unaligned {
+            return Self::Dense;
+        }
+        Self::Quantized {
+            dtype: quant.ggml_dtype(),
+            padded_in,
+        }
+    }
+
+    /// Resident bytes of an `[out, in]` weight held this way, `dense_width` bytes per element when
+    /// dense: the GGML blocks of the (padded) rows when packed.
+    pub fn weight_bytes(self, out: u64, in_features: u64, dense_width: u64) -> u64 {
+        match self {
+            Self::Dense => out * in_features * dense_width,
+            Self::Quantized { dtype, padded_in } => {
+                out * (padded_in / dtype.block_size()) as u64 * dtype.type_size() as u64
+            }
+        }
+    }
+}
+
 /// Builds modules from a checkpoint at one compute dtype.
 pub struct Loader<'a> {
     pub weights: &'a Checkpoint,
     pub compute: DType,
+    /// The load-time quantization of every projection ([`ProjectionLayout::of`]); `None` is the
+    /// dense tier.
+    pub quant: Option<BackboneQuant>,
 }
 
 impl Loader<'_> {
@@ -342,15 +464,22 @@ impl Loader<'_> {
     }
 
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
-        self.weights
-            .record_stored(&format!("{prefix}.weight"), self.compute);
+        let weight_key = format!("{prefix}.weight");
+        let residuals = self.weights.take_residuals(prefix);
+        let stored = self.weights.take(&weight_key)?;
+        // An adapted load never pads ([`BackboneQuant::for_load`]), so an adapted projection is
+        // aligned or dense; its residuals stay forward-time terms over the packed base.
+        if let ProjectionLayout::Quantized { dtype, padded_in } =
+            ProjectionLayout::of(stored.dims().last().copied().unwrap_or(0), self.quant)
+        {
+            return self.quantized_linear(prefix, stored, bias, residuals, dtype, padded_in);
+        }
+        self.weights.record_stored(&weight_key, self.compute);
         if bias {
             self.weights
                 .record_stored(&format!("{prefix}.bias"), self.compute);
         }
-        let weight = self
-            .weights
-            .take_as(&format!("{prefix}.weight"), self.compute)?;
+        let weight = self.weights.held_as(&weight_key, stored, self.compute)?;
         let bias = if bias {
             Some(
                 self.weights
@@ -359,16 +488,60 @@ impl Loader<'_> {
         } else {
             None
         };
-        let residuals = self
-            .weights
-            .take_residuals(prefix)
+        Ok(Linear {
+            base: Base::Dense { weight, bias },
+            residuals: self.prepare(residuals)?,
+        })
+    }
+
+    fn prepare(&self, residuals: Vec<Residual>) -> Result<Vec<Residual>> {
+        residuals
             .into_iter()
             .map(|r| r.prepare(self.compute, &self.weights.device))
-            .collect::<Result<Vec<_>>>()?;
+            .collect()
+    }
+
+    /// A projection packed at load (sc-26266): the checkpoint's weight, zero-padded to
+    /// `padded_in` columns, is quantized on the host to `dtype` straight from its stored (f32)
+    /// values and placed on the checkpoint's device — the compute-dtype copy is never built. The
+    /// bias stays in the compute dtype.
+    fn quantized_linear(
+        &self,
+        prefix: &str,
+        weight: Tensor,
+        bias: bool,
+        residuals: Vec<Residual>,
+        dtype: GgmlDType,
+        padded_in: usize,
+    ) -> Result<Linear> {
+        let (out, in_features) = weight.dims2()?;
+        let mut host = weight.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        drop(weight);
+        if padded_in > in_features {
+            host = host.pad_with_zeros(1, 0, padded_in - in_features)?;
+        }
+        // Candle's quantizer reads the source's backing storage from its start, so hand it owned,
+        // zero-offset storage.
+        let host = host.force_contiguous()?;
+        let packed = QTensor::quantize_onto(&host, dtype, &self.weights.device)?;
+        drop(host);
+        self.weights.hold(packed.storage_size_in_bytes() as u64);
+        let bias = if bias {
+            let key = format!("{prefix}.bias");
+            self.weights.record_stored(&key, self.compute);
+            Some(self.weights.take_as(&key, self.compute)?)
+        } else {
+            None
+        };
         Ok(Linear {
-            weight,
-            bias,
-            residuals,
+            base: Base::Quantized {
+                weight: QLinear::from_qtensor_dequant(std::sync::Arc::new(packed), bias),
+                compute: self.compute,
+                out,
+                in_features,
+                padded_in,
+            },
+            residuals: self.prepare(residuals)?,
         })
     }
 
@@ -474,29 +647,64 @@ impl Residual {
 
 /// `nn.Linear` (`[out, in]` weight) plus any forward-time adapter residuals.
 pub struct Linear {
-    weight: Tensor,
-    bias: Option<Tensor>,
+    base: Base,
     residuals: Vec<Residual>,
+}
+
+/// The base projection of a [`Linear`].
+enum Base {
+    /// `[out, in]` weight and optional `[out]` bias in the compute dtype.
+    Dense {
+        weight: Tensor,
+        bias: Option<Tensor>,
+    },
+    /// A GGML-packed weight (sc-26266), dequantized to the GEMM dtype per forward and multiplied
+    /// densely — the activation is never quantized (the shared `DequantDense` forward, sc-7702).
+    /// Its rows may be zero-padded past `in_features` ([`ProjectionLayout::Quantized`]).
+    Quantized {
+        weight: QLinear,
+        compute: DType,
+        out: usize,
+        in_features: usize,
+        padded_in: usize,
+    },
 }
 
 impl Linear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = self.weight.dtype();
+        let dtype = self.compute_dtype();
         let x = to(x, dtype)?;
         let dims = x.dims().to_vec();
         let (last, lead) = dims
             .split_last()
             .expect("linear input has at least one axis");
         let rows: usize = lead.iter().product();
-        let out_dim = self.weight.dim(0)?;
+        let (out_dim, _) = self.logical_shape()?;
         let flat = x.reshape((rows, *last))?;
         // Candle's CPU backend has no half-precision GEMM; there the bf16 policy is run as what a
         // bf16 GEMM is — bf16 operands, f32 accumulation, one rounding of the result.
-        let gemm = gemm_dtype(&self.weight);
-        let mut y = to(&flat, gemm)?.matmul(&to(&self.weight, gemm)?.t()?)?;
-        if let Some(b) = &self.bias {
-            y = y.broadcast_add(&to(b, gemm)?)?;
-        }
+        let gemm = kernel_dtype(x.device(), dtype);
+        let y = match &self.base {
+            Base::Dense { weight, bias } => {
+                let mut y = to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?)?;
+                if let Some(b) = bias {
+                    y = y.broadcast_add(&to(b, gemm)?)?;
+                }
+                y
+            }
+            Base::Quantized {
+                weight,
+                in_features,
+                padded_in,
+                ..
+            } => {
+                let mut input = to(&flat, gemm)?;
+                if padded_in > in_features {
+                    input = input.pad_with_zeros(1, 0, padded_in - in_features)?;
+                }
+                weight.forward(&input)?
+            }
+        };
         let mut y = to(&y, dtype)?;
         for r in &self.residuals {
             y = y.add(&to(&r.forward(&flat)?, dtype)?)?;
@@ -506,16 +714,45 @@ impl Linear {
         Ok(y.reshape(shape)?)
     }
 
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
+    /// The dtype the projection returns (its compute dtype).
+    fn compute_dtype(&self) -> DType {
+        match &self.base {
+            Base::Dense { weight, .. } => weight.dtype(),
+            Base::Quantized { compute, .. } => *compute,
+        }
+    }
+
+    /// The checkpoint's `[out, in]`, whatever the projection is held as.
+    pub fn logical_shape(&self) -> Result<(usize, usize)> {
+        match &self.base {
+            Base::Dense { weight, .. } => Ok(weight.dims2()?),
+            Base::Quantized {
+                out, in_features, ..
+            } => Ok((*out, *in_features)),
+        }
+    }
+
+    /// The dense `[out, in]` weight, or `None` for a packed projection.
+    pub fn dense_weight(&self) -> Option<&Tensor> {
+        match &self.base {
+            Base::Dense { weight, .. } => Some(weight),
+            Base::Quantized { .. } => None,
+        }
+    }
+
+    /// The GGML block type of a packed projection (`None` when dense).
+    pub fn quant_dtype(&self) -> Option<GgmlDType> {
+        match &self.base {
+            Base::Dense { .. } => None,
+            Base::Quantized { weight, .. } => weight.quant_dtype(),
+        }
     }
 
     /// A linear layer from an already-shaped `[out, in]` weight (and optional `[out]` bias), stored
     /// as given — e.g. the depth task's 1×1-conv reducer, whose `[1, C, 1, 1]` kernel is reshaped.
     pub fn from_parts(weight: Tensor, bias: Option<Tensor>) -> Self {
         Self {
-            weight,
-            bias,
+            base: Base::Dense { weight, bias },
             residuals: Vec::new(),
         }
     }
@@ -873,6 +1110,17 @@ pub fn key_padding_mask(mask: &[Vec<i32>], tokens: usize, device: &Device) -> Re
 }
 
 /// Shape check with a named error (checkpoint/config disagreement surfaces at load, by key).
+/// [`expect_shape`] over an `[out, in]` already in hand (a projection's
+/// [`Linear::logical_shape`]).
+pub fn expect_dims(name: &str, have: (usize, usize), want: (usize, usize)) -> Result<()> {
+    if have != want {
+        return Err(Error::Msg(format!(
+            "iris: {name} has shape {have:?}, the config implies {want:?}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
     if a.dims() != want {
         return Err(Error::Msg(format!(

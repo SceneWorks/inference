@@ -30,6 +30,9 @@ pub struct QuantSpec {
     /// Source group size when the checkpoint stores an MLX affine packed triple.
     /// Dense load-time quantization ignores this value.
     group_size: usize,
+    /// Dense load-time quantization serves the weight by dequantizing it per forward
+    /// ([`QuantSpec::with_dequantized_forward`]) instead of through `QMatMul`.
+    dequantized_forward: bool,
 }
 
 impl QuantSpec {
@@ -38,6 +41,7 @@ impl QuantSpec {
         Self {
             dtype: GgmlDType::Q4K,
             group_size: 64,
+            dequantized_forward: false,
         }
     }
 
@@ -46,7 +50,27 @@ impl QuantSpec {
         Self {
             dtype: GgmlDType::Q8_0,
             group_size: 64,
+            dequantized_forward: false,
         }
+    }
+
+    /// The same blocks, but a dense weight quantized on load is served **weight-only**: the
+    /// resident GGML tensor is dequantized to the activation dtype per forward and multiplied
+    /// densely, so the activation is never quantized. The default (`QMatMul`) path quantizes the
+    /// activation to per-32-element `q8_1` on CUDA, where a single outlier channel sets a block's
+    /// scale and flushes its neighbours — harmless for next-token logits, but a conditioning
+    /// encoder whose hidden states ARE the output (Iris-3B's Qwen3-VL tower, sc-26266) needs them
+    /// intact; the same reason the media providers' packed tiers dequantize (sc-7702). The
+    /// resident bytes are identical; only the per-forward dequant is added.
+    pub fn with_dequantized_forward(mut self) -> Self {
+        self.dequantized_forward = true;
+        self
+    }
+
+    /// Whether a dense weight quantized under this spec is served weight-only
+    /// ([`Self::with_dequantized_forward`]).
+    pub fn dequantizes_forward(&self) -> bool {
+        self.dequantized_forward
     }
 
     /// Map a persisted `quantization.bits` value to a spec: `4 → Q4_K`, `8 → Q8_0`. Any other width
@@ -64,10 +88,12 @@ impl QuantSpec {
             4 => Some(Self {
                 dtype: GgmlDType::Q4K,
                 group_size,
+                dequantized_forward: false,
             }),
             8 => Some(Self {
                 dtype: GgmlDType::Q8_0,
                 group_size,
+                dequantized_forward: false,
             }),
             _ => None,
         }
@@ -389,11 +415,12 @@ impl Projection {
             None => Ok(Projection::Dense(Linear::new(weight, bias))),
             Some(q) => {
                 let in_dim = weight.dims().last().copied().unwrap_or(0);
-                Ok(Projection::Quantized(QuantizedLinear::quantize(
-                    &weight,
-                    q.dtype_for_in_dim(in_dim),
-                    bias,
-                )?))
+                let dtype = q.dtype_for_in_dim(in_dim);
+                Ok(Projection::Quantized(if q.dequantizes_forward() {
+                    QuantizedLinear::quantize_dequantized(&weight, dtype, bias)?
+                } else {
+                    QuantizedLinear::quantize(&weight, dtype, bias)?
+                }))
             }
         }
     }

@@ -188,6 +188,28 @@ impl QuantizedLinear {
         })
     }
 
+    /// [`Self::quantize`], but served weight-only: the resident GGML tensor is dequantized to the
+    /// activation dtype per forward and multiplied densely, so the activation is never quantized
+    /// ([`QuantSpec::with_dequantized_forward`](crate::primitives::projection::QuantSpec::with_dequantized_forward)).
+    /// The blocks are those [`Self::quantize`] writes, quantized on the CPU and placed on
+    /// `weight`'s device.
+    pub fn quantize_dequantized(
+        weight: &Tensor,
+        dtype: GgmlDType,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        let source = weight.to_device(&Device::Cpu)?;
+        let source = match source.dtype() {
+            DType::F32 => source.force_contiguous()?,
+            _ => source.to_dtype(DType::F32)?,
+        };
+        let qt = QTensor::quantize_onto(&source, dtype, weight.device())?;
+        Ok(Self {
+            inner: QuantizedWeight::Dequant(std::sync::Arc::new(qt)),
+            bias,
+        })
+    }
+
     /// Convert an MLX affine Q8 triple (`U32` byte-packed codes plus per-group scale/bias) into the
     /// resident Q8_0 tensor used by this primitive. This matches the established Candle packed-tier
     /// policy: reconstruct the source affine grid exactly, then perform the accepted Q8_0 re-pack.
@@ -381,6 +403,46 @@ mod tests {
             .unwrap();
         for (a, b) in dense.iter().zip(&quant) {
             assert!((a - b).abs() < 0.05, "{a} vs {b}");
+        }
+    }
+
+    /// sc-26266: a weight-only projection holds the same GGML blocks as the `QMatMul` one (same
+    /// resident bytes) but multiplies the activation densely against the dequantized weight — so
+    /// its forward is exactly `x · deq(W)ᵀ`, even beside a 1e4 outlier channel, where the
+    /// activation-quantizing path visibly is not.
+    ///
+    /// *Mutation that reds this:* `quantize_dequantized` building a `QuantizedWeight::Matmul`.
+    #[test]
+    fn a_dequantized_forward_projection_never_quantizes_the_activation() {
+        let (out, inn) = (8usize, 64usize);
+        let wdata: Vec<f32> = (0..out * inn)
+            .map(|i| ((i * 7 % 13) as f32 / 13.0) - 0.5)
+            .collect();
+        let w = Tensor::from_vec(wdata, (out, inn), &Device::Cpu).unwrap();
+        let mut xdata: Vec<f32> = (0..2 * inn)
+            .map(|i| ((i * 5 % 11) as f32 / 11.0) - 0.5)
+            .collect();
+        xdata[3] = 1.0e4;
+        let x = Tensor::from_vec(xdata, (2, inn), &Device::Cpu).unwrap();
+        let rows = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for dtype in [GgmlDType::Q8_0, GgmlDType::Q4_0] {
+            let weight_only = QuantizedLinear::quantize_dequantized(&w, dtype, None).unwrap();
+            let matmul = QuantizedLinear::quantize(&w, dtype, None).unwrap();
+            assert_eq!(weight_only.resident_bytes(), matmul.resident_bytes());
+            assert_eq!(weight_only.ggml_dtype(), Some(dtype));
+            let deq = QTensor::quantize(&w, dtype)
+                .unwrap()
+                .dequantize(&Device::Cpu)
+                .unwrap();
+            let exact = rows(linear(&x, &deq, None).unwrap());
+            assert_eq!(rows(weight_only.forward(&x).unwrap()), exact, "{dtype:?}");
+            let fast = rows(matmul.forward(&x).unwrap());
+            let drift = exact
+                .iter()
+                .zip(&fast)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(drift > 0.0, "{dtype:?}: the QMatMul path matched exactly");
         }
     }
 
