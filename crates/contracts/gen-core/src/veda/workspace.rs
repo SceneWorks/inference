@@ -26,13 +26,16 @@ impl Default for Limits {
     }
 }
 impl Limits {
-    /// Allowances a backend's runtime batches heads under. CUDA scores, selects and launches a
-    /// whole head batch at once (one score readback and one kernel launch per batch), so its copy
-    /// allowance admits several heads: 4 GiB for a batch's gather/scorer copies plus its kernel
-    /// scratch. MLX keeps the default.
+    /// Allowances a backend's runtime batches heads under; one score readback per batch. CUDA: 4
+    /// GiB for a batch's gather/scorer copies plus its kernel scratch. MLX (sc-26214): 4 GiB for a
+    /// batch's scorer state; its attention is one layer-sized launch per tile shape reading Q/K/V
+    /// in place, charged per layer rather than batched under an allowance.
     pub fn for_backend(backend: Backend) -> Self {
         match backend {
-            Backend::Mlx => Self::default(),
+            Backend::Mlx => Self {
+                copies: 4 << 30,
+                ..Self::default()
+            },
             Backend::Cuda => Self {
                 copies: 4 << 30,
                 ..Self::default()
@@ -155,6 +158,28 @@ fn global_row_cost(l: LayoutSize, h: usize, d: usize, element: usize) -> Result<
             + 2 * l.slots as u128,
     )
 }
+/// MLX per-head scorer state of one batch: pooled Q/K features, projected features, device
+/// logits and their host copy, and the key-tile lists/counts on host and device.
+fn mlx_scorer_cost(l: LayoutSize, d: usize, k: usize) -> Result<u64> {
+    let (v, d, k) = (l.video as u128, d as u128, k as u128);
+    bytes(32 * v * d + 8 * v * v + 8 * v * k + 16 * v)
+}
+/// MLX per-head attention bytes of one layer. The Metal route sizes its attention buffers by
+/// the layer's total heads (never by a shape's per-layer head count, which would leave MLX's
+/// buffer cache a distinct size to hold for every layer), so `bound` charges this times every
+/// head, once per tile shape: the kernel's tiled video output, the global query rows with their
+/// output and join, the native-order result and its head-masked merge, and the key-tile lists.
+/// Q/K/V are read in place, so nothing else scales with the selected keys.
+fn mlx_attention_cost(l: LayoutSize, d: usize, element: usize, k: usize) -> Result<u64> {
+    let (video, globals) = (
+        (l.video * TILE) as u128,
+        l.slots.saturating_sub(l.video * TILE) as u128,
+    );
+    bytes(
+        element as u128 * d as u128 * (2 * video + 3 * globals + 2 * l.seq as u128)
+            + 4 * l.video as u128 * (k as u128 + 1),
+    )
+}
 /// The smallest batch is always priced even when it exceeds an allowance. Refusal is an outcome,
 /// not an excuse to charge zero bytes; callers check it BEFORE gather/pooling allocation.
 pub fn chunk(
@@ -176,30 +201,37 @@ pub fn chunk(
     {
         return Err(bad("invalid layout/dtype"));
     }
-    let copy = copy_cost(l, dim, element)?;
-    // A CUDA batch's kernel scratch grows with its heads too, so the copy allowance sizes the
-    // batch over both; the scratch itself is charged once, in `bound`'s `kernel_scratch_bytes`.
-    let per_head = copy
-        .checked_add(if backend == Backend::Cuda {
-            cuda_kernel_scratch(l, dim)?
-        } else {
-            0
-        })
-        .ok_or_else(|| bad("size overflow"))?;
-    // Both backends batch up to the whole same-shape head group within the copy allowance.
-    let mut h = (limits.copies / per_head.max(1)).min(group as u64).max(1) as usize;
     let k = keys(request.reference, l.ref_tokens, l.reference)
         + keys(request.generated, l.target_tokens, l.video - l.reference)
         + l.slots / TILE
         - l.video;
     if backend == Backend::Mlx {
-        let minimum = sparse_row_cost(l, 1, k, dim, element)?.max(if l.slots / TILE > l.video {
-            global_row_cost(l, 1, dim, element)?
-        } else {
-            0
+        let scorer = mlx_scorer_cost(l, dim, k)?;
+        let attention = mlx_attention_cost(l, dim, element, k)?;
+        // Only the scorer is batched (and padded to this batch, so its sizes repeat per layer);
+        // attention is one layer-sized launch per shape, charged in `bound` for every head.
+        let h = (limits.copies / scorer.max(1)).min(group as u64).max(1) as usize;
+        let refusal = (scorer > limits.copies)
+            .then(|| "minimum tile/scorer head exceeds copy allowance".into());
+        return Ok(Chunk {
+            heads: h,
+            query_tiles: l.video,
+            global_tiles: l.slots / TILE - l.video,
+            selected_keys: k,
+            copies_bytes: scorer.saturating_mul(h as u64),
+            attention_bytes: attention.saturating_mul(h as u64),
+            minimum_copies_bytes: scorer,
+            minimum_attention_bytes: attention,
+            refusal,
         });
-        h = h.min((limits.attention / minimum.max(1)).max(1) as usize);
     }
+    let copy = copy_cost(l, dim, element)?;
+    // A CUDA batch's kernel scratch grows with its heads too, so the copy allowance sizes the
+    // batch over both; the scratch itself is charged once, in `bound`'s `kernel_scratch_bytes`.
+    let per_head = copy
+        .checked_add(cuda_kernel_scratch(l, dim)?)
+        .ok_or_else(|| bad("size overflow"))?;
+    let h = (limits.copies / per_head.max(1)).min(group as u64).max(1) as usize;
     let row = sparse_row_cost(l, h, k, dim, element)?;
     let global = global_row_cost(l, h, dim, element)?;
     let qr = (limits.attention / row.max(1)).min(l.video as u64).max(1) as usize;
@@ -209,32 +241,18 @@ pub fn chunk(
     } else {
         (limits.attention / global.max(1)).min(ng as u64).max(1) as usize
     };
-    let min_attention = if backend == Backend::Mlx {
-        row.max(if ng > 0 { global } else { 0 })
-    } else {
-        0
-    };
-    let refusal = if per_head > limits.copies {
-        Some("minimum tile/scorer head exceeds copy allowance".into())
-    } else if min_attention > limits.attention {
-        Some("minimum query/global batch exceeds attention allowance".into())
-    } else {
-        None
-    };
+    // CUDA's kernel launch has no attention allowance; its scratch is charged in `bound`.
+    let refusal = (per_head > limits.copies)
+        .then(|| "minimum tile/scorer head exceeds copy allowance".into());
     Ok(Chunk {
         heads: h,
         query_tiles: qr,
         global_tiles: gr,
         selected_keys: k,
         copies_bytes: copy.saturating_mul(h as u64),
-        attention_bytes: if backend == Backend::Mlx {
-            row.saturating_mul(qr as u64)
-                .max(global.saturating_mul(gr as u64))
-        } else {
-            0
-        },
+        attention_bytes: 0,
         minimum_copies_bytes: copy,
-        minimum_attention_bytes: min_attention,
+        minimum_attention_bytes: 0,
         refusal,
     })
 }
@@ -296,12 +314,23 @@ pub fn bound(
         layout_bytes = layout_bytes
             .checked_add(bytes(8 * s + 16 * n + 4 * seq as u128 + 256)?)
             .ok_or_else(|| bad("size overflow"))?;
-        gather = gather.max(c.attention_bytes);
+        gather = if backend == Backend::Mlx {
+            // Every shape's layer-sized output may be live before its eval.
+            gather
+                .checked_add(c.minimum_attention_bytes.saturating_mul(heads as u64))
+                .ok_or_else(|| bad("size overflow"))?
+        } else {
+            gather.max(c.attention_bytes)
+        };
         // selected rows Vec + indices, per-column topk candidates, scores owned host/device.
         selector = selector.max(bytes(
             16 * h * n * n + 48 * h * n + 24 * n + 8 * h * (l.video as u128).pow(2),
         )?);
-        device = device.max(bytes(24 * h * d * d)?);
+        // CUDA decodes a batch's FP32 projections per call; MLX keeps every layer's BF16 Q/K
+        // projections device-resident, charged once below.
+        if backend == Backend::Cuda {
+            device = device.max(bytes(24 * h * d * d)?);
+        }
         // CUDA kernel scratch for every head of one batched launch, charged only here.
         if backend == Backend::Cuda {
             scratch = scratch.max(bytes(h * cuda_kernel_scratch(l, dim)? as u128 + 64)?);
@@ -317,13 +346,27 @@ pub fn bound(
         .checked_add(bytes(construction)?)
         .ok_or_else(|| bad("size overflow"))?;
     let predictor_host = bytes(12 * layers as u128 * heads as u128 * (dim as u128).pow(2))?;
+    if backend == Backend::Mlx {
+        // Resident BF16 Q/K projections of every layer, plus one layer's first-call upload
+        // transients (host FP32 vector and device FP32 array, for Q and for K).
+        device = predictor_host
+            .checked_add(bytes(48 * heads as u128 * (dim as u128).pow(2))?)
+            .ok_or_else(|| bad("size overflow"))?;
+    }
     let plans = 32 * FROZEN_PLANS.len() as u64;
     let load = 275_415_649 + plans + bytes(24 * heads as u128 * (dim as u128).pow(2))?;
     let position = bytes(6 * 24 * seq as u128)?; // packed layout/model clones, including Vec growth capacity
     let outputs =
         bytes(12 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128)?;
-    let inputs =
-        bytes(3 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128)?;
+    // MLX narrows FP32 Q/K/V to BF16 once per layer for its 16-bit NAX products.
+    let narrowed = if backend == Backend::Mlx && element == 4 {
+        3 * 2 * batch as u128 * heads as u128 * seq as u128 * dim as u128
+    } else {
+        0
+    };
+    let inputs = bytes(
+        3 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128 + narrowed,
+    )?;
     let self_test = match backend {
         Backend::Cuda => bytes(64 * 512 * dim as u128 + 12 * 512 * 512 + 64 * 512)?,
         Backend::Mlx => bytes(128 * 1024 * dim as u128 + 32 * 2 * 1024 * 1024 + 256 * 1024)?,
@@ -342,8 +385,10 @@ pub fn bound(
             bytes(16 * row * rows + outputs as u128 + inputs as u128)?
         }
     };
+    // MLX's Metal route builds no tile-order copy of Q/K/V: its kernels read them in place.
     let tile_bytes = layouts
         .iter()
+        .filter(|_| backend == Backend::Cuda)
         .map(|(shape, l)| {
             12 * l.slots as u128 * dim as u128 * element as u128 * chunks[shape].heads as u128
         })
@@ -353,6 +398,9 @@ pub fn bound(
     let scorer_bytes = layouts
         .iter()
         .map(|(shape, l)| {
+            if backend == Backend::Mlx {
+                return chunks[shape].copies_bytes;
+            }
             chunks[shape].copies_bytes.saturating_sub(
                 (12 * l.slots as u128 * dim as u128 * element as u128 * chunks[shape].heads as u128)
                     as u64,
@@ -756,12 +804,13 @@ mod tests {
         for backend in [Backend::Mlx, Backend::Cuda] {
             let b = for_request(&req(), backend).unwrap().unwrap();
             assert!(b.predictor_host_bytes > 500_000_000);
+            // MLX's Metal route builds no tile-order Q/K/V copy (sc-26214).
+            assert_eq!(b.tile_order_bytes == 0, backend == Backend::Mlx);
             for cost in [
                 b.predictor_device_bytes,
                 b.predictor_load_bytes,
                 b.layout_host_bytes,
                 b.position_rows_bytes,
-                b.tile_order_bytes,
                 b.scorer_bytes,
                 b.selector_bytes,
                 b.retained_output_bytes,
@@ -836,7 +885,8 @@ mod tests {
             assert!(c.refusal.is_none());
         }
         for c in mlx.chunks.values() {
-            assert!(c.copies_bytes <= Limits::default().copies.max(c.minimum_copies_bytes));
+            let limits = Limits::for_backend(Backend::Mlx);
+            assert!(c.copies_bytes <= limits.copies.max(c.minimum_copies_bytes));
         }
         // The batched launch's conversion/quant scratch is priced for every head of the batch.
         let r = req();
@@ -860,12 +910,12 @@ mod tests {
         assert!(cuda.kernel_scratch_bytes > 10 * single.kernel_scratch_bytes);
         assert!(cuda.kernel_scratch_bytes <= heads * single.kernel_scratch_bytes);
         // Charged once: the kernel scratch sizes the batch but is not also inside the copies
-        // (scorer) bytes, which are the backend-neutral per-head copy cost times the batch.
+        // (scorer) bytes, which are the per-head gather/scorer copy cost times the batch.
         let mut scratch = 0;
         for (shape, c) in &cuda.chunks {
             assert_eq!(
                 c.minimum_copies_bytes,
-                mlx.chunks[shape].minimum_copies_bytes
+                copy_cost(layouts[shape], 128, 2).unwrap()
             );
             assert_eq!(c.copies_bytes, c.heads as u64 * c.minimum_copies_bytes);
             let kernel = cuda_kernel_scratch(layouts[shape], 128).unwrap();
@@ -876,6 +926,57 @@ mod tests {
             scratch = scratch.max(c.heads as u64 * kernel + 64);
         }
         assert_eq!(cuda.kernel_scratch_bytes, scratch);
+    }
+    /// sc-26214: the MLX route batches most of a layer's same-shape heads per scorer readback, keeps
+    /// every layer's BF16 Q/K projections device-resident, prices its attention per layer for all
+    /// heads, and its attention bytes grow with the selected keys only by their key-tile lists.
+    #[test]
+    fn mlx_batches_heads_with_resident_projections_and_in_place_keys() {
+        let mlx = for_request(&req(), Backend::Mlx).unwrap().unwrap();
+        for c in mlx.chunks.values() {
+            assert!(c.heads >= 16, "MLX batches {} heads", c.heads);
+            assert!(c.refusal.is_none());
+            assert_eq!(c.copies_bytes, c.heads as u64 * c.minimum_copies_bytes);
+            assert_eq!(
+                c.attention_bytes,
+                c.heads as u64 * c.minimum_attention_bytes
+            );
+        }
+        assert_eq!(
+            mlx.predictor_device_bytes,
+            mlx.predictor_host_bytes + 48 * 56 * 128 * 128
+        );
+        assert_eq!(mlx.predictor_host_bytes, 12 * 50 * 56 * 128 * 128);
+        let mut dense = req();
+        dense.veda = Some(VedaRequest {
+            enabled: true,
+            generated: VedaBudget::SparsityPercent(0.),
+            reference: VedaBudget::SparsityPercent(0.),
+            ..Default::default()
+        });
+        let db = for_request(&dense, Backend::Mlx).unwrap().unwrap();
+        for (shape, c) in &db.chunks {
+            let sparse = &mlx.chunks[shape];
+            assert!(c.selected_keys > sparse.selected_keys);
+            // Only the key-tile lists grow with the selected keys; K/V are read in place.
+            assert_eq!(
+                c.minimum_attention_bytes - sparse.minimum_attention_bytes,
+                4 * sparse_layout_video(&db, shape)
+                    * (c.selected_keys - sparse.selected_keys) as u64
+            );
+            assert!(c.minimum_copies_bytes > sparse.minimum_copies_bytes);
+        }
+        // Attention is charged per layer for every head, once per shape.
+        assert_eq!(
+            mlx.gather_bytes,
+            mlx.chunks
+                .values()
+                .map(|c| 56 * c.minimum_attention_bytes)
+                .sum::<u64>()
+        );
+    }
+    fn sparse_layout_video(b: &WorkspaceBound, shape: &TileShape) -> u64 {
+        b.chunks[shape].query_tiles as u64
     }
     #[test]
     fn tiny_limits_price_minimum_batch_and_refuse_before_gather() {

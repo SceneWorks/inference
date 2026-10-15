@@ -35,9 +35,10 @@ peak because initialization, scoring, self-test and fallback do not all overlap)
 - Head-order and padded QKV gathers, masked tile copies, pool casts and mean/max/min
   operands, residual/projected features, host/device logits, downloaded scorer
   values, selector candidates and retained row/index vectors.
-- Gathered K/V, query and output chunks, host/device indices and masks, conservative
-  query/key score scratch, retained tile/head/batch outputs and final concatenate
-  and inverse-permutation outputs. Caller QKV is explicitly included.
+- CUDA: gathered K/V, query and output chunks, host/device indices and masks, conservative
+  query/key score scratch. MLX: the kernel's tiled output, global query/K/V/output
+  copies, key-tile lists and counts. Both: retained tile/head/batch outputs and final
+  concatenate and inverse-permutation outputs. Caller QKV is explicitly included.
 - CUDA FP32 conversion/contiguous copies, INT8 Q/K, scales, output, and expanded
   64-key CSR masks on host/device, plus each backend's fixed first-use self-test
   with retained masked reference/oracle outputs and numerical comparison buffers.
@@ -45,13 +46,23 @@ peak because initialization, scoring, self-test and fallback do not all overlap)
   streaming SDPA; Candle uses its production 1e9 score-element query budget, with
   the minimum one-query batch explicitly priced when that exceeds the budget.
 
-The 512 MiB copy/scorer and 512 MiB attention limits are allocation *allowances*,
-not whole-layer estimates. A minimum head or query/global row exceeding either
-allowance is still charged and reports refusal before tile/gather allocation.
-The MLX planner combines same-shape heads and independent sparse query tiles,
-reducing head/query batching as necessary. Globals are separate dense query
-chunks. Each pooled operand and bounded output is evaluated before constructing the next group so
-lazy graphs cannot retain all intermediate gathers concurrently.
+The copy/scorer and attention limits are allocation *allowances*, not whole-layer
+estimates. A minimum head exceeding either allowance is still charged and reports
+refusal before any scorer or attention allocation. CUDA batches heads under a 4 GiB
+copy allowance (512 MiB attention). MLX (sc-26214) batches same-shape heads under a
+4 GiB scorer allowance and a 4 GiB attention allowance: its Metal route scores the
+whole batch with one readback (pooled/projected features, device logits and their
+host copy, key-tile lists), runs one block-sparse kernel launch over every video
+query tile reading Q/K/V in place through the tile permutation, and one dense call
+over the batch's global query rows (with their head-selected K/V and output), then
+assembles the native-order output. No tile-order or gathered Q/K/V copy exists on
+the MLX Metal route, so none is charged; sparse execution refuses a non-Metal MLX
+device (the CPU gather route is a test-only reference). Every layer's BF16 Q/K
+projections are device-resident and charged once with one layer's FP32 upload
+transients (`predictor_device_bytes`); FP32 Q/K/V are narrowed to BF16 once per layer
+for the 16-bit NAX products, charged in `input_qkv_bytes`. Each batch's output is evaluated before the
+next batch's scorer graph, so lazy graphs cannot retain all batches concurrently.
+Globals stay separate from sparse video batches.
 
 Native H3 memory-strategy methods expose the explicit contract. SceneWorks adds
 it to the conservative dense baseline at both Candle pre-load and common queued

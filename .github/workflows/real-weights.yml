@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -321,6 +321,21 @@ on:
         type: string
         required: false
         default: ""
+      # sc-26214 -- `veda-mlx` only. `device` runs the lib binary's `veda::device_gate::` checks
+      # (exact sparse mask on Metal + per-layer bench), `ab` the dense-vs-sparse renders, `all` both.
+      veda_mlx_phase:
+        description: "veda-mlx only: device (on-device exact-mask gate + bench), ab (dense-vs-sparse renders), or all"
+        type: choice
+        required: false
+        default: device
+        options: [device, ab, all]
+      # Untrusted: reaches the job only as an environment variable, validated (digits/commas, 1-3)
+      # before the build. Cells 2 and 3 condition on cell 1's dense render, so they need cell 1.
+      veda_mlx_cells:
+        description: "veda-mlx ab/all only: comma-separated A/B cells, 1 = t2va turbo-8, 2 = fl2va turbo-4 768p, 3 = r2va ref2v turbo-4"
+        type: string
+        required: false
+        default: "1,2,3"
 
 permissions:
   contents: read
@@ -5821,6 +5836,74 @@ jobs:
         with:
           name: iris-memory-probe-mlx-evidence
           path: ${{ runner.temp }}/iris-memory-probe-mlx-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-26214 — the MLX Veda sparse-attention speed pass and its on-device exact-mask check.
+  # DISPATCH-ONLY (`veda-mlx` profile; never `all`, never the schedule). nax-macos-2 only: `rw-chroma`
+  # is registered on both Macs, so the first step FAILS on any other runner (or < 128 GB), before any
+  # build or GPU work. `veda_mlx_phase=device` runs every `#[ignore]`d `veda::device_gate::` test in
+  # `mlx-gen-minimax-h3`'s lib unit-test binary (Metal sparse kernel vs the exact dense mask, plus the
+  # per-layer bench's `VEDA_BENCH` lines -> bench.jsonl) against the pinned Veda predictor; a filter
+  # that matches nothing is red. `ab` renders the dev-Mac A/B cells c1-c3 (`veda_mlx_cells`) at q4
+  # 1344x768x124 through `tests/veda_ab.rs`, Veda off then on, one process per render under the
+  # external phys_footprint guard (cap 110 GB, 90 min wall), and records step-time speedup, peaks and
+  # the sparse outcome per cell. REPORT-ONLY: no speed threshold gates the job; it is red only for a
+  # failed / guard-stopped render or a cell without both result.json files. Run-scoped
+  # CARGO_TARGET_DIR, release profile unstripped (rust-lang/rust#157750).
+  mlx-veda:
+    name: MLX Veda sparse attention device gate and A/B
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'veda-mlx'
+    runs-on: [self-hosted, macOS, ARM64, rw-chroma]
+    # `all` = six renders of ~15-35 min each (c1 turbo-8, c2/c3 turbo-4, dense and sparse) plus the
+    # device gate, two release builds and a cold ~65 GB fetch (q4 tier ~52 GB, upstream slice ~11 GB,
+    # predictor, LoRAs) on a box that holds none of it yet. `device` alone is minutes.
+    timeout-minutes: 420
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      SCENEWORKS_MLX_MINIMAX_H3_BASE_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--MiniMaxAI--MiniMax-H3/snapshots/939557dc319dd91227e30195a763f272ba7f8765
+      SCENEWORKS_MLX_MINIMAX_H3_TIER_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--SceneWorks--minimax-h3-mlx/snapshots/137ce668c55a20bc0935fd1cf2a3de8448abb7f4
+      VEDA_AB_PREDICTOR_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--Veda-Sparse--Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/snapshots/9a1fd3a41b4a754a7886e64e82edbddf599fd1bd
+      VEDA_AB_TURBO_SNAPSHOT: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--lightx2v--Minimax-h3-Turbo/snapshots/5d1d4829fe614c1b93fcfd9cc7718e9ba71f73e1
+      VEDA_MLX_PHASE: ${{ inputs.veda_mlx_phase }}
+      VEDA_MLX_CELLS: ${{ inputs.veda_mlx_cells }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check the host (nax-macos-2, >= 128 GB) and the dispatch inputs
+        run: source scripts/ci/real-weights/mlx-veda/check-the-host.sh
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT SCENEWORKS_MLX_MINIMAX_H3_BASE_DIR SCENEWORKS_MLX_MINIMAX_H3_TIER_DIR
+          VEDA_AB_PREDICTOR_SNAPSHOT VEDA_AB_TURBO_SNAPSHOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT SCENEWORKS_MLX_MINIMAX_H3_BASE_DIR SCENEWORKS_MLX_MINIMAX_H3_TIER_DIR
+          VEDA_AB_PREDICTOR_SNAPSHOT VEDA_AB_TURBO_SNAPSHOT
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+      - name: Build the MiniMax-H3 MLX test binaries
+        run: source scripts/ci/real-weights/mlx-veda/build-the-test-binaries.sh
+      - name: Materialize and verify immutable snapshots
+        run: source scripts/ci/real-weights/mlx-veda/materialize-and-verify-immutable-snapshots.sh
+      - name: Run the Veda device gate
+        if: inputs.veda_mlx_phase != 'ab'
+        run: source scripts/ci/real-weights/mlx-veda/run-the-device-gate.sh
+      - name: Run the guarded Veda A/B renders
+        if: inputs.veda_mlx_phase != 'device'
+        run: source scripts/ci/real-weights/mlx-veda/run-the-guarded-ab.sh
+      - name: Keep the MLX Veda evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veda-mlx-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          # The raw frames / PCM (~0.4 GB per render) are dropped; result.json, logs, mp4s, PNGs kept.
+          path: |
+            ${{ runner.temp }}/veda-mlx-evidence
+            !${{ runner.temp }}/veda-mlx-evidence/**/frames.rgb
+            !${{ runner.temp }}/veda-mlx-evidence/**/audio.f32le
           if-no-files-found: error
           retention-days: 30
 
