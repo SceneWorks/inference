@@ -2536,6 +2536,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "mlx-gen-ideogram"
 version = "0.0.0"
 dependencies = [
