@@ -37,3 +37,18 @@ RUST_TEST_THREADS = { value = "1", force = true }
 # build script (and, with PMETAL_MLX_PREBUILT_DIR set, re-verifies the prebuilt's key).
 # Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
 MACOSX_DEPLOYMENT_TARGET = "26.2"
+
+# The iOS counterpart, and a SEPARATE knob — `MACOSX_DEPLOYMENT_TARGET` above does not apply to an
+# iOS target (runtime-ios, epic 16774). It must live here rather than only in mlx-sys's build.rs:
+# the fork's build.rs sets the C++/Metal side for cmake, but a build script's env::set_var never
+# reaches rustc's own link step, which otherwise defaults `aarch64-apple-ios` to 10.0 and drops
+# `___chkstk_darwin` (libSystem, iOS 12+).
+#
+# WHY 18.0 — chosen against Metal versions: iOS 16 -> Metal 300, 17 -> 310, 18 -> 320. MLX's own
+# macOS floor (14.0) IS Metal 310, and 18.0 keeps the `fence` kernel (built at Metal >= 320)
+# coherent with its `__builtin_available(macOS 15, iOS 18, *)` runtime guard. Keep this in step
+# with the iOS floor in the fork's mlx-sys/build.rs.
+#
+# NOT forced, matching MACOSX_DEPLOYMENT_TARGET: CI or a consumer can still override it. Inert on
+# non-iOS targets.
+IPHONEOS_DEPLOYMENT_TARGET = "18.0"

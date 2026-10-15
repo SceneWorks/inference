@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 107
+EXPECTED_MEMBER_COUNT = 109
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -25,12 +25,14 @@ INTERNAL_PACKAGES = {
     "core-llm",
     "core-llm-testkit",
     "mlx-gen-catalog",
+    "mlx-gen-ios-catalog",
     "mlx-llm",
     "candle-llm",
     "sceneworks-gen-core",
     "sceneworks-gen-core-testkit",
     "runtime-catalog",
     "runtime-macos",
+    "runtime-ios",
     "runtime-cpu",
     "runtime-cuda",
 }

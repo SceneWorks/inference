@@ -1,7 +1,7 @@
 # runtime-catalog
 
 The **validated, machine-readable composition** shared by every named runtime bundle
-(`runtime-macos`, `runtime-cuda`, `runtime-cpu`). This crate is **tensor-neutral**: it
+(`runtime-macos`, `runtime-ios`, `runtime-cuda`, `runtime-cpu`). This crate is **tensor-neutral**: it
 owns no providers and no model code. A platform bundle supplies its explicit media, LLM,
 and snapshot-preparer registries; `runtime-catalog` checks that the composition is
 internally consistent and exposes a stable snapshot.
@@ -56,11 +56,11 @@ contract types through this one path.
 ```text
 gen-core / core-llm (contracts)
         │
-mlx-gen-catalog / candle-gen-catalog + mlx-llm / candle-llm  (explicit registries)
+mlx-gen-catalog / mlx-gen-ios-catalog / candle-gen-catalog + mlx-llm / candle-llm  (explicit registries)
         │
    runtime-catalog        ← you are here: validate + snapshot
         │
-runtime-macos / runtime-cuda / runtime-cpu   (the product boundary)
+runtime-macos / runtime-ios / runtime-cuda / runtime-cpu   (the product boundary)
 ```
 
 Consumers depend on a **bundle**, not on this crate directly. See the

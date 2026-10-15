@@ -2564,6 +2564,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-ios-catalog"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-sana",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-iris"
 version = "0.0.0"
 dependencies = [
@@ -3557,6 +3567,16 @@ dependencies = [
  "candle-llm",
  "runtime-catalog",
  "sceneworks-gen-core-testkit",
+]
+
+[[package]]
+name = "runtime-ios"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen-ios-catalog",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "runtime-catalog",
 ]
 
 [[package]]
