@@ -71,6 +71,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use candle_core::Tensor;
+
 use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Generator, LoadSpec, PrefixKvCacheMode,
     Progress, Quant, WeightsSource,
@@ -267,14 +269,16 @@ fn cache_delta_bound(priced: u64) -> u64 {
 
 /// A cached render and its forced-shed twin together: holding the cache raised the device peak
 /// (`require_positive`: the delta is positive) and by no more than [`cache_delta_bound`] of its
-/// priced bytes. Prints the delta beside the priced bytes either way.
-fn assert_observed_cache_delta(
+/// priced bytes. Prints the delta beside the priced bytes either way, and **returns** what failed
+/// rather than panicking, so a render body collects it with every other case's checks and asserts
+/// once, after its last case has printed its numbers.
+fn observed_cache_delta_failures(
     label: &str,
     cached_peak: u64,
     shed_peak: u64,
     priced: u64,
     require_positive: bool,
-) {
+) -> Vec<String> {
     let delta = cached_peak as i128 - shed_peak as i128;
     let bound = cache_delta_bound(priced);
     eprintln!(
@@ -285,51 +289,43 @@ fn assert_observed_cache_delta(
         priced as f64 / GIB,
         bound as f64 / GIB,
     );
-    assert!(
-        delta <= bound as i128,
-        "{label}: holding the cache raised the device peak by {delta} bytes, above the {bound} \
-         its priced {priced} bytes allow"
-    );
-    if require_positive {
-        assert!(
-            delta > 0,
+    let mut failures = Vec::new();
+    if delta > bound as i128 {
+        failures.push(format!(
+            "{label}: holding the cache raised the device peak by {delta} bytes, above the {bound} \
+             its priced {priced} bytes allow"
+        ));
+    }
+    if require_positive && delta <= 0 {
+        failures.push(format!(
             "{label}: the cached render peaked {delta} bytes against its shed twin — the cache \
              added nothing to the device high-water mark"
-        );
+        ));
     }
+    failures
 }
 
 /// The bound and the sign check bite where they should, on synthetic peaks (no device).
 ///
-/// *Mutations that red this:* dropping either assertion of [`assert_observed_cache_delta`];
+/// *Mutations that red this:* dropping either check of [`observed_cache_delta_failures`];
 /// a bound without the priced term or without the headroom.
 #[test]
 fn the_observed_cache_delta_is_bounded_by_the_priced_cache() {
     const G: u64 = 1 << 30;
     let priced = 24 * G;
-    assert_observed_cache_delta(
-        "at bound",
-        30 * G + cache_delta_bound(priced),
-        30 * G,
-        priced,
-        true,
+    let check = |label, cached: u64, shed: u64, require_positive| {
+        observed_cache_delta_failures(label, cached, shed, priced, require_positive)
+    };
+    // At the bound, and a little below it, pass; one byte over fails.
+    assert!(check("at bound", 30 * G + cache_delta_bound(priced), 30 * G, true).is_empty());
+    assert!(check("typical", 50 * G, 30 * G, true).is_empty());
+    assert_eq!(
+        check("over", 30 * G + cache_delta_bound(priced) + 1, 30 * G, true).len(),
+        1
     );
-    assert_observed_cache_delta("typical", 50 * G, 30 * G, priced, true);
-    assert!(std::panic::catch_unwind(|| {
-        assert_observed_cache_delta(
-            "over",
-            30 * G + cache_delta_bound(priced) + 1,
-            30 * G,
-            priced,
-            true,
-        )
-    })
-    .is_err());
-    assert!(std::panic::catch_unwind(|| {
-        assert_observed_cache_delta("flat", 30 * G, 30 * G, priced, true)
-    })
-    .is_err());
-    assert_observed_cache_delta("flat dry run", 30 * G, 30 * G, priced, false);
+    // No rise is refused only when a rise is required.
+    assert_eq!(check("flat", 30 * G, 30 * G, true).len(), 1);
+    assert!(check("flat dry run", 30 * G, 30 * G, false).is_empty());
     assert_eq!(cache_delta_bound(10 * G), 11 * G + G);
 }
 
@@ -482,6 +478,13 @@ fn save_png(
 /// 20–35 for uninitialised memory; a row over 20 is static, and more than a quarter of them fails
 /// the render. The fraction is printed so a borderline pass is still readable in the log.
 fn assert_not_band_corrupted(label: &str, pixels: &[u8], width: u32, height: u32) {
+    if let Some(failure) = band_failure(label, pixels, width, height) {
+        panic!("{failure}");
+    }
+}
+
+/// [`assert_not_band_corrupted`]'s check, printed, returning the failure instead of panicking.
+fn band_failure(label: &str, pixels: &[u8], width: u32, height: u32) -> Option<String> {
     let (w, h) = (width as usize, height as usize);
     assert_eq!(pixels.len(), w * h * 3, "{label}: RGB8 geometry");
     assert!(w >= 3, "{label}: width {w} is too narrow to measure");
@@ -504,11 +507,12 @@ fn assert_not_band_corrupted(label: &str, pixels: &[u8], width: u32, height: u32
         "{label}: static rows {static_rows}/{h} ({:.1}%)",
         100.0 * fraction
     );
-    assert!(
-        fraction <= 0.25,
-        "{label}: {static_rows} of {h} rows are noise — the render is band-corrupted (a stale \
-         or truncated device buffer reached the output)"
-    );
+    (fraction > 0.25).then(|| {
+        format!(
+            "{label}: {static_rows} of {h} rows are noise — the render is band-corrupted (a stale \
+             or truncated device buffer reached the output)"
+        )
+    })
 }
 
 fn snapshot() -> PathBuf {
@@ -856,10 +860,13 @@ fn turbo_validation_renders(steps: &[Option<u32>]) {
     }
 }
 
-/// A deterministic synthetic reference, so the edit smoke needs no checked-in photographs.
-/// `QWEN_IMAGE_2_1_EDIT_REFS` points at a directory of raw `WxH.rgb` files to use instead, in
-/// name order — reference images for a real evaluation are user-provided, never synthesised or
-/// fetched here. Each file's dimensions come from its stem (`768x768.rgb`).
+/// A deterministic synthetic reference: three independent colour sawtooths. It is **not a
+/// picture** — a real-weight edit over it faithfully reproduces the sawtooth as a noise mosaic
+/// (sc-25909's CUDA evidence, run 38664658356: chroma busyness 32–41, [`assert_not_mosaic`]), so it
+/// proves nothing about image correctness. It stays for the miniature-fixture dry runs, the
+/// eleven-reference refusal (refused before any image is read), the base edit's AT4 golden
+/// comparison (the pre-epic goldens were rendered over exactly these inputs), and as the negative
+/// calibration of [`assert_not_mosaic`].
 fn synthetic_reference(seed: u32, width: u32, height: u32) -> candle_gen::gen_core::Image {
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
@@ -876,21 +883,139 @@ fn synthetic_reference(seed: u32, width: u32, height: u32) -> candle_gen::gen_co
     }
 }
 
-fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core::Image> {
-    let Ok(dir) = std::env::var("QWEN_IMAGE_2_1_EDIT_REFS") else {
-        return (0..count)
-            .map(|i| synthetic_reference(i as u32 + 1, width, height))
-            .collect();
+/// Edge of every reference the real-weight edit smokes send (each is fitted to
+/// `OUTPUT_RESOLUTION` by the processor whatever its size).
+const REFERENCE_EDGE: u32 = 768;
+
+/// The edit prompt every reference-edit render sends.
+const EDIT_PROMPT: &str =
+    "Combine the subjects of the reference images into one scene, evening light";
+
+/// One subject per reference, in reference order — distinct objects, so a correct edit is a scene
+/// visibly built from them.
+const REFERENCE_SUBJECTS: [&str; MAX_REFERENCES] = [
+    "A red vintage bicycle leaning against a white brick wall, daylight photograph",
+    "A golden retriever sitting on green grass, portrait photograph",
+    "A blue ceramic teapot on a wooden table, studio photograph",
+    "A yellow taxi cab parked on a city street, photograph",
+    "A potted cactus with pink flowers on a sunny windowsill, photograph",
+    "A white lighthouse on a rocky coast under a clear sky, photograph",
+    "An orange tabby cat curled up on a knitted blanket, photograph",
+    "A plate of colourful macarons on a marble counter, photograph",
+    "A green velvet armchair in an empty bright room, photograph",
+    "A striped hot air balloon over rolling hills, photograph",
+];
+
+/// Where an edit smoke's references come from when `QWEN_IMAGE_2_1_EDIT_REFS` names no directory.
+#[derive(Clone, Copy, Debug)]
+enum ReferenceSource {
+    /// [`synthetic_reference`] — for the dry runs and the AT4 golden comparison only.
+    Synthetic,
+    /// **Real pictures, rendered in the same run** by the generator under test
+    /// ([`rendered_references`]): the CUDA lane provisions no reference images, and the Qwen
+    /// licence keeps none in this repository, so the run makes its own — `edge`² text-to-image
+    /// renders of [`REFERENCE_SUBJECTS`], written beside the evidence.
+    Rendered { edge: u32 },
+}
+
+impl ReferenceSource {
+    /// Whether the edit output over these references must be a picture ([`assert_not_mosaic`]).
+    fn is_real(self) -> bool {
+        matches!(self, Self::Rendered { .. }) || std::env::var_os(EDIT_REFS_ENV).is_some()
+    }
+}
+
+/// `QWEN_IMAGE_2_1_EDIT_REFS`: a directory of raw `WxH.rgb` files to use as the references
+/// instead, in name order (operator-supplied; each file's dimensions come from its stem).
+const EDIT_REFS_ENV: &str = "QWEN_IMAGE_2_1_EDIT_REFS";
+
+/// `count` text-to-image renders of [`REFERENCE_SUBJECTS`] by `generator`, `edge`² each, at the
+/// generator's own step count and seeds `101..`, prefill (no cache selected), each written as
+/// `<stem>_reference_<n>_<edge>x<edge>.png`. With `checks` (every real-weight caller; a dry run
+/// on the miniature fixture renders noise by construction and passes `None`) each is also held
+/// to [`band_failure`] and [`mosaic_failure`], and what fails is pushed there — so the edit cases
+/// over a broken reference still render and print before the caller's one assertion.
+fn rendered_references(
+    generator: &dyn Generator,
+    count: usize,
+    edge: u32,
+    out_dir: &Path,
+    stem: &str,
+    mut checks: Option<&mut Vec<String>>,
+) -> Vec<candle_gen::gen_core::Image> {
+    assert!(count <= REFERENCE_SUBJECTS.len(), "{count} references");
+    REFERENCE_SUBJECTS[..count]
+        .iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let label = format!("{stem} reference {}", i + 1);
+            let started = Instant::now();
+            let out = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: (*subject).to_owned(),
+                        width: edge,
+                        height: edge,
+                        seed: Some(101 + i as u64),
+                        ..Default::default()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_or_else(|e| panic!("{label}: renders: {e}"));
+            let GenerationOutput::Images(mut images) = out else {
+                panic!("{label}: images expected");
+            };
+            let image = images.remove(0);
+            assert_eq!((image.width, image.height), (edge, edge), "{label}");
+            save_png(
+                &out_dir.join(format!("{stem}_reference_{}_{edge}x{edge}.png", i + 1)),
+                &image.pixels,
+                edge,
+                edge,
+                image::ColorType::Rgb8,
+            );
+            eprintln!(
+                "{label}: {subject:?} in {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            if let Some(failures) = checks.as_deref_mut() {
+                failures.extend(band_failure(&label, &image.pixels, edge, edge));
+                failures.extend(mosaic_failure(&label, &image.pixels, edge, edge));
+            }
+            image
+        })
+        .collect()
+}
+
+/// The `count` ordered references of an edit smoke: the operator's `QWEN_IMAGE_2_1_EDIT_REFS`
+/// directory when set, else `source`'s. `checks` is [`rendered_references`]'s.
+fn references(
+    generator: &dyn Generator,
+    source: ReferenceSource,
+    count: usize,
+    out_dir: &Path,
+    stem: &str,
+    checks: Option<&mut Vec<String>>,
+) -> Vec<candle_gen::gen_core::Image> {
+    let Ok(dir) = std::env::var(EDIT_REFS_ENV) else {
+        return match source {
+            ReferenceSource::Synthetic => (0..count)
+                .map(|i| synthetic_reference(i as u32 + 1, REFERENCE_EDGE, REFERENCE_EDGE))
+                .collect(),
+            ReferenceSource::Rendered { edge } => {
+                rendered_references(generator, count, edge, out_dir, stem, checks)
+            }
+        };
     };
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_EDIT_REFS={dir}: {e}"))
+        .unwrap_or_else(|e| panic!("{EDIT_REFS_ENV}={dir}: {e}"))
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "rgb"))
         .collect();
     paths.sort();
     assert!(
         paths.len() >= count,
-        "QWEN_IMAGE_2_1_EDIT_REFS={dir} holds {} .rgb files, {count} needed",
+        "{EDIT_REFS_ENV}={dir} holds {} .rgb files, {count} needed",
         paths.len()
     );
     paths
@@ -919,6 +1044,140 @@ fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core
             }
         })
         .collect()
+}
+
+/// **Chroma busyness**: the RGB8 image box-averaged onto a 64×64 grid, then the mean absolute
+/// difference between neighbouring cells of its two chroma channels (`B − Y`, `R − Y`, in 0..=255
+/// levels), averaged over both axes and both channels. A photograph or a rendered scene changes
+/// colour slowly at that scale; a colour mosaic changes it every few pixels. The grid makes it
+/// independent of the render size (cells are `width/64 × height/64` pixels; a remainder is
+/// ignored).
+fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
+    const GRID: usize = 64;
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(pixels.len(), w * h * 3, "RGB8 geometry");
+    assert!(
+        w >= GRID && h >= GRID,
+        "{w}x{h} is below the {GRID}-cell grid"
+    );
+    let (cw, ch) = (w / GRID, h / GRID);
+    // One plane per chroma channel: `B − Y`, then `R − Y`.
+    let mut planes = [vec![0f64; GRID * GRID], vec![0f64; GRID * GRID]];
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let mut sum = [0f64; 2];
+            for y in gy * ch..(gy + 1) * ch {
+                for x in gx * cw..(gx + 1) * cw {
+                    let px = &pixels[(y * w + x) * 3..][..3];
+                    let (r, g, b) = (f64::from(px[0]), f64::from(px[1]), f64::from(px[2]));
+                    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    sum[0] += b - luma;
+                    sum[1] += r - luma;
+                }
+            }
+            let n = (cw * ch) as f64;
+            planes[0][gy * GRID + gx] = sum[0] / n;
+            planes[1][gy * GRID + gx] = sum[1] / n;
+        }
+    }
+    let mut total = 0f64;
+    for plane in &planes {
+        let (mut across, mut down) = (0f64, 0f64);
+        for gy in 0..GRID {
+            for gx in 0..GRID {
+                let here = plane[gy * GRID + gx];
+                if gx + 1 < GRID {
+                    across += (plane[gy * GRID + gx + 1] - here).abs();
+                }
+                if gy + 1 < GRID {
+                    down += (plane[(gy + 1) * GRID + gx] - here).abs();
+                }
+            }
+        }
+        let pairs = (GRID * (GRID - 1)) as f64;
+        total += (across / pairs + down / pairs) / 2.0;
+    }
+    total / 2.0
+}
+
+/// The chroma busyness ([`chroma_busyness`]) above which a render is a colour mosaic, not a
+/// picture. Calibrated once, offline, on images that exist (not a machine-dependent value):
+///
+/// * known-bad — the CUDA edit renders over synthetic references (run 38664658356): 31.9 (ten
+///   references, 512²) and 40.9 (two references, 1024²); the synthetic reference itself scores
+///   higher still ([`the_mosaic_check_rejects_the_synthetic_references_only`]);
+/// * known-good — that run's 2048² Turbo text-to-image renders 3.1–3.4, and every final render
+///   committed under `docs/migration/evidence/` 3.0–19.3 (the highest: a saturated, busy Sana Heun
+///   render at 19.3 and a Kolors Heun lantern scene at 16.0).
+///
+/// 25 sits between the busiest real picture (19.3) and the mildest mosaic (31.9).
+const MOSAIC_CHROMA_BAR: f64 = 25.0;
+
+/// Reject a render that is a colour mosaic rather than a picture — the failure the band and
+/// degenerate checks both pass (a sawtooth reference reproduced by a correct edit).
+fn assert_not_mosaic(label: &str, pixels: &[u8], width: u32, height: u32) {
+    if let Some(failure) = mosaic_failure(label, pixels, width, height) {
+        panic!("{failure}");
+    }
+}
+
+thread_local! {
+    /// The bar [`mosaic_failure`] applies on this thread: [`MOSAIC_CHROMA_BAR`], except inside
+    /// [`the_edit_body_collects_every_check_and_asserts_after_its_last_case`], which lowers it to
+    /// zero so every picture check of a miniature-fixture render fails on purpose.
+    static MOSAIC_BAR: std::cell::Cell<f64> = const { std::cell::Cell::new(MOSAIC_CHROMA_BAR) };
+}
+
+/// [`assert_not_mosaic`]'s check, printed, returning the failure instead of panicking — for a
+/// render body that collects every case's checks and asserts once, after its last case.
+fn mosaic_failure(label: &str, pixels: &[u8], width: u32, height: u32) -> Option<String> {
+    let busyness = chroma_busyness(pixels, width, height);
+    let bar = MOSAIC_BAR.with(std::cell::Cell::get);
+    eprintln!("{label}: chroma busyness {busyness:.2} (mosaic above {bar})");
+    (busyness > bar).then(|| {
+        format!(
+            "{label}: chroma busyness {busyness:.2} > {bar} — a colour mosaic, not a \
+             picture derived from its references"
+        )
+    })
+}
+
+/// [`assert_not_mosaic`] rejects the synthetic sawtooth references at the sizes an edit renders
+/// and accepts a smooth synthetic scene with hard-edged shapes — device-free, so it runs on every
+/// `cuda` / `metal` test lane.
+#[test]
+fn the_mosaic_check_rejects_the_synthetic_references_only() {
+    for edge in [512, 768, 1024] {
+        let mosaic = synthetic_reference(1, edge, edge);
+        assert!(
+            std::panic::catch_unwind(|| assert_not_mosaic("sawtooth", &mosaic.pixels, edge, edge))
+                .is_err(),
+            "the {edge}² sawtooth must be rejected"
+        );
+    }
+    // A sky-to-ground gradient with three saturated discs: hard colour edges, but few of them.
+    let edge = 512u32;
+    let mut scene = Vec::with_capacity((edge * edge * 3) as usize);
+    for y in 0..edge {
+        for x in 0..edge {
+            let disc = |cx: f32, cy: f32, r: f32| {
+                ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt() < r
+            };
+            let px = if disc(128.0, 300.0, 70.0) {
+                [220, 30, 30]
+            } else if disc(300.0, 340.0, 60.0) {
+                [30, 60, 220]
+            } else if disc(420.0, 120.0, 50.0) {
+                [250, 210, 40]
+            } else if y < edge / 2 {
+                [90, 150, 230 - (y / 4) as u8]
+            } else {
+                [60, 140 - (y / 8) as u8, 50]
+            };
+            scene.extend_from_slice(&px);
+        }
+    }
+    assert_not_mosaic("scene", &scene, edge, edge);
 }
 
 /// One reference-edit render: how many references, the target size, the step count (`None`
@@ -955,6 +1214,11 @@ struct EditCase {
 /// comparison of both renders ([`compare_with_golden`]; *The pre-epic golden (AT4)* in
 /// `UPSTREAM.md`).
 ///
+/// **References.** Without a golden the references are real pictures rendered in the same run
+/// ([`ReferenceSource::Rendered`]) and each edit output must be a picture ([`assert_not_mosaic`]);
+/// with a golden they are the [`synthetic_reference`]s the pre-epic goldens were rendered over —
+/// a comparison of the same inputs, which proves the port unchanged and nothing about the image.
+///
 /// ```sh
 /// CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT=.../snapshots/790c9263... \
 /// QWEN_IMAGE_2_1_RENDER_OUT=.../render-validation-sc-24110 \
@@ -965,8 +1229,17 @@ struct EditCase {
 #[test]
 #[ignore]
 fn validation_render_reference_edit() {
+    let golden = render_golden();
+    let source = if golden.is_some() {
+        ReferenceSource::Synthetic
+    } else {
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        }
+    };
     reference_edit_renders(
         &Target::dense("qwen_image_2_1", snapshot(), "qwen_image_2_1_candle"),
+        source,
         candle_gen_qwen_image_2_1::DEFAULT_STEPS,
         vec![
             EditCase {
@@ -985,7 +1258,7 @@ fn validation_render_reference_edit() {
             },
         ],
         false,
-        render_golden().as_deref(),
+        golden.as_deref(),
     );
 }
 
@@ -1000,10 +1273,17 @@ fn validation_render_reference_edit() {
 /// Then the **forced-shed twins** (AT3): **each** cached case — the ten-reference one, which is
 /// AT3's cached ten-reference run, and the two-reference one — rendered again right after it with
 /// the cache shed, and compared with its cached render — the epic's "one run forced to shed that
-/// produces the prefill output". The two paths are the same mathematics and agree to rounding,
-/// not bit for bit; the bar is a mean absolute pixel difference of at most 2 of 255, and the mean
-/// and maximum are printed. **That bar has never been run on released weights or in bf16**: if
-/// the first real run exceeds it, the printed numbers are the finding.
+/// produces the prefill output". The two paths are the same mathematics but not the same bf16
+/// arithmetic, so the bar is the **same picture** ([`TWIN_SAME_PICTURE_BAR`] on a 16×16 grid; its
+/// derivation is there), not a pixel bar; the full-resolution mean and maximum are printed beside
+/// it. Where the two paths part, evaluation by evaluation, is
+/// [`turbo_validation_prefix_kv_cache_velocity`]'s question.
+///
+/// **References** are real pictures the run renders first ([`ReferenceSource::Rendered`]: ten
+/// 768² Turbo text-to-image renders of [`REFERENCE_SUBJECTS`], written beside the evidence), and
+/// every edit output must be a picture ([`assert_not_mosaic`]) — over synthetic references the
+/// edit faithfully reproduced a colour mosaic, which proved memory and timing but nothing about
+/// the image.
 ///
 /// Each twin pair is also AT3's / AT5's memory comparison on CUDA ([`device_memory`]): the pool's
 /// live-byte high-water over the cached render and over its shed twin, their difference
@@ -1046,6 +1326,9 @@ fn turbo_validation_render_reference_edit() {
             root,
             "qwen_image_2_1_turbo_candle",
         ),
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
         saved,
         vec![
             EditCase {
@@ -1066,6 +1349,834 @@ fn turbo_validation_render_reference_edit() {
         true,
         None,
     );
+}
+
+/// **Where the cached and prefill paths part, per model evaluation** (sc-25909 follow-up) — the
+/// component-level diagnostic behind the forced-shed twins of
+/// [`turbo_validation_render_reference_edit`]. On the released Turbo weights, over the same rendered
+/// references and the same two cases (two references at 1024², ten at 512²), it drives the DiT
+/// directly along the **prefill** trajectory and, at every evaluation, also runs the other path on
+/// the **same** latent and timestep:
+///
+/// * **evaluation 1** — `forward_joint_extract` against `forward_joint`: the same forward over the
+///   same rows, so the velocity must be **bit-identical** (asserted);
+/// * **the cache itself** — re-extracted at the last step, from a different latent and timestep:
+///   the prefix modulates from `t = 0` and is causal, so every cached K/V row must be
+///   **bit-identical** to the first extract's (asserted on blocks 0, middle and last);
+/// * **every later evaluation** — `forward_joint_cached` against `forward_joint` on the same input:
+///   the relative L2 gap `‖v_cached − v_prefill‖ / ‖v_prefill‖`, beside a **control** — the
+///   prefill's own gap under a one-bf16-ulp perturbation of its input ([`ulp_nudged`]) — and held
+///   to [`CACHED_GAP_CONTROL_RATIO_BAR`] times that control. Mathematically the gap is zero; in
+///   bf16 the per-token projections run on `S` joint rows in the prefill and on the target rows
+///   alone when cached, and cuBLAS picks its GEMM kernel by the row count `M`. The `[gemm]` lines
+///   measure that on this device, with random weights at the DiT's own projection shapes and this
+///   case's `(S, target)` row counts, in cuBLAS's default math mode and with reduced-precision
+///   (bf16) split-K reductions forbidden ([`strict_cublas_reductions`], which restores the handle's
+///   prior mode afterwards); the same pair of paths is also re-run in the strict mode at the first
+///   cached evaluation and the last;
+/// * **block 0, every later evaluation** — the cached evaluation is traced
+///   (`forward_joint_cached_traced`) and its `block_0_attn` / `_mlp` / `_out` held against the
+///   **target rows** of the prefill's own block 0 on the same input
+///   (`forward_joint_traced_through`, which traces the prefill only that far — the whole trace of
+///   the ten-reference sequence would be tens of GiB): at most [`CACHED_BLOCK0_REL_BAR`] relative
+///   L2. One block in, a defect in what the cached decode feeds its first attention (its RoPE
+///   rows, its prefix K/V, its modulation row) has not yet been mixed with 31 blocks of
+///   `M`-dependent rounding;
+/// * every evaluation is judged on its own ([`cached_evaluation_failures`]): a non-finite gap or
+///   control fails it, so a NaN cannot hide behind a `max`;
+/// * **the trajectories** — the cached path's own trajectory is run beside the prefill one and the
+///   relative latent gap printed per step, and both final latents are decoded and compared in
+///   pixels and on the same-picture grid ([`grid_difference`]), the number the forced-shed twin
+///   bar is about.
+///
+/// **What it measured** (CUDA, RTX PRO 6000 Blackwell, runs 38668492569 and 38671361727; the
+/// numbers are identical across the two):
+///
+/// * two references (`S` = 12 321, target 4 096): every evaluation, the cache and the decoded
+///   pixels **bit-identical** — no projection depends on `M` between 4 096 and 12 321 rows here;
+/// * ten references (`S` = 42 066, target 1 024): evaluation 1 and the cache **bit-identical**;
+///   the `hidden → inner` FFN projection (`12288 → 4096`) is **not** row-invariant at `M` = 1 024
+///   (27 % of its outputs differ, relative 2.1e-3, ≤ 4 bf16 ulps — the other two block shapes
+///   are); every cached evaluation sits 9.5e-3–4.0e-2 from the prefill, **0.72–1.44× the one-ulp
+///   control** (1.1e-2–5.5e-2) at the same step; forbidding reduced-precision reductions makes
+///   that projection row-invariant but leaves the gap the same size (4.9e-2 and 1.3e-2 at
+///   evaluations 2 and 8), so it is not the only `M`-dependent kernel and no single switch makes
+///   the paths bit-identical. Eight Turbo steps amplify it to a 16 % latent gap — the same scene,
+///   visibly shifted (pixels mean 7.8, 16-grid 3.5).
+///
+/// So the cached decode is the prefill to bf16 rounding — its divergence is the size of any
+/// one-ulp change — and not a defect. What a defect looks like was measured too (mutation run
+/// 38674397097, never merged): the cached decode's target RoPE rows shifted one position along
+/// the width — a subtle defect whose renders stay the same scene (16-grid 2.8–4.0, inside the
+/// twin bar) — sits **4.5× (ten references) and 4.8× (two references)** the control at its worst
+/// step, against the real path's 1.44× and 0×. That is what [`CACHED_GAP_CONTROL_RATIO_BAR`] is
+/// placed between, and why this test, not the twin, is the cached path's correctness check.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_prefix_kv_cache_velocity \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_prefix_kv_cache_velocity() {
+    use candle_gen::gen_core::Conditioning;
+    use candle_gen_qwen_image_2_1::{
+        collect_references, create_noise, decode_rgb, encode_references, joint_branch,
+        joint_images, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+        prepare_conditioning_references, scheduler::resample_saved_sigmas,
+    };
+
+    let root = turbo_snapshot();
+    let out_dir = out_dir();
+    let stem = "qwen_image_2_1_turbo_candle";
+    let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&root).unwrap();
+    let steps = saved.default_steps();
+    assert_eq!(steps, 8, "the pinned Turbo revision saves eight sigmas");
+    let sigmas = resample_saved_sigmas(&saved.sample_sigmas, steps).unwrap();
+
+    let mut failures = Vec::new();
+    // The references the edit smoke renders (same subjects, seeds and edge), made by the
+    // generator, which is then dropped before the components load.
+    let pool = {
+        let generator = Target::dense(
+            candle_gen_qwen_image_2_1::TURBO_MODEL_ID,
+            root.clone(),
+            stem,
+        )
+        .load();
+        let source = ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        };
+        references(
+            generator.as_ref(),
+            source,
+            MAX_REFERENCES,
+            &out_dir,
+            stem,
+            Some(&mut failures),
+        )
+    };
+
+    let device = candle_gen::default_device().unwrap();
+    let tokenizer = load_tokenizer(&root).unwrap();
+    let drop_count = system_prompt_drop_count(&tokenizer).unwrap();
+    let cases = [(2usize, 1024u32, 1024u32), (MAX_REFERENCES, 512, 512)];
+    // Both cases' text side first, so the tower is dropped before the DiT loads.
+    let branches: Vec<_> = {
+        let te = load_text_encoder(&root, &device).unwrap();
+        cases
+            .iter()
+            .map(|&(count, width, height)| {
+                let req = GenerationRequest {
+                    prompt: EDIT_PROMPT.to_owned(),
+                    width,
+                    height,
+                    conditioning: vec![Conditioning::MultiReference {
+                        images: pool[..count].to_vec(),
+                    }],
+                    ..Default::default()
+                };
+                let images = collect_references(&req).unwrap();
+                let prepared = prepare_conditioning_references(&te, &images).unwrap();
+                let conditioning = te
+                    .encode_conditioning(&tokenizer, EDIT_PROMPT, drop_count, &prepared)
+                    .unwrap();
+                let branch = joint_branch(&conditioning, &prepared, width, height).unwrap();
+                (prepared, branch)
+            })
+            .collect()
+    };
+    let transformer = load_transformer(&root, &device).unwrap();
+    let vae = load_vae(&root, &device).unwrap();
+    let cfg = transformer.config().clone();
+    let inner = cfg.inner_dim();
+
+    for (&(count, width, height), (prepared, branch)) in cases.iter().zip(&branches) {
+        let label = format!("{stem} {count} refs {width}x{height}");
+        let (total, target) = (branch.layout.total_len(), branch.layout.target_tokens());
+        eprintln!(
+            "[kv-velocity] {label}: joint S = {total} rows (prefix {}), target {target} rows",
+            branch.layout.prefix_len()
+        );
+        gemm_row_probe(&label, &device, total, target, inner, inner * cfg.mlp_ratio);
+        strict_cublas_reductions(&device, || {
+            gemm_row_probe(
+                &format!("{label} [no reduced-precision reductions]"),
+                &device,
+                total,
+                target,
+                inner,
+                inner * cfg.mlp_ratio,
+            )
+        });
+
+        let reference_latents = encode_references(&vae, prepared).unwrap();
+        let text = &branch.text;
+        let layout = &branch.layout;
+        let prefill = |x: &Tensor, sigma: f32| {
+            transformer
+                .forward_joint(text, &joint_images(&reference_latents, x), sigma, layout)
+                .unwrap()
+        };
+        let mut x_prefill = create_noise(42, width, height, cfg.in_channels, &device).unwrap();
+        let mut x_cached = x_prefill.clone();
+        let mut cache = None;
+        let (mut worst_gap, mut worst_ratio, mut worst_block0) = (0f64, 0f64, 0f64);
+        for i in 0..steps {
+            let (sigma, dt) = (sigmas[i], sigmas[i + 1] - sigmas[i]);
+            let v_prefill = prefill(&x_prefill, sigma);
+            let v_cached = match &cache {
+                None => {
+                    let (v_extract, extracted) = transformer
+                        .forward_joint_extract(
+                            text,
+                            &joint_images(&reference_latents, &x_prefill),
+                            sigma,
+                            layout,
+                        )
+                        .unwrap();
+                    let (gap, max_abs, differing) = velocity_gap(&v_extract, &v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step 1 extract vs prefill: rel {gap:.3e}, max \
+                         |Δ| {max_abs:.3e}, {differing} elements differ"
+                    );
+                    if differing != 0 {
+                        failures.push(format!(
+                            "{label}: the extract evaluation is not bit-identical to the prefill \
+                             ({differing} elements differ, rel {gap:.3e})"
+                        ));
+                    }
+                    cache = Some(extracted);
+                    v_extract
+                }
+                Some(cache) => {
+                    // The cached evaluation on the prefill's own input, traced, so its block 0
+                    // can be held against the prefill's block 0 below.
+                    let (same_input, cached_trace) = transformer
+                        .forward_joint_cached_traced(&x_prefill, sigma, cache)
+                        .unwrap();
+                    let (gap, max_abs, differing) = velocity_gap(&same_input, &v_prefill);
+                    // The control: the prefill path's own response to an input perturbation of
+                    // bf16-rounding size — what any one-ulp difference does to this velocity.
+                    let (control, _, _) =
+                        velocity_gap(&prefill(&ulp_nudged(&x_prefill), sigma), &v_prefill);
+                    let ratio = gap / control.max(f64::MIN_POSITIVE);
+                    // Block 0's target rows, cached against prefill on the same input: before
+                    // any `M`-dependent rounding has had 31 blocks to compound, so a defect in
+                    // what the cached decode feeds its first attention (its RoPE rows, its
+                    // prefix K/V, its modulation row) stands out at ulp scale here.
+                    let prefill_trace = transformer
+                        .forward_joint_traced_through(
+                            text,
+                            &joint_images(&reference_latents, &x_prefill),
+                            sigma,
+                            layout,
+                            0,
+                        )
+                        .unwrap();
+                    let block0 = block0_target_gaps(&prefill_trace, &cached_trace, target);
+                    drop(cached_trace);
+                    // Block 0's own one-ulp control, printed beside it: the prefill's block 0 on
+                    // the nudged input against the prefill's block 0 — the size of any one-ulp
+                    // difference at this depth, on this device.
+                    let nudged_trace = transformer
+                        .forward_joint_traced_through(
+                            text,
+                            &joint_images(&reference_latents, &ulp_nudged(&x_prefill)),
+                            sigma,
+                            layout,
+                            0,
+                        )
+                        .unwrap();
+                    let nudged_rows: Vec<_> = prefill_trace
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("block_0_"))
+                        .map(|(name, full)| (name.clone(), target_rows(full, target)))
+                        .collect();
+                    let block0_control = block0_target_gaps(&nudged_trace, &nudged_rows, target);
+                    drop((prefill_trace, nudged_trace, nudged_rows));
+                    let rms = rms(&v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step {} cached vs prefill on the same input: rel \
+                         {gap:.3e}, max |Δ| {max_abs:.3e} (velocity rms {rms:.3e}), {differing} \
+                         elements differ; one-ulp input control rel {control:.3e}; ratio \
+                         {ratio:.2}",
+                        i + 1
+                    );
+                    for ((stage, rel, max_abs, differing), (_, control_rel, _, _)) in
+                        block0.iter().zip(&block0_control)
+                    {
+                        eprintln!(
+                            "[kv-velocity] {label}: step {} {stage} target rows cached vs \
+                             prefill: rel {rel:.3e}, max |Δ| {max_abs:.3e}, {differing} elements \
+                             differ (bar rel {CACHED_BLOCK0_REL_BAR:.1e}); one-ulp input control \
+                             rel {control_rel:.3e}",
+                            i + 1
+                        );
+                    }
+                    let block0: Vec<(String, f64)> = block0
+                        .into_iter()
+                        .map(|(stage, rel, _, _)| (stage, rel))
+                        .collect();
+                    failures.extend(cached_evaluation_failures(
+                        &label,
+                        i + 1,
+                        gap,
+                        control,
+                        &block0,
+                    ));
+                    raise_worst(&mut worst_gap, gap);
+                    raise_worst(&mut worst_ratio, ratio);
+                    for (_, rel) in &block0 {
+                        raise_worst(&mut worst_block0, *rel);
+                    }
+                    // The mechanism, at the first cached evaluation and the last: the same pair
+                    // with cuBLAS forbidden to reduce split-K partials in bf16.
+                    let strict = (i == 1 || i + 1 == steps)
+                        .then(|| {
+                            strict_cublas_reductions(&device, || {
+                                let strict_prefill = prefill(&x_prefill, sigma);
+                                let strict_cached = transformer
+                                    .forward_joint_cached(&x_prefill, sigma, cache)
+                                    .unwrap();
+                                (strict_prefill, strict_cached)
+                            })
+                        })
+                        .flatten();
+                    if let Some((strict_prefill, strict_cached)) = strict {
+                        let (strict_gap, strict_max, strict_differing) =
+                            velocity_gap(&strict_cached, &strict_prefill);
+                        let (_, _, prefill_moved) = velocity_gap(&strict_prefill, &v_prefill);
+                        eprintln!(
+                            "[kv-velocity] {label}: step {} [no reduced-precision \
+                                 reductions] cached vs prefill: rel {strict_gap:.3e}, max |Δ| \
+                                 {strict_max:.3e}, {strict_differing} elements differ (the \
+                                 prefill itself moved in {prefill_moved} elements)",
+                            i + 1
+                        );
+                    }
+                    transformer
+                        .forward_joint_cached(&x_cached, sigma, cache)
+                        .unwrap()
+                }
+            };
+            if i + 1 == steps {
+                // The cache's step-independence, on this step's (different) latent and timestep.
+                let first = cache.take().unwrap();
+                let probe = [0, first.num_blocks() / 2, first.num_blocks() - 1];
+                let host: Vec<_> = probe
+                    .iter()
+                    .map(|&b| {
+                        let (k, v) = first.layer(b).unwrap();
+                        (host_bits(k), host_bits(v))
+                    })
+                    .collect();
+                drop(first);
+                let (_, again) = transformer
+                    .forward_joint_extract(
+                        text,
+                        &joint_images(&reference_latents, &x_prefill),
+                        sigma,
+                        layout,
+                    )
+                    .unwrap();
+                for (&b, (k, v)) in probe.iter().zip(&host) {
+                    let (k2, v2) = again.layer(b).unwrap();
+                    let same = *k == host_bits(k2) && *v == host_bits(v2);
+                    eprintln!(
+                        "[kv-velocity] {label}: block {b} prefix K/V re-extracted at step {}: {}",
+                        i + 1,
+                        if same { "bit-identical" } else { "DIFFERENT" }
+                    );
+                    if !same {
+                        failures.push(format!(
+                            "{label}: block {b}'s prefix K/V changed between extracts at step 1 \
+                             and step {}",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            x_prefill = (&x_prefill + (&v_prefill * f64::from(dt)).unwrap()).unwrap();
+            x_cached = (&x_cached + (&v_cached * f64::from(dt)).unwrap()).unwrap();
+            let (traj, _, _) = velocity_gap(&x_cached, &x_prefill);
+            eprintln!(
+                "[kv-velocity] {label}: after step {}: trajectory latent gap rel {traj:.3e}",
+                i + 1
+            );
+        }
+        let decode = |x: &Tensor| {
+            decode_rgb(&vae, x, width, height, None, None)
+                .unwrap()
+                .pixels
+        };
+        let (pixels_prefill, pixels_cached) = (decode(&x_prefill), decode(&x_cached));
+        let (mean, max) = pixel_difference(&pixels_cached, &pixels_prefill);
+        eprintln!(
+            "[kv-velocity] {label}: pixels cached vs prefill trajectory: mean |Δ| {mean:.4}, max \
+             {max}, 16-grid {:.2}; worst per-evaluation velocity gap rel {worst_gap:.3e}, \
+             {worst_ratio:.2}× the one-ulp control (bar {CACHED_GAP_CONTROL_RATIO_BAR}); worst \
+             block-0 target-row gap rel {worst_block0:.3e} (bar {CACHED_BLOCK0_REL_BAR:.1e})",
+            grid_difference(&pixels_cached, &pixels_prefill, width, height)
+        );
+        save_png(
+            &out_dir.join(format!(
+                "{stem}_velocity_{count}refs_{width}x{height}_{steps}steps_prefill.png"
+            )),
+            &pixels_prefill,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// How many times the one-ulp control's gap a cached evaluation's velocity may sit from the
+/// prefill one on the same latent and timestep ([`turbo_validation_prefix_kv_cache_velocity`]).
+/// Measured on CUDA, worst step: the real cached path 1.44× (ten references; two references 0×,
+/// bit-identical), reproduced bit for bit across runs 38668492569 and 38671361727; a one-position
+/// RoPE shift of the cached target rows 4.52× and 4.82× (mutation run 38674397097). 2.5 is the
+/// geometric middle: 1.7× headroom over the real path and 1.8× under the subtle defect. The bar is
+/// a ratio to a control measured on the same device, step and input, so it carries no device's
+/// absolute numbers.
+const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 2.5;
+
+/// The relative L2 gap block 0's target rows may show, cached against prefill on the same input
+/// ([`block0_target_gaps`]; worst of `block_0_attn`, `_mlp`, `_out`, at any one evaluation).
+/// Measured on CUDA (RTX PRO 6000 Blackwell, inference run 38683212858):
+///
+/// * the real cached path — two references: every stage of every evaluation **bit-identical**;
+///   ten references: `block_0_attn` bit-identical, `block_0_mlp` 1.99e-3–2.16e-3 (its
+///   `hidden → inner` projection is the one row-dependent GEMM, measured beside it at 2.15e-3),
+///   `block_0_out` 3.3e-4–7.1e-4. Worst **2.16e-3**;
+/// * the cached-decode RoPE-shift mutant (same run, a temporary reverted commit): worst
+///   **2.15e-2** (two references) and **3.01e-2** (ten), both `block_0_mlp` at step 2; the gap
+///   shrinks with the noise level (3.2e-3 / 3.8e-3 at step 8), but every evaluation is judged on
+///   its own and steps 2–6 are over the bar in both cases.
+///
+/// 7e-3 is near the geometric middle (6.8e-3) of the real path's worst and the mutant's: 3.2×
+/// headroom over the real path, 3.1× under the mutant. The block-0 one-ulp control is printed
+/// beside each reading (1.3e-3–1.5e-2 by stage and step).
+const CACHED_BLOCK0_REL_BAR: f64 = 7e-3;
+
+/// `x` with every element scaled by `1 ± 2⁻⁸` (a fixed pseudo-random sign per element): about
+/// half a bf16 ulp on average, so once the DiT casts its input to bf16 roughly half the elements
+/// move by one ulp — a perturbation the size of one bf16 rounding.
+fn ulp_nudged(x: &Tensor) -> Tensor {
+    let n = x.elem_count();
+    let factors: Vec<f32> = (0..n as u64)
+        .map(|i| {
+            let hash = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 63;
+            if hash == 0 {
+                1.0 + 1.0 / 256.0
+            } else {
+                1.0 - 1.0 / 256.0
+            }
+        })
+        .collect();
+    let factors = Tensor::from_vec(factors, x.shape(), x.device()).unwrap();
+    (x * factors).unwrap()
+}
+
+/// Forbid this device's cuBLAS handle to reduce split-K partial sums in the bf16 output type
+/// (`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`: partials reduced in the f32 compute type)
+/// — the switch `candle-audio-yue2`'s VAE sets on its own handle — while `f` runs, then **restore
+/// the mode the handle had** (read with `cublasGetMathMode`, not assumed to be the default; a
+/// guard restores it on unwind too). `None`, without running `f`, where there is nothing to
+/// switch: a build without CUDA, or a handle whose current mode is a combination of flags no
+/// single `cublasMath_t` names (it could not be restored exactly, so it is not touched; the strict
+/// probes are then skipped, and say so).
+#[cfg(feature = "cuda")]
+fn strict_cublas_reductions<T>(device: &candle_core::Device, f: impl FnOnce() -> T) -> Option<T> {
+    use candle_core::cuda::cudarc::cublas::sys::{self, cublasMath_t::*};
+    let blas = bound_cublas(device);
+    let mut raw = 0u32;
+    // SAFETY: the handle is this device's live cuBLAS handle, bound to the current thread; cuBLAS
+    // writes one `cublasMath_t` (a `u32`) through the pointer. It is read as the integer, never
+    // as the enum, because a handle's mode may be an OR of flags that names no variant.
+    unsafe { sys::cublasGetMathMode(*blas.handle(), (&mut raw as *mut u32).cast()) }
+        .result()
+        .unwrap();
+    let Some(prior) = [
+        CUBLAS_DEFAULT_MATH,
+        CUBLAS_TENSOR_OP_MATH,
+        CUBLAS_PEDANTIC_MATH,
+        CUBLAS_TF32_TENSOR_OP_MATH,
+        CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+    ]
+    .into_iter()
+    .find(|mode| *mode as u32 == raw) else {
+        eprintln!(
+            "[gemm] cuBLAS math mode {raw:#x} is a flag combination this test cannot restore \
+             exactly — left as is; the no-reduced-precision-reductions probes are SKIPPED"
+        );
+        return None;
+    };
+    set_cublas_math_mode(device, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+    let _restore = StrictCublasReductions {
+        device: device.clone(),
+        prior,
+    };
+    Some(f())
+}
+
+/// [`strict_cublas_reductions`]'s restore: sets the handle's prior math mode back on drop.
+#[cfg(feature = "cuda")]
+struct StrictCublasReductions {
+    device: candle_core::Device,
+    prior: candle_core::cuda::cudarc::cublas::sys::cublasMath_t,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for StrictCublasReductions {
+    fn drop(&mut self) {
+        set_cublas_math_mode(&self.device, self.prior);
+    }
+}
+
+/// This device's cuBLAS handle, with its CUDA context bound to the current thread.
+#[cfg(feature = "cuda")]
+fn bound_cublas(
+    device: &candle_core::Device,
+) -> std::sync::Arc<candle_core::cuda::cudarc::cublas::CudaBlas> {
+    let cuda = device.as_cuda_device().unwrap();
+    cuda.cuda_stream().context().bind_to_thread().unwrap();
+    cuda.cublas_handle()
+}
+
+#[cfg(feature = "cuda")]
+fn set_cublas_math_mode(
+    device: &candle_core::Device,
+    mode: candle_core::cuda::cudarc::cublas::sys::cublasMath_t,
+) {
+    let blas = bound_cublas(device);
+    // SAFETY: the handle is this device's live cuBLAS handle, bound to the current thread;
+    // setting its math mode reads and writes nothing else.
+    unsafe { candle_core::cuda::cudarc::cublas::sys::cublasSetMathMode(*blas.handle(), mode) }
+        .result()
+        .unwrap();
+}
+
+#[cfg(not(feature = "cuda"))]
+fn strict_cublas_reductions<T>(_device: &candle_core::Device, _f: impl FnOnce() -> T) -> Option<T> {
+    None
+}
+
+/// The last `target` rows of a `[1, S, C]` joint-sequence stage — the target block's.
+fn target_rows(full: &Tensor, target: usize) -> Tensor {
+    let rows = full.dim(1).unwrap();
+    full.narrow(1, rows - target, target).unwrap()
+}
+
+/// The rows a block-0 comparison reads: each of `block_0_attn`, `block_0_mlp` and `block_0_out`,
+/// the prefill trace's **target** rows (the last `target` of its `[1, S, inner]`) against the
+/// cached trace's `[1, target, inner]` — `(stage, relative L2, max |Δ|, elements that differ)`.
+fn block0_target_gaps(
+    prefill: &[(String, Tensor)],
+    cached: &[(String, Tensor)],
+    target: usize,
+) -> Vec<(String, f64, f32, usize)> {
+    let find = |trace: &[(String, Tensor)], stage: &str| -> Tensor {
+        trace
+            .iter()
+            .find(|(name, _)| name == stage)
+            .unwrap_or_else(|| panic!("the trace holds `{stage}`"))
+            .1
+            .clone()
+    };
+    ["block_0_attn", "block_0_mlp", "block_0_out"]
+        .into_iter()
+        .map(|stage| {
+            let prefill_rows = target_rows(&find(prefill, stage), target);
+            let (rel, max_abs, differing) = velocity_gap(&find(cached, stage), &prefill_rows);
+            (stage.to_owned(), rel, max_abs, differing)
+        })
+        .collect()
+}
+
+/// The block-0 comparison's plumbing on the committed miniature snapshot, on the CPU (no device):
+/// `forward_joint_traced_through(.., 0)` traces block 0 and nothing after it,
+/// [`block0_target_gaps`] reads the prefill's **target** rows against the cached decode's, and on
+/// the same input they agree far inside [`CACHED_BLOCK0_REL_BAR`] — while against the prefill on
+/// another latent, or against the prefill's leading (prefix) rows, they do not.
+///
+/// *Mutations that red this:* [`block0_target_gaps`] reading the first `target` rows; the seam
+/// tracing past block 0 or stopping before it.
+#[test]
+fn the_block0_comparison_reads_the_target_rows_on_the_miniature_fixture() {
+    use candle_gen_qwen_image_2_1::{joint_images, load_transformer, JointLayout, Segment};
+
+    let device = crate::common::device();
+    let model = load_transformer(&crate::common::tiny_snapshot(), &device).unwrap();
+    let cfg = model.config().clone();
+    let seeded = |shape: (usize, usize, usize), seed: f32| {
+        let n = shape.0 * shape.1 * shape.2;
+        let values: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37 + seed).sin()).collect();
+        Tensor::from_vec(values, shape, &device).unwrap()
+    };
+    let layout = JointLayout {
+        segments: vec![
+            Segment::Text { len: 6 },
+            Segment::Image {
+                height: 2,
+                width: 4,
+            },
+            Segment::Image {
+                height: 4,
+                width: 4,
+            },
+        ],
+    };
+    let target = layout.target_tokens();
+    let text = seeded((1, 6, cfg.context_in_dim), 0.1);
+    let refs = [seeded((1, 8, cfg.in_channels), 0.2)];
+    let (_, cache) = model
+        .forward_joint_extract(
+            &text,
+            &joint_images(&refs, &seeded((1, target, cfg.in_channels), 0.3)),
+            0.9,
+            &layout,
+        )
+        .unwrap();
+    let x = seeded((1, target, cfg.in_channels), 0.4);
+    let prefill = |x: &Tensor| {
+        model
+            .forward_joint_traced_through(&text, &joint_images(&refs, x), 0.5, &layout, 0)
+            .unwrap()
+    };
+    let traced = prefill(&x);
+    let stages: Vec<&str> = traced.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(stages.contains(&"block_0_out"), "{stages:?}");
+    assert!(
+        !stages.iter().any(|name| name.starts_with("block_1")),
+        "{stages:?}"
+    );
+    let (_, cached) = model.forward_joint_cached_traced(&x, 0.5, &cache).unwrap();
+    let same = block0_target_gaps(&traced, &cached, target);
+    assert_eq!(same.len(), 3);
+    for (stage, rel, _, _) in &same {
+        assert!(
+            *rel <= CACHED_BLOCK0_REL_BAR / 100.0,
+            "{stage}: rel {rel:.3e}"
+        );
+    }
+    let other = block0_target_gaps(
+        &prefill(&seeded((1, target, cfg.in_channels), 0.6)),
+        &cached,
+        target,
+    );
+    let leading: Vec<(String, Tensor)> = traced
+        .iter()
+        .filter(|(name, _)| name.starts_with("block_0_"))
+        .map(|(name, t)| (name.clone(), t.narrow(1, 0, target).unwrap()))
+        .collect();
+    let misread = block0_target_gaps(&leading, &cached, target);
+    for gaps in [other, misread] {
+        let worst = gaps.iter().map(|(_, rel, _, _)| *rel).fold(0.0, f64::max);
+        assert!(worst > CACHED_BLOCK0_REL_BAR, "worst {worst:.3e}");
+    }
+}
+
+/// `worst = max(worst, x)`, except that a NaN `x` replaces it (`f64::max` would drop it).
+fn raise_worst(worst: &mut f64, x: f64) {
+    if x.is_nan() || x > *worst {
+        *worst = x;
+    }
+}
+
+/// The verdict on one cached evaluation of [`turbo_validation_prefix_kv_cache_velocity`]: its
+/// velocity gap to the prefill on the same input, the one-ulp `control`, and block 0's
+/// target-row gaps `(stage, relative L2)`. **Per evaluation**, so no aggregate can hide one: a
+/// non-finite gap or control (a NaN would otherwise sail through any `max` and every `>`), a
+/// `gap / control` above [`CACHED_GAP_CONTROL_RATIO_BAR`], and a non-finite or above-bar block-0
+/// gap ([`CACHED_BLOCK0_REL_BAR`]) each fail.
+fn cached_evaluation_failures(
+    label: &str,
+    step: usize,
+    gap: f64,
+    control: f64,
+    block0: &[(String, f64)],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if !gap.is_finite() || !control.is_finite() {
+        failures.push(format!(
+            "{label}: step {step}'s cached-vs-prefill velocity gap ({gap}) or its one-ulp control \
+             ({control}) is not finite"
+        ));
+    } else {
+        let ratio = gap / control.max(f64::MIN_POSITIVE);
+        if ratio > CACHED_GAP_CONTROL_RATIO_BAR {
+            failures.push(format!(
+                "{label}: step {step}'s cached velocity is {ratio:.2}× further from the prefill \
+                 one on the same input than the one-ulp control, above \
+                 {CACHED_GAP_CONTROL_RATIO_BAR}"
+            ));
+        }
+    }
+    for (stage, rel) in block0 {
+        if !(rel.is_finite() && *rel <= CACHED_BLOCK0_REL_BAR) {
+            failures.push(format!(
+                "{label}: step {step}'s {stage} target rows sit rel {rel:.3e} from the prefill's, \
+                 above {CACHED_BLOCK0_REL_BAR:.1e} (or not finite)"
+            ));
+        }
+    }
+    failures
+}
+
+/// [`cached_evaluation_failures`] passes the real path's numbers and fails a NaN or infinite gap,
+/// a NaN control, a ratio over the bar, and a NaN or over-bar block-0 gap — device-free.
+///
+/// *Mutations that red this:* dropping the finiteness check (a NaN gap passes every `>`); the
+/// block-0 check comparing with `>` alone (a NaN passes); dropping the block-0 check.
+#[test]
+fn the_cached_evaluation_verdict_rejects_non_finite_and_over_bar_gaps() {
+    let block0 = |rel: f64| vec![("block_0_attn".to_owned(), rel)];
+    let verdict =
+        |gap, control, rel| cached_evaluation_failures("t", 2, gap, control, &block0(rel));
+    let control = 4e-2;
+    let ok = CACHED_BLOCK0_REL_BAR / 2.0;
+    assert!(verdict(0.0, control, 0.0).is_empty(), "bit-identical");
+    assert!(
+        verdict(1.44 * control, control, ok).is_empty(),
+        "the measured real path"
+    );
+    assert!(
+        verdict(
+            CACHED_GAP_CONTROL_RATIO_BAR * control,
+            control,
+            CACHED_BLOCK0_REL_BAR
+        )
+        .is_empty(),
+        "at both bars"
+    );
+    for (what, gap, control, rel) in [
+        ("NaN gap", f64::NAN, control, ok),
+        ("infinite gap", f64::INFINITY, control, ok),
+        ("NaN control", 1e-2, f64::NAN, ok),
+        ("ratio over the bar", 4.5 * control, control, ok),
+        ("NaN block-0 gap", 0.0, control, f64::NAN),
+        (
+            "block-0 gap over the bar",
+            0.0,
+            control,
+            CACHED_BLOCK0_REL_BAR * 1.01,
+        ),
+    ] {
+        assert_eq!(verdict(gap, control, rel).len(), 1, "{what}");
+    }
+    let mut worst = 0.0;
+    raise_worst(&mut worst, 1.0);
+    raise_worst(&mut worst, 0.5);
+    assert_eq!(worst, 1.0);
+    raise_worst(&mut worst, f64::NAN);
+    assert!(worst.is_nan(), "a NaN reaches the summary line");
+}
+
+/// `(relative L2, max |Δ|, elements that differ)` of `a` against `b` (same shape, any float dtype).
+fn velocity_gap(a: &Tensor, b: &Tensor) -> (f64, f32, usize) {
+    let a: Vec<f32> = a
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let b: Vec<f32> = b
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(a.len(), b.len(), "same shape");
+    let (mut diff2, mut ref2, mut max_abs, mut differing) = (0f64, 0f64, 0f32, 0usize);
+    for (x, y) in a.iter().zip(&b) {
+        let d = x - y;
+        diff2 += f64::from(d) * f64::from(d);
+        ref2 += f64::from(*y) * f64::from(*y);
+        max_abs = max_abs.max(d.abs());
+        differing += usize::from(x.to_bits() != y.to_bits());
+    }
+    (
+        (diff2 / ref2.max(f64::MIN_POSITIVE)).sqrt(),
+        max_abs,
+        differing,
+    )
+}
+
+/// Root mean square of a tensor's elements.
+fn rms(t: &Tensor) -> f64 {
+    let v: Vec<f32> = t
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+}
+
+/// The raw bits of a tensor's elements, on the host, for an exact comparison.
+fn host_bits(t: &Tensor) -> Vec<u32> {
+    t.to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect()
+}
+
+/// **The row-count dependence of a projection, measured on this device**: for each of the DiT's
+/// per-token projection shapes (`inner → inner`, `inner → hidden`, `hidden → inner`), a bf16
+/// `candle_nn::Linear` with random weights over `total` random rows, against the same Linear over
+/// the last `target` of those rows alone — the prefill's and the cached decode's `M` for the target
+/// tokens. Prints how many output elements of the target rows differ. Weights are random because
+/// the kernel choice depends on the shape and dtype, not the values. Printed, never asserted: which
+/// kernel a vendor library picks for an `M` is the device's and the library's, not this crate's.
+fn gemm_row_probe(
+    label: &str,
+    device: &candle_core::Device,
+    total: usize,
+    target: usize,
+    inner: usize,
+    hidden: usize,
+) {
+    use candle_core::{DType, Module};
+    for (k, n) in [(inner, inner), (inner, hidden), (hidden, inner)] {
+        let x = Tensor::randn(0f32, 1.0, (1, total, k), device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let w = (Tensor::randn(0f32, 1.0, (n, k), device).unwrap() / (k as f64).sqrt())
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let linear = candle_nn::Linear::new(w, None);
+        let full = linear.forward(&x).unwrap();
+        let full_rows = full.narrow(1, total - target, target).unwrap();
+        let alone = linear
+            .forward(
+                &x.narrow(1, total - target, target)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (gap, max_abs, differing) = velocity_gap(&alone, &full_rows);
+        eprintln!(
+            "[gemm] {label}: {k}->{n} over M={total} vs M={target}: {differing} of {} target \
+             outputs differ (rel {gap:.3e}, max |Δ| {max_abs:.3e})",
+            target * n
+        );
+    }
 }
 
 /// What a render body renders with: the engine id, how the generator is loaded, and the stem its
@@ -1104,13 +2215,14 @@ impl Target {
     }
 }
 
-/// The reference-edit smoke of `target`: one render per [`EditCase`] — `steps: None` leaves the
-/// count to the generator, which must then run `default_steps` — each cached case followed, with
-/// `forced_shed_twin`, by its forced-shed twin, then the eleven-reference refusal.
+/// The reference-edit smoke of `target` over `references`: one render per [`EditCase`] — `steps:
+/// None` leaves the count to the generator, which must then run `default_steps` — each cached case
+/// followed, with `forced_shed_twin`, by its forced-shed twin, then the eleven-reference refusal.
 /// `QWEN_IMAGE_2_1_PREFIX_KV_CACHE` forces one mode on every case and skips the twins; `golden`
 /// is [`compare_with_golden`]'s.
 fn reference_edit_renders(
     target: &Target,
+    references: ReferenceSource,
     default_steps: u32,
     mut cases: Vec<EditCase>,
     forced_shed_twin: bool,
@@ -1125,6 +2237,7 @@ fn reference_edit_renders(
     reference_edit_renders_in(
         target,
         &out_dir(),
+        references,
         default_steps,
         cases,
         forced_shed_twin && forced.is_none(),
@@ -1146,29 +2259,134 @@ fn pixel_difference(a: &[u8], b: &[u8]) -> (f64, u8) {
     (sum as f64 / a.len() as f64, max)
 }
 
-/// The mean absolute pixel difference (of 255) a forced-shed twin may show against its cached
-/// render. Not measured on released weights.
-const SHED_TWIN_MEAN_BAR: f64 = 2.0;
+/// The **same-picture** difference: both RGB8 images box-averaged onto a 16×16 grid, then the
+/// mean absolute difference of the cells over the three channels (0..=255 levels). It ignores
+/// where an edge or a texture lands to within a cell and compares what the picture is — layout,
+/// colour and tone. Cells are `width/16 × height/16` pixels; a remainder is ignored.
+fn grid_difference(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+    const GRID: usize = 16;
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(a.len(), w * h * 3, "RGB8 geometry");
+    assert_eq!(b.len(), a.len(), "the two renders are the same size");
+    assert!(
+        w >= GRID && h >= GRID,
+        "{w}x{h} is below the {GRID}-cell grid"
+    );
+    let (cw, ch) = (w / GRID, h / GRID);
+    let mut total = 0f64;
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let mut sums = [0f64; 6];
+            for y in gy * ch..(gy + 1) * ch {
+                for x in gx * cw..(gx + 1) * cw {
+                    let at = (y * w + x) * 3;
+                    for c in 0..3 {
+                        sums[c] += f64::from(a[at + c]);
+                        sums[3 + c] += f64::from(b[at + c]);
+                    }
+                }
+            }
+            let n = (cw * ch) as f64;
+            total += (0..3)
+                .map(|c| (sums[c] - sums[3 + c]).abs() / n)
+                .sum::<f64>();
+        }
+    }
+    total / (GRID * GRID * 3) as f64
+}
+
+/// The same-picture difference ([`grid_difference`]) a forced-shed twin may show against its
+/// cached render. **Not a pixel bar**: the two paths are the same mathematics but not the same
+/// bf16 arithmetic — cuBLAS reduces the target rows' `hidden → inner` projection differently at
+/// the cached decode's row count (see [`turbo_validation_prefix_kv_cache_velocity`]) — and an
+/// eight-step flow over a ~42k-token joint sequence amplifies that ulp-level difference into a
+/// visibly shifted but identical scene. Measured on CUDA (run 38668492569, real references):
+///
+/// * the two-reference twin: bit-identical (0.00);
+/// * the ten-reference twin: full-resolution mean 7.64 (max 242), but **3.41** on the grid;
+/// * the same prompt and seed at different step counts (4/6, 8/12, 12/16 steps, 2048²) —
+///   the same scene by construction — 4.50–5.08;
+/// * two different pictures (the ten- against the two-reference edit; this run's ten-reference
+///   edit against the synthetic-reference one of run 38664658356) 58.6–60.6.
+///
+/// 15 is three times the same-scene spread and four times under a different picture. It catches
+/// a cached path that renders something else; a subtle cached-path defect can still render the
+/// same scene (a one-position RoPE shift measured 2.8–4.0), and is
+/// [`turbo_validation_prefix_kv_cache_velocity`]'s to catch.
+///
+/// **Why the two-reference twin is not held bit-identical here**, although CUDA measured it so:
+/// that zero is a property of the device, not of the code — it holds because cuBLAS happened to
+/// pick an `M`-invariant kernel for every projection between 4 096 and 12 321 rows on that card
+/// and library, and a different GPU, driver or cuBLAS release may pick otherwise for the same
+/// shapes (as it does at 1 024 rows for the ten-reference case). A strict pixel bar would turn a
+/// library upgrade into a red twin with nothing wrong. The device-independent strict check of the
+/// cached path is [`turbo_validation_prefix_kv_cache_velocity`] — evaluation 1 and the cache
+/// bit-identical, every later evaluation within [`CACHED_GAP_CONTROL_RATIO_BAR`] of a control
+/// measured on the same device, and block 0 within [`CACHED_BLOCK0_REL_BAR`] — which runs on the
+/// same CUDA lane.
+const TWIN_SAME_PICTURE_BAR: f64 = 15.0;
+
+/// [`grid_difference`] passes a picture against itself shifted by a few pixels and fails it
+/// against a different one — device-free.
+#[test]
+fn the_same_picture_difference_tolerates_a_shift_and_rejects_another_picture() {
+    let (w, h) = (256u32, 256u32);
+    let scene = |shift: u32, invert: bool| -> Vec<u8> {
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let x = x.saturating_sub(shift);
+                let disc = ((x as f32 - 90.0).powi(2) + (y as f32 - 140.0).powi(2)).sqrt() < 50.0;
+                let rgb = if disc {
+                    [230u8, 40, 40]
+                } else if y < h / 2 {
+                    [80, 140, 220]
+                } else {
+                    [50, 120, 40]
+                };
+                px.extend(rgb.map(|v| if invert { 255 - v } else { v }));
+            }
+        }
+        px
+    };
+    let base = scene(0, false);
+    assert_eq!(grid_difference(&base, &base, w, h), 0.0);
+    let shifted = grid_difference(&base, &scene(4, false), w, h);
+    let other = grid_difference(&base, &scene(0, true), w, h);
+    eprintln!("shifted {shifted:.2}, other {other:.2}");
+    assert!(
+        shifted <= TWIN_SAME_PICTURE_BAR,
+        "a 4-px shift: {shifted:.2}"
+    );
+    assert!(other > TWIN_SAME_PICTURE_BAR, "another picture: {other:.2}");
+}
 
 /// [`reference_edit_renders`] over explicit cases into an explicit directory — the body, free of
 /// the `QWEN_IMAGE_2_1_*` environment so the dry run at the bottom of this file can drive it on
 /// the miniature fixture.
 ///
-/// `require_positive_delta` arms the sign half of [`assert_observed_cache_delta`] for the
-/// **ten-reference** twin — the one where the cache (24.5 GiB priced in bf16) dominates every
-/// other phase, so holding it must raise the device peak. With fewer references the reference
-/// encode or the decode can set both renders' peak, so those twins are printed and held to the
-/// upper bound only. Every real-weight caller sets it; the dry run cannot (the miniature cache is
-/// a few hundred kB under phases that are not).
+/// `real_weights` is set by every real-weight caller and by no dry run. It arms
+///
+/// * the sign half of [`observed_cache_delta_failures`] for the **ten-reference** twin — the one
+///   where the cache (24.5 GiB priced in bf16) dominates every other phase, so holding it must
+///   raise the device peak. With fewer references the reference encode or the decode can set both
+///   renders' peak, so those twins are printed and held to the upper bound only (the miniature
+///   cache is a few hundred kB under phases that are not);
+/// * over real `references` ([`ReferenceSource::is_real`]), [`assert_not_mosaic`] on every edit
+///   output — the miniature fixture's outputs are noise by construction.
+///
+/// The references are made (or read) once, after the generator loads, and every case takes the
+/// first `count` of them in order.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_in(
     target: &Target,
     out_dir: &std::path::Path,
+    references: ReferenceSource,
     default_steps: u32,
     cases: Vec<EditCase>,
     forced_shed_twin: bool,
     golden: Option<&Path>,
-    require_positive_delta: bool,
+    real_weights: bool,
 ) {
     use candle_gen::gen_core::Conditioning;
 
@@ -1176,12 +2394,27 @@ fn reference_edit_renders_in(
     let started = Instant::now();
     let generator = target.load();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+    // Every check of the body but the golden comparison (AT4, [`assert_golden_clean`]) — the
+    // references', each edit output's, each twin's — is collected here and asserted once, after
+    // the last case has rendered and printed its numbers.
+    let mut failures: Vec<String> = Vec::new();
+    let most = cases.iter().map(|case| case.references).max().unwrap_or(0);
+    let pool = self::references(
+        generator.as_ref(),
+        references,
+        most,
+        out_dir,
+        stem,
+        real_weights.then_some(&mut failures),
+    );
+    let check_picture = real_weights && references.is_real();
 
-    // One render of `case`, with the cache mode `cache` (the case's own, or the twin's).
+    // One render of `case`, with the cache mode `cache` (the case's own, or the twin's): its
+    // pixels, its observation, its golden failure and its picture-check failures.
     let render = |case: EditCase,
                   cache: PrefixKvCacheMode,
                   suffix: &str|
-     -> (Vec<u8>, Observed, Option<String>) {
+     -> (Vec<u8>, Observed, Option<String>, Vec<String>) {
         let EditCase {
             references: count,
             width,
@@ -1191,15 +2424,13 @@ fn reference_edit_renders_in(
         } = case;
         let req = selecting(
             GenerationRequest {
-                prompt:
-                    "Combine the subjects of the reference images into one scene, evening light"
-                        .to_owned(),
+                prompt: EDIT_PROMPT.to_owned(),
                 width,
                 height,
                 steps,
                 seed: Some(42),
                 conditioning: vec![Conditioning::MultiReference {
-                    images: references(count, 768, 768),
+                    images: pool[..count].to_vec(),
                 }],
                 ..Default::default()
             },
@@ -1246,13 +2477,18 @@ fn reference_edit_renders_in(
             image::ColorType::Rgb8,
         );
         let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image.pixels, cache);
-        assert_not_band_corrupted(&label, &image.pixels, width, height);
+        let mut picture_failures: Vec<String> = band_failure(&label, &image.pixels, width, height)
+            .into_iter()
+            .collect();
+        if check_picture {
+            picture_failures.extend(mosaic_failure(&label, &image.pixels, width, height));
+        }
         eprintln!(
             "wrote {} ({width}x{height} RGB8) after {:.1}s render",
             path.display(),
             render_started.elapsed().as_secs_f32()
         );
-        (image.pixels, observed, golden_failure)
+        (image.pixels, observed, golden_failure, picture_failures)
     };
 
     // Each twin is rendered **immediately after** the cached render it is compared with, so no
@@ -1265,19 +2501,23 @@ fn reference_edit_renders_in(
     let mut twins = 0;
     let mut golden_failures = Vec::new();
     for case in cases {
-        let (cached, cached_observed, failure) = render(case, case.cache, "");
+        let (cached, cached_observed, failure, picture) = render(case, case.cache, "");
         golden_failures.extend(failure);
+        failures.extend(picture);
         if !forced_shed_twin || !case.cache.is_cached() {
             continue;
         }
         twins += 1;
-        let (shed, shed_observed, failure) =
+        let (shed, shed_observed, failure, picture) =
             render(case, PrefixKvCacheMode::Prefill, "_prefill_twin");
         golden_failures.extend(failure);
+        failures.extend(picture);
         let (mean, max) = pixel_difference(&shed, &cached);
+        let same_picture = grid_difference(&shed, &cached, case.width, case.height);
         eprintln!(
             "[kv] {stem} forced-shed twin of the {}-reference case: mean |Δ| = {mean:.4}, max |Δ| = \
-             {max} (of 255) against its cached render; bar: mean <= {SHED_TWIN_MEAN_BAR}",
+             {max} (of 255), 16-grid {same_picture:.2} against its cached render; bar: 16-grid <= \
+             {TWIN_SAME_PICTURE_BAR}",
             case.references
         );
         let twin_label = format!("{stem} {}-reference twin", case.references);
@@ -1312,31 +2552,44 @@ fn reference_edit_renders_in(
                     memory_rows.join("\n") + "\n",
                 )
                 .unwrap();
-                assert_observed_cache_delta(
+                failures.extend(observed_cache_delta_failures(
                     &twin_label,
                     cached_peak,
                     shed_peak,
                     cached_observed.priced_cache,
-                    require_positive_delta && case.references == MAX_REFERENCES,
-                );
+                    real_weights && case.references == MAX_REFERENCES,
+                ));
             }
             _ => eprintln!(
                 "[kv] {twin_label}: NOT MEASURED — no device memory sampler on this build (the \
                  observed cache delta is a `--features cuda` measurement)"
             ),
         }
-        assert!(
-            mean <= SHED_TWIN_MEAN_BAR,
-            "the forced-shed render differs from the cached one by a mean of {mean:.4} levels \
-             (max {max}); the two paths are the same mathematics"
-        );
+        if same_picture > TWIN_SAME_PICTURE_BAR {
+            failures.push(format!(
+                "the {}-reference forced-shed render is a different picture from the cached one: \
+                 16-grid difference {same_picture:.2} (full-resolution mean {mean:.4}, max {max}), \
+                 above {TWIN_SAME_PICTURE_BAR}",
+                case.references
+            ));
+        }
     }
     assert!(
         !forced_shed_twin || twins > 0,
         "a forced-shed twin needs a cached case"
     );
-    // After every case has rendered, written its files and its `[golden]` line.
+    // After every case has rendered, written its files and its `[golden]` / `[kv]` lines — the
+    // collected failures printed first, so a golden miss does not hide them.
+    for failure in &failures {
+        eprintln!("[check] FAILED: {failure}");
+    }
     assert_golden_clean(&golden_failures);
+    assert!(
+        failures.is_empty(),
+        "{} check(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 
     let err = generator
         .validate(&GenerationRequest {
@@ -1401,9 +2654,11 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     // The miniature cache sits under the fixture's other phases, so the twins' sign check is not
     // armed here; the bound is, and the check itself is pinned by
     // `the_observed_cache_delta_is_bounded_by_the_priced_cache`.
+    // Rendered references, so the in-run reference renders are driven too (64² on the fixture).
     reference_edit_renders_in(
         &target,
         out.path(),
+        ReferenceSource::Rendered { edge: 64 },
         8,
         vec![case(2), case(10)],
         true,
@@ -1430,6 +2685,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &mixed,
         out.path(),
+        ReferenceSource::Synthetic,
         8,
         vec![
             case(2),
@@ -1451,7 +2707,13 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     ] {
         crate::turbo_tiers::compose_tier(turbo.path(), tiers.path(), tier);
     }
-    turbo_installed_tier_renders_in(tiers.path(), out.path(), (64, 64), 8);
+    turbo_installed_tier_renders_in(
+        tiers.path(),
+        out.path(),
+        (64, 64),
+        8,
+        ReferenceSource::Synthetic,
+    );
     for tier in ["q8", "q4"] {
         for name in [
             format!("qwen_image_2_1_turbo_candle_{tier}_64x64_8steps_seed42.png"),
@@ -1492,6 +2754,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &base_edit,
         golden.path(),
+        ReferenceSource::Synthetic,
         40,
         edit_cases(),
         false,
@@ -1509,6 +2772,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &base_edit,
         checked.path(),
+        ReferenceSource::Synthetic,
         40,
         edit_cases(),
         false,
@@ -1560,6 +2824,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
             reference_edit_renders_in(
                 &base_edit,
                 rechecked.path(),
+                ReferenceSource::Synthetic,
                 40,
                 edit_cases(),
                 false,
@@ -1588,6 +2853,62 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
         rechecked.path().join(ten_refs).is_file(),
         "and its render written"
     );
+}
+
+/// The edit body asserts **once**, after its last case: with its real-weight checks armed
+/// (`real_weights`) on the miniature fixture and the mosaic bar lowered to zero on this thread
+/// ([`MOSAIC_BAR`]) so that every picture check — each in-run reference's and each edit output's —
+/// fails, every case and twin still renders and writes its files, and the one failure names every
+/// case's check. It needs no snapshot and runs wherever the dry run does.
+///
+/// *Mutations that red this:* any collected check of [`reference_edit_renders_in`] (a
+/// reference's, an edit output's [`mosaic_failure`], a twin's [`observed_cache_delta_failures`]
+/// or same-picture bar) asserting in place — the ten-reference files are then never written.
+#[test]
+fn the_edit_body_collects_every_check_and_asserts_after_its_last_case() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let turbo = crate::common::turbo_snapshot();
+    let out = tempfile::tempdir().unwrap();
+    let id = candle_gen_qwen_image_2_1::TURBO_MODEL_ID;
+    let target = Target::dense(id, turbo.path().to_path_buf(), "deferred");
+    let case = |references| EditCase {
+        references,
+        width: 64,
+        height: 64,
+        steps: None,
+        cache: PrefixKvCacheMode::Cached,
+    };
+    MOSAIC_BAR.with(|bar| bar.set(0.0));
+    let err = catch_unwind(AssertUnwindSafe(|| {
+        reference_edit_renders_in(
+            &target,
+            out.path(),
+            ReferenceSource::Rendered { edge: 64 },
+            8,
+            vec![case(2), case(10)],
+            true,
+            None,
+            true,
+        );
+    }))
+    .expect_err("every picture check fails at a zero bar");
+    MOSAIC_BAR.with(|bar| bar.set(MOSAIC_CHROMA_BAR));
+    let message = err.downcast_ref::<String>().cloned().unwrap_or_default();
+    eprintln!("{message}");
+    for count in [2, 10] {
+        for suffix in ["", "_prefill_twin"] {
+            let name = format!("deferred_edit_{count}refs_64x64_8steps_seed42{suffix}.png");
+            assert!(
+                out.path().join(&name).is_file(),
+                "{name}: every case still rendered"
+            );
+        }
+        assert!(
+            message.contains(&format!("deferred {count} refs cached: chroma busyness")),
+            "the one failure carries the {count}-reference case's check:\n{message}"
+        );
+    }
 }
 
 fn turbo_tier_snapshot() -> PathBuf {
@@ -1641,16 +2962,26 @@ fn turbo_validation_render_installed_tiers() {
         .unwrap()
         .default_steps() as u32;
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
-    turbo_installed_tier_renders_in(&tiers, &out_dir(), (1024, 1024), saved);
+    turbo_installed_tier_renders_in(
+        &tiers,
+        &out_dir(),
+        (1024, 1024),
+        saved,
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
+    );
 }
 
-/// [`turbo_validation_render_installed_tiers`]'s body over an explicit tier directory, size and
-/// output directory, so the dry run drives it on tiers composed from the miniature fixture.
+/// [`turbo_validation_render_installed_tiers`]'s body over an explicit tier directory, size,
+/// output directory and reference source, so the dry run drives it on tiers composed from the
+/// miniature fixture.
 fn turbo_installed_tier_renders_in(
     tiers: &Path,
     out_dir: &Path,
     (width, height): (u32, u32),
     saved_steps: u32,
+    references: ReferenceSource,
 ) {
     use candle_gen_qwen_image_2_1::quant::{installed_tier, Tier};
     let id = candle_gen_qwen_image_2_1::TURBO_MODEL_ID;
@@ -1717,6 +3048,7 @@ fn turbo_installed_tier_renders_in(
         reference_edit_renders_in(
             &target,
             out_dir,
+            references,
             saved_steps,
             vec![EditCase {
                 references: 2,
@@ -1732,14 +3064,19 @@ fn turbo_installed_tier_renders_in(
     }
 }
 
-/// A **transparent** RGBA reference of `width`×`height`: the same deterministic picture
-/// [`synthetic_reference`] produces, matted onto a soft-edged disc so the alpha is a real ramp
-/// rather than a binary cut-out (a hard matte would survive any resampling order and so could not
-/// exercise the premultiplied resize). The candle twin of the MLX smoke's reference (sc-24111).
+/// A **transparent** RGBA reference: a real 1024² picture `generator` renders in the run (the
+/// first of [`rendered_references`]; the CUDA lane provisions no reference images) matted onto a
+/// soft-edged disc so the alpha is a real ramp rather than a binary cut-out (a hard matte would
+/// survive any resampling order and so could not exercise the premultiplied resize). The candle
+/// twin of the MLX smoke's reference (sc-24111).
 ///
-/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from a real image
-/// instead; reference images for a real evaluation are user-provided.
-fn transparent_reference(width: u32, height: u32) -> candle_gen::gen_core::RgbaImage {
+/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from that image
+/// instead (operator-supplied; nothing is rendered then).
+fn transparent_reference(
+    generator: &dyn Generator,
+    out_dir: &Path,
+    stem: &str,
+) -> candle_gen::gen_core::RgbaImage {
     if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
         let rgba = image::open(&path)
             .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
@@ -1750,8 +3087,12 @@ fn transparent_reference(width: u32, height: u32) -> candle_gen::gen_core::RgbaI
             pixels: rgba.into_raw(),
         };
     }
-    let rgb = synthetic_reference(1, width, height);
-    let mut out = candle_gen::gen_core::RgbaImage::from_rgb(&rgb).unwrap();
+    let mut failures = Vec::new();
+    let picture =
+        rendered_references(generator, 1, 1024, out_dir, stem, Some(&mut failures)).remove(0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let (width, height) = (picture.width, picture.height);
+    let mut out = candle_gen::gen_core::RgbaImage::from_rgb(&picture).unwrap();
     let (cx, cy) = ((width - 1) as f32 / 2.0, (height - 1) as f32 / 2.0);
     let radius = width.min(height) as f32 * 0.36;
     for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
@@ -1926,7 +3267,7 @@ fn transparency_renders(
              transparency; the background is fully transparent."
                 .to_owned(),
             vec![Conditioning::ReferenceRgba {
-                image: transparent_reference(1024, 1024),
+                image: transparent_reference(generator.as_ref(), &out_dir, stem),
                 strength: None,
             }],
         ),
