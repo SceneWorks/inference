@@ -342,15 +342,26 @@ pub fn bound(
         .ok_or_else(|| bad("size overflow"))?;
     let predictor_host = bytes(12 * layers as u128 * heads as u128 * (dim as u128).pow(2))?;
     if backend == Backend::Mlx {
-        device = predictor_host;
+        // Resident BF16 Q/K projections of every layer, plus one layer's first-call upload
+        // transients (host FP32 vector and device FP32 array, for Q and for K).
+        device = predictor_host
+            .checked_add(bytes(48 * heads as u128 * (dim as u128).pow(2))?)
+            .ok_or_else(|| bad("size overflow"))?;
     }
     let plans = 32 * FROZEN_PLANS.len() as u64;
     let load = 275_415_649 + plans + bytes(24 * heads as u128 * (dim as u128).pow(2))?;
     let position = bytes(6 * 24 * seq as u128)?; // packed layout/model clones, including Vec growth capacity
     let outputs =
         bytes(12 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128)?;
-    let inputs =
-        bytes(3 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128)?;
+    // MLX narrows FP32 Q/K/V to BF16 once per layer for its 16-bit NAX products.
+    let narrowed = if backend == Backend::Mlx && element == 4 {
+        3 * 2 * batch as u128 * heads as u128 * seq as u128 * dim as u128
+    } else {
+        0
+    };
+    let inputs = bytes(
+        3 * batch as u128 * heads as u128 * seq as u128 * dim as u128 * element as u128 + narrowed,
+    )?;
     let self_test = match backend {
         Backend::Cuda => bytes(64 * 512 * dim as u128 + 12 * 512 * 512 + 64 * 512)?,
         Backend::Mlx => bytes(128 * 1024 * dim as u128 + 32 * 2 * 1024 * 1024 + 256 * 1024)?,
@@ -927,8 +938,11 @@ mod tests {
                 c.heads as u64 * c.minimum_attention_bytes
             );
         }
-        assert_eq!(mlx.predictor_device_bytes, mlx.predictor_host_bytes);
-        assert_eq!(mlx.predictor_device_bytes, 12 * 50 * 56 * 128 * 128);
+        assert_eq!(
+            mlx.predictor_device_bytes,
+            mlx.predictor_host_bytes + 48 * 56 * 128 * 128
+        );
+        assert_eq!(mlx.predictor_host_bytes, 12 * 50 * 56 * 128 * 128);
         let mut dense = req();
         dense.veda = Some(VedaRequest {
             enabled: true,

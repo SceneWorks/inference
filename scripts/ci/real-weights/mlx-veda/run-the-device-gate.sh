@@ -25,4 +25,16 @@ if [[ -z "$passed" || "$passed" -eq 0 ]]; then
   echo "::error::no veda::device_gate:: / veda_fixture:: test ran (filter matched nothing, or no ok result line)"
   exit 1
 fi
+# A green total alone could come from `veda_fixture::` while `veda::device_gate::` matched nothing
+# (a module rename): the exactness evidence itself must be in the log.
+for want in "masks mode=t2va heads_checked=56 result=exact" \
+            "masks mode=fl2va heads_checked=56 result=exact" \
+            "masks mode=mixed-t2va heads_checked=56 result=exact" \
+            "logits mode=T2va" "logits mode=Fl2va" "logits mode=R2va" \
+            "frozen_fixtures cases="; do
+  if ! grep -q "^VEDA_GATE $want" "$log"; then
+    echo "::error::device gate evidence missing: VEDA_GATE $want"
+    exit 1
+  fi
+done
 echo "veda::device_gate:: + veda_fixture:: $passed passed"

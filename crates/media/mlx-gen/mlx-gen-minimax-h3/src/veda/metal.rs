@@ -557,8 +557,9 @@ impl DeviceLayout {
 /// Frozen learned tile logits `[heads, video, video]` of one same-shape head batch, equal bit for
 /// bit to gen-core's host `pool_video_tiles` + `tile_logits` for every head on its own, with one
 /// evaluation and one host readback for the whole batch. `x_q`/`x_k` are the native
-/// `[seq, heads_total, dim]` Q and K; `proj_*` the device-resident `[layers, heads, 3*dim, dim]`
-/// BF16 projections.
+/// `[seq, heads_total, dim]` Q and K; `proj_*` device-resident BF16 projections
+/// `[layers, heads, 3*dim, dim]` indexed at `layer` (the runtime passes one layer's
+/// `[heads, 3*dim, dim]` with `layer = 0`).
 #[allow(clippy::too_many_arguments)]
 pub fn scores(
     layout: &DeviceLayout,
@@ -673,8 +674,8 @@ pub(crate) fn attend_route(
     let keys = Array::from_slice(&keys, &[keys.len() as i32]);
     let counts = Array::from_slice(&counts, &[counts.len() as i32]);
     // NAX: one 256-thread threadgroup per 128-row query tile; otherwise four 128-thread quarters.
-    // The NAX products are 16-bit, so on a NAX device FP32 operands (fixtures only; the product
-    // DiT runs BF16) are rounded to BF16: one route per device, never a dtype-chosen second one.
+    // The NAX products are 16-bit: the runtime narrows FP32 operands once per layer; this keeps a
+    // direct FP32 caller (tests) on the same single route rather than a dtype-chosen second one.
     let narrow = |a: &Array| -> Result<Array> {
         Ok(if nax && a.dtype() == Dtype::Float32 {
             a.as_dtype(Dtype::Bfloat16)?

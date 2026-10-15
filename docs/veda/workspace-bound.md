@@ -56,8 +56,11 @@ host copy, key-tile lists), runs one block-sparse kernel launch over every video
 query tile reading Q/K/V in place through the tile permutation, and one dense call
 over the batch's global query rows (with their head-selected K/V and output), then
 assembles the native-order output. No tile-order or gathered Q/K/V copy exists on
-MLX, so none is charged; every layer's BF16 Q/K projections are device-resident and
-charged once (`predictor_device_bytes`). Each batch's output is evaluated before the
+the MLX Metal route, so none is charged; sparse execution refuses a non-Metal MLX
+device (the CPU gather route is a test-only reference). Every layer's BF16 Q/K
+projections are device-resident and charged once with one layer's FP32 upload
+transients (`predictor_device_bytes`); FP32 Q/K/V are narrowed to BF16 once per layer
+for the 16-bit NAX products, charged in `input_qkv_bytes`. Each batch's output is evaluated before the
 next batch's scorer graph, so lazy graphs cannot retain all batches concurrently.
 Globals stay separate from sparse video batches.
 

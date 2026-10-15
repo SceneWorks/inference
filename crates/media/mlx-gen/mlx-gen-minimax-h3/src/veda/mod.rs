@@ -36,6 +36,18 @@ pub const NAX_KERNEL: &str = "mlx-tile-sparse-nax-v2";
 /// MLX CPU device execution (tests, no Metal): the host scorer contract and gather + SDPA.
 pub const CPU_KERNEL: &str = "mlx-batched-gather-sdpa-v1";
 
+/// Production sparse execution is Metal-only: the CPU-device gather route is an unpriced test
+/// reference (its tile and per-query-tile K/V copies are outside the MLX workspace bound), so a
+/// non-Metal default device refuses before any allocation and the request stays dense.
+fn require_metal(gpu: bool) -> Result<()> {
+    if gpu || cfg!(test) {
+        Ok(())
+    } else {
+        Err(Error::Msg(
+            "Veda sparse attention requires the MLX Metal device".into(),
+        ))
+    }
+}
 fn on_gpu() -> Result<bool> {
     Ok(matches!(
         mlx_rs::Device::try_default()?.get_type()?,
@@ -445,6 +457,7 @@ impl VedaRuntime {
             batches.extend(group.chunks(reservation.heads).map(|h| (shape, h.to_vec())));
         }
         let gpu = on_gpu()?;
+        require_metal(gpu)?;
         if gpu && dim != metal::HEAD_DIM {
             return Err(Error::Msg(format!(
                 "Veda Metal kernel supports head dim {}, not {dim}",
@@ -453,9 +466,20 @@ impl VedaRuntime {
         }
         // The DiT's Q/K/V are head-transposed views of native `[seq, heads, dim]` rows, which is
         // what the Metal kernels index (through each layout's permutation), so no tile copy exists.
+        // The NAX products are 16-bit, so FP32 operands (fixtures only; the product DiT runs BF16)
+        // are rounded to BF16 once per layer, priced as `input_qkv_bytes`' narrowing term.
+        let narrow = gpu && metal::nax_available() && q.dtype() == Dtype::Float32;
         let native = |a: &Array| -> Result<Array> {
-            Ok(a.transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[seq as i32, heads as i32, dim as i32])?)
+            let a = a.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                seq as i32,
+                heads as i32,
+                dim as i32,
+            ])?;
+            Ok(if narrow {
+                a.as_dtype(Dtype::Bfloat16)?
+            } else {
+                a
+            })
         };
         let natives = if gpu {
             Some((native(q)?, native(k)?, native(v)?, self.projection(layer)?))
@@ -820,6 +844,8 @@ fn gather_attention(
 }
 /// Bounded actual-device oracle, including partial video tiles, global rows, and a non-dense mask.
 pub fn device_self_test() -> Result<()> {
+    let gpu = on_gpu()?;
+    require_metal(gpu)?;
     let l = Layout::t2va(17, [2, 9, 17], TileShape([2, 8, 8]), 323)?;
     let heads = 2usize;
     let dim = 128usize;
@@ -858,7 +884,10 @@ pub fn device_self_test() -> Result<()> {
     )?;
     // The production route of the current device, on the production batch shape.
     let ids: Vec<i32> = (0..heads as i32).collect();
-    let sparse = if on_gpu()? {
+    if gpu {
+        scorer_self_test(&l, &q, &k, heads, dim)?;
+    }
+    let sparse = if gpu {
         let native = |a: &Array| -> Result<Array> {
             Ok(a.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[seq as i32, heads as i32, dim as i32])?)
@@ -956,6 +985,61 @@ pub fn device_self_test() -> Result<()> {
         return Err(Error::Msg(format!(
             "Veda {} actual-device self-test failed: {error} > {SELF_TEST_ATOL}",
             kernel_id()?
+        )));
+    }
+    Ok(())
+}
+
+/// The Metal tile scorer must reproduce gen-core's host contract bit for bit (E2) on this device
+/// and compiler: synthetic BF16 projections over the self-test layout, every logit compared.
+fn scorer_self_test(l: &Layout, q: &Array, k: &Array, heads: usize, dim: usize) -> Result<()> {
+    let n = heads * 3 * dim * dim;
+    let proj = |phase: usize| -> Vec<u16> {
+        (0..n)
+            .map(|i| contract::bf16(((i * 37 + phase) % 101) as f32 / 101.0 - 0.5))
+            .collect()
+    };
+    let bundle = Bundle {
+        identity: "self-test".into(),
+        layers: 1,
+        heads,
+        dim,
+        plans: vec![],
+        q: vec![proj(3)],
+        k: vec![proj(11)],
+    };
+    let ids: Vec<i32> = (0..heads as i32).collect();
+    let upload = |query: bool| -> Result<Array> {
+        Ok(Array::from_slice(
+            &bundle.projection(0, &ids, query),
+            &[heads as i32, 3 * dim as i32, dim as i32],
+        )
+        .as_dtype(Dtype::Bfloat16)?)
+    };
+    let native = |a: &Array| -> Result<Array> {
+        Ok(a.transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[l.seq as i32, heads as i32, dim as i32])?)
+    };
+    let device = metal::scores(
+        &metal::DeviceLayout::new(l),
+        &native(q)?,
+        &native(k)?,
+        &upload(true)?,
+        &upload(false)?,
+        &ids,
+        0,
+        dim,
+    )?;
+    let host = host_scores(&bundle, 0, &ids, l, q, k)?;
+    let mismatched = device
+        .iter()
+        .zip(&host)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    if device.len() != host.len() || mismatched > 0 {
+        return Err(Error::Msg(format!(
+            "Veda Metal scorer self-test: {mismatched} of {} logits differ from the host contract",
+            host.len()
         )));
     }
     Ok(())
