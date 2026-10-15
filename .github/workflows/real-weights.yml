@@ -323,18 +323,6 @@ on:
         type: string
         required: false
         default: ""
-      # sc-26234 -- `flux3-klein-mlx` only: the render geometry of the one catalog text-to-image
-      # case (the component parity cases are fixed at 64²).
-      flux3_mlx_size:
-        description: "flux3-klein-mlx only: output side of the catalog render (multiple of 16, 64..=2048)"
-        type: string
-        required: false
-        default: "1024"
-      flux3_mlx_steps:
-        description: "flux3-klein-mlx only: Euler steps of the catalog render (1-99; the release is 16)"
-        type: string
-        required: false
-        default: "16"
       # sc-26214 -- `veda-mlx` only. `device` runs the lib binary's `veda::device_gate::` checks
       # (exact sparse mask on Metal + per-layer bench), `ab` the dense-vs-sparse renders, `all` both.
       veda_mlx_phase:
@@ -5941,8 +5929,10 @@ jobs:
     env:
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       FLUX3_PACKAGE_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein/snapshots/8454017f9ebaada30c998fccd9f67a80c7580f68
-      FLUX3_REAL_SIZE: ${{ inputs.flux3_mlx_size }}
-      FLUX3_REAL_STEPS: ${{ inputs.flux3_mlx_steps }}
+      # The release geometry, fixed: `workflow_dispatch` is capped at 25 inputs and this file sits at
+      # 24, so the render takes no dispatch inputs (the scripts still validate these values).
+      FLUX3_REAL_SIZE: "1024"
+      FLUX3_REAL_STEPS: "16"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Check the host (>= 48 GB, memory pressure) and the dispatch inputs

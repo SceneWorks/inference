@@ -855,6 +855,9 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
+            // sc-26234: FLUX 3 Image Klein ships on MLX first; the Candle lane is sc-26235, which
+            // maps this row and deletes the pin.
+            "flux3_image_klein",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.
