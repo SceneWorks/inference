@@ -26,7 +26,8 @@ use gen_core::iris::{
 use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_shard_roots};
 use gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::gen_core;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Quant, Result};
+use mlx_llm::primitives::projection::QuantSpec;
 use mlx_llm::{CausalLm, ModelConfig};
 use mlx_rs::ops::{concatenate_axis, stack_axis, zeros};
 use mlx_rs::transforms::eval;
@@ -85,10 +86,67 @@ pub(crate) fn weight_shards(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     )
 }
 
+/// The group size of a quantized text tower (sc-26266): the codebase default 64 when every
+/// projection input width (`hidden_size` for q/k/v/gate/up, `heads · head_dim` for o, the MLP width
+/// for down) divides it, else 32 — the shared decoder packs every projection at ONE group size.
+/// `None` when not even 32 divides them all: such a tower has no affine tier.
+pub fn text_encoder_quant_group(cfg: &ModelConfig) -> Option<i32> {
+    let widths = [
+        cfg.hidden_size,
+        cfg.num_heads * cfg.head_dim,
+        cfg.intermediate_size,
+    ];
+    [64, 32]
+        .into_iter()
+        .find(|group| widths.iter().all(|width| *width > 0 && width % group == 0))
+}
+
+/// The load-time quantization of the text tower at `quant` (`None` is the dense tier).
+pub fn text_encoder_quant_spec(
+    cfg: &ModelConfig,
+    quant: Option<Quant>,
+) -> Result<Option<QuantSpec>> {
+    let bits = match quant {
+        None => return Ok(None),
+        Some(Quant::Q4) => 4,
+        Some(Quant::Q8) => 8,
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+            "iris: the Qwen3-VL text tower has the q8 and q4 affine tiers; {other:?} is not one \
+                 of them"
+        )))
+        }
+    };
+    let group_size = text_encoder_quant_group(cfg).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "iris: the text tower's projection widths (hidden {}, attention {}, MLP {}) share no \
+             affine group size (64 or 32), so it has no quantized tier",
+            cfg.hidden_size,
+            cfg.num_heads * cfg.head_dim,
+            cfg.intermediate_size
+        ))
+    })?;
+    Ok(Some(QuantSpec { group_size, bits }))
+}
+
 impl IrisTextEncoder {
     /// Load from a `Qwen/Qwen3-VL-4B-Instruct` snapshot directory under the backbone's
     /// `text_encoder` config section. Only the language tower's tensors are read.
     pub fn load(dir: &Path, cfg: &TextEncoderConfig) -> Result<Self> {
+        Self::load_quantized(dir, cfg, None)
+    }
+
+    /// [`load`](Self::load) at a quantization tier (sc-26266): `quant` packs every attention and
+    /// MLP projection of the language tower to Q4/Q8 at load (group size
+    /// [`text_encoder_quant_group`]); the token embedding (tied to the head) and the norms stay
+    /// bf16, as the shared decoder keeps them. The quantized build materializes group by group and
+    /// releases each group's bf16 sources as it goes, so the load never holds the dense tower
+    /// beside the packed one.
+    pub fn load_quantized(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
         let model_cfg = ModelConfig::from_dir(dir).map_err(from_llm)?;
         if !model_cfg.architecture.is_qwen3_vl() {
             return Err(Error::Unsupported(format!(
@@ -132,10 +190,31 @@ impl IrisTextEncoder {
             })?;
             tensors.extend(part);
         }
-        let weights = mlx_llm::primitives::weights::Weights::from_map(tensors);
-        // `from_weights` evaluates every parameter group it built (the load boundary), so no
-        // forward ever reads a weight from disk.
-        let lm = CausalLm::from_weights(&weights, "", model_cfg).map_err(from_llm)?;
+        let quant = text_encoder_quant_spec(&model_cfg, quant)?;
+        let mut weights = mlx_llm::primitives::weights::Weights::from_map(tensors);
+        let lm = match quant {
+            // `from_weights` evaluates every parameter group it built (the load boundary), so no
+            // forward ever reads a weight from disk.
+            None => CausalLm::from_weights(&weights, "", model_cfg).map_err(from_llm)?,
+            // Read, verify, quantize and release one parameter group at a time (the shared
+            // decoder's bounded load, `mlx_llm::LlamaProvider`'s path), so the packed tower never
+            // sits beside the whole bf16 one.
+            Some(spec) => {
+                let lm =
+                    CausalLm::build_lazy(&weights, "", model_cfg, Some(spec)).map_err(from_llm)?;
+                let report = weights
+                    .materialize_groups(&lm.param_groups())
+                    .map_err(from_llm)?;
+                if report.leftover > 0 {
+                    return Err(Error::Msg(format!(
+                        "iris: {} text-encoder source tensor(s) were read but consumed by no \
+                         parameter group",
+                        report.leftover
+                    )));
+                }
+                lm
+            }
+        };
         drop(weights);
 
         let tokenizer = TextTokenizer::from_file(
@@ -171,6 +250,29 @@ impl IrisTextEncoder {
                 },
             )?,
         })
+    }
+
+    /// Bytes the loaded tower holds — every parameter group of the decoder, at the width it is
+    /// resident in. Measured from the model, not priced from the checkpoint.
+    ///
+    /// The decoder lists a tied head beside the embedding it shares (its first group is the
+    /// embedding's arrays, the final norm, then the head's arrays), so a tied head's arrays are
+    /// skipped rather than counted twice.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let mut groups = self.lm.param_groups();
+        if self.lm.config().tie_word_embeddings {
+            if let Some(outside) = groups.first_mut() {
+                // `[embedding.., norm, head..]` with as many head arrays as embedding arrays.
+                let embedding = (outside.len() - 1) / 2;
+                outside.truncate(embedding + 1);
+            }
+        }
+        groups.iter().flatten().map(|a| a.nbytes() as u64).sum()
+    }
+
+    /// Whether the tower's projections are affine-packed.
+    pub fn is_quantized(&self) -> bool {
+        self.lm.is_quantized()
     }
 
     pub fn prefix_ids(&self) -> &[i32] {

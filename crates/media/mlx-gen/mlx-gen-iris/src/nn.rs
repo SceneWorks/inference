@@ -19,10 +19,97 @@ use std::collections::{BTreeMap, BTreeSet};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::gen_core::iris;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, Quant, Result};
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
-use mlx_rs::ops::{concatenate_axis, stack_axis};
+use mlx_rs::ops::{concatenate_axis, pad, stack_axis};
 use mlx_rs::{Array, Dtype};
+
+/// Group size of every quantized backbone projection (sc-26266): the codebase default, which the
+/// release's projection widths (2560, 768, 256, 64, …) divide.
+pub const QUANT_GROUP_SIZE: usize = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
+
+/// The load-time quantization of one backbone build (sc-26266): the affine width of the `q8` /
+/// `q4` tier, and what happens to a projection whose input width is not a multiple of
+/// [`QUANT_GROUP_SIZE`].
+///
+/// The release has exactly one such family — the SwiGLU down projections (`*.mlp.w2`,
+/// `[2560, 6826]`, ~1.2 GB of the 5.6 GB bf16 backbone). Zero-padding their input to the next
+/// group multiple is exact (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like every other
+/// projection. An adapter residual reads the *unpadded* input, so a load that installs adapters
+/// keeps those projections dense instead ([`Self::for_load`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackboneQuant {
+    /// Affine bits per weight (4 or 8).
+    pub bits: i32,
+    /// Zero-pad an unaligned projection's input and quantize it (`true`), or keep it dense.
+    pub pad_unaligned: bool,
+}
+
+impl BackboneQuant {
+    /// The quantization a load with `quant` and (`adapted`) an adapter stack applies: `None` is
+    /// the dense tier. Only the affine tiers exist on this backend; NVFP4 is a typed refusal.
+    pub fn for_load(quant: Option<Quant>, adapted: bool) -> Result<Option<Self>> {
+        let bits = match quant {
+            None => return Ok(None),
+            Some(Quant::Q4) => 4,
+            Some(Quant::Q8) => 8,
+            Some(other) => {
+                return Err(Error::Unsupported(format!(
+                    "iris: the MLX Iris-3B route ships the q8 and q4 affine tiers; {other:?} is \
+                     not one of them"
+                )))
+            }
+        };
+        Ok(Some(Self {
+            bits,
+            pad_unaligned: !adapted,
+        }))
+    }
+}
+
+/// How one `[out, in]` projection is held under a [`BackboneQuant`] — the single rule
+/// [`Loader::linear`] applies and the memory contract prices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionLayout {
+    /// Stored in the compute dtype.
+    Dense,
+    /// Affine-packed at `bits` over an input zero-padded to `padded_in` (`== in` when aligned).
+    Quantized { bits: i32, padded_in: usize },
+}
+
+impl ProjectionLayout {
+    /// The layout of a projection with `in_features` inputs. A projection narrower than one group
+    /// (the release's 3-, 12- and 16-wide pixel and pooling heads, a few KB in all) stays dense.
+    pub fn of(in_features: usize, quant: Option<BackboneQuant>) -> Self {
+        let Some(quant) = quant else {
+            return Self::Dense;
+        };
+        if in_features < QUANT_GROUP_SIZE {
+            return Self::Dense;
+        }
+        let padded_in = in_features.div_ceil(QUANT_GROUP_SIZE) * QUANT_GROUP_SIZE;
+        if padded_in != in_features && !quant.pad_unaligned {
+            return Self::Dense;
+        }
+        Self::Quantized {
+            bits: quant.bits,
+            padded_in,
+        }
+    }
+
+    /// Resident bytes of an `[out, in]` weight held this way, `dense_width` bytes per element when
+    /// dense. A packed weight is `bits / 8` bytes per (padded) element plus one bf16 scale and one
+    /// bf16 bias per group — the layout `mlx_rs::ops::quantize` produces.
+    pub fn weight_bytes(self, out: u64, in_features: u64, dense_width: u64) -> u64 {
+        match self {
+            Self::Dense => out * in_features * dense_width,
+            Self::Quantized { bits, padded_in } => {
+                let padded_in = padded_in as u64;
+                out * padded_in * bits as u64 / 8 + out * (padded_in / QUANT_GROUP_SIZE as u64) * 4
+            }
+        }
+    }
+}
 
 /// Builds modules from a checkpoint at one compute dtype.
 pub struct Loader<'a> {
@@ -31,6 +118,9 @@ pub struct Loader<'a> {
     /// The adapted projections of a load that installed LoRA/LoKr adapters (see
     /// [`AdaptedLinears`]); `None` builds every projection bare from `weights`.
     pub adapted: Option<&'a AdaptedLinears>,
+    /// The load-time quantization of every projection ([`ProjectionLayout::of`]); `None` is the
+    /// dense tier.
+    pub quant: Option<BackboneQuant>,
 }
 
 /// The checkpoint's projections after an adapter install, keyed by upstream module path
@@ -74,7 +164,7 @@ impl Loader<'_> {
 
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
         if let Some(adapted) = self.adapted {
-            if let Some(inner) = adapted.linears.borrow_mut().remove(prefix) {
+            if let Some(mut inner) = adapted.linears.borrow_mut().remove(prefix) {
                 // Same keys a bare build reads (so the checkpoint's unused-key accounting holds).
                 self.require(&format!("{prefix}.weight"))?;
                 if bias {
@@ -89,9 +179,25 @@ impl Loader<'_> {
                 // Every adapter factor is read and evaluated here, at the load boundary, so no
                 // forward ever waits on a lazy adapter read.
                 inner.materialize_adapters()?;
+                // The adapters stay forward-time residuals over the packed base. An adapted load
+                // never pads ([`BackboneQuant::for_load`]), so the layout is aligned or dense.
+                let in_features = inner.base_shape()[1] as usize;
+                match ProjectionLayout::of(in_features, self.quant) {
+                    ProjectionLayout::Dense => {}
+                    ProjectionLayout::Quantized { bits, padded_in } => {
+                        if padded_in != in_features {
+                            return Err(Error::Msg(format!(
+                                "iris: the adapted projection {prefix} cannot be padded for \
+                                 quantization"
+                            )));
+                        }
+                        inner.quantize(bits, Some(QUANT_GROUP_SIZE as i32))?;
+                    }
+                }
                 return Ok(Linear {
                     inner,
                     compute: self.compute,
+                    in_pad: 0,
                 });
             }
         }
@@ -106,10 +212,29 @@ impl Loader<'_> {
         } else {
             None
         };
-        Ok(Linear {
-            inner: AdaptableLinear::dense(weight, bias),
-            compute: self.compute,
-        })
+        let in_features = *weight.shape().last().unwrap_or(&0) as usize;
+        match ProjectionLayout::of(in_features, self.quant) {
+            ProjectionLayout::Dense => Ok(Linear {
+                inner: AdaptableLinear::dense(weight, bias),
+                compute: self.compute,
+                in_pad: 0,
+            }),
+            ProjectionLayout::Quantized { bits, padded_in } => {
+                let in_pad = (padded_in - in_features) as i32;
+                let weight = if in_pad > 0 {
+                    pad(&weight, &[(0, 0), (0, in_pad)][..], None, None)?
+                } else {
+                    weight
+                };
+                let mut inner = AdaptableLinear::dense(weight, bias);
+                inner.quantize(bits, Some(QUANT_GROUP_SIZE as i32))?;
+                Ok(Linear {
+                    inner,
+                    compute: self.compute,
+                    in_pad,
+                })
+            }
+        }
     }
 
     pub fn norm(&self, prefix: &str, eps: f32) -> Result<RmsNorm> {
@@ -127,20 +252,45 @@ impl Loader<'_> {
 pub struct Linear {
     inner: AdaptableLinear,
     compute: Dtype,
+    /// Zero columns appended to the input before a packed base whose input width is not a group
+    /// multiple (`ProjectionLayout::Quantized::padded_in`); `0` for every other projection.
+    in_pad: i32,
 }
 
 impl Linear {
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = x.as_dtype(self.compute)?;
+        if self.in_pad > 0 {
+            let mut widths = vec![(0, 0); x.ndim()];
+            *widths.last_mut().expect("a projection input has an axis") = (0, self.in_pad);
+            return self.inner.forward(&pad(&x, &widths[..], None, None)?);
+        }
         self.inner.forward(&x)
     }
 
-    /// The dense base parameters (adapter factors are evaluated at load by the [`Loader`]).
+    /// The base parameters — dense weight and bias, or the packed codes, scales, biases and bias
+    /// (adapter factors are evaluated at load by the [`Loader`]).
     pub fn arrays(&self) -> Vec<&Array> {
-        match self.inner.dense_weight() {
-            Some((weight, bias)) => std::iter::once(weight).chain(bias).collect(),
+        if let Some((weight, bias)) = self.inner.dense_weight() {
+            return std::iter::once(weight).chain(bias).collect();
+        }
+        match self.inner.quantized_params() {
+            Some((codes, scales, biases, bias, _, _)) => {
+                [codes, scales, biases].into_iter().chain(bias).collect()
+            }
             None => Vec::new(),
         }
+    }
+
+    /// The checkpoint's `[out, in]`, whatever the projection is held as.
+    pub fn logical_shape(&self) -> [i32; 2] {
+        let shape = self.inner.base_shape();
+        [shape[0], shape[1] - self.in_pad]
+    }
+
+    /// Whether the base is affine-packed.
+    pub fn is_quantized(&self) -> bool {
+        self.inner.is_quantized()
     }
 }
 
@@ -282,10 +432,14 @@ pub fn cat(parts: &[&Array], axis: i32) -> Result<Array> {
 
 /// Shape check with a named error (checkpoint/config disagreement surfaces at load, by key).
 pub fn expect_shape(name: &str, a: &Array, want: &[i32]) -> Result<()> {
-    if a.shape() != want {
+    expect_dims(name, a.shape(), want)
+}
+
+/// [`expect_shape`] over a shape already in hand (a projection's [`Linear::logical_shape`]).
+pub fn expect_dims(name: &str, have: &[i32], want: &[i32]) -> Result<()> {
+    if have != want {
         return Err(Error::Msg(format!(
-            "iris: {name} has shape {:?}, the config implies {want:?}",
-            a.shape()
+            "iris: {name} has shape {have:?}, the config implies {want:?}"
         )));
     }
     Ok(())
