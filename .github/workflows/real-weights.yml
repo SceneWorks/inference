@@ -4981,6 +4981,9 @@ jobs:
   # case is then rendered again with the cache shed and compared with it (the forced-shed twins,
   # sc-25909). The test itself reads the CUDA pool's live-byte high-water around every render and
   # writes `qwen_image_2_1_turbo_candle_prefix_kv_cache_memory.csv` into the evidence (AT5).
+  # The edit references are real pictures each test renders first (this box provisions none), and
+  # `turbo_validation_prefix_kv_cache_velocity` compares the cached and prefill velocities
+  # evaluation by evaluation (`[kv-velocity]` / `[gemm]` lines).
   # `turbo_validation_render_installed_tiers` runs only when the dispatch names the operator-copied
   # Turbo q8/q4 tier directory (`qwen_image_2_1_turbo_tier_snapshot`; unpublished, so no manifest
   # row); otherwise the lane warns and leaves a NOT-RUN marker. Re-size it from the first run.

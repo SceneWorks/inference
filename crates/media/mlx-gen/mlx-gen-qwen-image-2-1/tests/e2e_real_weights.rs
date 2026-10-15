@@ -981,7 +981,8 @@ fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
         "{w}x{h} is below the {GRID}-cell grid"
     );
     let (cw, ch) = (w / GRID, h / GRID);
-    let mut cells = vec![[0f64; 2]; GRID * GRID];
+    // One plane per chroma channel: `B − Y`, then `R − Y`.
+    let mut planes = [vec![0f64; GRID * GRID], vec![0f64; GRID * GRID]];
     for gy in 0..GRID {
         for gx in 0..GRID {
             let mut sum = [0f64; 2];
@@ -995,20 +996,21 @@ fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
                 }
             }
             let n = (cw * ch) as f64;
-            cells[gy * GRID + gx] = [sum[0] / n, sum[1] / n];
+            planes[0][gy * GRID + gx] = sum[0] / n;
+            planes[1][gy * GRID + gx] = sum[1] / n;
         }
     }
     let mut total = 0f64;
-    for channel in 0..2 {
+    for plane in &planes {
         let (mut across, mut down) = (0f64, 0f64);
         for gy in 0..GRID {
             for gx in 0..GRID {
-                let here = cells[gy * GRID + gx][channel];
+                let here = plane[gy * GRID + gx];
                 if gx + 1 < GRID {
-                    across += (cells[gy * GRID + gx + 1][channel] - here).abs();
+                    across += (plane[gy * GRID + gx + 1] - here).abs();
                 }
                 if gy + 1 < GRID {
-                    down += (cells[(gy + 1) * GRID + gx][channel] - here).abs();
+                    down += (plane[(gy + 1) * GRID + gx] - here).abs();
                 }
             }
         }
@@ -1239,10 +1241,12 @@ fn validation_render_reference_edit() {
 /// Then the **forced-shed twins** (AT3): **each** cached case — the ten-reference one, which is
 /// AT3's cached ten-reference run, and the two-reference one — rendered again right after it with
 /// the cache shed, and compared with its cached render — the epic's "one run forced to shed that
-/// produces the prefill output". The two paths are the same mathematics; the bar is a mean
-/// absolute pixel difference of at most 2 of 255 (the bar this crate's tiling parity uses), and
-/// the mean and maximum are printed. **That bar has never been run on released weights**: if the
-/// first real run exceeds it, the printed numbers are the finding.
+/// produces the prefill output". The two paths are the same mathematics but not the same bf16
+/// arithmetic (the per-token projections run on a different row count), so the bar is the
+/// **same picture** ([`TWIN_SAME_PICTURE_BAR`] on a 16×16 grid), not a pixel bar; the
+/// full-resolution mean and maximum are printed beside it. The references are real pictures the
+/// run renders ([`ReferenceSource::Rendered`]), and every edit output must be a picture
+/// ([`assert_not_mosaic`]).
 ///
 /// Each twin pair is also AT3's memory comparison, printed **unconditionally**: MLX's peak active
 /// memory over the cached render and over its shed twin, their difference
@@ -1379,9 +1383,85 @@ fn pixel_difference(a: &[u8], b: &[u8]) -> (f64, u8) {
 /// The reference count whose forced-shed twin must show a positive peak difference.
 const MAX_REFERENCES: usize = mlx_gen_qwen_image_2_1::MAX_REFERENCE_IMAGES;
 
-/// The mean absolute pixel difference (of 255) a forced-shed twin may show against its cached
-/// render — this crate's tiling-parity bar. Not measured on released weights.
-const SHED_TWIN_MEAN_BAR: f64 = 2.0;
+/// The **same-picture** difference: both RGB8 images box-averaged onto a 16×16 grid, then the
+/// mean absolute difference of the cells over the three channels (0..=255 levels) — the candle
+/// twin's figure. It ignores where an edge or a texture lands to within a cell and compares what
+/// the picture is. Cells are `width/16 × height/16` pixels; a remainder is ignored.
+fn grid_difference(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+    const GRID: usize = 16;
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(a.len(), w * h * 3, "RGB8 geometry");
+    assert_eq!(b.len(), a.len(), "the two renders are the same size");
+    assert!(
+        w >= GRID && h >= GRID,
+        "{w}x{h} is below the {GRID}-cell grid"
+    );
+    let (cw, ch) = (w / GRID, h / GRID);
+    let mut total = 0f64;
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let mut sums = [0f64; 6];
+            for y in gy * ch..(gy + 1) * ch {
+                for x in gx * cw..(gx + 1) * cw {
+                    let at = (y * w + x) * 3;
+                    for c in 0..3 {
+                        sums[c] += f64::from(a[at + c]);
+                        sums[3 + c] += f64::from(b[at + c]);
+                    }
+                }
+            }
+            let n = (cw * ch) as f64;
+            total += (0..3)
+                .map(|c| (sums[c] - sums[3 + c]).abs() / n)
+                .sum::<f64>();
+        }
+    }
+    total / (GRID * GRID * 3) as f64
+}
+
+/// The same-picture difference ([`grid_difference`]) a forced-shed twin may show against its
+/// cached render — the candle twin's bar, derived from its CUDA measurement (inference run
+/// 38668492569, real references): an eight-step flow over the ~42k-token ten-reference sequence
+/// amplifies the ulp-level difference between the paths' bf16 arithmetic into a shifted but
+/// identical scene (full-resolution mean 7.64, max 242; **3.41** on the grid), where the same
+/// prompt at different step counts measures 4.50–5.08 and two different pictures 58.6–60.6.
+/// **Not measured on MLX**: the first real MLX run prints its own numbers beside this bar.
+const TWIN_SAME_PICTURE_BAR: f64 = 15.0;
+
+/// [`grid_difference`] passes a picture against itself shifted by a few pixels and fails it
+/// against a different one — device-free.
+#[test]
+fn the_same_picture_difference_tolerates_a_shift_and_rejects_another_picture() {
+    let (w, h) = (256u32, 256u32);
+    let scene = |shift: u32, invert: bool| -> Vec<u8> {
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let x = x.saturating_sub(shift);
+                let disc = ((x as f32 - 90.0).powi(2) + (y as f32 - 140.0).powi(2)).sqrt() < 50.0;
+                let rgb = if disc {
+                    [230u8, 40, 40]
+                } else if y < h / 2 {
+                    [80, 140, 220]
+                } else {
+                    [50, 120, 40]
+                };
+                px.extend(rgb.map(|v| if invert { 255 - v } else { v }));
+            }
+        }
+        px
+    };
+    let base = scene(0, false);
+    assert_eq!(grid_difference(&base, &base, w, h), 0.0);
+    let shifted = grid_difference(&base, &scene(4, false), w, h);
+    let other = grid_difference(&base, &scene(0, true), w, h);
+    eprintln!("shifted {shifted:.2}, other {other:.2}");
+    assert!(
+        shifted <= TWIN_SAME_PICTURE_BAR,
+        "a 4-px shift: {shifted:.2}"
+    );
+    assert!(other > TWIN_SAME_PICTURE_BAR, "another picture: {other:.2}");
+}
 
 /// [`reference_edit_renders`] over explicit cases into an explicit directory — the body, free of
 /// the `QWEN_IMAGE_2_1_*` environment so the default-run dry run at the bottom of this file can
@@ -1557,9 +1637,11 @@ fn reference_edit_renders_with(
             render(case, PrefixKvCacheMode::Prefill, "_prefill_twin");
         golden_failures.extend(failure);
         let (mean, max) = pixel_difference(&shed, &cached);
+        let same_picture = grid_difference(&shed, &cached, case.width, case.height);
         eprintln!(
             "[kv] {stem} forced-shed twin of the {}-reference case: mean |Δ| = {mean:.4}, max |Δ| = \
-             {max} (of 255) against its cached render; bar: mean <= {SHED_TWIN_MEAN_BAR}",
+             {max} (of 255), 16-grid {same_picture:.2} against its cached render; bar: 16-grid <= \
+             {TWIN_SAME_PICTURE_BAR}",
             case.references
         );
         let delta = cached_report.peak_active as i128 - shed_report.peak_active as i128;
@@ -1591,10 +1673,11 @@ fn reference_edit_renders_with(
             cached_report.priced_cache,
             real_weights && case.references == MAX_REFERENCES,
         );
-        if mean > SHED_TWIN_MEAN_BAR {
+        if same_picture > TWIN_SAME_PICTURE_BAR {
             twin_failures.push(format!(
-                "the {}-reference forced-shed render differs from the cached one by a mean of \
-                 {mean:.4} levels (max {max}), above {SHED_TWIN_MEAN_BAR}",
+                "the {}-reference forced-shed render is a different picture from the cached one: \
+                 16-grid difference {same_picture:.2} (full-resolution mean {mean:.4}, max {max}), \
+                 above {TWIN_SAME_PICTURE_BAR}",
                 case.references
             ));
         }

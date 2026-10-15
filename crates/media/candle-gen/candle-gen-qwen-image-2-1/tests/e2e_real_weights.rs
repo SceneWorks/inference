@@ -1050,7 +1050,8 @@ fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
         "{w}x{h} is below the {GRID}-cell grid"
     );
     let (cw, ch) = (w / GRID, h / GRID);
-    let mut cells = vec![[0f64; 2]; GRID * GRID];
+    // One plane per chroma channel: `B − Y`, then `R − Y`.
+    let mut planes = [vec![0f64; GRID * GRID], vec![0f64; GRID * GRID]];
     for gy in 0..GRID {
         for gx in 0..GRID {
             let mut sum = [0f64; 2];
@@ -1064,20 +1065,21 @@ fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
                 }
             }
             let n = (cw * ch) as f64;
-            cells[gy * GRID + gx] = [sum[0] / n, sum[1] / n];
+            planes[0][gy * GRID + gx] = sum[0] / n;
+            planes[1][gy * GRID + gx] = sum[1] / n;
         }
     }
     let mut total = 0f64;
-    for channel in 0..2 {
+    for plane in &planes {
         let (mut across, mut down) = (0f64, 0f64);
         for gy in 0..GRID {
             for gx in 0..GRID {
-                let here = cells[gy * GRID + gx][channel];
+                let here = plane[gy * GRID + gx];
                 if gx + 1 < GRID {
-                    across += (cells[gy * GRID + gx + 1][channel] - here).abs();
+                    across += (plane[gy * GRID + gx + 1] - here).abs();
                 }
                 if gy + 1 < GRID {
-                    down += (cells[(gy + 1) * GRID + gx][channel] - here).abs();
+                    down += (plane[(gy + 1) * GRID + gx] - here).abs();
                 }
             }
         }
@@ -1243,10 +1245,17 @@ fn validation_render_reference_edit() {
 /// Then the **forced-shed twins** (AT3): **each** cached case — the ten-reference one, which is
 /// AT3's cached ten-reference run, and the two-reference one — rendered again right after it with
 /// the cache shed, and compared with its cached render — the epic's "one run forced to shed that
-/// produces the prefill output". The two paths are the same mathematics and agree to rounding,
-/// not bit for bit; the bar is a mean absolute pixel difference of at most 2 of 255, and the mean
-/// and maximum are printed. **That bar has never been run on released weights or in bf16**: if
-/// the first real run exceeds it, the printed numbers are the finding.
+/// produces the prefill output". The two paths are the same mathematics but not the same bf16
+/// arithmetic, so the bar is the **same picture** ([`TWIN_SAME_PICTURE_BAR`] on a 16×16 grid; its
+/// derivation is there), not a pixel bar; the full-resolution mean and maximum are printed beside
+/// it. Where the two paths part, evaluation by evaluation, is
+/// [`turbo_validation_prefix_kv_cache_velocity`]'s question.
+///
+/// **References** are real pictures the run renders first ([`ReferenceSource::Rendered`]: ten
+/// 768² Turbo text-to-image renders of [`REFERENCE_SUBJECTS`], written beside the evidence), and
+/// every edit output must be a picture ([`assert_not_mosaic`]) — over synthetic references the
+/// edit faithfully reproduced a colour mosaic, which proved memory and timing but nothing about
+/// the image.
 ///
 /// Each twin pair is also AT3's / AT5's memory comparison on CUDA ([`device_memory`]): the pool's
 /// live-byte high-water over the cached render and over its shed twin, their difference
@@ -1327,16 +1336,38 @@ fn turbo_validation_render_reference_edit() {
 ///   the prefix modulates from `t = 0` and is causal, so every cached K/V row must be
 ///   **bit-identical** to the first extract's (asserted on blocks 0, middle and last);
 /// * **every later evaluation** — `forward_joint_cached` against `forward_joint` on the same input:
-///   the relative L2 gap `‖v_cached − v_prefill‖ / ‖v_prefill‖` is printed per step and held to
-///   [`CACHED_VELOCITY_GAP_BAR`]. Mathematically zero; in bf16 it is the rounding of the
-///   per-token projections, which run on `S` joint rows in the prefill and on the target rows
-///   alone when cached — cuBLAS chooses its GEMM kernel (tiling, split-K) by the row count `M`, so
-///   the target rows' reduction order can differ between the two. The `[gemm]` lines measure that
-///   directly on this device, with random weights at the DiT's own projection shapes and this
-///   case's `(S, target)` row counts;
+///   the relative L2 gap `‖v_cached − v_prefill‖ / ‖v_prefill‖`, beside a **control** — the
+///   prefill's own gap under a one-bf16-ulp perturbation of its input ([`ulp_nudged`]) — and held
+///   to [`CACHED_GAP_CONTROL_RATIO_BAR`] times that control. Mathematically the gap is zero; in
+///   bf16 the per-token projections run on `S` joint rows in the prefill and on the target rows
+///   alone when cached, and cuBLAS picks its GEMM kernel by the row count `M`. The `[gemm]` lines
+///   measure that on this device, with random weights at the DiT's own projection shapes and this
+///   case's `(S, target)` row counts, in cuBLAS's default math mode and with reduced-precision
+///   (bf16) split-K reductions forbidden ([`strict_cublas_reductions`]); the same pair of paths is
+///   also re-run in the strict mode at the first cached evaluation and the last;
 /// * **the trajectories** — the cached path's own trajectory is run beside the prefill one and the
 ///   relative latent gap printed per step, and both final latents are decoded and compared in
-///   pixels (`[kv-velocity] … pixels`), the number the forced-shed twin bar is about.
+///   pixels and on the same-picture grid ([`grid_difference`]), the number the forced-shed twin
+///   bar is about.
+///
+/// **What it measured** (CUDA, RTX PRO 6000 Blackwell, runs 38668492569 and 38671361727; the
+/// numbers are identical across the two):
+///
+/// * two references (`S` = 12 321, target 4 096): every evaluation, the cache and the decoded
+///   pixels **bit-identical** — no projection depends on `M` between 4 096 and 12 321 rows here;
+/// * ten references (`S` = 42 066, target 1 024): evaluation 1 and the cache **bit-identical**;
+///   the `hidden → inner` FFN projection (`12288 → 4096`) is **not** row-invariant at `M` = 1 024
+///   (27 % of its outputs differ, relative 2.1e-3, ≤ 4 bf16 ulps — the other two block shapes
+///   are); every cached evaluation sits 9.5e-3–4.0e-2 from the prefill, **0.72–1.44× the one-ulp
+///   control** (1.1e-2–5.5e-2) at the same step; forbidding reduced-precision reductions makes
+///   that projection row-invariant but leaves the gap the same size (4.9e-2 and 1.3e-2 at
+///   evaluations 2 and 8), so it is not the only `M`-dependent kernel and no single switch makes
+///   the paths bit-identical. Eight Turbo steps amplify it to a 16 % latent gap — the same scene,
+///   visibly shifted (pixels mean 7.8, 16-grid 3.5).
+///
+/// So the cached decode is the prefill to bf16 rounding — its divergence is the size of any
+/// one-ulp change — and not a defect: a wrong cache row, RoPE row or modulation row is an O(1)
+/// velocity error, tens of times the control.
 ///
 /// ```sh
 /// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
@@ -1596,8 +1627,11 @@ fn turbo_validation_prefix_kv_cache_velocity() {
 
 /// How many times the one-ulp control's gap a cached evaluation's velocity may sit from the
 /// prefill one on the same latent and timestep ([`turbo_validation_prefix_kv_cache_velocity`]).
-/// Provisional until the second CUDA measurement.
-const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 10.0;
+/// Measured on CUDA: at most 1.44× (ten references; two references: 0×). The bar is a ratio to a
+/// control measured on the same device, step and input, so it carries no device's absolute
+/// numbers; 4 leaves 2.8× headroom over the worst measured step and sits far below a defect's
+/// O(1) gap (≳ 20× a control of ≤ 5.5e-2).
+const CACHED_GAP_CONTROL_RATIO_BAR: f64 = 4.0;
 
 /// `x` with every element scaled by `1 ± 2⁻⁸` (a fixed pseudo-random sign per element): about
 /// half a bf16 ulp on average, so once the DiT casts its input to bf16 roughly half the elements
@@ -1634,6 +1668,8 @@ fn strict_cublas_reductions(device: &candle_core::Device, strict: bool) -> bool 
     } else {
         sys::cublasMath_t::CUBLAS_DEFAULT_MATH
     };
+    // SAFETY: the handle is this device's live cuBLAS handle, bound to the current thread above;
+    // setting its math mode reads and writes nothing else.
     unsafe { sys::cublasSetMathMode(*blas.handle(), mode) }
         .result()
         .unwrap();
