@@ -160,7 +160,7 @@ pub fn load_backbone_quantized(
     base_model: &str,
     quant: Option<Quant>,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
-    let quant = BackboneQuant::for_load(quant, !adapters.is_empty())?;
+    let quant = BackboneQuant::for_load(quant)?;
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;

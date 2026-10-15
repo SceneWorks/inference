@@ -255,19 +255,23 @@ impl IrisTextEncoder {
     /// Bytes the loaded tower holds — every parameter group of the decoder, at the width it is
     /// resident in. Measured from the model, not priced from the checkpoint.
     ///
-    /// The decoder lists a tied head beside the embedding it shares (its first group is the
-    /// embedding's arrays, the final norm, then the head's arrays), so a tied head's arrays are
-    /// skipped rather than counted twice.
+    /// The decoder lists a tied head beside the embedding it shares, so arrays are deduplicated by
+    /// the buffer they hold ([`mlx_llm::primitives::weights::data_address`], the identity the
+    /// decoder's own group materialization uses): a buffer two handles share is counted once,
+    /// wherever in the groups the second handle sits.
     pub fn resident_weight_bytes(&self) -> u64 {
-        let mut groups = self.lm.param_groups();
-        if self.lm.config().tie_word_embeddings {
-            if let Some(outside) = groups.first_mut() {
-                // `[embedding.., norm, head..]` with as many head arrays as embedding arrays.
-                let embedding = (outside.len() - 1) / 2;
-                outside.truncate(embedding + 1);
-            }
-        }
-        groups.iter().flatten().map(|a| a.nbytes() as u64).sum()
+        let mut seen = std::collections::BTreeSet::new();
+        self.lm
+            .param_groups()
+            .iter()
+            .flatten()
+            .filter(|a| {
+                // An array with no data yet (address 0) is not a shared buffer: count it.
+                let address = mlx_llm::primitives::weights::data_address(a);
+                address == 0 || seen.insert(address)
+            })
+            .map(|a| a.nbytes() as u64)
+            .sum()
     }
 
     /// Whether the tower's projections are affine-packed.

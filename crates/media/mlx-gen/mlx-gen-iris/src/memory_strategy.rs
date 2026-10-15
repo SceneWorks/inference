@@ -427,7 +427,7 @@ pub(crate) fn generation_contract(
     refuse_unloadable_spec(IrisTask::Generation, spec)?;
     let precision = spec.precision;
     let mut contract = base_contract(IrisTask::Generation, precision, Some(config));
-    let quant = crate::nn::BackboneQuant::for_load(spec.quantize, !spec.adapters.is_empty())?;
+    let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
     let transformer = backbone_bytes(
         &resources
             .backbone_dir
@@ -1903,11 +1903,12 @@ mod tests {
     /// sc-26266: a quantized generation load prices what its loaders hold at the tier — every
     /// backbone projection packed (the unaligned ones over a zero-padded input), the text tower's
     /// attention/MLP projections packed at its group size, everything else as on the dense tier —
-    /// and an adapted load keeps the unaligned backbone projections dense. Expectations are
-    /// recomputed here from the headers, not through the provider's helpers.
+    /// and an adapted load prices the same packed backbone (the tier is one layout whatever the
+    /// adapters; the stack is an overlay). Expectations are recomputed here from the headers, not
+    /// through the provider's helpers.
     ///
     /// *Mutations that red this:* pricing a quantized load at bf16; quantizing the token
-    /// embedding; dropping the padding (or padding under adapters); a scale/bias table at the
+    /// embedding; dropping the padding (with or without adapters); a scale/bias table at the
     /// wrong width.
     #[test]
     fn a_quantized_generation_load_prices_the_packed_projections() {
@@ -1996,7 +1997,7 @@ mod tests {
             loaded(IrisTask::Generation, &adapted)
                 .asset_facts
                 .transformer_bytes,
-            backbone_at(Some(4), false)
+            backbone_at(Some(4), true)
         );
 
         // The released miniature tower has no affine group, so it has no quantized tier.

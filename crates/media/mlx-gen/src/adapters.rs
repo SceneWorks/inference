@@ -960,6 +960,15 @@ impl AdaptableLinear {
         self.apply_adapters(x, out)
     }
 
+    /// [`forward`](Self::forward) with the base reading `base_x` and the adapter stack reading
+    /// `x`: for a host whose base was built over a zero-padded input (an unaligned projection
+    /// packed at a group-multiple width — `[x, 0] · [W, 0]ᵀ = x · Wᵀ`) while its adapters keep the
+    /// checkpoint's input width.
+    pub fn forward_split(&self, base_x: &Array, x: &Array) -> Result<Array> {
+        let out = self.base.forward(base_x)?;
+        self.apply_adapters(x, out)
+    }
+
     /// Evaluate with dense base weights widened to the activation dtype for this operation.
     /// Packed bases already compute from the activation dtype and are left packed. This supports
     /// bf16-resident/f32-compute text encoders without permanently widening their weight store.

@@ -92,18 +92,23 @@ fn backbone(quant: Option<Quant>) -> IrisDiT {
     .0
 }
 
-/// The backbone at each tier: packed resident bytes that shrink q8 → q4 and never exceed the
-/// contract's pricing; the solver's image within the tier's bound of the dense tier's from the
-/// same conditioning and noise.
+/// The backbone at each tier: packed resident bytes that shrink q8 → q4 and sit exactly the dense
+/// tier's constant below the contract's pricing; the solver's image within the tier's bound of the
+/// dense tier's from the same conditioning and noise.
 ///
 /// Bounds (on the [−1, 1] image, 3 CFG-3 steps over a random-weight miniature, which amplifies
 /// weight error far more than a trained network does). Measured on the MLX CPU stream: q8 mean
 /// |Δ| 3.7e-2 (cos 0.9964), q4 mean |Δ| 1.53e-1 (cos 0.946). Gated at q8 ≤ 6e-2 / cos ≥ 0.99 and
 /// q4 ≤ 2.5e-1 / cos ≥ 0.90.
 ///
+/// The contract prices norm gains and biases at their stored f32 width while the loader holds the
+/// biases in the compute dtype — a constant over-price no tier changes (the biases are never
+/// packed). Every tier's `priced − resident` must equal the dense tier's, so a packed projection
+/// held at any other width than priced reds in either direction.
+///
 /// *Mutations that red this:* a tier that loads dense (bytes do not shrink); quantizing without
-/// padding the 170-wide projections (q4 bytes above the contract's padded pricing); forgetting
-/// the input padding in the forward (a shape error); packing at the wrong width (bytes).
+/// padding the 170-wide projections (q4 resident below the padded pricing); forgetting the input
+/// padding in the forward (a shape error); packing at the wrong width (bytes).
 #[test]
 fn the_backbone_holds_packed_projections_at_each_tier() {
     cpu_process(
@@ -128,6 +133,7 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
 
             let mut images = Vec::new();
             let mut bytes = Vec::new();
+            let mut slack = None;
             for quant in TIERS {
                 let dit = backbone(quant);
                 let resident = dit.resident_weight_bytes();
@@ -136,11 +142,15 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
                     .asset_facts
                     .transformer_bytes;
                 eprintln!("backbone {quant:?}: resident {resident} B, priced {priced} B");
-                // The contract prices norm gains and biases at their stored f32 width while the
-                // loader holds biases in the compute dtype, so it may over-price, never under.
                 assert!(
                     resident <= priced,
                     "{quant:?}: {resident} > priced {priced}"
+                );
+                let gap = priced - resident;
+                assert_eq!(
+                    gap,
+                    *slack.get_or_insert(gap),
+                    "{quant:?}: priced − resident differs from the dense tier's"
                 );
                 bytes.push(resident);
                 images.push(
@@ -171,6 +181,157 @@ fn the_backbone_holds_packed_projections_at_each_tier() {
                 let min_cos = if tier == "q8" { 0.99 } else { 0.90 };
                 assert!(cos >= min_cos, "{tier}: cos {cos} < {min_cos}");
             }
+        },
+    );
+}
+
+/// The committed LoRA fixture plus one more module on `blocks.2.mlp.w2` — a 170-wide SwiGLU down
+/// projection, the one family a quantized tier packs over a zero-padded input — written under
+/// `root` with the fixture's identity stamps. Returns its path.
+fn lora_on_an_unaligned_projection(root: &Path) -> PathBuf {
+    let (mut tensors, metadata) = Array::load_safetensors_with_metadata(
+        crate::common::fixtures().join("iris_lora.safetensors"),
+    )
+    .unwrap();
+    let factor = |shape: [i32; 2], seed: u64| {
+        let key = mlx_rs::random::key(seed).unwrap();
+        mlx_rs::random::normal::<f32>(&shape[..], None, Some(0.5), Some(&key)).unwrap()
+    };
+    let module = "transformer.blocks.2.mlp.w2";
+    tensors.insert(format!("{module}.lora_A.weight"), factor([2, 170], 1));
+    tensors.insert(format!("{module}.lora_B.weight"), factor([64, 2], 2));
+    tensors.insert(
+        format!("{module}.alpha"),
+        Array::from_slice(&[4.0_f32], &[1]),
+    );
+    let path = root.join("iris_lora_w2.safetensors");
+    let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, &metadata, &path).unwrap();
+    path
+}
+
+/// An adapted load at the q4 tier is the q4 model: every projection — the adapted ones, and the
+/// 170-wide adapted down projection over its zero-padded input — is packed, so its resident bytes
+/// are the unadapted q4 model's and sit the dense tier's constant below the contract's pricing of
+/// the adapted spec; its image is within the q4 bound of the adapted bf16 image, the residuals
+/// reach it (it differs from the unadapted q4 image), and the residual on the padded projection
+/// is live (it differs from the same stack without that module).
+///
+/// Bounds are the backbone gate's q4 bounds (mean |Δ| ≤ 2.5e-1, cos ≥ 0.90). Measured on the MLX
+/// CPU stream: adapted q4 vs adapted bf16 mean |Δ| 1.86e-1 (cos 0.919); vs unadapted q4 1.52e-1;
+/// vs the stack without the down-projection module 1.49e-1.
+///
+/// *Mutations that red this:* dropping the adapted branch's load-time quantization (resident above
+/// the pricing); keeping the unaligned adapted projection dense, at load or in the pricing (bytes);
+/// dropping its adapter stack when the padded base is rebuilt (the image equals the stack without
+/// that module); handing the residuals the padded input (a shape error).
+#[test]
+fn an_adapted_load_holds_the_packed_model_at_a_tier() {
+    cpu_process(
+        "quant_tiers::an_adapted_load_holds_the_packed_model_at_a_tier",
+        || {
+            let scratch = tempfile::tempdir().unwrap();
+            let tower = aligned_tiny_text_encoder(scratch.path());
+            let w2_lora = lora_on_an_unaligned_projection(scratch.path());
+            let lora = |path: &Path| {
+                vec![mlx_gen::AdapterSpec::new(
+                    path.to_path_buf(),
+                    1.0,
+                    mlx_gen::AdapterKind::Lora,
+                )]
+            };
+            let with_w2 = lora(&w2_lora);
+            let without_w2 = lora(&crate::common::fixtures().join("iris_lora.safetensors"));
+            let config = tiny_config();
+            let te = IrisTextEncoder::load(&tower, &config.text_encoder).unwrap();
+            let req = GenerationRequest {
+                prompt: "a red fox in the snow".into(),
+                width: 16,
+                height: 16,
+                steps: Some(3),
+                guidance: Some(3.0),
+                seed: Some(7),
+                ..Default::default()
+            };
+            let params = GenerationParams::resolve(&req, 0, &config).unwrap();
+            let conditioning = encode(&te, &params).unwrap();
+            let z = noise(7, config.model.in_channels, 16, 16).unwrap();
+            let render = |dit: &IrisDiT| {
+                denoise(
+                    dit,
+                    &config.flow,
+                    &conditioning,
+                    &z,
+                    &params,
+                    &CancelFlag::new(),
+                    |_| {},
+                    &PreviewSink::default(),
+                )
+                .unwrap()
+            };
+            let load = |adapters: &[mlx_gen::AdapterSpec], quant: Option<Quant>| {
+                let (dit, reports) = load_backbone_quantized(
+                    &tiny_backbone(),
+                    &config,
+                    Dtype::Bfloat16,
+                    adapters,
+                    IrisTask::Generation,
+                    MODEL_ID,
+                    quant,
+                )
+                .unwrap();
+                for report in &reports {
+                    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+                }
+                dit
+            };
+            let priced = |adapters: &[mlx_gen::AdapterSpec], quant: Option<Quant>| {
+                let mut spec = spec(&tower, quant);
+                spec.adapters = adapters.to_vec();
+                memory_strategy_contract(MODEL_ID, &spec)
+                    .unwrap()
+                    .asset_facts
+                    .transformer_bytes
+            };
+
+            let dense = backbone(None);
+            let slack = priced(&[], None) - dense.resident_weight_bytes();
+            let plain_q4 = backbone(Some(Quant::Q4));
+            let adapted_bf16 = load(&with_w2, None);
+            let adapted_q4 = load(&with_w2, Some(Quant::Q4));
+            let resident = adapted_q4.resident_weight_bytes();
+            let adapted_priced = priced(&with_w2, Some(Quant::Q4));
+            eprintln!(
+                "adapted q4: resident {resident} B, priced {adapted_priced} B, slack {slack}"
+            );
+            assert_eq!(resident, plain_q4.resident_weight_bytes());
+            assert_eq!(adapted_priced, priced(&[], Some(Quant::Q4)));
+            assert_eq!(adapted_priced - resident, slack);
+
+            let image = render(&adapted_q4);
+            let (max_abs, _, mean) = errors(&image, &render(&adapted_bf16));
+            let (rel, cos) = rel_and_cos(&image, &render(&adapted_bf16));
+            eprintln!(
+                "adapted q4 vs adapted bf16 image: max|Δ|={max_abs:.3e} mean|Δ|={mean:.3e} \
+                 rel={rel:.3e} cos={cos:.5}"
+            );
+            assert!(mean <= 2.5e-1, "mean |Δ| {mean} > 2.5e-1");
+            assert!(cos >= 0.90, "cos {cos} < 0.90");
+            let (_, _, from_plain) = errors(&image, &render(&plain_q4));
+            let (_, _, from_without_w2) =
+                errors(&image, &render(&load(&without_w2, Some(Quant::Q4))));
+            eprintln!(
+                "adapted q4 mean|Δ| vs unadapted q4 {from_plain:.3e}, vs without the w2 module \
+                 {from_without_w2:.3e}"
+            );
+            assert!(
+                from_plain > 0.0,
+                "the adapted q4 image is the unadapted one"
+            );
+            assert!(
+                from_without_w2 > 0.0,
+                "the padded projection's residual did not reach the q4 image"
+            );
         },
     );
 }

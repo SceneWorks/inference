@@ -851,8 +851,9 @@ for the whole pipeline:
 * **Backbone** (`load_backbone_quantized`, `nn::ProjectionLayout`): every projection with an input
   width of at least one group (64) is packed at group size 64. The release's SwiGLU down
   projections are 6826 wide — no affine group divides that — so their input is zero-padded to 6848
-  (exact: `[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and they pack like the rest. An adapted load keeps them dense
-  instead (an adapter residual reads the unpadded input). The 3-, 12- and 16-wide pixel and pooling
+  (exact: `[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and they pack like the rest — on an adapted load too: the
+  packed base reads the padded input and the adapter residuals the unpadded one
+  (`AdaptableLinear::forward_split`), so the tier's layout does not depend on the adapters. The 3-, 12- and 16-wide pixel and pooling
   heads, the norms, the modulation biases and the text position table stay dense.
 * **Text tower** (`IrisTextEncoder::load_quantized`): every attention/MLP projection of the
   Qwen3-VL language tower is packed by the shared decoder at one group size (64 on the release,

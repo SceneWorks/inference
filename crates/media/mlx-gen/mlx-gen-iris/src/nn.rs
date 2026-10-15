@@ -29,26 +29,25 @@ use mlx_rs::{Array, Dtype};
 pub const QUANT_GROUP_SIZE: usize = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
 
 /// The load-time quantization of one backbone build (sc-26266): the affine width of the `q8` /
-/// `q4` tier, and what happens to a projection whose input width is not a multiple of
-/// [`QUANT_GROUP_SIZE`].
+/// `q4` tier.
 ///
-/// The release has exactly one such family — the SwiGLU down projections (`*.mlp.w2`,
-/// `[2560, 6826]`, ~1.2 GB of the 5.6 GB bf16 backbone). Zero-padding their input to the next
-/// group multiple is exact (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like every other
-/// projection. An adapter residual reads the *unpadded* input, so a load that installs adapters
-/// keeps those projections dense instead ([`Self::for_load`]).
+/// A projection whose input width is not a multiple of [`QUANT_GROUP_SIZE`] is packed over a
+/// zero-padded input. The release has exactly one such family — the SwiGLU down projections
+/// (`*.mlp.w2`, `[2560, 6826]`, ~1.2 GB of the 5.6 GB bf16 backbone). Zero-padding their input to
+/// the next group multiple is exact (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like
+/// every other projection — adapted or not: an adapter residual on such a projection reads the
+/// unpadded input while the packed base reads the padded one ([`Linear::forward`]), so the tier is
+/// one layout for the whole backbone whatever adapters a load installs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackboneQuant {
     /// Affine bits per weight (4 or 8).
     pub bits: i32,
-    /// Zero-pad an unaligned projection's input and quantize it (`true`), or keep it dense.
-    pub pad_unaligned: bool,
 }
 
 impl BackboneQuant {
-    /// The quantization a load with `quant` and (`adapted`) an adapter stack applies: `None` is
-    /// the dense tier. Only the affine tiers exist on this backend; NVFP4 is a typed refusal.
-    pub fn for_load(quant: Option<Quant>, adapted: bool) -> Result<Option<Self>> {
+    /// The quantization a load with `quant` applies: `None` is the dense tier. Only the affine
+    /// tiers exist on this backend; NVFP4 is a typed refusal.
+    pub fn for_load(quant: Option<Quant>) -> Result<Option<Self>> {
         let bits = match quant {
             None => return Ok(None),
             Some(Quant::Q4) => 4,
@@ -60,10 +59,7 @@ impl BackboneQuant {
                 )))
             }
         };
-        Ok(Some(Self {
-            bits,
-            pad_unaligned: !adapted,
-        }))
+        Ok(Some(Self { bits }))
     }
 }
 
@@ -88,9 +84,6 @@ impl ProjectionLayout {
             return Self::Dense;
         }
         let padded_in = in_features.div_ceil(QUANT_GROUP_SIZE) * QUANT_GROUP_SIZE;
-        if padded_in != in_features && !quant.pad_unaligned {
-            return Self::Dense;
-        }
         Self::Quantized {
             bits: quant.bits,
             padded_in,
@@ -179,25 +172,33 @@ impl Loader<'_> {
                 // Every adapter factor is read and evaluated here, at the load boundary, so no
                 // forward ever waits on a lazy adapter read.
                 inner.materialize_adapters()?;
-                // The adapters stay forward-time residuals over the packed base. An adapted load
-                // never pads ([`BackboneQuant::for_load`]), so the layout is aligned or dense.
+                // The adapters stay forward-time residuals over the packed base, reading the
+                // checkpoint-width input; an unaligned base is rebuilt over its zero-padded input
+                // with the same adapter stack ([`Linear::forward`] feeds each its own width).
                 let in_features = inner.base_shape()[1] as usize;
-                match ProjectionLayout::of(in_features, self.quant) {
-                    ProjectionLayout::Dense => {}
-                    ProjectionLayout::Quantized { bits, padded_in } => {
-                        if padded_in != in_features {
-                            return Err(Error::Msg(format!(
-                                "iris: the adapted projection {prefix} cannot be padded for \
-                                 quantization"
-                            )));
-                        }
-                        inner.quantize(bits, Some(QUANT_GROUP_SIZE as i32))?;
+                let mut in_pad = 0;
+                if let ProjectionLayout::Quantized { bits, padded_in } =
+                    ProjectionLayout::of(in_features, self.quant)
+                {
+                    in_pad = (padded_in - in_features) as i32;
+                    if in_pad > 0 {
+                        let (weight, bias) = inner.dense_weight().ok_or_else(|| {
+                            Error::Msg(format!(
+                                "iris: the adapted projection {prefix} is not dense before its \
+                                 load-time quantization"
+                            ))
+                        })?;
+                        let weight = pad(weight, &[(0, 0), (0, in_pad)][..], None, None)?;
+                        let mut padded = AdaptableLinear::dense(weight, bias.cloned());
+                        padded.set_adapters(inner.adapters().to_vec());
+                        inner = padded;
                     }
+                    inner.quantize(bits, Some(QUANT_GROUP_SIZE as i32))?;
                 }
                 return Ok(Linear {
                     inner,
                     compute: self.compute,
-                    in_pad: 0,
+                    in_pad,
                 });
             }
         }
@@ -253,7 +254,8 @@ pub struct Linear {
     inner: AdaptableLinear,
     compute: Dtype,
     /// Zero columns appended to the input before a packed base whose input width is not a group
-    /// multiple (`ProjectionLayout::Quantized::padded_in`); `0` for every other projection.
+    /// multiple (`ProjectionLayout::Quantized::padded_in`); `0` for every other projection. The
+    /// adapter residuals read the unpadded input.
     in_pad: i32,
 }
 
@@ -263,7 +265,9 @@ impl Linear {
         if self.in_pad > 0 {
             let mut widths = vec![(0, 0); x.ndim()];
             *widths.last_mut().expect("a projection input has an axis") = (0, self.in_pad);
-            return self.inner.forward(&pad(&x, &widths[..], None, None)?);
+            return self
+                .inner
+                .forward_split(&pad(&x, &widths[..], None, None)?, &x);
         }
         self.inner.forward(&x)
     }

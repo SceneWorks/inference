@@ -405,7 +405,7 @@ fn released(key: &str) -> Error {
 }
 
 /// The address of `a`'s data (evaluated): equal for two handles on one buffer.
-fn data_address(a: &Array) -> usize {
+pub fn data_address(a: &Array) -> usize {
     // SAFETY: `a` is a live, evaluated array; the accessor only reads its data pointer (MLX's
     // `array::data<T>` reinterprets the pointer whatever the dtype).
     unsafe { mlx_sys::mlx_array_data_uint8(a.as_ptr()) as usize }
