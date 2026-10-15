@@ -216,7 +216,10 @@ fn timestep_embedding_follows_the_compute_dtype_body() {
             Dtype::Bfloat16,
         )
         .unwrap();
-        let t = 0.990471661f32; // the first interior point of the 16-step release schedule
+        // The first interior point of the 16-step release schedule (≈ 0.99047), read off the
+        // contract rather than spelled as a literal f32 cannot hold exactly.
+        let t = mlx_gen::gen_core::flux3::flow_map_schedule(16, 6.93).unwrap()[1];
+        assert!((0.9904..0.9905).contains(&t), "schedule[1] = {t}");
         let f = host_f32(&f32_dit.timestep_embedding(t).unwrap());
         let b = host_f32(&bf16_dit.timestep_embedding(t).unwrap());
         assert_eq!(f.len(), 256);
