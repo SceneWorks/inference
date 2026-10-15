@@ -151,7 +151,11 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             )
             continue
 
-        if _under(path, "crates/bundles/runtime-macos"):
+        # runtime-ios is MLX like runtime-macos; its iOS cross-compile has no CI lane of its own,
+        # and its host build/tests run on the macOS Metal lane.
+        if _under(path, "crates/bundles/runtime-macos") or _under(
+            path, "crates/bundles/runtime-ios"
+        ):
             lanes.update(macos_metal=True, real_weights=True, release=True)
             continue
 

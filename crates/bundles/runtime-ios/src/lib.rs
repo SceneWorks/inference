@@ -95,16 +95,28 @@ impl MlxLimits {
     }
 }
 
+/// The ceiling on MLX's buffer cache that [`platform_limits_mib`] applies, MiB.
+///
+/// With `media`, this IS `mlx_gen_ios_catalog::IOS_MLX_CACHE_LIMIT_CAP_MIB`: the catalog's inferred
+/// SANA footprint bounds assume exactly this cap, so the image build takes the constant from there
+/// rather than restating it. An LLM-only build does not compile the catalog (that is the point of
+/// disabling `media`) and has no inferred bound to agree with, so it carries the value itself.
+#[cfg(feature = "media")]
+pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MLX_CACHE_LIMIT_CAP_MIB;
+/// The ceiling on MLX's buffer cache that [`platform_limits_mib`] applies, MiB.
+#[cfg(not(feature = "media"))]
+pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = 1024;
+
 /// The `(memory_limit, cache_limit)` pair, MiB, for a process with `available_mib` of per-process
 /// headroom and `active_mib` already live.
 ///
-/// * **Cache** — `min(25% of budget, 1 GiB)`: large enough that tile-to-tile buffer reuse still
+/// * **Cache** — `min(25% of budget, `[`MLX_CACHE_LIMIT_CAP_MIB`]`)` (1 GiB): large enough that tile-to-tile buffer reuse still
 ///   hits, small enough to leave room beside a multi-GB transient.
 /// * **Live allocation** — 85% of the budget, so MLX applies backpressure *before* jetsam applies a
 ///   kill — but never below 110% of what is already live, because a ceiling under the resident set
 ///   protects nothing and stalls the process against a limit it has already passed.
 pub fn platform_limits_mib(available_mib: f64, active_mib: f64) -> (f64, f64) {
-    let cache = (available_mib / 4.0).min(1024.0);
+    let cache = (available_mib / 4.0).min(f64::from(MLX_CACHE_LIMIT_CAP_MIB));
     let memory = (available_mib * 0.85).max(active_mib * 1.1);
     (memory, cache)
 }
@@ -207,6 +219,7 @@ mod tests {
         let (memory, cache) = super::platform_limits_mib(6014.0, 10.0);
         assert!((memory - 6014.0 * 0.85).abs() < 1e-9);
         assert_eq!(cache, 1024.0, "cache must be capped at 1 GiB");
+        assert_eq!(cache, f64::from(super::MLX_CACHE_LIMIT_CAP_MIB));
         assert!(memory < 6014.0, "backpressure must precede a jetsam kill");
 
         let (memory, cache) = super::platform_limits_mib(2000.0, 10.0);

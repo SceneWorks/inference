@@ -49,6 +49,13 @@ MACOSX_DEPLOYMENT_TARGET = "26.2"
 # coherent with its `__builtin_available(macOS 15, iOS 18, *)` runtime guard. Keep this in step
 # with the iOS floor in the fork's mlx-sys/build.rs.
 #
-# NOT forced, matching MACOSX_DEPLOYMENT_TARGET: CI or a consumer can still override it. Inert on
-# non-iOS targets.
+# NOT forced, matching MACOSX_DEPLOYMENT_TARGET: CI or a consumer can still override it.
+#
+# NOT target-scoped, and cannot be: Cargo's [env] applies to every build, and rustc reads the
+# deployment target only from this env var (there is no per-target flag), so the bare
+# `cargo build --target aarch64-apple-ios` needs it here. Host (macOS) builds therefore see it too.
+# The workspace's own build steps are unaffected — rustc, cc-rs and mlx-sys's build.rs each pick the
+# deployment variable of the triple they build for — but a tool invoked WITHOUT an explicit target
+# or version-min flag honours it: a bare `clang -c -arch arm64` emits iOS objects, and
+# `xcrun -sdk macosx metal` targets iPhone. Such a host build step must pass its target explicitly.
 IPHONEOS_DEPLOYMENT_TARGET = "18.0"

@@ -97,6 +97,7 @@ class SelectLanesTests(unittest.TestCase):
     def test_named_runtime_bundle_selects_only_its_platform(self) -> None:
         cases = {
             "runtime-macos": "macos_metal",
+            "runtime-ios": "macos_metal",
             "runtime-cpu": "candle_cpu",
             "runtime-cuda": "windows_cuda",
         }
@@ -106,6 +107,8 @@ class SelectLanesTests(unittest.TestCase):
                 self.assertTrue(lanes[expected])
                 self.assertTrue(lanes["real_weights"])
                 self.assertTrue(lanes["release"])
+                for other in {"macos_metal", "candle_cpu", "windows_cuda"} - {expected}:
+                    self.assertFalse(lanes[other], other)
 
     def test_docs_only_does_not_build_backends(self) -> None:
         lanes = select_lanes(["docs/migration/PHASE_2_CHECKPOINT.md"])
