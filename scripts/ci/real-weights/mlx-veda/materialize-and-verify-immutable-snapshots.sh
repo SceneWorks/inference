@@ -26,10 +26,11 @@ for v in "${vars[@]}"; do
   echo "$v=${!v}" >> "$GITHUB_ENV"
 done
 ensure() {
-  for attempt in 1 2 3; do
+  # Anonymous Hub API calls are rate-limited (HTTP 429 seen on nax-macos-2), so back off longer.
+  for attempt in 1 2 3 4 5; do
     PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model "$1" --snapshot "$2" && return 0
     echo "::warning::$1 materialization attempt $attempt failed"
-    sleep 30
+    sleep $((90 * attempt))
   done
   return 1
 }
