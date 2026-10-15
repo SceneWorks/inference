@@ -292,6 +292,8 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
 /// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<KolorsTrainer> {
     let root = snapshot_root(spec)?;
+    // Training reads the dense base; a packed U-Net tier is refused (the SDXL trainer's contract).
+    mlx_gen_sdxl::require_dense_training_base(root, MODEL_ID, &["unet"])?;
     let dtype = Dtype::Float32;
     let te_w = Weights::from_dir(root.join("text_encoder"))?;
     // bf16 frozen encoder (see the struct field) — half the f32 footprint, matches fp16 inference.
@@ -412,6 +414,37 @@ fn projected_dense_peak_gb(p: f64, bf16: bool) -> f64 {
         5.68 + 4.70e-4 * p + 2.166e-8 * p * p
     } else {
         11.02 + 9.50e-4 * p + 4.295e-8 * p * p
+    }
+}
+
+#[cfg(test)]
+mod dense_base_tests {
+    /// A packed U-Net tier is refused before the 6B encoder or any other weight is read.
+    #[test]
+    fn the_trainer_refuses_a_packed_unet_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("unet")).unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        let dense_err = match super::load_weights(&spec) {
+            Ok(_) => panic!("an empty tree cannot load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(!dense_err.contains("pre-quantized"), "{dense_err}");
+
+        std::fs::write(
+            root.join("unet/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        let err = match super::load_weights(&spec) {
+            Ok(_) => panic!("a packed tier must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("pre-quantized Q8") && err.contains("unet"),
+            "{err}"
+        );
     }
 }
 

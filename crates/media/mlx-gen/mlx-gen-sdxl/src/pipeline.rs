@@ -1345,10 +1345,16 @@ mod tests {
 
     /// sc-26268: **sequential CFG** (two batch-1 forwards) reproduces the batched `[cond, uncond]`
     /// forward on the tiny U-Net — the per-row split is right (the conditional half is row 0, the
-    /// unconditional half row 1) and nothing in the forward couples the two rows. The shared
-    /// `CfgBatching` contract
-    /// declares the class bit-identical; the asserted tolerance (1e-5 of peak) only admits a GEMM
-    /// tile specialization keyed on the row count, which some backends make.
+    /// unconditional half row 1) and nothing in the forward couples the two rows.
+    ///
+    /// Not asserted bitwise, on purpose: the shared `CfgBatching` contract
+    /// (`gen_core::execution_domains`) states the one admitted deviation — a backend GEMM whose
+    /// reduction order depends on the row count. The MLX CPU device is such a backend (sc-26268
+    /// review probe: a lone `[1, S, D] @ W` and row 0 of the `[2, S, D]` product differ in the last
+    /// ulps for every `S = 1` shape and many `S ≤ 64` shapes, while conv, GroupNorm, LayerNorm and
+    /// SDPA are row-exact), and this tiny U-Net drifts ~1e-6 of peak through it. The 1e-5 bound
+    /// admits exactly that reassociation and nothing a row mix-up could produce (see the
+    /// non-vacuity check, three orders larger).
     #[test]
     fn sequential_cfg_matches_the_batched_guided_pair() {
         let _cpu = crate::test_device::cpu_only();
@@ -1406,7 +1412,9 @@ mod tests {
     }
 
     /// The whole ancestral denoise loop under sequential CFG reproduces the batched loop's final
-    /// latent — the production route (`denoise_core`) actually consumes the plan's batching.
+    /// latent — the production route (`denoise_core`) actually consumes the plan's batching. Same
+    /// row-count GEMM bound as `sequential_cfg_matches_the_batched_guided_pair` (observed ~5e-6
+    /// of peak after five guided steps on the CPU device).
     #[test]
     fn sequential_cfg_denoise_reproduces_the_batched_denoise() {
         let _cpu = crate::test_device::cpu_only();

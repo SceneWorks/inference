@@ -177,7 +177,8 @@ fn low_memory_compositions_q4() {
             mean_delta(&staged.pixels, &seq.pixels),
         );
         eprintln!("[sc-26268 composition] {entry}: sequential vs batched CFG max {max}/255 mean {mean:.4}");
-        // The shared `CfgBatching` contract declares the class bit-identical.
+        // The shared `CfgBatching` contract admits only GEMM reassociation between the batchings,
+        // which must not move an 8-bit pixel.
         assert_eq!(max, 0, "{entry}: sequential CFG changed the image");
     }
 }

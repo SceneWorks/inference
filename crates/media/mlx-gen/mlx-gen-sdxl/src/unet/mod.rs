@@ -330,9 +330,9 @@ impl UNet2DConditionModel {
     /// U-Net, recording where each sub-stack's blocks can be re-read from.
     ///
     /// `source` must be the exact U-Net weight file the resident stack was built from (the resolved
-    /// `unet/diffusion_pytorch_model{,.fp16}.safetensors`, **not** the snapshot root) and
-    /// `quant_bits` the load-time quantization the resident stack received, so a streamed block is
-    /// byte-identical to its resident twin.
+    /// `unet/diffusion_pytorch_model{,.fp16}.safetensors`, **not** the snapshot root), `dtype` the
+    /// compute dtype the resident load cast it to, and `quant_bits` the load-time quantization the
+    /// resident stack received, so a streamed block is byte-identical to its resident twin.
     ///
     /// Call this **last** — after `install_ip_adapter`, after the adapter merge, after `quantize` —
     /// because each stream captures the installed IP projections and residual adapters off the
@@ -341,14 +341,23 @@ impl UNet2DConditionModel {
     ///
     /// Deliberately not called for an eager load: its blocks are already committed, so a window
     /// would add a second copy on top rather than bounding anything.
-    pub fn arm_block_streams(&mut self, source: &mlx_gen::WeightsSource, quant_bits: Option<i32>) {
+    pub fn arm_block_streams(
+        &mut self,
+        source: &mlx_gen::WeightsSource,
+        dtype: mlx_rs::Dtype,
+        quant_bits: Option<i32>,
+    ) {
         for (i, block) in self.down_blocks.iter_mut().enumerate() {
-            block.arm_block_streams(source, &format!("down_blocks.{i}"), quant_bits);
+            block.arm_block_streams(source, &format!("down_blocks.{i}"), dtype, quant_bits);
         }
-        self.mid_transformer
-            .arm_block_stream(source.clone(), "mid_block.attentions.0", quant_bits);
+        self.mid_transformer.arm_block_stream(
+            source.clone(),
+            "mid_block.attentions.0",
+            dtype,
+            quant_bits,
+        );
         for (k, block) in self.up_blocks.iter_mut().enumerate() {
-            block.arm_block_streams(source, &format!("up_blocks.{k}"), quant_bits);
+            block.arm_block_streams(source, &format!("up_blocks.{k}"), dtype, quant_bits);
         }
     }
 

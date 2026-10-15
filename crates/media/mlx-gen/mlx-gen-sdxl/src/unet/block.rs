@@ -227,6 +227,7 @@ impl UNetBlock2D {
         &mut self,
         source: &mlx_gen::WeightsSource,
         prefix: &str,
+        dtype: mlx_rs::Dtype,
         quant_bits: Option<i32>,
     ) {
         if let Some(attns) = &mut self.attentions {
@@ -234,6 +235,7 @@ impl UNetBlock2D {
                 attn.arm_block_stream(
                     source.clone(),
                     &format!("{prefix}.attentions.{j}"),
+                    dtype,
                     quant_bits,
                 );
             }

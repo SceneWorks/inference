@@ -49,12 +49,36 @@ fn is_packed(w: &Weights) -> bool {
 /// resident at f32: the published `illustrious-xl-v{1,2}` q4 U-Net carries 1.33 GB of f32 dense
 /// leaves (`sdxl` q4: 0.67 GB at f16), which the memory contract already prices at 16-bit — the load
 /// now matches the price.
-fn cast_for_load(w: &mut Weights, dtype: Dtype) -> Result<()> {
+///
+/// `pub(crate)` for ladder rung 4: [`crate::block_stream::SdxlBlockStream::open`] applies this same
+/// rule to every re-read window, so a streamed block's dense leaves carry the dtype its resident twin
+/// was cast to rather than the file's stored width.
+pub(crate) fn cast_for_load(w: &mut Weights, dtype: Dtype) -> Result<()> {
     if is_packed(w) {
         w.cast_unpacked_floats(dtype)
     } else {
         w.cast_all(dtype)
     }
+}
+
+/// Refuse a trainer load whose `components` include a **pre-quantized** (packed Q4/Q8) tier.
+///
+/// Training reads the dense base — the contract the `mage_flow_base` trainer already enforces, the
+/// engine-side twin of the app's `TrainingTierMissing` pre-flight. An SDXL-family packed tier would
+/// not fail on its own: the gradient path runs over the packed codes, and the load-time cast upcasts
+/// the snapshot's f16 dense leaves to the trainer's f32, so it would train against the q4/q8
+/// approximation of the base rather than the base. `trainer` names the caller in the refusal.
+pub fn require_dense_training_base(root: &Path, trainer: &str, components: &[&str]) -> Result<()> {
+    for component in components {
+        if let Some(bits) = mlx_gen::quant::packed_quant_bits(root, component)? {
+            return Err(Error::Msg(format!(
+                "{trainer} trainer requires the dense base, but {component} at {} is a \
+                 pre-quantized Q{bits} artifact; install the dense tier to train",
+                root.join(component).display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
@@ -441,7 +465,7 @@ mod vae_fp16_fix_tests {
     }
 }
 
-/// F-181: the `Sequential` re-quant warn/// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
+/// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
 /// when a load-time (re)quant over a **dense** snapshot will actually happen — an already-packed
 /// turnkey loads packed and must NOT warn. Weight-free: writes only a `unet/config.json`.
 #[cfg(test)]

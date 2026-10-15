@@ -283,6 +283,32 @@ impl TransformerBlock {
         Ok(())
     }
 
+    /// Every dense leaf's dtype, keyed by block-local path: the three norms and every linear's
+    /// dense bias (packed or not). The rung-4 stream test compares a streamed block against its
+    /// resident twin through this, so a cast that only one path applies is observable.
+    #[cfg(test)]
+    pub(crate) fn dense_leaf_dtypes(&mut self) -> Vec<(String, Dtype)> {
+        let mut out: Vec<(String, Dtype)> = [
+            ("norm1.weight", &self.norm1_w),
+            ("norm1.bias", &self.norm1_b),
+            ("norm2.weight", &self.norm2_w),
+            ("norm2.bias", &self.norm2_b),
+            ("norm3.weight", &self.norm3_w),
+            ("norm3.bias", &self.norm3_b),
+        ]
+        .into_iter()
+        .map(|(k, a)| (k.to_owned(), a.dtype()))
+        .collect();
+        for path in BLOCK_ADAPTER_PATHS {
+            let segs: Vec<&str> = path.split('.').collect();
+            let linear = self.adaptable_mut(&segs).expect("listed path resolves");
+            if let Some(bias) = linear.bias() {
+                out.push((format!("{path}.bias"), bias.dtype()));
+            }
+        }
+        out
+    }
+
     pub(crate) fn materialize_weights(&self) -> Result<()> {
         mlx_rs::transforms::eval([
             &self.norm1_w,
@@ -461,6 +487,7 @@ impl Transformer2D {
         &mut self,
         source: mlx_gen::WeightsSource,
         prefix: &str,
+        dtype: mlx_rs::Dtype,
         quant_bits: Option<i32>,
     ) {
         let mut stream = crate::block_stream::SdxlBlockStream::new(
@@ -469,6 +496,7 @@ impl Transformer2D {
             self.model_dims,
             self.num_heads,
             self.blocks.len(),
+            dtype,
             quant_bits,
         );
         stream.capture_from(&mut self.blocks);

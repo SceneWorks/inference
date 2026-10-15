@@ -327,7 +327,7 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 /// is admissible across the advertised range" argument no longer applies. What is left is float
 /// reassociation of the same arithmetic, asserted against the f32 untiled decode by
 /// `vae::tests::tiled_decode_matches_the_f32_untiled_decode_across_edges` (weights-free,
-/// CI) and `tests/sdxl_low_memory_real_weights.rs` (real weights, opt-in), each stating its
+/// CI) and `tests/low_memory_real_weights.rs` (real weights, opt-in), each stating its
 /// tolerance.
 ///
 /// So rung 2 is `Implemented` over [`DECODE_TILE_EDGES`] × [`DECODE_OVERLAPS`] on the native VAE

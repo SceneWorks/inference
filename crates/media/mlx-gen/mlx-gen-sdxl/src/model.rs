@@ -903,6 +903,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
             loader::resolve_weight_file(root, "unet", "diffusion_pytorch_model", DTYPE)?;
         unet.arm_block_streams(
             &WeightsSource::File(unet_file),
+            DTYPE,
             spec.quantize.map(|q| q.bits()),
         );
     }
@@ -1751,13 +1752,13 @@ pub(crate) fn component_footprint(
     };
     // sc-26268: a staged fp16-fix VAE replaces the in-snapshot (or fused) VAE and is resident at
     // f16 — price the file the load opens at the width it materializes, like every other component.
+    // A staged component the contract cannot resolve or read is an error, not a silent fallback to
+    // pricing the f32 VAE it replaces: the load would fail on the same file anyway.
     if let Some(source) = spec.components.get(loader::VAE_FP16_FIX_COMPONENT) {
         use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
-        if let Ok(bytes) = loader::resolve_vae_fp16_fix_file(source).and_then(|file| {
-            projected_safetensors_bytes(file, |_| ResidentProjection::Bfloat16).map_err(Error::from)
-        }) {
-            footprint.vae = bytes;
-        }
+        let file = loader::resolve_vae_fp16_fix_file(source)?;
+        footprint.vae = projected_safetensors_bytes(file, |_| ResidentProjection::Bfloat16)
+            .map_err(Error::from)?;
     }
     Ok(footprint)
 }
@@ -2081,6 +2082,32 @@ mod tests {
         assert_eq!(bare_footprint.dit, 0);
         assert_eq!(bare_footprint.vae, 0);
         assert_eq!(bare_footprint.text_encoder, 0);
+
+        // A staged fp16-fix VAE replaces the snapshot VAE and is priced at f16 from its own file.
+        let fix = tempfile::tempdir().unwrap();
+        write_tensor(
+            &fix.path().join("diffusion_pytorch_model.safetensors"),
+            "F32",
+            40,
+            4,
+        );
+        let staged = mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_component(
+            loader::VAE_FP16_FIX_COMPONENT,
+            WeightsSource::Dir(fix.path().to_path_buf()),
+        );
+        assert_eq!(component_footprint(&staged).unwrap().vae, 40 * 2);
+        // A staged component the contract cannot resolve is an error — never a silent fallback to
+        // pricing the f32 VAE it replaces.
+        let empty = tempfile::tempdir().unwrap();
+        let unresolvable = mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_component(
+                loader::VAE_FP16_FIX_COMPONENT,
+                WeightsSource::Dir(empty.path().to_path_buf()),
+            );
+        let err = component_footprint(&unresolvable)
+            .expect_err("an unresolvable staged fp16-fix VAE must not be priced as the f32 VAE")
+            .to_string();
+        assert!(err.contains(loader::VAE_FP16_FIX_COMPONENT), "{err}");
     }
 
     #[test]

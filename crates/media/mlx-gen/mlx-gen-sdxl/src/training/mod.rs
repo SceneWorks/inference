@@ -301,6 +301,11 @@ fn snapshot_root(spec: &LoadSpec) -> Result<&PathBuf> {
 /// The weight load behind [`load_trainer`], run by [`LazyTrainer`](mlx_gen::train::lazy::LazyTrainer) on first need.
 fn load_weights(spec: &LoadSpec) -> Result<SdxlTrainer> {
     let root = snapshot_root(spec)?;
+    crate::loader::require_dense_training_base(
+        root,
+        MODEL_ID,
+        &["unet", "text_encoder", "text_encoder_2"],
+    )?;
     Ok(SdxlTrainer {
         descriptor: trainer_descriptor(),
         vae: crate::loader::load_vae(root)?,
@@ -401,6 +406,40 @@ fn projected_dense_peak_gb(p: f64, bf16: bool) -> f64 {
         5.56 + 4.258e-4 * p + 2.157e-8 * p * p
     } else {
         10.78 + 8.582e-4 * p + 4.293e-8 * p * p
+    }
+}
+
+#[cfg(test)]
+mod dense_base_tests {
+    /// A packed tier is refused before any weight is read; a dense tree passes the guard (and then
+    /// fails later only on its missing files, never on the guard).
+    #[test]
+    fn the_trainer_refuses_a_packed_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for component in ["unet", "text_encoder", "text_encoder_2"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        let dense_err = match super::load_weights(&spec) {
+            Ok(_) => panic!("an empty tree cannot load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(!dense_err.contains("pre-quantized"), "{dense_err}");
+
+        std::fs::write(
+            root.join("text_encoder_2/config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        let err = match super::load_weights(&spec) {
+            Ok(_) => panic!("a packed tier must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("pre-quantized Q4") && err.contains("text_encoder_2"),
+            "{err}"
+        );
     }
 }
 

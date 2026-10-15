@@ -455,7 +455,7 @@ impl KolorsHeavy {
     ) -> Result<()> {
         let file = mlx_gen_sdxl::resolve_unet_weight_file(root, self.dtype)?;
         self.unet
-            .arm_block_streams(&mlx_gen::WeightsSource::File(file), quant_bits);
+            .arm_block_streams(&mlx_gen::WeightsSource::File(file), self.dtype, quant_bits);
         // All-or-nothing, checked rather than assumed. A partially armed U-Net would window some
         // sub-stacks and leave others resident — neither the measured configuration nor a
         // describable one — and the failure would surface eleven layers deep in a denoise step

@@ -77,6 +77,7 @@
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
+use mlx_rs::Dtype;
 
 use crate::unet::transformer::TransformerBlock;
 
@@ -137,6 +138,10 @@ pub(crate) struct SdxlBlockStream {
     model_dims: i32,
     num_heads: i32,
     n_blocks: usize,
+    /// The compute dtype the resident stack was cast to at load (`loader::cast_for_load`). Every
+    /// re-read window applies the same packed-aware cast, so a producer's stored-f32 dense leaves
+    /// (norms, biases) come back at the resident width instead of promoting the window to f32.
+    dtype: Dtype,
     /// The load-time quantization the resident stack received, replayed per materialized block so a
     /// streamed block is byte-identical to its resident twin. `None` for a dense/fp16 tier. On a
     /// pre-quantized (packed) snapshot this is recorded but is a documented no-op — the same no-op
@@ -162,6 +167,7 @@ impl SdxlBlockStream {
         model_dims: i32,
         num_heads: i32,
         n_blocks: usize,
+        dtype: Dtype,
         quant_bits: Option<i32>,
     ) -> Self {
         Self {
@@ -170,6 +176,7 @@ impl SdxlBlockStream {
             model_dims,
             num_heads,
             n_blocks,
+            dtype,
             quant_bits,
             adapters: vec![BlockAdapters::default(); n_blocks],
             ip: vec![None; n_blocks],
@@ -228,13 +235,22 @@ impl SdxlBlockStream {
         self.ip_expected = self.ip.iter().any(Option::is_some);
     }
 
-    /// Open a fresh lazy view of the U-Net checkpoint. Called once per window by
-    /// [`run_windowed`](mlx_gen::block_residency::run_windowed).
+    /// Open a fresh lazy view of the U-Net checkpoint, cast exactly as the resident load cast it.
+    /// Called once per window by [`run_windowed`](mlx_gen::block_residency::run_windowed).
+    ///
+    /// The cast is the resident path's own rule ([`crate::loader::cast_for_load`]: packs untouched,
+    /// every dense leaf to `dtype`), applied to the whole view once per window rather than per
+    /// block. It is lazy — dtype and key reads only — so only the tensors a block actually reads are
+    /// ever converted. Without it a streamed block keeps the file's stored width: a packed snapshot
+    /// whose producer wrote its norms/biases at f32 would hand the window f32 dense leaves while the
+    /// resident twin holds f16, breaking byte-identity and promoting the window's activations.
     pub(crate) fn open(&self) -> Result<Weights> {
-        match &self.source {
-            WeightsSource::Dir(dir) => Weights::from_dir(dir),
-            WeightsSource::File(file) => Weights::from_file(file),
-        }
+        let mut view = match &self.source {
+            WeightsSource::Dir(dir) => Weights::from_dir(dir)?,
+            WeightsSource::File(file) => Weights::from_file(file)?,
+        };
+        crate::loader::cast_for_load(&mut view, self.dtype)?;
+        Ok(view)
     }
 
     /// Materialize block `index` of this sub-stack out of `view` — quantized, adapted and
@@ -340,6 +356,7 @@ mod tests {
             DIMS,
             HEADS,
             n,
+            Dtype::Float32,
             None,
         )
     }
@@ -493,6 +510,115 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// sc-26268 review: a **packed** snapshot whose producer wrote its dense leaves (norms, linear
+    /// biases) at f32 — the shape of the published `realvisxl`/`illustrious-xl` q4/q8 U-Nets. The
+    /// resident load casts those leaves to the compute dtype (`loader::cast_for_load`); a streamed
+    /// block must come back with the same dtypes and run the same forward, bit for bit, or the
+    /// window promotes its activations to f32 and stops being the resident block's twin.
+    #[test]
+    fn a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block() {
+        let _cpu = crate::test_device::cpu_only();
+        let tmp = tempfile::tempdir().unwrap();
+        let dense = fixture(&tmp, "packed-src", 1);
+        // Pack every 2-D linear weight (u32 codes + f16 scales/biases, the converter's layout) and
+        // keep every dense leaf at f32 — exactly what the published packed snapshots carry.
+        let src = Weights::from_file(&dense).unwrap();
+        let mut named: Vec<(String, Array)> = Vec::new();
+        for key in src.keys().map(str::to_owned).collect::<Vec<_>>() {
+            let a = src.require(&key).unwrap().clone();
+            if key.ends_with(".weight") && a.ndim() == 2 {
+                let (codes, scales, biases) = mlx_rs::ops::quantize(&a, 64, 4).unwrap();
+                let base = key.trim_end_matches(".weight");
+                named.push((key.clone(), codes));
+                named.push((
+                    format!("{base}.scales"),
+                    scales.as_dtype(Dtype::Float16).unwrap(),
+                ));
+                named.push((
+                    format!("{base}.biases"),
+                    biases.as_dtype(Dtype::Float16).unwrap(),
+                ));
+            } else {
+                assert_eq!(
+                    a.dtype(),
+                    Dtype::Float32,
+                    "{key}: the fixture's dense leaves are f32"
+                );
+                named.push((key, a));
+            }
+        }
+        let dir = tmp.path().join("sdxl-block-stream-packed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(refs, None, &path).unwrap();
+
+        // Resident twin: the production load rule at f16.
+        let mut w = Weights::from_file(&path).unwrap();
+        crate::loader::cast_for_load(&mut w, Dtype::Float16).unwrap();
+        let mut resident =
+            TransformerBlock::from_weights(&w, "attentions.0.transformer_blocks.0", DIMS, HEADS)
+                .unwrap();
+
+        // Streamed block: armed at the same compute dtype.
+        let s = SdxlBlockStream::new(
+            WeightsSource::File(path.clone()),
+            "attentions.0",
+            DIMS,
+            HEADS,
+            1,
+            Dtype::Float16,
+            None,
+        );
+        let mut view = s.open().unwrap();
+        let mut streamed = s.materialize(&mut view, 0).unwrap();
+        assert!(
+            streamed
+                .adaptable_mut(&["attn1", "to_q"])
+                .unwrap()
+                .is_quantized(),
+            "the fixture must load packed"
+        );
+
+        let resident_dtypes = resident.dense_leaf_dtypes();
+        assert!(
+            resident_dtypes.len() > 6,
+            "the probe must cover the linear biases, not just the norms"
+        );
+        assert!(
+            resident_dtypes.iter().all(|(_, d)| *d == Dtype::Float16),
+            "resident dense leaves follow the compute dtype: {resident_dtypes:?}"
+        );
+        assert_eq!(
+            streamed.dense_leaf_dtypes(),
+            resident_dtypes,
+            "a streamed block's dense leaves must carry its resident twin's dtypes"
+        );
+
+        let ramp = |shape: &[i32], phase: f32| {
+            let n = shape.iter().product::<i32>();
+            let v: Vec<f32> = (0..n).map(|i| ((i as f32 + phase) * 0.37).sin()).collect();
+            Array::from_slice(&v, shape)
+                .as_dtype(Dtype::Float16)
+                .unwrap()
+        };
+        let x = ramp(&[1, 16, DIMS], 0.0);
+        let memory = ramp(&[1, 7, DIMS], 3.0);
+        let plan = crate::plan::SdxlForwardPlan::default();
+        let r = resident.forward_ip(&x, &memory, None, plan).unwrap();
+        let t = streamed.forward_ip(&x, &memory, None, plan).unwrap();
+        assert_eq!(
+            r.dtype(),
+            Dtype::Float16,
+            "the resident window stays at f16"
+        );
+        assert_eq!(t.dtype(), r.dtype(), "the streamed window must not promote");
+        assert!(
+            mlx_rs::ops::array_eq(&r, &t, false).unwrap().item::<bool>(),
+            "a streamed block must run bit-identically to its resident twin"
+        );
     }
 
     /// Captured residual adapters travel onto a materialized block, per block — a LoRA installed on

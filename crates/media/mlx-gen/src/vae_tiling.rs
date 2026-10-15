@@ -943,11 +943,6 @@ mod tests {
         }));
     }
 
-    /// sc-19753: layer-wise convolution tiling must use the dense activation's GroupNorm
-    /// statistics. A whole-tail tiled decoder instead normalizes every crop independently and is
-    /// exactly the bug this regression guards against. Position-dependent values make those local
-    /// statistics observably different; the halo/core convolution path must still track the dense
-    /// GroupNorm→SiLU→3×3 convolution.
     #[test]
     fn half_precision_group_stats_accumulate_at_f32_without_overflow() {
         // Weights-free numerics on the CPU device; restored for the next test in the binary.
@@ -1014,6 +1009,11 @@ mod tests {
         assert!(max_delta < 5e-3, "f16 apply drifted {max_delta}");
     }
 
+    /// sc-19753: layer-wise convolution tiling must use the dense activation's GroupNorm
+    /// statistics. A whole-tail tiled decoder instead normalizes every crop independently and is
+    /// exactly the bug this regression guards against. Position-dependent values make those local
+    /// statistics observably different; the halo/core convolution path must still track the dense
+    /// GroupNorm→SiLU→3×3 convolution.
     #[test]
     fn global_group_norm_tiled_conv_tracks_dense_layer() {
         let (batch, height, width, channels, out_channels) = (1, 7, 9, 32, 3);
