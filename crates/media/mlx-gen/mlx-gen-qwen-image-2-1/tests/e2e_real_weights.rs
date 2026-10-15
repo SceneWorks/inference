@@ -846,9 +846,13 @@ fn validation_render_at(
     reported
 }
 
-/// A deterministic synthetic reference, so the edit smoke needs no checked-in photographs.
-/// `QWEN_IMAGE_2_1_EDIT_REFS` points at a directory of real PNGs to use instead, in name order —
-/// reference images for a real evaluation are user-provided, never synthesised or fetched here.
+/// A deterministic synthetic reference: three independent colour sawtooths. It is **not a
+/// picture** — a real-weight edit over it faithfully reproduces the sawtooth as a colour mosaic (the
+/// candle twin's CUDA evidence, run 38664658356: chroma busyness 32–41, [`assert_not_mosaic`]), so
+/// it proves nothing about image correctness. It stays for the miniature-fixture dry runs, the
+/// eleven-reference refusal (refused before any image is read), the base edit's AT4 golden
+/// comparison (the pre-epic goldens were rendered over exactly these inputs), and as the negative
+/// calibration of [`assert_not_mosaic`].
 fn synthetic_reference(seed: u32, width: u32, height: u32) -> mlx_gen::gen_core::Image {
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
@@ -863,6 +867,211 @@ fn synthetic_reference(seed: u32, width: u32, height: u32) -> mlx_gen::gen_core:
         height,
         pixels,
     }
+}
+
+/// Edge of every reference the real-weight edit smokes send (each is fitted to
+/// `OUTPUT_RESOLUTION` by the processor whatever its size).
+const REFERENCE_EDGE: u32 = 768;
+
+/// The edit prompt every reference-edit render sends.
+const EDIT_PROMPT: &str =
+    "Combine the subjects of the reference images into one scene, evening light";
+
+/// One subject per reference, in reference order — distinct objects, so a correct edit is a scene
+/// visibly built from them. The candle twin renders the same list.
+const REFERENCE_SUBJECTS: [&str; MAX_REFERENCES] = [
+    "A red vintage bicycle leaning against a white brick wall, daylight photograph",
+    "A golden retriever sitting on green grass, portrait photograph",
+    "A blue ceramic teapot on a wooden table, studio photograph",
+    "A yellow taxi cab parked on a city street, photograph",
+    "A potted cactus with pink flowers on a sunny windowsill, photograph",
+    "A white lighthouse on a rocky coast under a clear sky, photograph",
+    "An orange tabby cat curled up on a knitted blanket, photograph",
+    "A plate of colourful macarons on a marble counter, photograph",
+    "A green velvet armchair in an empty bright room, photograph",
+    "A striped hot air balloon over rolling hills, photograph",
+];
+
+/// `QWEN_IMAGE_2_1_EDIT_REFS`: a directory of real images (any format `image` reads) to use as
+/// the references instead, in natural name order (operator-supplied).
+const EDIT_REFS_ENV: &str = "QWEN_IMAGE_2_1_EDIT_REFS";
+
+/// Where an edit smoke's references come from when `QWEN_IMAGE_2_1_EDIT_REFS` names no directory.
+#[derive(Clone, Copy, Debug)]
+enum ReferenceSource {
+    /// [`synthetic_reference`] — for the dry runs and the AT4 golden comparison only.
+    Synthetic,
+    /// **Real pictures, rendered in the same run** by the generator under test
+    /// ([`rendered_references`]): no reference images are provisioned with the snapshots, and the
+    /// Qwen licence keeps none in this repository, so the run makes its own — `edge`²
+    /// text-to-image renders of [`REFERENCE_SUBJECTS`], written beside the evidence.
+    Rendered { edge: u32 },
+}
+
+impl ReferenceSource {
+    /// Whether the edit output over these references must be a picture ([`assert_not_mosaic`]).
+    fn is_real(self) -> bool {
+        matches!(self, Self::Rendered { .. }) || std::env::var_os(EDIT_REFS_ENV).is_some()
+    }
+}
+
+/// `count` text-to-image renders of [`REFERENCE_SUBJECTS`] by `generator`, `edge`² each, at the
+/// generator's own step count and seeds `101..`, prefill (no cache selected), each written as
+/// `<stem>_reference_<n>_<edge>x<edge>.png`.
+fn rendered_references(
+    generator: &dyn Generator,
+    count: usize,
+    edge: u32,
+    out_dir: &Path,
+    stem: &str,
+) -> Vec<mlx_gen::gen_core::Image> {
+    assert!(count <= REFERENCE_SUBJECTS.len(), "{count} references");
+    REFERENCE_SUBJECTS[..count]
+        .iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let label = format!("{stem} reference {}", i + 1);
+            let started = Instant::now();
+            let out = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: (*subject).to_owned(),
+                        width: edge,
+                        height: edge,
+                        seed: Some(101 + i as u64),
+                        ..Default::default()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_or_else(|e| panic!("{label}: renders: {e}"));
+            let GenerationOutput::Images(mut images) = out else {
+                panic!("{label}: images expected");
+            };
+            let image = images.remove(0);
+            assert_eq!((image.width, image.height), (edge, edge), "{label}");
+            image::save_buffer(
+                out_dir.join(format!("{stem}_reference_{}_{edge}x{edge}.png", i + 1)),
+                &image.pixels,
+                edge,
+                edge,
+                image::ColorType::Rgb8,
+            )
+            .unwrap();
+            eprintln!(
+                "{label}: {subject:?} in {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            image
+        })
+        .collect()
+}
+
+/// **Chroma busyness**: the RGB8 image box-averaged onto a 64×64 grid, then the mean absolute
+/// difference between neighbouring cells of its two chroma channels (`B − Y`, `R − Y`, in 0..=255
+/// levels), averaged over both axes and both channels. A photograph or a rendered scene changes
+/// colour slowly at that scale; a colour mosaic changes it every few pixels. The grid makes it
+/// independent of the render size (cells are `width/64 × height/64` pixels; a remainder is
+/// ignored). The candle twin computes the same figure.
+fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
+    const GRID: usize = 64;
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(pixels.len(), w * h * 3, "RGB8 geometry");
+    assert!(
+        w >= GRID && h >= GRID,
+        "{w}x{h} is below the {GRID}-cell grid"
+    );
+    let (cw, ch) = (w / GRID, h / GRID);
+    let mut cells = vec![[0f64; 2]; GRID * GRID];
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let mut sum = [0f64; 2];
+            for y in gy * ch..(gy + 1) * ch {
+                for x in gx * cw..(gx + 1) * cw {
+                    let px = &pixels[(y * w + x) * 3..][..3];
+                    let (r, g, b) = (f64::from(px[0]), f64::from(px[1]), f64::from(px[2]));
+                    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    sum[0] += b - luma;
+                    sum[1] += r - luma;
+                }
+            }
+            let n = (cw * ch) as f64;
+            cells[gy * GRID + gx] = [sum[0] / n, sum[1] / n];
+        }
+    }
+    let mut total = 0f64;
+    for channel in 0..2 {
+        let (mut across, mut down) = (0f64, 0f64);
+        for gy in 0..GRID {
+            for gx in 0..GRID {
+                let here = cells[gy * GRID + gx][channel];
+                if gx + 1 < GRID {
+                    across += (cells[gy * GRID + gx + 1][channel] - here).abs();
+                }
+                if gy + 1 < GRID {
+                    down += (cells[(gy + 1) * GRID + gx][channel] - here).abs();
+                }
+            }
+        }
+        let pairs = (GRID * (GRID - 1)) as f64;
+        total += (across / pairs + down / pairs) / 2.0;
+    }
+    total / 2.0
+}
+
+/// The chroma busyness ([`chroma_busyness`]) above which a render is a colour mosaic, not a
+/// picture — the candle twin's bar, calibrated once, offline, on images that exist: the CUDA edit
+/// renders over synthetic references (run 38664658356) score 31.9 and 40.9; that run's Turbo
+/// text-to-image renders 3.1–3.4 and every final render committed under `docs/migration/evidence/`
+/// 3.0–19.3. 25 sits between the busiest real picture and the mildest mosaic.
+const MOSAIC_CHROMA_BAR: f64 = 25.0;
+
+/// Reject a render that is a colour mosaic rather than a picture — what an edit over the
+/// synthetic sawtooth produces, and what no shape or blank-frame check catches.
+fn assert_not_mosaic(label: &str, pixels: &[u8], width: u32, height: u32) {
+    let busyness = chroma_busyness(pixels, width, height);
+    eprintln!("{label}: chroma busyness {busyness:.2} (mosaic above {MOSAIC_CHROMA_BAR})");
+    assert!(
+        busyness <= MOSAIC_CHROMA_BAR,
+        "{label}: chroma busyness {busyness:.2} > {MOSAIC_CHROMA_BAR} — a colour mosaic, not a \
+         picture derived from its references"
+    );
+}
+
+/// [`assert_not_mosaic`] rejects the synthetic sawtooth references at the sizes an edit renders
+/// and accepts a smooth synthetic scene with hard-edged shapes. Device-free.
+#[test]
+fn the_mosaic_check_rejects_the_synthetic_references_only() {
+    for edge in [512, 768, 1024] {
+        let mosaic = synthetic_reference(1, edge, edge);
+        assert!(
+            std::panic::catch_unwind(|| assert_not_mosaic("sawtooth", &mosaic.pixels, edge, edge))
+                .is_err(),
+            "the {edge}² sawtooth must be rejected"
+        );
+    }
+    // A sky-to-ground gradient with three saturated discs: hard colour edges, but few of them.
+    let edge = 512u32;
+    let mut scene = Vec::with_capacity((edge * edge * 3) as usize);
+    for y in 0..edge {
+        for x in 0..edge {
+            let disc = |cx: f32, cy: f32, r: f32| {
+                ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt() < r
+            };
+            let px = if disc(128.0, 300.0, 70.0) {
+                [220, 30, 30]
+            } else if disc(300.0, 340.0, 60.0) {
+                [30, 60, 220]
+            } else if disc(420.0, 120.0, 50.0) {
+                [250, 210, 40]
+            } else if y < edge / 2 {
+                [90, 150, 230 - (y / 4) as u8]
+            } else {
+                [60, 140 - (y / 8) as u8, 50]
+            };
+            scene.extend_from_slice(&px);
+        }
+    }
+    assert_not_mosaic("scene", &scene, edge, edge);
 }
 
 /// A file name split into text and numeric runs (`ref10_x` → `["ref", 10, "_x"]`), so numbers
@@ -891,11 +1100,24 @@ fn natural_key(name: &str) -> Vec<(String, u64)> {
     key
 }
 
-fn references(count: usize, width: u32, height: u32) -> Vec<mlx_gen::gen_core::Image> {
-    let Ok(dir) = std::env::var("QWEN_IMAGE_2_1_EDIT_REFS") else {
-        return (0..count)
-            .map(|i| synthetic_reference(i as u32 + 1, width, height))
-            .collect();
+/// The `count` ordered references of an edit smoke: the operator's `QWEN_IMAGE_2_1_EDIT_REFS`
+/// directory when set, else `source`'s.
+fn references(
+    generator: &dyn Generator,
+    source: ReferenceSource,
+    count: usize,
+    out_dir: &Path,
+    stem: &str,
+) -> Vec<mlx_gen::gen_core::Image> {
+    let Ok(dir) = std::env::var(EDIT_REFS_ENV) else {
+        return match source {
+            ReferenceSource::Synthetic => (0..count)
+                .map(|i| synthetic_reference(i as u32 + 1, REFERENCE_EDGE, REFERENCE_EDGE))
+                .collect(),
+            ReferenceSource::Rendered { edge } => {
+                rendered_references(generator, count, edge, out_dir, stem)
+            }
+        };
     };
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_EDIT_REFS={dir}: {e}"))
@@ -969,8 +1191,21 @@ struct EditCase {
 #[test]
 #[ignore]
 fn validation_render_reference_edit() {
+    // Without a golden the references are real pictures rendered in the run and each edit output
+    // must be a picture ([`assert_not_mosaic`]); with one they are the synthetic references the
+    // pre-epic goldens were rendered over — the same inputs, which proves the port unchanged and
+    // nothing about the image.
+    let golden = render_golden();
+    let source = if golden.is_some() {
+        ReferenceSource::Synthetic
+    } else {
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        }
+    };
     reference_edit_renders(
         &Target::dense(mlx_gen_qwen_image_2_1::MODEL_ID, snapshot()),
+        source,
         mlx_gen_qwen_image_2_1::DEFAULT_STEPS,
         vec![
             EditCase {
@@ -989,7 +1224,7 @@ fn validation_render_reference_edit() {
             },
         ],
         false,
-        render_golden().as_deref(),
+        golden.as_deref(),
     );
 }
 
@@ -1043,6 +1278,9 @@ fn validation_render_turbo_reference_edit() {
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
     reference_edit_renders(
         &Target::dense(mlx_gen_qwen_image_2_1::TURBO_MODEL_ID, root),
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
         saved,
         vec![
             EditCase {
@@ -1078,6 +1316,7 @@ fn validation_render_turbo_reference_edit() {
 /// carries the encoder's transient — and, on a cached render, the prefix caches being built.
 fn reference_edit_renders(
     target: &Target,
+    references: ReferenceSource,
     default_steps: u32,
     default_cases: Vec<EditCase>,
     forced_shed_twin: bool,
@@ -1116,6 +1355,7 @@ fn reference_edit_renders(
     reference_edit_renders_in(
         target,
         &out_dir(),
+        references,
         default_steps,
         cases,
         forced_shed_twin && forced.is_none(),
@@ -1147,16 +1387,25 @@ const SHED_TWIN_MEAN_BAR: f64 = 2.0;
 /// the `QWEN_IMAGE_2_1_*` environment so the default-run dry run at the bottom of this file can
 /// drive it on the miniature fixture.
 ///
-/// `require_positive_delta` arms the sign half of [`assert_observed_cache_delta`] for the
-/// **ten-reference** twin — the one where the cache dominates every other phase (24.5 GiB priced
-/// at bf16 against a ~10.6 GiB denoise and a ≤ 9.4 GiB reference encode), so holding it must raise
-/// the peak. With fewer references the reference encode can set both renders' peak and the
-/// difference is legitimately near zero, so those twins are printed and held to the upper bound
-/// only. Every real-weight caller sets it; the dry run cannot (the miniature cache is a few
-/// hundred kB under a VAE encode that is not).
+/// `real_weights` (set by [`reference_edit_renders_in`], i.e. every real-weight caller; cleared
+/// by the dry run) arms
+///
+/// * the sign half of [`assert_observed_cache_delta`] for the **ten-reference** twin — the one
+///   where the cache dominates every other phase (24.5 GiB priced at bf16 against a ~10.6 GiB
+///   denoise and a ≤ 9.4 GiB reference encode), so holding it must raise the peak. With fewer
+///   references the reference encode can set both renders' peak and the difference is
+///   legitimately near zero, so those twins are printed and held to the upper bound only (the
+///   miniature cache is a few hundred kB under a VAE encode that is not);
+/// * over real `references` ([`ReferenceSource::is_real`]), [`assert_not_mosaic`] on every edit
+///   output — the miniature fixture's outputs are noise by construction.
+///
+/// The references are made (or read) once, after the generator loads, and every case takes the
+/// first `count` of them in order.
+#[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_in(
     target: &Target,
     out_dir: &std::path::Path,
+    references: ReferenceSource,
     default_steps: u32,
     cases: Vec<EditCase>,
     forced_shed_twin: bool,
@@ -1165,6 +1414,7 @@ fn reference_edit_renders_in(
     reference_edit_renders_with(
         target,
         out_dir,
+        references,
         default_steps,
         cases,
         forced_shed_twin,
@@ -1173,16 +1423,17 @@ fn reference_edit_renders_in(
     )
 }
 
-/// [`reference_edit_renders_in`] with the sign check's arming explicit — see there.
+/// [`reference_edit_renders_in`] with `real_weights` explicit — see there.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_with(
     target: &Target,
     out_dir: &std::path::Path,
+    references: ReferenceSource,
     default_steps: u32,
     cases: Vec<EditCase>,
     forced_shed_twin: bool,
     golden: Option<&Path>,
-    require_positive_delta: bool,
+    real_weights: bool,
 ) {
     use mlx_gen::gen_core::Conditioning;
 
@@ -1190,6 +1441,9 @@ fn reference_edit_renders_with(
     let started = Instant::now();
     let generator = target.load();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+    let most = cases.iter().map(|case| case.references).max().unwrap_or(0);
+    let pool = self::references(generator.as_ref(), references, most, out_dir, stem);
+    let check_picture = real_weights && references.is_real();
 
     let trace = std::env::var_os("QWEN_IMAGE_2_1_MEMORY_TRACE").is_some();
     let footprint_max = footprint_sampler();
@@ -1207,15 +1461,13 @@ fn reference_edit_renders_with(
         } = case;
         let req = selecting(
             GenerationRequest {
-                prompt:
-                    "Combine the subjects of the reference images into one scene, evening light"
-                        .to_owned(),
+                prompt: EDIT_PROMPT.to_owned(),
                 width,
                 height,
                 steps,
                 seed: Some(42),
                 conditioning: vec![Conditioning::MultiReference {
-                    images: references(count, 768, 768),
+                    images: pool[..count].to_vec(),
                 }],
                 ..Default::default()
             },
@@ -1278,6 +1530,9 @@ fn reference_edit_renders_with(
             render_started.elapsed().as_secs_f32()
         );
         let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image, cache);
+        if check_picture {
+            assert_not_mosaic(&label, &image.pixels, width, height);
+        }
         (image.pixels, observed, golden_failure)
     };
 
@@ -1290,6 +1545,7 @@ fn reference_edit_renders_with(
     ];
     let mut twins = 0;
     let mut golden_failures = Vec::new();
+    let mut twin_failures: Vec<String> = Vec::new();
     for case in cases {
         let (cached, cached_report, failure) = render(case, case.cache, "");
         golden_failures.extend(failure);
@@ -1333,20 +1589,23 @@ fn reference_edit_renders_with(
             cached_report.peak_active,
             shed_report.peak_active,
             cached_report.priced_cache,
-            require_positive_delta && case.references == MAX_REFERENCES,
+            real_weights && case.references == MAX_REFERENCES,
         );
-        assert!(
-            mean <= SHED_TWIN_MEAN_BAR,
-            "the forced-shed render differs from the cached one by a mean of {mean:.4} levels \
-             (max {max}); the two paths are the same mathematics"
-        );
+        if mean > SHED_TWIN_MEAN_BAR {
+            twin_failures.push(format!(
+                "the {}-reference forced-shed render differs from the cached one by a mean of \
+                 {mean:.4} levels (max {max}), above {SHED_TWIN_MEAN_BAR}",
+                case.references
+            ));
+        }
     }
     assert!(
         !forced_shed_twin || twins > 0,
         "a forced-shed twin needs a cached case"
     );
-    // After every case has rendered, written its PNG and its `[golden]` line.
+    // After every case has rendered, written its PNG and its `[golden]` / `[kv]` lines.
     assert_golden_clean(&golden_failures);
+    assert!(twin_failures.is_empty(), "{}", twin_failures.join("; "));
 
     let err = generator
         .validate(&GenerationRequest {
@@ -1367,14 +1626,18 @@ fn reference_edit_renders_with(
     assert!(err.contains("at most 10"), "{err}");
 }
 
-/// A **transparent** RGBA reference of `width`×`height`: the same deterministic picture
-/// [`synthetic_reference`] produces, matted onto a soft-edged disc so the alpha is a real ramp
+/// A **transparent** RGBA reference: a real 1024² picture `generator` renders in the run (the
+/// first of [`rendered_references`]) matted onto a soft-edged disc so the alpha is a real ramp
 /// rather than a binary cut-out (a hard matte would survive any resampling order and so could not
 /// exercise the premultiplied resize).
 ///
-/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from a real image
-/// instead; reference images for a real evaluation are user-provided.
-fn transparent_reference(width: u32, height: u32) -> mlx_gen::RgbaImage {
+/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from that image
+/// instead (operator-supplied; nothing is rendered then).
+fn transparent_reference(
+    generator: &dyn Generator,
+    out_dir: &Path,
+    stem: &str,
+) -> mlx_gen::RgbaImage {
     if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
         let rgba = image::open(&path)
             .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
@@ -1385,8 +1648,9 @@ fn transparent_reference(width: u32, height: u32) -> mlx_gen::RgbaImage {
             pixels: rgba.into_raw(),
         };
     }
-    let rgb = synthetic_reference(1, width, height);
-    let mut out = mlx_gen::RgbaImage::from_rgb(&rgb).unwrap();
+    let picture = rendered_references(generator, 1, 1024, out_dir, stem).remove(0);
+    let (width, height) = (picture.width, picture.height);
+    let mut out = mlx_gen::RgbaImage::from_rgb(&picture).unwrap();
     let (cx, cy) = ((width - 1) as f32 / 2.0, (height - 1) as f32 / 2.0);
     let radius = width.min(height) as f32 * 0.36;
     for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
@@ -1555,7 +1819,7 @@ fn transparency_renders(
              transparency; the background is fully transparent."
                 .to_owned(),
             vec![Conditioning::ReferenceRgba {
-                image: transparent_reference(1024, 1024),
+                image: transparent_reference(generator.as_ref(), &out_dir, id),
                 strength: None,
             }],
         ),
@@ -1675,18 +1939,27 @@ fn validation_render_turbo_installed_tiers() {
         .unwrap()
         .default_steps();
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
-    turbo_installed_tier_renders_in(&tiers, &out_dir(), (1024, 1024), saved);
+    turbo_installed_tier_renders_in(
+        &tiers,
+        &out_dir(),
+        (1024, 1024),
+        saved,
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
+    );
 }
 
-/// [`validation_render_turbo_installed_tiers`]'s body over an explicit tier directory, size and
-/// output directory, so the dry run below drives it on tiers converted from the miniature
-/// fixture. Its twin is a two-reference one, so its peak difference is printed and held to the
-/// upper bound only (see [`reference_edit_renders_with`]).
+/// [`validation_render_turbo_installed_tiers`]'s body over an explicit tier directory, size,
+/// output directory and reference source, so the dry run below drives it on tiers converted from
+/// the miniature fixture. Its twin is a two-reference one, so its peak difference is printed and
+/// held to the upper bound only (see [`reference_edit_renders_with`]).
 fn turbo_installed_tier_renders_in(
     tiers: &Path,
     out_dir: &Path,
     (width, height): (u32, u32),
     saved_steps: u32,
+    references: ReferenceSource,
 ) {
     use mlx_gen_qwen_image_2_1::quant::installed_tier;
     let id = mlx_gen_qwen_image_2_1::TURBO_MODEL_ID;
@@ -1717,6 +1990,7 @@ fn turbo_installed_tier_renders_in(
         reference_edit_renders_in(
             &target,
             out_dir,
+            references,
             saved_steps,
             vec![EditCase {
                 references: 2,
@@ -1811,7 +2085,17 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     // The miniature cache sits under the fixture's reference encode, so the twins' sign check is
     // not armed here; the bound is, and the check itself is pinned by
     // `the_observed_cache_delta_is_bounded_by_the_priced_cache`.
-    reference_edit_renders_with(&turbo, &out, 8, vec![case(2), case(10)], true, None, false);
+    // Rendered references, so the in-run reference renders are driven too (64² on the fixture).
+    reference_edit_renders_with(
+        &turbo,
+        &out,
+        ReferenceSource::Rendered { edge: 64 },
+        8,
+        vec![case(2), case(10)],
+        true,
+        None,
+        false,
+    );
     for count in [2, 10] {
         for suffix in ["", "_prefill_twin"] {
             let name = format!("{id}_edit_{count}refs_64x64_8steps_seed42{suffix}.png");
@@ -1829,6 +2113,7 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &turbo,
         &out,
+        ReferenceSource::Synthetic,
         8,
         vec![
             case(2),
@@ -1851,7 +2136,7 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         )
         .unwrap();
     }
-    turbo_installed_tier_renders_in(&tiers, &out, (64, 64), 8);
+    turbo_installed_tier_renders_in(&tiers, &out, (64, 64), 8, ReferenceSource::Synthetic);
     for tier in ["q8", "q4"] {
         for name in [
             format!("{id}_{tier}_64x64_8steps_seed42.png"),
@@ -1890,7 +2175,15 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         ]
     };
     validation_render_at(&base, &golden, (64, 64), &[Some(3)], prefill, None);
-    reference_edit_renders_in(&base, &golden, 40, edit_cases(), false, None);
+    reference_edit_renders_in(
+        &base,
+        &golden,
+        ReferenceSource::Synthetic,
+        40,
+        edit_cases(),
+        false,
+        None,
+    );
     let checked = tmp.path().join("checked");
     std::fs::create_dir_all(&checked).unwrap();
     validation_render_at(
@@ -1901,7 +2194,15 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
         prefill,
         Some(&golden),
     );
-    reference_edit_renders_in(&base, &checked, 40, edit_cases(), false, Some(&golden));
+    reference_edit_renders_in(
+        &base,
+        &checked,
+        ReferenceSource::Synthetic,
+        40,
+        edit_cases(),
+        false,
+        Some(&golden),
+    );
     // One byte off in the golden is a failure, a cached render against a golden is a usage
     // error, and a golden directory without the file is a failure — none of them a skip.
     let t2i = golden.join("qwen_image_2_1_64x64_3steps_seed42.png");
@@ -1938,7 +2239,15 @@ fn the_turbo_smoke_bodies_run_end_to_end_on_the_miniature_fixture() {
     std::fs::create_dir_all(&rechecked).unwrap();
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            reference_edit_renders_in(&base, &rechecked, 40, edit_cases(), false, Some(&first_off));
+            reference_edit_renders_in(
+                &base,
+                &rechecked,
+                ReferenceSource::Synthetic,
+                40,
+                edit_cases(),
+                false,
+                Some(&first_off),
+            );
         }))
         .is_err(),
         "a first-case mismatch fails the body"
