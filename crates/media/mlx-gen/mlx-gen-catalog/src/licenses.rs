@@ -216,6 +216,14 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "flux2_dev_control",
         components: &["flux2_dev", "nvidia_pid_students"],
     },
+    // --- flux3 -------------------------------------------------------------------------------
+    // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
+    // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
+    // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too.
+    ProviderComponents {
+        provider_id: "flux3_klein",
+        components: &["flux3_image_klein", "qwen3_vl_4b_instruct"],
+    },
     // --- ideogram ----------------------------------------------------------------------------
     // `ideogram_4_turbo` is the same base weights plus the bundled TurboTime LoRA and no
     // unconditional DiT (`mlx-gen-ideogram/src/config.rs:15`).
@@ -936,8 +944,9 @@ mod tests {
         // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
-        assert_eq!(registered.len(), 75, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 65);
+        // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
+        assert_eq!(registered.len(), 76, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 66);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1004,11 +1013,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            26,
+            27,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900)"
+             sc-25900, flux3_klein in sc-26234)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {

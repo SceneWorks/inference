@@ -382,6 +382,26 @@ pub const FLUX2_KLEIN_9B_KV: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// `black-forest-labs/flux-3-image-klein` — the distilled FLUX 3 Image Klein package: the 5.6B
+/// flow-map DiT (`model.safetensors`) and the autoencoder (`ae.safetensors`), both under the FLUX
+/// Kommunity License v1.0 (`LICENSE.md` of the package, read 2026-10-15 at revision
+/// `8454017f9ebaada30c998fccd9f67a80c7580f68` under an authenticated session; the card declares
+/// `license: other`, `license_name: flux-kommunity-license`). The bundled `text_encoder/` is a
+/// byte-identical copy of `Qwen/Qwen3-VL-4B-Instruct` and resolves through
+/// [`QWEN3_VL_4B_INSTRUCT`], not this row.
+pub const FLUX3_IMAGE_KLEIN: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein",
+    gated: true,
+    declared: "flux-kommunity-license",
+    family: "flux-kommunity-v1-0",
+    attribution: Some(
+        "This FLUX Model is licensed by Black Forest Labs Inc. under the FLUX Kommunity License. \
+         Copyright Black Forest Labs Inc.",
+    ),
+    retrieved: "2026-10-15",
+};
+
 /// Gemma-2-2B-IT — the PiD caption encoder and the SANA text encoder.
 ///
 /// Three redistributions are named in this codebase (`SceneWorks/gemma-2-2b-it`,
@@ -1262,6 +1282,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     FLUX2_DEV,
     FLUX2_KLEIN_9B,
     FLUX2_KLEIN_9B_KV,
+    FLUX3_IMAGE_KLEIN,
     GEMMA_2_2B_IT,
     GEMMA_3_12B_IT,
     GPT_OSS_20B,
@@ -1334,7 +1355,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 77);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 78);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1448,6 +1469,7 @@ mod tests {
                 "flux2_dev",
                 "flux2_klein_9b",
                 "flux2_klein_9b_kv",
+                "flux3_image_klein",
                 "gemma_2_2b_it",
                 "gemma_3_12b_it",
                 "ideogram_4_fp8",
@@ -1724,7 +1746,9 @@ mod tests {
         // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
         // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25900 read the
         // Qwen-Image-2.1-Turbo card and LICENSE on 2026-10-13
-        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`). A row carrying
+        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`); sc-26234 read the
+        // FLUX 3 Image Klein card and LICENSE.md on 2026-10-15
+        // (`docs/licensing/sc-26234-flux-kommunity-licence-evidence.md`). A row carrying
         // any other date is a row whose provenance nobody can re-read.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
@@ -1732,6 +1756,7 @@ mod tests {
             "2026-09-22",
             "2026-10-10",
             "2026-10-13",
+            "2026-10-15",
         ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(

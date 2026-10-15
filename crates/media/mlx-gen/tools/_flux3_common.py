@@ -114,7 +114,10 @@ def patch_autoencoder_constants(autoencoder_module) -> None:
 
 def patch_dit_constants(dit_module) -> None:
     """Shrink upstream `dit.py`'s module constants to the miniature geometry."""
-    dit_module.IN_CHANNELS = dict(DIT_IN_CHANNELS)
+    # In place: `pipeline.py` imported the same dict object at module load (`from flux3.dit import
+    # IN_CHANNELS`), so rebinding the name would leave `pack` on the release widths.
+    dit_module.IN_CHANNELS.clear()
+    dit_module.IN_CHANNELS.update(DIT_IN_CHANNELS)
     dit_module.HIDDEN = DIT_HIDDEN
     dit_module.HEADS = DIT_HEADS
     dit_module.DEPTH = DIT_DEPTH

@@ -22,13 +22,48 @@
 //! [`gen_core::flux3`]: mlx_gen::gen_core::flux3
 
 pub mod autoencoder;
+pub mod dit;
+pub mod memory_strategy;
+pub mod model;
+pub mod nn;
+pub mod pipeline;
+pub mod text_encoder;
 
 pub use autoencoder::Flux3AutoEncoder;
+pub use dit::{Flux3Dit, SampleTokens};
 pub use mlx_gen::gen_core::flux3::{
     AUTOENCODER_COMPONENT, DISTILLED_MODEL_ID, DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION,
     FAMILY, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_UPSTREAM_REPO, TEXT_ENCODER_UPSTREAM_REVISION,
     UPSTREAM_CODE_REVISION,
 };
+pub use model::{
+    compute_dtype, descriptor, load, load_autoencoder, load_dit, Flux3Klein, MODEL_ID,
+};
+pub use pipeline::{
+    decode_tokens, denoise_flow_map, denoise_one, float_image_to_rgb8, generate_one, image_ids,
+    noise,
+};
+pub use text_encoder::{Flux3TextEncoder, TextConditioning};
+
+/// Add the MLX distilled FLUX 3 generator to an explicit media registry builder, with its
+/// memory-strategy contract, weights-free contract fixture and behavior seam.
+///
+/// Deliberately registers **no** `ActivationMemoryRegistration`: that carrier publishes only real
+/// on-device measurements, and the epic's terminal campaign owns the anchors.
+pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model::REGISTRATION)
+        .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Build the complete explicit MLX FLUX 3 provider catalog.
+pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
+    register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
 
 #[cfg(test)]
 mod tests {
@@ -42,5 +77,18 @@ mod tests {
         ] {
             assert!(doc.contains(sha), "UPSTREAM.md must record {sha}");
         }
+    }
+
+    #[test]
+    fn explicit_catalog_has_stable_surface() {
+        let registry = super::provider_registry().unwrap();
+        let ids: Vec<_> = registry
+            .generators()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(ids, ["flux3_klein"]);
+        assert!(registry.descriptor_conformance_errors().is_empty());
+        assert_eq!(registry.memory_strategy_registrations().len(), 1);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 1);
     }
 }

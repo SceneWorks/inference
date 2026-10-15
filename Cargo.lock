@@ -2427,6 +2427,7 @@ dependencies = [
  "mlx-gen-face",
  "mlx-gen-flux",
  "mlx-gen-flux2",
+ "mlx-gen-flux3",
  "mlx-gen-ideogram",
  "mlx-gen-instantid",
  "mlx-gen-iris",

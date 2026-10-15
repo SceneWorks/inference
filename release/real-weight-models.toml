@@ -765,6 +765,49 @@ expected_files = [
 ]
 
 [[models]]
+# sc-26234 — the pinned distilled FLUX 3 Image Klein package for the dispatch-only `flux3-klein-mlx`
+# profile (`mlx-flux3-klein`): the bf16 flow-map DiT, the f32 autoencoder and the bundled
+# Qwen3-VL-4B-Instruct text encoder (byte-identical to `Qwen/Qwen3-VL-4B-Instruct` @ ebb281ec),
+# read as ONE package by `gen_core::flux3::GenerationResources`. The repository is gated under the
+# FLUX Kommunity License, so the fetch uses the runner's configured credential; the quantized
+# `variants/` and the gallery images are left out.
+key = "flux3-image-klein-mlx"
+repository = "black-forest-labs/flux-3-image-klein"
+revision = "8454017f9ebaada30c998fccd9f67a80c7580f68"
+requires_auth = true
+license = "FLUX Kommunity License v1.0"
+size_class = "very-large"
+profiles = ["flux3-klein-mlx"]
+environment = ["FLUX3_PACKAGE_DIR"]
+download_files = [
+    "config.json",
+    "manifest.json",
+    "model.safetensors",
+    "ae.safetensors",
+    "LICENSE.md",
+    "NOTICE.md",
+    "text_encoder/config.json",
+    "text_encoder/generation_config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/chat_template.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+]
+expected_files = [
+    "config.json",
+    "model.safetensors",
+    "ae.safetensors",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/tokenizer_config.json",
+    "text_encoder/model.safetensors.index.json",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+]
+
+[[models]]
 # … its Qwen3-VL-4B text encoder (the same files as `qwen3-vl-4b-instruct-cuda` below) …
 key = "qwen3-vl-4b-instruct-mlx"
 repository = "Qwen/Qwen3-VL-4B-Instruct"

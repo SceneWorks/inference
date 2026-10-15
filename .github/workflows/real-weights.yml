@@ -156,7 +156,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx]
+        options: [veda-s3-cuda, all, llm, llm-joycaption, starvector-terminal, qwen38-bonsai, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base, qwen-image-2-1, qwen-image-2-1-turbo, qwen-image-2-1-train, decode-speedups-bench, qwen-image-2-1-lora-mlx, iris, iris-depth-train-mlx, iris-restore-mlx, iris-curricula-mlx, iris-curricula-cuda, iris-memory-mlx, iris-memory-cuda, veda-mlx, flux3-klein-mlx]
       qwen38_bonsai_preflight_only:
         description: Qualify Qwen/Bonsai host capacity and CUDA operators without provisioning or loading models
         type: boolean
@@ -321,6 +321,24 @@ on:
         type: string
         required: false
         default: ""
+      # sc-26234 -- `flux3-klein-mlx` only: which Mac renders, and the render geometry of the one
+      # catalog text-to-image case (the component parity cases are fixed at 64²).
+      flux3_mlx_runner:
+        description: "flux3-klein-mlx only: rw-mage (second Mac) or rw-starvector (primary Mac)"
+        type: choice
+        required: false
+        default: rw-mage
+        options: [rw-mage, rw-starvector]
+      flux3_mlx_size:
+        description: "flux3-klein-mlx only: output side of the catalog render (multiple of 16, 64..=2048)"
+        type: string
+        required: false
+        default: "1024"
+      flux3_mlx_steps:
+        description: "flux3-klein-mlx only: Euler steps of the catalog render (1-99; the release is 16)"
+        type: string
+        required: false
+        default: "16"
       # sc-26214 -- `veda-mlx` only. `device` runs the lib binary's `veda::device_gate::` checks
       # (exact sparse mask on Metal + per-layer bench), `ab` the dense-vs-sparse renders, `all` both.
       veda_mlx_phase:
@@ -5904,6 +5922,64 @@ jobs:
             ${{ runner.temp }}/veda-mlx-evidence
             !${{ runner.temp }}/veda-mlx-evidence/**/frames.rgb
             !${{ runner.temp }}/veda-mlx-evidence/**/audio.f32le
+          if-no-files-found: error
+          retention-days: 30
+
+  # sc-26234 — the distilled FLUX 3 Image Klein MLX evidence: the component parity cases against
+  # the COMMITTED upstream CPU reference (`flux3_real_golden_64.safetensors`, the frozen source over
+  # the pinned package at 64²) and ONE text-to-image render through the ordinary catalog route
+  # (`provider_registry().load("flux3_klein")`, 1024² / 16 steps by default). DISPATCH-ONLY
+  # (`flux3-klein-mlx` profile; never `all`, never the schedule; nothing is gated on its numbers).
+  # The host is the dispatch input's Mac (`rw-mage` = nax-macos-2, `rw-starvector` = the primary);
+  # the first step SKIPS with the reason when it has < 48 GB of unified memory or heavy memory
+  # pressure. The GATED package (FLUX Kommunity License) is materialized into the box's task-owned
+  # hub through the runner's own Hugging Face credential (`requires_auth = true` on the manifest
+  # row); each case runs under the external phys_footprint guard (cap 64 GB, 30 min). The PNG, its
+  # JSON record and every case log go in the evidence artifact. Run-scoped CARGO_TARGET_DIR,
+  # build-override profile unstripped (rust-lang/rust#157750).
+  mlx-flux3-klein:
+    name: MLX FLUX 3 Image Klein distilled text-to-image (real weights)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-mlx'
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.flux3_mlx_runner || 'rw-mage' }}"]
+    timeout-minutes: 240
+    env:
+      MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
+      FLUX3_PACKAGE_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein/snapshots/8454017f9ebaada30c998fccd9f67a80c7580f68
+      FLUX3_REAL_SIZE: ${{ inputs.flux3_mlx_size }}
+      FLUX3_REAL_STEPS: ${{ inputs.flux3_mlx_steps }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check the host (>= 48 GB, memory pressure) and the dispatch inputs
+        run: source scripts/ci/real-weights/mlx-flux3-klein/check-the-host.sh
+      - name: Resolve runner-local snapshot paths
+        if: env.FLUX3_SKIP == '0'
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR
+      - name: Report runner disk headroom
+        if: env.FLUX3_SKIP == '0'
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR
+      - name: Toolchain versions
+        if: env.FLUX3_SKIP == '0'
+        run: rustc --version && cargo --version
+      - name: Build the FLUX 3 MLX test binary
+        if: env.FLUX3_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-flux3-klein/build-the-test-binary.sh
+      - name: Materialize and verify the immutable package snapshot
+        if: env.FLUX3_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-flux3-klein/materialize-and-verify-immutable-snapshot.sh
+      - name: Run the guarded real-weight checks
+        if: env.FLUX3_SKIP == '0'
+        run: source scripts/ci/real-weights/mlx-flux3-klein/run-the-guarded-checks.sh
+      - name: Keep the FLUX 3 MLX evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flux3-klein-mlx-evidence
+          path: ${{ runner.temp }}/flux3-klein-mlx-evidence
           if-no-files-found: error
           retention-days: 30
 

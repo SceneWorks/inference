@@ -845,7 +845,7 @@ impl GenerationParams {
         }
         match req.guidance {
             None => {}
-            Some(g) if g == 1.0 => {}
+            Some(1.0) => {}
             Some(g) => {
                 return Err(Error::Unsupported(format!(
                     "flux3: the distilled checkpoint samples without CFG; drop the guidance \

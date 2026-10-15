@@ -15,3 +15,18 @@ mod common;
 
 #[path = "ae_parity.rs"]
 mod ae_parity;
+
+#[path = "dit_parity.rs"]
+mod dit_parity;
+
+#[path = "e2e_parity.rs"]
+mod e2e_parity;
+
+#[path = "generator_contract.rs"]
+mod generator_contract;
+
+#[path = "real_weights.rs"]
+mod real_weights;
+
+#[path = "text_parity.rs"]
+mod text_parity;
