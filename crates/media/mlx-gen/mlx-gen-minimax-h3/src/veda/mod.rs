@@ -2,8 +2,11 @@
 //! Numerical and batching rules ported from Veda-on-ComfyUI at
 //! `60bfae688897dc41bc8685ca9f3130d7ed8f3b0c`; upstream MIT notice: `LICENSE.upstream`.
 pub mod contract;
+#[cfg(test)]
+mod device_gate;
+pub mod metal;
 use crate::denoise::PackedLayout;
-use contract::{Budget, Bundle, Layout, Plan, PredictorOps, TileShape, TILE};
+use contract::{Budget, Bundle, Layout, Plan, TileShape, TILE};
 use mlx_gen::attention::{sdpa_bounded_bhsd, slice_axis, BoundedAttention};
 use mlx_gen::gen_core::{VedaBudget, VedaExecutionReport, VedaRequest};
 use mlx_gen::{Error, Result};
@@ -20,8 +23,25 @@ use std::{
 };
 
 pub type ReportSink = Rc<RefCell<VedaExecutionReport>>;
+/// One executed head's selected rows: `(layer, head, rows)`.
+#[cfg(test)]
+pub(crate) type ExecutedMask = (usize, usize, Vec<Vec<usize>>);
 use mlx_gen::gen_core::veda::workspace::{self, Backend, Chunk, LayoutSize, Limits};
-pub const KERNEL: &str = "mlx-batched-gather-sdpa-v1";
+/// Metal execution (sc-26214): the exact device tile scorer plus [`metal::attend`]'s block-sparse
+/// attention over selected key tiles read in place, and one dense call for the global query rows.
+pub const KERNEL: &str = "mlx-tile-sparse-metal-v2";
+/// MLX CPU device execution (tests, no Metal): the host scorer contract and gather + SDPA.
+pub const CPU_KERNEL: &str = "mlx-batched-gather-sdpa-v1";
+
+fn on_gpu() -> Result<bool> {
+    Ok(matches!(
+        mlx_rs::Device::try_default()?.get_type()?,
+        mlx_rs::DeviceType::Gpu
+    ))
+}
+fn kernel_id() -> Result<&'static str> {
+    Ok(if on_gpu()? { KERNEL } else { CPU_KERNEL })
+}
 pub const SELF_TEST_ATOL: f32 = 0.025;
 
 fn predictor_path(path: Option<&Path>) -> Result<&Path> {
@@ -64,7 +84,11 @@ fn cached_self_test(
 /// device and [`KERNEL`].
 pub fn cached_device_self_test() -> Result<()> {
     let device = mlx_rs::Device::try_default()?;
-    let key = (u32::from(device.get_type()?), device.get_index()?, KERNEL);
+    let key = (
+        u32::from(device.get_type()?),
+        device.get_index()?,
+        kernel_id()?,
+    );
     cached_self_test(&SELF_TESTS, key, device_self_test)
 }
 
@@ -73,11 +97,23 @@ pub struct VedaRuntime {
     plan: Plan,
     grid: [usize; 3],
     layouts: BTreeMap<TileShape, Layout>,
+    /// Device-resident permutation/validity/assembly operands per tile shape (Metal only).
+    device: BTreeMap<TileShape, metal::DeviceLayout>,
+    /// Device-resident BF16 `[heads, 3*dim, dim]` (Q, K) projections per layer, uploaded on the
+    /// layer's first sparse call and kept for every later step.
+    projections: RefCell<BTreeMap<usize, (Array, Array)>>,
+    limits: Limits,
     request: VedaRequest,
     report: ReportSink,
     failed: RefCell<bool>,
     #[cfg(test)]
     pub(crate) calls: RefCell<Vec<(usize, usize, VedaRequest)>>,
+    /// Every executed head's selected rows as `(layer, head, rows)`, in execution order.
+    #[cfg(test)]
+    pub(crate) masks: RefCell<Vec<ExecutedMask>>,
+    /// Accumulated wall seconds per execution phase (device gate bench).
+    #[cfg(test)]
+    pub(crate) profile: RefCell<BTreeMap<&'static str, f64>>,
 }
 impl VedaRuntime {
     /// Called only for an enabled request, after the native packed layout is established.
@@ -121,7 +157,7 @@ impl VedaRuntime {
                 dim,
                 1,
                 2,
-                Limits::default(),
+                Limits::for_backend(Backend::Mlx),
             )?;
             report.borrow_mut().workspace_bytes = initial.total_bytes;
             let bundle = Bundle::load_cached(path, layers, heads, dim)?;
@@ -177,7 +213,7 @@ impl VedaRuntime {
             bundle.dim,
             1,
             2,
-            Limits::default(),
+            Limits::for_backend(Backend::Mlx),
         )?;
         report.borrow_mut().workspace_bytes = bound.total_bytes;
         // Actual-device check precedes sparse production calls. Failure leaves this request dense.
@@ -198,16 +234,27 @@ impl VedaRuntime {
             r.exact_plan = false;
             return Err(e);
         }
+        let device = layouts
+            .iter()
+            .map(|(&s, l)| (s, metal::DeviceLayout::new(l)))
+            .collect();
         Ok(Self {
             bundle,
             plan,
             grid,
             layouts,
+            device,
+            projections: Default::default(),
+            limits: Limits::for_backend(Backend::Mlx),
             request: request.clone(),
             report,
             failed: RefCell::new(false),
             #[cfg(test)]
             calls: Default::default(),
+            #[cfg(test)]
+            masks: Default::default(),
+            #[cfg(test)]
+            profile: Default::default(),
         })
     }
     #[cfg(test)]
@@ -265,12 +312,13 @@ impl VedaRuntime {
                 bounded,
             );
         }
-        let result = self.execute(layer, q, k, v);
+        let result = self.execute(layer, q, k, v, bounded);
         match result {
             Ok(out) => {
+                let kernel = kernel_id()?;
                 let mut report = self.report.borrow_mut();
                 report.sparse_calls += 1;
-                report.kernel = Some(KERNEL.into());
+                report.kernel = Some(kernel.into());
                 Ok(out)
             }
             Err(e) => {
@@ -301,7 +349,34 @@ impl VedaRuntime {
         r.dense_token_pairs += pairs;
     }
 
-    fn execute(&self, layer: usize, q: &Array, k: &Array, v: &Array) -> Result<Array> {
+    /// Device-resident BF16 `[heads, 3*dim, dim]` Q and K projections of `layer`.
+    fn projection(&self, layer: usize) -> Result<(Array, Array)> {
+        if let Some(p) = self.projections.borrow().get(&layer) {
+            return Ok(p.clone());
+        }
+        let (h, d) = (self.bundle.heads as i32, self.bundle.dim as i32);
+        let all: Vec<i32> = (0..h).collect();
+        // Projections are stored BF16 (E2): the f32 values below are exactly representable.
+        let upload = |query: bool| -> Result<Array> {
+            Ok(
+                Array::from_slice(&self.bundle.projection(layer, &all, query), &[h, 3 * d, d])
+                    .as_dtype(Dtype::Bfloat16)?,
+            )
+        };
+        let p = (upload(true)?, upload(false)?);
+        mlx_rs::transforms::eval([&p.0, &p.1])?;
+        self.projections.borrow_mut().insert(layer, p.clone());
+        Ok(p)
+    }
+
+    fn execute(
+        &self,
+        layer: usize,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        bounded: BoundedAttention<'_>,
+    ) -> Result<Array> {
         if q.shape().len() != 4
             || q.shape()[0] != 1
             || q.shape()[1] != self.bundle.heads as i32
@@ -313,6 +388,7 @@ impl VedaRuntime {
             return Err(Error::Msg("Veda QKV shape/layer mismatch".into()));
         }
         let dim = self.bundle.dim;
+        let heads = self.bundle.heads;
         let seq = q.shape()[2] as usize;
         let bytes = match q.dtype() {
             Dtype::Bfloat16 | Dtype::Float16 => 2,
@@ -331,16 +407,18 @@ impl VedaRuntime {
             self.grid,
             &sizes,
             self.bundle.layers,
-            self.bundle.heads,
+            heads,
             dim,
             1,
             bytes as usize,
-            Limits::default(),
+            self.limits,
         )?;
         {
             let mut r = self.report.borrow_mut();
             r.workspace_bytes = r.workspace_bytes.max(bound.total_bytes);
         }
+        // Same-shape head batches (ascending heads), each at most the bound's batch size. A
+        // refused shape fails before any scorer or attention allocation.
         let mut grouped: BTreeMap<TileShape, Vec<i32>> = BTreeMap::new();
         for (h, &si) in self.plan.heads[layer].iter().enumerate() {
             grouped
@@ -348,85 +426,266 @@ impl VedaRuntime {
                 .or_default()
                 .push(h as i32);
         }
-        let mut pieces = Vec::new();
-        let mut head_order: Vec<i32> = Vec::new();
-        let mut pairs = 0u64;
-        let mut high = 0u64;
-        for (shape, heads) in grouped {
-            let layout = &self.layouts[&shape];
-            // The shared estimate and execution use identical allowances, including the
-            // minimum head/query/global batch. Refuse before index, QKV or scorer allocation.
-            let slots = layout.perm.len();
+        let mut batches = Vec::new();
+        for (shape, group) in grouped {
             let reservation = &bound.chunks[&shape];
             if let Some(reason) = &reservation.refusal {
                 return Err(Error::Msg(format!("Veda {reason}")));
             }
-            let max_heads = reservation.heads;
-            for chunk in heads.chunks(max_heads) {
-                let n = chunk.len();
-                let index = Array::from_slice(chunk, &[n as i32]);
-                let perm: Vec<i32> = layout.perm.iter().map(|&r| r.max(0)).collect();
-                let perm = Array::from_slice(&perm, &[slots as i32]);
-                let valid: Vec<bool> = layout.perm.iter().map(|&r| r >= 0).collect();
-                let valid = Array::from_slice(&valid, &[1, slots as i32, 1]);
-                let tile = |a: &Array| -> Result<Array> {
-                    let a = a
-                        .take_axis(&index, 1)?
-                        .reshape(&[n as i32, seq as i32, dim as i32])?
-                        .take_axis(&perm, 1)?;
-                    Ok(
-                        r#where(&valid, &a, &Array::from_f32(0.0).as_dtype(a.dtype())?)?.reshape(
-                            &[n as i32, layout.valid.len() as i32, TILE as i32, dim as i32],
-                        )?,
-                    )
-                };
-                let (qt, kt, vt) = (tile(q)?, tile(k)?, tile(v)?);
-                let scores = learned_scores(&self.bundle, layer, chunk, layout, &qt, &kt)?;
-                self.report.borrow_mut().predictor_score_calls += 1;
-                let budget = |b: &VedaBudget| match b {
-                    VedaBudget::SparsityPercent(p) => Budget::Ratio(1.0 - p / 100.0),
-                    VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
-                };
-                let rows = layout.select_with_budgets(
-                    &scores,
-                    n,
-                    budget(&self.request.generated),
-                    budget(&self.request.reference),
-                )?;
-                let chunk_pairs: u64 = rows
-                    .iter()
-                    .enumerate()
-                    .map(|(r, keys)| {
-                        layout.valid[r % layout.valid.len()] as u64
-                            * keys.iter().map(|&k| layout.valid[k] as u64).sum::<u64>()
-                    })
-                    .sum();
-                pairs += chunk_pairs;
-                let (out, scratch) =
-                    gather_attention(layout, &rows, &qt, &kt, &vt, dim, bytes, reservation)?;
-                let _ = scratch;
-                high = bound.total_bytes;
-                // Materialize the whole head-group output before the next tile/scorer graph.
-                mlx_rs::transforms::eval([&out])?;
-                pieces.push(out.reshape(&[1, n as i32, seq as i32, dim as i32])?);
-                head_order.extend(chunk);
+            batches.extend(group.chunks(reservation.heads).map(|h| (shape, h.to_vec())));
+        }
+        let gpu = on_gpu()?;
+        if gpu && dim != metal::HEAD_DIM {
+            return Err(Error::Msg(format!(
+                "Veda Metal kernel supports head dim {}, not {dim}",
+                metal::HEAD_DIM
+            )));
+        }
+        // The DiT's Q/K/V are head-transposed views of native `[seq, heads, dim]` rows, which is
+        // what the Metal kernels index (through each layout's permutation), so no tile copy exists.
+        let native = |a: &Array| -> Result<Array> {
+            Ok(a.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[seq as i32, heads as i32, dim as i32])?)
+        };
+        let natives = if gpu {
+            Some((native(q)?, native(k)?, native(v)?, self.projection(layer)?))
+        } else {
+            None
+        };
+        let budgets = (
+            budget(&self.request.generated),
+            budget(&self.request.reference),
+        );
+        let mut pieces = Vec::with_capacity(batches.len());
+        let mut head_order: Vec<i32> = Vec::with_capacity(heads);
+        let mut pairs = 0u64;
+        #[cfg(test)]
+        let lap = |name: &'static str, from: std::time::Instant| {
+            *self.profile.borrow_mut().entry(name).or_default() += from.elapsed().as_secs_f64();
+            std::time::Instant::now()
+        };
+        #[cfg(test)]
+        let mut at = std::time::Instant::now();
+        for (shape, group) in &batches {
+            let layout = &self.layouts[shape];
+            let scores = match &natives {
+                Some((nq, nk, _, (pq, pk))) => {
+                    metal::scores(&self.device[shape], nq, nk, pq, pk, group, 0, dim)?
+                }
+                None => host_scores(&self.bundle, layer, group, layout, q, k)?,
+            };
+            self.report.borrow_mut().predictor_score_calls += 1;
+            #[cfg(test)]
+            {
+                at = lap("score", at);
             }
+            let rows = select(layout, &scores, group.len(), budgets)?;
+            #[cfg(test)]
+            {
+                at = lap("select", at);
+            }
+            #[cfg(test)]
+            self.masks.borrow_mut().extend(
+                group
+                    .iter()
+                    .zip(rows.chunks(layout.valid.len()))
+                    .map(|(&h, r)| (layer, h as usize, r.to_vec())),
+            );
+            pairs += rows
+                .iter()
+                .enumerate()
+                .map(|(r, keys)| {
+                    layout.valid[r % layout.valid.len()] as u64
+                        * keys.iter().map(|&k| layout.valid[k] as u64).sum::<u64>()
+                })
+                .sum::<u64>();
+            let out = match &natives {
+                Some((nq, nk, nv, _)) => metal_batch(
+                    &self.device[shape],
+                    group,
+                    &rows,
+                    [q, k, v],
+                    [nq, nk, nv],
+                    dim,
+                    bounded,
+                )?,
+                None => cpu_batch(
+                    layout,
+                    group,
+                    &rows,
+                    [q, k, v],
+                    dim,
+                    bytes,
+                    &bound.chunks[shape],
+                )?,
+            };
+            // Materialize each bounded batch output before the next batch's scorer graph (E8).
+            mlx_rs::transforms::eval([&out])?;
+            #[cfg(test)]
+            {
+                at = lap("attend", at);
+            }
+            pieces.push(out);
+            head_order.extend(group);
         }
         let refs: Vec<&Array> = pieces.iter().collect();
-        let merged = concatenate_axis(&refs, 1)?;
-        let mut inverse = vec![0i32; self.bundle.heads];
-        for (i, &h) in head_order.iter().enumerate() {
-            inverse[h as usize] = i as i32;
+        let mut out = concatenate_axis(&refs, 0)?;
+        if head_order.iter().enumerate().any(|(i, &h)| i as i32 != h) {
+            let mut inverse = vec![0i32; heads];
+            for (i, &h) in head_order.iter().enumerate() {
+                inverse[h as usize] = i as i32;
+            }
+            out = out.take_axis(Array::from_slice(&inverse, &[heads as i32]), 0)?;
         }
-        let out = merged.take_axis(Array::from_slice(&inverse, &[self.bundle.heads as i32]), 1)?;
+        let out = out.reshape(&[1, heads as i32, seq as i32, dim as i32])?;
         mlx_rs::transforms::eval([&out])?;
         ensure_finite(&out)?;
         let mut report = self.report.borrow_mut();
         report.selected_token_pairs += pairs;
-        report.dense_token_pairs += self.bundle.heads as u64 * seq as u64 * seq as u64;
-        report.workspace_bytes = report.workspace_bytes.max(high);
+        report.dense_token_pairs += heads as u64 * seq as u64 * seq as u64;
         Ok(out)
     }
+}
+fn budget(b: &VedaBudget) -> Budget {
+    match b {
+        VedaBudget::SparsityPercent(p) => Budget::Ratio(1.0 - p / 100.0),
+        VedaBudget::KeyTiles(n) => Budget::Tiles(*n as f64),
+    }
+}
+/// The frozen host selection of one batch (head-major rows). Heads select independently (head `h`
+/// reads only its own `[video, video]` scores), so contiguous head ranges run in parallel and are
+/// concatenated in head order: identical to one `select_with_budgets` over every head.
+fn select(
+    layout: &Layout,
+    scores: &[f32],
+    heads: usize,
+    (generated, reference): (Budget, Budget),
+) -> Result<Vec<Vec<usize>>> {
+    let per_head = layout.video * layout.video;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let span = heads.div_ceil(workers.clamp(1, heads.max(1)));
+    if per_head == 0 || scores.len() != heads * per_head || span >= heads {
+        return Ok(layout.select_with_budgets(scores, heads, generated, reference)?);
+    }
+    let parts = std::thread::scope(|scope| {
+        let jobs: Vec<_> = scores
+            .chunks(span * per_head)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    layout.select_with_budgets(chunk, chunk.len() / per_head, generated, reference)
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().expect("Veda selection worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut rows = Vec::with_capacity(heads * layout.valid.len());
+    for part in parts {
+        rows.extend(part?);
+    }
+    Ok(rows)
+}
+/// One batch on Metal: video query tiles through [`metal::attend`], the global query rows as one
+/// dense attention over every real key (frozen dense globals), assembled to `[heads, seq, dim]`.
+fn metal_batch(
+    dev: &metal::DeviceLayout,
+    heads: &[i32],
+    rows: &[Vec<usize>],
+    [q, k, v]: [&Array; 3],
+    [nq, nk, nv]: [&Array; 3],
+    dim: usize,
+    bounded: BoundedAttention<'_>,
+) -> Result<Array> {
+    let tiled = metal::attend(dev, nq, nk, nv, heads, rows)?;
+    let combined = match &dev.globals {
+        Some(globals) => {
+            let all = heads.len() == q.shape()[1] as usize
+                && heads.iter().enumerate().all(|(i, &h)| i as i32 == h);
+            let ids = Array::from_slice(heads, &[heads.len() as i32]);
+            let pick = |a: &Array| -> Result<Array> {
+                Ok(if all {
+                    a.clone()
+                } else {
+                    a.take_axis(&ids, 1)?
+                })
+            };
+            let (qb, kb, vb) = (pick(q)?, pick(k)?, pick(v)?);
+            let query = qb.take_axis(globals, 2)?;
+            let rows = globals.shape()[0];
+            let out =
+                sdpa_bounded_bhsd(&query, &kb, &vb, 1.0 / (dim as f32).sqrt(), None, bounded)?
+                    .reshape(&[heads.len() as i32, rows, dim as i32])?;
+            concatenate_axis(&[&tiled, &out], 1)?
+        }
+        None => tiled,
+    };
+    Ok(combined.take_axis(&dev.compact, 1)?)
+}
+/// One batch on the MLX CPU device: padded tile gathers and the gather + SDPA reference route.
+#[allow(clippy::too_many_arguments)]
+fn cpu_batch(
+    layout: &Layout,
+    heads: &[i32],
+    rows: &[Vec<usize>],
+    [q, k, v]: [&Array; 3],
+    dim: usize,
+    bytes: u64,
+    reservation: &Chunk,
+) -> Result<Array> {
+    let (qt, kt, vt) = (
+        tile(q, heads, layout, dim)?,
+        tile(k, heads, layout, dim)?,
+        tile(v, heads, layout, dim)?,
+    );
+    Ok(gather_attention(layout, rows, &qt, &kt, &vt, dim, bytes, reservation)?.0)
+}
+/// Gathers `heads` of `[1, H, seq, dim]` into padded tile order `[heads, tiles, TILE, dim]`.
+fn tile(a: &Array, heads: &[i32], layout: &Layout, dim: usize) -> Result<Array> {
+    let (n, seq, slots) = (heads.len() as i32, a.shape()[2], layout.perm.len() as i32);
+    let perm: Vec<i32> = layout.perm.iter().map(|&r| r.max(0)).collect();
+    let valid: Vec<bool> = layout.perm.iter().map(|&r| r >= 0).collect();
+    let a = a
+        .take_axis(Array::from_slice(heads, &[n]), 1)?
+        .reshape(&[n, seq, dim as i32])?
+        .take_axis(Array::from_slice(&perm, &[slots]), 1)?;
+    Ok(r#where(
+        Array::from_slice(&valid, &[1, slots, 1]),
+        &a,
+        &Array::from_f32(0.0).as_dtype(a.dtype())?,
+    )?
+    .reshape(&[n, layout.valid.len() as i32, TILE as i32, dim as i32])?)
+}
+/// gen-core's host scorer contract itself (`pool_video_tiles` + `tile_logits`).
+fn host_scores(
+    bundle: &Bundle,
+    layer: usize,
+    heads: &[i32],
+    layout: &Layout,
+    q: &Array,
+    k: &Array,
+) -> Result<Vec<f32>> {
+    let host = |a: &Array| -> Result<Vec<f32>> {
+        let a = tile(a, heads, layout, bundle.dim)?
+            .as_dtype(Dtype::Float32)?
+            .reshape(&[-1])?;
+        mlx_rs::transforms::eval([&a])?;
+        Ok(contract::pool_video_tiles(
+            a.as_slice::<f32>(),
+            layout,
+            heads.len(),
+            bundle.dim,
+        )?)
+    };
+    Ok(contract::tile_logits(
+        &host(q)?,
+        &host(k)?,
+        &bundle.projection(layer, heads, true),
+        &bundle.projection(layer, heads, false),
+        heads.len(),
+        layout.video,
+        bundle.dim,
+    )?)
 }
 /// Refuses a sparse attention output holding any NaN/Inf, so the caller recomputes that call
 /// densely and records the reason instead of letting the poison into the hidden state (a poisoned
@@ -441,69 +700,6 @@ fn ensure_finite(out: &Array) -> Result<()> {
         Err(Error::Msg(format!(
             "Veda sparse attention produced non-finite output (sum {sum})"
         )))
-    }
-}
-fn learned_scores(
-    bundle: &Bundle,
-    layer: usize,
-    heads: &[i32],
-    layout: &Layout,
-    q: &Array,
-    k: &Array,
-) -> Result<Vec<f32>> {
-    contract::learned_scores(bundle, layer, heads, layout, q, k, &MlxPredictorOps)
-}
-struct MlxPredictorOps;
-impl PredictorOps for MlxPredictorOps {
-    type Tensor = Array;
-    type Error = Error;
-    fn pool(&self, a: &Array, layout: &Layout, _heads: usize, _dim: usize) -> Result<Array> {
-        let n = layout.video as i32;
-        let valid: Vec<bool> = layout.valid[..layout.video]
-            .iter()
-            .flat_map(|&c| (0..TILE).map(move |r| r < c))
-            .collect();
-        let valid = Array::from_slice(&valid, &[1, n, TILE as i32, 1]);
-        let counts: Vec<f32> = layout.valid[..layout.video]
-            .iter()
-            .map(|&c| c.max(1) as f32)
-            .collect();
-        let counts = Array::from_slice(&counts, &[1, n, 1]);
-        let ok: Vec<bool> = layout.valid[..layout.video]
-            .iter()
-            .map(|&c| c > 0)
-            .collect();
-        let ok = Array::from_slice(&ok, &[1, n, 1]);
-        let a = slice_axis(a, 1, 0, n)?.as_dtype(Dtype::Float32)?;
-        let mean = a.sum_axis(2, false)?.divide(&counts)?;
-        let max = r#where(&valid, &a, Array::from_f32(f32::NEG_INFINITY))?.max_axis(2, false)?;
-        let min = r#where(&valid, &a, Array::from_f32(f32::INFINITY))?.min_axis(2, false)?;
-        let f = concatenate_axis(&[&mean, &max, &min], -1)?;
-        let pooled = r#where(&ok, &f, Array::from_f32(0.0))?;
-        // Release this pool's cast/where graph before constructing the other pooled operand.
-        mlx_rs::transforms::eval([&pooled])?;
-        Ok(pooled)
-    }
-    fn project(&self, f: &Array, p: &[f32], heads: usize, dim: usize) -> Result<Array> {
-        Ok(f.matmul(Array::from_slice(
-            p,
-            &[heads as i32, (3 * dim) as i32, dim as i32],
-        ))?)
-    }
-    fn prefix(&self, f: &Array, dim: usize) -> Result<Array> {
-        slice_axis(f, 2, 0, dim as i32)
-    }
-    fn add(&self, a: &Array, b: &Array) -> Result<Array> {
-        Ok(a.add(b)?)
-    }
-    fn dot_scaled(&self, q: &Array, k: &Array, divisor: f32) -> Result<Vec<f32>> {
-        let scores = q
-            .matmul(&k.transpose_axes(&[0, 2, 1])?)?
-            .divide(Array::from_f32(divisor))?
-            .reshape(&[-1])?;
-        // Logical flatten, because physical MLX result strides need not be row-major.
-        mlx_rs::transforms::eval([&scores])?;
-        Ok(scores.as_slice::<f32>().to_vec())
     }
 }
 
@@ -636,22 +832,6 @@ pub fn device_self_test() -> Result<()> {
             });
         }
     }
-    let perm: Vec<i32> = l.perm.iter().map(|&r| r.max(0)).collect();
-    let valid: Vec<bool> = l.perm.iter().map(|&r| r >= 0).collect();
-    let valid = Array::from_slice(&valid, &[1, l.perm.len() as i32, 1]);
-    let tile = |a: &Array| -> Result<Array> {
-        let a = a
-            .reshape(&[heads as i32, seq as i32, dim as i32])?
-            .take_axis(Array::from_slice(&perm, &[perm.len() as i32]), 1)?;
-        Ok(
-            r#where(&valid, &a, &Array::from_f32(0.0).as_dtype(a.dtype())?)?.reshape(&[
-                heads as i32,
-                l.valid.len() as i32,
-                TILE as i32,
-                dim as i32,
-            ])?,
-        )
-    };
     let reservation = workspace::chunk(
         LayoutSize::from(&l),
         heads,
@@ -664,19 +844,27 @@ pub fn device_self_test() -> Result<()> {
             reference: VedaBudget::KeyTiles(2),
             ..Default::default()
         },
-        Limits::default(),
+        Limits::for_backend(Backend::Mlx),
     )?;
-    let sparse = gather_attention(
-        &l,
-        &rows,
-        &tile(&q)?,
-        &tile(&k)?,
-        &tile(&v)?,
-        dim,
-        2,
-        &reservation,
-    )?
-    .0
+    // The production route of the current device, on the production batch shape.
+    let ids: Vec<i32> = (0..heads as i32).collect();
+    let sparse = if on_gpu()? {
+        let native = |a: &Array| -> Result<Array> {
+            Ok(a.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[seq as i32, heads as i32, dim as i32])?)
+        };
+        metal_batch(
+            &metal::DeviceLayout::new(&l),
+            &ids,
+            &rows,
+            [&q, &k, &v],
+            [&native(&q)?, &native(&k)?, &native(&v)?],
+            dim,
+            BoundedAttention::UNBOUNDED,
+        )?
+    } else {
+        cpu_batch(&l, &ids, &rows, [&q, &k, &v], dim, 2, &reservation)?
+    }
     .reshape(&[1, heads as i32, seq as i32, dim as i32])?;
     let mut mask = vec![false; heads * seq * seq];
     let mut pairs = 0usize;
@@ -753,10 +941,11 @@ pub fn device_self_test() -> Result<()> {
         })
         .fold(0f32, f32::max);
     #[cfg(test)]
-    println!("Veda device self-test: kernel={KERNEL}, D128 BF16, max_abs={error}, tolerance={SELF_TEST_ATOL}, selected_pairs={pairs}, dense_pairs={}",heads*seq*seq);
+    println!("Veda device self-test: kernel={}, D128 BF16, max_abs={error}, tolerance={SELF_TEST_ATOL}, selected_pairs={pairs}, dense_pairs={}",kernel_id()?,heads*seq*seq);
     if !error.is_finite() || error > SELF_TEST_ATOL {
         return Err(Error::Msg(format!(
-            "Veda {KERNEL} actual-device self-test failed: {error} > {SELF_TEST_ATOL}"
+            "Veda {} actual-device self-test failed: {error} > {SELF_TEST_ATOL}",
+            kernel_id()?
         )));
     }
     Ok(())
@@ -1017,146 +1206,5 @@ mod frozen_tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("empty problem"));
-    }
-    #[test]
-    #[ignore = "requires exclusive coordinator admission for actual MLX allocator accounting"]
-    fn full_self_test_lifetime_fits_declared_allocator_bound() {
-        let layout = Layout::t2va(17, [2, 9, 17], TileShape([2, 8, 8]), 323).unwrap();
-        let shape = TileShape([2, 8, 8]);
-        let plan = Plan {
-            name: "allocator-fixture".into(),
-            grid: [2, 9, 17],
-            shapes: vec![shape],
-            heads: vec![vec![0, 0]],
-            provenance: None,
-        };
-        let bound = workspace::bound(
-            &VedaRequest {
-                enabled: true,
-                ..Default::default()
-            },
-            Backend::Mlx,
-            &plan,
-            plan.grid,
-            &BTreeMap::from([(shape, LayoutSize::from(&layout))]),
-            1,
-            2,
-            128,
-            1,
-            2,
-            Limits::default(),
-        )
-        .unwrap();
-        mlx_rs::memory::clear_cache();
-        let baseline = mlx_rs::memory::get_active_memory() as u64;
-        mlx_rs::memory::reset_peak_memory();
-        device_self_test().unwrap();
-        let peak = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(baseline);
-        assert!(
-            peak <= bound.self_test_bytes,
-            "self-test owned peak {peak} > {}",
-            bound.self_test_bytes
-        );
-        assert!(peak <= bound.total_bytes);
-        println!("Veda allocator receipt: self_test_peak_bytes={peak}, self_test_bound_bytes={}, total_lifetime_bound_bytes={}",bound.self_test_bytes,bound.total_bytes);
-    }
-
-    /// Requires the coordinator's exclusive Metal token; never runs in CPU gates.
-    #[test]
-    #[ignore = "requires exclusive coordinator admission for an actual MLX device"]
-    fn frozen_upstream_device_scores_select_exact_masks() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../contracts/gen-core/tests/fixtures/veda/frozen.json"
-        )))
-        .unwrap();
-        let uv = |v: &serde_json::Value| {
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|n| n.as_u64().unwrap() as usize)
-                .collect::<Vec<_>>()
-        };
-        let fv = |v: &serde_json::Value| {
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|n| n.as_f64().unwrap() as f32)
-                .collect::<Vec<_>>()
-        };
-        for c in fixture["scorers"].as_array().unwrap() {
-            let spans = c["layout"]["spans"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| contract::TiledSpan {
-                    start: s["start"].as_u64().unwrap() as usize,
-                    grid: uv(&s["grid"]).try_into().unwrap(),
-                    shape: TileShape(uv(&s["shape"]).try_into().unwrap()),
-                })
-                .collect::<Vec<_>>();
-            let layout =
-                Layout::from_spans(&spans, c["layout"]["seq"].as_u64().unwrap() as usize).unwrap();
-            let heads = c["heads"].as_u64().unwrap() as usize;
-            let dim = c["dim"].as_u64().unwrap() as usize;
-            let pq = c["proj"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_i64().unwrap() as u16)
-                .collect::<Vec<_>>();
-            let mut pk = vec![0; pq.len()];
-            for h in 0..heads {
-                for i in 0..3 * dim {
-                    for d in 0..dim {
-                        pk[(h * 3 * dim + i) * dim + d] =
-                            pq[(h * 3 * dim + 3 * dim - 1 - i) * dim + d];
-                    }
-                }
-            }
-            let bundle = Bundle {
-                identity: "frozen-capture-fixture".into(),
-                layers: 1,
-                heads,
-                dim,
-                plans: vec![],
-                q: vec![pq],
-                k: vec![pk],
-            };
-            let shape = [
-                heads as i32,
-                layout.valid.len() as i32,
-                TILE as i32,
-                dim as i32,
-            ];
-            let q = Array::from_slice(&fv(&c["q"]), &shape)
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-            let k = Array::from_slice(&fv(&c["k"]), &shape)
-                .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-            let scores = learned_scores(
-                &bundle,
-                0,
-                &(0..heads as i32).collect::<Vec<_>>(),
-                &layout,
-                &q,
-                &k,
-            )
-            .unwrap();
-            let masks = layout
-                .select_with_budgets(&scores, heads, Budget::Tiles(2.3), Budget::Tiles(1.5))
-                .unwrap();
-            let expected = c["rows"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(&uv)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                masks, expected,
-                "device logits must select frozen masks exactly"
-            );
-        }
     }
 }
