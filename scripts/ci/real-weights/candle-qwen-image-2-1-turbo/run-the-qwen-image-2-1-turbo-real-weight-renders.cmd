@@ -1,6 +1,10 @@
 call "%VCVARS%"
 set "QWEN21_FAILED=0"
+call :run_one turbo_validation_render_default_preset || set "QWEN21_FAILED=1"
+call :run_one turbo_validation_render_reference_edit || set "QWEN21_FAILED=1"
 call :run_one turbo_validation_prefix_kv_cache_velocity || set "QWEN21_FAILED=1"
+call :run_one turbo_validation_render_transparency || set "QWEN21_FAILED=1"
+call :run_one turbo_validation_render_step_sweep || set "QWEN21_FAILED=1"
 if "%QWEN21_TURBO_TIERS%"=="1" (
   call :run_one turbo_validation_render_installed_tiers || set "QWEN21_FAILED=1"
 ) else (
