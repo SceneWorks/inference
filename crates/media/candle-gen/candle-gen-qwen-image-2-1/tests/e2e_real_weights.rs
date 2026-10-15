@@ -71,6 +71,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use candle_core::Tensor;
+
 use candle_gen::gen_core::{
     GenerationMemory, GenerationOutput, GenerationRequest, Generator, LoadSpec, PrefixKvCacheMode,
     Progress, Quant, WeightsSource,
@@ -856,10 +858,13 @@ fn turbo_validation_renders(steps: &[Option<u32>]) {
     }
 }
 
-/// A deterministic synthetic reference, so the edit smoke needs no checked-in photographs.
-/// `QWEN_IMAGE_2_1_EDIT_REFS` points at a directory of raw `WxH.rgb` files to use instead, in
-/// name order — reference images for a real evaluation are user-provided, never synthesised or
-/// fetched here. Each file's dimensions come from its stem (`768x768.rgb`).
+/// A deterministic synthetic reference: three independent colour sawtooths. It is **not a
+/// picture** — a real-weight edit over it faithfully reproduces the sawtooth as a noise mosaic
+/// (sc-25909's CUDA evidence, run 38664658356: chroma busyness 32–41, [`assert_not_mosaic`]), so it
+/// proves nothing about image correctness. It stays for the miniature-fixture dry runs, the
+/// eleven-reference refusal (refused before any image is read), the base edit's AT4 golden
+/// comparison (the pre-epic goldens were rendered over exactly these inputs), and as the negative
+/// calibration of [`assert_not_mosaic`].
 fn synthetic_reference(seed: u32, width: u32, height: u32) -> candle_gen::gen_core::Image {
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
     for y in 0..height {
@@ -876,21 +881,130 @@ fn synthetic_reference(seed: u32, width: u32, height: u32) -> candle_gen::gen_co
     }
 }
 
-fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core::Image> {
-    let Ok(dir) = std::env::var("QWEN_IMAGE_2_1_EDIT_REFS") else {
-        return (0..count)
-            .map(|i| synthetic_reference(i as u32 + 1, width, height))
-            .collect();
+/// Edge of every reference the real-weight edit smokes send (each is fitted to
+/// `OUTPUT_RESOLUTION` by the processor whatever its size).
+const REFERENCE_EDGE: u32 = 768;
+
+/// The edit prompt every reference-edit render sends.
+const EDIT_PROMPT: &str =
+    "Combine the subjects of the reference images into one scene, evening light";
+
+/// One subject per reference, in reference order — distinct objects, so a correct edit is a scene
+/// visibly built from them.
+const REFERENCE_SUBJECTS: [&str; MAX_REFERENCES] = [
+    "A red vintage bicycle leaning against a white brick wall, daylight photograph",
+    "A golden retriever sitting on green grass, portrait photograph",
+    "A blue ceramic teapot on a wooden table, studio photograph",
+    "A yellow taxi cab parked on a city street, photograph",
+    "A potted cactus with pink flowers on a sunny windowsill, photograph",
+    "A white lighthouse on a rocky coast under a clear sky, photograph",
+    "An orange tabby cat curled up on a knitted blanket, photograph",
+    "A plate of colourful macarons on a marble counter, photograph",
+    "A green velvet armchair in an empty bright room, photograph",
+    "A striped hot air balloon over rolling hills, photograph",
+];
+
+/// Where an edit smoke's references come from when `QWEN_IMAGE_2_1_EDIT_REFS` names no directory.
+#[derive(Clone, Copy, Debug)]
+enum ReferenceSource {
+    /// [`synthetic_reference`] — for the dry runs and the AT4 golden comparison only.
+    Synthetic,
+    /// **Real pictures, rendered in the same run** by the generator under test
+    /// ([`rendered_references`]): the CUDA lane provisions no reference images, and the Qwen
+    /// licence keeps none in this repository, so the run makes its own — `edge`² text-to-image
+    /// renders of [`REFERENCE_SUBJECTS`], written beside the evidence.
+    Rendered { edge: u32 },
+}
+
+impl ReferenceSource {
+    /// Whether the edit output over these references must be a picture ([`assert_not_mosaic`]).
+    fn is_real(self) -> bool {
+        matches!(self, Self::Rendered { .. }) || std::env::var_os(EDIT_REFS_ENV).is_some()
+    }
+}
+
+/// `QWEN_IMAGE_2_1_EDIT_REFS`: a directory of raw `WxH.rgb` files to use as the references
+/// instead, in name order (operator-supplied; each file's dimensions come from its stem).
+const EDIT_REFS_ENV: &str = "QWEN_IMAGE_2_1_EDIT_REFS";
+
+/// `count` text-to-image renders of [`REFERENCE_SUBJECTS`] by `generator`, `edge`² each, at the
+/// generator's own step count and seeds `101..`, prefill (no cache selected). Each is held to the
+/// same checks as any evidence render and written as `<stem>_reference_<n>_<edge>x<edge>.png`.
+fn rendered_references(
+    generator: &dyn Generator,
+    count: usize,
+    edge: u32,
+    out_dir: &Path,
+    stem: &str,
+) -> Vec<candle_gen::gen_core::Image> {
+    assert!(count <= REFERENCE_SUBJECTS.len(), "{count} references");
+    REFERENCE_SUBJECTS[..count]
+        .iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let label = format!("{stem} reference {}", i + 1);
+            let started = Instant::now();
+            let out = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: (*subject).to_owned(),
+                        width: edge,
+                        height: edge,
+                        seed: Some(101 + i as u64),
+                        ..Default::default()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_or_else(|e| panic!("{label}: renders: {e}"));
+            let GenerationOutput::Images(mut images) = out else {
+                panic!("{label}: images expected");
+            };
+            let image = images.remove(0);
+            assert_eq!((image.width, image.height), (edge, edge), "{label}");
+            save_png(
+                &out_dir.join(format!("{stem}_reference_{}_{edge}x{edge}.png", i + 1)),
+                &image.pixels,
+                edge,
+                edge,
+                image::ColorType::Rgb8,
+            );
+            eprintln!(
+                "{label}: {subject:?} in {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            image
+        })
+        .collect()
+}
+
+/// The `count` ordered references of an edit smoke: the operator's `QWEN_IMAGE_2_1_EDIT_REFS`
+/// directory when set, else `source`'s.
+fn references(
+    generator: &dyn Generator,
+    source: ReferenceSource,
+    count: usize,
+    out_dir: &Path,
+    stem: &str,
+) -> Vec<candle_gen::gen_core::Image> {
+    let Ok(dir) = std::env::var(EDIT_REFS_ENV) else {
+        return match source {
+            ReferenceSource::Synthetic => (0..count)
+                .map(|i| synthetic_reference(i as u32 + 1, REFERENCE_EDGE, REFERENCE_EDGE))
+                .collect(),
+            ReferenceSource::Rendered { edge } => {
+                rendered_references(generator, count, edge, out_dir, stem)
+            }
+        };
     };
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_EDIT_REFS={dir}: {e}"))
+        .unwrap_or_else(|e| panic!("{EDIT_REFS_ENV}={dir}: {e}"))
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "rgb"))
         .collect();
     paths.sort();
     assert!(
         paths.len() >= count,
-        "QWEN_IMAGE_2_1_EDIT_REFS={dir} holds {} .rgb files, {count} needed",
+        "{EDIT_REFS_ENV}={dir} holds {} .rgb files, {count} needed",
         paths.len()
     );
     paths
@@ -919,6 +1033,121 @@ fn references(count: usize, width: u32, height: u32) -> Vec<candle_gen::gen_core
             }
         })
         .collect()
+}
+
+/// **Chroma busyness**: the RGB8 image box-averaged onto a 64×64 grid, then the mean absolute
+/// difference between neighbouring cells of its two chroma channels (`B − Y`, `R − Y`, in 0..=255
+/// levels), averaged over both axes and both channels. A photograph or a rendered scene changes
+/// colour slowly at that scale; a colour mosaic changes it every few pixels. The grid makes it
+/// independent of the render size (cells are `width/64 × height/64` pixels; a remainder is
+/// ignored).
+fn chroma_busyness(pixels: &[u8], width: u32, height: u32) -> f64 {
+    const GRID: usize = 64;
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(pixels.len(), w * h * 3, "RGB8 geometry");
+    assert!(
+        w >= GRID && h >= GRID,
+        "{w}x{h} is below the {GRID}-cell grid"
+    );
+    let (cw, ch) = (w / GRID, h / GRID);
+    let mut cells = vec![[0f64; 2]; GRID * GRID];
+    for gy in 0..GRID {
+        for gx in 0..GRID {
+            let mut sum = [0f64; 2];
+            for y in gy * ch..(gy + 1) * ch {
+                for x in gx * cw..(gx + 1) * cw {
+                    let px = &pixels[(y * w + x) * 3..][..3];
+                    let (r, g, b) = (f64::from(px[0]), f64::from(px[1]), f64::from(px[2]));
+                    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    sum[0] += b - luma;
+                    sum[1] += r - luma;
+                }
+            }
+            let n = (cw * ch) as f64;
+            cells[gy * GRID + gx] = [sum[0] / n, sum[1] / n];
+        }
+    }
+    let mut total = 0f64;
+    for channel in 0..2 {
+        let (mut across, mut down) = (0f64, 0f64);
+        for gy in 0..GRID {
+            for gx in 0..GRID {
+                let here = cells[gy * GRID + gx][channel];
+                if gx + 1 < GRID {
+                    across += (cells[gy * GRID + gx + 1][channel] - here).abs();
+                }
+                if gy + 1 < GRID {
+                    down += (cells[(gy + 1) * GRID + gx][channel] - here).abs();
+                }
+            }
+        }
+        let pairs = (GRID * (GRID - 1)) as f64;
+        total += (across / pairs + down / pairs) / 2.0;
+    }
+    total / 2.0
+}
+
+/// The chroma busyness ([`chroma_busyness`]) above which a render is a colour mosaic, not a
+/// picture. Calibrated once, offline, on images that exist (not a machine-dependent value):
+///
+/// * known-bad — the CUDA edit renders over synthetic references (run 38664658356): 31.9 (ten
+///   references, 512²) and 40.9 (two references, 1024²); the synthetic reference itself scores
+///   higher still ([`the_mosaic_check_rejects_the_synthetic_references_only`]);
+/// * known-good — that run's 2048² Turbo text-to-image renders 3.1–3.4, and every final render
+///   committed under `docs/migration/evidence/` 3.0–19.3 (the highest: a saturated, busy Sana Heun
+///   render at 19.3 and a Kolors Heun lantern scene at 16.0).
+///
+/// 25 sits between the busiest real picture (19.3) and the mildest mosaic (31.9).
+const MOSAIC_CHROMA_BAR: f64 = 25.0;
+
+/// Reject a render that is a colour mosaic rather than a picture — the failure the band and
+/// degenerate checks both pass (a sawtooth reference reproduced by a correct edit).
+fn assert_not_mosaic(label: &str, pixels: &[u8], width: u32, height: u32) {
+    let busyness = chroma_busyness(pixels, width, height);
+    eprintln!("{label}: chroma busyness {busyness:.2} (mosaic above {MOSAIC_CHROMA_BAR})");
+    assert!(
+        busyness <= MOSAIC_CHROMA_BAR,
+        "{label}: chroma busyness {busyness:.2} > {MOSAIC_CHROMA_BAR} — a colour mosaic, not a \
+         picture derived from its references"
+    );
+}
+
+/// [`assert_not_mosaic`] rejects the synthetic sawtooth references at the sizes an edit renders
+/// and accepts a smooth synthetic scene with hard-edged shapes — device-free, so it runs on every
+/// `cuda` / `metal` test lane.
+#[test]
+fn the_mosaic_check_rejects_the_synthetic_references_only() {
+    for edge in [512, 768, 1024] {
+        let mosaic = synthetic_reference(1, edge, edge);
+        assert!(
+            std::panic::catch_unwind(|| assert_not_mosaic("sawtooth", &mosaic.pixels, edge, edge))
+                .is_err(),
+            "the {edge}² sawtooth must be rejected"
+        );
+    }
+    // A sky-to-ground gradient with three saturated discs: hard colour edges, but few of them.
+    let edge = 512u32;
+    let mut scene = Vec::with_capacity((edge * edge * 3) as usize);
+    for y in 0..edge {
+        for x in 0..edge {
+            let disc = |cx: f32, cy: f32, r: f32| {
+                ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt() < r
+            };
+            let px = if disc(128.0, 300.0, 70.0) {
+                [220, 30, 30]
+            } else if disc(300.0, 340.0, 60.0) {
+                [30, 60, 220]
+            } else if disc(420.0, 120.0, 50.0) {
+                [250, 210, 40]
+            } else if y < edge / 2 {
+                [90, 150, 230 - (y / 4) as u8]
+            } else {
+                [60, 140 - (y / 8) as u8, 50]
+            };
+            scene.extend_from_slice(&px);
+        }
+    }
+    assert_not_mosaic("scene", &scene, edge, edge);
 }
 
 /// One reference-edit render: how many references, the target size, the step count (`None`
@@ -955,6 +1184,11 @@ struct EditCase {
 /// comparison of both renders ([`compare_with_golden`]; *The pre-epic golden (AT4)* in
 /// `UPSTREAM.md`).
 ///
+/// **References.** Without a golden the references are real pictures rendered in the same run
+/// ([`ReferenceSource::Rendered`]) and each edit output must be a picture ([`assert_not_mosaic`]);
+/// with a golden they are the [`synthetic_reference`]s the pre-epic goldens were rendered over —
+/// a comparison of the same inputs, which proves the port unchanged and nothing about the image.
+///
 /// ```sh
 /// CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT=.../snapshots/790c9263... \
 /// QWEN_IMAGE_2_1_RENDER_OUT=.../render-validation-sc-24110 \
@@ -965,8 +1199,17 @@ struct EditCase {
 #[test]
 #[ignore]
 fn validation_render_reference_edit() {
+    let golden = render_golden();
+    let source = if golden.is_some() {
+        ReferenceSource::Synthetic
+    } else {
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        }
+    };
     reference_edit_renders(
         &Target::dense("qwen_image_2_1", snapshot(), "qwen_image_2_1_candle"),
+        source,
         candle_gen_qwen_image_2_1::DEFAULT_STEPS,
         vec![
             EditCase {
@@ -985,7 +1228,7 @@ fn validation_render_reference_edit() {
             },
         ],
         false,
-        render_golden().as_deref(),
+        golden.as_deref(),
     );
 }
 
@@ -1046,6 +1289,9 @@ fn turbo_validation_render_reference_edit() {
             root,
             "qwen_image_2_1_turbo_candle",
         ),
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
         saved,
         vec![
             EditCase {
@@ -1066,6 +1312,354 @@ fn turbo_validation_render_reference_edit() {
         true,
         None,
     );
+}
+
+/// **Where the cached and prefill paths part, per model evaluation** (sc-25909 follow-up) — the
+/// component-level diagnostic behind the forced-shed twins of
+/// [`turbo_validation_render_reference_edit`]. On the released Turbo weights, over the same rendered
+/// references and the same two cases (two references at 1024², ten at 512²), it drives the DiT
+/// directly along the **prefill** trajectory and, at every evaluation, also runs the other path on
+/// the **same** latent and timestep:
+///
+/// * **evaluation 1** — `forward_joint_extract` against `forward_joint`: the same forward over the
+///   same rows, so the velocity must be **bit-identical** (asserted);
+/// * **the cache itself** — re-extracted at the last step, from a different latent and timestep:
+///   the prefix modulates from `t = 0` and is causal, so every cached K/V row must be
+///   **bit-identical** to the first extract's (asserted on blocks 0, middle and last);
+/// * **every later evaluation** — `forward_joint_cached` against `forward_joint` on the same input:
+///   the relative L2 gap `‖v_cached − v_prefill‖ / ‖v_prefill‖` is printed per step and held to
+///   [`CACHED_VELOCITY_GAP_BAR`]. Mathematically zero; in bf16 it is the rounding of the
+///   per-token projections, which run on `S` joint rows in the prefill and on the target rows
+///   alone when cached — cuBLAS chooses its GEMM kernel (tiling, split-K) by the row count `M`, so
+///   the target rows' reduction order can differ between the two. The `[gemm]` lines measure that
+///   directly on this device, with random weights at the DiT's own projection shapes and this
+///   case's `(S, target)` row counts;
+/// * **the trajectories** — the cached path's own trajectory is run beside the prefill one and the
+///   relative latent gap printed per step, and both final latents are decoded and compared in
+///   pixels (`[kv-velocity] … pixels`), the number the forced-shed twin bar is about.
+///
+/// ```sh
+/// CANDLE_GEN_QWEN_IMAGE_2_1_TURBO_SNAPSHOT=…/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba19… \
+/// QWEN_IMAGE_2_1_RENDER_OUT=…/render-validation \
+///   cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda \
+///   --test integration e2e_real_weights::turbo_validation_prefix_kv_cache_velocity \
+///   -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore]
+fn turbo_validation_prefix_kv_cache_velocity() {
+    use candle_gen::gen_core::Conditioning;
+    use candle_gen_qwen_image_2_1::{
+        collect_references, create_noise, decode_rgb, encode_references, joint_branch,
+        joint_images, load_text_encoder, load_tokenizer, load_transformer, load_vae,
+        prepare_conditioning_references, scheduler::resample_saved_sigmas,
+    };
+
+    let root = turbo_snapshot();
+    let out_dir = out_dir();
+    let stem = "qwen_image_2_1_turbo_candle";
+    let saved = candle_gen_qwen_image_2_1::load_saved_sigma_schedule(&root).unwrap();
+    let steps = saved.default_steps();
+    assert_eq!(steps, 8, "the pinned Turbo revision saves eight sigmas");
+    let sigmas = resample_saved_sigmas(&saved.sample_sigmas, steps).unwrap();
+
+    // The references the edit smoke renders (same subjects, seeds and edge), made by the
+    // generator, which is then dropped before the components load.
+    let pool = {
+        let generator = Target::dense(
+            candle_gen_qwen_image_2_1::TURBO_MODEL_ID,
+            root.clone(),
+            stem,
+        )
+        .load();
+        let source = ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        };
+        references(generator.as_ref(), source, MAX_REFERENCES, &out_dir, stem)
+    };
+
+    let device = candle_gen::default_device().unwrap();
+    let tokenizer = load_tokenizer(&root).unwrap();
+    let drop_count = system_prompt_drop_count(&tokenizer).unwrap();
+    let cases = [(2usize, 1024u32, 1024u32), (MAX_REFERENCES, 512, 512)];
+    // Both cases' text side first, so the tower is dropped before the DiT loads.
+    let branches: Vec<_> = {
+        let te = load_text_encoder(&root, &device).unwrap();
+        cases
+            .iter()
+            .map(|&(count, width, height)| {
+                let req = GenerationRequest {
+                    prompt: EDIT_PROMPT.to_owned(),
+                    width,
+                    height,
+                    conditioning: vec![Conditioning::MultiReference {
+                        images: pool[..count].to_vec(),
+                    }],
+                    ..Default::default()
+                };
+                let images = collect_references(&req).unwrap();
+                let prepared = prepare_conditioning_references(&te, &images).unwrap();
+                let conditioning = te
+                    .encode_conditioning(&tokenizer, EDIT_PROMPT, drop_count, &prepared)
+                    .unwrap();
+                let branch = joint_branch(&conditioning, &prepared, width, height).unwrap();
+                (prepared, branch)
+            })
+            .collect()
+    };
+    let transformer = load_transformer(&root, &device).unwrap();
+    let vae = load_vae(&root, &device).unwrap();
+    let cfg = transformer.config().clone();
+    let inner = cfg.inner_dim();
+
+    let mut failures = Vec::new();
+    for (&(count, width, height), (prepared, branch)) in cases.iter().zip(&branches) {
+        let label = format!("{stem} {count} refs {width}x{height}");
+        let (total, target) = (branch.layout.total_len(), branch.layout.target_tokens());
+        eprintln!(
+            "[kv-velocity] {label}: joint S = {total} rows (prefix {}), target {target} rows",
+            branch.layout.prefix_len()
+        );
+        gemm_row_probe(&label, &device, total, target, inner, inner * cfg.mlp_ratio);
+
+        let reference_latents = encode_references(&vae, prepared).unwrap();
+        let text = &branch.text;
+        let layout = &branch.layout;
+        let prefill = |x: &Tensor, sigma: f32| {
+            transformer
+                .forward_joint(text, &joint_images(&reference_latents, x), sigma, layout)
+                .unwrap()
+        };
+        let mut x_prefill = create_noise(42, width, height, cfg.in_channels, &device).unwrap();
+        let mut x_cached = x_prefill.clone();
+        let mut cache = None;
+        let mut worst_gap = 0f64;
+        for i in 0..steps {
+            let (sigma, dt) = (sigmas[i], sigmas[i + 1] - sigmas[i]);
+            let v_prefill = prefill(&x_prefill, sigma);
+            let v_cached = match &cache {
+                None => {
+                    let (v_extract, extracted) = transformer
+                        .forward_joint_extract(
+                            text,
+                            &joint_images(&reference_latents, &x_prefill),
+                            sigma,
+                            layout,
+                        )
+                        .unwrap();
+                    let (gap, max_abs, differing) = velocity_gap(&v_extract, &v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step 1 extract vs prefill: rel {gap:.3e}, max \
+                         |Δ| {max_abs:.3e}, {differing} elements differ"
+                    );
+                    if differing != 0 {
+                        failures.push(format!(
+                            "{label}: the extract evaluation is not bit-identical to the prefill \
+                             ({differing} elements differ, rel {gap:.3e})"
+                        ));
+                    }
+                    cache = Some(extracted);
+                    v_extract
+                }
+                Some(cache) => {
+                    let same_input = transformer
+                        .forward_joint_cached(&x_prefill, sigma, cache)
+                        .unwrap();
+                    let (gap, max_abs, differing) = velocity_gap(&same_input, &v_prefill);
+                    worst_gap = worst_gap.max(gap);
+                    let rms = rms(&v_prefill);
+                    eprintln!(
+                        "[kv-velocity] {label}: step {} cached vs prefill on the same input: rel \
+                         {gap:.3e}, max |Δ| {max_abs:.3e} (velocity rms {rms:.3e}), {differing} \
+                         elements differ",
+                        i + 1
+                    );
+                    transformer
+                        .forward_joint_cached(&x_cached, sigma, cache)
+                        .unwrap()
+                }
+            };
+            if i + 1 == steps {
+                // The cache's step-independence, on this step's (different) latent and timestep.
+                let first = cache.take().unwrap();
+                let probe = [0, first.num_blocks() / 2, first.num_blocks() - 1];
+                let host: Vec<_> = probe
+                    .iter()
+                    .map(|&b| {
+                        let (k, v) = first.layer(b).unwrap();
+                        (host_bits(k), host_bits(v))
+                    })
+                    .collect();
+                drop(first);
+                let (_, again) = transformer
+                    .forward_joint_extract(
+                        text,
+                        &joint_images(&reference_latents, &x_prefill),
+                        sigma,
+                        layout,
+                    )
+                    .unwrap();
+                for (&b, (k, v)) in probe.iter().zip(&host) {
+                    let (k2, v2) = again.layer(b).unwrap();
+                    let same = *k == host_bits(k2) && *v == host_bits(v2);
+                    eprintln!(
+                        "[kv-velocity] {label}: block {b} prefix K/V re-extracted at step {}: {}",
+                        i + 1,
+                        if same { "bit-identical" } else { "DIFFERENT" }
+                    );
+                    if !same {
+                        failures.push(format!(
+                            "{label}: block {b}'s prefix K/V changed between extracts at step 1 \
+                             and step {}",
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            x_prefill = (&x_prefill + (&v_prefill * f64::from(dt)).unwrap()).unwrap();
+            x_cached = (&x_cached + (&v_cached * f64::from(dt)).unwrap()).unwrap();
+            let (traj, _, _) = velocity_gap(&x_cached, &x_prefill);
+            eprintln!(
+                "[kv-velocity] {label}: after step {}: trajectory latent gap rel {traj:.3e}",
+                i + 1
+            );
+        }
+        let decode = |x: &Tensor| {
+            decode_rgb(&vae, x, width, height, None, None)
+                .unwrap()
+                .pixels
+        };
+        let (pixels_prefill, pixels_cached) = (decode(&x_prefill), decode(&x_cached));
+        let (mean, max) = pixel_difference(&pixels_cached, &pixels_prefill);
+        eprintln!(
+            "[kv-velocity] {label}: pixels cached vs prefill trajectory: mean |Δ| {mean:.4}, max \
+             {max}; worst per-evaluation velocity gap rel {worst_gap:.3e} (bar \
+             {CACHED_VELOCITY_GAP_BAR:.1e})"
+        );
+        save_png(
+            &out_dir.join(format!(
+                "{stem}_velocity_{count}refs_{width}x{height}_{steps}steps_prefill.png"
+            )),
+            &pixels_prefill,
+            width,
+            height,
+            image::ColorType::Rgb8,
+        );
+        if worst_gap > CACHED_VELOCITY_GAP_BAR {
+            failures.push(format!(
+                "{label}: a cached evaluation's velocity is {worst_gap:.3e} (relative L2) from the \
+                 prefill one on the same input, above {CACHED_VELOCITY_GAP_BAR:.1e}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The relative-L2 gap a cached evaluation's velocity may show against the prefill one on the
+/// same latent and timestep ([`turbo_validation_prefix_kv_cache_velocity`]). Provisional until the
+/// first CUDA measurement.
+const CACHED_VELOCITY_GAP_BAR: f64 = 5e-2;
+
+/// `(relative L2, max |Δ|, elements that differ)` of `a` against `b` (same shape, any float dtype).
+fn velocity_gap(a: &Tensor, b: &Tensor) -> (f64, f32, usize) {
+    let a: Vec<f32> = a
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let b: Vec<f32> = b
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    assert_eq!(a.len(), b.len(), "same shape");
+    let (mut diff2, mut ref2, mut max_abs, mut differing) = (0f64, 0f64, 0f32, 0usize);
+    for (x, y) in a.iter().zip(&b) {
+        let d = x - y;
+        diff2 += f64::from(d) * f64::from(d);
+        ref2 += f64::from(*y) * f64::from(*y);
+        max_abs = max_abs.max(d.abs());
+        differing += usize::from(x.to_bits() != y.to_bits());
+    }
+    (
+        (diff2 / ref2.max(f64::MIN_POSITIVE)).sqrt(),
+        max_abs,
+        differing,
+    )
+}
+
+/// Root mean square of a tensor's elements.
+fn rms(t: &Tensor) -> f64 {
+    let v: Vec<f32> = t
+        .to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+}
+
+/// The raw bits of a tensor's elements, on the host, for an exact comparison.
+fn host_bits(t: &Tensor) -> Vec<u32> {
+    t.to_dtype(candle_core::DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .into_iter()
+        .map(f32::to_bits)
+        .collect()
+}
+
+/// **The row-count dependence of a projection, measured on this device**: for each of the DiT's
+/// per-token projection shapes (`inner → inner`, `inner → hidden`, `hidden → inner`), a bf16
+/// `candle_nn::Linear` with random weights over `total` random rows, against the same Linear over
+/// the last `target` of those rows alone — the prefill's and the cached decode's `M` for the target
+/// tokens. Prints how many output elements of the target rows differ. Weights are random because
+/// the kernel choice depends on the shape and dtype, not the values. Printed, never asserted: which
+/// kernel a vendor library picks for an `M` is the device's and the library's, not this crate's.
+fn gemm_row_probe(
+    label: &str,
+    device: &candle_core::Device,
+    total: usize,
+    target: usize,
+    inner: usize,
+    hidden: usize,
+) {
+    use candle_core::{DType, Module};
+    for (k, n) in [(inner, inner), (inner, hidden), (hidden, inner)] {
+        let x = Tensor::randn(0f32, 1.0, (1, total, k), device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let w = (Tensor::randn(0f32, 1.0, (n, k), device).unwrap() / (k as f64).sqrt())
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let linear = candle_nn::Linear::new(w, None);
+        let full = linear.forward(&x).unwrap();
+        let full_rows = full.narrow(1, total - target, target).unwrap();
+        let alone = linear
+            .forward(
+                &x.narrow(1, total - target, target)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (gap, max_abs, differing) = velocity_gap(&alone, &full_rows);
+        eprintln!(
+            "[gemm] {label}: {k}->{n} over M={total} vs M={target}: {differing} of {} target \
+             outputs differ (rel {gap:.3e}, max |Δ| {max_abs:.3e})",
+            target * n
+        );
+    }
 }
 
 /// What a render body renders with: the engine id, how the generator is loaded, and the stem its
@@ -1104,13 +1698,14 @@ impl Target {
     }
 }
 
-/// The reference-edit smoke of `target`: one render per [`EditCase`] — `steps: None` leaves the
-/// count to the generator, which must then run `default_steps` — each cached case followed, with
-/// `forced_shed_twin`, by its forced-shed twin, then the eleven-reference refusal.
+/// The reference-edit smoke of `target` over `references`: one render per [`EditCase`] — `steps:
+/// None` leaves the count to the generator, which must then run `default_steps` — each cached case
+/// followed, with `forced_shed_twin`, by its forced-shed twin, then the eleven-reference refusal.
 /// `QWEN_IMAGE_2_1_PREFIX_KV_CACHE` forces one mode on every case and skips the twins; `golden`
 /// is [`compare_with_golden`]'s.
 fn reference_edit_renders(
     target: &Target,
+    references: ReferenceSource,
     default_steps: u32,
     mut cases: Vec<EditCase>,
     forced_shed_twin: bool,
@@ -1125,6 +1720,7 @@ fn reference_edit_renders(
     reference_edit_renders_in(
         target,
         &out_dir(),
+        references,
         default_steps,
         cases,
         forced_shed_twin && forced.is_none(),
@@ -1154,21 +1750,28 @@ const SHED_TWIN_MEAN_BAR: f64 = 2.0;
 /// the `QWEN_IMAGE_2_1_*` environment so the dry run at the bottom of this file can drive it on
 /// the miniature fixture.
 ///
-/// `require_positive_delta` arms the sign half of [`assert_observed_cache_delta`] for the
-/// **ten-reference** twin — the one where the cache (24.5 GiB priced in bf16) dominates every
-/// other phase, so holding it must raise the device peak. With fewer references the reference
-/// encode or the decode can set both renders' peak, so those twins are printed and held to the
-/// upper bound only. Every real-weight caller sets it; the dry run cannot (the miniature cache is
-/// a few hundred kB under phases that are not).
+/// `real_weights` is set by every real-weight caller and by no dry run. It arms
+///
+/// * the sign half of [`assert_observed_cache_delta`] for the **ten-reference** twin — the one
+///   where the cache (24.5 GiB priced in bf16) dominates every other phase, so holding it must
+///   raise the device peak. With fewer references the reference encode or the decode can set both
+///   renders' peak, so those twins are printed and held to the upper bound only (the miniature
+///   cache is a few hundred kB under phases that are not);
+/// * over real `references` ([`ReferenceSource::is_real`]), [`assert_not_mosaic`] on every edit
+///   output — the miniature fixture's outputs are noise by construction.
+///
+/// The references are made (or read) once, after the generator loads, and every case takes the
+/// first `count` of them in order.
 #[allow(clippy::too_many_arguments)]
 fn reference_edit_renders_in(
     target: &Target,
     out_dir: &std::path::Path,
+    references: ReferenceSource,
     default_steps: u32,
     cases: Vec<EditCase>,
     forced_shed_twin: bool,
     golden: Option<&Path>,
-    require_positive_delta: bool,
+    real_weights: bool,
 ) {
     use candle_gen::gen_core::Conditioning;
 
@@ -1176,6 +1779,9 @@ fn reference_edit_renders_in(
     let started = Instant::now();
     let generator = target.load();
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
+    let most = cases.iter().map(|case| case.references).max().unwrap_or(0);
+    let pool = self::references(generator.as_ref(), references, most, out_dir, stem);
+    let check_picture = real_weights && references.is_real();
 
     // One render of `case`, with the cache mode `cache` (the case's own, or the twin's).
     let render = |case: EditCase,
@@ -1191,15 +1797,13 @@ fn reference_edit_renders_in(
         } = case;
         let req = selecting(
             GenerationRequest {
-                prompt:
-                    "Combine the subjects of the reference images into one scene, evening light"
-                        .to_owned(),
+                prompt: EDIT_PROMPT.to_owned(),
                 width,
                 height,
                 steps,
                 seed: Some(42),
                 conditioning: vec![Conditioning::MultiReference {
-                    images: references(count, 768, 768),
+                    images: pool[..count].to_vec(),
                 }],
                 ..Default::default()
             },
@@ -1247,6 +1851,9 @@ fn reference_edit_renders_in(
         );
         let golden_failure = compare_with_golden(golden, out_dir, &file_name, &image.pixels, cache);
         assert_not_band_corrupted(&label, &image.pixels, width, height);
+        if check_picture {
+            assert_not_mosaic(&label, &image.pixels, width, height);
+        }
         eprintln!(
             "wrote {} ({width}x{height} RGB8) after {:.1}s render",
             path.display(),
@@ -1264,6 +1871,7 @@ fn reference_edit_renders_in(
     ];
     let mut twins = 0;
     let mut golden_failures = Vec::new();
+    let mut twin_failures: Vec<String> = Vec::new();
     for case in cases {
         let (cached, cached_observed, failure) = render(case, case.cache, "");
         golden_failures.extend(failure);
@@ -1317,7 +1925,7 @@ fn reference_edit_renders_in(
                     cached_peak,
                     shed_peak,
                     cached_observed.priced_cache,
-                    require_positive_delta && case.references == MAX_REFERENCES,
+                    real_weights && case.references == MAX_REFERENCES,
                 );
             }
             _ => eprintln!(
@@ -1325,18 +1933,21 @@ fn reference_edit_renders_in(
                  observed cache delta is a `--features cuda` measurement)"
             ),
         }
-        assert!(
-            mean <= SHED_TWIN_MEAN_BAR,
-            "the forced-shed render differs from the cached one by a mean of {mean:.4} levels \
-             (max {max}); the two paths are the same mathematics"
-        );
+        if mean > SHED_TWIN_MEAN_BAR {
+            twin_failures.push(format!(
+                "the {}-reference forced-shed render differs from the cached one by a mean of \
+                 {mean:.4} levels (max {max}), above {SHED_TWIN_MEAN_BAR}",
+                case.references
+            ));
+        }
     }
     assert!(
         !forced_shed_twin || twins > 0,
         "a forced-shed twin needs a cached case"
     );
-    // After every case has rendered, written its files and its `[golden]` line.
+    // After every case has rendered, written its files and its `[golden]` / `[kv]` lines.
     assert_golden_clean(&golden_failures);
+    assert!(twin_failures.is_empty(), "{}", twin_failures.join("; "));
 
     let err = generator
         .validate(&GenerationRequest {
@@ -1401,9 +2012,11 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     // The miniature cache sits under the fixture's other phases, so the twins' sign check is not
     // armed here; the bound is, and the check itself is pinned by
     // `the_observed_cache_delta_is_bounded_by_the_priced_cache`.
+    // Rendered references, so the in-run reference renders are driven too (64² on the fixture).
     reference_edit_renders_in(
         &target,
         out.path(),
+        ReferenceSource::Rendered { edge: 64 },
         8,
         vec![case(2), case(10)],
         true,
@@ -1430,6 +2043,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &mixed,
         out.path(),
+        ReferenceSource::Synthetic,
         8,
         vec![
             case(2),
@@ -1451,7 +2065,13 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     ] {
         crate::turbo_tiers::compose_tier(turbo.path(), tiers.path(), tier);
     }
-    turbo_installed_tier_renders_in(tiers.path(), out.path(), (64, 64), 8);
+    turbo_installed_tier_renders_in(
+        tiers.path(),
+        out.path(),
+        (64, 64),
+        8,
+        ReferenceSource::Synthetic,
+    );
     for tier in ["q8", "q4"] {
         for name in [
             format!("qwen_image_2_1_turbo_candle_{tier}_64x64_8steps_seed42.png"),
@@ -1492,6 +2112,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &base_edit,
         golden.path(),
+        ReferenceSource::Synthetic,
         40,
         edit_cases(),
         false,
@@ -1509,6 +2130,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
     reference_edit_renders_in(
         &base_edit,
         checked.path(),
+        ReferenceSource::Synthetic,
         40,
         edit_cases(),
         false,
@@ -1560,6 +2182,7 @@ fn the_turbo_reference_edit_body_runs_end_to_end_on_the_miniature_fixture() {
             reference_edit_renders_in(
                 &base_edit,
                 rechecked.path(),
+                ReferenceSource::Synthetic,
                 40,
                 edit_cases(),
                 false,
@@ -1641,16 +2264,26 @@ fn turbo_validation_render_installed_tiers() {
         .unwrap()
         .default_steps() as u32;
     assert_eq!(saved, 8, "the pinned Turbo revision saves eight sigmas");
-    turbo_installed_tier_renders_in(&tiers, &out_dir(), (1024, 1024), saved);
+    turbo_installed_tier_renders_in(
+        &tiers,
+        &out_dir(),
+        (1024, 1024),
+        saved,
+        ReferenceSource::Rendered {
+            edge: REFERENCE_EDGE,
+        },
+    );
 }
 
-/// [`turbo_validation_render_installed_tiers`]'s body over an explicit tier directory, size and
-/// output directory, so the dry run drives it on tiers composed from the miniature fixture.
+/// [`turbo_validation_render_installed_tiers`]'s body over an explicit tier directory, size,
+/// output directory and reference source, so the dry run drives it on tiers composed from the
+/// miniature fixture.
 fn turbo_installed_tier_renders_in(
     tiers: &Path,
     out_dir: &Path,
     (width, height): (u32, u32),
     saved_steps: u32,
+    references: ReferenceSource,
 ) {
     use candle_gen_qwen_image_2_1::quant::{installed_tier, Tier};
     let id = candle_gen_qwen_image_2_1::TURBO_MODEL_ID;
@@ -1717,6 +2350,7 @@ fn turbo_installed_tier_renders_in(
         reference_edit_renders_in(
             &target,
             out_dir,
+            references,
             saved_steps,
             vec![EditCase {
                 references: 2,
@@ -1732,14 +2366,19 @@ fn turbo_installed_tier_renders_in(
     }
 }
 
-/// A **transparent** RGBA reference of `width`×`height`: the same deterministic picture
-/// [`synthetic_reference`] produces, matted onto a soft-edged disc so the alpha is a real ramp
-/// rather than a binary cut-out (a hard matte would survive any resampling order and so could not
-/// exercise the premultiplied resize). The candle twin of the MLX smoke's reference (sc-24111).
+/// A **transparent** RGBA reference: a real 1024² picture `generator` renders in the run (the
+/// first of [`rendered_references`]; the CUDA lane provisions no reference images) matted onto a
+/// soft-edged disc so the alpha is a real ramp rather than a binary cut-out (a hard matte would
+/// survive any resampling order and so could not exercise the premultiplied resize). The candle
+/// twin of the MLX smoke's reference (sc-24111).
 ///
-/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from a real image
-/// instead; reference images for a real evaluation are user-provided.
-fn transparent_reference(width: u32, height: u32) -> candle_gen::gen_core::RgbaImage {
+/// Set `QWEN_IMAGE_2_1_RGBA_REF` to a PNG with an alpha channel to extract from that image
+/// instead (operator-supplied; nothing is rendered then).
+fn transparent_reference(
+    generator: &dyn Generator,
+    out_dir: &Path,
+    stem: &str,
+) -> candle_gen::gen_core::RgbaImage {
     if let Ok(path) = std::env::var("QWEN_IMAGE_2_1_RGBA_REF") {
         let rgba = image::open(&path)
             .unwrap_or_else(|e| panic!("QWEN_IMAGE_2_1_RGBA_REF={path}: {e}"))
@@ -1750,8 +2389,9 @@ fn transparent_reference(width: u32, height: u32) -> candle_gen::gen_core::RgbaI
             pixels: rgba.into_raw(),
         };
     }
-    let rgb = synthetic_reference(1, width, height);
-    let mut out = candle_gen::gen_core::RgbaImage::from_rgb(&rgb).unwrap();
+    let picture = rendered_references(generator, 1, 1024, out_dir, stem).remove(0);
+    let (width, height) = (picture.width, picture.height);
+    let mut out = candle_gen::gen_core::RgbaImage::from_rgb(&picture).unwrap();
     let (cx, cy) = ((width - 1) as f32 / 2.0, (height - 1) as f32 / 2.0);
     let radius = width.min(height) as f32 * 0.36;
     for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
@@ -1926,7 +2566,7 @@ fn transparency_renders(
              transparency; the background is fully transparent."
                 .to_owned(),
             vec![Conditioning::ReferenceRgba {
-                image: transparent_reference(1024, 1024),
+                image: transparent_reference(generator.as_ref(), &out_dir, stem),
                 strength: None,
             }],
         ),
