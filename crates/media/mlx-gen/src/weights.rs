@@ -428,6 +428,32 @@ impl Weights {
         }
         Ok(())
     }
+
+    /// Cast every **dense floating** tensor to `dtype`, leaving an affine quantization pack exactly
+    /// as stored: integer codes are not floating, and a pack's `{base}.scales` / `{base}.biases`
+    /// companions keep the dtype the quantizer wrote them at (the dequantize kernel reads them at
+    /// that width).
+    ///
+    /// This is the load-time downcast for a **pre-quantized** snapshot, which [`Self::cast_all`] must
+    /// never touch (it would corrupt the u32 codes and re-round the scales). Skipping the cast
+    /// outright is the other wrong answer: a packed snapshot still carries dense convolutions, norms
+    /// and embeddings, and a producer that wrote those at f32 would leave them resident — and
+    /// running — at twice the width a dense load of the same model gets (sc-26268: the published
+    /// `illustrious-xl-v2` q4 U-Net carries 1.33 GB of f32 dense leaves where `sdxl` q4 has 0.67 GB
+    /// at f16). Reads only dtypes and key names, so no tensor is evaluated or marked accessed.
+    pub fn cast_unpacked_floats(&mut self, dtype: Dtype) -> Result<()> {
+        for (key, value) in &mut self.tensors {
+            let floating = matches!(
+                value.dtype(),
+                Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Float64
+            );
+            let pack_companion = key.ends_with(".scales") || key.ends_with(".biases");
+            if floating && !pack_companion && value.dtype() != dtype {
+                *value = value.as_dtype(dtype)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Cast to a target compute dtype (e.g. bf16, mirroring mflux's torch_convert downcast). A thin
@@ -538,6 +564,51 @@ mod tests {
                 .unwrap()
                 .dtype(),
             Dtype::Float32
+        );
+    }
+
+    /// sc-26268: a packed snapshot's dense leaves follow the compute dtype; the affine pack (u32
+    /// codes, `.scales`, `.biases`) is preserved verbatim. Dtype-only — no array is evaluated.
+    #[test]
+    fn cast_unpacked_floats_casts_dense_leaves_and_preserves_the_pack() {
+        let mut w = Weights::empty();
+        w.insert("conv_in.weight", Array::from_slice(&[1.0f32], &[1]));
+        w.insert("norm.bias", Array::from_slice(&[1.0f32], &[1]));
+        w.insert("proj.weight", Array::from_slice(&[7u32], &[1]));
+        w.insert(
+            "proj.scales",
+            Array::from_slice(&[1.0f32], &[1])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        w.insert(
+            "proj.biases",
+            Array::from_slice(&[1.0f32], &[1])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        w.insert("proj.bias", Array::from_slice(&[1.0f32], &[1]));
+
+        w.cast_unpacked_floats(Dtype::Float16).unwrap();
+
+        let dtype = |key: &str| w.require(key).unwrap().dtype();
+        assert_eq!(dtype("conv_in.weight"), Dtype::Float16);
+        assert_eq!(dtype("norm.bias"), Dtype::Float16);
+        assert_eq!(
+            dtype("proj.bias"),
+            Dtype::Float16,
+            "a packed linear's dense bias casts"
+        );
+        assert_eq!(dtype("proj.weight"), Dtype::Uint32, "codes are never cast");
+        assert_eq!(
+            dtype("proj.scales"),
+            Dtype::Bfloat16,
+            "scales keep stored width"
+        );
+        assert_eq!(
+            dtype("proj.biases"),
+            Dtype::Bfloat16,
+            "biases keep stored width"
         );
     }
 

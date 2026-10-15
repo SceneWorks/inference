@@ -67,12 +67,17 @@ impl GlobalGroupNorm {
         }
 
         let group_size = channels / groups;
-        let grouped = x
-            .reshape(&[batch, height, width, groups, group_size])?
-            .transpose_axes(&[0, 3, 1, 2, 4])?;
-        let mean = grouped.mean_axes(&[2, 3, 4], Some(true))?;
-        let variance = grouped.var_axes(&[2, 3, 4], Some(true), None)?;
-        let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+        let (mean, inv_std) = if x.dtype() == mlx_rs::Dtype::Float16 {
+            half_precision_group_stats(x, groups, eps, HALF_STATS_CHUNK_ELEMS)?
+        } else {
+            let grouped = x
+                .reshape(&[batch, height, width, groups, group_size])?
+                .transpose_axes(&[0, 3, 1, 2, 4])?;
+            let mean = grouped.mean_axes(&[2, 3, 4], Some(true))?;
+            let variance = grouped.var_axes(&[2, 3, 4], Some(true), None)?;
+            let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+            (mean, inv_std)
+        };
         mean.eval()?;
         inv_std.eval()?;
 
@@ -103,8 +108,82 @@ impl GlobalGroupNorm {
         let normalized = multiply(&subtract(&grouped, &self.mean)?, &self.inv_std)?
             .transpose_axes(&[0, 2, 3, 1, 4])?
             .reshape(&[batch, height, width, self.channels])?;
-        Ok(add(&multiply(&normalized, &self.weight)?, &self.bias)?)
+        let out = add(&multiply(&normalized, &self.weight)?, &self.bias)?;
+        // f16 statistics are held at f32 (see `half_precision_group_stats`); hand the crop back at
+        // its own dtype so the following convolution stays at the decoder's compute width.
+        if tile.dtype() == mlx_rs::Dtype::Float16 && out.dtype() != tile.dtype() {
+            Ok(out.as_dtype(tile.dtype())?)
+        } else {
+            Ok(out)
+        }
     }
+}
+
+/// Elements one statistics pass reads per evaluated row chunk (16 Mi, a 64 MiB f32 transient).
+const HALF_STATS_CHUNK_ELEMS: i64 = 1 << 24;
+
+/// Per-batch/per-group mean and inverse standard deviation of an **f16** NHWC activation, accumulated
+/// at f32 over bounded row chunks (sc-26268).
+///
+/// An f16 variance taken in place is not safe: `var_axes` squares the activation, and a decoder
+/// activation of magnitude ≥ 256 squares past f16's 65 504 ceiling. The dense decode never meets that,
+/// because `nn::group_norm` reduces through MLX's fused layer norm, which accumulates at f32. This
+/// matches it. Upcasting the whole activation would materialize a full-resolution f32 copy (512 MiB
+/// for SDXL's 128-channel layer at 1024²) — exactly the transient a bounded decode exists to avoid —
+/// so both passes (mean, then the centred second moment, the numerically stable two-pass form) walk
+/// row chunks of at most [`HALF_STATS_CHUNK_ELEMS`] elements. f32 and bf16 callers never reach this,
+/// so their statistics are byte-identical to before.
+fn half_precision_group_stats(
+    x: &Array,
+    groups: i32,
+    eps: f32,
+    chunk_elems: i64,
+) -> Result<(Array, Array)> {
+    let shape = x.shape();
+    let (batch, height, width, channels) = (shape[0], shape[1], shape[2], shape[3]);
+    let group_size = channels / groups;
+    let row_elems = i64::from(width) * i64::from(channels) * i64::from(batch);
+    let rows_per_chunk = (chunk_elems / row_elems.max(1)).clamp(1, i64::from(height)) as i32;
+    let count = f64::from(height) * f64::from(width) * f64::from(group_size);
+    let chunks = (0..height)
+        .step_by(rows_per_chunk as usize)
+        .map(|y0| (y0, (y0 + rows_per_chunk).min(height)))
+        .collect::<Vec<_>>();
+    let grouped_f32 = |y0: i32, y1: i32| -> Result<Array> {
+        Ok(slice_axis(x, 1, y0, y1)?
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .reshape(&[batch, y1 - y0, width, groups, group_size])?
+            .transpose_axes(&[0, 3, 1, 2, 4])?)
+    };
+    let mut sum: Option<Array> = None;
+    for &(y0, y1) in &chunks {
+        let part = grouped_f32(y0, y1)?.sum_axes(&[2, 3, 4], Some(true))?;
+        let next = match sum.take() {
+            Some(acc) => add(&acc, &part)?,
+            None => part,
+        };
+        next.eval()?;
+        sum = Some(next);
+    }
+    let sum = sum.ok_or_else(|| Error::Msg("global group norm: empty activation".into()))?;
+    let mean = divide(&sum, scalar(count as f32))?;
+    mean.eval()?;
+    let mut centred: Option<Array> = None;
+    for &(y0, y1) in &chunks {
+        let deviation = subtract(&grouped_f32(y0, y1)?, &mean)?;
+        let part = multiply(&deviation, &deviation)?.sum_axes(&[2, 3, 4], Some(true))?;
+        let next = match centred.take() {
+            Some(acc) => add(&acc, &part)?,
+            None => part,
+        };
+        next.eval()?;
+        centred = Some(next);
+    }
+    let centred =
+        centred.ok_or_else(|| Error::Msg("global group norm: empty activation".into()))?;
+    let variance = divide(&centred, scalar(count as f32))?;
+    let inv_std = rsqrt(&add(&variance, scalar(eps))?)?;
+    Ok((mean, inv_std))
 }
 
 /// Apply one NHWC 3×3/pad-1 convolution with bounded spatial work and exact convolution halos.
@@ -869,6 +948,72 @@ mod tests {
     /// exactly the bug this regression guards against. Position-dependent values make those local
     /// statistics observably different; the halo/core convolution path must still track the dense
     /// GroupNorm→SiLU→3×3 convolution.
+    #[test]
+    fn half_precision_group_stats_accumulate_at_f32_without_overflow() {
+        // Weights-free numerics on the CPU device; restored for the next test in the binary.
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        // Magnitudes past 256 square beyond f16's 65 504 ceiling: an in-place f16 variance would be
+        // inf. Every row-chunk size — one row, a ragged split, the whole activation — must land on
+        // the f32 reference statistics, and `apply` must hand the crop back at f16.
+        let (batch, height, width, channels, groups) = (1, 7, 5, 8, 4);
+        let count = (batch * height * width * channels) as usize;
+        let values = (0..count)
+            .map(|i| ((i as f32) * 0.37).sin() * 300.0 + 40.0)
+            .collect::<Vec<_>>();
+        let x32 = Array::from_slice(&values, &[batch, height, width, channels]);
+        let x16 = x32.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        let weight = Array::ones::<f32>(&[channels]).unwrap();
+        let bias = Array::zeros::<f32>(&[channels]).unwrap();
+        // The reference: the f32 path over the f16-rounded activation.
+        let reference = GlobalGroupNorm::new(
+            &x16.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            &weight,
+            &bias,
+            groups,
+            1e-5,
+        )
+        .unwrap();
+        let row = i64::from(width * channels);
+        for chunk in [row, row * 3, row * i64::from(height) * 4] {
+            let (mean, inv_std) = half_precision_group_stats(&x16, groups, 1e-5, chunk).unwrap();
+            assert_eq!(mean.dtype(), mlx_rs::Dtype::Float32);
+            for (got, want) in [(&mean, &reference.mean), (&inv_std, &reference.inv_std)] {
+                let got = got.flatten(None, None).unwrap();
+                let want = want.flatten(None, None).unwrap();
+                for (g, w) in got.as_slice::<f32>().iter().zip(want.as_slice::<f32>()) {
+                    assert!(g.is_finite(), "chunk {chunk}: non-finite statistic");
+                    assert!(
+                        (g - w).abs() <= 1e-4 * w.abs().max(1e-3),
+                        "chunk {chunk}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+        let norm = GlobalGroupNorm::new(&x16, &weight, &bias, groups, 1e-5).unwrap();
+        let applied = norm.apply(&x16).unwrap();
+        assert_eq!(applied.dtype(), mlx_rs::Dtype::Float16);
+        let applied = applied.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let expected = reference
+            .apply(&x16.as_dtype(mlx_rs::Dtype::Float32).unwrap())
+            .unwrap();
+        let max_delta = applied
+            .subtract(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_delta < 5e-3, "f16 apply drifted {max_delta}");
+    }
+
     #[test]
     fn global_group_norm_tiled_conv_tracks_dense_layer() {
         let (batch, height, width, channels, out_channels) = (1, 7, 9, 32, 3);

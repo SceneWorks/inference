@@ -45,6 +45,27 @@ pub mod unet;
 pub mod vae;
 pub mod vision_encoder;
 
+/// Weights-free numerics on MLX's **CPU** device (sc-26268): the low-memory parity tests run the
+/// same op graphs as production on tiny synthetic weights, need no accelerator, and must not depend
+/// on whose GPU the test host has. The guard restores the previous default device on drop, so a
+/// following test in the same (single-threaded) binary is unaffected.
+#[cfg(test)]
+pub(crate) mod test_device {
+    pub(crate) struct DeviceGuard(mlx_rs::Device);
+
+    impl Drop for DeviceGuard {
+        fn drop(&mut self) {
+            mlx_rs::Device::set_default(&self.0);
+        }
+    }
+
+    pub(crate) fn cpu_only() -> DeviceGuard {
+        let guard = DeviceGuard(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        guard
+    }
+}
+
 pub use adapters::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, lora_delta, LoraCoverage, SdxlLoraReport,
 };
@@ -229,25 +250,25 @@ mod explicit_registry_tests {
     }
 
     /// sc-21510: rung 4 is tier-agnostic. The selector names an already-resolved artifact tier, so a
-    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. Every other
-    /// (surface, rung) disposition is unchanged.
+    /// packed Q4/Q8 snapshot re-quantizes nothing and its blocks stay as lazy as BF16's. sc-26268:
+    /// rung 2 (bounded decode) is published route-blind on every surface. Rung 3 stays `Missing`.
     #[test]
     fn published_ladder_surface_is_pinned_per_selector() {
         assert_eq!(
             ladder_lines(super::MODEL_ID),
             [
-                "bf16:resident:eager II---",
-                "bf16:resident:deferred II--I",
-                "bf16:sequential:eager II---",
-                "bf16:sequential:deferred II--I",
-                "q4:resident:eager II---",
-                "q4:resident:deferred II--I",
-                "q4:sequential:eager II---",
-                "q4:sequential:deferred II--I",
-                "q8:resident:eager II---",
-                "q8:resident:deferred II--I",
-                "q8:sequential:eager II---",
-                "q8:sequential:deferred II--I",
+                "bf16:resident:eager III--",
+                "bf16:resident:deferred III-I",
+                "bf16:sequential:eager III--",
+                "bf16:sequential:deferred III-I",
+                "q4:resident:eager III--",
+                "q4:resident:deferred III-I",
+                "q4:sequential:eager III--",
+                "q4:sequential:deferred III-I",
+                "q8:resident:eager III--",
+                "q8:resident:deferred III-I",
+                "q8:sequential:eager III--",
+                "q8:sequential:deferred III-I",
             ]
         );
     }

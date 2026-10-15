@@ -16,8 +16,8 @@
 //! | Rung | Support | Executable seam |
 //! |---|---|---|
 //! | 0 Resident | Implemented | Warm [`Residency`](mlx_gen::Residency) pair — dual CLIP + (U-Net + control/IP/VAE/PiD) held across requests |
-//! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise + decode |
-//! | 2 Bounded decode | route-blind **Missing**; exact measured rows may be Implemented ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) uses SC-19753 full-image GroupNorm statistics and sealed route/tier/mode/overlay/geometry admission; historical whole-tail memory was 14.360 → 11.237 GiB and must be recaptured for the new arithmetic |
+//! | 1 Staged residency | Implemented (request-scoped) | `GenerationMemory::stage_residency` drives encode → **drop both CLIP encoders** → load heavy → denoise → **drop the U-Net, control branches and IP encoder** (sc-26268) → decode |
+//! | 2 Bounded decode | **Implemented** over [`DECODE_TILE_EDGES`] (sc-26268); sealed route/geometry rows still override ([`DECODE_SUPPORT`]) | [`Autoencoder::decode_tiled`](crate::vae::Autoencoder) — layer-wise halo tiling with SC-19753 full-image GroupNorm statistics, exact up to float reassociation at every edge |
 //! | 3 Bounded attention | **Missing** (measured — [`ATTENTION_SUPPORT`]) | [`mlx_gen::attention::sdpa_budgeted_bhsd`] reaches every site, moves the peak **0.00% at BOTH scopes** (the request and the U-Net seam), and its query-row axis is not bit-exact on Metal |
 //! | 4 Bounded transformer residency | Implemented (streamable loads) | [`mlx_gen::block_residency::run_windowed`] per `Transformer2D` — eleven sub-stacks, 70 blocks |
 //!
@@ -101,6 +101,15 @@
 //! and rung 4 replays the *recorded tier* into every re-materialized block — so the two must not be
 //! allowed to disagree about what tier that is.
 //!
+//! **sc-26268 re-check.** The snapshots SceneWorks now pins (`illustrious-xl-v1-mlx@778c3f02`,
+//! `illustrious-xl-v2-mlx@672e9851`) carry the marker at q4 (`{"bits": 4, "group_size": 64}`,
+//! read from the cached q4 `unet/config.json`), so the q4 tier streams; the table above predates
+//! them. The q8 tier at those revisions was not cached and is unverified here. The same re-check
+//! found why the published q4 is ~1.2 GB larger than `sdxl`'s: its dense leaves were written at
+//! f32 (U-Net +0.67 GB, CLIP towers +0.2 GB) and its `vae/` ships both variants (+0.33 GB).
+//! `crate::convert` now writes neither, and the loader casts a packed snapshot's dense leaves to
+//! the compute dtype, so the already-published tiers stop running those leaves at f32.
+//!
 //! **Two of the five rungs are `Missing`, and both verdicts are measurements rather than gaps.**
 //! Their mechanisms are implemented, reach every advertised route, and are exercised by
 //! `tests/memory_ladder_real_weights.rs`; what they failed is the bar, not the wiring. Recording
@@ -114,12 +123,15 @@
 //! reconstruction, and the load-time policy survives only as the **default** for a request that
 //! names nothing.
 //!
-//! Be precise about what the staged schedule buys, because it is two phases and not three. The seam
-//! releases the **text encoders** before the heavy bundle loads, so the peak is bounded by
-//! `max(CLIP-L + bigG, U-Net + VAE + overlays)` rather than the sum. It does **not** release the
-//! U-Net before the decode: `SdxlHeavyOwned` is one bundle and the decode runs inside the same
-//! render closure the denoise did. That is why rung 2 matters here more than on a family that can
-//! shed its transformer first — SDXL's decode peak stacks on top of a resident U-Net.
+//! The staged schedule is **three** phases (sc-26268). The seam releases the **text encoders**
+//! before the heavy bundle loads, and — since sc-26268 — releases the **U-Net, the ControlNet
+//! branches and the IP-Adapter encoder** after the denoise and before the decode
+//! (`StagedHeavy::shed_dit` on `SdxlHeavyOwned`, driven by the shared
+//! `Residency::run_staged_request_scoped`). The peak is therefore bounded by
+//! `max(CLIP-L + bigG, U-Net + overlays + denoise transient, VAE + decode transient)` rather than
+//! by a decode stacked on a resident U-Net, which is where every SDXL request high-water was
+//! measured before (the decode carries the peak — see [`TRANSFORMER_WINDOW_SIZES`]). A **resident**
+//! (warm) request keeps the bundle across requests by design and still decodes beside it.
 //!
 //! ## Rung 4: a plan per `Transformer2D`, not one per model
 //!
@@ -302,7 +314,42 @@ pub const DECODE_OVERLAPS_SWEPT: &[u32] = &[64, 128, 192, 256];
 ///
 /// Publishing it as-is would be substituting quality for memory without saying so — the same refusal
 /// the catalog already makes for precision (tier integrity) and geometry (SC-15807).
-pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Missing;
+///
+/// ## sc-26268: published as a general rung
+///
+/// Everything above measured the **retired whole-tail** decoder, which normalized each tile against
+/// its own crop. The decoder this crate now runs (SC-19753) holds every tail GroupNorm to the
+/// statistics of the **full** activation ([`mlx_gen::vae_tiling::GlobalGroupNorm`]) and tiles only
+/// the 3×3 convolutions, with exact one-pixel halos and no blend
+/// ([`mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc`]). That removes the mechanism both withholding
+/// measurements above were measuring: a tile no longer sees statistics that depend on its fraction
+/// of the image, so the drift is no longer a property of the geometry and the "no fixed pixel edge
+/// is admissible across the advertised range" argument no longer applies. What is left is float
+/// reassociation of the same arithmetic, asserted against the f32 untiled decode by
+/// `vae::tests::tiled_decode_matches_the_f32_untiled_decode_across_edges` (weights-free,
+/// CI) and `tests/sdxl_low_memory_real_weights.rs` (real weights, opt-in), each stating its
+/// tolerance.
+///
+/// So rung 2 is `Implemented` over [`DECODE_TILE_EDGES`] × [`DECODE_OVERLAPS`] on the native VAE
+/// route, and over the PiD student's own measured geometry on the PiD route
+/// (`mlx_gen_pid::DecodeRoutes`, which the contract publishes as `pid_decode_routes`). Sealed
+/// route/geometry quality rows (SC-19753) still take precedence when a caller packages them: a
+/// contract that adopts them publishes exactly their admitted geometry and nothing else. Publishing
+/// the rung bumped [`MEMORY_CALIBRATION_FINGERPRINT`] as this file always said it must, because it
+/// changes which phase can carry the peak.
+pub const DECODE_SUPPORT: MemoryStrategySupport = MemoryStrategySupport::Implemented;
+
+/// The published rung-2 tile-edge domain (sc-26268), in output pixels, largest first: the swept
+/// set. Every edge is exact up to float reassociation (see [`DECODE_SUPPORT`]); what differs is the
+/// convolution scratch each bounds, which is calibration's to measure per cell, not this crate's to
+/// assume.
+pub const DECODE_TILE_EDGES: &[u32] = DECODE_TILE_EDGES_SWEPT;
+
+/// The published rung-2 overlap domain. The layer-wise decoder tiles with exact convolution halos
+/// and never blends, so the overlap does not change the arithmetic; it remains part of the tiling
+/// identity a selection names (`TilingConfig`), and one value is published so a selection cannot
+/// claim a distinction the decoder does not make.
+pub const DECODE_OVERLAPS: &[u32] = &[DECODE_OVERLAP];
 
 /// The attention chunk size the rung-3 sweep exercised.
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
@@ -580,7 +627,24 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// peak (see [`TRANSFORMER_WINDOW_SIZES`]). A story that publishes a bounded decode changes which
 /// phase is peak-bearing, which invalidates every rung-4 row here — so it must bump this fingerprint
 /// and re-measure the cadence domain in the same change, not inherit these numbers.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v3";
+///
+/// `v4` (sc-26268) because the execution structure changed three ways at once: the staged decode no
+/// longer carries a resident U-Net (`StagedWeightSchedule::ThreeStage`), rung 2 is published
+/// ([`DECODE_SUPPORT`]), and a packed snapshot's dense leaves now load at the compute dtype instead
+/// of their stored one. Every v3 row described a different decode-phase peak.
+pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sdxl-mlx-unet-shared-ladder-v4";
+
+/// The calibration fingerprint of a load that runs the staged **fp16-fix VAE**
+/// ([`crate::loader::VAE_FP16_FIX_COMPONENT`], sc-26268). A different decoder at a different
+/// activation width is a different execution: its decode-phase evidence must never be reused for
+/// the f32 in-snapshot VAE or the other way round.
+pub const MEMORY_CALIBRATION_FINGERPRINT_VAE_FP16: &str = "sdxl-mlx-unet-shared-ladder-v4-vae-fp16";
+
+/// Whether this load runs the staged fp16-fix VAE.
+pub fn uses_fp16_vae(spec: &LoadSpec) -> bool {
+    spec.components
+        .contains_key(crate::loader::VAE_FP16_FIX_COMPONENT)
+}
 
 /// Whether THIS load can execute rung 4. **Four** independent facts decide it.
 ///
@@ -683,12 +747,14 @@ fn phase_facts(spec: &LoadSpec) -> CoreResult<mlx_gen::gen_core::MemoryPhaseFact
     let config = crate::config::VaeConfig::sdxl_base();
     let mut facts = MemoryPhaseFacts {
         architecture: Some(mlx_gen::gen_core::ImagePipelineArchitecture::SdxlUnetWithDualClip),
-        staged_weights: StagedWeightSchedule::TwoStage,
+        // sc-26268: a staged request sheds the U-Net (and control/IP) before the decode.
+        staged_weights: StagedWeightSchedule::ThreeStage,
         transformer_stream: None,
-        // load_vae casts to f32; the upsampling constructor uses this same preset.
+        // `load_vae` casts to f32; the staged fp16-fix VAE runs f16 (sc-26268). The upsampling
+        // constructor uses this same preset.
         decoder_workspace: Some(DecoderWorkspaceFacts {
             tiling: DecoderTilingRealization::LayerwiseConvolution,
-            activation_dtype_width: 4,
+            activation_dtype_width: if uses_fp16_vae(spec) { 2 } else { 4 },
             channels: config
                 .block_out_channels
                 .iter()
@@ -987,6 +1053,13 @@ fn contract_with_asset_facts_and_streamability(
             mlx_gen::gen_core::MemoryDecodeQualityDisposition::Admitted
         )
     });
+    // Rung 2 is selectable route-blind (sc-26268) unless sealed rows take over, in which case the
+    // rows alone decide (`adopt_decode_geometry_policies` below).
+    let decode_selectable = if decode_policies.is_empty() {
+        matches!(DECODE_SUPPORT, MemoryStrategySupport::Implemented)
+    } else {
+        geometry_decode
+    };
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::MlxMetal {
@@ -1010,12 +1083,17 @@ fn contract_with_asset_facts_and_streamability(
         mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
     );
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+        if uses_fp16_vae(spec) {
+            MEMORY_CALIBRATION_FINGERPRINT_VAE_FP16
+        } else {
+            MEMORY_CALIBRATION_FINGERPRINT
+        },
         spec.load_shape,
     ));
-    // Only what the PUBLISHED rungs consume. `DecodeTileArea` and `AttentionChunkSize` are absent
-    // because rungs 2 and 3 are declared `Missing` here — a formula that reads a parameter no
-    // selectable strategy can set would invite calibration keyed on a value that never varies.
+    // Only what the PUBLISHED rungs consume. `AttentionChunkSize` is absent because rung 3 is
+    // declared `Missing` here — a formula that reads a parameter no selectable strategy can set would
+    // invite calibration keyed on a value that never varies. `DecodeTileArea` joins when rung 2 is
+    // selectable, route-blind (sc-26268) or through sealed rows.
     let mut variables = vec![
         MemoryFormulaVariable::AssetBytes,
         MemoryFormulaVariable::PixelCount,
@@ -1027,7 +1105,7 @@ fn contract_with_asset_facts_and_streamability(
         // folded into `AssetBytes`.
         variables.push(MemoryFormulaVariable::TransformerWindowSize);
     }
-    if geometry_decode {
+    if decode_selectable {
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     let overlay_bytes = overlays.iter().fold(0_u64, |total, component| {
@@ -1069,7 +1147,7 @@ fn contract_with_asset_facts_and_streamability(
         // Request-scoped: the same cached generator serves warm → staged → warm without
         // reconstruction, so the hook is available regardless of the load-time `OffloadPolicy`.
         synchronized_phase_release: true,
-        decode_tiling: geometry_decode,
+        decode_tiling: decode_selectable,
         attention_chunking: false,
         transformer_window_materialization: streamable,
     };
@@ -1094,16 +1172,42 @@ fn contract_with_asset_facts_and_streamability(
                 transformer_window_components: TRANSFORMER_WINDOW_COMPONENTS.to_vec(),
                 ..Default::default()
             },
+            MemoryStrategy::BoundedDecode
+                if matches!(DECODE_SUPPORT, MemoryStrategySupport::Implemented) =>
+            {
+                // The union of the native and PiD routes — the static validator is route-blind;
+                // admission narrows to the route the request runs (`DecodeRoutes::validate`).
+                let routes = decode_routes(provider_id)?;
+                MemoryParameterRanges {
+                    decode_tile_edges: routes.published_edges(),
+                    decode_overlaps: routes.published_overlaps(),
+                    ..Default::default()
+                }
+            }
             _ => MemoryParameterRanges::default(),
         };
     }
     contract.decode_geometry_policy_authoritative = spec.decode_geometry_policy_authoritative;
-    contract.adopt_decode_geometry_policies("sdxl", decode_policies)?;
-    // No `pid_decode_routes`: that declaration exists to split rung 2's candidate domain between the
-    // native VAE and the PiD student, and rung 2 is not selectable on this provider. The student
-    // keeps its own internal auto-planning (`mlx_gen_pid::mint_planned_decoder_with_tiling` with
-    // `selected = None`) exactly as it did before this story — unchanged behaviour, not a removal.
-    contract.pid_decode_routes = None;
+    let sealed = contract.adopt_decode_geometry_policies("sdxl", decode_policies)?;
+    // Route-blind rung 2 (sc-26268) is split between the native VAE and the PiD student
+    // (`mlx_gen_pid::DecodeRoutes`, sc-15775): the native ladder is [`DECODE_TILE_EDGES`] at
+    // [`DECODE_OVERLAP`], the student's is its own measured edge. Sealed geometry rows, when adopted,
+    // replace the whole domain and carry no PiD route.
+    contract.pid_decode_routes = if sealed || decode_policies_were_adopted(&contract) {
+        None
+    } else {
+        let routes = decode_routes(provider_id)?;
+        Some(mlx_gen::gen_core::MemoryPidDecodeRoutes {
+            native: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+                tile_edges: routes.native_edges().to_vec(),
+                tile_overlap: DECODE_OVERLAP,
+            },
+            pid: mlx_gen::gen_core::MemoryDecodeRouteDomain {
+                tile_edges: mlx_gen_pid::DecodeRoutes::pid_edges(),
+                tile_overlap: mlx_gen_pid::DecodeRoutes::pid_overlap(),
+            },
+        })
+    };
     if streamable {
         // Rung 4 bounds the U-Net's denoise-phase weight residency. Without rung 1 engaged, both
         // CLIP towers stay resident alongside it and the REQUEST peak does not move — a phase win
@@ -1120,20 +1224,74 @@ fn contract_with_asset_facts_and_streamability(
     Ok(contract)
 }
 
-/// Refuse a bounded-decode geometry. Rung 2 is `Missing` on this provider ([`DECODE_SUPPORT`]), so
-/// there is no admitted domain to validate against and every geometry is out of it.
+/// Whether sealed geometry rows took over rung 2 (they set the authoritative flag on adoption).
+fn decode_policies_were_adopted(contract: &MemoryProviderContract) -> bool {
+    contract
+        .capability(MemoryStrategy::BoundedDecode)
+        .is_some_and(|capability| !capability.parameters.decode_geometry_policies.is_empty())
+}
+
+/// The route split for rung 2 (sc-26268): the native VAE ladder, checked by the shared constructor
+/// against the PiD student's disjoint domain (sc-15775).
+fn decode_routes(provider_id: &str) -> CoreResult<mlx_gen_pid::DecodeRoutes> {
+    mlx_gen_pid::DecodeRoutes::new_core(
+        provider_id,
+        DECODE_TILE_EDGES.iter().copied(),
+        DECODE_OVERLAP,
+    )
+}
+
+/// The geometry a route-blind bounded decode runs at when the selection names none. Only the
+/// native route has a default: the PiD student honours a selected tile only when it is named
+/// (`mlx_gen_pid::engine::selected_decode_tiling`), so an unnamed PiD geometry stays unnamed and
+/// `DecodeRoutes::validate` refuses it rather than admitting a tile the student would not run.
+fn resolve_decode_geometry(
+    use_pid: bool,
+    edge: Option<u32>,
+    overlap: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    if use_pid {
+        (edge, overlap)
+    } else {
+        (
+            Some(edge.unwrap_or(DECODE_TILE_EDGE)),
+            Some(overlap.unwrap_or(DECODE_OVERLAP)),
+        )
+    }
+}
+
+/// Validate a route-blind bounded-decode selection against the domain of the route it will run
+/// (`DecodeRoutes::validate`) — the decode twin of [`validate_window`], enforced at admission
+/// *and* by the request-side resolver, because a calibration harness that hand-builds a
+/// [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory) never crosses admission. A native edge
+/// on a PiD request (or the reverse) is refused, never re-planned.
+fn validate_route_blind_decode(
+    provider_id: &str,
+    use_pid: bool,
+    edge: Option<u32>,
+    overlap: Option<u32>,
+) -> CoreResult<()> {
+    decode_routes(provider_id)?
+        .validate(use_pid, edge, overlap)
+        .map_err(|reason| refuse_decode_reason(provider_id, &reason))
+}
+
+fn refuse_decode_reason(provider_id: &str, reason: &str) -> CoreError {
+    CoreError::Unsupported(format!(
+        "{provider_id}: bounded decode geometry is outside the published rung-2 domain: {reason}"
+    ))
+}
+
+/// Refuse a bounded-decode geometry outside the published domain.
 ///
-/// This is a *rejection* rather than an absence on purpose. The shared `validate_selection` already
-/// refuses a rung the contract declares `Missing`, but a calibration harness that hand-builds a
-/// [`GenerationMemory`](mlx_gen::gen_core::GenerationMemory) and calls `generate` never crosses
-/// admission — and the tiling mechanism is still present in the crate as the sweep's subject. This
-/// closes the path from "the code exists" to "a render silently used it".
+/// This is a *rejection* rather than a silent fallback on purpose: executing an unpublished edge
+/// would run a decode no calibration priced.
 fn refuse_decode(provider_id: &str, edge: Option<u32>, overlap: Option<u32>) -> CoreError {
     CoreError::Unsupported(format!(
-        "{provider_id}: bounded decode is not selectable under the route-blind fallback (rung 2 is \
-         declared Missing). SC-19753 admits only exact sealed route/tier/mode/overlay/geometry \
-         quality rows; no applicable admitted row reached this fallback. Requested edge {edge:?} \
-         overlap {overlap:?}."
+        "{provider_id}: bounded decode geometry edge {edge:?} overlap {overlap:?} is outside the \
+         published rung-2 domain (edges {DECODE_TILE_EDGES:?}, overlaps {DECODE_OVERLAPS:?}); \
+         sealed SC-19753 route/geometry rows, when adopted, replace that domain with exactly their \
+         admitted coordinates."
     ))
 }
 
@@ -1176,16 +1334,29 @@ pub(crate) fn safety_check(
         // mode axis is deliberately permissive — unlike a text-to-image-only family. What is NOT
         // permissive is the geometry: a bounded decode must name a geometry from the route it will
         // actually execute on.
-        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode)
-            && contract
-                .capability(MemoryStrategy::BoundedDecode)
-                .is_none_or(|capability| capability.parameters.decode_geometry_policies.is_empty())
-        {
-            return Err(refuse_decode(
-                &contract.provider_id,
-                context.selection.parameters.decode_tile_edge,
-                context.selection.parameters.decode_overlap,
-            ));
+        if contract.engages_selection(&context.selection, MemoryStrategy::BoundedDecode) {
+            let capability = contract.capability(MemoryStrategy::BoundedDecode);
+            let sealed = capability.is_some_and(|capability| {
+                !capability.parameters.decode_geometry_policies.is_empty()
+            });
+            if !sealed {
+                // Route-blind rung 2 (sc-26268): the domain of the route this request runs.
+                if !capability.is_some_and(|capability| {
+                    matches!(capability.support, MemoryStrategySupport::Implemented)
+                }) {
+                    return Err(refuse_decode(
+                        &contract.provider_id,
+                        context.selection.parameters.decode_tile_edge,
+                        context.selection.parameters.decode_overlap,
+                    ));
+                }
+                let (edge, overlap) = resolve_decode_geometry(
+                    context.use_pid,
+                    context.selection.parameters.decode_tile_edge,
+                    context.selection.parameters.decode_overlap,
+                );
+                validate_route_blind_decode(&contract.provider_id, context.use_pid, edge, overlap)?;
+            }
         }
         if contract.engages(context.selection.strategy, MemoryStrategy::BoundedAttention) {
             return Err(CoreError::Unsupported(format!(
@@ -1257,7 +1428,7 @@ pub(crate) fn registered_valid_fixture(
         has_phases: true,
         overlay: None,
     };
-    let fixtures = vec![MemoryBehaviorFixture::new(
+    let mut fixtures = vec![MemoryBehaviorFixture::new(
         mlx_gen::gen_core::standard_memory_behavior_context(
             contract,
             strategy,
@@ -1265,6 +1436,19 @@ pub(crate) fn registered_valid_fixture(
             route(false),
         )?,
     )];
+    // sc-26268: the PiD route of rung 2 is a distinct admitted domain, so it gets its own fixture.
+    if contract.pid_decode_routes.is_some()
+        && contract.engages(strategy, MemoryStrategy::BoundedDecode)
+    {
+        fixtures.push(MemoryBehaviorFixture::new(
+            mlx_gen::gen_core::standard_memory_behavior_context(
+                contract,
+                strategy,
+                tier,
+                route(true),
+            )?,
+        ));
+    }
     Ok(fixtures)
 }
 
@@ -1333,12 +1517,14 @@ fn begin_with_cleanup(
         contract.generation_memory(&context.selection),
         context.use_pid,
         widest_transformer_stack(),
-        move |_use_pid, edge, overlap| Err(refuse_decode(id, Some(edge), Some(overlap))),
+        move |use_pid, edge, overlap| {
+            validate_route_blind_decode(id, use_pid, Some(edge), Some(overlap))
+        },
     )?;
     config.load_shape = context.load_shape;
     mlx_gen::request_scope::authorize_selected_geometry_decode(&mut config, contract, context)?;
-    // Rung 2 may be engaged only by the exact policy authorization above. Rung 3 remains `Missing`,
-    // so attention chunking is never set.
+    // Rung 2 is engaged by the route-blind domain (sc-26268) or by the exact policy authorization
+    // above. Rung 3 remains `Missing`, so attention chunking is never set.
     config.attention_chunk_size = None;
     config.transformer_window = contract
         .engages(
@@ -1379,14 +1565,14 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
     Ok(Some(size as usize))
 }
 
-/// Resolve rung 2 for this request. The route-blind default remains `Missing`
-/// ([`DECODE_SUPPORT`]); only a contract carrying the exact sealed geometry row may tile.
+/// Resolve rung 2 for this request: the sealed geometry row when the contract carries one, else the
+/// published route-blind domain (sc-26268, [`DECODE_SUPPORT`]).
 ///
 /// It returns `Ok(None)` — the exact single-pass decode — when the request did not ask for a bounded
-/// decode, and a typed error when it asked without exact authorization. The error direction is what
-/// matters: `Ok(None)` for a
-/// request that *did* ask would silently render an unbounded decode while the caller believed it had
-/// selected a bounded one, which is the false-green this seam exists to prevent.
+/// decode, and a typed error when it asked for a geometry outside what it may run (or with PiD).
+/// The error direction is what matters: `Ok(None)` for a request that *did* ask would silently
+/// render an unbounded decode while the caller believed it had selected a bounded one, which is the
+/// false-green this seam exists to prevent.
 #[cfg(test)]
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
     decode_tiling_with_contract(req, None)
@@ -1450,14 +1636,33 @@ fn decode_tiling_with_contract(
             overlap as i32,
         )));
     }
-    Err(mlx_gen::Error::Unsupported(
-        refuse_decode(
-            crate::MODEL_ID,
-            memory.decode_tile_edge,
-            memory.decode_overlap,
-        )
-        .to_string(),
-    ))
+    if !matches!(DECODE_SUPPORT, MemoryStrategySupport::Implemented) {
+        return Err(mlx_gen::Error::Unsupported(
+            refuse_decode(
+                crate::MODEL_ID,
+                memory.decode_tile_edge,
+                memory.decode_overlap,
+            )
+            .to_string(),
+        ));
+    }
+    let (edge, overlap) =
+        resolve_decode_geometry(req.use_pid, memory.decode_tile_edge, memory.decode_overlap);
+    validate_route_blind_decode(crate::MODEL_ID, req.use_pid, edge, overlap)
+        .map_err(|error| mlx_gen::Error::Unsupported(error.to_string()))?;
+    // `validate` refused a missing value on either route, so both are present here.
+    let (Some(edge), Some(overlap)) = (edge, overlap) else {
+        unreachable!("DecodeRoutes::validate rejects an unnamed geometry");
+    };
+    mlx_gen::diagnostics::record_geometry_decode_decision(
+        mlx_gen::diagnostics::DecodePolicyDisposition::Unchanged,
+        mlx_gen::diagnostics::DecodePathDisposition::Tiled,
+        None,
+    );
+    Ok(Some(TilingConfig::spatial_only(
+        edge as i32,
+        overlap as i32,
+    )))
 }
 
 /// Rung 3: **always the unbounded plan.** Bounded attention is `Missing` on this provider
@@ -1496,9 +1701,9 @@ pub(crate) fn default_stage_residency(spec: &LoadSpec) -> bool {
 pub fn declared_parameters() -> mlx_gen::gen_core::MemoryStrategyParameters {
     mlx_gen::gen_core::MemoryStrategyParameters {
         stage_residency: None,
-        decode_tile_edge: None,
-        decode_overlap: None,
-        // Rungs 2 and 3 are `Missing`, so this provider declares no decode or attention parameter.
+        // Rung 2 is published route-blind (sc-26268); rung 3 is `Missing`, so no attention parameter.
+        decode_tile_edge: Some(DECODE_TILE_EDGE),
+        decode_overlap: Some(DECODE_OVERLAP),
         attention_chunk_size: None,
         transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
         transformer_window_component: Some(TRANSFORMER_WINDOW_COMPONENT),
@@ -1702,53 +1907,29 @@ mod tests {
         assert!(contract.conformance_errors().is_empty());
     }
 
-    /// **Rungs 2 and 3 are refused on every layer**, and the refusal names why.
+    /// **Rung 3 is refused on every layer**, and the refusal names why.
     ///
     /// This is the test that keeps a measured-and-rejected rung from drifting back into
-    /// reachability: the mechanisms are still in the crate (the sweep drives them), so the only
-    /// thing standing between `Autoencoder::decode_tiled` and a production render is these
-    /// refusals.
+    /// reachability: the mechanism is still in the crate (the sweep drives it), so the only thing
+    /// standing between `sdpa_budgeted_bhsd` and a production render is these refusals.
     #[test]
-    fn the_rejected_rungs_are_refused_on_every_layer() {
+    fn the_rejected_attention_rung_is_refused_on_every_layer() {
         let contract = contract(LoadShape::DeferredMaterialization);
-        for strategy in [
-            MemoryStrategy::BoundedDecode,
-            MemoryStrategy::BoundedAttention,
-        ] {
-            assert_eq!(
-                contract.capability(strategy).unwrap().support,
-                MemoryStrategySupport::Missing,
-                "{strategy:?} was measured and rejected; it must declare Missing"
-            );
-            // A `Missing` rung is never engaged, so the cost-order default cannot drag it in behind
-            // a rung-4 selection either.
-            assert!(
-                !contract.engages(MemoryStrategy::BoundedTransformerResidency, strategy),
-                "{strategy:?} must not be engaged by the rung-4 cost-order default"
-            );
-        }
-        assert!(!contract.lifecycle.decode_tiling);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Missing,
+            "rung 3 was measured and rejected; it must declare Missing"
+        );
+        // A `Missing` rung is never engaged, so the cost-order default cannot drag it in behind a
+        // rung-4 selection either.
+        assert!(!contract.engages(
+            MemoryStrategy::BoundedTransformerResidency,
+            MemoryStrategy::BoundedAttention
+        ));
         assert!(!contract.lifecycle.attention_chunking);
-        assert!(
-            contract.pid_decode_routes.is_none(),
-            "the PiD route split exists to parameterize rung 2, which is not selectable here"
-        );
-
-        // Layer two: the request-side resolvers, which a calibration harness reaches directly.
-        let tiled = GenerationRequest {
-            memory: Some(GenerationMemory {
-                tile_vae_decode: true,
-                decode_tile_edge: Some(DECODE_TILE_EDGE),
-                decode_overlap: Some(DECODE_OVERLAP),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let err = decode_tiling(&tiled).expect_err("a bounded-decode request must be refused");
-        assert!(
-            err.to_string().contains("no applicable admitted row"),
-            "got: {err}"
-        );
 
         let chunked = GenerationRequest {
             memory: Some(GenerationMemory {
@@ -1760,12 +1941,160 @@ mod tests {
         let err =
             attention_plan(&chunked).expect_err("a bounded-attention request must be refused");
         assert!(err.to_string().contains("0.00%"), "got: {err}");
-
-        // The controls. Without these, a resolver that refused unconditionally would pass.
-        assert!(decode_tiling(&GenerationRequest::default())
-            .unwrap()
-            .is_none());
+        // The control. Without it, a resolver that refused unconditionally would pass.
         assert!(attention_plan(&GenerationRequest::default()).is_ok());
+    }
+
+    /// sc-26268: **rung 2 is published route-blind** over [`DECODE_TILE_EDGES`] ×
+    /// [`DECODE_OVERLAPS`], and every layer — the contract, admission (`safety_check`), the request
+    /// scope's validator, and the request-side resolver a harness reaches directly — admits exactly
+    /// that domain, refuses a geometry outside it by name, and refuses it under PiD.
+    #[test]
+    fn the_published_decode_rung_is_admitted_and_bounded_on_every_layer() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
+        assert_eq!(decode.support, MemoryStrategySupport::Implemented);
+        let routes = decode_routes(crate::MODEL_ID).unwrap();
+        assert_eq!(routes.native_edges(), DECODE_TILE_EDGES);
+        assert_eq!(
+            decode.parameters.decode_tile_edges,
+            routes.published_edges()
+        );
+        assert_eq!(
+            decode.parameters.decode_overlaps,
+            routes.published_overlaps()
+        );
+        for edge in DECODE_TILE_EDGES {
+            assert!(decode.parameters.decode_tile_edges.contains(edge));
+        }
+        assert!(decode.parameters.decode_geometry_policies.is_empty());
+        assert!(contract.lifecycle.decode_tiling);
+        assert!(DECODE_TILE_EDGES.contains(&DECODE_TILE_EDGE));
+        assert!(DECODE_OVERLAPS.contains(&DECODE_OVERLAP));
+        let split = contract
+            .pid_decode_routes
+            .as_ref()
+            .expect("a PiD-eligible provider splits rung 2 by route");
+        assert_eq!(split.native.tile_edges, DECODE_TILE_EDGES);
+        assert_eq!(split.pid.tile_edges, mlx_gen_pid::DecodeRoutes::pid_edges());
+
+        // Admission: a calibrated rung-2 context at every published edge is admitted; an
+        // unpublished edge and a PiD route are refused by the provider gate.
+        let tier = loaded_tier(&spec);
+        let route = |use_pid| MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid,
+            has_phases: true,
+            overlay: None,
+        };
+        let context_at = |edge: u32, use_pid: bool| {
+            let mut context = mlx_gen::gen_core::standard_memory_behavior_context(
+                &contract,
+                MemoryStrategy::BoundedDecode,
+                tier,
+                route(use_pid),
+            )
+            .unwrap();
+            context.selection.parameters.decode_tile_edge = Some(edge);
+            context.selection.parameters.decode_overlap = Some(DECODE_OVERLAP);
+            context
+        };
+        let rejected = |decision: MemorySafetyDecision| match decision {
+            MemorySafetyDecision::Reject { reason } => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+        for edge in DECODE_TILE_EDGES {
+            let decision = safety_check(&spec, &contract, &context_at(*edge, false));
+            assert!(
+                !matches!(decision, MemorySafetyDecision::Reject { .. }),
+                "edge {edge} is published and must be admitted: {decision:?}"
+            );
+        }
+        let reason = rejected(safety_check(&spec, &contract, &context_at(1000, false)));
+        assert!(reason.contains("outside"), "got: {reason}");
+        // A native edge on the PiD route is refused, never re-planned.
+        let reason = rejected(safety_check(
+            &spec,
+            &contract,
+            &context_at(DECODE_TILE_EDGE, true),
+        ));
+        assert!(reason.contains("outside"), "got: {reason}");
+        let (pid_edge, pid_overlap) = (
+            mlx_gen_pid::DecodeRoutes::pid_edges()[0],
+            mlx_gen_pid::DecodeRoutes::pid_overlap(),
+        );
+        let mut pid = context_at(pid_edge, true);
+        pid.selection.parameters.decode_overlap = Some(pid_overlap);
+        let decision = safety_check(&spec, &contract, &pid);
+        assert!(
+            !matches!(decision, MemorySafetyDecision::Reject { .. }),
+            "the PiD route's own geometry is admitted: {decision:?}"
+        );
+
+        // The request scope's own validator — the closure `begin_with_cleanup` installs.
+        let check = |use_pid, edge: u32, overlap: u32| {
+            validate_route_blind_decode("sdxl", use_pid, Some(edge), Some(overlap))
+        };
+        assert!(check(false, 512, DECODE_OVERLAP).is_ok());
+        assert!(check(false, 500, DECODE_OVERLAP).is_err());
+        assert!(check(false, 512, 7).is_err());
+        assert!(check(true, 512, DECODE_OVERLAP).is_err());
+        assert!(check(true, pid_edge, pid_overlap).is_ok());
+        assert!(validate_route_blind_decode("sdxl", true, None, None).is_err());
+
+        // The request-side resolver: the selected geometry, the published default, and the refusals.
+        let tiled = |edge: Option<u32>, overlap: Option<u32>, use_pid: bool| GenerationRequest {
+            use_pid,
+            memory: Some(GenerationMemory {
+                tile_vae_decode: true,
+                decode_tile_edge: edge,
+                decode_overlap: overlap,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spatial = |req: &GenerationRequest| {
+            let tiling = decode_tiling_for_contract(req, &contract)
+                .unwrap()
+                .expect("a bounded-decode request must tile");
+            let spatial = tiling.spatial.unwrap();
+            (spatial.tile_px, spatial.overlap_px)
+        };
+        assert_eq!(
+            spatial(&tiled(Some(256), Some(DECODE_OVERLAP), false)),
+            (256, DECODE_OVERLAP as i32)
+        );
+        assert_eq!(
+            spatial(&tiled(None, None, false)),
+            (DECODE_TILE_EDGE as i32, DECODE_OVERLAP as i32)
+        );
+        assert!(decode_tiling_for_contract(&tiled(Some(1000), None, false), &contract).is_err());
+        assert!(
+            decode_tiling_for_contract(&tiled(Some(512), Some(DECODE_OVERLAP), true), &contract)
+                .is_err(),
+            "a native edge on the PiD route is refused"
+        );
+        assert_eq!(
+            spatial(&tiled(Some(pid_edge), Some(pid_overlap), true)),
+            (pid_edge as i32, pid_overlap as i32)
+        );
+        assert!(
+            decode_tiling_for_contract(&tiled(None, None, true), &contract).is_err(),
+            "the student honours only a named tile, so an unnamed PiD geometry is refused"
+        );
+        // The control: a request that did not ask decodes exactly.
+        assert!(
+            decode_tiling_for_contract(&GenerationRequest::default(), &contract)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2061,6 +2390,56 @@ mod tests {
         bytes.extend(header);
         bytes.resize(bytes.len() + data_bytes, 0);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// sc-26268: a staged fp16-fix VAE is a different execution — its own calibration fingerprint,
+    /// a 2-byte decoder workspace, and a decoder priced at f16 from the component file the load
+    /// opens (here an f32 file of 1000 elements: 4000 B stored, 2000 B resident). Every load now
+    /// publishes the three-stage schedule, because a staged request sheds the U-Net before decode.
+    #[test]
+    fn a_staged_fp16_fix_vae_is_priced_and_keyed_as_its_own_execution() {
+        use mlx_gen::gen_core::StagedWeightSchedule;
+        let tmp = tempfile::tempdir().unwrap();
+        let vae_dir = tmp.path().join("sdxl-vae-fp16-fix");
+        std::fs::create_dir_all(&vae_dir).unwrap();
+        write_tensor(
+            &vae_dir.join("diffusion_pytorch_model.safetensors"),
+            "F32",
+            1000,
+            4,
+        );
+        let plain = spec(LoadShape::DeferredMaterialization);
+        let with_fix = plain.clone().with_component(
+            crate::loader::VAE_FP16_FIX_COMPONENT,
+            WeightsSource::Dir(vae_dir),
+        );
+        assert!(!uses_fp16_vae(&plain));
+        assert!(uses_fp16_vae(&with_fix));
+
+        let fingerprint = |contract: &MemoryProviderContract| {
+            contract.calibration.as_ref().unwrap().fingerprint.clone()
+        };
+        let workspace_width = |contract: &MemoryProviderContract| {
+            let facts = contract.phase_facts.as_ref().unwrap();
+            assert_eq!(facts.staged_weights, StagedWeightSchedule::ThreeStage);
+            facts
+                .decoder_workspace
+                .as_ref()
+                .unwrap()
+                .activation_dtype_width
+        };
+        let base = memory_strategy_contract(crate::MODEL_ID, &plain).unwrap();
+        let fixed = memory_strategy_contract(crate::MODEL_ID, &with_fix).unwrap();
+        assert!(
+            fixed.conformance_errors().is_empty(),
+            "{:?}",
+            fixed.conformance_errors()
+        );
+        assert_eq!(fingerprint(&base), MEMORY_CALIBRATION_FINGERPRINT);
+        assert_eq!(fingerprint(&fixed), MEMORY_CALIBRATION_FINGERPRINT_VAE_FP16);
+        assert_eq!(workspace_width(&base), 4);
+        assert_eq!(workspace_width(&fixed), 2);
+        assert_eq!(fixed.asset_facts.decoder_bytes, 2000);
     }
 
     /// A multi-tensor safetensors file. Each entry is `(name, dtype, shape, data_bytes)`; the

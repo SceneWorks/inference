@@ -22,6 +22,7 @@
 //! "a plan per Transformer2D, not one per model", expressed in the type.
 
 use mlx_gen::attention::AttentionPlan;
+use mlx_gen::gen_core::CfgBatching;
 use mlx_gen::CancelFlag;
 
 /// Rung 4's request-scoped cadence: how many consecutive `TransformerBlock`s of **each**
@@ -39,30 +40,48 @@ pub struct SdxlBlockWindow<'a> {
 
 /// The bounded-execution levers for one denoise forward.
 ///
-/// `Copy` and cheap (a budget, two `Option`s and a borrow), so the per-step closures in
+/// `Copy` and cheap (a budget, two `Option`s, a mode and a borrow), so the per-step closures in
 /// `pipeline` can capture it without a lifetime fight.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct SdxlForwardPlan<'a> {
     /// Rung 3 — the query-row chunking budget handed to
     /// [`mlx_gen::attention::sdpa_budgeted_bhsd`] at every attention site.
     pub attention: AttentionPlan<'a>,
     /// Rung 4 — the block-window cadence, or `None` for the resident stack.
     pub window: Option<SdxlBlockWindow<'a>>,
+    /// How a guided step evaluates its conditional and unconditional halves (sc-26268) — the shared
+    /// [`CfgBatching`] execution domain, not a ladder rung. [`CfgBatching::Batched`] is the
+    /// historical `[cond, uncond]` doubled-batch forward; [`CfgBatching::Sequential`] runs two
+    /// batch-1 forwards, halving the guided denoise's activation high-water. Inert when CFG is off.
+    pub cfg_batching: CfgBatching,
+}
+
+impl Default for SdxlForwardPlan<'_> {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
 }
 
 impl<'a> SdxlForwardPlan<'a> {
-    /// The historical unbounded forward: no attention chunking, no block window.
+    /// The historical unbounded forward: no attention chunking, no block window, batched CFG.
     pub const UNBOUNDED: Self = Self {
         attention: AttentionPlan::UNBOUNDED,
         window: None,
+        cfg_batching: CfgBatching::Batched,
     };
 
     /// Rung 3 only, leaving the transformer stack resident.
     pub fn with_attention(attention: AttentionPlan<'a>) -> Self {
         Self {
             attention,
-            window: None,
+            ..Self::UNBOUNDED
         }
+    }
+
+    /// Select the guided step's CFG batching (sc-26268).
+    pub fn with_cfg_batching(mut self, cfg_batching: CfgBatching) -> Self {
+        self.cfg_batching = cfg_batching;
+        self
     }
 
     /// Add (or clear) rung 4's cadence.

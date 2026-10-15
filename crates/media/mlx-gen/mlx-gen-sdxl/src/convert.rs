@@ -122,8 +122,52 @@ fn quantize_component(
 ) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     let map = quantize_map(load_component_map(src, stem)?, bits, GROUP_SIZE, is_target)?;
+    let map = dense_leaves_at_compute_dtype(map)?;
     save_map(&dst.join(format!("{stem}.safetensors")), &map)?;
     write_quantized_config(src, dst, bits, GROUP_SIZE)
+}
+
+/// The compute dtype every dense leaf of a packed tier runs at — the loader casts a dense snapshot's
+/// U-Net and CLIP towers to it, and (since sc-26268) a packed snapshot's dense leaves too.
+const DENSE_LEAF_DTYPE: mlx_rs::Dtype = mlx_rs::Dtype::Float16;
+
+/// Write a packed tier's **dense** leaves (convs, norms, embeddings, the packed linears' own biases)
+/// at [`DENSE_LEAF_DTYPE`], leaving each affine pack (u32 codes + `.scales`/`.biases`) as
+/// `quantize_map` wrote it (sc-26268).
+///
+/// [`load_component_map`] reads the f32 master when a source ships one, and `quantize_map` keeps
+/// every non-target leaf at its source dtype — so a source with an f32 master (RealVisXL,
+/// Illustrious) produced a packed U-Net carrying 1.33 GB of f32 dense leaves where `sdxl` (fp16
+/// source) carries 0.67 GB. The loader casts them to f16 anyway, so the f32 bytes bought nothing
+/// but download size (the bulk of `illustrious-xl-v2` q4's 3.91 GB against `sdxl` q4's 2.70 GB).
+fn dense_leaves_at_compute_dtype(map: HashMap<String, Array>) -> Result<HashMap<String, Array>> {
+    let mut weights = Weights::from_map(map);
+    weights.cast_unpacked_floats(DENSE_LEAF_DTYPE)?;
+    Ok(weights.into_tensors())
+}
+
+/// Mirror the dense VAE into a tier: the `.fp16` variant alone when the source ships one (every
+/// published SDXL-family tier's loader reads it — `loader::resolve_vae_weight_file` falls back to it
+/// and upcasts), else the directory verbatim. Before sc-26268 a source shipping both variants put
+/// both in every tier: 335 MB of f32 VAE no load needed beside the 167 MB fp16 one.
+fn mirror_vae(src: &Path, dst: &Path) -> Result<()> {
+    let fp16 = src.join("diffusion_pytorch_model.fp16.safetensors");
+    if !fp16.is_file() {
+        return copy_dir(src, dst);
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') || !path.is_file() {
+            continue;
+        }
+        if name.ends_with(".safetensors") && path != fp16 {
+            continue;
+        }
+        std::fs::copy(&path, dst.join(name))?;
+    }
+    Ok(())
 }
 
 /// Assemble a full pre-quantized turnkey SDXL snapshot in `dst_root`: pack the U-Net + both CLIP text
@@ -157,7 +201,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     // VAE stays dense (never quantized) — mirror the source `vae/` verbatim (deref symlinks).
     let vae_src = src_root.join("vae");
     if vae_src.exists() {
-        copy_dir(&vae_src, &dst_root.join("vae"))?;
+        mirror_vae(&vae_src, &dst_root.join("vae"))?;
     }
     // Tokenizers + scheduler are non-weight assets — copy verbatim.
     for rel in ["tokenizer", "tokenizer_2", "scheduler"] {
@@ -174,6 +218,49 @@ mod tests {
     use super::*;
     use mlx_rs::ops::{eq, quantize};
     use mlx_rs::{Array, Dtype};
+
+    /// sc-26268: a tier's dense leaves land at f16 whatever the source master's dtype, the pack is
+    /// untouched, and a VAE shipped in both variants is mirrored as its `.fp16` file alone.
+    #[test]
+    fn packed_tiers_store_dense_leaves_at_f16_and_one_vae_variant() {
+        let mut map: HashMap<String, Array> = HashMap::new();
+        map.insert(
+            "conv_in.weight".into(),
+            Array::from_slice(&[0.5f32; 4], &[1, 1, 2, 2]),
+        );
+        map.insert("proj.weight".into(), Array::from_slice(&[1u32], &[1]));
+        map.insert(
+            "proj.scales".into(),
+            Array::from_slice(&[1.0f32], &[1])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        let out = dense_leaves_at_compute_dtype(map).unwrap();
+        assert_eq!(out["conv_in.weight"].dtype(), Dtype::Float16);
+        assert_eq!(out["proj.weight"].dtype(), Dtype::Uint32);
+        assert_eq!(out["proj.scales"].dtype(), Dtype::Bfloat16);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        for name in [
+            "config.json",
+            "diffusion_pytorch_model.safetensors",
+            "diffusion_pytorch_model.fp16.safetensors",
+        ] {
+            std::fs::write(src.join(name), name).unwrap();
+        }
+        mirror_vae(&src, &dst).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["config.json", "diffusion_pytorch_model.fp16.safetensors"]
+        );
+    }
 
     #[test]
     fn clip_predicate_skips_embeddings_packs_projections() {

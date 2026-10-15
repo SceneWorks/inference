@@ -39,6 +39,24 @@ fn is_packed(w: &Weights) -> bool {
     w.keys().any(|k| k.ends_with(".scales"))
 }
 
+/// The load-time downcast for one component at `dtype`, for both snapshot shapes.
+///
+/// A dense snapshot casts every tensor (the vendored reference's `v.astype(dtype)`). A **packed**
+/// snapshot must leave its affine packs alone (a blanket cast corrupts the u32 codes) — but its
+/// *dense* leaves (convs, norms, embeddings, the packed linears' own biases) still follow the
+/// compute dtype, exactly as they would on a dense load of the same model. Before sc-26268 a packed
+/// snapshot skipped the cast entirely, so a producer that wrote its dense leaves at f32 shipped them
+/// resident at f32: the published `illustrious-xl-v{1,2}` q4 U-Net carries 1.33 GB of f32 dense
+/// leaves (`sdxl` q4: 0.67 GB at f16), which the memory contract already prices at 16-bit — the load
+/// now matches the price.
+fn cast_for_load(w: &mut Weights, dtype: Dtype) -> Result<()> {
+    if is_packed(w) {
+        w.cast_unpacked_floats(dtype)
+    } else {
+        w.cast_all(dtype)
+    }
+}
+
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
 ///
 /// `pub(crate)` for ladder rung 4 (SC-15525): `model::load_heavy` records the U-Net file this
@@ -85,10 +103,8 @@ fn load_clip_dtype(
 ) -> Result<ClipTextEncoder> {
     let file = resolve_weight_file(root, subdir, "model", dtype)?;
     let mut w = Weights::from_file(&file)?;
-    // A packed (pre-quantized) snapshot keeps its on-disk dtypes; only a dense snapshot downcasts.
-    if !is_packed(&w) {
-        w.cast_all(dtype)?;
-    }
+    // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
+    cast_for_load(&mut w, dtype)?;
     let encoder = ClipTextEncoder::from_weights(&w, "text_model", cfg)?;
     // Materialize at load (after the cast, before any `quantize`): left lazy, the first forward's
     // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
@@ -102,7 +118,7 @@ pub(crate) fn load_clip_from_weights(
     cfg: &ClipTextConfig,
     dtype: Dtype,
 ) -> Result<ClipTextEncoder> {
-    weights.cast_all(dtype)?;
+    cast_for_load(&mut weights, dtype)?;
     ClipTextEncoder::from_weights(&weights, "text_model", cfg)
 }
 
@@ -124,7 +140,7 @@ pub(crate) fn load_unet_from_weights(
     mut weights: Weights,
     dtype: Dtype,
 ) -> Result<UNet2DConditionModel> {
-    weights.cast_all(dtype)?;
+    cast_for_load(&mut weights, dtype)?;
     UNet2DConditionModel::from_weights(&weights, &UNetConfig::sdxl_base())
 }
 
@@ -187,10 +203,8 @@ pub fn load_unet_with_config_streamed(
 ) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
     let mut w = Weights::from_file(&file)?;
-    // A packed (pre-quantized) snapshot keeps its on-disk dtypes; only a dense snapshot downcasts.
-    if !is_packed(&w) {
-        w.cast_all(dtype)?;
-    }
+    // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
+    cast_for_load(&mut w, dtype)?;
     let unet = UNet2DConditionModel::from_weights(&w, cfg)?;
     if streamed {
         let resident: Vec<(String, mlx_rs::Array)> = w
@@ -241,11 +255,8 @@ pub fn load_controlnet(
         mlx_gen::WeightsSource::File(p) => Weights::from_file(p)?,
         mlx_gen::WeightsSource::Dir(p) => Weights::from_dir(p)?,
     };
-    // F-082: same packed guard as the U-Net load — casting a pre-quantized checkpoint's packed u32
-    // payloads to a float dtype would corrupt them; only a dense checkpoint downcasts.
-    if !is_packed(&w) {
-        w.cast_all(dtype)?;
-    }
+    // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
+    cast_for_load(&mut w, dtype)?;
     let control = crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())?;
     // Materialize at load, before any `quantize` (sc-24245; see [`load_unet_with_config_streamed`]).
     w.materialize_accessed()?;
@@ -279,10 +290,8 @@ pub fn load_ip_adapter(
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
     let mut enc_w = Weights::from_file(dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE))?;
-    // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
-    if !is_packed(&enc_w) {
-        enc_w.cast_all(dtype)?;
-    }
+    // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
+    cast_for_load(&mut enc_w, dtype)?;
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
     // Materialize at load (sc-24245; see [`load_unet_with_config_streamed`]).
     enc_w.materialize_accessed()?;
@@ -298,10 +307,8 @@ pub fn load_ip_adapter(
             ))
         })?;
     let mut ip_w = Weights::from_file(&ip_file)?;
-    // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
-    if !is_packed(&ip_w) {
-        ip_w.cast_all(dtype)?;
-    }
+    // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
+    cast_for_load(&mut ip_w, dtype)?;
     let resampler =
         Resampler::from_weights(&ip_w, "image_proj", &ResamplerConfig::plus_sdxl_vit_h())?;
     let pairs = load_ip_kv_pairs(&ip_w)?;
@@ -338,7 +345,103 @@ pub fn resolve_vae_weight_file(root: &Path) -> Result<PathBuf> {
     resolve_weight_file(root, "vae", "diffusion_pytorch_model", Dtype::Float32)
 }
 
-/// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
+/// The caller-staged component id of the **fp16-fix VAE** (`madebyollin/sdxl-vae-fp16-fix`) — the
+/// same id the Candle SDXL engine requires and SceneWorks already provisions for it
+/// (`LoadSpec::components` registry, epic 13657).
+///
+/// On MLX the component is **optional** (sc-26268). Absent, the VAE is the in-snapshot one at f32,
+/// byte-identical to every earlier release. Present, the VAE is that checkpoint at **f16** — the
+/// fp16-fix finetune keeps the decoder's activations inside the f16 range, which is the whole reason
+/// it exists (the stock SDXL VAE overflows at f16, which is why the in-snapshot path runs f32). It
+/// halves the VAE's resident weights and, more importantly, the decode's full-resolution activation
+/// working set — the low-memory path an 8 GB device needs.
+pub const VAE_FP16_FIX_COMPONENT: &str = "vae_fp16_fix";
+
+/// The f16 compute dtype the fp16-fix VAE runs at.
+pub const VAE_FP16_FIX_DTYPE: Dtype = Dtype::Float16;
+
+/// The exact checkpoint file a staged fp16-fix VAE component resolves to: a `File` is used as-is; a
+/// `Dir` (the `madebyollin/sdxl-vae-fp16-fix` snapshot) resolves `diffusion_pytorch_model.safetensors`,
+/// then its `.fp16` variant — the same rule the Candle loader applies to the same component.
+pub fn resolve_vae_fp16_fix_file(source: &mlx_gen::WeightsSource) -> Result<PathBuf> {
+    match source {
+        mlx_gen::WeightsSource::File(file) => Ok(file.clone()),
+        mlx_gen::WeightsSource::Dir(dir) => [
+            "diffusion_pytorch_model.safetensors",
+            "diffusion_pytorch_model.fp16.safetensors",
+        ]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "sdxl: staged `{VAE_FP16_FIX_COMPONENT}` component has no \
+                         diffusion_pytorch_model(.fp16).safetensors in {}",
+                dir.display()
+            ))
+        }),
+    }
+}
+
+/// Load the staged fp16-fix VAE at [`VAE_FP16_FIX_DTYPE`].
+pub fn load_vae_fp16_fix(source: &mlx_gen::WeightsSource) -> Result<Autoencoder> {
+    let mut w = Weights::from_file(resolve_vae_fp16_fix_file(source)?)?;
+    w.cast_all(VAE_FP16_FIX_DTYPE)?;
+    let vae = Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())?;
+    // Materialize at load (sc-24245; see [`load_unet_with_config_streamed`]).
+    w.materialize_accessed()?;
+    Ok(vae)
+}
+
+/// The VAE a load runs: the staged fp16-fix component at f16 when the spec carries one, else the
+/// in-snapshot VAE at f32 (the historical path, byte-identical).
+pub(crate) fn load_vae_for_spec(spec: &mlx_gen::LoadSpec, root: &Path) -> Result<Autoencoder> {
+    match spec.components.get(VAE_FP16_FIX_COMPONENT) {
+        Some(source) => load_vae_fp16_fix(source),
+        None => load_vae(root),
+    }
+}
+
+/// sc-26268: the staged fp16-fix VAE component resolves exactly like the Candle loader resolves
+/// the same component — a file as-is, a snapshot directory's master then its `.fp16` variant — and
+/// a directory holding neither is a load error naming the component.
+#[cfg(test)]
+mod vae_fp16_fix_tests {
+    use super::*;
+    use mlx_gen::WeightsSource;
+
+    #[test]
+    fn the_component_resolves_like_the_candle_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = resolve_vae_fp16_fix_file(&WeightsSource::Dir(dir.clone())).unwrap_err();
+        assert!(
+            missing.to_string().contains(VAE_FP16_FIX_COMPONENT),
+            "{missing}"
+        );
+
+        let fp16 = dir.join("diffusion_pytorch_model.fp16.safetensors");
+        std::fs::write(&fp16, b"").unwrap();
+        assert_eq!(
+            resolve_vae_fp16_fix_file(&WeightsSource::Dir(dir.clone())).unwrap(),
+            fp16
+        );
+        let master = dir.join("diffusion_pytorch_model.safetensors");
+        std::fs::write(&master, b"").unwrap();
+        assert_eq!(
+            resolve_vae_fp16_fix_file(&WeightsSource::Dir(dir.clone())).unwrap(),
+            master,
+            "the master wins when both are staged"
+        );
+        assert_eq!(
+            resolve_vae_fp16_fix_file(&WeightsSource::File(fp16.clone())).unwrap(),
+            fp16
+        );
+    }
+}
+
+/// F-181: the `Sequential` re-quant warn/// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
 /// when a load-time (re)quant over a **dense** snapshot will actually happen — an already-packed
 /// turnkey loads packed and must NOT warn. Weight-free: writes only a `unet/config.json`.
 #[cfg(test)]

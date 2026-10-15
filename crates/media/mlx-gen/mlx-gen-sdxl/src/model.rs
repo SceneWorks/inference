@@ -17,7 +17,7 @@ use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Residency, Result, Scheduler, Solver, TcdSampler, WeightsSource,
+    Quant, Residency, Result, Scheduler, Solver, StagedHeavy, TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
@@ -25,7 +25,7 @@ use std::path::Path;
 
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
-use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 
 use crate::config::{DiffusionConfig, UNetConfig};
 use crate::inpaint::{preprocess_mask, InpaintBlend};
@@ -226,9 +226,33 @@ pub fn descriptor() -> ModelDescriptor {
             // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
             supports_sequential_offload: true,
             supports_preview: true,
+            // sc-26268: both CFG batchings are implemented on every denoise route (ancestral,
+            // curated, CFG++), through `pipeline::guided_eps_pair`.
+            execution: mlx_gen::gen_core::ExecutionSurface {
+                cfg_batching: mlx_gen::gen_core::CfgBatchingDomain::Modes(
+                    CFG_BATCHING_MODES.to_vec(),
+                ),
+                ..Default::default()
+            },
             ..Default::default()
         },
     }
+}
+
+/// The CFG batchings this provider implements (sc-26268): the historical doubled batch and the
+/// two-forward sequential mode a constrained device selects.
+pub const CFG_BATCHING_MODES: [mlx_gen::gen_core::CfgBatching; 2] = [
+    mlx_gen::gen_core::CfgBatching::Batched,
+    mlx_gen::gen_core::CfgBatching::Sequential,
+];
+
+/// The request's CFG batching. `None` ⇒ [`CfgBatching::Batched`](mlx_gen::gen_core::CfgBatching),
+/// exactly what every SDXL denoise ran before sc-26268. The shared request floor
+/// (`Capabilities::validate_request`) has already refused a mode outside [`CFG_BATCHING_MODES`].
+pub(crate) fn resolve_cfg_batching(req: &GenerationRequest) -> mlx_gen::gen_core::CfgBatching {
+    req.memory
+        .and_then(|memory| memory.cfg_batching)
+        .unwrap_or(mlx_gen::gen_core::CfgBatching::Batched)
 }
 
 /// A loaded SDXL generator: the dual CLIP encoders + tokenizer, the U-Net, the VAE, the
@@ -327,6 +351,49 @@ impl SdxlHeavyOwned {
     }
 }
 
+/// The decode-only half of [`SdxlHeavyOwned`] that survives a **staged** request's denoise
+/// (sc-26268): the VAE and the optional PiD overlay. [`StagedHeavy::shed_dit`] drops the U-Net, the
+/// ControlNet branches and the IP-Adapter encoder before decode starts, so the decode's
+/// full-resolution working set no longer stacks on top of a resident U-Net — the dominant term of an
+/// SDXL request's high-water, because the decode is where that high-water is reached.
+pub(crate) struct SdxlLight {
+    vae: Autoencoder,
+    #[allow(dead_code)] // carried for symmetry: the PiD decoder is minted during denoise
+    pid: Option<PidEngine>,
+}
+
+/// A borrowed decode view — from the still-warm [`SdxlHeavyOwned`] on a resident request, or from
+/// the post-shed [`SdxlLight`] on a staged one — so the decode body is written once.
+pub(crate) struct SdxlDecodeView<'a> {
+    vae: &'a Autoencoder,
+}
+
+impl StagedHeavy for SdxlHeavyOwned {
+    type Light = SdxlLight;
+    type DecodeView<'a> = SdxlDecodeView<'a>;
+
+    fn shed_dit(self) -> SdxlLight {
+        // `unet`, `controls` and `ip_adapter` drop here; the shared driver then runs the runtime's
+        // `after_component_drop` (an eval barrier + `clear_cache`) before decode begins.
+        SdxlLight {
+            vae: self.vae,
+            pid: self.pid,
+        }
+    }
+
+    fn decode_view(&self) -> SdxlDecodeView<'_> {
+        SdxlDecodeView { vae: &self.vae }
+    }
+
+    fn light_view(light: &SdxlLight) -> SdxlDecodeView<'_> {
+        SdxlDecodeView { vae: &light.vae }
+    }
+}
+
+/// What the denoise phase hands the decode phase: every image's final latent (evaluated), plus the
+/// PiD decoder minted for this request (owned, so it outlives the shed U-Net bundle).
+type SdxlDenoised = (Vec<mlx_rs::Array>, Option<PidDecoder>);
+
 /// Construct an [`Sdxl`] from a [`LoadSpec`].
 ///
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a
@@ -351,7 +418,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
     if matches!(spec.weights, WeightsSource::File(_)) {
-        mlx_gen::gen_core::reject_unknown_components(spec, &[LDM_TOKENIZER_COMPONENT], MODEL_ID)?;
+        mlx_gen::gen_core::reject_unknown_components(
+            spec,
+            &[LDM_TOKENIZER_COMPONENT, loader::VAE_FP16_FIX_COMPONENT],
+            MODEL_ID,
+        )?;
         let tokenizer_root = match spec.components.get(LDM_TOKENIZER_COMPONENT) {
             Some(WeightsSource::Dir(path)) => path,
             Some(WeightsSource::File(path)) => {
@@ -585,8 +656,18 @@ fn build_ldm_heavy(
     // arrays while the packed model is walked below. The VAE intentionally stays dense and is
     // materialized as its own bounded component under the same immutable-file guard.
     let mut unet = loader::load_unet_from_weights(unet_weights, DTYPE)?;
-    vae_weights.materialize()?;
-    let vae = loader::load_vae_from_weights(vae_weights)?;
+    // A staged fp16-fix VAE replaces the fused file's VAE (sc-26268); the fused VAE's lazy arrays are
+    // then dropped unread rather than materialized for nothing.
+    let vae = match spec.components.get(loader::VAE_FP16_FIX_COMPONENT) {
+        Some(source) => {
+            drop(vae_weights);
+            loader::load_vae_fp16_fix(source)?
+        }
+        None => {
+            vae_weights.materialize()?;
+            loader::load_vae_from_weights(vae_weights)?
+        }
+    };
     if !spec.adapters.is_empty() {
         let coverage = if std::env::var_os("SDXL_LORA_VENDORED").is_some() {
             crate::adapters::LoraCoverage::Vendored
@@ -736,7 +817,9 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         };
         crate::adapters::apply_sdxl_adapters_with(&mut unet, &spec.adapters, coverage)?;
     }
-    let vae = loader::load_vae(root)?; // VAE always f32 (vendored loads the autoencoder float16=False)
+    // The in-snapshot VAE at f32 (the vendored reference loads the autoencoder `float16=False`), or
+    // the staged fp16-fix VAE at f16 when the spec carries one (sc-26268).
+    let vae = loader::load_vae_for_spec(spec, root)?;
 
     // ControlNet branches (sc-3058; MultiControlNet sc-3378) — `spec.control` first, then each
     // `spec.extra_controls`, all at the U-Net dtype (fp16). Quantized with the U-Net below when
@@ -1080,9 +1163,10 @@ impl Sdxl {
         .with_window(window_size.map(|size| crate::plan::SdxlBlockWindow {
             size,
             cancel: &req.cancel,
-        }));
+        }))
+        .with_cfg_batching(resolve_cfg_batching(req));
 
-        self.residency.run_request_scoped(
+        self.residency.run_staged_request_scoped(
             stage_residency,
             false,
             &req.cancel,
@@ -1098,10 +1182,11 @@ impl Sdxl {
                 Some(enc) => Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
                 None => Ok(()),
             },
-            // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
-            // denoise/decode body once against the `heavy` borrow — identical for both residencies.
-            // `on_progress` is threaded through the seam (F-179) and shadows the outer sink here.
-            |heavy_owned, enc, on_progress| {
+            // ── Phase B (denoise): the heavy render components (U-Net + control/IP + VAE + PiD) run
+            // every image's denoise against the `heavy` borrow — identical for both residencies — and
+            // hand the evaluated latents to phase C. `on_progress` is threaded through the seam
+            // (F-179) and shadows the outer sink here.
+            |heavy_owned: &SdxlHeavyOwned, enc, on_progress| -> Result<SdxlDenoised> {
         let heavy = heavy_owned.as_ref();
         let (conditioning, pooled) = enc;
 
@@ -1240,12 +1325,11 @@ impl Sdxl {
             self.descriptor.id,
             capture_sigma,
         )?;
-        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
         mlx_gen::diagnostics::record_phase_boundary(
             mlx_gen::diagnostics::BenchmarkPhaseBoundary::DenoiseStart,
         );
-        let mut images = Vec::with_capacity(req.count as usize);
+        let mut finals = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
             let seed = base_seed.wrapping_add(i as u64);
@@ -1345,20 +1429,7 @@ impl Sdxl {
                     Some(p) => multiply(&latents, scalar(p.rescale))?,
                     None => latents,
                 };
-                if let Some(observer) = final_latent_observer.as_deref_mut() {
-                    observer(heavy.vae, &latents, pid_ref)?;
-                }
-                mlx_gen::diagnostics::record_phase_boundary(
-                    mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
-                );
-                on_progress(Progress::Decoding);
-                images.push(crate::pipeline::decode_image_tiled(
-                    heavy.vae,
-                    &latents,
-                    pid_ref,
-                    decode_tiling.as_ref(),
-                    Some(&req.cancel),
-                )?);
+                finals.push(latents);
                 continue;
             }
 
@@ -1501,22 +1572,36 @@ impl Sdxl {
                 )?
             };
 
-            if let Some(observer) = final_latent_observer.as_deref_mut() {
-                observer(heavy.vae, &latents, pid_ref)?;
-            }
-
-            mlx_gen::diagnostics::record_phase_boundary(
-                mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
-            );
-            on_progress(Progress::Decoding);
-            images.push(crate::pipeline::decode_image_tiled(
-                    heavy.vae,
-                    &latents,
-                    pid_ref,
-                    decode_tiling.as_ref(),
-                    Some(&req.cancel),
-                )?);
+            finals.push(latents);
         }
+                Ok((finals, pid_decoder))
+            },
+            // Materialize every final latent while the U-Net is still alive: MLX is lazy, so an
+            // un-evaluated latent keeps the whole denoise graph — and through it the U-Net — referenced,
+            // and the shed below would free nothing.
+            |(finals, _pid): &SdxlDenoised| Ok(mlx_rs::transforms::eval(finals.iter())?),
+            // ── Phase C (decode): on a staged request the U-Net, control branches and IP encoder
+            // have been dropped (`StagedHeavy::shed_dit`) and the cache cleared before this runs; a
+            // resident request decodes against the warm bundle exactly as before.
+            |view: SdxlDecodeView<'_>, (finals, pid_decoder): SdxlDenoised, on_progress| {
+                let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                let mut images = Vec::with_capacity(finals.len());
+                for latents in &finals {
+                    if let Some(observer) = final_latent_observer.as_deref_mut() {
+                        observer(view.vae, latents, pid_ref)?;
+                    }
+                    mlx_gen::diagnostics::record_phase_boundary(
+                        mlx_gen::diagnostics::BenchmarkPhaseBoundary::DecodeStart,
+                    );
+                    on_progress(Progress::Decoding);
+                    images.push(crate::pipeline::decode_image_tiled(
+                        view.vae,
+                        latents,
+                        pid_ref,
+                        decode_tiling.as_ref(),
+                        Some(&req.cancel),
+                    )?);
+                }
                 Ok(GenerationOutput::Images(images))
             },
         )
@@ -1660,10 +1745,21 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    match &spec.weights {
-        WeightsSource::Dir(root) => Ok(snapshot_component_footprint(root)),
-        WeightsSource::File(file) => fused_ldm_component_footprint(file, spec.quantize),
+    let mut footprint = match &spec.weights {
+        WeightsSource::Dir(root) => snapshot_component_footprint(root),
+        WeightsSource::File(file) => fused_ldm_component_footprint(file, spec.quantize)?,
+    };
+    // sc-26268: a staged fp16-fix VAE replaces the in-snapshot (or fused) VAE and is resident at
+    // f16 — price the file the load opens at the width it materializes, like every other component.
+    if let Some(source) = spec.components.get(loader::VAE_FP16_FIX_COMPONENT) {
+        use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+        if let Ok(bytes) = loader::resolve_vae_fp16_fix_file(source).and_then(|file| {
+            projected_safetensors_bytes(file, |_| ResidentProjection::Bfloat16).map_err(Error::from)
+        }) {
+            footprint.vae = bytes;
+        }
     }
+    Ok(footprint)
 }
 
 /// Header-only resident projection for a diffusers **snapshot tree** — the directory twin of
@@ -2056,6 +2152,126 @@ mod tests {
                 previous
             );
         }
+    }
+
+    /// sc-26268 AC (bullet 1): **the U-Net is not resident during a staged request's decode**,
+    /// asserted with a memory probe. The production generator's heavy bundle type runs through the
+    /// shared three-phase driver it now uses (`Residency::run_staged_request_scoped`); MLX's active
+    /// byte count is read inside the denoise phase and again inside the decode phase. On a staged
+    /// request the decode must see the tiny U-Net's whole weight set gone; on a resident (warm)
+    /// request — the control — it must still be there, since a warm bundle is kept across requests
+    /// by design.
+    #[test]
+    fn a_staged_request_releases_the_unet_before_decode() {
+        use crate::training::family::test_support::{tiny_unet, tiny_unet_weights};
+        use mlx_rs::memory::{clear_cache, get_active_memory};
+        use std::sync::{Arc, Mutex};
+
+        let _cpu = crate::test_device::cpu_only();
+        let unet_bytes: usize = tiny_unet_weights(11)
+            .unwrap()
+            .into_tensors()
+            .values()
+            .map(mlx_rs::Array::nbytes)
+            .sum();
+        assert!(
+            unet_bytes > 1 << 20,
+            "the probe needs a U-Net it can resolve"
+        );
+
+        let heavy = || -> Result<SdxlHeavyOwned> {
+            let unet = tiny_unet(11)?;
+            unet.materialize_weights()?;
+            let (weights, cfg) = crate::vae::tests::fixture();
+            let vae = Autoencoder::from_weights(&weights, &cfg)?;
+            weights.materialize()?;
+            Ok(SdxlHeavyOwned {
+                unet,
+                controls: Vec::new(),
+                ip_adapter: None,
+                vae,
+                pid: None,
+            })
+        };
+        let probe = |stage_residency: bool| -> (usize, usize) {
+            let residency =
+                Residency::<u8, SdxlHeavyOwned>::request_scoped(|_| Ok(0_u8), move |_, _| heavy());
+            clear_cache();
+            let seen = Arc::new(Mutex::new((0_usize, 0_usize)));
+            let (in_denoise, in_decode) = (Arc::clone(&seen), Arc::clone(&seen));
+            residency
+                .run_staged_request_scoped(
+                    stage_residency,
+                    false,
+                    &mlx_gen::CancelFlag::new(),
+                    false,
+                    &mut |_| {},
+                    |_: &u8| Ok(()),
+                    |_| Ok(()),
+                    move |heavy: &SdxlHeavyOwned, (), _| {
+                        heavy.unet.materialize_weights()?;
+                        in_denoise.lock().unwrap().0 = get_active_memory();
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                    move |view: SdxlDecodeView<'_>, (), _| {
+                        assert_eq!(view.vae.dtype(), mlx_rs::Dtype::Float32);
+                        in_decode.lock().unwrap().1 = get_active_memory();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let seen = *seen.lock().unwrap();
+            seen
+        };
+
+        let (denoise, decode) = probe(true);
+        let released = denoise.saturating_sub(decode);
+        assert!(
+            released * 10 >= unet_bytes * 9,
+            "staged decode must not hold the U-Net: active {denoise} B in denoise, {decode} B in \
+             decode, released {released} B of a {unet_bytes} B U-Net"
+        );
+        // The control: the warm arm keeps its bundle, so the same probe sees no release. Without
+        // it, a probe that read zero in every phase would pass.
+        let (denoise, decode) = probe(false);
+        assert!(
+            decode + unet_bytes / 10 >= denoise,
+            "a resident request keeps its warm bundle through decode: {denoise} B vs {decode} B"
+        );
+        assert!(
+            denoise >= unet_bytes,
+            "the probe must see the U-Net while it denoises"
+        );
+    }
+
+    /// sc-26268: the descriptor declares both CFG batchings, the shared request floor admits each
+    /// and refuses nothing it declares, and an unset request resolves to the historical batched
+    /// mode.
+    #[test]
+    fn cfg_batching_is_declared_admitted_and_defaults_to_batched() {
+        use mlx_gen::gen_core::{CfgBatching, GenerationMemory};
+        let caps = descriptor().capabilities;
+        for mode in CfgBatching::ALL {
+            assert!(caps.execution.cfg_batching.accepts(mode), "{mode:?}");
+            let req = GenerationRequest {
+                prompt: "p".into(),
+                width: 1024,
+                height: 1024,
+                count: 1,
+                memory: Some(GenerationMemory {
+                    cfg_batching: Some(mode),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            validate_request(&caps, &req).unwrap();
+            assert_eq!(resolve_cfg_batching(&req), mode);
+        }
+        assert_eq!(
+            resolve_cfg_batching(&GenerationRequest::default()),
+            CfgBatching::Batched
+        );
     }
 
     #[test]
