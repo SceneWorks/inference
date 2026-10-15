@@ -27,9 +27,9 @@ impl Default for Limits {
 }
 impl Limits {
     /// Allowances a backend's runtime batches heads under. CUDA scores, selects and launches a
-    /// whole head batch at once (one score readback and one kernel launch per batch), so its
-    /// gather/scorer copy allowance admits several heads: 4 GiB, below the dense SDPA score
-    /// transient (`dense_fallback_bytes`) the sparse call replaces. MLX keeps the default.
+    /// whole head batch at once (one score readback and one kernel launch per batch), so its copy
+    /// allowance admits several heads: 4 GiB for a batch's gather/scorer copies plus its kernel
+    /// scratch. MLX keeps the default.
     pub fn for_backend(backend: Backend) -> Self {
         match backend {
             Backend::Mlx => Self::default(),
@@ -176,19 +176,18 @@ pub fn chunk(
     {
         return Err(bad("invalid layout/dtype"));
     }
-    let mut copy = copy_cost(l, dim, element)?;
-    if backend == Backend::Cuda {
-        copy = copy
-            .checked_add(bytes(
-                20 * l.slots as u128 * dim as u128
-                    + 32 * (l.slots / TILE) as u128 * (l.slots / TILE) as u128
-                    + 64 * (l.slots / TILE) as u128
-                    + 64,
-            )?)
-            .ok_or_else(|| bad("size overflow"))?;
-    }
+    let copy = copy_cost(l, dim, element)?;
+    // A CUDA batch's kernel scratch grows with its heads too, so the copy allowance sizes the
+    // batch over both; the scratch itself is charged once, in `bound`'s `kernel_scratch_bytes`.
+    let per_head = copy
+        .checked_add(if backend == Backend::Cuda {
+            cuda_kernel_scratch(l, dim)?
+        } else {
+            0
+        })
+        .ok_or_else(|| bad("size overflow"))?;
     // Both backends batch up to the whole same-shape head group within the copy allowance.
-    let mut h = (limits.copies / copy.max(1)).min(group as u64).max(1) as usize;
+    let mut h = (limits.copies / per_head.max(1)).min(group as u64).max(1) as usize;
     let k = keys(request.reference, l.ref_tokens, l.reference)
         + keys(request.generated, l.target_tokens, l.video - l.reference)
         + l.slots / TILE
@@ -215,7 +214,7 @@ pub fn chunk(
     } else {
         0
     };
-    let refusal = if copy > limits.copies {
+    let refusal = if per_head > limits.copies {
         Some("minimum tile/scorer head exceeds copy allowance".into())
     } else if min_attention > limits.attention {
         Some("minimum query/global batch exceeds attention allowance".into())
@@ -238,6 +237,12 @@ pub fn chunk(
         minimum_attention_bytes: min_attention,
         refusal,
     })
+}
+/// Per-head CUDA kernel scratch: FP32 conversion inputs/output, INT8 Q/K and scales, and the
+/// expanded CSR 64-key masks on host and device.
+fn cuda_kernel_scratch(l: LayoutSize, dim: usize) -> Result<u64> {
+    let (s, n) = (l.slots as u128, (l.slots / TILE) as u128);
+    bytes(20 * s * dim as u128 + 32 * n * n + 64 * n)
 }
 /// Sum full-layer lifetimes rather than treating one gather allowance as the layer bound.
 #[allow(clippy::too_many_arguments)]
@@ -297,10 +302,9 @@ pub fn bound(
             16 * h * n * n + 48 * h * n + 24 * n + 8 * h * (l.video as u128).pow(2),
         )?);
         device = device.max(bytes(24 * h * d * d)?);
-        // CUDA conversion inputs/output/quant/scales and expanded CSR 64-key masks on host/device,
-        // for every head of one batched launch.
+        // CUDA kernel scratch for every head of one batched launch, charged only here.
         if backend == Backend::Cuda {
-            scratch = scratch.max(bytes(h * (20 * s * d + 32 * n * n + 32 * n) + 64)?);
+            scratch = scratch.max(bytes(h * cuda_kernel_scratch(l, dim)? as u128 + 64)?);
         }
         chunks.insert(shape, c);
     }
@@ -855,6 +859,23 @@ mod tests {
         let heads = cuda.chunks.values().map(|c| c.heads as u64).max().unwrap();
         assert!(cuda.kernel_scratch_bytes > 10 * single.kernel_scratch_bytes);
         assert!(cuda.kernel_scratch_bytes <= heads * single.kernel_scratch_bytes);
+        // Charged once: the kernel scratch sizes the batch but is not also inside the copies
+        // (scorer) bytes, which are the backend-neutral per-head copy cost times the batch.
+        let mut scratch = 0;
+        for (shape, c) in &cuda.chunks {
+            assert_eq!(
+                c.minimum_copies_bytes,
+                mlx.chunks[shape].minimum_copies_bytes
+            );
+            assert_eq!(c.copies_bytes, c.heads as u64 * c.minimum_copies_bytes);
+            let kernel = cuda_kernel_scratch(layouts[shape], 128).unwrap();
+            assert!(
+                c.copies_bytes + c.heads as u64 * kernel
+                    <= Limits::for_backend(Backend::Cuda).copies
+            );
+            scratch = scratch.max(c.heads as u64 * kernel + 64);
+        }
+        assert_eq!(cuda.kernel_scratch_bytes, scratch);
     }
     #[test]
     fn tiny_limits_price_minimum_batch_and_refuse_before_gather() {

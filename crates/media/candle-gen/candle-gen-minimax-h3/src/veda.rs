@@ -4,10 +4,10 @@ pub use candle_gen::gen_core::veda::contract;
 use candle_gen::{
     candle_core::{DType, Device, Tensor},
     gen_core::{VedaBudget, VedaExecutionReport, VedaRequest},
-    quant::veda_int8,
+    quant::{veda_int8, veda_score},
     CandleError, Result,
 };
-use contract::{Budget, Bundle, Layout, Plan, PredictorOps, TileShape, TILE};
+use contract::{Budget, Bundle, Layout, Plan, TileShape, TILE};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 pub const COMPONENT: &str = "veda_predictor";
 pub use candle_gen::quant::veda_int8::KERNEL;
@@ -62,6 +62,9 @@ impl Prepared {
         Ok(batches)
     }
 }
+/// Selected rows of sparse calls as `(sample, head, rows)`.
+#[cfg(test)]
+pub(crate) type Masks = Vec<(usize, usize, Vec<Vec<usize>>)>;
 pub struct VedaRuntime {
     request: VedaRequest,
     report: ReportSink,
@@ -72,6 +75,9 @@ pub struct VedaRuntime {
     self_test: fn(&Device, DType, usize) -> Result<()>,
     #[cfg(test)]
     pub(crate) calls: RefCell<Vec<AttentionCall>>,
+    /// Every executed head's selected rows as `(sample, head, rows)`, in execution order.
+    #[cfg(test)]
+    pub(crate) masks: RefCell<Masks>,
 }
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +164,8 @@ impl VedaRuntime {
             self_test: device_self_test,
             #[cfg(test)]
             calls: Default::default(),
+            #[cfg(test)]
+            masks: Default::default(),
         })
     }
     fn build(
@@ -323,6 +331,13 @@ impl VedaRuntime {
                 let vt = tile(v, b, group, layout)?;
                 let rows = select(p, &self.request, layer, group, layout, &qt, &kt)?;
                 self.report.borrow_mut().predictor_score_calls += 1;
+                #[cfg(test)]
+                self.masks.borrow_mut().extend(
+                    group
+                        .iter()
+                        .zip(rows.chunks(tiles))
+                        .map(|(&h, r)| (b, h, r.to_vec())),
+                );
                 pairs += rows
                     .iter()
                     .enumerate()
@@ -366,9 +381,58 @@ fn assemble(outputs: &[Tensor], order: &[usize]) -> Result<Tensor> {
     }
     Ok(out.index_select(&Tensor::from_vec(position, order.len(), out.device())?, 0)?)
 }
-/// Learned selection for one same-shape head batch of one sample: one pooled-QK scoring pass over
-/// every head of the batch and one host readback of its `[heads, tiles, tiles]` scores. Rows are
-/// head-major, as [`veda_int8::Mask`] expects.
+/// The frozen learned tile logits `[heads, video, video]` of one same-shape head batch of one
+/// sample, equal bit for bit to gen-core's host `pool_video_tiles` + `tile_logits` for every head
+/// on its own: on CUDA the exact device scorer with one host readback for the whole batch, on any
+/// other device the host contract itself. Masks therefore never depend on the batch size.
+fn scores(
+    p: &Prepared,
+    layer: usize,
+    heads: &[usize],
+    layout: &Layout,
+    qt: &Tensor,
+    kt: &Tensor,
+) -> Result<Vec<f32>> {
+    if layer >= p.bundle.layers || heads.is_empty() || heads.iter().any(|&h| h >= p.bundle.heads) {
+        return Err("Veda invalid scorer layer/heads".into());
+    }
+    let ids: Vec<i32> = heads.iter().map(|&h| h as i32).collect();
+    let (pq, pk) = (
+        p.bundle.projection(layer, &ids, true),
+        p.bundle.projection(layer, &ids, false),
+    );
+    if matches!(qt.device(), Device::Cuda(_)) {
+        return Ok(veda_score::tile_logits(
+            qt,
+            kt,
+            &layout.valid,
+            layout.video,
+            &pq,
+            &pk,
+        )?);
+    }
+    let pool = |x: &Tensor| -> Result<Vec<f32>> {
+        let x = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok(contract::pool_video_tiles(
+            &x,
+            layout,
+            heads.len(),
+            p.bundle.dim,
+        )?)
+    };
+    Ok(contract::tile_logits(
+        &pool(qt)?,
+        &pool(kt)?,
+        &pq,
+        &pk,
+        heads.len(),
+        layout.video,
+        p.bundle.dim,
+    )?)
+}
+/// Learned selection for one same-shape head batch of one sample: one scoring pass over every
+/// head of the batch ([`scores`]) and the frozen host selection. Rows are head-major, as
+/// [`veda_int8::Mask`] expects.
 fn select(
     p: &Prepared,
     request: &VedaRequest,
@@ -378,9 +442,7 @@ fn select(
     qt: &Tensor,
     kt: &Tensor,
 ) -> Result<Vec<Vec<usize>>> {
-    let ids: Vec<i32> = heads.iter().map(|&h| h as i32).collect();
-    let scores =
-        contract::learned_scores(&p.bundle, layer, &ids, layout, qt, kt, &CandlePredictorOps)?;
+    let scores = scores(p, layer, heads, layout, qt, kt)?;
     let (generated, reference) = (budget(&request.generated), budget(&request.reference));
     // Heads select independently (head h reads only its own `[tiles, tiles]` scores), so the
     // frozen host selection runs on contiguous head ranges in parallel and concatenates them in
@@ -457,67 +519,6 @@ fn tile(x: &Tensor, b: usize, heads: &[usize], l: &Layout) -> Result<Tensor> {
     Ok(valid
         .where_cond(&a, &zero)?
         .reshape((heads.len(), l.valid.len(), TILE, dim))?)
-}
-struct CandlePredictorOps;
-impl PredictorOps for CandlePredictorOps {
-    type Tensor = Tensor;
-    type Error = CandleError;
-    fn pool(&self, x: &Tensor, l: &Layout, h: usize, d: usize) -> Result<Tensor> {
-        let n = l.video;
-        let x = x.narrow(1, 0, n)?.to_dtype(DType::F32)?;
-        let valid = Tensor::from_vec(
-            l.valid[..n]
-                .iter()
-                .flat_map(|&c| (0..TILE).map(move |r| u8::from(r < c)))
-                .collect::<Vec<_>>(),
-            (1, n, TILE, 1),
-            x.device(),
-        )?
-        .broadcast_as((h, n, TILE, d))?;
-        let counts = Tensor::from_vec(
-            l.valid[..n]
-                .iter()
-                .map(|&c| c.max(1) as f32)
-                .collect::<Vec<_>>(),
-            (1, n, 1),
-            x.device(),
-        )?;
-        let mean = x.sum(2)?.broadcast_div(&counts)?;
-        let max = valid
-            .where_cond(&x, &Tensor::full(f32::NEG_INFINITY, x.dims(), x.device())?)?
-            .max(2)?;
-        let min = valid
-            .where_cond(&x, &Tensor::full(f32::INFINITY, x.dims(), x.device())?)?
-            .min(2)?;
-        let f = Tensor::cat(&[mean, max, min], 2)?;
-        let ok = Tensor::from_vec(
-            l.valid[..n]
-                .iter()
-                .map(|&c| u8::from(c > 0))
-                .collect::<Vec<_>>(),
-            (1, n, 1),
-            x.device(),
-        )?
-        .broadcast_as(f.dims())?;
-        Ok(ok.where_cond(&f, &Tensor::zeros(f.dims(), DType::F32, x.device())?)?)
-    }
-    fn project(&self, f: &Tensor, p: &[f32], h: usize, d: usize) -> Result<Tensor> {
-        Ok(f.contiguous()?
-            .matmul(&Tensor::from_vec(p.to_vec(), (h, 3 * d, d), f.device())?)?)
-    }
-    fn prefix(&self, f: &Tensor, d: usize) -> Result<Tensor> {
-        Ok(f.narrow(2, 0, d)?)
-    }
-    fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        Ok((a + b)?)
-    }
-    fn dot_scaled(&self, q: &Tensor, k: &Tensor, divisor: f32) -> Result<Vec<f32>> {
-        Ok(
-            (q.contiguous()?.matmul(&k.transpose(1, 2)?.contiguous()?)? / divisor as f64)?
-                .flatten_all()?
-                .to_vec1::<f32>()?,
-        )
-    }
 }
 /// Fixed fixture problem bound, including device/host QKV, conversion/quant buffers,
 /// retained host oracles and dense additive masks/scores/probabilities. Independent
@@ -704,17 +705,20 @@ mod tests {
     fn packed(dev: &Device) -> PackedLayout {
         packed_with(dev, &[])
     }
-    /// `t2va`, or `fl2va` with keyframe anchors packed as reference segments.
+    /// `t2va`, or `fl2va` with keyframe anchors packed as reference segments: one video tile.
     fn packed_with(dev: &Device, anchors: &[KeyframeAnchor]) -> PackedLayout {
-        PackedLayout::build(
-            JointGeometry::new(5, 16, 16).unwrap(),
-            [1, 2, 2],
-            &[TEXT_TAG; 3],
-            32,
-            anchors,
-            dev,
-        )
-        .unwrap()
+        packed_geometry(dev, anchors, JointGeometry::new(5, 16, 16).unwrap())
+    }
+    /// A `t2va` grid of several video tiles, so learned selection has real choices per head.
+    fn packed_large(dev: &Device) -> PackedLayout {
+        packed_geometry(dev, &[], JointGeometry::new(22, 16, 32).unwrap())
+    }
+    fn packed_geometry(
+        dev: &Device,
+        anchors: &[KeyframeAnchor],
+        geometry: JointGeometry,
+    ) -> PackedLayout {
+        PackedLayout::build(geometry, [1, 2, 2], &[TEXT_TAG; 3], 32, anchors, dev).unwrap()
     }
     fn predictor(layers: usize, heads: usize, dim: usize) -> Bundle {
         predictor_with(
@@ -760,12 +764,17 @@ mod tests {
         header.insert("__metadata__".into(), json!(metadata));
         let mut bytes = vec![];
         for layer in 0..layers {
-            for name in ["proj_q", "proj_k"] {
+            for (kind, name) in ["proj_q", "proj_k"].into_iter().enumerate() {
                 let key = format!("layers.{layer}.{name}");
                 let start = bytes.len();
-                bytes.extend(
-                    (0..heads * 3 * dim * dim).map(|i| if i % 7 == 0 { 0x9b } else { 0x1a }),
-                );
+                // Distinct per layer, projection and head (so heads select different rows): finite
+                // E4M3 bytes of either sign from a multiplicative hash.
+                bytes.extend((0..heads * 3 * dim * dim).map(|i| {
+                    let x = (i as u64 + 1)
+                        .wrapping_mul(2654435761)
+                        .wrapping_add((layer * 2 + kind) as u64 * 40503);
+                    ((x >> 9) % 0x58) as u8 | (((x >> 20) & 1) as u8) << 7
+                }));
                 header.insert(key.clone(),json!({"dtype":"F8_E4M3","shape":[heads,3*dim,dim],"data_offsets":[start,bytes.len()]}));
                 let start = bytes.len();
                 for _ in 0..heads {
@@ -806,7 +815,26 @@ mod tests {
         reference: VedaBudget,
         bundle: Bundle,
     ) -> VedaRuntime {
-        let p = packed_with(dev, anchors);
+        runtime_packed(report, reference, bundle, &packed_with(dev, anchors))
+    }
+    /// A sparse `t2va` runtime over [`packed_large`] keeping three generated key tiles per query
+    /// tile, so each head's learned choice beyond its forced diagonal shows in its rows.
+    fn runtime_large(dev: &Device, report: ReportSink, bundle: Bundle) -> VedaRuntime {
+        let mut r = runtime_packed(
+            report,
+            VedaBudget::SparsityPercent(0.),
+            bundle,
+            &packed_large(dev),
+        );
+        r.request.generated = VedaBudget::KeyTiles(3);
+        r
+    }
+    fn runtime_packed(
+        report: ReportSink,
+        reference: VedaBudget,
+        bundle: Bundle,
+        p: &PackedLayout,
+    ) -> VedaRuntime {
         VedaRuntime {
             prepared: Some(
                 VedaRuntime::build(
@@ -815,7 +843,7 @@ mod tests {
                         enabled: true,
                         ..Default::default()
                     },
-                    &p,
+                    p,
                     &report,
                 )
                 .unwrap(),
@@ -831,12 +859,84 @@ mod tests {
             tested: RefCell::new(None),
             self_test: device_self_test,
             calls: Default::default(),
+            masks: Default::default(),
         }
     }
-    /// Host oracle for one sparse call: token-order Q/K/V gathered into slots straight from
-    /// `layout.perm` (padding zero), the runtime's own learned selection, masked FP32 attention
-    /// over exactly the selected keys, then scattered back through `layout.inverse`. Returns the
-    /// expected output and the INT8 quantization error bound of the worst head.
+    /// Host values of `x` and, per sample and head, its token-order rows gathered into the head's
+    /// tile slots straight from `layout.perm` (padding zero).
+    fn host_slots(x: &Tensor, p: &Prepared, layer: usize) -> Vec<Vec<f32>> {
+        let (batch, heads, seq, dim) = x.dims4().unwrap();
+        let x = x
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut out = Vec::new();
+        for b in 0..batch {
+            for h in 0..heads {
+                let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
+                let base = (b * heads + h) * seq;
+                out.push(
+                    layout
+                        .perm
+                        .iter()
+                        .flat_map(|&t| {
+                            let x = &x;
+                            (0..dim).map(move |d| {
+                                if t >= 0 {
+                                    x[(base + t as usize) * dim + d]
+                                } else {
+                                    0.
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+    /// The masks of one sparse call, independent of the runtime's batching, scorer and selection
+    /// code: per sample and per head on its own, the frozen host `pool_video_tiles` +
+    /// `tile_logits` over [`host_slots`], then the frozen `select_with_budgets`.
+    fn oracle_masks(r: &VedaRuntime, layer: usize, q: &Tensor, k: &Tensor) -> Masks {
+        let p = r.prepared.as_ref().unwrap();
+        let (_, heads, _, dim) = q.dims4().unwrap();
+        let (qs, ks) = (host_slots(q, p, layer), host_slots(k, p, layer));
+        (0..qs.len())
+            .map(|i| {
+                let (b, h) = (i / heads, i % heads);
+                let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][h]]];
+                let logits = contract::tile_logits(
+                    &contract::pool_video_tiles(&qs[i], layout, 1, dim).unwrap(),
+                    &contract::pool_video_tiles(&ks[i], layout, 1, dim).unwrap(),
+                    &p.bundle.projection(layer, &[h as i32], true),
+                    &p.bundle.projection(layer, &[h as i32], false),
+                    1,
+                    layout.video,
+                    dim,
+                )
+                .unwrap();
+                let rows = layout
+                    .select_with_budgets(
+                        &logits,
+                        1,
+                        budget(&r.request.generated),
+                        budget(&r.request.reference),
+                    )
+                    .unwrap();
+                (b, h, rows)
+            })
+            .collect()
+    }
+    /// Host oracle for one sparse call: the [`oracle_masks`], masked FP32 attention per head over
+    /// exactly the selected keys, scattered back through `layout.inverse`. Returns the expected
+    /// output, the INT8 quantization error bound of the worst head, and the masks the runtime
+    /// must have selected exactly.
     fn masked_dense_oracle(
         r: &VedaRuntime,
         layer: usize,
@@ -844,76 +944,54 @@ mod tests {
         k: &Tensor,
         v: &Tensor,
         scale: f32,
-    ) -> (Vec<f32>, f32) {
+    ) -> (Vec<f32>, f32, Masks) {
+        masked_dense_oracle_for(r, layer, q, k, v, scale, |_, _| true)
+    }
+    /// [`masked_dense_oracle`] with the (host-costly) attention output computed only for the
+    /// `(sample, head)` pairs `keep` admits; the others stay NaN and are not compared. The masks
+    /// always cover every head.
+    #[allow(clippy::too_many_arguments)]
+    fn masked_dense_oracle_for(
+        r: &VedaRuntime,
+        layer: usize,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        keep: impl Fn(usize, usize) -> bool,
+    ) -> (Vec<f32>, f32, Masks) {
         let p = r.prepared.as_ref().unwrap();
-        let (batch, heads, seq, dim) = q.dims4().unwrap();
-        let host = |x: &Tensor| {
-            x.to_dtype(DType::F32)
-                .unwrap()
-                .to_device(&Device::Cpu)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap()
-        };
-        let (qh, kh, vh) = (host(q), host(k), host(v));
-        let mut out = vec![f32::NAN; qh.len()];
+        let (_, heads, seq, dim) = q.dims4().unwrap();
+        let masks = oracle_masks(r, layer, q, k);
+        let (qs, ks, vs) = (
+            host_slots(q, p, layer),
+            host_slots(k, p, layer),
+            host_slots(v, p, layer),
+        );
+        let mut out = vec![f32::NAN; q.elem_count()];
         let mut worst = 0f32;
-        let bound = p.bound(&r.request, batch).unwrap();
-        for b in 0..batch {
-            // The runtime's own head batches and learned selection; each head's slice of the
-            // batch's rows masks an independent per-head FP32 attention.
-            for (shape, group) in p.batches(layer, &bound).unwrap() {
-                let layout = &p.layouts[&shape];
-                let tiles = layout.valid.len();
-                let rows = select(
-                    p,
-                    &r.request,
-                    layer,
-                    &group,
-                    layout,
-                    &tile(q, b, &group, layout).unwrap(),
-                    &tile(k, b, &group, layout).unwrap(),
-                )
-                .unwrap();
-                for (i, &h) in group.iter().enumerate() {
-                    let base = (b * heads + h) * seq;
-                    let gather = |x: &[f32]| -> Vec<f32> {
-                        layout
-                            .perm
-                            .iter()
-                            .flat_map(|&t| {
-                                (0..dim).map(move |d| {
-                                    if t >= 0 {
-                                        x[(base + t as usize) * dim + d]
-                                    } else {
-                                        0.
-                                    }
-                                })
-                            })
-                            .collect()
-                    };
-                    let mask =
-                        veda_int8::Mask::new(&rows[i * tiles..(i + 1) * tiles], &layout.valid, 1)
-                            .unwrap();
-                    let (slots, bound) = masked_reference(
-                        &gather(&qh),
-                        &gather(&kh),
-                        &gather(&vh),
-                        dim,
-                        scale,
-                        &mask,
-                    );
-                    worst = worst.max(bound);
-                    for t in 0..seq {
-                        let slot = layout.inverse[t] as usize;
-                        out[(base + t) * dim..][..dim].copy_from_slice(&slots[slot * dim..][..dim]);
-                    }
-                }
+        for (i, (b, h, rows)) in masks.iter().enumerate() {
+            if !keep(*b, *h) {
+                continue;
+            }
+            let layout = &p.layouts[&p.plan.shapes[p.plan.heads[layer][*h]]];
+            let base = (b * heads + h) * seq;
+            let mask = veda_int8::Mask::new(rows, &layout.valid, 1).unwrap();
+            let (slots, bound) = masked_reference(&qs[i], &ks[i], &vs[i], dim, scale, &mask);
+            worst = worst.max(bound);
+            for t in 0..seq {
+                let slot = layout.inverse[t] as usize;
+                out[(base + t) * dim..][..dim].copy_from_slice(&slots[slot * dim..][..dim]);
             }
         }
-        (out, worst)
+        (out, worst, masks)
+    }
+    /// The runtime's recorded masks, sorted like the oracle's.
+    #[cfg(feature = "cuda")]
+    fn runtime_masks(r: &VedaRuntime) -> Masks {
+        let mut masks = r.masks.borrow().clone();
+        masks.sort_by_key(|&(b, h, _)| (b, h));
+        masks
     }
     #[test]
     fn masked_dense_oracle_is_dense_attention_when_every_key_is_kept() {
@@ -945,62 +1023,114 @@ mod tests {
             );
             let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let dense = flat(crate::nn::sdpa(&q, &k, &v, 0.25).unwrap());
-            let (want, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
+            let (want, _, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
             for (i, (&a, &b)) in want.iter().zip(&dense).enumerate() {
                 assert!((a - b).abs() < 1e-4, "{anchors:?} {i}: {a} vs {b}");
             }
             // A one-tile generated budget really masks keys.
             r.request.generated = VedaBudget::KeyTiles(1);
-            let (sparse, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
+            let (sparse, _, _) = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
             assert!(sparse.iter().zip(&dense).any(|(a, b)| (a - b).abs() > 1e-3));
         }
+    }
+    /// Batched against single-head scoring and selection of every layer and sample, against the
+    /// independent host oracle per head: logits bit for bit (`to_bits`), rows exactly, gathers
+    /// identical and every head scored exactly once. Returns every failure, so one run names all.
+    fn batched_scoring_failures(r: &VedaRuntime, q: &Tensor, k: &Tensor) -> Vec<String> {
+        let p = r.prepared.as_ref().unwrap();
+        let (batch, heads, _, dim) = q.dims4().unwrap();
+        let flat = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let bound = p.bound(&r.request, batch).unwrap();
+        let mut failures = Vec::new();
+        for layer in 0..p.bundle.layers {
+            let batches = p.batches(layer, &bound).unwrap();
+            let mut order: Vec<usize> = batches.iter().flat_map(|(_, g)| g.clone()).collect();
+            order.sort_unstable();
+            if order != (0..heads).collect::<Vec<_>>() {
+                failures.push(format!("layer {layer}: heads not batched exactly once"));
+            }
+            let mut batched = Vec::new();
+            for b in 0..batch {
+                for (shape, group) in &batches {
+                    let l = &p.layouts[shape];
+                    let (tiles, per) = (l.valid.len(), l.video * l.video);
+                    let (qt, kt) = (tile(q, b, group, l).unwrap(), tile(k, b, group, l).unwrap());
+                    let s = scores(p, layer, group, l, &qt, &kt).unwrap();
+                    let rows = select(p, &r.request, layer, group, l, &qt, &kt).unwrap();
+                    for (i, &h) in group.iter().enumerate() {
+                        let at = format!("layer {layer} sample {b} head {h} of {group:?}");
+                        let (qh, kh) = (tile(q, b, &[h], l).unwrap(), tile(k, b, &[h], l).unwrap());
+                        if flat(&qt.get(i).unwrap()) != flat(&qh.get(0).unwrap()) {
+                            failures.push(format!("{at}: batched gather differs"));
+                        }
+                        let single = scores(p, layer, &[h], l, &qh, &kh).unwrap();
+                        let host = contract::tile_logits(
+                            &contract::pool_video_tiles(&flat(&qh), l, 1, dim).unwrap(),
+                            &contract::pool_video_tiles(&flat(&kh), l, 1, dim).unwrap(),
+                            &p.bundle.projection(layer, &[h as i32], true),
+                            &p.bundle.projection(layer, &[h as i32], false),
+                            1,
+                            l.video,
+                            dim,
+                        )
+                        .unwrap();
+                        let mine = &s[i * per..(i + 1) * per];
+                        if bits(mine) != bits(&single) {
+                            failures.push(format!("{at}: batched logits differ from single-head"));
+                        }
+                        if bits(mine) != bits(&host) {
+                            failures.push(format!("{at}: logits differ from host tile_logits"));
+                        }
+                        let one = select(p, &r.request, layer, &[h], l, &qh, &kh).unwrap();
+                        let rows = rows[i * tiles..(i + 1) * tiles].to_vec();
+                        if rows != one {
+                            failures.push(format!("{at}: batched rows differ from single-head"));
+                        }
+                        batched.push((b, h, rows));
+                    }
+                }
+            }
+            batched.sort_by_key(|&(b, h, _)| (b, h));
+            if batched != oracle_masks(r, layer, q, k) {
+                failures.push(format!(
+                    "layer {layer}: batched rows differ from host oracle"
+                ));
+            }
+        }
+        failures
     }
     #[test]
     fn head_batches_select_and_reassemble_exactly_as_single_heads() {
         let dev = Device::Cpu;
-        for bundle in [predictor(2, 2, 16), mixed_predictor()] {
-            let r = runtime_with(
-                &dev,
-                ReportSink::default(),
-                &[],
-                VedaBudget::SparsityPercent(0.),
-                bundle,
-            );
+        for (bundle, heads, dim) in [
+            (predictor(2, 2, 16), 2, 16),
+            (mixed_predictor(), 2, 16),
+            (predictor(2, 12, 128), 12, 128),
+        ] {
+            let r = runtime_large(&dev, ReportSink::default(), bundle);
             let p = r.prepared.as_ref().unwrap();
+            assert!(
+                p.layouts.values().all(|l| l.video > 2),
+                "selection has choices"
+            );
             let n = p.layouts.values().next().unwrap().seq;
             let (q, k) = (
-                tensor(n, &dev, DType::F32, 0),
-                tensor(n, &dev, DType::F32, 3),
+                tensor_hd(n, heads, dim, &dev, DType::F32, 0),
+                tensor_hd(n, heads, dim, &dev, DType::F32, 3),
             );
-            let bound = p.bound(&r.request, 2).unwrap();
-            for layer in 0..2 {
-                let batches = p.batches(layer, &bound).unwrap();
-                let mut order: Vec<usize> = batches.iter().flat_map(|(_, g)| g.clone()).collect();
-                order.sort_unstable();
-                assert_eq!(order, vec![0, 1], "every head exactly once");
-                for b in 0..2 {
-                    for (shape, group) in &batches {
-                        let l = &p.layouts[shape];
-                        let (qt, kt) = (
-                            tile(&q, b, group, l).unwrap(),
-                            tile(&k, b, group, l).unwrap(),
-                        );
-                        let rows = select(p, &r.request, layer, group, l, &qt, &kt).unwrap();
-                        let tiles = l.valid.len();
-                        for (i, &h) in group.iter().enumerate() {
-                            let (qh, kh) =
-                                (tile(&q, b, &[h], l).unwrap(), tile(&k, b, &[h], l).unwrap());
-                            let flat =
-                                |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                            assert_eq!(flat(&qt.get(i).unwrap()), flat(&qh.get(0).unwrap()));
-                            let single = select(p, &r.request, layer, &[h], l, &qh, &kh).unwrap();
-                            assert_eq!(&rows[i * tiles..(i + 1) * tiles], &single[..]);
-                        }
-                    }
-                }
-            }
+            let failures = batched_scoring_failures(&r, &q, &k);
+            assert!(failures.is_empty(), "{failures:#?}");
             // Single-shape plans batch every head at once; mixed plans one batch per shape, with
             // layer 0's batches running out of head order.
+            let bound = p.bound(&r.request, 2).unwrap();
             let batches = p.batches(0, &bound).unwrap();
             if p.plan.shapes.len() == 1 {
                 assert_eq!(batches.len(), 1);
@@ -1150,11 +1280,22 @@ mod tests {
         assert!(rep.outcome_json()["planMatch"].is_null());
     }
     fn tensor(n: usize, dev: &Device, dtype: DType, phase: usize) -> Tensor {
+        tensor_hd(n, 2, 16, dev, dtype, phase)
+    }
+    /// `[2, heads, n, dim]` deterministic inputs.
+    fn tensor_hd(
+        n: usize,
+        heads: usize,
+        dim: usize,
+        dev: &Device,
+        dtype: DType,
+        phase: usize,
+    ) -> Tensor {
         Tensor::from_vec(
-            (0..2 * 2 * n * 16)
+            (0..2 * heads * n * dim)
                 .map(|i| ((i * 17 + phase) % 101) as f32 / 80. - 0.5)
                 .collect::<Vec<_>>(),
-            (2, 2, n, 16),
+            (2, heads, n, dim),
             dev,
         )
         .unwrap()
@@ -1204,42 +1345,203 @@ mod tests {
         assert_eq!(report.borrow().sparse_calls, 0);
     }
     #[test]
-    fn candle_trip_pool_and_projection_use_shared_frozen_scorer() {
+    fn host_scores_are_the_frozen_host_contract() {
+        // Off CUDA the scorer is gen-core's host contract itself (the CUDA gate holds the device
+        // scorer to it bit for bit).
         let dev = Device::Cpu;
-        let p = packed(&dev);
-        let l = p.veda_layout(TileShape([2, 4, 16])).unwrap();
-        let n = p.seq_len();
-        let q = tensor(n, &dev, DType::F32, 0);
-        let k = tensor(n, &dev, DType::F32, 3);
-        let qt = tile(&q, 0, &[0], &l).unwrap();
-        let kt = tile(&k, 0, &[0], &l).unwrap();
-        let bundle = predictor(2, 2, 16);
-        let scores =
-            contract::learned_scores(&bundle, 0, &[0], &l, &qt, &kt, &CandlePredictorOps).unwrap();
-        let qhost = qt.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let khost = kt.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let qpool = contract::pool_video_tiles(&qhost, &l, 1, 16).unwrap();
-        let kpool = contract::pool_video_tiles(&khost, &l, 1, 16).unwrap();
-        let oracle = contract::tile_logits(
-            &qpool,
-            &kpool,
-            &bundle.projection(0, &[0], true),
-            &bundle.projection(0, &[0], false),
-            1,
+        let r = runtime_with(
+            &dev,
+            ReportSink::default(),
+            &[],
+            VedaBudget::SparsityPercent(0.),
+            predictor(2, 2, 16),
+        );
+        let p = r.prepared.as_ref().unwrap();
+        let l = p.layouts.values().next().unwrap();
+        let n = l.seq;
+        let (q, k) = (
+            tensor(n, &dev, DType::F32, 0),
+            tensor(n, &dev, DType::F32, 3),
+        );
+        let (qt, kt) = (
+            tile(&q, 0, &[0, 1], l).unwrap(),
+            tile(&k, 0, &[0, 1], l).unwrap(),
+        );
+        let got = scores(p, 1, &[0, 1], l, &qt, &kt).unwrap();
+        let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let fq = contract::pool_video_tiles(&host(&qt), l, 2, 16).unwrap();
+        let fk = contract::pool_video_tiles(&host(&kt), l, 2, 16).unwrap();
+        let want = contract::tile_logits(
+            &fq,
+            &fk,
+            &p.bundle.projection(1, &[0, 1], true),
+            &p.bundle.projection(1, &[0, 1], false),
+            2,
             l.video,
             16,
         )
         .unwrap();
-        for (&a, &b) in scores.iter().zip(&oracle) {
-            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(scores(p, 2, &[0], l, &qt, &kt).is_err());
+        assert!(scores(p, 0, &[2], l, &qt, &kt).is_err());
+    }
+    /// The tiled production attention kernel against the frozen per-row `pointer-v1` kernel it
+    /// replaced (`veda_pointer_v1.cu`, verbatim from main), on one problem with three heads whose
+    /// rows differ, reference/generated/partial tiles and a dense global tile: the FP32 outputs
+    /// must be equal bit for bit, and the harness's tiled launch must be the production route.
+    #[cfg(feature = "cuda")]
+    fn tiled_kernel_bit_failures(dev: &Device, dtype: DType, dim: usize) -> Vec<String> {
+        use candle_gen::candle_core::{cuda_backend::cudarc, CudaStorage, Storage};
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let Device::Cuda(cuda) = dev else {
+            unreachable!()
+        };
+        let heads = 3;
+        let valid = vec![17, 128, 9, 3]; // reference, generated, partial generated, dense global
+        let rows: Vec<Vec<usize>> = vec![
+            vec![0, 3],
+            vec![1, 3],
+            vec![2, 3],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 3],
+            vec![1, 3],
+            vec![0, 2, 3],
+            vec![0, 1, 2, 3],
+            vec![3],
+            vec![0, 1, 2, 3],
+            vec![1, 2, 3],
+            vec![0, 1, 2, 3],
+        ];
+        let mask = veda_int8::Mask::new(&rows, &valid, heads).unwrap();
+        let slots = mask.slots();
+        let n = heads * slots * dim;
+        let make = |a: usize, b: usize, c: usize| {
+            Tensor::from_vec(
+                (0..n)
+                    .map(|i| ((i * a % b) as f32 - (b / 2) as f32) / c as f32)
+                    .collect::<Vec<_>>(),
+                (heads, slots, dim),
+                dev,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+        };
+        let (q, k, v) = (make(17, 101, 40), make(31, 103, 40), make(13, 97, 60));
+        let scale = 1. / (dim as f32).sqrt();
+        let mut v1 = veda_int8::SOURCE;
+        v1.name = "cuda-veda-sage-int8-pointer-v1";
+        v1.src = include_str!("veda_pointer_v1.cu");
+        let stream = cuda.cuda_stream();
+        let mut outputs = Vec::new();
+        for (source, rows_per_cta) in [(veda_int8::SOURCE, 32), (v1, 1)] {
+            let module = source.compiled(cuda).unwrap();
+            let quant = module.function("veda_quant").unwrap();
+            let attention = module.function("veda_attend").unwrap();
+            let mut qi = unsafe { cuda.alloc::<u8>(n) }.unwrap();
+            let mut ki = unsafe { cuda.alloc::<u8>(n) }.unwrap();
+            let mut qs = unsafe { cuda.alloc::<f32>(heads * slots / 128) }.unwrap();
+            let mut ks = unsafe { cuda.alloc::<f32>(heads * slots / 64) }.unwrap();
+            let mut out = unsafe { cuda.alloc::<f32>(n) }.unwrap();
+            let offsets = stream.clone_htod(&mask.offsets).unwrap();
+            let indices = stream.clone_htod(&mask.indices).unwrap();
+            let valid = stream.clone_htod(&mask.valid).unwrap();
+            let f32s: Vec<Tensor> = [&q, &k, &v]
+                .iter()
+                .map(|t| t.to_dtype(DType::F32).unwrap().contiguous().unwrap())
+                .collect();
+            let storages: Vec<_> = f32s.iter().map(|t| t.storage_and_layout()).collect();
+            let views: Vec<_> = storages
+                .iter()
+                .map(|(s, l)| {
+                    let Storage::Cuda(s) = &**s else {
+                        unreachable!()
+                    };
+                    let s: &CudaStorage = s;
+                    s.as_cuda_slice::<f32>().unwrap().slice(l.start_offset()..)
+                })
+                .collect();
+            let (sl, d, qb, kb) = (slots as i32, dim as i32, 128i32, 64i32);
+            let (pre, one) = (scale * veda_int8::LOG2E, 1f32);
+            let cfg = |rows: usize| LaunchConfig {
+                grid_dim: (rows as u32, heads as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&quant)
+                    .arg(&views[0])
+                    .arg(&mut qi)
+                    .arg(&mut qs)
+                    .arg(&sl)
+                    .arg(&d)
+                    .arg(&qb)
+                    .arg(&pre)
+                    .launch(cfg(slots / 128))
+                    .unwrap();
+                stream
+                    .launch_builder(&quant)
+                    .arg(&views[1])
+                    .arg(&mut ki)
+                    .arg(&mut ks)
+                    .arg(&sl)
+                    .arg(&d)
+                    .arg(&kb)
+                    .arg(&one)
+                    .launch(cfg(slots / 64))
+                    .unwrap();
+                stream
+                    .launch_builder(&attention)
+                    .arg(&qi)
+                    .arg(&ki)
+                    .arg(&views[2])
+                    .arg(&qs)
+                    .arg(&ks)
+                    .arg(&offsets)
+                    .arg(&indices)
+                    .arg(&valid)
+                    .arg(&mut out)
+                    .arg(&sl)
+                    .arg(&d)
+                    .launch(cfg(slots / rows_per_cta))
+                    .unwrap();
+            }
+            outputs.push(stream.clone_dtoh(&out).unwrap());
         }
-        let actual = l
-            .select_with_budgets(&scores, 1, Budget::Tiles(1.), Budget::Ratio(1.))
+        let mut failures = Vec::new();
+        let label = format!("{dtype:?} D{dim}");
+        if let Some(i) = (0..n).find(|&i| outputs[0][i].to_bits() != outputs[1][i].to_bits()) {
+            failures.push(format!(
+                "{label}: tiled kernel differs from pointer-v1 at {i}: {:e} vs {:e}",
+                outputs[0][i], outputs[1][i]
+            ));
+        }
+        let host = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let production = host(veda_int8::attend(&q, &k, &v, &mask, scale).unwrap());
+        let harness = Tensor::from_vec(outputs[0].clone(), (heads, slots, dim), dev)
+            .unwrap()
+            .to_dtype(dtype)
             .unwrap();
-        let expected = l
-            .select_with_budgets(&oracle, 1, Budget::Tiles(1.), Budget::Ratio(1.))
-            .unwrap();
-        assert_eq!(actual, expected);
+        if production != host(harness) {
+            failures.push(format!(
+                "{label}: production attend differs from the tiled launch"
+            ));
+        }
+        failures
     }
     /// Coordinator must explicitly admit a CUDA device before running this gate.
     /// Missing/unsupported CUDA is failure, never an ignored or early-return success.
@@ -1250,6 +1552,39 @@ mod tests {
         for dtype in [DType::BF16, DType::F16] {
             for dim in [16, 128] {
                 device_self_test(&dev, dtype, dim).unwrap();
+            }
+            // Exactness checks collect every failure before any tolerance assertion, so one run
+            // names all of them.
+            let mut failures = Vec::new();
+            for dim in [16, 128] {
+                failures.extend(tiled_kernel_bit_failures(&dev, dtype, dim));
+            }
+            // Batched device scoring/selection against single heads and the host oracle,
+            // including a many-head D128 plan.
+            for (bundle, heads, dim) in [
+                (predictor(2, 2, 16), 2, 16),
+                (mixed_predictor(), 2, 16),
+                (predictor(2, 12, 128), 12, 128),
+            ] {
+                let r = runtime_large(&dev, ReportSink::default(), bundle);
+                let n = r
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .layouts
+                    .values()
+                    .next()
+                    .unwrap()
+                    .seq;
+                let (q, k) = (
+                    tensor_hd(n, heads, dim, &dev, dtype, 0),
+                    tensor_hd(n, heads, dim, &dev, dtype, 3),
+                );
+                failures.extend(
+                    batched_scoring_failures(&r, &q, &k)
+                        .into_iter()
+                        .map(|f| format!("{dtype:?} H{heads} D{dim} {f}")),
+                );
             }
             let report = ReportSink::default();
             let mut r = runtime(&dev, report.clone());
@@ -1274,16 +1609,33 @@ mod tests {
                     .unwrap()
             };
             // Same tolerance shape as the first-use self-test: INT8 quantization bound plus
-            // two output ULPs and FP32 reduction roundoff.
+            // two output ULPs and FP32 reduction roundoff. The masks themselves are exact.
             let ulp = if dtype == DType::BF16 {
                 1. / 128.
             } else {
                 1. / 1024.
             };
-            let check = |label: &str, got: Tensor, (want, bound): (Vec<f32>, f32)| {
+            let check = |label: &str,
+                         runtime: &VedaRuntime,
+                         got: Tensor,
+                         (want, bound, masks): (Vec<f32>, f32, Masks),
+                         failures: &mut Vec<String>| {
+                if runtime_masks(runtime) != masks {
+                    failures.push(format!(
+                        "{label} {dtype:?}: runtime masks differ from oracle"
+                    ));
+                }
+                assert!(failures.is_empty(), "exactness failures: {failures:#?}");
                 let got = host(got);
                 assert_eq!(got.len(), want.len());
+                assert!(
+                    want.iter().any(|b| !b.is_nan()),
+                    "{label}: nothing compared"
+                );
                 for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                    if b.is_nan() {
+                        continue; // head not computed by the oracle
+                    }
                     assert!(
                         a.is_finite() && (a - b).abs() <= bound + 2. * ulp * b.abs() + 2e-4,
                         "{label} {dtype:?} {i}: sparse {a} vs masked dense {b} (bound {bound})"
@@ -1291,7 +1643,8 @@ mod tests {
                 }
             };
             let sparse = r.attention(0, 0, &q, &k, &v, 0.25).unwrap();
-            check("t2va", sparse, masked_dense_oracle(&r, 0, &q, &k, &v, 0.25));
+            let oracle = masked_dense_oracle(&r, 0, &q, &k, &v, 0.25);
+            check("t2va", &r, sparse, oracle, &mut failures);
             assert_eq!(report.borrow().sparse_calls, 1);
             // One batched scoring pass per sample: both heads share the fixture's single shape.
             assert_eq!(report.borrow().predictor_score_calls, 2);
@@ -1327,11 +1680,8 @@ mod tests {
                 tensor(n, &dev, dtype, 9),
             );
             let sparse = fl.attention(1, 0, &fq, &fk, &fv, 0.25).unwrap();
-            check(
-                "fl2va",
-                sparse,
-                masked_dense_oracle(&fl, 1, &fq, &fk, &fv, 0.25),
-            );
+            let oracle = masked_dense_oracle(&fl, 1, &fq, &fk, &fv, 0.25);
+            check("fl2va", &fl, sparse, oracle, &mut failures);
             assert_eq!(fl_report.borrow().sparse_calls, 1);
             assert!(fl_report.borrow().fallback_reason.is_none());
             // Mixed tile shapes: per-shape head batches launch out of head order and are
@@ -1345,14 +1695,38 @@ mod tests {
                 mixed_predictor(),
             );
             let sparse = mixed.attention(0, 0, &q, &k, &v, 0.25).unwrap();
-            check(
-                "mixed",
-                sparse,
-                masked_dense_oracle(&mixed, 0, &q, &k, &v, 0.25),
-            );
+            let oracle = masked_dense_oracle(&mixed, 0, &q, &k, &v, 0.25);
+            check("mixed", &mixed, sparse, oracle, &mut failures);
             assert_eq!(mixed_report.borrow().sparse_calls, 1);
             assert_eq!(mixed_report.borrow().predictor_score_calls, 4);
             assert!(mixed_report.borrow().fallback_reason.is_none());
+            // Many heads at production width: twelve D128 heads through the batched route.
+            let many_report = ReportSink::default();
+            let many = runtime_large(&dev, many_report.clone(), predictor(2, 12, 128));
+            let n = many
+                .prepared
+                .as_ref()
+                .unwrap()
+                .layouts
+                .values()
+                .next()
+                .unwrap()
+                .seq;
+            let (mq, mk, mv) = (
+                tensor_hd(n, 12, 128, &dev, dtype, 2),
+                tensor_hd(n, 12, 128, &dev, dtype, 4),
+                tensor_hd(n, 12, 128, &dev, dtype, 6),
+            );
+            let scale = 1. / 128f32.sqrt();
+            let sparse = many.attention(1, 0, &mq, &mk, &mv, scale as f64).unwrap();
+            // Every head's mask is compared exactly; the host FP32 attention (~13 s per head in a
+            // debug build) is computed for the first head of sample 0 and the last of sample 1.
+            let oracle = masked_dense_oracle_for(&many, 1, &mq, &mk, &mv, scale, |b, h| {
+                (b, h) == (0, 0) || (b, h) == (1, 11)
+            });
+            check("many", &many, sparse, oracle, &mut failures);
+            assert_eq!(many_report.borrow().sparse_calls, 1);
+            assert!(many_report.borrow().fallback_reason.is_none());
             let unsupported_report = ReportSink::default();
             let unsupported = runtime(&dev, unsupported_report.clone());
             let (qf, kf, vf) = (
@@ -1408,12 +1782,13 @@ mod tests {
             println!(
                 "S3_DEVICE_RECEIPT {}",
                 serde_json::json!({
-                    "schema":"sc-25771-actual-cuda-kernel-v1", "kernel":KERNEL,
+                    "schema":"sc-25777-actual-cuda-kernel-v2", "kernel":KERNEL,
                     "device_ordinal":cuda.cuda_stream().context().ordinal(),
                     "dtype":format!("{dtype:?}"), "self_test_dimensions":[16,128],
                     "native_batch":2, "native_heads":2,
                     "sparse_calls":report.borrow().sparse_calls,
-                    "predictor_score_calls":report.borrow().predictor_score_calls,
+                    "predictor_score_batches":report.borrow().predictor_score_calls,
+                    "exact_scorer_and_masks":true, "tiled_kernel_bits_equal_pointer_v1":true,
                     "forced_failure_dense":true, "unsupported_dtype_dense":true,
                     "intentional_dense_identity":true,
                 })

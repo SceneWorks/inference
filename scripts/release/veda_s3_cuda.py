@@ -17,7 +17,9 @@ from scripts.release import veda_cuda_guard as guard
 
 TEST = "veda::tests::actual_cuda_kernel_gate"
 KERNEL = "cuda-veda-sage-int8-tiled-v2"
-SCHEMA = "sc-25771-actual-cuda-kernel-v1"
+# v2 (sc-25777): one scoring pass per same-shape head batch (`predictor_score_batches`, was
+# per-head `predictor_score_calls`), plus the exact scorer/mask and tiled-vs-pointer-v1 checks.
+SCHEMA = "sc-25777-actual-cuda-kernel-v2"
 
 
 def hash_file(path: Path) -> str:
@@ -80,7 +82,9 @@ def verify_test_output(out: Path, phase: str, result: dict, absent: bool) -> lis
         if (row.get("kernel") != KERNEL or row.get("device_ordinal") != 0
                 or row.get("self_test_dimensions") != [16, 128]
                 or row.get("native_batch") != 2 or row.get("native_heads") != 2
-                or row.get("sparse_calls") != 1 or row.get("predictor_score_calls") != 2
+                or row.get("sparse_calls") != 1 or row.get("predictor_score_batches") != 2
+                or row.get("exact_scorer_and_masks") is not True
+                or row.get("tiled_kernel_bits_equal_pointer_v1") is not True
                 or row.get("forced_failure_dense") is not True
                 or row.get("unsupported_dtype_dense") is not True
                 or row.get("intentional_dense_identity") is not True):
