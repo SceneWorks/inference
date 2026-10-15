@@ -14,7 +14,8 @@ ROOT=Path(__file__).resolve().parents[2]
 def device_rows():
     return [dict(schema=s3.SCHEMA,kernel=s3.KERNEL,device_ordinal=0,dtype=d,
                  self_test_dimensions=[16,128],native_batch=2,native_heads=2,
-                 sparse_calls=1,predictor_score_calls=4,forced_failure_dense=True,
+                 sparse_calls=1,predictor_score_batches=2,exact_scorer_and_masks=True,
+                 tiled_kernel_bits_equal_pointer_v1=True,forced_failure_dense=True,
                  unsupported_dtype_dense=True,intentional_dense_identity=True)
             for d in ("BF16","F16")]
 
@@ -71,7 +72,7 @@ class S3CudaTests(unittest.TestCase):
                 return f"running 1 test\ntest {s3.TEST} ... "+"\n".join("S3_DEVICE_RECEIPT "+json.dumps(r) for r in rows)+"\ntest result: ok. 1 passed; 0 failed; 0 ignored"
             rows=device_rows();logs(out,body(rows))
             self.assertEqual(s3.verify_test_output(out,"test",dict(returncode=0,timeout=False),False),rows)
-            for field,value in [("kernel","other"),("device_ordinal",1),("self_test_dimensions",[16]),("native_batch",1),("predictor_score_calls",0),("forced_failure_dense",False)]:
+            for field,value in [("kernel","other"),("device_ordinal",1),("self_test_dimensions",[16]),("native_batch",1),("predictor_score_batches",0),("exact_scorer_and_masks",False),("tiled_kernel_bits_equal_pointer_v1",None),("forced_failure_dense",False)]:
                 changed=device_rows();changed[0][field]=value;logs(out,body(changed))
                 with self.assertRaises(RuntimeError):s3.verify_test_output(out,"test",dict(returncode=0,timeout=False),False)
             logs(out,body(rows[:1]))

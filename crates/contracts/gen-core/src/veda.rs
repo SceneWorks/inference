@@ -169,6 +169,7 @@ pub struct VedaExecutionReport {
     pub execution_grid: Option<[usize; 3]>,
     pub plan_grid: Option<[usize; 3]>,
     pub predictor_load_attempts: u64,
+    /// Learned scoring passes: one per same-shape head batch of one sample (MLX and CUDA).
     pub predictor_score_calls: u64,
     pub sparse_calls: u64,
     pub dense_calls: u64,
