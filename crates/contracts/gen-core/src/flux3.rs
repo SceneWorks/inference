@@ -36,6 +36,7 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod image_input;
 pub mod pup;
 
 // ---------------------------------------------------------------------------------------------
