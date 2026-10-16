@@ -810,7 +810,7 @@ jobs:
   # CPU-kernel JIT (see `.cargo/config.toml`). No prebuilt MLX either: none is published for the
   # iOS cells, and the point of the lane is to check the metallib THIS build emits.
   ios-build:
-    name: runtime-ios cross-build (iOS device + simulator)
+    name: runtime-ios cross-build (${{ matrix.target }})
     needs: changes
     if: needs.changes.outputs.ios_build == 'true'
     runs-on: macos-15
