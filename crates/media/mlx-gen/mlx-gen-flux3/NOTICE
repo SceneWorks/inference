@@ -1,0 +1,21 @@
+mlx-gen-flux3 — the Rust/MLX port in this directory is licensed under Apache-2.0 like every sibling
+provider crate in this workspace.
+
+It is a port of the FLUX 3 Image Klein inference code
+(https://github.com/black-forest-labs/flux-3-image-klein, commit
+45e57c9fb06f9751cdced29a65c5d2171003be05), which is distributed under the Apache License,
+Version 2.0 (its LICENSE file).
+
+The weights it loads — black-forest-labs/flux-3-image-klein (revision
+8454017f9ebaada30c998fccd9f67a80c7580f68: the DiT `model.safetensors` and the autoencoder
+`ae.safetensors`) — are distributed under the FLUX Kommunity License v1.0, whose Attribution Notice
+reads:
+
+    This FLUX Model is licensed by Black Forest Labs Inc. under the FLUX Kommunity License.
+    Copyright Black Forest Labs Inc. IN NO EVENT SHALL BLACK FOREST LABS INC. BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+    ARISING FROM, OUT OF OR IN CONNECTION WITH USE OF THIS MODEL.
+
+The package's bundled text encoder (`text_encoder/`) is a byte-identical copy of
+Qwen/Qwen3-VL-4B-Instruct (revision ebb281ec70b05090aa6165b016eac8ec08e71b17, Alibaba Cloud),
+distributed under the Apache License, Version 2.0. See UPSTREAM.md.

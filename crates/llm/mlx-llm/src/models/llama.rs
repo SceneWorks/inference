@@ -991,6 +991,41 @@ impl CausalLm {
         self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
     }
 
+    /// [`CausalLm::hidden_states_with_mask`] from **explicit absolute positions** rather than the
+    /// contiguous `offset..offset + seq` run — the text-encoder twin of
+    /// [`CausalLm::decode_logits_masked_at`]. `positions` is a row-major `[batch, seq]` grid, so
+    /// a right-padded window whose pads all sit at one position (FLUX 3's
+    /// `positions.masked_fill(mask == 0, 1)`) rotates exactly as upstream's `position_ids`, and
+    /// the additive `mask` keeps the pads out of every query's keys. Every layer type's RoPE
+    /// tables are built from the same grid, so a per-layer-type model (Gemma 4) is served too.
+    ///
+    /// Returns the same `num_layers + 1` HF-ordered stack as [`CausalLm::hidden_states`], with the
+    /// same evaluate-in-order guidance.
+    pub fn hidden_states_with_mask_at(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Array>> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        if positions.len() != (b * s) as usize {
+            return Err(Error::Msg(format!(
+                "hidden_states_with_mask_at: {} positions for a {b}x{s} window",
+                positions.len()
+            )));
+        }
+        let embeds = self.embed(input_ids)?;
+        let ropes = self.stack_rope_at(positions, b, s)?;
+        let mut out = Vec::with_capacity(self.cfg.num_layers + 1);
+        self.run_decoder_stack_collecting(&embeds, cache, &ropes, mask, Some(&mut out))?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps)?;
+        }
+        Ok(out)
+    }
+
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
     ///
     /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's

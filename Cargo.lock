@@ -2427,6 +2427,7 @@ dependencies = [
  "mlx-gen-face",
  "mlx-gen-flux",
  "mlx-gen-flux2",
+ "mlx-gen-flux3",
  "mlx-gen-ideogram",
  "mlx-gen-instantid",
  "mlx-gen-iris",
@@ -2527,6 +2528,20 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-pid",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
