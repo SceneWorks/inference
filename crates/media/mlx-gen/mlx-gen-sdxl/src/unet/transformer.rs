@@ -505,6 +505,12 @@ impl Transformer2D {
         self.block_stream = Some(stream);
     }
 
+    pub(crate) fn bind_source_inventory(&mut self, guard: &mlx_gen::gen_core::SourceInventory) {
+        if let Some(stream) = &mut self.block_stream {
+            stream.bind_source_inventory(guard.clone());
+        }
+    }
+
     /// Disarm rung 4 on this sub-stack. Used when an in-place mutation lands that a re-materialized
     /// block could not reproduce — see
     /// [`UNet2DConditionModel::set_sdpa_checkpoint`](crate::unet::UNet2DConditionModel).

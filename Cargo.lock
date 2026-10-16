@@ -2572,6 +2572,7 @@ dependencies = [
  "mlx-gen-anima",
  "mlx-gen-iris",
  "mlx-gen-sana",
+ "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "sha2",

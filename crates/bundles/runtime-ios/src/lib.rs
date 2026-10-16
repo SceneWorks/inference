@@ -17,10 +17,11 @@
 //!
 //! # Admission (epic 16774, E4)
 //!
-//! [`load_admitted`] is the **only** admitted load entry point: it refuses, before the loader runs,
-//! a request whose footprint estimate is absent, exceeds [`IOS_APP_MEMORY_CAP_MIB`], or exceeds the
-//! per-process headroom iOS reports at that moment. `media::load_sana` (with `media`) is SANA's
-//! admitted load, built on it. Nothing else here is admitted:
+//! [`load_admitted`] is the generic estimate/cap guard: it refuses, before the loader runs,
+//! an absent estimate or one above [`IOS_APP_MEMORY_CAP_MIB`] or live process headroom.
+//! `media::load_sana` adds SANA's source applicability checks. `media::load_sdxl` additionally
+//! retains source inventory and an actual-request binding across deferred execution, with live
+//! capacity rechecked before generation. Other raw load surfaces are not admitted:
 //!
 //! * [`llm`] re-exports `mlx-llm` whole, and its loaders (`load_for_model`, …) do **not** admit.
 //!   MLX LLMs carry no footprint estimate yet, so the admitted answer for an LLM load today is a
@@ -28,7 +29,7 @@
 //!   must say so.
 //! * [`catalog`]'s registries are a composition/snapshot surface (the shared
 //!   [`RuntimeCatalog`] contract) and load unadmitted. A product loads through
-//!   [`load_admitted`], not through them.
+//!   the model's admitted facade, not through them.
 //! * `media` deliberately does not re-export the catalog's `provider_registry`, so the
 //!   unadmitted registry load is not this bundle's default image surface. The one unadmitted image
 //!   loader, `media::load_sana_unadmitted_for_diagnostics`, is named for what it is.
@@ -49,7 +50,7 @@ pub mod media {
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, ios_memory_budget, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
         FootprintBound, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
         IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
         SANA_DEVICE_FOOTPRINTS,
@@ -68,6 +69,41 @@ pub mod media {
         crate::load_admitted(Some(estimate), || {
             mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
         })
+    }
+
+    /// Select the caller's highest-preference SDXL candidate using artifact/device-bound evidence
+    /// and the provider's registered shared safety check, BEFORE any tensor payload is loaded.
+    /// Returns the selected candidate index along with the generator so the caller retains its
+    /// selected geometry/tier/execution controls rather than silently rendering another candidate.
+    /// Every SDXL-family checkpoint and route remains registered, but no current iPhone capture
+    /// authorizes a product load. Raw catalog access remains diagnostic, not admission authority.
+    pub fn load_sdxl(
+        candidates: &[sdxl::SdxlCandidate],
+    ) -> crate::gen_core::Result<(usize, mlx_gen_ios_catalog::BoundSdxlGenerator)> {
+        if !super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::gen_core::Error::Unsupported(
+                "iOS SDXL admission requires platform allocator/cache limits bound first".into(),
+            ));
+        }
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        // No existing process bytes are credited: compare absolute captured process footprints
+        // conservatively to BOTH fixed cap and current live capacity during candidate selection.
+        let live = super::os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64);
+        let budget = sdxl::capacity_budget(u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20, 0, live);
+        let admitted =
+            sdxl::select_sdxl_candidate(&registry, candidates, &super::device_machine(), budget)?;
+        let index = admitted.index();
+        // Recheck live capacity before loading AND every actual generate; retain the sealed source
+        // inventory and actual-request binding instead of returning an unguarded inner Generator.
+        let bound = admitted.load(&registry, |bytes| {
+            let estimate = u32::try_from(bytes.div_ceil(1 << 20)).map_err(|_| {
+                crate::gen_core::Error::Unsupported("SDXL footprint exceeds runtime range".into())
+            })?;
+            super::admit_estimate_mib(Some(estimate))?;
+            super::admit_within_headroom(estimate, super::os_proc_available_mib())?;
+            Ok(())
+        })?;
+        Ok((index, bound))
     }
 
     /// Load SANA **without** admission. For a diagnostic run whose purpose is to execute a render
@@ -546,6 +582,17 @@ mod tests {
         assert!(super::admit_sana_render(1024, 192).is_err());
     }
 
+    #[cfg(feature = "media")]
+    #[test]
+    fn sdxl_product_load_refuses_before_loading_an_unverified_source() {
+        // No device capture exists. Even a caller supplying no candidates must not reach loading;
+        // no host peak or unadmitted registry is exposed as this facade's default SDXL loader.
+        assert!(super::media::load_sdxl(&[]).is_err());
+        let registry = super::catalog().unwrap().snapshot();
+        assert!(registry.generator_ids.contains(&"sdxl".to_string()));
+        assert!(registry.trainer_ids.is_empty());
+    }
+
     /// SANA admission reads the catalog's bound and compares it to the cap (whatever value the
     /// cap is filled in with); a pair with no bound (1024²/256) is refused.
     #[cfg(feature = "media")]
@@ -648,13 +695,19 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is SANA + Anima Turbo + Iris under `media`, empty without it. An
+        // The media surface is SANA + Anima Turbo + SDXL + Iris under `media`, empty without it. An
         // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
         // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "iris_3b"],
+            [
+                "sana_1600m",
+                "sana_sprint_1600m",
+                "anima_turbo",
+                "sdxl",
+                "iris_3b"
+            ],
             "the iOS image surface changed; registration is not a device fitting claim"
         );
         #[cfg(not(feature = "media"))]

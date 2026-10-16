@@ -9,7 +9,7 @@ repository = "https://github.com/SceneWorks/inference"
 [dependencies]
 sha2 = { workspace = true }
 mlx-gen = { path = ".." }
-# SANA and Anima Turbo only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
+# SANA, Anima Turbo, the SDXL family and all Iris inference tasks only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
 # the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for
 # a device with a hard per-app memory cap. Depending on the whole catalog to obtain one small
 # generator would compile a graph the platform cannot run.
@@ -24,6 +24,8 @@ mlx-gen-sana = { path = "../mlx-gen-sana" }
 mlx-gen-anima = { path = "../mlx-gen-anima", default-features = false }
 # All Iris inference modes; no trainer/JACCL training shim in the iOS graph.
 mlx-gen-iris = { path = "../mlx-gen-iris", default-features = false }
+# The complete SDXL family shares one generator; never compile its trainer on iOS.
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }
