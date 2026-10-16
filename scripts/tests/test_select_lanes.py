@@ -1,6 +1,12 @@
+import re
+import shutil
+import subprocess
 import unittest
+from pathlib import Path
 
 from scripts.ci.select_lanes import LANES, only_lanes, select_lanes
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SelectLanesTests(unittest.TestCase):
@@ -38,6 +44,7 @@ class SelectLanesTests(unittest.TestCase):
 
     def test_mlx_provider_change_stays_on_macos(self) -> None:
         lanes = select_lanes(["crates/media/mlx-gen/mlx-gen-flux/src/lib.rs"])
+        self.assertFalse(lanes["ios_build"])
         self.assertTrue(lanes["workspace"])
         self.assertTrue(lanes["macos_metal"])
         self.assertTrue(lanes["real_weights"])
@@ -109,6 +116,78 @@ class SelectLanesTests(unittest.TestCase):
                 self.assertTrue(lanes["release"])
                 for other in {"macos_metal", "candle_cpu", "windows_cuda"} - {expected}:
                     self.assertFalse(lanes[other], other)
+
+    def test_ios_bound_paths_select_the_ios_build_lane(self) -> None:
+        for path in (
+            "crates/bundles/runtime-ios/src/lib.rs",
+            "crates/media/mlx-gen/mlx-gen-ios-catalog/src/lib.rs",
+            "crates/media/mlx-gen/mlx-gen-sana/src/lib.rs",
+            "crates/media/mlx-gen/src/lib.rs",
+            "crates/media/mlx-gen/Cargo.toml",
+            "crates/llm/mlx-llm/src/lib.rs",
+            "crates/contracts/gen-core/src/lib.rs",
+            "Cargo.lock",
+            ".cargo/config.toml",
+            ".github/workflows/ci.yml",
+            "scripts/ci/assert_metallib_triple.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(select_lanes([path])["ios_build"])
+
+    def test_non_ios_paths_do_not_select_the_ios_build_lane(self) -> None:
+        for path in (
+            "crates/media/mlx-gen/mlx-gen-flux/src/lib.rs",
+            "crates/media/mlx-gen/mlx-gen-catalog/src/lib.rs",
+            "crates/media/mlx-gen/mlx-gen-sanaish/src/lib.rs",
+            "crates/bundles/runtime-macos/src/lib.rs",
+            "crates/media/candle-gen/candle-gen-flux/src/lib.rs",
+            "crates/contracts/gen-core-testkit/src/lib.rs",
+            "docs/migration/PHASE_2_CHECKPOINT.md",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(select_lanes([path])["ios_build"])
+
+    def test_every_crate_on_the_ios_graph_selects_the_ios_build_lane(self) -> None:
+        """The static iOS path list must cover runtime-ios's live dependency graph.
+
+        `cargo tree -p runtime-ios` resolves runtime-ios's OWN features (unlike `cargo metadata`,
+        which unifies features across the whole workspace), so this is the graph the iOS lane
+        actually builds. The path list may over-select; it must not miss a crate.
+        """
+        if shutil.which("cargo") is None:
+            self.skipTest("cargo is not installed")
+        result = subprocess.run(
+            [
+                "cargo",
+                "tree",
+                "--locked",
+                "-p",
+                "runtime-ios",
+                "--target",
+                "aarch64-apple-ios",
+                "-e",
+                "normal,build",
+                "--prefix",
+                "none",
+                "--format",
+                "{p}",
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+        )
+        root = REPO_ROOT.resolve()
+        crate_dirs = set()
+        for match in re.finditer(r"\((/[^)]+)\)", result.stdout):
+            path = Path(match.group(1)).resolve()
+            if path.is_relative_to(root):
+                crate_dirs.add(path.relative_to(root).as_posix())
+        self.assertIn("crates/bundles/runtime-ios", crate_dirs)
+        self.assertIn("crates/media/mlx-gen/mlx-gen-ios-catalog", crate_dirs)
+        for crate_dir in sorted(crate_dirs):
+            with self.subTest(crate=crate_dir):
+                self.assertTrue(select_lanes([f"{crate_dir}/src/lib.rs"])["ios_build"])
 
     def test_docs_only_does_not_build_backends(self) -> None:
         lanes = select_lanes(["docs/migration/PHASE_2_CHECKPOINT.md"])
