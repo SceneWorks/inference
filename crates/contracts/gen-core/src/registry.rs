@@ -944,6 +944,7 @@ pub enum MemoryContractSurfaceTier {
     Q4,
     Q8,
     Nvfp4,
+    Fp8Rowwise,
 }
 
 impl MemoryContractSurfaceTier {
@@ -956,6 +957,7 @@ impl MemoryContractSurfaceTier {
             Self::Q4 => spec.with_quant(crate::Quant::Q4),
             Self::Q8 => spec.with_quant(crate::Quant::Q8),
             Self::Nvfp4 => spec.with_quant(crate::Quant::Nvfp4),
+            Self::Fp8Rowwise => spec.with_quant(crate::Quant::Fp8Rowwise),
         }
     }
 }
@@ -982,6 +984,9 @@ impl MemoryContractSurfaceSelector {
             MemoryContractSurfaceTier::Q4 => spec.quantize == Some(crate::Quant::Q4),
             MemoryContractSurfaceTier::Q8 => spec.quantize == Some(crate::Quant::Q8),
             MemoryContractSurfaceTier::Nvfp4 => spec.quantize == Some(crate::Quant::Nvfp4),
+            MemoryContractSurfaceTier::Fp8Rowwise => {
+                spec.quantize == Some(crate::Quant::Fp8Rowwise)
+            }
         };
         tier_matches
             && self.offload_policy == spec.offload_policy
@@ -1070,6 +1075,26 @@ impl MemoryContractSurfaceSelector {
                 crate::OffloadPolicy::Sequential,
                 crate::LoadShape::DeferredMaterialization,
             ) => "nvfp4:sequential:deferred",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::EagerMaterialization,
+            ) => "fp8r:resident:eager",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Resident,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "fp8r:resident:deferred",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::EagerMaterialization,
+            ) => "fp8r:sequential:eager",
+            (
+                MemoryContractSurfaceTier::Fp8Rowwise,
+                crate::OffloadPolicy::Sequential,
+                crate::LoadShape::DeferredMaterialization,
+            ) => "fp8r:sequential:deferred",
         }
     }
 }
@@ -2217,7 +2242,7 @@ macro_rules! explicit_registry_kind {
                         id = id
                     ))
                 })?;
-            self.ensure_quant_supported(id, spec)?;
+            self.ensure_quant_supported(id, spec, $kind)?;
             spec.read_prepared_files_unchanged(|| (registration.load)(spec))
         }
     };
@@ -2706,7 +2731,7 @@ impl ProviderRegistry {
     /// check covers the whole catalog — the composition root states the platform's tier support once
     /// instead of each provider re-deriving it. Runs *after* id resolution so an unknown id still
     /// reports as an unknown id.
-    fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec) -> Result<()> {
+    fn ensure_quant_supported(&self, id: &str, spec: &LoadSpec, kind: &str) -> Result<()> {
         if spec.yue2_ar_mode != crate::Yue2ArMode::Native && id != "yue2" {
             return Err(Error::Unsupported(format!(
                 "the YuE2 AR mode {:?} cannot be used by provider '{id}'",
@@ -2728,7 +2753,22 @@ impl ProviderRegistry {
                  (requested for '{id}'): {reason}. Refusing to load rather than silently \
                  serving a different tier's numerics."
             ))),
-            None => Ok(()),
+            None => {
+                // A NEW packed float format never inherits affine Q8 support. Reuse
+                // the descriptor's exact typed list as the one opt-in source; no
+                // parallel builder allow-list or model-id exception exists.
+                if quant == Quant::Fp8Rowwise
+                    && (kind != "generator"
+                        || !self.generators().any(|registration| {
+                            let descriptor = (registration.descriptor)();
+                            descriptor.id == id
+                                && descriptor.capabilities.supported_quants.contains(&quant)
+                        }))
+                {
+                    return Err(Error::Unsupported(format!("provider '{id}' does not advertise the exact fp8r packed format (it is not Q8); install/convert a compatible artifact and select a supported native tier")));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -2823,6 +2863,9 @@ impl ProviderRegistry {
             .generators()
             .find(|registration| (registration.descriptor)().id == id)
             .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
+        if spec.quantize == Some(Quant::Fp8Rowwise) {
+            self.ensure_quant_supported(id, spec, "generator")?;
+        }
         match registration.footprint {
             Some(footprint) => spec
                 .read_prepared_files_unchanged(|| footprint(spec))
@@ -2846,6 +2889,9 @@ impl ProviderRegistry {
         let is_composed_route = self.composed_memory_strategy_ids.contains(&id);
         if !has_generator && !is_composed_route {
             return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        if spec.quantize == Some(Quant::Fp8Rowwise) {
+            self.ensure_quant_supported(id, spec, "generator")?;
         }
         let Some(registration) = self
             .memory_strategy
@@ -4524,6 +4570,86 @@ mod tests {
             ),
             other => panic!("a rejected quant tier is a capability gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rowwise_fp8_requires_exact_provider_capability_not_q8_width() {
+        fn q8_only() -> ModelDescriptor {
+            let mut descriptor = dummy_candle_descriptor();
+            descriptor.capabilities.supported_quants = &[Quant::Q8];
+            descriptor
+        }
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: q8_only,
+                load: dummy_load,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        let q8 = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Q8);
+        assert!(registry.load("dummy_candle_test_model", &q8).is_ok());
+        let fp8 = q8.with_quant(Quant::Fp8Rowwise);
+        for error in [
+            registry.load("dummy_candle_test_model", &fp8).err(),
+            registry.footprint("dummy_candle_test_model", &fp8).err(),
+            registry
+                .memory_strategy_contract("dummy_candle_test_model", &fp8)
+                .err(),
+        ] {
+            assert!(
+                matches!(error,Some(Error::Unsupported(message)) if message.contains("fp8r")&&message.contains("not Q8"))
+            );
+        }
+    }
+
+    #[test]
+    fn flux3_fp8_is_not_advertised_until_explicitly_listed() {
+        fn without_fp8() -> ModelDescriptor {
+            ModelDescriptor {
+                id: crate::flux3::DISTILLED_MODEL_ID,
+                family: "flux3",
+                backend: "candle",
+                ..dummy_descriptor()
+            }
+        }
+        fn with_fp8() -> ModelDescriptor {
+            let mut descriptor = without_fp8();
+            descriptor.capabilities.supported_quants = &[Quant::Fp8Rowwise];
+            descriptor
+        }
+        fn load_fp8(_: &LoadSpec) -> Result<Box<dyn Generator>> {
+            Ok(Box::new(DummyGen { desc: with_fp8() }))
+        }
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(Quant::Fp8Rowwise);
+        let unlisted = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: without_fp8,
+                load: load_fp8,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        assert!(matches!(
+            unlisted.load(crate::flux3::DISTILLED_MODEL_ID, &spec),
+            Err(Error::Unsupported(_))
+        ));
+        let listed = ProviderRegistryBuilder::new()
+            .register_generator(ModelRegistration {
+                descriptor: with_fp8,
+                load: load_fp8,
+                footprint: None,
+            })
+            .build()
+            .unwrap();
+        assert!(listed.load(crate::flux3::DISTILLED_MODEL_ID, &spec).is_ok());
+        assert_eq!(
+            (listed.generators().next().unwrap().descriptor)()
+                .capabilities
+                .supported_quants,
+            &[Quant::Fp8Rowwise]
+        );
     }
 
     /// A model-specific AR execution choice cannot be silently ignored by another provider.

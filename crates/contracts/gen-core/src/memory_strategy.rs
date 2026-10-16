@@ -4309,11 +4309,7 @@ const fn precision_key(precision: Precision) -> &'static str {
 }
 
 const fn quant_key(quant: Quant) -> &'static str {
-    match quant {
-        Quant::Q4 => "q4",
-        Quant::Q8 => "q8",
-        Quant::Nvfp4 => "nvfp4",
-    }
+    quant.key()
 }
 
 impl MemoryEvidence {
