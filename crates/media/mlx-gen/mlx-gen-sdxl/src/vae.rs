@@ -241,21 +241,43 @@ impl EncoderDecoderBlock2D {
             trace_decode_stage(&format!("resnet.{index}.out"), &x)?;
         }
         if let Some((cw, cb)) = &self.upsample {
-            let up = upsample_nearest(&x, 2)?;
-            x = mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
-                &up,
-                cw,
-                Some(cb),
-                upsampled_tile_edge,
-                cancel,
-                |tile| Ok(tile.clone()),
-            )?;
+            x = upsample_tiled(&x, cw, cb, upsampled_tile_edge, cancel)?;
         }
         Ok(x)
     }
 
     fn upsamples(&self) -> bool {
         self.upsample.is_some()
+    }
+}
+
+/// The VAE upsample convolution has no normalization between nearest-neighbor expansion and
+/// convolution: unlike a resnet's normalized inputs its activation can be ~2000 (sc-26268).
+fn upsample_tiled(
+    x: &Array,
+    weight: &Array,
+    bias: &Array,
+    tile: i32,
+    cancel: Option<&CancelFlag>,
+) -> Result<Array> {
+    let up = upsample_nearest(x, 2)?;
+    trace_decode_stage("upsample.nearest", &up)?;
+    if x.dtype() == Dtype::Float16 {
+        // Half storage, wide accumulation: only this unnormalized convolution is sensitive to
+        // partial-sum overflow. The helper promotes one crop and casts each core back before
+        // assembling the image, so no full-resolution f32 activation is introduced.
+        mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc_f32_accum(
+            &up,
+            weight,
+            Some(bias),
+            tile,
+            cancel,
+            |tile| Ok(tile.clone()),
+        )
+    } else {
+        mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(&up, weight, Some(bias), tile, cancel, |tile| {
+            Ok(tile.clone())
+        })
     }
 }
 
@@ -1218,6 +1240,72 @@ pub(crate) mod tests {
             plain, traced,
             "stage observation must not change the output"
         );
+    }
+
+    /// Real failing kernel geometry with synthetic weights: the upsample feeds a 256²×256 half
+    /// activation to a 256-channel 3×3 convolution. Positive partial sums exceed f16's range
+    /// before negative terms cancel them; the mathematical result (including bias) is one.
+    #[test]
+    fn half_upsample_conv_keeps_cancelling_high_range_dot_products_finite() {
+        for cpu in [true, false] {
+            let _guard = cpu.then(crate::test_device::cpu_only);
+            let x = Array::full::<f32>(&[1, 128, 128, 256], scalar(1954.0))
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let v = (0..256 * 3 * 3 * 256)
+                .map(|i| if i % 256 < 128 { 0.5f32 } else { -0.5 })
+                .collect::<Vec<_>>();
+            let weight = Array::from_slice(&v, &[256, 3, 3, 256])
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let bias = Array::ones::<f32>(&[256])
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap();
+            let up = upsample_nearest(&x, 2).unwrap();
+            let up_stats = decode_stage_stats(&up).unwrap();
+            assert_eq!(
+                (up_stats.nan, up_stats.inf),
+                (0, 0),
+                "nearest-neighbor must stay finite"
+            );
+            // Same kernel geometry and weights at low amplitude: no nonfinite values. This
+            // distinguishes high-range accumulation from an unconditional shape/indexing defect.
+            let low = conv2d(
+                &multiply(&up, scalar(1.0 / 1954.0).as_dtype(Dtype::Float16).unwrap()).unwrap(),
+                &weight,
+                Some(&bias),
+                1,
+                1,
+            )
+            .unwrap();
+            let low_stats = decode_stage_stats(&low).unwrap();
+            assert_eq!((low_stats.nan, low_stats.inf), (0, 0));
+            let expected = conv2d(
+                &up.as_dtype(Dtype::Float32).unwrap(),
+                &weight.as_dtype(Dtype::Float32).unwrap(),
+                Some(&bias.as_dtype(Dtype::Float32).unwrap()),
+                1,
+                1,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+            let got = upsample_tiled(&x, &weight, &bias, 256, None).unwrap();
+            assert_eq!(got.dtype(), Dtype::Float16, "storage must remain half");
+            let stats = decode_stage_stats(&got).unwrap();
+            eprintln!("cpu={cpu}: high-range upsample conv {stats:?}");
+            assert_eq!(
+                (stats.nan, stats.inf),
+                (0, 0),
+                "finite cancellation cannot overflow a partial sum"
+            );
+            assert!(
+                relative_max_delta(&expected, &got) <= 1e-3,
+                "wide accumulation must match the f32 convolution"
+            );
+        }
     }
 
     /// Scaled analogue of the failing real-weight cell: 4×4+ragged core grids at half precision,
