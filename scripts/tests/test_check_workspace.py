@@ -2031,11 +2031,13 @@ class IosHostMlxPinTests(unittest.TestCase):
     def write(self, root: Path, harness_rev: str) -> None:
         dep = '{ package = "pmetal-mlx-rs", git = "https://github.com/x/mlx-rs", rev = "%s" }'
         (root / "Cargo.toml").write_text(
-            "[workspace]\n[workspace.dependencies]\nmlx-rs = " + dep % "aaa" + "\n"
+            "[workspace]\n[workspace.dependencies]\nmlx-rs = " + dep % "aaa" + "\n",
+            encoding="utf-8",
         )
         (root / "ios-host" / "smoke").mkdir(parents=True)
         (root / "ios-host" / "smoke" / "Cargo.toml").write_text(
-            "[package]\nname = \"x\"\n[dependencies]\nmlx-rs = " + dep % harness_rev + "\n"
+            "[package]\nname = \"x\"\n[dependencies]\nmlx-rs = " + dep % harness_rev + "\n",
+            encoding="utf-8",
         )
 
     def test_matching_pin_passes_and_drift_fails(self) -> None:
