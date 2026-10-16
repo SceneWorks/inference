@@ -3,7 +3,7 @@
 //! autoencoder), registered as [`MODEL_ID`]. The request/load surface is the MLX twin's, field for
 //! field (both read `gen_core::flux3`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::flux3::{
@@ -34,6 +34,16 @@ pub const MIN_SIZE: u32 = gen_core::flux3::MIN_SIDE;
 pub const MAX_SIZE: u32 = gen_core::flux3::MAX_SIDE;
 /// Images per request (rendered one after another, each from `seed + i`).
 pub const MAX_COUNT: u32 = 8;
+
+fn fenced_image_load<T>(device: &Device, load: impl FnOnce() -> Result<T>) -> Result<T> {
+    let primary = load();
+    if primary.is_err() {
+        if let Err(cleanup) = device.synchronize() {
+            eprintln!("FLUX3 partial image-load cleanup fence failed; primary error preserved, no release claimed: {cleanup}");
+        }
+    }
+    primary
+}
 
 /// Identity + capabilities, constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
@@ -104,6 +114,22 @@ pub struct Heavy {
     pub ae: Flux3AutoEncoder,
 }
 
+impl gen_core::StagedHeavy for Heavy {
+    type Light = Flux3AutoEncoder;
+    type DecodeView<'a> = &'a Flux3AutoEncoder;
+    fn shed_dit(self) -> Self::Light {
+        let Self { dit, ae } = self;
+        drop(dit);
+        ae
+    }
+    fn decode_view(&self) -> Self::DecodeView<'_> {
+        &self.ae
+    }
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+        light
+    }
+}
+
 /// A loaded distilled generator.
 pub struct Flux3Klein {
     descriptor: ModelDescriptor,
@@ -111,7 +137,9 @@ pub struct Flux3Klein {
     config: Flux3Config,
     device: Device,
     residency: Residency<Flux3TextEncoder, Heavy>,
-    prompt_upsampler: Option<crate::pup::Flux3PromptUpsampler>,
+    prompt_upsampler_dir: Option<PathBuf>,
+    prompt_upsampler:
+        gen_core::flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
     /// memory-strategy seam checks a request selection against.
     spec: LoadSpec,
@@ -222,7 +250,9 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     // registration refuses is the same refusal through `load` on every offload policy
     // (`Sequential` defers every component to the first render).
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
-    let prompt_upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
+    // Resolve only the optional source path. No VLM/model/prefix cache is loaded
+    // until an enabled request enters the exclusive prepare phase.
+    let prompt_upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
     let device = candle_gen::default_device().map_err(|e| {
         Error::Unsupported(format!(
         "{MODEL_ID}: cannot initialize the selected native Candle device: {e}; use a supported \
@@ -241,21 +271,27 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     let heavy_device = device.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || Flux3TextEncoder::load(&te_dir, &te_cfg, text_in, &te_device),
+        move || {
+            fenced_image_load(&te_device, || {
+                Flux3TextEncoder::load(&te_dir, &te_cfg, text_in, &te_device)
+            })
+        },
         move |_use_pid| {
-            let mut dit = load_dit(&dit_path, &heavy_cfg, compute, &heavy_device)?;
-            crate::adapters::install(&mut dit, &adapters)?;
-            let ae = load_autoencoder(&ae_path, &heavy_device)?;
-            if ae.latent_channels() != heavy_cfg.dit.image_in_channels {
-                return Err(Error::Msg(format!(
-                    "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
+            fenced_image_load(&heavy_device, || {
+                let mut dit = load_dit(&dit_path, &heavy_cfg, compute, &heavy_device)?;
+                crate::adapters::install(&mut dit, &adapters)?;
+                let ae = load_autoencoder(&ae_path, &heavy_device)?;
+                if ae.latent_channels() != heavy_cfg.dit.image_in_channels {
+                    return Err(Error::Msg(format!(
+                        "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
                      reads {}",
-                    ae_path.display(),
-                    ae.latent_channels(),
-                    heavy_cfg.dit.image_in_channels
-                )));
-            }
-            Ok(Heavy { dit, ae })
+                        ae_path.display(),
+                        ae.latent_channels(),
+                        heavy_cfg.dit.image_in_channels
+                    )));
+                }
+                Ok(Heavy { dit, ae })
+            })
         },
     )?;
     Ok(Flux3Klein {
@@ -268,7 +304,8 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         config,
         device,
         residency,
-        prompt_upsampler,
+        prompt_upsampler_dir,
+        prompt_upsampler: Default::default(),
         spec: spec.clone(),
         memory_strategy,
     })
@@ -329,7 +366,96 @@ fn prepared_image_request<Text, HeavyPhase, Prepared, Encoded, Out>(
 }
 
 impl Flux3Klein {
+    fn staged_images(
+        &self,
+        req: &GenerationRequest,
+        prepared: Option<&PreparedReferences>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<gen_core::Image>> {
+        self.residency.run_staged_request_scoped_with_prepare(
+            true,false,&req.cancel,false,on_progress,
+            Some(||Ok(self.device.synchronize()?)),
+            |progress|self.effective_params(req,progress),
+            |te:&Flux3TextEncoder,params:GenerationParams| ->Result<(TextConditioning,Option<TextConditioning>,GenerationParams)> {
+                let text=te.encode(&params.prompt)?;
+                let negative=if params.guidance.is_some(){Some(te.encode(&params.negative_prompt)?)}else{None};
+                Ok((text,negative,params))
+            },
+            encoder_materialization_boundary(||Ok(self.device.synchronize()?)),
+            |heavy:&Heavy,(text,negative,params):(TextConditioning,Option<TextConditioning>,GenerationParams),progress| {
+                let reference_tokens=prepared.map(|p|crate::references::encode(&heavy.ae,p,&self.device,&req.cancel)).transpose()?;
+                let total=params.steps*req.count;
+                let mut tokens=Vec::with_capacity(req.count as usize);
+                for index in 0..req.count {
+                    let done=index*params.steps;
+                    let seed=candle_gen::image_seed(params.seed,index);
+                    tokens.push(denoise_one_with_references(&heavy.dit,&text,negative.as_ref(),reference_tokens.as_ref(),&params,seed,&req.cancel,|step|progress(Progress::Step{current:done+step as u32,total}))?);
+                }
+                Ok((tokens,params))
+            },
+            |_mid|Ok(self.device.synchronize()?),
+            |ae,(tokens,params),progress| {
+                progress(Progress::Decoding);
+                if req.cancel.is_cancelled(){return Err(Error::Canceled);}
+                let (h,w)=params.latent_shape()?;
+                let primary=decode_batch(&tokens,&req.cancel,|token| {
+                    let image=decode_tokens(ae,token,h,w)?;
+                    match prepared {Some(p)=>Ok(references::crop_output(image,&p.output)?),None=>Ok(image)}
+                });
+                let fence=self.device.synchronize().map_err(Error::from);
+                match primary {
+                    Err(primary)=>{if let Err(cleanup)=fence{eprintln!("FLUX3 decode cleanup fence failed; primary error preserved: {cleanup}");}Err(primary)},
+                    Ok(images)=>{fence?;Ok(images)},
+                }
+            },
+        )
+    }
+
+    fn effective_params(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationParams> {
+        let outcome=self.prompt_upsampler.with_request(
+            req.enhance_prompt,stage_residency_for(&self.spec,req),&req.cancel,
+            || {
+                let dir=self.prompt_upsampler_dir.as_ref().ok_or_else(||gen_core::Error::Unsupported(
+                    "FLUX3 prompt enhancement requires the separate pinned prompt_upsampler component; install it or explicitly disable enhancement".into()
+                ))?;
+                crate::pup::Flux3PromptUpsampler::load(dir).map_err(gen_core::Error::from)
+            },
+            |upsampler|crate::pup::effective_prompt(upsampler,req,on_progress).map_err(gen_core::Error::from),
+            crate::pup::Flux3PromptUpsampler::synchronize_before_release,
+            || {}, // Candle storage owns deallocation; unlike MLX there is no allocator-drain hook.
+        )?;
+        let mut effective = req.clone();
+        effective.prompt = outcome.caption;
+        Ok(GenerationParams::resolve(
+            &effective,
+            prompt_seed(&effective.prompt),
+            &self.config,
+        )?)
+    }
+
     fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationReport> {
+        let result = self.generate_inner(req, on_progress);
+        if result.is_err() {
+            match self.prompt_upsampler.cleanup_pending() {
+                Ok(false)=>if let Err(cleanup)=self.prompt_upsampler.release_cached(
+                    crate::pup::Flux3PromptUpsampler::synchronize_before_release,||{},
+                ) {eprintln!("FLUX3 PUP cleanup failed; primary generation error preserved, owner retained: {cleanup}");},
+                Ok(true)=>eprintln!("FLUX3 PUP owner remains retained after failed cleanup; no duplicate fence or reclamation claimed"),
+                Err(status)=>eprintln!("FLUX3 PUP cleanup state unavailable; primary generation error preserved: {status}"),
+            }
+        }
+        result
+    }
+
+    fn generate_inner(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -348,23 +474,15 @@ impl Flux3Klein {
                 references::request_output(req),
             )?)
         };
-        let images = prepared_image_request(
+        let images = if stage_residency_for(&self.spec, req) {
+            self.staged_images(req, prepared.as_ref(), on_progress)?
+        } else {
+            prepared_image_request(
             &self.residency,
             stage_residency_for(&self.spec, req),
             &req.cancel,
             on_progress,
-            |on_progress| -> Result<GenerationParams> {
-                // Staged warm components are evicted under the exclusive lifecycle BEFORE PUP.
-                let outcome =
-                    crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
-                let mut effective = req.clone();
-                effective.prompt = outcome.caption;
-                Ok(GenerationParams::resolve(
-                    &effective,
-                    prompt_seed(&effective.prompt),
-                    &self.config,
-                )?)
-            },
+            |on_progress| self.effective_params(req,on_progress),
             |te: &Flux3TextEncoder,
              params: GenerationParams|
              -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
@@ -424,7 +542,8 @@ impl Flux3Klein {
                     }
                 })
             },
-        )?;
+        )?
+        };
         checked_completion(
             &req.cancel,
             GenerationReport {
@@ -541,6 +660,64 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::WeightsSource;
+
+    #[test]
+    fn actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
+        for policy in [
+            gen_core::OffloadPolicy::Resident,
+            gen_core::OffloadPolicy::Sequential,
+        ] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(fixtures.join("tiny-snapshot")))
+                .with_offload_policy(policy);
+            spec.precision = Precision::Fp32;
+            spec.components.insert(
+                gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+                WeightsSource::Dir(fixtures.join("tiny-pup-snapshot")),
+            );
+            let model = load_inner(&spec, false).unwrap();
+            assert!(
+                !model.prompt_upsampler.is_loaded().unwrap(),
+                "loading the image generator must not load an unused VLM"
+            );
+            let mut req = GenerationRequest {
+                prompt: "a red bicycle leaning against a brick wall".into(),
+                width: 80,
+                height: 64,
+                steps: Some(1),
+                seed: Some(17),
+                enhance_max_tokens: None,
+                ..Default::default()
+            };
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert!(
+                !model.prompt_upsampler.is_loaded().unwrap(),
+                "bypass must not secretly load PUP"
+            );
+            req.enhance_prompt = true;
+            req.enhance_max_tokens = Some(12);
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert_eq!(
+                model.prompt_upsampler.is_loaded().unwrap(),
+                policy == gen_core::OffloadPolicy::Resident
+            );
+            if policy == gen_core::OffloadPolicy::Sequential {
+                assert!(model
+                    .residency
+                    .with_resident_parts(|_, _| ())
+                    .unwrap()
+                    .is_none());
+            }
+            req.enhance_prompt = false;
+            req.enhance_max_tokens = None;
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert!(
+                !model.prompt_upsampler.is_loaded().unwrap(),
+                "bypass must evict a prior resident PUP owner"
+            );
+        }
+    }
 
     #[test]
     fn candle_prepare_driver_evicts_before_pup_once_and_observes_prepare_cancellation() {

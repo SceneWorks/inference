@@ -178,6 +178,9 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
         attention_chunking: false,
         transformer_window_materialization: false,
     };
+    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
+        gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
         // The attention transient moves with the pixel count (image tokens) and with the text

@@ -2,7 +2,7 @@
 //! request validation and the staged generate (text encoder → DiT + autoencoder), registered as
 //! [`MODEL_ID`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gen_core::flux3::{
     prompt_seed, validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
@@ -33,6 +33,33 @@ pub const MIN_SIZE: u32 = gen_core::flux3::MIN_SIDE;
 pub const MAX_SIZE: u32 = gen_core::flux3::MAX_SIDE;
 /// Images per request (rendered one after another, each from `seed + i`).
 pub const MAX_COUNT: u32 = 8;
+
+fn new_image_fence() -> gen_core::core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream> {
+    gen_core::core_llm::text_llm::OwnedExecutionFence::new(
+        mlx_rs::Stream::cpu(),
+        mlx_rs::Stream::task_local_or_default(),
+    )
+}
+fn synchronize_image_stream(stream: &mlx_rs::Stream) -> Result<()> {
+    mlx_llm::primitives::synchronize_stream(stream).map_err(|error| {
+        Error::Msg(format!(
+            "FLUX3 image stream fence failed; no release claimed: {error}"
+        ))
+    })
+}
+
+fn fenced_image_load<T>(load: impl FnOnce() -> Result<T>) -> Result<T> {
+    // Created INSIDE the Send+Sync loader invocation; no non-Send stream handle
+    // is captured by its reusable path/config closure.
+    let streams = new_image_fence();
+    let primary = load();
+    if primary.is_err() {
+        if let Err(cleanup) = streams.synchronize(synchronize_image_stream) {
+            eprintln!("FLUX3 partial image-load cleanup fence failed; primary error preserved, no release claimed: {cleanup}");
+        }
+    }
+    primary
+}
 
 /// Identity + capabilities, constructible without weights.
 pub fn descriptor() -> ModelDescriptor {
@@ -105,6 +132,22 @@ pub struct Heavy {
     pub ae: Flux3AutoEncoder,
 }
 
+impl gen_core::StagedHeavy for Heavy {
+    type Light = Flux3AutoEncoder;
+    type DecodeView<'a> = &'a Flux3AutoEncoder;
+    fn shed_dit(self) -> Self::Light {
+        let Self { dit, ae } = self;
+        drop(dit);
+        ae
+    }
+    fn decode_view(&self) -> Self::DecodeView<'_> {
+        &self.ae
+    }
+    fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+        light
+    }
+}
+
 /// A loaded distilled generator.
 pub struct Flux3Klein {
     descriptor: ModelDescriptor,
@@ -116,9 +159,10 @@ pub struct Flux3Klein {
     spec: LoadSpec,
     /// The loaded memory contract, published through [`Generator::memory_strategy_contract`].
     memory_strategy: gen_core::MemoryProviderContract,
-    /// The optional prompt upsampler (sc-26238; the `prompt_upsampler` component), resident
-    /// beside the image model for the generator's lifetime.
-    upsampler: Option<crate::pup::Flux3PromptUpsampler>,
+    /// No VLM weights or prefix cache exist until an enabled prepare phase.
+    upsampler_dir: Option<PathBuf>,
+    upsampler: gen_core::flux3::phase_resource::PhaseResourceSlot<crate::pup::Flux3PromptUpsampler>,
+    image_execution_fence: gen_core::core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream>,
 }
 
 /// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
@@ -259,31 +303,32 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
     let ae_path = resources.autoencoder_file.clone();
     let heavy_cfg = config.clone();
     let adapters = spec.adapters.clone();
+    // Header/config inventory precedes any model-weight materialization.
+    let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || Flux3TextEncoder::load(&te_dir, &te_cfg, text_in),
+        move || fenced_image_load(|| Flux3TextEncoder::load(&te_dir, &te_cfg, text_in)),
         move |_use_pid| {
-            let mut dit = load_dit(&dit_path, &heavy_cfg, compute)?;
-            crate::adapters::install(&mut dit, &adapters)?;
-            let ae = load_autoencoder(&ae_path)?;
-            if ae.latent_channels() as usize != heavy_cfg.dit.image_in_channels {
-                return Err(Error::Msg(format!(
-                    "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
+            fenced_image_load(|| {
+                let mut dit = load_dit(&dit_path, &heavy_cfg, compute)?;
+                crate::adapters::install(&mut dit, &adapters)?;
+                let ae = load_autoencoder(&ae_path)?;
+                if ae.latent_channels() as usize != heavy_cfg.dit.image_in_channels {
+                    return Err(Error::Msg(format!(
+                        "{MODEL_ID}: the autoencoder at {} packs {} channels per token, the DiT \
                      reads {}",
-                    ae_path.display(),
-                    ae.latent_channels(),
-                    heavy_cfg.dit.image_in_channels
-                )));
-            }
-            Ok(Heavy { dit, ae })
+                        ae_path.display(),
+                        ae.latent_channels(),
+                        heavy_cfg.dit.image_in_channels
+                    )));
+                }
+                Ok(Heavy { dit, ae })
+            })
         },
     )?;
-    // Priced from the resources' tensor headers after the components loaded, so a broken
-    // resource surfaces as its loader's own error.
-    let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
-    // sc-26238: the optional upsampler loads last, after every image-model resource proved
-    // sound, so its own load error is unmistakably the component's.
-    let upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
+    // Only an optional local source path is retained here. An enabled prepare
+    // phase owns the VLM load and a bounded phase drops it before image encoding.
+    let upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
     Ok(Box::new(Flux3Klein {
         adapter_reports,
         descriptor: if base {
@@ -295,7 +340,9 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
         residency,
         spec: spec.clone(),
         memory_strategy,
-        upsampler,
+        upsampler_dir,
+        upsampler: Default::default(),
+        image_execution_fence: new_image_fence(),
     }))
 }
 
@@ -327,7 +374,112 @@ fn checked_completion<T>(cancel: &gen_core::CancelFlag, value: T) -> Result<T> {
 }
 
 impl Flux3Klein {
+    fn staged_images(
+        &self,
+        req: &GenerationRequest,
+        prepared: Option<&PreparedReferences>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Vec<gen_core::Image>> {
+        self.residency.run_staged_request_scoped_with_prepare(
+            true,false,&req.cancel,false,on_progress,
+            Some(||self.synchronize_image()),
+            |progress|self.effective_params(req,progress),
+            |te:&Flux3TextEncoder,params:GenerationParams| ->Result<(TextConditioning,Option<TextConditioning>,GenerationParams)> {
+                let text=te.encode(&params.prompt)?;
+                let negative=if params.guidance.is_some(){Some(te.encode(&params.negative_prompt)?)}else{None};
+                Ok((text,negative,params))
+            },
+            |encoded:Option<&(TextConditioning,Option<TextConditioning>,GenerationParams)>| {
+                if let Some((text,negative,_))=encoded {
+                    text.tokens.eval()?;if let Some(negative)=negative {negative.tokens.eval()?;}
+                }
+                self.synchronize_image()
+            },
+            |heavy:&Heavy,(text,negative,params):(TextConditioning,Option<TextConditioning>,GenerationParams),progress| {
+                let reference_tokens=prepared.map(|p|crate::references::encode(&heavy.ae,p,&req.cancel)).transpose()?;
+                let total=params.steps*req.count;
+                let mut tokens=Vec::with_capacity(req.count as usize);
+                for index in 0..req.count {
+                    let done=index*params.steps;
+                    let seed=params.seed.wrapping_add(u64::from(index));
+                    tokens.push(denoise_one_with_references(&heavy.dit,&text,negative.as_ref(),reference_tokens.as_ref(),&params,seed,&req.cancel,|step|progress(Progress::Step{current:done+step as u32,total}))?);
+                }
+                Ok((tokens,params))
+            },
+            |mid:Option<&(Vec<mlx_rs::Array>,GenerationParams)>| {
+                if let Some((tokens,_))=mid {eval(tokens.iter().collect::<Vec<_>>())?;}
+                self.synchronize_image()
+            },
+            |ae,(tokens,params),progress| {
+                progress(Progress::Decoding);
+                if req.cancel.is_cancelled(){return Err(Error::Canceled);}
+                let (h,w)=params.latent_shape()?;
+                let primary=decode_batch(&tokens,&req.cancel,|token| {
+                    let image=decode_tokens(ae,token,h,w)?;
+                    match prepared {Some(p)=>Ok(references::crop_output(image,&p.output)?),None=>Ok(image)}
+                });
+                let fence=self.synchronize_image();
+                match primary {
+                    Err(primary)=>{if let Err(cleanup)=fence{eprintln!("FLUX3 decode cleanup fence failed; primary error preserved: {cleanup}");}Err(primary)},
+                    Ok(images)=>{fence?;mlx_rs::memory::clear_cache();Ok(images)},
+                }
+            },
+        )
+    }
+
+    fn effective_params(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationParams> {
+        let staged = stage_residency_for(&self.spec, req);
+        let outcome=self.upsampler.with_request(
+            req.enhance_prompt,staged,&req.cancel,
+            || {
+                let dir=self.upsampler_dir.as_ref().ok_or_else(||gen_core::Error::Unsupported(
+                    "FLUX3 prompt enhancement requires the separate pinned prompt_upsampler component; install it or explicitly disable enhancement".into()
+                ))?;
+                let loaded=if staged {crate::pup::Flux3PromptUpsampler::load_bounded(dir)}else{crate::pup::Flux3PromptUpsampler::load(dir)};
+                loaded.map_err(gen_core::Error::from)
+            },
+            |upsampler|crate::pup::effective_prompt(upsampler,req,&references::upsampler_input(req)?,on_progress).map_err(gen_core::Error::from),
+            crate::pup::Flux3PromptUpsampler::synchronize_before_release,
+            ||{mlx_gen::residency::drain_allocator_cache();},
+        )?;
+        let mut effective = req.clone();
+        effective.prompt = outcome.caption;
+        Ok(GenerationParams::resolve(
+            &effective,
+            prompt_seed(&effective.prompt),
+            &self.config,
+        )?)
+    }
+
+    fn synchronize_image(&self) -> Result<()> {
+        self.image_execution_fence
+            .synchronize(synchronize_image_stream)
+    }
+
     fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationReport> {
+        let result = self.generate_inner(req, on_progress);
+        if result.is_err() {
+            match self.upsampler.cleanup_pending() {
+                Ok(false)=>if let Err(cleanup)=self.upsampler.release_cached(
+                    crate::pup::Flux3PromptUpsampler::synchronize_before_release,
+                    ||{mlx_gen::residency::drain_allocator_cache();},
+                ) {eprintln!("FLUX3 PUP cleanup failed; primary generation error preserved, owner retained: {cleanup}");},
+                Ok(true)=>eprintln!("FLUX3 PUP owner remains retained after failed cleanup; no duplicate fence or reclamation claimed"),
+                Err(status)=>eprintln!("FLUX3 PUP cleanup state unavailable; primary generation error preserved: {status}"),
+            }
+        }
+        result
+    }
+
+    fn generate_inner(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
@@ -346,30 +498,22 @@ impl Flux3Klein {
                 references::request_output(req),
             )?)
         };
+        self.image_execution_fence.before_execution(
+            mlx_rs::Stream::task_local_or_default(),
+            synchronize_image_stream,
+        )?;
         // Preparation belongs to the exclusive request lifecycle. In particular a staged
         // request must evict a reused resident pair before the optional VLM runs.
-        let images = self.residency.run_request_scoped_with_prepare(
+        let images = if stage_residency_for(&self.spec, req) {
+            self.staged_images(req, prepared.as_ref(), on_progress)?
+        } else {
+            self.residency.run_request_scoped_with_prepare(
             stage_residency_for(&self.spec, req),
             false,
             &req.cancel,
             false,
             on_progress,
-            |on_progress| -> Result<GenerationParams> {
-                let caption = crate::pup::effective_prompt(
-                    self.upsampler.as_ref(),
-                    req,
-                    &references::upsampler_input(req)?,
-                    on_progress,
-                )?
-                .caption;
-                let mut effective = req.clone();
-                effective.prompt = caption;
-                Ok(GenerationParams::resolve(
-                    &effective,
-                    prompt_seed(&effective.prompt),
-                    &self.config,
-                )?)
-            },
+            |on_progress| self.effective_params(req,on_progress),
             |te: &Flux3TextEncoder,
              params: GenerationParams|
              -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
@@ -431,7 +575,8 @@ impl Flux3Klein {
                 mlx_rs::memory::clear_cache();
                 Ok(images)
             },
-        )?;
+        )?
+        };
         checked_completion(
             &req.cancel,
             GenerationReport {
