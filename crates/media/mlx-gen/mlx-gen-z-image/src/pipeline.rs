@@ -967,6 +967,7 @@ pub(crate) fn decode_batch(
 /// periodic preview. `cap` is the (already dtype-matched) caption conditioning for the sample prompt;
 /// `dtype` is the trainer's compute dtype (bf16/f32) so the noise enters the loop at the same
 /// precision as the cast DiT weights. No progress/cancel plumbing — the caller drives the cadence.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     transformer: &ZImageTransformer,

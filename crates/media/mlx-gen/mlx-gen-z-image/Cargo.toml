@@ -22,15 +22,22 @@ mlx-rs = { workspace = true }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Depth anchoring (epic 2123, sc-2125): the frozen Depth-Anything-V2 perceptor the trainer's
 # decoded-x0 depth loss runs. Depends only on core (acyclic).
-mlx-gen-depth = { path = "../mlx-gen-depth" }
+mlx-gen-depth = { path = "../mlx-gen-depth", optional = true }
 # The shared epic-2123 aux-loss builder (sc-24830): config -> PerceptualPath.
-mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual", optional = true }
 # Decode training-dataset images (LoRA training, sc-3044). PNG + JPEG cover the SceneWorks dataset
 # formats; the trainer center-crops + hands the Image to the VAE preprocess.
-image = { workspace = true }
+image = { workspace = true, optional = true }
 # Read/annotate per-component `config.json` with the `quantization` block in the offline
 # pre-quantization converter (`convert.rs`, sc-8670) — matches mlx-gen-flux2.
 serde_json = { workspace = true }
+
+[features]
+# The LoRA trainer (`training`) and its training-only deps (depth/perceptual aux losses, dataset
+# image decode). Default-on, so every existing consumer is unchanged; an inference-only graph (the
+# iOS bundle, through `mlx-gen-anima`) depends with `default-features = false` (sc-26265).
+default = ["training"]
+training = ["dep:image", "dep:mlx-gen-depth", "dep:mlx-gen-perceptual"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
@@ -50,3 +57,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+# The binary carries the trainer tests and the training-only deps (`image`), so it needs the
+# default-on `training` feature; `--no-default-features` skips it rather than failing (sc-26265).
+required-features = ["training"]

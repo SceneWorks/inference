@@ -250,13 +250,13 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is exactly SANA under `media`, empty without it. An incidental
-        // `mlx-gen-catalog` dependency — every provider including video — fails here rather than
-        // quietly compiling into an iPhone app.
+        // The media surface is exactly SANA + Anima Turbo under `media`, empty without it. An
+        // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
+        // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
             "the iOS image surface changed; confirm the new provider fits the measured iOS cap \
              before updating this"
         );

@@ -6,10 +6,21 @@
 //! (whose build directory holds `libjaccl.a` beside `mlx.metallib`) gets JACCL linked here; a
 //! prebuilt MLX cell that ships without `libjaccl.a` gets `jaccl_absent.cpp` — JACCL reports
 //! unavailable (the trainer refuses `transport: mlx_jaccl` typed) and `ring` / `mpi` are unaffected.
-
-use std::path::PathBuf;
+//!
+//! Only the `training` feature calls `distributed::init`, so without it (the iOS bundle, sc-26265)
+//! nothing is linked or compiled here.
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(iris_jaccl_linked)");
+    #[cfg(feature = "training")]
+    link_jaccl();
+}
+
+#[cfg(feature = "training")]
+fn link_jaccl() {
+    use std::path::PathBuf;
+
     println!("cargo:rerun-if-env-changed=DEP_MLX_METALLIB");
     println!("cargo:rerun-if-changed=src/train/jaccl_absent.cpp");
     let lib_dir = std::env::var_os("DEP_MLX_METALLIB")
@@ -29,5 +40,4 @@ fn main() {
                 .compile("iris_jaccl_absent");
         }
     }
-    println!("cargo:rustc-check-cfg=cfg(iris_jaccl_linked)");
 }

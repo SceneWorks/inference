@@ -38,6 +38,7 @@ pub mod prompt_weight;
 pub mod rope;
 pub mod text_encoder;
 pub mod tokenizer;
+#[cfg(feature = "training")]
 pub mod training;
 pub mod transformer;
 pub mod vae;
@@ -56,6 +57,7 @@ pub use pipeline::{
 };
 pub use prompt_weight::{parse_prompt_weights, strip_prompt_weights};
 pub use text_encoder::AnimaQwen3;
+#[cfg(feature = "training")]
 pub use training::{
     trainer_descriptor_aesthetic, trainer_descriptor_base, trainer_descriptor_turbo, AnimaTrainer,
 };
@@ -71,8 +73,27 @@ pub const BASE_ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemo
         },
     };
 
-/// Add all MLX Anima generators and trainers to an explicit media registry builder.
+/// Add all MLX Anima generators — and, with the `training` feature, their trainers — to an explicit
+/// media registry builder.
 pub fn register_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    let registry = register_turbo_generator(register_aesthetic_generator(register_base_generator(
+        registry,
+    )));
+    // The trainers (and their perceptual/dataset deps) are the default-on `training` feature
+    // (sc-26265), so an inference-only graph compiles none of them.
+    #[cfg(feature = "training")]
+    let registry = registry
+        .register_trainer(training::BASE_TRAINER_REGISTRATION)
+        .register_trainer(training::AESTHETIC_TRAINER_REGISTRATION)
+        .register_trainer(training::TURBO_TRAINER_REGISTRATION);
+    registry
+}
+
+/// Add the `anima_base` generator with its activation anchor and its complete memory-strategy
+/// registration (contract, weights-free fixture, behavior seam). No trainer.
+pub fn register_base_generator(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
@@ -87,6 +108,13 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::BASE_MEMORY_BEHAVIOR)
+}
+
+/// Add the `anima_aesthetic` generator with its complete memory-strategy registration. No trainer.
+pub fn register_aesthetic_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_generator(model::AESTHETIC_REGISTRATION)
         .register_memory_strategy(model::AESTHETIC_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -97,6 +125,15 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::AESTHETIC_MEMORY_BEHAVIOR)
+}
+
+/// Add the `anima_turbo` generator with its complete memory-strategy registration — the same
+/// registrations [`register_providers`] makes for it, and no trainer. This is the seam a narrow
+/// catalog (the iOS bundle, sc-26265) ships one variant through without hand-copying a strategy.
+pub fn register_turbo_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_generator(model::TURBO_REGISTRATION)
         .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -107,9 +144,6 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
-        .register_trainer(training::BASE_TRAINER_REGISTRATION)
-        .register_trainer(training::AESTHETIC_TRAINER_REGISTRATION)
-        .register_trainer(training::TURBO_TRAINER_REGISTRATION)
 }
 
 /// Build the complete explicit MLX Anima provider catalog.
@@ -135,10 +169,12 @@ mod explicit_registry_tests {
             explicit_generators,
             ["anima_base", "anima_aesthetic", "anima_turbo"]
         );
-        assert_eq!(
-            explicit_trainers,
-            ["anima_base", "anima_aesthetic", "anima_turbo"]
-        );
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["anima_base", "anima_aesthetic", "anima_turbo"]
+        } else {
+            &[]
+        };
+        assert_eq!(explicit_trainers, expected_trainers);
     }
 
     /// The shared weights-free behavior oracle: every registered contract, safety check, fixture and
