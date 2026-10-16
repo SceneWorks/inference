@@ -2,6 +2,24 @@
 use gen_core::flux3::{training::*, DitConfig};
 
 #[test]
+fn single_pair_training_conditioning_uses_pinned_l_minus_one_grid() {
+    let ids = training_condition_ids(2, 3).unwrap();
+    assert_eq!(
+        ids,
+        vec![
+            [0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 0.5, -1.0],
+            [0.0, 0.0, 1.0, -1.0],
+            [0.0, 0.5, 0.0, -1.0],
+            [0.0, 0.5, 0.5, -1.0],
+            [0.0, 0.5, 1.0, -1.0]
+        ]
+    );
+    assert!(training_condition_ids(0, 3).is_err());
+    assert!(training_condition_ids(usize::MAX, 2).is_err());
+}
+
+#[test]
 fn shifted_discrete_schedule_is_not_inference_flow_map_or_continuous_uniform() {
     assert_eq!(training_sigma(0).unwrap(), 1.0);
     assert!((training_sigma(500).unwrap() - 0.8738966).abs() < 2e-7);

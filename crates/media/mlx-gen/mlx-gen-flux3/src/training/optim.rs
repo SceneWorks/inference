@@ -16,6 +16,7 @@ pub struct AdamMoment {
 pub struct SourceAdamW {
     pub moments: HashMap<Rc<str>, AdamMoment>,
     learning_rate: f32,
+    base_learning_rate: f32,
     weight_decay: f32,
 }
 
@@ -33,8 +34,31 @@ impl SourceAdamW {
         Ok(Self {
             moments: HashMap::new(),
             learning_rate,
+            base_learning_rate: learning_rate,
             weight_decay,
         })
+    }
+
+    pub fn configuration_fingerprint(&self) -> String {
+        format!(
+            "adamw;lr={:08x};wd={:08x};beta1=0.9;beta2=0.999;eps=1e-8;bias_correction=true",
+            self.base_learning_rate.to_bits(),
+            self.weight_decay.to_bits()
+        )
+    }
+
+    /// The scheduler is reconstructed from the strong configuration + update cursor.
+    pub fn set_lr_scaled(&mut self, multiplier: f32) -> Result<()> {
+        if !multiplier.is_finite()
+            || multiplier < 0.0
+            || !(self.base_learning_rate * multiplier).is_finite()
+        {
+            return Err(Error::Unsupported(
+                "flux3 training: invalid LR schedule multiplier".into(),
+            ));
+        }
+        self.learning_rate = self.base_learning_rate * multiplier;
+        Ok(())
     }
 
     pub fn step(&mut self, params: &mut LoraParams, grads: &LoraParams) -> Result<()> {

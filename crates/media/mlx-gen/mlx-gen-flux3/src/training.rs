@@ -1,6 +1,7 @@
 //! Functional native FLUX3 LoRA autograd seam. No Python execution path.
 //! Each differentiation re-injects independent A/B factors for every declared
 //! projection inside the traced closure. The frozen DiT/AE/text weights are never parameters.
+pub mod checkpoint;
 pub mod optim;
 
 use crate::{Flux3Dit, SampleTokens};

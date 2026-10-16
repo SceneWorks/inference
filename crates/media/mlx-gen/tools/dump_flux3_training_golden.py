@@ -1,10 +1,12 @@
 """Synthetic CPU-only gradient/AdamW oracle for sc-26240. No production training route.
 
-Run with -I and FLUX3_SRC pointing to the exact hash-verified frozen BFL tree.
+Run with -I, FLUX3_SRC pointing to the exact hash-verified frozen BFL tree,
+and FLUX3_TRAINING_REF pointing to the two exact frozen diffusers scripts.
 The forward is frozen BFL45e57c9; objective/discrete shift6.93/AdamW/default
 plain-LoRA targets follow diffusers7ecb1e1b. These are NOT actual BFL weights.
 """
 from pathlib import Path
+import hashlib
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _flux3_common import import_upstream, patch_dit_constants, FIXTURE_DIR, SNAPSHOT, FLUX3_COMMIT
@@ -14,6 +16,16 @@ from safetensors.torch import load_file, save_file
 import flux3.dit as dit_module
 
 TRAINING_REF = "7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941"
+from _paths import require_env
+training_source = Path(require_env("FLUX3_TRAINING_REF", "directory containing the two frozen diffusers7ecb1e1b training scripts"))
+training_hashes = {
+    "train_dreambooth_lora_flux3_klein.py": "89cc2ff1af1909c1652deefdee7a60e589c3d4e7169d22ab7e05e3ca0c49be72",
+    "train_dreambooth_lora_flux3_klein_img2img.py": "c33420f2f487476474ae12e5490655874a6f5226712b2e74f64e19dce6a630c9",
+}
+for name, expected in training_hashes.items():
+    actual = hashlib.sha256((training_source / name).read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(f"frozen training source mismatch: {name}: {actual} != {expected}")
 torch.set_num_threads(2)
 patch_dit_constants(dit_module)
 model = dit_module.DiT(flow_map=False).eval()
@@ -24,9 +36,13 @@ text = load_file(str(FIXTURE_DIR / "flux3_text_golden.safetensors"))
 inputs = load_file(str(FIXTURE_DIR / "flux3_dit_golden.safetensors"))
 clean = inputs["single/x"].float() * 0.4
 noise = torch.cos(torch.arange(clean.numel()).reshape(clean.shape).float() * 0.13)
-reference = clean[:2].clone()
-reference_ids = inputs["single/image_ids"][:2].clone()
-reference_ids[:, 0] = 1
+# Pinned _img2img training keeps paired images in the SAME bucket/geometry and
+# places the reference at L=-1, T=0 (also S3 inference's FIRST-reference id law).
+# This replaces the former arbitrary T1/L0 probe; paired preprocessing is training-specific.
+reference = clean.clone() * 0.7
+reference_ids = inputs["single/image_ids"].clone()
+reference_ids[:, 0] = 0
+reference_ids[:, 3] = -1
 rank, alpha = 3, 1.5
 factors, handles, out = {}, [], {}
 for name, layer in model.named_modules():
@@ -72,5 +88,5 @@ for step, index in enumerate([137, 721]):
 for handle in handles:
     handle.remove()
 assert all(not parameter.requires_grad for parameter in model.parameters())
-save_file({k: v.detach().contiguous().float() for k, v in out.items()}, str(FIXTURE_DIR / "flux3_training_golden.safetensors"), metadata={"fixture": "synthetic tiny geometry, NOT actual BFL weights", "training_reference": TRAINING_REF, "forward_reference": FLUX3_COMMIT, "optimizer": "torch AdamW CPU lr0.0003 beta0.9,0.999 eps1e-8 wd0.0001", "rank": str(rank), "alpha": str(alpha), "precision": "f32", "steps": "2"})
+save_file({k: v.detach().contiguous().float() for k, v in out.items()}, str(FIXTURE_DIR / "flux3_training_golden.safetensors"), metadata={"fixture": "synthetic tiny geometry, NOT actual BFL weights", "training_reference": TRAINING_REF, "training_img2img_source_sha256": training_hashes["train_dreambooth_lora_flux3_klein_img2img.py"], "conditioning_position": "T0/H0.5/W0.5/L-1, paired same-grid cached synthetic latents", "initialization": "controlled synthetic sinusoidal A, zero B; not a PEFT RNG-stream identity claim", "forward_reference": FLUX3_COMMIT, "optimizer": "torch AdamW CPU lr0.0003 beta0.9,0.999 eps1e-8 wd0.0001", "rank": str(rank), "alpha": str(alpha), "precision": "f32", "steps": "2"})
 print(f"Synthetic CPU oracle: {len(factors)} factors, two nonzero-gradient AdamW steps; no real weights")

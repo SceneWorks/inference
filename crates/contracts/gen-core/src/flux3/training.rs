@@ -4,6 +4,8 @@
 //! scalar decisions while keeping all differentiable tensor operations on their backend.
 //! The reference is inference-independent: captions are dropped per instance, not
 //! duplicated into the inference base checkpoint's two CFG conditioning rows.
+pub mod checkpoint;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{adapters::native_target, DitConfig};
@@ -31,6 +33,26 @@ pub const DEFAULT_TARGETS: [&str; 6] = [
     "ff.linear_in",
     "ff.linear_out",
 ];
+
+/// Pinned `_img2img.py::prepare_image_cond_ids`: a SINGLE paired conditioning
+/// image uses the same bucket/geometry as its target and sits at L=-1, T=0.
+/// These ids match S3's FIRST reference. Training's paired resize/crop/flip
+/// recipe remains separate from inference's image preprocessing.
+pub fn training_condition_ids(height: usize, width: usize) -> Result<Vec<[f32; 4]>> {
+    let count = height
+        .checked_mul(width)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| invalid("conditioning grid must be nonempty and not overflow"))?;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(count)
+        .map_err(|e| invalid(format!("conditioning id allocation: {e}")))?;
+    for row in 0..height {
+        for col in 0..width {
+            ids.push([0.0, row as f32 * 0.5, col as f32 * 0.5, -1.0]);
+        }
+    }
+    Ok(ids)
+}
 
 fn invalid(detail: impl std::fmt::Display) -> Error {
     Error::Unsupported(format!("flux3 training: {detail}"))
