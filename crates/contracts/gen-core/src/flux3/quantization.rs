@@ -254,6 +254,15 @@ pub fn validate_headers(
     headers: &[SafetensorsTensorHeader],
 ) -> Result<()> {
     let expected = expected_tensors(cfg, format)?;
+    validate_tensor_inventory(&expected, headers)
+}
+
+/// Common exact physical inventory validation, shared with native converter
+/// formats. The caller supplies an explicit schema, never a dtype-based guess.
+pub fn validate_tensor_inventory(
+    expected: &BTreeMap<String, TensorSpec>,
+    headers: &[SafetensorsTensorHeader],
+) -> Result<()> {
     let mut seen = BTreeSet::new();
     for header in headers {
         if !seen.insert(&header.name) {
@@ -437,7 +446,7 @@ pub fn quantize_nvfp4_static(
         || !width.is_multiple_of(16)
         || !values.len().is_multiple_of(width)
         || !input_scale.is_finite()
-        || input_scale <= 0.
+        || input_scale < 0.
         || values.iter().any(|v| !v.is_finite())
     {
         return Err(invalid(

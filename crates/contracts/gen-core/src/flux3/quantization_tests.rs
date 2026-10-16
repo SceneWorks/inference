@@ -118,7 +118,11 @@ fn nvfp4_static_scale_is_not_replaced_by_observed_amax() {
     assert_eq!(static_b.scales[0], 0x40); // E4M3(2), same divisor, different static scale.
     assert_eq!(static_a.scales.len(), 128 * 4);
     assert!(quantize_nvfp4_static(&data, 16, f32::INFINITY).is_err());
-    assert!(quantize_nvfp4_static(&data, 16, 0.).is_err());
+    assert!(quantize_nvfp4_static(&data, 16, -0.25).is_err());
+    assert_eq!(
+        quantize_nvfp4_static(&data, 16, 0.).unwrap().global_scale,
+        0.
+    );
 }
 
 #[test]
@@ -168,6 +172,18 @@ fn swizzle_and_nibble_order_are_explicit() {
 #[test]
 fn nvfp4_quantizer_clamp_does_not_rewrite_source_gemm_alpha() {
     let data = [1.; 16];
+    let zero_alpha = quantize_nvfp4_static(&data, 16, 0.).unwrap();
+    let decoded_scale = decode_e4m3(zero_alpha.scales[0]);
+    let effective_sum: f32 = zero_alpha
+        .packed
+        .iter()
+        .flat_map(|byte| [byte & 15, byte >> 4])
+        .map(|code| {
+            let value = E2M1[(code & 7) as usize] * if code & 8 == 0 { 1. } else { -1. };
+            value * decoded_scale * zero_alpha.global_scale
+        })
+        .sum();
+    assert_eq!(effective_sum, 0.);
     let tiny = quantize_nvfp4_static(&data, 16, 1e-12).unwrap();
     let clamped = quantize_nvfp4_static(&data, 16, 1e-8).unwrap();
     // Frozen nvfp4.py clamps ONLY the quantizer's reciprocal scale; alpha still
