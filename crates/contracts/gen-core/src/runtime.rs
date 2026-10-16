@@ -2118,11 +2118,12 @@ impl std::fmt::Debug for HdrFrameSink {
 /// The request-local outcome of optional prompt enhancement.
 ///
 /// This is deliberately a small, tensor-free fact rather than a log convention. Consumers use it
-/// to distinguish a prompt that was actually rewritten from a safe fallback and from the identity
-/// path where enhancement was not requested.
+/// to distinguish an enhancer that ran and produced an accepted caption from a safe fallback
+/// and from the identity path where enhancement was not requested. A valid accepted answer can
+/// match an already-rich original prompt; `Enhanced` is not a claim that its bytes must differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptEnhancementOutcome {
-    /// The provider produced and consumed a non-empty rewritten prompt.
+    /// The enhancer ran and the provider consumed its non-empty accepted answer (possibly unchanged).
     Enhanced,
     /// Enhancement was requested, but the provider safely consumed the original prompt instead.
     Fallback,

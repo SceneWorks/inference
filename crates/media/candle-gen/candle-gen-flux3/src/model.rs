@@ -270,6 +270,32 @@ fn checked_completion<T>(cancel: &gen_core::CancelFlag, value: T) -> Result<T> {
     Ok(value)
 }
 
+/// Fixed-flags Candle image adapter to the shared prepared-request driver. This forwards phase
+/// ordering/locking/eviction to gen-core; the seam lets CPU witnesses exercise the production call.
+#[allow(clippy::too_many_arguments)]
+fn prepared_image_request<Text, HeavyPhase, Prepared, Encoded, Out>(
+    residency: &Residency<Text, HeavyPhase>,
+    stage: bool,
+    cancel: &gen_core::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    prepare: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Prepared>,
+    encode: impl FnOnce(&Text, Prepared) -> Result<Encoded>,
+    materialize: impl FnOnce(Option<&Encoded>) -> Result<()>,
+    render: impl FnOnce(&HeavyPhase, Encoded, &mut dyn FnMut(Progress)) -> Result<Out>,
+) -> Result<Out> {
+    residency.run_request_scoped_with_prepare(
+        stage,
+        false,
+        cancel,
+        false,
+        on_progress,
+        prepare,
+        encode,
+        materialize,
+        render,
+    )
+}
+
 impl Flux3Klein {
     fn generate_impl(
         &self,
@@ -277,24 +303,33 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        // Upsampling precedes BOTH caption-derived seeding and the text encoder, never decoding.
-        let outcome =
-            crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
-        let mut effective = req.clone();
-        effective.prompt = outcome.caption;
-        let req = &effective;
-        // Upstream `generate.py`: an unseeded request is seeded from its effective caption.
-        let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
-        let total = params.steps * req.count;
-        let images = self.residency.run_request_scoped(
+        let images = prepared_image_request(
+            &self.residency,
             stage_residency_for(&self.spec, req),
-            false,
             &req.cancel,
-            false,
             on_progress,
-            |te: &Flux3TextEncoder| -> Result<TextConditioning> { te.encode(&params.prompt) },
+            |on_progress| -> Result<GenerationParams> {
+                // The shared driver evicts a staged warm pair BEFORE this separate VLM runs.
+                // Upsampling still precedes BOTH effective-caption seeding and text encoding.
+                let outcome =
+                    crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
+                let mut effective = req.clone();
+                effective.prompt = outcome.caption;
+                Ok(GenerationParams::resolve(
+                    &effective,
+                    prompt_seed(&effective.prompt),
+                    &self.config,
+                )?)
+            },
+            |te: &Flux3TextEncoder,
+             params: GenerationParams|
+             -> Result<(TextConditioning, GenerationParams)> {
+                let text = te.encode(&params.prompt)?;
+                Ok((text, params))
+            },
             encoder_materialization_boundary(|| Ok(self.device.synchronize()?)),
-            |heavy: &Heavy, text: TextConditioning, on_progress| {
+            |heavy: &Heavy, (text, params): (TextConditioning, GenerationParams), on_progress| {
+                let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
                 let mut tokens = Vec::with_capacity(req.count as usize);
@@ -431,6 +466,135 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::WeightsSource;
+
+    #[test]
+    fn candle_prepare_driver_evicts_before_pup_once_and_observes_prepare_cancellation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        struct Component {
+            kind: &'static str,
+            id: usize,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        impl Drop for Component {
+            fn drop(&mut self) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop-{}-{}", self.kind, self.id));
+            }
+        }
+        for stage in [true, false] {
+            for cancel_prepare in [false, true] {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let text_count = Arc::new(AtomicUsize::new(0));
+                let heavy_count = Arc::new(AtomicUsize::new(0));
+                let te = events.clone();
+                let tc = text_count.clone();
+                let he = events.clone();
+                let hc = heavy_count.clone();
+                let advisory = events.clone();
+                let residency = Residency::from_policy(
+                    gen_core::OffloadPolicy::Resident,
+                    move || {
+                        let id = tc.fetch_add(1, Ordering::SeqCst);
+                        te.lock().unwrap().push(format!("load-text-{id}"));
+                        Ok(Component {
+                            kind: "text",
+                            id,
+                            events: te.clone(),
+                        })
+                    },
+                    move |_| {
+                        let id = hc.fetch_add(1, Ordering::SeqCst);
+                        he.lock().unwrap().push(format!("load-heavy-{id}"));
+                        Ok(Component {
+                            kind: "heavy",
+                            id,
+                            events: he.clone(),
+                        })
+                    },
+                )
+                .unwrap()
+                .with_staged_advisory(move || advisory.lock().unwrap().push("stage".into()));
+                events.lock().unwrap().clear(); // The old resident pair is already warm.
+                let cancel = gen_core::CancelFlag::new();
+                let result = prepared_image_request(
+                    &residency,
+                    stage,
+                    &cancel,
+                    &mut |_| {},
+                    |_| {
+                        events.lock().unwrap().push("pup".into());
+                        if cancel_prepare {
+                            cancel.cancel();
+                        }
+                        Ok(17)
+                    },
+                    |_: &Component, prepared| {
+                        events.lock().unwrap().push("encode".into());
+                        Ok(prepared)
+                    },
+                    encoder_materialization_boundary(|| {
+                        events.lock().unwrap().push("sync".into());
+                        Ok(())
+                    }),
+                    |_: &Component, encoded, _| {
+                        events.lock().unwrap().push("render".into());
+                        Ok(encoded)
+                    },
+                );
+                let seen = events.lock().unwrap().clone();
+                let pup = seen.iter().position(|s| s == "pup").unwrap();
+                assert_eq!(
+                    seen.iter().filter(|s| s.as_str() == "stage").count(),
+                    usize::from(stage)
+                );
+                for component in ["text", "heavy"] {
+                    let old_drop = format!("drop-{component}-0");
+                    assert_eq!(
+                        seen.iter().filter(|s| **s == old_drop).count(),
+                        usize::from(stage)
+                    );
+                    if stage {
+                        assert!(
+                            seen.iter().position(|s| *s == old_drop).unwrap() < pup,
+                            "{seen:?}"
+                        );
+                    }
+                }
+                if cancel_prepare {
+                    assert!(matches!(result, Err(Error::Canceled)));
+                    assert!(
+                        !seen
+                            .iter()
+                            .any(|s| s == "encode" || s == "render" || s.starts_with("load-")),
+                        "{seen:?}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 17);
+                    assert!(pup < seen.iter().position(|s| s == "encode").unwrap());
+                    if stage {
+                        assert_eq!(text_count.load(Ordering::SeqCst), 2);
+                        assert_eq!(heavy_count.load(Ordering::SeqCst), 2);
+                        assert_eq!(
+                            seen.iter().filter(|s| s.as_str() == "drop-text-1").count(),
+                            1
+                        );
+                        assert_eq!(
+                            seen.iter().filter(|s| s.as_str() == "drop-heavy-1").count(),
+                            1
+                        );
+                    } else {
+                        assert_eq!(text_count.load(Ordering::SeqCst), 1);
+                        assert_eq!(heavy_count.load(Ordering::SeqCst), 1);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cancellation_during_decode_stops_the_batch_and_withholds_the_last_result() {
