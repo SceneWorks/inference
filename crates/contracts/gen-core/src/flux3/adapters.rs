@@ -195,6 +195,18 @@ fn inspect_header(
         if a.len() != 2 || b.len() != 2 || a[0] == 0 || a[1] != input || b != [output, a[0]] {
             return Err(unsupported(format!("{target}: incompatible rank/shape A{a:?}, B{b:?}; expected [rank,{input}] and [{output},rank]")));
         }
+        if let Some(rank) = meta.get("rank") {
+            let declared = rank
+                .as_str()
+                .and_then(|rank| rank.parse::<usize>().ok())
+                .or_else(|| rank.as_u64().and_then(|rank| usize::try_from(rank).ok()));
+            if declared != Some(a[0]) {
+                return Err(unsupported(format!(
+                    "{target}: declared rank must match actual tensor rank {}",
+                    a[0]
+                )));
+            }
+        }
         let scale = f64::from(spec.scale) * alpha / a[0] as f64;
         if !scale.is_finite() || !(scale as f32).is_finite() {
             return Err(unsupported(format!("{target}: alpha/rank/scale overflow")));
@@ -246,6 +258,12 @@ mod tests {
         assert_eq!(p[0].target, "content_mode_blocks.image.1.q_proj");
         assert_eq!(p[0].rank, 2);
         assert_eq!(p[0].scale, -0.75);
+        let mut stamped = header();
+        stamped["__metadata__"]["rank"] = "2".into();
+        assert_eq!(
+            inspect_header(&spec, &config(), &stamped).unwrap()[0].rank,
+            2
+        );
         for (source, want) in [
             (
                 "single_transformer_blocks.2.ff.linear_in",
@@ -283,6 +301,8 @@ mod tests {
             ("base_revision", "wrong"),
             ("lora_alpha", "NaN"),
             ("lora_alpha", "0"),
+            ("rank", "3"),
+            ("rank", "0"),
         ] {
             let mut h = header();
             h["__metadata__"][key] = value.into();
