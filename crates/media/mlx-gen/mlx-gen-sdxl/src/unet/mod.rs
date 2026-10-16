@@ -590,7 +590,9 @@ impl UNet2DConditionModel {
             timestep,
             text_emb,
             time_ids,
-            batch,
+            // A sequential CFG half embeds the whole guided pair (sc-26268): `temb` stays at the
+            // pair's batch and each resnet keeps its own row after projecting it.
+            plan.conditioning_batch(batch),
             dtype,
         )?;
 
@@ -609,9 +611,9 @@ impl UNet2DConditionModel {
         inject_control_down_residuals(&mut residuals, control)?;
 
         // Mid.
-        x = self.mid_resnet0.forward(&x, Some(&temb))?;
+        x = self.mid_resnet0.forward_planned(&x, Some(&temb), plan)?;
         x = self.mid_transformer.forward_ip(&x, encoder_x, ip, plan)?;
-        x = self.mid_resnet1.forward(&x, Some(&temb))?;
+        x = self.mid_resnet1.forward_planned(&x, Some(&temb), plan)?;
         // ControlNet: add the (scaled) control mid residual to the mid output.
         x = inject_control_mid_residual(x, control)?;
 

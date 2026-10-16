@@ -156,8 +156,10 @@ impl AttentionMHA {
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
         let q = to_heads(self.q.forward(x)?, l)?;
-        let k = to_heads(self.k.forward(context)?, s)?;
-        let v = to_heads(self.v.forward(context)?, s)?;
+        // A sequential CFG half projects the text memory at the guided pair's batch and keeps its
+        // own row (sc-26268); self-attention's context is `x` itself, so it never selects.
+        let k = to_heads(plan.select_cfg_row(self.k.forward(context)?, b)?, s)?;
+        let v = to_heads(plan.select_cfg_row(self.v.forward(context)?, b)?, s)?;
         // 6th arg is `sinks`; `None` = standard attention. sc-4941: optionally checkpoint just the
         // SDPA so its backward recomputes the decomposed attention (q/k/v threaded as inputs, scale
         // captured) rather than retaining the seq² probability matrix. Grads stay bit-identical.
@@ -180,8 +182,8 @@ impl AttentionMHA {
         if let (Some(k_ip), Some(v_ip), Some((tokens, scale))) = (&self.to_k_ip, &self.to_v_ip, ip)
         {
             let n_ip = tokens.shape()[1];
-            let k_i = to_heads(k_ip.forward(tokens)?, n_ip)?;
-            let v_i = to_heads(v_ip.forward(tokens)?, n_ip)?;
+            let k_i = to_heads(plan.select_cfg_row(k_ip.forward(tokens)?, b)?, n_ip)?;
+            let v_i = to_heads(plan.select_cfg_row(v_ip.forward(tokens)?, b)?, n_ip)?;
             let o_ip = sdpa_budgeted_bhsd(&q, &k_i, &v_i, self.scale, None, plan.attention)?;
             o = add(
                 &o,

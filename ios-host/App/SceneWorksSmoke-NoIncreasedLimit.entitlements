@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The CONTROL build for the per-app cap A/B (sc-16780): identical to
+	     SceneWorksSmoke.entitlements except that com.apple.developer.kernel.increased-memory-limit
+	     is absent. Extended virtual addressing stays, so the pair differs in exactly the one
+	     setting being measured. Selected by run_smoke.sh when its memory-entitlement option is "off" (an XML comment cannot hold a double hyphen, so the flag is not spelled out here). -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

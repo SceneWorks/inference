@@ -201,6 +201,36 @@ pub fn tiled_conv2d_3x3_nhwc(
     cancel: Option<&CancelFlag>,
     preprocess: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
+    tiled_conv2d_3x3_impl(x, weight, bias, max_tile_edge, cancel, preprocess, false)
+}
+
+/// The same spatial cores and halos as [`tiled_conv2d_3x3_nhwc`], with each convolution computed
+/// at f32 and each cropped output core cast back to the input's storage dtype BEFORE assembly.
+/// This prevents f16 intermediate accumulation overflow for unnormalized, high-range decoder
+/// activations (e.g. SDXL's upsample convolution). Only a single tile is promoted, never the full
+/// activation/output. Norm/activation preprocessing retains its original arithmetic width.
+/// The f32 weight/bias views are shared by all tiles in this call.
+pub fn tiled_conv2d_3x3_nhwc_f32_accum(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    max_tile_edge: i32,
+    cancel: Option<&CancelFlag>,
+    preprocess: impl Fn(&Array) -> Result<Array>,
+) -> Result<Array> {
+    tiled_conv2d_3x3_impl(x, weight, bias, max_tile_edge, cancel, preprocess, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tiled_conv2d_3x3_impl(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    max_tile_edge: i32,
+    cancel: Option<&CancelFlag>,
+    preprocess: impl Fn(&Array) -> Result<Array>,
+    f32_accum: bool,
+) -> Result<Array> {
     let shape = x.shape();
     if shape.len() != 4 {
         return Err(Error::Msg(format!(
@@ -220,11 +250,38 @@ pub fn tiled_conv2d_3x3_nhwc(
     }
     let (batch, height, width) = (shape[0], shape[1], shape[2]);
     let out_channels = weight_shape[0];
+    let wide_weight = f32_accum
+        .then(|| weight.as_dtype(mlx_rs::Dtype::Float32))
+        .transpose()?;
+    let wide_bias = if f32_accum {
+        bias.map(|b| b.as_dtype(mlx_rs::Dtype::Float32))
+            .transpose()?
+    } else {
+        None
+    };
+    let weight = wide_weight.as_ref().unwrap_or(weight);
+    let bias = wide_bias.as_ref().or(bias);
+    let convolve = |tile: &Array| -> Result<Array> {
+        let tile = preprocess(tile)?;
+        let tile = if f32_accum {
+            tile.as_dtype(mlx_rs::Dtype::Float32)?
+        } else {
+            tile
+        };
+        crate::nn::conv2d(&tile, weight, bias, 1, 1)
+    };
+    let to_storage = |a: Array| -> Result<Array> {
+        if f32_accum {
+            Ok(a.as_dtype(x.dtype())?)
+        } else {
+            Ok(a)
+        }
+    };
     if height <= max_tile_edge && width <= max_tile_edge {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
-        return crate::nn::conv2d(&preprocess(x)?, weight, bias, 1, 1);
+        return to_storage(convolve(x)?);
     }
 
     const HALO: i32 = 1;
@@ -247,12 +304,13 @@ pub fn tiled_conv2d_3x3_nhwc(
 
             let tile = slice_axis(x, 1, input_y0, input_y1)?;
             let tile = slice_axis(&tile, 2, input_x0, input_x1)?;
-            let tile = preprocess(&tile)?;
-            let convolved = crate::nn::conv2d(&tile, weight, bias, 1, 1)?;
+            let convolved = convolve(&tile)?;
             let crop_y0 = y0 - input_y0;
             let crop_x0 = x0 - input_x0;
             let core = slice_axis(&convolved, 1, crop_y0, crop_y0 + (y1 - y0))?;
             let core = slice_axis(&core, 2, crop_x0, crop_x0 + (x1 - x0))?;
+            // Cast per core, not after concatenate: the full assembled image stays at storage width.
+            let core = to_storage(core)?;
             core.eval()?;
             cores.push(core);
             x0 = x1;
@@ -690,6 +748,72 @@ pub fn tiled_decode_with_hooks(
 mod tests {
     use super::*;
     use crate::tiling::{AxisTile, SpatialTiling, TemporalTiling, TilingConfig, VaeTiling};
+
+    #[test]
+    fn f32_accumulated_tiles_keep_half_storage_and_full_image_geometry() {
+        struct Restore(mlx_rs::Device);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _restore = Restore(mlx_rs::Device::try_default().unwrap());
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = Array::from_slice(
+            &(0..9 * 11 * 4).map(|i| (i % 7) as f32).collect::<Vec<_>>(),
+            &[1, 9, 11, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
+        let weight = Array::from_slice(
+            &(0..3 * 3 * 3 * 4)
+                .map(|i| if i % 2 == 0 { 0.125f32 } else { -0.125 })
+                .collect::<Vec<_>>(),
+            &[3, 3, 3, 4],
+        )
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap();
+        let bias = Array::from_slice(&[0.25f32; 3], &[3])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        let reference = crate::nn::conv2d(
+            &x.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            &weight.as_dtype(mlx_rs::Dtype::Float32).unwrap(),
+            Some(&bias.as_dtype(mlx_rs::Dtype::Float32).unwrap()),
+            1,
+            1,
+        )
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float16)
+        .unwrap()
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .unwrap();
+        // Non-tiled fast path, ragged and minimal cores. Each output must be half BEFORE
+        // assembly, not a full-image f32 intermediate cast by the caller afterwards.
+        for edge in [32, 8, 5, 3] {
+            let got =
+                tiled_conv2d_3x3_nhwc_f32_accum(&x, &weight, Some(&bias), edge, None, |tile| {
+                    Ok(tile.clone())
+                })
+                .unwrap();
+            assert_eq!(got.dtype(), mlx_rs::Dtype::Float16);
+            assert_eq!(got.shape(), &[1, 9, 11, 3]);
+            assert_eq!(
+                got.as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>(),
+                reference.as_slice::<f32>()
+            );
+        }
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            tiled_conv2d_3x3_nhwc_f32_accum(&x, &weight, Some(&bias), 8, Some(&cancel), |tile| Ok(
+                tile.clone()
+            )),
+            Err(Error::Canceled)
+        ));
+    }
 
     /// Two non-overlapping tiles along the temporal axis with all-ones masks and an identity decode must
     /// exactly reconstruct the input — exercising slice/mask/pad placement and accumulation for a given

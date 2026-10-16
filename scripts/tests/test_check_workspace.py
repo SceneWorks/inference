@@ -51,7 +51,9 @@ class WithinWorkspaceTests(unittest.TestCase):
         )
 
     def test_ignored_parts_cover_the_documented_set(self) -> None:
-        self.assertEqual(self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex"})
+        self.assertEqual(
+            self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex", "ios-host"}
+        )
 
 
 class RustCommentStrippingTests(unittest.TestCase):
@@ -2015,6 +2017,74 @@ class RootTrainTwinTests(unittest.TestCase):
         self.assertTrue(
             any("taehv.rs is missing" in v for v in self.gate._root_train_twin_violations(root))
         )
+
+
+class IosHostMlxPinTests(unittest.TestCase):
+    """sc-16780: the excluded iOS harness must build the workspace's MLX, not a stale fork rev."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def write(self, root: Path, harness_rev: str) -> None:
+        dep = '{ package = "pmetal-mlx-rs", git = "https://github.com/x/mlx-rs", rev = "%s" }'
+        (root / "Cargo.toml").write_text(
+            "[workspace]\n[workspace.dependencies]\nmlx-rs = " + dep % "aaa" + "\n",
+            encoding="utf-8",
+        )
+        (root / "ios-host" / "smoke").mkdir(parents=True)
+        (root / "ios-host" / "smoke" / "Cargo.toml").write_text(
+            "[package]\nname = \"x\"\n[dependencies]\nmlx-rs = " + dep % harness_rev + "\n",
+            encoding="utf-8",
+        )
+
+    def test_matching_pin_passes_and_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "aaa")
+            self.gate.check_ios_host_mlx_pin(Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "bbb")
+            with self.assertRaises(AssertionError):
+                self.gate.check_ios_host_mlx_pin(Path(tmp))
+
+
+class IosHostLockDriftTests(unittest.TestCase):
+    """sc-16780: the harness's own Cargo.lock must lock third-party packages as the root does."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    @staticmethod
+    def lock(*packages: str) -> str:
+        return "version = 4\n" + "".join(f"\n[[package]]\n{p}\n" for p in packages)
+
+    def write(self, root: Path, harness_version: str) -> None:
+        registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"'
+        (root / "Cargo.lock").write_text(
+            self.lock('name = "libc"\nversion = "0.2.1"\n' + registry),
+            encoding="utf-8",
+        )
+        (root / "ios-host" / "smoke").mkdir(parents=True)
+        (root / "ios-host" / "smoke" / "Cargo.lock").write_text(
+            self.lock(
+                f'name = "libc"\nversion = "{harness_version}"\n' + registry,
+                # A path package (no source) is the harness's own crate; never compared.
+                'name = "ios-smoke"\nversion = "0.0.0"',
+            ),
+            encoding="utf-8",
+        )
+
+    def test_matching_lock_passes_and_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "0.2.1")
+            self.gate.check_ios_host_lock_drift(Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "0.2.2")
+            with self.assertRaises(AssertionError):
+                self.gate.check_ios_host_lock_drift(Path(tmp))
+
+    def test_the_real_harness_lock_matches_the_root(self) -> None:
+        self.gate.check_ios_host_lock_drift(self.gate.ROOT)
+
 
 if __name__ == "__main__":
     unittest.main()
