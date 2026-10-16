@@ -378,7 +378,38 @@ pub(crate) fn generation_contract(
         decoder_bytes: decoder,
         overlay_bytes: 0,
     };
+    if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
+        account_upsampler(&mut contract, crate::pup::load_memory_bytes(&dir)?)?;
+    }
     Ok(contract)
+}
+
+/// Keep the optional VLM separate from the image encoder. This is its conservative native
+/// source/load bound held throughout the render, NOT measured KV/activation peak memory.
+fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+    if bytes == 0 {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: prompt_upsampler has no accountable weights; install the complete package"
+        )));
+    }
+    contract.asset_facts.overlay_bytes = bytes;
+    contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::ConditioningTokenCount,
+            MemoryFormulaVariable::OverlayBytes,
+        ],
+        resident_components: vec![gen_core::MemoryResidentComponent {
+            id: gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            kind: gen_core::MemoryComponentKind::PromptUpsampler,
+            resident_bytes: bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::WholeRender,
+        }],
+    };
+    Ok(())
 }
 
 /// The provider safety check: the shared handshake (calibration identity, loaded tier,
@@ -545,6 +576,38 @@ mod tests {
     /// *Mutations that red this:* declaring `StagedResidency` `Missing`; promoting a bounded
     /// rung to `Implemented` (no lifecycle hook backs it); dropping the eager filter in
     /// `memory_contract_surface_specs`.
+    #[test]
+    fn optional_upsampler_is_a_separate_whole_render_component() {
+        let mut contract = base_contract(Precision::Bf16, None);
+        contract.asset_facts.base_bytes = 113;
+        contract.asset_facts.conditioning_bytes = 17;
+        account_upsampler(&mut contract, 37).unwrap();
+        assert_eq!(contract.asset_facts.base_bytes, 113);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 17);
+        assert_eq!(contract.asset_facts.overlay_bytes, 37);
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            resident_components,
+            variables,
+            ..
+        } = &contract.formula
+        else {
+            panic!("optional model must be included in the component envelope");
+        };
+        assert!(variables.contains(&MemoryFormulaVariable::OverlayBytes));
+        assert_eq!(resident_components.len(), 1);
+        assert_eq!(resident_components[0].id, "prompt_upsampler");
+        assert_eq!(resident_components[0].resident_bytes, 37);
+        assert_eq!(
+            resident_components[0].kind,
+            gen_core::MemoryComponentKind::PromptUpsampler
+        );
+        assert_eq!(
+            resident_components[0].residency,
+            gen_core::MemoryComponentResidency::WholeRender
+        );
+        assert!(account_upsampler(&mut contract, 0).is_err());
+    }
+
     #[test]
     fn the_route_declares_exactly_the_rungs_its_engine_runs() {
         let surfaces = memory_contract_surface_specs();

@@ -43,6 +43,7 @@ pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod pup;
 pub mod text_encoder;
 
 pub use autoencoder::Flux3AutoEncoder;

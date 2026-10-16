@@ -25,6 +25,9 @@ mod e2e_parity;
 #[path = "generator_contract.rs"]
 mod generator_contract;
 
+#[path = "pup_parity.rs"]
+mod pup_parity;
+
 #[path = "real_weights.rs"]
 mod real_weights;
 

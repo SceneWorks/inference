@@ -90,6 +90,7 @@ pub struct Flux3Klein {
     descriptor: ModelDescriptor,
     config: Flux3Config,
     residency: Residency<Flux3TextEncoder, Heavy>,
+    prompt_upsampler: Option<crate::pup::Flux3PromptUpsampler>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
     /// memory-strategy seam checks a request selection against.
     spec: LoadSpec,
@@ -193,6 +194,7 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     // registration refuses is the same refusal through `load` on every offload policy
     // (`Sequential` defers every component to the first render).
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
+    let prompt_upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
     let device = candle_gen::default_device()?;
     let compute = compute_dtype(spec);
     let te_dir = resources.text_encoder_dir.clone();
@@ -225,6 +227,7 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
         descriptor: descriptor(),
         config,
         residency,
+        prompt_upsampler,
         spec: spec.clone(),
         memory_strategy,
     })
@@ -237,7 +240,13 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        // Upstream `generate.py`: an unseeded request is seeded from its caption.
+        // Upsampling precedes BOTH caption-derived seeding and the text encoder, never decoding.
+        let outcome =
+            crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
+        let mut effective = req.clone();
+        effective.prompt = outcome.caption;
+        let req = &effective;
+        // Upstream `generate.py`: an unseeded request is seeded from its effective caption.
         let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
         let total = params.steps * req.count;
         let images = self.residency.run_request_scoped(
