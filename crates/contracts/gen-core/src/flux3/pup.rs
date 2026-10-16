@@ -1431,6 +1431,18 @@ pub struct UpsampleOptions {
     pub seed: Option<u64>,
 }
 
+impl UpsampleOptions {
+    /// Native request transport: preserve absent values so frozen model defaults resolve at the
+    /// producer, rather than substituting a legacy enhancer's default or silently clamping a cap.
+    pub fn from_generation_request(request: &crate::GenerationRequest) -> Self {
+        Self {
+            temperature: request.enhance_temperature,
+            max_tokens: request.enhance_max_tokens,
+            seed: request.seed,
+        }
+    }
+}
+
 /// A planned run: the messages, the locked rows to re-impose and the sampling policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpsamplePlan {
