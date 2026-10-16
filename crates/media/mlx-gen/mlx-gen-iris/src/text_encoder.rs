@@ -27,7 +27,7 @@ use gen_core::safetensors_shards::{resolve_indexed_safetensors_shards, snapshot_
 use gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::gen_core;
 use mlx_gen::{Error, Quant, Result};
-use mlx_llm::primitives::projection::QuantSpec;
+use mlx_llm::primitives::projection::{QuantGrid, QuantSpec};
 use mlx_llm::{CausalLm, ModelConfig};
 use mlx_rs::ops::{concatenate_axis, stack_axis, zeros};
 use mlx_rs::transforms::eval;
@@ -126,7 +126,13 @@ pub fn text_encoder_quant_spec(
             cfg.intermediate_size
         ))
     })?;
-    Ok(Some(QuantSpec { group_size, bits }))
+    // Codes on the stored bf16 grid (`QuantGrid::Stored`): the same packed bytes as MLX's
+    // `quantize`, 0.64 x its weight error at q8 on this tower (see `nn::pack_projection`).
+    Ok(Some(QuantSpec {
+        group_size,
+        bits,
+        grid: QuantGrid::Stored,
+    }))
 }
 
 impl IrisTextEncoder {

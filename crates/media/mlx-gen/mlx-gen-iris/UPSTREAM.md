@@ -860,6 +860,13 @@ for the whole pipeline:
   `text_encoder_quant_group`); the tied embedding and the norms stay bf16. The quantized build
   materializes group by group and releases each group's bf16 sources, so the dense tower is never
   held beside the packed one.
+* **Codes on the stored grid.** Both components round every code to the bf16 scales and
+  biases they store (`mlx_llm::primitives::quant::quantize_on_stored_grid`; the backbone through
+  `nn::pack_projection`, the tower through `QuantSpec { grid: QuantGrid::Stored }`). MLX's own
+  `quantize` rounds the codes to the f32 grid and only then casts the scales and biases to bf16;
+  at 8 bits that mismatch is ~1.5 x the rounding error the bytes pay for (release projections:
+  0.83–1.0 % relative weight error against the 0.55 % f32-grid optimum). Same bytes and layout;
+  at 4 bits the two agree to the noise.
 * A quantized tier runs under the bf16 compute policy only (`Precision::Fp32` + a tier and
   NVFP4 are typed refusals).
 
@@ -867,9 +874,21 @@ Header-priced resident weights of the release (the contract's own pricing): back
 1.57 GiB, text tower 7.49 / 4.32 / 2.63 GiB, together 13.06 / 7.28 / 4.20 GiB for bf16 / q8 / q4
 (0.558 x and 0.322 x of bf16 — the tower's 0.73 GiB tied embedding stays bf16). Verification:
 `tests/quant_tiers.rs` on the miniature (CPU, every tier: measured resident bytes against the
-contract, image / conditioning distance to the dense tier) and the `#[ignore]`d
-`tests/quant_real_weights.rs` (measured resident ratios on the release; 512² bf16 / q8 / q4 renders
-from one seed against a declared tolerance).
+contract, image / conditioning distance to the dense tier, every packed projection at the
+stored-grid optimum) and the `#[ignore]`d `tests/quant_real_weights.rs` on the release: measured
+resident ratios; every packed projection of both components within 1.05 x of the f32-grid
+optimum (CPU); the conditioning and ONE CFG-combined denoiser step at 512² against the dense
+tier, bounded as multiples of the dense tier's own bf16-vs-f32 precision floor (GPU); and 512²
+bf16 / q8 / q4 renders from one seed (coherence + composition only).
+
+Why no 30-step pixel bound (sc-26266): on the release a 0.086 % Gaussian perturbation of every
+backbone weight — a tenth of q8's rounding — moves one CFG-3 denoiser step by ~7 %, the same as
+bf16-vs-f32 compute of the dense tier (7.6 % / 5.8 % at s = 1.0 / 0.8); the q8 backbone moves it
+7.6 % / 8.9 %, exactly as far as unstructured noise of its own weight error does (no structured
+defect). Thirty steps turn any perturbation at that floor into a different fine-detail
+trajectory: the first GPU run measured q8 / q4 mean |Δ| 16.4 / 33.4 against the pre-measurement
+12 / 28 with both renders coherent and the composition kept (corr 0.953 / 0.864). The measured
+bounds and their derivation are in the doc comments of `tests/quant_real_weights.rs`.
 
 Memory-contract verification: `memory_strategy` unit tests (declaration, admission gate, pricing, registry
 conformance) and `tests/memory_contract.rs` (a staged selection on a warm generator loads the two

@@ -18,6 +18,23 @@ pub struct QuantSpec {
     pub group_size: i32,
     /// Bits per weight (4 or 8).
     pub bits: i32,
+    /// How load-time quantization rounds each weight to its group's grid. Describes the
+    /// quantizer, not the packed layout: both grids produce the same `weight` / `scales` /
+    /// `biases` shapes and dtypes.
+    pub grid: QuantGrid,
+}
+
+/// The grid a load-time quantization rounds each weight to (sc-26266).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuantGrid {
+    /// MLX's `quantize` as-is: codes rounded to the f32 grid, scales and biases then cast to
+    /// the weight's dtype.
+    #[default]
+    Computed,
+    /// Codes rounded to the scales and biases as stored
+    /// ([`crate::primitives::quant::quantize_on_stored_grid`]) — the same bytes, ~0.64 x the
+    /// weight error at 8 bits on a 16-bit weight.
+    Stored,
 }
 
 impl QuantSpec {
@@ -26,6 +43,7 @@ impl QuantSpec {
         Self {
             group_size: 64,
             bits: 4,
+            grid: QuantGrid::Computed,
         }
     }
 
@@ -34,6 +52,7 @@ impl QuantSpec {
         Self {
             group_size: 64,
             bits: 8,
+            grid: QuantGrid::Computed,
         }
     }
 }
@@ -70,12 +89,14 @@ impl Projection {
     ) -> Result<Self> {
         match quant {
             None => Ok(Projection::Dense { weight, bias }),
-            Some(q) => Ok(Projection::Quantized(QuantizedLinear::quantize(
-                &weight,
-                q.group_size,
-                q.bits,
-                bias,
-            )?)),
+            Some(q) => Ok(Projection::Quantized(match q.grid {
+                QuantGrid::Computed => {
+                    QuantizedLinear::quantize(&weight, q.group_size, q.bits, bias)?
+                }
+                QuantGrid::Stored => {
+                    QuantizedLinear::quantize_on_stored_grid(&weight, q.group_size, q.bits, bias)?
+                }
+            })),
         }
     }
 

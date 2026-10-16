@@ -223,3 +223,37 @@ pub fn assert_ac_bf16_noise_only(
     );
     out
 }
+
+/// Relative Frobenius error of an `[out, in]` affine packing (`codes`, `scales`, `biases`, group
+/// 64) against the bf16 weight `w` — the packed input zero-padded to the group multiple, the
+/// padding sliced off again (sc-26266). The scales and biases are widened to f32 first:
+/// `quantized_matmul` dequantizes in f32 and never rounds the weight to the scale dtype, as
+/// `dequantize` would.
+pub fn packing_error(w: &Array, codes: &Array, scales: &Array, biases: &Array, bits: i32) -> f64 {
+    use mlx_rs::ops::indexing::IndexOp;
+    let input = w.shape()[1];
+    let f32 = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+    let dq = mlx_rs::ops::dequantize(codes, f32(scales), &f32(biases), 64, bits)
+        .unwrap()
+        .index((.., ..input));
+    let fro = |a: &Array| f64::from(a.square().unwrap().sum(None).unwrap().item::<f32>()).sqrt();
+    let w = f32(w);
+    fro(&dq.subtract(&w).unwrap()) / fro(&w)
+}
+
+/// The f32-grid optimum of a group-64 affine packing of the bf16 weight `w`: MLX's `quantize`
+/// over the f32 copy keeps f32 scales, so its codes sit on the grid it stores — the error a
+/// bf16 grid can at best match (sc-26266).
+pub fn f32_grid_error(w: &Array, bits: i32) -> f64 {
+    let input = w.shape()[1];
+    let pad = (input as usize).div_ceil(64) as i32 * 64 - input;
+    let f = mlx_rs::ops::pad(
+        w.as_dtype(Dtype::Float32).unwrap(),
+        &[(0, 0), (0, pad)][..],
+        None,
+        None,
+    )
+    .unwrap();
+    let (codes, scales, biases) = mlx_rs::ops::quantize(&f, 64, bits).unwrap();
+    packing_error(w, &codes, &scales, &biases, bits)
+}
