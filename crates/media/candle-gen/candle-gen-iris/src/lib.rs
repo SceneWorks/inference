@@ -46,7 +46,7 @@
 //! **at load** from the same dense release — there is no converted artifact. A tier is a
 //! whole-pipeline contract with the MLX twin's packing rule: every backbone projection at least one
 //! 64-wide group wide ([`load_backbone_quantized`], [`nn::ProjectionLayout`]; the 6826-wide SwiGLU
-//! down projections zero-padded to 6848, kept dense under adapters) and every attention/MLP
+//! down projections zero-padded to 6848, adapted or not) and every attention/MLP
 //! projection of the Qwen3-VL tower ([`IrisTextEncoder::load_quantized`]) are held as GGML
 //! `Q8_0` / `Q4_0` (`Q4_K` on the tower where its 256-wide super-block divides) and dequantized per
 //! forward, so no activation is ever quantized. Embeddings, norms, the text position table and the

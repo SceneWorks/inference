@@ -79,9 +79,10 @@ converted is shipped or written, the MLX twin's convention. The tier semantics a
   64-wide group wide is held as GGML `Q8_0` / `Q4_0` (32-wide blocks, 8.5 / 4.5 bits per weight —
   the cost of MLX's group-64 affine scales and biases), quantized on the host straight from the
   checkpoint's f32 values and placed on the device. The 6826-wide SwiGLU down projections are
-  zero-padded to 6848 (exact) and packed; an adapted load keeps them dense, as on MLX. The 3-, 12-
-  and 16-wide pixel and pooling heads, the norms, the modulation biases and the text position table
-  stay dense.
+  zero-padded to 6848 (exact) and packed — on an adapted load too, as on MLX: the packed base reads
+  the padded input and the adapter residuals the unpadded one (`nn::Linear::forward`), so the tier's
+  layout and pricing do not depend on the adapters. The 3-, 12- and 16-wide pixel and pooling heads,
+  the norms, the modulation biases and the text position table stay dense.
 * **Text tower** (`IrisTextEncoder::load_quantized`): every attention/MLP projection of the
   Qwen3-VL language tower is quantized by the shared decoder (`candle_llm` `QuantSpec::q8` /
   `QuantSpec::q4` — `Q8_0`, and `Q4_K` where its 256-wide super-block divides, `Q4_0` otherwise, both

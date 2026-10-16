@@ -161,7 +161,7 @@ pub fn load_backbone_with_adapters(
 /// [`load_backbone_with_adapters`] at a quantization tier (sc-26266): `quant` packs every
 /// projection [`crate::nn::ProjectionLayout::of`] selects to GGML Q8_0 / Q4_0 at load, straight
 /// from the checkpoint's stored values; `None` is the dense tier. Adapters stay forward-time
-/// residuals over the packed base, and an adapted load keeps the unaligned projections dense
+/// residuals over the packed base; an adapted load packs the same projections as a plain one
 /// ([`BackboneQuant::for_load`]).
 #[allow(clippy::too_many_arguments)]
 pub fn load_backbone_quantized(
@@ -174,7 +174,7 @@ pub fn load_backbone_quantized(
     base_model: &str,
     quant: Option<Quant>,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
-    let quant = BackboneQuant::for_load(quant, !adapters.is_empty())?;
+    let quant = BackboneQuant::for_load(quant)?;
     let path = dir.join(BACKBONE_WEIGHTS_FILE);
     let checkpoint = Checkpoint::open(&path, device)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;

@@ -490,7 +490,7 @@ pub fn generation_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCo
     let resources = GenerationResources::from_spec(spec, MODEL_ID)?;
     let config = IrisConfig::from_dir(&resources.backbone_dir)?;
     let compute_width = compute_dtype(spec).size_in_bytes() as u64;
-    let quant = BackboneQuant::for_load(spec.quantize, !spec.adapters.is_empty())?;
+    let quant = BackboneQuant::for_load(spec.quantize)?;
     let transformer = backbone_bytes(
         &resources.backbone_dir.join(BACKBONE_WEIGHTS_FILE),
         compute_width,
@@ -2533,11 +2533,12 @@ mod tests {
     /// sc-26266: a quantized generation load prices what its loaders hold at the tier — every
     /// backbone projection at least 64 wide packed (the unaligned ones over an input zero-padded to
     /// the next multiple of 64), the text tower's attention/MLP projections packed, everything else
-    /// as on the dense tier — and an adapted load keeps the unaligned backbone projections dense.
-    /// Expectations are recomputed here from the headers, not through the provider's layout rule.
+    /// as on the dense tier — and an adapted load prices the same packed backbone (the tier is one
+    /// layout whatever the adapters; the stack is an overlay). Expectations are recomputed here
+    /// from the headers, not through the provider's layout rule.
     ///
     /// *Mutations that red this:* pricing a quantized load at bf16; quantizing the token
-    /// embedding; dropping the padding (or padding under adapters); a block at the wrong width.
+    /// embedding; dropping the padding (with or without adapters); a block at the wrong width.
     #[test]
     fn a_quantized_generation_load_prices_the_packed_projections() {
         let scratch = tempfile::tempdir().unwrap();
@@ -2622,7 +2623,7 @@ mod tests {
                 .unwrap()
                 .asset_facts
                 .transformer_bytes,
-            backbone_at(4, false)
+            backbone_at(4, true)
         );
 
         // The released miniature tower has no GGML-aligned MLP width, so it has no quantized tier.

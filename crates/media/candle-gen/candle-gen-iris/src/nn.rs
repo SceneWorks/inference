@@ -363,32 +363,28 @@ pub fn safetensors_shapes(file: &Path) -> Result<BTreeMap<String, Vec<usize>>> {
 pub const QUANT_GROUP_SIZE: usize = candle_gen::quant::MLX_GROUP_SIZE;
 
 /// The load-time quantization of one backbone build (sc-26266) — the Candle twin of
-/// `mlx_gen_iris::nn::BackboneQuant`: the tier, and what happens to a projection whose input width
-/// is not a multiple of [`QUANT_GROUP_SIZE`].
+/// `mlx_gen_iris::nn::BackboneQuant`: the tier.
 ///
-/// The release has exactly one such family — the SwiGLU down projections (`*.mlp.w2`,
-/// `[2560, 6826]`). Zero-padding their input to the next group multiple is exact
-/// (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like every other projection. A load that
-/// installs adapters keeps those projections dense instead, as the MLX twin does, so one adapted
-/// spec prices and holds the same bytes on both backends.
+/// A projection whose input width is not a multiple of [`QUANT_GROUP_SIZE`] is packed over a
+/// zero-padded input. The release has exactly one such family — the SwiGLU down projections
+/// (`*.mlp.w2`, `[2560, 6826]`). Zero-padding their input to the next group multiple is exact
+/// (`[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and lets them quantize like every other projection — adapted or
+/// not: an adapter residual on such a projection reads the unpadded input while the packed base
+/// reads the padded one ([`Linear::forward`]), so the tier is one layout for the whole backbone
+/// whatever adapters a load installs, as on the MLX twin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackboneQuant {
     /// The tier ([`Quant::Q4`] or [`Quant::Q8`]).
     pub quant: Quant,
-    /// Zero-pad an unaligned projection's input and quantize it (`true`), or keep it dense.
-    pub pad_unaligned: bool,
 }
 
 impl BackboneQuant {
-    /// The quantization a load with `quant` and (`adapted`) an adapter stack applies: `None` is
-    /// the dense tier. Only the q8 / q4 tiers exist on this route; NVFP4 is a typed refusal.
-    pub fn for_load(quant: Option<Quant>, adapted: bool) -> Result<Option<Self>> {
+    /// The quantization a load with `quant` applies: `None` is the dense tier. Only the q8 / q4
+    /// tiers exist on this route; NVFP4 is a typed refusal.
+    pub fn for_load(quant: Option<Quant>) -> Result<Option<Self>> {
         match quant {
             None => Ok(None),
-            Some(quant @ (Quant::Q4 | Quant::Q8)) => Ok(Some(Self {
-                quant,
-                pad_unaligned: !adapted,
-            })),
+            Some(quant @ (Quant::Q4 | Quant::Q8)) => Ok(Some(Self { quant })),
             Some(other) => Err(Error::Unsupported(format!(
                 "iris: LoadSpec::quantize {other:?} is not a tier of the Candle Iris-3B route; it \
                  packs the q8 and q4 tiers"
@@ -426,9 +422,6 @@ impl ProjectionLayout {
             return Self::Dense;
         }
         let padded_in = in_features.div_ceil(QUANT_GROUP_SIZE) * QUANT_GROUP_SIZE;
-        if padded_in != in_features && !quant.pad_unaligned {
-            return Self::Dense;
-        }
         Self::Quantized {
             dtype: quant.ggml_dtype(),
             padded_in,
@@ -467,8 +460,8 @@ impl Loader<'_> {
         let weight_key = format!("{prefix}.weight");
         let residuals = self.weights.take_residuals(prefix);
         let stored = self.weights.take(&weight_key)?;
-        // An adapted load never pads ([`BackboneQuant::for_load`]), so an adapted projection is
-        // aligned or dense; its residuals stay forward-time terms over the packed base.
+        // An adapted projection packs like any other; its residuals stay forward-time terms over
+        // the packed base, reading the checkpoint-width input ([`Linear::forward`]).
         if let ProjectionLayout::Quantized { dtype, padded_in } =
             ProjectionLayout::of(stored.dims().last().copied().unwrap_or(0), self.quant)
         {
