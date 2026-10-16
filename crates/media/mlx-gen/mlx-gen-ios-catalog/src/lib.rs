@@ -6,7 +6,8 @@
 //! memory cap. Depending on it to obtain one small generator would compile a graph the platform
 //! cannot run.
 //!
-//! So this catalog is a deliberate, reviewable subset: the generators that actually fit. Adding
+//! So this catalog is a deliberate, reviewable subset of candidate generators. Registration is
+//! not a claim of device fit: artifact-bound product admission is separate. Adding
 //! one is an edit here *and* to this crate's ordered surface test, exactly as the platform
 //! catalogs work — a provider crate existing in the workspace does not mean it ships.
 //!
@@ -26,6 +27,10 @@
 //! safety check. Its Qwen-Image VAE brings `mlx-gen-qwen-image`, and with it `mlx-gen-wan` (Qwen's
 //! optional single-frame decoder), as compiled code only: no Qwen-Image or Wan generator is
 //! registered here.
+//!
+//! **SDXL family** (`sdxl`, Illustrious v1/v2, RealVisXL and Lightning checkpoints): one complete
+//! generator, no trainer even under feature unification. [`sdxl`] keeps source/device/route-bound
+//! admission separate from the Mac engine measurements; unverified iPhone artifacts are refused.
 
 mod admission;
 pub use admission::{sana_snapshot_footprint_bound, sana_snapshot_profile, SanaSnapshotProfile};
@@ -38,6 +43,7 @@ use mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES;
 use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVERLAP};
 
 pub mod anima;
+pub mod sdxl;
 pub use anima::{
     anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
     anima_turbo_memory_selection, ios_memory_budget, ANIMA_TURBO_ID,
@@ -50,7 +56,9 @@ pub use anima::{
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     // Turbo alone, through the provider's own per-variant seam: its generator and complete memory
     // registration, never a trainer — whatever features another crate unifies onto `mlx-gen-anima`.
-    mlx_gen_anima::register_turbo_generator(mlx_gen_sana::register_providers(registry))
+    mlx_gen_sdxl::register_generator(mlx_gen_anima::register_turbo_generator(
+        mlx_gen_sana::register_providers(registry),
+    ))
 }
 
 /// Build the complete, explicit iOS media provider catalog.
@@ -264,12 +272,102 @@ mod tests {
 
         assert_eq!(
             ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "sdxl"],
             "the iOS media surface changed -- if deliberate, update this test and confirm the new \
              provider fits the measured iOS cap"
         );
         assert_eq!(registry.trainers().len(), 0, "iOS ships no trainers");
         assert_eq!(registry.captioners().len(), 0, "iOS ships no captioners");
+    }
+
+    #[test]
+    fn sdxl_is_reachable_with_the_full_generator_surface_and_no_trainer() {
+        let registry = super::provider_registry().unwrap();
+        let descriptor = registry
+            .generators()
+            .map(|r| (r.descriptor)())
+            .find(|d| d.id == "sdxl")
+            .expect("SDXL must actually be registered, not just linked");
+        let caps = descriptor.capabilities;
+        assert!(!caps.mac_only, "SDXL is supported on iOS");
+        assert!(caps.supports_lora && caps.supports_lokr);
+        for kind in [
+            mlx_gen::gen_core::ConditioningKind::Reference,
+            mlx_gen::gen_core::ConditioningKind::Mask,
+            mlx_gen::gen_core::ConditioningKind::Control,
+        ] {
+            assert!(
+                caps.conditioning.contains(&kind),
+                "mode {kind:?} was dropped"
+            );
+        }
+        for sampler in [
+            "euler_ancestral",
+            "lightning",
+            "lcm",
+            "hyper",
+            "euler",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            assert!(
+                caps.samplers.contains(&sampler),
+                "sampler {sampler} was dropped"
+            );
+        }
+        use mlx_gen::gen_core::{Conditioning, ControlKind, GenerationRequest, Image, Quant};
+        let image = || Image {
+            width: 1,
+            height: 1,
+            pixels: vec![128; 3],
+        };
+        for conditioning in [
+            vec![],
+            vec![Conditioning::Reference {
+                image: image(),
+                strength: Some(0.5),
+            }],
+            vec![
+                Conditioning::Reference {
+                    image: image(),
+                    strength: Some(0.5),
+                },
+                Conditioning::Mask { image: image() },
+            ],
+            vec![Conditioning::Control {
+                image: image(),
+                kind: ControlKind::Other("tile".into()),
+                scale: Some(1.0),
+            }],
+        ] {
+            let request = GenerationRequest {
+                width: 512,
+                height: 512,
+                count: 1,
+                conditioning,
+                ..Default::default()
+            };
+            caps.validate_request("sdxl", &request)
+                .expect("registered route must remain selectable");
+        }
+        assert_eq!(caps.supported_quants, &[Quant::Q4, Quant::Q8]);
+        for route in super::sdxl::SDXL_FAMILY_ROUTES {
+            let spec =
+                super::sdxl::sdxl_load_spec(route, WeightsSource::Dir("/nonexistent".into()))
+                    .unwrap();
+            assert_eq!(spec.resolved_route.as_deref(), Some(*route));
+        }
+        assert!(registry
+            .memory_strategy_registrations()
+            .any(|r| r.provider_id == "sdxl"));
+        assert_eq!(
+            registry.trainers().len(),
+            0,
+            "feature unification must not register a trainer"
+        );
     }
 
     /// The shared weights-free behavior oracle over this catalog's own registrations — Anima

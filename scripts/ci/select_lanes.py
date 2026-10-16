@@ -55,6 +55,7 @@ IOS_BOUND_PATHS = (
     "crates/media/mlx-gen/mlx-gen-pid",
     "crates/media/mlx-gen/mlx-gen-qwen-image",
     "crates/media/mlx-gen/mlx-gen-sana",
+    "crates/media/mlx-gen/mlx-gen-sdxl",
     "crates/media/mlx-gen/mlx-gen-wan",
     "crates/media/mlx-gen/mlx-gen-z-image",
 )

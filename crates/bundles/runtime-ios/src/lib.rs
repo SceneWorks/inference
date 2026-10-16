@@ -42,7 +42,7 @@ pub mod media {
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, ios_memory_budget, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
         FootprintBound, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
         IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
         SANA_DEVICE_FOOTPRINTS,
@@ -60,6 +60,37 @@ pub mod media {
         let estimate = crate::admit_sana_snapshot(sana_id, spec, image_edge, tile_edge)?;
         crate::load_admitted(Some(estimate), || {
             mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
+        })
+    }
+
+    /// Select the caller's highest-preference SDXL candidate using artifact/device-bound evidence
+    /// and the provider's registered shared safety check, BEFORE any tensor payload is loaded.
+    /// Returns the selected candidate index along with the generator so the caller retains its
+    /// selected geometry/tier/execution controls rather than silently rendering another candidate.
+    /// Every SDXL-family checkpoint and route remains registered, but no current iPhone capture
+    /// authorizes a product load. Raw catalog access remains diagnostic, not admission authority.
+    pub fn load_sdxl(
+        candidates: &[sdxl::SdxlCandidate],
+    ) -> crate::gen_core::Result<(usize, Box<dyn crate::gen_core::Generator>)> {
+        if !super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::gen_core::Error::Unsupported(
+                "iOS SDXL admission requires platform allocator/cache limits bound first".into(),
+            ));
+        }
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let budget = crate::gen_core::MemoryBudget {
+            total_bytes: u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let (index, estimate) =
+            sdxl::select_sdxl_candidate(&registry, candidates, &super::device_machine(), budget)?;
+        super::load_admitted(Some(estimate), || {
+            Ok((
+                index,
+                registry.load(sdxl::SDXL_ID, &candidates[index].spec)?,
+            ))
         })
     }
 
@@ -535,6 +566,17 @@ mod tests {
         assert!(super::admit_sana_render(1024, 192).is_err());
     }
 
+    #[cfg(feature = "media")]
+    #[test]
+    fn sdxl_product_load_refuses_before_loading_an_unverified_source() {
+        // No device capture exists. Even a caller supplying no candidates must not reach loading;
+        // no host peak or unadmitted registry is exposed as this facade's default SDXL loader.
+        assert!(super::media::load_sdxl(&[]).is_err());
+        let registry = super::catalog().unwrap().snapshot();
+        assert!(registry.generator_ids.contains(&"sdxl".to_string()));
+        assert!(registry.trainer_ids.is_empty());
+    }
+
     /// SANA admission reads the catalog's bound and compares it to the cap (whatever value the
     /// cap is filled in with); a pair with no bound (1024²/256) is refused.
     #[cfg(feature = "media")]
@@ -643,7 +685,7 @@ mod tests {
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "sdxl"],
             "the iOS image surface changed; confirm the new provider fits the measured iOS cap \
              before updating this"
         );

@@ -219,7 +219,7 @@ pub fn descriptor() -> ModelDescriptor {
             min_size: 512,
             max_size: 2048,
             max_count: 8,
-            mac_only: true,
+            mac_only: false,
             // On-the-fly Q4/Q8 over the U-Net + CLIP encoders + IdentityNet, conv_shortcut kept
             // dense (sc-2769 / sc-3329). Read by the worker capability advertisement (sc-3723).
             supported_quants: &[Quant::Q4, Quant::Q8],
