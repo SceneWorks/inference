@@ -233,3 +233,121 @@ fn timestep_embedding_follows_the_compute_dtype_body() {
         );
     });
 }
+
+/// Same independent frozen-source fixture as Candle; hosted macOS verifies this body.
+#[test]
+fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
+    cpu_process(
+        "dit_parity::base_cfg_and_explicit_adapter_identity_match_frozen_source",
+        || {
+            on_cpu(|| {
+                use mlx_gen::{
+                    gen_core::{flux3::assemble_window, AdapterKind, AdapterSpec, CancelFlag},
+                    weights::Weights,
+                };
+                use mlx_gen_flux3::pipeline::denoise_cfg;
+                use mlx_gen_flux3::{Flux3Dit, TextConditioning};
+                let mut config = tiny_config();
+                config.dit.flow_map = false;
+                let mut weights =
+                    Weights::from_file(&tiny_package().join("model.safetensors")).unwrap();
+                let remove: Vec<_> = weights
+                    .keys()
+                    .filter(|key| key.starts_with("ref_time_in."))
+                    .map(str::to_owned)
+                    .collect();
+                for key in remove {
+                    weights.remove(&key);
+                }
+                let mut dit =
+                    Flux3Dit::from_weights(&weights, &config.dit, Dtype::Float32).unwrap();
+                let text_fixture = fixture("flux3_text_golden.safetensors");
+                let conditioning = |name: &str| {
+                    let tokens = text_fixture
+                        .require(&format!("{name}/tokens"))
+                        .unwrap()
+                        .clone();
+                    let ids = ids_of(text_fixture.require(&format!("{name}/ids")).unwrap());
+                    let window = assemble_window(&vec![1; ids.len()], 0, 1, 4096).unwrap();
+                    TextConditioning {
+                        tokens,
+                        ids,
+                        window,
+                    }
+                };
+                let positive = conditioning("short");
+                let negative = conditioning("empty");
+                let alt = conditioning("long");
+                let golden = fixture("flux3_base_golden.safetensors");
+                let x = golden.require("noise").unwrap();
+                let ids = ids_of(golden.require("image_ids").unwrap());
+                let schedule = host_f32(golden.require("schedule").unwrap());
+                for guidance in [0.0f32, 1.0, 3.5] {
+                    let mut steps = Vec::new();
+                    let output = denoise_cfg(
+                        &dit,
+                        &positive,
+                        &negative,
+                        x,
+                        &ids,
+                        &schedule,
+                        guidance,
+                        &CancelFlag::new(),
+                        |step| steps.push(step),
+                    )
+                    .unwrap();
+                    assert_eq!(steps, [1, 2, 3, 4]);
+                    assert_close(
+                        "base CFG",
+                        &output,
+                        golden.require(&format!("cfg_{guidance:.1}")).unwrap(),
+                        1e-4,
+                    );
+                }
+                let out = denoise_cfg(
+                    &dit,
+                    &positive,
+                    &alt,
+                    x,
+                    &ids,
+                    &schedule,
+                    3.5,
+                    &CancelFlag::new(),
+                    |_| {},
+                )
+                .unwrap();
+                assert_close(
+                    "explicit negative row",
+                    &out,
+                    golden.require("negative_alt").unwrap(),
+                    1e-4,
+                );
+                let spec = AdapterSpec::new(
+                    crate::common::fixtures().join("flux3_base_lora.safetensors"),
+                    -0.25,
+                    AdapterKind::Lora,
+                );
+                mlx_gen_flux3::adapters::install(&mut dit, &[spec]).unwrap();
+                let out = denoise_cfg(
+                    &dit,
+                    &positive,
+                    &negative,
+                    x,
+                    &ids,
+                    &schedule,
+                    3.5,
+                    &CancelFlag::new(),
+                    |_| {},
+                )
+                .unwrap();
+                assert_close(
+                    "six target LoRA",
+                    &out,
+                    golden.require("adapter_on").unwrap(),
+                    1e-4,
+                );
+                assert!(crate::common::errors(&out, golden.require("cfg_3.5").unwrap()).0 > 1e-5);
+            });
+        },
+    );
+}

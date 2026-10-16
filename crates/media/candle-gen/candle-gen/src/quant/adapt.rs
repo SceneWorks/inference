@@ -925,7 +925,13 @@ impl AdaptLinear {
     /// cast only at the hand-off to the host output dtype before addition. With no live adapter this
     /// is byte-identical to the bare base forward.
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let mut y = self.base.forward(x)?;
+        self.apply_residuals(x, self.base.forward(x)?)
+    }
+
+    /// Add this layer's existing residual stack to an already computed base output. Providers
+    /// with an explicit base precision policy (FLUX3's autocast/opmath boundary) use the same
+    /// adapter math without recomputing or changing that base. No adapters returns `y` untouched.
+    pub fn apply_residuals(&self, x: &Tensor, mut y: Tensor) -> candle_core::Result<Tensor> {
         for ad in &self.adapters {
             if ad.is_zero() {
                 continue;
@@ -1876,6 +1882,87 @@ mod tests {
             packed.is_packed(),
             "`.scales` ⇒ packed load, not a silent dense fallback"
         );
+    }
+
+    #[test]
+    fn precomputed_base_residual_seam_preserves_output_and_stack() {
+        let dev = Device::Cpu;
+        let weight = Tensor::new(&[[1f32, 2.], [-3., 4.]], &dev).unwrap();
+        let base = Linear::new(weight, None);
+        let x = Tensor::new(&[[0.5f32, -2.], [3., 0.25]], &dev).unwrap();
+        let bare = base.forward(&x).unwrap();
+        let mut linear = AdaptLinear::from_dense(base, 2, 2);
+        let bits = |t: Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(linear.apply_residuals(&x, bare.clone()).unwrap()),
+            bits(bare.clone())
+        );
+        let a = Tensor::new(&[[0.25f32], [-0.5]], &dev).unwrap();
+        let b = Tensor::new(&[[2f32, -1.]], &dev).unwrap();
+        linear.push_lora(a, b, -0.7).unwrap();
+        let actual = linear
+            .apply_residuals(&x, bare.clone())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (got, want) in actual.iter().zip([-5.075f32, -8.7125, 2.625, -7.5625]) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "independent bottleneck arithmetic: {got} != {want}"
+            );
+        }
+        assert_eq!(
+            bits(linear.forward(&x).unwrap()),
+            bits(linear.apply_residuals(&x, bare.clone()).unwrap())
+        );
+        let w1 = Tensor::new(&[[0.5f32]], &dev).unwrap();
+        let w2 = Tensor::new(&[[1f32, 0.25], [-0.2, 0.7]], &dev).unwrap();
+        let factors = LokrFactors::build(
+            0.3,
+            (2, 2),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        linear.push_lokr_structured(factors).unwrap();
+        let actual = linear
+            .apply_residuals(&x, bare.clone())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (got, want) in actual
+            .iter()
+            .zip([-5.075f32, -8.9375, 3.084_375, -7.626_25])
+        {
+            assert!(
+                (got - want).abs() < 2e-6,
+                "independent LoKr arithmetic: {got} != {want}"
+            );
+        }
+        assert_eq!(
+            bits(linear.forward(&x).unwrap()),
+            bits(linear.apply_residuals(&x, bare).unwrap())
+        );
+        let wrong = Tensor::zeros((3, 3), DType::F32, &dev).unwrap();
+        assert!(linear.apply_residuals(&wrong, wrong.clone()).is_err());
     }
 
     /// The additive LoRA residual `scale·((x·a)·b)` reproduces the **folded** `x·(W + δ)ᵀ` with

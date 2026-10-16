@@ -402,6 +402,17 @@ pub const FLUX3_IMAGE_KLEIN: ComponentLicense = ComponentLicense {
     retrieved: "2026-10-15",
 };
 
+/// Base CFG checkpoint. Pinned Hub metadata at revision
+/// `1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4` declares `license_name: flux-kommunity-license`.
+/// Its LICENSE.md git blob id `044cf48568c278150d132a7479ea237a79766ea7` equals distilled's;
+/// this is API metadata evidence, not a claim of authenticated base-file download.
+pub const FLUX3_IMAGE_KLEIN_BASE: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein_base",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein-base",
+    retrieved: "2026-10-16",
+    ..FLUX3_IMAGE_KLEIN
+};
+
 /// `black-forest-labs/flux-3-image-klein-pup` — the FLUX 3 Image Klein **prompt upsampler**
 /// (sc-26238): a 9B Qwen3.5 vision-language model, a full fine-tune of `Qwen/Qwen3.5-9B`, in a
 /// separate, ungated repository. The card front matter at the pinned revision
@@ -1305,6 +1316,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     FLUX2_KLEIN_9B,
     FLUX2_KLEIN_9B_KV,
     FLUX3_IMAGE_KLEIN,
+    FLUX3_IMAGE_KLEIN_BASE,
     FLUX3_IMAGE_KLEIN_PUP,
     GEMMA_2_2B_IT,
     GEMMA_3_12B_IT,
@@ -1378,7 +1390,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 79);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 80);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1493,6 +1505,7 @@ mod tests {
                 "flux2_klein_9b",
                 "flux2_klein_9b_kv",
                 "flux3_image_klein",
+                "flux3_image_klein_base",
                 "gemma_2_2b_it",
                 "gemma_3_12b_it",
                 "ideogram_4_fp8",
@@ -1771,8 +1784,11 @@ mod tests {
         // Qwen-Image-2.1-Turbo card and LICENSE on 2026-10-13
         // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`); sc-26234 read the
         // FLUX 3 Image Klein card and LICENSE.md on 2026-10-15
-        // (`docs/licensing/sc-26234-flux-kommunity-licence-evidence.md`). A row carrying
-        // any other date is a row whose provenance nobody can re-read.
+        // (`docs/licensing/sc-26234-flux-kommunity-licence-evidence.md`); sc-26239 compared
+        // pinned base Hub metadata and LICENSE git blob identity on 2026-10-16
+        // (`mlx-gen-flux3/tests/fixtures/base-hub-identity.json`, its UPSTREAM.md distinguishes
+        // metadata evidence from gated-file authorization). A row carrying any other date is
+        // a row whose provenance nobody can re-read.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
             "2026-08-12",
@@ -1780,6 +1796,7 @@ mod tests {
             "2026-10-10",
             "2026-10-13",
             "2026-10-15",
+            "2026-10-16",
         ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(

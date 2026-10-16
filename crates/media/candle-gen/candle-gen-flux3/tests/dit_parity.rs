@@ -200,3 +200,146 @@ fn flow_map_inputs_and_config_are_checked() {
         other => panic!("expected a typed refusal, got {:?}", other.err()),
     }
 }
+
+/// Independent frozen-source CFG and additive adapter goldens; CPU only, no real weights.
+#[test]
+fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
+    use candle_gen::candle_core::safetensors;
+    use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::gen_core::{
+        flux3::{adapters, assemble_window},
+        AdapterKind, AdapterSpec, CancelFlag,
+    };
+    use candle_gen_flux3::pipeline::denoise_cfg;
+    use candle_gen_flux3::{Flux3Dit, TextConditioning};
+    let device = Device::Cpu;
+    let mut config = tiny_config();
+    config.dit.flow_map = false;
+    let weights = safetensors::load(tiny_package().join("model.safetensors"), &device)
+        .unwrap()
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with("ref_time_in."))
+        .collect();
+    let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+    let mut dit = Flux3Dit::from_var_builder(&vb, &config.dit, DType::F32, &device).unwrap();
+    let text_fixture = fixture("flux3_text_golden.safetensors");
+    let conditioning = |name: &str| {
+        let tokens = text_fixture.require(&format!("{name}/tokens")).clone();
+        let ids = ids_of(text_fixture.require(&format!("{name}/ids")));
+        let window = assemble_window(&vec![1; ids.len()], 0, 1, 4096).unwrap();
+        TextConditioning {
+            tokens,
+            ids,
+            window,
+        }
+    };
+    let positive = conditioning("short");
+    let negative = conditioning("empty");
+    let alt = conditioning("long");
+    let golden = fixture("flux3_base_golden.safetensors");
+    let x = golden.require("noise");
+    let ids = ids_of(golden.require("image_ids"));
+    let schedule = host_f32(golden.require("schedule"));
+    for guidance in [0.0f32, 1.0, 3.5] {
+        let mut steps = Vec::new();
+        let output = denoise_cfg(
+            &dit,
+            &positive,
+            &negative,
+            x,
+            &ids,
+            &schedule,
+            guidance,
+            &CancelFlag::new(),
+            |step| steps.push(step),
+        )
+        .unwrap();
+        assert_eq!(steps, [1, 2, 3, 4]);
+        assert_close(
+            "base CFG",
+            &output,
+            golden.require(&format!("cfg_{guidance:.1}")),
+            1e-4,
+        );
+    }
+    let out = denoise_cfg(
+        &dit,
+        &positive,
+        &alt,
+        x,
+        &ids,
+        &schedule,
+        3.5,
+        &CancelFlag::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_close(
+        "explicit negative row",
+        &out,
+        golden.require("negative_alt"),
+        1e-4,
+    );
+    let spec = AdapterSpec::new(
+        crate::common::fixtures().join("flux3_base_lora.safetensors"),
+        -0.25,
+        AdapterKind::Lora,
+    );
+    let plan = adapters::inspect(&spec, &config.dit).unwrap();
+    assert_eq!(plan.len(), 6);
+    candle_gen_flux3::adapters::install(&mut dit, std::slice::from_ref(&spec)).unwrap();
+    let out = denoise_cfg(
+        &dit,
+        &positive,
+        &negative,
+        x,
+        &ids,
+        &schedule,
+        3.5,
+        &CancelFlag::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_close("six target LoRA", &out, golden.require("adapter_on"), 1e-4);
+    let max = errors(&out, golden.require("cfg_3.5")).0;
+    assert!(max > 1e-5, "adapter must change actual sampled tokens");
+    let mut wrong = spec.clone();
+    wrong.scale = f32::NAN;
+    assert!(matches!(
+        candle_gen_flux3::adapters::validate(&[wrong], &config.dit),
+        Err(candle_gen::CandleError::Unsupported(_))
+    ));
+    let mut zero = spec;
+    zero.scale = 0.0;
+    let mut zero_dit = Flux3Dit::from_var_builder(&vb, &config.dit, DType::F32, &device).unwrap();
+    let bare = denoise_cfg(
+        &zero_dit,
+        &positive,
+        &negative,
+        x,
+        &ids,
+        &schedule,
+        3.5,
+        &CancelFlag::new(),
+        |_| {},
+    )
+    .unwrap();
+    candle_gen_flux3::adapters::install(&mut zero_dit, &[zero]).unwrap();
+    let disabled = denoise_cfg(
+        &zero_dit,
+        &positive,
+        &negative,
+        x,
+        &ids,
+        &schedule,
+        3.5,
+        &CancelFlag::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        host_f32(&bare),
+        host_f32(&disabled),
+        "zero adapter scale is a bitwise no-op"
+    );
+}

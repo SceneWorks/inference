@@ -895,6 +895,7 @@ mod preview_advertising {
         ("qwen_image_2_1", "sc-24111"),
         ("qwen_image_2_1_turbo", "sc-24111"),
         ("flux3_klein", "sc-26243"),
+        ("flux3_klein_base", "sc-26243"),
     ];
 
     /// The epics that own the deferred routes above. An epic is a container, not the unit of work
@@ -5907,6 +5908,7 @@ mod tests {
                 "flux2_klein_9b",
                 "flux2_dev",
                 "flux3_klein",
+                "flux3_klein_base",
                 "ideogram_4",
                 "ideogram_4_turbo",
                 "iris_3b",
@@ -6008,8 +6010,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 66);
-        assert_eq!(super::provider_components().len(), 56);
+        assert_eq!(distinct.len(), 67);
+        assert_eq!(super::provider_components().len(), 57);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

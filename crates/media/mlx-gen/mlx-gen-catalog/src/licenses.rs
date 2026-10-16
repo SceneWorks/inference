@@ -231,6 +231,14 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "flux3_image_klein_pup",
         ],
     },
+    ProviderComponents {
+        provider_id: "flux3_klein_base",
+        components: &[
+            "flux3_image_klein_base",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
     // --- ideogram ----------------------------------------------------------------------------
     // `ideogram_4_turbo` is the same base weights plus the bundled TurboTime LoRA and no
     // unconditional DiT (`mlx-gen-ideogram/src/config.rs:15`).
@@ -952,8 +960,8 @@ mod tests {
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
         // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
-        assert_eq!(registered.len(), 76, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 66);
+        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 67);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 

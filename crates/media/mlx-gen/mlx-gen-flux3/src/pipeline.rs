@@ -84,6 +84,62 @@ pub fn denoise_flow_map(
     Ok(x)
 }
 
+/// Base Euler CFG with independent unconditional/conditional samples in that order.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: &TextConditioning,
+    noise: &Array,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    guidance: f32,
+    cancel: &CancelFlag,
+    mut on_step: impl FnMut(usize),
+) -> Result<Array> {
+    if dit.is_flow_map() || !guidance.is_finite() || guidance < 0.0 {
+        return Err(Error::Unsupported(
+            "flux3: CFG needs a base DiT and finite non-negative guidance".into(),
+        ));
+    }
+    if schedule.len() < 2 {
+        return Err(Error::Msg("flux3: CFG schedule needs two points".into()));
+    }
+    let compute = dit.compute_dtype();
+    let mut x = noise.as_dtype(Dtype::Float32)?;
+    for step in 0..schedule.len() - 1 {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let samples = [negative, text].map(|conditioning| SampleTokens {
+            text: &conditioning.tokens,
+            text_ids: &conditioning.ids,
+            image: &x,
+            image_ids,
+            image_cond: None,
+            timestep: schedule[step],
+            target_timestep: None,
+        });
+        let prediction = dit.forward(&samples)?;
+        let rows = prediction.split(2, 0)?;
+        let difference = rows[1].subtract(&rows[0])?.as_dtype(compute)?;
+        let scaled = difference
+            .as_dtype(Dtype::Float32)?
+            .multiply(&Array::from_f32(guidance))?
+            .as_dtype(compute)?;
+        let velocity = rows[0].add(&scaled)?.as_dtype(compute)?;
+        let dt = schedule[step + 1] - schedule[step];
+        let update = velocity
+            .as_dtype(Dtype::Float32)?
+            .multiply(&Array::from_f32(dt))?
+            .as_dtype(compute)?;
+        x = x.add(&update)?.as_dtype(Dtype::Float32)?;
+        eval([&x])?;
+        on_step(step + 1);
+    }
+    Ok(x)
+}
+
 /// The image ids of a `(h, w)` token grid, scaled for the DiT (`scaled_ids(latent_ids(h, w))`).
 pub fn image_ids(h: usize, w: usize, image_rope_scale: f32) -> Vec<[f32; 4]> {
     scaled_image_ids(&latent_ids(h, w), image_rope_scale)
@@ -99,11 +155,41 @@ pub fn denoise_one(
     cancel: &CancelFlag,
     on_step: impl FnMut(usize),
 ) -> Result<Array> {
+    denoise_one_conditioned(dit, text, None, params, seed, cancel, on_step)
+}
+
+/// Render tokens with an independently encoded negative caption for CFG.
+pub fn denoise_one_conditioned(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: Option<&TextConditioning>,
+    params: &GenerationParams,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
     let (h, w) = params.latent_shape()?;
     let channels = dit.config().image_in_channels;
     let ids = image_ids(h, w, dit.config().image_rope_scale as f32);
     let z = noise(seed, h, w, channels)?;
-    denoise_flow_map(dit, text, &z, &ids, &params.schedule()?, cancel, on_step)
+    match params.guidance {
+        Some(guidance) => denoise_cfg(
+            dit,
+            text,
+            negative.ok_or_else(|| {
+                Error::Unsupported(
+                    "flux3: base CFG needs independently encoded negative conditioning".into(),
+                )
+            })?,
+            &z,
+            &ids,
+            &params.schedule()?,
+            guidance,
+            cancel,
+            on_step,
+        ),
+        None => denoise_flow_map(dit, text, &z, &ids, &params.schedule()?, cancel, on_step),
+    }
 }
 
 /// Render one image: [`denoise_one`] → decode → RGB8 (the caller reports `Decoding`).

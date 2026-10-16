@@ -19,8 +19,8 @@ use mlx_rs::Dtype;
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
-use crate::pipeline::{decode_tokens, denoise_one};
-use crate::text_encoder::Flux3TextEncoder;
+use crate::pipeline::{decode_tokens, denoise_one_conditioned};
+use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
 
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = gen_core::flux3::DISTILLED_MODEL_ID;
@@ -57,8 +57,8 @@ pub fn descriptor() -> ModelDescriptor {
             // alpha is fixed, so no scheduler is advertised.
             samplers: SAMPLERS.to_vec(),
             schedulers: Vec::new(),
-            // LoRA loading is sc-26239 (with the base checkpoint).
-            supports_lora: false,
+            // Compatible LoRA stacks are admitted by exact base/revision, rank/alpha and target mapping (S6).
+            supports_lora: true,
             supports_lokr: false,
             // No per-step preview: the packed latent has no fitted RGB projection and the
             // autoencoder decode is the only exact view of a step.
@@ -82,6 +82,16 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// Base checkpoint public surface: CFG and independently encoded negative conditioning.
+pub fn descriptor_base() -> ModelDescriptor {
+    let mut descriptor = descriptor();
+    descriptor.id = gen_core::flux3::BASE_MODEL_ID;
+    descriptor.capabilities.supports_guidance = true;
+    descriptor.capabilities.supports_true_cfg = true;
+    descriptor.capabilities.supports_negative_prompt = true;
+    descriptor
+}
+
 /// The heavy half: the DiT and the autoencoder.
 pub struct Heavy {
     pub dit: Flux3Dit,
@@ -91,6 +101,7 @@ pub struct Heavy {
 /// A loaded distilled generator.
 pub struct Flux3Klein {
     descriptor: ModelDescriptor,
+    adapter_reports: Vec<gen_core::AdapterApplyReport>,
     config: Flux3Config,
     residency: Residency<Flux3TextEncoder, Heavy>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
@@ -167,9 +178,8 @@ pub fn load_autoencoder(path: &Path) -> Result<Flux3AutoEncoder> {
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
-    let refusals: [(&str, bool); 8] = [
+    let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
-        ("adapters", !spec.adapters.is_empty()),
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -197,6 +207,14 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 /// autoencoder, per request. A `Resident` generator runs one request the same staged way when
 /// its admitted `GenerationMemory::stage_residency` is set.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_inner(spec, false)
+}
+
+pub fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_inner(spec, true)
+}
+
+fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
     refuse_unsupported_spec(spec)?;
     let package_dir = match &spec.weights {
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
@@ -209,13 +227,22 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     };
     let config = Flux3Config::from_dir(&package_dir)?;
     config.validate_supported()?;
-    if !config.dit.flow_map {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: {} is a CFG checkpoint; this route serves the distilled flow map (the \
-             base checkpoint is sc-26239)",
-            config.model
-        )));
+    if config.dit.flow_map == base {
+        return Err(Error::Unsupported(format!("flux3: selected {} route but package {} has flow_map={}; select the matching CFG checkpoint or distilled flow-map route", if base { "base CFG" } else { "distilled flow-map" }, config.model, config.dit.flow_map)));
     }
+    crate::adapters::validate(&spec.adapters, &config.dit)?;
+    let adapter_reports = spec
+        .adapters
+        .iter()
+        .map(|adapter| {
+            Ok(gen_core::AdapterApplyReport {
+                adapter_path: adapter.path.clone(),
+                applied: gen_core::flux3::adapters::inspect(adapter, &config.dit)?.len(),
+                skipped: Vec::new(),
+            })
+        })
+        .collect::<gen_core::Result<Vec<_>>>()?;
+
     let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
     let compute = compute_dtype(spec);
     let te_dir = resources.text_encoder_dir.clone();
@@ -224,11 +251,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let dit_path = resources.dit_weights();
     let ae_path = resources.autoencoder_file.clone();
     let heavy_cfg = config.clone();
+    let adapters = spec.adapters.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || Flux3TextEncoder::load(&te_dir, &te_cfg, text_in),
         move |_use_pid| {
-            let dit = load_dit(&dit_path, &heavy_cfg, compute)?;
+            let mut dit = load_dit(&dit_path, &heavy_cfg, compute)?;
+            crate::adapters::install(&mut dit, &adapters)?;
             let ae = load_autoencoder(&ae_path)?;
             if ae.latent_channels() as usize != heavy_cfg.dit.image_in_channels {
                 return Err(Error::Msg(format!(
@@ -249,7 +278,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // sound, so its own load error is unmistakably the component's.
     let upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
     Ok(Box::new(Flux3Klein {
-        descriptor: descriptor(),
+        adapter_reports,
+        descriptor: if base {
+            descriptor_base()
+        } else {
+            descriptor()
+        },
         config,
         residency,
         spec: spec.clone(),
@@ -287,18 +321,28 @@ impl Flux3Klein {
             &req.cancel,
             false,
             on_progress,
-            |te: &Flux3TextEncoder| te.encode(&params.prompt),
+            |te: &Flux3TextEncoder| -> Result<(TextConditioning, Option<TextConditioning>)> {
+                Ok((
+                    te.encode(&params.prompt)?,
+                    if params.guidance.is_some() {
+                        Some(te.encode(&params.negative_prompt)?)
+                    } else {
+                        None
+                    },
+                ))
+            },
             |_| Ok(()),
-            |heavy: &Heavy, text, on_progress| {
+            |heavy: &Heavy, (text, negative), on_progress| {
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
                 let mut tokens = Vec::with_capacity(req.count as usize);
                 for c in 0..req.count {
                     let done = c * params.steps;
                     let seed = params.seed.wrapping_add(u64::from(c));
-                    tokens.push(denoise_one(
+                    tokens.push(denoise_one_conditioned(
                         &heavy.dit,
                         &text,
+                        negative.as_ref(),
                         &params,
                         seed,
                         &req.cancel,
@@ -334,8 +378,8 @@ impl Flux3Klein {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         self.descriptor
             .capabilities
-            .validate_request(MODEL_ID, req)?;
-        validate_generation_request(MODEL_ID, req, &self.config)?;
+            .validate_request(self.descriptor.id, req)?;
+        validate_generation_request(self.descriptor.id, req, &self.config)?;
         refuse_unhonored_memory(req)?;
         Ok(())
     }
@@ -369,6 +413,10 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Flux3Klein {
+    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
+        self.adapter_reports.clone()
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -424,6 +472,10 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
 
+mlx_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,7 +493,7 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
-        assert!(!d.capabilities.supports_lora && !d.capabilities.supports_lokr);
+        assert!(d.capabilities.supports_lora && !d.capabilities.supports_lokr);
         assert!(!d.capabilities.supports_preview);
         assert!(d.required_components.is_empty());
         assert_eq!(

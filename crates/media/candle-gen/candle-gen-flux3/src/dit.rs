@@ -265,6 +265,53 @@ fn push_mode<'a>(
 }
 
 impl Flux3Dit {
+    /// Install one preflight-validated projection; unknown paths remain typed refusals.
+    pub fn install_lora(
+        &mut self,
+        target: &str,
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+    ) -> Result<()> {
+        let (parent, leaf) = target
+            .rsplit_once('.')
+            .ok_or_else(|| Error::Unsupported(format!("flux3 LoRA: invalid target {target}")))?;
+        let (blocks, index) = if let Some(index) = parent.strip_prefix("content_mode_blocks.image.")
+        {
+            (&mut self.image_blocks, index)
+        } else if let Some(index) = parent.strip_prefix("content_mode_blocks.image_cond.") {
+            (&mut self.image_cond_blocks, index)
+        } else if let Some(index) = parent.strip_prefix("txt_mode_blocks.") {
+            (&mut self.txt_blocks, index)
+        } else if let Some(index) = parent.strip_prefix("single_blocks.") {
+            (&mut self.single_blocks, index)
+        } else {
+            return Err(Error::Unsupported(format!(
+                "flux3 LoRA: unknown target {target}"
+            )));
+        };
+        let index: usize = index
+            .parse()
+            .map_err(|_| Error::Unsupported(format!("flux3 LoRA: invalid block {target}")))?;
+        let block = blocks.get_mut(index).ok_or_else(|| {
+            Error::Unsupported(format!("flux3 LoRA: block out of range {target}"))
+        })?;
+        let linear = match leaf {
+            "q_proj" => &mut block.q_proj,
+            "k_proj" => &mut block.k_proj,
+            "v_proj" => &mut block.v_proj,
+            "attn_out" => &mut block.attn_out,
+            "mlp_in" => &mut block.mlp_in,
+            "mlp_out" => &mut block.mlp_out,
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "flux3 LoRA: unknown projection {target}"
+                )))
+            }
+        };
+        linear.push_lora(down, up, scale)
+    }
+
     /// Load from the package's `model.safetensors` (upstream key names; an mmap read one tensor
     /// at a time, each cast to `compute` as it is consumed, so the load peak is the compute-dtype
     /// model plus a single stored tensor) onto `device`.

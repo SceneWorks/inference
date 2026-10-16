@@ -212,6 +212,14 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "flux3_image_klein_pup",
         ],
     },
+    ProviderComponents {
+        provider_id: "flux3_klein_base",
+        components: &[
+            "flux3_image_klein_base",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
     // --- ideogram ---------------------------------------------------------------------------
     // Both DiTs, the VAE and the text encoder ship in one gated snapshot. `ideogram_4_turbo`
     // merges the bundled TurboTime LoRA on **every** run, so that row is listed rather than
@@ -603,7 +611,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 56);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 57);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -635,9 +643,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            66,
-            "66 distinct Candle provider ids: 59 generators (qwen_image_2_1_turbo joined in \
-             sc-25901, flux3_klein in sc-26235) + 19 trainers (15 of them also \
+            67,
+            "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
+             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239) + 19 trainers (15 of them also \
              generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -792,6 +800,7 @@ mod tests {
                 "chroma1_flash",
                 "chroma1_hd",
                 "flux3_klein",
+                "flux3_klein_base",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",

@@ -109,12 +109,6 @@ fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
              at load (sc-26241), so there is no quantized memory contract"
         )));
     }
-    if !spec.adapters.is_empty() {
-        return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: LoadSpec::adapters is refused at load (sc-26239), so there is no adapter \
-             memory contract"
-        )));
-    }
     Ok(())
 }
 
@@ -317,13 +311,30 @@ pub fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
+    if provider_id != MODEL_ID && provider_id != gen_core::flux3::BASE_MODEL_ID {
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: not the FLUX 3 Candle memory provider"
         )));
     }
     refuse_unloadable_spec(spec)?;
-    Ok(base_contract(spec.precision, None))
+    if !spec.adapters.is_empty() {
+        return Err(CoreError::Unsupported(
+            "flux3: adapters require the real package config for identity/rank admission".into(),
+        ));
+    }
+
+    let mut contract = base_contract(spec.precision, None);
+    contract.provider_id = provider_id.into();
+    if provider_id == gen_core::flux3::BASE_MODEL_ID {
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            "flux3-klein-base-candle-cfg-source-v1",
+            LoadShape::EagerMaterialization,
+        ));
+        if let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &mut contract.formula {
+            variables.push(MemoryFormulaVariable::BatchCount);
+        }
+    }
+    Ok(contract)
 }
 
 /// The executable contract for a real load: the declaration plus the resident bytes of what the
@@ -332,7 +343,7 @@ pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    if provider_id != MODEL_ID {
+    if provider_id != MODEL_ID && provider_id != gen_core::flux3::BASE_MODEL_ID {
         return Err(CoreError::Unsupported(format!(
             "{provider_id}: not the FLUX 3 Candle memory provider"
         )));
@@ -349,6 +360,12 @@ pub fn memory_strategy_contract(
     };
     let config = Flux3Config::from_dir(&package_dir)?;
     let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
+    if config.dit.flow_map == (provider_id == gen_core::flux3::BASE_MODEL_ID) {
+        return Err(CoreError::Unsupported(format!(
+            "{provider_id}: checkpoint flow_map={} does not match selected route",
+            config.dit.flow_map
+        )));
+    }
     generation_contract(spec, &resources, &config)
 }
 
@@ -361,6 +378,21 @@ pub(crate) fn generation_contract(
     refuse_unloadable_spec(spec)?;
     let precision = spec.precision;
     let mut contract = base_contract(precision, Some(config));
+    if !config.dit.flow_map {
+        contract.provider_id = gen_core::flux3::BASE_MODEL_ID.into();
+        // Base is a distinct CFG graph (no target-time embedder), never a distilled calibration.
+        contract.calibration = Some(MemoryCalibrationIdentity::new(
+            "flux3-klein-base-candle-cfg-source-v1",
+            LoadShape::EagerMaterialization,
+        ));
+        if let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &mut contract.formula {
+            variables.push(MemoryFormulaVariable::BatchCount);
+        }
+    }
+    for adapter in &spec.adapters {
+        gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
+    }
+
     let transformer = dit_bytes(&resources.dit_weights(), precision)?;
     let conditioning = text_encoder_bytes(
         &resources.text_encoder_dir,
@@ -380,6 +412,49 @@ pub(crate) fn generation_contract(
     };
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
         account_upsampler(&mut contract, crate::pup::load_memory_bytes(&dir)?)?;
+    }
+    let mut adapter_bytes = 0u64;
+    for adapter in &spec.adapters {
+        for header in safetensors_path_tensor_headers(&adapter.path)? {
+            // Source F32 plus one compute-dtype preparation: a source-derived upper bound,
+            // not a measured peak. Each admitted tensor is charged once per loaded adapter.
+            adapter_bytes = adapter_bytes
+                .checked_add(header.materialized_bytes(8)?)
+                .ok_or_else(|| CoreError::Unsupported("flux3: adapter byte sum overflow".into()))?;
+        }
+    }
+    if adapter_bytes > 0 {
+        contract.asset_facts.overlay_bytes = contract
+            .asset_facts
+            .overlay_bytes
+            .checked_add(adapter_bytes)
+            .ok_or_else(|| CoreError::Unsupported("flux3: overlay byte sum overflow".into()))?;
+        let component = gen_core::MemoryResidentComponent {
+            id: "lora_adapters".into(),
+            kind: gen_core::MemoryComponentKind::AdapterStack,
+            resident_bytes: adapter_bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::WholeRender,
+        };
+        match &mut contract.formula {
+            MemoryFormulaKind::ComponentPhaseEnvelope {
+                resident_components,
+                ..
+            } => resident_components.push(component),
+            _ => {
+                contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases: contract.lifecycle.phases.clone(),
+                    variables: vec![
+                        MemoryFormulaVariable::AssetBytes,
+                        MemoryFormulaVariable::PixelCount,
+                        MemoryFormulaVariable::ConditioningTokenCount,
+                        MemoryFormulaVariable::BatchCount,
+                        MemoryFormulaVariable::OverlayBytes,
+                    ],
+                    resident_components: vec![component],
+                }
+            }
+        }
     }
     Ok(contract)
 }
@@ -495,7 +570,11 @@ pub(crate) fn registered_begin_request(
         return Err(CoreError::Unsupported(reason));
     }
     let config = candle_gen::request_scope::CandleRequestScopeConfig::new(
-        MODEL_ID,
+        if contract.provider_id == gen_core::flux3::BASE_MODEL_ID {
+            gen_core::flux3::BASE_MODEL_ID
+        } else {
+            MODEL_ID
+        },
         candle_gen::default_device()?,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -553,12 +632,96 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
         begin_request: registered_begin_request,
     };
 
+pub const BASE_MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
+    provider_id: gen_core::flux3::BASE_MODEL_ID,
+    contract: |spec| memory_strategy_contract(gen_core::flux3::BASE_MODEL_ID, spec),
+    safety_check,
+};
+
+/// The weights-free contract fixture.
+pub const BASE_MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+    gen_core::MemoryContractFixtureRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        contract: |spec| {
+            weights_free_memory_strategy_contract(gen_core::flux3::BASE_MODEL_ID, spec)
+        },
+        surface_specs: memory_contract_surface_specs,
+    };
+
+/// The provider-owned valid fixtures and the executable admission seam.
+pub const BASE_MEMORY_BEHAVIOR_REGISTRATION: gen_core::MemoryBehaviorRegistration =
+    gen_core::MemoryBehaviorRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        valid_fixtures: registered_valid_fixture,
+        begin_request: registered_begin_request,
+    };
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Quant, WeightsSource};
 
     /// A spec no loader could open: the weights-free surface.
+    #[test]
+    fn base_identity_and_adapter_overlay_are_distinct_and_counted_once() {
+        let empty = sentinel();
+        let distilled = weights_free_memory_strategy_contract(MODEL_ID, &empty).unwrap();
+        let base =
+            weights_free_memory_strategy_contract(gen_core::flux3::BASE_MODEL_ID, &empty).unwrap();
+        assert_ne!(base.provider_id, distilled.provider_id);
+        assert_ne!(base.calibration, distilled.calibration);
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
+        let mut spec = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-snapshot")));
+        let mut config = Flux3Config::from_dir(&fixture.join("tiny-snapshot")).unwrap();
+        config.dit.flow_map = false;
+        config.sampler.guidance = Some(3.5);
+        let resources =
+            GenerationResources::from_spec(&spec, &config, gen_core::flux3::BASE_MODEL_ID).unwrap();
+        let plain = generation_contract(&spec, &resources, &config).unwrap();
+        spec.adapters.push(gen_core::AdapterSpec::new(
+            fixture.join("flux3_base_lora.safetensors"),
+            0.4,
+            gen_core::AdapterKind::Lora,
+        ));
+        let adapted = generation_contract(&spec, &resources, &config).unwrap();
+        assert!(adapted.asset_facts.overlay_bytes > 0);
+        assert_eq!(adapted.asset_facts.base_bytes, plain.asset_facts.base_bytes);
+        spec.components.insert(
+            gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            WeightsSource::Dir(fixture.join("tiny-pup-snapshot")),
+        );
+        let both = generation_contract(&spec, &resources, &config).unwrap();
+        spec.adapters.clear();
+        let pup = generation_contract(&spec, &resources, &config).unwrap();
+        assert_eq!(
+            both.asset_facts.overlay_bytes,
+            adapted.asset_facts.overlay_bytes + pup.asset_facts.overlay_bytes
+        );
+        let MemoryFormulaKind::ComponentPhaseEnvelope {
+            resident_components,
+            ..
+        } = both.formula
+        else {
+            panic!("component envelope required")
+        };
+        assert_eq!(resident_components.len(), 2);
+        assert_eq!(
+            resident_components
+                .iter()
+                .filter(|c| c.kind == gen_core::MemoryComponentKind::AdapterStack)
+                .count(),
+            1
+        );
+        assert_eq!(
+            resident_components
+                .iter()
+                .filter(|c| c.kind == gen_core::MemoryComponentKind::PromptUpsampler)
+                .count(),
+            1
+        );
+    }
+
     fn sentinel() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()))
     }
