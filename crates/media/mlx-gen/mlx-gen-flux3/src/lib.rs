@@ -64,6 +64,7 @@ pub fn register_providers(
     registry
         .register_generator(model::REGISTRATION)
         .register_generator(model::BASE_REGISTRATION)
+        .register_trainer(training::trainer::TRAINER_REGISTRATION)
         .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION)

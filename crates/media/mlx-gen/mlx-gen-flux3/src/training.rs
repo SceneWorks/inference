@@ -3,6 +3,7 @@
 //! projection inside the traced closure. The frozen DiT/AE/text weights are never parameters.
 pub mod checkpoint;
 pub mod optim;
+pub mod trainer;
 
 use crate::{Flux3Dit, SampleTokens};
 use mlx_gen::gen_core::flux3::training::{lora_targets, LoraTarget};

@@ -37,6 +37,9 @@ mod real_weights;
 #[path = "text_parity.rs"]
 mod text_parity;
 
+#[path = "text_training.rs"]
+mod text_training;
+
 #[path = "training_checkpoint.rs"]
 mod training_checkpoint;
 
