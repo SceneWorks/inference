@@ -341,7 +341,7 @@ pub fn memory_strategy_contract(
     let package_dir = match &spec.weights {
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
         gen_core::WeightsSource::File(file) => {
-            return Err(CoreError::Msg(format!(
+            return Err(CoreError::Unsupported(format!(
                 "{MODEL_ID}: the weights resource must be the package directory, not {}",
                 file.display()
             )))
