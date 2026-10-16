@@ -1112,6 +1112,34 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertLess(names.index(reclaim), names.index("Cache Cargo and MLX native build"))
         self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
+    def test_flux3_cuda_profile_stays_dispatch_only_without_new_inputs(self) -> None:
+        workflow = yaml.load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+        self.assertLessEqual(len(inputs), 25, "GitHub rejects workflows above the dispatch input cap")
+        self.assertIn("flux3-klein-cuda", inputs["profile"]["options"])
+        self.assertNotIn("flux3_mlx_size", inputs)
+        self.assertNotIn("flux3_mlx_steps", inputs)
+        job = workflow["jobs"]["candle-flux3-klein"]
+        self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.profile == 'flux3-klein-cuda'")
+        self.assertEqual(job["env"]["FLUX3_REAL_SIZE"], "1024")
+        self.assertEqual(job["env"]["FLUX3_REAL_STEPS"], "16")
+
+    def test_flux3_image_and_optional_upsampler_manifest_rows_both_survive(self) -> None:
+        manifest = tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
+        models = {row["key"]: row for row in manifest["models"]}
+        image = models["flux3-image-klein-cuda"]
+        self.assertEqual(image["repository"], "black-forest-labs/flux-3-image-klein")
+        self.assertEqual(image["revision"], "8454017f9ebaada30c998fccd9f67a80c7580f68")
+        self.assertTrue(image["requires_auth"])
+        self.assertEqual(image["profiles"], ["flux3-klein-cuda"])
+        self.assertIn("ae.safetensors", image["expected_files"])
+        self.assertIn("text_encoder/model-00002-of-00002.safetensors", image["expected_files"])
+        upsampler = models["flux3-image-klein-pup-mlx"]
+        self.assertEqual(upsampler["repository"], "black-forest-labs/flux-3-image-klein-pup")
+        self.assertEqual(upsampler["revision"], "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed")
+        self.assertEqual(upsampler["profiles"], ["flux3-klein-mlx"])
+        self.assertIn("system_prompts.json", upsampler["expected_files"])
+
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
         workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])

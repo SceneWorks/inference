@@ -201,10 +201,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
     // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
     // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too. The
-    // same complete row the MLX twin's catalog names (sc-26234 / sc-26235).
+    // same complete row the MLX twin's catalog names (sc-26234 / sc-26235), including the optional
+    // separately provisioned Apache-2.0 prompt upsampler (sc-26238); the census is a component union,
+    // not a claim that the optional model is required or downloaded for every request.
     ProviderComponents {
         provider_id: "flux3_klein",
-        components: &["flux3_image_klein", "qwen3_vl_4b_instruct"],
+        components: &[
+            "flux3_image_klein",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
     },
     // --- ideogram ---------------------------------------------------------------------------
     // Both DiTs, the VAE and the text encoder ship in one gated snapshot. `ideogram_4_turbo`

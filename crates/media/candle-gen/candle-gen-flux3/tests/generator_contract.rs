@@ -50,6 +50,58 @@ fn request() -> GenerationRequest {
 }
 
 #[test]
+fn effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding() {
+    use candle_gen::gen_core::{PromptEnhancementReport, PromptEnhancementSink};
+    use std::sync::{Arc, Mutex};
+    let mut loaded = spec(OffloadPolicy::Resident);
+    loaded.components.insert(
+        "prompt_upsampler".into(),
+        WeightsSource::Dir(crate::common::fixtures().join("tiny-pup-snapshot")),
+    );
+    let generator = candle_gen_flux3::provider_registry()
+        .unwrap()
+        .load(ID, &loaded)
+        .unwrap();
+    assert!(
+        generator
+            .memory_strategy_contract()
+            .unwrap()
+            .asset_facts
+            .overlay_bytes
+            > 0
+    );
+    let reports: Arc<Mutex<Vec<PromptEnhancementReport>>> = Arc::default();
+    let sink = reports.clone();
+    let mut enhanced = request();
+    enhanced.prompt = "a red bicycle leaning against a brick wall".into();
+    enhanced.seed = None;
+    enhanced.enhance_prompt = true;
+    enhanced.enhance_max_tokens = Some(12);
+    enhanced.prompt_enhancement = PromptEnhancementSink::new(move |r| sink.lock().unwrap().push(r));
+    let first = generator.generate(&enhanced, &mut |_| {}).unwrap();
+    let effective = {
+        let captured = reports.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_ne!(captured[0].effective_prompt, enhanced.prompt);
+        captured[0].effective_prompt.clone()
+    };
+    let replay = GenerationRequest {
+        prompt: effective,
+        enhance_prompt: false,
+        enhance_max_tokens: None,
+        prompt_enhancement: Default::default(),
+        ..enhanced
+    };
+    let second = generator.generate(&replay, &mut |_| {}).unwrap();
+    match (first, second) {
+        (GenerationOutput::Images(a), GenerationOutput::Images(b)) => {
+            assert_eq!(a[0].pixels, b[0].pixels)
+        }
+        other => panic!("expected images from both native requests: {other:?}"),
+    }
+}
+
+#[test]
 fn gen_core_conformance_resident() {
     gen_core_testkit::conformance(|| load(OffloadPolicy::Resident), &profile());
 }
@@ -326,6 +378,12 @@ fn components_override_the_bundled_copies() {
 #[test]
 fn base_and_quantized_packages_are_typed_refusals() {
     let registry = candle_gen_flux3::provider_registry().unwrap();
+    let file = LoadSpec::new(WeightsSource::File(
+        tiny_package().join("model.safetensors"),
+    ));
+    assert!(
+        matches!(registry.load(ID, &file), Err(CoreError::Unsupported(message)) if message.contains("package directory"))
+    );
     let config = std::fs::read_to_string(tiny_package().join("config.json")).unwrap();
     for (what, needle, edit) in [
         (

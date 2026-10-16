@@ -71,6 +71,8 @@ pub fn descriptor() -> ModelDescriptor {
             // Quantized variants are sc-26241.
             supported_quants: &[],
             supports_sequential_offload: true,
+            // The optional native VLM resolves the effective caption before encoding.
+            supports_prompt_enhancement: true,
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
@@ -174,7 +176,7 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     let package_dir = match &spec.weights {
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
         gen_core::WeightsSource::File(file) => {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: the weights resource must be the package directory, not {}",
                 file.display()
             )))
@@ -195,7 +197,12 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     // (`Sequential` defers every component to the first render).
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
     let prompt_upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
-    let device = candle_gen::default_device()?;
+    let device = candle_gen::default_device().map_err(|e| {
+        Error::Unsupported(format!(
+        "{MODEL_ID}: cannot initialize the selected native Candle device: {e}; use a supported \
+         NVIDIA CUDA device and driver, or the native MLX backend on Apple Silicon"
+    ))
+    })?;
     let compute = compute_dtype(spec);
     let te_dir = resources.text_encoder_dir.clone();
     let te_cfg = config.text_encoder.clone();
