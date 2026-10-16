@@ -66,9 +66,25 @@ fn layout_error(msg: impl Into<String>) -> Error {
     Error::Msg(format!("flux3 autoencoder: {}", msg.into()))
 }
 
+// Keep the upload boundary injectable for CPU assertion tests: the callback sees
+// rounded CPU operands, never a full-F32 parameter/input awaiting a device cast.
+fn training_cast_before_upload(
+    host: &Tensor,
+    compute: DType,
+    upload: impl FnOnce(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    if !host.device().is_cpu() {
+        return Err(layout_error("training cast requires host operands"));
+    }
+    let rounded = host.to_dtype(compute)?;
+    upload(&rounded)
+}
+
 /// The `ae.safetensors` mmap plus the key presence probe the optional modules switch on.
 struct Loader<'a> {
     vb: &'a VarBuilder<'static>,
+    /// Additive training-only load policy. Inference always leaves this None.
+    training: Option<(DType, Device)>,
 }
 
 impl Loader<'_> {
@@ -79,6 +95,15 @@ impl Loader<'_> {
     fn take(&self, key: &str) -> Result<Tensor> {
         if !self.vb.contains_tensor(key) {
             return Err(Error::Msg(format!("missing tensor: {key}")));
+        }
+        if let Some((compute, device)) = &self.training {
+            // The training builder is CPU-backed: round BEFORE uploading a parameter,
+            // never retain an F32 device map beside the selected-dtype representation.
+            return training_cast_before_upload(
+                &self.vb.get_unchecked(key)?,
+                *compute,
+                |rounded| Ok(rounded.to_device(device)?),
+            );
         }
         Ok(self.vb.get_unchecked(key)?.to_dtype(DType::F32)?)
     }
@@ -510,7 +535,7 @@ impl Flux3AutoEncoder {
 
     /// [`Self::load`] over an already-mapped checkpoint.
     pub fn from_var_builder(vb: &VarBuilder<'static>, device: &Device) -> Result<Self> {
-        let l = Loader { vb };
+        let l = Loader { vb, training: None };
         let (encoder, levels, num_res_blocks) = Encoder::load(&l)?;
         let decoder = Decoder::load(&l, levels, num_res_blocks)?;
 
@@ -688,5 +713,317 @@ impl Flux3AutoEncoder {
             )));
         }
         Ok(image)
+    }
+}
+
+// Additive training forwards: frozen HF training uses fused SiLU and selected
+// precision; ordinary BFL inference forwards above remain unchanged.
+fn training_swish(x: &Tensor) -> Result<Tensor> {
+    let out = bounded::silu(&bounded::training_cast(x, DType::F32)?)?;
+    bounded::training_cast(&out, x.dtype())
+}
+
+impl ResnetBlock {
+    fn training_forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = training_swish(&self.norm1.training_forward_f32_opmath(x)?)?;
+        let h = bounded::training_conv_f32_opmath(&h, &self.conv1, false)?;
+        let h = training_swish(&self.norm2.training_forward_f32_opmath(&h)?)?;
+        let h = bounded::training_conv_f32_opmath(&h, &self.conv2, false)?;
+        let res = match &self.nin_shortcut {
+            Some(conv) => bounded::training_conv_f32_opmath(x, conv, false)?,
+            None => x.clone(),
+        };
+        bounded::add(&res, &h)
+    }
+}
+
+impl AttnBlock {
+    fn training_forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, h, w) = x.dims4()?;
+        let y = self.norm.training_forward_f32_opmath(x)?;
+        let seq = |conv: &Conv2d| -> Result<Tensor> {
+            // SDPA accumulates scores/softmax/value products in F32 and writes
+            // selected dtype once; no rounded intermediate score cache.
+            Ok(bounded::training_conv_f32_opmath(&y, conv, false)?
+                .to_dtype(DType::F32)?
+                .reshape((b, c, h * w))?
+                .transpose(1, 2)?
+                .unsqueeze(1)?
+                .contiguous()?)
+        };
+        let (q, k, v) = (seq(&self.q)?, seq(&self.k)?, seq(&self.v)?);
+        let out = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            1.0 / (c as f64).sqrt(),
+            None,
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?;
+        let out = out
+            .squeeze(1)?
+            .transpose(1, 2)?
+            .reshape((b, c, h, w))?
+            .contiguous()?;
+        let out = bounded::training_cast(&out, x.dtype())?;
+        bounded::add(
+            x,
+            &bounded::training_conv_f32_opmath(&out, &self.proj_out, false)?,
+        )
+    }
+}
+
+impl Encoder {
+    fn training_forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = bounded::training_conv_f32_opmath(x, &self.conv_in, false)?;
+        for level in &self.down {
+            for block in &level.blocks {
+                h = block.training_forward(&h)?;
+            }
+            if let Some(conv) = &level.downsample {
+                h = bounded::training_conv_f32_opmath(&h, conv, true)?;
+            }
+        }
+        h = self.mid.block_1.training_forward(&h)?;
+        h = self.mid.attn_1.training_forward(&h)?;
+        h = self.mid.block_2.training_forward(&h)?;
+        let h = training_swish(&self.norm_out.training_forward_f32_opmath(&h)?)?;
+        let h = bounded::training_conv_f32_opmath(&h, &self.conv_out, false)?;
+        bounded::training_conv_f32_opmath(&h, &self.quant_conv, false)
+    }
+}
+
+/// Encoder-only frozen training AE; selected-dtype retained parameters and
+/// operation writes, with original F32 BN statistics. Convolution, GroupNorm
+/// and SDPA use explicit F32 opmath. CPU half convolution is EMULATION, not a
+/// native BF16/CUDA-kernel claim. No decoder is loaded or uploaded.
+pub struct FrozenTrainingEncoder {
+    encoder: Encoder,
+    bn_mean: Tensor,
+    bn_std: Tensor,
+    embed_dim: usize,
+    compute: DType,
+    device: Device,
+}
+
+impl FrozenTrainingEncoder {
+    pub fn load(path: &Path, compute: DType, device: &Device) -> Result<Self> {
+        let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], DType::F32, &Device::Cpu)?;
+        Self::from_var_builder(&vb, compute, device)
+    }
+
+    /// A CPU builder is mandatory: selected parameters round BEFORE upload,
+    /// without a retained full-F32 device map beside the selected representation.
+    pub fn from_var_builder(
+        vb: &VarBuilder<'static>,
+        compute: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        if !matches!(compute, DType::F32 | DType::BF16 | DType::F16) {
+            return Err(layout_error("training compute must be F32, BF16 or F16"));
+        }
+        if !vb.device().is_cpu() {
+            return Err(layout_error(
+                "training weights must be CPU-backed before upload",
+            ));
+        }
+        let original = Loader { vb, training: None };
+        // Capture ORIGINAL F32 stats before constructing the half encoder.
+        let mean = original.take("bn.running_mean")?;
+        let var = original.take("bn.running_var")?;
+        let std = (var + BN_EPS)?.sqrt()?;
+        let l = Loader {
+            vb,
+            training: Some((compute, device.clone())),
+        };
+        let (encoder, levels, _) = Encoder::load(&l)?;
+        let (two_e, qin, _, _) = encoder.quant_conv.weight().dims4()?;
+        if two_e == 0
+            || two_e % 2 != 0
+            || qin != two_e
+            || encoder.conv_out.weight().dim(0)? != two_e
+        {
+            return Err(layout_error(
+                "training encoder requires matching [2E,2E,1,1] quant_conv",
+            ));
+        }
+        if levels != 4 {
+            return Err(layout_error(
+                "training encoder requires source four-level packed geometry",
+            ));
+        }
+        let embed_dim = two_e / 2;
+        let channels = embed_dim * PATCH * PATCH;
+        if mean.dims() != [channels] || std.dims() != [channels] {
+            return Err(layout_error(
+                "training original BN statistics must have 4E channels",
+            ));
+        }
+        Ok(Self {
+            encoder,
+            bn_mean: mean.reshape((1, channels, 1, 1))?.to_device(device)?,
+            bn_std: std.reshape((1, channels, 1, 1))?.to_device(device)?,
+            embed_dim,
+            compute,
+            device: device.clone(),
+        })
+    }
+
+    pub fn compute_dtype(&self) -> DType {
+        self.compute
+    }
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    pub fn latent_channels(&self) -> usize {
+        self.embed_dim * PATCH * PATCH
+    }
+
+    /// HOST F32 NCHW input -> deterministic mean -> packed -> original-F32-BN
+    /// normalized F32 row-major tokens. Never patchify or normalize again.
+    pub fn encode(&self, image: &Tensor) -> Result<(Tensor, (usize, usize))> {
+        let dims = image.dims();
+        if !image.device().is_cpu() || image.dtype() != DType::F32 {
+            return Err(layout_error(
+                "training input must be host CPU F32 before upload",
+            ));
+        }
+        if dims.len() != 4
+            || dims[0] != 1
+            || dims[1] != 3
+            || dims[2] == 0
+            || dims[3] == 0
+            || !dims[2].is_multiple_of(DOWNSAMPLING_RATIO)
+            || !dims[3].is_multiple_of(DOWNSAMPLING_RATIO)
+        {
+            return Err(layout_error(
+                "training encode requires [1,3,H,W], positive sides multiple16",
+            ));
+        }
+        let (h, w) = (dims[2] / DOWNSAMPLING_RATIO, dims[3] / DOWNSAMPLING_RATIO);
+        let e = self.embed_dim;
+        let c = self.latent_channels();
+        let image = training_cast_before_upload(image, self.compute, |rounded| {
+            Ok(rounded.to_device(&self.device)?)
+        })?;
+        let moments = self.encoder.training_forward(&image)?;
+        if moments.dims() != [1, 2 * e, h * PATCH, w * PATCH] {
+            return Err(layout_error(
+                "training encoder moments differ from expected geometry",
+            ));
+        }
+        let mean = moments.narrow(1, 0, e)?.to_dtype(DType::F32)?;
+        let packed = mean
+            .reshape((1, e, h, PATCH, w, PATCH))?
+            .permute((0, 1, 3, 5, 2, 4))?
+            .contiguous()?
+            .reshape((1, c, h, w))?;
+        let normalized = packed
+            .broadcast_sub(&self.bn_mean)?
+            .broadcast_div(&self.bn_std)?;
+        let tokens = normalized
+            .squeeze(0)?
+            .permute((1, 2, 0))?
+            .contiguous()?
+            .reshape((h * w, c))?;
+        Ok((tokens, (h, w)))
+    }
+}
+
+#[cfg(test)]
+mod training_precision_tests {
+    use super::*;
+
+    #[test]
+    fn training_silu_has_one_half_write_not_bfl_split_rounding() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../mlx-gen/mlx-gen-flux3/tests/fixtures/flux3_ae_training_precision.safetensors",
+        );
+        let g = candle_gen::candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        let values = |x: &Tensor| {
+            x.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let got = training_swish(&g["silu_input"]).unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        assert_eq!(values(&got), values(&g["silu_fused"]));
+        assert_ne!(values(&got), values(&g["silu_wrong_split"]));
+    }
+
+    #[test]
+    fn selected_cast_is_observed_before_upload_callback() {
+        let host = Tensor::from_vec(vec![1.001f32, -0.3333], 2, &Device::Cpu).unwrap();
+        for compute in [DType::F32, DType::BF16, DType::F16] {
+            let expected = host
+                .to_dtype(compute)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut called = false;
+            let out = training_cast_before_upload(&host, compute, |at_upload| {
+                called = true;
+                assert!(at_upload.device().is_cpu());
+                assert_eq!(at_upload.dtype(), compute);
+                assert_eq!(at_upload.to_dtype(DType::F32)?.to_vec1::<f32>()?, expected);
+                Ok(at_upload.clone())
+            })
+            .unwrap();
+            assert!(called);
+            assert_eq!(out.dtype(), compute);
+        }
+    }
+
+    #[test]
+    fn retained_encoder_weights_and_original_bn_are_distinct_precisions() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot/ae.safetensors");
+        let mut tensors = candle_gen::candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        // Construct from an inventory that has NO decoder at all.
+        tensors.retain(|name, _| name.starts_with("encoder.") || name.starts_with("bn."));
+        let mean = tensors["bn.running_mean"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let ae = FrozenTrainingEncoder::from_var_builder(&vb, DType::BF16, &Device::Cpu).unwrap();
+        assert_eq!(ae.encoder.conv_in.weight().dtype(), DType::BF16);
+        assert_eq!(ae.encoder.quant_conv.weight().dtype(), DType::BF16);
+        assert_eq!(ae.encoder.mid.attn_1.q.weight().dtype(), DType::BF16);
+        for level in &ae.encoder.down {
+            for block in &level.blocks {
+                assert_eq!(block.conv1.weight().dtype(), DType::BF16);
+                assert_eq!(block.conv2.weight().dtype(), DType::BF16);
+                if let Some(sc) = &block.nin_shortcut {
+                    assert_eq!(sc.weight().dtype(), DType::BF16);
+                }
+            }
+            if let Some(conv) = &level.downsample {
+                assert_eq!(conv.weight().dtype(), DType::BF16);
+            }
+        }
+        assert_eq!(ae.bn_mean.dtype(), DType::F32);
+        assert_eq!(ae.bn_std.dtype(), DType::F32);
+        assert_eq!(
+            ae.bn_mean.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            mean
+        );
+        let rounded = ae
+            .bn_mean
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_ne!(
+            rounded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            mean
+        );
     }
 }
