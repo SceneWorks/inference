@@ -155,8 +155,9 @@ pub fn memory_mode(task: IrisTask) -> MemoryMode {
     }
 }
 
-/// The numeric tier a spec loads: the precision it names and no quantization (every Iris loader
-/// refuses `LoadSpec::quantize`). No component is resident above the selected width.
+/// The numeric tier a spec loads: the precision and the affine tier it names (only generation
+/// accepts one, and it packs the text tower and the backbone at that same width — sc-26266). No
+/// component is resident above the selected width.
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
@@ -190,16 +191,43 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
     Ok(())
 }
 
+/// Refuse a quantized tier the generation loader cannot build (sc-26266): it packs the affine
+/// `q8` / `q4` tiers only, and only under the bf16 compute policy (the packed scales are bf16, and
+/// upstream's FP32 path is a dense reference, not a tier). The loader and the contract factories
+/// share this one refusal.
+pub(crate) fn refuse_unloadable_quant(id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    match spec.quantize {
+        None | Some(gen_core::Quant::Q4 | gen_core::Quant::Q8) => {}
+        Some(other) => {
+            return Err(CoreError::Unsupported(format!(
+                "{id}: LoadSpec::quantize {other:?} is not a tier of the MLX Iris-3B route; it \
+                 packs the q8 and q4 affine tiers"
+            )))
+        }
+    }
+    if spec.quantize.is_some() && spec.precision != Precision::Bf16 {
+        return Err(CoreError::Unsupported(format!(
+            "{id}: a quantized tier runs under the bf16 compute policy; LoadSpec::precision {:?} \
+             is the dense reference path only",
+            spec.precision
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse the spec axes that would make a contract describe a load that cannot happen: a deferred
-/// load shape or a quantized tier on any route (every Iris loader refuses both by name), and an
-/// adapter stack on the two encoder-free tasks (their loaders refuse `LoadSpec::adapters`; only
-/// generation installs adapters, and prices them as overlays).
+/// load shape on any route, a tier the generation loader cannot pack
+/// ([`refuse_unloadable_quant`]), a quantized tier on the two encoder-free tasks (their loaders
+/// ship one dense tier), and an adapter stack on those tasks (their loaders refuse
+/// `LoadSpec::adapters`; only generation installs adapters, and prices them as overlays).
 fn refuse_unloadable_spec(task: IrisTask, spec: &LoadSpec) -> CoreResult<()> {
     let id = provider_id(task);
     refuse_deferred_load_shape(id, spec)?;
-    if spec.quantize.is_some() {
+    if task.uses_text_encoder() {
+        refuse_unloadable_quant(id, spec)?;
+    } else if spec.quantize.is_some() {
         return Err(CoreError::Unsupported(format!(
-            "{id}: the Iris-3B routes ship one dense tier; LoadSpec::quantize is refused at load, \
+            "{id}: this Iris-3B task ships one dense tier; LoadSpec::quantize is refused at load, \
              so there is no quantized memory contract"
         )));
     }
@@ -399,13 +427,15 @@ pub(crate) fn generation_contract(
     refuse_unloadable_spec(IrisTask::Generation, spec)?;
     let precision = spec.precision;
     let mut contract = base_contract(IrisTask::Generation, precision, Some(config));
+    let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
     let transformer = backbone_bytes(
         &resources
             .backbone_dir
             .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
         precision,
+        quant,
     )?;
-    let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
+    let conditioning = text_encoder_bytes(&resources.text_encoder_dir, spec.quantize)?;
     let overlays = adapter_overlay_components(spec, precision)?;
     let overlay_bytes = overlays
         .iter()
@@ -458,7 +488,7 @@ pub(crate) fn export_contract(
     let mut contract = base_contract(task, precision, Some(&export.config));
     // The export's `model.safetensors`: the backbone (under `pixel.` plus the 1×1 reducer for
     // depth), every matrix cast to the compute dtype.
-    let transformer = backbone_bytes(&export.weights_path(), precision)?;
+    let transformer = backbone_bytes(&export.weights_path(), precision, None)?;
     // The shipped empty-prompt states are the whole conditioning of these tasks. They are read to
     // the host and uploaded as stored (f32), so they price at their file width.
     let conditioning =
@@ -478,25 +508,37 @@ pub(crate) fn export_contract(
     Ok(contract)
 }
 
-/// Resident bytes of a backbone checkpoint, priced the way the loaders hold it: every tensor of
-/// rank two or more is cast to the compute dtype, except the text position table; vectors (norm
-/// gains, biases) and that table stay as stored. The rule is the one in
-/// [`crate::model::load_backbone_with_adapters`] and [`crate::depth::load_depth_export`] (whose
-/// keys carry a `pixel.` prefix, hence the suffix match).
-fn backbone_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
-    let cast = match precision {
-        Precision::Bf16 => ResidentProjection::Bfloat16,
-        Precision::Fp32 => ResidentProjection::Float32,
-    };
-    projected_safetensors_bytes(weights, |header| {
+/// Resident bytes of a backbone checkpoint, priced the way the loaders hold it: every projection
+/// weight (a rank-2 `.weight`) as [`crate::nn::ProjectionLayout::of`] holds it under `quant` —
+/// in the compute dtype on the dense tier, packed (over its zero-padded input) on a quantized one;
+/// every other tensor of rank two or more (the text position table excepted) cast to the compute
+/// dtype; vectors (norm gains, biases) and that table as stored. The rule is the one in
+/// [`crate::model::load_backbone_quantized`] and [`crate::depth::load_depth_export`] (whose keys
+/// carry a `pixel.` prefix, hence the suffix match).
+fn backbone_bytes(
+    weights: &Path,
+    precision: Precision,
+    quant: Option<crate::nn::BackboneQuant>,
+) -> CoreResult<u64> {
+    let width = u64::from(compute_width(precision));
+    let mut total = 0_u64;
+    for header in gen_core::weightsmeta::safetensors_path_tensor_headers(weights)? {
         let position_table =
             header.name == "y_pos_embedding" || header.name.ends_with(".y_pos_embedding");
-        if header.shape.len() >= 2 && !position_table {
-            cast
-        } else {
-            ResidentProjection::Stored
-        }
-    })
+        let elements = header.shape.iter().map(|&d| d as u64).product::<u64>();
+        let bytes = match header.shape.as_slice() {
+            [out, input] if header.name.ends_with(".weight") => crate::nn::ProjectionLayout::of(
+                *input, quant,
+            )
+            .weight_bytes(*out as u64, *input as u64, width),
+            shape if shape.len() >= 2 && !position_table => elements * width,
+            _ => header.data_bytes,
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: backbone byte sum overflow")))?;
+    }
+    Ok(total)
 }
 
 /// Key prefix of the Qwen3-VL language tower inside the VLM checkpoint.
@@ -504,24 +546,41 @@ const LANGUAGE_TOWER_PREFIX: &str = "model.language_model.";
 /// The untied output head, at the checkpoint root.
 const LANGUAGE_HEAD_KEY: &str = "lm_head.weight";
 
-/// Resident bytes of the text encoder as [`crate::text_encoder::IrisTextEncoder::load`] builds it.
+/// Resident bytes of the text encoder as [`crate::text_encoder::IrisTextEncoder::load_quantized`]
+/// builds it at `quant`.
 ///
 /// The shared decoder (`mlx_llm::CausalLm`) reads the language tower (`model.language_model.*`)
-/// and, when the head is untied — it is on Qwen3-VL — `lm_head.weight`, casting each to bf16
-/// whatever the file stores. The vision tower (`model.visual.*`) rides along on disk and is
-/// materialized by nothing on this route. The file list is the loader's own
-/// ([`crate::text_encoder::weight_shards`]), so a stray safetensors beside the shards is not
-/// priced.
-fn text_encoder_bytes(dir: &Path) -> CoreResult<u64> {
-    let untied_head = !mlx_llm::ModelConfig::from_dir(dir)
-        .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: reading the text encoder config: {e}")))?
-        .tie_word_embeddings;
+/// and, when the head is untied, `lm_head.weight`, casting each to bf16 whatever the file stores.
+/// On a quantized tier every attention / MLP projection (each rank-2 `.weight` of the tower but
+/// the token embedding) is packed at the tower's group size
+/// ([`crate::text_encoder::text_encoder_quant_group`]); the embedding, the head and the norms stay
+/// bf16. The vision tower (`model.visual.*`) rides along on disk and is materialized by nothing on
+/// this route. The file list is the loader's own ([`crate::text_encoder::weight_shards`]), so a
+/// stray safetensors beside the shards is not priced.
+fn text_encoder_bytes(dir: &Path, quant: Option<gen_core::Quant>) -> CoreResult<u64> {
+    let config = mlx_llm::ModelConfig::from_dir(dir)
+        .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: reading the text encoder config: {e}")))?;
+    let untied_head = !config.tie_word_embeddings;
+    let packed = crate::text_encoder::text_encoder_quant_spec(&config, quant)?;
+    let embedding = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
     let mut total = 0_u64;
     for shard in crate::text_encoder::weight_shards(dir)? {
         let bytes = projected_safetensors_bytes(&shard, |header| {
-            if header.name.starts_with(LANGUAGE_TOWER_PREFIX)
-                || (untied_head && header.name == LANGUAGE_HEAD_KEY)
-            {
+            if header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
+                match packed {
+                    Some(spec)
+                        if header.shape.len() == 2
+                            && header.name.ends_with(".weight")
+                            && header.name != embedding =>
+                    {
+                        ResidentProjection::GroupQuantized {
+                            bits: spec.bits,
+                            group_size: spec.group_size as usize,
+                        }
+                    }
+                    _ => ResidentProjection::Bfloat16,
+                }
+            } else if untied_head && header.name == LANGUAGE_HEAD_KEY {
                 ResidentProjection::Bfloat16
             } else {
                 ResidentProjection::Omit
@@ -919,10 +978,10 @@ pub(crate) fn registered_begin_request(
     })))
 }
 
-/// The registry-load surface every Iris route witnesses: the one dense tier, eagerly materialized,
-/// under both offload policies (advisory on the encoder-free tasks, which are always resident).
-/// No loader accepts a quantized tier or has a deferred-materialization load shape, so neither is
-/// witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the two encoder-free routes witness: the one dense tier, eagerly
+/// materialized, under both offload policies (advisory there: those tasks are always resident).
+/// Neither loader accepts a quantized tier or has a deferred-materialization load shape, so
+/// neither is witnessed — a selector no load can take would be a witness-only surface.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
         .into_iter()
@@ -930,6 +989,16 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
             surface.selector.tier == MemoryContractSurfaceTier::Bf16
                 && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
+        .collect()
+}
+
+/// The registry-load surface of generation (sc-26266): the dense tier and the two affine tiers
+/// the loader packs, eagerly materialized (there is no deferred loader), under both offload
+/// policies.
+pub fn generation_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    gen_core::mlx_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization)
         .collect()
 }
 
@@ -958,7 +1027,7 @@ pub const MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: MODEL_ID,
         contract: |spec| weights_free_memory_strategy_contract(MODEL_ID, spec),
-        surface_specs: memory_contract_surface_specs,
+        surface_specs: generation_memory_contract_surface_specs,
     };
 /// Depth: the weights-free contract fixture.
 pub const DEPTH_MEMORY_CONTRACT_FIXTURE: gen_core::MemoryContractFixtureRegistration =
@@ -1097,20 +1166,43 @@ mod tests {
     /// hook backs it).
     #[test]
     fn each_route_declares_exactly_the_rungs_its_engine_runs() {
-        let surfaces = memory_contract_surface_specs();
+        let dense = memory_contract_surface_specs();
         // *Mutation that reds this:* dropping the eager filter in
         // `memory_contract_surface_specs` (a deferred selector no loader can take reappears, and
         // its contract construction is refused).
         assert_eq!(
-            surfaces.len(),
+            dense.len(),
             2,
             "one dense tier, eager, x 2 offload policies"
         );
-        let selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
+        let selectors: Vec<_> = dense.iter().map(|s| s.selector.id()).collect();
         assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
+        // sc-26266: generation witnesses the two affine tiers its loader packs as well.
+        // *Mutation that reds this:* dropping the eager filter, or filtering generation to bf16.
+        let generation = generation_memory_contract_surface_specs();
+        let mut selectors: Vec<_> = generation.iter().map(|s| s.selector.id()).collect();
+        selectors.sort();
+        assert_eq!(
+            selectors,
+            [
+                "bf16:resident:eager",
+                "bf16:sequential:eager",
+                "q4:resident:eager",
+                "q4:sequential:eager",
+                "q8:resident:eager",
+                "q8:sequential:eager",
+            ]
+        );
         for task in TASKS {
-            for surface in &surfaces {
-                assert_eq!(surface.selector.tier, MemoryContractSurfaceTier::Bf16);
+            let surfaces = if task == IrisTask::Generation {
+                &generation
+            } else {
+                &dense
+            };
+            for surface in surfaces {
+                if task != IrisTask::Generation {
+                    assert_eq!(surface.selector.tier, MemoryContractSurfaceTier::Bf16);
+                }
                 let contract =
                     weights_free_memory_strategy_contract(provider_id(task), &surface.spec)
                         .unwrap();
@@ -1183,26 +1275,61 @@ mod tests {
         );
     }
 
-    /// No Iris loader opens a quantized spec, and only generation installs adapters, so neither
-    /// has a contract — weights-free or loaded.
+    /// Only generation packs a quantized tier — Q4/Q8 under bf16 compute (sc-26266) — and only
+    /// generation installs adapters, so every other spec has no contract, weights-free or loaded.
     ///
-    /// *Mutation that reds this:* dropping either arm of `refuse_unloadable_spec`.
+    /// *Mutations that red this:* dropping either arm of `refuse_unloadable_spec`; dropping either
+    /// arm of `refuse_unloadable_quant`.
     #[test]
     fn a_spec_no_loader_opens_has_no_contract() {
+        let refused =
+            |id: &str, result: CoreResult<MemoryProviderContract>, field: &str| match result {
+                Err(CoreError::Unsupported(message)) => {
+                    assert!(message.contains(field), "{id}: {message}")
+                }
+                other => panic!("{id}: expected a typed refusal, got {other:?}"),
+            };
+        let scratch = tempfile::tempdir().unwrap();
+        let aligned_tower = write_aligned_tiny_text_encoder(scratch.path());
         for task in TASKS {
             let id = provider_id(task);
-            let quantized = sentinel().with_quant(Quant::Q4);
-            for result in [
-                weights_free_memory_strategy_contract(id, &quantized),
-                memory_strategy_contract(id, &tiny_spec(task).with_quant(Quant::Q4)),
-            ] {
-                match result {
-                    Err(CoreError::Unsupported(message)) => {
-                        assert!(message.contains("quantize"), "{message}")
-                    }
-                    other => panic!("{id}: expected a typed refusal, got {other:?}"),
+            let mut resources = tiny_spec(task);
+            if task == IrisTask::Generation {
+                // The released miniature tower has no affine group (see
+                // `a_quantized_generation_load_prices_the_packed_projections`).
+                resources.components.insert(
+                    gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+                    WeightsSource::Dir(aligned_tower.clone()),
+                );
+            }
+            for quant in [Quant::Q4, Quant::Q8] {
+                let weights_free =
+                    weights_free_memory_strategy_contract(id, &sentinel().with_quant(quant));
+                let loaded = memory_strategy_contract(id, &resources.clone().with_quant(quant));
+                if task == IrisTask::Generation {
+                    gen_core_testkit::memory_strategy_conformance(&weights_free.unwrap());
+                    gen_core_testkit::memory_strategy_conformance(&loaded.unwrap());
+                } else {
+                    refused(id, weights_free, "quantize");
+                    refused(id, loaded, "quantize");
                 }
             }
+            refused(
+                id,
+                weights_free_memory_strategy_contract(id, &sentinel().with_quant(Quant::Nvfp4)),
+                "quantize",
+            );
+            let mut fp32 = sentinel().with_quant(Quant::Q8);
+            fp32.precision = Precision::Fp32;
+            refused(
+                id,
+                weights_free_memory_strategy_contract(id, &fp32),
+                if task == IrisTask::Generation {
+                    "precision"
+                } else {
+                    "quantize"
+                },
+            );
             let mut adapted = sentinel();
             adapted.adapters = vec![AdapterSpec::new(
                 fixtures().join("iris_lora.safetensors"),
@@ -1596,7 +1723,8 @@ mod tests {
         );
 
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        assert_eq!(surfaces.len(), 3 * 2);
+        // Generation: three tiers x two policies (sc-26266); depth and restoration: bf16 x two.
+        assert_eq!(surfaces.len(), 3 * 2 + 2 + 2);
         assert!(surfaces
             .iter()
             .all(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization));
@@ -1612,7 +1740,7 @@ mod tests {
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
         let coverage =
             gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
-        assert_eq!(coverage.surfaces_checked, 6);
+        assert_eq!(coverage.surfaces_checked, 10);
         for load_shape in [
             LoadShape::EagerMaterialization,
             LoadShape::DeferredMaterialization,
@@ -1723,6 +1851,204 @@ mod tests {
                 declaration,
                 weights_free_memory_strategy_contract(provider_id(task), &spec).unwrap()
             );
+        }
+    }
+
+    /// The miniature text tower with an MLP width every affine group divides (its released 48 does
+    /// not, so the miniature has no quantized tier): `config.json` with `intermediate_size: 64` and
+    /// a `model.safetensors` of the same keys with the MLP shapes widened, zero-filled. Pricing
+    /// reads headers only. Returns the snapshot directory.
+    fn write_aligned_tiny_text_encoder(root: &Path) -> PathBuf {
+        let source = fixtures().join("tiny-snapshot/text_encoder");
+        let dir = root.join("text_encoder");
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_owned();
+            if name != "model.safetensors" && name != "config.json" {
+                std::fs::copy(&path, dir.join(name)).unwrap();
+            }
+        }
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(source.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["text_config"]["intermediate_size"], 48);
+        config["text_config"]["intermediate_size"] = 64.into();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_usize;
+        for tensor in safetensors_path_tensor_headers(source.join("model.safetensors")).unwrap() {
+            let mut shape = tensor.shape.clone();
+            if tensor.name.contains(".mlp.gate_proj.") || tensor.name.contains(".mlp.up_proj.") {
+                shape[0] = 64;
+            } else if tensor.name.contains(".mlp.down_proj.") {
+                shape[1] = 64;
+            }
+            let bytes = shape.iter().product::<usize>() * 4;
+            header.insert(
+                tensor.name.clone(),
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [offset, offset + bytes]}),
+            );
+            offset += bytes;
+        }
+        let header = serde_json::Value::Object(header).to_string().into_bytes();
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.resize(file.len() + offset, 0);
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+        dir
+    }
+
+    /// sc-26266: a quantized generation load prices what its loaders hold at the tier — every
+    /// backbone projection packed (the unaligned ones over a zero-padded input), the text tower's
+    /// attention/MLP projections packed at its group size, everything else as on the dense tier —
+    /// and an adapted load prices the same packed backbone (the tier is one layout whatever the
+    /// adapters; the stack is an overlay). Expectations are recomputed here from the headers, not
+    /// through the provider's helpers.
+    ///
+    /// *Mutations that red this:* pricing a quantized load at bf16; quantizing the token
+    /// embedding; dropping the padding (with or without adapters); a scale/bias table at the
+    /// wrong width.
+    #[test]
+    fn a_quantized_generation_load_prices_the_packed_projections() {
+        let scratch = tempfile::tempdir().unwrap();
+        let tower = write_aligned_tiny_text_encoder(scratch.path());
+        let mut spec = tiny_spec(IrisTask::Generation);
+        spec.components.insert(
+            gen_core::iris::TEXT_ENCODER_COMPONENT.into(),
+            WeightsSource::Dir(tower.clone()),
+        );
+        let packed = |out: u64, padded_in: u64, bits: u64, group: u64| {
+            out * padded_in * bits / 8 + out * (padded_in / group) * 4
+        };
+        let backbone = fixtures().join("tiny-snapshot/iris/model.safetensors");
+        let backbone_at = |bits: Option<u64>, pad: bool| {
+            sum(&backbone, |h| match (h.shape.as_slice(), bits) {
+                ([out, input], Some(bits))
+                    if h.name.ends_with(".weight") && *input >= 64 && (input % 64 == 0 || pad) =>
+                {
+                    packed(*out as u64, input.div_ceil(64) as u64 * 64, bits, 64)
+                }
+                (shape, _) if shape.len() >= 2 && !h.name.ends_with("y_pos_embedding") => {
+                    elements(h) * 2
+                }
+                _ => h.data_bytes,
+            })
+        };
+        let tower_at = |bits: Option<u64>| {
+            sum(&tower.join("model.safetensors"), |h| {
+                if !h.name.starts_with("model.language_model.") {
+                    return 0;
+                }
+                match (h.shape.as_slice(), bits) {
+                    ([out, input], Some(bits))
+                        if h.name.ends_with(".weight")
+                            && !h.name.ends_with("embed_tokens.weight") =>
+                    {
+                        // The miniature's hidden width (32) is not a multiple of 64.
+                        packed(*out as u64, *input as u64, bits, 32)
+                    }
+                    _ => elements(h) * 2,
+                }
+            })
+        };
+        // The miniature carries an unaligned projection (the 170-wide SwiGLU down projections),
+        // so padding is observable.
+        assert!(backbone_at(Some(4), true) < backbone_at(Some(4), false));
+
+        let bf16 = loaded(IrisTask::Generation, &spec);
+        assert_eq!(bf16.asset_facts.transformer_bytes, backbone_at(None, true));
+        assert_eq!(bf16.asset_facts.conditioning_bytes, tower_at(None));
+        let mut previous = bf16.asset_facts;
+        for (quant, bits) in [(Quant::Q8, 8), (Quant::Q4, 4)] {
+            let contract = loaded(IrisTask::Generation, &spec.clone().with_quant(quant));
+            gen_core_testkit::memory_strategy_conformance(&contract);
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+            let facts = contract.asset_facts;
+            assert_eq!(
+                facts.transformer_bytes,
+                backbone_at(Some(bits), true),
+                "{quant:?}"
+            );
+            assert_eq!(facts.conditioning_bytes, tower_at(Some(bits)), "{quant:?}");
+            assert_eq!(
+                facts.base_bytes,
+                facts.transformer_bytes + facts.conditioning_bytes
+            );
+            assert!(
+                facts.transformer_bytes < previous.transformer_bytes,
+                "{quant:?}"
+            );
+            assert!(
+                facts.conditioning_bytes < previous.conditioning_bytes,
+                "{quant:?}"
+            );
+            previous = facts;
+        }
+
+        let mut adapted = spec.clone().with_quant(Quant::Q4);
+        adapted.adapters = vec![AdapterSpec::new(
+            fixtures().join("iris_lora.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )];
+        assert_eq!(
+            loaded(IrisTask::Generation, &adapted)
+                .asset_facts
+                .transformer_bytes,
+            backbone_at(Some(4), true)
+        );
+
+        // The released miniature tower has no affine group, so it has no quantized tier.
+        match memory_strategy_contract(
+            MODEL_ID,
+            &tiny_spec(IrisTask::Generation).with_quant(Quant::Q4),
+        ) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("group size"), "{message}")
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    /// The loaded tier names the quantization (sc-26266), so a selection at another tier — or a
+    /// dense load handed a quantized selection — is rejected by the shared handshake.
+    ///
+    /// *Mutation that reds this:* `loaded_tier` dropping `spec.quantize`.
+    #[test]
+    fn a_selection_must_name_the_tier_the_generator_loaded() {
+        let route = || MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
+            reference_count: 0,
+            use_pid: false,
+            has_phases: true,
+            overlay: None,
+        };
+        for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+            let mut spec = sentinel();
+            spec.quantize = quant;
+            let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
+            for selected in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+                let mut at = sentinel();
+                at.quantize = selected;
+                let context = gen_core::standard_memory_behavior_context(
+                    &contract,
+                    MemoryStrategy::Resident,
+                    loaded_tier(&at),
+                    route(),
+                )
+                .unwrap();
+                let decision = safety_check(&spec, &contract, &context);
+                if selected == quant {
+                    assert_eq!(decision, MemorySafetyDecision::Accept, "{quant:?}");
+                } else {
+                    assert!(
+                        matches!(decision, MemorySafetyDecision::Reject { .. }),
+                        "{quant:?} load, {selected:?} selection"
+                    );
+                }
+            }
         }
     }
 

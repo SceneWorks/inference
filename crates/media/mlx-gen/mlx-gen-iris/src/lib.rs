@@ -20,6 +20,16 @@
 //! returns a float32 relative-log-depth map, not an image. [`depth::load`] resolves only the
 //! `depth/` export and returns a `gen_core::iris::depth::IrisDepthEstimator`.
 //!
+//! ## Quantized tiers (sc-26266)
+//!
+//! `iris_3b` loads at bf16 (the release's autocast policy) and at the affine `q8` / `q4` tiers,
+//! which are quantized **at load** from the same dense release — there is no converted artifact.
+//! A tier is a whole-pipeline contract: the Qwen3-VL tower's attention/MLP projections
+//! ([`IrisTextEncoder::load_quantized`]) and every backbone projection ([`load_backbone_quantized`],
+//! [`nn::ProjectionLayout`]) pack at the selected width. Embeddings, norms, the text position table
+//! and the sub-group-wide pixel heads stay dense. The depth and restoration tasks and every trainer
+//! ship the dense tier only.
+//!
 //! ## Frozen upstream
 //!
 //! See `UPSTREAM.md` (revisions, resource layout, the generation coverage table, fixtures and
@@ -46,13 +56,17 @@ pub use mlx_gen::gen_core::iris::{
     UPSTREAM_CODE_REVISION, UPSTREAM_WEIGHTS_REPO, UPSTREAM_WEIGHTS_REVISION,
 };
 pub use model::{
-    compute_dtype, descriptor, load, load_backbone, load_backbone_with_adapters, Iris3b, MODEL_ID,
+    compute_dtype, descriptor, load, load_backbone, load_backbone_quantized,
+    load_backbone_with_adapters, Iris3b, MODEL_ID,
 };
+pub use nn::{BackboneQuant, ProjectionLayout, QUANT_GROUP_SIZE};
 pub use pipeline::{
     denoise, encode, noise, noise_batch, preview_image, to_image, to_images, Conditioning,
 };
 pub use restoration::IrisRestorer;
-pub use text_encoder::{IrisTextEncoder, TextConditioning};
+pub use text_encoder::{
+    text_encoder_quant_group, text_encoder_quant_spec, IrisTextEncoder, TextConditioning,
+};
 
 /// Add the MLX Iris-3B generator, its generation (sc-25685) and depth (sc-25687) trainers and the
 /// restoration transform to an explicit media registry builder, with the memory-strategy contract,

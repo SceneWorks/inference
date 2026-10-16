@@ -17,8 +17,8 @@ use mlx_rs::nn::{gelu, sigmoid, silu};
 use mlx_rs::{Array, Dtype};
 
 use crate::nn::{
-    attention, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, Linear, Loader,
-    RmsNorm, Rope,
+    attention, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, BackboneQuant, Linear,
+    Loader, RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -320,7 +320,7 @@ impl IrisDiT {
         compute: Dtype,
         input_channels: usize,
     ) -> Result<Self> {
-        Self::build(w, cfg, compute, input_channels, None)
+        Self::build(w, cfg, compute, input_channels, None, None)
     }
 
     /// [`from_weights`](Self::from_weights) with the projections of an adapter install
@@ -332,7 +332,21 @@ impl IrisDiT {
         compute: Dtype,
         adapted: Option<&AdaptedLinears>,
     ) -> Result<Self> {
-        let dit = Self::build(w, cfg, compute, cfg.in_channels, adapted)?;
+        Self::from_weights_quantized(w, cfg, compute, adapted, None)
+    }
+
+    /// [`from_weights_adapted`](Self::from_weights_adapted) at a quantized tier (sc-26266): every
+    /// projection is held as [`crate::nn::ProjectionLayout::of`] says under `quant` (`None` is
+    /// the dense tier). Adapters are installed on the dense projections first and stay
+    /// forward-time residuals over the packed base.
+    pub fn from_weights_quantized(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        adapted: Option<&AdaptedLinears>,
+        quant: Option<BackboneQuant>,
+    ) -> Result<Self> {
+        let dit = Self::build(w, cfg, compute, cfg.in_channels, adapted, quant)?;
         if let Some(adapted) = adapted {
             let orphans = adapted.unconsumed();
             if !orphans.is_empty() {
@@ -350,11 +364,13 @@ impl IrisDiT {
         compute: Dtype,
         input_channels: usize,
         adapted: Option<&AdaptedLinears>,
+        quant: Option<BackboneQuant>,
     ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
             adapted,
+            quant,
         };
         let eps = cfg.norm_eps as f32;
         let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);
@@ -431,14 +447,14 @@ impl IrisDiT {
             )));
         }
         let p = cfg.patch_size as i32;
-        crate::nn::expect_shape(
+        crate::nn::expect_dims(
             "s_embedder.proj.weight",
-            &dit.s_embedder.arrays()[0].clone(),
+            &dit.s_embedder.logical_shape(),
             &[cfg.hidden_size as i32, p * p * input_channels as i32],
         )?;
-        crate::nn::expect_shape(
+        crate::nn::expect_dims(
             "pixel_embedder.proj.weight",
-            &dit.pixel_proj.arrays()[0].clone(),
+            &dit.pixel_proj.logical_shape(),
             &[cfg.pixel.hidden_size as i32, input_channels as i32],
         )?;
         Ok(dit)
@@ -539,6 +555,13 @@ impl IrisDiT {
 
     pub fn compute_dtype(&self) -> Dtype {
         self.compute
+    }
+
+    /// Bytes the loaded parameters hold — every array [`Self::arrays`] names, at the width it is
+    /// resident in (packed codes, scales and biases on a quantized tier). Measured from the model,
+    /// not priced from the checkpoint.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        self.arrays().iter().map(|a| a.nbytes() as u64).sum()
     }
 
     /// Every parameter array, for an eager evaluation at load (never inside a forward).
@@ -1165,6 +1188,7 @@ impl IrisDiT {
             weights: w,
             compute,
             adapted,
+            quant: None,
         };
         let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);
         Ok(TrunkBlock(Self::load_block(
@@ -1188,6 +1212,7 @@ impl IrisDiT {
             weights: w,
             compute,
             adapted,
+            quant: None,
         };
         Ok(PixelBlock(Self::load_pit(&l, cfg, i, cfg.norm_eps as f32)?))
     }

@@ -824,17 +824,17 @@ composed routes.
 | BoundedAttention | missing | missing | missing |
 | BoundedTransformerResidency | missing | missing | missing |
 | Calibration fingerprint | `iris-3b-mlx-derived-2026-10-12-v1` | `iris-3b-depth-mlx-derived-2026-10-12-v1` | `iris-3b-restore-mlx-derived-2026-10-12-v1` |
-| Witnessed load surfaces | `bf16:resident:eager`, `bf16:sequential:eager` | same | same |
+| Witnessed load surfaces | `{bf16,q8,q4}:{resident,sequential}:eager` (sc-26266) | `bf16:resident:eager`, `bf16:sequential:eager` | same as depth |
 | Admission geometry | request width × height; batch = prompts × count | `depth_memory_geometry(plan)` (the model grid) | `restoration_memory_geometry(plan)` (the processing size); `restoration_forward_pixels(plan)` is the one-tile forward bound |
-| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, bf16) + backbone at the compute dtype + adapter overlays | `empty_prompt.safetensors` (stored f32) + backbone and reducer at the compute dtype | `empty_prompt.safetensors` + backbone at the compute dtype |
+| Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, bf16; attention/MLP projections packed at a quantized tier) + backbone at the compute dtype (projections packed at a quantized tier) + adapter overlays | `empty_prompt.safetensors` (stored f32) + backbone and reducer at the compute dtype | `empty_prompt.safetensors` + backbone at the compute dtype |
 
 Staged residency is a per-request decision on generation: the request scope writes
 `GenerationMemory::stage_residency`, and a `Sequential` load stages every request. The scope bounds
 `prompts × count` by the admitted batch (a prompt batch denoises its rows together), and
 `Iris3b::validate` refuses the controls the route has no mechanism for (`tile_vae_decode`,
 `chunk_attention`, `stream_transformer_blocks`). No loader has a deferred-materialization load
-shape: all three refuse `LoadShape::DeferredMaterialization` at load, and a deferred or quantized
-spec has no contract. The loaded models publish the same contract their registration builds and the
+shape: all three refuse `LoadShape::DeferredMaterialization` at load, and a deferred spec has no
+contract; depth and restoration refuse a quantized spec too. The loaded models publish the same contract their registration builds and the
 registered safety check (`Generator::memory_strategy_contract` / `memory_strategy_safety_check` for
 generation; the inherent methods of the same names on `IrisDepth` and `IrisRestorer`). An adapted
 generation load prices its stack as the typed overlay components
@@ -842,7 +842,36 @@ generation load prices its stack as the typed overlay components
 fixture carries the overlay key `lora`. Nothing numeric beyond header-priced resident bytes is published, and no activation
 anchor is registered: those are measurements the epic's terminal campaign owns.
 
-Verification: `memory_strategy` unit tests (declaration, admission gate, pricing, registry
+### Quantized tiers (sc-26266)
+
+`iris_3b` loads at bf16 and at the affine `q8` / `q4` tiers (`LoadSpec::quantize`), quantized **at
+load** from the same dense release — nothing converted is shipped or written. A tier is one width
+for the whole pipeline:
+
+* **Backbone** (`load_backbone_quantized`, `nn::ProjectionLayout`): every projection with an input
+  width of at least one group (64) is packed at group size 64. The release's SwiGLU down
+  projections are 6826 wide — no affine group divides that — so their input is zero-padded to 6848
+  (exact: `[x, 0] · [W, 0]ᵀ = x · Wᵀ`) and they pack like the rest — on an adapted load too: the
+  packed base reads the padded input and the adapter residuals the unpadded one
+  (`AdaptableLinear::forward_split`), so the tier's layout does not depend on the adapters. The 3-, 12- and 16-wide pixel and pooling
+  heads, the norms, the modulation biases and the text position table stay dense.
+* **Text tower** (`IrisTextEncoder::load_quantized`): every attention/MLP projection of the
+  Qwen3-VL language tower is packed by the shared decoder at one group size (64 on the release,
+  `text_encoder_quant_group`); the tied embedding and the norms stay bf16. The quantized build
+  materializes group by group and releases each group's bf16 sources, so the dense tower is never
+  held beside the packed one.
+* A quantized tier runs under the bf16 compute policy only (`Precision::Fp32` + a tier and
+  NVFP4 are typed refusals).
+
+Header-priced resident weights of the release (the contract's own pricing): backbone 5.57 / 2.96 /
+1.57 GiB, text tower 7.49 / 4.32 / 2.63 GiB, together 13.06 / 7.28 / 4.20 GiB for bf16 / q8 / q4
+(0.558 x and 0.322 x of bf16 — the tower's 0.73 GiB tied embedding stays bf16). Verification:
+`tests/quant_tiers.rs` on the miniature (CPU, every tier: measured resident bytes against the
+contract, image / conditioning distance to the dense tier) and the `#[ignore]`d
+`tests/quant_real_weights.rs` (measured resident ratios on the release; 512² bf16 / q8 / q4 renders
+from one seed against a declared tolerance).
+
+Memory-contract verification: `memory_strategy` unit tests (declaration, admission gate, pricing, registry
 conformance) and `tests/memory_contract.rs` (a staged selection on a warm generator loads the two
 components in staged order and renders the identical image; the encoder-free loaders publish their
 registered contract).
