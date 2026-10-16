@@ -38,6 +38,7 @@ use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVER
 // Iris generation, depth and restoration are inference-only registrations, not device-fit claims.
 
 pub mod anima;
+pub mod iris_depth;
 pub use anima::{
     anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
     anima_turbo_memory_selection, ios_memory_budget, ANIMA_TURBO_ID,

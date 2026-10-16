@@ -17,6 +17,10 @@
 
 #[cfg(feature = "media")]
 pub use mlx_gen_ios_catalog as media;
+/// Callable Iris depth API, independent of the image registry and any safe-media facade.
+/// The only load entry point is explicitly named unadmitted diagnostics; no fitting claim.
+#[cfg(feature = "media")]
+pub use mlx_gen_ios_catalog::iris_depth;
 pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
@@ -333,4 +337,59 @@ mod tests {
             ["aarch64-apple-ios", "aarch64-apple-ios-sim"]
         );
     }
+}
+
+// This bundle-only consumer imports no provider crate. Keep the CPU subprocess/Metal guard so
+// the miniature callable task test cannot contend with the host GPU.
+#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[path = "../../../media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
+mod iris_cpu_guard;
+
+#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[test]
+fn bundle_only_consumer_executes_iris_depth() {
+    use crate::{gen_core, iris_depth};
+    use iris_depth::IrisDepthEstimator;
+    const CHILD: &str = "SW_IOS_DEPTH_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bundle_only_consumer_executes_iris_depth",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout).contains("iris-depth-body-complete"));
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    iris_cpu_guard::forbid_metal();
+    assert!(iris_cpu_guard::metal_forbidden());
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-depth");
+        let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(path));
+        let model = iris_depth::load_depth_unadmitted_for_diagnostics(&spec).unwrap();
+        let req = iris_depth::DepthRequest {
+            image: gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![127; 16 * 16 * 3],
+            },
+            resolution: iris_depth::DepthResolution::Native,
+            ..Default::default()
+        };
+        let output = model.estimate(&req, &mut |_| {}).unwrap();
+        assert_eq!((output.map.width, output.map.height), (16, 16));
+        assert_eq!(output.map.values.len(), 256);
+        assert!(output.map.values.iter().all(|v| v.is_finite()));
+        println!("iris-depth-body-complete");
+    });
 }

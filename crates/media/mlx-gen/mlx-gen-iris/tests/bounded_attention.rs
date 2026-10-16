@@ -117,3 +117,157 @@ fn full_backbone() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn production_solver_observes_every_site_and_cancels_inside_the_forward() {
+    crate::common::cpu_process(
+        "bounded_attention::production_solver_observes_every_site_and_cancels_inside_the_forward",
+        production_solver,
+    );
+}
+
+#[cfg(debug_assertions)]
+fn production_solver() {
+    use mlx_gen::gen_core::iris::GenerationParams;
+    use mlx_gen_iris::nn::diagnostics;
+    use mlx_gen_iris::{
+        encode,
+        pipeline::{denoise_budgeted, noise_batch},
+        IrisTextEncoder,
+    };
+    let config = crate::common::tiny_config();
+    let dit = mlx_gen_iris::load_backbone(&crate::common::tiny_backbone(), &config, Dtype::Float32)
+        .unwrap();
+    let te =
+        IrisTextEncoder::load(&crate::common::tiny_text_encoder(), &config.text_encoder).unwrap();
+    let sites = ["adapter", "refiner", "dual", "single", "pixel"];
+    for guidance in [1.0, 3.0] {
+        let req = mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 32,
+            height: 16,
+            steps: Some(1),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let params = GenerationParams::resolve(&req, 0, &config).unwrap();
+        let conditioning = encode(&te, &params).unwrap();
+        let noise = noise_batch(&[1], config.model.in_channels, 32, 16).unwrap();
+        let budget = AttentionBudget::from_score_elements(1, true);
+        diagnostics::reset();
+        denoise_budgeted(
+            &dit,
+            &config.flow,
+            &conditioning,
+            &noise,
+            &params,
+            &mlx_gen::CancelFlag::new(),
+            |_| {},
+            &mlx_gen::PreviewSink::default(),
+            budget,
+        )
+        .unwrap();
+        let observations = diagnostics::observations();
+        for site in sites {
+            let rows: Vec<_> = observations.iter().filter(|r| r.site == site).collect();
+            assert!(!rows.is_empty(), "CFG {guidance}: missing {site}");
+            for row in rows {
+                assert_eq!(
+                    row.budget.max_score_elements(),
+                    1,
+                    "CFG {guidance}: {site} dropped plan"
+                );
+                assert!(row.budget.eval_per_chunk());
+                assert!(
+                    row.chunks > 1,
+                    "CFG {guidance}: {site} never actually chunked: {row:?}"
+                );
+            }
+        }
+        // One solver evaluation only: if a site ignores cancellation there is no later solver
+        // iteration whose check could hide that defect. Cancel immediately before each site.
+        for site in sites {
+            let cancel = mlx_gen::CancelFlag::new();
+            diagnostics::reset();
+            diagnostics::cancel_at(site, cancel.clone());
+            let result = denoise_budgeted(
+                &dit,
+                &config.flow,
+                &conditioning,
+                &noise,
+                &params,
+                &cancel,
+                |_| {},
+                &mlx_gen::PreviewSink::default(),
+                budget,
+            );
+            assert!(
+                matches!(result, Err(mlx_gen::Error::Canceled)),
+                "CFG {guidance}: {site} failed to cancel inside the forward"
+            );
+            assert!(
+                !diagnostics::observations().iter().any(|r| r.site == site),
+                "{site} completed despite its cancelled plan"
+            );
+        }
+    }
+    diagnostics::reset();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn generator_request_budget_reaches_cfg_and_non_cfg_solver_sites() {
+    crate::common::cpu_process(
+        "bounded_attention::generator_request_budget_reaches_cfg_and_non_cfg_solver_sites",
+        generator_request,
+    );
+}
+
+#[cfg(debug_assertions)]
+fn generator_request() {
+    use mlx_gen::gen_core::{iris::TEXT_ENCODER_COMPONENT, GenerationMemory};
+    use mlx_gen_iris::nn::diagnostics;
+    let mut spec =
+        mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(crate::common::tiny_backbone()));
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        mlx_gen::WeightsSource::Dir(crate::common::tiny_text_encoder()),
+    );
+    let generator = mlx_gen_iris::provider_registry()
+        .unwrap()
+        .load("iris_3b", &spec)
+        .unwrap();
+    for guidance in [1.0, 3.0] {
+        let req = mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 32,
+            height: 16,
+            steps: Some(1),
+            guidance: Some(guidance),
+            memory: Some(GenerationMemory {
+                stage_residency: true,
+                chunk_attention: true,
+                attention_chunk_size: Some(mlx_gen_iris::memory_strategy::ATTENTION_CHUNK_SIZE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        diagnostics::reset();
+        generator.generate(&req, &mut |_| {}).unwrap();
+        let observations = diagnostics::observations();
+        for site in ["adapter", "refiner", "dual", "single", "pixel"] {
+            let rows: Vec<_> = observations.iter().filter(|r| r.site == site).collect();
+            assert!(!rows.is_empty());
+            for row in rows {
+                assert_eq!(
+                    row.budget.max_score_elements(),
+                    u64::from(mlx_gen_iris::memory_strategy::ATTENTION_CHUNK_SIZE),
+                    "request budget lost at CFG {guidance}/{site}"
+                );
+                assert!(row.budget.eval_per_chunk());
+            }
+        }
+    }
+    diagnostics::reset();
+}

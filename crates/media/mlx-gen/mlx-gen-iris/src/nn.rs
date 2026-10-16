@@ -458,6 +458,85 @@ pub fn attention_budgeted(
     Ok(out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?)
 }
 
+/// One named production attention site. Debug observations report the *executed* shared kernel
+/// chunk count, not a predicted count, so dropping a plan cannot pass a parity-only test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_at_site(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    compute: Dtype,
+    mask: Option<&Array>,
+    plan: mlx_gen::AttentionPlan<'_>,
+    site: &'static str,
+) -> Result<Array> {
+    #[cfg(debug_assertions)]
+    diagnostics::before(site);
+    let out = attention_budgeted(q, k, v, compute, mask, plan)?;
+    #[cfg(debug_assertions)]
+    diagnostics::record(site, plan.budget, mlx_gen::attention::last_chunk_count());
+    #[cfg(not(debug_assertions))]
+    let _ = site;
+    Ok(out)
+}
+
+/// Debug-build-only observation seam for CPU regression tests. Absent from release builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod diagnostics {
+    use mlx_gen::{AttentionBudget, CancelFlag};
+    use std::cell::RefCell;
+    #[derive(Clone, Debug)]
+    pub struct Observation {
+        pub site: &'static str,
+        pub budget: AttentionBudget,
+        pub chunks: usize,
+    }
+    #[derive(Default)]
+    struct State {
+        enabled: bool,
+        observations: Vec<Observation>,
+        cancel_at: Option<(&'static str, CancelFlag)>,
+    }
+    thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
+    /// Opt in to observation and clear prior test state. Normal debug consumers record nothing.
+    pub fn reset() {
+        STATE.with(|s| {
+            *s.borrow_mut() = State {
+                enabled: true,
+                ..Default::default()
+            }
+        });
+    }
+    pub fn observations() -> Vec<Observation> {
+        STATE.with(|s| s.borrow().observations.clone())
+    }
+    pub fn cancel_at(site: &'static str, flag: CancelFlag) {
+        STATE.with(|s| s.borrow_mut().cancel_at = Some((site, flag)));
+    }
+    pub(super) fn before(site: &'static str) {
+        STATE.with(|s| {
+            if let Some((at, flag)) = &s.borrow().cancel_at {
+                if *at == site {
+                    flag.cancel();
+                }
+            }
+        });
+    }
+    pub(super) fn record(site: &'static str, budget: AttentionBudget, chunks: usize) {
+        STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            if state.enabled {
+                state.observations.push(Observation {
+                    site,
+                    budget,
+                    chunks,
+                });
+            }
+        });
+    }
+}
+
 /// `TransformerTextEmbedder`'s key mask: real keys OR the diagonal, additive `[B, 1, T, T]`.
 pub fn key_padding_mask(mask: &[Vec<i32>], tokens: usize) -> Array {
     let data = iris::key_padding_additive(mask, tokens);

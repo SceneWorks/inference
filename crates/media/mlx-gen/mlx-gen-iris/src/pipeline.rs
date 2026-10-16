@@ -161,15 +161,20 @@ pub fn denoise_budgeted(
                 Some(batch) if params.cfg_at(step) => {
                     let xb = concatenate_axis(&[x, x], 0)?;
                     let tb = Array::from_slice(&vec![t; 2 * rows], &[2 * rows as i32]);
-                    let out = dit.forward_budgeted(&xb, &tb, batch, budget)?;
+                    let out = dit.forward_plan(
+                        &xb,
+                        &tb,
+                        batch,
+                        mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                    )?;
                     let halves = out.split(2, 0)?;
                     cfg_combine(&halves[0], &halves[1], params.cfg_scale)
                 }
-                _ => dit.forward_budgeted(
+                _ => dit.forward_plan(
                     x,
                     &Array::from_slice(&vec![t; rows], &[rows as i32]),
                     &cond_text,
-                    budget,
+                    mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
                 ),
             }
         },
