@@ -919,6 +919,29 @@ pub struct LlamaProvider {
     kv_family: Option<core_llm::KvModelFamily>,
 }
 
+// The partial model's tensors unwind before this earlier-declared guard. Fence
+// the ACTUAL load device/stream on failure, without replacing the primary error.
+struct LoadFailureFence<F: FnOnce() -> CoreResult<()>> {
+    fence: Option<F>,
+}
+impl<F: FnOnce() -> CoreResult<()>> LoadFailureFence<F> {
+    fn new(fence: F) -> Self {
+        Self { fence: Some(fence) }
+    }
+    fn disarm(&mut self) {
+        self.fence = None;
+    }
+}
+impl<F: FnOnce() -> CoreResult<()>> Drop for LoadFailureFence<F> {
+    fn drop(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            if let Err(error) = fence() {
+                eprintln!("candle-llama partial-load synchronization failed; original load error preserved, no reclamation claimed: {error}");
+            }
+        }
+    }
+}
+
 /// A draft model resident beside its target (sc-24436).
 struct ResidentDraft {
     /// The draft decoder.
@@ -1628,6 +1651,12 @@ impl LlamaProvider {
         let cuda_graphs = spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
         let _cuda_graphs_scope = crate::decode::cuda_graphs_scope(Some(cuda_graphs));
         let device = select_device().map_err(to_core)?;
+        let fence_device = device.clone();
+        let mut failed_load_fence = LoadFailureFence::new(move || {
+            fence_device
+                .synchronize()
+                .map_err(|error| to_core(error.into()))
+        });
         // NVFP4 (sc-24135): the capability floor is settled first — before the accelerator gate,
         // admission or any weight read — so a CPU or sub-sm_120 device answers an NVFP4 request with
         // the typed refusal naming the capability, never a fallback to another representation.
@@ -1764,6 +1793,7 @@ impl LlamaProvider {
             }
         }
         provider.note_graph_refusal(cuda_graphs, &device);
+        failed_load_fence.disarm();
         Ok(provider)
     }
 
@@ -4177,6 +4207,15 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
+    fn synchronize_before_release(&self) -> CoreResult<()> {
+        // This is the decoder/VLM's OWN device, including an explicitly selected
+        // non-blocking CUDA stream; an image generator's stream is not a fence for it.
+        self.model
+            .device()
+            .synchronize()
+            .map_err(|error| to_core(error.into()))
+    }
+
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
@@ -5849,6 +5888,59 @@ mod tests {
     use candle_core::Tensor;
     use core_llm::ProposerKind;
     use std::collections::HashMap;
+
+    #[test]
+    fn actual_cpu_provider_exposes_its_owned_release_fence() {
+        let (cfg, weights) = tiny_llama_parts();
+        let vocab = cfg["vocab_size"].as_u64().unwrap() as usize;
+        let tokenizer = core_llm::Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap();
+        let provider =
+            super::LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tokenizer, vec![]);
+        let engine: &dyn core_llm::TextLlm = &provider;
+        engine.synchronize_before_release().unwrap();
+    }
+
+    #[test]
+    fn partial_load_failure_fences_after_drop_and_preserves_primary_error() {
+        use std::{cell::RefCell, rc::Rc};
+        struct Partial(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for Partial {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("partial-drop");
+            }
+        }
+        for cancelled in [false, true] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let result: core_llm::Result<()> = {
+                let trace = events.clone();
+                let _fence = super::LoadFailureFence::new(move || {
+                    trace.borrow_mut().push("owned-fence");
+                    Err(core_llm::Error::Unsupported(
+                        "injected cleanup failure".into(),
+                    ))
+                });
+                let _partial = Partial(events.clone());
+                if cancelled {
+                    Err(core_llm::Error::Canceled)
+                } else {
+                    Err(core_llm::Error::Load("primary load error".into()))
+                }
+            };
+            if cancelled {
+                assert!(matches!(result, Err(core_llm::Error::Canceled)));
+            } else {
+                assert!(
+                    matches!(result,Err(core_llm::Error::Load(message)) if message=="primary load error")
+                );
+            }
+            assert_eq!(*events.borrow(), vec!["partial-drop", "owned-fence"]);
+        }
+        let mut fence = super::LoadFailureFence::new(|| -> core_llm::Result<()> {
+            panic!("successful load must not add a synchronization")
+        });
+        fence.disarm();
+        drop(fence);
+    }
 
     /// A device's row of the decode-defaults table, read directly (not through the provider's own
     /// reader) so a provider that stops following the table is caught.
