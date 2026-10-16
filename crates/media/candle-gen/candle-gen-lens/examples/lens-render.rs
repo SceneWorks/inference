@@ -111,6 +111,7 @@ fn main() -> Result<()> {
         }
         Progress::Decoding => println!("\n[lens-render] decoding"),
         Progress::Loading(phase) => println!("\n[lens-render] loading {phase:?}"),
+        Progress::Upsampling { .. } => {}
     };
     let t0 = std::time::Instant::now();
     let output = gen.generate(&req, &mut on_progress)?;

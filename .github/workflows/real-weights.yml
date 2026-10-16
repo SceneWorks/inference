@@ -5941,6 +5941,8 @@ jobs:
     env:
       MLX_GEN_MODELS_ROOT: ${{ vars.MLX_GEN_MODELS_ROOT }}
       FLUX3_PACKAGE_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein/snapshots/8454017f9ebaada30c998fccd9f67a80c7580f68
+      # sc-26238: the separate prompt-upsampler package (ungated, Apache-2.0), one ignored case.
+      FLUX3_PUP_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein-pup/snapshots/8b069751eb5dcab23829d9c5eccb470eb8b8a4ed
       FLUX3_REAL_SIZE: ${{ inputs.flux3_mlx_size }}
       FLUX3_REAL_STEPS: ${{ inputs.flux3_mlx_steps }}
     steps:
@@ -5951,13 +5953,13 @@ jobs:
         if: env.FLUX3_SKIP == '0'
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
-          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR
+          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR FLUX3_PUP_DIR
       - name: Report runner disk headroom
         if: env.FLUX3_SKIP == '0'
         continue-on-error: true
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
-          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR
+          MLX_GEN_MODELS_ROOT FLUX3_PACKAGE_DIR FLUX3_PUP_DIR
       - name: Toolchain versions
         if: env.FLUX3_SKIP == '0'
         run: rustc --version && cargo --version

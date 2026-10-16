@@ -808,6 +808,7 @@ expected_files = [
 ]
 
 [[models]]
+<<<<<<< HEAD
 # sc-26235 — the same pinned distilled FLUX 3 Image Klein package for the dispatch-only
 # `flux3-klein-cuda` profile (`candle-flux3-klein`): materialized on the Windows CUDA runner under
 # `CANDLE_GEN_MODELS_ROOT` and read by `candle-gen-flux3/tests/real_weights.rs` as ONE package
@@ -836,10 +837,36 @@ download_files = [
     "text_encoder/model.safetensors.index.json",
     "text_encoder/model-00001-of-00002.safetensors",
     "text_encoder/model-00002-of-00002.safetensors",
+=======
+# sc-26238 — the FLUX 3 Image Klein PROMPT UPSAMPLER, a separate ungated Apache-2.0 package
+# (a 9B Qwen3.5 VLM, `model_type: qwen3_5`, bf16 `model.safetensors` of 18.8 GB) read by
+# `gen_core::flux3::pup` + `mlx_gen_flux3::pup` as the optional `prompt_upsampler` component.
+# Same dispatch-only `flux3-klein-mlx` profile as the image package (one ignored case, the
+# upsampler alone resident); the gallery images and the README are left out.
+key = "flux3-image-klein-pup-mlx"
+repository = "black-forest-labs/flux-3-image-klein-pup"
+revision = "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["flux3-klein-mlx"]
+environment = ["FLUX3_PUP_DIR"]
+download_files = [
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
+    "system_prompts.json",
+>>>>>>> 9aff8152a
 ]
 expected_files = [
     "config.json",
     "model.safetensors",
+<<<<<<< HEAD
     "ae.safetensors",
     "text_encoder/config.json",
     "text_encoder/tokenizer.json",
@@ -847,6 +874,13 @@ expected_files = [
     "text_encoder/model.safetensors.index.json",
     "text_encoder/model-00001-of-00002.safetensors",
     "text_encoder/model-00002-of-00002.safetensors",
+=======
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "system_prompts.json",
+>>>>>>> 9aff8152a
 ]
 
 [[models]]

@@ -19,6 +19,14 @@ fi
 FLUX3_PACKAGE_DIR="$lane_hub/$tail_path"
 export FLUX3_PACKAGE_DIR
 echo "FLUX3_PACKAGE_DIR=$FLUX3_PACKAGE_DIR" >> "$GITHUB_ENV"
+# sc-26238: the prompt-upsampler package rides the same lane hub (ungated; no credential).
+pup_tail="${FLUX3_PUP_DIR#"$MLX_GEN_MODELS_ROOT"/}"
+if [[ "$pup_tail" == "$FLUX3_PUP_DIR" || "$pup_tail" == *..* ]]; then
+  echo "snapshot must stay beneath the resolved hub: FLUX3_PUP_DIR=$FLUX3_PUP_DIR" >&2; exit 1
+fi
+FLUX3_PUP_DIR="$lane_hub/$pup_tail"
+export FLUX3_PUP_DIR
+echo "FLUX3_PUP_DIR=$FLUX3_PUP_DIR" >> "$GITHUB_ENV"
 ensure() {
   for attempt in 1 2 3; do
     PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model "$1" --snapshot "$2" && return 0
@@ -28,3 +36,4 @@ ensure() {
   return 1
 }
 ensure flux3-image-klein-mlx "$FLUX3_PACKAGE_DIR"
+ensure flux3-image-klein-pup-mlx "$FLUX3_PUP_DIR"

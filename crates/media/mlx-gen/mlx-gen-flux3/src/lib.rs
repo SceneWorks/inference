@@ -15,9 +15,11 @@
 //!
 //! `LoadSpec::weights` is the package directory (`config.json` + `model.safetensors`);
 //! `components["text_encoder"]` and `components["autoencoder"]` optionally override the bundled
-//! `text_encoder/` snapshot and `ae.safetensors`. See `UPSTREAM.md` for the pinned revisions and
-//! the coverage table, and `tests/fixtures/` for the committed miniature fixtures dumped by
-//! `../tools/dump_flux3_*.py` from the frozen source.
+//! `text_encoder/` snapshot and `ae.safetensors`; `components["prompt_upsampler"]` (sc-26238,
+//! [`pup`]) optionally names the separate `flux-3-image-klein-pup` package that rewrites the
+//! prompt before encoding when a request sets `enhance_prompt`. See `UPSTREAM.md` for the
+//! pinned revisions and the coverage table, and `tests/fixtures/` for the committed miniature
+//! fixtures dumped by `../tools/dump_flux3_*.py` from the frozen source.
 //!
 //! [`gen_core::flux3`]: mlx_gen::gen_core::flux3
 
@@ -27,6 +29,7 @@ pub mod memory_strategy;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod pup;
 pub mod text_encoder;
 
 pub use autoencoder::Flux3AutoEncoder;
@@ -43,6 +46,7 @@ pub use pipeline::{
     decode_tokens, denoise_flow_map, denoise_one, float_image_to_rgb8, generate_one, image_ids,
     noise,
 };
+pub use pup::{Flux3PromptUpsampler, UPSAMPLER_COMPONENT, UPSAMPLER_REPO, UPSAMPLER_REVISION};
 pub use text_encoder::{Flux3TextEncoder, TextConditioning};
 
 /// Add the MLX distilled FLUX 3 generator to an explicit media registry builder, with its
@@ -74,6 +78,7 @@ mod tests {
             super::UPSTREAM_CODE_REVISION,
             super::DISTILLED_WEIGHTS_REVISION,
             super::TEXT_ENCODER_UPSTREAM_REVISION,
+            super::UPSAMPLER_REVISION,
         ] {
             assert!(doc.contains(sha), "UPSTREAM.md must record {sha}");
         }

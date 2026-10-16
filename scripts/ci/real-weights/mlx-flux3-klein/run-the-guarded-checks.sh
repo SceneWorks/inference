@@ -24,5 +24,7 @@ run_guarded 64 1800 real_weights::real_autoencoder_decode_matches_upstream
 run_guarded 64 1800 real_weights::real_dit_forward_matches_upstream
 run_guarded 64 1800 real_weights::real_e2e_64_matches_upstream
 run_guarded 64 1800 real_weights::real_distilled_text_to_image_renders
+# sc-26238: the prompt upsampler alone (the 9B VLM resident, ~19 GB), two real rewrites.
+run_guarded 64 1800 real_weights::real_prompt_upsampler_rewrites_the_readme_request
 ls -la "$FLUX3_OUT"
 exit "$failed"

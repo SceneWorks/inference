@@ -774,6 +774,9 @@ fn validation_render_at(
                         Progress::Loading(phase) => format!("loading {phase:?}"),
                         Progress::Step { current, .. } => format!("step {current} reported"),
                         Progress::Decoding => "before decode".to_owned(),
+                        Progress::Upsampling { tokens, max_tokens } => {
+                            format!("upsampling {tokens}/{max_tokens}")
+                        }
                     };
                     memory_line(&label, &footprint_for_progress);
                 }
