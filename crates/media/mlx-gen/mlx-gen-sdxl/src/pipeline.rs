@@ -20,7 +20,9 @@ use mlx_gen::{
 
 use crate::inpaint::InpaintBlend;
 use crate::long_prompt::ChunkedTokens;
-use crate::sampler::{AncestralEuler, EulerSampler};
+#[cfg(any(test, feature = "training"))]
+use crate::sampler::AncestralEuler;
+use crate::sampler::EulerSampler;
 use crate::text_encoder::ClipTextEncoder;
 use crate::unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 use crate::vae::{Autoencoder, SdxlLatentDecoder};
@@ -1277,6 +1279,7 @@ pub fn decode_image_tiled(
 /// as inference does, runs the plain [`denoise`] with the configured `guidance`. `conditioning`/`pooled`
 /// are the pre-encoded **CFG batch** (`[2, …]` = positive then empty-negative), so the denoise loop's
 /// classifier-free guidance has both streams. No progress/cancel plumbing — the caller drives cadence.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     unet: &UNet2DConditionModel,
@@ -1331,7 +1334,7 @@ mod tests {
     /// The tiny-U-Net inputs for one guided step: a latent and a distinct `[cond, uncond]` pair in
     /// every CFG-batched input, so a mode that mixed up rows would fail.
     fn guided_inputs() -> (Array, Array, Array, Array) {
-        use crate::training::family::test_support::{TINY_CONTEXT_DIM, TINY_POOLED_DIM};
+        use crate::test_support::{TINY_CONTEXT_DIM, TINY_POOLED_DIM};
         let ramp = |shape: &[i32], phase: f32| {
             let n = shape.iter().product::<i32>();
             let v = (0..n)
@@ -1360,7 +1363,7 @@ mod tests {
 
     /// The tiny U-Net at `dtype` (weights cast before construction, like a real f16 load).
     fn tiny_unet_at(dtype: mlx_rs::Dtype) -> UNet2DConditionModel {
-        use crate::training::family::test_support::{tiny_unet_config, tiny_unet_weights};
+        use crate::test_support::{tiny_unet_config, tiny_unet_weights};
         let mut w = tiny_unet_weights(7).unwrap();
         w.cast_all(dtype).unwrap();
         UNet2DConditionModel::from_weights(&w, &tiny_unet_config()).unwrap()
@@ -1445,7 +1448,7 @@ mod tests {
     /// too, and a sequential half must run them at the pair's batch as well.
     #[test]
     fn sequential_cfg_is_byte_identical_with_the_ip_adapter() {
-        use crate::training::family::test_support::TINY_CONTEXT_DIM;
+        use crate::test_support::TINY_CONTEXT_DIM;
         for (cpu, dtype) in cfg_identity_cells() {
             on_device(cpu, || {
                 let mut unet = tiny_unet_at(dtype);

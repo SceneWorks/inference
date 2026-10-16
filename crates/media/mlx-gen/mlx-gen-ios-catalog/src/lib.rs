@@ -18,6 +18,14 @@
 //! exactly as on macOS; this crate only chooses the iOS **defaults** inside that published
 //! domain: the [`IOS_OFFLOAD_POLICY`] load and the decode tile edge [`sana_decode_tile_edge`]
 //! selects from the device measurements (and bounds inferred from them).
+//!
+//! **Anima Turbo** (`mlx-gen-anima`, `anima_turbo` only — not Base or Aesthetic), compiled without
+//! the crate's `training` feature, so no trainer and no `mlx-gen-perceptual` reaches the bundle. Its
+//! ladder is the provider's contract too; [`anima`] supplies the measured peaks admission checks and
+//! picks the iOS selection — staged residency with a tiled decode — through the provider's registered
+//! safety check. Its Qwen-Image VAE brings `mlx-gen-qwen-image`, and with it `mlx-gen-wan` (Qwen's
+//! optional single-frame decoder), as compiled code only: no Qwen-Image or Wan generator is
+//! registered here.
 
 use mlx_gen::gen_core::{
     Error, GenerationMemory, LoadSpec, OffloadPolicy, ProviderRegistry, ProviderRegistryBuilder,
@@ -26,12 +34,20 @@ use mlx_gen::gen_core::{
 use mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES;
 use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVERLAP};
 
+pub mod anima;
+pub use anima::{
+    anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
+    anima_turbo_memory_selection, ios_memory_budget, ANIMA_TURBO_ID,
+};
+
 /// Add the iOS image generators to an explicit media registry builder, in catalog order.
 ///
 /// Order is part of the surface: [`provider_registry`]'s ids are asserted in this order by the
 /// crate's surface test, so a reordering is a deliberate edit rather than an accident.
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
-    mlx_gen_sana::register_providers(registry)
+    // Turbo alone, through the provider's own per-variant seam: its generator and complete memory
+    // registration, never a trainer — whatever features another crate unifies onto `mlx-gen-anima`.
+    mlx_gen_anima::register_turbo_generator(mlx_gen_sana::register_providers(registry))
 }
 
 /// Build the complete, explicit iOS media provider catalog.
@@ -237,12 +253,27 @@ mod tests {
 
         assert_eq!(
             ids,
-            ["sana_1600m", "sana_sprint_1600m"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
             "the iOS media surface changed -- if deliberate, update this test and confirm the new \
              provider fits the measured iOS cap"
         );
         assert_eq!(registry.trainers().len(), 0, "iOS ships no trainers");
         assert_eq!(registry.captioners().len(), 0, "iOS ships no captioners");
+    }
+
+    /// The shared weights-free behavior oracle over this catalog's own registrations — Anima
+    /// Turbo's contract, fixture, safety check and request scope arrive through
+    /// `register_turbo_generator` exactly as `mlx-gen-catalog` registers them, on the iOS load.
+    #[test]
+    fn memory_registrations_pass_the_weights_free_behavior_oracle() {
+        let registry = super::provider_registry().expect("iOS media catalog builds");
+        let spec = super::anima_turbo_load_spec(WeightsSource::Dir("/nonexistent".into()));
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        let adopted: Vec<_> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert!(adopted.contains(&super::ANIMA_TURBO_ID), "{adopted:?}");
     }
 
     /// Every descriptor is on the `mlx` backend, which `runtime-catalog` enforces again when this

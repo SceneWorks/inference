@@ -20,20 +20,30 @@ mlx-rs = { workspace = true }
 # root workspace so cargo unifies ONE mlx-llm across the worker graph.
 mlx-llm = { workspace = true }
 # state.json of the durable training checkpoints and the adapter metadata lists (sc-25685).
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 # MLX's distributed layer (`mlx::core::distributed`: ring / jaccl / mpi) for data-parallel
 # training (sc-25689) — the C bindings mlx-rs does not wrap. Same pin as mlx-rs (workspace).
-mlx-sys = { workspace = true }
+mlx-sys = { workspace = true, optional = true }
 # Header-only image validation in the training dataset pass (decode lives in gen_core::iris::train).
-image = { workspace = true }
+image = { workspace = true, optional = true }
+
+[features]
+# The three trainers (`training`: generation, depth, restoration) and their training-only deps —
+# MLX distributed + the JACCL link (`build.rs`), dataset image validation, checkpoint state.
+# Default-on, so every existing consumer is unchanged; an inference-only graph (the iOS bundle)
+# depends with `default-features = false` and compiles and links no trainer (sc-26265).
+default = ["training"]
+training = ["dep:cc", "dep:image", "dep:mlx-sys", "dep:serde_json"]
 
 [build-dependencies]
 # build.rs links MLX's libjaccl.a (or compiles the JACCL-absent shim for a prebuilt MLX without it)
 # so `mlx::core::distributed::init` links (sc-25689).
-cc = { workspace = true }
+cc = { workspace = true, optional = true }
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }
+# The weights-free memory-contract fixtures write a safetensors header (`memory_strategy` tests).
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 # The restoration fixture pins upstream's PIL-Lanczos budget resize by the sha256 of its bytes.
 sha2 = { workspace = true }
@@ -45,3 +55,6 @@ sha2 = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+# The binary carries the trainer tests and the training-only deps (`image`), so it needs the
+# default-on `training` feature; `--no-default-features` skips it rather than failing (sc-26265).
+required-features = ["training"]

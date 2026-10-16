@@ -11,7 +11,7 @@ collection of backend crates.
 | `BACKEND` | `mlx` |
 | `SUPPORTED_TARGET_TRIPLES` | `aarch64-apple-ios`, `aarch64-apple-ios-sim` |
 | `NATIVE_PREREQUISITES` | iOS 18.0+, Xcode 16+ with the Metal toolchain |
-| Media surface (`media`, default) | `sana_1600m`, `sana_sprint_1600m` |
+| Media surface (`media`, default) | `sana_1600m`, `sana_sprint_1600m`, `anima_turbo` |
 | Text LLMs | `mlx-llama`, `mlx-joycaption`, `mlx-starvector-1b`, `mlx-starvector-8b` |
 | Snapshot preparer | `mlx` |
 
@@ -26,10 +26,12 @@ Not an omission — a composition decision, enforced by this crate's surface tes
 `mlx-gen-catalog` composes every MLX provider crate, including the video families (`wan`, `ltx`,
 `mochi`, `svd`). That is the wrong shape for a device with a hard per-app memory cap, and none of
 it has been validated on iOS. The image lane instead composes
-[`mlx-gen-ios-catalog`](../../media/mlx-gen/mlx-gen-ios-catalog), a reviewable subset: today SANA,
-whose memory ladder is the provider's own contract and whose iOS defaults (the `Sequential` load
-and the DC-AE decode tile chosen from recorded device footprints against a 4 GiB budget) live in
-that crate.
+[`mlx-gen-ios-catalog`](../../media/mlx-gen/mlx-gen-ios-catalog), a reviewable subset: today SANA
+and Anima Turbo. Each memory ladder is the provider's own contract; the iOS defaults live in that
+crate — for SANA the `Sequential` load and the DC-AE decode tile chosen from recorded device
+footprints against a 4 GiB budget, for Anima Turbo (built without its trainers) the deferred load and
+the staged + tiled selection admitted through the provider's safety check against host-measured
+bounds.
 
 The Candle `audio` lane is out of scope until an iOS audio story exists: that lane is the one
 sanctioned cross-backend seam (`docs/architecture/audio-backend-strategy.md`) and should not be
