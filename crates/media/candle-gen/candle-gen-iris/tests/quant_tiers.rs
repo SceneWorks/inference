@@ -375,9 +375,11 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
 /// cos ≥ 0.90.
 ///
 /// *Mutations that red this:* loading dense at a quantized tier; counting the tied head twice;
-/// quantizing the embedding (pricing mismatch); a forward that quantizes the activation is not
-/// caught here (CPU) — `candle-llm`'s `a_dequantized_forward_projection_never_quantizes_the_activation`
-/// holds that.
+/// quantizing the embedding (pricing mismatch); a tower spec without
+/// `with_dequantized_forward` (every packed projection would fall back to `QMatMul`, which
+/// quantizes the activation — the census below counts weight-only projections; the conditioning
+/// bounds alone absorb it). That the weight-only forward is exact is held by `candle-llm`'s
+/// `a_dequantized_forward_projection_never_quantizes_the_activation`.
 #[test]
 fn the_text_tower_holds_packed_projections_at_each_tier() {
     let scratch = tempfile::tempdir().unwrap();
@@ -389,6 +391,19 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
         let te =
             IrisTextEncoder::load_quantized(&tower, &config.text_encoder, &cpu(), quant).unwrap();
         assert_eq!(te.is_quantized(), quant.is_some(), "{quant:?}");
+        let census = te.projection_census();
+        if quant.is_some() {
+            // Every attention / MLP projection packed and served weight-only; only the tied head
+            // stays dense.
+            assert!(census.ggml.count > 0, "{quant:?}: {census:?}");
+            assert_eq!(
+                census.ggml_weight_only, census.ggml.count,
+                "{quant:?}: {census:?}"
+            );
+            assert_eq!(census.dense.count, 1, "{quant:?}: {census:?}");
+        } else {
+            assert_eq!(census.ggml.count, 0, "{census:?}");
+        }
         let resident = te.resident_weight_bytes();
         let priced = generation_contract(&spec(&tower, quant))
             .unwrap()

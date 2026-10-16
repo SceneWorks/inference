@@ -351,6 +351,13 @@ impl QuantizedLinear {
         }
     }
 
+    /// Whether the forward dequantizes the weight and multiplies the activation densely (built by
+    /// [`Self::quantize_dequantized`] or an MLX affine source) instead of through `QMatMul`, which
+    /// quantizes the activation.
+    pub fn dequantizes_forward(&self) -> bool {
+        matches!(self.inner, QuantizedWeight::Dequant(_))
+    }
+
     /// Forward pass: `x @ dequant(weight)ᵀ (+ bias)`. The quantized matmul runs in f32; the result is
     /// cast back to `x`'s dtype so it composes with a bf16 decoder.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -411,10 +418,23 @@ mod tests {
     /// its forward is exactly `x · deq(W)ᵀ`, even beside a 1e4 outlier channel, where the
     /// activation-quantizing path visibly is not.
     ///
-    /// *Mutation that reds this:* `quantize_dequantized` building a `QuantizedWeight::Matmul`.
+    /// *Mutation that reds this:* `quantize_dequantized` building a `QuantizedWeight::Matmul` (for
+    /// any one of Q8_0 / Q4_0 / Q4_K), or `dequantizes_forward` not reporting it.
     #[test]
     fn a_dequantized_forward_projection_never_quantizes_the_activation() {
-        let (out, inn) = (8usize, 64usize);
+        // Q4_K is the shipped q4 tier on 256-aligned widths (the real Qwen3-VL tower); its
+        // super-block needs `in` = 256.
+        for (dtype, inn) in [
+            (GgmlDType::Q8_0, 64usize),
+            (GgmlDType::Q4_0, 64),
+            (GgmlDType::Q4K, 256),
+        ] {
+            weight_only_forward_is_exact(dtype, inn);
+        }
+    }
+
+    fn weight_only_forward_is_exact(dtype: GgmlDType, inn: usize) {
+        let out = 8usize;
         let wdata: Vec<f32> = (0..out * inn)
             .map(|i| ((i * 7 % 13) as f32 / 13.0) - 0.5)
             .collect();
@@ -425,25 +445,24 @@ mod tests {
         xdata[3] = 1.0e4;
         let x = Tensor::from_vec(xdata, (2, inn), &Device::Cpu).unwrap();
         let rows = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for dtype in [GgmlDType::Q8_0, GgmlDType::Q4_0] {
-            let weight_only = QuantizedLinear::quantize_dequantized(&w, dtype, None).unwrap();
-            let matmul = QuantizedLinear::quantize(&w, dtype, None).unwrap();
-            assert_eq!(weight_only.resident_bytes(), matmul.resident_bytes());
-            assert_eq!(weight_only.ggml_dtype(), Some(dtype));
-            let deq = QTensor::quantize(&w, dtype)
-                .unwrap()
-                .dequantize(&Device::Cpu)
-                .unwrap();
-            let exact = rows(linear(&x, &deq, None).unwrap());
-            assert_eq!(rows(weight_only.forward(&x).unwrap()), exact, "{dtype:?}");
-            let fast = rows(matmul.forward(&x).unwrap());
-            let drift = exact
-                .iter()
-                .zip(&fast)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
-            assert!(drift > 0.0, "{dtype:?}: the QMatMul path matched exactly");
-        }
+        let weight_only = QuantizedLinear::quantize_dequantized(&w, dtype, None).unwrap();
+        let matmul = QuantizedLinear::quantize(&w, dtype, None).unwrap();
+        assert_eq!(weight_only.resident_bytes(), matmul.resident_bytes());
+        assert_eq!(weight_only.ggml_dtype(), Some(dtype));
+        assert!(weight_only.dequantizes_forward() && !matmul.dequantizes_forward());
+        let deq = QTensor::quantize(&w, dtype)
+            .unwrap()
+            .dequantize(&Device::Cpu)
+            .unwrap();
+        let exact = rows(linear(&x, &deq, None).unwrap());
+        assert_eq!(rows(weight_only.forward(&x).unwrap()), exact, "{dtype:?}");
+        let fast = rows(matmul.forward(&x).unwrap());
+        let drift = exact
+            .iter()
+            .zip(&fast)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(drift > 0.0, "{dtype:?}: the QMatMul path matched exactly");
     }
 
     /// sc-19375: a stored block is used exactly as stored. The hand-built Q8_0 blocks are **not**

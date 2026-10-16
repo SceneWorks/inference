@@ -311,6 +311,10 @@ pub struct ProjectionCensus {
     pub prism: ProjectionTally,
     /// NVFP4 projections.
     pub nvfp4: ProjectionTally,
+    /// How many of the `ggml` projections are served weight-only (sc-26266): the forward
+    /// dequantizes the weight and multiplies the activation densely, never quantizing it
+    /// ([`QuantSpec::with_dequantized_forward`]). The rest of `ggml` runs through `QMatMul`.
+    pub ggml_weight_only: u64,
 }
 
 impl ProjectionCensus {
@@ -322,6 +326,9 @@ impl ProjectionCensus {
             ProjectionKind::Prism => &mut self.prism,
             ProjectionKind::Nvfp4 => &mut self.nvfp4,
         };
+        if let Projection::Quantized(q) = p {
+            self.ggml_weight_only += u64::from(q.dequantizes_forward());
+        }
         tally.count += 1;
         tally.params += p.params();
         match p.resident_bytes() {
@@ -355,6 +362,7 @@ impl ProjectionCensus {
         self.ggml.add(&other.ggml);
         self.prism.add(&other.prism);
         self.nvfp4.add(&other.nvfp4);
+        self.ggml_weight_only += other.ggml_weight_only;
     }
 }
 

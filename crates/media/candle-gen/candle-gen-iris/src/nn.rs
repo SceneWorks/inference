@@ -111,9 +111,14 @@ enum Source {
 pub struct Checkpoint {
     source: Source,
     device: Device,
+    /// The same file mmapped onto the host, when `device` is not the CPU: the source a packed
+    /// projection is quantized from (sc-26266), so its f32 weight never reaches the device.
+    host: Option<VarBuilder<'static>>,
     /// Key prefix of this view (`""` for the whole file); `keys` are stored without it.
     prefix: String,
     keys: BTreeSet<String>,
+    /// Each key's stored shape, read from the header (a tensor map's own shapes).
+    shapes: BTreeMap<String, Vec<usize>>,
     used: RefCell<BTreeSet<String>>,
     /// The dtype each key a [`Loader`] consumed is held in once its module is built — the
     /// load-exact width inventory `crate::memory_strategy` prices a backbone against.
@@ -141,6 +146,13 @@ pub fn loader_cast_bytes() -> usize {
     LOADER_CAST_BYTES.with(|c| c.get())
 }
 
+fn missing(key: &str) -> Error {
+    Error::Msg(format!(
+        "iris: the backbone checkpoint is missing `{key}` (config.yaml and model.safetensors \
+         disagree)"
+    ))
+}
+
 impl Checkpoint {
     /// mmap `file` onto `device` (tensors are read one at a time at f32, then cast by the caller).
     pub fn open(file: &Path, device: &Device) -> Result<Self> {
@@ -150,16 +162,29 @@ impl Checkpoint {
     /// The view of `file` under `prefix` (e.g. the depth export's `pixel.` backbone): keys are
     /// taken and reported without the prefix, and keys outside it are not part of this view.
     pub fn open_prefixed(file: &Path, device: &Device, prefix: &str) -> Result<Self> {
-        let keys = safetensors_keys(file)?
+        let shapes: BTreeMap<String, Vec<usize>> = safetensors_shapes(file)?
             .into_iter()
-            .filter_map(|k| k.strip_prefix(prefix).map(str::to_owned))
+            .filter_map(|(k, shape)| k.strip_prefix(prefix).map(|k| (k.to_owned(), shape)))
             .collect();
-        let vb = candle_gen::mmap_var_builder(&[file.to_path_buf()], DType::F32, device)?;
+        let keys = shapes.keys().cloned().collect();
+        let files = [file.to_path_buf()];
+        let vb = candle_gen::mmap_var_builder(&files, DType::F32, device)?;
+        let host = if device.is_cpu() {
+            None
+        } else {
+            Some(candle_gen::mmap_var_builder(
+                &files,
+                DType::F32,
+                &Device::Cpu,
+            )?)
+        };
         Ok(Self {
             source: Source::Mmap(vb),
+            host,
             device: device.clone(),
             prefix: prefix.to_owned(),
             keys,
+            shapes,
             used: RefCell::new(BTreeSet::new()),
             stored: RefCell::new(BTreeMap::new()),
             residuals: RefCell::new(BTreeMap::new()),
@@ -174,7 +199,12 @@ impl Checkpoint {
     pub fn from_tensors(tensors: HashMap<String, Tensor>, device: &Device) -> Self {
         Self {
             keys: tensors.keys().cloned().collect(),
+            shapes: tensors
+                .iter()
+                .map(|(k, t)| (k.clone(), t.dims().to_vec()))
+                .collect(),
             source: Source::Map(tensors),
+            host: None,
             device: device.clone(),
             prefix: String::new(),
             used: RefCell::new(BTreeSet::new()),
@@ -204,17 +234,41 @@ impl Checkpoint {
     /// Read one tensor (as f32 from a file; as stored from a tensor map), recording the key as
     /// consumed.
     pub fn take(&self, key: &str) -> Result<Tensor> {
-        if !self.keys.contains(key) {
-            return Err(Error::Msg(format!(
-                "iris: the backbone checkpoint is missing `{key}` (config.yaml and \
-                 model.safetensors disagree)"
-            )));
-        }
-        self.used.borrow_mut().insert(key.to_owned());
+        self.consume(key)?;
         Ok(match &self.source {
             Source::Mmap(vb) => vb.get_unchecked(&format!("{}{key}", self.prefix))?,
             Source::Map(map) => map[key].clone(),
         })
+    }
+
+    /// [`take`](Self::take), read onto the host when this checkpoint is mmapped onto another
+    /// device (a tensor map's tensor as stored) — the source a packed projection is quantized
+    /// from, so its f32 weight never occupies the device.
+    fn take_host(&self, key: &str) -> Result<Tensor> {
+        match &self.host {
+            Some(host) => {
+                self.consume(key)?;
+                Ok(host.get_unchecked(&format!("{}{key}", self.prefix))?)
+            }
+            None => self.take(key),
+        }
+    }
+
+    /// The stored shape of `key`, read without touching its bytes.
+    fn shape_of(&self, key: &str) -> Result<&[usize]> {
+        self.shapes
+            .get(key)
+            .map(Vec::as_slice)
+            .ok_or_else(|| missing(key))
+    }
+
+    /// Record `key` as consumed (refused when the checkpoint does not carry it).
+    fn consume(&self, key: &str) -> Result<()> {
+        if !self.keys.contains(key) {
+            return Err(missing(key));
+        }
+        self.used.borrow_mut().insert(key.to_owned());
+        Ok(())
     }
 
     /// [`take`](Self::take) at `dtype`, as the modules hold it.
@@ -459,14 +513,21 @@ impl Loader<'_> {
     pub fn linear(&self, prefix: &str, bias: bool) -> Result<Linear> {
         let weight_key = format!("{prefix}.weight");
         let residuals = self.weights.take_residuals(prefix);
-        let stored = self.weights.take(&weight_key)?;
+        let in_features = self
+            .weights
+            .shape_of(&weight_key)?
+            .last()
+            .copied()
+            .unwrap_or(0);
         // An adapted projection packs like any other; its residuals stay forward-time terms over
         // the packed base, reading the checkpoint-width input ([`Linear::forward`]).
         if let ProjectionLayout::Quantized { dtype, padded_in } =
-            ProjectionLayout::of(stored.dims().last().copied().unwrap_or(0), self.quant)
+            ProjectionLayout::of(in_features, self.quant)
         {
+            let stored = self.weights.take_host(&weight_key)?;
             return self.quantized_linear(prefix, stored, bias, residuals, dtype, padded_in);
         }
+        let stored = self.weights.take(&weight_key)?;
         self.weights.record_stored(&weight_key, self.compute);
         if bias {
             self.weights
@@ -494,9 +555,10 @@ impl Loader<'_> {
             .collect()
     }
 
-    /// A projection packed at load (sc-26266): the checkpoint's weight, zero-padded to
-    /// `padded_in` columns, is quantized on the host to `dtype` straight from its stored (f32)
-    /// values and placed on the checkpoint's device — the compute-dtype copy is never built. The
+    /// A projection packed at load (sc-26266): the checkpoint's weight — read from the host mmap
+    /// ([`Checkpoint::take_host`]), never staged on the device — zero-padded to `padded_in`
+    /// columns, is quantized on the host to `dtype` straight from its stored (f32) values and
+    /// placed on the checkpoint's device — the compute-dtype copy is never built. The
     /// bias stays in the compute dtype.
     fn quantized_linear(
         &self,
