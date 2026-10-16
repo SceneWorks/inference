@@ -212,12 +212,12 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
     let mut over_bound = false;
     'edges: for edge in [512_i32, 1024] {
         let latent = quadrant_latent(&full, edge);
-        let (reference, ref_peak) = bounded_decode(|| full.decode(&latent));
+        let (reference, ref_peak) = bounded_decode(|| full.decode_evaluated(&latent));
         let mut decodes: Vec<Decode<'_>> = vec![(
             format!("{edge}² fp16 untiled"),
             FP16_MAX_PIXEL_DELTA,
             FP16_MEAN_PIXEL_DELTA,
-            Box::new(|| half.decode(&latent)),
+            Box::new(|| half.decode_evaluated(&latent)),
         )];
         for tile in DECODE_TILE_EDGES.iter().filter(|t| (**t as i32) < edge) {
             let tiling =

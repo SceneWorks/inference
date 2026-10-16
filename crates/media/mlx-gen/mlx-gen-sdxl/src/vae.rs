@@ -254,6 +254,38 @@ impl Decoder {
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
     }
 
+    /// Untiled inference tail with explicit lifetime boundaries. Every convolution and GroupNorm
+    /// still sees the ENTIRE spatial tensor, with the exact dense kernel geometry. Evaluating each
+    /// resnet convolution and upsample before proceeding prevents MLX's lazy graph from keeping
+    /// multiple full-resolution normalization/conv intermediates simultaneously live (sc-26268:
+    /// 1024² f32 reference peaked at 17.55 GiB despite a cleared allocator cache).
+    fn tail_evaluated(&self, x: &Array) -> Result<Array> {
+        x.eval()?;
+        let mut x = x.clone();
+        for up in &self.up_blocks {
+            for resnet in &up.resnets {
+                x = resnet.forward_evaluated_vae(&x)?;
+            }
+            if let Some((cw, cb)) = &up.upsample {
+                let enlarged = upsample_nearest(&x, 2)?;
+                enlarged.eval()?;
+                // Drop the previous-resolution activation before allocating convolution scratch.
+                x = enlarged;
+                x = conv2d(&x, cw, Some(cb), 1, 1)?;
+                x.eval()?;
+            }
+        }
+        let norm = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+        norm.eval()?;
+        drop(x);
+        let activated = silu(&norm)?;
+        activated.eval()?;
+        drop(norm);
+        let out = conv2d(&activated, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)?;
+        out.eval()?;
+        Ok(out)
+    }
+
     /// Layer-wise bounded tail with dense-image GroupNorm semantics (sc-19753).
     fn tail_tiled(
         &self,
@@ -448,6 +480,20 @@ impl Autoencoder {
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
         self.to_output(self.decoder.forward(&z)?)
+    }
+
+    /// Untiled, evaluated inference decode. Uses exactly [`decode`](Self::decode)'s full-image
+    /// convolutions, global normalization and attention, but materializes the head and every tail
+    /// convolution before constructing the next. Intended for memory-bounded dense reference
+    /// generation; this is NOT a tiled reference and does not change convolution geometry.
+    /// Do not use under autograd (evaluation intentionally releases the lazy graph).
+    pub fn decode_evaluated(&self, latents: &Array) -> Result<Array> {
+        let latents = self.to_compute(latents)?;
+        let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
+        let z = self.post_quant_proj.forward(&z)?;
+        let head = self.decoder.head(&z)?;
+        head.eval()?;
+        self.to_output(self.decoder.tail_evaluated(&head)?)
     }
 
     /// Ladder rung 2 — **bounded decode** (SC-15525): the same decode with each tail convolution
@@ -877,6 +923,43 @@ pub(crate) mod tests {
         assert!(
             max_delta < 3e-3,
             "layer-wise tiled SDXL VAE diverged from dense decode: max|delta|={max_delta:.3e}"
+        );
+    }
+
+    /// Evaluated reference keeps the untiled arithmetic, byte for byte, while cutting the lazy
+    /// graph's lifetime. This compares both output and allocator high-water on a decorrelated
+    /// tiny VAE: replacing `decode_evaluated` with the lazy decode must fail the peak comparison.
+    #[test]
+    fn evaluated_untiled_decode_preserves_pixels_and_reduces_peak() {
+        let _cpu = crate::test_device::cpu_only();
+        let (weights, cfg) = decorrelated_fixture();
+        let vae = f32_reference(&weights, &cfg);
+        let z = latent();
+        z.eval().unwrap();
+        let run = |evaluated| {
+            mlx_rs::memory::clear_cache();
+            mlx_rs::memory::reset_peak_memory();
+            let out = if evaluated {
+                vae.decode_evaluated(&z).unwrap()
+            } else {
+                vae.decode(&z).unwrap()
+            };
+            out.eval().unwrap();
+            let peak = mlx_rs::memory::get_peak_memory();
+            (f32_values(&out), peak)
+        };
+        // Warm the weight casts before measuring activation peaks.
+        drop(run(false));
+        let (dense, lazy_peak) = run(false);
+        let (evaluated, evaluated_peak) = run(true);
+        eprintln!("dense reference peak bytes: lazy={lazy_peak} evaluated={evaluated_peak}");
+        assert_eq!(
+            dense, evaluated,
+            "evaluating must not alter dense arithmetic"
+        );
+        assert!(
+            evaluated_peak < lazy_peak,
+            "evaluation must release transients: evaluated {evaluated_peak}, lazy {lazy_peak}"
         );
     }
 
