@@ -39,6 +39,7 @@ use crate::{Error, Result};
 pub mod adapters;
 pub mod image_input;
 pub mod pup;
+pub mod quantization;
 pub mod references;
 pub mod training;
 
