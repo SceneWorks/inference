@@ -244,6 +244,36 @@ impl ControlNet {
         time_ids: &Array,
         scale: f32,
     ) -> Result<ControlResiduals> {
+        self.forward_planned(
+            x,
+            cond_embed,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            scale,
+            crate::plan::SdxlForwardPlan::UNBOUNDED,
+        )
+    }
+
+    /// [`forward`](Self::forward) as one half of a sequential guided pair: `plan.cfg_row` (and
+    /// nothing else of the plan) is honoured exactly as the U-Net honours it — `encoder_x`,
+    /// `text_emb` and `time_ids` arrive at the pair's batch, every conditioning-only projection
+    /// runs at that batch, and each keeps this forward's row (sc-26268). `x` and `cond_embed` are
+    /// the half's own row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_planned(
+        &self,
+        x: &Array,
+        cond_embed: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        scale: f32,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+    ) -> Result<ControlResiduals> {
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_row(plan.cfg_row);
         let batch = x.shape()[0];
         let dtype = x.dtype();
 
@@ -268,7 +298,7 @@ impl ControlNet {
             timestep,
             text_emb,
             time_ids,
-            batch,
+            plan.conditioning_batch(batch),
             dtype,
         )?;
 
@@ -279,15 +309,15 @@ impl ControlNet {
         // Down — collect skip residuals (starting with the stem+cond output).
         let mut residuals: Vec<Array> = vec![x.clone()];
         for block in &self.down_blocks {
-            let (out, res) = block.forward(&x, encoder_x, &temb, None)?;
+            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, None, plan)?;
             x = out;
             residuals.extend(res);
         }
 
         // Mid.
-        x = self.mid_resnet0.forward(&x, Some(&temb))?;
-        x = self.mid_transformer.forward(&x, encoder_x)?;
-        x = self.mid_resnet1.forward(&x, Some(&temb))?;
+        x = self.mid_resnet0.forward_planned(&x, Some(&temb), plan)?;
+        x = self.mid_transformer.forward_ip(&x, encoder_x, None, plan)?;
+        x = self.mid_resnet1.forward_planned(&x, Some(&temb), plan)?;
 
         // Zero-conv heads + scale. Each collected skip residual must pair with exactly one zero-conv;
         // assert the geometry before the `zip` so a count mismatch points at the real cause here,

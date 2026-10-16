@@ -131,6 +131,36 @@ impl ResnetBlock2D {
 
     /// `x`: NHWC `[B, H, W, in]`; `temb`: `Some([B, temb_dim])` for the UNet, `None` for the VAE.
     pub fn forward(&self, x: &Array, temb: Option<&Array>) -> Result<Array> {
+        self.forward_planned(x, temb, crate::plan::SdxlForwardPlan::UNBOUNDED)
+    }
+
+    /// [`forward`](Self::forward) under a U-Net forward plan. Only the plan's
+    /// [`cfg_row`](crate::plan::SdxlForwardPlan::cfg_row) reaches a resnet: a sequential CFG half
+    /// hands in the guided pair's full-batch `temb`, projects it at that batch, and keeps its own
+    /// row (sc-26268).
+    pub fn forward_planned(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
+        self.forward_core(x, temb, plan, false)
+    }
+
+    /// Dense VAE inference with evaluation boundaries between convolutions. No spatial slicing or
+    /// arithmetic change; unlike the lazy/autograd forward this releases each convolution's
+    /// transients before constructing the next one.
+    pub(crate) fn forward_evaluated_vae(&self, x: &Array) -> Result<Array> {
+        self.forward_core(x, None, crate::plan::SdxlForwardPlan::UNBOUNDED, true)
+    }
+
+    fn forward_core(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        evaluate: bool,
+    ) -> Result<Array> {
         let y = group_norm(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let mut y = conv2d(
             &silu_glue(&y)?,
@@ -139,9 +169,12 @@ impl ResnetBlock2D {
             1,
             1,
         )?;
+        if evaluate {
+            y.eval()?;
+        }
         // Add the projected time embedding (UNet only), broadcast over H,W.
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
-            let tp = proj.forward(&silu_glue(t)?)?;
+            let tp = plan.select_cfg_row(proj.forward(&silu_glue(t)?)?, x.shape()[0])?;
             let tb = tp.shape();
             y = add(&y, &tp.reshape(&[tb[0], 1, 1, tb[1]])?)?;
         }
@@ -154,11 +187,18 @@ impl ResnetBlock2D {
             1,
         )?;
 
+        if evaluate {
+            y.eval()?;
+        }
         let residual = match &self.shortcut {
             Some(sc) => sc.forward(x)?,
             None => x.clone(),
         };
-        Ok(add(&residual, &y)?)
+        let out = add(&residual, &y)?;
+        if evaluate {
+            out.eval()?;
+        }
+        Ok(out)
     }
 
     /// VAE-only, normalization-correct bounded forward (sc-19753).
@@ -191,6 +231,7 @@ impl ResnetBlock2D {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
+        crate::vae::trace_decode_stage("resnet.conv1", &y)?;
         let norm2 = GlobalGroupNorm::new(&y, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
             &y,
@@ -200,6 +241,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| silu_glue(&norm2.apply(tile)?),
         )?;
+        crate::vae::trace_decode_stage("resnet.conv2", &y)?;
         let residual = match &self.shortcut {
             Some(sc) => sc.forward(x)?,
             None => x.clone(),
