@@ -30,6 +30,11 @@ Writes:
 Inputs: `FLUX3_SRC` (the frozen source tree) and `FLUX3_PUP` (the pinned pup package snapshot:
 only its configs, tokenizer and template are read, sha256-verified; the 18.8 GB weights are not
 needed). Run: `FLUX3_SRC=… FLUX3_PUP=… python -I tools/dump_flux3_pup_golden.py`.
+
+The ADDITIVE MLX mixed-precision oracle can be reproduced offline from the committed synthetic
+checkpoint and F32 inputs only: `python -I tools/dump_flux3_pup_golden.py --mlx-bf16-only`. It
+keeps language/lm_head BF16, vision F32 and recurrent state F32; the original F32 oracle is never
+rewritten by this mode. Exact ties are recorded, not promoted into hard greedy token identities.
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers  # noqa: E402
 from transformers import AutoProcessor, LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerFast  # noqa: E402
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor, smart_resize  # noqa: E402
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config  # noqa: E402
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration  # noqa: E402
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5RMSNorm  # noqa: E402
 
 torch.manual_seed(0)
 
@@ -67,12 +72,13 @@ PUP_SOURCE_SHA256 = {
 }
 # Verify every executable frozen module BEFORE importing it; dependencies above were loaded
 # before exposing the downloaded source directory on sys.path. Keep the trusted oracle as cwd.
-_frozen_source = import_upstream()
-for _relative, _expected in PUP_SOURCE_SHA256.items():
-    _got = hashlib.sha256((_frozen_source / _relative).read_bytes()).hexdigest()
-    if _got != _expected:
-        raise SystemExit(f"{_relative}: sha256 {_got} != pinned {_expected}")
-from flux3 import bbox, pup  # noqa: E402
+if "--mlx-bf16-only" not in sys.argv:
+    _frozen_source = import_upstream()
+    for _relative, _expected in PUP_SOURCE_SHA256.items():
+        _got = hashlib.sha256((_frozen_source / _relative).read_bytes()).hexdigest()
+        if _got != _expected:
+            raise SystemExit(f"{_relative}: sha256 {_got} != pinned {_expected}")
+    from flux3 import bbox, pup  # noqa: E402
 
 # sha256 of the pinned package files this oracle reads (revision PUP_REVISION).
 PUP_PACKAGE_SHA256 = {
@@ -513,8 +519,156 @@ def run_tiny(model, fast, processor_cfg: dict, prompts: dict, case: dict, refere
     }
 
 
+def assert_mlx_cast_boundaries(model, cache=None) -> None:
+    """The production Qwen35 loader casts language weights, not the source-dtype vision tower."""
+    assert all(p.dtype == torch.bfloat16 for p in model.model.language_model.parameters()), "language must be BF16"
+    assert model.lm_head.weight.dtype == torch.bfloat16, "lm_head must be BF16"
+    frequencies = [t for name, t in model.model.language_model.named_buffers() if name.endswith("inv_freq")]
+    assert frequencies and all(t.dtype == torch.float32 for t in frequencies), "RoPE frequencies must retain F32"
+    norms = [m for m in model.model.language_model.modules() if isinstance(m, Qwen3_5RMSNorm)]
+    assert norms and all(torch.equal(1.0 + m.weight.float(), (1.0 + m.weight).float()) for m in norms), "ordinary RMS multiplier must be load-folded in BF16"
+    assert all(p.dtype == torch.float32 for p in model.model.visual.parameters()), "vision must retain source F32"
+    if cache is not None:
+        conv, recurrent, kv = [], [], []
+        for layer in cache.layers:
+            conv_states = getattr(layer, "conv_states", {})
+            recurrent_states = getattr(layer, "recurrent_states", {})
+            conv.extend(t.dtype for t in conv_states.values() if t is not None)
+            recurrent.extend(t.dtype for t in recurrent_states.values() if t is not None)
+            for name in ["keys", "values"]:
+                tensor = getattr(layer, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    kv.append(tensor.dtype)
+        assert conv and all(t == torch.bfloat16 for t in conv), "convolution cache must be BF16"
+        assert recurrent and all(t == torch.float32 for t in recurrent), "recurrence must accumulate in F32"
+        assert kv and all(t == torch.bfloat16 for t in kv), "attention KV must be BF16"
+
+
+def dump_mlx_bf16_only() -> None:
+    """Add a mixed-precision oracle; NEVER rewrite the existing F32/Candle oracle or checkpoint.
+
+    This path needs only committed synthetic fixtures, no downloaded modules or model weights.
+    It consumes the frozen F32 oracle's exact token ids and policy pixels, first reproduces its
+    four F32 greedy runs, then runs language/lm_head BF16 with source-F32 vision. Per-step raw
+    logits and penalized scores support teacher-forced native replay across ambiguous ties.
+    """
+    import copy
+    from importlib.metadata import version
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    before = sha256_of(MLX_GOLDEN)
+    checkpoint = TINY_SNAPSHOT / "model.safetensors"
+    checkpoint_sha = sha256_of(checkpoint)
+    data = load_file(str(MLX_GOLDEN))
+    with safe_open(str(MLX_GOLDEN), framework="pt") as source:
+        metadata = dict(source.metadata())
+    config = Qwen3_5Config.from_pretrained(str(TINY_SNAPSHOT), local_files_only=True)
+    config._attn_implementation = "eager"
+    model = Qwen3_5ForConditionalGeneration(config).eval()
+    model.load_state_dict(load_file(str(checkpoint)), strict=True)
+    fast = PreTrainedTokenizerFast.from_pretrained(str(TINY_SNAPSHOT), local_files_only=True)
+    processor_cfg = json.loads((TINY_SNAPSHOT / "preprocessor_config.json").read_text(encoding="utf-8"))
+    processor = Qwen2VLImageProcessor(**{k: v for k, v in processor_cfg.items() if k != "image_processor_type"})
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(1)
+
+    def inputs_for(case):
+        ids = data[f"ids_{case}"].long().unsqueeze(0)
+        extras = {}
+        count = int(metadata[f"n_refs_{case}"])
+        if count:
+            images = [Image.fromarray(data[f"ref_{case}_{i}"].numpy(), "RGB") for i in range(count)]
+            pixels = processor(images=images, return_tensors="pt")
+            assert torch.equal(pixels["image_grid_thw"].int(), data[f"grid_{case}"])
+            extras.update(pixel_values=pixels["pixel_values"], image_grid_thw=pixels["image_grid_thw"])
+            extras["mm_token_type_ids"] = (ids == fast.convert_tokens_to_ids("<|image_pad|>")).long()
+        return ids, extras
+
+    def generate(case):
+        ids, extras = inputs_for(case)
+        penalty = float(metadata[f"presence_penalty_{case}"])
+        return model.generate(
+            input_ids=ids, **extras, max_new_tokens=GREEDY_STEPS, do_sample=False,
+            logits_processor=LogitsProcessorList([GeneratedOnlyPresence(ids.shape[1], penalty)]),
+            output_scores=True, output_logits=True, return_dict_in_generate=True,
+            eos_token_id=[fast.convert_tokens_to_ids(t) for t in ["<|im_end|>", "<|endoftext|>"]],
+        ), ids.shape[1]
+
+    cases = ["t2i", "t2i_bbox", "i2i", "i2i_bbox"]
+    with torch.inference_mode():
+        for case in cases:
+            run, n = generate(case)
+            assert torch.equal(run.sequences[0, n:].int(), data[f"generated_{case}"]), f"{case}: F32 source reproduction"
+    # Exactly the native loader's PARAMETER boundary: module.to(BF16) would also quantize the
+    # derived RoPE frequencies, unlike the native F32 inv_freq/cos/sin computation.
+    for parameter in model.model.language_model.parameters():
+        parameter.data = parameter.data.to(torch.bfloat16)
+    model.lm_head.to(torch.bfloat16)
+    # Native checkpoint_norm_weight loads (1 + w) in BF16 before RMS normalization. Re-express
+    # that rounded direct multiplier in HF's zero-centered parameterization; HF forward is
+    # unchanged, and the committed checkpoint is never written.
+    for module in model.model.language_model.modules():
+        if isinstance(module, Qwen3_5RMSNorm):
+            module.weight.data = ((1.0 + module.weight).float() - 1.0).to(torch.bfloat16)
+    assert_mlx_cast_boundaries(model)
+    wrong_models = [
+        ("whole_model_float32", copy.deepcopy(model).float()),
+        ("whole_model_bfloat16", copy.deepcopy(model).bfloat16()),
+    ]
+    wrong = copy.deepcopy(model)
+    wrong.model.language_model.to(torch.bfloat16)
+    wrong_models.append(("whole_language_module_bfloat16", wrong))
+    wrong = copy.deepcopy(model)
+    source_weights = load_file(str(checkpoint))
+    for name, module in wrong.model.language_model.named_modules():
+        if isinstance(module, Qwen3_5RMSNorm):
+            module.weight.data = source_weights[f"model.language_model.{name}.weight"].to(torch.bfloat16)
+    wrong_models.append(("unfolded_norm", wrong))
+    for label, wrong in wrong_models:
+        try:
+            assert_mlx_cast_boundaries(wrong)
+        except AssertionError as error:
+            print(f"{label}: cast-certificate assertion RED ({error})", flush=True)
+        else:
+            raise AssertionError(f"wrong {label} oracle escaped the cast certificate")
+    del wrong_models, wrong, source_weights
+
+    metadata.update(
+        oracle_precision="mlx_mixed_bf16_f32", language_compute_dtype="bfloat16",
+        vision_compute_dtype="float32", recurrence_dtype="float32", conv_cache_dtype="bfloat16",
+        rope_frequency_dtype="float32", ordinary_norm_multiplier="bf16_load_folded",
+        kv_cache_dtype="bfloat16", reference_torch_version=torch.__version__,
+        reference_transformers_version=version("transformers"), reference_python_version=sys.version.split()[0],
+        f32_oracle_sha256=before, checkpoint_sha256=checkpoint_sha,
+        cast_guard_negative_controls="whole_model_float32,whole_model_bfloat16,whole_language_module_bfloat16,unfolded_norm",
+    )
+    with torch.inference_mode():
+        for case in cases:
+            run, n = generate(case)
+            assert_mlx_cast_boundaries(model, run.past_key_values)
+            generated = run.sequences[0, n:].int()
+            scores = torch.stack([row[0].float() for row in run.scores])
+            raw_logits = torch.stack([row[0].float() for row in run.logits])
+            top = scores.topk(2, dim=-1).values
+            data[f"generated_{case}"] = generated
+            data[f"margins_{case}"] = top[:, 0] - top[:, 1]
+            data[f"logits_{case}"] = raw_logits[0].clone()
+            data[f"step_logits_{case}"] = raw_logits
+            data[f"step_scores_{case}"] = scores
+            metadata[f"decoded_{case}"] = fast.decode(generated.tolist(), skip_special_tokens=True)
+            print(f"{case}: BF16 language/F32 vision ids {generated.tolist()} margins {(top[:, 0] - top[:, 1]).tolist()}", flush=True)
+    assert sha256_of(MLX_GOLDEN) == before and sha256_of(checkpoint) == checkpoint_sha
+    out = FIXTURE_DIR / "flux3_pup_mlx_bf16_golden.safetensors"
+    save_file(data, str(out), metadata={k: str(v) for k, v in metadata.items()})
+    print(f"wrote {out}; original F32 oracle and checkpoint unchanged", flush=True)
+
+
 def main() -> None:
     verify_presence_processor()
+    if "--mlx-bf16-only" in sys.argv:
+        dump_mlx_bf16_only()
+        return
     global _TINY_CONFIG_JSON
     src = upstream_root()
     package = package_root()
