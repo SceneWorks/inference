@@ -382,6 +382,42 @@ fn conv_with_limit(x: &Tensor, conv: &Conv2d, padding: Padding, limit: usize) ->
     Ok(output)
 }
 
+/// Training-only bounded dtype conversion; never launches across the large-tensor bound.
+pub(super) fn training_cast(x: &Tensor, dtype: candle_gen::candle_core::DType) -> Result<Tensor> {
+    unary_with_limit(x, WORK_ELEMENTS, |part| Ok(part.to_dtype(dtype)?))
+}
+
+/// Training-only source opmath: retained parameters are selected precision. Convert only
+/// this operation's rounded operands, accumulate convolution AND bias in F32, then write
+/// selected precision ONCE. CPU half convolution is explicitly emulated; this is not a
+/// claim of a CUDA half/tensor-core kernel. Both paths reuse the safe spatial planner.
+pub(super) fn training_conv_f32_opmath(
+    x: &Tensor,
+    conv: &BoundedConv2d,
+    asymmetric_downsample: bool,
+) -> Result<Tensor> {
+    use candle_gen::candle_core::DType;
+    let inner = &conv.inner;
+    let float_conv = Conv2d::new(
+        inner.weight().to_dtype(DType::F32)?,
+        inner.bias().map(|b| b.to_dtype(DType::F32)).transpose()?,
+        *inner.config(),
+    );
+    let p = inner.config().padding;
+    let padding = if asymmetric_downsample {
+        Padding([0, 1, 0, 1])
+    } else {
+        Padding([p, p, p, p])
+    };
+    let value = conv_with_limit(
+        &training_cast(x, DType::F32)?,
+        &float_conv,
+        padding,
+        WORK_ELEMENTS,
+    )?;
+    training_cast(&value, x.dtype())
+}
+
 /// Retain affine tensors so a large norm can be split at WHOLE original group boundaries.
 /// Splitting spatial tiles and recomputing their norms would change the image and is not used.
 pub(super) struct BoundedGroupNorm {
@@ -436,6 +472,21 @@ impl BoundedGroupNorm {
         self.forward_with_limit(x, WORK_ELEMENTS)
     }
 
+    /// Training-only F32 statistics/affine opmath with one selected-dtype output write.
+    /// Whole-group splitting and usize assembly are exactly the inference planner's.
+    pub(super) fn training_forward_f32_opmath(&self, x: &Tensor) -> Result<Tensor> {
+        use candle_gen::candle_core::DType;
+        let norm = Self::new(
+            self.weight.to_dtype(DType::F32)?,
+            self.bias.to_dtype(DType::F32)?,
+            self.channels,
+            self.groups,
+            self.eps,
+        )?;
+        let output = norm.forward(&training_cast(x, DType::F32)?)?;
+        training_cast(&output, x.dtype())
+    }
+
     fn forward_with_limit(&self, x: &Tensor, limit: usize) -> Result<Tensor> {
         let (b, c, h, w) = x.dims4()?;
         if c != self.channels {
@@ -474,6 +525,35 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device};
     use candle_gen::candle_nn::Conv2dConfig;
+
+    #[test]
+    fn training_bf16_conv_cpu_emulation_fuses_bias_before_write_rounding() {
+        let low = |v: Vec<f32>, shape| {
+            Tensor::from_vec(v, shape, &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let x = low(vec![1.0078125], (1, 1, 1, 1));
+        let weight = low(vec![1.0078125], (1, 1, 1, 1));
+        let bias = Tensor::from_vec(vec![0.00390625f32], 1, &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let conv = BoundedConv2d::new(weight, Some(bias), Conv2dConfig::default());
+        let got = training_conv_f32_opmath(&x, &conv, false).unwrap();
+        assert_eq!(got.dtype(), DType::BF16);
+        assert_eq!(
+            got.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0234375]
+        );
+        assert_eq!(conv.weight().dtype(), DType::BF16);
+    }
 
     fn values(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()

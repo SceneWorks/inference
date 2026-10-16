@@ -16,6 +16,9 @@ mod common;
 #[path = "ae_parity.rs"]
 mod ae_parity;
 
+#[path = "ae_training_precision.rs"]
+mod ae_training_precision;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
