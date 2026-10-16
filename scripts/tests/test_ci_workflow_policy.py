@@ -3991,12 +3991,17 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if "macos" in json.dumps(job.get("runs-on", "")).lower()
         }
         self.assertIn("macos-nax", macos_jobs)
+        self.assertIn("ios-build", macos_jobs)
+        # Every macOS job is gated on a macOS-runner lane (macos_metal, or sc-16779's ios_build)
+        # that the windows-cuda dispatch leaves unselected.
+        macos_lanes = {"macos_metal", "ios_build"}
+        self.assertFalse(macos_lanes & {lane for lane, value in selected.items() if value == "true"})
         for name in macos_jobs:
             with self.subTest(job=name):
-                self.assertIn(
-                    "needs.changes.outputs.macos_metal == 'true'",
-                    parsed["jobs"][name].get("if", ""),
-                    f"{name} could be scheduled by a dispatch that did not select the macOS lane",
+                condition = parsed["jobs"][name].get("if", "")
+                self.assertTrue(
+                    any(f"needs.changes.outputs.{lane} == 'true'" in condition for lane in macos_lanes),
+                    f"{name} could be scheduled by a dispatch that did not select a macOS lane",
                 )
 
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
