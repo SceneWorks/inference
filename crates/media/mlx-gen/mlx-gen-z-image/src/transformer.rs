@@ -10,9 +10,11 @@
 //! trained checkpoint's pad tokens are non-zero. Position ids / coord grids are computed in plain
 //! Rust and asserted exact in the parity test.
 
+#[cfg(feature = "training")]
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+#[cfg(feature = "training")]
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::Array;
 
@@ -21,8 +23,11 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+#[cfg(feature = "training")]
+use mlx_gen::adapters::Adapter;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::AttentionPlan;
+#[cfg(feature = "training")]
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -389,6 +394,7 @@ impl ZImageTransformer {
     /// Run the DiT for one denoise step against a cached [`Prepared`]. `x` is the current latent
     /// `(C, F, H, W)` (same dims as `prep` was built for) and `timestep` ∈ [0,1]; only the latent
     /// values and timestep vary across steps. Returns the latent-shaped velocity `(C, F, H, W)`.
+    #[cfg(feature = "training")]
     pub(crate) fn forward_with(&self, prep: &Prepared, x: &Array, timestep: f32) -> Result<Array> {
         self.forward_with_budgeted(prep, x, timestep, AttentionPlan::UNBOUNDED)
     }
@@ -576,6 +582,7 @@ impl ZImageTransformer {
     /// adapter-routable LOCAL paths (e.g. `"attention.to_q"`) trained on main block `i`, in the order
     /// their factors are threaded as checkpoint inputs. Blocks with no trained targets still run
     /// checkpointed (hidden-only input) so the whole stack is uniformly recompute-on-backward.
+    #[cfg(feature = "training")]
     pub(crate) fn forward_with_main_checkpointed(
         &self,
         prep: &Prepared,
@@ -854,6 +861,7 @@ impl Prepared {
     /// f32 — the caption entry runs full precision and joins the unified stack cast (see
     /// `ZImageTransformer::train_unify_dtype`). The keep masks are handled dtype-following inside
     /// `apply_pad`. Inference never calls this (its `Prepared` stays f32, KEEP-F32 / sc-2609).
+    #[cfg(feature = "training")]
     pub(crate) fn cast_floats(&self, dtype: mlx_rs::Dtype) -> Result<Prepared> {
         Ok(Prepared {
             cap_tokens: self.cap_tokens.clone(),

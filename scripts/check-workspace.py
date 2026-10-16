@@ -73,6 +73,17 @@ FORBIDDEN_GRAPH_PACKAGES = {
     # make linker participation part of the supported runtime graph again.
     "inventory",
 }
+# sc-26265 (epic 16774 E6): the iPhone build compiles no trainer and no training-only perceptor.
+# Each root is resolved on its own for aarch64-apple-ios over normal edges with the features that
+# build would really activate (`cargo tree -p <root>`, not the workspace-unified `cargo metadata`
+# feature set, where mlx-gen-catalog's default-on `training` would mask every root). A single edge
+# that drops `default-features = false` (anima -> z-image, qwen-image -> wan, ...) turns this red.
+IOS_GRAPH_ROOTS = ("mlx-gen-ios-catalog", "runtime-ios")
+IOS_GRAPH_TARGET = "aarch64-apple-ios"
+IOS_FORBIDDEN_PACKAGES = {"mlx-gen-perceptual", "mlx-gen-depth"}
+# Any first-party MLX crate resolving with `training` on (anima, z-image, wan, qwen-image, and the
+# iris/sdxl crates should they ever join the iOS graph).
+IOS_FORBIDDEN_FEATURE = ("mlx-gen", "training")
 # Directory names whose subtrees are not part of this checkout's single workspace: the git store
 # and build output (.git, target), plus agent tooling that nests its own gitignored worktrees --
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
@@ -429,6 +440,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "the behavior registration of the restoration contract (sc-25690): wired to each backend's "
         "own fixture and begin-request functions, as this family's RESTORE_MEMORY_REGISTRATION is "
         "to its contract. Not geometry."
+    ),
+    ("iris", "QUANT_GROUP_SIZE"): (
+        "the same number spelled through each backend's own crate (sc-26266): both are MLX's default "
+        "affine group size, 64 — mlx `mlx_gen::quant::DEFAULT_GROUP_SIZE`, candle "
+        "`candle_gen::quant::MLX_GROUP_SIZE` (the candle twin names it so the two backends pack the "
+        "same projections over the same padded widths). `_const_numbers` resolves same-crate names "
+        "only, so the two compare unequal by spelling whatever the value does."
     ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
@@ -1207,6 +1225,51 @@ def check_graph(metadata: dict) -> None:
     }
     if tokenizer_minors != {"0.21", "0.22"}:
         fail(f"expected intentional tokenizers 0.21/0.22 split, found {tokenizer_minors}")
+
+
+def ios_root_graph(root: str, offline: bool) -> dict[str, set[str]]:
+    """Package name -> activated features for one root's normal-edge iOS build graph.
+
+    `cargo tree --target` only asks rustc for the target's cfg set, so it needs neither the iOS
+    standard library nor an SDK and runs on the Linux workspace lane.
+    """
+    command = [
+        "cargo", "tree", "--locked", "-p", root, "--target", IOS_GRAPH_TARGET,
+        "-e", "normal", "--prefix", "none", "--format", "{p}|{f}",
+    ]
+    if offline:
+        command.append("--offline")
+    result = subprocess.run(command, cwd=ROOT, check=False, capture_output=True)
+    if result.returncode:
+        sys.stderr.write(result.stderr.decode("utf-8", errors="replace"))
+        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} failed with exit code {result.returncode}")
+    graph: dict[str, set[str]] = {}
+    for line in result.stdout.decode("utf-8").splitlines():
+        package, _, features = line.partition("|")
+        if not package.strip():
+            continue
+        name = package.split()[0]
+        enabled = {feature for feature in features.replace("(*)", "").strip().split(",") if feature}
+        graph.setdefault(name, set()).update(enabled)
+    if root not in graph:
+        fail(f"cargo tree for {root} on {IOS_GRAPH_TARGET} did not list the root itself")
+    return graph
+
+
+def check_ios_graph(offline: bool) -> None:
+    """No trainer and no training-only perceptor in any iOS root's build graph (sc-26265 / E6)."""
+    prefix, feature = IOS_FORBIDDEN_FEATURE
+    for root in IOS_GRAPH_ROOTS:
+        graph = ios_root_graph(root, offline)
+        forbidden = sorted(IOS_FORBIDDEN_PACKAGES & graph.keys())
+        if forbidden:
+            fail(f"{root} on {IOS_GRAPH_TARGET} reaches training-only packages: {forbidden}")
+        training = sorted(
+            name for name, features in graph.items()
+            if name.startswith(prefix) and feature in features
+        )
+        if training:
+            fail(f"{root} on {IOS_GRAPH_TARGET} enables `{feature}` on: {training}")
 
 
 def check_network_clients(metadata: dict) -> None:
@@ -3193,6 +3256,7 @@ def main() -> int:
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)
+        check_ios_graph(args.offline)
         check_rust_sources(ROOT)
         check_pid_decode_route_adoption(metadata, ROOT)
         check_snapshot_path_derivation(ROOT)
@@ -3205,7 +3269,8 @@ def main() -> int:
     print(
         "workspace gate: OK "
         f"({EXPECTED_MEMBER_COUNT} path members, one lockfile, explicit registries, pinned backends, "
-        "intentional tokenizer split, no network clients, no HF-cache references, "
+        "intentional tokenizer split, no network clients, no trainers in the iOS graph, "
+        "no HF-cache references, "
         "no $HOME-derived snapshot paths, no unguarded test temp roots, "
         "no cross-backend geometry drift)"
     )

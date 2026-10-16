@@ -71,6 +71,7 @@ jobs:
       contracts: ${{ steps.select.outputs.contracts }}
       candle_cpu: ${{ steps.select.outputs.candle_cpu }}
       macos_metal: ${{ steps.select.outputs.macos_metal }}
+      ios_build: ${{ steps.select.outputs.ios_build }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
       docs: ${{ steps.select.outputs.docs }}
       release: ${{ steps.select.outputs.release }}
@@ -795,6 +796,69 @@ jobs:
           cargo test --locked -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
 
+  # sc-16779 (epic 16774): the iOS cross-build. `runtime-ios`'s HOST build and tests ride
+  # `macos-metal`; this lane proves the bundle compiles for the device and simulator triples AND that
+  # what it emits is an iOS artifact. A green build alone is not that evidence: the failure mode is a
+  # build that succeeds while MLX's kernels were compiled with `xcrun -sdk macosx`, which links fine
+  # and dies at `newLibraryWithURL` on a device. The triple assertion is the mlx-rs fork's
+  # cross-apple.yml check, factored into scripts/ci/assert_metallib_triple.sh so it runs locally too.
+  #
+  # Deliberately NO `IPHONEOS_DEPLOYMENT_TARGET` here, job- or step-level: `.cargo/config.toml`
+  # scopes the iOS floor (18.0) to the iOS triples and the fork's build.rs defaults the C++/Metal
+  # side to the same floor, so a clean clone must build with no environment help. An
+  # IPHONEOS_DEPLOYMENT_TARGET that reached a host process would also break MLX's runtime `g++`
+  # CPU-kernel JIT (see `.cargo/config.toml`). No prebuilt MLX either: none is published for the
+  # iOS cells, and the point of the lane is to check the metallib THIS build emits.
+  ios-build:
+    name: runtime-ios cross-build (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.ios_build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      # Nothing reads the DWARF of an artifact that is never run; it only costs runner disk across
+      # two target directories.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            metallib_triple: air64-apple-ios18.0.0
+          # The simulator differs from the device only in the `-simulator` suffix, which is
+          # exactly the bug a wrong-SDK selection produces, so it is asserted separately.
+          - target: aarch64-apple-ios-sim
+            metallib_triple: air64-apple-ios18.0.0-simulator
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+      - name: Ensure Metal compiler
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version || true
+      - name: Install pinned Rust toolchain and ${{ matrix.target }}
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - name: Cache Cargo and MLX native build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+          # Save only on `main` — see the note on the `workspace` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build runtime-ios for ${{ matrix.target }}
+        run: cargo build --locked --target ${{ matrix.target }} -p runtime-ios
+      - name: Assert the metallib targets ${{ matrix.target }}
+        run: scripts/ci/assert_metallib_triple.sh target/${{ matrix.target }} ${{ matrix.metallib_triple }}
+
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)
     needs: changes
@@ -1166,6 +1230,7 @@ jobs:
       - candle-cpu-conformance
       - candle-cpu-bundles
       - macos-metal
+      - ios-build
       - macos-nax
       - windows-cuda-check
       - windows-cuda

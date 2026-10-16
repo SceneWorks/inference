@@ -48,6 +48,7 @@ pub mod pipeline;
 pub mod restoration;
 pub mod solver;
 pub mod text_encoder;
+#[cfg(feature = "training")]
 pub mod train;
 
 pub use dit::{IrisDiT, TextBatch};
@@ -83,11 +84,16 @@ pub use text_encoder::{
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
-        .register_generator(model::REGISTRATION)
+    // The three trainers and their training-only deps (MLX distributed / JACCL, dataset image
+    // decode, checkpoint state) are the default-on `training` feature (sc-26265), so an
+    // inference-only graph compiles none of them.
+    let registry = registry.register_generator(model::REGISTRATION);
+    #[cfg(feature = "training")]
+    let registry = registry
         .register_trainer(train::REGISTRATION)
         .register_trainer(train::depth::REGISTRATION)
-        .register_trainer(train::restore::REGISTRATION)
+        .register_trainer(train::restore::REGISTRATION);
+    registry
         .register_transform(restoration::REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)
@@ -136,7 +142,12 @@ mod tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(trainers, ["iris_3b", "iris_3b_depth", "iris_3b_restore"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["iris_3b", "iris_3b_depth", "iris_3b_restore"]
+        } else {
+            &[]
+        };
+        assert_eq!(trainers, expected_trainers);
         assert!(registry.descriptor_conformance_errors().is_empty());
     }
 }

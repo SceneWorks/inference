@@ -24,7 +24,7 @@ crate-type = ["staticlib", "rlib"]
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
 media = ["runtime-ios/media", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
 # E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
-# `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA only) and widening it is an
+# `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA and Anima Turbo) and widening it is an
 # architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
 # so a dep here reaches neither `EXPECTED_MEMBER_COUNT` nor the catalog's ordered surface test.
 # If z-image earns a place on iOS, THAT is when the catalog changes.
@@ -48,7 +48,7 @@ libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 # Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
 # is why it is the cheapest second model to try.
-mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", optional = true }
+mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", default-features = false, optional = true }
 # For `pipeline::resolved_decode_plan` — reading back which of env/request/residency actually chose
 # the decode geometry. The GENERATOR still comes from the catalog registry, so this changes nothing
 # about what ships; it reaches a diagnostic the catalog does not re-export. Same shape as the

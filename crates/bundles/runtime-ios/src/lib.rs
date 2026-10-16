@@ -40,10 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "media")]
 pub mod media {
     pub use mlx_gen_ios_catalog::{
-        sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory,
-        sana_load_spec, sana_snapshot_profile, FootprintBound, SanaDeviceFootprint,
-        SanaSnapshotProfile, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB,
-        IOS_OFFLOAD_POLICY, SANA_DEVICE_FOOTPRINTS,
+        anima, anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
+        anima_turbo_memory_selection, ios_memory_budget, sana_decode_plan, sana_decode_tile_edge,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile,
+        FootprintBound, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
+        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
+        SANA_DEVICE_FOOTPRINTS,
     };
 
     /// Load SANA generator `sana_id` for a render of `image_edge`² decoded at `tile_edge`, through
@@ -600,6 +602,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "media")]
+    #[test]
+    fn media_facade_preserves_anima_turbo_surface() {
+        let spec = super::media::anima_turbo_load_spec(super::gen_core::WeightsSource::Dir(
+            "/no-weights".into(),
+        ));
+        assert_eq!(
+            spec.offload_policy,
+            super::gen_core::OffloadPolicy::Sequential
+        );
+        assert_eq!(
+            spec.load_shape,
+            super::gen_core::LoadShape::DeferredMaterialization
+        );
+        assert_eq!(super::media::ANIMA_TURBO_ID, "anima_turbo");
+        assert_eq!(
+            super::media::ios_memory_budget().total_bytes,
+            u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20
+        );
+        // Keep the S4 facade reachable without re-exposing the unadmitted provider registry.
+        let _ = super::media::anima_turbo_admission;
+        let _ = super::media::anima_turbo_ios_selection;
+        let _ = super::media::anima_turbo_memory_selection;
+        assert!(!super::media::anima::ANIMA_HOST_REQUEST_PEAKS.is_empty());
+    }
+
     /// The bundle's exact, ordered surface. This is the reviewable source of truth for what ships
     /// on iOS: adding a provider means editing this test deliberately.
     #[test]
@@ -609,13 +637,13 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is exactly SANA under `media`, empty without it. An incidental
-        // `mlx-gen-catalog` dependency — every provider including video — fails here rather than
-        // quietly compiling into an iPhone app.
+        // The media surface is exactly SANA + Anima Turbo under `media`, empty without it. An
+        // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
+        // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
             "the iOS image surface changed; confirm the new provider fits the measured iOS cap \
              before updating this"
         );

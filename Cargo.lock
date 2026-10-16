@@ -2569,8 +2569,10 @@ version = "0.0.0"
 dependencies = [
  "image",
  "mlx-gen",
+ "mlx-gen-anima",
  "mlx-gen-sana",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "sha2",
  "tempfile",
 ]

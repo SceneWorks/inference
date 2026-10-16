@@ -9,7 +9,7 @@ repository = "https://github.com/SceneWorks/inference"
 [dependencies]
 sha2 = { workspace = true }
 mlx-gen = { path = ".." }
-# SANA only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
+# SANA and Anima Turbo only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
 # the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for
 # a device with a hard per-app memory cap. Depending on the whole catalog to obtain one small
 # generator would compile a graph the platform cannot run.
@@ -17,9 +17,16 @@ mlx-gen = { path = ".." }
 # `mlx-gen-sana` pulls `mlx-gen-pid` transitively for the Gemma-2 CHI caption encoder (epic 8485 /
 # sc-8488) -- SANA's text conditioning IS Gemma-2-2b-it, reused rather than duplicated.
 mlx-gen-sana = { path = "../mlx-gen-sana" }
+# Anima Turbo (`anima_turbo`, sc-26265), inference only: `default-features = false` drops the crate's
+# `training` feature, so neither its trainers nor `mlx-gen-perceptual` (and the depth/face/body
+# perceptors behind it) are compiled for iOS. The Qwen-Image VAE and z-image's Qwen3 encoder block it
+# reuses arrive the same way, each without its own trainers.
+mlx-gen-anima = { path = "../mlx-gen-anima", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The shared weights-free memory-strategy oracle, run over this catalog's exact registrations.
+sceneworks-gen-core-testkit = { workspace = true }
 # The image_budget example reads MLX's allocator accounting directly (get_active_memory /
 # get_peak_memory), which the gen-core contract deliberately does not expose -- it is tensor-free.
 mlx-rs = { workspace = true }

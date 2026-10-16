@@ -424,7 +424,7 @@ impl AdaptableHost for AnimaTextConditioner {
 /// Build the conditioner module tree with **placeholder** (1×1) weights so the target-enumeration
 /// guard (sc-10522) can exercise the real [`AdaptableHost::adaptable_paths`] surface without the
 /// licensed checkpoint or any Metal compute — enumeration only walks the tree; nothing is evaluated.
-#[cfg(test)]
+#[cfg(all(test, feature = "training"))]
 mod structural {
     use super::*;
 
@@ -487,7 +487,7 @@ mod structural {
 /// Real-weight conditioner for the grad-parity test (sc-10576): a dimension-parametric build with
 /// small random weights so the 6-block conditioner forward+backward runs on Metal without the licensed
 /// checkpoint. Mirrors [`CosmosDiT::synthetic`]. `cfg` sets every dim; use a tiny `cfg` for speed.
-#[cfg(test)]
+#[cfg(all(test, feature = "training"))]
 pub(crate) mod synthetic {
     use super::*;
     use mlx_rs::random;

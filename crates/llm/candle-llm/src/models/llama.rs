@@ -366,6 +366,22 @@ impl CausalLm {
         )
     }
 
+    /// [`CausalLm::from_weights_on_device`] with an explicit compute `dtype` (sc-26266): host-staged
+    /// weights are installed on `device` one tensor at a time — a projection quantized under
+    /// `quant` lands there in its resident GGML form, so the dense checkpoint never occupies
+    /// `device` beside it — and run in `dtype` rather than the device default.
+    pub fn from_weights_on_device_dtype(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let format = quant.map(ProjectionFormat::from);
+        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, Some(device))
+    }
+
     /// Like [`CausalLm::from_weights_with`] but with an explicit dense compute `dtype` — the
     /// f16-vs-bf16 knob for CUDA dtype perf tuning (story 7263). Dequantized projections accumulate in
     /// this dtype too. Passing a dtype the backend can't run (e.g. f16 on CPU) surfaces at forward time.
