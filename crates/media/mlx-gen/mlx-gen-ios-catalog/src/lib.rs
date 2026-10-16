@@ -44,9 +44,13 @@ pub fn provider_registry() -> Result<ProviderRegistry> {
 /// 1024² was measured at 9177 MiB on the host and killed the app on device.
 pub const IOS_OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 
-/// The per-app memory budget iOS defaults are chosen against, in MiB: an 8 GB device's assumed
-/// cap. The measured cap of the target device replaces this assumption at admission time
-/// (epic 16774, E4); the default tile choice only has to fit under it.
+/// The per-app memory cap of the 8 GB target device (iPhone 16 Pro Max), in MiB — the **single**
+/// cap constant: the iOS default tile choice here and `runtime-ios`'s admission
+/// (`IOS_APP_MEMORY_CAP_MIB`, which is this constant) both read it (epic 16774, E4).
+///
+/// **PROVISIONAL — UNMEASURED.** 4096 is the `claude/ios-strategy` branch's *assumed* 8 GB cap,
+/// not a device reading. It is replaced by the `os_proc_available_memory()` value the `ios-host`
+/// harness records at launch on the 16 Pro Max (sc-16780). Do not cite it as a measurement.
 pub const IOS_MEMORY_BUDGET_MIB: u32 = 4096;
 
 /// The square output edges (px) every iOS default must fit at.

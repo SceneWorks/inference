@@ -107,6 +107,78 @@ pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MLX_CACHE_LIMI
 #[cfg(not(feature = "media"))]
 pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = 1024;
 
+/// The iOS per-app memory cap admission refuses against, MiB (epic 16774, E4).
+///
+/// **PROVISIONAL — UNMEASURED.** With `media` this IS `mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB`
+/// (the one cap constant; see its docs): 4096 is an *assumed* 8 GB-device cap carried from the
+/// `claude/ios-strategy` branch, to be replaced by the value the `ios-host` harness measures with
+/// `os_proc_available_memory()` at launch on the iPhone 16 Pro Max.
+#[cfg(feature = "media")]
+pub const IOS_APP_MEMORY_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB;
+/// The iOS per-app memory cap admission refuses against, MiB. **PROVISIONAL — UNMEASURED.**
+///
+/// An LLM-only build does not compile the catalog, so it carries the value itself; a test asserts it
+/// equals the catalog's constant, so the two cannot drift.
+#[cfg(not(feature = "media"))]
+pub const IOS_APP_MEMORY_CAP_MIB: u32 = 4096;
+
+const MIB: u64 = 1024 * 1024;
+
+/// Admit a request whose footprint estimate is `estimate_mib`, against [`IOS_APP_MEMORY_CAP_MIB`].
+///
+/// Returns the admitted estimate. Refuses with [`gen_core::Error::Unsupported`] when the estimate
+/// exceeds the cap (an exact fit is admitted), and when there is **no** estimate: an unmeasured fit
+/// is not a fit, and on iOS the alternative to refusing is a jetsam kill, not backpressure.
+pub fn admit_estimate_mib(estimate_mib: Option<u32>) -> gen_core::Result<u32> {
+    match estimate_mib {
+        None => Err(gen_core::Error::Unsupported(format!(
+            "iOS admission: request has no footprint estimate; refusing rather than risk a jetsam \
+             kill against the {IOS_APP_MEMORY_CAP_MIB} MiB per-app cap"
+        ))),
+        Some(estimate) if estimate > IOS_APP_MEMORY_CAP_MIB => {
+            Err(gen_core::Error::Unsupported(format!(
+                "iOS admission: estimated footprint {estimate} MiB exceeds the \
+                 {IOS_APP_MEMORY_CAP_MIB} MiB per-app cap"
+            )))
+        }
+        Some(estimate) => Ok(estimate),
+    }
+}
+
+/// Run `load` only if [`admit_estimate_mib`] admits `estimate_mib`.
+///
+/// The refusal happens **before** `load` is called, so a refused request never touches its weights.
+pub fn load_admitted<T>(
+    estimate_mib: Option<u32>,
+    load: impl FnOnce() -> gen_core::Result<T>,
+) -> gen_core::Result<T> {
+    admit_estimate_mib(estimate_mib)?;
+    load()
+}
+
+/// The shared-safety-check budget for an iOS process: `total_bytes` is [`IOS_APP_MEMORY_CAP_MIB`],
+/// so `standard_memory_strategy_safety_check` admits against the same cap as
+/// [`admit_estimate_mib`]. `reclaimable_bytes` is creditable only after
+/// [`bound_mlx_to_platform_limits`] has run (see [`gen_core::MemoryBudget::reclaimable_bytes`]).
+pub fn ios_memory_budget(committed_bytes: u64, reclaimable_bytes: u64) -> gen_core::MemoryBudget {
+    gen_core::MemoryBudget {
+        total_bytes: u64::from(IOS_APP_MEMORY_CAP_MIB) * MIB,
+        committed_bytes,
+        reclaimable_bytes,
+        reserved_headroom_bytes: 0,
+    }
+}
+
+/// Admit a SANA render of `image_edge`² decoded at `tile_edge` against [`IOS_APP_MEMORY_CAP_MIB`],
+/// using the catalog's footprint bound (measured or inferred). Call before loading any weights.
+#[cfg(feature = "media")]
+pub fn admit_sana_render(image_edge: u32, tile_edge: u32) -> gen_core::Result<u32> {
+    admit_estimate_mib(
+        mlx_gen_ios_catalog::sana_footprint_bound(image_edge, tile_edge)
+            .map(mlx_gen_ios_catalog::FootprintBound::mib),
+    )
+}
+
 /// The `(memory_limit, cache_limit)` pair, MiB, for a process with `available_mib` of per-process
 /// headroom and `active_mib` already live.
 ///
@@ -239,6 +311,74 @@ mod tests {
         };
         assert!(late.called_late());
         assert!(late.changed());
+    }
+
+    /// E4: a request whose estimate exceeds the cap is refused BEFORE its loader runs; an exact fit
+    /// and anything under it load; an absent estimate is refused, also before loading.
+    #[test]
+    fn admission_refuses_over_cap_estimates_before_any_weight_load() {
+        use std::cell::Cell;
+        let cap = super::IOS_APP_MEMORY_CAP_MIB;
+        let loads = Cell::new(0u32);
+        let load = || {
+            loads.set(loads.get() + 1);
+            Ok("loaded")
+        };
+
+        let refused = super::load_admitted(Some(cap + 1), load);
+        assert!(
+            matches!(refused, Err(super::gen_core::Error::Unsupported(_))),
+            "an estimate over the cap must be refused: {refused:?}"
+        );
+        assert_eq!(loads.get(), 0, "refusal must precede the weight load");
+
+        assert!(matches!(
+            super::load_admitted(None, load),
+            Err(super::gen_core::Error::Unsupported(_))
+        ));
+        assert_eq!(
+            loads.get(),
+            0,
+            "an unestimated request must not load either"
+        );
+
+        assert_eq!(super::load_admitted(Some(cap), load).unwrap(), "loaded");
+        assert_eq!(super::load_admitted(Some(cap - 1), load).unwrap(), "loaded");
+        assert_eq!(loads.get(), 2, "admitted requests load exactly once each");
+
+        // The shared safety check's budget carries the same cap.
+        let budget = super::ios_memory_budget(0, 0);
+        assert_eq!(budget.total_bytes, u64::from(cap) * 1024 * 1024);
+        assert!(budget.fits(u64::from(cap) * 1024 * 1024));
+        assert!(!budget.fits(u64::from(cap + 1) * 1024 * 1024));
+    }
+
+    /// There is ONE cap constant: the LLM-only literal must equal the catalog's.
+    #[test]
+    fn the_app_memory_cap_is_the_catalogs_single_constant() {
+        assert_eq!(
+            super::IOS_APP_MEMORY_CAP_MIB,
+            mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB
+        );
+    }
+
+    /// SANA admission reads the catalog's bound and compares it to the cap (whatever value the
+    /// cap is filled in with); a pair with no bound (1024²/256) is refused.
+    #[cfg(feature = "media")]
+    #[test]
+    fn sana_admission_uses_the_catalog_footprint_bound() {
+        for (image, tile) in [(1024, 192), (512, 192), (1024, 128), (512, 256)] {
+            let bound = mlx_gen_ios_catalog::sana_footprint_bound(image, tile)
+                .expect("bounded pair")
+                .mib();
+            assert_eq!(
+                super::admit_sana_render(image, tile).ok(),
+                (bound <= super::IOS_APP_MEMORY_CAP_MIB).then_some(bound),
+                "{image}²/{tile}: bound {bound} MiB vs cap {}",
+                super::IOS_APP_MEMORY_CAP_MIB
+            );
+        }
+        assert!(super::admit_sana_render(1024, 256).is_err());
     }
 
     /// The bundle's exact, ordered surface. This is the reviewable source of truth for what ships

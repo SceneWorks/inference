@@ -77,7 +77,12 @@ FORBIDDEN_GRAPH_PACKAGES = {
 # and build output (.git, target), plus agent tooling that nests its own gitignored worktrees --
 # each a separate checkout carrying its own Cargo.lock/manifest (.claude, .codex). They must not
 # be swept into the single-lockfile / single-manifest invariants below.
-IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex"})
+#
+# `ios-host` joins them for a different reason: it is host-app scaffolding for on-device testing
+# (an Xcode project plus a small Rust staticlib, sc-16780), deliberately EXCLUDED from the workspace
+# in the root Cargo.toml so it never enters the shipped runtime graph. Being excluded, it resolves
+# its own Cargo.lock -- legitimately, not as drift.
+IGNORED_TREE_PARTS = frozenset({".git", "target", ".claude", ".codex", "ios-host"})
 # The Rust-source lints below additionally skip `vendor/` subtrees: those are upstream crates
 # copied verbatim (candle-kernels, candle-core — each with a VENDORED.md) that a [patch] points
 # at, not first-party code, so a lint finding there could only be fixed by forking upstream.
@@ -1030,6 +1035,27 @@ def _within_workspace(path: Path) -> bool:
     own root Cargo.lock/manifest -- only subtrees *below* ROOT named in IGNORED_TREE_PARTS drop out.
     """
     return IGNORED_TREE_PARTS.isdisjoint(path.relative_to(ROOT).parts)
+
+
+def check_ios_host_mlx_pin(root: Path) -> None:
+    """The excluded iOS harness (ios-host/smoke, own Cargo.lock) must pin the workspace's mlx-rs.
+
+    Being outside the workspace it cannot say `workspace = true`, so a workspace pin bump would
+    otherwise leave the device harness building a different MLX than the runtime it exercises
+    (epic 16774, E1; the branch it was ported from pinned a since-deleted fork rev).
+    """
+    harness = root / "ios-host" / "smoke" / "Cargo.toml"
+    if not harness.is_file():
+        return
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    expected = workspace["workspace"]["dependencies"]["mlx-rs"]
+    actual = tomllib.loads(harness.read_text(encoding="utf-8"))["dependencies"]["mlx-rs"]
+    keys = ("package", "git", "rev")
+    if {k: actual.get(k) for k in keys} != {k: expected.get(k) for k in keys}:
+        fail(
+            f"ios-host/smoke pins mlx-rs {[actual.get(k) for k in keys]}, but the workspace pins "
+            f"{[expected.get(k) for k in keys]}; bump both together"
+        )
 
 
 def check_filesystem() -> None:
@@ -3135,6 +3161,7 @@ def main() -> int:
 
     try:
         check_filesystem()
+        check_ios_host_mlx_pin(ROOT)
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)

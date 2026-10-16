@@ -20,6 +20,11 @@ mlx-rs = { workspace = true }
 # platform cannot run. `mlx-gen-ios-catalog` is the narrow, reviewable subset instead.
 mlx-gen-ios-catalog = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Test-only, so an LLM-only (`--no-default-features`) build still compiles no image graph: lets the
+# non-media cap literal be asserted equal to the catalog's single cap constant.
+mlx-gen-ios-catalog = { workspace = true }
+
 [features]
 # The iOS product is the image lane, so it is on by default, as `media` is on runtime-macos. An
 # LLM-only product disables default features and does not compile the image graph at all.

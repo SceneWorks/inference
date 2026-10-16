@@ -51,7 +51,9 @@ class WithinWorkspaceTests(unittest.TestCase):
         )
 
     def test_ignored_parts_cover_the_documented_set(self) -> None:
-        self.assertEqual(self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex"})
+        self.assertEqual(
+            self.gate.IGNORED_TREE_PARTS, {".git", "target", ".claude", ".codex", "ios-host"}
+        )
 
 
 class RustCommentStrippingTests(unittest.TestCase):
@@ -2018,3 +2020,29 @@ class RootTrainTwinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IosHostMlxPinTests(unittest.TestCase):
+    """sc-16780: the excluded iOS harness must build the workspace's MLX, not a stale fork rev."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def write(self, root: Path, harness_rev: str) -> None:
+        dep = '{ package = "pmetal-mlx-rs", git = "https://github.com/x/mlx-rs", rev = "%s" }'
+        (root / "Cargo.toml").write_text(
+            "[workspace]\n[workspace.dependencies]\nmlx-rs = " + dep % "aaa" + "\n"
+        )
+        (root / "ios-host" / "smoke").mkdir(parents=True)
+        (root / "ios-host" / "smoke" / "Cargo.toml").write_text(
+            "[package]\nname = \"x\"\n[dependencies]\nmlx-rs = " + dep % harness_rev + "\n"
+        )
+
+    def test_matching_pin_passes_and_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "aaa")
+            self.gate.check_ios_host_mlx_pin(Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "bbb")
+            with self.assertRaises(AssertionError):
+                self.gate.check_ios_host_mlx_pin(Path(tmp))

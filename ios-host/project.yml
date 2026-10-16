@@ -1,0 +1,119 @@
+# XcodeGen spec for the iOS host app (E3).
+#
+# The .xcodeproj is generated, not committed: an Xcode project file is a merge-hostile blob, and
+# this one is fully derived. Regenerate with `xcodegen generate` from this directory, or use
+# scripts/ios/run_smoke.sh which does it for you.
+#
+# Deliberately minimal. This exists to exercise and measure the runtime on real hardware -- to
+# answer "do the cross-compiled Metal kernels actually work in an app sandbox" -- not to be a
+# product. See docs/ios-epics.md (E3).
+
+name: SceneWorksSmoke
+options:
+  bundleIdPrefix: com.idkplay
+  deploymentTarget:
+    # Matches the floor in .cargo/config.toml. iOS 18 == Metal 320, which is what MLX's kernels
+    # are compiled against; see crates/bundles/runtime-ios/src/lib.rs for why that is not
+    # arbitrary.
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    # Signing is resolved from the developer's own team at generate time; nothing team-specific is
+    # committed. Override with `XCODEGEN_TEAM_ID` if the default identity is not the right one.
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+
+targets:
+  SceneWorksSmoke:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: SW Smoke
+        UILaunchScreen: {}
+        # Exposes the app's Documents container so `devicectl device copy from` can pull
+        # smoke-report.txt off the device. Without it the container is private and the report
+        # can only be read off the screen -- which is not assertable in CI.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # The report can take a few seconds on first launch (Metal library load + kernel
+        # dispatch), so the app must not be killed as unresponsive during it.
+        UIApplicationSupportsIndirectInputEvents: true
+        # Which entitlement build this is, read by the app at launch and logged beside
+        # `os_proc_available_memory` so a report can never be attributed to the wrong build.
+        SWSmokeIncreasedMemoryLimit: $(SMOKE_INCREASED_MEMORY_LIMIT)
+    settings:
+      base:
+        # Interpolated for the same reason `DEVELOPMENT_TEAM` is: a bundle id belongs to whoever is
+        # signing. `run_smoke.sh` defaults it to the value below, so nothing changes for the usual
+        # case; a second developer whose team cannot claim `com.idkplay.*` sets `SMOKE_BUNDLE_ID` and
+        # every script follows. Changing it gives the app a FRESH Documents container, so any pushed
+        # model snapshot must be pushed again — do not change it speculatively.
+        PRODUCT_BUNDLE_IDENTIFIER: ${SMOKE_BUNDLE_ID}
+        # Raises the per-app memory limit and the virtual-address ceiling. See the file itself for
+        # why both, and why this is not an approval-gated capability. If automatic signing cannot
+        # grant them the build fails here rather than the app being killed on device.
+        #
+        # Switchable for the cap A/B (sc-16780): the app logs `os_proc_available_memory` at launch,
+        # so one build with and one without the increased-memory-limit entitlement measures what it
+        # is worth on the device rather than assuming it. The two settings move TOGETHER — the
+        # control file keeps extended-virtual-addressing and drops only increased-memory-limit:
+        #   scripts/ios/run_smoke.sh --memory-entitlement off
+        # which passes, as xcodebuild overrides,
+        #   CODE_SIGN_ENTITLEMENTS=App/SceneWorksSmoke-NoIncreasedLimit.entitlements
+        #   SMOKE_INCREASED_MEMORY_LIMIT=NO
+        CODE_SIGN_ENTITLEMENTS: App/SceneWorksSmoke.entitlements
+        SMOKE_INCREASED_MEMORY_LIMIT: "YES"
+        # The Rust staticlib and everything MLX links against.
+        OTHER_LDFLAGS:
+          - -lios_smoke
+          - -lc++
+          - -lobjc
+        LIBRARY_SEARCH_PATHS:
+          - $(PROJECT_DIR)/smoke/target/aarch64-apple-ios/release
+        # The simulator links the aarch64-apple-ios-sim staticlib (run_smoke.sh --simulator).
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]":
+          - $(PROJECT_DIR)/smoke/target/aarch64-apple-ios-sim/release
+        # MLX ships C++ symbols; without this the link fails on std:: symbols.
+        CLANG_CXX_LIBRARY: libc++
+      configs:
+        Debug:
+          LIBRARY_SEARCH_PATHS:
+            - $(PROJECT_DIR)/smoke/target/aarch64-apple-ios/debug
+          "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]":
+            - $(PROJECT_DIR)/smoke/target/aarch64-apple-ios-sim/debug
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: Accelerate.framework
+      - sdk: Foundation.framework
+    preBuildScripts:
+      # The metallib is NOT optional: inside the sandbox MLX can only resolve it from
+      # $PMETAL_METALLIB_PATH or from beside the executable, so an app without it fails at the
+      # first Metal op with no build-time warning. --expect-platform ios turns "wrong metallib"
+      # from a runtime crash into a build failure.
+      - name: Bundle mlx.metallib
+        basedOn: script
+        script: |
+          set -euo pipefail
+          cd "$PROJECT_DIR/.."
+          profile=release
+          [ "$CONFIGURATION" = "Debug" ] && profile=debug
+          triple=aarch64-apple-ios
+          platform=ios
+          if [ "$PLATFORM_NAME" = "iphonesimulator" ]; then
+            triple=aarch64-apple-ios-sim
+            platform=ios-simulator
+          fi
+          python3 scripts/ios/bundle_metallib.py \
+            --target-dir ios-host/smoke/target --triple "$triple" --profile "$profile" \
+            --dest "$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH" \
+            --expect-platform "$platform"
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/mlx.metallib
