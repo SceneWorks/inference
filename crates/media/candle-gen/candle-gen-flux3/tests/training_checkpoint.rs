@@ -9,7 +9,7 @@ use candle_gen::gen_core::flux3::{
     BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION,
 };
 use candle_gen::gen_core::{AdapterKind, AdapterSpec, CancelFlag};
-use candle_gen::train::optim::{accumulate_grads, scale_grads, TrainOptimizer};
+use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen_flux3::{
     training::{
         checkpoint::{export_adapter, restore, save, Snapshot},
@@ -86,6 +86,10 @@ fn identity(graph: &TrainingGraph) -> ResumeIdentity {
             ("backend".into(), "candle-cpu".into()),
             ("scheduler".into(), "constant".into()),
             ("accumulation".into(), "1".into()),
+            (
+                "accumulation_scaling".into(),
+                "loss/configured_N_before_backward".into(),
+            ),
             ("rng".into(), "synthetic-oracle-cursor-v1".into()),
             (
                 "fixture".into(),
@@ -96,6 +100,9 @@ fn identity(graph: &TrainingGraph) -> ResumeIdentity {
     }
 }
 fn grads(graph: &TrainingGraph, step: u64) -> GradStore {
+    grads_scaled(graph, step, 1)
+}
+fn grads_scaled(graph: &TrainingGraph, step: u64, accumulation: u32) -> GradStore {
     let golden = fixture("flux3_training_golden.safetensors");
     let sigma = host_f32(golden.require(&format!("step{step}/sigma")))[0];
     let image = ((golden.require("clean") * (1.0 - sigma) as f64).unwrap()
@@ -120,7 +127,7 @@ fn grads(graph: &TrainingGraph, step: u64) -> GradStore {
                 target_timestep: None,
             }],
             &target,
-            1.0,
+            1.0 / accumulation as f64,
         )
         .unwrap()
         .backward()
@@ -160,6 +167,7 @@ fn cursor(accumulation: u32) -> TrainingCursor {
         sampler_epoch: 0,
         sampler_cursor: 1,
         rng_state: vec![0x53, 1, 0, 0],
+        last_loss_bits: None,
     }
 }
 
@@ -283,7 +291,7 @@ fn real_saved_checkpoint_resumes_optimizer_then_adapter_reloads_with_effect_and_
 fn interrupted_gradient_accumulation_is_saved_and_resumed_without_reset() {
     let continuous = graph();
     let mut opt = optimizer(&continuous);
-    let first = grads(&continuous, 0);
+    let first = grads_scaled(&continuous, 0, 2);
     let pending = named(&continuous)
         .into_iter()
         .map(|(name, var)| (name, first.get(var.as_tensor()).unwrap().clone()))
@@ -315,9 +323,13 @@ fn interrupted_gradient_accumulation_is_saved_and_resumed_without_reset() {
     )
     .unwrap();
     let mut acc = Some(first);
-    accumulate_grads(&mut acc, grads(&continuous, 1), &continuous.vars()).unwrap();
-    let mut acc = acc.unwrap();
-    scale_grads(&mut acc, &continuous.vars(), 0.5).unwrap();
+    accumulate_grads(
+        &mut acc,
+        grads_scaled(&continuous, 1, 2),
+        &continuous.vars(),
+    )
+    .unwrap();
+    let acc = acc.unwrap();
     opt.step(&acc).unwrap();
     let resumed = graph();
     let mut resumed_opt = optimizer(&resumed);
@@ -338,12 +350,11 @@ fn interrupted_gradient_accumulation_is_saved_and_resumed_without_reset() {
     let mut resumed_acc = Some(resumed_acc);
     accumulate_grads(
         &mut resumed_acc,
-        grads(&resumed, state.cursor.sampler_cursor),
+        grads_scaled(&resumed, state.cursor.sampler_cursor, 2),
         &resumed.vars(),
     )
     .unwrap();
-    let mut resumed_acc = resumed_acc.unwrap();
-    scale_grads(&mut resumed_acc, &resumed.vars(), 0.5).unwrap();
+    let resumed_acc = resumed_acc.unwrap();
     resumed_opt.step(&resumed_acc).unwrap();
     assert_eq!(values(&resumed), values(&continuous));
 }

@@ -17,6 +17,7 @@ fn invalid(message: impl std::fmt::Display) -> Error {
 pub struct ResumePolicy {
     pub total_micro_steps: u64,
     pub accumulation: u32,
+    /// Prebuilt full MICRO-BATCHES per epoch after drop-last-per-bucket, not image count.
     pub sampler_len: u64,
 }
 impl ResumePolicy {
@@ -34,19 +35,38 @@ impl ResumePolicy {
 pub struct TrainingCursor {
     pub micro_step: u64,
     pub update_step: u64,
+    /// Pending micro-batch gradients, already divided by configured N before backward.
     pub accumulation_count: u32,
     pub sampler_epoch: u64,
+    /// Consumed batches in this epoch; may equal sampler_len just before epoch wrap.
     pub sampler_cursor: u64,
     pub rng_state: Vec<u8>,
+    /// Last actually observed raw micro-batch loss, for truthful completed-run resume/no-op.
+    /// Optional for low-level codec fixtures/older snapshots; never fabricate a zero metric.
+    pub last_loss_bits: Option<u32>,
 }
 
 impl TrainingCursor {
+    pub fn last_loss(&self) -> Result<Option<f32>> {
+        self.last_loss_bits
+            .map(|bits| {
+                let value = f32::from_bits(bits);
+                if !value.is_finite() || value < 0.0 {
+                    Err(invalid("saved last loss must be finite and nonnegative"))
+                } else {
+                    Ok(value)
+                }
+            })
+            .transpose()
+    }
+
     pub fn validate(
         &self,
         total_micro_steps: u64,
         accumulation: u32,
         sampler_len: u64,
     ) -> Result<()> {
+        self.last_loss()?;
         if accumulation == 0
             || sampler_len == 0
             || self.micro_step > total_micro_steps
@@ -59,18 +79,46 @@ impl TrainingCursor {
             ));
         }
         let accumulation = accumulation as u64;
-        let regular = self.update_step == self.micro_step / accumulation
-            && self.accumulation_count as u64 == self.micro_step % accumulation;
-        let final_tail = self.micro_step == total_micro_steps
+        let expected_micro = self
+            .sampler_epoch
+            .checked_mul(sampler_len)
+            .and_then(|n| n.checked_add(self.sampler_cursor))
+            .ok_or_else(|| invalid("epoch/batch cursor overflows"))?;
+        if self.micro_step != expected_micro {
+            return Err(invalid(
+                "micro-step does not match saved epoch/batch cursor",
+            ));
+        }
+        // Accelerator flushes and resets accumulation at EACH dataloader exhaustion.
+        // A global micro_step/accumulation quotient would lose short epoch tails.
+        let previous_updates = self
+            .sampler_epoch
+            .checked_mul(sampler_len.div_ceil(accumulation))
+            .ok_or_else(|| invalid("epoch update count overflows"))?;
+        let closed = previous_updates
+            .checked_add(self.sampler_cursor / accumulation)
+            .ok_or_else(|| invalid("update cursor overflows"))?;
+        let regular = self.update_step == closed
+            && self.accumulation_count as u64 == self.sampler_cursor % accumulation;
+        let ready_full = self.sampler_cursor > 0
+            && self.sampler_cursor.is_multiple_of(accumulation)
+            && self.accumulation_count as u64 == accumulation
+            && self.update_step.checked_add(1) == Some(closed);
+        let flushed_updates = previous_updates
+            .checked_add(self.sampler_cursor.div_ceil(accumulation))
+            .ok_or_else(|| invalid("flushed update cursor overflows"))?;
+        let flushed_tail = (self.sampler_cursor == sampler_len
+            || self.micro_step == total_micro_steps)
             && self.accumulation_count == 0
-            && self.update_step == self.micro_step.div_ceil(accumulation);
-        if !regular && !final_tail {
+            && self.update_step == flushed_updates;
+        if !regular && !ready_full && !flushed_tail {
             return Err(invalid("micro-step/update/accumulation counters disagree; refusing to discard pending gradients"));
         }
         Ok(())
     }
 
     pub fn to_metadata(&self) -> Result<String> {
+        self.last_loss()?;
         if self.rng_state.is_empty() || self.rng_state.len() > 4096 {
             return Err(invalid("missing/oversized RNG state"));
         }
@@ -78,6 +126,7 @@ impl TrainingCursor {
             "schema": 1, "micro_step": self.micro_step, "update_step": self.update_step,
             "accumulation_count": self.accumulation_count, "sampler_epoch": self.sampler_epoch,
             "sampler_cursor": self.sampler_cursor, "rng_state": self.rng_state,
+            "last_loss_bits": self.last_loss_bits,
         })
         .to_string())
     }
@@ -85,7 +134,8 @@ impl TrainingCursor {
     pub fn from_metadata(text: &str) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| invalid(format!("invalid cursor JSON: {e}")))?;
-        const KEYS: [&str; 7] = [
+        const KEYS: [&str; 8] = [
+            "last_loss_bits",
             "schema",
             "micro_step",
             "update_step",
@@ -97,7 +147,7 @@ impl TrainingCursor {
         let object = value
             .as_object()
             .ok_or_else(|| invalid("cursor must be an object"))?;
-        if object.len() != KEYS.len()
+        if !(7..=8).contains(&object.len())
             || object.keys().any(|k| !KEYS.contains(&k.as_str()))
             || value["schema"] != 1
         {
@@ -108,16 +158,27 @@ impl TrainingCursor {
                 .as_u64()
                 .ok_or_else(|| invalid(format!("invalid cursor {key}")))
         };
-        let cursor = Self {
-            micro_step: number("micro_step")?,
-            update_step: number("update_step")?,
-            accumulation_count: u32::try_from(number("accumulation_count")?)
-                .map_err(|_| invalid("accumulation count overflow"))?,
-            sampler_epoch: number("sampler_epoch")?,
-            sampler_cursor: number("sampler_cursor")?,
-            rng_state: serde_json::from_value(value["rng_state"].clone())
-                .map_err(|e| invalid(format!("invalid RNG state: {e}")))?,
-        };
+        let cursor =
+            Self {
+                micro_step: number("micro_step")?,
+                update_step: number("update_step")?,
+                accumulation_count: u32::try_from(number("accumulation_count")?)
+                    .map_err(|_| invalid("accumulation count overflow"))?,
+                sampler_epoch: number("sampler_epoch")?,
+                sampler_cursor: number("sampler_cursor")?,
+                rng_state: serde_json::from_value(value["rng_state"].clone())
+                    .map_err(|e| invalid(format!("invalid RNG state: {e}")))?,
+                last_loss_bits: match value.get("last_loss_bits") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(
+                        u32::try_from(value.as_u64().ok_or_else(|| {
+                            invalid("last loss bits must be an unsigned integer")
+                        })?)
+                        .map_err(|_| invalid("last loss bits overflow"))?,
+                    ),
+                },
+            };
+        cursor.last_loss()?;
         if cursor.rng_state.is_empty() || cursor.rng_state.len() > 4096 {
             return Err(invalid("missing/oversized RNG state"));
         }

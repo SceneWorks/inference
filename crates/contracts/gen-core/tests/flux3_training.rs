@@ -108,6 +108,24 @@ fn default_targets_roundtrip_the_existing_strict_generation_mapping() {
         .any(|t| t.native == "txt_mode_blocks.0.mlp_in"));
     let selected = lora_targets(&cfg, &["to_q".into(), "ff.linear_out".into()]).unwrap();
     assert_eq!(selected.len(), 10);
+    let exact = lora_targets(
+        &cfg,
+        &["transformer.single_transformer_blocks.1.ff.linear_out".into()],
+    )
+    .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].native, "single_blocks.1.mlp_out");
+    let overlapping = lora_targets(
+        &cfg,
+        &["to_q".into(), "mode_blocks.image.0.attn.to_q".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        overlapping.len(),
+        5,
+        "literal PEFT suffix/exact overlap must not duplicate trainable factors"
+    );
+    assert!(lora_targets(&cfg, &[".*to_q".into()]).is_err());
     assert!(lora_targets(&cfg, &["typo".into()]).is_err());
     assert!(lora_targets(&cfg, &["to_q".into(), "to_q".into()]).is_err());
 }

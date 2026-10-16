@@ -1,6 +1,8 @@
 //! Native trainable FLUX3 DiT seam. Frozen base weights stay in the inference graph;
 //! adapter `Var`s use the shared trainable residual mechanism, not pre-merged deltas.
 pub mod checkpoint;
+pub(crate) mod runner;
+pub mod trainer;
 
 use std::collections::BTreeMap;
 

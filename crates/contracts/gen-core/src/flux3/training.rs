@@ -5,6 +5,13 @@
 //! The reference is inference-independent: captions are dropped per instance, not
 //! duplicated into the inference base checkpoint's two CFG conditioning rows.
 pub mod checkpoint;
+pub mod controller;
+pub mod identity;
+pub mod options;
+pub mod policy;
+pub mod preprocess;
+pub mod rng;
+pub mod sampler;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,19 +46,11 @@ pub const DEFAULT_TARGETS: [&str; 6] = [
 /// These ids match S3's FIRST reference. Training's paired resize/crop/flip
 /// recipe remains separate from inference's image preprocessing.
 pub fn training_condition_ids(height: usize, width: usize) -> Result<Vec<[f32; 4]>> {
-    let count = height
+    height
         .checked_mul(width)
         .filter(|n| *n > 0)
         .ok_or_else(|| invalid("conditioning grid must be nonempty and not overflow"))?;
-    let mut ids = Vec::new();
-    ids.try_reserve_exact(count)
-        .map_err(|e| invalid(format!("conditioning id allocation: {e}")))?;
-    for row in 0..height {
-        for col in 0..width {
-            ids.push([0.0, row as f32 * 0.5, col as f32 * 0.5, -1.0]);
-        }
-    }
-    Ok(ids)
+    super::references::conditioning_ids(height, width, 0)
 }
 
 fn invalid(detail: impl std::fmt::Display) -> Error {
@@ -191,24 +190,25 @@ pub struct LoraTarget {
     pub input: usize,
 }
 
-/// Expand ONLY the source-supported suffixes across all mode/shared blocks. Use S6's
-/// generation mapping as the authority, not a second fuzzy name-conversion implementation.
+/// Expand literal PEFT module suffixes or exact module paths over the six compatible
+/// projection families. Shapes/names always come from S6's explicit mapping. Regex,
+/// per-target rank/alpha patterns and unknown/unmatched modules are never ignored.
 pub fn lora_targets(cfg: &DitConfig, requested: &[String]) -> Result<Vec<LoraTarget>> {
     if cfg.flow_map {
         return Err(invalid(
             "adaptation requires the undistilled base checkpoint, not a flow map",
         ));
     }
-    let selected: Vec<&str> = if requested.is_empty() {
+    let selectors: Vec<&str> = if requested.is_empty() {
         DEFAULT_TARGETS.to_vec()
     } else {
-        requested.iter().map(String::as_str).collect()
+        requested.iter().map(|name| name.trim()).collect()
     };
     let mut unique = BTreeSet::new();
-    for suffix in &selected {
-        if !DEFAULT_TARGETS.contains(suffix) || !unique.insert(*suffix) {
+    for selector in &selectors {
+        if selector.is_empty() || !unique.insert(*selector) {
             return Err(invalid(format!(
-                "unknown or repeated LoRA target `{suffix}`"
+                "empty or repeated LoRA target `{selector}`"
             )));
         }
     }
@@ -226,7 +226,7 @@ pub fn lora_targets(cfg: &DitConfig, requested: &[String]) -> Result<Vec<LoraTar
     }
     let mut targets = Vec::new();
     for parent in parents {
-        for suffix in &selected {
+        for suffix in DEFAULT_TARGETS {
             let leaf = if suffix.starts_with("ff.") {
                 suffix.to_string()
             } else {
@@ -245,7 +245,39 @@ pub fn lora_targets(cfg: &DitConfig, requested: &[String]) -> Result<Vec<LoraTar
     if targets.is_empty() {
         return Err(invalid("base config has no trainable blocks"));
     }
-    Ok(targets)
+    let mut selected = BTreeSet::new();
+    for selector in selectors {
+        let selector = selector
+            .strip_prefix("transformer.")
+            .or_else(|| selector.strip_prefix("diffusion_model."))
+            .unwrap_or(selector);
+        let tail = format!(".{selector}");
+        let mut matched = false;
+        for (index, target) in targets.iter().enumerate() {
+            let diffusers = target
+                .diffusers
+                .strip_prefix("transformer.")
+                .expect("canonical prefix");
+            if target.native == selector
+                || diffusers == selector
+                || target.native.ends_with(&tail)
+                || diffusers.ends_with(&tail)
+            {
+                selected.insert(index);
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(invalid(format!(
+                "unknown/unmatched literal LoRA target `{selector}`"
+            )));
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, target)| selected.contains(&index).then_some(target))
+        .collect())
 }
 
 /// A trajectory identity, separate from a checkpoint directory name. The caller supplies

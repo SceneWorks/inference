@@ -78,6 +78,10 @@ fn identity(params: &LoraParams) -> ResumeIdentity {
             ("backend".into(), "mlx-cpu".into()),
             ("scheduler".into(), "constant".into()),
             ("accumulation".into(), "1".into()),
+            (
+                "accumulation_scaling".into(),
+                "loss/configured_N_before_backward".into(),
+            ),
             ("rng".into(), "synthetic-oracle-cursor-v1".into()),
             (
                 "fixture".into(),
@@ -96,6 +100,14 @@ fn identity(params: &LoraParams) -> ResumeIdentity {
     }
 }
 fn grads(graph: &mut TrainingGraph, params: &LoraParams, step: u64) -> LoraParams {
+    grads_scaled(graph, params, step, 1)
+}
+fn grads_scaled(
+    graph: &mut TrainingGraph,
+    params: &LoraParams,
+    step: u64,
+    accumulation: u32,
+) -> LoraParams {
     let golden = fixture("flux3_training_golden.safetensors");
     let get = |key: &str| golden.require(key).unwrap();
     let sigma = host_f32(get(&format!("step{step}/sigma")))[0];
@@ -121,7 +133,7 @@ fn grads(graph: &mut TrainingGraph, params: &LoraParams, step: u64) -> LoraParam
                 target_timestep: None,
             }],
             &target,
-            1.0,
+            1.0 / accumulation as f32,
         )
         .unwrap()
         .1
@@ -145,6 +157,7 @@ fn cursor(accumulation: u32) -> TrainingCursor {
         sampler_epoch: 0,
         sampler_cursor: 1,
         rng_state: vec![0x53, 1, 0, 0],
+        last_loss_bits: None,
     }
 }
 
@@ -183,12 +196,12 @@ fn saved_checkpoint_resumes_corrected_optimizer_and_adapter_reloads_with_effect(
 fn partial_accumulation_roundtrips_and_identity_mismatch_refuses_without_reset() {
     cpu_process("training_checkpoint::partial_accumulation_roundtrips_and_identity_mismatch_refuses_without_reset", || on_cpu(|| {
         let (mut continuous,mut params)=graph(); let mut optimizer=SourceAdamW::new(0.0003,0.0001).unwrap();
-        let first=grads(&mut continuous,&params,0); let mut identity=identity(&params); identity.configuration.insert("accumulation".into(),"2".into());
+        let first=grads_scaled(&mut continuous,&params,0,2); let mut identity=identity(&params); identity.configuration.insert("accumulation".into(),"2".into());
         let cursor=cursor(2); let policy=ResumePolicy {total_micro_steps:2,accumulation:2,sampler_len:2};
         let root=tempfile::tempdir().unwrap(); let flag=CancelFlag::new();
         let path=save(&continuous,Snapshot {params:&params,optimizer:&optimizer,identity:&identity,cursor:&cursor,policy,pending:&first},root.path(),"partial.resume.safetensors",&flag).unwrap();
-        let second=grads(&mut continuous,&params,1);
-        let average:LoraParams=first.iter().map(|(key,g)| (key.clone(),g.add(&second[key]).unwrap().multiply(Array::from_f32(0.5)).unwrap())).collect(); optimizer.step(&mut params,&average).unwrap();
+        let second=grads_scaled(&mut continuous,&params,1,2);
+        let average:LoraParams=first.iter().map(|(key,g)| (key.clone(),g.add(&second[key]).unwrap())).collect(); optimizer.step(&mut params,&average).unwrap();
         let (mut resumed,mut restored)=graph(); let mut resumed_opt=SourceAdamW::new(0.0003,0.0001).unwrap();
         let initial=values(&restored); let mut wrong=identity.clone(); wrong.dataset="e".repeat(64);
         assert!(restore(&resumed,&mut restored,&mut resumed_opt,&wrong,policy,&path,&flag).is_err()); assert_eq!(values(&restored),initial); assert!(resumed_opt.moments.is_empty());
@@ -197,8 +210,51 @@ fn partial_accumulation_roundtrips_and_identity_mismatch_refuses_without_reset()
         let changed_policy=ResumePolicy {total_micro_steps:3,..policy};
         assert!(restore(&resumed,&mut restored,&mut resumed_opt,&identity,changed_policy,&path,&flag).is_err()); assert_eq!(values(&restored),initial); assert!(resumed_opt.moments.is_empty());
         let state=restore(&resumed,&mut restored,&mut resumed_opt,&identity,policy,&path,&flag).unwrap(); assert_eq!(state.cursor.accumulation_count,1);
-        let second=grads(&mut resumed,&restored,state.cursor.sampler_cursor);
-        let average:LoraParams=state.pending.iter().map(|(key,g)| (key.clone(),g.add(&second[key]).unwrap().multiply(Array::from_f32(0.5)).unwrap())).collect(); resumed_opt.step(&mut restored,&average).unwrap();
+        let second=grads_scaled(&mut resumed,&restored,state.cursor.sampler_cursor,2);
+        let average:LoraParams=state.pending.iter().map(|(key,g)| (key.clone(),g.add(&second[key]).unwrap())).collect(); resumed_opt.step(&mut restored,&average).unwrap();
         assert_eq!(values(&restored),values(&params));
     }));
+}
+
+#[test]
+fn checkpoint_codec_preserves_logical_strided_factor_moment_and_pending_bytes() {
+    cpu_process("training_checkpoint::checkpoint_codec_preserves_logical_strided_factor_moment_and_pending_bytes", || {
+        on_cpu(|| {
+            use mlx_gen_flux3::training::optim::AdamMoment;
+            let (source, mut params) = graph();
+            let key = std::rc::Rc::<str>::from(format!("{}.lora_A.weight", source.targets[0].native));
+            let rows = source.rank; let columns = source.targets[0].input;
+            let strided = |offset: f32| {
+                let data = (0..rows*columns).map(|i| offset+i as f32*0.001).collect::<Vec<_>>();
+                Array::from_slice(&data,&[columns as i32,rows as i32]).transpose_axes(&[1,0]).unwrap()
+            };
+            params.insert(key.clone(), strided(0.0));
+            let mut optimizer = SourceAdamW::new(0.0003,0.0001).unwrap();
+            optimizer.moments.insert(key.clone(), AdamMoment {first:strided(0.25),second:strided(0.5),step:1});
+            let pending = LoraParams::from([(key.clone(),strided(0.75))]);
+            let mut identity = identity(&params); identity.configuration.insert("accumulation".into(),"2".into());
+            let cursor = TrainingCursor {micro_step:3,update_step:1,accumulation_count:1,sampler_epoch:0,sampler_cursor:3,rng_state:vec![0x53,3,0,0],last_loss_bits:None};
+            let policy = ResumePolicy {total_micro_steps:4,accumulation:2,sampler_len:4};
+            let root = tempfile::tempdir().unwrap(); let flag = CancelFlag::new();
+            let path = save(&source,Snapshot {params:&params,optimizer:&optimizer,identity:&identity,cursor:&cursor,policy,pending:&pending},root.path(),"strided.resume.safetensors",&flag).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let (_,header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+            let manifest:serde_json::Value = serde_json::from_str(&header.metadata().as_ref().unwrap()["tensor_manifest"]).unwrap();
+            let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            for (prefix,offset) in [("factor",0.0f32),("moment_first",0.25),("moment_second",0.5),("pending",0.75)] {
+                let name = format!("{prefix}/{key}"); let tensor = tensors.tensor(&name).unwrap();
+                assert_eq!(tensor.shape(),[rows,columns]);
+                // Independent row/column indexing, NOT the codec's flatten/readback helper.
+                let expected = (0..rows).flat_map(|row| (0..columns).map(move |col| offset+(col*rows+row) as f32*0.001)).collect::<Vec<_>>();
+                let expected_bytes = expected.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+                assert_eq!(tensor.data(),expected_bytes);
+                assert_eq!(manifest[&name]["sha256"].as_str(),Some(format!("{:x}",Sha256::digest(&expected_bytes)).as_str()));
+            }
+            let (fresh,mut restored) = graph(); let mut fresh_optimizer = SourceAdamW::new(0.0003,0.0001).unwrap();
+            let state = restore(&fresh,&mut restored,&mut fresh_optimizer,&identity,policy,&path,&flag).unwrap();
+            assert_eq!(values(&restored),values(&params));
+            assert_eq!(host_f32(&state.pending[&key]),host_f32(&pending[&key]));
+            assert_eq!(host_f32(&fresh_optimizer.moments[&key].first),host_f32(&optimizer.moments[&key].first));
+        })
+    });
 }
