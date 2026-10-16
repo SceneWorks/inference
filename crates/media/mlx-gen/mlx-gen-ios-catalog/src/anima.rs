@@ -41,10 +41,10 @@
 //! exactly (2.680 / 2.680 GiB), and it is inside the provider's admitted quality ladder.
 
 use mlx_gen::gen_core::{
-    Error, LoadShape, LoadSpec, MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryMode,
-    MemoryNumericTier, MemoryOptimizationAuthority, MemoryProviderContract, MemoryRunContext,
-    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyParameters,
-    ProviderRegistry, Result, WeightsSource,
+    standard_memory_behavior_context, Error, LoadShape, LoadSpec, MemoryBehaviorRoute,
+    MemoryBudget, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
+    MemoryProviderContract, MemorySafetyDecision, MemorySelection, MemoryStrategy,
+    MemoryStrategyParameters, ProviderRegistry, Result, WeightsSource,
 };
 
 use crate::{IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY};
@@ -111,8 +111,9 @@ const fn row(
 /// |---|---:|---:|---|---|
 /// | resident | untiled | ≥ 7.921 | floor | untiled decode inside the staged envelope; a resident request runs the same decode with more held |
 /// | staged | untiled | ≥ 7.921 | floor | the same decode |
-/// | staged + tiled (rung 2) | 640 | ≥ 5.378 | floor | its denoise phase, which no tile edge moves |
+/// | staged + tiled (rung 2) | 768 … 192 | ≥ 5.378 | floor | its denoise phase, measured at 640, which no tile edge moves |
 /// | + chunked attention (rung 3) | 640 | 5.229 | request | rung 3's request peak |
+/// | + chunked attention (rung 3) | 768, 512 … 192 | ≥ 5.229 | floor | rung 3's denoise phase, again tile-independent |
 /// | + DiT window 1 (rung 4) | 768 … 192 | 4.649 … 2.680 | request | the tile sweep inside the full ladder, worse of two runs |
 pub const ANIMA_HOST_REQUEST_PEAKS: &[AnimaHostRequestPeak] = {
     use AnimaPeakEvidence::{Floor, UpperBound};
@@ -122,8 +123,20 @@ pub const ANIMA_HOST_REQUEST_PEAKS: &[AnimaHostRequestPeak] = {
     &[
         row(Resident, None, 7921, Floor),
         row(StagedResidency, None, 7921, Floor),
+        row(BoundedDecode, Some(768), 5378, Floor),
         row(BoundedDecode, Some(640), 5378, Floor),
+        row(BoundedDecode, Some(512), 5378, Floor),
+        row(BoundedDecode, Some(384), 5378, Floor),
+        row(BoundedDecode, Some(320), 5378, Floor),
+        row(BoundedDecode, Some(256), 5378, Floor),
+        row(BoundedDecode, Some(192), 5378, Floor),
+        row(BoundedAttention, Some(768), 5229, Floor),
         row(BoundedAttention, Some(640), 5229, UpperBound),
+        row(BoundedAttention, Some(512), 5229, Floor),
+        row(BoundedAttention, Some(384), 5229, Floor),
+        row(BoundedAttention, Some(320), 5229, Floor),
+        row(BoundedAttention, Some(256), 5229, Floor),
+        row(BoundedAttention, Some(192), 5229, Floor),
         row(BoundedTransformerResidency, Some(768), 4649, UpperBound),
         row(BoundedTransformerResidency, Some(640), 4153, UpperBound),
         row(BoundedTransformerResidency, Some(512), 4261, UpperBound),
@@ -200,11 +213,6 @@ pub fn anima_turbo_admission(
         .ok_or_else(|| {
             Error::Unsupported(format!("{ANIMA_TURBO_ID} registers no memory strategy"))
         })?;
-    let calibration = contract.calibration.as_ref().ok_or_else(|| {
-        Error::Unsupported(format!(
-            "{ANIMA_TURBO_ID} publishes no calibration identity"
-        ))
-    })?;
     let Some(record) = anima_host_request_peak(selection, image_edge) else {
         return Ok(MemorySafetyDecision::Reject {
             reason: format!(
@@ -214,39 +222,38 @@ pub fn anima_turbo_admission(
             ),
         });
     };
-    let context = MemoryRunContext {
-        selection: *selection,
-        optimization_authority: if selection.strategy.is_optimized() {
-            // A host measurement carried to the device under a stated bound: an estimate, not a
-            // calibration of this device.
-            MemoryOptimizationAuthority::Estimated
-        } else {
-            MemoryOptimizationAuthority::Resident
-        },
-        calibration_abi: calibration.abi,
-        calibration_fingerprint: calibration.fingerprint.clone(),
-        load_shape: spec.load_shape,
-        mode: MemoryMode::TextToImage,
-        has_reference: false,
-        use_pid: false,
-        // Anima's phase release is request-scoped, so every load has phases to shed.
-        has_phases: true,
-        geometry: MemoryGeometry {
-            width: image_edge,
-            height: image_edge,
-            batch: 1,
-            frames: 1,
+    // The shared weights-free context every provider's behavior fixture is built from, so the
+    // route facts (mode, phases, PID, overlay, calibration identity, load shape) cannot drift from
+    // the provider's own; only what this admission knows and the fixture does not is overridden.
+    let mut context = standard_memory_behavior_context(
+        contract,
+        selection.strategy,
+        loaded_tier(spec),
+        MemoryBehaviorRoute {
+            mode: MemoryMode::TextToImage,
             reference_count: 0,
+            use_pid: false,
+            // Anima's phase release is request-scoped, so every load has phases to shed.
+            has_phases: true,
+            overlay: None,
         },
-        overlay: None,
-        budget,
-        predicted_peak_bytes: record.footprint_bound_bytes(),
-        cache_state: MemoryCacheState::Cold,
-        evidence_revision: format!(
-            "ios-host-bound:anima_base-bf16-{image_edge}:{:?}:{:?}",
-            record.strategy, record.decode_tile_edge
-        ),
+    )?;
+    context.selection = *selection;
+    // A host measurement carried to the device under a stated bound: an estimate, not a
+    // calibration of this device.
+    context.optimization_authority = if selection.strategy.is_optimized() {
+        MemoryOptimizationAuthority::Estimated
+    } else {
+        MemoryOptimizationAuthority::Resident
     };
+    context.geometry.width = image_edge;
+    context.geometry.height = image_edge;
+    context.budget = budget;
+    context.predicted_peak_bytes = record.footprint_bound_bytes();
+    context.evidence_revision = format!(
+        "ios-host-bound:anima_base-bf16-{image_edge}:{:?}:{:?}",
+        record.strategy, record.decode_tile_edge
+    );
     let decision = (registration.safety_check)(spec, contract, &context);
     Ok(match (decision, record.evidence) {
         (MemorySafetyDecision::Accept, AnimaPeakEvidence::Floor) => MemorySafetyDecision::Reject {
@@ -461,16 +468,19 @@ mod tests {
     }
 
     /// Staged + tiled without the DiT window keeps the DiT resident through the denoise; its
-    /// measured floor is over the cap, so it is refused — the window is what makes 4 GiB fit.
+    /// measured floor is over the cap at every tile edge, so it is refused on the budget — never
+    /// for want of a measurement. The window is what makes 4 GiB fit.
     #[test]
     fn staged_tiled_without_the_window_is_refused_under_4_gib() {
         let registry = crate::provider_registry().expect("iOS media catalog builds");
         let spec = spec();
         let contract = contract(&registry, &spec);
+        let mut tiled = 0;
         for candidate in candidate_selections(&spec, &contract)
             .into_iter()
             .filter(|candidate| candidate.strategy != MemoryStrategy::BoundedTransformerResidency)
         {
+            tiled += usize::from(candidate.parameters.decode_tile_edge.is_some());
             let decision = anima_turbo_admission(
                 &registry,
                 &spec,
@@ -480,13 +490,27 @@ mod tests {
                 ios_memory_budget(),
             )
             .unwrap();
+            let MemorySafetyDecision::Reject { reason } = decision else {
+                panic!(
+                    "{:?} at tile {:?} was admitted under 4 GiB",
+                    candidate.strategy, candidate.parameters.decode_tile_edge
+                );
+            };
             assert!(
-                matches!(decision, MemorySafetyDecision::Reject { .. }),
-                "{:?} at tile {:?} was admitted under 4 GiB",
+                !reason.contains("unmeasured"),
+                "{:?} at tile {:?} is unmeasured: {reason}",
+                candidate.strategy,
+                candidate.parameters.decode_tile_edge
+            );
+            assert!(
+                reason.contains("exceeds effective budget"),
+                "{:?} at tile {:?} must be refused on the budget, got: {reason}",
                 candidate.strategy,
                 candidate.parameters.decode_tile_edge
             );
         }
+        // Rungs 2 and 3, each at every published tile edge.
+        assert_eq!(tiled, 2 * 7);
     }
 
     /// On an eager load the provider declares rung 4 `Missing`, so nothing is offered that fits and
@@ -506,7 +530,10 @@ mod tests {
     fn host_peaks_round_up_to_bytes() {
         let tile_192 = ANIMA_HOST_REQUEST_PEAKS
             .iter()
-            .find(|record| record.decode_tile_edge == Some(192))
+            .find(|record| {
+                record.strategy == MemoryStrategy::BoundedTransformerResidency
+                    && record.decode_tile_edge == Some(192)
+            })
             .unwrap();
         assert_eq!(tile_192.live_peak_bytes(), 2_877_628_089);
         assert!(tile_192.live_peak_bytes() as f64 >= 2.680 * f64::from(1u32 << 30));
