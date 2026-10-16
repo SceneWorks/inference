@@ -26,6 +26,45 @@ use crate::common::{
 };
 
 #[test]
+fn rgb8_materializes_strided_non_square_nhwc_in_pixel_order() {
+    cpu_process(
+        "e2e_parity::rgb8_materializes_strided_non_square_nhwc_in_pixel_order",
+        rgb8_materializes_strided_non_square_nhwc_in_pixel_order_body,
+    );
+}
+
+fn rgb8_materializes_strided_non_square_nhwc_in_pixel_order_body() {
+    let interleaved = [
+        -2.0f32, 0.0, 2.0, -0.5, 0.5, -0.25, 0.25, -0.75, 0.75, 2.0, -2.0, 0.0, 0.5, -0.25, -0.5,
+        -0.75, 0.75, 0.25,
+    ];
+    let expected = [
+        0u8, 127, 255, 63, 191, 95, 159, 31, 223, 255, 0, 127, 191, 95, 63, 31, 223, 159,
+    ];
+    let contiguous = mlx_rs::Array::from_slice(&interleaved, &[1, 2, 3, 3]);
+    let mut planar = Vec::with_capacity(interleaved.len());
+    for channel in 0..3 {
+        for pixel in interleaved.chunks_exact(3) {
+            planar.push(pixel[channel]);
+        }
+    }
+    let nchw = mlx_rs::Array::from_slice(&planar, &[1, 3, 2, 3]);
+    let strided = nchw_to_nhwc(&nchw);
+    assert_eq!(strided.shape(), contiguous.shape());
+    assert_eq!(host_f32(&strided), interleaved);
+    for image in [&contiguous, &strided] {
+        let rgb = float_image_to_rgb8(image).unwrap();
+        assert_eq!((rgb.width, rgb.height), (3, 2));
+        assert_eq!(
+            rgb.pixels, expected,
+            "logical HWC order, clamp and truncation"
+        );
+    }
+    // Removing pipeline::float_image_to_rgb8's reshape(-1) reads planar storage from `strided`;
+    // the explicit channel-distinct bytes above must then fail, not merely the two outputs agree.
+}
+
+#[test]
 fn generate_matches_upstream_from_injected_noise() {
     cpu_process(
         "e2e_parity::generate_matches_upstream_from_injected_noise",

@@ -27,6 +27,12 @@ const PROMPTS: [(&str, &str); 4] = [
 
 fn encoder() -> Flux3TextEncoder {
     let config = tiny_config();
+    let tower = mlx_llm::ModelConfig::from_dir(tiny_text_encoder()).unwrap();
+    assert_eq!(
+        tower.rope_theta, 5_000_000.0,
+        "use the snapshot's modern rope_parameters theta, not the legacy default"
+    );
+    assert_eq!(tower.mrope_section, Some([4, 2, 2]));
     Flux3TextEncoder::load(
         &tiny_text_encoder(),
         &config.text_encoder,

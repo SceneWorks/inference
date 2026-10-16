@@ -75,7 +75,7 @@ pub fn denoise_flow_map(
         // opmath and only the product takes the velocity's dtype.
         let scaled = velocity
             .as_dtype(Dtype::Float32)?
-            .multiply(&Array::from_f32(dt))?
+            .multiply(Array::from_f32(dt))?
             .as_dtype(compute)?;
         x = x.add(&scaled)?.as_dtype(Dtype::Float32)?;
         eval([&x])?;
@@ -151,10 +151,14 @@ pub fn float_image_to_rgb8(image: &Array) -> Result<Image> {
     }
     let (height, width) = (sh[1] as u32, sh[2] as u32);
     let scaled = mlx_rs::ops::clip(&image.as_dtype(Dtype::Float32)?, (-1.0f32, 1.0f32))?
-        .add(&Array::from_f32(1.0))?
-        .multiply(&Array::from_f32(127.5))?;
-    eval([&scaled])?;
-    let values = scaled.as_slice::<f32>();
+        .add(Array::from_f32(1.0))?
+        .multiply(Array::from_f32(127.5))?;
+    // A decoded/transposed NHWC view may still have planar (NCHW) physical storage. Elementwise
+    // arithmetic need not change its strides; materialize logical C-order before host readback,
+    // just like mlx-gen's shared decoded_to_interleaved_u8 boundary.
+    let flat = scaled.reshape(&[-1])?;
+    eval([&flat])?;
+    let values = flat.as_slice::<f32>();
     let pixels: Vec<u8> = values.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
     Ok(Image {
         width,

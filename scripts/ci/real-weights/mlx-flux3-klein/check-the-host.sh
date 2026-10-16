@@ -2,17 +2,17 @@
 # the component parity cases) runs on the `rw-mage` weight set (nax-macos-2). The bf16 package is ~20 GB resident (11 GB DiT +
 # 8 GB Qwen3-VL tower + 0.3 GB autoencoder) plus the 1024-squared activations, so the host needs
 # >= 48 GB of unified memory and no heavy memory pressure; anywhere else it records why and skips
-# (FLUX3_SKIP=1), it never queues work onto a busy box. The size / steps dispatch inputs are
-# untrusted and reach this step only as environment variables; both are validated here.
+# (FLUX3_SKIP=1), it never queues work onto a busy box. The size / steps are job env fixed to the
+# release geometry (the dispatch form sits at GitHub's 25-input cap); both are validated here anyway.
 FLUX3_OUT="$RUNNER_TEMP/flux3-klein-mlx-evidence"
 mkdir -p "$FLUX3_OUT"
 echo "FLUX3_OUT=$FLUX3_OUT" >> "$GITHUB_ENV"
 if [[ ! "${FLUX3_REAL_SIZE:-1024}" =~ ^[0-9]{2,4}$ ]] || (( FLUX3_REAL_SIZE % 16 != 0 || FLUX3_REAL_SIZE < 64 || FLUX3_REAL_SIZE > 2048 )); then
-  echo "::error::flux3_mlx_size must be a multiple of 16 in 64..=2048"
+  echo "::error::FLUX3_REAL_SIZE must be a multiple of 16 in 64..=2048"
   exit 1
 fi
 if [[ ! "${FLUX3_REAL_STEPS:-16}" =~ ^[1-9][0-9]?$ ]]; then
-  echo "::error::flux3_mlx_steps must be 1-99"
+  echo "::error::FLUX3_REAL_STEPS must be 1-99"
   exit 1
 fi
 mem_bytes="$(sysctl -n hw.memsize)"

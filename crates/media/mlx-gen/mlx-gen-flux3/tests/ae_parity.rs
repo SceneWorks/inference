@@ -233,8 +233,7 @@ fn load_reads_geometry_and_rejects_missing_keys_body() {
         Array::zeros::<f32>(&[1, h * DOWNSAMPLING_RATIO + 8, w * DOWNSAMPLING_RATIO, 3]).unwrap();
     let err = ae
         .encode(&bad_image)
-        .err()
-        .expect("non-multiple side is refused");
+        .expect_err("non-multiple side is refused");
     assert!(
         err.to_string().contains("multiples of 16"),
         "named geometry error, got {err}"
