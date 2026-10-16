@@ -20,6 +20,88 @@ use crate::unet::ResnetBlock2D;
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
 
+thread_local! {
+    static TRACE_DECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opt-in diagnostics for one tiled decode, restored even on error. An unset variable does not
+/// evaluate or modify the graph. `SDXL_VAE_TRACE_TILE=256` traces precisely that tile edge,
+/// including the global head; it can be combined with the parity test's single-cell selectors.
+struct DecodeTrace(bool);
+
+impl DecodeTrace {
+    fn for_tile(tile: i32) -> Self {
+        let enabled = std::env::var("SDXL_VAE_TRACE_TILE")
+            .ok()
+            .is_some_and(|v| v.parse::<i32>() == Ok(tile));
+        Self(TRACE_DECODE.with(|active| active.replace(enabled)))
+    }
+}
+
+impl Drop for DecodeTrace {
+    fn drop(&mut self) {
+        TRACE_DECODE.with(|active| active.set(self.0));
+    }
+}
+
+#[derive(Debug)]
+struct DecodeStageStats {
+    min: f32,
+    max: f32,
+    nan: u64,
+    inf: u64,
+}
+
+/// Bounded diagnostic reductions, never a full activation copied/upcast to the host. Reducing
+/// each row chunk before casting its scalar min/max avoids f16 sum overflow and bounds scratch.
+fn decode_stage_stats(x: &Array) -> Result<DecodeStageStats> {
+    let sh = x.shape();
+    let row_elems = i64::from(sh[0]) * i64::from(sh[2]) * i64::from(sh[3]);
+    let rows = ((1 << 20) / row_elems.max(1)).clamp(1, i64::from(sh[1])) as i32;
+    let mut stats = DecodeStageStats {
+        min: f32::INFINITY,
+        max: f32::NEG_INFINITY,
+        nan: 0,
+        inf: 0,
+    };
+    for y in (0..sh[1]).step_by(rows as usize) {
+        let end = (y + rows).min(sh[1]);
+        // A contiguous row range, not a gather: the diagnostic does not allocate a full copy.
+        use mlx_rs::ops::indexing::IndexOp;
+        let part = x.index((.., y..end, .., ..));
+        let count = |a: Array| -> Result<u64> {
+            Ok(u64::from(
+                a.as_dtype(Dtype::Uint32)?.sum(None)?.item::<u32>(),
+            ))
+        };
+        stats.nan += count(part.is_nan()?)?;
+        stats.inf += count(part.is_inf()?)?;
+        let finite = part.is_finite()?;
+        let minimum = mlx_rs::ops::r#where(&finite, &part, scalar(f32::INFINITY))?;
+        let maximum = mlx_rs::ops::r#where(&finite, &part, scalar(f32::NEG_INFINITY))?;
+        stats.min = stats
+            .min
+            .min(minimum.min(None)?.as_dtype(Dtype::Float32)?.item::<f32>());
+        stats.max = stats
+            .max
+            .max(maximum.max(None)?.as_dtype(Dtype::Float32)?.item::<f32>());
+    }
+    Ok(stats)
+}
+
+pub(crate) fn trace_decode_stage(label: &str, x: &Array) -> Result<()> {
+    if TRACE_DECODE.with(|active| active.get()) {
+        let stats = decode_stage_stats(x)?;
+        eprintln!(
+            "[sdxl VAE trace] {label} {:?} {:?}: min={} max={} nan={} inf={} active={} cache={} peak={}",
+            x.shape(), x.dtype(), stats.min, stats.max, stats.nan, stats.inf,
+            mlx_rs::memory::get_active_memory(), mlx_rs::memory::get_cache_memory(),
+            mlx_rs::memory::get_peak_memory()
+        );
+    }
+    Ok(())
+}
+
 /// The SDXL VAE's tiling geometry for ladder rung 2 (SC-15525).
 ///
 /// A **still-image** VAE: spatial ×8 (three `upsample_nearest(2)`+conv stages in `up_blocks.0..2`;
@@ -154,8 +236,9 @@ impl EncoderDecoderBlock2D {
             ));
         }
         let mut x = x.clone();
-        for resnet in &self.resnets {
+        for (index, resnet) in self.resnets.iter().enumerate() {
             x = resnet.forward_tiled_vae(&x, tile_edge, cancel)?;
+            trace_decode_stage(&format!("resnet.{index}.out"), &x)?;
         }
         if let Some((cw, cb)) = &self.upsample {
             let up = upsample_nearest(&x, 2)?;
@@ -305,7 +388,8 @@ impl Decoder {
             .filter(|block| block.upsamples())
             .fold(1_i32, |scale, _| scale.saturating_mul(2));
         let mut x = x.clone();
-        for up in &self.up_blocks {
+        for (index, up) in self.up_blocks.iter().enumerate() {
+            trace_decode_stage(&format!("up.{index}.input"), &x)?;
             let current_edge = tile_edge_at(remaining_scale);
             let next_scale = if up.upsamples() {
                 (remaining_scale / 2).max(1)
@@ -313,6 +397,7 @@ impl Decoder {
                 remaining_scale
             };
             x = up.forward_tiled_decode(&x, current_edge, tile_edge_at(next_scale), cancel)?;
+            trace_decode_stage(&format!("up.{index}.output"), &x)?;
             remaining_scale = next_scale;
         }
         if remaining_scale != 1 {
@@ -523,6 +608,8 @@ impl Autoencoder {
         if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
             return Err(mlx_gen::Error::Canceled);
         }
+        let _trace = DecodeTrace::for_tile(cfg.spatial.as_ref().map_or(0, |s| s.tile_px));
+        trace_decode_stage("latent", latents)?;
         let sh = latents.shape();
         if sh.len() != 4 {
             return Err(mlx_gen::Error::Msg(format!(
@@ -539,12 +626,17 @@ impl Autoencoder {
         // Head once on the whole latent. The tail tiles layer-by-layer so every GroupNorm keeps the
         // dense image's statistics while each 3×3 convolution stays bounded by the selected edge.
         let head = self.decoder.head(&z)?;
+        trace_decode_stage("head", &head)?;
         let tile_edge = cfg
             .spatial
             .as_ref()
             .ok_or_else(|| mlx_gen::Error::Msg("SDXL tiled decode requires spatial tiling".into()))?
             .tile_px;
-        self.to_output(self.decoder.tail_tiled(&head, tile_edge, cancel)?)
+        let out = self.decoder.tail_tiled(&head, tile_edge, cancel)?;
+        trace_decode_stage("output_compute", &out)?;
+        let out = self.to_output(out)?;
+        trace_decode_stage("output_f32", &out)?;
+        Ok(out)
     }
 
     /// Encode an image `[B, 3, ...]`-normalized NHWC `[B, H, W, 3]` → latent **mean** `[B, H/8, W/8,
@@ -1086,6 +1178,80 @@ pub(crate) mod tests {
                 delta <= FP16_RELATIVE_TOLERANCE,
                 "fp16 tiled decode at edge {edge} drifted {delta:.3e} of peak"
             );
+        }
+    }
+
+    /// The tracer must distinguish finite corruption, NaN and infinity before RGB conversion
+    /// clips or casts them away. Explicit trace state avoids process-environment mutation in tests.
+    #[test]
+    fn decode_trace_counts_nonfinite_values_and_restores_scope() {
+        let _cpu = crate::test_device::cpu_only();
+        let x = Array::from_slice(
+            &[-2.0f32, 3.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            &[1, 1, 5, 1],
+        );
+        let stats = decode_stage_stats(&x).unwrap();
+        assert_eq!(
+            (stats.min, stats.max, stats.nan, stats.inf),
+            (-2.0, 3.0, 1, 2)
+        );
+        TRACE_DECODE.with(|active| active.set(false));
+        {
+            let _guard = DecodeTrace(TRACE_DECODE.with(|active| active.replace(true)));
+            assert!(TRACE_DECODE.with(|active| active.get()));
+            trace_decode_stage("test.nonfinite", &x).unwrap();
+        }
+        assert!(!TRACE_DECODE.with(|active| active.get()));
+        // A traced finite synthetic decode has exactly the same output as the untraced call.
+        let (weights, cfg) = decorrelated_fixture();
+        let half = fp16_vae(&weights, &cfg);
+        let z = latent().as_dtype(Dtype::Float16).unwrap();
+        let decode = || {
+            half.decoder
+                .tail_tiled(&half.decoder.head(&z).unwrap(), 8, None)
+                .unwrap()
+        };
+        let plain = f32_values(&decode());
+        let _guard = DecodeTrace(TRACE_DECODE.with(|active| active.replace(true)));
+        let traced = f32_values(&decode());
+        assert_eq!(
+            plain, traced,
+            "stage observation must not change the output"
+        );
+    }
+
+    /// Scaled analogue of the failing real-weight cell: 4×4+ragged core grids at half precision,
+    /// after other decode sizes have populated/released allocator buffers. Tiny synthetic weights,
+    /// CPU only; retains a tight decoded-float comparison, not a clipped RGB-only comparison.
+    #[test]
+    fn fp16_tiled_ragged_grids_remain_finite_after_cache_reuse() {
+        let _cpu = crate::test_device::cpu_only();
+        let (weights, cfg) = decorrelated_fixture();
+        let half = fp16_vae(&weights, &cfg);
+        for edge in [16, 32, 64, 32] {
+            let z = values(&[1, edge, edge, 4], 1.7, 0.2);
+            let reference = f32_values(&half.decode_evaluated(&z).unwrap());
+            for tile in [56, 48, 40, 32, 24, 16] {
+                let decoded = half
+                    .decode_tiled(&z, &TilingConfig::spatial_only(tile, 0), None)
+                    .unwrap();
+                let got = f32_values(&decoded);
+                assert!(
+                    got.iter().all(|v| v.is_finite()),
+                    "edge={edge} tile={tile}: non-finite"
+                );
+                let peak = reference.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let max = reference
+                    .iter()
+                    .zip(&got)
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(
+                    max <= 1e-2 * peak,
+                    "edge={edge} tile={tile}: drift {max} peak {peak}"
+                );
+                drop(decoded);
+                mlx_rs::memory::clear_cache();
+            }
         }
     }
 

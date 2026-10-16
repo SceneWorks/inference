@@ -186,12 +186,83 @@ struct ParityRow {
     peak_gib: f64,
 }
 
+/// Optional diagnostic selection. No selectors means the complete supported sweep; selecting a
+/// tile keeps BOTH compute widths compared against a genuinely untiled f32 reference.
+fn parity_cases(size: Option<i32>, tile: Option<u32>) -> Result<Vec<(i32, Vec<u32>)>, String> {
+    if size.is_some_and(|s| ![512, 1024].contains(&s)) {
+        return Err("SDXL_VAE_PARITY_SIZE must be 512 or 1024".into());
+    }
+    if tile.is_some_and(|t| !DECODE_TILE_EDGES.contains(&t)) {
+        return Err("SDXL_VAE_PARITY_TILE must be a supported decode edge".into());
+    }
+    let cases = [512, 1024]
+        .into_iter()
+        .filter(|s| size.is_none_or(|wanted| *s == wanted))
+        .map(|s| {
+            (
+                s,
+                DECODE_TILE_EDGES
+                    .iter()
+                    .copied()
+                    .filter(|t| (*t as i32) < s && tile.is_none_or(|wanted| *t == wanted))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if cases.iter().all(|(_, tiles)| tiles.is_empty()) {
+        return Err("selected tile must be smaller than the selected image".into());
+    }
+    Ok(cases)
+}
+
+#[test]
+fn parity_diagnostic_selection_preserves_both_widths_and_default_coverage() {
+    let full = parity_cases(None, None).unwrap();
+    for (edge, tiles) in &full {
+        assert_eq!(
+            tiles,
+            &DECODE_TILE_EDGES
+                .iter()
+                .copied()
+                .filter(|t| (*t as i32) < *edge)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        full.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![512, 1024]
+    );
+    assert_eq!(
+        parity_cases(Some(1024), Some(256)).unwrap(),
+        vec![(1024, vec![256])]
+    );
+    assert!(parity_cases(Some(512), Some(896)).is_err());
+    assert!(parity_cases(Some(256), None).is_err());
+    assert!(parity_cases(None, Some(1)).is_err());
+}
+
 /// Memory-bounded (see [`PARITY_DECODE_PEAK_GIB`]): one decode at a time, each with its own peak
 /// counter and a cleared cache, and the run stops at the first decode over the bound. Every row is
 /// printed before anything is asserted, so one failing edge never hides the others.
 #[test]
 #[ignore = "real weights + Apple GPU: set SDXL_VAE_FP16_FIX_DIR"]
 fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
+    let size = std::env::var("SDXL_VAE_PARITY_SIZE").ok().map(|v| {
+        v.parse::<i32>()
+            .expect("SDXL_VAE_PARITY_SIZE is an integer")
+    });
+    let tile = std::env::var("SDXL_VAE_PARITY_TILE").ok().map(|v| {
+        v.parse::<u32>()
+            .expect("SDXL_VAE_PARITY_TILE is an integer")
+    });
+    let cases = parity_cases(size, tile).expect("valid parity selection");
+    let expected = cases
+        .iter()
+        .map(|(_, tiles)| usize::from(tile.is_none()) + 2 * tiles.len())
+        .sum::<usize>();
+    eprintln!(
+        "[sc-26268 parity] selection size={size:?} tile={tile:?}; expected comparisons={expected}"
+    );
     let _cap = MemoryCap::new(
         (PARITY_DECODE_PEAK_GIB * GIB) as usize,
         PARITY_CACHE_LIMIT_BYTES,
@@ -210,16 +281,19 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
 
     let mut rows: Vec<ParityRow> = Vec::new();
     let mut over_bound = false;
-    'edges: for edge in [512_i32, 1024] {
+    'edges: for (edge, tiles) in cases {
         let latent = quadrant_latent(&full, edge);
         let (reference, ref_peak) = bounded_decode(|| full.decode_evaluated(&latent));
-        let mut decodes: Vec<Decode<'_>> = vec![(
-            format!("{edge}² fp16 untiled"),
-            FP16_MAX_PIXEL_DELTA,
-            FP16_MEAN_PIXEL_DELTA,
-            Box::new(|| half.decode_evaluated(&latent)),
-        )];
-        for tile in DECODE_TILE_EDGES.iter().filter(|t| (**t as i32) < edge) {
+        let mut decodes: Vec<Decode<'_>> = Vec::new();
+        if tile.is_none() {
+            decodes.push((
+                format!("{edge}² fp16 untiled"),
+                FP16_MAX_PIXEL_DELTA,
+                FP16_MEAN_PIXEL_DELTA,
+                Box::new(|| half.decode_evaluated(&latent)),
+            ));
+        }
+        for tile in &tiles {
             let tiling =
                 mlx_gen::tiling::TilingConfig::spatial_only(*tile as i32, DECODE_OVERLAP as i32);
             let t2 = tiling;
@@ -287,11 +361,10 @@ fn fp16_fix_vae_and_tiled_decode_match_the_f32_untiled_decode() {
             .collect::<Vec<_>>()
             .join("; ")
     );
-    // 512² has nine decodes past its reference (fp16 untiled + 4 edges × 2), 1024² seventeen.
     assert_eq!(
         rows.len(),
-        1 + 2 * 4 + 1 + 2 * 8,
-        "every edge must be measured"
+        expected,
+        "every selected comparison must be measured"
     );
 }
 

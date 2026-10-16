@@ -231,6 +231,7 @@ impl ResnetBlock2D {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
+        crate::vae::trace_decode_stage("resnet.conv1", &y)?;
         let norm2 = GlobalGroupNorm::new(&y, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
             &y,
@@ -240,6 +241,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| silu_glue(&norm2.apply(tile)?),
         )?;
+        crate::vae::trace_decode_stage("resnet.conv2", &y)?;
         let residual = match &self.shortcut {
             Some(sc) => sc.forward(x)?,
             None => x.clone(),
