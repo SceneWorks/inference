@@ -49,6 +49,23 @@ export SMOKE_BUNDLE_ID=com.michaeltrefry.SceneWorksSmoke
 export EVIDENCE="$HOME/ios-evidence/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$EVIDENCE"
 git rev-parse HEAD > "$EVIDENCE/source-sha.txt"
+
+# Record BEFORE invoking the harness, including attempts that fail before launch.
+# This wrapper deliberately returns normally so recovery is not skipped by set -e.
+# Its saved exit-status file, NOT the wrapper's return, is the harness outcome.
+run_attempt() {
+  ATTEMPT=$1; EXPECTED_LIMIT=$2; shift 2
+  ATTEMPT_STARTED=$(date +%s)
+  printf '%s\n' "$ATTEMPT_STARTED" > "$EVIDENCE/$ATTEMPT.started-epoch"
+  printf '%s\n' "$EXPECTED_LIMIT" > "$EVIDENCE/$ATTEMPT.expected-entitlement"
+  if "$@" > "$EVIDENCE/$ATTEMPT.log" 2>&1; then
+    ATTEMPT_STATUS=0
+  else
+    ATTEMPT_STATUS=$?
+  fi
+  printf '%s\n' "$ATTEMPT_STATUS" > "$EVIDENCE/$ATTEMPT.exit-status"
+  printf 'Harness exit %s; log: %s\n' "$ATTEMPT_STATUS" "$EVIDENCE/$ATTEMPT.log"
+}
 ```
 
 Signing is automatic. Other developers supply their own team/bundle ID. Changing
@@ -68,13 +85,15 @@ footprint estimate exists; model absence may also yield skipped checks.
 # Start with a clean diagnostic environment, not inherited unadmitted/soak knobs.
 unset IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY
 unset IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE
-set -e  # Stop immediately rather than copying a stale file after a failed run.
 for entitlement in on off; do
+  expected=YES; [ "$entitlement" = on ] || expected=NO
   for n in 1 2 3; do
-    scripts/ios/run_smoke.sh --device "$DEVICE" --memory-entitlement "$entitlement" \
-      > "$EVIDENCE/launch-$entitlement-$n.log" 2>&1
-    cp /tmp/ios-smoke-launch-memory.txt "$EVIDENCE/launch-$entitlement-$n.txt"
-    cp /tmp/ios-smoke-report.txt "$EVIDENCE/report-$entitlement-$n.txt"
+    run_attempt "launch-$entitlement-$n" "$expected" \
+      scripts/ios/run_smoke.sh --device "$DEVICE" --memory-entitlement "$entitlement"
+    # Stop the sequence, but keep the failed status/log and enter section 6 recovery.
+    if [ "$ATTEMPT_STATUS" -ne 0 ]; then break 2; fi
+    cp /tmp/ios-smoke-launch-memory.txt "$EVIDENCE/$ATTEMPT.launch-memory.txt"
+    cp /tmp/ios-smoke-report.txt "$EVIDENCE/$ATTEMPT.report.txt"
   done
 done
 ```
@@ -118,10 +137,12 @@ The installed app must exist first; the remote tree is `Documents/sana/`.
 ## 4. Admitted SANA check
 
 ```sh
-IOS_SMOKE_ONLY=sana scripts/ios/run_smoke.sh --media \
-  --device "$DEVICE" --memory-entitlement on \
-  > "$EVIDENCE/sana-admitted.log" 2>&1
-cp /tmp/ios-smoke-report.txt "$EVIDENCE/sana-admitted-report.txt"
+run_attempt sana-admitted YES env IOS_SMOKE_ONLY=sana \
+  scripts/ios/run_smoke.sh --media --device "$DEVICE" --memory-entitlement on
+if [ "$ATTEMPT_STATUS" -eq 0 ]; then
+  cp /tmp/ios-smoke-report.txt "$EVIDENCE/$ATTEMPT.report.txt"
+fi
+# If nonzero, retain the saved status/log and use section 6 before another attempt.
 ```
 
 The regular SANA harness configurations are 1024/tile192, 1024/tile128 and
@@ -138,11 +159,35 @@ production render**, even if a PNG is produced. It requires a real device and
 explicit `--unadmitted`. The capture path selects only 256/tile128, not the
 legacy untiled experiment; there is no arbitrary size flag for SANA.
 
+**Mandatory BEFORE capture:** independently establish and record a conservative
+**total process working-set bound for the actual snapshot and exact capture
+configuration**. The record must identify the layout/component precisions,
+source, phone/OS/entitlement, 256/tile128 execution configuration, derivation and
+margin, and account for weight conversions, simultaneously resident tensors,
+activations, allocator/cache and driver/process overhead. Compare that bound
+conservatively with the available capacity for this attempt. The header-only
+payload/profile and the harness's automated payload/cap/headroom preflight
+**DO NOT satisfy this prerequisite**: they cannot bound these transients.
+Neither launch headroom nor the provisional constant establishes such a bound.
+**Do not execute capture if this independent bound is missing or unsupported.**
+No numerical safe bound is supplied by this runbook, and none is asserted to
+exist for the target snapshot. Merely creating a receipt file is not evidence.
+
+Only after the operator has reviewed and recorded that independently supported
+bound, set `CAPTURE_BOUND_RECORD` to its receipt and run:
+
 ```sh
-IOS_SMOKE_ONLY=sana IOS_SMOKE_SANA_CAPTURE=1 \
-  scripts/ios/run_smoke.sh --media --unadmitted \
-  --device "$DEVICE" --memory-entitlement on \
-  > "$EVIDENCE/sana-UNADMITTED-capture.log" 2>&1
+# Leave unset unless the mandatory total-working-set prerequisite above is met.
+if [ -n "${CAPTURE_BOUND_RECORD:-}" ] && [ -s "$CAPTURE_BOUND_RECORD" ]; then
+  cp "$CAPTURE_BOUND_RECORD" "$EVIDENCE/capture-total-working-set-bound.txt"
+  run_attempt sana-UNADMITTED-capture YES env \
+    IOS_SMOKE_ONLY=sana IOS_SMOKE_SANA_CAPTURE=1 \
+    scripts/ios/run_smoke.sh --media --unadmitted \
+    --device "$DEVICE" --memory-entitlement on
+else
+  printf '%s\n' 'NOT RUN: independent total-working-set bound is missing.' >&2
+fi
+# If attempted, retain its saved exit status even on failure and enter section 6.
 ```
 
 Keep the exit status, launch-memory record, progress trace, full report and
@@ -161,18 +206,80 @@ A missing report can mean launch failure, crash, termination or slow execution.
 A progress file proves how far execution got, not why it stopped. Retrieve the
 matching timestamped device crash/jetsam diagnostic before assigning a cause.
 
+Use the `ATTEMPT` recorded **before that invocation**, never the current time or
+another attempt's receipt. A failure before launch or before progress truncation
+can leave both device files from an older run. A local copy's creation/mtime is
+not freshness evidence. Preserve the device-reported modification timestamps in
+the metadata JSON below; if metadata is unavailable, keep files **unverified**.
+
 ```sh
-xcrun devicectl device copy from --device "$DEVICE" \
+# Retrieval failures must not abort the remaining recovery steps under set -e.
+unset DEVICE_PROGRESS_MTIME DEVICE_LAUNCH_MTIME  # Never reuse a prior transcription.
+if xcrun devicectl device info files --device "$DEVICE" \
   --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
-  --source Documents/sana-progress.txt --destination "$EVIDENCE/sana-progress.txt"
-xcrun devicectl device copy from --device "$DEVICE" \
-  --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
-  --source Documents/launch-memory.txt --destination "$EVIDENCE/launch-memory-recovery.txt"
+  --subdirectory Documents --no-recurse \
+  --json-output "$EVIDENCE/$ATTEMPT.device-files.json" \
+  > "$EVIDENCE/$ATTEMPT.device-files.log" 2>&1; then
+  printf '%s\n' 'Device metadata saved; inspect each source modification timestamp.'
+else
+  printf '%s\n' 'Metadata unavailable: recovered files remain UNVERIFIED.' >&2
+fi
+for name in sana-progress.txt launch-memory.txt; do
+  if xcrun devicectl device copy from --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
+    --source "Documents/$name" \
+    --destination "$EVIDENCE/$ATTEMPT.$name.unverified" \
+    > "$EVIDENCE/$ATTEMPT.$name.copy.log" 2>&1; then
+    printf '%s\n' "Copied $name as UNVERIFIED, not current-attempt evidence."
+  else
+    printf '%s\n' "Unavailable: $name; preserve the copy log." >&2
+  fi
+done
+cat "$EVIDENCE/$ATTEMPT.exit-status"  # Original harness outcome, never overwritten.
 ```
 
-The script also attempts `/tmp/ios-sana-progress.txt` on failure. Preserve the
-logs immediately: `/tmp/ios-smoke-report.txt` and launch-memory filenames are
-reused. Retrieve crash/termination reports through Xcode Devices and Simulators
+Inspect the saved device metadata for **each exact source file**, and record its
+modification time as Unix epoch seconds, retaining the original device timestamp
+and timezone alongside that transcription. Do not substitute the copy timestamp.
+The following classifier takes that device-derived value, not a guessed JSON
+field (Xcode metadata schemas may differ). Unknown/missing timestamps, times at
+or before the pre-invocation boundary, and mismatched entitlement are not current
+evidence. The equality case is conservatively ambiguous at one-second precision.
+
+```sh
+classify_recovered() {
+  file=$1; device_mtime=$2; kind=$3
+  started=$(cat "$EVIDENCE/$ATTEMPT.started-epoch")
+  expected=$(cat "$EVIDENCE/$ATTEMPT.expected-entitlement")
+  case "$device_mtime" in
+    ''|*[!0-9]*) printf '%s\n' UNVERIFIED; return ;;
+  esac
+  if [ ! -f "$file" ]; then printf '%s\n' MISSING; return; fi
+  if [ "$device_mtime" -le "$started" ]; then
+    printf '%s\n' STALE_OR_AMBIGUOUS; return
+  fi
+  if [ "$kind" = launch ]; then
+    case "$expected" in YES|NO) ;; *) printf '%s\n' UNVERIFIED; return ;; esac
+    if ! grep -q "increased-memory-limit = $expected\$" "$file"; then
+      printf '%s\n' WRONG_ENTITLEMENT; return
+    fi
+  fi
+  printf '%s\n' CURRENT
+}
+# Leave unknown until transcribed from the preserved DEVICE metadata, separately.
+classify_recovered "$EVIDENCE/$ATTEMPT.sana-progress.txt.unverified" \
+  "${DEVICE_PROGRESS_MTIME:-}" progress > "$EVIDENCE/$ATTEMPT.progress-freshness"
+classify_recovered "$EVIDENCE/$ATTEMPT.launch-memory.txt.unverified" \
+  "${DEVICE_LAUNCH_MTIME:-}" launch > "$EVIDENCE/$ATTEMPT.launch-freshness"
+```
+
+Only `CURRENT` files may be attributed to this attempt. Fresh progress alone
+does not establish the entitlement: require a `CURRENT` launch record matching
+YES/NO as well; otherwise keep build/entitlement attribution unverified. Store
+all stale/mismatched files as historical evidence, not this run's measurements.
+The script also attempts `/tmp/ios-sana-progress.txt` on failure; apply the same
+attribution discipline. Preserve logs immediately: `/tmp/ios-smoke-report.txt`
+and launch-memory filenames are reused. Retrieve crash/termination reports through Xcode Devices and Simulators
 or the phone's Analytics Data, matching app, time, device and source receipt.
 Do not label a timeout or a breadcrumb as a jetsam diagnosis.
 
@@ -190,7 +297,7 @@ No GPU measurements were run for this documentation update.
 |---|---|---|
 | Iris conditioning, fixed-input denoiser, renders, resident bytes | `1d64ac261df315000ef68a81d19db2ee4ac95455`, merged via #1275 `2f3265c71`; local logs `/tmp/sc16774-rerun3` | All passed; q8 backbone+tower 7.283 GiB, q4 4.200 GiB. Not process footprint or phone fit. |
 | SDXL/Illustrious sequential CFG and all-three low-memory pipeline | Earlier `770fa87c28a9c5efcbe8e942c10d36e86dd79827` run, `/tmp/sc16774-rerun2` | Sequential CFG byte-identical; all-three MLX peak 3.2289 GiB, NOT process footprint (sampled suite footprint reached 12.736 GiB). Predates final fp16 accumulation fix; NOT a remeasured final pipeline claim. |
-| Final VAE parity | `7b5684a1bdc9bf9ec5273351be9cb05febbc962e`, merged via #1274 `a54ad6c3a`; `/tmp/sc16774-vae-final/source-and-build.txt`, `metrics.json`, `full.log` | 26/26 comparisons passed at max ≤3/255, mean ≤0.25. fp16 tile256 overflow fixed by narrowly widening convolution accumulation to f32 with f16 storage. |
+| Final VAE parity | `7b5684a1bdc9bf9ec5273351be9cb05febbc962e`, merged via #1274 `a54ad6c3a`; `/tmp/sc16774-vae-final/source-and-build.txt`, `metrics.json`, `full.log` | 26/26 comparisons passed: absolute pixel error max ≤3 and mean ≤0.25, both in 8-bit pixel units (equivalently normalized max ≤3/255 and mean ≤0.25/255). fp16 tile256 overflow fixed by narrowly widening convolution accumulation to f32 with f16 storage. |
 | Final VAE memory | Same final source/run | Genuinely untiled 1024 f32 reference peak 7.69 GiB; sweep maximum MLX peak 10.48 GiB; sampled process footprint 8.971 GiB. VAE test, not full-pipeline or target-phone evidence. |
 
 Historical SANA data on the 12 GB iPhone 17 Pro Max is unbound planning data:
