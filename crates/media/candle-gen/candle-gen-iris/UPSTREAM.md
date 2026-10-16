@@ -106,7 +106,7 @@ from the headers, adapted pricing, tier handshake, witnessed surfaces), `tests/q
 the miniature (Candle CPU, every tier: measured resident bytes equal to the contract, image /
 conditioning distance to the dense tier, the production load at both residency policies) and the
 `#[ignore]`d `tests/quant_real_weights.rs` (measured resident ratios on the release; 512² bf16 /
-q8 / q4 renders from one seed against the MLX twin's declared tolerance) on the CUDA lane.
+q8 / q4 renders from one seed: coherence + composition; no pixel-distance bound, per the MLX twin's measured bf16 floor) on the CUDA lane.
 
 ## The folded tape (training, sc-25690)
 
