@@ -59,13 +59,25 @@ On the merged feature base `a54ad6c3a`:
 
 Iris registration [#1277](https://github.com/SceneWorks/inference/pull/1277) and
 SDXL registration [#1278](https://github.com/SceneWorks/inference/pull/1278) were
-open at this documentation snapshot. Their final merged public facades must be
-checked before documenting consumer calls. In particular, preserve the safe
-SANA/SDXL facade boundary: do not recommend raw registry loads as admitted.
-Iris depth is a distinct callable surface, with explicitly unadmitted diagnostic
-loading, not an image-registry mode or a measured-fit claim. No Iris or SDXL
-phone fit is established by these registration changes. All conditioning/mode
-routes must remain represented even when admission refuses them.
+open at this documentation snapshot. Their reviewed heads (`9829ca95` and
+`abf72cf1` respectively) preserve the safe media facade; neither exposes
+`runtime_ios::media::provider_registry` as an admitted shortcut.
+
+In the reviewed SDXL head, `runtime_ios::media::load_sdxl(candidates)` selects
+from ordered `sdxl::SdxlCandidate` values and returns the selected index and a
+`BoundSdxlGenerator`. It requires platform limits bound first, checks applicable
+artifact/device evidence and the provider's shared safety check before tensor
+loading, then rechecks capacity and request/source binding at generation. No
+current iPhone capture authorizes a product load. This is a pending interface,
+not a call available on the merged base above.
+
+In the reviewed Iris head, `runtime_ios::iris_depth` is separate from the safe
+image facade. Its `load_depth_unadmitted_for_diagnostics` loader exposes the
+callable depth task without claiming admission or phone fit. Iris image catalog
+registration likewise does not authorize a raw registry load as production
+admission. No Iris or SDXL phone fit is established by these changes. Preserve
+all conditioning/mode routes even when admission refuses them, and reconcile
+these source-bound interface notes if the final merged heads differ.
 
 ## Evidence and measurement contract
 
