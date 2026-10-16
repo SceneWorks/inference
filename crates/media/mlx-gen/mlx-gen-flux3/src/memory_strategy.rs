@@ -536,13 +536,16 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
-    Ok(Some(gen_core::flux3::references::guard_memory_scope(
-        Box::new(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
-            config,
-            mlx_gen::request_scope::MlxScopeCleanup::Device,
-        )),
-        context.geometry,
-    )))
+    Ok(Some(
+        gen_core::flux3::references::guard_memory_scope_with_resources(
+            Box::new(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
+                config,
+                mlx_gen::request_scope::MlxScopeCleanup::Device,
+            )),
+            context.geometry,
+            context.reference_resources.clone(),
+        ),
+    ))
 }
 
 /// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,

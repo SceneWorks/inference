@@ -583,12 +583,15 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
-    Ok(Some(gen_core::flux3::references::guard_memory_scope(
-        Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
-            config,
-        )),
-        context.geometry,
-    )))
+    Ok(Some(
+        gen_core::flux3::references::guard_memory_scope_with_resources(
+            Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
+                config,
+            )),
+            context.geometry,
+            context.reference_resources.clone(),
+        ),
+    ))
 }
 
 /// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,

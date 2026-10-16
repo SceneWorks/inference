@@ -1174,6 +1174,7 @@ mod tests {
         // gate below still binds exactly, but nothing hands it the q4 evidence key.
         assert_eq!(contract.calibration, None);
         let context_for = |quant| MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,

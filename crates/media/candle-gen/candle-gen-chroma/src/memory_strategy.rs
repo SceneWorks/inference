@@ -1798,6 +1798,7 @@ fn estimated_behavior_context(
     route: MemoryBehaviorRoute,
 ) -> gen_core::Result<MemoryRunContext> {
     Ok(MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
         // sc-22731: the handshake half is the contract's OWN identity, whatever it is — the empty
@@ -2305,6 +2306,7 @@ mod tests {
 
     fn context(contract: &MemoryProviderContract, count: u32) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
                 parameters: MemoryStrategyParameters::default(),

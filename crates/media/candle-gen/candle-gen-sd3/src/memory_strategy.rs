@@ -1652,6 +1652,7 @@ pub fn registered_valid_fixture(
     .into_iter()
     .map(|request_route| {
         let context = MemoryRunContext {
+            reference_resources: None,
             selection: contract.representative_selection(
                 strategy,
                 MemoryNumericTier {
@@ -2124,6 +2125,7 @@ mod tests {
             contract_from_receipt(&spec(receipt.route, &receipt.root, Vec::new()), receipt);
         let refs = u32::from(mode == MemoryMode::ImageToImage);
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
                 parameters: MemoryStrategyParameters::default(),

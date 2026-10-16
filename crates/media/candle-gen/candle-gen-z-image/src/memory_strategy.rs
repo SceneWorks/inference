@@ -2346,6 +2346,7 @@ mod tests {
     fn context(contract: &MemoryProviderContract) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: rung_four_selection(),
             calibration_abi: calibration.abi,

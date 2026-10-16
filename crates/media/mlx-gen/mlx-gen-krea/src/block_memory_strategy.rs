@@ -1982,6 +1982,7 @@ mod tests {
     ) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().unwrap();
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
