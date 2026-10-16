@@ -575,6 +575,7 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-flux",
  "candle-gen-flux2",
+ "candle-gen-flux3",
  "candle-gen-ideogram",
  "candle-gen-instantid",
  "candle-gen-iris",
@@ -698,6 +699,21 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-flux3"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-llm",
+ "image",
+ "rand",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

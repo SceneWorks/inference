@@ -1258,6 +1258,49 @@ impl CausalLm {
         self.hidden_states_from_embeds_with_mask(&embeds, cache, offset, mask)
     }
 
+    /// [`CausalLm::hidden_states_with_mask`] from **explicit absolute positions** rather than the
+    /// contiguous `offset..offset + seq` run — the text-encoder twin of
+    /// [`CausalLm::decode_logits_masked`] over [`CausalLm::rope_tables`]. `positions` is a
+    /// row-major `[batch, seq]` grid, so a right-padded window whose pads all sit at one position
+    /// (FLUX 3's `positions.masked_fill(mask == 0, 1)`) rotates exactly as upstream's
+    /// `position_ids`, and the additive `mask` keeps the pads out of every query's keys. Every
+    /// layer type's RoPE tables are built from the same grid, so a per-layer-type model (Gemma 4)
+    /// is served too.
+    ///
+    /// Returns the same `num_layers + 1` HF-ordered stack as [`CausalLm::hidden_states`].
+    pub fn hidden_states_with_mask_at(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        positions: &[i32],
+        mask: AttnMask<'_>,
+    ) -> Result<Vec<Tensor>> {
+        let (b, s) = input_ids.dims2()?;
+        if positions.len() != b * s {
+            return Err(Error::Msg(format!(
+                "hidden_states_with_mask_at: {} positions for a {b}x{s} window",
+                positions.len()
+            )));
+        }
+        let embeds = self.embed(input_ids)?;
+        let tables = self.rope_tables(positions, b as i32, s as i32)?;
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        self.run_decoder_stack_collecting(
+            &embeds,
+            cache,
+            &tables,
+            mask,
+            Some(&mut out),
+            self.attn_formulation,
+            false,
+            false,
+        )?;
+        if let Some(last) = out.last_mut() {
+            *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
+        }
+        Ok(out)
+    }
+
     /// Like [`CausalLm::hidden_states`] but from pre-computed input embeddings.
     ///
     /// Returns `num_layers + 1` tensors, each `[batch, seq, hidden]`, in Hugging Face's

@@ -197,6 +197,15 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "flux2_klein_9b",
         components: &["flux2_klein_9b"],
     },
+    // --- flux3 -------------------------------------------------------------------------------
+    // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
+    // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
+    // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too. The
+    // same complete row the MLX twin's catalog names (sc-26234 / sc-26235).
+    ProviderComponents {
+        provider_id: "flux3_klein",
+        components: &["flux3_image_klein", "qwen3_vl_4b_instruct"],
+    },
     // --- ideogram ---------------------------------------------------------------------------
     // Both DiTs, the VAE and the text encoder ship in one gated snapshot. `ideogram_4_turbo`
     // merges the bundled TurboTime LoRA on **every** run, so that row is listed rather than
@@ -588,7 +597,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 55);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 56);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -620,9 +629,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            65,
-            "65 distinct Candle provider ids: 58 generators (qwen_image_2_1_turbo joined in \
-             sc-25901) + 19 trainers (15 of them also \
+            66,
+            "66 distinct Candle provider ids: 59 generators (qwen_image_2_1_turbo joined in \
+             sc-25901, flux3_klein in sc-26235) + 19 trainers (15 of them also \
              generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -776,6 +785,7 @@ mod tests {
                 "chroma1_base",
                 "chroma1_flash",
                 "chroma1_hd",
+                "flux3_klein",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",

@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_MEMBER_COUNT = 108
+EXPECTED_MEMBER_COUNT = 109
 INTERNAL_PACKAGES = {
     "candle-audio",
     "candle-audio-catalog",
@@ -356,6 +356,18 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "each backend prices the Turbo checkpoint at the width ITS loader materializes it at — the "
         "bf16 autoencoder is held at bf16 on mlx and at the lane's compute dtype on candle — so a "
         "record built against one backend must not satisfy the other's handshake."
+    ),
+    ("flux3", "ATTENTION_NOT_ENABLED"): (
+        "the reason rung 3 is declared `Missing`, in prose that names each backend's own attention "
+        "kernel (mlx: the shared MLX kernel's saving; candle: the shared bounded plan's saving) — "
+        "the same unmeasured per-family saving on both sides, not geometry (sc-26235)."
+    ),
+    ("flux3", "MEMORY_CALIBRATION_FINGERPRINT"): (
+        "a calibration identity, per-backend by construction (sc-26235): both values name a "
+        "DERIVED memory model, each pricing its components at the width its own loader "
+        "materializes them at, and a shared fingerprint would let a record built against one "
+        "backend satisfy the other's handshake. The registration aggregates of this family are "
+        "spelled alike on both backends and are compared."
     ),
     ("iris", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction (sc-25690, generation) — the same "
