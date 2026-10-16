@@ -2190,7 +2190,7 @@ mod tests {
     /// by design.
     #[test]
     fn a_staged_request_releases_the_unet_before_decode() {
-        use crate::training::family::test_support::{tiny_unet, tiny_unet_weights};
+        use crate::test_support::{tiny_unet, tiny_unet_weights};
         use mlx_rs::memory::{clear_cache, get_active_memory};
         use std::sync::{Arc, Mutex};
 

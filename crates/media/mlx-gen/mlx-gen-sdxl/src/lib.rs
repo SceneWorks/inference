@@ -38,8 +38,11 @@ pub mod plan;
 pub mod preview;
 pub mod quant;
 pub mod sampler;
+#[doc(hidden)]
+pub mod test_support;
 pub mod text_encoder;
 pub mod tokenizer;
+#[cfg(feature = "training")]
 pub mod training;
 pub mod unet;
 pub mod vae;
@@ -102,7 +105,9 @@ pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
+#[cfg(feature = "training")]
 pub use training::family::{train_family, SdxlFamilyHooks, TrainTimestep};
+#[cfg(feature = "training")]
 pub use training::{load_trainer, SdxlTrainer};
 pub use unet::{ControlNet, ControlResiduals, Transformer2D, UNet2DConditionModel};
 pub use vae::{Autoencoder, SdxlLatentDecoder};
@@ -173,7 +178,7 @@ pub fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> mlx_gen::Re
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(model::REGISTRATION)
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
@@ -211,8 +216,12 @@ pub fn register_providers(
                 },
             },
         )
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION);
+    // The LoRA/LoKr trainer and its perceptual/dataset deps are the default-on `training` feature
+    // (sc-26265), so an inference-only graph compiles none of them.
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::TRAINER_REGISTRATION);
+    registry
 }
 
 /// Build the complete explicit MLX SDXL provider catalog.
@@ -286,7 +295,12 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit_generators, ["sdxl"]);
-        assert_eq!(explicit_trainers, ["sdxl"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["sdxl"]
+        } else {
+            &[]
+        };
+        assert_eq!(explicit_trainers, expected_trainers);
     }
 
     /// Weights-free behavioral oracle for the shared memory ladder (SC-15525).

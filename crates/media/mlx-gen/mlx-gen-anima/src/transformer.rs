@@ -10,18 +10,23 @@
 //! `CosmosTransformerBlock`, final layer. **Skipped** (config-off for Anima): learnable pos-embed
 //! (`extra_pos_embed_type=null`), cross-attn projection, ControlNet hooks, img-context.
 
-use mlx_rs::error::{Exception, Result as MlxResult};
+#[cfg(feature = "training")]
+use mlx_rs::error::Exception;
+use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, zeros_dtype};
 use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter, LinearFacts};
+#[cfg(feature = "training")]
+use mlx_gen::adapters::Adapter;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, LinearFacts};
 use mlx_gen::nn::{gelu_exact, modulate, silu, timestep_sincos};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, FusedQkvProjection, QkNormSpec, QkvPart, QkvSource, RopeSpec, RopeStyle,
     RopeTables,
 };
+#[cfg(feature = "training")]
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::{join, Weights};
 use mlx_gen::Result;
@@ -797,6 +802,7 @@ impl CosmosDiT {
     /// LOCAL paths (e.g. `"self_attn.q_proj"`, `"adaln_modulation_mlp.2"`) trained on block `i`, in the
     /// order their `lora_a`/`lora_b` are threaded. Blocks with no trained targets still run checkpointed
     /// (hidden+encoder inputs only), so the whole stack is uniformly recompute-on-backward.
+    #[cfg(feature = "training")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_with_main_checkpointed(
         &self,
@@ -824,6 +830,7 @@ impl CosmosDiT {
     /// `thread_encoder` gates the sc-10522 trap: `true` threads `encoder` as an explicit checkpoint
     /// input (the production path); `false` CAPTURES it as a constant (the deliberately-wrong path the
     /// grad-parity mutation test drives to prove the conditioner grads collapse to zero when captured).
+    #[cfg(feature = "training")]
     #[allow(clippy::too_many_arguments)]
     fn checkpointed_impl(
         &self,
@@ -953,7 +960,7 @@ impl CosmosDiT {
     /// that deliberately CAPTURES `encoder` instead of threading it — the sc-10522 inert-conditioner
     /// bug. Used only by the grad-parity mutation test to prove the conditioner factors receive zero
     /// gradient on the wrong path (so the correct path's non-zero conditioner grads are meaningful).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "training"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_with_main_checkpointed_encoder_captured(
         &self,
@@ -1154,7 +1161,7 @@ impl AdaptableHost for CosmosDiT {
 /// (sc-10522) can exercise the real [`AdaptableHost::adaptable_paths`] surface without the licensed
 /// checkpoint or any Metal compute — enumeration only walks the module tree; no placeholder tensor is
 /// ever evaluated.
-#[cfg(test)]
+#[cfg(all(test, feature = "training"))]
 mod structural {
     use super::*;
 
