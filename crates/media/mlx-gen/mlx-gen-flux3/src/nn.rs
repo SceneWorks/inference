@@ -78,6 +78,31 @@ impl Linear {
         Ok(())
     }
 
+    /// Replace the factors inside the functional autograd closure. No evaluation,
+    /// serialization or merged delta: each trace receives the current A/B arrays.
+    /// Normal inference residual arithmetic is deliberate: source mixed precision and
+    /// generation reload must use the same cast/alpha/rank convention.
+    pub fn replace_training_lora(&mut self, down: Array, up: Array, scale: f64) -> Result<()> {
+        let (output, input) = self.out_in()?;
+        let rank = down.shape().first().copied().unwrap_or(0);
+        if rank <= 0
+            || down.shape() != [rank, input]
+            || up.shape() != [output, rank]
+            || !scale.is_finite()
+        {
+            return Err(Error::Unsupported(
+                "flux3 training: invalid trainable LoRA shape/gain".into(),
+            ));
+        }
+        self.inner
+            .set_adapters(vec![mlx_gen::adapters::Adapter::Lora {
+                a: down.transpose_axes(&[1, 0])?.as_dtype(self.compute)?,
+                b: up.transpose_axes(&[1, 0])?.as_dtype(self.compute)?,
+                scale: scale as f32,
+            }]);
+        Ok(())
+    }
+
     /// `[out, in]` of the dense base.
     pub fn out_in(&self) -> Result<(i32, i32)> {
         let (weight, _) = self
