@@ -178,7 +178,18 @@ pub fn exercise_retained_compile_inventory(input: &mlx_rs::Array) -> mlx_gen::Re
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
+    let registry = register_generator(registry);
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::TRAINER_REGISTRATION);
+    registry
+}
+
+/// Register the complete SDXL generator, imported-checkpoint and memory surfaces, never a trainer.
+/// iOS uses this seam even when another workspace consumer unifies `training` on this crate.
+pub fn register_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_generator(model::REGISTRATION)
         .register_checkpoint_adapter(mlx_gen::gen_core::CheckpointAdapterRegistration {
             backend_bindings: &[
@@ -216,12 +227,7 @@ pub fn register_providers(
                 },
             },
         )
-        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION);
-    // The LoRA/LoKr trainer and its perceptual/dataset deps are the default-on `training` feature
-    // (sc-26265), so an inference-only graph compiles none of them.
-    #[cfg(feature = "training")]
-    let registry = registry.register_trainer(training::TRAINER_REGISTRATION);
-    registry
+        .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit MLX SDXL provider catalog.

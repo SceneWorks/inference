@@ -131,6 +131,7 @@ pub(crate) struct SdxlBlockStream {
     /// from (`unet/diffusion_pytorch_model{,.fp16}.safetensors`) rather than the caller's raw
     /// `LoadSpec::weights`, which is the snapshot ROOT and would re-read every component.
     source: WeightsSource,
+    source_inventory: Option<mlx_gen::gen_core::SourceInventory>,
     /// This sub-stack's `attentions.{i}` prefix, already absolute
     /// (`down_blocks.2.attentions.0`, `mid_block.attentions.0`, …), so block `n` is
     /// `{base}.transformer_blocks.{n}`.
@@ -172,6 +173,7 @@ impl SdxlBlockStream {
     ) -> Self {
         Self {
             source,
+            source_inventory: None,
             prefix: prefix.to_owned(),
             model_dims,
             num_heads,
@@ -244,12 +246,22 @@ impl SdxlBlockStream {
     /// ever converted. Without it a streamed block keeps the file's stored width: a packed snapshot
     /// whose producer wrote its norms/biases at f32 would hand the window f32 dense leaves while the
     /// resident twin holds f16, breaking byte-identity and promoting the window's activations.
+    pub(crate) fn bind_source_inventory(&mut self, guard: mlx_gen::gen_core::SourceInventory) {
+        self.source_inventory = Some(guard);
+    }
+
     pub(crate) fn open(&self) -> Result<Weights> {
+        if let Some(guard) = &self.source_inventory {
+            guard.verify_unchanged()?;
+        }
         let mut view = match &self.source {
             WeightsSource::Dir(dir) => Weights::from_dir(dir)?,
             WeightsSource::File(file) => Weights::from_file(file)?,
         };
         crate::loader::cast_for_load(&mut view, self.dtype)?;
+        if let Some(guard) = &self.source_inventory {
+            guard.verify_unchanged()?;
+        }
         Ok(view)
     }
 
@@ -257,6 +269,9 @@ impl SdxlBlockStream {
     /// IP-installed exactly like its resident twin — then drain the view of precisely the tensors
     /// that block read.
     pub(crate) fn materialize(&self, view: &mut Weights, index: usize) -> Result<TransformerBlock> {
+        if let Some(guard) = &self.source_inventory {
+            guard.verify_unchanged()?;
+        }
         if index >= self.n_blocks {
             return Err(Error::Msg(format!(
                 "sdxl block stream `{}`: block {index} is out of range for a {}-block sub-stack",
@@ -300,6 +315,12 @@ impl SdxlBlockStream {
             )));
         }
         self.adapters[index].install(&mut block)?;
+        if let Some(guard) = &self.source_inventory {
+            // Lazy file arrays must be consumed while the retained identity is guarded, not
+            // returned to a later forward that might otherwise reopen a replaced source.
+            block.materialize_weights()?;
+            guard.verify_unchanged()?;
+        }
         Ok(block)
     }
 }
@@ -359,6 +380,23 @@ mod tests {
             Dtype::Float32,
             None,
         )
+    }
+
+    #[test]
+    fn stream_reopen_rejects_retained_inventory_change_before_loading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("unet.safetensors");
+        std::fs::write(&file, b"not tensor data").unwrap();
+        let spec = mlx_gen::LoadSpec::new(WeightsSource::Dir(tmp.path().to_owned()));
+        let guard = mlx_gen::gen_core::SourceInventory::capture(&spec).unwrap();
+        let mut stream = stream(&file, 1);
+        stream.bind_source_inventory(guard);
+        std::fs::write(tmp.path().join("added.safetensors"), b"new").unwrap();
+        let error = stream.open().err().unwrap().to_string();
+        assert!(
+            error.contains("source inventory changed"),
+            "must reject at reopen, not parse tensors: {error}"
+        );
     }
 
     fn resident(stream: &SdxlBlockStream, n: usize) -> Vec<TransformerBlock> {

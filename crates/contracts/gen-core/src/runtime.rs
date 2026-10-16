@@ -829,6 +829,7 @@ pub struct LoadSpec {
     /// [`prepared_receipt_paths`](Self::prepared_receipt_paths). Known file tokens reject mutation;
     /// this receipt additionally rejects directory additions, removals, renames, and type changes.
     prepared_encoder_receipt: Option<crate::encoder_contract::PreparedEncoderLoadReceipt>,
+    source_inventory: Option<std::sync::Arc<crate::SourceInventory>>,
     pub quantize: Option<Quant>,
     pub precision: Precision,
     /// YuE2-only AR execution mode; every other provider refuses a non-native value.
@@ -998,6 +999,7 @@ impl LoadSpec {
             prepared_file_pins: PreparedFilePins::default(),
             prepared_receipt_paths: BTreeSet::new(),
             prepared_encoder_receipt: None,
+            source_inventory: None,
             quantize: None,
             precision: Precision::Bf16,
             yue2_ar_mode: Yue2ArMode::Native,
@@ -1464,6 +1466,9 @@ impl LoadSpec {
 
     /// Validate that prepared mode covers exactly the File sources currently configured by the spec.
     pub fn validate_prepared_file_pins(&self) -> crate::Result<()> {
+        if let Some(guard) = &self.source_inventory {
+            guard.verify_for(self)?;
+        }
         if !self.prepared_file_pins.is_prepared() {
             return Ok(());
         }
@@ -1477,6 +1482,27 @@ impl LoadSpec {
 
     /// Return path-free planning facts from the retained selected-encoder acquisition receipt.
     ///
+    /// Bind all configured directory members and File/auxiliary sources to one retained inventory.
+    /// Providers must use `read_prepared_files_unchanged` around deferred reads/materialization.
+    pub fn bind_source_inventory(
+        &mut self,
+        inventory: crate::SourceInventory,
+    ) -> crate::Result<()> {
+        inventory.verify_for(self)?;
+        // Retain the original configured File tokens in the standard loader path as well; do not
+        // re-pin a fused checkpoint/override when a later phase consumes it. Directory members
+        // additionally need the inventory guard (a configured-File set cannot detect new shards).
+        if !self.prepared_file_pins.is_prepared() {
+            self.prepare_with_file_pins(inventory.configured_file_pins(self)?)?;
+        }
+        self.source_inventory = Some(std::sync::Arc::new(inventory));
+        Ok(())
+    }
+
+    pub fn source_inventory(&self) -> Option<&crate::SourceInventory> {
+        self.source_inventory.as_deref()
+    }
+
     /// Stable receipts are checked through their metadata identity only; this never acquires a new
     /// artifact seal or repeats full-content hashing. A changed source still fails closed before
     /// facts are returned. `None` means this spec has no crate-validated encoder receipt and a
@@ -1676,7 +1702,13 @@ impl LoadSpec {
         E: From<crate::Error>,
     {
         if !self.prepared_file_pins.is_prepared() {
-            return read();
+            return match &self.source_inventory {
+                Some(guard) => {
+                    guard.verify_for(self).map_err(E::from)?;
+                    guard.read_unchanged(read)
+                }
+                None => read(),
+            };
         }
         self.validate_prepared_file_pins().map_err(E::from)?;
         let pins = self
@@ -1690,6 +1722,9 @@ impl LoadSpec {
         let result = read();
         for pin in &pins {
             pin.verify_unchanged().map_err(E::from)?;
+        }
+        if let Some(guard) = &self.source_inventory {
+            guard.verify_unchanged().map_err(E::from)?;
         }
         result
     }
