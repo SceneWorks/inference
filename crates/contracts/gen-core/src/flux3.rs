@@ -38,6 +38,7 @@ use crate::{Error, Result};
 
 pub mod adapters;
 pub mod pup;
+pub mod training;
 
 // ---------------------------------------------------------------------------------------------
 // Identity
