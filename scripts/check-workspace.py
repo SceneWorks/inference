@@ -1058,6 +1058,33 @@ def check_ios_host_mlx_pin(root: Path) -> None:
         )
 
 
+def check_ios_host_lock_drift(root: Path) -> None:
+    """Every non-path package in ios-host/smoke/Cargo.lock must be locked identically in the root.
+
+    The harness carries its own lockfile (it is excluded from the workspace), so without this a
+    root `cargo update` would leave the device harness building different third-party code than the
+    runtime it exercises. Compared on (name, version, source); path packages have no source.
+    """
+    harness = root / "ios-host" / "smoke" / "Cargo.lock"
+    if not harness.is_file():
+        return
+    locked = {
+        (package["name"], package["version"], package.get("source"))
+        for package in tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))["package"]
+    }
+    drift = sorted(
+        f"{package['name']} {package['version']} ({package['source']})"
+        for package in tomllib.loads(harness.read_text(encoding="utf-8")).get("package", [])
+        if "source" in package
+        and (package["name"], package["version"], package["source"]) not in locked
+    )
+    if drift:
+        fail(
+            "ios-host/smoke/Cargo.lock locks packages the root Cargo.lock does not "
+            f"(re-lock the harness against the root): {drift}"
+        )
+
+
 def check_filesystem() -> None:
     lockfiles = sorted(
         path.relative_to(ROOT)
@@ -3162,6 +3189,7 @@ def main() -> int:
     try:
         check_filesystem()
         check_ios_host_mlx_pin(ROOT)
+        check_ios_host_lock_drift(ROOT)
         metadata = cargo_metadata(args.offline)
         check_graph(metadata)
         check_network_clients(metadata)

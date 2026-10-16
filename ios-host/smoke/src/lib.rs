@@ -425,6 +425,43 @@ fn check_memory_headroom() -> Check {
     }
 }
 
+/// iOS admission (E4) for a load with no footprint estimate: every LLM load, and Z-Image.
+///
+/// Neither lane has an estimate yet, so `runtime_ios::admit_estimate_mib(None)` refuses it — the
+/// admitted answer. The measurement lane (`IOS_SMOKE_UNADMITTED=1`, `run_smoke.sh --unadmitted`)
+/// exists to PRODUCE that estimate, so it loads anyway, and the report says the run was unadmitted
+/// (see [`check_admission_lane`]). `Err` is the refusal to report in place of the check.
+fn admit_unestimated() -> Result<(), String> {
+    match runtime_ios::admit_estimate_mib(None) {
+        Ok(_) => Ok(()),
+        Err(_) if measurement_lane() => Ok(()),
+        Err(refusal) => Err(format!(
+            "refused before load: {refusal} (unadmitted; IOS_SMOKE_UNADMITTED=1 runs it to measure)"
+        )),
+    }
+}
+
+fn measurement_lane() -> bool {
+    std::env::var_os("IOS_SMOKE_UNADMITTED").is_some()
+}
+
+/// One report line naming how unestimated (LLM, Z-Image) loads were treated, so a report from the
+/// measurement lane can never be read as an admitted run.
+fn check_admission_lane() -> Check {
+    Check {
+        name: "iOS admission lane (E4)",
+        passed: true,
+        detail: match runtime_ios::admit_estimate_mib(None) {
+            Ok(_) => "unestimated loads admitted".to_string(),
+            Err(refusal) if measurement_lane() => format!(
+                "LLM and Z-Image loads ran UNADMITTED (measurement lane, IOS_SMOKE_UNADMITTED): \
+                 {refusal}"
+            ),
+            Err(refusal) => format!("LLM and Z-Image loads refused before load: {refusal}"),
+        },
+    }
+}
+
 /// End-to-end generation through the `runtime-ios` bundle, from a snapshot in the app container.
 ///
 /// This is the check that matters for the product: not "does MLX dispatch a kernel" but "does the
@@ -443,6 +480,13 @@ fn check_generation(model_dir: Option<&Path>) -> Check {
             detail: "skipped -- no snapshot in Documents/ (see docs/ios-epics.md S3.4)".to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     let before = peak_rss_mib();
     let started = Instant::now();
@@ -556,6 +600,13 @@ fn check_sustained_decode(model_dir: Option<&Path>) -> Check {
             detail: "skipped -- no snapshot in Documents/".to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     let run = || -> Result<String, String> {
         let llm =
@@ -666,6 +717,13 @@ fn check_thermal_soak(model_dir: Option<&Path>) -> Check {
             detail: "skipped -- no snapshot in Documents/".to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     let run = || -> Result<String, String> {
         let llm =
@@ -767,6 +825,13 @@ fn check_unload_seam(model_dir: Option<&Path>) -> Check {
             detail: "skipped -- no snapshot in Documents/".to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     let spec = LoadSpec::dense(dir.to_string_lossy().to_string());
@@ -870,6 +935,13 @@ fn check_conformance(model_dir: Option<&Path>) -> Check {
             detail: "skipped -- no snapshot in Documents/".to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     let dir = dir.to_string_lossy().to_string();
     let started = Instant::now();
@@ -970,6 +1042,11 @@ fn dirs_documents() -> Option<std::path::PathBuf> {
     let docs = std::path::PathBuf::from(home).join("Documents");
     docs.is_dir().then_some(docs)
 }
+
+/// Documents/ file listing, one per line, every PNG this run wrote. `run_smoke.sh` pulls renders by
+/// this list rather than by a hand-copied set of names that drifts from the labels they derive from.
+/// Truncated at the start of [`run_report`].
+const RENDERS_MANIFEST: &str = "renders.txt";
 
 /// Append one line to a file in Documents, flushing immediately.
 ///
@@ -1151,16 +1228,19 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             std::env::remove_var("MLX_GEN_DCAE_EVAL_STAGES");
         }
 
-        // E4: admission BEFORE any weight load, against runtime-ios's single cap constant. A
-        // refused configuration is the designed outcome, not a failure: it is recorded and the
-        // next one runs. The diagnostic lane (`IOS_SMOKE_IMAGE_ONLY`) deliberately bypasses
-        // admission — its whole purpose is to run configurations admission would refuse — and
-        // says so in the report.
+        // E4: admission BEFORE any weight load, against runtime-ios's single cap constant and the
+        // headroom left in this process now. A refused configuration is the designed outcome, not
+        // a failure: it is recorded and the next one runs. The load itself goes through
+        // `runtime_ios::media::load_sana`, which re-admits, so admission is bound to the load
+        // rather than only reported beside it. The diagnostic lane (`IOS_SMOKE_IMAGE_ONLY`)
+        // deliberately bypasses admission — its whole purpose is to run configurations admission
+        // would refuse — loads through the explicitly unadmitted diagnostic loader, and says so in
+        // the report.
         let admission = match tile {
             Some(t) if t > 0 => runtime_ios::admit_sana_render(edge, t),
             _ => runtime_ios::admit_estimate_mib(None),
         };
-        if let Err(refusal) = admission {
+        if let Err(refusal) = &admission {
             if diagnostic {
                 let line = format!("{label}: ADMISSION BYPASSED (diagnostic lane): {refusal}");
                 append_breadcrumb("sana-progress.txt", &line);
@@ -1195,11 +1275,11 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             // Through the REGISTRY, not a direct loader — the same reasoning as the LLM checks
             // taking the bundle rather than `mlx-llm`. This is the path a product takes, so it
             // exercises catalog composition and provider resolution, not just the engine.
-            let registry = runtime_ios::media::provider_registry()
-                .map_err(|e| format!("{label}: registry build failed: {e}"))?;
-            let generator = registry
-                .load(SANA_ID, &spec)
-                .map_err(|e| format!("{label}: load failed: {e}"))?;
+            let generator = match (admission.is_ok(), tile) {
+                (true, Some(t)) => runtime_ios::media::load_sana(SANA_ID, &spec, edge, t),
+                _ => runtime_ios::media::load_sana_unadmitted_for_diagnostics(SANA_ID, &spec),
+            }
+            .map_err(|e| format!("{label}: load failed: {e}"))?;
 
             // Tiling asked for through the CONTRACT, not the env var.
             //
@@ -1281,11 +1361,10 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             if let Some(docs) = dirs_documents() {
                 let name = format!("sana-{}.png", label.replace(' ', "-"));
                 match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
-                    Some(buf) => {
-                        if let Err(e) = buf.save(docs.join(&name)) {
-                            eprintln!("could not write {name}: {e}");
-                        }
-                    }
+                    Some(buf) => match buf.save(docs.join(&name)) {
+                        Ok(()) => append_breadcrumb(RENDERS_MANIFEST, &name),
+                        Err(e) => eprintln!("could not write {name}: {e}"),
+                    },
                     None => eprintln!("{name}: pixel buffer does not match {edge}x{edge}"),
                 }
             }
@@ -1382,6 +1461,13 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
                     .to_string(),
         };
     };
+    if let Err(refusal) = admit_unestimated() {
+        return Check {
+            name: NAME,
+            passed: true,
+            detail: refusal,
+        };
+    }
 
     use runtime_ios::gen_core::{
         GenerationMemory, GenerationOutput, GenerationRequest, LoadShape, LoadSpec as GenLoadSpec,
@@ -1646,8 +1732,10 @@ fn check_zimage_generation(dir: Option<&Path>) -> Check {
         if let Some(docs) = dirs_documents() {
             match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
                 Some(buf) => {
-                    if let Err(e) = buf.save(docs.join(format!("zimage-{edge}.png"))) {
-                        eprintln!("could not write zimage-{edge}.png: {e}");
+                    let name = format!("zimage-{edge}.png");
+                    match buf.save(docs.join(&name)) {
+                        Ok(()) => append_breadcrumb(RENDERS_MANIFEST, &name),
+                        Err(e) => eprintln!("could not write {name}: {e}"),
                     }
                 }
                 None => eprintln!("zimage pixel buffer does not match dimensions"),
@@ -1763,6 +1851,9 @@ pub fn run_report() -> String {
     // was residue and the decode is exonerated; if it dies anyway, the decode really is too large
     // and the residue hypothesis is dead. Either answer is worth one device run.
     let image_only = std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
+    if let Some(docs) = dirs_documents() {
+        let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));
+    }
 
     // `IOS_SMOKE_ONLY=sana|zimage` runs ONE model lane and skips the rest.
     //
@@ -1803,6 +1894,7 @@ pub fn run_report() -> String {
         check_gemm(Dtype::Float32, "f32 GEMM (steel)"),
         check_gemm(Dtype::Bfloat16, "bf16 GEMM (steel)"),
         check_softmax(),
+        check_admission_lane(),
         check_generation(snapshot.as_deref()),
         check_conformance(snapshot.as_deref()),
         check_sustained_decode(snapshot.as_deref()),

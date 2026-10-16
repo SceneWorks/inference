@@ -14,9 +14,62 @@
 //! the executable. The host-side links are unavailable — `~/.cache/pmetal/lib` is not readable in
 //! the sandbox, and the compiled-in `METAL_PATH` points into the cargo target directory, which is
 //! not shipped. `pmetal-mlx-sys` publishes the built metallib's path as `DEP_MLX_METALLIB`.
+//!
+//! # Admission (epic 16774, E4)
+//!
+//! [`load_admitted`] is the **only** admitted load entry point: it refuses, before the loader runs,
+//! a request whose footprint estimate is absent, exceeds [`IOS_APP_MEMORY_CAP_MIB`], or exceeds the
+//! per-process headroom iOS reports at that moment. `media::load_sana` (with `media`) is SANA's
+//! admitted load, built on it. Nothing else here is admitted:
+//!
+//! * [`llm`] re-exports `mlx-llm` whole, and its loaders (`load_for_model`, …) do **not** admit.
+//!   MLX LLMs carry no footprint estimate yet, so the admitted answer for an LLM load today is a
+//!   refusal (`admit_estimate_mib(None)`); a caller loading one anyway is running unadmitted and
+//!   must say so.
+//! * [`catalog`]'s registries are a composition/snapshot surface (the shared
+//!   [`RuntimeCatalog`] contract) and load unadmitted. A product loads through
+//!   [`load_admitted`], not through them.
+//! * `media` deliberately does not re-export the catalog's `provider_registry`, so the
+//!   unadmitted registry load is not this bundle's default image surface. The one unadmitted image
+//!   loader, `media::load_sana_unadmitted_for_diagnostics`, is named for what it is.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The iOS image lane. The catalog's specs, constants, and footprint table, plus the admitted SANA
+/// loader — but not its `provider_registry`, whose `load` is unadmitted (see the crate docs).
 #[cfg(feature = "media")]
-pub use mlx_gen_ios_catalog as media;
+pub mod media {
+    pub use mlx_gen_ios_catalog::{
+        sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory,
+        sana_load_spec, FootprintBound, SanaDeviceFootprint, IOS_IMAGE_EDGES,
+        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
+        SANA_DEVICE_FOOTPRINTS,
+    };
+
+    /// Load SANA generator `sana_id` for a render of `image_edge`² decoded at `tile_edge`, through
+    /// [`crate::admit_sana_render`] and [`crate::load_admitted`]: a refused render never touches its
+    /// weights.
+    pub fn load_sana(
+        sana_id: &str,
+        spec: &crate::gen_core::LoadSpec,
+        image_edge: u32,
+        tile_edge: u32,
+    ) -> crate::gen_core::Result<Box<dyn crate::gen_core::Generator>> {
+        let estimate = crate::admit_sana_render(image_edge, tile_edge)?;
+        crate::load_admitted(Some(estimate), || {
+            mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
+        })
+    }
+
+    /// Load SANA **without** admission. For a diagnostic run whose purpose is to execute a render
+    /// admission would refuse (the harness's untiled experiment); never a product path.
+    pub fn load_sana_unadmitted_for_diagnostics(
+        sana_id: &str,
+        spec: &crate::gen_core::LoadSpec,
+    ) -> crate::gen_core::Result<Box<dyn crate::gen_core::Generator>> {
+        mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
+    }
+}
 pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
@@ -122,8 +175,6 @@ pub const IOS_APP_MEMORY_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_M
 #[cfg(not(feature = "media"))]
 pub const IOS_APP_MEMORY_CAP_MIB: u32 = 4096;
 
-const MIB: u64 = 1024 * 1024;
-
 /// Admit a request whose footprint estimate is `estimate_mib`, against [`IOS_APP_MEMORY_CAP_MIB`].
 ///
 /// Returns the admitted estimate. Refuses with [`gen_core::Error::Unsupported`] when the estimate
@@ -145,38 +196,77 @@ pub fn admit_estimate_mib(estimate_mib: Option<u32>) -> gen_core::Result<u32> {
     }
 }
 
-/// Run `load` only if [`admit_estimate_mib`] admits `estimate_mib`.
+/// Refuse an admitted `estimate_mib` that exceeds the per-process headroom left **now**.
+///
+/// The cap check alone ignores memory already resident: headroom does not recover across renders
+/// in one process (measured 4664 -> 1223 MiB across a single SANA render), so a request under the
+/// cap can still be over what is left. `available_mib` is `os_proc_available_memory()`; `None`
+/// (off-iOS, or the simulator reporting no budget) means there is no live reading to refuse on.
+fn admit_within_headroom(estimate_mib: u32, available_mib: Option<f64>) -> gen_core::Result<u32> {
+    match available_mib {
+        Some(available) if f64::from(estimate_mib) > available => {
+            Err(gen_core::Error::Unsupported(format!(
+                "iOS admission: estimated footprint {estimate_mib} MiB exceeds the {available:.0} \
+                 MiB of per-process headroom left"
+            )))
+        }
+        _ => Ok(estimate_mib),
+    }
+}
+
+/// Run `load` only if `estimate_mib` is admitted: present, within [`IOS_APP_MEMORY_CAP_MIB`], and
+/// within the per-process headroom iOS reports right now. **The only admitted load entry point.**
 ///
 /// The refusal happens **before** `load` is called, so a refused request never touches its weights.
 pub fn load_admitted<T>(
     estimate_mib: Option<u32>,
     load: impl FnOnce() -> gen_core::Result<T>,
 ) -> gen_core::Result<T> {
-    admit_estimate_mib(estimate_mib)?;
+    let estimate = admit_estimate_mib(estimate_mib)?;
+    admit_within_headroom(estimate, os_proc_available_mib())?;
     load()
 }
 
-/// The shared-safety-check budget for an iOS process: `total_bytes` is [`IOS_APP_MEMORY_CAP_MIB`],
-/// so `standard_memory_strategy_safety_check` admits against the same cap as
-/// [`admit_estimate_mib`]. `reclaimable_bytes` is creditable only after
-/// [`bound_mlx_to_platform_limits`] has run (see [`gen_core::MemoryBudget::reclaimable_bytes`]).
-pub fn ios_memory_budget(committed_bytes: u64, reclaimable_bytes: u64) -> gen_core::MemoryBudget {
-    gen_core::MemoryBudget {
-        total_bytes: u64::from(IOS_APP_MEMORY_CAP_MIB) * MIB,
-        committed_bytes,
-        reclaimable_bytes,
-        reserved_headroom_bytes: 0,
-    }
-}
+/// Set once [`bound_mlx_to_platform_limits`] has capped MLX's buffer cache in this process — the
+/// precondition for every [`mlx_gen_ios_catalog::FootprintBound::Inferred`] bound.
+static PLATFORM_LIMITS_BOUND: AtomicBool = AtomicBool::new(false);
 
-/// Admit a SANA render of `image_edge`² decoded at `tile_edge` against [`IOS_APP_MEMORY_CAP_MIB`],
-/// using the catalog's footprint bound (measured or inferred). Call before loading any weights.
+/// Admit a SANA render of `image_edge`² decoded at `tile_edge`, using the catalog's footprint bound
+/// (measured or inferred). Call before loading any weights; [`media::load_sana`] calls it for you.
+///
+/// Checks the cap and the live per-process headroom, like [`load_admitted`]. An **inferred** bound
+/// (`live_peak + IOS_MLX_CACHE_LIMIT_CAP_MIB`) is valid only once [`bound_mlx_to_platform_limits`]
+/// has capped the cache, so it is refused until then — off-device and on the simulator that is
+/// always, because there is no per-process cap to bind to. A measured bound needs no binding.
 #[cfg(feature = "media")]
 pub fn admit_sana_render(image_edge: u32, tile_edge: u32) -> gen_core::Result<u32> {
-    admit_estimate_mib(
-        mlx_gen_ios_catalog::sana_footprint_bound(image_edge, tile_edge)
-            .map(mlx_gen_ios_catalog::FootprintBound::mib),
-    )
+    let estimate = sana_render_estimate(
+        image_edge,
+        tile_edge,
+        PLATFORM_LIMITS_BOUND.load(Ordering::Acquire),
+    )?;
+    admit_within_headroom(estimate, os_proc_available_mib())
+}
+
+/// [`admit_sana_render`]'s cap decision with the binding state passed in, so both states are
+/// testable without mutating the process-global flag.
+#[cfg(feature = "media")]
+fn sana_render_estimate(
+    image_edge: u32,
+    tile_edge: u32,
+    limits_bound: bool,
+) -> gen_core::Result<u32> {
+    use mlx_gen_ios_catalog::FootprintBound;
+    match mlx_gen_ios_catalog::sana_footprint_bound(image_edge, tile_edge) {
+        Some(FootprintBound::Inferred(mib)) if !limits_bound => {
+            Err(gen_core::Error::Unsupported(format!(
+                "iOS admission: {image_edge}²/{tile_edge} has only an inferred bound ({mib} MiB), \
+                 which holds only after bound_mlx_to_platform_limits capped MLX's cache; it has not \
+                 in this process"
+            )))
+        }
+        bound => admit_estimate_mib(bound.map(FootprintBound::mib)),
+    }
 }
 
 /// The `(memory_limit, cache_limit)` pair, MiB, for a process with `available_mib` of per-process
@@ -231,6 +321,9 @@ pub fn bound_mlx_to_platform_limits() -> Option<MlxLimits> {
     let to_bytes = |m: f64| (m * 1024.0 * 1024.0) as usize;
     mlx_rs::memory::set_memory_limit(to_bytes(memory_mib));
     mlx_rs::memory::set_cache_limit(to_bytes(cache_mib));
+    // The cache is now capped at `MLX_CACHE_LIMIT_CAP_MIB` (or tighter), so inferred footprint
+    // bounds hold from here on.
+    PLATFORM_LIMITS_BOUND.store(true, Ordering::Release);
 
     Some(MlxLimits {
         os_available_mib: available_mib,
@@ -345,12 +438,21 @@ mod tests {
         assert_eq!(super::load_admitted(Some(cap), load).unwrap(), "loaded");
         assert_eq!(super::load_admitted(Some(cap - 1), load).unwrap(), "loaded");
         assert_eq!(loads.get(), 2, "admitted requests load exactly once each");
+    }
 
-        // The shared safety check's budget carries the same cap.
-        let budget = super::ios_memory_budget(0, 0);
-        assert_eq!(budget.total_bytes, u64::from(cap) * 1024 * 1024);
-        assert!(budget.fits(u64::from(cap) * 1024 * 1024));
-        assert!(!budget.fits(u64::from(cap + 1) * 1024 * 1024));
+    /// Already-resident memory counts: an estimate under the cap but over the headroom left now is
+    /// refused; an exact fit and no live reading (off-iOS) are admitted.
+    #[test]
+    fn admission_refuses_estimates_over_the_live_headroom() {
+        assert!(matches!(
+            super::admit_within_headroom(1300, Some(1223.0)),
+            Err(super::gen_core::Error::Unsupported(_))
+        ));
+        assert_eq!(
+            super::admit_within_headroom(1223, Some(1223.0)).unwrap(),
+            1223
+        );
+        assert_eq!(super::admit_within_headroom(4096, None).unwrap(), 4096);
     }
 
     /// There is ONE cap constant: the LLM-only literal must equal the catalog's.
@@ -372,13 +474,42 @@ mod tests {
                 .expect("bounded pair")
                 .mib();
             assert_eq!(
-                super::admit_sana_render(image, tile).ok(),
+                super::sana_render_estimate(image, tile, true).ok(),
                 (bound <= super::IOS_APP_MEMORY_CAP_MIB).then_some(bound),
                 "{image}²/{tile}: bound {bound} MiB vs cap {}",
                 super::IOS_APP_MEMORY_CAP_MIB
             );
         }
         assert!(super::admit_sana_render(1024, 256).is_err());
+    }
+
+    /// An inferred bound assumes the capped cache, so it is refused until the limits are bound; a
+    /// measured bound is admitted either way. Off-iOS nothing ever binds, so the public entry point
+    /// is the unbound case.
+    #[cfg(feature = "media")]
+    #[test]
+    fn inferred_sana_bounds_are_refused_until_the_cache_is_capped() {
+        use mlx_gen_ios_catalog::{sana_footprint_bound, FootprintBound};
+        let inferred = (512, 192);
+        let measured = (1024, 192);
+        assert!(matches!(
+            sana_footprint_bound(inferred.0, inferred.1),
+            Some(FootprintBound::Inferred(_))
+        ));
+        assert!(matches!(
+            sana_footprint_bound(measured.0, measured.1),
+            Some(FootprintBound::Measured(_))
+        ));
+
+        assert!(super::sana_render_estimate(inferred.0, inferred.1, false).is_err());
+        assert!(super::sana_render_estimate(inferred.0, inferred.1, true).is_ok());
+        assert!(super::sana_render_estimate(measured.0, measured.1, false).is_ok());
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            assert!(super::admit_sana_render(inferred.0, inferred.1).is_err());
+            assert!(super::admit_sana_render(measured.0, measured.1).is_ok());
+        }
     }
 
     /// The bundle's exact, ordered surface. This is the reviewable source of truth for what ships

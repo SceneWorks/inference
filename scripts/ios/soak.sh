@@ -34,10 +34,14 @@ done
 say() { printf '\n=== %s\n' "$1"; }
 
 if [ -z "$DEVICE" ]; then
+  # By UUID shape and any usable state, as run_smoke.sh does: `$(NF-3)` returned "17" for
+  # "iPhone 17 Pro Max (iPhone18,2)", and a filter on "available (paired)" missed "connected".
   DEVICE=$(xcrun devicectl list devices 2>/dev/null \
-    | awk '/available \(paired\)/ {print $(NF-3); exit}')
+    | grep -Ei 'available|connected' \
+    | grep -oE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' \
+    | head -1 || true)
 fi
-[ -n "$DEVICE" ] || { echo "no paired device" >&2; exit 1; }
+[ -n "$DEVICE" ] || { echo "no paired device found; connect an iPhone with Developer Mode enabled" >&2; exit 1; }
 
 # Follows run_smoke.sh's SMOKE_BUNDLE_ID so a second developer's signing team only has to be
 # named once. Changing it gives the app a fresh Documents container, so anything already
@@ -73,8 +77,11 @@ fi
 
 # devicectl forwards variables prefixed DEVICECTL_CHILD_ from the CALLING environment into the
 # launched process, stripping the prefix -- not via a flag.
-say "launching with IOS_SMOKE_SOAK_SECS=$SECS"
+# IOS_SMOKE_UNADMITTED: the soak is a measurement of an LLM load, which has no footprint estimate,
+# so iOS admission would refuse it; the report's "iOS admission lane" line records the bypass.
+say "launching with IOS_SMOKE_SOAK_SECS=$SECS IOS_SMOKE_UNADMITTED=1"
 DEVICECTL_CHILD_IOS_SMOKE_SOAK_SECS="$SECS" \
+DEVICECTL_CHILD_IOS_SMOKE_UNADMITTED=1 \
 xcrun devicectl device process launch \
   --device "$DEVICE" --terminate-existing \
   "$BUNDLE" 2>&1 | tail -3

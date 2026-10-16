@@ -5,7 +5,7 @@
 #   S3.3 -- does the bundled metallib resolve inside the app sandbox?
 #   R11  -- are the cross-compiled Metal kernels numerically correct?
 #
-# Usage:  scripts/ios/run_smoke.sh [--debug] [--media|--zimage]
+# Usage:  scripts/ios/run_smoke.sh [--debug] [--media|--zimage] [--unadmitted]
 #             [--device <udid> | --simulator [<udid>|<name>]] [--memory-entitlement on|off]
 #
 # Device:    a paired device with Developer Mode on, xcodegen, and a signing identity.
@@ -46,6 +46,10 @@ while [ $# -gt 0 ]; do
     # E5 go/no-go for Z-Image-Turbo. Additive over --media; needs a q4 tier pushed to
     # Documents/<name containing "zimage">/ (scripts/ios/push_model.sh <tier> zimage-q4).
     --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
+    # The measurement lane: LLM and Z-Image loads have no footprint estimate, so iOS admission
+    # refuses them by default (the report says "refused before load"). This runs them UNADMITTED to
+    # produce that estimate, and the report's "iOS admission lane" line says so.
+    --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -140,7 +144,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
-  for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+  for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
     val=$(printenv "$var" || true)
     if [ -n "$val" ]; then export "SIMCTL_CHILD_$var=$val"; say "forwarding $var=$val"; fi
   done
@@ -337,7 +341,7 @@ LAUNCH_ENV="{}"
 # produced a 216.3 s "rung 4 disabled" run whose MLX peak (2901 MiB) was byte-identical to the
 # rung-4-ENABLED run, when the host A/B moves that peak by 1662 MiB. The measurement was a no-op
 # wearing the name of an experiment. If you add a knob to the harness, add it here in the same edit.
-for var in IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "
@@ -402,10 +406,22 @@ done
 # it survives a jetsam kill of the report and is the cap measurement even when nothing else is.
 LAUNCH_MEMORY=/tmp/ios-smoke-launch-memory.txt
 rm -f "$LAUNCH_MEMORY"
+EXPECTED_LIMIT=$( [ "$MEMORY_ENTITLEMENT" = on ] && echo YES || echo NO )
 if xcrun devicectl device copy from --device "$DEVICE" \
     --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
     --source Documents/launch-memory.txt --destination "$LAUNCH_MEMORY" >/dev/null 2>&1; then
-  say "$(cat "$LAUNCH_MEMORY") (expected increased-memory-limit = $( [ "$MEMORY_ENTITLEMENT" = on ] && echo YES || echo NO ))"
+  # Same freshness guard as the report: a file left by the OTHER entitlement build's launch would
+  # otherwise be printed as this run's cap measurement.
+  if [ "$(stat -f%m "$LAUNCH_MEMORY" 2>/dev/null || echo 0)" -lt "$LAUNCHED_AT" ]; then
+    echo "launch-memory.txt predates this launch (stale, from an earlier run); no cap reading" >&2
+    exit 1
+  fi
+  say "$(cat "$LAUNCH_MEMORY") (expected increased-memory-limit = $EXPECTED_LIMIT)"
+  if ! grep -q "increased-memory-limit = $EXPECTED_LIMIT\$" "$LAUNCH_MEMORY"; then
+    echo "launch-memory.txt does not report increased-memory-limit = $EXPECTED_LIMIT;" \
+      "the installed build is not the --memory-entitlement $MEMORY_ENTITLEMENT one" >&2
+    exit 1
+  fi
 fi
 
 if [ ! -f "$REPORT" ]; then
@@ -442,13 +458,25 @@ fi
 # survive and can actually be looked at.
 ARTIFACT_DIR=${ARTIFACT_DIR:-$HOME/Desktop/sana-ios}
 mkdir -p "$ARTIFACT_DIR"
-for png in sana-1024-tile128.png sana-512-tile256.png zimage-1024.png; do
-  if xcrun devicectl device copy from --device "$DEVICE" \
-      --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
-      --source "Documents/$png" --destination "$ARTIFACT_DIR/device-$png" >/dev/null 2>&1; then
-    echo "  pulled $png -> $ARTIFACT_DIR/device-$png"
-  fi
-done
+# By the harness's own manifest (Documents/renders.txt, one PNG name per line, truncated at launch):
+# the names derive from per-configuration labels, and a hand-copied list here drifted from them.
+RENDERS=/tmp/ios-smoke-renders.txt
+rm -f "$RENDERS"
+if xcrun devicectl device copy from --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
+    --source Documents/renders.txt --destination "$RENDERS" >/dev/null 2>&1 \
+    && [ "$(stat -f%m "$RENDERS" 2>/dev/null || echo 0)" -ge "$LAUNCHED_AT" ]; then
+  while IFS= read -r png; do
+    [ -n "$png" ] || continue
+    if xcrun devicectl device copy from --device "$DEVICE" \
+        --domain-type appDataContainer --domain-identifier "$SMOKE_BUNDLE_ID" \
+        --source "Documents/$png" --destination "$ARTIFACT_DIR/device-$png" >/dev/null 2>&1; then
+      echo "  pulled $png -> $ARTIFACT_DIR/device-$png"
+    else
+      echo "  could not pull $png (listed in renders.txt)" >&2
+    fi
+  done < "$RENDERS"
+fi
 
 # --- performance regression thresholds (S4.6) ---------------------------------------------------
 # The report carries measurements the checks themselves do not assert on: a threshold invented

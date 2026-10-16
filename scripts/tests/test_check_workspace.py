@@ -2018,9 +2018,6 @@ class RootTrainTwinTests(unittest.TestCase):
             any("taehv.rs is missing" in v for v in self.gate._root_train_twin_violations(root))
         )
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class IosHostMlxPinTests(unittest.TestCase):
     """sc-16780: the excluded iOS harness must build the workspace's MLX, not a stale fork rev."""
@@ -2048,3 +2045,46 @@ class IosHostMlxPinTests(unittest.TestCase):
             self.write(Path(tmp), "bbb")
             with self.assertRaises(AssertionError):
                 self.gate.check_ios_host_mlx_pin(Path(tmp))
+
+
+class IosHostLockDriftTests(unittest.TestCase):
+    """sc-16780: the harness's own Cargo.lock must lock third-party packages as the root does."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    @staticmethod
+    def lock(*packages: str) -> str:
+        return "version = 4\n" + "".join(f"\n[[package]]\n{p}\n" for p in packages)
+
+    def write(self, root: Path, harness_version: str) -> None:
+        registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"'
+        (root / "Cargo.lock").write_text(
+            self.lock('name = "libc"\nversion = "0.2.1"\n' + registry),
+            encoding="utf-8",
+        )
+        (root / "ios-host" / "smoke").mkdir(parents=True)
+        (root / "ios-host" / "smoke" / "Cargo.lock").write_text(
+            self.lock(
+                f'name = "libc"\nversion = "{harness_version}"\n' + registry,
+                # A path package (no source) is the harness's own crate; never compared.
+                'name = "ios-smoke"\nversion = "0.0.0"',
+            ),
+            encoding="utf-8",
+        )
+
+    def test_matching_lock_passes_and_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "0.2.1")
+            self.gate.check_ios_host_lock_drift(Path(tmp))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(Path(tmp), "0.2.2")
+            with self.assertRaises(AssertionError):
+                self.gate.check_ios_host_lock_drift(Path(tmp))
+
+    def test_the_real_harness_lock_matches_the_root(self) -> None:
+        self.gate.check_ios_host_lock_drift(self.gate.ROOT)
+
+
+if __name__ == "__main__":
+    unittest.main()
