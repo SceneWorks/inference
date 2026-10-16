@@ -128,6 +128,25 @@ pub const TOP_K: usize = 20;
 pub const MIN_P: f32 = 0.0;
 /// `pup.SAMPLING["max_tokens"]` — the decode budget.
 pub const MAX_TOKENS: u32 = 3584;
+/// Product admission bound for the COMPLETE effective caption and locked-annotation metadata,
+/// in Unicode scalar values (`str::chars`), not UTF-8 bytes or an assumed token/character ratio.
+/// Applied after reconciliation and before any image encoding/rendering; oversized locked rows
+/// are rejected actionably, never truncated. Bypass keeps the caller's original prompt unchanged.
+pub const MAX_EFFECTIVE_CAPTION_CHARS: usize = 16_000;
+
+/// Validate text the producer will hand to the renderer/persistence consumer.
+pub fn validate_caption_size(text: &str, field: &'static str) -> Result<()> {
+    let chars = text.chars().count();
+    if chars > MAX_EFFECTIVE_CAPTION_CHARS {
+        return Err(UpsampleError::CaptionTooLong {
+            field,
+            chars,
+            max: MAX_EFFECTIVE_CAPTION_CHARS,
+        }
+        .into());
+    }
+    Ok(())
+}
 /// `pup.PRESENCE_PENALTY["t2i"]`.
 pub const PRESENCE_PENALTY_T2I: f32 = 1.5;
 /// `pup.PRESENCE_PENALTY["i2i"]`.
@@ -1110,6 +1129,13 @@ pub enum UpsampleError {
     PromptTooLong { tokens: usize, max: usize },
     /// The model produced nothing (`RuntimeError("empty generation")`).
     EmptyGeneration,
+    /// The complete post-reconcile output exceeds the renderer/persistence contract's character
+    /// admission bound. This is a pre-image error, not a request to truncate authoritative rows.
+    CaptionTooLong {
+        field: &'static str,
+        chars: usize,
+        max: usize,
+    },
     /// `bbox.reconcile` met an answer it cannot re-impose the locks on.
     Reconcile(String),
 }
@@ -1175,6 +1201,9 @@ impl fmt::Display for UpsampleError {
                  in the {max}-token window"
             ),
             UpsampleError::EmptyGeneration => f.write_str("empty generation"),
+            UpsampleError::CaptionTooLong { field, chars, max } => write!(
+                f, "{field} contains {chars} Unicode characters, exceeding the {max}-character limit; reduce the caption token budget or locked annotations (no rows were truncated)"
+            ),
             UpsampleError::Reconcile(reason) => write!(f, "reconcile: {reason}"),
         }
     }
@@ -1192,7 +1221,8 @@ impl From<UpsampleError> for Error {
             | UpsampleError::ModeMismatch { .. }
             | UpsampleError::InvalidBox { .. }
             | UpsampleError::ReferenceAspectRatio { .. }
-            | UpsampleError::PromptTooLong { .. } => Error::Unsupported(text),
+            | UpsampleError::PromptTooLong { .. }
+            | UpsampleError::CaptionTooLong { .. } => Error::Unsupported(text),
             UpsampleError::IncompletePackage { .. }
             | UpsampleError::EmptyGeneration
             | UpsampleError::Reconcile(_) => Error::Msg(text),
@@ -1501,11 +1531,23 @@ impl UpsamplePlan {
             Some(locked) => reconcile(caption, locked)?,
             None => caption.to_string(),
         };
+        // This complete caption (including re-imposed rows) must be admissible BEFORE the image
+        // encoder/render starts, not rejected later when its already-rendered asset is persisted.
+        validate_caption_size(&caption, "effective caption")?;
+        let locked_annotations = self
+            .locked
+            .as_ref()
+            .map(|rows| dumps(&JsonValue::Array(rows.clone())));
+        if let Some(rows) = &locked_annotations {
+            validate_caption_size(rows, "locked annotations")?;
+        }
+        // Enhanced means the enhancer ran and its answer was accepted. An already-rich caption
+        // may legitimately be returned unchanged; that is not a failed/fallback LLM execution.
         let mut report =
             PromptEnhancementReport::enhanced(self.original_prompt.clone(), caption.clone())
                 .with_mode(self.mode.system_key());
-        if let Some(locked) = &self.locked {
-            report = report.with_locked_annotations(dumps(&JsonValue::Array(locked.clone())));
+        if let Some(rows) = locked_annotations {
+            report = report.with_locked_annotations(rows);
         }
         Ok(UpsampleOutcome { caption, report })
     }
@@ -2118,6 +2160,68 @@ mod tests {
             Some("reference_aspect_ratio")
         );
         assert_eq!(UpsampleError::TooManyReferences(11).fallback_reason(), None);
+    }
+
+    fn finish_plan(prompt: &str, locked: Option<Vec<JsonValue>>) -> UpsamplePlan {
+        UpsamplePlan {
+            mode: if locked.is_some() {
+                UpsampleMode::TextWithBoxes
+            } else {
+                UpsampleMode::Text
+            },
+            original_prompt: prompt.to_owned(),
+            system_prompt: String::new(),
+            user_text: String::new(),
+            locked,
+            references: vec![],
+            max_new_tokens: MAX_TOKENS,
+        }
+    }
+
+    #[test]
+    fn accepted_unchanged_caption_is_successful_not_a_failed_fallback() {
+        let out = finish_plan("a rich caption", None)
+            .finish("a rich caption")
+            .unwrap();
+        assert_eq!(out.report.outcome, PromptEnhancementOutcome::Enhanced);
+        assert_eq!(out.report.original_prompt, out.report.effective_prompt);
+        assert_eq!(out.report.mode.as_deref(), Some("t2i"));
+        assert_eq!(out.report.fallback_reason, None);
+    }
+
+    #[test]
+    fn complete_caption_admission_counts_unicode_scalars_not_bytes_or_tokens() {
+        let plan = finish_plan("original", None);
+        let edge = "界".repeat(MAX_EFFECTIVE_CAPTION_CHARS);
+        assert_eq!(edge.len(), MAX_EFFECTIVE_CAPTION_CHARS * 3);
+        assert_eq!(plan.finish(&edge).unwrap().caption, edge);
+        let over = format!("界{edge}");
+        assert!(
+            matches!(plan.finish(&over), Err(Error::Unsupported(message)) if message.contains("effective caption") && message.contains("16001"))
+        );
+    }
+
+    #[test]
+    fn admission_covers_complete_reconciled_rows_and_original_locked_metadata() {
+        let mut locked = loads(r#"[{"id":"obj_1","bbox":[10,20,30,40],"desc":"locked"}]"#)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .to_vec();
+        locked[0].set(
+            "desc",
+            JsonValue::Str("界".repeat(MAX_EFFECTIVE_CAPTION_CHARS)),
+        );
+        let plan = finish_plan("original", Some(locked));
+        assert!(
+            matches!(plan.finish("scene <obj_1>"), Err(Error::Unsupported(message)) if message.contains("effective caption"))
+        );
+        // A concise generated desc shrinks the rendered table, but the original authoritative
+        // metadata is still carried verbatim and must fit BEFORE any renderer is called.
+        let short_answer = r#"scene <obj_1> [{"id":"obj_1","bbox":[10,20,30,40],"desc":"short"}]"#;
+        assert!(
+            matches!(plan.finish(short_answer), Err(Error::Unsupported(message)) if message.contains("locked annotations"))
+        );
     }
 
     #[test]
