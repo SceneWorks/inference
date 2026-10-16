@@ -423,14 +423,14 @@ pub fn sdpa_head_budgeted_bhsd(
     Ok(concatenate_axis(&refs, 1)?)
 }
 
-/// Test-only observation of how many chunks the last [`sdpa_budgeted_bhsd`] call actually ran.
+/// Debug/test observation of how many chunks the last [`sdpa_budgeted_bhsd`] call actually ran.
 ///
 /// Without this, every equivalence test in this module — and every one in `mlx-gen-z-image` — passes
 /// with the chunking deleted, because they all assert *chunked == unbounded*, which is trivially true
 /// when the chunking never engages. This lets a test assert that the lever it is exercising is
 /// actually pulled. Compiled out entirely in release; `RUST_TEST_THREADS=1` is forced repo-wide, so a
 /// process-global counter is safe.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 mod chunk_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -458,24 +458,24 @@ mod chunk_probe {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub use chunk_probe::{last_chunk_count, last_head_chunk_count, reset as reset_chunk_count};
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn record_chunk_count(n: usize) {
     chunk_probe::LAST_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, debug_assertions)))]
 #[inline(always)]
 fn record_chunk_count(_n: usize) {}
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn record_head_chunk_count(n: usize) {
     chunk_probe::LAST_HEAD_CHUNK_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, debug_assertions)))]
 #[inline(always)]
 fn record_head_chunk_count(_n: usize) {}
 

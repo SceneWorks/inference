@@ -87,13 +87,21 @@ pub fn register_providers(
     // The three trainers and their training-only deps (MLX distributed / JACCL, dataset image
     // decode, checkpoint state) are the default-on `training` feature (sc-26265), so an
     // inference-only graph compiles none of them.
-    let registry = registry.register_generator(model::REGISTRATION);
     #[cfg(feature = "training")]
     let registry = registry
         .register_trainer(train::REGISTRATION)
         .register_trainer(train::depth::REGISTRATION)
         .register_trainer(train::restore::REGISTRATION);
+    register_inference_providers(registry)
+}
+
+/// Register every Iris inference route, never trainers, even if Cargo unifies `training` on.
+/// Registration does not claim a device fit: admission owns that decision for each mode.
+pub fn register_inference_providers(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_generator(model::REGISTRATION)
         .register_transform(restoration::REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_composed_memory_strategy(memory_strategy::DEPTH_MEMORY_REGISTRATION)

@@ -1,7 +1,7 @@
 //! The memory-strategy contract of the three Iris inference tasks on their **loaded** models
 //! (sc-25690), on the committed miniature resources: each loaded model publishes exactly the
-//! contract its registration builds for the same spec, and the one optimized rung the family
-//! implements — generation's staged residency — is executed end to end through the shared
+//! contract its registration builds for the same spec, and generation's staged residency plus
+//! bounded-attention selection execute end to end through the shared
 //! request-scope seam, not merely declared.
 
 use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
@@ -136,6 +136,32 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
     );
     assert_eq!(staged_pixels, warm, "staging must not change the render");
 
+    // The same admitted request can compose staging with bounded attention. At miniature size
+    // the published budget is in-budget, so this also pins the unchanged single-call fast path.
+    context.selection = contract
+        .representative_selection(
+            MemoryStrategy::BoundedAttention,
+            context.selection.tier,
+            false,
+        )
+        .unwrap();
+    context.selection.parameters.stage_residency = Some(true);
+    let mut bounded = request();
+    let mut scope = generator
+        .begin_memory_strategy_request(&context)
+        .unwrap()
+        .unwrap();
+    scope.configure_request(&mut bounded).unwrap();
+    assert!(bounded
+        .memory
+        .is_some_and(|m| m.stage_residency && m.chunk_attention));
+    generator.validate(&bounded).unwrap();
+    let (bounded_events, bounded_pixels) = render(generator.as_ref(), &bounded);
+    scope.finish(MemoryRunOutcome::Complete).unwrap();
+    drop(scope);
+    assert_eq!(bounded_events, staged_events);
+    assert_eq!(bounded_pixels, warm);
+
     // The staged request evicted the warm pair; the next unstaged request rebuilds it.
     let (rebuild_events, rebuilt) = render(generator.as_ref(), &request());
     assert_eq!(&rebuild_events[..2], &STAGED_LOADS);
@@ -154,6 +180,7 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
         },
         GenerationMemory {
             chunk_attention: true,
+            attention_chunk_size: Some(17),
             ..Default::default()
         },
         GenerationMemory {
@@ -165,7 +192,11 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
         unhonoured.memory = Some(memory);
         match generator.validate(&unhonoured) {
             Err(gen_core::Error::Unsupported(message)) => {
-                assert!(message.contains("GenerationMemory::"), "{message}")
+                assert!(
+                    message.contains("GenerationMemory::")
+                        || message.contains("attention_chunk_size"),
+                    "{message}"
+                )
             }
             other => panic!("expected a typed refusal, got {other:?}"),
         }

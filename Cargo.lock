@@ -2570,6 +2570,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-anima",
+ "mlx-gen-iris",
  "mlx-gen-sana",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",

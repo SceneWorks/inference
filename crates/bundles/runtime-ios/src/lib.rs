@@ -33,11 +33,18 @@
 //! * `media` deliberately does not re-export the catalog's `provider_registry`, so the
 //!   unadmitted registry load is not this bundle's default image surface. The one unadmitted image
 //!   loader, `media::load_sana_unadmitted_for_diagnostics`, is named for what it is.
+//! * `iris_depth` exposes the callable provider-specific depth task, with an explicitly named
+//!   unadmitted diagnostic loader. It supplies no footprint evidence or admitted-load shortcut.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The iOS image lane. The catalog's specs, constants, and footprint table, plus the admitted SANA
 /// loader — but not its `provider_registry`, whose `load` is unadmitted (see the crate docs).
+///
+/// The product media facade must not expose an unrestricted registry loader:
+/// ```compile_fail
+/// let _ = runtime_ios::media::provider_registry();
+/// ```
 #[cfg(feature = "media")]
 pub mod media {
     pub use mlx_gen_ios_catalog::{
@@ -108,6 +115,10 @@ pub mod media {
         mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
     }
 }
+/// Callable Iris depth API, independent of the image registry and the admitted media facade.
+/// The only load entry point is explicitly named unadmitted diagnostics; no fitting claim.
+#[cfg(feature = "media")]
+pub use mlx_gen_ios_catalog::iris_depth;
 pub use mlx_llm as llm;
 pub use runtime_catalog::{core_llm, gen_core, RuntimeCatalog, RuntimeCatalogSnapshot};
 
@@ -684,15 +695,20 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is exactly SANA + Anima Turbo under `media`, empty without it. An
+        // The media surface is SANA + Anima Turbo + SDXL + Iris under `media`, empty without it. An
         // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
         // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "sdxl"],
-            "the iOS image surface changed; confirm the new provider fits the measured iOS cap \
-             before updating this"
+            [
+                "sana_1600m",
+                "sana_sprint_1600m",
+                "anima_turbo",
+                "sdxl",
+                "iris_3b"
+            ],
+            "the iOS image surface changed; registration is not a device fitting claim"
         );
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
@@ -709,8 +725,12 @@ mod tests {
         );
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
 
-        // Never, on either profile: these belong to the full media graph, not to a phone.
+        // Iris restoration is a transform, not a generator; keep the mode registered on iOS.
+        #[cfg(feature = "media")]
+        assert_eq!(snapshot.transform_ids, ["iris_3b_restore"]);
+        #[cfg(not(feature = "media"))]
         assert!(snapshot.transform_ids.is_empty());
+        // Never, on either profile: no training or unrelated full-catalog routes.
         assert!(snapshot.trainer_ids.is_empty());
         assert!(snapshot.captioner_ids.is_empty());
         assert!(snapshot.image_embedder_ids.is_empty());
@@ -764,4 +784,59 @@ mod tests {
             ["aarch64-apple-ios", "aarch64-apple-ios-sim"]
         );
     }
+}
+
+// This bundle-only consumer imports no provider crate. Keep the CPU subprocess/Metal guard so
+// the miniature callable task test cannot contend with the host GPU.
+#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[path = "../../../media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
+mod iris_cpu_guard;
+
+#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[test]
+fn bundle_only_consumer_executes_iris_depth() {
+    use crate::{gen_core, iris_depth};
+    use iris_depth::IrisDepthEstimator;
+    const CHILD: &str = "SW_IOS_DEPTH_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bundle_only_consumer_executes_iris_depth",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout).contains("iris-depth-body-complete"));
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    iris_cpu_guard::forbid_metal();
+    assert!(iris_cpu_guard::metal_forbidden());
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-depth");
+        let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(path));
+        let model = iris_depth::load_depth_unadmitted_for_diagnostics(&spec).unwrap();
+        let req = iris_depth::DepthRequest {
+            image: gen_core::Image {
+                width: 16,
+                height: 16,
+                pixels: vec![127; 16 * 16 * 3],
+            },
+            resolution: iris_depth::DepthResolution::Native,
+            ..Default::default()
+        };
+        let output = model.estimate(&req, &mut |_| {}).unwrap();
+        assert_eq!((output.map.width, output.map.height), (16, 16));
+        assert_eq!(output.map.values.len(), 256);
+        assert!(output.map.values.iter().all(|v| v.is_finite()));
+        println!("iris-depth-body-complete");
+    });
 }
