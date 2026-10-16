@@ -131,6 +131,19 @@ impl ResnetBlock2D {
 
     /// `x`: NHWC `[B, H, W, in]`; `temb`: `Some([B, temb_dim])` for the UNet, `None` for the VAE.
     pub fn forward(&self, x: &Array, temb: Option<&Array>) -> Result<Array> {
+        self.forward_planned(x, temb, crate::plan::SdxlForwardPlan::UNBOUNDED)
+    }
+
+    /// [`forward`](Self::forward) under a U-Net forward plan. Only the plan's
+    /// [`cfg_row`](crate::plan::SdxlForwardPlan::cfg_row) reaches a resnet: a sequential CFG half
+    /// hands in the guided pair's full-batch `temb`, projects it at that batch, and keeps its own
+    /// row (sc-26268).
+    pub fn forward_planned(
+        &self,
+        x: &Array,
+        temb: Option<&Array>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
         let y = group_norm(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let mut y = conv2d(
             &silu_glue(&y)?,
@@ -141,7 +154,7 @@ impl ResnetBlock2D {
         )?;
         // Add the projected time embedding (UNet only), broadcast over H,W.
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
-            let tp = proj.forward(&silu_glue(t)?)?;
+            let tp = plan.select_cfg_row(proj.forward(&silu_glue(t)?)?, x.shape()[0])?;
             let tb = tp.shape();
             y = add(&y, &tp.reshape(&[tb[0], 1, 1, tb[1]])?)?;
         }

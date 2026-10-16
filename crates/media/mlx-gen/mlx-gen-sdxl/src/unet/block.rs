@@ -158,26 +158,9 @@ impl UNetBlock2D {
 
     /// Run the block. `residuals` is `Some` on the up path (each resnet pops one skip tensor and
     /// concatenates it onto `x` first). Returns the block output plus the per-step output states
-    /// (the down path pushes these onto the residual stack).
-    pub fn forward(
-        &self,
-        x: &Array,
-        encoder_x: &Array,
-        temb: &Array,
-        residuals: Option<&mut Vec<Array>>,
-    ) -> Result<(Array, Vec<Array>)> {
-        self.forward_ip(
-            x,
-            encoder_x,
-            temb,
-            residuals,
-            None,
-            crate::plan::SdxlForwardPlan::UNBOUNDED,
-        )
-    }
-
-    /// As [`forward`](Self::forward) but threads the IP-Adapter tokens + scale into each
-    /// cross-attention transformer (sc-3059), and the ladder's rung-3/rung-4 `plan` (SC-15525).
+    /// (the down path pushes these onto the residual stack). Threads the IP-Adapter tokens + scale
+    /// into each cross-attention transformer (sc-3059), and the ladder's rung-3/rung-4 `plan`
+    /// (SC-15525) — whose `cfg_row` also reaches the resnets (sc-26268).
     ///
     /// The resnets, samplers and the skip stack this block builds are the **resident remainder**:
     /// `plan` reaches only the `attentions`, because only a `Transformer2D` holds a uniform block
@@ -201,7 +184,7 @@ impl UNetBlock2D {
                 })?;
                 x = concatenate_axis(&[&x, &skip], -1)?;
             }
-            x = self.resnets[i].forward(&x, Some(temb))?;
+            x = self.resnets[i].forward_planned(&x, Some(temb), plan)?;
             if let Some(attns) = &self.attentions {
                 x = attns[i].forward_ip(&x, encoder_x, ip, plan)?;
             }

@@ -622,7 +622,7 @@ fn forward_eps(
     let combined: Option<ControlResiduals> = {
         let mut acc: Option<ControlResiduals> = None;
         for cc in controls {
-            let res = cc.controlnet.forward(
+            let res = cc.controlnet.forward_planned(
                 x_unet,
                 &cc.cond_embed,
                 timestep,
@@ -630,6 +630,7 @@ fn forward_eps(
                 pooled,
                 time_ids,
                 cc.scale,
+                plan,
             )?;
             acc = Some(match acc {
                 None => res,
@@ -671,11 +672,14 @@ fn cfg_row(a: &Array, k: i32) -> Result<Array> {
 ///   `[x, x]` doubled-batch forward, split by row afterwards. Byte-identical to every earlier
 ///   release: it is the same op graph the three denoise loops each spelled inline.
 /// * [`CfgBatching::Sequential`](mlx_gen::gen_core::CfgBatching::Sequential) — two batch-1
-///   forwards, conditional then unconditional, each against row `k` of every CFG-batched input
-///   (`conditioning`, `pooled`, `time_ids`, the ControlNet conditioning embedding and encoder, the
-///   IP-Adapter tokens). Each half is evaluated before the next starts, so the guided step holds
-///   one row's activations at a time — the high-water the shared `CfgBatching` domain exists to
-///   offer a constrained device.
+///   forwards over the one-row latent, conditional then unconditional. Each half receives the
+///   pair's conditioning-only inputs whole (`conditioning`, `pooled`, `time_ids`, the ControlNet
+///   encoder, the IP-Adapter tokens) and keeps its own row after projecting them
+///   ([`SdxlForwardPlan::cfg_row`](crate::plan::SdxlForwardPlan::cfg_row)), so it is
+///   byte-identical to its batched row; the ControlNet conditioning embedding, added to the latent
+///   rather than projected, is sliced up front. Each half is evaluated before the next starts, so
+///   the guided step holds one row's latent activations at a time — the high-water the shared
+///   `CfgBatching` domain exists to offer a constrained device.
 #[allow(clippy::too_many_arguments)]
 fn guided_eps_pair(
     unet: &UNet2DConditionModel,
@@ -717,21 +721,21 @@ fn guided_eps_pair(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let row_ip = match ip {
-            Some((tokens, scale)) => Some((cfg_row(tokens, k)?, scale)),
-            None => None,
-        };
+        // The conditioning-only inputs go in WHOLE: the forward projects them at the pair's batch
+        // and keeps row `k` (`SdxlForwardPlan::cfg_row`), so every kernel sees the row count the
+        // batched forward gave it. Only `cond_embed` — added to the latent stem, never projected —
+        // is sliced here.
         let eps = forward_eps(
             unet,
             x_in,
             timestep,
-            &cfg_row(conditioning, k)?,
-            &cfg_row(pooled, k)?,
-            &cfg_row(time_ids, k)?,
+            conditioning,
+            pooled,
+            time_ids,
             &row_controls,
-            &cfg_row(cn_enc, k)?,
-            row_ip.as_ref().map(|(tokens, scale)| (tokens, *scale)),
-            plan,
+            cn_enc,
+            ip,
+            plan.with_cfg_row(Some(k)),
         )?;
         // Materialize this half before the other one is built, so the two forwards' activations
         // are never live together — the point of the sequential mode.
@@ -1343,118 +1347,202 @@ mod tests {
         )
     }
 
-    /// sc-26268: **sequential CFG** (two batch-1 forwards) reproduces the batched `[cond, uncond]`
-    /// forward on the tiny U-Net — the per-row split is right (the conditional half is row 0, the
-    /// unconditional half row 1) and nothing in the forward couples the two rows.
-    ///
-    /// Not asserted bitwise, on purpose: the shared `CfgBatching` contract
-    /// (`gen_core::execution_domains`) states the one admitted deviation — a backend GEMM whose
-    /// reduction order depends on the row count. The MLX CPU device is such a backend (sc-26268
-    /// review probe: a lone `[1, S, D] @ W` and row 0 of the `[2, S, D]` product differ in the last
-    /// ulps for every `S = 1` shape and many `S ≤ 64` shapes, while conv, GroupNorm, LayerNorm and
-    /// SDPA are row-exact), and this tiny U-Net drifts ~1e-6 of peak through it. The 1e-5 bound
-    /// admits exactly that reassociation and nothing a row mix-up could produce (see the
-    /// non-vacuity check, three orders larger).
-    #[test]
-    fn sequential_cfg_matches_the_batched_guided_pair() {
-        let _cpu = crate::test_device::cpu_only();
-        let unet = crate::training::family::test_support::tiny_unet(7).unwrap();
+    /// The devices × dtypes the sequential-CFG identity is held on: the CPU at f32 (where a lone
+    /// `[1, K]` GEMV and row 0 of the `[2, K]` GEMM differ in the last ulps) and the default
+    /// device at f16 (Metal: `[1, K]` vs `[2, K]` and the 77- vs 154-row text-memory projections
+    /// pick different kernels, ~1e-3 of peak apart). Both differed before sc-26268's fix.
+    fn cfg_identity_cells() -> [(bool, mlx_rs::Dtype); 2] {
+        [
+            (true, mlx_rs::Dtype::Float32),
+            (false, mlx_rs::Dtype::Float16),
+        ]
+    }
+
+    /// The tiny U-Net at `dtype` (weights cast before construction, like a real f16 load).
+    fn tiny_unet_at(dtype: mlx_rs::Dtype) -> UNet2DConditionModel {
+        use crate::training::family::test_support::{tiny_unet_config, tiny_unet_weights};
+        let mut w = tiny_unet_weights(7).unwrap();
+        w.cast_all(dtype).unwrap();
+        UNet2DConditionModel::from_weights(&w, &tiny_unet_config()).unwrap()
+    }
+
+    /// Run `f` on the CPU (`cpu = true`) or the process default device.
+    fn on_device<T>(cpu: bool, f: impl FnOnce() -> T) -> T {
+        let _guard = cpu.then(crate::test_device::cpu_only);
+        f()
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        a.eval().unwrap();
+        a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// One guided step's pair under `batching`, with optional IP-Adapter tokens.
+    #[allow(clippy::type_complexity)]
+    fn guided_pair_bits(
+        unet: &UNet2DConditionModel,
+        dtype: mlx_rs::Dtype,
+        ip_tokens: Option<&Array>,
+        batching: gen_core::CfgBatching,
+    ) -> (Vec<u32>, Vec<u32>) {
         let (x, conditioning, pooled, time_ids) = guided_inputs();
-        let pair = |batching| {
-            let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
-            let (text, neg) = guided_eps_pair(
-                &unet,
-                &x,
-                500.0,
-                &conditioning,
-                &pooled,
-                &time_ids,
-                &[],
-                &conditioning,
-                None,
-                plan,
-            )
-            .unwrap();
-            assert_eq!(text.shape(), x.shape());
-            assert_eq!(neg.shape(), x.shape());
-            (text, neg)
-        };
-        let (bt, bn) = pair(gen_core::CfgBatching::Batched);
-        let (st, sn) = pair(gen_core::CfgBatching::Sequential);
-        let rel = |a: &Array, b: &Array| {
-            let peak = a.abs().unwrap().max(None).unwrap().item::<f32>();
-            let delta = a
-                .subtract(b)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>();
-            delta / peak
-        };
-        assert!(
-            rel(&bt, &st) <= 1e-5,
-            "conditional half: {:.3e}",
-            rel(&bt, &st)
-        );
-        assert!(
-            rel(&bn, &sn) <= 1e-5,
-            "unconditional half: {:.3e}",
-            rel(&bn, &sn)
-        );
-        // Non-vacuity: the two halves genuinely differ, so a mode that returned one row twice (or
-        // swapped them) cannot pass the comparisons above.
-        assert!(
-            rel(&bt, &bn) > 1e-3,
-            "the guided pair must carry two distinct conditionings"
-        );
+        let at = |a: &Array| a.as_dtype(dtype).unwrap();
+        let (x, conditioning, pooled) = (at(&x), at(&conditioning), at(&pooled));
+        let ip = ip_tokens.map(|t| (t, 0.7_f32));
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+        let (text, neg) = guided_eps_pair(
+            unet,
+            &x,
+            500.0,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            &[],
+            &conditioning,
+            ip,
+            plan,
+        )
+        .unwrap();
+        assert_eq!(text.shape(), x.shape());
+        assert_eq!(neg.shape(), x.shape());
+        (bits(&text), bits(&neg))
+    }
+
+    /// sc-26268: **sequential CFG** (two batch-1 forwards) is **byte-identical** to the batched
+    /// `[cond, uncond]` forward — each half is exactly its batched row: the per-row split is right
+    /// (the conditional half is row 0, the unconditional half row 1), nothing couples the rows,
+    /// and every conditioning-only projection (time/`text_time` embedding, each resnet's
+    /// `time_emb_proj`, each cross-attention `to_k`/`to_v`) runs at the pair's row count
+    /// ([`SdxlForwardPlan::cfg_row`](crate::plan::SdxlForwardPlan::cfg_row)).
+    ///
+    /// Before that fix the halves sliced their conditioning to one row first, so those projections
+    /// ran a `[1, K]` (and 77-row) product where the batched pair ran `[2, K]` (154 rows): ~1e-6 of
+    /// peak on the CPU at f32, ~3e-3 at f16 on Metal — which CFG × 7 and the ancestral noise grew
+    /// into a 255/255 pixel on the real SDXL q4 render (`low_memory_compositions_q4`).
+    #[test]
+    fn sequential_cfg_is_byte_identical_to_the_batched_guided_pair() {
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let unet = tiny_unet_at(dtype);
+                let (bt, bn) = guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Batched);
+                let (st, sn) =
+                    guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Sequential);
+                assert!(bt == st, "cpu={cpu} {dtype:?}: conditional half moved");
+                assert!(bn == sn, "cpu={cpu} {dtype:?}: unconditional half moved");
+                // Non-vacuity: the two halves genuinely differ, so a mode that returned one row
+                // twice (or swapped them) cannot pass the comparisons above.
+                assert!(
+                    bt != bn,
+                    "the guided pair must carry two distinct conditionings"
+                );
+            });
+        }
+    }
+
+    /// The same identity with the **IP-Adapter** decoupled cross-attention installed: its
+    /// `to_k_ip`/`to_v_ip` over the `[image tokens, zeros]` pair are conditioning-only projections
+    /// too, and a sequential half must run them at the pair's batch as well.
+    #[test]
+    fn sequential_cfg_is_byte_identical_with_the_ip_adapter() {
+        use crate::training::family::test_support::TINY_CONTEXT_DIM;
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let mut unet = tiny_unet_at(dtype);
+                // One `[hidden, ctx]` pair per cross-attention, in install order (down → up →
+                // mid): four, all at the tiny U-Net's 64-wide attention level.
+                let ramp = |rows: i32, phase: f32| {
+                    let n = rows * TINY_CONTEXT_DIM;
+                    let v = (0..n)
+                        .map(|i| ((i as f32 + phase) * 0.311).cos() * 0.2)
+                        .collect::<Vec<_>>();
+                    Array::from_slice(&v, &[rows, TINY_CONTEXT_DIM])
+                        .as_dtype(dtype)
+                        .unwrap()
+                };
+                let pairs = [64; 4]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| (ramp(h, i as f32), ramp(h, 50.0 + i as f32)))
+                    .collect();
+                unet.install_ip_adapter(pairs).unwrap();
+                // A single image token: its per-half projection would be a `[1, ctx]` GEMV where
+                // the pair runs a `[2, ctx]` GEMM — the row count whose kernels round differently
+                // on both devices, so a half that projected only its own row is observable.
+                let tokens = concatenate_axis(
+                    &[
+                        &ramp(1, 3.0).reshape(&[1, 1, TINY_CONTEXT_DIM]).unwrap(),
+                        &Array::zeros::<f32>(&[1, 1, TINY_CONTEXT_DIM])
+                            .unwrap()
+                            .as_dtype(dtype)
+                            .unwrap(),
+                    ],
+                    0,
+                )
+                .unwrap();
+                let batched =
+                    guided_pair_bits(&unet, dtype, Some(&tokens), gen_core::CfgBatching::Batched);
+                let sequential = guided_pair_bits(
+                    &unet,
+                    dtype,
+                    Some(&tokens),
+                    gen_core::CfgBatching::Sequential,
+                );
+                assert!(
+                    batched.0 == sequential.0,
+                    "cpu={cpu} {dtype:?}: IP conditional half"
+                );
+                assert!(
+                    batched.1 == sequential.1,
+                    "cpu={cpu} {dtype:?}: IP unconditional half"
+                );
+                // Non-vacuity: the IP branch is live (it moves the conditional half).
+                let plain = guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Batched);
+                assert!(plain.0 != batched.0, "the IP branch must change the output");
+            });
+        }
     }
 
     /// The whole ancestral denoise loop under sequential CFG reproduces the batched loop's final
-    /// latent — the production route (`denoise_core`) actually consumes the plan's batching. Same
-    /// row-count GEMM bound as `sequential_cfg_matches_the_batched_guided_pair` (observed ~5e-6
-    /// of peak after five guided steps on the CPU device).
+    /// latent **byte for byte** — the production route (`denoise_core`) actually consumes the
+    /// plan's batching, and the identity survives the guidance combine and the ancestral noise.
     #[test]
-    fn sequential_cfg_denoise_reproduces_the_batched_denoise() {
-        let _cpu = crate::test_device::cpu_only();
-        let unet = crate::training::family::test_support::tiny_unet(7).unwrap();
-        let (x, conditioning, pooled, time_ids) = guided_inputs();
-        let inner = EulerSampler::new_with_dtype(
-            &crate::config::DiffusionConfig::sdxl_base(),
-            true,
-            mlx_rs::Dtype::Float32,
-        )
-        .unwrap();
-        let run = |batching| {
-            random::seed(42).unwrap();
-            let sampler = AncestralEuler::new(&inner, 2, inner.max_time()).unwrap();
-            let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
-            let d = Denoiser::with_plan(&unet, &sampler, plan);
-            denoise(
-                &d,
-                x.clone(),
-                &conditioning,
-                &pooled,
-                &time_ids,
-                5.0,
-                &CancelFlag::new(),
-                &mut |_| {},
-            )
-            .unwrap()
-        };
-        let batched = run(gen_core::CfgBatching::Batched);
-        let sequential = run(gen_core::CfgBatching::Sequential);
-        let peak = batched.abs().unwrap().max(None).unwrap().item::<f32>();
-        let delta = batched
-            .subtract(&sequential)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-        assert!(delta / peak <= 1e-5, "denoise drifted {:.3e}", delta / peak);
+    fn sequential_cfg_denoise_is_byte_identical_to_the_batched_denoise() {
+        for (cpu, dtype) in cfg_identity_cells() {
+            on_device(cpu, || {
+                let unet = tiny_unet_at(dtype);
+                let (x, conditioning, pooled, time_ids) = guided_inputs();
+                let at = |a: &Array| a.as_dtype(dtype).unwrap();
+                let (x, conditioning, pooled) = (at(&x), at(&conditioning), at(&pooled));
+                let inner = EulerSampler::new_with_dtype(
+                    &crate::config::DiffusionConfig::sdxl_base(),
+                    true,
+                    dtype,
+                )
+                .unwrap();
+                let run = |batching| {
+                    random::seed(42).unwrap();
+                    let sampler = AncestralEuler::new(&inner, 2, inner.max_time()).unwrap();
+                    let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+                    let d = Denoiser::with_plan(&unet, &sampler, plan);
+                    let out = denoise(
+                        &d,
+                        x.clone(),
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        5.0,
+                        &CancelFlag::new(),
+                        &mut |_| {},
+                    )
+                    .unwrap();
+                    bits(&out)
+                };
+                let batched = run(gen_core::CfgBatching::Batched);
+                let sequential = run(gen_core::CfgBatching::Sequential);
+                assert!(batched == sequential, "cpu={cpu} {dtype:?}: denoise moved");
+            });
+        }
     }
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
