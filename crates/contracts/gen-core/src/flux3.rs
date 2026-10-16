@@ -880,6 +880,9 @@ impl GenerationParams {
         default_seed: u64,
         config: &Flux3Config,
     ) -> Result<Self> {
+        if req.true_cfg.is_some() {
+            return Err(Error::Unsupported("flux3: the separate true_cfg axis is not supported; use guidance for the base checkpoint's CFG scale".into()));
+        }
         if let Some(g) = req.guidance.filter(|_| config.dit.flow_map) {
             return Err(Error::Unsupported(format!(
                 "flux3: the distilled checkpoint samples without CFG; drop the guidance (got {g})"
@@ -1258,6 +1261,14 @@ mod tests {
         assert_eq!(p.steps, 7);
         assert_eq!(p.guidance, Some(1.0));
         assert_eq!(p.negative_prompt, "blur, watermark");
+        let separate_true_cfg = GenerationRequest {
+            true_cfg: Some(4.25),
+            ..request()
+        };
+        assert!(matches!(
+            GenerationParams::resolve(&separate_true_cfg, 19, &base),
+            Err(Error::Unsupported(_))
+        ));
         for guidance in [f32::NAN, f32::INFINITY, -1.0] {
             let req = GenerationRequest {
                 guidance: Some(guidance),

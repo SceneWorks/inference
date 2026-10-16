@@ -309,11 +309,18 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
         let generator = registry.load("flux3_klein_base", &loaded).unwrap();
         assert_eq!(generator.descriptor().id, "flux3_klein_base");
         assert!(generator.descriptor().capabilities.supports_guidance);
+        assert!(!generator.descriptor().capabilities.supports_true_cfg);
         assert!(generator.descriptor().capabilities.supports_negative_prompt);
         assert!(generator.descriptor().capabilities.supports_lora);
         assert_eq!(generator.memory_strategy_contract().unwrap().provider_id, "flux3_klein_base");
         let request = GenerationRequest { guidance: Some(2.25), negative_prompt: Some("a cat on a roof".into()), ..request() };
         generator.validate(&request).unwrap();
+        for guidance in [0.0f32, 1.0, 3.5] {
+            let mut standard = request.clone(); standard.guidance = Some(guidance);
+            generator.validate(&standard).unwrap();
+        }
+        let mut separate = request.clone(); separate.true_cfg = Some(4.25);
+        assert!(matches!(generator.validate(&separate), Err(CoreError::Unsupported(_))));
         let mut progress = Vec::new();
         let GenerationOutput::Images(images) = generator.generate(&request, &mut |p| progress.push(p)).unwrap() else { panic!("image output required") };
         assert_eq!(images.len(), 1);

@@ -87,7 +87,8 @@ pub fn descriptor_base() -> ModelDescriptor {
     let mut descriptor = descriptor();
     descriptor.id = gen_core::flux3::BASE_MODEL_ID;
     descriptor.capabilities.supports_guidance = true;
-    descriptor.capabilities.supports_true_cfg = true;
+    // CFG uses the standard guidance axis; the separate true_cfg control is not consumed.
+    descriptor.capabilities.supports_true_cfg = false;
     descriptor.capabilities.supports_negative_prompt = true;
     descriptor
 }
