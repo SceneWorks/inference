@@ -854,30 +854,6 @@ jobs:
           key: ${{ matrix.target }}
           # Save only on `main` — see the note on the `workspace` job's cache step.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # DELIBERATE WRONG-SDK NEGATIVE RUN (sc-16779 AC 2) -- REVERTED in the next commit. Rewrites
-      # the iOS SDK to macOS for Metal compiles only, i.e. the pre-apple-metal-sdk.patch regression.
-      - name: "NEGATIVE RUN: force the macOS SDK onto Metal compiles"
-        run: |
-          mkdir -p "$RUNNER_TEMP/wrong-sdk"
-          cat > "$RUNNER_TEMP/wrong-sdk/xcrun" <<'EOS'
-          #!/bin/bash
-          is_metal=0
-          for a in "$@"; do case "$a" in metal|metallib) is_metal=1;; esac; done
-          if [ "$is_metal" = 1 ]; then
-            args=()
-            for a in "$@"; do
-              case "$a" in
-                iphoneos|iphonesimulator) a=macosx ;;
-                -mios-version-min=*|-mios-simulator-version-min=*) a=-mmacosx-version-min=15.0 ;;
-              esac
-              args+=("$a")
-            done
-            exec /usr/bin/xcrun "${args[@]}"
-          fi
-          exec /usr/bin/xcrun "$@"
-          EOS
-          chmod +x "$RUNNER_TEMP/wrong-sdk/xcrun"
-          echo "$RUNNER_TEMP/wrong-sdk" >> "$GITHUB_PATH"
       - name: Build runtime-ios for ${{ matrix.target }}
         run: cargo build --locked --target ${{ matrix.target }} -p runtime-ios
       - name: Assert the metallib targets ${{ matrix.target }}
