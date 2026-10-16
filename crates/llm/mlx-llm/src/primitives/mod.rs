@@ -75,7 +75,7 @@ pub use paged_packed_kv::{
     PagedCacheSelection, PagedCacheSnapshot, PagedFallbackReason, PagedModelKey,
     PagedPackedKvCache, PagedPoolStorage, PAGED_PACKED_LAYOUT_VERSION,
 };
-pub use projection::{KvProjection, Projection, QuantSpec};
+pub use projection::{KvProjection, Projection, QuantGrid, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};

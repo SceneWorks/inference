@@ -799,7 +799,11 @@ impl ModelConfig {
         let quantization = v.get("quantization").and_then(|q| {
             let group_size = q.get("group_size").and_then(|x| x.as_i64())? as i32;
             let bits = q.get("bits").and_then(|x| x.as_i64())? as i32;
-            Some(QuantSpec { group_size, bits })
+            Some(QuantSpec {
+                group_size,
+                bits,
+                grid: Default::default(),
+            })
         });
 
         // Mixture-of-Experts FFN params: present iff a routed-expert count is configured
@@ -1406,7 +1410,8 @@ mod tests {
             cfg.quantization,
             Some(QuantSpec {
                 group_size: 64,
-                bits: 4
+                bits: 4,
+                grid: Default::default(),
             })
         );
 
