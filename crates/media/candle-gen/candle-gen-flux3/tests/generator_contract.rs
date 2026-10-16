@@ -384,6 +384,9 @@ fn base_and_quantized_packages_are_typed_refusals() {
     assert!(
         matches!(registry.load(ID, &file), Err(CoreError::Unsupported(message)) if message.contains("package directory"))
     );
+    assert!(
+        matches!(registry.memory_strategy_contract(ID, &file), Err(CoreError::Unsupported(message)) if message.contains("package directory"))
+    );
     let config = std::fs::read_to_string(tiny_package().join("config.json")).unwrap();
     for (what, needle, edit) in [
         (
