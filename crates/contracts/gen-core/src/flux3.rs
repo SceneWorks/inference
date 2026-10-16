@@ -38,6 +38,7 @@ use crate::{Error, Result};
 
 pub mod adapters;
 pub mod pup;
+pub mod references;
 
 // ---------------------------------------------------------------------------------------------
 // Identity
@@ -939,7 +940,10 @@ impl GenerationParams {
         if steps == 0 {
             return Err(Error::Msg("flux3: steps must be >= 1".into()));
         }
-        latent_shape(req.width, req.height)?;
+        let (width, height) = references::request_plan(req)?
+            .map(|plan| plan.output.canvas)
+            .unwrap_or((req.width, req.height));
+        latent_shape(width, height)?;
         Ok(Self {
             prompt: req.prompt.clone(),
             guidance,
@@ -947,8 +951,8 @@ impl GenerationParams {
             steps,
             alpha: config.sampler.alpha as f32,
             seed: req.seed.unwrap_or(default_seed),
-            width: req.width,
-            height: req.height,
+            width,
+            height,
         })
     }
 

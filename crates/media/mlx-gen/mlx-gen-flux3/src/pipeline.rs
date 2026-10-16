@@ -10,6 +10,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::{Flux3Dit, SampleTokens};
+use crate::references::ReferenceConditioning;
 use crate::text_encoder::TextConditioning;
 
 /// `torch.randn((h·w, C), generator=seed).to(bfloat16).float()`: the repo's seeded MLX normal,
@@ -31,12 +32,28 @@ pub fn noise(seed: u64, h: usize, w: usize, channels: usize) -> Result<Array> {
 /// noise is `.float()`). `on_step(i)` fires after step `i` (1-based). Cancellation is checked
 /// before every network evaluation and surfaces as [`Error::Canceled`] — the partial state is
 /// dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn denoise_flow_map(
     dit: &Flux3Dit,
     text: &TextConditioning,
     noise: &Array,
     image_ids: &[[f32; 4]],
     schedule: &[f32],
+    cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
+    denoise_flow_map_with_references(dit, text, noise, image_ids, schedule, None, cancel, on_step)
+}
+
+/// Same frozen integrator with immutable AE conditioning shared by both CFG branches.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_flow_map_with_references(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    noise: &Array,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    references: Option<&ReferenceConditioning>,
     cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Array> {
@@ -67,7 +84,7 @@ pub fn denoise_flow_map(
             text_ids: &text.ids,
             image: &x,
             image_ids,
-            image_cond: None,
+            image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
             timestep: t,
             target_timestep: Some(target),
         }])?;
@@ -95,6 +112,25 @@ pub fn denoise_cfg(
     schedule: &[f32],
     guidance: f32,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
+    denoise_cfg_with_references(
+        dit, text, negative, noise, image_ids, schedule, guidance, None, cancel, on_step,
+    )
+}
+
+/// Same frozen integrator with immutable AE conditioning shared by both CFG branches.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_references(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: &TextConditioning,
+    noise: &Array,
+    image_ids: &[[f32; 4]],
+    schedule: &[f32],
+    guidance: f32,
+    references: Option<&ReferenceConditioning>,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
 ) -> Result<Array> {
     if dit.is_flow_map() || !guidance.is_finite() || guidance < 0.0 {
@@ -116,7 +152,7 @@ pub fn denoise_cfg(
             text_ids: &conditioning.ids,
             image: &x,
             image_ids,
-            image_cond: None,
+            image_cond: references.map(|r| (&r.tokens, r.ids.as_slice())),
             timestep: schedule[step],
             target_timestep: None,
         });
@@ -168,12 +204,27 @@ pub fn denoise_one_conditioned(
     cancel: &CancelFlag,
     on_step: impl FnMut(usize),
 ) -> Result<Array> {
+    denoise_one_with_references(dit, text, negative, None, params, seed, cancel, on_step)
+}
+
+/// Generate fresh noise, while reference tokens remain pinned image_cond (not img2img).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_one_with_references(
+    dit: &Flux3Dit,
+    text: &TextConditioning,
+    negative: Option<&TextConditioning>,
+    references: Option<&ReferenceConditioning>,
+    params: &GenerationParams,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+) -> Result<Array> {
     let (h, w) = params.latent_shape()?;
     let channels = dit.config().image_in_channels;
     let ids = image_ids(h, w, dit.config().image_rope_scale as f32);
     let z = noise(seed, h, w, channels)?;
     match params.guidance {
-        Some(guidance) => denoise_cfg(
+        Some(guidance) => denoise_cfg_with_references(
             dit,
             text,
             negative.ok_or_else(|| {
@@ -185,10 +236,20 @@ pub fn denoise_one_conditioned(
             &ids,
             &params.schedule()?,
             guidance,
+            references,
             cancel,
             on_step,
         ),
-        None => denoise_flow_map(dit, text, &z, &ids, &params.schedule()?, cancel, on_step),
+        None => denoise_flow_map_with_references(
+            dit,
+            text,
+            &z,
+            &ids,
+            &params.schedule()?,
+            references,
+            cancel,
+            on_step,
+        ),
     }
 }
 

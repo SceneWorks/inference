@@ -496,18 +496,10 @@ pub fn safety_check(
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
     let route_gate = || {
-        if context.mode != MemoryMode::TextToImage {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: this route's request surface is text_to_image; got {:?}",
-                context.mode.as_key()
-            )));
-        }
-        if context.geometry.reference_count > 0 {
-            return Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: the distilled text-to-image route takes no reference images \
-                 (sc-26236)"
-            )));
-        }
+        gen_core::flux3::references::validate_memory_route(
+            &context.mode,
+            context.geometry.reference_count,
+        )?;
         if context.use_pid {
             return Err(CoreError::Unsupported(format!(
                 "{MODEL_ID}: there is no PiD decoder on this route"
@@ -591,8 +583,11 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
-    Ok(Some(Box::new(
-        candle_gen::request_scope::CandleRequestScopeCore::new(config),
+    Ok(Some(gen_core::flux3::references::guard_memory_scope(
+        Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
+            config,
+        )),
+        context.geometry,
     )))
 }
 

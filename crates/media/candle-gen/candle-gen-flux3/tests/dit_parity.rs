@@ -29,6 +29,199 @@ fn dit(compute: DType, device: &Device) -> candle_gen_flux3::Flux3Dit {
     .unwrap()
 }
 
+/// Frozen source independently encodes ordered non-square RGB references and holds their AE
+/// tokens fixed across every step, including BOTH base CFG branches at guidance zero and one.
+#[test]
+fn ordered_reference_edits_match_frozen_source() {
+    use candle_gen::gen_core::{
+        flux3::{
+            assemble_window,
+            references::{prepare, ReferenceOutputSize},
+        },
+        CancelFlag, Image,
+    };
+    use candle_gen_flux3::pipeline::{
+        decode_tokens, denoise_cfg_with_references, denoise_flow_map_with_references,
+    };
+    use candle_gen_flux3::{load_autoencoder, TextConditioning};
+    let dev = Device::Cpu;
+    let golden = fixture("flux3_reference_edit_golden.safetensors");
+    assert_eq!(
+        golden.meta("upstream_code_revision"),
+        candle_gen::gen_core::flux3::UPSTREAM_CODE_REVISION
+    );
+    let ae = load_autoencoder(&tiny_package().join("ae.safetensors"), &dev).unwrap();
+    let flow = dit(DType::F32, &dev);
+    let mut cfg = tiny_config();
+    cfg.dit.flow_map = false;
+    let base = candle_gen_flux3::load_dit(
+        &crate::common::fixtures().join("tiny-base-snapshot/model.safetensors"),
+        &cfg,
+        DType::F32,
+        &dev,
+    )
+    .unwrap();
+    let text = fixture("flux3_text_golden.safetensors");
+    let conditioning = |name: &str| {
+        let tokens = text.require(&format!("{name}/tokens")).clone();
+        let ids = ids_of(text.require(&format!("{name}/ids")));
+        let window = assemble_window(&vec![1; ids.len()], 0, 1, 4096).unwrap();
+        TextConditioning {
+            tokens,
+            ids,
+            window,
+        }
+    };
+    let positive = conditioning("short");
+    let negative = conditioning("empty");
+    let originals: Vec<Image> = (0..10)
+        .map(|i| {
+            let t = golden.require(&format!("input/{i}"));
+            let dims = t.dims();
+            Image {
+                width: dims[1] as u32,
+                height: dims[0] as u32,
+                pixels: t.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+            }
+        })
+        .collect();
+    let ids = ids_of(golden.require("image_ids"));
+    let schedule = host_f32(golden.require("schedule"));
+    for (name, order) in [
+        ("one", vec![0]),
+        ("two", vec![0, 1]),
+        ("ten", (0..10).collect()),
+        ("reversed", (0..10).rev().collect()),
+    ] {
+        let input = order
+            .iter()
+            .map(|&i| originals[i].clone())
+            .collect::<Vec<_>>();
+        let prepared = prepare(&input, ReferenceOutputSize::default()).unwrap();
+        // Same source colors with alpha0/128/255: AE drops alpha; PUP independently composites.
+        let mixed = candle_gen::gen_core::GenerationRequest {
+            flux3_reference_output: Some(ReferenceOutputSize::default()),
+            conditioning: order
+                .iter()
+                .map(|&i| {
+                    if i % 2 == 0 {
+                        candle_gen::gen_core::Conditioning::ReferenceRgba {
+                            image: candle_gen::gen_core::RgbaImage {
+                                width: originals[i].width,
+                                height: originals[i].height,
+                                pixels: crate::common::host_f32(
+                                    golden.require(&format!("rgba/{i}")),
+                                )
+                                .into_iter()
+                                .map(|v| v as u8)
+                                .collect(),
+                            },
+                            strength: None,
+                        }
+                    } else {
+                        candle_gen::gen_core::Conditioning::Reference {
+                            image: originals[i].clone(),
+                            strength: None,
+                        }
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ae_input = candle_gen::gen_core::flux3::references::request_images(&mixed).unwrap();
+        let mixed_prepared = candle_gen::gen_core::flux3::references::prepare_borrowed(
+            &ae_input.iter().map(|i| i.as_ref()).collect::<Vec<_>>(),
+            ReferenceOutputSize::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mixed_prepared.images, prepared.images,
+            "source RGB-drop-alpha is exact, not white-premultiplied"
+        );
+        let pup = candle_gen::gen_core::flux3::references::upsampler_input(&mixed).unwrap();
+        for (position, &i) in order.iter().enumerate() {
+            if i % 2 == 0 {
+                let (_, _, rgb) = pup.references[position].to_rgb8().unwrap();
+                let expected = crate::common::host_f32(golden.require(&format!("pup_rgb/{i}")))
+                    .into_iter()
+                    .map(|v| v as u8)
+                    .collect::<Vec<_>>();
+                assert_eq!(rgb, expected, "Pillow source alpha-over-white fork");
+            }
+        }
+        let prepared = mixed_prepared;
+        let references =
+            candle_gen_flux3::references::encode(&ae, &prepared, &dev, &CancelFlag::new()).unwrap();
+        assert_eq!(references.tokens.dtype(), DType::BF16);
+        assert_eq!(
+            references.ids,
+            ids_of(golden.require(&format!("{name}/reference_ids")))
+        );
+        assert_close(
+            "AE reference tokens",
+            &references.tokens,
+            golden.require(&format!("{name}/reference_tokens")),
+            1e-4,
+        );
+        let out = denoise_flow_map_with_references(
+            &flow,
+            &positive,
+            golden.require("noise"),
+            &ids,
+            &schedule,
+            Some(&references),
+            &CancelFlag::new(),
+            |_| {},
+        )
+        .unwrap();
+        assert_close(
+            name,
+            &out,
+            golden.require(&format!("{name}/flow_tokens")),
+            1e-4,
+        );
+        let decoded = decode_tokens(&ae, &out, 2, 3).unwrap();
+        let expected = golden
+            .require(&format!("{name}/rgb8"))
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
+        assert_eq!((decoded.width, decoded.height), (48, 32));
+        let delta = decoded
+            .pixels
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        assert!(delta <= 1, "decoded RGB rounding, max byte delta {delta}");
+        if name == "two" || name == "ten" {
+            for g in [0.0f32, 1.0, 3.5] {
+                let result = denoise_cfg_with_references(
+                    &base,
+                    &positive,
+                    &negative,
+                    golden.require("noise"),
+                    &ids,
+                    &schedule,
+                    g,
+                    Some(&references),
+                    &CancelFlag::new(),
+                    |_| {},
+                )
+                .unwrap();
+                assert_close(
+                    "base ordered reference CFG",
+                    &result,
+                    golden.require(&format!("{name}/cfg_{g:.1}")),
+                    1e-4,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn single_sample_forward_matches_upstream_in_fp32() {
     let dit = dit(DType::F32, &cpu());
