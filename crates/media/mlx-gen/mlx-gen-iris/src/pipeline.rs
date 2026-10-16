@@ -79,8 +79,34 @@ pub fn denoise(
     noise: &Array,
     params: &GenerationParams,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+    preview: &PreviewSink,
+) -> Result<Array> {
+    denoise_budgeted(
+        dit,
+        flow,
+        conditioning,
+        noise,
+        params,
+        cancel,
+        on_step,
+        preview,
+        mlx_gen::AttentionBudget::UNBOUNDED,
+    )
+}
+
+/// Solver with a bounded-attention forward, leaving the legacy/training API unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_budgeted(
+    dit: &IrisDiT,
+    flow: &FlowConfig,
+    conditioning: &Conditioning,
+    noise: &Array,
+    params: &GenerationParams,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
     preview: &PreviewSink,
+    budget: mlx_gen::AttentionBudget,
 ) -> Result<Array> {
     let plan = params.plan()?;
     let rows = conditioning.cond.len();
@@ -135,14 +161,15 @@ pub fn denoise(
                 Some(batch) if params.cfg_at(step) => {
                     let xb = concatenate_axis(&[x, x], 0)?;
                     let tb = Array::from_slice(&vec![t; 2 * rows], &[2 * rows as i32]);
-                    let out = dit.forward(&xb, &tb, batch)?;
+                    let out = dit.forward_budgeted(&xb, &tb, batch, budget)?;
                     let halves = out.split(2, 0)?;
                     cfg_combine(&halves[0], &halves[1], params.cfg_scale)
                 }
-                _ => dit.forward(
+                _ => dit.forward_budgeted(
                     x,
                     &Array::from_slice(&vec![t; rows], &[rows as i32]),
                     &cond_text,
+                    budget,
                 ),
             }
         },

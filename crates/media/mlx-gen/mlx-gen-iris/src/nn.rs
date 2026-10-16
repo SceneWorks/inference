@@ -20,7 +20,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::gen_core::iris;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{concatenate_axis, pad, stack_axis};
 use mlx_rs::{Array, Dtype};
 
@@ -434,23 +434,27 @@ pub fn attention(
     compute: Dtype,
     mask: Option<&Array>,
 ) -> Result<Array> {
+    attention_budgeted(q, k, v, compute, mask, mlx_gen::AttentionPlan::UNBOUNDED)
+}
+
+/// Query-row bounded SDPA. Each chunk retains every key/value head, including GQA groups.
+/// This axis is tolerance-equivalent (not bit-exact); evaluated chunks cut the lazy graph.
+pub fn attention_budgeted(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    compute: Dtype,
+    mask: Option<&Array>,
+    plan: mlx_gen::AttentionPlan<'_>,
+) -> Result<Array> {
     let sh = q.shape();
     let (b, n, h, d) = (sh[0], sh[1], sh[2], sh[3]);
     let t =
         |a: &Array| -> Result<Array> { Ok(a.as_dtype(compute)?.transpose_axes(&[0, 2, 1, 3])?) };
     let (q, k, v) = (t(q)?, t(k)?, t(v)?);
     let scale = 1.0 / (d as f32).sqrt();
-    let out = match mask {
-        Some(m) => scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            scale,
-            ScaledDotProductAttentionMask::Array(&m.as_dtype(compute)?),
-            None,
-        )?,
-        None => scaled_dot_product_attention(&q, &k, &v, scale, None, None)?,
-    };
+    let mask = mask.map(|m| m.as_dtype(compute)).transpose()?;
+    let out = mlx_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, mask.as_ref(), plan)?;
     Ok(out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?)
 }
 

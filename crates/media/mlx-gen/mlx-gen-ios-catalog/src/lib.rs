@@ -6,7 +6,8 @@
 //! memory cap. Depending on it to obtain one small generator would compile a graph the platform
 //! cannot run.
 //!
-//! So this catalog is a deliberate, reviewable subset: the generators that actually fit. Adding
+//! So this catalog is a deliberate, reviewable subset with admission-gated routes. Registration
+//! is not a claim that a model fits the device budget. Adding
 //! one is an edit here *and* to this crate's ordered surface test, exactly as the platform
 //! catalogs work — a provider crate existing in the workspace does not mean it ships.
 //!
@@ -34,6 +35,8 @@ use mlx_gen::gen_core::{
 use mlx_gen_sana::memory_strategy::DECODE_TILE_EDGES;
 use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVERLAP};
 
+// Iris generation, depth and restoration are inference-only registrations, not device-fit claims.
+
 pub mod anima;
 pub use anima::{
     anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
@@ -47,7 +50,9 @@ pub use anima::{
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     // Turbo alone, through the provider's own per-variant seam: its generator and complete memory
     // registration, never a trainer — whatever features another crate unifies onto `mlx-gen-anima`.
-    mlx_gen_anima::register_turbo_generator(mlx_gen_sana::register_providers(registry))
+    mlx_gen_iris::register_inference_providers(mlx_gen_anima::register_turbo_generator(
+        mlx_gen_sana::register_providers(registry),
+    ))
 }
 
 /// Build the complete, explicit iOS media provider catalog.
@@ -253,11 +258,21 @@ mod tests {
 
         assert_eq!(
             ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "iris_3b"],
             "the iOS media surface changed -- if deliberate, update this test and confirm the new \
-             provider fits the measured iOS cap"
+             provider is admission-gated; registration is not a device fitting claim"
         );
         assert_eq!(registry.trainers().len(), 0, "iOS ships no trainers");
+        assert!(registry
+            .transforms()
+            .any(|r| (r.descriptor)().id == "iris_3b_restore"));
+        let memory: Vec<_> = registry
+            .memory_strategy_registrations()
+            .map(|r| r.provider_id)
+            .collect();
+        for id in ["iris_3b", "iris_3b_depth", "iris_3b_restore"] {
+            assert!(memory.contains(&id), "missing Iris mode {id}: {memory:?}");
+        }
         assert_eq!(registry.captioners().len(), 0, "iOS ships no captioners");
     }
 

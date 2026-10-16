@@ -8,7 +8,7 @@
 //! | 0 | [`MemoryStrategy::Resident`] | implemented | implemented | implemented |
 //! | 1 | [`MemoryStrategy::StagedResidency`] | **implemented** — the Qwen3-VL tower is loaded, encodes, and is dropped before the backbone loads | not applicable — no text encoder | not applicable — no text encoder |
 //! | 2 | [`MemoryStrategy::BoundedDecode`] | not applicable — pixel space, no decoder | not applicable | not applicable |
-//! | 3 | [`MemoryStrategy::BoundedAttention`] | missing | missing | missing |
+//! | 3 | [`MemoryStrategy::BoundedAttention`] | implemented (query rows) | missing | missing |
 //! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | missing | missing | missing |
 //!
 //! # What each declaration is true of
@@ -31,9 +31,9 @@
 //!   growing with the output; what does grow with the output is the host-side fusion canvas. That
 //!   is why the contract publishes [`MemoryStrategy::Resident`] only and a pixel-count formula: a
 //!   tiling "rung" would be one the engine could not decline.
-//! * **Rungs 3 and 4 are `Missing`, not "not applicable".** The backbone has attention and a block
-//!   stack, so both rungs describe real work; neither is wired. See the two constants
-//!   [`ATTENTION_NOT_ENABLED`] and [`TRANSFORMER_WINDOW_NOT_ENABLED`] for why.
+//! * **Rung 3** is request-selected on generation, including the GQA trunk, text adapter and pixel
+//!   stage. It is tolerance-equivalent, not bit-exact. Rung 4 remains missing: no window loader is
+//!   claimed without evidence that it lowers peak. Encoder-free routes keep resident attention.
 //!
 //! # Nothing here is a measurement
 //!
@@ -81,27 +81,13 @@ pub const DEPTH_MEMORY_MODE: &str = "depth";
 /// [`MemoryMode::Other`] key of the restoration route (`IrisTask::Restoration.name()`).
 pub const RESTORE_MEMORY_MODE: &str = "restoration";
 
-/// Why rung 3 is declared `Missing` on every Iris route (applicable, not enabled).
-///
-/// The shared MLX kernel (`mlx_gen::attention`) bounds no score matrix on this backend — the fused
-/// SDPA streams the scores — so its saving is a graph cut whose size is a per-family measurement
-/// (−1.7 % on the one family measured), and that module's own rule is that a family selects the
-/// rung only on its own real-weight measurement, which this story's CPU-only lane cannot take.
-///
-/// The kernel's bit-exact axis slices complete heads of q, k and v together. That fits the pixel
-/// stage and the text refiner, whose attention is ordinary multi-head, but not the trunk, which is
-/// grouped-query in the release (20 query heads over 5 key/value heads, `model.num_kv_heads`): a
-/// plain head slice would cut k/v out of step with q. A split aligned to the key/value groups
-/// would be exact in principle, but it is new kernel code, not a call into the shared seam, and
-/// its saving would still need a real-weight measurement. The remaining query-row axis is
-/// tolerance-equivalent only, i.e. a change to the rendered pixels. Depth and restoration
-/// additionally have no request-memory carrier (`TransformRequest` and the depth request have no
-/// `GenerationMemory`), so no selection could reach their forward.
+/// Score-element bound of the query-row attention plan. This is an execution parameter,
+/// not a measured activation/footprint bound. iOS admission still needs capture evidence.
+pub const ATTENTION_CHUNK_SIZE: u32 = 67_108_864;
+
+/// Encoder-free routes have no request attention carrier and retain their resident baseline.
 pub const ATTENTION_NOT_ENABLED: &str =
-    "bounded attention is not wired through IrisDiT::forward: the shared MLX kernel's saving is a \
-     per-family real-weight measurement; its bit-exact head axis fits the pixel stage and the \
-     text refiner but not the grouped-query trunk, where an exact split needs a new \
-     group-aligned kernel; and the query-row axis is not bit-exact";
+    "encoder-free Iris routes have no request-selected attention carrier";
 
 /// Why rung 4 is declared `Missing` on every Iris route (applicable, not enabled).
 ///
@@ -323,7 +309,7 @@ fn base_contract(
             ],
             synchronized_phase_release: true,
             decode_tiling: false,
-            attention_chunking: false,
+            attention_chunking: true,
             transformer_window_materialization: false,
         };
         contract.formula = MemoryFormulaKind::PhaseEnvelope {
@@ -373,10 +359,14 @@ fn base_contract(
                     ),
                 },
             },
+            MemoryStrategy::BoundedAttention if staged => MemoryStrategySupport::Implemented,
             MemoryStrategy::BoundedAttention | MemoryStrategy::BoundedTransformerResidency => {
                 MemoryStrategySupport::Missing
             }
         };
+        if capability.strategy == MemoryStrategy::BoundedAttention && staged {
+            capability.parameters.attention_chunk_sizes = vec![ATTENTION_CHUNK_SIZE];
+        }
     }
     contract
 }
@@ -954,7 +944,7 @@ pub(crate) fn registered_begin_request(
     if !task_of(&contract.provider_id)?.uses_text_encoder() {
         return Ok(None);
     }
-    let config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
+    let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         MODEL_ID,
         context.geometry,
         contract.generation_memory(&context.selection),
@@ -969,6 +959,7 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
+    config.attention_chunk_size = config.memory.and_then(|m| m.attention_chunk_size);
     Ok(Some(Box::new(GenerationRequestScope {
         core: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
             config,
@@ -1162,8 +1153,8 @@ mod tests {
     ///
     /// *Mutations that red this:* declaring `StagedResidency` implemented on an encoder-free task
     /// (the shared conformance refuses a staged rung with no lifecycle phases); declaring it
-    /// `Missing` on generation; promoting either bounded-DiT rung to `Implemented` (no lifecycle
-    /// hook backs it).
+    /// `Missing` on generation; withdrawing the bounded-attention hook or promoting the
+    /// unimplemented transformer-window rung.
     #[test]
     fn each_route_declares_exactly_the_rungs_its_engine_runs() {
         let dense = memory_contract_surface_specs();
@@ -1229,7 +1220,11 @@ mod tests {
                         "implemented",
                         staged,
                         "not-applicable",
-                        "missing",
+                        if task == IrisTask::Generation {
+                            "implemented"
+                        } else {
+                            "missing"
+                        },
                         "missing"
                     ],
                     "{} [{}]",
@@ -1238,7 +1233,10 @@ mod tests {
                 );
                 // No hook is declared for a rung that is not implemented.
                 assert!(!contract.lifecycle.decode_tiling);
-                assert!(!contract.lifecycle.attention_chunking);
+                assert_eq!(
+                    contract.lifecycle.attention_chunking,
+                    task == IrisTask::Generation
+                );
                 assert!(!contract.lifecycle.transformer_window_materialization);
                 assert_eq!(
                     contract.lifecycle.synchronized_phase_release,
@@ -1638,7 +1636,10 @@ mod tests {
             let fixtures = registered_valid_fixture(&spec, &contract, strategy).unwrap();
             assert_eq!(
                 fixtures.len(),
-                usize::from(strategy == MemoryStrategy::StagedResidency),
+                usize::from(matches!(
+                    strategy,
+                    MemoryStrategy::StagedResidency | MemoryStrategy::BoundedAttention
+                )),
                 "{strategy:?}"
             );
         }
@@ -1692,6 +1693,69 @@ mod tests {
             foreign.mode = MemoryMode::TextToImage;
             assert!(registered_begin_request(&spec, &contract, &foreign).is_err());
         }
+    }
+
+    /// Synthetic admission coordinates, NOT device measurements. The shared handshake must
+    /// enforce the caller's budget and parameter domain before a loader can run.
+    #[test]
+    fn bounded_selection_reaches_request_and_budget_refuses_next_fixture_edge() {
+        let spec = sentinel().with_quant(Quant::Q4);
+        let contract = weights_free_memory_strategy_contract(MODEL_ID, &spec).unwrap();
+        let mut at = gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::BoundedAttention,
+            loaded_tier(&spec),
+            MemoryBehaviorRoute {
+                mode: MemoryMode::TextToImage,
+                reference_count: 0,
+                use_pid: false,
+                has_phases: true,
+                overlay: None,
+            },
+        )
+        .unwrap();
+        at.selection.parameters.stage_residency = Some(true);
+        let mut request = MemoryBehaviorFixture::new(at.clone()).request;
+        let mut scope = registered_begin_request(&spec, &contract, &at)
+            .unwrap()
+            .unwrap();
+        scope.configure_request(&mut request).unwrap();
+        let controls = request.memory.unwrap();
+        assert!(controls.stage_residency && controls.chunk_attention);
+        assert_eq!(controls.attention_chunk_size, Some(ATTENTION_CHUNK_SIZE));
+        scope.finish(MemoryRunOutcome::Complete).unwrap();
+        at.budget = gen_core::MemoryBudget {
+            total_bytes: 4096 << 20,
+            committed_bytes: 0,
+            reclaimable_bytes: 0,
+            reserved_headroom_bytes: 0,
+        };
+        let mut largest = None;
+        for (edge, synthetic_mib) in [(512, 3000_u64), (768, 3900), (1024, 4300)] {
+            at.geometry.width = edge;
+            at.geometry.height = edge;
+            at.predicted_peak_bytes = synthetic_mib << 20;
+            if edge <= 768 {
+                assert_eq!(
+                    safety_check(&spec, &contract, &at),
+                    MemorySafetyDecision::Accept
+                );
+                largest = Some(edge);
+            } else {
+                assert!(matches!(
+                    safety_check(&spec, &contract, &at),
+                    MemorySafetyDecision::Reject { .. }
+                ));
+                assert!(registered_begin_request(&spec, &contract, &at).is_err());
+            }
+        }
+        assert_eq!(largest, Some(768));
+        at.predicted_peak_bytes = 1;
+        at.selection.parameters.attention_chunk_size = Some(17);
+        assert!(matches!(
+            safety_check(&spec, &contract, &at),
+            MemorySafetyDecision::Reject { .. }
+        ));
     }
 
     /// The explicit catalog carries all three routes through the shared seams and conforms.

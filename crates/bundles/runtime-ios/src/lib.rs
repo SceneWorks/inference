@@ -250,15 +250,14 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is exactly SANA + Anima Turbo under `media`, empty without it. An
+        // The media surface is SANA + Anima Turbo + Iris under `media`, empty without it. An
         // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
         // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
         assert_eq!(
             snapshot.generator_ids,
-            ["sana_1600m", "sana_sprint_1600m", "anima_turbo"],
-            "the iOS image surface changed; confirm the new provider fits the measured iOS cap \
-             before updating this"
+            ["sana_1600m", "sana_sprint_1600m", "anima_turbo", "iris_3b"],
+            "the iOS image surface changed; registration is not a device fitting claim"
         );
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
@@ -275,8 +274,12 @@ mod tests {
         );
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
 
-        // Never, on either profile: these belong to the full media graph, not to a phone.
+        // Iris restoration is a transform, not a generator; keep the mode registered on iOS.
+        #[cfg(feature = "media")]
+        assert_eq!(snapshot.transform_ids, ["iris_3b_restore"]);
+        #[cfg(not(feature = "media"))]
         assert!(snapshot.transform_ids.is_empty());
+        // Never, on either profile: no training or unrelated full-catalog routes.
         assert!(snapshot.trainer_ids.is_empty());
         assert!(snapshot.captioner_ids.is_empty());
         assert!(snapshot.image_embedder_ids.is_empty());

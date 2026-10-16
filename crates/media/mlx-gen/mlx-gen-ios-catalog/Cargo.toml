@@ -21,6 +21,8 @@ mlx-gen-sana = { path = "../mlx-gen-sana" }
 # perceptors behind it) are compiled for iOS. The Qwen-Image VAE and z-image's Qwen3 encoder block it
 # reuses arrive the same way, each without its own trainers.
 mlx-gen-anima = { path = "../mlx-gen-anima", default-features = false }
+# All Iris inference modes; no trainer/JACCL training shim in the iOS graph.
+mlx-gen-iris = { path = "../mlx-gen-iris", default-features = false }
 
 [dev-dependencies]
 # The shared weights-free memory-strategy oracle, run over this catalog's exact registrations.

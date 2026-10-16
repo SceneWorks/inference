@@ -17,8 +17,8 @@ use mlx_rs::nn::{gelu, sigmoid, silu};
 use mlx_rs::{Array, Dtype};
 
 use crate::nn::{
-    attention, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, BackboneQuant, Linear,
-    Loader, RmsNorm, Rope,
+    attention_budgeted, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, BackboneQuant,
+    Linear, Loader, RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -79,6 +79,7 @@ impl SelfAttention {
         rope: Option<&Rope>,
         mask: Option<&Array>,
         compute: Dtype,
+        budget: mlx_gen::AttentionBudget,
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, n, dim) = (sh[0], sh[1], sh[2]);
@@ -104,7 +105,14 @@ impl SelfAttention {
             q = rope.apply(&q)?;
             k = rope.apply(&k)?;
         }
-        self.proj.forward(&attention(&q, &k, &v, compute, mask)?)
+        self.proj.forward(&attention_budgeted(
+            &q,
+            &k,
+            &v,
+            compute,
+            mask,
+            mlx_gen::AttentionPlan::budgeted(budget),
+        )?)
     }
 
     fn arrays(&self) -> Vec<&Array> {
@@ -675,6 +683,14 @@ impl IrisDiT {
 
     /// `LayerwiseTextEmbedder.forward(y, mask)` (`y` `[B, T, L, Dt]`) → `[B, T, D]` f32.
     pub fn text_adapter(&self, text: &TextBatch) -> Result<Array> {
+        self.text_adapter_budgeted(text, mlx_gen::AttentionBudget::UNBOUNDED)
+    }
+
+    fn text_adapter_budgeted(
+        &self,
+        text: &TextBatch,
+        budget: mlx_gen::AttentionBudget,
+    ) -> Result<Array> {
         let sh = text.states.shape();
         let (b, t, layers, dt) = (sh[0], sh[1], sh[2], sh[3]);
         if text.mask.len() != b as usize || text.mask.iter().any(|m| m.len() != t as usize) {
@@ -688,9 +704,10 @@ impl IrisDiT {
             .as_dtype(Dtype::Float32)?
             .reshape(&[b * t, layers, dt])?;
         for block in &y_ad.layer_blocks {
-            let h = block
-                .attn
-                .forward(&block.norm1.forward(&y)?, None, None, self.compute)?;
+            let h =
+                block
+                    .attn
+                    .forward(&block.norm1.forward(&y)?, None, None, self.compute, budget)?;
             y = y.add(&h)?;
             let m = block
                 .mlp2
@@ -711,6 +728,7 @@ impl IrisDiT {
                 None,
                 Some(&key_mask),
                 self.compute,
+                budget,
             )?;
             y = y.add(&h)?;
             y = y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?;
@@ -749,6 +767,28 @@ impl IrisDiT {
         text: &TextBatch,
         hooks: &mut dyn ForwardHooks,
     ) -> Result<Array> {
+        self.forward_budgeted_hooked(x, t, text, hooks, mlx_gen::AttentionBudget::UNBOUNDED)
+    }
+
+    /// Inference forward with a request-selected score-element budget. No persistent state changes.
+    pub fn forward_budgeted(
+        &self,
+        x: &Array,
+        t: &Array,
+        text: &TextBatch,
+        budget: mlx_gen::AttentionBudget,
+    ) -> Result<Array> {
+        self.forward_budgeted_hooked(x, t, text, &mut NoHooks, budget)
+    }
+
+    fn forward_budgeted_hooked(
+        &self,
+        x: &Array,
+        t: &Array,
+        text: &TextBatch,
+        hooks: &mut dyn ForwardHooks,
+        budget: mlx_gen::AttentionBudget,
+    ) -> Result<Array> {
         let cfg = &self.cfg;
         let sh = x.shape();
         let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
@@ -783,7 +823,7 @@ impl IrisDiT {
         let t_emb = self.timestep_embedding(t)?;
         let cond = silu(&t_emb)?;
 
-        let mut y = self.text_adapter(text)?;
+        let mut y = self.text_adapter_budgeted(text, budget)?;
         let n_txt = y.shape()[1];
         let pos = self
             .y_pos_embedding
@@ -812,6 +852,7 @@ impl IrisDiT {
             .transpose()?;
         let ctx = TrunkCtx {
             compute: self.compute,
+            budget,
             rope_img,
             rope_txt,
             heads: cfg.num_heads as i32,
@@ -848,6 +889,7 @@ impl IrisDiT {
         );
         let pctx = PixelCtx {
             compute: self.compute,
+            budget,
             rope_pix,
             batch: b,
             n_patches,
@@ -879,6 +921,7 @@ impl IrisDiT {
         rope_txt: &Rope,
         heads: i32,
         kv_heads: i32,
+        budget: mlx_gen::AttentionBudget,
     ) -> Result<(Array, Array)> {
         let mx = blk.mod_img.chunks(core_img)?;
         let my = blk.mod_txt.chunks(core_txt)?;
@@ -893,7 +936,14 @@ impl IrisDiT {
         let q = cat(&[&qy, &qx], 1)?;
         let k = cat(&[&ky, &kx], 1)?;
         let v = cat(&[&vy, &vx], 1)?;
-        let out = attention(&q, &k, &v, compute, None)?;
+        let out = attention_budgeted(
+            &q,
+            &k,
+            &v,
+            compute,
+            None,
+            mlx_gen::AttentionPlan::budgeted(budget),
+        )?;
         let n_txt = y.shape()[1];
         let mut halves = out.split_axis(&[n_txt], 1)?;
         let out_x = halves.swap_remove(1);
@@ -926,6 +976,7 @@ impl IrisDiT {
         rope_txt: &Rope,
         heads: i32,
         kv_heads: i32,
+        budget: mlx_gen::AttentionBudget,
     ) -> Result<(Array, Array)> {
         let m = blk.modulation.chunks(core)?;
         let n_txt = y.shape()[1];
@@ -940,7 +991,14 @@ impl IrisDiT {
         let (kx, ky) = (ks.swap_remove(1), ks.swap_remove(0));
         let q = cat(&[&rope_txt.apply(&qy)?, &rope_img.apply(&qx)?], 1)?;
         let k = cat(&[&rope_txt.apply(&ky)?, &rope_img.apply(&kx)?], 1)?;
-        let mut attn = attention(&q, &k, &v, compute, None)?;
+        let mut attn = attention_budgeted(
+            &q,
+            &k,
+            &v,
+            compute,
+            None,
+            mlx_gen::AttentionPlan::budgeted(budget),
+        )?;
         let (mut h, mut tokens) = (h, tokens);
         if !blk.text_out {
             attn = attn.split_axis(&[n_txt], 1)?.swap_remove(1);
@@ -963,6 +1021,7 @@ impl IrisDiT {
         Ok((x, y))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pit(
         compute: Dtype,
         blk: &PitBlock,
@@ -971,6 +1030,7 @@ impl IrisDiT {
         rope: &Rope,
         batch: i32,
         n_patches: i32,
+        budget: mlx_gen::AttentionBudget,
     ) -> Result<Array> {
         let sh = x.shape();
         let (rows, ppp, pix) = (sh[0], sh[1], sh[2]);
@@ -985,6 +1045,7 @@ impl IrisDiT {
             Some(rope),
             None,
             compute,
+            budget,
         )?;
         let expanded = blk
             .expand
@@ -1007,6 +1068,7 @@ impl IrisDiT {
 #[derive(Clone)]
 pub struct TrunkCtx {
     compute: Dtype,
+    budget: mlx_gen::AttentionBudget,
     rope_img: Rope,
     rope_txt: Rope,
     heads: i32,
@@ -1017,6 +1079,7 @@ pub struct TrunkCtx {
 #[derive(Clone)]
 pub struct PixelCtx {
     compute: Dtype,
+    budget: mlx_gen::AttentionBudget,
     rope_pix: Rope,
     batch: i32,
     n_patches: i32,
@@ -1122,6 +1185,7 @@ impl IrisDiT {
                 &ctx.rope_txt,
                 ctx.heads,
                 ctx.kv_heads,
+                ctx.budget,
             ),
             Block::Single(blk) => Self::single(
                 ctx.compute,
@@ -1133,6 +1197,7 @@ impl IrisDiT {
                 &ctx.rope_txt,
                 ctx.heads,
                 ctx.kv_heads,
+                ctx.budget,
             ),
         }
     }
@@ -1153,6 +1218,7 @@ impl IrisDiT {
             &ctx.rope_pix,
             ctx.batch,
             ctx.n_patches,
+            ctx.budget,
         )
     }
 
@@ -1172,6 +1238,7 @@ impl IrisDiT {
             &ctx.rope_pix,
             ctx.batch,
             ctx.n_patches,
+            ctx.budget,
         )
     }
 
@@ -1244,6 +1311,7 @@ impl PixelBlock {
             &ctx.rope_pix,
             ctx.batch,
             ctx.n_patches,
+            ctx.budget,
         )
     }
 }

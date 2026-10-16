@@ -52,6 +52,7 @@ IOS_BOUND_PATHS = (
     "crates/llm/mlx-llm",
     "crates/media/mlx-gen/mlx-gen-anima",
     "crates/media/mlx-gen/mlx-gen-ios-catalog",
+    "crates/media/mlx-gen/mlx-gen-iris",
     "crates/media/mlx-gen/mlx-gen-pid",
     "crates/media/mlx-gen/mlx-gen-qwen-image",
     "crates/media/mlx-gen/mlx-gen-sana",

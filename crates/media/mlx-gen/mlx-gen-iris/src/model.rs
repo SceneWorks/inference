@@ -20,7 +20,7 @@ use mlx_rs::Dtype;
 
 use crate::dit::IrisDiT;
 use crate::nn::BackboneQuant;
-use crate::pipeline::{denoise, encode, noise_batch, to_images, Conditioning};
+use crate::pipeline::{encode, noise_batch, to_images, Conditioning};
 use crate::text_encoder::IrisTextEncoder;
 
 /// Registry id (the SceneWorks worker's `payload.model`).
@@ -311,7 +311,7 @@ impl Iris3b {
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height)?;
                     let done = c * params.steps as u32;
-                    let x = denoise(
+                    let x = crate::pipeline::denoise_budgeted(
                         &heavy.dit,
                         &flow,
                         &conditioning,
@@ -325,6 +325,7 @@ impl Iris3b {
                             })
                         },
                         &req.preview,
+                        attention_budget(req)?,
                     )?;
                     images.push(x);
                 }
@@ -366,16 +367,15 @@ impl Iris3b {
 }
 
 /// Refuse the memory-ladder controls this route has no mechanism for, so none is accepted and
-/// ignored: there is no decoder to tile (pixel space), no bounded-attention path through the
-/// backbone and no block-streaming loader. Staged residency is the one control honoured
-/// ([`stage_residency_for`]), and it is the only one the route's request scope ever writes.
+/// ignored: there is no decoder to tile (pixel space) and no block-streaming loader.
+/// Staged residency and bounded attention are request-scoped controls.
 fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
     let Some(memory) = req.memory else {
         return Ok(());
     };
+    attention_budget(req)?;
     let refusals = [
         ("tile_vae_decode", memory.tile_vae_decode),
-        ("chunk_attention", memory.chunk_attention),
         (
             "stream_transformer_blocks",
             memory.stream_transformer_blocks,
@@ -385,11 +385,35 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
         if set {
             return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: GenerationMemory::{control} is not a memory strategy of the MLX \
-                 Iris-3B generation route (it stages residency only)"
+                 Iris-3B generation route"
             )));
         }
     }
     Ok(())
+}
+
+/// Resolve only the provider's published parameter; never silently accept another budget.
+fn attention_budget(req: &GenerationRequest) -> Result<mlx_gen::AttentionBudget> {
+    match req.memory {
+        Some(m) if m.chunk_attention => {
+            let size = m
+                .attention_chunk_size
+                .unwrap_or(crate::memory_strategy::ATTENTION_CHUNK_SIZE);
+            if size != crate::memory_strategy::ATTENTION_CHUNK_SIZE {
+                return Err(Error::Unsupported(format!(
+                    "{MODEL_ID}: attention_chunk_size {size} is outside the published domain"
+                )));
+            }
+            Ok(mlx_gen::AttentionBudget::from_score_elements(
+                u64::from(size),
+                true,
+            ))
+        }
+        Some(m) if m.attention_chunk_size.is_some() => Err(Error::Unsupported(format!(
+            "{MODEL_ID}: attention_chunk_size requires chunk_attention"
+        ))),
+        _ => Ok(mlx_gen::AttentionBudget::UNBOUNDED),
+    }
 }
 
 impl Generator for Iris3b {
@@ -546,7 +570,7 @@ mod tests {
         assert!(stage_residency_for(&sequential, &staged));
     }
 
-    /// The route honours staged residency only; every other memory-ladder control is refused by
+    /// The route honours staged residency and bounded attention; unsupported controls are refused by
     /// name rather than accepted and ignored.
     ///
     /// *Mutation that reds this:* removing any row of `refuse_unhonored_memory`'s table.
@@ -573,10 +597,10 @@ mod tests {
                 },
             ),
             (
-                "chunk_attention",
+                "attention_chunk_size",
                 GenerationMemory {
                     chunk_attention: true,
-                    attention_chunk_size: Some(1 << 26),
+                    attention_chunk_size: Some(1),
                     ..Default::default()
                 },
             ),
