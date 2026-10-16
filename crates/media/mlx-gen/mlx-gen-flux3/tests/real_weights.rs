@@ -482,7 +482,7 @@ fn real_prompt_upsampler_rewrites_the_readme_request() {
     );
     let text_caption = &out.caption;
     assert!(
-        !text_caption.contains('<') && !text_caption.contains('['),
+        !text_caption.contains("<") && !text_caption.contains("["),
         "t2i captions carry no ids or tables: {text_caption}"
     );
     assert!(tokens > 0 && tokens <= pup::MAX_TOKENS);
