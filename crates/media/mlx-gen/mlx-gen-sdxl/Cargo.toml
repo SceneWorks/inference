@@ -12,7 +12,7 @@ autotests = false
 [dependencies]
 # Epic 2123 auxiliary perceptual losses (sc-24830): the shared builder every trainer calls
 # (depth anchoring today). Depends only on core + the aux-model crates (acyclic).
-mlx-gen-perceptual = { path = "../mlx-gen-perceptual" }
+mlx-gen-perceptual = { path = "../mlx-gen-perceptual", optional = true }
 mlx-gen = { path = ".." }
 # Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): the `sdxl` PiD student as an
 # opt-in 4× decode replacement for the SDXL-family VAE. `mlx-gen-pid` depends only on the mlx-gen
@@ -30,7 +30,14 @@ serde_json = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-3045) and save the e2e render for
 # inspection. PNG + JPEG cover the SceneWorks dataset formats; the trainer center-crops + hands the
 # Image to the VAE preprocess.
-image = { workspace = true }
+image = { workspace = true, optional = true }
+
+[features]
+# The LoRA/LoKr trainer (`training`) and its training-only deps (perceptual aux losses, dataset
+# image decode). Default-on, so every existing consumer is unchanged; an inference-only graph (the
+# iOS bundle) depends with `default-features = false` and compiles no trainer (sc-26265).
+default = ["training"]
+training = ["dep:image", "dep:mlx-gen-perceptual"]
 
 [dev-dependencies]
 sha2 = { workspace = true }
@@ -48,3 +55,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+# The binary carries the trainer tests and the training-only deps (`image`), so it needs the
+# default-on `training` feature; `--no-default-features` skips it rather than failing (sc-26265).
+required-features = ["training"]

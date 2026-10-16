@@ -909,6 +909,7 @@ impl StagedHeavy for AnimaHeavy {
 /// The conditioner forward here is the sc-10522 correctness point: the DiT + conditioner adapters must
 /// already be installed on `dit`/`conditioner` (the trainer re-installs the current factors before each
 /// cadence), so this reflects the conditioner adapters' training — it is NOT a cached output.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_preview(
     dit: &CosmosDiT,
@@ -951,6 +952,7 @@ pub(crate) fn render_preview(
 /// weights-free (no-VAE) test can drive the exact production path and prove the conditioner is live —
 /// if this ever regressed to a cached conditioner output, the latent would stop responding to the
 /// conditioner adapters (the sc-10522 trap) and the guard test reddens.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_preview_latent(
     dit: &CosmosDiT,
@@ -990,6 +992,7 @@ pub(crate) fn render_preview_latent(
 /// (+ optional `uncond_enc` for CFG). The sampling half of [`render_preview_latent`], factored so the
 /// live path and the guard test share one integrator and differ ONLY in whether `cond` was produced
 /// live or (the trap) reused stale.
+#[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_latent_with_enc(
     dit: &CosmosDiT,

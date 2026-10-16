@@ -39,7 +39,9 @@ pub mod quant;
 pub mod rope_embedder;
 pub mod text_encoder;
 pub mod timestep_embedder;
+#[cfg(feature = "training")]
 pub mod training;
+#[cfg(feature = "training")]
 mod training_adapter;
 pub mod transformer;
 pub mod transformer_block;
@@ -227,6 +229,7 @@ pub use pipeline::{
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
+#[cfg(feature = "training")]
 pub use training::{LoraTarget, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
@@ -235,7 +238,7 @@ pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    registry
+    let registry = registry
         .register_generator(model::REGISTRATION)
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
         .register_generator(model_base::REGISTRATION)
@@ -282,8 +285,13 @@ pub fn register_providers(
                 )
             },
         })
-        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
-        .register_trainer(training::REGISTRATION)
+        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION);
+    // The LoRA trainer and its perceptual/depth/dataset deps are the `training` feature, so an
+    // inference-only graph (the iOS bundle reaches this crate through `mlx-gen-anima`'s reuse of
+    // the Qwen3 `EncoderLayer`) compiles no trainer (sc-26265).
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::REGISTRATION);
+    registry
 }
 
 /// Build the complete explicit Z-Image MLX provider catalog.
@@ -446,7 +454,12 @@ mod explicit_registry_tests {
             .trainers()
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
-        assert_eq!(explicit_trainers, ["z_image_turbo"]);
+        let expected_trainers: &[&str] = if cfg!(feature = "training") {
+            &["z_image_turbo"]
+        } else {
+            &[]
+        };
+        assert_eq!(explicit_trainers, expected_trainers);
     }
 
     /// The four `register_memory_strategy` calls are what makes the SC-15449 contract resolvable before
