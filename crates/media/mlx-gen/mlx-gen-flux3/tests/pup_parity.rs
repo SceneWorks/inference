@@ -115,7 +115,10 @@ fn plan_for(up: &Flux3PromptUpsampler, g: &Weights, case: &str) -> UpsamplePlan 
 }
 
 /// Stream the plan through the engine, returning the generated ids and the prompt length.
-fn run_engine(up: &Flux3PromptUpsampler, plan: &UpsamplePlan) -> (Vec<i32>, u32) {
+fn run_engine(
+    up: &Flux3PromptUpsampler,
+    plan: &UpsamplePlan,
+) -> (Vec<i32>, core_llm::TextLlmOutput) {
     let request = plan.request(&UpsampleOptions::default(), core_llm::CancelFlag::new());
     let mut ids = Vec::new();
     let out = up
@@ -131,34 +134,77 @@ fn run_engine(up: &Flux3PromptUpsampler, plan: &UpsamplePlan) -> (Vec<i32>, u32)
             }
         })
         .expect("the miniature engine generates");
-    (ids, out.usage.prompt_tokens)
+    (ids, out)
 }
 
-fn assert_greedy_parity(case: &str, got: &[i32], want: &[i32], margins: &[f32]) {
+/// Compare the public Content projection, not raw HF generation ids. The independent raw CPU
+/// decoder gate is candle-llm/tests/flux3_pup_decoder.rs; never delete protocol ids from its oracle.
+fn assert_greedy_parity(
+    up: &Flux3PromptUpsampler,
+    case: &str,
+    got: &[i32],
+    raw: &[i32],
+    margins: &[f32],
+    output: &core_llm::TextLlmOutput,
+) {
+    assert_eq!(raw.len(), margins.len());
+    let tokenizer = up.package().tokenizer();
+    let special = tokenizer.constraint_decode_table().special;
+    let stops: Vec<u32> = pup::STOP_TOKENS
+        .iter()
+        .map(|token| {
+            let ids = tokenizer.encode(token, false).unwrap();
+            assert_eq!(ids.len(), 1, "the frozen EOS marker is one tokenizer id");
+            ids[0]
+        })
+        .collect();
+    let raw_count = raw
+        .iter()
+        .position(|&id| stops.contains(&(id as u32)))
+        .unwrap_or(raw.len());
+    let visible: Vec<_> = raw[..raw_count]
+        .iter()
+        .zip(&margins[..raw_count])
+        .enumerate()
+        .filter(|(_, (id, _))| !special.contains(&(**id as u32)))
+        .map(|(index, (&id, &margin))| (index, id, margin))
+        .collect();
     let mut matched = 0usize;
-    for (i, (&w, &m)) in want.iter().zip(margins).enumerate() {
-        let Some(&g) = got.get(i) else {
-            panic!(
-                "{case}: the engine stopped after {i} tokens, the oracle produced {}",
-                want.len()
-            );
-        };
-        if g == w {
+    for (index, &(raw_index, expected, margin)) in visible.iter().enumerate() {
+        let actual = *got.get(index).unwrap_or_else(|| {
+            panic!("{case}: public stream omitted visible token {index} (raw step {raw_index})")
+        });
+        if actual == expected {
             matched += 1;
             continue;
         }
+        assert!(margin < MARGIN,
+            "{case}: visible step {index}, raw step {raw_index} differs ({actual} vs {expected}) on wide margin {margin:.4}");
         assert!(
-            m < MARGIN,
-            "{case}: step {i} differs ({g} vs {w}) on a wide margin {m:.4} — not rounding"
+            matched >= MIN_MATCHED,
+            "{case}: only {matched} greedy steps matched before a narrow-margin divergence"
         );
-        eprintln!("{case}: trajectories diverge at step {i} (margin {m:.4}) after {matched} matched steps");
-        break;
+        eprintln!(
+            "{case}: narrow-margin divergence at raw step {raw_index} after {matched} matches"
+        );
+        return; // Existing rounding policy: later trajectories need not have the same EOS/tail.
     }
-    assert!(
-        matched >= MIN_MATCHED,
-        "{case}: only {matched} greedy steps matched the oracle (got {got:?}, want {want:?})"
+    assert!(matched >= MIN_MATCHED);
+    assert_eq!(got.len(), visible.len(), "{case}: exact public token count");
+    assert_eq!(
+        output.usage.generated_tokens as usize, raw_count,
+        "{case}: suppressed protocol ids still count toward the raw decode budget; EOS does not"
     );
-    eprintln!("{case}: {matched}/{} greedy steps matched", want.len());
+    let reason = if raw_count < raw.len() {
+        core_llm::FinishReason::Stop
+    } else {
+        core_llm::FinishReason::Length
+    };
+    assert_eq!(
+        output.finish_reason,
+        Some(reason),
+        "{case}: source EOS/budget boundary"
+    );
 }
 
 #[test]
@@ -205,15 +251,15 @@ fn text_modes_match_the_oracle_greedy_run() {
             want_ids.len(),
             "{case}: prompt length"
         );
-        let (got, prompt_tokens) = run_engine(&up, &plan);
+        let (got, output) = run_engine(&up, &plan);
         assert_eq!(
-            prompt_tokens as usize,
+            output.usage.prompt_tokens as usize,
             want_ids.len(),
             "{case}: the engine tokenized the same prompt length"
         );
         let want = host_i32(g.get(&format!("generated_{case}")).unwrap());
         let margins = host_f32(g.get(&format!("margins_{case}")).unwrap());
-        assert_greedy_parity(case, &got, &want, &margins);
+        assert_greedy_parity(&up, case, &got, &want, &margins, &output);
     }
 }
 
@@ -236,15 +282,15 @@ fn editing_modes_match_the_oracle_greedy_run_with_the_same_reference_pixels() {
             want_ids.len(),
             "{case}: expanded prompt length"
         );
-        let (got, prompt_tokens) = run_engine(&up, &plan);
+        let (got, output) = run_engine(&up, &plan);
         assert_eq!(
-            prompt_tokens as usize,
+            output.usage.prompt_tokens as usize,
             want_ids.len(),
             "{case}: the engine expanded the image tokens as the processor does"
         );
         let want = host_i32(g.get(&format!("generated_{case}")).unwrap());
         let margins = host_f32(g.get(&format!("margins_{case}")).unwrap());
-        assert_greedy_parity(case, &got, &want, &margins);
+        assert_greedy_parity(&up, case, &got, &want, &margins, &output);
     }
 }
 
