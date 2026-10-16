@@ -923,8 +923,9 @@ pub fn vision_tokens(width: u32, height: u32) -> Result<usize> {
 
 /// A reference image as the caller holds it. The upsampler's policy ([`policy_reference`])
 /// starts from Pillow's `RGB` conversion of the opened file: an already-decoded buffer skips
-/// the decode, an alpha channel is composited over white, a path is decoded here (EXIF
-/// orientation applied, as `ImageOps.exif_transpose`).
+/// the decode, an explicit alpha carrier is composited over white, and a path applies EXIF plus
+/// the frozen ORIGINAL-mode policy. PNG RGB/L `tRNS` does not acquire alpha-composite semantics;
+/// PNG16 gray saturates while color PNG16 uses its high bytes (as Pillow opens those modes).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceImage {
     /// RGB8, row-major, `width * height * 3` bytes.
@@ -1035,38 +1036,18 @@ pub fn composite_over_white(rgba: &[u8]) -> Vec<u8> {
 }
 
 fn decode_reference_file(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
-    use image::ImageDecoder;
-    let reader = image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| {
-            Error::Msg(format!(
-                "flux3 upsampler: open reference {}: {e}",
-                path.display()
-            ))
-        })?;
-    let mut decoder = reader.into_decoder().map_err(|e| {
-        Error::Msg(format!(
-            "flux3 upsampler: decode reference {}: {e}",
-            path.display()
-        ))
-    })?;
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|e| {
-        Error::Msg(format!(
-            "flux3 upsampler: decode reference {}: {e}",
-            path.display()
-        ))
-    })?;
-    decoded.apply_orientation(orientation);
-    let (width, height) = (decoded.width(), decoded.height());
-    let rgb = if decoded.color().has_alpha() {
-        composite_over_white(&decoded.to_rgba8().into_raw())
-    } else {
-        decoded.to_rgb8().into_raw()
-    };
-    Ok((width, height, rgb))
+    use super::image_input::{decode_reference_file as decode_input, DecodedReference};
+    // The shared decoder returns pixel data, NEVER another Path, so this delegation cannot
+    // recurse through ReferenceImage::Path. Preserve the original Pillow mode policy first;
+    // PNG EXPAND alpha is not evidence that upstream would composite it (RGB/L tRNS do not).
+    match decode_input(path)? {
+        DecodedReference::Rgb(image) => Ok((image.width, image.height, image.pixels)),
+        DecodedReference::Rgba(image) => Ok((
+            image.width,
+            image.height,
+            composite_over_white(&image.pixels),
+        )),
+    }
 }
 
 /// `pup.policy_reference`: RGB over white, Pillow `LANCZOS` to the size budget, JPEG q92 —

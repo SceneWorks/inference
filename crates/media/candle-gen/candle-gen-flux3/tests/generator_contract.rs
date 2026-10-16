@@ -50,6 +50,214 @@ fn request() -> GenerationRequest {
 }
 
 #[test]
+fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progress() {
+    use candle_gen::gen_core::flux3::references::ReferenceOutputSize;
+    use candle_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
+    let refs: Vec<Conditioning> = (0..10)
+        .map(|n| {
+            let (w, h) = if n % 2 == 0 { (83, 67) } else { (67, 99) };
+            let rgb = (0..w * h)
+                .flat_map(|p| [n * 19, (p % 251) as u8, (p / w % 251) as u8])
+                .collect::<Vec<_>>();
+            if n % 2 == 0 {
+                Conditioning::ReferenceRgba {
+                    image: RgbaImage {
+                        width: w,
+                        height: h,
+                        pixels: rgb
+                            .chunks_exact(3)
+                            .enumerate()
+                            .flat_map(|(i, p)| [p[0], p[1], p[2], [0, 128, 255][i % 3]])
+                            .collect(),
+                    },
+                    strength: None,
+                }
+            } else {
+                Conditioning::Reference {
+                    image: Image {
+                        width: w,
+                        height: h,
+                        pixels: rgb,
+                    },
+                    strength: None,
+                }
+            }
+        })
+        .collect();
+    for id in [ID, "flux3_klein_base"] {
+        let mut loaded = if id == ID {
+            spec(OffloadPolicy::Resident)
+        } else {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(
+                crate::common::fixtures().join("tiny-base-snapshot"),
+            ));
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(tiny_text_encoder()),
+            );
+            spec.components.insert(
+                AUTOENCODER_COMPONENT.into(),
+                WeightsSource::File(tiny_autoencoder()),
+            );
+            spec
+        };
+        loaded.precision = Precision::Fp32;
+        let g = candle_gen_flux3::provider_registry()
+            .unwrap()
+            .load(id, &loaded)
+            .unwrap();
+        let render = |req: &GenerationRequest| {
+            let GenerationOutput::Images(mut images) = g.generate(req, &mut |_| {}).unwrap() else {
+                panic!("image output required")
+            };
+            assert_eq!(images.len(), 1);
+            images.remove(0)
+        };
+        let mut edit = GenerationRequest {
+            width: 1024,
+            height: 1024,
+            steps: Some(1),
+            conditioning: vec![refs[0].clone()],
+            flux3_reference_output: Some(ReferenceOutputSize::default()),
+            ..request()
+        };
+        if id != "flux3_klein" {
+            edit.guidance = Some(1.0);
+        }
+        g.validate(&edit).unwrap();
+        let image = render(&edit);
+        assert_eq!(
+            (image.width, image.height),
+            (83, 67),
+            "single-auto result removes only the source padding"
+        );
+        let exif = candle_gen::gen_core::flux3::references::decode_reference_file(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../contracts/gen-core/tests/fixtures/flux3-references/exif6.png"),
+        )
+        .unwrap();
+        edit.conditioning = vec![exif.clone()];
+        let oriented = render(&edit);
+        assert_eq!(
+            (oriented.width, oriented.height),
+            (67, 83),
+            "EXIF orientation is applied before auto canvas/crop"
+        );
+        edit.conditioning = vec![exif; 10];
+        let oriented_ten = render(&edit);
+        assert_eq!(
+            (oriented_ten.width, oriented_ten.height),
+            (64, 80),
+            "ten EXIF references use upstream multi-reference crop"
+        );
+        let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
+        for file in [
+            "mode-luma16.png",
+            "mode-rgb16.png",
+            "mode-palette-alpha.png",
+            "mode-rgb-trns.png",
+        ] {
+            edit.conditioning = vec![
+                candle_gen::gen_core::flux3::references::decode_reference_file(&formats.join(file))
+                    .unwrap(),
+            ];
+            let normalized = candle_gen::gen_core::flux3::references::request_images(&edit)
+                .unwrap()[0]
+                .as_ref()
+                .clone();
+            let encoded = render(&edit);
+            assert_eq!(
+                (encoded.width, encoded.height),
+                (4, 3),
+                "{file}: source auto output crop"
+            );
+            let mut canonical = edit.clone();
+            canonical.conditioning = vec![Conditioning::Reference {
+                image: normalized,
+                strength: None,
+            }];
+            assert_eq!(
+                encoded.pixels,
+                render(&canonical).pixels,
+                "{file}: encoded input equals source-normalized RGB through the public provider"
+            );
+        }
+        edit.conditioning = vec![refs[0].clone()];
+        for (intent, size) in [
+            (
+                ReferenceOutputSize {
+                    width: Some(128),
+                    height: None,
+                },
+                (128, 80),
+            ),
+            (
+                ReferenceOutputSize {
+                    width: None,
+                    height: Some(128),
+                },
+                (96, 128),
+            ),
+        ] {
+            edit.flux3_reference_output = Some(intent);
+            let image = render(&edit);
+            assert_eq!(
+                (image.width, image.height),
+                size,
+                "either explicit side suppresses output crop"
+            );
+        }
+        edit.conditioning = refs.clone();
+        edit.flux3_reference_output = Some(ReferenceOutputSize::default());
+        let ten = render(&edit);
+        assert_eq!((ten.width, ten.height), (80, 64));
+        let mut text_only = edit.clone();
+        text_only.width = 80;
+        text_only.height = 64;
+        text_only.conditioning.clear();
+        text_only.flux3_reference_output = None;
+        let plain = render(&text_only);
+        assert_ne!(
+            ten.pixels, plain.pixels,
+            "ordinary Generator must consume references, not silently render T2I"
+        );
+        edit.conditioning.reverse();
+        let reverse = render(&edit);
+        assert_eq!(
+            (reverse.width, reverse.height),
+            (64, 96),
+            "first prepared reference controls auto geometry, never reordered"
+        );
+        let mut bad = edit.clone();
+        bad.conditioning.push(refs[0].clone());
+        let mut progress = Vec::new();
+        assert!(g.generate(&bad, &mut |p| progress.push(p)).is_err());
+        assert!(
+            progress.is_empty(),
+            "excess references fail before any generation phase"
+        );
+        bad = edit.clone();
+        bad.strength = Some(1.0);
+        assert!(g.generate(&bad, &mut |p| progress.push(p)).is_err());
+        assert!(
+            progress.is_empty(),
+            "unsupported strength cannot become silent T2I"
+        );
+        bad = edit.clone();
+        bad.conditioning = vec![Conditioning::ReferenceRgba {
+            image: RgbaImage::default(),
+            strength: None,
+        }];
+        assert!(g.generate(&bad, &mut |p| progress.push(p)).is_err());
+        assert!(
+            progress.is_empty(),
+            "invalid pixel carriers fail before encoding/PUP/render"
+        );
+    }
+}
+
+#[test]
 fn effective_caption_is_recorded_before_encoding_and_prompt_derived_seeding() {
     use candle_gen::gen_core::{PromptEnhancementReport, PromptEnhancementSink};
     use std::sync::{Arc, Mutex};
