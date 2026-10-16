@@ -414,7 +414,11 @@ pub(crate) fn generation_contract(
         overlay_bytes: 0,
     };
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
-        account_upsampler(&mut contract, crate::pup::load_memory_bytes(&dir)?)?;
+        account_upsampler(
+            &mut contract,
+            crate::pup::load_memory_bytes(&dir)?,
+            upsampler_residency(spec.offload_policy),
+        )?;
     }
     let mut adapter_bytes = 0u64;
     for adapter in &spec.adapters {
@@ -462,9 +466,34 @@ pub(crate) fn generation_contract(
     Ok(contract)
 }
 
-/// Keep the optional VLM separate from the image encoder. This is its conservative native
-/// source/load bound held throughout the render, NOT measured KV/activation peak memory.
-fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+/// A `Sequential` load always runs the PUP slot exclusively: the bounded VLM is fenced and its
+/// actual owner dropped before the text encoder loads, so it is priced as consumed during
+/// conditioning with nothing retained. A `Resident` load may keep it warm across requests and
+/// stays conservatively whole-render (a request-admitted staging only lowers the real peak).
+pub(crate) fn upsampler_residency(
+    policy: gen_core::OffloadPolicy,
+) -> gen_core::MemoryComponentResidency {
+    match policy {
+        gen_core::OffloadPolicy::Resident => gen_core::MemoryComponentResidency::WholeRender,
+        gen_core::OffloadPolicy::Sequential => {
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                evidence: "candle_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \n                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                    .into(),
+            }
+        }
+    }
+}
+
+/// Keep the optional VLM separate from the image encoder. `bytes` is its native header-only
+/// load bound (prefix cache and CUDA graphs disabled), NOT measured KV/activation peak memory;
+/// the LLM admits its request-time KV separately.
+fn account_upsampler(
+    contract: &mut MemoryProviderContract,
+    bytes: u64,
+    residency: gen_core::MemoryComponentResidency,
+) -> CoreResult<()> {
     if bytes == 0 {
         return Err(CoreError::Unsupported(format!(
             "{MODEL_ID}: prompt_upsampler has no accountable weights; install the complete package"
@@ -484,7 +513,7 @@ fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreR
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
+            residency,
         }],
     };
     Ok(())
@@ -745,7 +774,12 @@ mod tests {
         let mut contract = base_contract(Precision::Bf16, None);
         contract.asset_facts.base_bytes = 113;
         contract.asset_facts.conditioning_bytes = 17;
-        account_upsampler(&mut contract, 37).unwrap();
+        account_upsampler(
+            &mut contract,
+            37,
+            upsampler_residency(gen_core::OffloadPolicy::Resident),
+        )
+        .unwrap();
         assert_eq!(contract.asset_facts.base_bytes, 113);
         assert_eq!(contract.asset_facts.conditioning_bytes, 17);
         assert_eq!(contract.asset_facts.overlay_bytes, 37);
@@ -769,7 +803,43 @@ mod tests {
             resident_components[0].residency,
             gen_core::MemoryComponentResidency::WholeRender
         );
-        assert!(account_upsampler(&mut contract, 0).is_err());
+        assert_eq!(contract.auxiliary_resident_bytes(), 37);
+        assert!(account_upsampler(
+            &mut contract,
+            0,
+            upsampler_residency(gen_core::OffloadPolicy::Resident)
+        )
+        .is_err());
+
+        // Sequential: the exclusive slot drops PUP before conditioning work, so the bound is the
+        // conditioning-phase head only and NO later phase is charged for it.
+        let mut staged = base_contract(Precision::Bf16, None);
+        staged.asset_facts.base_bytes = 113;
+        staged.asset_facts.conditioning_bytes = 17;
+        staged.asset_facts.transformer_bytes = 96;
+        account_upsampler(
+            &mut staged,
+            37,
+            upsampler_residency(gen_core::OffloadPolicy::Sequential),
+        )
+        .unwrap();
+        let component = &staged.resident_components()[0];
+        assert_eq!(component.resident_bytes, 37);
+        assert_eq!(component.steady_state_bytes(), 0);
+        assert_eq!(component.evicted_bytes(), 37);
+        assert!(matches!(
+            component.residency,
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                ..
+            }
+        ));
+        assert!(
+            staged.conformance_errors().is_empty(),
+            "{:?}",
+            staged.conformance_errors()
+        );
     }
 
     #[test]

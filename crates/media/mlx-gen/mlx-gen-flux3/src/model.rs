@@ -266,6 +266,10 @@ pub fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
+    Ok(Box::new(load_model(spec, base)?))
+}
+
+fn load_model(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     refuse_unsupported_spec(spec)?;
     let package_dir = match &spec.weights {
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
@@ -329,7 +333,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
     // Only an optional local source path is retained here. An enabled prepare
     // phase owns the VLM load and a bounded phase drops it before image encoding.
     let upsampler_dir = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)?;
-    Ok(Box::new(Flux3Klein {
+    Ok(Flux3Klein {
         adapter_reports,
         descriptor: if base {
             descriptor_base()
@@ -343,7 +347,7 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
         upsampler_dir,
         upsampler: Default::default(),
         image_execution_fence: new_image_fence(),
-    }))
+    })
 }
 
 // Keep cancellation at the image decode/completion boundaries too: the shared residency
@@ -692,6 +696,67 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hosted-only (MLX does not build on Windows); the twin of the Candle generator test. Evidence
+    /// for the `Sequential` PUP `PrecomputedThenEvicted` charge in `memory_strategy`. Mutations:
+    /// load the VLM eagerly at generator load, keep it after a bounded request, or skip the
+    /// bypass eviction of a resident owner.
+    #[test]
+    fn actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for policy in [
+            gen_core::OffloadPolicy::Resident,
+            gen_core::OffloadPolicy::Sequential,
+        ] {
+            let mut spec =
+                LoadSpec::new(gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot")))
+                    .with_offload_policy(policy);
+            spec.precision = Precision::Fp32;
+            spec.components.insert(
+                gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(fixtures.join("tiny-pup-snapshot")),
+            );
+            let model = load_model(&spec, false).unwrap();
+            assert!(
+                !model.upsampler.is_loaded().unwrap(),
+                "loading the image generator must not load an unused VLM"
+            );
+            let mut req = GenerationRequest {
+                prompt: "a red bicycle leaning against a brick wall".into(),
+                width: 80,
+                height: 64,
+                steps: Some(1),
+                seed: Some(17),
+                ..Default::default()
+            };
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert!(
+                !model.upsampler.is_loaded().unwrap(),
+                "bypass must not secretly load PUP"
+            );
+            req.enhance_prompt = true;
+            req.enhance_max_tokens = Some(12);
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert_eq!(
+                model.upsampler.is_loaded().unwrap(),
+                policy == gen_core::OffloadPolicy::Resident
+            );
+            if policy == gen_core::OffloadPolicy::Sequential {
+                assert!(model
+                    .residency
+                    .with_resident_parts(|_, _| ())
+                    .unwrap()
+                    .is_none());
+            }
+            req.enhance_prompt = false;
+            req.enhance_max_tokens = None;
+            model.generate_impl(&req, &mut |_| {}).unwrap();
+            assert!(
+                !model.upsampler.is_loaded().unwrap(),
+                "bypass must evict a prior resident PUP owner"
+            );
+        }
+    }
 
     /// Hosted-only here (MLX does not build on Windows). Mutations: remove the per-item guard
     /// (second decode runs), remove final guard (last decode publishes), or remove completion guard.

@@ -309,13 +309,14 @@ pub(crate) fn generation_contract(
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
         gen_core::flux3::pup::UpsamplePackage::check(&dir)?;
         let llm_spec = gen_core::core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
-        let bytes = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
+        let load_bound = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
             CoreError::Unsupported(format!(
                 "{MODEL_ID}: cannot account for prompt_upsampler at {}: {e}",
                 dir.display()
             ))
         })?;
-        account_upsampler(&mut contract, bytes)?;
+        let (bytes, residency) = upsampler_charge(load_bound, spec.offload_policy)?;
+        account_upsampler(&mut contract, bytes, residency)?;
     }
     let mut adapter_bytes = 0u64;
     for adapter in &spec.adapters {
@@ -363,11 +364,41 @@ pub(crate) fn generation_contract(
     Ok(contract)
 }
 
-/// Charge the optional VLM exactly once, separate from the base encoder. The shared LLM
-/// header-only load bound includes derivatives and staging and conservatively reserves those
-/// bytes throughout the render, since this loader keeps the VLM alive. It does NOT estimate
-/// upsampling activations or its KV cache: those require the terminal resource campaign.
-fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+/// What the PUP slot actually holds per load policy. `Sequential` always takes the exclusive
+/// path: `load_bounded` (prefix cache 0), fenced and dropped before the text encoder loads, so
+/// the bare load bound is consumed in conditioning with nothing retained. `Resident` keeps the
+/// default `load` warm, whose cross-request prefix cache reserves its default budget on top of
+/// the weights; the header-only load bound does not include that budget, so it is added here.
+pub(crate) fn upsampler_charge(
+    load_bound: u64,
+    policy: gen_core::OffloadPolicy,
+) -> CoreResult<(u64, gen_core::MemoryComponentResidency)> {
+    Ok(match policy {
+        gen_core::OffloadPolicy::Resident => (
+            load_bound
+                .checked_add(gen_core::core_llm::defaults::MLX.prefix_cache_bytes)
+                .ok_or_else(|| CoreError::Unsupported("flux3: prompt_upsampler byte overflow".into()))?,
+            gen_core::MemoryComponentResidency::WholeRender,
+        ),
+        gen_core::OffloadPolicy::Sequential => (
+            load_bound,
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                evidence: "mlx_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \n                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                    .into(),
+            },
+        ),
+    })
+}
+
+/// Charge the optional VLM exactly once, separate from the base encoder. It does NOT estimate
+/// upsampling activations or its KV cache: the LLM admits those at request time.
+fn account_upsampler(
+    contract: &mut MemoryProviderContract,
+    bytes: u64,
+    residency: gen_core::MemoryComponentResidency,
+) -> CoreResult<()> {
     if bytes == 0 {
         return Err(CoreError::Unsupported(
             "flux3: prompt_upsampler has no accountable weights; provision a complete package"
@@ -388,7 +419,7 @@ fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreR
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
+            residency,
         }],
     };
     Ok(())
@@ -751,7 +782,12 @@ mod tests {
         };
         let original = contract.asset_facts;
         let before = contract.total_resident_bytes();
-        account_upsampler(&mut contract, 37).unwrap();
+        account_upsampler(
+            &mut contract,
+            37,
+            gen_core::MemoryComponentResidency::WholeRender,
+        )
+        .unwrap();
         assert_eq!(contract.asset_facts.base_bytes, original.base_bytes);
         assert_eq!(
             contract.asset_facts.conditioning_bytes,
@@ -778,8 +814,39 @@ mod tests {
             contract.conformance_errors()
         );
         let mut absent = base_contract(Precision::Bf16, None);
-        assert!(account_upsampler(&mut absent, 0).is_err());
+        assert!(account_upsampler(
+            &mut absent,
+            0,
+            gen_core::MemoryComponentResidency::WholeRender
+        )
+        .is_err());
         assert_eq!(absent.asset_facts.overlay_bytes, 0);
+    }
+
+    #[test]
+    fn upsampler_charge_matches_the_loader_each_policy_actually_runs() {
+        let prefix = gen_core::core_llm::defaults::MLX.prefix_cache_bytes;
+        assert!(prefix > 0);
+        let (resident, whole) = upsampler_charge(37, gen_core::OffloadPolicy::Resident).unwrap();
+        assert_eq!(
+            resident,
+            37 + prefix,
+            "a warm default load reserves its prefix-cache budget"
+        );
+        assert_eq!(whole, gen_core::MemoryComponentResidency::WholeRender);
+        let (bounded, evicted) = upsampler_charge(37, gen_core::OffloadPolicy::Sequential).unwrap();
+        assert_eq!(bounded, 37, "load_bounded disables the prefix cache");
+        let mut staged = base_contract(Precision::Bf16, None);
+        account_upsampler(&mut staged, bounded, evicted).unwrap();
+        let component = &staged.resident_components()[0];
+        assert_eq!(component.steady_state_bytes(), 0);
+        assert_eq!(component.evicted_bytes(), 37);
+        assert!(
+            staged.conformance_errors().is_empty(),
+            "{:?}",
+            staged.conformance_errors()
+        );
+        assert!(upsampler_charge(u64::MAX, gen_core::OffloadPolicy::Resident).is_err());
     }
 
     #[test]
