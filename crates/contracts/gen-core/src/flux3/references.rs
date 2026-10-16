@@ -273,63 +273,17 @@ pub fn prepare_borrowed(
 /// never expose this path argument as an untrusted generation-request field.
 /// Preserve alpha/hidden RGB until request_images (AE) or upsampler_input (PUP) chooses its policy.
 pub fn decode_reference_file(path: &std::path::Path) -> Result<crate::Conditioning> {
-    use image::ImageDecoder;
-    let reader = image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| {
-            invalid(format!(
-                "cannot open owned reference {}: {e}",
-                path.display()
-            ))
-        })?;
-    let mut decoder = reader.into_decoder().map_err(|e| {
-        invalid(format!(
-            "cannot decode owned reference {}: {e}",
-            path.display()
-        ))
-    })?;
-    let orientation = decoder.orientation().map_err(|e| {
-        invalid(format!(
-            "invalid reference orientation {}: {e}",
-            path.display()
-        ))
-    })?;
-    let mut decoded = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| invalid(format!("invalid reference image {}: {e}", path.display())))?;
-    decoded.apply_orientation(orientation);
-    if !matches!(
-        decoded.color(),
-        image::ColorType::L8
-            | image::ColorType::La8
-            | image::ColorType::Rgb8
-            | image::ColorType::Rgba8
-    ) {
-        return Err(invalid(format!(
-            "reference {} uses unsupported {:?} pixels; export an 8-bit RGB/RGBA image",
-            path.display(),
-            decoded.color()
-        )));
-    }
-    let (width, height) = (decoded.width(), decoded.height());
-    if decoded.color().has_alpha() {
-        Ok(crate::Conditioning::ReferenceRgba {
-            image: crate::RgbaImage {
-                width,
-                height,
-                pixels: decoded.to_rgba8().into_raw(),
-            },
+    use super::image_input::{decode_reference_file as decode_input, DecodedReference};
+    Ok(match decode_input(path)? {
+        DecodedReference::Rgb(image) => crate::Conditioning::Reference {
+            image,
             strength: None,
-        })
-    } else {
-        Ok(crate::Conditioning::Reference {
-            image: Image {
-                width,
-                height,
-                pixels: decoded.to_rgb8().into_raw(),
-            },
+        },
+        DecodedReference::Rgba(image) => crate::Conditioning::ReferenceRgba {
+            image,
             strength: None,
-        })
-    }
+        },
+    })
 }
 
 enum Input<'a> {

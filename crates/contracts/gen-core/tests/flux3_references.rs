@@ -123,6 +123,97 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
 }
 
 #[test]
+fn encoded_png_modes_match_frozen_ae_and_pup_forks() {
+    use gen_core::flux3::{
+        pup::{policy_reference, ReferenceImage},
+        references::{decode_reference_file, prepare_borrowed, request_images, upsampler_input},
+    };
+    use gen_core::{Conditioning, GenerationRequest};
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flux3-image-input");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("image-input.json")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["pup_source_sha256"],
+        "e3561ae3cbff1a080ad8854c0b89bd0687c1ea9d84c74f5203b44844cbd4684d"
+    );
+    for row in metadata["encoded_formats"].as_array().unwrap() {
+        let name = row["name"].as_str().unwrap();
+        let path = root.join(row["file"].as_str().unwrap());
+        let decoded = decode_reference_file(&path).unwrap();
+        match row["carrier"].as_str().unwrap() {
+            "rgba" => {
+                let Conditioning::ReferenceRgba { image, .. } = &decoded else {
+                    panic!("{name}: source alpha mode must remain RGBA until the fork")
+                };
+                assert_eq!(
+                    image.pixels,
+                    std::fs::read(root.join(format!("{name}.decoded.rgba"))).unwrap(),
+                    "{name}: preserve hidden RGB and alpha"
+                );
+            }
+            "rgb" => assert!(
+                matches!(&decoded, Conditioning::Reference { .. }),
+                "{name}: source original mode must not acquire white-composited alpha"
+            ),
+            _ => panic!("unknown source carrier"),
+        }
+        let req = GenerationRequest {
+            conditioning: vec![decoded],
+            flux3_reference_output: Some(ReferenceOutputSize::default()),
+            ..Default::default()
+        };
+        let ae = request_images(&req).unwrap();
+        assert_eq!(
+            ae[0].pixels,
+            std::fs::read(root.join(format!("{name}.ae.rgb"))).unwrap(),
+            "{name}: source AE RGB conversion"
+        );
+        let prepared = prepare_borrowed(
+            &ae.iter().map(|i| i.as_ref()).collect::<Vec<_>>(),
+            ReferenceOutputSize::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.images[0].pixels,
+            std::fs::read(root.join(format!("{name}.prepared.rgb"))).unwrap(),
+            "{name}: source AE RGB+padding"
+        );
+        let pup = upsampler_input(&req).unwrap();
+        let expected = std::fs::read(root.join(format!("{name}.pup.rgb"))).unwrap();
+        assert_eq!(
+            pup.references[0].to_rgb8().unwrap().2,
+            expected,
+            "{name}: source PUP RGB fork"
+        );
+        let path_input = ReferenceImage::Path(path);
+        assert_eq!(
+            path_input.to_rgb8().unwrap().2,
+            expected,
+            "{name}: existing PUP path input shares the exact original-mode policy"
+        );
+        for count in [1, 10] {
+            let expected = std::fs::read(root.join(format!("{name}.policy{count}.rgb"))).unwrap();
+            for input in [&pup.references[0], &path_input] {
+                let actual = policy_reference(input, count).unwrap();
+                assert_eq!(
+                    actual.pixels, expected,
+                    "{name}: full frozen PUP JPEG policy at {count} refs"
+                );
+                assert_eq!(
+                    actual.width as u64,
+                    row[format!("policy{count}_size")][0].as_u64().unwrap()
+                );
+                assert_eq!(
+                    actual.height as u64,
+                    row[format!("policy{count}_size")][1].as_u64().unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn owned_file_exif_precedes_ae_rgb_and_pup_white_forks_for_one_and_ten() {
     use gen_core::flux3::references::{
         decode_reference_file, prepare_borrowed, request_images, upsampler_input,

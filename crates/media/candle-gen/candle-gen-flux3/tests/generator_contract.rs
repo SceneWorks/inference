@@ -150,6 +150,39 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             (64, 80),
             "ten EXIF references use upstream multi-reference crop"
         );
+        let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
+        for file in [
+            "mode-luma16.png",
+            "mode-rgb16.png",
+            "mode-palette-alpha.png",
+            "mode-rgb-trns.png",
+        ] {
+            edit.conditioning = vec![
+                candle_gen::gen_core::flux3::references::decode_reference_file(&formats.join(file))
+                    .unwrap(),
+            ];
+            let normalized = candle_gen::gen_core::flux3::references::request_images(&edit)
+                .unwrap()[0]
+                .as_ref()
+                .clone();
+            let encoded = render(&edit);
+            assert_eq!(
+                (encoded.width, encoded.height),
+                (4, 3),
+                "{file}: source auto output crop"
+            );
+            let mut canonical = edit.clone();
+            canonical.conditioning = vec![Conditioning::Reference {
+                image: normalized,
+                strength: None,
+            }];
+            assert_eq!(
+                encoded.pixels,
+                render(&canonical).pixels,
+                "{file}: encoded input equals source-normalized RGB through the public provider"
+            );
+        }
         edit.conditioning = vec![refs[0].clone()];
         for (intent, size) in [
             (
