@@ -44,10 +44,12 @@ use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVER
 
 pub mod anima;
 pub mod sdxl;
+mod sdxl_bound;
 pub use anima::{
     anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
     anima_turbo_memory_selection, ios_memory_budget, ANIMA_TURBO_ID,
 };
+pub use sdxl_bound::BoundSdxlGenerator;
 
 /// Add the iOS image generators to an explicit media registry builder, in catalog order.
 ///

@@ -384,6 +384,13 @@ impl UNet2DConditionModel {
             && self.up_blocks.iter().all(UNetBlock2D::block_streams_armed)
     }
 
+    pub(crate) fn bind_source_inventory(&mut self, guard: &mlx_gen::gen_core::SourceInventory) {
+        for block in self.down_blocks.iter_mut().chain(self.up_blocks.iter_mut()) {
+            block.bind_source_inventory(guard);
+        }
+        self.mid_transformer.bind_source_inventory(guard);
+    }
+
     /// Every windowable sub-stack's depth, in forward order — `down_blocks` → `mid` → `up_blocks`.
     ///
     /// For SDXL-base this is `[2, 2, 10, 10, 10, 10, 10, 10, 2, 2, 2]`: eleven `Transformer2D`, six

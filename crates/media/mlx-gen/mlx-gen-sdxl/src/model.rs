@@ -712,6 +712,9 @@ fn build_ldm_heavy(
     } else {
         None
     };
+    if let Some(guard) = spec.source_inventory() {
+        unet.bind_source_inventory(guard);
+    }
     Ok(SdxlHeavyOwned {
         unet,
         controls,
@@ -737,8 +740,16 @@ pub(crate) fn build_residency(
     let spec_heavy = spec.clone();
     Residency::from_policy(
         spec.offload_policy,
-        move || load_text_encoders(resolve_root(&spec_text)?, spec_text.quantize),
-        move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
+        move || {
+            spec_text.read_prepared_files_unchanged(|| {
+                load_text_encoders(resolve_root(&spec_text)?, spec_text.quantize)
+            })
+        },
+        move |use_pid| {
+            spec_heavy.read_prepared_files_unchanged(|| {
+                load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid)
+            })
+        },
     )
 }
 
@@ -908,6 +919,9 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         );
     }
 
+    if let Some(guard) = spec.source_inventory() {
+        unet.bind_source_inventory(guard);
+    }
     Ok(SdxlHeavyOwned {
         unet,
         controls,
@@ -2567,6 +2581,32 @@ mod tests {
             "/nonexistent/sdxl-residency-test-snapshot".into(),
         ))
         .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn prepared_directory_change_is_rejected_by_deferred_text_loader() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("placeholder.safetensors");
+        std::fs::write(&file, b"original").unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        spec.bind_source_inventory(mlx_gen::gen_core::SourceInventory::capture(&spec).unwrap())
+            .unwrap();
+        let residency = build_residency(&spec).unwrap();
+        std::fs::write(root.path().join("new-shard.safetensors"), b"new").unwrap();
+        let result: Result<()> = residency.run(
+            &mlx_gen::CancelFlag::new(),
+            false,
+            &mut |_| {},
+            |_| Ok(()),
+            |_| Ok(()),
+            |_, _, _| Ok(()),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("source inventory changed"),
+            "must reject at phase guard, not attempt a tensor load: {error}"
+        );
     }
 
     #[test]

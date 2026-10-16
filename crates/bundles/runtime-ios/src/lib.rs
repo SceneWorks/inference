@@ -17,10 +17,11 @@
 //!
 //! # Admission (epic 16774, E4)
 //!
-//! [`load_admitted`] is the **only** admitted load entry point: it refuses, before the loader runs,
-//! a request whose footprint estimate is absent, exceeds [`IOS_APP_MEMORY_CAP_MIB`], or exceeds the
-//! per-process headroom iOS reports at that moment. `media::load_sana` (with `media`) is SANA's
-//! admitted load, built on it. Nothing else here is admitted:
+//! [`load_admitted`] is the generic estimate/cap guard: it refuses, before the loader runs,
+//! an absent estimate or one above [`IOS_APP_MEMORY_CAP_MIB`] or live process headroom.
+//! `media::load_sana` adds SANA's source applicability checks. `media::load_sdxl` additionally
+//! retains source inventory and an actual-request binding across deferred execution, with live
+//! capacity rechecked before generation. Other raw load surfaces are not admitted:
 //!
 //! * [`llm`] re-exports `mlx-llm` whole, and its loaders (`load_for_model`, …) do **not** admit.
 //!   MLX LLMs carry no footprint estimate yet, so the admitted answer for an LLM load today is a
@@ -28,7 +29,7 @@
 //!   must say so.
 //! * [`catalog`]'s registries are a composition/snapshot surface (the shared
 //!   [`RuntimeCatalog`] contract) and load unadmitted. A product loads through
-//!   [`load_admitted`], not through them.
+//!   the model's admitted facade, not through them.
 //! * `media` deliberately does not re-export the catalog's `provider_registry`, so the
 //!   unadmitted registry load is not this bundle's default image surface. The one unadmitted image
 //!   loader, `media::load_sana_unadmitted_for_diagnostics`, is named for what it is.
@@ -71,27 +72,31 @@ pub mod media {
     /// authorizes a product load. Raw catalog access remains diagnostic, not admission authority.
     pub fn load_sdxl(
         candidates: &[sdxl::SdxlCandidate],
-    ) -> crate::gen_core::Result<(usize, Box<dyn crate::gen_core::Generator>)> {
+    ) -> crate::gen_core::Result<(usize, mlx_gen_ios_catalog::BoundSdxlGenerator)> {
         if !super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
             return Err(crate::gen_core::Error::Unsupported(
                 "iOS SDXL admission requires platform allocator/cache limits bound first".into(),
             ));
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        let budget = crate::gen_core::MemoryBudget {
-            total_bytes: u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
-            committed_bytes: 0,
-            reclaimable_bytes: 0,
-            reserved_headroom_bytes: 0,
-        };
-        let (index, estimate) =
+        // No existing process bytes are credited: compare absolute captured process footprints
+        // conservatively to BOTH fixed cap and current live capacity during candidate selection.
+        let live = super::os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64);
+        let budget = sdxl::capacity_budget(u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20, 0, live);
+        let admitted =
             sdxl::select_sdxl_candidate(&registry, candidates, &super::device_machine(), budget)?;
-        super::load_admitted(Some(estimate), || {
-            Ok((
-                index,
-                registry.load(sdxl::SDXL_ID, &candidates[index].spec)?,
-            ))
-        })
+        let index = admitted.index();
+        // Recheck live capacity before loading AND every actual generate; retain the sealed source
+        // inventory and actual-request binding instead of returning an unguarded inner Generator.
+        let bound = admitted.load(&registry, |bytes| {
+            let estimate = u32::try_from(bytes.div_ceil(1 << 20)).map_err(|_| {
+                crate::gen_core::Error::Unsupported("SDXL footprint exceeds runtime range".into())
+            })?;
+            super::admit_estimate_mib(Some(estimate))?;
+            super::admit_within_headroom(estimate, super::os_proc_available_mib())?;
+            Ok(())
+        })?;
+        Ok((index, bound))
     }
 
     /// Load SANA **without** admission. For a diagnostic run whose purpose is to execute a render

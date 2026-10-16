@@ -112,3 +112,17 @@ candidate selection through the provider's registered shared memory safety check
 footprint evidence, then applies the runtime cap and live headroom before loading.
 No validated iPhone SDXL capture exists yet, so product loads fail closed. Mac allocator peaks
 and synthetic budget tests do not authorize a snapshot or constitute an iPhone fit claim.
+
+The SDXL product loader returns an admission-bound generator, never the raw provider. Each candidate
+includes its actual `GenerationRequest`; geometry, conditioning, full prompt/negative prompt (and
+therefore token windows), sampling and complete execution settings are bound. A changed request
+requires new admission. Cancellation and seed remain usable, and every generator/lifecycle method
+is forwarded under the binding (scope ladder configuration preserves independent sequential CFG).
+The source receipt retains the standard content-sealed file tokens plus the exact directory
+inventory. Directory phase loaders and transformer block materialization verify those identities
+before/after deferred consumption; replacing a shard/component or adding a new file invalidates it.
+Initial seals may hash payloads once; later guards perform identity checks, not weight rehashing.
+This has the existing `PinnedWeightsFile` persistent-replacement guarantee, not filesystem
+transaction isolation against fully restored-path attacks. Candidate selection considers live
+headroom before preference, and a missing/malformed preferred artifact does not hide a valid
+fallback. A final capacity check runs again before load and actual generation.

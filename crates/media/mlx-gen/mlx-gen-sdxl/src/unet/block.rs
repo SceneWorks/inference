@@ -234,6 +234,14 @@ impl UNetBlock2D {
         }
     }
 
+    pub(crate) fn bind_source_inventory(&mut self, guard: &mlx_gen::gen_core::SourceInventory) {
+        if let Some(attentions) = &mut self.attentions {
+            for attention in attentions {
+                attention.bind_source_inventory(guard);
+            }
+        }
+    }
+
     /// This block's `Transformer2D` depths, in order — the per-sub-stack window domains.
     pub(crate) fn attention_depths(&self) -> Vec<usize> {
         self.attentions
