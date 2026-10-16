@@ -129,24 +129,24 @@ fn swizzle_and_nibble_order_are_explicit() {
     }
     let swizzled = swizzle_scales(&row_major, 129, 5).unwrap();
     assert_eq!(swizzled.len(), 256 * 8);
-    // Independent CUTLASS LayoutLeft atom coordinates, not a round trip through
-    // the helper used by the writer. Transposing the atom grid must fail here.
+    // Exact FlashInfer 0.6.8.post1 quantization.cu: K-atoms are fastest. These
+    // coordinates deliberately distinguish the legacy HOST column-major grid.
     for (r, c, offset) in [
         (0, 0, 0),
         (1, 0, 16),
         (31, 3, 499),
         (32, 0, 4),
         (127, 3, 511),
-        (128, 0, 512),
-        (0, 4, 1024),
+        (128, 0, 1024),
+        (0, 4, 512),
     ] {
-        assert_eq!(scale_offset(r, c, 256).unwrap(), offset);
+        assert_eq!(scale_offset(r, c, 8).unwrap(), offset);
         assert_eq!(swizzled[offset], row_major[r * 5 + c]);
     }
     for r in 0..129 {
         for c in 0..5 {
             assert_eq!(
-                swizzled[scale_offset(r, c, 256).unwrap()],
+                swizzled[scale_offset(r, c, 8).unwrap()],
                 row_major[r * 5 + c]
             );
         }
@@ -163,6 +163,24 @@ fn swizzle_and_nibble_order_are_explicit() {
     assert_eq!(q.packed[0] & 8, 0);
     assert_ne!(q.packed[0] & 0x80, 0);
     assert!(swizzle_scales(&[1], usize::MAX, 2).is_err());
+}
+
+#[test]
+fn nvfp4_quantizer_clamp_does_not_rewrite_source_gemm_alpha() {
+    let data = [1.; 16];
+    let tiny = quantize_nvfp4_static(&data, 16, 1e-12).unwrap();
+    let clamped = quantize_nvfp4_static(&data, 16, 1e-8).unwrap();
+    // Frozen nvfp4.py clamps ONLY the quantizer's reciprocal scale; alpha still
+    // uses original input_scale * weight_scale_2. Both cases pack identically.
+    assert_eq!(tiny.packed, clamped.packed);
+    assert_eq!(tiny.scales, clamped.scales);
+    assert_eq!(tiny.global_scale, 1e-12);
+    assert_ne!(tiny.global_scale, clamped.global_scale);
+    let extreme = quantize_nvfp4_static(&[f32::MAX; 16], 16, 1e-12).unwrap();
+    assert!(extreme.packed.iter().all(|v| *v == 0x77));
+    let zero = quantize_nvfp4_static(&[0.; 16], 16, 0.25).unwrap();
+    assert!(zero.packed.iter().all(|v| *v == 0));
+    assert!(zero.scales.iter().all(|v| *v == 0));
 }
 
 #[test]

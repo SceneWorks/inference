@@ -369,14 +369,16 @@ fn round_up(value: usize, alignment: usize) -> Result<usize> {
         .ok_or_else(|| invalid("padded geometry overflow"))
 }
 
-/// CUTLASS/FlashInfer 128x4 block-scale atom layout; M-atoms are fastest.
-pub fn scale_offset(row: usize, block: usize, padded_rows: usize) -> Result<usize> {
-    if padded_rows == 0 || !padded_rows.is_multiple_of(128) || row >= padded_rows {
-        return Err(invalid("invalid scale row"));
+/// FlashInfer 0.6.8.post1 `get_sf_out_offset_128x4`: K-atoms are fastest.
+/// This is the COMPUTE layout. Legacy `Nvfp4Tensor`'s host container uses the
+/// opposite atom-grid order; `CublasLt::stage_nvfp4` explicitly retiles that container.
+pub fn scale_offset(row: usize, block: usize, padded_blocks: usize) -> Result<usize> {
+    if padded_blocks == 0 || !padded_blocks.is_multiple_of(4) || block >= padded_blocks {
+        return Err(invalid("invalid scale block"));
     }
-    let atom = (block / 4)
-        .checked_mul(padded_rows / 128)
-        .and_then(|a| a.checked_add(row / 128))
+    let atom = (row / 128)
+        .checked_mul(padded_blocks / 4)
+        .and_then(|a| a.checked_add(block / 4))
         .ok_or_else(|| invalid("scale atom overflow"))?;
     atom.checked_mul(512)
         .and_then(|a| a.checked_add((row % 32) * 16 + (row % 128 / 32) * 4 + block % 4))
@@ -388,13 +390,14 @@ pub fn swizzle_scales(values: &[u8], rows: usize, blocks: usize) -> Result<Vec<u
         return Err(invalid("invalid block-scale inventory"));
     }
     let padded_rows = round_up(rows, 128)?;
+    let padded_blocks = round_up(blocks, 4)?;
     let len = padded_rows
-        .checked_mul(round_up(blocks, 4)?)
+        .checked_mul(padded_blocks)
         .ok_or_else(|| invalid("scale allocation overflow"))?;
     let mut result = vec![0; len];
     for r in 0..rows {
         for b in 0..blocks {
-            result[scale_offset(r, b, padded_rows)?] = values[r * blocks + b];
+            result[scale_offset(r, b, padded_blocks)?] = values[r * blocks + b];
         }
     }
     Ok(result)
@@ -412,8 +415,9 @@ const E2M1: [f32; 8] = [0., 0.5, 1., 1.5, 2., 3., 4., 6.];
 fn encode_e2m1(value: f32) -> u8 {
     let mut best = 0usize;
     let mut distance = f32::INFINITY;
+    let magnitude = value.abs().min(6.);
     for (i, &candidate) in E2M1.iter().enumerate() {
-        let d = (candidate - value.abs()).abs();
+        let d = (candidate - magnitude).abs();
         if d < distance || (d == distance && i % 2 == 0) {
             best = i;
             distance = d;
@@ -440,15 +444,18 @@ pub fn quantize_nvfp4_static(
             "invalid static NVFP4 geometry, input scale or value",
         ));
     }
-    let global_scale = input_scale.max(1e-8);
+    // The frozen source clamps only the reciprocal passed to the activation
+    // quantizer. Its GEMM alpha still multiplies the ORIGINAL calibrated scale.
+    let global_scale = input_scale;
+    let quantization_scale = input_scale.max(1e-8);
     let rows = values.len() / width;
     let mut packed = vec![0; values.len() / 2];
     let mut scales = Vec::with_capacity(values.len() / 16);
     for (block_index, block) in values.chunks_exact(16).enumerate() {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let code = encode_e4m3(amax / (6. * global_scale))?;
+        let code = encode_e4m3((amax / (6. * quantization_scale)).min(448.))?;
         scales.push(code);
-        let divisor = decode_e4m3(code) * global_scale;
+        let divisor = decode_e4m3(code) * quantization_scale;
         for (i, &v) in block.iter().enumerate() {
             let q = if divisor == 0. {
                 0
