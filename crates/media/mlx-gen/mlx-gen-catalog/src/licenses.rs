@@ -492,10 +492,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         components: &["clip_vit_bigg_14_laion2b", "t5_v1_1_xxl"],
     },
     // --- sdxl --------------------------------------------------------------------------------
-    // One id, two interchangeable bases. **No `sdxl_vae_fp16_fix`**: MLX reads the VAE inside the
-    // SDXL snapshot at f32, while Candle requires the staged fp16-fix VAE — the genuine per-backend
-    // component difference sc-16665 called out. The caller-supplied ControlNet has no fixed upstream
-    // (which is why the catalog lists `sdxl` in `NO_BRANCH_POLICY`), so no row can name it.
+    // One id, two interchangeable bases. `sdxl_vae_fp16_fix` is listed since sc-26268: MLX reads
+    // the in-snapshot VAE at f32 by default but loads the staged fp16-fix VAE at f16 when a caller
+    // provisions the `vae_fp16_fix` component (the low-memory path), so a load may distribute it.
+    // The per-backend difference that remains is *required* (Candle) vs *optional* (MLX). The
+    // caller-supplied ControlNet has no fixed upstream (which is why the catalog lists `sdxl` in
+    // `NO_BRANCH_POLICY`), so no row can name it.
     ProviderComponents {
         provider_id: "sdxl",
         components: &[
@@ -504,6 +506,7 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "clip_vit_bigg_14_laion2b",
             "ip_adapter",
             "nvidia_pid_students",
+            "sdxl_vae_fp16_fix",
         ],
     },
     // --- seedvr2 -----------------------------------------------------------------------------
@@ -1120,8 +1123,9 @@ mod tests {
                 .components
         };
 
-        // SDXL: MLX reads the in-snapshot VAE; the fp16-fix VAE is a required Candle component.
-        assert!(!components("sdxl").contains(&"sdxl_vae_fp16_fix"));
+        // SDXL: MLX reads the in-snapshot VAE by default and the fp16-fix VAE when staged
+        // (sc-26268); Candle requires the fp16-fix VAE. Both backends can therefore distribute it.
+        assert!(components("sdxl").contains(&"sdxl_vae_fp16_fix"));
         assert!(components("sdxl").contains(&"stable_diffusion_xl_base_1_0"));
         // FLUX.2's separately distilled kv checkpoint is MLX-only.
         assert!(components("flux2_klein_9b_kv_edit").contains(&"flux2_klein_9b_kv"));
@@ -1205,7 +1209,7 @@ mod tests {
             .iter()
             .find(|p| p["provider_id"] == "sdxl")
             .expect("sdxl is in the manifest");
-        assert!(!sdxl["components"]
+        assert!(sdxl["components"]
             .as_array()
             .unwrap()
             .iter()

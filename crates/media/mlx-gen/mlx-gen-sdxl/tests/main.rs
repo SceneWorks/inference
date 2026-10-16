@@ -64,6 +64,12 @@ mod lora_complete_real_weights;
 #[path = "lora_real_weights.rs"]
 mod lora_real_weights;
 
+#[path = "low_memory_peak_real_weights.rs"]
+mod low_memory_peak_real_weights;
+
+#[path = "low_memory_real_weights.rs"]
+mod low_memory_real_weights;
+
 #[path = "memory_ladder_real_weights.rs"]
 mod memory_ladder_real_weights;
 

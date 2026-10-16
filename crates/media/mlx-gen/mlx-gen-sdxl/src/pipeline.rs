@@ -655,6 +655,94 @@ fn forward_eps(
     )
 }
 
+/// Row `k` of a CFG-batched `[cond, uncond]` tensor, or the tensor itself when it carries a single
+/// row shared by both halves (a batch-1 conditioning broadcast across the guided pair).
+fn cfg_row(a: &Array, k: i32) -> Result<Array> {
+    if a.shape().first() == Some(&2) {
+        Ok(a.take_axis(Array::from_slice(&[k], &[1]), 0)?)
+    } else {
+        Ok(a.clone())
+    }
+}
+
+/// One guided step's `(eps_text, eps_neg)` pair under the request's CFG batching (sc-26268).
+///
+/// * [`CfgBatching::Batched`](mlx_gen::gen_core::CfgBatching::Batched) — the historical
+///   `[x, x]` doubled-batch forward, split by row afterwards. Byte-identical to every earlier
+///   release: it is the same op graph the three denoise loops each spelled inline.
+/// * [`CfgBatching::Sequential`](mlx_gen::gen_core::CfgBatching::Sequential) — two batch-1
+///   forwards, conditional then unconditional, each against row `k` of every CFG-batched input
+///   (`conditioning`, `pooled`, `time_ids`, the ControlNet conditioning embedding and encoder, the
+///   IP-Adapter tokens). Each half is evaluated before the next starts, so the guided step holds
+///   one row's activations at a time — the high-water the shared `CfgBatching` domain exists to
+///   offer a constrained device.
+#[allow(clippy::too_many_arguments)]
+fn guided_eps_pair(
+    unet: &UNet2DConditionModel,
+    x_in: &Array,
+    timestep: f32,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    controls: &[ControlContext],
+    cn_enc: &Array,
+    ip: Option<(&Array, f32)>,
+    plan: crate::plan::SdxlForwardPlan<'_>,
+) -> Result<(Array, Array)> {
+    if plan.cfg_batching.is_batched() {
+        let x_unet = concatenate_axis(&[x_in, x_in], 0)?;
+        let eps = forward_eps(
+            unet,
+            &x_unet,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            controls,
+            cn_enc,
+            ip,
+            plan,
+        )?;
+        let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
+        return Ok((row(0)?, row(1)?));
+    }
+    let half = |k: i32| -> Result<Array> {
+        let row_controls = controls
+            .iter()
+            .map(|cc| {
+                Ok(ControlContext {
+                    controlnet: cc.controlnet,
+                    cond_embed: cfg_row(&cc.cond_embed, k)?,
+                    scale: cc.scale,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row_ip = match ip {
+            Some((tokens, scale)) => Some((cfg_row(tokens, k)?, scale)),
+            None => None,
+        };
+        let eps = forward_eps(
+            unet,
+            x_in,
+            timestep,
+            &cfg_row(conditioning, k)?,
+            &cfg_row(pooled, k)?,
+            &cfg_row(time_ids, k)?,
+            &row_controls,
+            &cfg_row(cn_enc, k)?,
+            row_ip.as_ref().map(|(tokens, scale)| (tokens, *scale)),
+            plan,
+        )?;
+        // Materialize this half before the other one is built, so the two forwards' activations
+        // are never live together — the point of the sequential mode.
+        eps.eval()?;
+        Ok(eps)
+    };
+    let eps_text = half(0)?;
+    let eps_neg = half(1)?;
+    Ok((eps_text, eps_neg))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_core(
     d: &Denoiser,
@@ -708,28 +796,20 @@ fn denoise_core(
             preview_sigmas[i],
             &x_in,
         );
-        let x_unet = if cfg_on {
-            concatenate_axis(&[&x_in, &x_in], 0)?
-        } else {
-            x_in
-        };
         let timestep = d.sampler.timestep(i);
-        let eps = forward_eps(
-            d.unet,
-            &x_unet,
-            timestep,
-            conditioning,
-            pooled,
-            time_ids,
-            controls,
-            cn_enc,
-            ip,
-            d.plan,
-        )?;
         let eps = if cfg_on {
-            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-            let eps_text = row(0)?;
-            let eps_neg = row(1)?;
+            let (eps_text, eps_neg) = guided_eps_pair(
+                d.unet,
+                &x_in,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                d.plan,
+            )?;
             // `eps_neg + cfg·(eps_text − eps_neg)` via the shared gen-core `cfg` over `MlxLatentOps`
             // (epic 7434 P3, sc-7443). The dtype-preserving `MlxLatentOps::axpy` casts the scale to the
             // eps dtype, so CFG runs in the compute dtype (fp16) byte-identically to the retired hand
@@ -738,7 +818,18 @@ fn denoise_core(
             // proven by `guidance_ops_tests::cfg_half_precision_is_byte_identical_and_preserves_dtype`.)
             gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
         } else {
-            eps
+            forward_eps(
+                d.unet,
+                &x_in,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+                d.plan,
+            )?
         };
         latents = d.sampler.step(&eps, &latents, i)?;
         // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's σ,
@@ -858,31 +949,23 @@ pub fn denoise_curated_with_preview(
         |x_in, timestep| {
             // `x_in` is the c_in-scaled latent (f32); cast to the U-Net compute dtype, then CFG-batch.
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let x_unet = if cfg_on {
-                concatenate_axis(&[&x16, &x16], 0)?
-            } else {
-                x16
-            };
-            let eps = forward_eps(
-                unet,
-                &x_unet,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                controls,
-                cn_enc,
-                ip,
-                plan,
-            )?;
             // CFG combine via the shared `gen_core::guidance::cfg` over `MlxLatentOps` (the sc-7443
             // migration `denoise_core` already carries, F-082): byte-identical to the retired hand
             // `eps_neg + cfg·(eps_text − eps_neg)` form — the dtype-preserving `axpy` casts the
             // scale to the eps dtype so the blend runs in the compute dtype (fp16).
             if cfg_on {
-                let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-                let eps_text = row(0)?;
-                let eps_neg = row(1)?;
+                let (eps_text, eps_neg) = guided_eps_pair(
+                    unet,
+                    &x16,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    controls,
+                    cn_enc,
+                    ip,
+                    plan,
+                )?;
                 Ok(gen_core::guidance::cfg(
                     &MlxLatentOps,
                     &eps_text,
@@ -890,7 +973,18 @@ pub fn denoise_curated_with_preview(
                     cfg,
                 )?)
             } else {
-                Ok(eps)
+                Ok(forward_eps(
+                    unet,
+                    &x16,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    controls,
+                    cn_enc,
+                    ip,
+                    plan,
+                )?)
             }
         },
     )
@@ -979,10 +1073,9 @@ pub fn denoise_cfgpp_with_preview(
         |x_in, timestep| {
             // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
-            let x_unet = concatenate_axis(&[&x16, &x16], 0)?;
-            let eps = forward_eps(
+            let (eps_text, eps_neg) = guided_eps_pair(
                 unet,
-                &x_unet,
+                &x16,
                 timestep,
                 conditioning,
                 pooled,
@@ -993,9 +1086,6 @@ pub fn denoise_cfgpp_with_preview(
                 plan,
             )?;
             // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
-            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
-            let eps_text = row(0)?;
-            let eps_neg = row(1)?;
             let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
             Ok((guided, eps_neg))
         },
@@ -1147,18 +1237,12 @@ pub fn decode_image(
 /// different geometries.
 ///
 /// **On SDXL that branch is unreachable with `tiling` set, and the reason is worth stating rather
-/// than implying.** An earlier version of this comment said `memory_strategy::decode_tiling` "returns
-/// `None` on a PiD request"; it does not. Since SC-15525 it returns `Err` **unconditionally** whenever
-/// `GenerationMemory::tile_vae_decode` is set, PiD or not, because rung 2 is declared `Missing` on
-/// this provider. So a `use_pid` request that also sets `tile_vae_decode` is refused at
-/// `Sdxl::generate_impl` and never reaches here — where before SC-15525 it would have fallen through
-/// to the student's own auto-planning.
-///
-/// That is deliberate. A request that asked for a bounded decode and silently got the student's
-/// auto-plan instead would be executing a strategy the selector did not choose, which is the exact
-/// false-green the shared contract forbids; refusing is the only honest answer while the native rung
-/// is `Missing`. A PiD request that does **not** set the flag is completely unaffected and still gets
-/// the student's auto-planning, which is the pre-SC-15525 behaviour.
+/// than implying.** `memory_strategy::decode_tiling_for_contract` validates a bounded decode against
+/// the route it runs (sc-26268, `mlx_gen_pid::DecodeRoutes`): a `use_pid` request reaches here with
+/// `tiling` set only at the student's own measured geometry, which the student's `decode_tiled`
+/// executes; a native edge on the PiD route is refused before generate. A PiD request that does
+/// **not** set the flag is completely unaffected and still gets the student's auto-planning, which is
+/// the pre-SC-15525 behaviour.
 ///
 /// `cancel` gives the decode a cancellation point it has never had: it is a dominant fraction of an
 /// SDXL render's wall clock, and the shared tile loop checks between tiles.
@@ -1225,6 +1309,153 @@ pub(crate) fn render_sample(
 mod tests {
     use super::*;
     use mlx_gen::{AlphaSchedule, LightningSampler};
+
+    /// `cfg_row` takes row `k` of a CFG-batched `[cond, uncond]` tensor and passes a single shared
+    /// row through untouched — the slicing every sequential-CFG input (conditioning, pooled,
+    /// time ids, ControlNet embedding/encoder, IP tokens) goes through.
+    #[test]
+    fn cfg_row_splits_a_guided_pair_and_shares_a_single_row() {
+        let _cpu = crate::test_device::cpu_only();
+        let pair = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        assert_eq!(cfg_row(&pair, 0).unwrap().as_slice::<f32>(), &[1.0, 2.0]);
+        assert_eq!(cfg_row(&pair, 1).unwrap().as_slice::<f32>(), &[3.0, 4.0]);
+        assert_eq!(cfg_row(&pair, 0).unwrap().shape(), &[1, 2]);
+        let shared = Array::from_slice(&[5.0f32, 6.0], &[1, 2]);
+        assert_eq!(cfg_row(&shared, 1).unwrap().as_slice::<f32>(), &[5.0, 6.0]);
+    }
+
+    /// The tiny-U-Net inputs for one guided step: a latent and a distinct `[cond, uncond]` pair in
+    /// every CFG-batched input, so a mode that mixed up rows would fail.
+    fn guided_inputs() -> (Array, Array, Array, Array) {
+        use crate::training::family::test_support::{TINY_CONTEXT_DIM, TINY_POOLED_DIM};
+        let ramp = |shape: &[i32], phase: f32| {
+            let n = shape.iter().product::<i32>();
+            let v = (0..n)
+                .map(|i| ((i as f32 + phase) * 0.173).sin() * 0.5)
+                .collect::<Vec<_>>();
+            Array::from_slice(&v, shape)
+        };
+        (
+            ramp(&[1, 8, 8, 4], 0.0),
+            ramp(&[2, 5, TINY_CONTEXT_DIM], 11.0),
+            ramp(&[2, TINY_POOLED_DIM], 29.0),
+            text_time_ids(2),
+        )
+    }
+
+    /// sc-26268: **sequential CFG** (two batch-1 forwards) reproduces the batched `[cond, uncond]`
+    /// forward on the tiny U-Net — the per-row split is right (the conditional half is row 0, the
+    /// unconditional half row 1) and nothing in the forward couples the two rows.
+    ///
+    /// Not asserted bitwise, on purpose: the shared `CfgBatching` contract
+    /// (`gen_core::execution_domains`) states the one admitted deviation — a backend GEMM whose
+    /// reduction order depends on the row count. The MLX CPU device is such a backend (sc-26268
+    /// review probe: a lone `[1, S, D] @ W` and row 0 of the `[2, S, D]` product differ in the last
+    /// ulps for every `S = 1` shape and many `S ≤ 64` shapes, while conv, GroupNorm, LayerNorm and
+    /// SDPA are row-exact), and this tiny U-Net drifts ~1e-6 of peak through it. The 1e-5 bound
+    /// admits exactly that reassociation and nothing a row mix-up could produce (see the
+    /// non-vacuity check, three orders larger).
+    #[test]
+    fn sequential_cfg_matches_the_batched_guided_pair() {
+        let _cpu = crate::test_device::cpu_only();
+        let unet = crate::training::family::test_support::tiny_unet(7).unwrap();
+        let (x, conditioning, pooled, time_ids) = guided_inputs();
+        let pair = |batching| {
+            let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+            let (text, neg) = guided_eps_pair(
+                &unet,
+                &x,
+                500.0,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                &[],
+                &conditioning,
+                None,
+                plan,
+            )
+            .unwrap();
+            assert_eq!(text.shape(), x.shape());
+            assert_eq!(neg.shape(), x.shape());
+            (text, neg)
+        };
+        let (bt, bn) = pair(gen_core::CfgBatching::Batched);
+        let (st, sn) = pair(gen_core::CfgBatching::Sequential);
+        let rel = |a: &Array, b: &Array| {
+            let peak = a.abs().unwrap().max(None).unwrap().item::<f32>();
+            let delta = a
+                .subtract(b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            delta / peak
+        };
+        assert!(
+            rel(&bt, &st) <= 1e-5,
+            "conditional half: {:.3e}",
+            rel(&bt, &st)
+        );
+        assert!(
+            rel(&bn, &sn) <= 1e-5,
+            "unconditional half: {:.3e}",
+            rel(&bn, &sn)
+        );
+        // Non-vacuity: the two halves genuinely differ, so a mode that returned one row twice (or
+        // swapped them) cannot pass the comparisons above.
+        assert!(
+            rel(&bt, &bn) > 1e-3,
+            "the guided pair must carry two distinct conditionings"
+        );
+    }
+
+    /// The whole ancestral denoise loop under sequential CFG reproduces the batched loop's final
+    /// latent — the production route (`denoise_core`) actually consumes the plan's batching. Same
+    /// row-count GEMM bound as `sequential_cfg_matches_the_batched_guided_pair` (observed ~5e-6
+    /// of peak after five guided steps on the CPU device).
+    #[test]
+    fn sequential_cfg_denoise_reproduces_the_batched_denoise() {
+        let _cpu = crate::test_device::cpu_only();
+        let unet = crate::training::family::test_support::tiny_unet(7).unwrap();
+        let (x, conditioning, pooled, time_ids) = guided_inputs();
+        let inner = EulerSampler::new_with_dtype(
+            &crate::config::DiffusionConfig::sdxl_base(),
+            true,
+            mlx_rs::Dtype::Float32,
+        )
+        .unwrap();
+        let run = |batching| {
+            random::seed(42).unwrap();
+            let sampler = AncestralEuler::new(&inner, 2, inner.max_time()).unwrap();
+            let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
+            let d = Denoiser::with_plan(&unet, &sampler, plan);
+            denoise(
+                &d,
+                x.clone(),
+                &conditioning,
+                &pooled,
+                &time_ids,
+                5.0,
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let batched = run(gen_core::CfgBatching::Batched);
+        let sequential = run(gen_core::CfgBatching::Sequential);
+        let peak = batched.abs().unwrap().max(None).unwrap().item::<f32>();
+        let delta = batched
+            .subtract(&sequential)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(delta / peak <= 1e-5, "denoise drifted {:.3e}", delta / peak);
+    }
 
     /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
     /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a

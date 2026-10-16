@@ -6,7 +6,7 @@
 
 use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{add, multiply, pad};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
@@ -375,6 +375,10 @@ pub struct Autoencoder {
     /// `post_quant_conv` [4,4,1,1] → [4,4] Linear over channels.
     post_quant_proj: AdaptableLinear,
     scaling_factor: f32,
+    /// The compute dtype this VAE was loaded at — the dtype of its weights. `Float32` is the
+    /// historical in-snapshot VAE (the stock SDXL VAE overflows at f16); `Float16` is the staged
+    /// fp16-fix VAE (sc-26268, [`crate::loader::VAE_FP16_FIX_COMPONENT`]).
+    dtype: Dtype,
 }
 
 impl Autoencoder {
@@ -393,14 +397,57 @@ impl Autoencoder {
             quant_proj: squeeze_lin("quant_conv")?,
             post_quant_proj: squeeze_lin("post_quant_conv")?,
             scaling_factor: cfg.scaling_factor,
+            dtype: w.require("decoder.conv_in.weight")?.dtype(),
         })
+    }
+
+    /// The compute dtype this VAE runs at (the dtype of its weights).
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// Bring a caller tensor into this VAE's compute dtype.
+    ///
+    /// **An f32 VAE leaves its input untouched**, so the historical path keeps its exact op graph
+    /// (an f16 latent promotes inside the first f32 op, as it always has) and stays byte-identical.
+    /// A half-precision VAE casts explicitly: left to promotion, the first f32 scalar would lift the
+    /// whole decode back to f32 and silently forfeit the memory the fp16 VAE exists to save.
+    fn to_compute(&self, x: &Array) -> Result<Array> {
+        if self.dtype == Dtype::Float32 || x.dtype() == self.dtype {
+            Ok(x.clone())
+        } else {
+            Ok(x.as_dtype(self.dtype)?)
+        }
+    }
+
+    /// Hand a half-precision VAE's output back at f32 — every consumer (`decoded_to_image`, the
+    /// img2img init latents, the sampler's f32 step math) was written against the f32 VAE's
+    /// output dtype. An f32 VAE's output is returned as is.
+    fn to_output(&self, x: Array) -> Result<Array> {
+        if self.dtype == Dtype::Float32 {
+            Ok(x)
+        } else {
+            Ok(x.as_dtype(Dtype::Float32)?)
+        }
+    }
+
+    /// `1 / scaling_factor` (or `scaling_factor`) as a scalar in this VAE's compute dtype, so the
+    /// (de)normalization does not promote a half-precision decode to f32.
+    fn scale(&self, value: f32) -> Result<Array> {
+        let s = scalar(value);
+        if self.dtype == Dtype::Float32 {
+            Ok(s)
+        } else {
+            Ok(s.as_dtype(self.dtype)?)
+        }
     }
 
     /// Decode latents `[B, H/8, W/8, 4]` (NHWC) → image tensor `[B, H, W, 3]` in roughly `[-1, 1]`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
-        let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
+        let latents = self.to_compute(latents)?;
+        let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
-        self.decoder.forward(&z)
+        self.to_output(self.decoder.forward(&z)?)
     }
 
     /// Ladder rung 2 — **bounded decode** (SC-15525): the same decode with each tail convolution
@@ -440,7 +487,8 @@ impl Autoencoder {
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
         }
-        let z = multiply(latents, scalar(1.0 / self.scaling_factor))?;
+        let latents = self.to_compute(latents)?;
+        let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
         // Head once on the whole latent. The tail tiles layer-by-layer so every GroupNorm keeps the
         // dense image's statistics while each 3×3 convolution stays bounded by the selected edge.
@@ -450,20 +498,21 @@ impl Autoencoder {
             .as_ref()
             .ok_or_else(|| mlx_gen::Error::Msg("SDXL tiled decode requires spatial tiling".into()))?
             .tile_px;
-        self.decoder.tail_tiled(&head, tile_edge, cancel)
+        self.to_output(self.decoder.tail_tiled(&head, tile_edge, cancel)?)
     }
 
     /// Encode an image `[B, 3, ...]`-normalized NHWC `[B, H, W, 3]` → latent **mean** `[B, H/8, W/8,
     /// 4]` (scaled by `scaling_factor`). Mirrors the vendored `Autoencoder.encode` (returns the mean;
     /// img2img seeds from the mean, not a sample).
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {
-        let moments = self.quant_proj.forward(&self.encoder.forward(x)?)?;
+        let x = self.to_compute(x)?;
+        let moments = self.quant_proj.forward(&self.encoder.forward(&x)?)?;
         // split into (mean, logvar) along the channel axis; keep the mean · scaling_factor.
         let c = moments.shape()[3];
         let half = c / 2;
         let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
         let mean = moments.take_axis(&idx, 3)?;
-        Ok(multiply(&mean, scalar(self.scaling_factor))?)
+        self.to_output(multiply(&mean, self.scale(self.scaling_factor)?)?)
     }
 }
 
@@ -584,7 +633,7 @@ mod decoder_seam_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
@@ -593,6 +642,12 @@ mod tests {
 
     const CHANNELS: i32 = 32;
 
+    /// A synthetic tensor generator: `(shape, phase, scale) -> Array`.
+    type Gen = fn(&[i32], f32, f32) -> Array;
+
+    /// Smooth, position-correlated values (period ~88 elements). Neighbouring taps are nearly
+    /// equal, so this fixture's convolutions act as smoothing filters — exactly what makes per-crop
+    /// GroupNorm statistics drift, which is the geometry test's subject.
     fn values(shape: &[i32], phase: f32, scale: f32) -> Array {
         let count = shape.iter().product::<i32>();
         let values = (0..count)
@@ -601,7 +656,24 @@ mod tests {
         Array::from_slice(&values, shape)
     }
 
+    /// Decorrelated values (a fixed hash per element). A trained decoder's filters are not
+    /// smoothing kernels, and the smooth generator above leaves every GroupNorm input nearly
+    /// constant across space — a catastrophic-cancellation case no trained VAE presents, which
+    /// would make a precision tolerance measure the fixture rather than the arithmetic.
+    fn decorrelated(shape: &[i32], phase: f32, scale: f32) -> Array {
+        let count = shape.iter().product::<i32>();
+        let values = (0..count)
+            .map(|i| {
+                let h = ((i as f32) * 12.9898 + phase * 78.233).sin() * 43_758.547;
+                (h - h.floor()) * 2.0 - 1.0
+            })
+            .map(|v| v * scale)
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, shape)
+    }
+
     fn insert_conv(
+        gen: Gen,
         tensors: &mut HashMap<String, Array>,
         prefix: &str,
         input: i32,
@@ -611,30 +683,24 @@ mod tests {
     ) {
         tensors.insert(
             format!("{prefix}.weight"),
-            values(&[output, input, kernel, kernel], phase, 0.025),
+            gen(&[output, input, kernel, kernel], phase, 0.025),
         );
-        tensors.insert(
-            format!("{prefix}.bias"),
-            values(&[output], phase + 3.0, 0.01),
-        );
+        tensors.insert(format!("{prefix}.bias"), gen(&[output], phase + 3.0, 0.01));
     }
 
-    fn insert_resnet(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+    fn insert_resnet(gen: Gen, tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
         for (name, offset) in [("norm1", 0.0), ("norm2", 1.0)] {
             tensors.insert(
                 format!("{prefix}.{name}.weight"),
-                add(
-                    values(&[CHANNELS], phase + offset, 0.15),
-                    Array::from_f32(1.0),
-                )
-                .unwrap(),
+                add(gen(&[CHANNELS], phase + offset, 0.15), Array::from_f32(1.0)).unwrap(),
             );
             tensors.insert(
                 format!("{prefix}.{name}.bias"),
-                values(&[CHANNELS], phase + offset + 2.0, 0.05),
+                gen(&[CHANNELS], phase + offset + 2.0, 0.05),
             );
         }
         insert_conv(
+            gen,
             tensors,
             &format!("{prefix}.conv1"),
             CHANNELS,
@@ -643,6 +709,7 @@ mod tests {
             phase + 4.0,
         );
         insert_conv(
+            gen,
             tensors,
             &format!("{prefix}.conv2"),
             CHANNELS,
@@ -652,34 +719,49 @@ mod tests {
         );
     }
 
-    fn insert_attention(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+    fn insert_attention(gen: Gen, tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
         tensors.insert(
             format!("{prefix}.group_norm.weight"),
             Array::ones::<f32>(&[CHANNELS]).unwrap(),
         );
         tensors.insert(
             format!("{prefix}.group_norm.bias"),
-            values(&[CHANNELS], phase, 0.03),
+            gen(&[CHANNELS], phase, 0.03),
         );
         for (index, name) in ["to_q", "to_k", "to_v", "to_out.0"].iter().enumerate() {
             tensors.insert(
                 format!("{prefix}.{name}.weight"),
-                values(&[CHANNELS, CHANNELS], phase + index as f32 + 1.0, 0.02),
+                gen(&[CHANNELS, CHANNELS], phase + index as f32 + 1.0, 0.02),
             );
             tensors.insert(
                 format!("{prefix}.{name}.bias"),
-                values(&[CHANNELS], phase + index as f32 + 5.0, 0.005),
+                gen(&[CHANNELS], phase + index as f32 + 5.0, 0.005),
             );
         }
     }
 
-    fn insert_mid(tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
-        insert_resnet(tensors, &format!("{prefix}.resnets.0"), phase);
-        insert_attention(tensors, &format!("{prefix}.attentions.0"), phase + 10.0);
-        insert_resnet(tensors, &format!("{prefix}.resnets.1"), phase + 20.0);
+    fn insert_mid(gen: Gen, tensors: &mut HashMap<String, Array>, prefix: &str, phase: f32) {
+        insert_resnet(gen, tensors, &format!("{prefix}.resnets.0"), phase);
+        insert_attention(
+            gen,
+            tensors,
+            &format!("{prefix}.attentions.0"),
+            phase + 10.0,
+        );
+        insert_resnet(gen, tensors, &format!("{prefix}.resnets.1"), phase + 20.0);
     }
 
-    fn fixture() -> (Weights, VaeConfig) {
+    /// A tiny synthetic SDXL-layout VAE (32 channels, one upsample) and its config.
+    pub(crate) fn fixture() -> (Weights, VaeConfig) {
+        fixture_with(values)
+    }
+
+    /// [`fixture`] over the [`decorrelated`] generator — the precision tests' fixture.
+    fn decorrelated_fixture() -> (Weights, VaeConfig) {
+        fixture_with(decorrelated)
+    }
+
+    fn fixture_with(gen: Gen) -> (Weights, VaeConfig) {
         let cfg = VaeConfig {
             in_channels: 3,
             out_channels: 3,
@@ -692,11 +774,12 @@ mod tests {
         };
         let mut tensors = HashMap::new();
 
-        insert_conv(&mut tensors, "decoder.conv_in", 4, CHANNELS, 3, 1.0);
-        insert_mid(&mut tensors, "decoder.mid_block", 10.0);
+        insert_conv(gen, &mut tensors, "decoder.conv_in", 4, CHANNELS, 3, 1.0);
+        insert_mid(gen, &mut tensors, "decoder.mid_block", 10.0);
         for block in 0..2 {
             for resnet in 0..2 {
                 insert_resnet(
+                    gen,
                     &mut tensors,
                     &format!("decoder.up_blocks.{block}.resnets.{resnet}"),
                     40.0 + (block * 10 + resnet) as f32,
@@ -704,6 +787,7 @@ mod tests {
             }
         }
         insert_conv(
+            gen,
             &mut tensors,
             "decoder.up_blocks.0.upsamplers.0.conv",
             CHANNELS,
@@ -717,19 +801,21 @@ mod tests {
         );
         tensors.insert(
             "decoder.conv_norm_out.bias".into(),
-            values(&[CHANNELS], 72.0, 0.04),
+            gen(&[CHANNELS], 72.0, 0.04),
         );
-        insert_conv(&mut tensors, "decoder.conv_out", CHANNELS, 3, 3, 74.0);
+        insert_conv(gen, &mut tensors, "decoder.conv_out", CHANNELS, 3, 3, 74.0);
 
-        insert_conv(&mut tensors, "encoder.conv_in", 3, CHANNELS, 3, 80.0);
+        insert_conv(gen, &mut tensors, "encoder.conv_in", 3, CHANNELS, 3, 80.0);
         for block in 0..2 {
             insert_resnet(
+                gen,
                 &mut tensors,
                 &format!("encoder.down_blocks.{block}.resnets.0"),
                 90.0 + block as f32 * 10.0,
             );
         }
         insert_conv(
+            gen,
             &mut tensors,
             "encoder.down_blocks.0.downsamplers.0.conv",
             CHANNELS,
@@ -737,18 +823,18 @@ mod tests {
             3,
             112.0,
         );
-        insert_mid(&mut tensors, "encoder.mid_block", 120.0);
+        insert_mid(gen, &mut tensors, "encoder.mid_block", 120.0);
         tensors.insert(
             "encoder.conv_norm_out.weight".into(),
             Array::ones::<f32>(&[CHANNELS]).unwrap(),
         );
         tensors.insert(
             "encoder.conv_norm_out.bias".into(),
-            values(&[CHANNELS], 145.0, 0.04),
+            gen(&[CHANNELS], 145.0, 0.04),
         );
-        insert_conv(&mut tensors, "encoder.conv_out", CHANNELS, 8, 3, 150.0);
-        insert_conv(&mut tensors, "quant_conv", 8, 8, 1, 160.0);
-        insert_conv(&mut tensors, "post_quant_conv", 4, 4, 1, 170.0);
+        insert_conv(gen, &mut tensors, "encoder.conv_out", CHANNELS, 8, 3, 150.0);
+        insert_conv(gen, &mut tensors, "quant_conv", 8, 8, 1, 160.0);
+        insert_conv(gen, &mut tensors, "post_quant_conv", 4, 4, 1, 170.0);
 
         (Weights::from_map(tensors), cfg)
     }
@@ -792,6 +878,132 @@ mod tests {
             max_delta < 3e-3,
             "layer-wise tiled SDXL VAE diverged from dense decode: max|delta|={max_delta:.3e}"
         );
+    }
+
+    /// The declared tolerance for a **half-precision** decode against the f32 untiled decode of
+    /// the same weights (sc-26268), as a fraction of the reference output's peak magnitude: 1%.
+    /// f16 carries an 11-bit significand (relative rounding 4.9e-4 per op); a decoder chains ~20
+    /// normalized conv/attention stages, so a few ulps of compounding is the expected class, and a
+    /// promotion or overflow defect (the failure this guards) lands orders of magnitude above it.
+    /// On SDXL's real `[-1, 1]` output 1% is 1.3/255 — below one 8-bit level in the worst pixel.
+    const FP16_RELATIVE_TOLERANCE: f32 = 1e-2;
+
+    /// The declared tolerance for an **f32** tiled decode against the f32 untiled decode: the same
+    /// arithmetic up to float reassociation of the halo-cropped convolutions, so 1e-4 of peak.
+    const F32_TILED_RELATIVE_TOLERANCE: f32 = 1e-4;
+
+    /// Output tile edges for the synthetic fixture (its output is 16×18): one that does not tile,
+    /// even and ragged splits, and the 3-pixel floor `tiled_conv2d_3x3_nhwc` accepts.
+    const SYNTHETIC_EDGES: [i32; 5] = [32, 9, 8, 5, 3];
+
+    fn f32_values(a: &Array) -> Vec<f32> {
+        let a = a.as_dtype(Dtype::Float32).unwrap();
+        a.eval().unwrap();
+        a.as_slice::<f32>().to_vec()
+    }
+
+    /// `max|a - b| / max|reference|`.
+    fn relative_max_delta(reference: &Array, candidate: &Array) -> f32 {
+        assert_eq!(reference.shape(), candidate.shape());
+        let reference = f32_values(reference);
+        let candidate = f32_values(candidate);
+        let peak = reference.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!(
+            peak > 0.0,
+            "a zero reference cannot ground a relative tolerance"
+        );
+        let delta = reference
+            .iter()
+            .zip(&candidate)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        delta / peak
+    }
+
+    fn fp16_vae(weights: &Weights, cfg: &VaeConfig) -> Autoencoder {
+        let mut half = weights.clone();
+        half.cast_all(Dtype::Float16).unwrap();
+        Autoencoder::from_weights(&half, cfg).unwrap()
+    }
+
+    /// The f32 reference for a half-precision VAE: the **same** f16-stored weights, computed at
+    /// f32 — exactly the comparison the real fp16-fix checkpoint (stored f16) is held to, so the
+    /// tolerance measures compute precision rather than the weights' storage rounding.
+    fn f32_reference(weights: &Weights, cfg: &VaeConfig) -> Autoencoder {
+        let mut rounded = weights.clone();
+        rounded.cast_all(Dtype::Float16).unwrap();
+        rounded.cast_all(Dtype::Float32).unwrap();
+        Autoencoder::from_weights(&rounded, cfg).unwrap()
+    }
+
+    /// sc-26268 AC: the **fp16 VAE decode** matches the f32 untiled decode of the same weights
+    /// within [`FP16_RELATIVE_TOLERANCE`], runs at f16 (no silent promotion back to f32), and hands
+    /// its output back at f32.
+    #[test]
+    fn fp16_decode_matches_the_f32_untiled_decode_within_the_declared_tolerance() {
+        let _cpu = crate::test_device::cpu_only();
+        let (weights, cfg) = decorrelated_fixture();
+        let reference = f32_reference(&weights, &cfg);
+        assert_eq!(reference.dtype(), Dtype::Float32);
+        let half = fp16_vae(&weights, &cfg);
+        assert_eq!(half.dtype(), Dtype::Float16);
+
+        // The production latent arrives at the U-Net's f16.
+        let latent = latent().as_dtype(Dtype::Float16).unwrap();
+        let dense = reference.decode(&latent).unwrap();
+        assert_eq!(dense.dtype(), Dtype::Float32);
+        let decoded = half.decode(&latent).unwrap();
+        assert_eq!(decoded.dtype(), Dtype::Float32, "callers receive f32");
+        let delta = relative_max_delta(&dense, &decoded);
+        assert!(
+            delta <= FP16_RELATIVE_TOLERANCE,
+            "fp16 decode drifted {delta:.3e} of peak from the f32 decode (tolerance \
+             {FP16_RELATIVE_TOLERANCE:.0e})"
+        );
+        // Non-vacuity: f16 rounding is real, so an identical output would mean the "f16" VAE never
+        // ran at f16 (a promotion back to f32 that forfeits the memory saving).
+        assert!(delta > 0.0, "the f16 decode must actually compute at f16");
+
+        // The img2img encode follows the same contract.
+        let image = values(&[1, 16, 18, 3], 3.0, 0.8);
+        let encoded = half.encode_mean(&image).unwrap();
+        assert_eq!(encoded.dtype(), Dtype::Float32);
+        let delta = relative_max_delta(&reference.encode_mean(&image).unwrap(), &encoded);
+        assert!(
+            delta <= FP16_RELATIVE_TOLERANCE,
+            "fp16 encode drifted {delta:.3e}"
+        );
+    }
+
+    /// sc-26268 AC: the **fixed tiled decode** (layer-wise halo tiling + full-image GroupNorm)
+    /// matches the f32 untiled decode — within [`F32_TILED_RELATIVE_TOLERANCE`] at f32 and within
+    /// [`FP16_RELATIVE_TOLERANCE`] on the fp16 VAE — at every edge, including ragged splits. The
+    /// pre-SC-19753 per-crop normalization moved this position-dependent fixture by orders of
+    /// magnitude more (see `tiled_autoencoder_decode_tracks_dense_with_global_group_norm`).
+    #[test]
+    fn tiled_decode_matches_the_f32_untiled_decode_across_edges() {
+        let _cpu = crate::test_device::cpu_only();
+        let (weights, cfg) = decorrelated_fixture();
+        let reference = f32_reference(&weights, &cfg);
+        let half = fp16_vae(&weights, &cfg);
+        let latent = latent().as_dtype(Dtype::Float16).unwrap();
+        let dense = reference.decode(&latent).unwrap();
+        for edge in SYNTHETIC_EDGES {
+            let tiling = TilingConfig::spatial_only(edge, 0);
+            let tiled = reference.decode_tiled(&latent, &tiling, None).unwrap();
+            let delta = relative_max_delta(&dense, &tiled);
+            assert!(
+                delta <= F32_TILED_RELATIVE_TOLERANCE,
+                "f32 tiled decode at edge {edge} drifted {delta:.3e} of peak"
+            );
+            let tiled_half = half.decode_tiled(&latent, &tiling, None).unwrap();
+            assert_eq!(tiled_half.dtype(), Dtype::Float32);
+            let delta = relative_max_delta(&dense, &tiled_half);
+            assert!(
+                delta <= FP16_RELATIVE_TOLERANCE,
+                "fp16 tiled decode at edge {edge} drifted {delta:.3e} of peak"
+            );
+        }
     }
 
     #[test]
