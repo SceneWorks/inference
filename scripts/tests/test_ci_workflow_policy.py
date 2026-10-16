@@ -4004,6 +4004,29 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     f"{name} could be scheduled by a dispatch that did not select a macOS lane",
                 )
 
+    def test_ios_build_metallib_triples_follow_the_cargo_config_deployment_floor(self) -> None:
+        """The hand-typed metallib triples must track the `.cargo/config.toml` iOS floor."""
+        config = tomllib.loads(
+            (WORKFLOW.parents[2] / ".cargo" / "config.toml").read_text(encoding="utf-8")
+        )
+        matrix = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["ios-build"][
+            "strategy"
+        ]["matrix"]["include"]
+        expected = {
+            "aarch64-apple-ios": ("ios", ""),
+            "aarch64-apple-ios-sim": ("ios-simulator", "-simulator"),
+        }
+        self.assertEqual({entry["target"] for entry in matrix}, set(expected))
+        for entry in matrix:
+            platform, suffix = expected[entry["target"]]
+            with self.subTest(target=entry["target"]):
+                flags = " ".join(config["target"][entry["target"]]["rustflags"])
+                floor = re.search(rf"-platform_version,{re.escape(platform)},(\d+\.\d+),", flags)
+                self.assertIsNotNone(floor, flags)
+                self.assertEqual(
+                    entry["metallib_triple"], f"air64-apple-ios{floor.group(1)}.0{suffix}"
+                )
+
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
         job = jobs["windows-cuda"]

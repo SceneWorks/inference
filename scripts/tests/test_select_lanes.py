@@ -1,4 +1,4 @@
-import json
+import re
 import shutil
 import subprocess
 import unittest
@@ -148,46 +148,44 @@ class SelectLanesTests(unittest.TestCase):
                 self.assertFalse(select_lanes([path])["ios_build"])
 
     def test_every_crate_on_the_ios_graph_selects_the_ios_build_lane(self) -> None:
-        """The static iOS path list must cover runtime-ios's live dependency graph."""
+        """The static iOS path list must cover runtime-ios's live dependency graph.
+
+        `cargo tree -p runtime-ios` resolves runtime-ios's OWN features (unlike `cargo metadata`,
+        which unifies features across the whole workspace), so this is the graph the iOS lane
+        actually builds. The path list may over-select; it must not miss a crate.
+        """
         if shutil.which("cargo") is None:
             self.skipTest("cargo is not installed")
         result = subprocess.run(
             [
                 "cargo",
-                "metadata",
+                "tree",
                 "--locked",
-                "--format-version",
-                "1",
-                "--filter-platform",
+                "-p",
+                "runtime-ios",
+                "--target",
                 "aarch64-apple-ios",
+                "-e",
+                "normal,build",
+                "--prefix",
+                "none",
+                "--format",
+                "{p}",
             ],
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
             encoding="utf-8",
         )
-        metadata = json.loads(result.stdout)
-        members = set(metadata["workspace_members"])
-        packages = {package["id"]: package for package in metadata["packages"]}
-        nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-        root = next(
-            pid for pid in members if packages[pid]["name"] == "runtime-ios"
-        )
-        seen, stack = set(), [root]
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            for dep in nodes[pid]["deps"]:
-                if any(kind["kind"] in (None, "build") for kind in dep["dep_kinds"]):
-                    stack.append(dep["pkg"])
-        crate_dirs = sorted(
-            Path(packages[pid]["manifest_path"]).parent.relative_to(REPO_ROOT).as_posix()
-            for pid in seen & members
-        )
+        root = REPO_ROOT.resolve()
+        crate_dirs = set()
+        for match in re.finditer(r"\((/[^)]+)\)", result.stdout):
+            path = Path(match.group(1)).resolve()
+            if path.is_relative_to(root):
+                crate_dirs.add(path.relative_to(root).as_posix())
+        self.assertIn("crates/bundles/runtime-ios", crate_dirs)
         self.assertIn("crates/media/mlx-gen/mlx-gen-ios-catalog", crate_dirs)
-        for crate_dir in crate_dirs:
+        for crate_dir in sorted(crate_dirs):
             with self.subTest(crate=crate_dir):
                 self.assertTrue(select_lanes([f"{crate_dir}/src/lib.rs"])["ios_build"])
 

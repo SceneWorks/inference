@@ -42,17 +42,21 @@ def _is_sa3_reference_fixture(path: str) -> bool:
 # aarch64-apple-ios`), plus the bundle itself. A change under any of them can change what the iOS
 # cross-build compiles or the metallib it emits, so it selects the `ios_build` lane. The mlx-rs pin
 # (Cargo.toml / Cargo.lock), `.cargo/`, scripts/ci and the workflows already select every lane.
-# test_select_lanes pins this set to the live dependency graph, so a new iOS dependency cannot be
-# left out silently.
+# test_select_lanes asserts the live `cargo tree -p runtime-ios` graph is a subset of this set, so a
+# new iOS dependency cannot be left out silently (over-selecting is harmless).
 IOS_BOUND_PATHS = (
     "crates/bundles/runtime-ios",
     "crates/bundles/runtime-catalog",
     "crates/contracts/core-llm",
     "crates/contracts/gen-core",
     "crates/llm/mlx-llm",
+    "crates/media/mlx-gen/mlx-gen-anima",
     "crates/media/mlx-gen/mlx-gen-ios-catalog",
     "crates/media/mlx-gen/mlx-gen-pid",
+    "crates/media/mlx-gen/mlx-gen-qwen-image",
     "crates/media/mlx-gen/mlx-gen-sana",
+    "crates/media/mlx-gen/mlx-gen-wan",
+    "crates/media/mlx-gen/mlx-gen-z-image",
 )
 
 
