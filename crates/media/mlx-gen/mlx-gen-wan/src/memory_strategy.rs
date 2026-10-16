@@ -458,9 +458,10 @@ fn numeric_tier_from_config(
 }
 
 fn fixture_tier(spec: &LoadSpec) -> gen_core::Result<MemoryNumericTier> {
-    if spec.quantize == Some(Quant::Nvfp4) {
+    if let Some(q @ (Quant::Nvfp4 | Quant::Fp8Rowwise)) = spec.quantize {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: NVFP4 is not an MLX affine tier"
+            "{MODEL_ID}: {} is not an MLX affine tier",
+            q.key()
         )));
     }
     Ok(MemoryNumericTier {
@@ -674,7 +675,9 @@ fn calibration_fingerprint(tier: MemoryNumericTier, fixture: bool) -> String {
         None => format!("{prefix}-dense-v1"),
         Some(Quant::Q4) => format!("{prefix}-q4-g{PACK_GROUP_SIZE}-teq8-v1"),
         Some(Quant::Q8) => format!("{prefix}-q8-g{PACK_GROUP_SIZE}-teq8-v1"),
-        Some(Quant::Nvfp4) => unreachable!("fixture/production tier validation rejects NVFP4"),
+        Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => {
+            unreachable!("fixture/production tier validation rejects NVFP4 and FP8 rowwise")
+        }
     }
 }
 
@@ -1847,7 +1850,7 @@ mod tests {
                 None => assert!(fingerprint.contains("dense")),
                 Some(Quant::Q4) => assert!(fingerprint.contains("q4-g64-teq8")),
                 Some(Quant::Q8) => assert!(fingerprint.contains("q8-g64-teq8")),
-                Some(Quant::Nvfp4) => unreachable!(),
+                Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
             }
 
             // A supplied override is an assertion only: matching succeeds, conflicting fails.

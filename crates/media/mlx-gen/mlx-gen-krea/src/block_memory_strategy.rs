@@ -204,6 +204,7 @@ fn selector_tier_token(tier: mlx_gen::gen_core::MemoryContractSurfaceTier) -> &'
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => "q4",
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => "q8",
         mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => "nvfp4",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Fp8Rowwise => "fp8r",
     }
 }
 
@@ -220,6 +221,7 @@ fn spec_tier_token(spec: &LoadSpec) -> &'static str {
         (_, Some(mlx_gen::Quant::Q4)) => "q4",
         (_, Some(mlx_gen::Quant::Q8)) => "q8",
         (_, Some(mlx_gen::Quant::Nvfp4)) => "nvfp4",
+        (_, Some(mlx_gen::Quant::Fp8Rowwise)) => "fp8r",
     }
 }
 
@@ -396,7 +398,8 @@ pub(crate) fn surface_selector_matches_spec(
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => {
             surface.spec.quantize == Some(mlx_gen::Quant::Q8)
         }
-        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4
+        | mlx_gen::gen_core::MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     if tier_matches
         && matches!(surface.spec.weights, WeightsSource::Dir(_))

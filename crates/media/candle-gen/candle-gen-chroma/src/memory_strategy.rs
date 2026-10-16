@@ -1037,6 +1037,11 @@ pub(crate) fn weights_free_contract(
                 "Chroma has no NVFP4 turnkey".into(),
             ))
         }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
+            ))
+        }
     };
     let mut normalized = spec.clone();
     normalized.quantize = None;
@@ -1084,6 +1089,11 @@ pub(crate) fn weights_free_surface_contract(
         gen_core::MemoryContractSurfaceTier::Nvfp4 => {
             return Err(gen_core::Error::Unsupported(
                 "Chroma has no NVFP4 turnkey".into(),
+            ))
+        }
+        gen_core::MemoryContractSurfaceTier::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
             ))
         }
     };
@@ -1775,6 +1785,11 @@ fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::R
         Some(Quant::Nvfp4) => {
             return Err(gen_core::Error::Unsupported(
                 "Chroma has no NVFP4 turnkey".into(),
+            ))
+        }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
             ))
         }
     };

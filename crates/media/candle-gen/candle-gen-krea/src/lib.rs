@@ -2408,6 +2408,7 @@ fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String>
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
+        Some(Quant::Fp8Rowwise) => "fp8r",
     };
     Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
 }
@@ -2587,7 +2588,8 @@ fn request_scoped_surface_tier(tier: gen_core::MemoryContractSurfaceTier) -> Opt
         gen_core::MemoryContractSurfaceTier::Bf16 => Some(None),
         gen_core::MemoryContractSurfaceTier::Q4 => Some(Some(Quant::Q4)),
         gen_core::MemoryContractSurfaceTier::Q8 => Some(Some(Quant::Q8)),
-        gen_core::MemoryContractSurfaceTier::Nvfp4 => None,
+        gen_core::MemoryContractSurfaceTier::Nvfp4
+        | gen_core::MemoryContractSurfaceTier::Fp8Rowwise => None,
     }
 }
 
@@ -2686,7 +2688,8 @@ fn surface_selector_matches_request_scoped_spec(
         }
         gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+        gen_core::MemoryContractSurfaceTier::Nvfp4
+        | gen_core::MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     let exact_base_axes = surface.spec.resolved_route.is_none()
         && surface.spec.decode_geometry_policies.is_empty()

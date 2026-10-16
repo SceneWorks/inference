@@ -1238,6 +1238,7 @@ mod tests {
                     MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
                     MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
                     MemoryContractSurfaceTier::Nvfp4 => Some(mlx_gen::Quant::Nvfp4),
+                    MemoryContractSurfaceTier::Fp8Rowwise => Some(mlx_gen::Quant::Fp8Rowwise),
                 };
                 let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
                 assert_eq!(

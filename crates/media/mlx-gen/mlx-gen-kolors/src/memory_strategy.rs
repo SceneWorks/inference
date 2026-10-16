@@ -539,6 +539,7 @@ fn static_behavior_identity(spec: &LoadSpec) -> MemoryCalibrationIdentity {
         Some(mlx_gen::Quant::Q4) => "q4",
         Some(mlx_gen::Quant::Q8) => "q8",
         Some(mlx_gen::Quant::Nvfp4) => "nvfp4",
+        Some(mlx_gen::Quant::Fp8Rowwise) => "fp8r",
     };
     let policy = match spec.offload_policy {
         OffloadPolicy::Resident => "resident",
@@ -581,7 +582,7 @@ pub fn production_calibration_fingerprint(
         Some(mlx_gen::Quant::Q8) => Some("kolors-q8-mlx-shared-ladder-v1".to_owned()),
         None => Some("kolors-bf16-mlx-shared-ladder-v1".to_owned()),
         // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
-        Some(mlx_gen::Quant::Nvfp4) => None,
+        Some(mlx_gen::Quant::Nvfp4 | mlx_gen::Quant::Fp8Rowwise) => None,
     }
 }
 

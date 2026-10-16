@@ -537,10 +537,10 @@ fn registered_fp8_load_publishes_a_mode_bound_run() {
 #[test]
 fn the_advertised_quants_are_exactly_the_accepted_ones() {
     // Exhaustive: a new `Quant` fails to compile here until it is classified.
-    let every = [Quant::Q4, Quant::Q8, Quant::Nvfp4];
+    let every = [Quant::Q4, Quant::Q8, Quant::Nvfp4, Quant::Fp8Rowwise];
     for q in every {
         match q {
-            Quant::Q4 | Quant::Q8 | Quant::Nvfp4 => {}
+            Quant::Q4 | Quant::Q8 | Quant::Nvfp4 | Quant::Fp8Rowwise => {}
         }
     }
     let advertised = descriptor().capabilities.supported_quants;

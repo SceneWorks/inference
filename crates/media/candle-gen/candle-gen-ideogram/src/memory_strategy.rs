@@ -393,6 +393,7 @@ impl IdeogramLoadReceipt {
                     Some(Quant::Q4) => b"q4",
                     Some(Quant::Q8) => b"q8",
                     Some(Quant::Nvfp4) => b"nvfp4",
+                    Some(Quant::Fp8Rowwise) => b"fp8r",
                     None => b"bf16",
                 },
             );
@@ -1053,7 +1054,7 @@ fn production_calibration_fingerprint(provider_id: &str, tier: Option<Quant>) ->
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
-        Some(Quant::Nvfp4) => return None,
+        Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => return None,
     };
     Some(format!(
         "ideogram4-candle-request-scoped-staged-residency-v1-{route}-{tier}"

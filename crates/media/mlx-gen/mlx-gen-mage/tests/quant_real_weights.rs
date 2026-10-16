@@ -512,7 +512,7 @@ fn all_three_tiers_generate_and_round_trip_mean_latents() {
             None => (16.0, 20.0),
             Some(Quant::Q8) => (8.5, 12.0),
             Some(Quant::Q4) => (7.0, 9.0),
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         };
         assert!(
             (low..=high).contains(&peak_gb),

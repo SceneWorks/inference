@@ -1122,7 +1122,7 @@ fn surface_selector_matches_spec(
         }
         MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        MemoryContractSurfaceTier::Nvfp4 => false,
+        MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     let plain = surface.spec.adapters.is_empty()
         && surface.spec.control.is_none()

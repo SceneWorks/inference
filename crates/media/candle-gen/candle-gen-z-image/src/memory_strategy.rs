@@ -170,7 +170,8 @@ fn surface_selector_matches_spec(
         }
         gen_core::MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         gen_core::MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        gen_core::MemoryContractSurfaceTier::Nvfp4 => false,
+        gen_core::MemoryContractSurfaceTier::Nvfp4
+        | gen_core::MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     if tier_matches
         && surface.selector.offload_policy == surface.spec.offload_policy
