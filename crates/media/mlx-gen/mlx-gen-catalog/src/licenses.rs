@@ -1205,7 +1205,31 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 65);
+        // The census is pinned separately; this test verifies that serialization preserves
+        // the complete mapping rather than duplicating a provider count that can go stale.
+        let providers = value["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), MLX_MEDIA_PROVIDER_COMPONENTS.len());
+        let serialized_ids: BTreeSet<_> = providers
+            .iter()
+            .map(|provider| provider["provider_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(serialized_ids, mapped_ids());
+        let flux3 = value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["provider_id"] == "flux3_klein")
+            .expect("the new FLUX 3 provider is serialized, not just counted");
+        let components = flux3["components"].as_array().unwrap();
+        assert_eq!(components.len(), 2);
+        for component in ["flux3_image_klein", "qwen3_vl_4b_instruct"] {
+            assert!(
+                components
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(component)),
+                "FLUX 3 manifest omitted {component}"
+            );
+        }
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]
