@@ -190,9 +190,9 @@ fn single_sample_forward_matches_upstream_in_bf16_body() {
     });
 }
 
-/// The timestep embedding forms `1000·t` in the compute dtype: under bf16 the DiT sees the
-/// rounded time (`0.9163 → 0.9921875·1000 → 992`? no: `bf16(0.9163) = 0.91796875`, `×1000` in
-/// bf16 = 916), under f32 the exact one.
+/// The timestep embedding forms `1000·t` in the compute dtype: the first interior release
+/// timestep becomes 992 under bf16, versus about 990.47 under f32. Evaluate independent phase
+/// references with the same backend transcendental kernel, not Rust libm's different rounding.
 #[test]
 fn timestep_embedding_follows_the_compute_dtype() {
     cpu_process(
@@ -220,16 +220,42 @@ fn timestep_embedding_follows_the_compute_dtype_body() {
         // contract rather than spelled as a literal f32 cannot hold exactly.
         let t = mlx_gen::gen_core::flux3::flow_map_schedule(16, 6.93).unwrap()[1];
         assert!((0.9904..0.9905).contains(&t), "schedule[1] = {t}");
-        let f = host_f32(&f32_dit.timestep_embedding(t).unwrap());
-        let b = host_f32(&bf16_dit.timestep_embedding(t).unwrap());
+        let f_embedding = f32_dit.timestep_embedding(t).unwrap();
+        let b_embedding = bf16_dit.timestep_embedding(t).unwrap();
+        assert_eq!(f_embedding.dtype(), Dtype::Float32);
+        assert_eq!(b_embedding.dtype(), Dtype::Bfloat16);
+        let f = host_f32(&f_embedding);
+        let b = host_f32(&b_embedding);
         assert_eq!(f.len(), 256);
-        // cos(1000·t · freq_0 = 990.47…) vs cos(992): different phases.
-        assert_eq!(f[0], (1000.0f32 * t).cos());
-        assert!(
-            (b[0] - (992.0f32).cos()).abs() < 2e-2,
-            "bf16 time 992: {}",
-            b[0]
-        );
+        assert_eq!(b.len(), 256);
+        // Pin frequencies 0 and 1 independently of timestep_freqs/DiT. Keep the same 128-wide
+        // backend unary kernel as the cosine/sine halves; Rust f32::cos differs by one ulp on
+        // macOS, which is not a phase/dtype defect. No numeric tolerance is relaxed here.
+        let second_frequency = (-(10000.0f64.ln() as f32) / 128.0).exp();
+        let reference = |phase: f32, dtype: Dtype| {
+            let mut phases = [phase; 128];
+            phases[1] = phase * second_frequency;
+            let args = mlx_rs::Array::from_slice(&phases, &[1, 128]);
+            let mut values = host_f32(&args.cos().unwrap().as_dtype(dtype).unwrap());
+            values.extend(host_f32(&args.sin().unwrap().as_dtype(dtype).unwrap()));
+            values
+        };
+        let expected_f = reference(1000.0f32 * t, Dtype::Float32);
+        let expected_b = reference(992.0, Dtype::Bfloat16);
+        for index in [0, 1, 128, 129] {
+            assert_eq!(
+                f[index], expected_f[index],
+                "f32 phase/frequency at {index}"
+            );
+            assert_eq!(
+                b[index], expected_b[index],
+                "bf16 phase/frequency at {index}"
+            );
+        }
+        // Negative controls: omitting the 1000 scaling or using the f32 phase for bf16 must
+        // disagree with these exact references (the latter still has the right output dtype).
+        assert_ne!(f[0], reference(t, Dtype::Float32)[0]);
+        assert_ne!(b[0], reference(1000.0f32 * t, Dtype::Bfloat16)[0]);
         assert!(
             (f[0] - b[0]).abs() > 1e-2,
             "the two policies differ at the first frequency"

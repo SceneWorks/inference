@@ -153,8 +153,12 @@ pub fn float_image_to_rgb8(image: &Array) -> Result<Image> {
     let scaled = mlx_rs::ops::clip(&image.as_dtype(Dtype::Float32)?, (-1.0f32, 1.0f32))?
         .add(Array::from_f32(1.0))?
         .multiply(Array::from_f32(127.5))?;
-    eval([&scaled])?;
-    let values = scaled.as_slice::<f32>();
+    // A decoded/transposed NHWC view may still have planar (NCHW) physical storage. Elementwise
+    // arithmetic need not change its strides; materialize logical C-order before host readback,
+    // just like mlx-gen's shared decoded_to_interleaved_u8 boundary.
+    let flat = scaled.reshape(&[-1])?;
+    eval([&flat])?;
+    let values = flat.as_slice::<f32>();
     let pixels: Vec<u8> = values.iter().map(|v| v.clamp(0.0, 255.0) as u8).collect();
     Ok(Image {
         width,
