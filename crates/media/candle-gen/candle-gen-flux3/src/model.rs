@@ -91,6 +91,7 @@ pub struct Heavy {
 pub struct Flux3Klein {
     descriptor: ModelDescriptor,
     config: Flux3Config,
+    device: Device,
     residency: Residency<Flux3TextEncoder, Heavy>,
     prompt_upsampler: Option<crate::pup::Flux3PromptUpsampler>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
@@ -233,11 +234,40 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     Ok(Flux3Klein {
         descriptor: descriptor(),
         config,
+        device,
         residency,
         prompt_upsampler,
         spec: spec.clone(),
         memory_strategy,
     })
+}
+
+/// The residency driver also calls this boundary with `None` after an encoding error. Do not
+/// condition synchronization on a successful encoding: queued work must finish before text drops.
+fn encoder_materialization_boundary<T>(
+    synchronize: impl FnOnce() -> Result<()>,
+) -> impl FnOnce(Option<&T>) -> Result<()> {
+    move |_| synchronize()
+}
+
+/// Every decode is a cancellation boundary, including the last one before results can escape.
+fn decode_batch<T, Out>(
+    tokens: &[T],
+    cancel: &gen_core::CancelFlag,
+    mut decode: impl FnMut(&T) -> Result<Out>,
+) -> Result<Vec<Out>> {
+    let mut images = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        candle_gen::residency::check_cancel(cancel)?;
+        images.push(decode(token)?);
+    }
+    candle_gen::residency::check_cancel(cancel)?;
+    Ok(images)
+}
+
+fn checked_completion<T>(cancel: &gen_core::CancelFlag, value: T) -> Result<T> {
+    candle_gen::residency::check_cancel(cancel)?;
+    Ok(value)
 }
 
 impl Flux3Klein {
@@ -263,7 +293,7 @@ impl Flux3Klein {
             false,
             on_progress,
             |te: &Flux3TextEncoder| -> Result<TextConditioning> { te.encode(&params.prompt) },
-            |_| Ok(()),
+            encoder_materialization_boundary(|| Ok(self.device.synchronize()?)),
             |heavy: &Heavy, text: TextConditioning, on_progress| {
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
@@ -290,19 +320,18 @@ impl Flux3Klein {
                     return Err(Error::Canceled);
                 }
                 let (h, w) = params.latent_shape()?;
-                let mut images = Vec::with_capacity(tokens.len());
-                for t in &tokens {
-                    images.push(decode_tokens(&heavy.ae, t, h, w)?);
-                }
-                Ok(images)
+                decode_batch(&tokens, &req.cancel, |t| decode_tokens(&heavy.ae, t, h, w))
             },
         )?;
-        Ok(GenerationReport {
-            output: Some(GenerationOutput::Images(images)),
-            artifacts: None,
-            warnings: Vec::new(),
-            prefix_kv_cache: None,
-        })
+        checked_completion(
+            &req.cancel,
+            GenerationReport {
+                output: Some(GenerationOutput::Images(images)),
+                artifacts: None,
+                warnings: Vec::new(),
+                prefix_kv_cache: None,
+            },
+        )
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -402,6 +431,113 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::WeightsSource;
+
+    #[test]
+    fn cancellation_during_decode_stops_the_batch_and_withholds_the_last_result() {
+        for count in [1, 8] {
+            let cancel = gen_core::CancelFlag::new();
+            let mut entered = 0;
+            let tokens = vec![17; count];
+            let result = decode_batch(&tokens, &cancel, |token| {
+                entered += 1; // The decoder has begun, not merely the denoise/progress phase.
+                cancel.cancel();
+                Ok(*token)
+            });
+            assert!(matches!(result, Err(Error::Canceled)));
+            assert_eq!(
+                entered, 1,
+                "do not decode the remaining images after cancellation"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_decode_completion_still_prevents_publication() {
+        let cancel = gen_core::CancelFlag::new();
+        let images = decode_batch(&[17, 23], &cancel, |token| Ok(*token)).unwrap();
+        assert_eq!(images, [17, 23]);
+        cancel.cancel();
+        assert!(matches!(
+            checked_completion(&cancel, images),
+            Err(Error::Canceled)
+        ));
+    }
+
+    #[test]
+    fn encoder_boundary_syncs_before_drop_on_success_and_error_preserving_primary_error() {
+        use std::sync::{Arc, Mutex};
+        struct Text(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Text {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("text-drop");
+            }
+        }
+        for (encode_fails, sync_fails) in
+            [(false, false), (true, false), (true, true), (false, true)]
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let load_events = events.clone();
+            let heavy_events = events.clone();
+            let residency = Residency::from_policy(
+                gen_core::OffloadPolicy::Sequential,
+                move || {
+                    load_events.lock().unwrap().push("text-load");
+                    Ok(Text(load_events.clone()))
+                },
+                move |_| {
+                    heavy_events.lock().unwrap().push("heavy-load");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let result = residency.run_request_scoped(
+                true,
+                false,
+                &gen_core::CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_: &Text| {
+                    events.lock().unwrap().push("encode");
+                    if encode_fails {
+                        Err(Error::Msg("primary-encoding-error".into()))
+                    } else {
+                        Ok(17)
+                    }
+                },
+                encoder_materialization_boundary(|| {
+                    events.lock().unwrap().push("synchronize");
+                    if sync_fails {
+                        Err(Error::Msg("synchronization-error".into()))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                |_: &(), encoded, _| {
+                    events.lock().unwrap().push("render");
+                    Ok(encoded)
+                },
+            );
+            let seen = events.lock().unwrap();
+            assert_eq!(
+                &seen[..4],
+                &["text-load", "encode", "synchronize", "text-drop"]
+            );
+            if encode_fails {
+                assert!(
+                    matches!(result, Err(Error::Msg(ref message)) if message == "primary-encoding-error")
+                );
+                assert_eq!(seen.len(), 4);
+            } else if sync_fails {
+                assert!(
+                    matches!(result, Err(Error::Msg(ref message)) if message == "synchronization-error")
+                );
+                assert_eq!(seen.len(), 4);
+            } else {
+                assert_eq!(result.unwrap(), 17);
+                assert_eq!(&seen[4..], &["heavy-load", "render"]);
+            }
+        }
+    }
 
     #[test]
     fn descriptor_is_a_flow_map_and_honest() {

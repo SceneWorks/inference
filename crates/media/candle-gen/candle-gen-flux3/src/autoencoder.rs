@@ -11,9 +11,10 @@
 //! `quant_conv.weight` → 2·EMBED_DIM), so a miniature fixture loads through the same code as the
 //! release. Weight keys are upstream's own — the released `ae.safetensors` loads unchanged.
 //!
-//! Every 3×3 convolution goes through the shared launch-bound-safe guard
-//! ([`candle_gen::conv2d_budgeted`], sc-24114) and the mid attention through the shared
-//! i32-overflow-safe SDPA, so the release's 4096² ceiling decodes correctly on CUDA.
+//! Convolutions (including 1×1 shortcuts), upsampling, normalization, pointwise operations and
+//! output assembly use bounded operation-level launches, including the 2^32-element 4096² stage.
+//! GroupNorm retains full-image group statistics; this is not approximate spatial VAE tiling.
+//! Mid attention uses the shared i32-overflow-safe SDPA.
 //!
 //! ## Upstream structure (what is ported, verbatim)
 //!
@@ -38,9 +39,12 @@
 
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Module, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, GroupNorm, VarBuilder};
+use candle_gen::candle_nn::{Conv2dConfig, VarBuilder};
+
+mod bounded;
+use bounded::{BoundedConv2d as Conv2d, BoundedGroupNorm as GroupNorm};
 use candle_gen::{CandleError as Error, Result};
 
 /// Pixels per packed token on each side (`DOWNSAMPLING_RATIO`): 8× VAE × 2×2 patchify.
@@ -123,21 +127,17 @@ impl Loader<'_> {
                 "{prefix} normalizes {channels} channels, not a multiple of GroupNorm({GN_GROUPS})"
             )));
         }
-        Ok(GroupNorm::new(weight, bias, channels, GN_GROUPS, GN_EPS)?)
+        GroupNorm::new(weight, bias, channels, GN_GROUPS, GN_EPS)
     }
 }
 
-/// A 3×3 conv behind the shared im2col launch guard.
+/// A 3×3 conv behind bounded local-padding, im2col, bias and output-copy launches.
 fn conv3(x: &Tensor, conv: &Conv2d) -> Result<Tensor> {
-    Ok(candle_gen::conv2d_budgeted(
-        x,
-        conv,
-        candle_gen::CONV_IM2COL_BUDGET,
-    )?)
+    bounded::conv2d(x, conv)
 }
 
 fn swish(x: &Tensor) -> Result<Tensor> {
-    Ok(candle_gen::candle_nn::ops::silu(x)?)
+    bounded::silu(x)
 }
 
 /// Out channels of a stored conv weight (`[O, I, kH, kW]`), by header.
@@ -191,10 +191,10 @@ impl ResnetBlock {
         let h = conv3(&swish(&self.norm1.forward(x)?)?, &self.conv1)?;
         let h = conv3(&swish(&self.norm2.forward(&h)?)?, &self.conv2)?;
         let res = match &self.nin_shortcut {
-            Some(sc) => sc.forward(x)?,
+            Some(sc) => bounded::conv2d(x, sc)?,
             None => x.clone(),
         };
-        Ok((res + h)?)
+        bounded::add(&res, &h)
     }
 }
 
@@ -227,8 +227,7 @@ impl AttnBlock {
         let (b, c, h, w) = x.dims4()?;
         let y = self.norm.forward(x)?;
         let seq = |conv: &Conv2d| -> Result<Tensor> {
-            Ok(conv
-                .forward(&y)?
+            Ok(bounded::conv2d(&y, conv)?
                 .reshape((b, c, h * w))?
                 .transpose(1, 2)?
                 .unsqueeze(1)?
@@ -252,7 +251,7 @@ impl AttnBlock {
             .transpose(1, 2)?
             .reshape((b, c, h, w))?
             .contiguous()?;
-        Ok((x + self.proj_out.forward(&o)?)?)
+        bounded::add(x, &bounded::conv2d(&o, &self.proj_out)?)
     }
 }
 
@@ -323,8 +322,7 @@ impl DownLevel {
         }
         if let Some(conv) = &self.downsample {
             // `F.pad(x, (0, 1, 0, 1))`: one zero column on the right, one zero row at the bottom.
-            x = x.pad_with_zeros(3, 0, 1)?.pad_with_zeros(2, 0, 1)?;
-            x = conv3(&x, conv)?;
+            x = bounded::downsample(&x, conv)?;
         }
         Ok(x)
     }
@@ -345,7 +343,7 @@ impl UpLevel {
         }
         if let Some(conv) = &self.upsample {
             let (_, _, h, w) = x.dims4()?;
-            x = conv3(&x.upsample_nearest2d(2 * h, 2 * w)?, conv)?;
+            x = conv3(&bounded::nearest2d(&x, 2 * h, 2 * w)?, conv)?;
         }
         Ok(x)
     }
@@ -409,7 +407,7 @@ impl Encoder {
         }
         let h = self.mid.forward(&h)?;
         let h = conv3(&swish(&self.norm_out.forward(&h)?)?, &self.conv_out)?;
-        Ok(self.quant_conv.forward(&h)?)
+        bounded::conv2d(&h, &self.quant_conv)
     }
 }
 
@@ -468,7 +466,7 @@ impl Decoder {
 
     /// `z`: `[1, E, H/8, W/8]` (already de-normalized and unpatchified) → `[1, 3, H, W]`.
     fn forward(&self, z: &Tensor) -> Result<Tensor> {
-        let z = self.post_quant_conv.forward(z)?;
+        let z = bounded::conv2d(z, &self.post_quant_conv)?;
         let mut h = conv3(&z, &self.conv_in)?;
         h = self.mid.forward(&h)?;
         for level in self.up.iter().rev() {
