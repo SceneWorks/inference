@@ -118,9 +118,13 @@ goldens and the Pillow policy fixture read by `gen-core/tests/flux3_pup.rs`. The
 ## S6 adapter identity and mapping
 
 `LoadSpec::adapters` carries the explicit user scale. Safetensors metadata must name
-`base_model` (the canonical base or distilled Hub repo), its frozen `base_revision`, and a
-finite positive `lora_alpha`. Only complete `lora_A.weight` / `lora_B.weight` pairs are admitted;
-all tensors must map, ranks/shapes must match, and LoKr/pass/expert overrides fail typed.
+`base_model` (the canonical base or distilled Hub repo) and its frozen `base_revision`. An explicit
+finite positive global alpha is read from native `alpha` / `lora_alpha` / `ss_network_alpha` or
+standard JSON `lora_adapter_metadata`; duplicate declarations must agree, never fall back to rank.
+Every declared native/PEFT rank must match the actual factors. Plain native and diffusers A/B
+adapters are supported; rsLoRA/DoRA, fan-in/fan-out and nonempty rank/alpha patterns are typed
+refusals rather than silently applying the wrong gain. Only complete `lora_A.weight` /
+`lora_B.weight` pairs are admitted; all tensors must map, and LoKr/pass/expert overrides fail typed.
 The mapping is the explicit inverse of diffusers' pinned FLUX3 converter, not FLUX2 aliases:
 `mode_blocks` ↔ `content_mode_blocks`, `single_transformer_blocks` ↔ `single_blocks`,
 `txt_mode_blocks` unchanged; `attn.to_q/to_k/to_v/to_out.0` ↔ `q_proj/k_proj/v_proj/attn_out`,

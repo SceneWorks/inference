@@ -1,6 +1,7 @@
 //! Strict FLUX3 LoRA admission and the explicit inverse of diffusers' frozen
 //! `_convert_non_diffusers_flux3_lora_to_diffusers` (7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941).
-//! Identity metadata is mandatory: `base_model`, `base_revision`, `lora_alpha`.
+//! Identity metadata is mandatory: `base_model`, `base_revision`. A consistent explicit global
+//! alpha must be declared by native alpha/lora_alpha or PEFT metadata; no alpha=rank fallback.
 //! Tensor values are read only by the native backend after this tensor-neutral preflight.
 use super::{
     DitConfig, BASE_WEIGHTS_REPO, BASE_WEIGHTS_REVISION, DISTILLED_WEIGHTS_REPO,
@@ -117,6 +118,136 @@ pub fn inspect(spec: &AdapterSpec, cfg: &DitConfig) -> Result<Vec<Projection>> {
     inspect_header(spec, cfg, &header)
 }
 
+/// Only plain additive LoRA: honor explicit native/PEFT alpha, never invent alpha=rank or
+/// silently reinterpret algorithms with different gain/orientation/per-target semantics.
+fn plain_metadata(meta: &serde_json::Value) -> Result<(f64, Vec<usize>)> {
+    let peft = meta
+        .get("lora_adapter_metadata")
+        .map(|raw| {
+            let text = raw
+                .as_str()
+                .ok_or_else(|| unsupported("lora_adapter_metadata must be a JSON string"))?;
+            let value: serde_json::Value = serde_json::from_str(text)
+                .map_err(|e| unsupported(format!("invalid lora_adapter_metadata: {e}")))?;
+            if !value.is_object() {
+                return Err(unsupported("lora_adapter_metadata must contain an object"));
+            }
+            Ok(value)
+        })
+        .transpose()?;
+    let mut alpha: Option<f64> = None;
+    let mut ranks = Vec::new();
+    for section in std::iter::once(meta).chain(peft.iter()) {
+        for key in ["networkType", "network_type", "peft_type"] {
+            if let Some(kind) = section.get(key) {
+                if !kind
+                    .as_str()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("lora"))
+                {
+                    return Err(unsupported(format!(
+                        "{key} must name plain LoRA, got {kind}"
+                    )));
+                }
+            }
+        }
+        let args = section
+            .get("ss_network_args")
+            .map(|raw| {
+                let text = raw
+                    .as_str()
+                    .ok_or_else(|| unsupported("ss_network_args must be a JSON string"))?;
+                let value = serde_json::from_str::<serde_json::Value>(text)
+                    .map_err(|e| unsupported(format!("invalid ss_network_args: {e}")))?;
+                if !value.is_object() {
+                    return Err(unsupported("ss_network_args must contain an object"));
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        let algo = args
+            .as_ref()
+            .and_then(|args| args.get("algo"))
+            .and_then(serde_json::Value::as_str);
+        if algo.is_some_and(|algo| !algo.eq_ignore_ascii_case("lora")) {
+            return Err(unsupported("ss_network_args.algo must name plain LoRA"));
+        }
+        if let Some(module) = section.get("ss_network_module") {
+            let plain = module.as_str().is_some_and(|module| {
+                matches!(module, "lora" | "networks.lora")
+                    || (module == "lycoris.kohya"
+                        && algo.is_some_and(|algo| algo.eq_ignore_ascii_case("lora")))
+            });
+            if !plain {
+                return Err(unsupported(
+                    "ss_network_module does not identify plain LoRA",
+                ));
+            }
+        }
+        for key in ["use_rslora", "use_dora", "fan_in_fan_out"] {
+            if let Some(value) = section.get(key) {
+                let enabled = value.as_bool().or_else(|| {
+                    match value.as_str()?.trim().to_ascii_lowercase().as_str() {
+                        "false" => Some(false),
+                        "true" => Some(true),
+                        _ => None,
+                    }
+                });
+                if enabled != Some(false) {
+                    return Err(unsupported(format!(
+                        "{key} is not supported; export plain additive LoRA"
+                    )));
+                }
+            }
+        }
+        for key in ["rank_pattern", "alpha_pattern"] {
+            if let Some(value) = section.get(key) {
+                let value = if let Some(text) = value.as_str() {
+                    serde_json::from_str(text)
+                        .map_err(|e| unsupported(format!("invalid {key}: {e}")))?
+                } else {
+                    value.clone()
+                };
+                if !value.is_null() && !value.as_object().is_some_and(|object| object.is_empty()) {
+                    return Err(unsupported(format!("per-target {key} is not supported; export a resolved global alpha/rank adapter")));
+                }
+            }
+        }
+        for key in ["lora_alpha", "alpha", "ss_network_alpha"] {
+            if let Some(value) = section.get(key) {
+                let value = value
+                    .as_f64()
+                    .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+                    .ok_or_else(|| unsupported(format!("{key} must be numeric")))?;
+                if !value.is_finite() || value <= 0.0 || alpha.is_some_and(|alpha| alpha != value) {
+                    return Err(unsupported(format!(
+                        "{key} must be finite, positive and consistent with every declared alpha"
+                    )));
+                }
+                alpha = Some(value);
+            }
+        }
+        for key in ["rank", "r", "ss_network_dim"] {
+            if let Some(value) = section.get(key) {
+                let rank = value
+                    .as_u64()
+                    .and_then(|rank| usize::try_from(rank).ok())
+                    .or_else(|| value.as_str()?.trim().parse::<usize>().ok())
+                    .filter(|rank| *rank > 0)
+                    .ok_or_else(|| unsupported(format!("{key} must be a positive integer")))?;
+                ranks.push(rank);
+            }
+        }
+    }
+    Ok((
+        alpha.ok_or_else(|| {
+            unsupported(
+                "explicit alpha/lora_alpha (native or PEFT metadata) is required; no rank fallback",
+            )
+        })?,
+        ranks,
+    ))
+}
+
 fn inspect_header(
     spec: &AdapterSpec,
     cfg: &DitConfig,
@@ -133,13 +264,7 @@ fn inspect_header(
             return Err(unsupported(format!("{key} must be {want:?}; got {}. Export identity metadata for the actual base checkpoint", meta[key])));
         }
     }
-    let alpha: f64 = meta["lora_alpha"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| unsupported("missing numeric lora_alpha metadata"))?;
-    if !alpha.is_finite() || alpha <= 0.0 {
-        return Err(unsupported("lora_alpha must be finite and positive"));
-    }
+    let (alpha, declared_ranks) = plain_metadata(meta)?;
     let object = header
         .as_object()
         .ok_or_else(|| unsupported("header must be an object"))?;
@@ -195,17 +320,11 @@ fn inspect_header(
         if a.len() != 2 || b.len() != 2 || a[0] == 0 || a[1] != input || b != [output, a[0]] {
             return Err(unsupported(format!("{target}: incompatible rank/shape A{a:?}, B{b:?}; expected [rank,{input}] and [{output},rank]")));
         }
-        if let Some(rank) = meta.get("rank") {
-            let declared = rank
-                .as_str()
-                .and_then(|rank| rank.parse::<usize>().ok())
-                .or_else(|| rank.as_u64().and_then(|rank| usize::try_from(rank).ok()));
-            if declared != Some(a[0]) {
-                return Err(unsupported(format!(
-                    "{target}: declared rank must match actual tensor rank {}",
-                    a[0]
-                )));
-            }
+        if declared_ranks.iter().any(|rank| *rank != a[0]) {
+            return Err(unsupported(format!(
+                "{target}: every declared rank must match actual tensor rank {}",
+                a[0]
+            )));
         }
         let scale = f64::from(spec.scale) * alpha / a[0] as f64;
         if !scale.is_finite() || !(scale as f32).is_finite() {
@@ -292,6 +411,79 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn plain_native_and_peft_metadata_never_silently_switch_scaling_algorithms() {
+        let spec = AdapterSpec::new("adapter.safetensors".into(), -0.25, AdapterKind::Lora);
+        let mut native = header();
+        native["__metadata__"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lora_alpha");
+        native["__metadata__"]["alpha"] = "6".into();
+        native["__metadata__"]["ss_network_module"] = "networks.lora".into();
+        assert_eq!(
+            inspect_header(&spec, &config(), &native).unwrap()[0].scale,
+            -0.75
+        );
+        let blob = serde_json::json!({"peft_type":"LORA", "r":2, "lora_alpha":6, "use_rslora":false, "use_dora":false, "fan_in_fan_out":false, "rank_pattern":{}, "alpha_pattern":{}});
+        let mut peft = header();
+        peft["__metadata__"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lora_alpha");
+        peft["__metadata__"]["lora_adapter_metadata"] = blob.to_string().into();
+        assert_eq!(
+            inspect_header(&spec, &config(), &peft).unwrap()[0].scale,
+            -0.75
+        );
+        for field in [
+            "use_rslora",
+            "use_dora",
+            "fan_in_fan_out",
+            "alpha_pattern",
+            "rank_pattern",
+        ] {
+            let mut changed = blob.clone();
+            changed[field] = if field.ends_with("pattern") {
+                serde_json::json!({"mode_blocks.image.1.attn.to_q":12})
+            } else {
+                true.into()
+            };
+            let mut h = header();
+            h["__metadata__"]["lora_adapter_metadata"] = changed.to_string().into();
+            assert!(
+                matches!(
+                    inspect_header(&spec, &config(), &h),
+                    Err(Error::Unsupported(_))
+                ),
+                "{field}"
+            );
+        }
+        for (key, value) in [("ss_network_module", "networks.lokr"), ("r", "3")] {
+            let mut h = header();
+            h["__metadata__"][key] = value.into();
+            assert!(
+                matches!(
+                    inspect_header(&spec, &config(), &h),
+                    Err(Error::Unsupported(_))
+                ),
+                "{key}"
+            );
+        }
+        let mut h = header();
+        h["__metadata__"]["networkType"] = "lokr".into();
+        assert!(matches!(
+            inspect_header(&spec, &config(), &h),
+            Err(Error::Unsupported(_))
+        ));
+        let mut h = header();
+        h["__metadata__"]["alpha"] = "12".into();
+        assert!(matches!(
+            inspect_header(&spec, &config(), &h),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
     #[test]
     fn incompatible_identity_rank_alpha_and_unconsumed_weights_fail_typed() {
         let spec = AdapterSpec::new("adapter.safetensors".into(), 0.3, AdapterKind::Lora);
