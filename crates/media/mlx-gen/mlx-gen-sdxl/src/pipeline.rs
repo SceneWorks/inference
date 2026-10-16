@@ -1353,7 +1353,8 @@ mod tests {
     /// The devices × dtypes the sequential-CFG identity is held on: the CPU at f32 (where a lone
     /// `[1, K]` GEMV and row 0 of the `[2, K]` GEMM differ in the last ulps) and the default
     /// device at f16 (Metal: `[1, K]` vs `[2, K]` and the 77- vs 154-row text-memory projections
-    /// pick different kernels, ~1e-3 of peak apart). Both differed before sc-26268's fix.
+    /// pick different kernels, ~1e-3 of peak apart). Both differed before sc-26268's fix (M5 Max:
+    /// 1.8e-6 and 3.2e-3 of peak; 0 and 0 after).
     fn cfg_identity_cells() -> [(bool, mlx_rs::Dtype); 2] {
         [
             (true, mlx_rs::Dtype::Float32),
@@ -1375,6 +1376,110 @@ mod tests {
         f()
     }
 
+    fn rel(a: &[u32], b: &[u32]) -> f32 {
+        let (a, b): (Vec<f32>, Vec<f32>) = (
+            a.iter().map(|v| f32::from_bits(*v)).collect(),
+            b.iter().map(|v| f32::from_bits(*v)).collect(),
+        );
+        let peak = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        a.iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+            / peak
+    }
+
+    /// Whether this backend computes every **latent-path** op of the tiny U-Net row-exactly
+    /// between a one-row and a two-row batch — each dense projection of its 4×4 (16-token)
+    /// attention level and each 3×3/1×1 convolution of its two levels, with random data at
+    /// `dtype`. It probes MLX itself, never the code under test, so a defect in the CFG split
+    /// cannot lower the bar it is held to. True for both cells on Apple M5; a CPU BLAS that blocks
+    /// by row count (hosted CI's M1) makes it false.
+    fn latent_path_is_row_exact(dtype: mlx_rs::Dtype) -> bool {
+        let rnd = |shape: &[i32], seed: u64| {
+            let key = random::key(seed).unwrap();
+            random::normal::<f32>(shape, None, None, Some(&key))
+                .unwrap()
+                .as_dtype(dtype)
+                .unwrap()
+        };
+        let pair_row0_matches = |one: Array, two: Array| {
+            let two = two.take_axis(Array::from_slice(&[0], &[1]), 0).unwrap();
+            bits(&one) == bits(&two)
+        };
+        let linears = [(64, 64), (64, 256), (256, 64)].into_iter().all(|(k, n)| {
+            let (x1, w) = (rnd(&[1, 16, k], 1), rnd(&[n, k], 2));
+            let x2 = concatenate_axis(&[&x1, &rnd(&[1, 16, k], 3)], 0).unwrap();
+            let wt = w.transpose().unwrap();
+            pair_row0_matches(
+                mlx_rs::ops::matmul(&x1, &wt).unwrap(),
+                mlx_rs::ops::matmul(&x2, &wt).unwrap(),
+            )
+        });
+        // (spatial, in, out, kernel, stride): conv_in/out, the resnets' 3×3s and 1×1 shortcuts
+        // over both levels' (skip-concatenated) widths, and the stride-2 downsampler.
+        let convs = [
+            (8, 4, 32, 3, 1),
+            (8, 32, 32, 3, 1),
+            (8, 32, 32, 3, 2),
+            (8, 32, 4, 3, 1),
+            (4, 32, 64, 3, 1),
+            (4, 64, 64, 3, 1),
+            (4, 128, 64, 3, 1),
+            (4, 96, 64, 3, 1),
+            (8, 96, 32, 3, 1),
+            (8, 64, 32, 3, 1),
+            (4, 32, 64, 1, 1),
+            (4, 128, 64, 1, 1),
+            (4, 96, 64, 1, 1),
+            (8, 96, 32, 1, 1),
+            (8, 64, 32, 1, 1),
+        ]
+        .into_iter()
+        .all(|(hw, cin, cout, k, stride)| {
+            let (x1, w) = (rnd(&[1, hw, hw, cin], 4), rnd(&[cout, k, k, cin], 5));
+            let x2 = concatenate_axis(&[&x1, &rnd(&[1, hw, hw, cin], 6)], 0).unwrap();
+            let pad = k / 2;
+            let conv = |x: &Array| {
+                mlx_rs::ops::conv2d(x, &w, (stride, stride), (pad, pad), None, None).unwrap()
+            };
+            pair_row0_matches(conv(&x1), conv(&x2))
+        });
+        linears && convs
+    }
+
+    /// The sequential-CFG identity check: **byte for byte** wherever the backend's latent path is
+    /// row-exact ([`latent_path_is_row_exact`] — both cells on Apple M5, which is where the pre-fix
+    /// code was measured RED). Elsewhere the latent GEMMs legitimately differ by row count (the
+    /// reassociation `CfgBatching` admits), so the halves are held to that class instead: 1e-5 of
+    /// peak at f32, 1e-2 at f16 — the backend then cannot tell a conditioning-path deviation from
+    /// its own reassociation, and the eprintln says so.
+    fn assert_cfg_identity(
+        label: &str,
+        dtype: mlx_rs::Dtype,
+        exact: bool,
+        batched: &[u32],
+        sequential: &[u32],
+    ) {
+        let delta = rel(batched, sequential);
+        if exact {
+            assert!(batched == sequential, "{label}: moved by {delta:.3e}");
+        } else {
+            let bound = if dtype == mlx_rs::Dtype::Float32 {
+                1e-5
+            } else {
+                1e-2
+            };
+            eprintln!(
+                "{label}: this backend's latent path is not row-exact; held to {bound:.0e} of peak \
+                 (measured {delta:.3e}) instead of byte identity"
+            );
+            assert!(
+                delta <= bound,
+                "{label}: moved by {delta:.3e} (bound {bound:.0e})"
+            );
+        }
+    }
+
     fn bits(a: &Array) -> Vec<u32> {
         let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
         a.eval().unwrap();
@@ -1382,7 +1487,6 @@ mod tests {
     }
 
     /// One guided step's pair under `batching`, with optional IP-Adapter tokens.
-    #[allow(clippy::type_complexity)]
     fn guided_pair_bits(
         unet: &UNet2DConditionModel,
         dtype: mlx_rs::Dtype,
@@ -1392,7 +1496,8 @@ mod tests {
         let (x, conditioning, pooled, time_ids) = guided_inputs();
         let at = |a: &Array| a.as_dtype(dtype).unwrap();
         let (x, conditioning, pooled) = (at(&x), at(&conditioning), at(&pooled));
-        let ip = ip_tokens.map(|t| (t, 0.7_f32));
+        let tokens = ip_tokens.cloned();
+        let ip = tokens.as_ref().map(|t| (t, 0.7_f32));
         let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(batching);
         let (text, neg) = guided_eps_pair(
             unet,
@@ -1428,11 +1533,13 @@ mod tests {
         for (cpu, dtype) in cfg_identity_cells() {
             on_device(cpu, || {
                 let unet = tiny_unet_at(dtype);
-                let (bt, bn) = guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Batched);
-                let (st, sn) =
-                    guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Sequential);
-                assert!(bt == st, "cpu={cpu} {dtype:?}: conditional half moved");
-                assert!(bn == sn, "cpu={cpu} {dtype:?}: unconditional half moved");
+                let exact = latent_path_is_row_exact(dtype);
+                let pair = |batching| guided_pair_bits(&unet, dtype, None, batching);
+                let (bt, bn) = pair(gen_core::CfgBatching::Batched);
+                let (st, sn) = pair(gen_core::CfgBatching::Sequential);
+                let label = |half: &str| format!("cpu={cpu} {dtype:?}: {half} half");
+                assert_cfg_identity(&label("conditional"), dtype, exact, &bt, &st);
+                assert_cfg_identity(&label("unconditional"), dtype, exact, &bn, &sn);
                 // Non-vacuity: the two halves genuinely differ, so a mode that returned one row
                 // twice (or swapped them) cannot pass the comparisons above.
                 assert!(
@@ -1483,21 +1590,24 @@ mod tests {
                     0,
                 )
                 .unwrap();
-                let batched =
-                    guided_pair_bits(&unet, dtype, Some(&tokens), gen_core::CfgBatching::Batched);
-                let sequential = guided_pair_bits(
-                    &unet,
+                let exact = latent_path_is_row_exact(dtype);
+                let pair = |batching| guided_pair_bits(&unet, dtype, Some(&tokens), batching);
+                let batched = pair(gen_core::CfgBatching::Batched);
+                let sequential = pair(gen_core::CfgBatching::Sequential);
+                let label = |half: &str| format!("cpu={cpu} {dtype:?}: IP {half} half");
+                assert_cfg_identity(
+                    &label("conditional"),
                     dtype,
-                    Some(&tokens),
-                    gen_core::CfgBatching::Sequential,
+                    exact,
+                    &batched.0,
+                    &sequential.0,
                 );
-                assert!(
-                    batched.0 == sequential.0,
-                    "cpu={cpu} {dtype:?}: IP conditional half"
-                );
-                assert!(
-                    batched.1 == sequential.1,
-                    "cpu={cpu} {dtype:?}: IP unconditional half"
+                assert_cfg_identity(
+                    &label("unconditional"),
+                    dtype,
+                    exact,
+                    &batched.1,
+                    &sequential.1,
                 );
                 // Non-vacuity: the IP branch is live (it moves the conditional half).
                 let plain = guided_pair_bits(&unet, dtype, None, gen_core::CfgBatching::Batched);
@@ -1543,7 +1653,9 @@ mod tests {
                 };
                 let batched = run(gen_core::CfgBatching::Batched);
                 let sequential = run(gen_core::CfgBatching::Sequential);
-                assert!(batched == sequential, "cpu={cpu} {dtype:?}: denoise moved");
+                let exact = latent_path_is_row_exact(dtype);
+                let label = format!("cpu={cpu} {dtype:?}: denoise");
+                assert_cfg_identity(&label, dtype, exact, &batched, &sequential);
             });
         }
     }
