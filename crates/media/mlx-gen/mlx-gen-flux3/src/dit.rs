@@ -469,7 +469,7 @@ impl Flux3Dit {
     pub fn timestep_embedding(&self, t: f32) -> Result<Array> {
         let t = Array::from_f32(t).as_dtype(self.compute)?;
         let scaled = t
-            .multiply(&Array::from_f32(1000.0).as_dtype(self.compute)?)?
+            .multiply(Array::from_f32(1000.0).as_dtype(self.compute)?)?
             .as_dtype(Dtype::Float32)?
             .reshape(&[1, 1])?;
         let freqs = timestep_freqs(TIMESTEP_EMBED_DIM, TIMESTEP_MAX_PERIOD);

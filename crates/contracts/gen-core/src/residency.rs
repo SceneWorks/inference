@@ -431,11 +431,50 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         materialize_before_text_drop: impl FnOnce(Option<&Encoded>) -> RuntimeResult<R, ()>,
         render: impl FnOnce(&Heavy, Encoded, &mut dyn FnMut(Progress)) -> RuntimeResult<R, Out>,
     ) -> RuntimeResult<R, Out> {
+        self.run_request_scoped_with_prepare(
+            stage_residency,
+            streamable,
+            cancel,
+            use_pid,
+            on_progress,
+            |_| Ok(()),
+            |text, ()| encode(text),
+            materialize_before_text_drop,
+            render,
+        )
+    }
+
+    /// Execute request preparation while holding the SAME exclusive lifecycle lock as encoding
+    /// and rendering. A staged request sheds any previous warm pair BEFORE preparation, so a
+    /// separate VLM cannot overlap the old resident image weights outside its admitted envelope.
+    /// Preparation runs before image components load, with cancellation checked on both sides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_request_scoped_with_prepare<Prepared, Encoded, Out>(
+        &self,
+        stage_residency: bool,
+        streamable: bool,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        prepare: impl FnOnce(&mut dyn FnMut(Progress)) -> RuntimeResult<R, Prepared>,
+        encode: impl FnOnce(&Text, Prepared) -> RuntimeResult<R, Encoded>,
+        materialize_before_text_drop: impl FnOnce(Option<&Encoded>) -> RuntimeResult<R, ()>,
+        render: impl FnOnce(&Heavy, Encoded, &mut dyn FnMut(Progress)) -> RuntimeResult<R, Out>,
+    ) -> RuntimeResult<R, Out> {
         check_cancel::<R>(cancel)?;
         if stage_residency || streamable {
             self.ensure_rebuildable("stage or rematerialize components")?;
         }
         let mut warm = self.warm()?;
+        if stage_residency {
+            if let Some(advisory) = &self.on_staged {
+                advisory();
+            }
+            Self::evict_warm_locked(&mut warm);
+        }
+        check_cancel::<R>(cancel)?;
+        let prepared = prepare(on_progress)?;
+        check_cancel::<R>(cancel)?;
         if !stage_residency {
             // A warm load puts BOTH components in memory before the prompt encode, which is why
             // this arm used to report `Loading(TextEncoder)` and `Loading(Renderer)` back to back
@@ -453,7 +492,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
-            let encoded = match encode(&pair.text) {
+            let encoded = match encode(&pair.text, prepared) {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     let _ = materialize_before_text_drop(None);
@@ -469,15 +508,11 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             return result;
         }
 
-        if let Some(advisory) = &self.on_staged {
-            advisory();
-        }
-        Self::evict_warm_locked(&mut warm);
         let result = run_two_phase::<R, _, _, _, _>(
             cancel,
             on_progress,
             || (self.loaders.load_text)(streamable, Some(cancel)),
-            encode,
+            |text| encode(text, prepared),
             materialize_before_text_drop,
             || (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)),
             render,
@@ -723,7 +758,209 @@ mod tests {
     }
     impl Drop for Witness {
         fn drop(&mut self) {
-            self.log.lock().unwrap().push(self.name);
+            // Keep a primary ordering assertion failure visible rather than aborting on a
+            // second panic from its poisoned test log while components unwind.
+            self.log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(self.name);
+        }
+    }
+
+    fn prepared_owner(log: &Arc<Mutex<Vec<&'static str>>>) -> Residency<Witness, Witness, Runtime> {
+        let text_log = Arc::clone(log);
+        let heavy_log = Arc::clone(log);
+        let owner = Residency::<Witness, Witness, Runtime>::request_scoped(
+            move |_| {
+                text_log.lock().unwrap().push("load-text");
+                Ok(Witness {
+                    name: "drop-text",
+                    log: Arc::clone(&text_log),
+                })
+            },
+            move |_, _| {
+                heavy_log.lock().unwrap().push("load-heavy");
+                Ok(Witness {
+                    name: "drop-heavy",
+                    log: Arc::clone(&heavy_log),
+                })
+            },
+        );
+        owner
+            .run_request_scoped(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_| Ok(()),
+                |_| Ok(()),
+                |_, (), _| Ok(()),
+            )
+            .unwrap();
+        log.lock().unwrap().clear();
+        owner
+    }
+
+    #[test]
+    fn prepared_staged_request_evicts_warm_before_vlm_and_holds_the_lifecycle_lock() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_owner(&log);
+        let output = owner
+            .run_request_scoped_with_prepare(
+                true,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_| {
+                    assert_eq!(log.lock().unwrap().clone(), vec!["drop-text", "drop-heavy"]);
+                    assert!(matches!(
+                        owner.warm.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    log.lock().unwrap().push("pup");
+                    Ok(17_u32)
+                },
+                |_, prepared| {
+                    assert_eq!(prepared, 17);
+                    log.lock().unwrap().push("encode");
+                    Ok(prepared)
+                },
+                |_| {
+                    log.lock().unwrap().push("materialize");
+                    Ok(())
+                },
+                |_, encoded, _| {
+                    log.lock().unwrap().push("render");
+                    Ok(encoded)
+                },
+            )
+            .unwrap();
+        assert_eq!(output, 17);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                "drop-text",
+                "drop-heavy",
+                "pup",
+                "load-text",
+                "encode",
+                "materialize",
+                "drop-text",
+                "load-heavy",
+                "render",
+                "drop-heavy",
+            ]
+        );
+        assert!(owner.with_resident_parts(|_, _| ()).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_resident_request_keeps_warm_parts_and_prepares_before_encoding() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_owner(&log);
+        owner
+            .run_request_scoped_with_prepare(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_| {
+                    assert!(log.lock().unwrap().is_empty());
+                    log.lock().unwrap().push("pup");
+                    Ok(())
+                },
+                |_, ()| {
+                    log.lock().unwrap().push("encode");
+                    Ok(())
+                },
+                |_| panic!("resident path does not materialize a staged encoder"),
+                |_, (), _| {
+                    log.lock().unwrap().push("render");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(log.lock().unwrap().clone(), vec!["pup", "encode", "render"]);
+        assert!(owner.with_resident_parts(|_, _| ()).unwrap().is_some());
+    }
+
+    #[test]
+    fn prepared_request_preserves_primary_error_and_releases_its_lock() {
+        for stage in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let owner = prepared_owner(&log);
+            let result: crate::Result<()> = owner.run_request_scoped_with_prepare(
+                stage,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_| {
+                    log.lock().unwrap().push("pup-error");
+                    Err::<(), _>(Error::Msg("primary preparation error".into()))
+                },
+                |_, ()| panic!("no image encode after failed preparation"),
+                |_| Err(Error::Msg("secondary materialization error".into())),
+                |_, (), _| panic!("no image render after failed preparation"),
+            );
+            assert!(
+                matches!(result, Err(Error::Msg(ref message)) if message == "primary preparation error")
+            );
+            let expected = if stage {
+                vec!["drop-text", "drop-heavy", "pup-error"]
+            } else {
+                vec!["pup-error"]
+            };
+            assert_eq!(log.lock().unwrap().clone(), expected);
+            assert_eq!(
+                owner.with_resident_parts(|_, _| ()).unwrap().is_some(),
+                !stage
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_request_checks_cancellation_before_and_after_vlm_without_image_work() {
+        for stage in [false, true] {
+            for cancel_before in [false, true] {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let owner = prepared_owner(&log);
+                let cancel = CancelFlag::new();
+                if cancel_before {
+                    cancel.cancel();
+                }
+                let result: crate::Result<()> = owner.run_request_scoped_with_prepare(
+                    stage,
+                    false,
+                    &cancel,
+                    false,
+                    &mut |_| {},
+                    |_| {
+                        log.lock().unwrap().push("pup-cancel");
+                        cancel.cancel();
+                        Ok(())
+                    },
+                    |_, ()| panic!("no image encode after cancellation"),
+                    |_| panic!("no materialization after cancellation before image load"),
+                    |_, (), _| panic!("no image render after cancellation"),
+                );
+                assert!(matches!(result, Err(Error::Canceled)));
+                let expected = if cancel_before {
+                    vec![]
+                } else if stage {
+                    vec!["drop-text", "drop-heavy", "pup-cancel"]
+                } else {
+                    vec!["pup-cancel"]
+                };
+                assert_eq!(log.lock().unwrap().clone(), expected);
+                assert_eq!(
+                    owner.with_resident_parts(|_, _| ()).unwrap().is_some(),
+                    cancel_before || !stage
+                );
+            }
         }
     }
 

@@ -103,6 +103,7 @@ pub struct Flux3Klein {
     descriptor: ModelDescriptor,
     adapter_reports: Vec<gen_core::AdapterApplyReport>,
     config: Flux3Config,
+    device: Device,
     residency: Residency<Flux3TextEncoder, Heavy>,
     prompt_upsampler: Option<crate::pup::Flux3PromptUpsampler>,
     /// The spec this generator was loaded from: the tier and residency policy the shared
@@ -259,11 +260,66 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
             descriptor()
         },
         config,
+        device,
         residency,
         prompt_upsampler,
         spec: spec.clone(),
         memory_strategy,
     })
+}
+
+/// The residency driver also calls this boundary with `None` after an encoding error. Do not
+/// condition synchronization on a successful encoding: queued work must finish before text drops.
+fn encoder_materialization_boundary<T>(
+    synchronize: impl FnOnce() -> Result<()>,
+) -> impl FnOnce(Option<&T>) -> Result<()> {
+    move |_| synchronize()
+}
+
+/// Every decode is a cancellation boundary, including the last one before results can escape.
+fn decode_batch<T, Out>(
+    tokens: &[T],
+    cancel: &gen_core::CancelFlag,
+    mut decode: impl FnMut(&T) -> Result<Out>,
+) -> Result<Vec<Out>> {
+    let mut images = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        candle_gen::residency::check_cancel(cancel)?;
+        images.push(decode(token)?);
+    }
+    candle_gen::residency::check_cancel(cancel)?;
+    Ok(images)
+}
+
+fn checked_completion<T>(cancel: &gen_core::CancelFlag, value: T) -> Result<T> {
+    candle_gen::residency::check_cancel(cancel)?;
+    Ok(value)
+}
+
+/// Fixed-flags Candle image adapter to the shared prepared-request driver. This forwards phase
+/// ordering/locking/eviction to gen-core; the seam lets CPU witnesses exercise the production call.
+#[allow(clippy::too_many_arguments)]
+fn prepared_image_request<Text, HeavyPhase, Prepared, Encoded, Out>(
+    residency: &Residency<Text, HeavyPhase>,
+    stage: bool,
+    cancel: &gen_core::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    prepare: impl FnOnce(&mut dyn FnMut(Progress)) -> Result<Prepared>,
+    encode: impl FnOnce(&Text, Prepared) -> Result<Encoded>,
+    materialize: impl FnOnce(Option<&Encoded>) -> Result<()>,
+    render: impl FnOnce(&HeavyPhase, Encoded, &mut dyn FnMut(Progress)) -> Result<Out>,
+) -> Result<Out> {
+    residency.run_request_scoped_with_prepare(
+        stage,
+        false,
+        cancel,
+        false,
+        on_progress,
+        prepare,
+        encode,
+        materialize,
+        render,
+    )
 }
 
 impl Flux3Klein {
@@ -273,35 +329,43 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        // Upsampling precedes BOTH caption-derived seeding and the text encoder, never decoding.
-        let outcome =
-            crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
-        let mut effective = req.clone();
-        effective.prompt = outcome.caption;
-        let req = &effective;
-        // Upstream `generate.py`: an unseeded request is seeded from its effective caption.
-        let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
-        let total = params.steps * req.count;
-        let images = self.residency.run_request_scoped(
+        let images = prepared_image_request(
+            &self.residency,
             stage_residency_for(&self.spec, req),
-            false,
             &req.cancel,
-            false,
             on_progress,
-            |te: &Flux3TextEncoder| -> Result<(TextConditioning, Option<TextConditioning>)> {
-                Ok((
-                    te.encode(&params.prompt)?,
-                    if params.guidance.is_some() {
-                        Some(te.encode(&params.negative_prompt)?)
-                    } else {
-                        None
-                    },
-                ))
+            |on_progress| -> Result<GenerationParams> {
+                // Staged warm components are evicted under the exclusive lifecycle BEFORE PUP.
+                let outcome =
+                    crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
+                let mut effective = req.clone();
+                effective.prompt = outcome.caption;
+                Ok(GenerationParams::resolve(
+                    &effective,
+                    prompt_seed(&effective.prompt),
+                    &self.config,
+                )?)
             },
-            |_| Ok(()),
+            |te: &Flux3TextEncoder,
+             params: GenerationParams|
+             -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
+                let text = te.encode(&params.prompt)?;
+                let negative = if params.guidance.is_some() {
+                    Some(te.encode(&params.negative_prompt)?)
+                } else {
+                    None
+                };
+                Ok((text, negative, params))
+            },
+            encoder_materialization_boundary(|| Ok(self.device.synchronize()?)),
             |heavy: &Heavy,
-             (text, negative): (TextConditioning, Option<TextConditioning>),
+             (text, negative, params): (
+                TextConditioning,
+                Option<TextConditioning>,
+                GenerationParams,
+            ),
              on_progress| {
+                let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
                 let mut tokens = Vec::with_capacity(req.count as usize);
@@ -328,19 +392,18 @@ impl Flux3Klein {
                     return Err(Error::Canceled);
                 }
                 let (h, w) = params.latent_shape()?;
-                let mut images = Vec::with_capacity(tokens.len());
-                for t in &tokens {
-                    images.push(decode_tokens(&heavy.ae, t, h, w)?);
-                }
-                Ok(images)
+                decode_batch(&tokens, &req.cancel, |t| decode_tokens(&heavy.ae, t, h, w))
             },
         )?;
-        Ok(GenerationReport {
-            output: Some(GenerationOutput::Images(images)),
-            artifacts: None,
-            warnings: Vec::new(),
-            prefix_kv_cache: None,
-        })
+        checked_completion(
+            &req.cancel,
+            GenerationReport {
+                output: Some(GenerationOutput::Images(images)),
+                artifacts: None,
+                warnings: Vec::new(),
+                prefix_kv_cache: None,
+            },
+        )
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -448,6 +511,242 @@ candle_gen::register_generators! {
 mod tests {
     use super::*;
     use candle_gen::gen_core::WeightsSource;
+
+    #[test]
+    fn candle_prepare_driver_evicts_before_pup_once_and_observes_prepare_cancellation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        struct Component {
+            kind: &'static str,
+            id: usize,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        impl Drop for Component {
+            fn drop(&mut self) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("drop-{}-{}", self.kind, self.id));
+            }
+        }
+        for stage in [true, false] {
+            for cancel_prepare in [false, true] {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let text_count = Arc::new(AtomicUsize::new(0));
+                let heavy_count = Arc::new(AtomicUsize::new(0));
+                let te = events.clone();
+                let tc = text_count.clone();
+                let he = events.clone();
+                let hc = heavy_count.clone();
+                let advisory = events.clone();
+                let residency = Residency::from_policy(
+                    gen_core::OffloadPolicy::Resident,
+                    move || {
+                        let id = tc.fetch_add(1, Ordering::SeqCst);
+                        te.lock().unwrap().push(format!("load-text-{id}"));
+                        Ok(Component {
+                            kind: "text",
+                            id,
+                            events: te.clone(),
+                        })
+                    },
+                    move |_| {
+                        let id = hc.fetch_add(1, Ordering::SeqCst);
+                        he.lock().unwrap().push(format!("load-heavy-{id}"));
+                        Ok(Component {
+                            kind: "heavy",
+                            id,
+                            events: he.clone(),
+                        })
+                    },
+                )
+                .unwrap()
+                .with_staged_advisory(move || advisory.lock().unwrap().push("stage".into()));
+                events.lock().unwrap().clear(); // The old resident pair is already warm.
+                let cancel = gen_core::CancelFlag::new();
+                let result = prepared_image_request(
+                    &residency,
+                    stage,
+                    &cancel,
+                    &mut |_| {},
+                    |_| {
+                        events.lock().unwrap().push("pup".into());
+                        if cancel_prepare {
+                            cancel.cancel();
+                        }
+                        Ok(17)
+                    },
+                    |_: &Component, prepared| {
+                        events.lock().unwrap().push("encode".into());
+                        Ok(prepared)
+                    },
+                    encoder_materialization_boundary(|| {
+                        events.lock().unwrap().push("sync".into());
+                        Ok(())
+                    }),
+                    |_: &Component, encoded, _| {
+                        events.lock().unwrap().push("render".into());
+                        Ok(encoded)
+                    },
+                );
+                let seen = events.lock().unwrap().clone();
+                let pup = seen.iter().position(|s| s == "pup").unwrap();
+                assert_eq!(
+                    seen.iter().filter(|s| s.as_str() == "stage").count(),
+                    usize::from(stage)
+                );
+                for component in ["text", "heavy"] {
+                    let old_drop = format!("drop-{component}-0");
+                    assert_eq!(
+                        seen.iter().filter(|s| **s == old_drop).count(),
+                        usize::from(stage)
+                    );
+                    if stage {
+                        assert!(
+                            seen.iter().position(|s| *s == old_drop).unwrap() < pup,
+                            "{seen:?}"
+                        );
+                    }
+                }
+                if cancel_prepare {
+                    assert!(matches!(result, Err(Error::Canceled)));
+                    assert!(
+                        !seen
+                            .iter()
+                            .any(|s| s == "encode" || s == "render" || s.starts_with("load-")),
+                        "{seen:?}"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 17);
+                    assert!(pup < seen.iter().position(|s| s == "encode").unwrap());
+                    if stage {
+                        assert_eq!(text_count.load(Ordering::SeqCst), 2);
+                        assert_eq!(heavy_count.load(Ordering::SeqCst), 2);
+                        assert_eq!(
+                            seen.iter().filter(|s| s.as_str() == "drop-text-1").count(),
+                            1
+                        );
+                        assert_eq!(
+                            seen.iter().filter(|s| s.as_str() == "drop-heavy-1").count(),
+                            1
+                        );
+                    } else {
+                        assert_eq!(text_count.load(Ordering::SeqCst), 1);
+                        assert_eq!(heavy_count.load(Ordering::SeqCst), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_during_decode_stops_the_batch_and_withholds_the_last_result() {
+        for count in [1, 8] {
+            let cancel = gen_core::CancelFlag::new();
+            let mut entered = 0;
+            let tokens = vec![17; count];
+            let result = decode_batch(&tokens, &cancel, |token| {
+                entered += 1; // The decoder has begun, not merely the denoise/progress phase.
+                cancel.cancel();
+                Ok(*token)
+            });
+            assert!(matches!(result, Err(Error::Canceled)));
+            assert_eq!(
+                entered, 1,
+                "do not decode the remaining images after cancellation"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_decode_completion_still_prevents_publication() {
+        let cancel = gen_core::CancelFlag::new();
+        let images = decode_batch(&[17, 23], &cancel, |token| Ok(*token)).unwrap();
+        assert_eq!(images, [17, 23]);
+        cancel.cancel();
+        assert!(matches!(
+            checked_completion(&cancel, images),
+            Err(Error::Canceled)
+        ));
+    }
+
+    #[test]
+    fn encoder_boundary_syncs_before_drop_on_success_and_error_preserving_primary_error() {
+        use std::sync::{Arc, Mutex};
+        struct Text(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Text {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("text-drop");
+            }
+        }
+        for (encode_fails, sync_fails) in
+            [(false, false), (true, false), (true, true), (false, true)]
+        {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let load_events = events.clone();
+            let heavy_events = events.clone();
+            let residency = Residency::from_policy(
+                gen_core::OffloadPolicy::Sequential,
+                move || {
+                    load_events.lock().unwrap().push("text-load");
+                    Ok(Text(load_events.clone()))
+                },
+                move |_| {
+                    heavy_events.lock().unwrap().push("heavy-load");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let result = residency.run_request_scoped(
+                true,
+                false,
+                &gen_core::CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_: &Text| {
+                    events.lock().unwrap().push("encode");
+                    if encode_fails {
+                        Err(Error::Msg("primary-encoding-error".into()))
+                    } else {
+                        Ok(17)
+                    }
+                },
+                encoder_materialization_boundary(|| {
+                    events.lock().unwrap().push("synchronize");
+                    if sync_fails {
+                        Err(Error::Msg("synchronization-error".into()))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                |_: &(), encoded, _| {
+                    events.lock().unwrap().push("render");
+                    Ok(encoded)
+                },
+            );
+            let seen = events.lock().unwrap();
+            assert_eq!(
+                &seen[..4],
+                &["text-load", "encode", "synchronize", "text-drop"]
+            );
+            if encode_fails {
+                assert!(
+                    matches!(result, Err(Error::Msg(ref message)) if message == "primary-encoding-error")
+                );
+                assert_eq!(seen.len(), 4);
+            } else if sync_fails {
+                assert!(
+                    matches!(result, Err(Error::Msg(ref message)) if message == "synchronization-error")
+                );
+                assert_eq!(seen.len(), 4);
+            } else {
+                assert_eq!(result.unwrap(), 17);
+                assert_eq!(&seen[4..], &["heavy-load", "render"]);
+            }
+        }
+    }
 
     #[test]
     fn descriptor_is_a_flow_map_and_honest() {

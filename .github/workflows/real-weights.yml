@@ -5931,6 +5931,8 @@ jobs:
       FLUX3_PACKAGE_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein/snapshots/8454017f9ebaada30c998fccd9f67a80c7580f68
       # sc-26238: the separate prompt-upsampler package (ungated, Apache-2.0), one ignored case.
       FLUX3_PUP_DIR: ${{ vars.MLX_GEN_MODELS_ROOT }}/models--black-forest-labs--flux-3-image-klein-pup/snapshots/8b069751eb5dcab23829d9c5eccb470eb8b8a4ed
+      # The release geometry, fixed: `workflow_dispatch` is capped at 25 inputs and this file sits at
+      # 24, so the render takes no dispatch inputs (the scripts still validate these values).
       FLUX3_REAL_SIZE: "1024"
       FLUX3_REAL_STEPS: "16"
     steps:

@@ -300,40 +300,50 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        // sc-26238: the prompt-upsampling stage runs first (identity when `enhance_prompt` is
-        // off) and the caption it returns is what the encoder reads and what seeds an unseeded
-        // request — upstream `generate.py` seeds from the upsampled caption, not the input.
-        let caption = crate::pup::effective_prompt(
-            self.upsampler.as_ref(),
-            req,
-            &crate::pup::text_input(req),
-            on_progress,
-        )?
-        .caption;
-        let mut req = req.clone();
-        req.prompt = caption;
-        let req = &req;
-        // Upstream `generate.py`: an unseeded request is seeded from its caption.
-        let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
-        let total = params.steps * req.count;
-        let images = self.residency.run_request_scoped(
+        // Preparation belongs to the exclusive request lifecycle. In particular a staged
+        // request must evict a reused resident pair before the optional VLM runs.
+        let images = self.residency.run_request_scoped_with_prepare(
             stage_residency_for(&self.spec, req),
             false,
             &req.cancel,
             false,
             on_progress,
-            |te: &Flux3TextEncoder| -> Result<(TextConditioning, Option<TextConditioning>)> {
-                Ok((
-                    te.encode(&params.prompt)?,
-                    if params.guidance.is_some() {
-                        Some(te.encode(&params.negative_prompt)?)
-                    } else {
-                        None
-                    },
-                ))
+            |on_progress| -> Result<GenerationParams> {
+                let caption = crate::pup::effective_prompt(
+                    self.upsampler.as_ref(),
+                    req,
+                    &crate::pup::text_input(req),
+                    on_progress,
+                )?
+                .caption;
+                let mut effective = req.clone();
+                effective.prompt = caption;
+                Ok(GenerationParams::resolve(
+                    &effective,
+                    prompt_seed(&effective.prompt),
+                    &self.config,
+                )?)
+            },
+            |te: &Flux3TextEncoder,
+             params: GenerationParams|
+             -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
+                let text = te.encode(&params.prompt)?;
+                let negative = if params.guidance.is_some() {
+                    Some(te.encode(&params.negative_prompt)?)
+                } else {
+                    None
+                };
+                Ok((text, negative, params))
             },
             |_| Ok(()),
-            |heavy: &Heavy, (text, negative), on_progress| {
+            |heavy: &Heavy,
+             (text, negative, params): (
+                TextConditioning,
+                Option<TextConditioning>,
+                GenerationParams,
+            ),
+             on_progress| {
+                let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
                 let mut tokens = Vec::with_capacity(req.count as usize);

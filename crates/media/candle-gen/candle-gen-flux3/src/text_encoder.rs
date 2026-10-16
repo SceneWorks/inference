@@ -121,6 +121,21 @@ pub fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Cast each floating checkpoint tensor on the host before the upload boundary. Keeping an
+/// F32 device map beside the constructed BF16 tower would exceed the header-priced load shape.
+fn upload_text_weight(
+    tensor: Tensor,
+    dtype: DType,
+    upload: impl FnOnce(Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let tensor = if tensor.dtype().is_float() {
+        tensor.to_dtype(dtype)?
+    } else {
+        tensor
+    };
+    upload(tensor)
+}
+
 impl Flux3TextEncoder {
     /// Load from the Qwen3-VL snapshot directory under the package's `text_encoder` section, onto
     /// `device`. Only the language tower's tensors reach the device; the vision tower
@@ -175,7 +190,10 @@ impl Flux3TextEncoder {
                 if key.starts_with("model.visual.") {
                     continue;
                 }
-                tensors.insert(key, tensor.to_device(device)?);
+                tensors.insert(
+                    key,
+                    upload_text_weight(tensor, dtype, |tensor| Ok(tensor.to_device(device)?))?,
+                );
             }
         }
         let weights = LlmWeights::from_map(tensors, device.clone());
@@ -282,5 +300,61 @@ impl Flux3TextEncoder {
             ids: text_ids(n),
             window,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f32_stored_weights_are_bf16_before_the_upload_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f32-stored.safetensors");
+        let source =
+            Tensor::from_vec(vec![1.00391_f32, -0.001, 2.125], (3,), &Device::Cpu).unwrap();
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([("weight".to_owned(), source.clone())]),
+            &file,
+        )
+        .unwrap();
+        let mut stored = candle_gen::candle_core::safetensors::load(&file, &Device::Cpu).unwrap();
+        let input = stored.remove("weight").unwrap();
+        assert_eq!(input.dtype(), DType::F32);
+        let output = upload_text_weight(input, DType::BF16, |staged| {
+            assert!(
+                staged.device().is_cpu(),
+                "conversion must occur while still host-resident"
+            );
+            assert_eq!(
+                staged.dtype(),
+                DType::BF16,
+                "no full F32 map may cross the upload boundary"
+            );
+            assert_eq!(staged.elem_count() * staged.dtype().size_in_bytes(), 6);
+            Ok(staged)
+        })
+        .unwrap();
+        assert_eq!(
+            output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            source
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        let integer = Tensor::from_vec(vec![2_u32, 129], (2,), &Device::Cpu).unwrap();
+        let integer = upload_text_weight(integer, DType::BF16, |staged| {
+            assert_eq!(staged.dtype(), DType::U32);
+            Ok(staged)
+        })
+        .unwrap();
+        assert_eq!(integer.to_vec1::<u32>().unwrap(), [2, 129]);
     }
 }
