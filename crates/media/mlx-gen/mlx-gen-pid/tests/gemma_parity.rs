@@ -29,6 +29,7 @@ fn tiny_cfg() -> Gemma2Config {
 
 #[test]
 fn gemma2_decoder_matches() {
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     let w = Weights::from_file(format!("{dir}/gemma2_tiny.safetensors")).unwrap();
 

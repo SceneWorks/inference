@@ -20,7 +20,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
-use mlx_gen::nn::gelu_tanh;
+use mlx_gen::nn::{gelu_tanh, TokenEmbedding};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -62,7 +62,7 @@ fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
     // Gemma-2 (the SANA Q4/Q8 tier — `{base}.scales` present) loads its projections packed, while a
     // dense Gemma-2 (every PiD decoder — no `.scales`) loads dense EXACTLY as before (bit-identical
     // `AdaptableLinear::dense`). Callers pass the full `{base}.weight` key; Gemma-2 Linears are
-    // bias-free. `embed_tokens` is NOT routed here — it stays dense in every tier.
+    // bias-free. `embed_tokens` uses the shared packed embedding loader below.
     let base = key.strip_suffix(".weight").unwrap_or(key);
     mlx_gen::quant::lin(w, base, false, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
@@ -260,9 +260,37 @@ impl Layer {
     }
 }
 
+/// Validate the exact affine embedding layout before constructing any gather graph.
+fn gemma_embedding(w: &Weights, base: &str, hidden: i32) -> Result<TokenEmbedding> {
+    let weight = w.require(&format!("{base}.weight"))?;
+    let scales = w.get(&format!("{base}.scales"));
+    let biases = w.get(&format!("{base}.biases"));
+    let valid = if let Some(scales) = scales {
+        let _bits =
+            mlx_gen::quant::packed_bits(weight, scales, mlx_gen::quant::DEFAULT_GROUP_SIZE)?;
+        biases.is_some_and(|biases| {
+            biases.shape() == scales.shape() && biases.dtype() == scales.dtype()
+        }) && scales.shape()[1] * mlx_gen::quant::DEFAULT_GROUP_SIZE == hidden
+    } else {
+        biases.is_none()
+            && weight.shape().len() == 2
+            && weight.shape()[1] == hidden
+            && matches!(
+                weight.dtype(),
+                Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+            )
+    };
+    if !valid {
+        return Err(mlx_gen::Error::Msg(format!(
+            "Gemma-2: invalid dense/packed embedding layout at {base} (hidden {hidden})"
+        )));
+    }
+    mlx_gen::quant::embedding(w, base, mlx_gen::quant::DEFAULT_GROUP_SIZE)
+}
+
 /// The Gemma-2 decoder (caption encoder).
 pub struct Gemma2 {
-    embed: Array, // [vocab, hidden]
+    embed: TokenEmbedding, // dense [vocab, hidden] or packed affine Q4/Q8
     layers: Vec<Layer>,
     norm: Array,
     cfg: Gemma2Config,
@@ -279,7 +307,7 @@ impl Gemma2 {
             &scalar(1.0).as_dtype(w.require(&format!("{prefix}norm.weight"))?.dtype())?,
         )?;
         Ok(Self {
-            embed: w.require(&format!("{prefix}embed_tokens.weight"))?.clone(),
+            embed: gemma_embedding(w, &format!("{prefix}embed_tokens"), cfg.hidden_size)?,
             layers,
             norm,
             cfg: cfg.clone(),
@@ -295,7 +323,17 @@ impl Gemma2 {
 
         // embed + √hidden scale (cast to embedding dtype, per the reference)
         let flat = ids.reshape(&[b * l])?;
-        let emb = self.embed.take_axis(&flat, 0)?.reshape(&[b, l, hidden])?;
+        // TokenEmbedding gathers packed rows BEFORE dequantizing, never the full vocabulary.
+        // Its common forward returns f32; Gemma must retain the stored embedding dtype.
+        let dtype = match &self.embed {
+            TokenEmbedding::Dense(w) => w.dtype(),
+            TokenEmbedding::Quantized { scales, .. } => scales.dtype(),
+        };
+        let emb = self
+            .embed
+            .forward(&flat)?
+            .as_dtype(dtype)?
+            .reshape(&[b, l, hidden])?;
         let normalizer = scalar((hidden as f32).sqrt()).as_dtype(emb.dtype())?;
         let mut x = multiply(&emb, &normalizer)?;
 
@@ -329,6 +367,101 @@ fn causal_mask(b: i32, l: i32, pad_mask: Option<&Array>) -> Result<Array> {
             let one = scalar(1.0);
             let key_add = multiply(&mlx_rs::ops::subtract(&one, &pad)?, scalar(neg))?;
             Ok(add(&causal, &key_add)?)
+        }
+    }
+}
+
+#[cfg(test)]
+mod embedding_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn malformed_packed_embeddings_fail_at_load_not_gather() {
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        for bits in [4, 8] {
+            let source = Array::from_slice(&[0.25f32; 3 * 128], &[3, 128]);
+            let (codes, scales, biases) = mlx_rs::ops::quantize(&source, 64, bits).unwrap();
+            let valid = HashMap::from([
+                ("e.weight".into(), codes),
+                ("e.scales".into(), scales.clone()),
+                ("e.biases".into(), biases),
+            ]);
+            assert!(gemma_embedding(&Weights::from_map(valid.clone()), "e", 128).is_ok());
+            for missing in ["e.scales", "e.biases", "e.weight"] {
+                let mut bad = valid.clone();
+                bad.remove(missing);
+                assert!(
+                    gemma_embedding(&Weights::from_map(bad), "e", 128).is_err(),
+                    "q{bits}: missing {missing}"
+                );
+            }
+            let mut bad = valid.clone();
+            bad.insert("e.biases".into(), Array::from_slice(&[0.0f32; 3], &[3, 1]));
+            assert!(gemma_embedding(&Weights::from_map(bad), "e", 128).is_err());
+            let mut bad = valid.clone();
+            bad.insert("e.biases".into(), scales.as_dtype(Dtype::Int32).unwrap());
+            assert!(gemma_embedding(&Weights::from_map(bad), "e", 128).is_err());
+            assert!(gemma_embedding(&Weights::from_map(valid), "e", 64).is_err());
+        }
+    }
+
+    // No real weights and no GPU: isolate the embedding + Gemma normalization from attention.
+    #[test]
+    fn packed_embedding_matches_dequantized_rows_in_native_dtype() {
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        for prefix in ["", "model."] {
+            for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+                for bits in [4, 8] {
+                    let source = Array::from_slice(
+                        &(0..7 * 128)
+                            .map(|i| (i as f32 * 0.13).sin())
+                            .collect::<Vec<_>>(),
+                        &[7, 128],
+                    )
+                    .as_dtype(dtype)
+                    .unwrap();
+                    let (codes, scales, biases) = mlx_rs::ops::quantize(&source, 64, bits).unwrap();
+                    let dense =
+                        mlx_rs::ops::dequantize(&codes, &scales, &biases, 64, bits).unwrap();
+                    let cfg = Gemma2Config {
+                        hidden_size: 128,
+                        num_layers: 0,
+                        ..Gemma2Config::gemma_2_2b()
+                    };
+                    let norm = Array::from_slice(&[0.0f32; 128], &[128])
+                        .as_dtype(dtype)
+                        .unwrap();
+                    let mut packed = HashMap::from([
+                        (format!("{prefix}embed_tokens.weight"), codes),
+                        (format!("{prefix}embed_tokens.scales"), scales),
+                        (format!("{prefix}embed_tokens.biases"), biases),
+                        (format!("{prefix}norm.weight"), norm.clone()),
+                    ]);
+                    let model =
+                        Gemma2::from_weights(&Weights::from_map(packed.clone()), prefix, &cfg)
+                            .unwrap();
+                    packed.remove(&format!("{prefix}embed_tokens.scales"));
+                    packed.remove(&format!("{prefix}embed_tokens.biases"));
+                    packed.insert(format!("{prefix}embed_tokens.weight"), dense);
+                    let reference =
+                        Gemma2::from_weights(&Weights::from_map(packed), prefix, &cfg).unwrap();
+                    // Repeated and out-of-order IDs across batches catch row/gather mistakes.
+                    let ids = Array::from_slice(&[6i32, 0, 2, 2, 5, 1], &[2, 3]);
+                    let got = model.forward(&ids, None).unwrap();
+                    let expected = reference.forward(&ids, None).unwrap();
+                    assert_eq!(got.shape(), &[2, 3, 128]);
+                    assert_eq!(got.dtype(), dtype);
+                    let delta = mlx_rs::ops::subtract(&got, &expected)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap()
+                        .item::<f32>();
+                    assert!(delta < 1e-6, "q{bits} {dtype:?} {prefix:?}: {delta}");
+                }
+            }
         }
     }
 }

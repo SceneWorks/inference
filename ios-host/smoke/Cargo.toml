@@ -1,0 +1,60 @@
+[package]
+name = "ios-smoke"
+version = "0.0.0"
+edition = "2021"
+description = "On-device MLX smoke test: proves the bundled metallib resolves and its kernels compute correctly on iOS."
+license = "Apache-2.0"
+publish = false
+
+# Deliberately NOT a workspace member (the root manifest excludes it, and check-workspace.py ignores
+# `ios-host/`). This is host-app scaffolding for the device harness (epic 16774, sc-16780), not part
+# of the shipped runtime graph. mlx-rs is pinned to the SAME rev as the workspace's
+# `[workspace.dependencies] mlx-rs`; bump both together.
+
+# Its own workspace root, so cargo never adopts it into an enclosing checkout (an agent worktree is
+# nested inside the main clone, whose root manifest does not list it).
+[workspace]
+
+[lib]
+# staticlib for linking into the .app; rlib so `cargo test` can exercise the same code on macOS.
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
+# E3/E4 ship, and so a media compile break can never block the text lane's device runs.
+media = ["runtime-ios/media", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
+# E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
+# `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA and Anima Turbo) and widening it is an
+# architectural decision, not a way to run an experiment. This crate is excluded from the workspace,
+# so a dep here reaches neither `EXPECTED_MEMBER_COUNT` nor the catalog's ordered surface test.
+# If z-image earns a place on iOS, THAT is when the catalog changes.
+zimage = ["dep:mlx-gen-z-image", "dep:mlx-gen", "dep:image"]
+
+[dependencies]
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "fe22998bf73e5e785d7659beb2f24d624b785bda" }
+# Deliberately the BUNDLE, not mlx-llm directly: the point of an on-device test is to exercise the
+# composition a product actually consumes (registry, capability descriptor, provider selection),
+# not just the engine underneath it.
+runtime-ios = { path = "../../crates/bundles/runtime-ios" }
+# The backend-neutral conformance suite (S3.5). Running the SAME suite the macOS lane runs is the
+# point: it makes "conformant on iOS" mean exactly what it means on every other platform, rather
+# than whatever a bespoke on-device check happened to assert.
+core-llm-testkit = { path = "../../crates/contracts/core-llm/core-llm-testkit" }
+# getrusage for the peak-RSS number the memory story (E4) needs.
+libc = "0.2"
+# PNG encoding for the E5 image check, so a device-generated render can be pulled off the phone and
+# LOOKED at. A pixel-range assertion proves the decode produced content; only the image proves it
+# produced the right content, and "SANA runs on iPhone" is a claim worth being able to see.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
+# is why it is the cheapest second model to try.
+mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", default-features = false, optional = true }
+# For `pipeline::resolved_decode_plan` — reading back which of env/request/residency actually chose
+# the decode geometry. The GENERATOR still comes from the catalog registry, so this changes nothing
+# about what ships; it reaches a diagnostic the catalog does not re-export. Same shape as the
+# z-image dep below.
+mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = true }
+# For `memory_probe::FootprintProbe` — the shared MLX `active + cache` sampler, the footprint term
+# `get_peak_memory` omits. Same path crate the provider already links, so this adds no code to the
+# binary, only a name to read it by.
+mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }

@@ -2573,6 +2573,8 @@ dependencies = [
  "mlx-gen-sana",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -3579,6 +3581,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "runtime-catalog",
+ "tempfile",
 ]
 
 [[package]]
