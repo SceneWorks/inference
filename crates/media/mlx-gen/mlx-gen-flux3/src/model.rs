@@ -293,6 +293,33 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Box<dyn Generator>> {
     }))
 }
 
+// Keep cancellation at the image decode/completion boundaries too: the shared residency
+// driver returns the renderer's result directly, and a Metal decode cannot be interrupted mid-op.
+fn decode_batch<T, U>(
+    tokens: &[T],
+    cancel: &gen_core::CancelFlag,
+    mut decode: impl FnMut(&T) -> Result<U>,
+) -> Result<Vec<U>> {
+    let mut images = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        images.push(decode(token)?);
+    }
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok(images)
+}
+
+fn checked_completion<T>(cancel: &gen_core::CancelFlag, value: T) -> Result<T> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok(value)
+}
+
 impl Flux3Klein {
     fn generate_impl(
         &self,
@@ -370,20 +397,21 @@ impl Flux3Klein {
                     return Err(Error::Canceled);
                 }
                 let (h, w) = params.latent_shape()?;
-                let mut images = Vec::with_capacity(tokens.len());
-                for t in &tokens {
-                    images.push(decode_tokens(&heavy.ae, t, h, w)?);
-                }
+                let images =
+                    decode_batch(&tokens, &req.cancel, |t| decode_tokens(&heavy.ae, t, h, w))?;
                 mlx_rs::memory::clear_cache();
                 Ok(images)
             },
         )?;
-        Ok(GenerationReport {
-            output: Some(GenerationOutput::Images(images)),
-            artifacts: None,
-            warnings: Vec::new(),
-            prefix_kv_cache: None,
-        })
+        checked_completion(
+            &req.cancel,
+            GenerationReport {
+                output: Some(GenerationOutput::Images(images)),
+                artifacts: None,
+                warnings: Vec::new(),
+                prefix_kv_cache: None,
+            },
+        )
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -490,6 +518,48 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hosted-only here (MLX does not build on Windows). Mutations: remove the per-item guard
+    /// (second decode runs), remove final guard (last decode publishes), or remove completion guard.
+    #[test]
+    fn late_decode_cancellation_never_returns_partial_or_completed_output() {
+        let cancel = gen_core::CancelFlag::new();
+        let mut calls = 0;
+        let output = decode_batch(&[1u8, 2], &cancel, |token| {
+            calls += 1;
+            cancel.cancel();
+            Ok(*token)
+        });
+        assert!(matches!(output, Err(Error::Canceled)));
+        assert_eq!(calls, 1);
+        let cancel = gen_core::CancelFlag::new();
+        let output = decode_batch(&[1u8], &cancel, |token| {
+            cancel.cancel();
+            Ok(*token)
+        });
+        assert!(matches!(output, Err(Error::Canceled)));
+        let cancel = gen_core::CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            checked_completion(&cancel, vec![1u8]),
+            Err(Error::Canceled)
+        ));
+        let cancel = gen_core::CancelFlag::new();
+        assert_eq!(
+            decode_batch(&[1u8, 2], &cancel, |token| Ok(*token * 2)).unwrap(),
+            [2, 4]
+        );
+    }
+
+    #[test]
+    fn decode_primary_error_is_preserved_when_cancellation_arrives_with_it() {
+        let cancel = gen_core::CancelFlag::new();
+        let output = decode_batch(&[1u8], &cancel, |_| {
+            cancel.cancel();
+            Err::<u8, _>(Error::Msg("primary decode error".into()))
+        });
+        assert!(matches!(output, Err(Error::Msg(message)) if message == "primary decode error"));
+    }
     use mlx_gen::WeightsSource;
 
     #[test]
