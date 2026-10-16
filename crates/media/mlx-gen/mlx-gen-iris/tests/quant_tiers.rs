@@ -98,7 +98,7 @@ fn backbone(quant: Option<Quant>) -> IrisDiT {
 ///
 /// Bounds (on the [−1, 1] image, 3 CFG-3 steps over a random-weight miniature, which amplifies
 /// weight error far more than a trained network does). Measured on the MLX CPU stream: q8 mean
-/// |Δ| 3.7e-2 (cos 0.9964), q4 mean |Δ| 1.53e-1 (cos 0.946). Gated at q8 ≤ 6e-2 / cos ≥ 0.99 and
+/// |Δ| 2.5e-2 (cos 0.9984), q4 mean |Δ| 1.56e-1 (cos 0.944). Gated at q8 ≤ 6e-2 / cos ≥ 0.99 and
 /// q4 ≤ 2.5e-1 / cos ≥ 0.90.
 ///
 /// The contract prices norm gains and biases at their stored f32 width while the loader holds the
@@ -218,8 +218,8 @@ fn lora_on_an_unaligned_projection(root: &Path) -> PathBuf {
 /// is live (it differs from the same stack without that module).
 ///
 /// Bounds are the backbone gate's q4 bounds (mean |Δ| ≤ 2.5e-1, cos ≥ 0.90). Measured on the MLX
-/// CPU stream: adapted q4 vs adapted bf16 mean |Δ| 1.86e-1 (cos 0.919); vs unadapted q4 1.52e-1;
-/// vs the stack without the down-projection module 1.49e-1.
+/// CPU stream: adapted q4 vs adapted bf16 mean |Δ| 1.83e-1 (cos 0.923); vs unadapted q4 1.46e-1;
+/// vs the stack without the down-projection module 1.46e-1.
 ///
 /// *Mutations that red this:* dropping the adapted branch's load-time quantization (resident above
 /// the pricing); keeping the unaligned adapted projection dense, at load or in the pricing (bytes);
@@ -336,12 +336,162 @@ fn an_adapted_load_holds_the_packed_model_at_a_tier() {
     );
 }
 
+/// Every packed backbone projection holds its codes on the bf16 grid it stores (sc-26266):
+/// its dequantized weight is as close to the bf16 checkpoint weight as the f32-grid optimum —
+/// at q8 too, where MLX's `quantize` (codes rounded to the f32 grid, scales then cast to bf16)
+/// lands ~1.5 x above it. An adapted load packs the same base: its packed arrays equal the
+/// unadapted load's, word for word.
+///
+/// Bound: error ≤ 1.05 x the f32-grid optimum per projection. Measured on the miniature (MLX CPU
+/// stream), worst projection: q8 1.022 x, q4 1.001 x; with MLX's `quantize` q8 is
+/// 1.395 x.
+///
+/// *Mutations that red this:* packing with MLX's `quantize` (`AdaptableLinear::quantize`) in
+/// either loader branch — the bare one (q8 ratio), the adapted one (arrays differ from the
+/// unadapted load's).
+#[test]
+fn packed_projections_sit_on_their_stored_grid() {
+    cpu_process(
+        "quant_tiers::packed_projections_sit_on_their_stored_grid",
+        || {
+            use mlx_gen_iris::nn::{BackboneQuant, Loader};
+            let weights =
+                mlx_gen::weights::Weights::from_file(tiny_backbone().join("model.safetensors"))
+                    .unwrap();
+            let mut keys: Vec<String> = weights
+                .keys()
+                .filter(|k| k.ends_with(".weight"))
+                .map(str::to_owned)
+                .collect();
+            keys.sort();
+            for bits in [8, 4] {
+                let loader = Loader {
+                    weights: &weights,
+                    compute: Dtype::Bfloat16,
+                    adapted: None,
+                    quant: Some(BackboneQuant { bits }),
+                };
+                let (mut worst, mut worst_mlx, mut packed) = (0f64, 0f64, 0);
+                for key in &keys {
+                    let w = weights.get(key).unwrap();
+                    if w.ndim() != 2 || w.shape()[1] < 64 {
+                        continue;
+                    }
+                    let prefix = key.trim_end_matches(".weight");
+                    let bias = weights.get(&format!("{prefix}.bias")).is_some();
+                    let linear = loader.linear(prefix, bias).unwrap();
+                    assert!(linear.is_quantized(), "{prefix} is not packed");
+                    let arrays = linear.arrays();
+                    let bf16 = w.as_dtype(Dtype::Bfloat16).unwrap();
+                    let err =
+                        crate::common::packing_error(&bf16, arrays[0], arrays[1], arrays[2], bits);
+                    let ratio = err / crate::common::f32_grid_error(&bf16, bits);
+                    // MLX's own packing of the same padded bf16 weight, for the record.
+                    let mut mlx = mlx_gen::adapters::AdaptableLinear::dense(
+                        mlx_rs::ops::pad(
+                            &bf16,
+                            &[
+                                (0, 0),
+                                (
+                                    0,
+                                    (w.shape()[1] as usize).div_ceil(64) as i32 * 64 - w.shape()[1],
+                                ),
+                            ][..],
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                        None,
+                    );
+                    mlx.quantize(bits, Some(64)).unwrap();
+                    let (c, s, b, ..) = mlx.quantized_params().unwrap();
+                    worst_mlx = worst_mlx.max(
+                        crate::common::packing_error(&bf16, c, s, b, bits)
+                            / crate::common::f32_grid_error(&bf16, bits),
+                    );
+                    assert!(
+                        ratio <= 1.05,
+                        "q{bits} {prefix}: packing error {err:.4e} is {ratio:.3} x the f32-grid optimum"
+                    );
+                    worst = worst.max(ratio);
+                    packed += 1;
+                }
+                eprintln!(
+                    "q{bits}: {packed} packed projections, worst {worst:.4} x the f32-grid optimum \
+                     (MLX quantize: {worst_mlx:.4} x)"
+                );
+                assert!(packed > 0);
+            }
+
+            // The adapted loader branch packs the same base (the LoRA stays a residual).
+            let scratch = tempfile::tempdir().unwrap();
+            let lora = vec![mlx_gen::AdapterSpec::new(
+                lora_on_an_unaligned_projection(scratch.path()),
+                1.0,
+                mlx_gen::AdapterKind::Lora,
+            )];
+            let load = |adapters: &[mlx_gen::AdapterSpec]| {
+                load_backbone_quantized(
+                    &tiny_backbone(),
+                    &tiny_config(),
+                    Dtype::Bfloat16,
+                    adapters,
+                    IrisTask::Generation,
+                    MODEL_ID,
+                    Some(Quant::Q8),
+                )
+                .unwrap()
+                .0
+            };
+            let (plain, adapted) = (load(&[]), load(&lora));
+            let (a, b) = (plain.arrays(), adapted.arrays());
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.shape(), y.shape(), "array {i}");
+                let same = x
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .eq(y.as_dtype(Dtype::Float32).unwrap())
+                    .unwrap()
+                    .all(None)
+                    .unwrap()
+                    .item::<bool>();
+                assert!(
+                    same,
+                    "array {i} of the adapted q8 load differs from the unadapted one"
+                );
+            }
+        },
+    );
+}
+
+/// The text tower's load-time quantization rounds to the stored grid too (sc-26266) — the shared
+/// decoder's `QuantGrid::Stored`, the same packing rule as the backbone's.
+///
+/// *Mutation that reds this:* `text_encoder_quant_spec` leaving the grid at MLX's default.
+#[test]
+fn the_text_tower_quantizes_on_the_stored_grid() {
+    let tower = mlx_llm::ModelConfig::from_dir(crate::common::tiny_text_encoder()).unwrap();
+    let mut aligned = tower.clone();
+    aligned.intermediate_size = 64;
+    for quant in [Quant::Q8, Quant::Q4] {
+        let spec = mlx_gen_iris::text_encoder::text_encoder_quant_spec(&aligned, Some(quant))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spec.grid,
+            mlx_llm::primitives::QuantGrid::Stored,
+            "{quant:?}"
+        );
+    }
+}
+
 /// The text tower at each tier: packed projections whose measured resident bytes equal the
 /// contract's conditioning pricing exactly (the embedding counted once though the head is tied),
 /// and conditioning within the tier's bound of the dense tower's.
 ///
 /// Bounds (relative L2 over the stacked hidden states the backbone reads, 36 random-weight layers).
-/// Measured on the MLX CPU stream: q8 rel 3.3e-2 (cos 0.9995), q4 rel 0.355 (cos 0.939) — about
+/// Measured on the MLX CPU stream: q8 rel 3.5e-2 (cos 0.9994), q4 rel 0.358 (cos 0.938) — about
 /// what per-layer affine rounding (~0.6 % at 8 bits, ~10 % at 4 bits of a group's spread)
 /// compounds to over the depth. Gated at q8 ≤ 6e-2 / cos ≥ 0.998 and q4 ≤ 0.5 / cos ≥ 0.90.
 ///
@@ -402,7 +552,7 @@ fn the_text_tower_holds_packed_projections_at_each_tier() {
 /// within the tier's bound of the dense render.
 ///
 /// Bounds (mean |Δ| on RGB8, 0–255; same miniature caveat as the backbone gate, now with the tower
-/// quantized too). Measured on the MLX CPU stream: q8 3.58, q4 14.6, identical under both
+/// quantized too). Measured on the MLX CPU stream: q8 2.51, q4 14.0, identical under both
 /// policies. Gated at q8 ≤ 6 and q4 ≤ 24.
 ///
 /// *Mutation that reds this:* `load` refusing a quantized spec, or dropping `spec.quantize` on

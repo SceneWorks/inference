@@ -318,6 +318,7 @@ fn parse_quantization(value: Option<&serde_json::Value>, label: &str) -> Result<
     let spec = QuantSpec {
         group_size: integer("group_size")?,
         bits: integer("bits")?,
+        grid: Default::default(),
     };
     if !matches!(spec.bits, 4 | 8) {
         return Err(Error::Config(format!(
