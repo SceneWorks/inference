@@ -37,3 +37,25 @@ RUST_TEST_THREADS = { value = "1", force = true }
 # build script (and, with PMETAL_MLX_PREBUILT_DIR set, re-verifies the prebuilt's key).
 # Requires macOS 26.2 at runtime for the fast path. See sc-2352 / sc-2772.
 MACOSX_DEPLOYMENT_TARGET = "26.2"
+
+# The iOS deployment target (runtime-ios, epic 16774) is deliberately NOT an `[env]` entry. Cargo's
+# [env] reaches every process cargo spawns — including `cargo test` binaries — and MLX's CPU backend
+# JIT-compiles kernels at runtime by shelling out to a bare `g++ -shared`. With
+# IPHONEOS_DEPLOYMENT_TARGET in its environment that clang targets iPhone against the macOS SDK and
+# fails (`no member named 'float16_t'`), so every host MLX CPU-compile test broke.
+#
+# Instead it is scoped to the iOS triples. `MACOSX_DEPLOYMENT_TARGET` above does not apply to them,
+# and the fork's mlx-sys/build.rs only sets the C++/Metal side for cmake; rustc's own link step would
+# otherwise default `aarch64-apple-ios` to 10.0 and drop `___chkstk_darwin` (libSystem, iOS 12+).
+# rustc has no per-target deployment flag, and a clang `-mios-version-min` link-arg loses to the
+# `-target arm64-apple-ios10.0.0` rustc passes, so the floor goes to ld as `-platform_version`.
+#
+# WHY 18.0 — chosen against Metal versions: iOS 16 -> Metal 300, 17 -> 310, 18 -> 320. MLX's own
+# macOS floor (14.0) IS Metal 310, and 18.0 keeps the `fence` kernel (built at Metal >= 320)
+# coherent with its `__builtin_available(macOS 15, iOS 18, *)` runtime guard. Keep this in step
+# with the iOS floor in the fork's mlx-sys/build.rs.
+[target.aarch64-apple-ios]
+rustflags = ["-C", "link-arg=-Wl,-platform_version,ios,18.0,18.0"]
+
+[target.aarch64-apple-ios-sim]
+rustflags = ["-C", "link-arg=-Wl,-platform_version,ios-simulator,18.0,18.0"]

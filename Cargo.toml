@@ -51,6 +51,7 @@ sceneworks-gen-core = { path = "crates/contracts/gen-core" }
 sceneworks-gen-core-testkit = { path = "crates/contracts/gen-core-testkit" }
 runtime-catalog = { path = "crates/bundles/runtime-catalog" }
 mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
+mlx-gen-ios-catalog = { path = "crates/media/mlx-gen/mlx-gen-ios-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 

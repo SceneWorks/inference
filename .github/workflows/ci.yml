@@ -680,7 +680,7 @@ jobs:
       - name: Clippy MLX packages
         run: >-
           cargo clippy --locked
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
           --all-targets -- -D warnings
       - name: Rustdoc macOS MLX packages
         # This is the complete macOS/MLX package set the lane already builds. Keep its public
@@ -692,7 +692,7 @@ jobs:
           cargo doc --locked --no-deps
           -p mlx-llm -p mlx-llm-server
           -p mlx-gen -p 'mlx-gen-*'
-          -p runtime-macos
+          -p runtime-macos -p runtime-ios
       # sc-19556 CI-disk mitigation. `target/doc` is written by the step above and read by nothing
       # else in this job, so it is free to drop before the four cargo invocations start stacking
       # feature-set generations into `target/debug`. The `df`/`du` lines are the permanent probes
@@ -727,7 +727,7 @@ jobs:
       - name: Test MLX packages
         run: >-
           cargo test --locked --lib --tests
-          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos
+          -p mlx-llm -p mlx-llm-server -p mlx-gen -p 'mlx-gen-*' -p runtime-macos -p runtime-ios
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after MLX package tests
         if: always()
@@ -741,7 +741,7 @@ jobs:
       # builds below reuse the dependency and `pmetal-mlx-sys` artifacts of the test step instead of
       # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
-        run: cargo test --locked --no-default-features --lib -p runtime-macos
+        run: cargo test --locked --no-default-features --lib -p runtime-macos -p runtime-ios
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()
