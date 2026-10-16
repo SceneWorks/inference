@@ -33,3 +33,6 @@ mod real_weights;
 
 #[path = "text_parity.rs"]
 mod text_parity;
+
+#[path = "training_parity.rs"]
+mod training_parity;

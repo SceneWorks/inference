@@ -32,6 +32,7 @@ pub mod nn;
 pub mod pipeline;
 pub mod pup;
 pub mod text_encoder;
+pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
 pub use dit::{Flux3Dit, SampleTokens};

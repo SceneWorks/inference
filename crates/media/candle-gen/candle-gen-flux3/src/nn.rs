@@ -203,6 +203,34 @@ impl Linear {
             .push_lora_checked(down.t()?.contiguous()?, up.t()?.contiguous()?, scale)
     }
 
+    /// Training-only storage-sharing factors. Unlike inference's prepared-factor cache,
+    /// `TrainableLora` reads the Var leaves on EVERY forward and transposes inside that graph.
+    pub fn push_trainable_lora(&mut self, down: Tensor, up: Tensor, scale: f64) -> Result<()> {
+        let (output, input) = self.out_in()?;
+        let rank = down.dim(0)?;
+        if down.dims() != [rank, input]
+            || up.dims() != [output, rank]
+            || rank == 0
+            || !scale.is_finite()
+        {
+            return Err(Error::Unsupported(
+                "flux3 training: invalid trainable LoRA shape/gain".into(),
+            ));
+        }
+        if self.adapted.is_none() {
+            self.adapted = Some(candle_gen::quant::AdaptLinear::from_dense(
+                candle_gen::candle_nn::Linear::new(self.weight.clone(), None),
+                input,
+                output,
+            ));
+        }
+        self.adapted
+            .as_mut()
+            .expect("initialized")
+            .push_trainable_lora(down, up, scale);
+        Ok(())
+    }
+
     /// `[out, in]` of the weight.
     pub fn out_in(&self) -> Result<(usize, usize)> {
         Ok(self.weight.dims2()?)
@@ -264,10 +292,25 @@ impl Rope {
 /// adjacent-pair complex rotation in f32, returned in `x`'s dtype. `x` is `[B, H, L, D]`;
 /// `rope` holds `[L, D/2]` tables.
 pub fn rmsnorm_rope(x: &Tensor, scale: &Tensor, rope: &Rope) -> Result<Tensor> {
+    rmsnorm_rope_impl(x, scale, rope, false)
+}
+
+/// Differentiable RMSNorm + RoPE. Candle's pinned `rms_norm` calls `apply_op2_no_bwd`,
+/// so using it here would sever gradients to q/k adapters AND preceding blocks.
+/// The pinned `rms_norm_slow` is the primitive-op equivalent with a real backward graph.
+pub fn rmsnorm_rope_training(x: &Tensor, scale: &Tensor, rope: &Rope) -> Result<Tensor> {
+    rmsnorm_rope_impl(x, scale, rope, true)
+}
+
+fn rmsnorm_rope_impl(x: &Tensor, scale: &Tensor, rope: &Rope, training: bool) -> Result<Tensor> {
     let (b, h, l, d) = x.dims4()?;
     let pairs = d / 2;
     let xf = to(x, DType::F32)?.contiguous()?;
-    let normed = candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS)?;
+    let normed = if training {
+        candle_gen::candle_nn::ops::rms_norm_slow(&xf, scale, RMS_EPS)?
+    } else {
+        candle_gen::candle_nn::ops::rms_norm(&xf, scale, RMS_EPS)?
+    };
     let xr = normed.reshape((b, h, l, pairs, 2))?;
     let re = xr.narrow(4, 0, 1)?.squeeze(4)?;
     let im = xr.narrow(4, 1, 1)?.squeeze(4)?;
@@ -299,6 +342,29 @@ pub fn packed_attention(
     bounds: &[(usize, usize)],
     compute: DType,
 ) -> Result<Tensor> {
+    packed_attention_impl(q, k, v, bounds, compute, false)
+}
+
+/// Training-only differentiable softmax. The pinned `softmax_last_dim` explicitly
+/// uses `apply_op1_no_bwd`, so inference's callback cannot carry q/k gradients.
+pub fn packed_attention_training(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    bounds: &[(usize, usize)],
+    compute: DType,
+) -> Result<Tensor> {
+    packed_attention_impl(q, k, v, bounds, compute, true)
+}
+
+fn packed_attention_impl(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    bounds: &[(usize, usize)],
+    compute: DType,
+    training: bool,
+) -> Result<Tensor> {
     let (_, h, l, d) = q.dims4()?;
     let kernel = DType::F32;
     let prep = |a: &Tensor| -> Result<Tensor> { Ok(to(&to(a, compute)?, kernel)?.contiguous()?) };
@@ -320,7 +386,13 @@ pub fn packed_attention(
             &v,
             scale,
             None,
-            softmax_last_dim,
+            |scores| {
+                if training {
+                    candle_gen::candle_nn::ops::softmax(scores, D::Minus1)
+                } else {
+                    softmax_last_dim(scores)
+                }
+            },
             candle_gen::ATTN_SCORES_BUDGET,
         )?;
         Ok(to(&o, compute)?
