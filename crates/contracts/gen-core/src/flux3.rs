@@ -37,6 +37,7 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
 pub mod adapters;
+pub mod conversion;
 pub mod image_input;
 pub mod pup;
 pub mod quantization;
