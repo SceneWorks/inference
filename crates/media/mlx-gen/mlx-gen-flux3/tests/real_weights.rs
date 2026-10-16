@@ -368,3 +368,180 @@ fn real_distilled_text_to_image_renders() {
     );
     let _ = Progress::Decoding;
 }
+
+/// sc-26238: the pinned prompt-upsampler package (`FLUX3_PUP_DIR`) is the pinned revision
+/// (weights sha256), loads through the shared MLX engine, renders the oracle's chat text and
+/// token counts byte-for-byte with the REAL tokenizer (the gen-core golden), and rewrites the
+/// README request and a locked-box request for real: a non-empty caption with no angle-bracket
+/// ids in text mode, and in the box mode a caption citing both locked ids whose table keeps both
+/// locked boxes verbatim. The captions are kept in the evidence artifact (`FLUX3_OUT`).
+#[test]
+#[ignore = "needs the pinned upsampler package (FLUX3_PUP_DIR)"]
+fn real_prompt_upsampler_rewrites_the_readme_request() {
+    use mlx_gen::gen_core::flux3::pup::{
+        self, upsample, BoxSpec, PromptUpsampler, UpsampleMode, UpsampleOptions, UpsamplePlan,
+        UpsamplerInput, UPSAMPLER_WEIGHTS_SHA256,
+    };
+    use mlx_gen::gen_core::PromptEnhancementOutcome;
+
+    let dir = env_dir("FLUX3_PUP_DIR");
+    assert_eq!(
+        sha256_hex(&dir.join("model.safetensors")),
+        UPSAMPLER_WEIGHTS_SHA256,
+        "model.safetensors is not the pinned upsampler revision's"
+    );
+    let started = Instant::now();
+    let up = mlx_gen_flux3::Flux3PromptUpsampler::load(&dir).unwrap();
+    let load_seconds = started.elapsed().as_secs_f64();
+
+    // The oracle's text goldens with the REAL tokenizer: chat text and token counts.
+    let golden_path = std::env::var("FLUX3_PUP_GOLDEN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../contracts/gen-core/tests/fixtures/flux3_pup/golden.json")
+        });
+    let golden: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&golden_path).unwrap()).unwrap();
+    for case in golden["plan"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let prompt = case["prompt"].as_str().unwrap();
+        let boxes = case["boxes_json"]
+            .as_str()
+            .map(|b| BoxSpec::parse_list(b).unwrap());
+        let n = case["n_images"].as_u64().unwrap() as usize;
+        let (mode, user_text, locked) = pup::plan_text(prompt, boxes.as_deref(), n).unwrap();
+        let user_text = if mode.uses_references() {
+            pup::i2i_scaffold(&user_text, locked.is_some())
+        } else {
+            user_text
+        };
+        let plan = UpsamplePlan {
+            mode,
+            original_prompt: prompt.to_string(),
+            system_prompt: up.package().prompts().get(mode).to_string(),
+            user_text,
+            locked,
+            references: (0..n)
+                .map(|_| mlx_gen::gen_core::core_llm::ImageRef::new(1, 1, vec![0, 0, 0]).unwrap())
+                .collect(),
+            max_new_tokens: 1,
+        };
+        let chat = up.package().render(&plan).unwrap();
+        assert_eq!(
+            chat,
+            case["chat_text"].as_str().unwrap(),
+            "{name}: chat text"
+        );
+        assert_eq!(
+            up.package().tokenizer().encode(&chat, false).unwrap().len() as u64,
+            case["chat_tokens_real"].as_u64().unwrap(),
+            "{name}: real tokenizer count"
+        );
+    }
+
+    let out_dir = std::env::var("FLUX3_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut record = serde_json::Map::new();
+    record.insert("package_revision".into(), pup::UPSAMPLER_REVISION.into());
+    record.insert("load_seconds".into(), load_seconds.into());
+
+    // Text mode: the README request.
+    let started = Instant::now();
+    let input = UpsamplerInput {
+        prompt: "A man walking with his dog, afternoon sun".into(),
+        references: Vec::new(),
+        boxes: None,
+        mode: UpsampleMode::Text,
+        bypass: false,
+    };
+    let mut tokens = 0u32;
+    let out = upsample(
+        Some(&up as &dyn PromptUpsampler),
+        &input,
+        &UpsampleOptions::default(),
+        &CancelFlag::new(),
+        &mut |p| {
+            if let Progress::Upsampling { tokens: t, .. } = p {
+                tokens = t;
+            }
+        },
+    )
+    .unwrap();
+    let t2i_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(out.report.outcome, PromptEnhancementOutcome::Enhanced);
+    assert_eq!(out.report.mode.as_deref(), Some("t2i"));
+    assert_eq!(out.report.effective_prompt, out.caption);
+    let words = out.caption.split_whitespace().count();
+    assert!(
+        words >= 60,
+        "a t2i caption is 100-350 words upstream, got {words}: {}",
+        out.caption
+    );
+    let text_caption = &out.caption;
+    assert!(
+        !text_caption.contains('<') && !text_caption.contains('['),
+        "t2i captions carry no ids or tables: {text_caption}"
+    );
+    assert!(tokens > 0 && tokens <= pup::MAX_TOKENS);
+    record.insert("t2i_prompt".into(), input.prompt.clone().into());
+    record.insert("t2i_caption".into(), out.caption.clone().into());
+    record.insert("t2i_tokens".into(), tokens.into());
+    record.insert("t2i_seconds".into(), t2i_seconds.into());
+
+    // Text with locked boxes: the README balloons.
+    let started = Instant::now();
+    let boxes = BoxSpec::parse_list(
+        r#"[{"id": "obj_1", "desc": "a red and yellow striped hot-air balloon", "bbox": [0.08, 0.06, 0.48, 0.38]}, {"id": "obj_2", "desc": "a small blue hot-air balloon", "bbox": [0.20, 0.62, 0.42, 0.80]}]"#,
+    )
+    .unwrap();
+    let input = UpsamplerInput {
+        prompt: "two hot-air balloons over the sea".into(),
+        references: Vec::new(),
+        boxes: Some(boxes),
+        mode: UpsampleMode::TextWithBoxes,
+        bypass: false,
+    };
+    let out = upsample(
+        Some(&up as &dyn PromptUpsampler),
+        &input,
+        &UpsampleOptions::default(),
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    let bbox_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(out.report.mode.as_deref(), Some("t2i_bbox"));
+    let locked = out
+        .report
+        .locked_annotations
+        .clone()
+        .expect("locked rows recorded");
+    assert!(locked.contains("[80, 60, 480, 380]") && locked.contains("[200, 620, 420, 800]"));
+    assert!(
+        out.caption.contains("<obj_1>") && out.caption.contains("<obj_2>"),
+        "{}",
+        out.caption
+    );
+    assert!(
+        out.caption.contains("\"bbox\": [80, 60, 480, 380]")
+            && out.caption.contains("\"bbox\": [200, 620, 420, 800]"),
+        "the locked boxes survive reconcile verbatim: {}",
+        out.caption
+    );
+    assert!(
+        pup::is_finished(&out.caption),
+        "a finished answer: its table fully cited"
+    );
+    record.insert("t2i_bbox_prompt".into(), input.prompt.clone().into());
+    record.insert("t2i_bbox_caption".into(), out.caption.clone().into());
+    record.insert("t2i_bbox_locked".into(), locked.into());
+    record.insert("t2i_bbox_seconds".into(), bbox_seconds.into());
+    std::fs::write(
+        out_dir.join("flux3_pup_upsample.json"),
+        serde_json::to_string_pretty(&serde_json::Value::Object(record)).unwrap() + "\n",
+    )
+    .unwrap();
+}

@@ -291,7 +291,7 @@ fn admit_lane(
         req_index: ri,
         cache,
         rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
-        params: r.sampling,
+        params: r.sampling.for_prompt(r.prompt_ids.len()),
         history: r.prompt_ids.clone(),
         next_token: 0,
     };
@@ -444,7 +444,7 @@ fn admit_wave_throughput(
                 req_index: ri,
                 cache,
                 rng: SplitMix64::new(r.seed.unwrap_or_else(default_seed)),
-                params: r.sampling,
+                params: r.sampling.for_prompt(r.prompt_ids.len()),
                 history: r.prompt_ids.clone(),
                 next_token: 0,
             };

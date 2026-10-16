@@ -393,6 +393,7 @@ fn reference_partition_step_cost_against_base() {
                 format!("step-{current}/{total}")
             }
             Progress::Decoding => "decode-start".to_owned(),
+            Progress::Upsampling { tokens, max_tokens } => format!("upsample-{tokens}/{max_tokens}"),
         };
         marks.push((label, started.elapsed().as_secs_f64(), get_peak_memory()));
     };

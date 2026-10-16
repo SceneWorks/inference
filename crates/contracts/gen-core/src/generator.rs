@@ -3470,7 +3470,7 @@ const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
 /// Shared hard ceiling for autoregressive prompt enhancement. Providers may choose a lower cap.
-pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
+pub const MAX_ENHANCE_TOKENS: u32 = 3_584;
 /// Shared temperature range for prompt enhancement sampling.
 pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 

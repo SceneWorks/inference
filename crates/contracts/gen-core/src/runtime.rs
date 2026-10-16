@@ -2140,6 +2140,15 @@ pub struct PromptEnhancementReport {
     pub effective_prompt: String,
     /// Stable, non-sensitive reason code for a fallback. `None` for enhanced/absent outcomes.
     pub fallback_reason: Option<String>,
+    /// The enhancer's mode, for an enhancer that has several (sc-26238: the FLUX 3 upsampler's
+    /// system-prompt key — `t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`). `None` for single-mode
+    /// enhancers and for the bypass/absent paths.
+    pub mode: Option<String>,
+    /// The locked box annotations the effective prompt was required to preserve, as the exact
+    /// canvas-row JSON text the enhancer was given (sc-26238: `bbox.to_canvas` rows). `None`
+    /// when the request locked nothing. Present on the bypass path too, where the rows are
+    /// appended to the prompt as typed.
+    pub locked_annotations: Option<String>,
 }
 
 impl PromptEnhancementReport {
@@ -2150,6 +2159,8 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2162,6 +2173,8 @@ impl PromptEnhancementReport {
             original_prompt: original_prompt.into(),
             effective_prompt: effective_prompt.into(),
             fallback_reason: None,
+            mode: None,
+            locked_annotations: None,
         }
     }
 
@@ -2172,7 +2185,21 @@ impl PromptEnhancementReport {
             original_prompt: prompt.clone(),
             effective_prompt: prompt,
             fallback_reason: Some(reason.into()),
+            mode: None,
+            locked_annotations: None,
         }
+    }
+
+    /// Record the enhancer's mode (see [`mode`](Self::mode)).
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
+    /// Record the locked annotations (see [`locked_annotations`](Self::locked_annotations)).
+    pub fn with_locked_annotations(mut self, rows: impl Into<String>) -> Self {
+        self.locked_annotations = Some(rows.into());
+        self
     }
 }
 
@@ -2220,6 +2247,12 @@ pub enum Progress {
     /// without this the UI would freeze silently while a component streams from disk (F-179). The
     /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
     Loading(LoadPhase),
+    /// The optional prompt-upsampling stage is decoding (sc-26238): `tokens` content tokens of
+    /// at most `max_tokens` generated so far, emitted once at `0` when the stage starts and once
+    /// per streamed token. Fires before any `Step` (it rewrites the prompt the encoder will
+    /// read) and never on a request that did not ask for enhancement, so a consumer that does
+    /// not know it can ignore it without losing the step contract.
+    Upsampling { tokens: u32, max_tokens: u32 },
 }
 
 /// Which component the residency seam is loading when it emits [`Progress::Loading`] (sc-11126). The

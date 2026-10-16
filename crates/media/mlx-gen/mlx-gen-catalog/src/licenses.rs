@@ -220,9 +220,16 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     // The distilled FLUX 3 Image Klein package (DiT + autoencoder under the FLUX Kommunity
     // License) and its bundled `text_encoder/`, which is byte-identical (LFS sha256 of both
     // shards) to the pinned Qwen/Qwen3-VL-4B-Instruct snapshot, so that row is loaded too.
+    // The prompt upsampler (sc-26238; `black-forest-labs/flux-3-image-klein-pup`, Apache-2.0)
+    // is an OPTIONAL co-requisite the provider loads only when the `prompt_upsampler`
+    // component names it — rowed here because a request with `enhance_prompt` runs it.
     ProviderComponents {
         provider_id: "flux3_klein",
-        components: &["flux3_image_klein", "qwen3_vl_4b_instruct"],
+        components: &[
+            "flux3_image_klein",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
     },
     // --- ideogram ----------------------------------------------------------------------------
     // `ideogram_4_turbo` is the same base weights plus the bundled TurboTime LoRA and no

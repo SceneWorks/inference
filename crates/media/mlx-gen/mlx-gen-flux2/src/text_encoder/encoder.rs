@@ -324,6 +324,8 @@ impl Qwen3TextEncoder {
             repetition_penalty: 1.0,
             repetition_context: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
         };
 
         if cancel.is_cancelled() {
@@ -631,6 +633,8 @@ mod tests {
             repetition_penalty: 1.0,
             repetition_context: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
         };
         let mut logits = te
             .decode_logits_from_embeds(prompt_embeds, &mut cache, 0)

@@ -241,6 +241,8 @@ impl<'a> EnhanceSampler<'a> {
                 top_p: knobs.top_p,
                 top_k: usize::try_from(knobs.top_k).unwrap_or(0),
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: knobs.repetition_penalty.unwrap_or(1.0),
                 repetition_context: knobs.repetition_context,
             },

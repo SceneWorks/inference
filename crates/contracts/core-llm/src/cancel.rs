@@ -20,6 +20,13 @@ impl CancelFlag {
         Self::default()
     }
 
+    /// Adopt a caller-owned flag. Media-to-LLM pre-generation stages share the same atomic
+    /// rather than forwarding cancellation only when a streamed token arrives (sc-26238).
+    /// This lets an engine observe a cancel during prefill as well as during decoding.
+    pub fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     /// Request cancellation.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
@@ -39,6 +46,18 @@ impl CancelFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopted_atomic_is_shared_before_any_stream_event() {
+        let atomic = Arc::new(AtomicBool::new(false));
+        let flag = CancelFlag::from_arc(atomic.clone());
+        atomic.store(true, Ordering::SeqCst);
+        assert!(flag.is_cancelled());
+        flag.reset();
+        assert!(!atomic.load(Ordering::SeqCst));
+        flag.cancel();
+        assert!(atomic.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn clones_share_state() {

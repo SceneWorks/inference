@@ -139,7 +139,7 @@ fn whisper_transcribes_kokoro_roundtrip_within_cer() {
         .transcribe(&req, &mut |p| match p {
             Progress::Step { .. } => steps += 1,
             Progress::Decoding => decoding += 1,
-            Progress::Loading(_) => {}
+            Progress::Loading(_) | Progress::Upsampling { .. } => {}
         })
         .expect("transcribe");
     assert!(steps >= 1 && decoding == 1, "progress contract");

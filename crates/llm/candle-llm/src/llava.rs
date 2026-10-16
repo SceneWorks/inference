@@ -712,6 +712,8 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         top_p: s.top_p,
         top_k: s.top_k,
         presence_penalty: s.presence_penalty,
+        presence_penalty_generated_only: s.presence_penalty_generated_only,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }

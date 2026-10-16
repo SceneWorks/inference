@@ -19,3 +19,9 @@ reads:
 The package's bundled text encoder (`text_encoder/`) is a byte-identical copy of
 Qwen/Qwen3-VL-4B-Instruct (revision ebb281ec70b05090aa6165b016eac8ec08e71b17, Alibaba Cloud),
 distributed under the Apache License, Version 2.0. See UPSTREAM.md.
+
+The optional prompt upsampler the `pup` module loads — black-forest-labs/flux-3-image-klein-pup
+(revision 8b069751eb5dcab23829d9c5eccb470eb8b8a4ed, a full fine-tune of Qwen/Qwen3.5-9B by Black
+Forest Labs) — is distributed under the Apache License, Version 2.0; its system prompts
+(`system_prompts.json`, identical to the inference code's `pup_prompts.json`) are embedded in
+`gen-core/src/flux3/pup_system_prompts.json` under that licence.

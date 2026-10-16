@@ -73,6 +73,10 @@ pub fn descriptor() -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            // sc-26238: `enhance_prompt` runs the separate FLUX 3 prompt upsampler (the optional
+            // `prompt_upsampler` component) before encoding; without it the request is a typed
+            // refusal, never a silent pass-through.
+            supports_prompt_enhancement: true,
             ..Default::default()
         },
     }
@@ -94,6 +98,9 @@ pub struct Flux3Klein {
     spec: LoadSpec,
     /// The loaded memory contract, published through [`Generator::memory_strategy_contract`].
     memory_strategy: gen_core::MemoryProviderContract,
+    /// The optional prompt upsampler (sc-26238; the `prompt_upsampler` component), resident
+    /// beside the image model for the generator's lifetime.
+    upsampler: Option<crate::pup::Flux3PromptUpsampler>,
 }
 
 /// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
@@ -238,12 +245,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Priced from the resources' tensor headers after the components loaded, so a broken
     // resource surfaces as its loader's own error.
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
+    // sc-26238: the optional upsampler loads last, after every image-model resource proved
+    // sound, so its own load error is unmistakably the component's.
+    let upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
     Ok(Box::new(Flux3Klein {
         descriptor: descriptor(),
         config,
         residency,
         spec: spec.clone(),
         memory_strategy,
+        upsampler,
     }))
 }
 
@@ -254,6 +265,19 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
+        // sc-26238: the prompt-upsampling stage runs first (identity when `enhance_prompt` is
+        // off) and the caption it returns is what the encoder reads and what seeds an unseeded
+        // request — upstream `generate.py` seeds from the upsampled caption, not the input.
+        let caption = crate::pup::effective_prompt(
+            self.upsampler.as_ref(),
+            req,
+            &crate::pup::text_input(req),
+            on_progress,
+        )?
+        .caption;
+        let mut req = req.clone();
+        req.prompt = caption;
+        let req = &req;
         // Upstream `generate.py`: an unseeded request is seeded from its caption.
         let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
         let total = params.steps * req.count;

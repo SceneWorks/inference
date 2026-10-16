@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Progress::Decoding => eprintln!("decoding…"),
         Progress::Loading(phase) => eprintln!("loading {phase:?}"),
+        Progress::Upsampling { .. } => {}
     };
 
     let gen_phase = probe.phase();

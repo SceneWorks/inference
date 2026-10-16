@@ -9,6 +9,8 @@ Python appears only in the offline oracle (`../tools/dump_flux3_*.py`), never at
 | Inference code (`dit.py`, `autoencoder.py`, `text_encoder.py`, `sampling.py`, `pipeline.py`) | `black-forest-labs/flux-3-image-klein` (GitHub) | `45e57c9fb06f9751cdced29a65c5d2171003be05` |
 | Distilled package: `config.json`, `model.safetensors` (5.6B flow-map DiT, bf16), `ae.safetensors` (f32), `text_encoder/` | `black-forest-labs/flux-3-image-klein` (Hugging Face, gated) | `8454017f9ebaada30c998fccd9f67a80c7580f68` |
 | The bundled `text_encoder/` is byte-identical to this snapshot (same LFS sha256 of both shards, same tokenizer and config) | `Qwen/Qwen3-VL-4B-Instruct` (Hugging Face) | `ebb281ec70b05090aa6165b016eac8ec08e71b17` |
+| Prompt upsampler code (`pup.py`, `bbox.py`, `pup_prompts.json`; sc-26238) | `black-forest-labs/flux-3-image-klein` (GitHub) | `45e57c9fb06f9751cdced29a65c5d2171003be05` (`pup.py` sha256 `e3561ae3…`, `bbox.py` `fbea10c1…`) |
+| Prompt upsampler package: `config.json` (`qwen3_5`), `model.safetensors` (9B VLM, bf16, 18.8 GB, sha256 `f5062a1f…`), tokenizer + `chat_template.jinja`, `system_prompts.json` (sha256 `b5da3ed8…`, identical to `pup_prompts.json`) | `black-forest-labs/flux-3-image-klein-pup` (Hugging Face, ungated, Apache-2.0) | `8b069751eb5dcab23829d9c5eccb470eb8b8a4ed` |
 
 `model.safetensors` sha256 `c3e9813cdd049c831c836b2e9db61150e49a93fc1a4c63b256494642fee0bd7c`;
 `ae.safetensors` sha256 `868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3`
@@ -20,9 +22,11 @@ commercial-output exception for Qualifying Users under US$5M revenue, content-fi
 attribution obligations); the text encoder is Apache-2.0 (Qwen). See `NOTICE` and the catalog's
 licence rows (`gen_core::license`).
 
-The base checkpoint (`flux-3-image-klein-base`), the prompt upsampler (`flux-3-image-klein-pup`),
-reference images and boxes are later stories of the epic (sc-26239, sc-26238, sc-26236/7); nothing
-here pins them.
+The base checkpoint (`flux-3-image-klein-base`), reference images and boxes are later stories of
+the epic (sc-26239, sc-26236/7); nothing here pins them. The prompt upsampler is sc-26238 (the
+`pup` module here and `gen_core::flux3::pup`): an **optional** co-requisite, loaded only when the
+`prompt_upsampler` component names its package and accounted separately from the image model and
+its text encoder.
 
 ## Source authority
 
@@ -44,7 +48,14 @@ components["text_encoder"] (a directory)       optional; default <root>/text_enc
   config.json, tokenizer.json, tokenizer_config.json
   model.safetensors.index.json + model-0000N-of-00002.safetensors   language tower only
 components["autoencoder"] (a file)             optional; default <root>/ae.safetensors (config `vae.path`)
+components["prompt_upsampler"] (a directory)   optional (sc-26238); the flux-3-image-klein-pup package root
+  config.json, model.safetensors, tokenizer.json, tokenizer_config.json, chat_template.jinja,
+  preprocessor_config.json, system_prompts.json (optional: the embedded copy is the fallback)
 ```
+
+The upsampler is never read from the image package: it is a separate 18.8 GB model, a second
+resident beside the DiT when loaded, and a request with `enhance_prompt` on a generator loaded
+without it is a typed refusal (never a silent pass-through).
 
 A missing/incomplete resource is a typed load error that names the path and the resource. A
 quantized variant (`variants/fp8r`, `variants/nvfp4`; `config.json` `quantization != null`) is a
@@ -69,7 +80,10 @@ typed refusal until sc-26241.
 | Output `clamp(−1, 1)` → RGB8 | `pipeline.to_pil` | `mlx_gen::image::decoded_to_image` | S1 |
 | Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core::flux3::prompt_seed` | S1 |
 | CFG sampling (base checkpoint) | `sampling.denoise` | — | sc-26239 |
-| Reference images (`image_cond`), boxes, upsampler, quantized variants, LoRA | `pipeline.encode_references`, `bbox.py`, `pup.py`, `fp8.py`/`nvfp4.py` | — | sc-26236/7/8, sc-26241, sc-26239 |
+| Reference images (`image_cond`), boxes in the DiT prompt, quantized variants, LoRA | `pipeline.encode_references`, `fp8.py`/`nvfp4.py` | — | sc-26236/7, sc-26241, sc-26239 |
+| **Prompt upsampler (sc-26238)** — four modes by system prompt (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`): `bbox.plan` (passed boxes → canvas rows; a table already in the prompt locks by itself), the `ORIGINAL PROMPT:` / `LOCKED BOUNDING-BOX ANNOTATIONS` input, the two `I2I_SCAFFOLD`s, the chat template with `enable_thinking=False`, greedy `top_p 0.95 / top_k 20 / max_tokens 3584`, presence penalty 1.5 (t2i) / 0.0 (i2i), `max_model_len 8192`, `bbox.reconcile` (IoU ≥ 0.9 rename, locked rows verbatim adopting the desc, valid cited rows appended), `generate.py`'s `--no-pup` caption and finished-answer skip | `pup.py`, `bbox.py` | `gen_core::flux3::pup` (tensor-neutral, byte-for-byte text), `pup.rs` (the engine) | S5 |
+| Upsampler reference policy: EXIF transpose, alpha over white, `reference_size` budget (1 MP / 724² / 512² by reference count, multiples of 32, aspect ≤ 200:1 else the prompt as typed), Pillow `LANCZOS`, JPEG q92 | `pup.policy_reference` | `gen_core::flux3::pup::policy_reference` (bit-exact Pillow RGB/alpha/LANCZOS and libjpeg's q92 integer 4:2:0 round trip, pixel-equality fixtures) | S5 |
+| Qwen3.5 VLM serving (hybrid linear/full attention, Qwen3-VL ViT, `<\|image_pad\|>` expansion by the processor's `smart_resize`) | vLLM | shared `mlx_llm` provider (`mlx-llama`, `qwen3_5`) | S5 |
 
 ## Precision policy
 
@@ -89,3 +103,13 @@ The port mirrors this at `Precision::Bf16` (the default) and runs everything in 
 miniature widths (`../tools/_flux3_common.py`). Real-weight goldens
 (`../tools/dump_flux3_realweight.py`, CPU torch over the pinned package at a 64×64 output) are
 read by the `#[ignore]`d `real_weights::` cases from `FLUX3_REAL_GOLDEN`.
+
+`tests/fixtures/tiny-pup-snapshot/` (sc-26238) is a miniature upsampler package — a seeded
+`Qwen3_5ForConditionalGeneration` (4 hybrid layers, a 2-layer ViT with no deepstack, as the
+release) with a WordLevel tokenizer carrying the PINNED `chat_template.jinja`, `system_prompts.json`
+and processor configs verbatim — and `flux3_pup_golden.safetensors` its greedy run over the four
+modes (expanded prompt ids, the reference pixels after upstream's policy, generated ids, top-2
+logit margins), produced by `../tools/dump_flux3_pup_golden.py`, which also writes the text
+goldens and the Pillow policy fixture read by `gen-core/tests/flux3_pup.rs`. The real-weight case
+`real_weights::real_prompt_upsampler_rewrites_the_readme_request` reads the pinned package from
+`FLUX3_PUP_DIR`.

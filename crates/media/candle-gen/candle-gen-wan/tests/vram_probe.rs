@@ -359,7 +359,7 @@ fn measure(engine_id: &str) {
                     gib(dh),
                 );
             }
-            Progress::Loading(_) => {}
+            Progress::Loading(_) | Progress::Upsampling { .. } => {}
         })
         .unwrap_or_else(|e| panic!("{engine_id} ({tier}) generate: {e}"));
     probe.end_gen(generate_phase);
