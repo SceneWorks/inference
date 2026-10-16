@@ -58,6 +58,12 @@ mod generator_contract;
 #[path = "memory_strategy.rs"]
 mod memory_strategy;
 
+#[path = "quant_real_weights.rs"]
+mod quant_real_weights;
+
+#[path = "quant_tiers.rs"]
+mod quant_tiers;
+
 #[path = "real_weights.rs"]
 mod real_weights;
 

@@ -436,6 +436,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "own fixture and begin-request functions, as this family's RESTORE_MEMORY_REGISTRATION is "
         "to its contract. Not geometry."
     ),
+    ("iris", "QUANT_GROUP_SIZE"): (
+        "the same number spelled through each backend's own crate (sc-26266): both are MLX's default "
+        "affine group size, 64 — mlx `mlx_gen::quant::DEFAULT_GROUP_SIZE`, candle "
+        "`candle_gen::quant::MLX_GROUP_SIZE` (the candle twin names it so the two backends pack the "
+        "same projections over the same padded widths). `_const_numbers` resolves same-crate names "
+        "only, so the two compare unequal by spelling whatever the value does."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."
