@@ -395,7 +395,7 @@ impl Drop for MemorySampler {
 ///
 /// The line also names the build's `increased-memory-limit` setting (the Swift host exports it from
 /// the Info.plist as `IOS_SMOKE_INCREASED_MEMORY_LIMIT` before calling in) and runtime-ios's cap
-/// constant, so one report from each entitlement build is the whole cap measurement (sc-16780).
+/// constant, so each launch records diagnostics, not a validated safe rendering envelope (sc-16780).
 fn check_memory_headroom() -> Check {
     const NAME: &str = "per-app memory limit (OS-reported)";
     let entitlement =
@@ -409,7 +409,7 @@ fn check_memory_headroom() -> Check {
                 "os_proc_available_memory = {mib:.0} MiB available at start of run \
                  ({:.2} GiB), increased-memory-limit entitlement = {entitlement}; runtime-ios \
                  IOS_APP_MEMORY_CAP_MIB = {cap} (PROVISIONAL, unmeasured) -- the OS number is \
-                 the real ceiling every peak below is measured against",
+                 launch headroom only, NOT a validated safe rendering ceiling",
                 mib / 1024.0
             ),
         },
@@ -448,6 +448,10 @@ fn measurement_lane() -> bool {
 /// One report line naming how unestimated (LLM, Z-Image) loads were treated, so a report from the
 /// measurement lane can never be read as an admitted run.
 fn check_admission_lane() -> Check {
+    if std::env::var_os("IOS_SMOKE_SANA_CAPTURE").is_some() {
+        return Check { name: "iOS admission lane (E4)", passed: true,
+            detail: "SANA evidence capture is UNADMITTED; successful diagnostic output does NOT establish admitted rendering or a safe budget".into() };
+    }
     Check {
         name: "iOS admission lane (E4)",
         passed: true,
@@ -1192,8 +1196,27 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         ),
     ];
 
-    let diagnostic = std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
-    let configs: &[(&str, u32, Option<u32>, bool)] = if diagnostic { DIAGNOSTIC } else { SHIPPING };
+    // Focused evidence collection must never silently start the legacy UNTILED death experiment.
+    // It remains explicitly unadmitted and is device-only, never a passing admitted render.
+    let capture = std::env::var_os("IOS_SMOKE_SANA_CAPTURE").is_some();
+    if capture && (!cfg!(all(target_os = "ios", not(target_abi = "sim"))) || !measurement_lane()) {
+        return Check { name: NAME, passed: false,
+            detail: "SANA capture requires a real device and explicit IOS_SMOKE_UNADMITTED=1; no weights loaded".into() };
+    }
+    let diagnostic = capture || std::env::var_os("IOS_SMOKE_IMAGE_ONLY").is_some();
+    const CAPTURE: &[(&str, u32, Option<u32>, bool)] = &[(
+        "256 tile128 UNADMITTED evidence capture",
+        256,
+        Some(128),
+        false,
+    )];
+    let configs: &[(&str, u32, Option<u32>, bool)] = if capture {
+        CAPTURE
+    } else if diagnostic {
+        DIAGNOSTIC
+    } else {
+        SHIPPING
+    };
 
     // Truncate any breadcrumb from a previous run FIRST. A stale one would be read as this run's
     // progress and point the blame at the wrong configuration — the same class of mistake as the
@@ -1236,8 +1259,37 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
         // deliberately bypasses admission — its whole purpose is to run configurations admission
         // would refuse — loads through the explicitly unadmitted diagnostic loader, and says so in
         // the report.
+        let admission_spec =
+            runtime_ios::media::sana_load_spec(WeightsSource::Dir(dir.to_path_buf()));
+        if capture {
+            // Necessary payload/headroom preflight, not a total working-set proof: headers cannot
+            // bound activation/allocator/driver transients. The operator must establish that bound
+            // before using this diagnostic route. Reject even an impossible payload fit first.
+            let profile = match runtime_ios::media::sana_snapshot_profile(&admission_spec) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return Check {
+                        name: NAME,
+                        passed: false,
+                        detail: format!("capture header preflight refused before load: {error}"),
+                    }
+                }
+            };
+            let payload = profile.component_bytes[1]
+                .max(profile.component_bytes[0].saturating_add(profile.component_bytes[2]));
+            let payload_mib = payload.div_ceil(1024 * 1024);
+            let headroom = available_memory_mib().unwrap_or(0.0);
+            let line = format!("UNADMITTED capture: layout {:02x?}, component bytes {:?}, Sequential payload allowance {payload_mib} MiB; live headroom {headroom:.0} MiB. Payload only, NOT a safe working-set bound", profile.layout_sha256, profile.component_bytes);
+            append_breadcrumb("sana-progress.txt", &line);
+            details.push(line);
+            if payload_mib > u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB)
+                || payload_mib as f64 > headroom
+            {
+                return Check { name: NAME, passed: false, detail: format!("capture payload exceeds provisional cap/live headroom; refused before load: {}", details.join(" | ")) };
+            }
+        }
         let admission = match tile {
-            Some(t) if t > 0 => runtime_ios::admit_sana_render(edge, t),
+            Some(t) if t > 0 => runtime_ios::admit_sana_snapshot(SANA_ID, &admission_spec, edge, t),
             _ => runtime_ios::admit_estimate_mib(None),
         };
         if let Err(refusal) = &admission {
@@ -1968,6 +2020,30 @@ pub unsafe extern "C" fn ios_smoke_free(ptr: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "media", not(target_os = "ios")))]
+    #[test]
+    fn sana_capture_is_device_only_and_never_reported_as_admitted() {
+        let old_capture = std::env::var_os("IOS_SMOKE_SANA_CAPTURE");
+        let old_measurement = std::env::var_os("IOS_SMOKE_UNADMITTED");
+        std::env::set_var("IOS_SMOKE_SANA_CAPTURE", "1");
+        std::env::set_var("IOS_SMOKE_UNADMITTED", "1");
+        let result =
+            super::check_image_generation(Some(std::path::Path::new("/definitely-no-snapshot")));
+        let lane = super::check_admission_lane();
+        match old_capture {
+            Some(v) => std::env::set_var("IOS_SMOKE_SANA_CAPTURE", v),
+            None => std::env::remove_var("IOS_SMOKE_SANA_CAPTURE"),
+        }
+        match old_measurement {
+            Some(v) => std::env::set_var("IOS_SMOKE_UNADMITTED", v),
+            None => std::env::remove_var("IOS_SMOKE_UNADMITTED"),
+        }
+        assert!(!result.passed);
+        assert!(result.detail.contains("real device"), "{}", result.detail);
+        assert!(lane.detail.contains("UNADMITTED"));
+        assert!(lane.detail.contains("does NOT establish admitted"));
+    }
+
     /// The same checks must pass on the host, so a failure on device is attributable to the iOS
     /// build rather than to a bug in the checks themselves.
     #[test]

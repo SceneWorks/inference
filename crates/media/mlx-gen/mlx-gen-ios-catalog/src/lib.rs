@@ -19,6 +19,9 @@
 //! domain: the [`IOS_OFFLOAD_POLICY`] load and the decode tile edge [`sana_decode_tile_edge`]
 //! selects from the device measurements (and bounds inferred from them).
 
+mod admission;
+pub use admission::{sana_snapshot_footprint_bound, sana_snapshot_profile, SanaSnapshotProfile};
+
 use mlx_gen::gen_core::{
     Error, GenerationMemory, LoadSpec, OffloadPolicy, ProviderRegistry, ProviderRegistryBuilder,
     Result, WeightsSource,
@@ -49,8 +52,9 @@ pub const IOS_OFFLOAD_POLICY: OffloadPolicy = OffloadPolicy::Sequential;
 /// (`IOS_APP_MEMORY_CAP_MIB`, which is this constant) both read it (epic 16774, E4).
 ///
 /// **PROVISIONAL — UNMEASURED.** 4096 is the `claude/ios-strategy` branch's *assumed* 8 GB cap,
-/// not a device reading. It is replaced by the `os_proc_available_memory()` value the `ios-host`
-/// harness records at launch on the 16 Pro Max (sc-16780). Do not cite it as a measurement.
+/// not a validated rendering ceiling. Entitled launch headroom on iPhone 16 Pro Max was
+/// 6142 MiB (three launches), versus 3374 MiB without the entitlement (three launches). These
+/// are diagnostics, NOT a safe peak working-set budget. Do not substitute a launch reading.
 pub const IOS_MEMORY_BUDGET_MIB: u32 = 4096;
 
 /// The square output edges (px) every iOS default must fit at.
@@ -68,8 +72,8 @@ pub struct SanaDeviceFootprint {
     pub image_edge: u32,
     /// DC-AE decode tile edge, px.
     pub tile_edge: u32,
-    /// Peak process **footprint** (`phys_footprint`, what jetsam charges — MLX live allocation
-    /// *plus* its reuse cache), MiB.
+    /// Historical sampled MLX active + reuse-cache peak, MiB. This is NOT a measurement of
+    /// kernel `phys_footprint` and does not include every process/driver allocation.
     pub footprint_mib: u32,
     /// MLX's **live** peak (`get_peak_memory`, excludes the reuse cache), MiB.
     pub mlx_live_peak_mib: u32,
@@ -77,6 +81,7 @@ pub struct SanaDeviceFootprint {
 
 /// SANA (`sana_1600m`, q4, Sequential) renders measured on device (iPhone 17 Pro Max).
 ///
+/// Unbound historical planning observations, NOT applicable product-admission evidence.
 /// Source: the device table in `mlx-gen-sana/src/pipeline.rs`'s `DECODE_TILE_EDGE` notes on the
 /// `claude/ios-strategy` branch (the 1024² rows), and `docs/ios-device-runbook.md` there (the 512²
 /// row). **Label conflict:** the runbook labels its 2733 / 2860 MiB SANA 1024² run "tile128"
@@ -112,7 +117,7 @@ pub const SANA_DEVICE_FOOTPRINTS: &[SanaDeviceFootprint] = &[
 /// A footprint bound for one SANA render, MiB, and where it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FootprintBound {
-    /// A device measurement of exactly this render.
+    /// A historical device observation of this geometry; artifact/device applicability is separate.
     Measured(u32),
     /// Not measured: derived by [`sana_footprint_bound`] from a measured live peak plus the iOS
     /// cache ceiling. Holds only in a process where `runtime-ios`'s `bound_mlx_to_platform_limits`
@@ -129,7 +134,9 @@ impl FootprintBound {
     }
 }
 
-/// The footprint bound for a render of `image_edge`² decoded at `tile_edge`.
+/// Historical planning bound for `image_edge`² decoded at `tile_edge`. NOT product admission:
+/// the source snapshot identity is missing and the capture device was an iPhone 17 Pro Max.
+/// Use [`sana_snapshot_footprint_bound`] for admission against an actual snapshot/device.
 ///
 /// An exact device record is [`FootprintBound::Measured`]. Otherwise the bound is
 /// [`FootprintBound::Inferred`] from the smallest record at the **same tile edge and a larger

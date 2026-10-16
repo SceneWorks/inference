@@ -41,13 +41,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod media {
     pub use mlx_gen_ios_catalog::{
         sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory,
-        sana_load_spec, FootprintBound, SanaDeviceFootprint, IOS_IMAGE_EDGES,
-        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
-        SANA_DEVICE_FOOTPRINTS,
+        sana_load_spec, sana_snapshot_profile, FootprintBound, SanaDeviceFootprint,
+        SanaSnapshotProfile, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB,
+        IOS_OFFLOAD_POLICY, SANA_DEVICE_FOOTPRINTS,
     };
 
     /// Load SANA generator `sana_id` for a render of `image_edge`² decoded at `tile_edge`, through
-    /// [`crate::admit_sana_render`] and [`crate::load_admitted`]: a refused render never touches its
+    /// [`crate::admit_sana_snapshot`] and [`crate::load_admitted`]: a refused render never touches its
     /// weights.
     pub fn load_sana(
         sana_id: &str,
@@ -55,7 +55,7 @@ pub mod media {
         image_edge: u32,
         tile_edge: u32,
     ) -> crate::gen_core::Result<Box<dyn crate::gen_core::Generator>> {
-        let estimate = crate::admit_sana_render(image_edge, tile_edge)?;
+        let estimate = crate::admit_sana_snapshot(sana_id, spec, image_edge, tile_edge)?;
         crate::load_admitted(Some(estimate), || {
             mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
         })
@@ -164,8 +164,9 @@ pub const MLX_CACHE_LIMIT_CAP_MIB: u32 = 1024;
 ///
 /// **PROVISIONAL — UNMEASURED.** With `media` this IS `mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB`
 /// (the one cap constant; see its docs): 4096 is an *assumed* 8 GB-device cap carried from the
-/// `claude/ios-strategy` branch, to be replaced by the value the `ios-host` harness measures with
-/// `os_proc_available_memory()` at launch on the iPhone 16 Pro Max.
+/// `claude/ios-strategy` branch. The iPhone 16 Pro Max launch readings were 6142 MiB entitled
+/// and 3374 MiB unentitled (three identical readings each). Those are diagnostics, not a validated
+/// safe rendering envelope: DO NOT replace this provisional cap with a launch reading.
 #[cfg(feature = "media")]
 pub const IOS_APP_MEMORY_CAP_MIB: u32 = mlx_gen_ios_catalog::IOS_MEMORY_BUDGET_MIB;
 /// The iOS per-app memory cap admission refuses against, MiB. **PROVISIONAL — UNMEASURED.**
@@ -231,41 +232,97 @@ pub fn load_admitted<T>(
 /// precondition for every [`mlx_gen_ios_catalog::FootprintBound::Inferred`] bound.
 static PLATFORM_LIMITS_BOUND: AtomicBool = AtomicBool::new(false);
 
-/// Admit a SANA render of `image_edge`² decoded at `tile_edge`, using the catalog's footprint bound
-/// (measured or inferred). Call before loading any weights; [`media::load_sana`] calls it for you.
+/// Legacy geometry-only entry point, now fail-closed: dimensions alone do not identify a
+/// snapshot, component precision, hardware, or applicable footprint evidence.
+/// Use [`admit_sana_snapshot`] or the load-bound [`media::load_sana`] entry point.
 ///
 /// Checks the cap and the live per-process headroom, like [`load_admitted`]. An **inferred** bound
 /// (`live_peak + IOS_MLX_CACHE_LIMIT_CAP_MIB`) is valid only once [`bound_mlx_to_platform_limits`]
 /// has capped the cache, so it is refused until then — off-device and on the simulator that is
-/// always, because there is no per-process cap to bind to. A measured bound needs no binding.
+/// always, because there is no per-process cap to bind to. Both kinds require artifact/device binding.
 #[cfg(feature = "media")]
-pub fn admit_sana_render(image_edge: u32, tile_edge: u32) -> gen_core::Result<u32> {
-    let estimate = sana_render_estimate(
+pub fn admit_sana_render(_image_edge: u32, _tile_edge: u32) -> gen_core::Result<u32> {
+    Err(gen_core::Error::Unsupported(
+        "iOS SANA admission requires the actual snapshot and hardware; use admit_sana_snapshot"
+            .into(),
+    ))
+}
+
+/// Admit using the actual component tensor layout, stored precision and hardware identity.
+/// Historical geometry-only observations cannot authorize an arbitrary q4-named directory.
+#[cfg(feature = "media")]
+pub fn admit_sana_snapshot(
+    sana_id: &str,
+    spec: &gen_core::LoadSpec,
+    image_edge: u32,
+    tile_edge: u32,
+) -> gen_core::Result<u32> {
+    let bound = mlx_gen_ios_catalog::sana_snapshot_footprint_bound(
+        sana_id,
+        spec,
+        &device_machine(),
         image_edge,
         tile_edge,
-        PLATFORM_LIMITS_BOUND.load(Ordering::Acquire),
     )?;
+    let estimate = sana_bound_estimate(bound, PLATFORM_LIMITS_BOUND.load(Ordering::Acquire))?;
     admit_within_headroom(estimate, os_proc_available_mib())
 }
 
-/// [`admit_sana_render`]'s cap decision with the binding state passed in, so both states are
+/// Hardware identity is independent of total RAM and launch-time available memory.
+#[cfg(feature = "media")]
+pub fn device_machine() -> String {
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut buffer = [0u8; 128];
+        let mut size = buffer.len();
+        let status = unsafe {
+            sysctlbyname(
+                c"hw.machine".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 && size > 1 && size <= buffer.len() {
+            if let Ok(value) = std::str::from_utf8(&buffer[..size - 1]) {
+                return value.to_owned();
+            }
+        }
+        "unknown-ios-device".into()
+    }
+    #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
+    {
+        "non-device-host".into()
+    }
+}
+
+/// [`admit_sana_snapshot`]'s cap decision with the binding state passed in, so both states are
 /// testable without mutating the process-global flag.
 #[cfg(feature = "media")]
-fn sana_render_estimate(
-    image_edge: u32,
-    tile_edge: u32,
+fn sana_bound_estimate(
+    bound: mlx_gen_ios_catalog::FootprintBound,
     limits_bound: bool,
 ) -> gen_core::Result<u32> {
     use mlx_gen_ios_catalog::FootprintBound;
-    match mlx_gen_ios_catalog::sana_footprint_bound(image_edge, tile_edge) {
-        Some(FootprintBound::Inferred(mib)) if !limits_bound => {
+    match bound {
+        FootprintBound::Inferred(mib) if !limits_bound => {
             Err(gen_core::Error::Unsupported(format!(
-                "iOS admission: {image_edge}²/{tile_edge} has only an inferred bound ({mib} MiB), \
+                "iOS admission: render has only an inferred bound ({mib} MiB), \
                  which holds only after bound_mlx_to_platform_limits capped MLX's cache; it has not \
                  in this process"
             )))
         }
-        bound => admit_estimate_mib(bound.map(FootprintBound::mib)),
+        bound => admit_estimate_mib(Some(bound.mib())),
     }
 }
 
@@ -464,6 +521,18 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "media")]
+    #[test]
+    fn source_aware_admission_precedes_even_a_deferred_sequential_load() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = mlx_gen_ios_catalog::sana_load_spec(super::gen_core::WeightsSource::Dir(
+            root.path().to_path_buf(),
+        ));
+        assert!(super::admit_sana_snapshot("sana_1600m", &spec, 1024, 192).is_err());
+        assert!(super::media::load_sana("sana_1600m", &spec, 1024, 192).is_err());
+        assert!(super::admit_sana_render(1024, 192).is_err());
+    }
+
     /// SANA admission reads the catalog's bound and compares it to the cap (whatever value the
     /// cap is filled in with); a pair with no bound (1024²/256) is refused.
     #[cfg(feature = "media")]
@@ -474,7 +543,11 @@ mod tests {
                 .expect("bounded pair")
                 .mib();
             assert_eq!(
-                super::sana_render_estimate(image, tile, true).ok(),
+                super::sana_bound_estimate(
+                    mlx_gen_ios_catalog::sana_footprint_bound(image, tile).unwrap(),
+                    true
+                )
+                .ok(),
                 (bound <= super::IOS_APP_MEMORY_CAP_MIB).then_some(bound),
                 "{image}²/{tile}: bound {bound} MiB vs cap {}",
                 super::IOS_APP_MEMORY_CAP_MIB
@@ -501,14 +574,29 @@ mod tests {
             Some(FootprintBound::Measured(_))
         ));
 
-        assert!(super::sana_render_estimate(inferred.0, inferred.1, false).is_err());
-        assert!(super::sana_render_estimate(inferred.0, inferred.1, true).is_ok());
-        assert!(super::sana_render_estimate(measured.0, measured.1, false).is_ok());
+        assert!(super::sana_bound_estimate(
+            sana_footprint_bound(inferred.0, inferred.1).unwrap(),
+            false
+        )
+        .is_err());
+        assert!(super::sana_bound_estimate(
+            sana_footprint_bound(inferred.0, inferred.1).unwrap(),
+            true
+        )
+        .is_ok());
+        assert!(super::sana_bound_estimate(
+            sana_footprint_bound(measured.0, measured.1).unwrap(),
+            false
+        )
+        .is_ok());
 
         #[cfg(not(target_os = "ios"))]
         {
             assert!(super::admit_sana_render(inferred.0, inferred.1).is_err());
-            assert!(super::admit_sana_render(measured.0, measured.1).is_ok());
+            assert!(
+                super::admit_sana_render(measured.0, measured.1).is_err(),
+                "geometry alone is not artifact evidence"
+            );
         }
     }
 

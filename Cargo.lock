@@ -2571,6 +2571,8 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-sana",
  "pmetal-mlx-rs",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -3577,6 +3579,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "runtime-catalog",
+ "tempfile",
 ]
 
 [[package]]

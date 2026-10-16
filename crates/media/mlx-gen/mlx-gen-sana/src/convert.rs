@@ -11,7 +11,7 @@
 //!    caption-projection MLP, and `proj_out`. The `patch_embed` conv and the GLUMBConv depth/point/
 //!    inverted convs stay dense (they are conv weights, not a quant target).
 //!  * the Gemma-2 CHI `text_encoder/` — every decoder projection (`is_te_target`): `self_attn`
-//!    `q/k/v/o_proj` and the `mlp` `gate/up/down_proj`. `embed_tokens` + all RMSNorms stay dense.
+//!    `q/k/v/o_proj`, the `mlp` `gate/up/down_proj`, and `model.embed_tokens`. RMSNorms stay dense.
 //!    (This is the biggest component, so packing it is where the low-RAM win is.)
 //!
 //! The **DC-AE `vae/`** decoder stays dense in every tier (all-conv; its Linear-attention is a
@@ -86,8 +86,11 @@ fn is_transformer_target(base: &str) -> bool {
 
 /// Whether a `text_encoder/` key's `base` is a Gemma-2 decoder **projection** the TE quantizes —
 /// matching `mlx_gen_pid::gemma2`'s `lin` sites exactly (`self_attn` q/k/v/o + `mlp` gate/up/down).
-/// `model.embed_tokens`, `model.norm`, and every `*_layernorm` stay dense.
+/// `model.embed_tokens` uses the shared packed embedding loader; norms and `lm_head` stay dense.
 fn is_te_target(base: &str) -> bool {
+    if base == "model.embed_tokens" {
+        return true;
+    }
     let Some(rest) = base.strip_prefix("model.layers.") else {
         return false;
     };
@@ -165,7 +168,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     let tr = quantize_map(load_map(&tr_src)?, bits, GROUP_SIZE, is_transformer_target)?;
     save_map(&tr_dst.join(TRANSFORMER_FILE), &tr)?;
 
-    // Text encoder: pack the Gemma-2 projections, keep the tokenizer.json sidecar.
+    // Text encoder: pack the Gemma-2 projections and token embedding, keep tokenizer.json.
     let te_src = src_root.join("text_encoder");
     if !te_src.is_dir() {
         return Err(Error::Msg(format!(
@@ -231,8 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn te_predicate_matches_gemma_projections_only() {
+    fn te_predicate_matches_gemma_projections_and_embedding() {
         for base in [
+            "model.embed_tokens",
             "model.layers.0.self_attn.q_proj",
             "model.layers.0.self_attn.k_proj",
             "model.layers.0.self_attn.v_proj",
@@ -244,13 +248,69 @@ mod tests {
             assert!(is_te_target(base), "{base} should pack");
         }
         for base in [
-            "model.embed_tokens",
+            "lm_head",
             "model.norm",
             "model.layers.0.input_layernorm",
             "model.layers.0.post_attention_layernorm",
             "model.layers.0.pre_feedforward_layernorm",
         ] {
             assert!(!is_te_target(base), "{base} should stay dense");
+        }
+    }
+
+    #[test]
+    fn converter_embedding_is_consumed_by_gemma_at_both_packed_tiers() {
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        for bits in [4, 8] {
+            let source = Array::from_slice(
+                &(0..5 * 128).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+                &[5, 128],
+            );
+            let norm = Array::from_slice(&[0.0f32; 128], &[128]);
+            let map = HashMap::from([
+                ("model.embed_tokens.weight".into(), source),
+                ("model.norm.weight".into(), norm),
+            ]);
+            let packed = quantize_map(map, bits, GROUP_SIZE, is_te_target).unwrap();
+            assert_eq!(packed["model.embed_tokens.weight"].dtype(), Dtype::Uint32);
+            assert!(packed.contains_key("model.embed_tokens.scales"));
+            assert_eq!(packed["model.norm.weight"].dtype(), Dtype::Float32);
+            let dense = mlx_rs::ops::dequantize(
+                &packed["model.embed_tokens.weight"],
+                &packed["model.embed_tokens.scales"],
+                &packed["model.embed_tokens.biases"],
+                GROUP_SIZE,
+                bits,
+            )
+            .unwrap();
+            let cfg = mlx_gen_pid::Gemma2Config {
+                hidden_size: 128,
+                num_layers: 0,
+                ..mlx_gen_pid::Gemma2Config::gemma_2_2b()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("gemma-2-2b-it.safetensors");
+            save_map(&file, &packed).unwrap();
+            let model = mlx_gen_pid::Gemma2::from_weights(
+                &Weights::from_file(&file).unwrap(),
+                "model.",
+                &cfg,
+            )
+            .unwrap();
+            let mut reference = packed;
+            reference.remove("model.embed_tokens.scales");
+            reference.remove("model.embed_tokens.biases");
+            reference.insert("model.embed_tokens.weight".into(), dense);
+            let reference =
+                mlx_gen_pid::Gemma2::from_weights(&Weights::from_map(reference), "model.", &cfg)
+                    .unwrap();
+            let ids = Array::from_slice(&[4i32, 0, 4, 2], &[2, 2]);
+            let got = model.forward(&ids, None).unwrap();
+            let expected = reference.forward(&ids, None).unwrap();
+            assert!(
+                byte_equal(&got, &expected),
+                "converter/loader embedding q{bits} mismatch"
+            );
         }
     }
 

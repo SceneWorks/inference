@@ -144,7 +144,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
-  for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+  for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
     val=$(printenv "$var" || true)
     if [ -n "$val" ]; then export "SIMCTL_CHILD_$var=$val"; say "forwarding $var=$val"; fi
   done
@@ -341,7 +341,7 @@ LAUNCH_ENV="{}"
 # produced a 216.3 s "rung 4 disabled" run whose MLX peak (2901 MiB) was byte-identical to the
 # rung-4-ENABLED run, when the host A/B moves that peak by 1662 MiB. The measurement was a no-op
 # wearing the name of an experiment. If you add a knob to the harness, add it here in the same edit.
-for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "
@@ -349,6 +349,7 @@ import json,sys
 d = json.loads(sys.argv[1]); d[sys.argv[2]] = sys.argv[3]; print(json.dumps(d))" "$LAUNCH_ENV" "$var" "$val")
   fi
 done
+LAUNCHED_AT=$(date +%s)
 say "launching (unlock the device if prompted; console output follows)"
 # Two explicit invocations rather than an argument array. devicectl rejects an empty `{}` with
 # "Unable to decode environment variables" (which reads like a quoting bug and is not one), and
@@ -390,7 +391,6 @@ if [ -n "$CARGO_FEATURES" ]; then POLL_TRIES=${POLL_TRIES_MEDIA:-100}; fi
 say "waiting for the on-device report (up to ~$((POLL_TRIES * 6))s)"
 REPORT=/tmp/ios-smoke-report.txt
 rm -f "$REPORT"
-LAUNCHED_AT=$(date +%s)
 for _ in $(seq 1 "$POLL_TRIES"); do
   sleep 3
   rm -f "$REPORT"
@@ -436,10 +436,10 @@ if [ ! -f "$REPORT" ]; then
       --source Documents/sana-progress.txt --destination "$BREADCRUMB" >/dev/null 2>&1; then
     echo >&2
     echo "the app DID run -- image-generation breadcrumbs found, so this is a mid-run death" >&2
-    echo "(most likely jetsam: no increased-memory-limit entitlement, see E5/S4.7):" >&2
+    echo "(termination cause unconfirmed; retrieve the matching device diagnostic):" >&2
     sed 's/^/  /' "$BREADCRUMB" >&2
     echo >&2
-    echo "the configuration AFTER the last line above is the one that exceeded the cap" >&2
+    echo "the last breadcrumbs identify progress, not the termination cause" >&2
   fi
   exit 1
 fi

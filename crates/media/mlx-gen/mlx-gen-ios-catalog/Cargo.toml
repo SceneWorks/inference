@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
+sha2 = { workspace = true }
 mlx-gen = { path = ".." }
 # SANA only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
 # the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for
@@ -18,6 +19,7 @@ mlx-gen = { path = ".." }
 mlx-gen-sana = { path = "../mlx-gen-sana" }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The image_budget example reads MLX's allocator accounting directly (get_active_memory /
 # get_peak_memory), which the gen-core contract deliberately does not expose -- it is tensor-free.
 mlx-rs = { workspace = true }
