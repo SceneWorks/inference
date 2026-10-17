@@ -73,6 +73,10 @@ pub fn descriptor() -> ModelDescriptor {
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
+            // sc-26238: `enhance_prompt` runs the separate FLUX 3 prompt upsampler (the optional
+            // `prompt_upsampler` component) before encoding; without it the request is a typed
+            // refusal, never a silent pass-through.
+            supports_prompt_enhancement: true,
             ..Default::default()
         },
     }
@@ -94,6 +98,9 @@ pub struct Flux3Klein {
     spec: LoadSpec,
     /// The loaded memory contract, published through [`Generator::memory_strategy_contract`].
     memory_strategy: gen_core::MemoryProviderContract,
+    /// The optional prompt upsampler (sc-26238; the `prompt_upsampler` component), resident
+    /// beside the image model for the generator's lifetime.
+    upsampler: Option<crate::pup::Flux3PromptUpsampler>,
 }
 
 /// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
@@ -238,12 +245,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Priced from the resources' tensor headers after the components loaded, so a broken
     // resource surfaces as its loader's own error.
     let memory_strategy = crate::memory_strategy::generation_contract(spec, &resources, &config)?;
+    // sc-26238: the optional upsampler loads last, after every image-model resource proved
+    // sound, so its own load error is unmistakably the component's.
+    let upsampler = crate::pup::Flux3PromptUpsampler::from_spec(spec)?;
     Ok(Box::new(Flux3Klein {
         descriptor: descriptor(),
         config,
         residency,
         spec: spec.clone(),
         memory_strategy,
+        upsampler,
     }))
 }
 
@@ -254,18 +265,36 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
-        // Upstream `generate.py`: an unseeded request is seeded from its caption.
-        let params = GenerationParams::resolve(req, prompt_seed(&req.prompt), &self.config)?;
-        let total = params.steps * req.count;
-        let images = self.residency.run_request_scoped(
+        // Preparation belongs to the exclusive request lifecycle. In particular a staged
+        // request must evict a reused resident pair before the optional VLM runs.
+        let images = self.residency.run_request_scoped_with_prepare(
             stage_residency_for(&self.spec, req),
             false,
             &req.cancel,
             false,
             on_progress,
-            |te: &Flux3TextEncoder| te.encode(&params.prompt),
+            |on_progress| {
+                let caption = crate::pup::effective_prompt(
+                    self.upsampler.as_ref(),
+                    req,
+                    &crate::pup::text_input(req),
+                    on_progress,
+                )?
+                .caption;
+                let mut effective = req.clone();
+                effective.prompt = caption;
+                Ok(GenerationParams::resolve(
+                    &effective,
+                    prompt_seed(&effective.prompt),
+                    &self.config,
+                )?)
+            },
+            |te: &Flux3TextEncoder, params: GenerationParams| {
+                Ok((te.encode(&params.prompt)?, params))
+            },
             |_| Ok(()),
-            |heavy: &Heavy, text, on_progress| {
+            |heavy: &Heavy, (text, params), on_progress| {
+                let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
                 let mut tokens = Vec::with_capacity(req.count as usize);

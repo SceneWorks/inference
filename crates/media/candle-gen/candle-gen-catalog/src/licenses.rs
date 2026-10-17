@@ -858,6 +858,9 @@ mod tests {
             // sc-26234: FLUX 3 Image Klein ships on MLX first; the Candle lane is sc-26235, which
             // maps this row and deletes the pin.
             "flux3_image_klein",
+            // sc-26238 adds the optional PUP row on MLX; the following Candle port (sc-26235)
+            // registers the FLUX 3 provider and maps this separate component too.
+            "flux3_image_klein_pup",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

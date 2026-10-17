@@ -402,6 +402,28 @@ pub const FLUX3_IMAGE_KLEIN: ComponentLicense = ComponentLicense {
     retrieved: "2026-10-15",
 };
 
+/// `black-forest-labs/flux-3-image-klein-pup` — the FLUX 3 Image Klein **prompt upsampler**
+/// (sc-26238): a 9B Qwen3.5 vision-language model, a full fine-tune of `Qwen/Qwen3.5-9B`, in a
+/// separate, ungated repository. The card front matter at the pinned revision
+/// `8b069751eb5dcab23829d9c5eccb470eb8b8a4ed` declares `license: apache-2.0` (verbatim) and the
+/// card's own licence section says "released under the Apache License 2.0 … derived from
+/// Qwen3.5-9B … released under the Apache License 2.0". The Hub API reported `gated: false` on
+/// 2026-10-15. Rowed separately from [`FLUX3_IMAGE_KLEIN`]: the image model's weights are under
+/// the FLUX Kommunity License, the upsampler's are not, and the upsampler is an optional
+/// co-requisite the provider loads only when the `prompt_upsampler` component names it.
+pub const FLUX3_IMAGE_KLEIN_PUP: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein_pup",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some(
+        "FLUX 3 Image Klein Prompt Upsampler \u{a9} Black Forest Labs — licensed under \
+         Apache-2.0; derived from Qwen3.5-9B \u{a9} Alibaba Cloud (Apache-2.0)",
+    ),
+    retrieved: "2026-10-15",
+};
+
 /// Gemma-2-2B-IT — the PiD caption encoder and the SANA text encoder.
 ///
 /// Three redistributions are named in this codebase (`SceneWorks/gemma-2-2b-it`,
@@ -1283,6 +1305,7 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     FLUX2_KLEIN_9B,
     FLUX2_KLEIN_9B_KV,
     FLUX3_IMAGE_KLEIN,
+    FLUX3_IMAGE_KLEIN_PUP,
     GEMMA_2_2B_IT,
     GEMMA_3_12B_IT,
     GPT_OSS_20B,
@@ -1355,7 +1378,7 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 78);
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 79);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),

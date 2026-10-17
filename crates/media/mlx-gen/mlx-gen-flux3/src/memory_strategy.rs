@@ -270,7 +270,49 @@ pub(crate) fn generation_contract(
         decoder_bytes: decoder,
         overlay_bytes: 0,
     };
+    if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
+        gen_core::flux3::pup::UpsamplePackage::check(&dir)?;
+        let llm_spec = gen_core::core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
+        let bytes = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
+            CoreError::Unsupported(format!(
+                "{MODEL_ID}: cannot account for prompt_upsampler at {}: {e}",
+                dir.display()
+            ))
+        })?;
+        account_upsampler(&mut contract, bytes)?;
+    }
     Ok(contract)
+}
+
+/// Charge the optional VLM exactly once, separate from the base encoder. The shared LLM
+/// header-only load bound includes derivatives and staging and conservatively reserves those
+/// bytes throughout the render, since this loader keeps the VLM alive. It does NOT estimate
+/// upsampling activations or its KV cache: those require the terminal resource campaign.
+fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+    if bytes == 0 {
+        return Err(CoreError::Unsupported(
+            "flux3: prompt_upsampler has no accountable weights; provision a complete package"
+                .into(),
+        ));
+    }
+    contract.asset_facts.overlay_bytes = bytes;
+    contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+        phases: contract.lifecycle.phases.clone(),
+        variables: vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::ConditioningTokenCount,
+            MemoryFormulaVariable::OverlayBytes,
+        ],
+        resident_components: vec![gen_core::MemoryResidentComponent {
+            id: gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
+            kind: gen_core::MemoryComponentKind::PromptUpsampler,
+            resident_bytes: bytes,
+            bounded_by: None,
+            residency: gen_core::MemoryComponentResidency::WholeRender,
+        }],
+    };
+    Ok(())
 }
 
 /// Resident bytes of the DiT as [`crate::model::load_dit`] holds it: every tensor of rank two or
@@ -528,6 +570,54 @@ mod tests {
             assert!(contract.lifecycle.synchronized_phase_release);
             assert!(contract.phase_facts.is_some());
         }
+    }
+
+    #[test]
+    fn optional_upsampler_is_separate_and_charged_once() {
+        let mut contract = weights_free_memory_strategy_contract(MODEL_ID, &sentinel()).unwrap();
+        assert!(matches!(
+            contract.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
+        assert!(contract.resident_components().is_empty());
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 0,
+        };
+        let original = contract.asset_facts;
+        let before = contract.total_resident_bytes();
+        account_upsampler(&mut contract, 37).unwrap();
+        assert_eq!(contract.asset_facts.base_bytes, original.base_bytes);
+        assert_eq!(
+            contract.asset_facts.conditioning_bytes,
+            original.conditioning_bytes
+        );
+        assert_eq!(contract.asset_facts.overlay_bytes, 37);
+        assert_eq!(contract.total_resident_bytes(), before + 37);
+        assert_eq!(contract.auxiliary_resident_bytes(), 37);
+        assert_eq!(contract.resident_components().len(), 1);
+        let component = &contract.resident_components()[0];
+        assert_eq!(component.id, "prompt_upsampler");
+        assert_eq!(
+            component.kind,
+            gen_core::MemoryComponentKind::PromptUpsampler
+        );
+        assert_eq!(component.resident_bytes, 37);
+        assert_eq!(
+            component.residency,
+            gen_core::MemoryComponentResidency::WholeRender
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        let mut absent = base_contract(Precision::Bf16, None);
+        assert!(account_upsampler(&mut absent, 0).is_err());
+        assert_eq!(absent.asset_facts.overlay_bytes, 0);
     }
 
     #[test]

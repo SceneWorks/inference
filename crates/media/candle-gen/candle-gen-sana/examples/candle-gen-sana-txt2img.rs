@@ -118,7 +118,7 @@ fn main() -> Result<()> {
             let _ = std::io::stdout().flush();
         }
         Progress::Decoding => println!("\n[sana] decoding"),
-        Progress::Loading(_) => {}
+        Progress::Loading(_) | Progress::Upsampling { .. } => {}
     };
 
     let t0 = std::time::Instant::now();

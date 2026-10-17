@@ -110,6 +110,7 @@ fn main() -> Result<()> {
         }
         Progress::Decoding => println!("\n[smoke] decoding"),
         Progress::Loading(phase) => println!("[smoke] loading {phase:?}"),
+        Progress::Upsampling { .. } => {}
     };
     // This provider is LAZY: the weights land on the device inside the first `generate`, not in
     // `load`. So the load phase cannot be closed before it — closing both phases after the single

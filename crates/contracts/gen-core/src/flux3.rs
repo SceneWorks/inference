@@ -23,9 +23,10 @@
 //!   [`TEXT_ENCODER_UPSTREAM_REPO`] @ [`TEXT_ENCODER_UPSTREAM_REVISION`] (same LFS sha256 for both
 //!   shards, same tokenizer and config), which is why that snapshot may be provisioned as the
 //!   `text_encoder` component and why the licence row is Qwen's.
-//! * The base checkpoint (`flux-3-image-klein-base`, CFG sampling) is sc-26239's; the prompt
-//!   upsampler (`flux-3-image-klein-pup`) is sc-26238's; references and boxes are sc-26236/7's.
-//!   Nothing here pins them.
+//! * The base checkpoint (`flux-3-image-klein-base`, CFG sampling) is sc-26239's; references
+//!   and boxes are sc-26236/7's. Nothing here pins them. The prompt upsampler
+//!   (`flux-3-image-klein-pup`, sc-26238) is the [`pup`] submodule: a separate, optional
+//!   package named by the [`pup::UPSAMPLER_COMPONENT`] component.
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,9 @@ use sha2::{Digest, Sha256};
 use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
+
+pub mod image_input;
+pub mod pup;
 
 // ---------------------------------------------------------------------------------------------
 // Identity
@@ -512,7 +516,11 @@ impl GenerationResources {
     pub fn from_spec(spec: &LoadSpec, config: &Flux3Config, model_id: &str) -> Result<Self> {
         crate::control::reject_unknown_components(
             spec,
-            &[TEXT_ENCODER_COMPONENT, AUTOENCODER_COMPONENT],
+            &[
+                TEXT_ENCODER_COMPONENT,
+                AUTOENCODER_COMPONENT,
+                pup::UPSAMPLER_COMPONENT,
+            ],
             model_id,
         )?;
         let package_dir = match &spec.weights {

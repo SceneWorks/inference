@@ -3469,8 +3469,18 @@ const MAX_STEPS: u32 = 100_000;
 const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
-/// Shared hard ceiling for autoregressive prompt enhancement. Providers may choose a lower cap.
+/// Legacy prompt-enhancement token ceiling. Unrelated providers must not inherit FLUX 3's cap.
 pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
+
+/// Resolve the provider's token ceiling, distinct from the effective-caption character bound.
+/// Only the two canonical FLUX 3 ids opt into the frozen PUP source's 3584-token budget.
+/// Unknown ids and every legacy enhancer retain their existing 2048-token limit.
+pub fn max_enhance_tokens_for_model(model_id: &str) -> u32 {
+    match model_id {
+        "flux3_klein" | "flux3_klein_base" => crate::flux3::pup::MAX_TOKENS,
+        _ => MAX_ENHANCE_TOKENS,
+    }
+}
 /// Shared temperature range for prompt enhancement sampling.
 pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 
@@ -4108,9 +4118,10 @@ impl Capabilities {
                     "{id}: enhance_max_tokens requires enhance_prompt=true"
                 )));
             }
-            if tokens == 0 || tokens > MAX_ENHANCE_TOKENS {
+            let max_tokens = max_enhance_tokens_for_model(id);
+            if tokens == 0 || tokens > max_tokens {
                 return Err(Error::Msg(format!(
-                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={MAX_ENHANCE_TOKENS}"
+                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={max_tokens}"
                 )));
             }
         }
@@ -5012,6 +5023,50 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    #[test]
+    fn enhancement_token_limits_are_canonical_model_scoped_without_changing_defaults() {
+        let supported = Capabilities {
+            supports_prompt_enhancement: true,
+            ..caps()
+        };
+        for (id, limit) in [
+            ("flux2_dev", 2_048),
+            ("ltx_2_3", 2_048),
+            ("unknown", 2_048),
+            ("flux3_klein_alias", 2_048),
+            ("flux3_klein", 3_584),
+            ("flux3_klein_base", 3_584),
+        ] {
+            assert_eq!(max_enhance_tokens_for_model(id), limit, "{id}");
+            for tokens in [0, 2_048, 2_049, 3_584, 3_585] {
+                let request = GenerationRequest {
+                    enhance_prompt: true,
+                    enhance_max_tokens: Some(tokens),
+                    ..base_req()
+                };
+                assert_eq!(
+                    supported.validate_request(id, &request).is_ok(),
+                    tokens > 0 && tokens <= limit,
+                    "{id}: {tokens} tokens"
+                );
+            }
+            for enabled in [false, true] {
+                let request = GenerationRequest {
+                    enhance_prompt: enabled,
+                    ..base_req()
+                };
+                assert!(supported.validate_request(id, &request).is_ok(), "{id}");
+                assert!(request.enhance_max_tokens.is_none());
+            }
+            let disabled_tuning = GenerationRequest {
+                enhance_max_tokens: Some(limit),
+                ..base_req()
+            };
+            assert!(supported.validate_request(id, &disabled_tuning).is_err());
+        }
+        assert_eq!(MAX_ENHANCE_TOKENS, 2_048);
     }
 
     fn base_req() -> GenerationRequest {

@@ -747,6 +747,8 @@ pub enum MemoryComponentKind {
     /// object *does* build both halves at load charges those in `decoder_bytes` and declares here
     /// only the encoder copy it builds lazily on the first reference.
     ReferenceEncoder,
+    /// A separately loaded optional caption-rewriting VLM, outside the image model's encoder.
+    PromptUpsampler,
 }
 
 /// How long one declared component's bytes stay resident within a single render (SC-18665).
@@ -1021,6 +1023,7 @@ impl MemoryComponentKind {
                 | Self::IpAdapter
                 | Self::IdentityEncoder
                 | Self::ReferenceEncoder
+                | Self::PromptUpsampler
         )
     }
 }
@@ -1102,7 +1105,7 @@ impl MemoryPeakBreakdown {
 ///
 /// **Auxiliary means outside the base model, not merely outside the usual three names.** The set is
 /// closed and enumerated by [`MemoryComponentKind::is_auxiliary`]: a control branch, an adapter
-/// stack, an IP-Adapter, an identity encoder, a reference (VAE) encoder — networks a *request* opts
+/// stack, an IP-Adapter, an identity encoder, a reference (VAE) encoder, a prompt upsampler — networks a *request* opts
 /// into, which a plain render of the same checkpoint does not load. Those are the ones
 /// `overlay_bytes` exists for, and the reason it is excluded from `base_bytes` is precisely that a
 /// fit decision for a request without them must not carry them.
@@ -5662,6 +5665,50 @@ mod tests {
             default_memory_strategy_safety_check(&mutated, &context),
             MemorySafetyDecision::Accept,
             "explicitly authorized conservative estimates preserve calibration-free optimized fallback"
+        );
+    }
+
+    #[test]
+    fn prompt_upsampler_is_a_separate_once_charged_auxiliary_network() {
+        let mut contract = adopted_contract();
+        contract.asset_facts = MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 40,
+            decoder_bytes: 10,
+            overlay_bytes: 0,
+        };
+        assert_eq!(contract.total_resident_bytes(), 60);
+        contract.asset_facts.overlay_bytes = 37;
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases: contract.lifecycle.phases.clone(),
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::OverlayBytes,
+            ],
+            resident_components: vec![MemoryResidentComponent {
+                id: "prompt_upsampler".into(),
+                kind: MemoryComponentKind::PromptUpsampler,
+                resident_bytes: 37,
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        };
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        assert_eq!(contract.asset_facts.base_bytes, 60);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 10);
+        assert_eq!(contract.auxiliary_resident_bytes(), 37);
+        assert_eq!(contract.total_resident_bytes(), 97);
+        let breakdown = contract.decompose_predicted_peak(1000);
+        assert_eq!(breakdown.unattributed_bytes, 963);
+        assert_eq!(breakdown.components.len(), 1);
+        assert_eq!(
+            breakdown.components[0].kind,
+            MemoryComponentKind::PromptUpsampler
         );
     }
 

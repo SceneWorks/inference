@@ -429,6 +429,17 @@ pub fn generate_speculative_monitored<M: StepModel + ?Sized, P: Proposer + ?Size
 /// distribution and seeded stream — so moving that pipeline onto the one engine loop
 /// ([`generate_with_sampler`]) leaves its tokens unchanged.
 pub trait TokenSampler {
+    /// Reset the presence-penalty boundary for this request. Custom samplers must opt in.
+    fn begin_generation(&mut self, prompt_len: usize, generated_only: bool) -> Result<()> {
+        let _ = prompt_len;
+        if generated_only {
+            return Err(Error::Msg(
+                "custom sampler does not support generated-only presence penalty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Draw one token from the logits row of the current position (`[1, vocab]` from a prefill,
     /// `[1, 1, vocab]` from a decode step) given the running `history` (prompt + generated ids)
     /// and an optional constraint mask, and say where the draw ran. The engine records the path
@@ -590,6 +601,17 @@ fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             )
         }
     };
+    // Copy per request so a reused config cannot retain the previous prompt boundary.
+    // Prefilled multimodal histories already contain expanded image tokens.
+    let mut request_config = config.clone();
+    request_config.sampling.presence_penalty_prompt_len = history.len();
+    let config = &request_config;
+    if let Some(sampler) = sampler.as_mut() {
+        sampler.begin_generation(
+            history.len(),
+            config.sampling.presence_penalty_generated_only,
+        )?;
+    }
     if let Some(boundary) = on_prefill_complete.as_mut() {
         boundary()?;
     }
@@ -1974,6 +1996,56 @@ mod tests {
                 logits,
                 hidden: None,
             })
+        }
+    }
+
+    #[test]
+    fn generated_only_presence_resets_actual_prefill_boundary_per_request() {
+        let model = Ramp {
+            vocab: 8,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        };
+        let mut config = greedy(6);
+        config.sampling.presence_penalty = 20.0;
+        config.sampling.presence_penalty_generated_only = true;
+        // Deliberately stale: the engine must replace this on its local config, never mutate ours.
+        config.sampling.presence_penalty_prompt_len = 999;
+        for prompt in [&[3, 1, 2][..], &[1][..], &[3, 1, 2][..]] {
+            let expected = run(&model, &mut NoProposer, prompt, &config, 0);
+            assert_eq!(expected.output.tokens[0], prompt.len() as i32);
+            let speculative = run(&model, &mut NgramProposer::default(), prompt, &config, 3);
+            assert_eq!(speculative.output.tokens, expected.output.tokens);
+            // The multimodal route adopts an already-expanded prompt history, not a guessed
+            // text-token count or RoPE/cache position. Its first draw must use that boundary too.
+            let mut cache = model.new_cache();
+            let prefill = model
+                .forward_step(&mut cache, StepRequest::last(prompt).as_prefill())
+                .unwrap();
+            let adopted = generate_speculative(
+                &model,
+                &mut NoProposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits: prefill.logits,
+                    hidden: None,
+                    history: prompt,
+                    position_delta: 0,
+                    warm_proposer: false,
+                },
+                &config,
+                0,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(adopted.output.tokens, expected.output.tokens);
+            let mut legacy = config.clone();
+            legacy.sampling.presence_penalty_generated_only = false;
+            let legacy = run(&model, &mut NoProposer, prompt, &legacy, 0);
+            assert_ne!(legacy.output.tokens[0], expected.output.tokens[0]);
+            assert_eq!(config.sampling.presence_penalty_prompt_len, 999);
         }
     }
 
