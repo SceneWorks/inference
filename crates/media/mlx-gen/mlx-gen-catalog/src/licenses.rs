@@ -1236,15 +1236,32 @@ mod tests {
             .find(|provider| provider["provider_id"] == "flux3_klein")
             .expect("the new FLUX 3 provider is serialized, not just counted");
         let components = flux3["components"].as_array().unwrap();
-        assert_eq!(components.len(), 2);
-        for component in ["flux3_image_klein", "qwen3_vl_4b_instruct"] {
-            assert!(
-                components
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(component)),
-                "FLUX 3 manifest omitted {component}"
-            );
-        }
+        assert_eq!(components.len(), 3);
+        let component_ids: BTreeSet<_> = components
+            .iter()
+            .map(|entry| entry.as_str().expect("component ids are strings"))
+            .collect();
+        assert_eq!(
+            component_ids,
+            BTreeSet::from([
+                "flux3_image_klein",
+                "qwen3_vl_4b_instruct",
+                "flux3_image_klein_pup",
+            ])
+        );
+        let pup = resolve_component(component_licenses(), "flux3_image_klein_pup")
+            .expect("the optional PUP identity resolves to its own license row");
+        assert_eq!(
+            pup.source_url,
+            "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup"
+        );
+        assert_eq!(pup.declared, "apache-2.0");
+        assert_eq!(pup.family, "apache-2-0");
+        assert!(!pup.gated);
+        assert_eq!(
+            gen_core::flux3::pup::UPSAMPLER_REVISION,
+            "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
+        );
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]
