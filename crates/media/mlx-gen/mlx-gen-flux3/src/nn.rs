@@ -29,6 +29,15 @@ pub const RMS_EPS: f32 = 1e-6;
 pub struct Loader<'a> {
     pub weights: &'a Weights,
     pub compute: Dtype,
+    /// MLX affine targets of a converted package; `None` for the dense package.
+    pub affine: Option<&'a AffineTargets>,
+}
+
+/// The packed `<stem>.weight` targets of an MLX affine package and their exact parameters.
+pub struct AffineTargets {
+    pub targets: std::collections::BTreeSet<String>,
+    pub bits: i32,
+    pub group_size: i32,
 }
 
 impl Loader<'_> {
@@ -43,6 +52,33 @@ impl Loader<'_> {
 
     /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`), stored in the compute dtype.
     pub fn linear(&self, prefix: &str) -> Result<Linear> {
+        if let Some(affine) = self
+            .affine
+            .filter(|a| a.targets.contains(&format!("{prefix}.weight")))
+        {
+            let wq = self.require(&format!("{prefix}.weight"))?;
+            let scales = self.require(&format!("{prefix}.scales"))?;
+            // The packed shapes must encode EXACTLY the declared bits at the declared group.
+            let bits = mlx_gen::quant::packed_bits(wq, scales, affine.group_size)?;
+            if bits != affine.bits {
+                return Err(Error::Unsupported(format!(
+                    "flux3: {prefix} packs {bits} bits, the package declares {}",
+                    affine.bits
+                )));
+            }
+            return Ok(Linear {
+                inner: AdaptableLinear::from_quantized_parts(
+                    wq.clone(),
+                    scales.as_dtype(self.compute)?,
+                    self.require(&format!("{prefix}.biases"))?
+                        .as_dtype(self.compute)?,
+                    None,
+                    affine.group_size,
+                    bits,
+                ),
+                compute: self.compute,
+            });
+        }
         let weight = self
             .require(&format!("{prefix}.weight"))?
             .as_dtype(self.compute)?;
@@ -83,6 +119,13 @@ impl Linear {
     /// Normal inference residual arithmetic is deliberate: source mixed precision and
     /// generation reload must use the same cast/alpha/rank convention.
     pub fn replace_training_lora(&mut self, down: Array, up: Array, scale: f64) -> Result<()> {
+        if self.is_quantized() {
+            return Err(Error::Unsupported(
+                "flux3 training: a packed MLX affine base has no differentiable dense weight; \
+                 train on the original dense package"
+                    .into(),
+            ));
+        }
         let (output, input) = self.out_in()?;
         let rank = down.shape().first().copied().unwrap_or(0);
         if rank <= 0
@@ -103,20 +146,31 @@ impl Linear {
         Ok(())
     }
 
-    /// `[out, in]` of the dense base.
+    /// `[out, in]` of the base (a packed base reports its logical, unpacked shape).
     pub fn out_in(&self) -> Result<(i32, i32)> {
-        let (weight, _) = self
-            .inner
-            .dense_weight()
-            .ok_or_else(|| Error::Msg("flux3: a Linear base is not dense".into()))?;
-        let sh = weight.shape();
-        Ok((sh[0], sh[1]))
+        let sh = self.inner.base_shape();
+        match sh.as_slice() {
+            [out, input] => Ok((*out, *input)),
+            other => Err(Error::Msg(format!(
+                "flux3: a Linear base has shape {other:?}"
+            ))),
+        }
     }
 
-    /// The dense base parameters.
+    /// Whether the base is a packed MLX affine projection.
+    pub fn is_quantized(&self) -> bool {
+        self.inner.dense_weight().is_none()
+    }
+
+    /// Every base parameter (dense weight, or packed codes + scales + biases), for eval.
     pub fn arrays(&self) -> Vec<&Array> {
-        match self.inner.dense_weight() {
-            Some((weight, bias)) => std::iter::once(weight).chain(bias).collect(),
+        if let Some((weight, bias)) = self.inner.dense_weight() {
+            return std::iter::once(weight).chain(bias).collect();
+        }
+        match self.inner.quantized_params() {
+            Some((wq, scales, biases, bias, _, _)) => {
+                [wq, scales, biases].into_iter().chain(bias).collect()
+            }
             None => Vec::new(),
         }
     }
@@ -239,4 +293,99 @@ pub fn expect_shape(name: &str, a: &Array, want: &[i32]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod affine_tests {
+    use super::*;
+    use mlx_gen::gen_core::flux3::affine;
+
+    fn seeded(n: usize, salt: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| (i as f32 * 0.37 + salt).sin() * 0.8 + (i as f32 * 0.011).cos() * 0.2)
+            .collect()
+    }
+
+    fn bf16_array(bits: &[u16], shape: &[i32]) -> Array {
+        let values: Vec<f32> = bits.iter().map(|b| affine::bf16_value(*b)).collect();
+        Array::from_slice(&values, shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+    }
+
+    /// Hosted-only (MLX does not build on Windows). The backend-neutral converter's pack runs
+    /// through MLX's own `quantized_matmul` exactly as its dequantized reference, and reconstructs
+    /// within one affine step of `mx.quantize` on the same weights (byte identity is NOT claimed).
+    ///
+    /// *Mutations that red this:* packing codes high-bits-first, swapping scales and biases, or
+    /// casting the `u32` codes in the loader.
+    #[test]
+    fn gen_core_affine_pack_runs_through_mlx_quantized_matmul() {
+        let (n, k) = (32usize, 128usize);
+        let w = seeded(n * k, 0.3);
+        let x = Array::from_slice(&seeded(3 * k, 1.7), &[3, k as i32]);
+        for (bits, group) in [(4u32, 64u32), (8, 32)] {
+            let packed = affine::quantize(&w, n, k, bits, group).unwrap();
+            let words = (k * bits as usize / 32) as i32;
+            let groups = (k / group as usize) as i32;
+            let linear = Linear {
+                inner: AdaptableLinear::from_quantized_parts(
+                    Array::from_slice(&packed.codes, &[n as i32, words]),
+                    bf16_array(&packed.scales, &[n as i32, groups])
+                        .as_dtype(Dtype::Float32)
+                        .unwrap(),
+                    bf16_array(&packed.biases, &[n as i32, groups])
+                        .as_dtype(Dtype::Float32)
+                        .unwrap(),
+                    None,
+                    group as i32,
+                    bits as i32,
+                ),
+                compute: Dtype::Float32,
+            };
+            assert!(linear.is_quantized());
+            assert_eq!(linear.out_in().unwrap(), (n as i32, k as i32));
+            let y = linear.forward(&x).unwrap();
+            let reference = Array::from_slice(
+                &affine::dequantize(&packed, n, k, bits, group).unwrap(),
+                &[n as i32, k as i32],
+            );
+            let want = x
+                .matmul(&reference.transpose_axes(&[1, 0]).unwrap())
+                .unwrap();
+            let diff = y
+                .subtract(&want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            let peak = want.abs().unwrap().max(None).unwrap().item::<f32>();
+            assert!(diff <= 1e-4 * peak.max(1.0), "q{bits}: {diff} vs {peak}");
+            // Same weights through mx.quantize: both reconstruct within one affine step.
+            let dense = Array::from_slice(&w, &[n as i32, k as i32])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let (mq, ms, mb) = mlx_rs::ops::quantize(&dense, group as i32, bits as i32).unwrap();
+            let theirs = mlx_rs::ops::dequantize(&mq, &ms, &mb, group as i32, bits as i32)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap();
+            let gap = theirs
+                .subtract(&reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            let step = packed
+                .scales
+                .iter()
+                .map(|s| affine::bf16_value(*s).abs())
+                .fold(0f32, f32::max);
+            assert!(gap <= 1.5 * step, "q{bits}: {gap} vs step {step}");
+        }
+    }
 }

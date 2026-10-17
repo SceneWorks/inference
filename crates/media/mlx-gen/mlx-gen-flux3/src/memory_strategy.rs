@@ -32,6 +32,8 @@
 use std::path::Path;
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::gen_core::flux3::artifacts::NativeDitStorage;
+use mlx_gen::gen_core::flux3::quantization::DitFormat;
 use mlx_gen::gen_core::flux3::{Flux3Config, GenerationResources};
 use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
 use mlx_gen::gen_core::{
@@ -40,8 +42,8 @@ use mlx_gen::gen_core::{
     MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
     MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, ResidentRequestMemory,
-    Result as CoreResult,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, Quant,
+    ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::LoadSpec;
 
@@ -96,13 +98,24 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 /// Refuse the spec axes that would make a contract describe a load that cannot happen.
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
-    if spec.quantize.is_some() {
-        return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: the distilled route ships one dense tier in S1; LoadSpec::quantize is \
-             refused at load (sc-26241), so there is no quantized memory contract"
-        )));
+    match spec.quantize {
+        None | Some(Quant::Q4 | Quant::Q8) => Ok(()),
+        Some(other) => Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: {} has no MLX FLUX3 kernel; the native MLX tiers are affine q4/q8 \
+             converted from the original dense package",
+            other.key()
+        ))),
     }
-    Ok(())
+}
+
+/// The calibration identity of one tier: a packed MLX affine tier never inherits the dense
+/// identity. Weights-free surfaces know only the bit width; a loaded package adds its group.
+pub fn tier_fingerprint(base: &str, quant: Option<Quant>, group: Option<u32>) -> String {
+    match (quant, group) {
+        (None, _) => base.to_owned(),
+        (Some(q), None) => format!("{base}-mlx-affine-{}", q.key()),
+        (Some(q), Some(g)) => format!("{base}-mlx-affine-{}-g{g}", q.key()),
+    }
 }
 
 /// Bytes per element of the DiT's compute dtype.
@@ -162,11 +175,6 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
     // loaded policy: warm for a `Resident` load, staged for a `Sequential` one.
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
-    // After the conditioning release the DiT + autoencoder are the one heavy bundle, through the
-    // decode.
-    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
-        gen_core::StagedWeightSchedule::TwoStage,
-    ));
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -233,6 +241,9 @@ pub fn weights_free_memory_strategy_contract(
             variables.push(MemoryFormulaVariable::BatchCount);
         }
     }
+    if let Some(calibration) = &mut contract.calibration {
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, None);
+    }
     Ok(contract)
 }
 
@@ -292,7 +303,16 @@ pub(crate) fn generation_contract(
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let transformer = dit_bytes(&resources.dit_weights(), precision)?;
+    let storage = NativeDitStorage::from_package(&resources.package_dir)?;
+    storage.validate_selection(spec.quantize, precision)?;
+    if let Some(calibration) = &mut contract.calibration {
+        let group = match storage {
+            NativeDitStorage::MlxAffine { group_size, .. } => Some(group_size),
+            _ => None,
+        };
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, group);
+    }
+    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
     let decoder = autoencoder_bytes(&resources.autoencoder_file)?;
     let base_bytes = conditioning
@@ -385,7 +405,8 @@ pub(crate) fn upsampler_charge(
             gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
                 precomputed_in: gen_core::MemoryPhase::Conditioning,
                 retained_bytes: 0,
-                evidence: "mlx_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \n                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                evidence: "mlx_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
+                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
                     .into(),
             },
         ),
@@ -434,6 +455,35 @@ fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
     };
     projected_safetensors_bytes(weights, |header| {
         if header.shape.len() >= 2 {
+            cast
+        } else {
+            ResidentProjection::Stored
+        }
+    })
+}
+
+/// Resident DiT bytes for the declared storage, as `load_dit_with_storage` holds it: packed
+/// `u32` codes at their exact stored bytes, their scales/biases and every other matrix at the
+/// compute width, vectors as stored. MLX affine is W4/8A16: `quantized_matmul` reads the compute
+/// input directly and writes the same output a dense GEMM does, so it adds no packed transient.
+fn native_dit_bytes(
+    weights: &Path,
+    precision: Precision,
+    storage: NativeDitStorage,
+    cfg: &gen_core::flux3::DitConfig,
+) -> CoreResult<u64> {
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        return dit_bytes(weights, precision);
+    }
+    let targets = storage.packed_targets(cfg)?;
+    let cast = match precision {
+        Precision::Bf16 => ResidentProjection::Bfloat16,
+        Precision::Fp32 => ResidentProjection::Float32,
+    };
+    projected_safetensors_bytes(weights, |header| {
+        if targets.contains(&header.name) {
+            ResidentProjection::Stored
+        } else if header.shape.len() >= 2 {
             cast
         } else {
             ResidentProjection::Stored
@@ -582,15 +632,19 @@ pub(crate) fn registered_begin_request(
     ))
 }
 
-/// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,
-/// under both offload policies. No loader accepts a quantized tier or has a deferred load shape,
-/// so neither is witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the route witnesses: the dense tier and the MLX affine q4/q8
+/// tiers, eagerly materialized, under both offload policies. NVFP4 and the deferred load
+/// shape have no MLX FLUX3 loader, so neither is witnessed.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
         .into_iter()
         .filter(|surface| {
-            surface.selector.tier == MemoryContractSurfaceTier::Bf16
-                && surface.selector.load_shape == LoadShape::EagerMaterialization
+            matches!(
+                surface.selector.tier,
+                MemoryContractSurfaceTier::Bf16
+                    | MemoryContractSurfaceTier::Q4
+                    | MemoryContractSurfaceTier::Q8
+            ) && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
 }
@@ -729,17 +783,32 @@ mod tests {
         let surfaces = memory_contract_surface_specs();
         assert_eq!(
             surfaces.len(),
-            2,
-            "one dense tier, eager, x 2 offload policies"
+            6,
+            "dense + MLX affine q4/q8 tiers, eager, x 2 offload policies"
         );
-        let selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
-        assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
+        let mut selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
+        selectors.sort();
+        assert_eq!(
+            selectors,
+            [
+                "bf16:resident:eager",
+                "bf16:sequential:eager",
+                "q4:resident:eager",
+                "q4:sequential:eager",
+                "q8:resident:eager",
+                "q8:sequential:eager"
+            ]
+        );
         for surface in &surfaces {
             let contract = weights_free_memory_strategy_contract(MODEL_ID, &surface.spec).unwrap();
             gen_core_testkit::memory_strategy_conformance(&contract);
             assert_eq!(contract.provider_id, MODEL_ID);
             let calibration = contract.calibration.as_ref().unwrap();
-            assert_eq!(calibration.fingerprint, MEMORY_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                calibration.fingerprint,
+                tier_fingerprint(MEMORY_CALIBRATION_FINGERPRINT, surface.spec.quantize, None)
+            );
+            gen_core::validate_calibration_fingerprint(&calibration.fingerprint).unwrap();
             assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
             let declared: Vec<&str> = MemoryStrategy::ALL
                 .into_iter()
@@ -858,7 +927,8 @@ mod tests {
     #[test]
     fn a_spec_no_loader_opens_has_no_contract() {
         for spec in [
-            sentinel().with_quant(Quant::Q4),
+            sentinel().with_quant(Quant::Nvfp4),
+            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             match weights_free_memory_strategy_contract(MODEL_ID, &spec) {
