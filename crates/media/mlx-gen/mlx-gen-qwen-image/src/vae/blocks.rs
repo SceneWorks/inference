@@ -56,11 +56,14 @@ pub(super) fn element_bytes(x: &Array) -> u64 {
     x.item_size() as u64
 }
 
+/// Every counted VAE buffer is its own allocation, priced as MLX's allocator holds it
+/// ([`mlx_gen::ios_quantum::allocated_tensor_bytes`]: page-rounded above 16 KiB).
+///
 /// [`rms_norm_channels`] over `[B, C, T, H, W]`: the squared input and the normalized, scaled,
 /// weighted output (2 full-width buffers; the scale and weight multiplies are donated in place) plus
 /// the per-position sum, root and clamp (3 single-channel planes).
 pub(super) fn channel_norm_bytes([b, c, t, h, w]: [u64; 5], eb: u64) -> u64 {
-    let tb = mlx_gen::ios_quantum::tensor_bytes;
+    let tb = mlx_gen::ios_quantum::allocated_tensor_bytes;
     (2 * tb(eb, &[b, c, t, h, w])).saturating_add(3 * tb(eb, &[b, 1, t, h, w]))
 }
 
@@ -115,7 +118,7 @@ impl CausalConv3d {
         let d = |i: usize| ws.get(i).copied().unwrap_or(0).max(0) as u64;
         let (cout, kvol) = (d(0), d(1) * d(2) * d(3));
         let p = self.padding.max(0) as u64;
-        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        let tb = mlx_gen::ios_quantum::allocated_tensor_bytes;
         let staged = if p > 0 {
             2 * tb(eb, &[b, cin, t + 2 * p, h + 2 * p, w + 2 * p])
         } else {
@@ -158,6 +161,12 @@ pub struct ResBlock3D {
 }
 
 impl ResBlock3D {
+    /// The first 3x3x3 convolution (the CPU proofs measure a full-width conv on its own).
+    #[cfg(test)]
+    pub(super) fn conv1(&self) -> &CausalConv3d {
+        &self.conv1
+    }
+
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let skip = if w
             .get(&format!("{prefix}.skip_conv.conv3d.weight"))
@@ -185,7 +194,7 @@ impl ResBlock3D {
     /// width, `conv2`, the 1x1x1 skip conv when the widths differ, and the residual sum. MLX holds
     /// an op's buffers until its stream catches up, so two convs' unfolds are live together.
     pub(super) fn quantum_bytes(&self, x: [u64; 5], eb: u64) -> u64 {
-        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        let tb = mlx_gen::ios_quantum::allocated_tensor_bytes;
         let [b, _, t, h, w] = x;
         let mid = [b, self.conv1.out_channels().max(0) as u64, t, h, w];
         let out = [b, self.conv2.out_channels().max(0) as u64, t, h, w];
@@ -274,8 +283,10 @@ impl AttentionBlock3D {
     /// and the residual sum (1) = 18. Chunked, every chunk is evaluated before the next is built,
     /// which synchronizes the stream and releases each buffer once its consumers have run: live at
     /// the peak are the qkv conv and its bias sum (6, kept alive by the k/v views every chunk
-    /// reads), the per-position statistics (1), the finished output chunks (1) and their
-    /// concatenation (1) = 9.
+    /// reads), the per-position statistics (1), the finished output chunks (1), their
+    /// concatenation (1) and one earlier full-width buffer whose release the CPU stream can still
+    /// lag when the first chunk peaks (1; measured in 1 of 200 runs, a whole extra `[B·T, H·W, C]`
+    /// buffer) = 10.
     pub(super) fn quantum_geometry(
         &self,
         x: [u64; 5],
@@ -295,7 +306,7 @@ impl AttentionBlock3D {
             query_rows,
             element_bytes: eb,
             weight_bytes: 0,
-            attn_hidden_live: if query_rows < tokens { 9 } else { 18 },
+            attn_hidden_live: if query_rows < tokens { 10 } else { 18 },
             context_live: 0,
             scores: Scores::Materialized {
                 live: 1,
@@ -400,7 +411,7 @@ impl Resample3d {
     /// `3·3·C` patch, the conv output and its bias sum (2 x `[B·T, H', W', Cout]`) and the NCTHW
     /// copy back (1). The bias add is counted even where MLX fuses or donates it.
     pub(super) fn quantum_bytes(&self, [b, c, t, h, w]: [u64; 5], eb: u64) -> u64 {
-        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        let tb = mlx_gen::ios_quantum::allocated_tensor_bytes;
         let ws = self.conv_w.shape();
         let d = |i: usize| ws.get(i).copied().unwrap_or(0).max(0) as u64;
         let (cout, kh, kw) = (d(0), d(1), d(2));

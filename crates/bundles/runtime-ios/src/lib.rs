@@ -50,12 +50,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```
 ///
 /// Nor, in a product build, the device-capture path (only the `device-capture` feature, which
-/// only `ios-host/smoke` enables, compiles it):
-/// ```compile_fail
+/// only `ios-host/smoke` enables, compiles it). Without the feature these must not compile; with
+/// it, they must (so the doctest is meaningful both ways):
+#[cfg_attr(not(feature = "device-capture"), doc = "```compile_fail")]
+#[cfg_attr(feature = "device-capture", doc = "```")]
 /// let _ = runtime_ios::media::capture_permit;
-/// ```
-/// ```compile_fail
 /// let _ = runtime_ios::media::capture_capacity;
+/// ```
+#[cfg_attr(not(feature = "device-capture"), doc = "```compile_fail")]
+#[cfg_attr(feature = "device-capture", doc = "```")]
+/// let _ = mlx_gen_ios_catalog::capture_permit;
 /// ```
 #[cfg(feature = "media")]
 pub mod media {
@@ -86,40 +90,52 @@ pub mod media {
         }
     }
 
-    /// The capacity recheck at admission, before load and before every bound call. The evidence
-    /// footprint is the capture process's absolute lifetime peak; what is still to come is that
-    /// peak minus what this process already holds (weights loaded since admission are in the
-    /// current footprint AND already gone from live headroom, so comparing the absolute peak with
-    /// live headroom would count them twice). `at_admission` is the reading taken when this load
-    /// was admitted, used to derive the current footprint if the kernel reading is unavailable.
+    /// The capacity check at admission, before load and before every bound call (E4).
+    ///
+    /// `demand_bytes` is the admitted work's own growth: the capture's peak minus the capture
+    /// process's starting footprint (the evidence row's baseline). Nothing this process already
+    /// holds is credited as reusable. On a recheck only the growth realized SINCE ADMISSION is
+    /// credited, `remaining = demand - (F_now - F_admission)`, so a loaded generator's second render
+    /// is not charged its weights twice while an unrelated resident never makes room. The
+    /// [`ios_quantum::PROCESS_RESERVE_BYTES`] reserve is part of the boundary: `remaining + reserve`
+    /// must fit live headroom; the projected absolute footprint must fit the single cap.
     pub(crate) fn incremental_capacity(
-        evidence_bytes: u64,
+        demand_bytes: u64,
         now: super::ProcessMemory,
         at_admission: super::ProcessMemory,
     ) -> Result<()> {
-        let estimate = u32::try_from(evidence_bytes.div_ceil(1 << 20))
+        let realized = match (now.footprint, at_admission.footprint) {
+            (Some(current), Some(admitted)) => current.saturating_sub(admitted),
+            // No kernel reading: the headroom consumed since admission.
+            _ => match (at_admission.available, now.available) {
+                (Some(then), Some(current)) => then.saturating_sub(current),
+                _ => 0,
+            },
+        };
+        let remaining = demand_bytes.saturating_sub(realized);
+        let held = now
+            .footprint
+            .or_else(|| at_admission.footprint.map(|f| f.saturating_add(realized)))
+            .unwrap_or(0);
+        let projected = held.saturating_add(remaining);
+        let projected_mib = u32::try_from(projected.div_ceil(1 << 20))
             .map_err(|_| Error::Unsupported("iOS footprint exceeds runtime range".into()))?;
-        super::admit_estimate_mib(Some(estimate)).inspect_err(|_| record_capacity_refusal())?;
+        super::admit_estimate_mib(Some(projected_mib))
+            .inspect_err(|_| record_capacity_refusal())?;
         let Some(available) = now.available else {
             // Off-iOS / no live reading: nothing to refuse on beyond the cap.
             return Ok(());
         };
-        let footprint =
-            now.footprint
-                .or_else(|| match (at_admission.footprint, at_admission.available) {
-                    (Some(p0), Some(a0)) => Some(p0.saturating_add(a0.saturating_sub(available))),
-                    _ => None,
-                });
-        // Without any footprint reading, fall back to the conservative absolute comparison.
-        let demand = footprint.map_or(evidence_bytes, |held| evidence_bytes.saturating_sub(held));
-        if demand > available {
+        let required = remaining.saturating_add(ios_quantum::PROCESS_RESERVE_BYTES);
+        if required > available {
             record_capacity_refusal();
             return Err(Error::Unsupported(format!(
-                "iOS admission: {} MiB still to come (evidence {} MiB, process holds {} MiB) \
-                 exceeds the {} MiB of per-process headroom left",
-                demand >> 20,
-                evidence_bytes >> 20,
-                footprint.unwrap_or(0) >> 20,
+                "iOS admission: {} MiB still to come (demand {} MiB, {} MiB realized since \
+                 admission) + {} MiB reserve exceeds the {} MiB of per-process headroom left",
+                remaining >> 20,
+                demand_bytes >> 20,
+                realized >> 20,
+                ios_quantum::PROCESS_RESERVE_BYTES >> 20,
                 available >> 20
             )));
         }
@@ -169,14 +185,15 @@ pub mod media {
         // committed (subtracted from the prediction exactly once), and the total is the smaller of
         // the fixed cap and what the process could reach now.
         let now = super::process_memory();
-        let budget = mlx_gen_ios_catalog::capacity_budget(
+        let mut budget = mlx_gen_ios_catalog::capacity_budget(
             u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
             now.footprint.unwrap_or(0),
             now.available,
         );
+        budget.reserved_headroom_bytes = ios_quantum::PROCESS_RESERVE_BYTES;
         let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
-        incremental_capacity(admission.footprint_bytes(), now, now)
+        incremental_capacity(admission.demand_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
         Ok((registry, admission, now))
     }
@@ -934,46 +951,44 @@ mod tests {
         use super::media::incremental_capacity;
         use super::ProcessMemory;
         const MIB: u64 = 1 << 20;
-        let evidence = 3500 * MIB; // under the 4096 MiB provisional cap
+        // The evidence row: capture peak 3600 MiB from a 200 MiB harness baseline.
+        let demand = 3400 * MIB;
         let read = |footprint: u64, available: u64| ProcessMemory {
             footprint: Some(footprint * MIB),
             available: Some(available * MIB),
         };
-        let admission = read(200, 5900);
-        // Admission itself: 3300 MiB still to come, 5900 available.
-        incremental_capacity(evidence, admission, admission).unwrap();
-        // First render after a 2 GiB weight load: the absolute check (3500 > 3000) would refuse.
-        let first = read(2200, 3000);
-        assert!(
-            evidence > first.available.unwrap(),
-            "fixture must defeat the absolute check"
-        );
-        incremental_capacity(evidence, first, admission).unwrap();
-        // Second render: headroom did not recover (1200 MiB left), the process holds 3400 MiB.
-        let second = read(3400, 1200);
-        incremental_capacity(evidence, second, admission).unwrap();
-        // The kernel footprint unavailable: derived from the admission reading and the headroom
-        // consumed since (200 + (5900 - 1200) = 4900 MiB held).
-        let derived = ProcessMemory {
-            footprint: None,
-            available: Some(1200 * MIB),
-        };
-        incremental_capacity(evidence, derived, admission).unwrap();
-        // Genuinely short: 3000 MiB still to come, 2000 available — and recorded, typed.
+        // Admission needs the demand plus the reserve: 3400 + 512 = 3912 MiB > 3600 refuses.
+        let short = read(200, 3600);
+        assert!(incremental_capacity(demand, short, short).is_err());
+        let fresh = read(200, 5900);
+        incremental_capacity(demand, fresh, fresh).unwrap();
+        // An unrelated resident (SANA ~2 GB still loaded): 1800 MiB available. The old absolute
+        // arithmetic (3600 - 2200 = 1400 <= 1800) would admit; the growth is 3400: refused.
+        let busy = read(2200, 1800);
         let _ = super::media::take_capacity_refusal();
-        assert!(incremental_capacity(evidence, read(500, 2000), admission).is_err());
-        assert!(super::media::take_capacity_refusal());
-        assert!(!super::media::take_capacity_refusal(), "taking clears it");
-        // No footprint reading at all: the conservative absolute comparison.
+        assert!(incremental_capacity(demand, busy, busy).is_err());
+        assert!(
+            super::media::take_capacity_refusal(),
+            "typed capacity record"
+        );
+        // First render after loading 2000 MiB of weights: 1400 still to come + 512 <= 3900.
+        incremental_capacity(demand, read(2200, 3900), fresh).unwrap();
+        // Second render on the same generator: the whole demand already realized (headroom did
+        // not recover): only the reserve must fit.
+        incremental_capacity(demand, read(3600, 2500), fresh).unwrap();
+        // The reserve is part of the boundary: exactly remaining + reserve fits, one MiB less not.
+        incremental_capacity(demand, read(2200, 1400 + 512), fresh).unwrap();
+        assert!(incremental_capacity(demand, read(2200, 1400 + 511), fresh).is_err());
+        // Kernel footprint unavailable: realized growth derived from the headroom consumed.
         let blind = ProcessMemory {
             footprint: None,
-            available: Some(3000 * MIB),
+            available: Some(3900 * MIB),
         };
-        assert!(incremental_capacity(evidence, blind, ProcessMemory::default()).is_err());
-        // Over the single cap: refused whatever the headroom.
-        assert!(incremental_capacity(4097 * MIB, read(0, 9000), admission).is_err());
+        incremental_capacity(demand, blind, fresh).unwrap();
+        // Over the single cap: 3000 held + 1400 to come > 4096.
+        assert!(incremental_capacity(demand, read(3000, 9000), read(1600, 9000)).is_err());
         // Off-device (no live reading): only the cap applies.
-        incremental_capacity(evidence, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+        incremental_capacity(demand, ProcessMemory::default(), ProcessMemory::default()).unwrap();
     }
 
     /// The capture permit is not an admission and is unavailable off-device: without bounded

@@ -24,7 +24,7 @@ use mlx_gen::ios_quantum::{
     attention_block_bytes, conv_stage_bytes, scores_bytes, tensor_bytes, AttentionBlockGeometry,
     ConvStageGeometry, Scores,
 };
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// U-Net stem: Kolors context projection, timestep/`text_time` embedding and `conv_in`.
 pub(crate) const UNET_STEM: &str = "SDXL UNet stem";
@@ -93,6 +93,12 @@ pub(crate) const VAE_TILE: &str = "SDXL VAE tile";
 /// The assembled output of one tiled VAE layer (resnet / upsample / output convolution).
 pub(crate) const VAE_TILED_STAGE: &str = "SDXL VAE tiled stage";
 
+/// One adapter (LoRA / LoKr / LoHa) file's read, checked against its header floor before the read.
+pub(crate) const ADAPTER_LOAD: &str = "SDXL adapter load";
+/// One adapter target's delta reconstruction + merge into the base (or, on a packed base, the
+/// install of its forward-time residual).
+pub(crate) const ADAPTER_MERGE: &str = "SDXL adapter merge";
+
 /// The MLX backend whose kernels run a quantum, which decides the kernel transients priced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
@@ -129,6 +135,29 @@ pub(crate) fn elements(a: &Array) -> u64 {
 /// Bytes of `a` as stored.
 pub(crate) fn bytes(a: &Array) -> u64 {
     elements(a).saturating_mul(element_bytes(a))
+}
+
+/// Bytes per element of `dtype`.
+pub(crate) fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+        Dtype::Float16 | Dtype::Bfloat16 | Dtype::Uint16 | Dtype::Int16 => 2,
+        Dtype::Float64 | Dtype::Int64 | Dtype::Uint64 | Dtype::Complex64 => 8,
+        _ => 4,
+    }
+}
+
+/// The dtype `x`-typed activations leave `linear` at: MLX promotes a dense matmul to
+/// `result_type(x, weight)` and a quantized one to `result_type(x, scales)`, so a pre-quantized
+/// SceneWorks snapshot's BF16 `.scales` (every packed U-Net / CLIP projection) turn f16 activations
+/// into f32 (measured: `quantum_tests::proofs::f16_transformer_quanta_track_their_measured_peaks`),
+/// and everything downstream of that projection — residual sums, norms, convolutions — runs at f32.
+pub(crate) fn linear_output_dtype(linear: &AdaptableLinear, x: Dtype) -> Dtype {
+    let weight = match linear.quantized_params() {
+        Some((_, scales, ..)) => scales.dtype(),
+        None => linear.weight_dtype().unwrap_or(x),
+    };
+    Dtype::from_promoting_types(x, weight)
 }
 
 /// Output-row count of one projection (the `out` of its logical `[out, in]` weight).
@@ -222,7 +251,9 @@ impl ConvCall {
     /// The bytes this call's kernel allocates beside its input and output, on `backend`:
     ///
     /// * Metal (`conv_2D_gpu`): `ensure_row_contiguous(wt)` copies the weight, which SDXL holds as
-    ///   an NHWC transposed VIEW of its NCHW checkpoint tensor; Winograd (`winograd_conv_2D_gpu`)
+    ///   an NHWC transposed VIEW of its NCHW checkpoint tensor — at the activation width when the
+    ///   activations are wider than the stored weight (the packed tier's f32 activations over f16
+    ///   convs: `conv2d` promotes, and the cast copy is that row-contiguous copy); Winograd (`winograd_conv_2D_gpu`)
     ///   adds the zero-padded input `[N, 6⌈(H+2p−2)/6⌉+2, …, C]`, the transformed input
     ///   `[64, tiles, C]`, output `[64, tiles, O]` and filter `[64, C, O]` (`tiles = N⌈oH/6⌉⌈oW/6⌉`).
     /// * CPU (`explicit_gemm_conv_ND_cpu`): an f32 padded input, the f32 im2col
@@ -232,7 +263,7 @@ impl ConvCall {
         let weight_copy = |width: u64| self.weight_elements().saturating_mul(width);
         match backend {
             Backend::Metal => {
-                let mut bytes = weight_copy(self.weight);
+                let mut bytes = weight_copy(self.weight.max(self.act));
                 if self.winograd() {
                     let padded = |n: u64| 6 * (n + 2 * self.pad).saturating_sub(2).div_ceil(6) + 2;
                     let tiles = self.batch * self.out_h.div_ceil(6) * self.out_w.div_ceil(6);
@@ -272,8 +303,28 @@ impl ConvCall {
 /// Buffers of the counted ops of the composed `mlx_gen::nn::group_norm` over its input: the
 /// grouped-transpose reshape copy, the LayerNorm output, the transposed-back reshape copy, the weight
 /// product and the bias sum (neither affine op can donate: their operand is the reshape copy's view
-/// with a second consumer pending). Measured: 5.00 input-sized buffers.
+/// with a second consumer pending). Measured: 5.00 input-sized buffers at f32 (and on Metal at any
+/// width — see [`group_norm_buffers`]).
 pub(crate) const GROUP_NORM_BUFFERS: u64 = 5;
+
+/// Extra input-sized buffers, in units of the activation width `act`, that one `mlx_rs::fast::
+/// layer_norm` (alone, or inside [`GROUP_NORM_BUFFERS`]' composed GroupNorm) holds on `backend`
+/// beyond its f32 count when the activations are narrower than f32. MLX's CPU backend
+/// runs the fast op's composed fallback in f32 — `astype(x, f32)` plus the centred input, its square
+/// and the normalized product at f32 — so an f16 norm holds three f32 input-sized buffers more than
+/// its width-scaled f32 count (measured at f16: GroupNorm 11.0, LayerNorm 9.06 input-sized buffers,
+/// against 5.0 / 3.03 at f32). Metal's fused kernel keeps the f32 statistics in registers: none.
+pub(crate) fn norm_promotion_units(backend: Backend, act: u64) -> u64 {
+    match backend {
+        Backend::Cpu if act < 4 => 3 * 4 / act.max(1),
+        _ => 0,
+    }
+}
+
+/// [`GROUP_NORM_BUFFERS`] on `backend` at activation width `act` (+ [`norm_promotion_units`]).
+pub(crate) fn group_norm_buffers(backend: Backend, act: u64) -> u64 {
+    GROUP_NORM_BUFFERS + norm_promotion_units(backend, act)
+}
 
 /// MLX's Metal allocator (also the macOS CPU backend's) rounds every buffer above one page up to
 /// the 16 KiB `vm_page_size`: at most one page of slack per counted buffer.
@@ -318,33 +369,46 @@ pub(crate) fn conv_sum(
     .saturating_add(page_slack(buffers))
 }
 
-/// A resnet (`ResnetBlock2D::forward_core`, U-Net or VAE) over input `x` `[B,H,W,Cx]`, whose
-/// `conv1` takes `cin` (= Cx, or Cx + skip after the up path's concat) to `cout`. Counted new
-/// buffers (see [`conv_sum`]): input width — the skip concatenation (up path), GroupNorm 1
-/// ([`GROUP_NORM_BUFFERS`]) and SiLU; output width — `conv1`, GroupNorm 2, SiLU, `conv2`, the 1x1
-/// shortcut (when `cin != cout`); the bias adds, the time-embedding add and the residual sum donate
-/// their convolution operand. Plus both convolutions' kernel transients.
+/// A resnet (`ResnetBlock2D::forward_core`, U-Net or VAE) over input `x` `[B,H,W,Cx]` at
+/// `act_in` bytes per element, whose `conv1` takes `cin` (= Cx, or Cx + skip after the up path's
+/// concat) to `cout`, and whose second half runs at `act_out` (wider than `act_in` when the
+/// projected time embedding is: the packed tier's f32 `temb` promotes the sum, and GroupNorm 2,
+/// SiLU, `conv2` and the residual follow it). Counted new buffers (see [`conv_sum`]): input width
+/// — the skip concatenation (up path), GroupNorm 1 ([`group_norm_buffers`]), SiLU, `conv1` and
+/// the 1x1 shortcut (when `cin != cout`); output width — the promoted time-embedding sum (only when
+/// it widens: otherwise it donates `conv1`), GroupNorm 2, SiLU, `conv2`; the bias adds and the
+/// residual sum donate. Plus both convolutions' kernel transients (`conv2`'s at `act_out`).
 pub(crate) fn resnet_bytes(
     x: &[i32],
-    act: u64,
+    act_in: u64,
+    act_out: u64,
     conv1: &Array,
     conv2: &Array,
     backend: Backend,
 ) -> u64 {
     let (cin, cout) = conv_channels(conv1);
+    let act_out = act_out.max(act_in);
     let input = [x[0], x[1], x[2], cin];
-    let c1 = ConvCall::new(&input, act, conv1, 1, 1);
+    let c1 = ConvCall::new(&input, act_in, conv1, 1, 1);
     let mid = [x[0], x[1], x[2], conv_channels(conv2).0];
-    let c2 = ConvCall::new(&mid, act, conv2, 1, 1);
+    let c2 = ConvCall::new(&mid, act_out, conv2, 1, 1);
     let concat = u64::from(cin != x[3]);
     let shortcut = u64::from(cin != cout);
-    conv_sum(
-        &c1,
-        concat + GROUP_NORM_BUFFERS + 1,
-        1 + GROUP_NORM_BUFFERS + 1 + 1 + shortcut,
-        &[&c1, &c2],
-        backend,
-    )
+    let widened = u64::from(act_out > act_in);
+    let in_units = concat + group_norm_buffers(backend, act_in) + 1;
+    let narrow_out = 1 + shortcut;
+    let wide_out = widened + group_norm_buffers(backend, act_out) + 1 + 1;
+    let out = |width: u64, units: u64| {
+        tensor_bytes(width, &[u(x[0]), u(x[1]), u(x[2]), u(cout)]).saturating_mul(units)
+    };
+    let buffers = in_units + narrow_out + wide_out + 10;
+    c1.in_bytes()
+        .saturating_mul(in_units)
+        .saturating_add(out(act_in, narrow_out))
+        .saturating_add(out(act_out, wide_out))
+        .saturating_add(c1.transient(backend))
+        .saturating_add(c2.transient(backend))
+        .saturating_add(page_slack(buffers))
 }
 
 /// A single convolution quantum over an already-materialized input: the output, `extra_out`
@@ -363,7 +427,13 @@ pub(crate) fn single_conv_bytes(
 /// GroupNorm + SiLU + one convolution (the `conv_out` heads): GroupNorm and SiLU at input width,
 /// the convolution's output and transient.
 pub(crate) fn norm_conv_bytes(call: &ConvCall, backend: Backend) -> u64 {
-    conv_sum(call, GROUP_NORM_BUFFERS + 1, 1, &[call], backend)
+    conv_sum(
+        call,
+        group_norm_buffers(backend, call.act) + 1,
+        1,
+        &[call],
+        backend,
+    )
 }
 
 /// How a call site's attention scores exist on `backend`: MLX's Metal SDPA is fused for a query
@@ -389,14 +459,16 @@ pub(crate) fn scores(backend: Backend, head_dim: i32, query_rows: i32, act: u64)
 
 /// Buffers of one `mlx_rs::fast::layer_norm` at its input's size: Metal runs the fused kernel (its
 /// output only); MLX's CPU backend runs the composed fallback — the centred input, its square and
-/// the output (measured 2.4 input-sized buffers).
+/// the output (measured 3.03 input-sized buffers at f32). Below f32 the CPU fallback also holds f32
+/// working copies ([`norm_promotion_units`]); a U-Net transformer block's measured f16 peak is
+/// already covered without them (1.09-1.14x: its scores dominate), a CLIP layer's is not
+/// ([`clip_layer_bytes`] adds them).
 pub(crate) fn layer_norm_buffers(backend: Backend) -> u64 {
     match backend {
         Backend::Metal => 1,
         Backend::Cpu => 3,
     }
 }
-
 /// Query-sized buffers the unfused SDPA fallback adds per self-attention when `scores`
 /// materializes: the scaled query (row-contiguous), and the row-contiguous copies of the head-split
 /// k/v views its batched matmuls take.
@@ -426,7 +498,9 @@ pub(crate) fn clip_layer_bytes(
     backend: Backend,
 ) -> u64 {
     let s = scores(backend, head_dim, n, act);
-    let ln = layer_norm_buffers(backend);
+    // A 77-token layer's small score tensors leave the CPU fallback LayerNorm's f32 working copies
+    // at the layer's peak below f32 (measured at f16: 0.86x without them).
+    let ln = layer_norm_buffers(backend) + norm_promotion_units(backend, act);
     let attn_hidden_live = 6 + ln + fallback_hidden(s);
     let mlp_hidden_live = 2 + ln;
     let mask_bytes = if mask {
@@ -546,17 +620,24 @@ pub(crate) const VAE_ATTENTION_SCORE_ELEMENTS: u64 = 16 * 1024 * 1024;
 /// On iOS the projections are materialized before the attention (`VaeAttention::forward_planned`),
 /// so the price is the wider of two phases, each counted as new buffers under [`conv_sum`]'s
 /// retention model:
-/// * projections — GroupNorm ([`GROUP_NORM_BUFFERS`]), q, k, v (hidden-sized);
+/// * projections — GroupNorm ([`group_norm_buffers`]), q, k, v (hidden-sized);
 /// * attention — q, k, v, the fallback's scaled query, the SDPA output and, chunked, the
 ///   concatenation of the per-chunk outputs, the output projection (hidden-sized; the residual sum
 ///   donates); a chunk's scores (the single-head softmax donates them in place: measured one
 ///   score tensor) and its scaled query / output rows —
 ///   each chunk is evaluated before the next is built, which releases the previous chunk's scores.
-pub(crate) fn vae_attention_bytes(b: i32, n: i32, c: i32, query_rows: i32, act: u64) -> u64 {
+pub(crate) fn vae_attention_bytes(
+    b: i32,
+    n: i32,
+    c: i32,
+    query_rows: i32,
+    act: u64,
+    backend: Backend,
+) -> u64 {
     let rows = query_rows.clamp(1, n.max(1));
     let chunked = u64::from(rows < n);
     let hidden = tensor_bytes(act, &[u(b), u(n), u(c)]);
-    let projections = GROUP_NORM_BUFFERS + 3;
+    let projections = group_norm_buffers(backend, act) + 3;
     let attention_units = 3 + 1 + 1 + chunked + 1;
     let attention = hidden
         .saturating_mul(attention_units)
@@ -684,6 +765,27 @@ pub(crate) fn elementwise_bytes(arrays: &[&Array], copies: u64) -> u64 {
         .iter()
         .fold(0u64, |n, a| n.saturating_add(bytes(a)))
         .saturating_mul(copies)
+}
+
+/// One adapter target's install (`adapters.rs`), counted under MLX's retention (every buffer the
+/// install creates stays live until its command buffer completes): `widths` lists the bytes per
+/// element of each target-sized (`elements`) buffer the delta reconstruction and the merge create
+/// (an elementwise op whose single-consumer operand has its width donates and is not listed),
+/// `small` the factor-sized buffers (f32 casts, low-rank products, a scaled factor), and
+/// `unread_base` the base weight's stored bytes when it has not been read yet — a lazily loaded
+/// base is read inside the merge, and the merged weight replaces it only once the merge completes.
+pub(crate) fn adapter_install_bytes(
+    elements: u64,
+    widths: &[u64],
+    small: u64,
+    unread_base: u64,
+) -> u64 {
+    widths
+        .iter()
+        .fold(0u64, |n, w| n.saturating_add(w.saturating_mul(elements)))
+        .saturating_add(small)
+        .saturating_add(unread_base)
+        .saturating_add(page_slack(widths.len() as u64 + 2))
 }
 
 /// iOS pre-load floor for a component that [`crate::loader::cast_for_load`]-style casts after

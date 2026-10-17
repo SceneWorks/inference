@@ -197,6 +197,7 @@ impl VaeAttention {
             s[3],
             rows,
             crate::quantum::element_bytes(x),
+            crate::quantum::Backend::current(),
         );
         mlx_gen::ios_quantum::run(crate::quantum::VAE_ATTENTION, scratch, || {
             self.forward_planned(x, plan)
@@ -471,7 +472,7 @@ pub(crate) fn downsample_tiled(
 fn resnet_quantum(resnet: &ResnetBlock2D, x: &Array, evaluated: bool) -> Result<Array> {
     mlx_gen::ios_quantum::run(
         crate::quantum::VAE_RESNET,
-        resnet.quantum_scratch(x),
+        resnet.quantum_scratch(x, None),
         || {
             if evaluated {
                 resnet.forward_evaluated_vae(x)

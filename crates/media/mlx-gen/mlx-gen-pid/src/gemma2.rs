@@ -250,9 +250,13 @@ impl Layer {
         })
     }
 
-    /// Bytes of the single largest dense projection weight that a forward at `compute` must
-    /// promote (its stored dtype differs from the activations). Packed projections run
-    /// `quantized_matmul` on the stored codes and same-dtype dense weights are used in place: 0.
+    /// Bytes of every dense projection weight copy a forward at `compute` makes (its stored dtype
+    /// differs from the activations), SUMMED: the layer is one quantum under one `eval`, and MLX
+    /// encodes ahead of execution — a promoted copy is allocated when its cast is encoded and
+    /// released only when the command buffer (Metal) or queued task (CPU) of the matmul consuming
+    /// it completes, so in op order (q, k, v, o, gate, up, down) every copy can be live before the
+    /// first consumer retires. Packed projections run `quantized_matmul` on the stored codes and
+    /// same-dtype dense weights are used in place: 0.
     fn promoted_weight_bytes(&self, compute: Dtype) -> u64 {
         [
             &self.attn.q,
@@ -267,8 +271,7 @@ impl Layer {
         .filter_map(|lin| lin.dense_weight())
         .filter(|(w, _)| w.dtype() != compute)
         .map(|(w, _)| w.size() as u64 * dtype_bytes(w.dtype()).max(dtype_bytes(compute)))
-        .max()
-        .unwrap_or(0)
+        .fold(0u64, u64::saturating_add)
     }
 
     fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
@@ -305,11 +308,11 @@ fn rms_live(element_bytes: u64) -> u64 {
 }
 
 /// One Gemma-2 decoder layer quantum (norm sandwich → GQA soft-capped attention → norm sandwich →
-/// gelu-tanh MLP), COUNTED from [`Layer::forward`] at the activation width `element_bytes`.
+/// gelu-tanh MLP), COUNTED from `Layer::forward` at the activation width `element_bytes`.
 ///
 /// Attention phase, in `[B, L, hidden]` buffers (q/k/v widths `heads·head_dim` and
 /// `kv_heads·head_dim` never exceed `hidden` for Gemma-2, so each is priced at hidden width): the
-/// residual `x`, the input-norm output plus its f32 transients ([`rms_live`]), the q/k/v projections
+/// residual `x`, the input-norm output plus its f32 transients (`rms_live`), the q/k/v projections
 /// (3), the RoPE'd q and k with one `rotate_half` concat/negate transient each (4), and the two
 /// `repeat_kv` broadcast copies (2). Scores are MATERIALIZED (soft-capping blocks fused SDPA):
 /// `[B, heads, L, L]` with three f32-wide buffers live at once: each scale/softcap/cast/mask step
@@ -320,7 +323,7 @@ fn rms_live(element_bytes: u64) -> u64 {
 /// gate projection (held to gelu-tanh's final product), the gelu chain's cube/inner/tanh term and
 /// its `0.5·x` factor (the chain's elementwise steps reuse their predecessor, so two live), the
 /// output, and the up projection (5 live). `weight_bytes` is
-/// [`Layer::promoted_weight_bytes`].
+/// `Layer::promoted_weight_bytes`.
 pub fn gemma_layer_bytes(
     cfg: &Gemma2Config,
     batch: u64,
@@ -375,7 +378,7 @@ pub fn gemma_embedding_bytes(
         .saturating_add(tensor_bytes(4, &[batch, tokens]))
 }
 
-/// The final-norm quantum: [`rms_live`] `[B, L, hidden]` buffers at the activation width plus the
+/// The final-norm quantum: `rms_live` `[B, L, hidden]` buffers at the activation width plus the
 /// f32 per-row `[B, L, 1]` mean square and its reciprocal root (both live at the normalize).
 pub fn gemma_final_norm_bytes(
     cfg: &Gemma2Config,
@@ -659,6 +662,9 @@ mod quantum_proofs {
     /// Maximum formula/measurement ratio every Gemma proof accepts.
     const MAX_RATIO: f64 = 1.5;
 
+    /// Unthrottled runs per weight-dominated measurement; the proof asserts the worst (largest).
+    const RUNS: usize = 5;
+
     fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
         mlx_rs::random::normal::<f32>(shape, None, None, Some(&mlx_rs::random::key(seed).unwrap()))
             .unwrap()
@@ -669,6 +675,17 @@ mod quantum_proofs {
     }
 
     fn model(cfg: &Gemma2Config, vocab: i32, dtype: Dtype) -> Gemma2 {
+        model_with_projections(cfg, vocab, dtype, dtype)
+    }
+
+    /// [`model`] with the seven projection weights stored at `projection` (the embedding and the
+    /// norms at `dtype`, which sets the compute dtype).
+    fn model_with_projections(
+        cfg: &Gemma2Config,
+        vocab: i32,
+        dtype: Dtype,
+        projection: Dtype,
+    ) -> Gemma2 {
         let (h, q, kv, i) = (
             cfg.hidden_size,
             cfg.num_heads * cfg.head_dim,
@@ -679,7 +696,13 @@ mod quantum_proofs {
         let mut seed = 500;
         let mut put = |m: &mut HashMap<String, Array>, k: String, shape: &[i32]| {
             seed += 1;
-            m.insert(k, rand(shape, seed, dtype));
+            // The seven projections (`*_proj`) at their own storage dtype.
+            let dt = if k.ends_with("_proj.weight") {
+                projection
+            } else {
+                dtype
+            };
+            m.insert(k, rand(shape, seed, dt));
         };
         put(&mut m, "embed_tokens.weight".into(), &[vocab, h]);
         put(&mut m, "norm.weight".into(), &[h]);
@@ -816,5 +839,38 @@ mod quantum_proofs {
                 }
             }
         }
+
+        // WEIGHT-dominated: bf16 projections against an f32 stream (f32 embedding), hidden 1024
+        // over 8 tokens, so the seven promoted projection copies (~60 MB) dwarf every activation
+        // (~32 KB each): the proof sees whether they are live together (summed) or one at a time.
+        let cfg = cfg(1024, 8, 4, 128, 4096);
+        let model = model_with_projections(&cfg, 97, Dtype::Float32, Dtype::Bfloat16);
+        let tokens = 8;
+        let ids = Array::from_slice(&(0..tokens).collect::<Vec<i32>>(), &[1, tokens]);
+        let (x, cos, sin, mask) = model.embed_inputs(&ids, None, Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&x, &cos, &sin, &mask]).unwrap();
+        let layer = &model.layers[0];
+        let measured = (0..RUNS)
+            .map(|_| {
+                measured_peak_bytes(|| Ok(vec![layer.forward(&x, &cos, &sin, &mask)?])).unwrap()
+            })
+            .max()
+            .unwrap();
+        let copies = layer.promoted_weight_bytes(Dtype::Float32);
+        let formula = gemma_layer_bytes(&cfg, 1, tokens as u64, 4, copies);
+        println!(
+            "[gemma layer weight copies] formula {formula} measured {measured} ratio {:.3}",
+            formula as f64 / measured as f64
+        );
+        assert_tracks_measured("gemma layer weight copies", formula, measured, MAX_RATIO);
+        // Discrimination: pricing only the largest copy (the pre-fix model) under-prices it.
+        let largest = 4 * (cfg.intermediate_size as u64) * (cfg.hidden_size as u64);
+        let single = gemma_layer_bytes(&cfg, 1, tokens as u64, 4, largest);
+        println!("[gemma layer weight copies] largest-copy-only formula {single}");
+        assert!(
+            single < measured,
+            "the largest-copy-only pricing ({single} B) must under-price the measured peak \
+             ({measured} B), or this shape cannot tell the models apart"
+        );
     }
 }

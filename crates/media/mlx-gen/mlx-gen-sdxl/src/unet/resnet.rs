@@ -201,14 +201,25 @@ impl ResnetBlock2D {
         Ok(out)
     }
 
-    /// iOS quantum scratch (sc-26270) for this resnet over its (pre-concat) input `x`, counted by
-    /// [`crate::quantum::resnet_bytes`] from the loaded `conv1`/`conv2` weights (whose `conv1`
-    /// input width tells whether the up path's skip concatenation runs inside the quantum) and
-    /// `x`'s dtype, on the running backend.
-    pub(crate) fn quantum_scratch(&self, x: &Array) -> u64 {
+    /// iOS quantum scratch (sc-26270) for this resnet over its (pre-concat) input `x` and the
+    /// time embedding `temb` it adds, counted by [`crate::quantum::resnet_bytes`] from the loaded
+    /// `conv1`/`conv2` weights (whose `conv1` input width tells whether the up path's skip
+    /// concatenation runs inside the quantum), `x`'s dtype, and the dtype the projected `temb`
+    /// promotes the second half to (a packed `time_emb_proj` with BF16 scales, or an f32 `temb`,
+    /// makes it f32 — [`crate::quantum::linear_output_dtype`]), on the running backend.
+    pub(crate) fn quantum_scratch(&self, x: &Array, temb: Option<&Array>) -> u64 {
+        let act_in = crate::quantum::element_bytes(x);
+        let act_out = match (&self.time_emb_proj, temb) {
+            (Some(proj), Some(t)) => {
+                let projected = crate::quantum::linear_output_dtype(proj, t.dtype());
+                crate::quantum::dtype_bytes(Dtype::from_promoting_types(x.dtype(), projected))
+            }
+            _ => act_in,
+        };
         crate::quantum::resnet_bytes(
             x.shape(),
-            crate::quantum::element_bytes(x),
+            act_in,
+            act_out,
             self.conv1.weight(),
             self.conv2.weight(),
             crate::quantum::Backend::current(),
@@ -225,7 +236,7 @@ impl ResnetBlock2D {
         temb: Option<&Array>,
         plan: crate::plan::SdxlForwardPlan<'_>,
     ) -> Result<Array> {
-        let scratch = self.quantum_scratch(x);
+        let scratch = self.quantum_scratch(x, temb);
         mlx_gen::ios_quantum::run(crate::quantum::UNET_RESNET, scratch, || {
             let input = match skip {
                 Some(skip) => mlx_rs::ops::concatenate_axis(&[x, &skip], -1)?,

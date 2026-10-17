@@ -109,6 +109,12 @@ fn converter_body() {
         // The tier is the layout's; the dense release reads as dense.
         let file = dst.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
         assert_eq!(artifact_tier(&file).unwrap(), Some(quant));
+        let recorded = mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&file).unwrap();
+        assert_eq!(
+            recorded[crate::packed::BITS_METADATA],
+            bits(quant).to_string()
+        );
+        assert_eq!(recorded[crate::packed::GROUP_SIZE_METADATA], "64");
         assert!(dst.join("config.yaml").is_file());
         // Converting a packed artifact again is refused, not requantized.
         assert!(prequantize_cpu(kind, &dst, &root.path().join("again"), 4, u64::MAX).is_err());
@@ -422,4 +428,249 @@ impl WithQuantOpt for LoadSpec {
         self.quantize = quant;
         self
     }
+}
+
+// ---- The recorded pack (sc-26270 review): the tier is never inferred from shapes at an assumed
+// group size, a partially packed artifact never loads, and the text tower's group is checked.
+
+/// Rewrite the safetensors file at `file` in place through `edit` (tensors and `__metadata__`).
+fn rewrite(
+    file: &Path,
+    edit: impl FnOnce(
+        &mut std::collections::HashMap<String, Array>,
+        &mut std::collections::HashMap<String, String>,
+    ),
+) {
+    let (mut tensors, mut metadata) = Array::load_safetensors_with_metadata(file).unwrap();
+    for array in tensors.values() {
+        array.eval().unwrap();
+    }
+    edit(&mut tensors, &mut metadata);
+    let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(refs, Some(&metadata), file).unwrap();
+}
+
+fn unsupported<T>(result: mlx_gen::Result<T>, needle: &str) {
+    match result {
+        Err(mlx_gen::Error::Unsupported(message)) => {
+            assert!(message.contains(needle), "`{needle}` not in: {message}")
+        }
+        Err(other) => panic!("expected a typed Unsupported refusal ({needle}), got {other}"),
+        Ok(_) => panic!("expected a typed Unsupported refusal ({needle}), got Ok"),
+    }
+}
+
+fn metadata(bits: &str, group: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        (crate::packed::BITS_METADATA.to_owned(), bits.to_owned()),
+        (
+            crate::packed::GROUP_SIZE_METADATA.to_owned(),
+            group.to_owned(),
+        ),
+    ])
+}
+
+/// Build the backbone straight from the map of `file` (no `artifact_tier` gate first): the
+/// [`crate::nn::Loader`]'s own checks.
+fn build_from_map(file: &Path) -> mlx_gen::Result<crate::IrisDiT> {
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let weights = mlx_gen::weights::Weights::from_file(file).unwrap();
+    crate::IrisDiT::from_weights_quantized(&weights, &config.model, Dtype::Bfloat16, None, None)
+}
+
+fn group_128_body() {
+    let root = tempfile::tempdir().unwrap();
+    // One [64, 256] projection packed at q4 over group 128: codes [64, 32], scales [64, 2] — the
+    // shapes a group-64 reading takes for q8.
+    let weight = rand(&[64, 256], 7).as_dtype(Dtype::Bfloat16).unwrap();
+    let (codes, scales, biases) =
+        mlx_llm::primitives::quant::quantize_on_stored_grid(&weight, 128, 4).unwrap();
+    let file = root.path().join("model.safetensors");
+    let write = |meta: Option<std::collections::HashMap<String, String>>| {
+        let refs = [
+            ("blocks.0.proj.weight", &codes),
+            ("blocks.0.proj.scales", &scales),
+            ("blocks.0.proj.biases", &biases),
+        ];
+        Array::save_safetensors(refs, meta.as_ref(), &file).unwrap();
+    };
+    // Recorded truthfully: read as q4 at group 128 and refused — the loader unpacks at 64.
+    write(Some(metadata("4", "128")));
+    unsupported(artifact_tier(&file), "group size 128");
+    // Unrecorded: refused, never inferred as q8 at an assumed group.
+    write(None);
+    unsupported(artifact_tier(&file), crate::packed::BITS_METADATA);
+    // Recorded at the loader's group: the shapes decode to 8 bits there, not the recorded 4.
+    write(Some(metadata("4", "64")));
+    unsupported(artifact_tier(&file), "not the recorded 4");
+
+    // A whole converted artifact whose metadata records group 128: refused at tier detection, on
+    // the load route, and by the loader's own map check.
+    let packed = convert(
+        ConvertKind::Export { depth: false },
+        &backbone_dir(),
+        root.path(),
+        Quant::Q4,
+    );
+    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    rewrite(&weights, |_, meta| {
+        meta.insert(crate::packed::GROUP_SIZE_METADATA.into(), "128".into());
+    });
+    unsupported(artifact_tier(&weights), "group size 128");
+    unsupported(load(&packed, None, &[]), "group size 128");
+    unsupported(build_from_map(&weights), "records");
+}
+
+#[test]
+fn a_q4_pack_at_group_128_is_never_read_as_q8() {
+    in_cpu_child(
+        "packed_tests::a_q4_pack_at_group_128_is_never_read_as_q8",
+        group_128_body,
+    );
+}
+
+fn partial_pack_body() {
+    let root = tempfile::tempdir().unwrap();
+    let packed = convert(
+        ConvertKind::Export { depth: false },
+        &backbone_dir(),
+        root.path(),
+        Quant::Q8,
+    );
+    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    // One target projection (64 wide, quantized by `ProjectionLayout::of`) stored dense.
+    let target = "blocks.0.attn.q_proj_x";
+    let dense = mlx_gen::weights::Weights::from_file(backbone_dir().join("model.safetensors"))
+        .unwrap()
+        .require(&format!("{target}.weight"))
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    rewrite(&weights, |tensors, _| {
+        tensors.remove(&format!("{target}.scales")).unwrap();
+        tensors.remove(&format!("{target}.biases")).unwrap();
+        tensors.insert(format!("{target}.weight"), dense);
+    });
+    unsupported(artifact_tier(&weights), "partially packed");
+    unsupported(load(&packed, Some(Quant::Q8), &[]), "partially packed");
+    unsupported(build_from_map(&weights), "partially packed");
+}
+
+#[test]
+fn a_partially_packed_backbone_is_refused() {
+    in_cpu_child(
+        "packed_tests::a_partially_packed_backbone_is_refused",
+        partial_pack_body,
+    );
+}
+
+fn text_group_body() {
+    use crate::text_encoder::IrisTextEncoder;
+    let root = tempfile::tempdir().unwrap();
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let tower = aligned_tiny_text_encoder(root.path());
+    let packed = convert(ConvertKind::TextEncoder, &tower, root.path(), Quant::Q4);
+    let group = crate::text_encoder::text_encoder_quant_group(
+        &mlx_llm::ModelConfig::from_dir(&tower).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(group, 32, "the miniature tower's group (hidden 32)");
+    let weights = packed.join("model.safetensors");
+    let file_meta = mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&weights).unwrap();
+    assert_eq!(file_meta[crate::packed::BITS_METADATA], "4");
+    assert_eq!(file_meta[crate::packed::GROUP_SIZE_METADATA], "32");
+    let pristine = std::fs::read(&weights).unwrap();
+    let config_path = packed.join("config.json");
+    let pristine_config = std::fs::read_to_string(&config_path).unwrap();
+    let refused = |needle: &str| {
+        unsupported(crate::packed::text_encoder_tier(&packed), needle);
+        unsupported(
+            IrisTextEncoder::load_quantized(&packed, &config.text_encoder, None),
+            needle,
+        );
+    };
+
+    // config.json's group is not the tower's.
+    let mut cfg: serde_json::Value = serde_json::from_str(&pristine_config).unwrap();
+    cfg["text_config"]["quantization"]["group_size"] = 64.into();
+    std::fs::write(&config_path, cfg.to_string()).unwrap();
+    refused("the tower's group size is Some(32)");
+    std::fs::write(&config_path, &pristine_config).unwrap();
+
+    // The weight file records another group than config.json / the tower.
+    rewrite(&weights, |_, meta| {
+        meta.insert(crate::packed::GROUP_SIZE_METADATA.into(), "64".into());
+    });
+    refused("group size 64");
+    std::fs::write(&weights, &pristine).unwrap();
+
+    // One projection's codes / scales are packed at group 64 under a recorded group of 32.
+    let down = format!(
+        "{}layers.0.mlp.down_proj",
+        crate::text_encoder::LANGUAGE_TOWER_PREFIX
+    );
+    let dense = Array::load_safetensors(tower.join("model.safetensors")).unwrap()
+        [&format!("{down}.weight")]
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let (codes, scales, biases) =
+        mlx_llm::primitives::quant::quantize_on_stored_grid(&dense, 64, 4).unwrap();
+    rewrite(&weights, |tensors, _| {
+        tensors.insert(format!("{down}.weight"), codes);
+        tensors.insert(format!("{down}.scales"), scales);
+        tensors.insert(format!("{down}.biases"), biases);
+    });
+    refused("not the recorded 4");
+    std::fs::write(&weights, &pristine).unwrap();
+
+    // Restored: the snapshot reads and loads at its tier again.
+    assert_eq!(
+        crate::packed::text_encoder_tier(&packed).unwrap(),
+        Some(Quant::Q4)
+    );
+    IrisTextEncoder::load_quantized(&packed, &config.text_encoder, None).unwrap();
+}
+
+#[test]
+fn a_text_encoder_group_size_mismatch_is_refused() {
+    in_cpu_child(
+        "packed_tests::a_text_encoder_group_size_mismatch_is_refused",
+        text_group_body,
+    );
+}
+
+fn missing_metadata_body() {
+    use crate::text_encoder::IrisTextEncoder;
+    let root = tempfile::tempdir().unwrap();
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let packed = convert(
+        ConvertKind::Export { depth: false },
+        &backbone_dir(),
+        root.path(),
+        Quant::Q4,
+    );
+    let weights = packed.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    rewrite(&weights, |_, meta| meta.clear());
+    unsupported(artifact_tier(&weights), crate::packed::BITS_METADATA);
+    unsupported(load(&packed, None, &[]), crate::packed::BITS_METADATA);
+
+    let tower = aligned_tiny_text_encoder(root.path());
+    let text = convert(ConvertKind::TextEncoder, &tower, root.path(), Quant::Q8);
+    rewrite(&text.join("model.safetensors"), |_, meta| meta.clear());
+    unsupported(
+        crate::packed::text_encoder_tier(&text),
+        crate::packed::BITS_METADATA,
+    );
+    unsupported(
+        IrisTextEncoder::load_quantized(&text, &config.text_encoder, Some(Quant::Q8)),
+        crate::packed::BITS_METADATA,
+    );
+}
+
+#[test]
+fn a_packed_artifact_without_recorded_metadata_is_refused() {
+    in_cpu_child(
+        "packed_tests::a_packed_artifact_without_recorded_metadata_is_refused",
+        missing_metadata_body,
+    );
 }

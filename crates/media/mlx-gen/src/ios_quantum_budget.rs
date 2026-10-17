@@ -21,6 +21,26 @@ pub fn tensor_bytes(element_bytes: u64, dims: &[u64]) -> u64 {
     product(&[product(dims), element_bytes])
 }
 
+/// The allocator's page: MLX's Metal allocator (`backend/metal/allocator.cpp`, `malloc`) rounds
+/// every allocation larger than `vm_page_size` (16 KiB on Apple Silicon and iOS) up to whole pages.
+pub const ALLOCATOR_PAGE_BYTES: u64 = 16 * 1024;
+
+/// Bytes ONE allocation of `bytes` actually occupies: page-rounded above one page, exact below.
+pub fn allocated_bytes(bytes: u64) -> u64 {
+    if bytes > ALLOCATOR_PAGE_BYTES {
+        bytes
+            .div_ceil(ALLOCATOR_PAGE_BYTES)
+            .saturating_mul(ALLOCATOR_PAGE_BYTES)
+    } else {
+        bytes
+    }
+}
+
+/// [`tensor_bytes`] as the allocator holds it: one page-rounded allocation.
+pub fn allocated_tensor_bytes(element_bytes: u64, dims: &[u64]) -> u64 {
+    allocated_bytes(tensor_bytes(element_bytes, dims))
+}
+
 /// How an attention's scores exist in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scores {
@@ -333,6 +353,15 @@ mod tests {
             weight_bytes: 10,
         };
         assert_eq!(conv_stage_bytes(conv), 10 + 2 * 64 * 4 * 4 + 64 * 6 * 4);
+    }
+
+    #[test]
+    fn allocations_above_a_page_round_to_whole_pages() {
+        assert_eq!(allocated_bytes(100), 100);
+        assert_eq!(allocated_bytes(16 * 1024), 16 * 1024);
+        assert_eq!(allocated_bytes(16 * 1024 + 1), 32 * 1024);
+        assert_eq!(allocated_tensor_bytes(4, &[4097]), 32 * 1024);
+        assert_eq!(allocated_bytes(u64::MAX), u64::MAX);
     }
 
     #[test]

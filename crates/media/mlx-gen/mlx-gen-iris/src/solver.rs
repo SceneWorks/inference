@@ -43,18 +43,19 @@ pub fn sample(
     Ok(x)
 }
 
-/// iOS floor of one solver update over `state_elements` f32 elements, counted from
-/// [`step_update`] together with the lazy CFG combine it materializes. Live at once (`[B, C, H, W]`
-/// f32 each): a first-order step holds four — of the combine's difference, scaled difference and
-/// sum, `s·out`, `x0` and the update's two scaled terms and new state, MLX releasing (and
-/// donating) each operand as its consumer runs; a second-order step adds the difference to the
-/// previous `x0` and its scaled copy. Plus the update's scalar coefficients (four, six; 4 B each).
+/// iOS floor of one solver update over `state_elements` f32 elements, counted under MLX's
+/// retention ([`crate::retention`]) from [`step_update`] together with the lazy CFG combine it
+/// materializes, each `[B, C, H, W]` f32 buffer rounded as allocated: the combine's difference (its
+/// scaled copy and the sum donate), `x0` (`s·out` and the difference donate), the update's `cx·x`
+/// and `c0·x0` (the difference donates) — three states for a first-order step — and for a
+/// second-order step the difference to the previous `x0` (its divided and scaled copies donate).
+/// Plus the update's scalar coefficients (four, six; 4 B each).
 pub(crate) fn step_scratch(state_elements: u64, update: &DpmUpdate) -> u64 {
     let (states, scalars) = match update {
-        DpmUpdate::First { .. } => (4, 4),
-        DpmUpdate::Second { .. } => (6, 6),
+        DpmUpdate::First { .. } => (3, 4),
+        DpmUpdate::Second { .. } => (4, 6),
     };
-    mlx_gen::ios_quantum::tensor_bytes(4, &[states, state_elements]).saturating_add(4 * scalars)
+    states * crate::retention::allocated(4 * state_elements) + 4 * scalars
 }
 
 /// One FlowDPM-Solver++ update of `x` from the network output `out` (both f32): returns the new

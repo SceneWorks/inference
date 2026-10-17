@@ -64,6 +64,78 @@ pub(crate) fn dtype_bytes(dtype: Dtype) -> u64 {
     }
 }
 
+/// The MLX backend whose kernels run a quantum's attention, which decides whether its scores
+/// materialize ([`sdpa_scores`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    /// The device: Metal kernels (fused SDPA where [`sdpa_scores`] says so).
+    Metal,
+    /// MLX's CPU backend: SDPA always runs the unfused fallback.
+    Cpu,
+}
+
+impl Backend {
+    /// The backend of the current default device.
+    pub(crate) fn current() -> Self {
+        match mlx_rs::Device::try_default() {
+            Ok(device) if device == mlx_rs::Device::cpu() => Backend::Cpu,
+            _ => Backend::Metal,
+        }
+    }
+}
+
+/// How the scores of a quantum's `mlx_rs::fast::scaled_dot_product_attention` calls exist in
+/// memory on `backend` — the iOS quantum accounting's score term, for every Anima attention (DiT,
+/// conditioner, Qwen3 tower).
+///
+/// `attentions` lists each attention as `(queries, rows_per_call, keys)`: a query-chunked
+/// attention (`sdpa_budgeted_bhsd`) issues calls of `rows_per_call` queries plus one call over the
+/// remainder; an unchunked one passes `rows_per_call = queries`. The scores are
+/// [`Scores::Fused`](mlx_gen::ios_quantum::Scores::Fused) only when MLX 0.32's Metal kernel serves
+/// EVERY call (`ScaledDotProductAttention::use_fallback`, mlx/backend/metal/
+/// scaled_dot_product_attention.cpp):
+/// * `sdpa_full` — more than 8 query rows at head dims 64/80/128;
+/// * `sdpa_vector` — at most 8 query rows, no more than the keys, at head dims 64/96/128/256
+///   (and `rows x gqa <= 32`; every Anima SDPA has gqa 1 — the Qwen3 tower repeats its kv heads
+///   before the call);
+/// * an element width the kernels are instantiated for: float32, float16, bfloat16 (4 or 2 bytes).
+///
+/// Every Anima SDPA is unmasked or takes an array mask, which both kernels accept. Anything else —
+/// the CPU, or a head dim / row count / width the kernels reject — runs MLX's unfused fallback
+/// (`q·kᵀ → softmax → ·v`), which materializes the logits and their softmax at the compute width:
+/// [`Scores::Materialized`](mlx_gen::ios_quantum::Scores::Materialized) with 2 live (measured in
+/// `quantum_tests`). One block prices both of its attentions with one score treatment, so a single
+/// falling-back call prices them all as materialized (an over-estimate, never an under-estimate).
+pub(crate) fn sdpa_scores(
+    backend: Backend,
+    head_dim: u64,
+    element_bytes: u64,
+    attentions: &[(u64, u64, u64)],
+) -> mlx_gen::ios_quantum::Scores {
+    let served = |rows: u64, keys: u64| {
+        if rows > 8 {
+            matches!(head_dim, 64 | 80 | 128)
+        } else {
+            rows <= keys && matches!(head_dim, 64 | 96 | 128 | 256)
+        }
+    };
+    let fused = backend == Backend::Metal
+        && matches!(element_bytes, 2 | 4)
+        && attentions.iter().all(|&(queries, rows, keys)| {
+            let rows = rows.min(queries);
+            rows == 0
+                || (served(rows, keys) && (queries % rows == 0 || served(queries % rows, keys)))
+        });
+    if fused {
+        mlx_gen::ios_quantum::Scores::Fused
+    } else {
+        mlx_gen::ios_quantum::Scores::Materialized {
+            live: 2,
+            element_bytes,
+        }
+    }
+}
+
 /// The activation width a DiT block quantum runs at: the f32 RoPE tables promote the rotated q/k,
 /// and from there the attention output, the residual stream and the MLP, to f32 whatever the
 /// incoming hidden state's width (the first block takes the bf16 patch embedding and returns f32).
@@ -479,10 +551,10 @@ impl Block {
     /// in place; the block's stored bytes for a rung-4 streamed block, read inside its quantum).
     ///
     /// Both attentions call `mlx_rs::fast::scaled_dot_product_attention` (directly, or per query
-    /// chunk through `sdpa_budgeted_bhsd`) at `head_dim` 128, which the fused Metal kernel serves:
-    /// no score tensor materializes, so scores are [`mlx_gen::ios_quantum::Scores::Fused`] and
-    /// q/k/v/out are counted among the live hidden buffers. The width is f32 (see
-    /// [`block_element_bytes`]).
+    /// chunk through `sdpa_budgeted_bhsd`); their score treatment on `backend` is [`sdpa_scores`]
+    /// of the loaded head dim (128 in the shipped DiT, which the fused Metal kernel serves: no score
+    /// tensor materializes), the width and each attention's query chunking. q/k/v/out are counted
+    /// among the live hidden buffers. The width is f32 (see [`block_element_bytes`]).
     ///
     /// Weight copies ([`Self::promoted_weight_bytes`]): a dense bf16 projection fed the f32 stream
     /// is promoted to an f32 copy for its matmul — the larger phase's copies are priced (a phase's
@@ -511,6 +583,7 @@ impl Block {
     ///
     /// Proven against MLX's measured peak, with f32 and with bf16 weights, in
     /// `quantum_tests::dit_formulas_track_the_measured_peak`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn quantum_geometry(
         &self,
         batch: i32,
@@ -519,15 +592,24 @@ impl Block {
         plan: mlx_gen::attention::AttentionPlan<'_>,
         element_bytes: u64,
         read_bytes: u64,
+        backend: Backend,
     ) -> mlx_gen::ios_quantum::AttentionBlockGeometry {
         let heads = self.attn1.heads;
         let self_rows = plan.budget.query_block(batch, heads, tokens, tokens);
-        let query_rows = self_rows
-            .max(
-                plan.budget
-                    .query_block(batch, heads, tokens, context_tokens),
-            )
-            .min(tokens);
+        let cross_rows = plan
+            .budget
+            .query_block(batch, heads, tokens, context_tokens);
+        let query_rows = self_rows.max(cross_rows).min(tokens);
+        let u = |v: i32| v.max(0) as u64;
+        let scores = sdpa_scores(
+            backend,
+            u(self.attn1.head_dim),
+            element_bytes,
+            &[
+                (u(tokens), u(self_rows), u(tokens)),
+                (u(tokens), u(cross_rows), u(context_tokens)),
+            ],
+        );
         // A chunked self-attention evaluates every chunk before building the next, which
         // synchronizes the stream: the self-attention's prefix is released before the
         // cross-attention's buffers exist, so the phase holds the larger attention, not both.
@@ -548,13 +630,14 @@ impl Block {
             weight_bytes: read_bytes.saturating_add(self.promoted_weight_bytes(element_bytes)),
             attn_hidden_live,
             context_live: BLOCK_CONTEXT_LIVE,
-            scores: mlx_gen::ios_quantum::Scores::Fused,
+            scores,
             mlp_hidden_live: BLOCK_MLP_HIDDEN_LIVE,
             ff_live: BLOCK_FF_LIVE,
         }
     }
 
     /// iOS quantum scratch for one forward of THIS block ([`Self::quantum_geometry`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn quantum_scratch(
         &self,
         batch: i32,
@@ -563,6 +646,7 @@ impl Block {
         plan: mlx_gen::attention::AttentionPlan<'_>,
         element_bytes: u64,
         read_bytes: u64,
+        backend: Backend,
     ) -> u64 {
         mlx_gen::ios_quantum::attention_block_bytes(self.quantum_geometry(
             batch,
@@ -571,6 +655,7 @@ impl Block {
             plan,
             element_bytes,
             read_bytes,
+            backend,
         ))
     }
 
@@ -627,6 +712,7 @@ impl Block {
             plan,
             block_element_bytes(hidden, rope.0),
             read_bytes,
+            Backend::current(),
         );
         mlx_gen::ios_quantum::run(DIT_BLOCK_QUANTUM, scratch, || {
             self.forward(hidden, encoder, embedded, temb, rope, plan)

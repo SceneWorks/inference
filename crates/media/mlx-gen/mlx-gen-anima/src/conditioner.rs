@@ -189,8 +189,9 @@ impl Block {
     /// The geometry of one forward of THIS block from its loaded tensors: `St` target (T5 query)
     /// tokens attend over themselves and cross-attend over `Ss` source (Qwen3) tokens; the MLP
     /// runs over the `St` tokens. Both attentions call `mlx_rs::fast::scaled_dot_product_attention`
-    /// at `head_dim` 64, which the fused Metal kernel serves, so scores are
-    /// [`mlx_gen::ios_quantum::Scores::Fused`].
+    /// unchunked; their score treatment on `backend` is [`crate::transformer::sdpa_scores`] of the
+    /// loaded head dim (64 in the shipped conditioner, which the fused Metal kernel serves at any
+    /// `St` above 8), the width and the token counts.
     ///
     /// The width is f32: the f32 RoPE tables promote the rotated q/k and everything after them
     /// (and in production the Qwen3 states arrive f32 already).
@@ -220,21 +221,29 @@ impl Block {
         target_tokens: i32,
         source_tokens: i32,
         element_bytes: u64,
+        backend: crate::transformer::Backend,
     ) -> mlx_gen::ios_quantum::AttentionBlockGeometry {
         let tokens = target_tokens.max(0) as u64;
+        let source = source_tokens.max(0) as u64;
+        let scores = crate::transformer::sdpa_scores(
+            backend,
+            self.self_attn.head_dim.max(0) as u64,
+            element_bytes,
+            &[(tokens, tokens, tokens), (tokens, tokens, source)],
+        );
         mlx_gen::ios_quantum::AttentionBlockGeometry {
             batch: batch.max(0) as u64,
             tokens,
             dim: self.norm_self_attn.size() as u64,
             heads: self.self_attn.heads.max(0) as u64,
-            context_tokens: source_tokens.max(0) as u64,
+            context_tokens: source,
             ff_hidden: self.mlp_in.base_shape()[0].max(0) as u64,
             query_rows: tokens,
             element_bytes,
             weight_bytes: self.promoted_weight_bytes(element_bytes),
             attn_hidden_live: COND_ATTN_HIDDEN_LIVE,
             context_live: COND_CONTEXT_LIVE,
-            scores: mlx_gen::ios_quantum::Scores::Fused,
+            scores,
             mlp_hidden_live: COND_MLP_HIDDEN_LIVE,
             ff_live: COND_FF_LIVE,
         }
@@ -274,12 +283,14 @@ impl Block {
         target_tokens: i32,
         source_tokens: i32,
         element_bytes: u64,
+        backend: crate::transformer::Backend,
     ) -> u64 {
         mlx_gen::ios_quantum::attention_block_bytes(self.quantum_geometry(
             batch,
             target_tokens,
             source_tokens,
             element_bytes,
+            backend,
         ))
     }
 
@@ -410,7 +421,7 @@ impl AnimaTextConditioner {
             let block_eb = eb.max(t_cos.item_size() as u64);
             hidden = mlx_gen::ios_quantum::run(
                 CONDITIONER_BLOCK_QUANTUM,
-                block.quantum_scratch(b, st, ss, block_eb),
+                block.quantum_scratch(b, st, ss, block_eb, crate::transformer::Backend::current()),
                 || block.forward(&hidden, source_hidden, target_rope, source_rope),
             )?;
         }
@@ -470,8 +481,10 @@ impl AnimaTextConditioner {
     /// The output quantum's counted body ([`Self::output`]) over the blocks' `element_bytes`-wide
     /// output: `out_proj`, the RMSNorm's square and output (3 `[B, St, target_dim]`; the bias sum
     /// and the prompt-weight product are donated), the zero padding (`[B, 512 - St, ..]`), the
-    /// padded concat (`[B, 512, ..]`), and `out_proj`'s f32 weight copy when it is dense and
-    /// narrower than the stream. Proven in
+    /// padded concat (`[B, 512, ..]`), three f32 per-row vectors (`[B, St]`: the prompt-weight
+    /// vector and the RMSNorm's mean of squares and its reciprocal root — measured, they are live
+    /// with the rest at the peak), and the f32 copies of `out_proj`'s weight when it is dense and
+    /// of the norm weight, each when narrower than the stream. Proven in
     /// `quantum_tests::conditioner_formulas_track_the_measured_peak`.
     pub(crate) fn output_quantum_scratch(
         &self,
@@ -493,7 +506,14 @@ impl AnimaTextConditioner {
         } else {
             0
         };
+        let norm_promoted = if crate::transformer::dtype_bytes(self.norm.dtype()) < element_bytes {
+            (self.norm.size() as u64).saturating_mul(element_bytes)
+        } else {
+            0
+        };
         (3 * tb(element_bytes, &[b, st, d]))
+            .saturating_add(3 * tb(4, &[b, st]))
+            .saturating_add(norm_promoted)
             .saturating_add(tb(element_bytes, &[b, min.saturating_sub(st), d]))
             .saturating_add(tb(element_bytes, &[b, min.max(st), d]))
             .saturating_add(promoted)

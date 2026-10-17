@@ -51,8 +51,13 @@ pub struct EvidenceKey {
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRow {
     pub key: EvidenceKey,
-    /// Kernel-ledger lifetime `phys_footprint` peak of the capture process, bytes.
+    /// Kernel-ledger lifetime `phys_footprint` peak of the capture process, bytes (ABSOLUTE: it
+    /// includes the harness's own baseline).
     pub footprint_bytes: u64,
+    /// The capture process's `phys_footprint` when the case started, before any of its loads.
+    /// The render's own demand is `footprint_bytes - baseline_footprint_bytes`; admission charges
+    /// only that growth against live headroom (never credits a product's unrelated residents).
+    pub baseline_footprint_bytes: u64,
     /// MLX `get_peak_memory`, bytes (informational).
     pub mlx_peak_bytes: u64,
     /// Minimum sampled `os_proc_available_memory`, MiB (informational).
@@ -85,6 +90,12 @@ fn validate(rows: &[EvidenceRow]) -> Result<(), String> {
         if row.footprint_bytes == 0 || row.run_id.is_empty() || row.build_sha.is_empty() {
             return Err(format!("row {k:?}: missing footprint/run/build provenance"));
         }
+        if row.baseline_footprint_bytes == 0 || row.baseline_footprint_bytes >= row.footprint_bytes
+        {
+            return Err(format!(
+                "row {k:?}: capture baseline footprint must be present and below its peak"
+            ));
+        }
         if k.layout_sha256.len() != 64
             || !k
                 .layout_sha256
@@ -114,7 +125,9 @@ fn validate(rows: &[EvidenceRow]) -> Result<(), String> {
 
 pub(crate) fn parse(json: &str) -> Result<Vec<EvidenceRow>, String> {
     let table: Table = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    if table.schema != 1 {
+    // Schema 2 added the capture baseline footprint; a schema-1 row cannot say how much of its
+    // peak was the harness itself, so it is refused (fail closed), never migrated by guess.
+    if table.schema != 2 {
         return Err(format!("unknown evidence schema {}", table.schema));
     }
     validate(&table.rows)?;
@@ -159,7 +172,8 @@ mod tests {
     fn row(key: EvidenceKey) -> EvidenceRow {
         EvidenceRow {
             key,
-            footprint_bytes: 1,
+            footprint_bytes: 2,
+            baseline_footprint_bytes: 1,
             mlx_peak_bytes: 1,
             min_headroom_mib: 1.0,
             elapsed_seconds: 1.0,
@@ -170,7 +184,7 @@ mod tests {
     }
 
     fn table(rows: &[EvidenceRow]) -> String {
-        serde_json::json!({"schema": 1, "about": "t", "rows": rows}).to_string()
+        serde_json::json!({"schema": 2, "about": "t", "rows": rows}).to_string()
     }
 
     #[test]
@@ -192,12 +206,30 @@ mod tests {
         let mut zero = row(key());
         zero.footprint_bytes = 0;
         assert!(parse(&table(&[zero])).is_err());
+        // The capture baseline is required, nonzero and below the peak: a row without it fails
+        // the whole table closed (nothing is admitted from a malformed table).
+        let mut no_baseline = row(key());
+        no_baseline.baseline_footprint_bytes = 0;
+        assert!(parse(&table(&[no_baseline])).is_err());
+        let mut above = row(key());
+        above.baseline_footprint_bytes = above.footprint_bytes;
+        assert!(parse(&table(&[above])).is_err());
+        let mut missing = serde_json::to_value(row(key())).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("baseline_footprint_bytes");
+        let missing = serde_json::json!({"schema": 2, "about": "t", "rows": [missing]});
+        assert!(parse(&missing.to_string()).is_err());
+        assert!(
+            parse(&serde_json::json!({"schema": 1, "about": "t", "rows": []}).to_string()).is_err()
+        );
         let mut bad = key();
         bad.layout_sha256 = "AB".repeat(32);
         assert!(parse(&table(&[row(bad)])).is_err());
         assert!(parse(&table(&[row(key()), row(key())])).is_err());
-        assert!(parse(r#"{"schema":2,"about":"","rows":[]}"#).is_err());
-        assert!(parse(r#"{"schema":1,"about":"","rows":[],"extra":1}"#).is_err());
+        assert!(parse(r#"{"schema":3,"about":"","rows":[]}"#).is_err());
+        assert!(parse(r#"{"schema":2,"about":"","rows":[],"extra":1}"#).is_err());
     }
 
     #[test]

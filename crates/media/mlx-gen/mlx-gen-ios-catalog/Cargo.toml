@@ -30,6 +30,11 @@ mlx-gen-iris = { path = "../mlx-gen-iris", default-features = false }
 # The complete SDXL family shares one generator; never compile its trainer on iOS.
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl", default-features = false }
 
+[features]
+# The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only
+# `runtime-ios/device-capture`, which only the device harness (`ios-host/smoke`) enables, turns it on.
+device-capture = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The shared weights-free memory-strategy oracle, run over this catalog's exact registrations.

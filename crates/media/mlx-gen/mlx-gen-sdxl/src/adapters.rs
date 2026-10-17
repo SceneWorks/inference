@@ -53,12 +53,14 @@ use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr_thirdparty,
     resolve_lokr_path,
 };
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::adapters::{
     build_lokr_factors, conv_lora_delta, reconstruct_lokr_delta, AdaptableHost, Adapter,
 };
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{
-    resolve_kohya_stem, LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY,
+    resolve_kohya_stem, LoraAdapterMeta, LOHA_TP_SUFFIXES, LOKR_TP_SUFFIXES,
+    LORA_ADAPTER_METADATA_KEY,
 };
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
@@ -139,6 +141,221 @@ fn rows(a: &Array, lo: i32, hi: i32) -> Result<Array> {
     Ok(a.take_axis(&idx, 0)?)
 }
 
+// -------------------------------------------------------------------------------------------------
+// sc-26270: every adapter file read and every per-target install is a guarded iOS quantum, priced
+// from the code below with `quantum::adapter_install_bytes` (the target-sized buffers each install
+// creates, at their widths). The guards are pass-throughs off device: every install builds and
+// merges exactly the graph it always did.
+// -------------------------------------------------------------------------------------------------
+
+/// Bytes per element of `dtype`.
+fn width(dtype: Dtype) -> u64 {
+    crate::quantum::dtype_bytes(dtype)
+}
+
+/// Bytes of the f32 copy `a.as_dtype(Float32)` makes (none when `a` already is f32).
+fn f32_copy(a: &Array) -> u64 {
+    if a.dtype() == Dtype::Float32 {
+        0
+    } else {
+        crate::quantum::elements(a).saturating_mul(4)
+    }
+}
+
+/// The stored bytes of `base` when it has not been read yet: a lazily loaded base (the fused-LDM
+/// route merges before the U-Net is materialized) is read inside the merge.
+fn unread(base: &Array) -> u64 {
+    if mlx_gen::array::is_materialized(base) {
+        0
+    } else {
+        crate::quantum::bytes(base)
+    }
+}
+
+/// [`lora_delta`] / [`conv_lora_delta`]'s target-sized buffers for `src`-typed factors: the f32
+/// `up @ down` product and, below f32, its round trip through `src` (the scale multiply donates).
+fn lora_chain(src: Dtype) -> Vec<u64> {
+    if src == Dtype::Float32 {
+        vec![4]
+    } else {
+        vec![4, width(src), 4]
+    }
+}
+
+/// A Kronecker (LoKr) reconstruction's target-sized buffers for `factor`-typed factors, then the
+/// caller's strength multiply: the `kron` product, its f32 scale multiply and the strength multiply
+/// — neither multiply can donate, as each one's operand is a reshape VIEW of the previous buffer
+/// (measured).
+fn kron_chain(factor: Dtype) -> Vec<u64> {
+    vec![width(factor), 4, 4]
+}
+
+/// A Hadamard (LoHa) reconstruction's, then the caller's strength multiply: the two low-rank
+/// products (their elementwise product donates one), below f32 the promoting scale multiply (at
+/// f32 it donates), and the strength multiply over the reshaped view.
+fn hadamard_chain(factor: Dtype) -> Vec<u64> {
+    let mut chain = vec![width(factor), width(factor)];
+    if factor != Dtype::Float32 {
+        chain.push(4);
+    }
+    chain.push(4);
+    chain
+}
+
+/// [`AdaptableLinear::merge_dense_delta`] of an f32 delta into a `base`-typed weight: the delta's
+/// cast (which the sum then donates) below f32; at f32 the sum donates the delta itself.
+fn linear_merge(base: Dtype) -> Option<u64> {
+    (base != Dtype::Float32).then(|| width(base))
+}
+
+/// The promoted dtype of the third-party factors stored under `raw` + one of `suffixes` in `w`,
+/// and the bytes of their factor-sized buffers (every factor's f32 copy or low-rank product,
+/// bounded by its own size times the rank-product fan-out).
+fn factor_stats(w: &Weights, raw: &str, suffixes: &[&str]) -> (Dtype, u64) {
+    let mut dtype: Option<Dtype> = None;
+    let mut small = 0u64;
+    for suffix in suffixes {
+        if let Some(t) = w.get(&format!("{raw}{suffix}")) {
+            dtype = Some(dtype.map_or(t.dtype(), |d| Dtype::from_promoting_types(d, t.dtype())));
+            small = small.saturating_add(crate::quantum::elements(t).saturating_mul(4));
+        }
+    }
+    (dtype.unwrap_or(Dtype::Float32), small)
+}
+
+/// The products of the low-rank factor pairs `(a, b)` (`a @ b`) present in `pairs`, at `factor`'s
+/// width — the small Kronecker factors a LoKr rebuilds before its `kron`.
+fn product_bytes(pairs: &[(Option<&Array>, Option<&Array>)], factor: Dtype) -> u64 {
+    pairs
+        .iter()
+        .filter_map(|(a, b)| {
+            Some((a.as_ref()?.shape()[0] as u64) * (b.as_ref()?.shape()[1] as u64))
+        })
+        .fold(0u64, |n, e| {
+            n.saturating_add(e.saturating_mul(width(factor)))
+        })
+}
+
+/// One adapter target's install as a guarded iOS quantum (sc-26270): checked against `scratch`
+/// before the install's graph is built, and the installed tensors (the merged weight, or a packed
+/// base's residual factors / delta) materialized and synchronized before the next target's.
+fn guarded_install(scratch: u64, install: impl FnOnce() -> Result<Vec<Array>>) -> Result<()> {
+    mlx_gen::ios_quantum::before(crate::quantum::ADAPTER_MERGE, scratch)?;
+    let installed = install()?;
+    let refs: Vec<&Array> = installed.iter().collect();
+    mlx_gen::ios_quantum::finish(crate::quantum::ADAPTER_MERGE, &refs)
+}
+
+/// The dense base weight of `lin` (the merge target).
+fn dense_base(lin: &AdaptableLinear) -> Result<Array> {
+    lin.dense_weight()
+        .map(|(w, _)| w.clone())
+        .ok_or_else(|| Error::Msg("sdxl adapter: expected a dense base".into()))
+}
+
+/// Install an already-built `[out,in]` f32 `delta` (lazy, built by `chain`) on `lin` as one
+/// guarded quantum: merged into a dense base (`W += δ`), or carried as an [`Adapter::Lokr`]
+/// residual on a packed one (the delta itself then stays resident). `chain` lists the
+/// target-sized buffers the delta's reconstruction creates, `small` its factor-sized ones.
+pub(crate) fn install_delta(
+    lin: &mut AdaptableLinear,
+    delta: Array,
+    chain: &[u64],
+    small: u64,
+) -> Result<()> {
+    let elements = crate::quantum::elements(&delta);
+    if lin.is_quantized() {
+        let scratch = crate::quantum::adapter_install_bytes(elements, chain, small, 0);
+        return guarded_install(scratch, || {
+            lin.push(Adapter::Lokr {
+                delta: delta.clone(),
+                scale: 1.0,
+            });
+            Ok(vec![delta])
+        });
+    }
+    let base = dense_base(lin)?;
+    // The 1x1 conv-shortcut route hands in a reshaped view, which an f32 sum cannot donate: price
+    // the merged weight at the base's width whether the delta's cast or the sum allocates it.
+    let mut widths = chain.to_vec();
+    widths.push(width(base.dtype()));
+    let scratch = crate::quantum::adapter_install_bytes(elements, &widths, small, unread(&base));
+    guarded_install(scratch, || {
+        lin.merge_dense_delta(&delta)?;
+        Ok(vec![dense_base(lin)?])
+    })
+}
+
+/// Install a LoRA `(down, up)` on `lin` as one guarded quantum (see [`apply_lora_into`] for the
+/// dense merge vs packed residual choice).
+pub(crate) fn install_lora(
+    lin: &mut AdaptableLinear,
+    down: &Array,
+    up: &Array,
+    s: LoraScale,
+) -> Result<()> {
+    if lin.is_quantized() {
+        // The scaled `B` (`A` is a view of the resident `down`).
+        let scratch = crate::quantum::adapter_install_bytes(0, &[], crate::quantum::bytes(up), 0);
+        return guarded_install(scratch, || {
+            // `A = downᵀ`, `B = upᵀ` with `alpha/rank` folded into B (Wan's `install_one_lora`);
+            // user `scale` stays the residual scale. Fold into an owned `b` (a dtype-matched
+            // scalar keeps the factor dtype, matching the fork's weak-float multiply).
+            let a = down.t();
+            let mut b = up.t();
+            b = multiply(&b, &scalar(s.alpha / s.rank).as_dtype(up.dtype())?)?;
+            lin.push(Adapter::Lora {
+                a: a.clone(),
+                b: b.clone(),
+                scale: s.scale,
+            });
+            Ok(vec![a, b])
+        });
+    }
+    let base = dense_base(lin)?;
+    let mut widths = lora_chain(up.dtype());
+    widths.extend(linear_merge(base.dtype()));
+    let scratch = crate::quantum::adapter_install_bytes(
+        crate::quantum::elements(&base),
+        &widths,
+        f32_copy(up).saturating_add(f32_copy(down)),
+        unread(&base),
+    );
+    guarded_install(scratch, || {
+        let delta = lora_delta(down, up, s.alpha, s.rank, s.scale)?;
+        lin.merge_dense_delta(&delta)?;
+        Ok(vec![dense_base(lin)?])
+    })
+}
+
+/// Merge a conv LoRA's NCHW `delta` (lazy, from [`conv_lora_delta`] over `src`-typed factors with
+/// `small` factor-sized casts) into `conv` as one guarded quantum: the NHWC transpose is a view; its
+/// cast to the conv's dtype (below f32) and the merged sum, which cannot donate an operand beside
+/// the conv's strided NHWC view, are each a weight-sized buffer. The conv weight is itself an
+/// NHWC view, unevaluated until the U-Net's `materialize_weights` (after the merges), so its
+/// stored bytes are priced as read here.
+pub(crate) fn install_conv_delta(
+    conv: &mut mlx_gen::adapters::AdaptableConv2d,
+    delta_nchw: &Array,
+    src: Dtype,
+    small: u64,
+) -> Result<()> {
+    let base = conv.weight().dtype();
+    let mut widths = lora_chain(src);
+    widths.extend(linear_merge(base));
+    widths.push(width(base));
+    let scratch = crate::quantum::adapter_install_bytes(
+        crate::quantum::elements(delta_nchw),
+        &widths,
+        small,
+        unread(conv.weight()),
+    );
+    guarded_install(scratch, || {
+        conv.merge_conv_delta(delta_nchw)?;
+        Ok(vec![conv.weight().clone()])
+    })
+}
+
 /// Apply a reconstructed `[out,in]` `delta` at the Linear at `dotted`, counting it (or surfacing a
 /// miss as skipped). The path is the internal module path (FF already translated to `ff.linearN`).
 ///
@@ -152,21 +369,16 @@ fn merge_into(
     unet: &mut UNet2DConditionModel,
     dotted: &str,
     delta: &Array,
+    (chain, small): (&[u64], u64),
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     let parts: Vec<&str> = dotted.split('.').collect();
     match unet.adaptable_mut(&parts) {
         Some(lin) => {
-            if lin.is_quantized() {
-                // `Adapter::Lokr` residual is `scale·x·δᵀ`; with the `[out,in]` δ and scale 1.0 this is
-                // exactly the merged `x·(W+δ)ᵀ − x·Wᵀ`, on a base that cannot be merged into.
-                lin.push(Adapter::Lokr {
-                    delta: delta.clone(),
-                    scale: 1.0,
-                });
-            } else {
-                lin.merge_dense_delta(delta)?;
-            }
+            // A packed base carries the delta as an `Adapter::Lokr` residual `scale·x·δᵀ`; with the
+            // `[out,in]` δ and scale 1.0 this is exactly the merged `x·(W+δ)ᵀ − x·Wᵀ`, on a base that
+            // cannot be merged into. A dense base merges it (`install_delta`).
+            install_delta(lin, delta.clone(), chain, small)?;
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -184,10 +396,10 @@ fn merge_into(
 /// A LoRA target's scaling: the `alpha`/`rank` fold and the user `scale`. Bundled so the routing
 /// helpers stay under clippy's argument bound and thread one value.
 #[derive(Clone, Copy)]
-struct LoraScale {
-    alpha: f32,
-    rank: f32,
-    scale: f32,
+pub(crate) struct LoraScale {
+    pub(crate) alpha: f32,
+    pub(crate) rank: f32,
+    pub(crate) scale: f32,
 }
 
 fn apply_lora_into(
@@ -201,22 +413,7 @@ fn apply_lora_into(
     let parts: Vec<&str> = dotted.split('.').collect();
     match unet.adaptable_mut(&parts) {
         Some(lin) => {
-            if lin.is_quantized() {
-                // `A = downᵀ`, `B = upᵀ` with `alpha/rank` folded into B (Wan's `install_one_lora`);
-                // user `scale` stays the residual scale. Fold into an owned `b` (a dtype-matched
-                // scalar keeps the factor dtype, matching the fork's weak-float multiply).
-                let a = down.t();
-                let mut b = up.t();
-                b = multiply(&b, &scalar(s.alpha / s.rank).as_dtype(up.dtype())?)?;
-                lin.push(Adapter::Lora {
-                    a,
-                    b,
-                    scale: s.scale,
-                });
-            } else {
-                let delta = lora_delta(down, up, s.alpha, s.rank, s.scale)?;
-                lin.merge_dense_delta(&delta)?;
-            }
+            install_lora(lin, down, up, s)?;
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -277,11 +474,12 @@ fn merge_conv_routed(
     unet: &mut UNet2DConditionModel,
     path: &str,
     delta_nchw: &Array,
+    (src, small): (Dtype, u64),
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     let parts: Vec<&str> = path.split('.').collect();
     if let Some(conv) = unet.adaptable_conv_mut(&parts) {
-        conv.merge_conv_delta(delta_nchw)?;
+        install_conv_delta(conv, delta_nchw, src, small)?;
         report.merged += 1;
         return Ok(());
     }
@@ -295,6 +493,7 @@ fn merge_conv_routed(
             unet,
             &parts.join("."),
             &delta_nchw.reshape(&[sh[0], sh[1]])?,
+            (&lora_chain(src), small),
             report,
         );
     }
@@ -427,7 +626,8 @@ fn merge_one(
             let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
             let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
             let delta = conv_lora_delta(&down, &up, alpha, rank, scale)?;
-            merge_conv_routed(unet, &path, &delta, report)?;
+            let small = f32_copy(&up).saturating_add(f32_copy(&down));
+            merge_conv_routed(unet, &path, &delta, (up.dtype(), small), report)?;
             continue;
         }
         if down.ndim() != 2 || up.ndim() != 2 {
@@ -539,6 +739,20 @@ fn merge_one_lokr(
             continue;
         }
         let parts: Vec<&str> = path.split('.').collect();
+        // The factors' promoted dtype and the small Kronecker factors they rebuild (sc-26270).
+        let factor = f
+            .values()
+            .map(Array::dtype)
+            .reduce(Dtype::from_promoting_types)
+            .unwrap_or(Dtype::Float32);
+        let products = product_bytes(
+            &[
+                (f.get("lokr_w1_a"), f.get("lokr_w1_b")),
+                (f.get("lokr_w2_a"), f.get("lokr_w2_b")),
+            ],
+            factor,
+        );
+        let factor_bytes = f.values().fold(0u64, |n, a| n.saturating_add(f32_copy(a)));
         match unet.adaptable_mut(&parts) {
             Some(lin) => {
                 let base_shape = lin.base_shape();
@@ -546,7 +760,15 @@ fn merge_one_lokr(
                     // Packed base (sc-10734 / epic 10043): the deferred, structured Kronecker residual
                     // — `vec(w1·reshape(x)·w2ᵀ)` — never materializes the `[out,in]` delta, so a LoKr
                     // works on q4/q8 at plain-LoRA memory. The FULL `(alpha/rank)·scale` bakes into the
-                    // structured `w2` (a structured residual carries no separate scale).
+                    // structured `w2` (a structured residual carries no separate scale). Priced: the
+                    // rebuilt factors, the scaled `w2` and the f32 casts (all factor-sized).
+                    let scratch = crate::quantum::adapter_install_bytes(
+                        0,
+                        &[],
+                        products.saturating_mul(2).saturating_add(factor_bytes),
+                        0,
+                    );
+                    mlx_gen::ios_quantum::before(crate::quantum::ADAPTER_MERGE, scratch)?;
                     match build_lokr_factors(
                         (alpha / rank) * scale,
                         &base_shape,
@@ -559,10 +781,27 @@ fn merge_one_lokr(
                         f.get("lokr_w2_b"),
                         Dtype::Float32,
                     )? {
-                        Some(factors) => lin.push(Adapter::LokrStructured { factors }),
+                        Some(factors) => {
+                            let installed = [factors.w1.clone(), factors.w2.clone()];
+                            lin.push(Adapter::LokrStructured { factors });
+                            mlx_gen::ios_quantum::finish(
+                                crate::quantum::ADAPTER_MERGE,
+                                &[&installed[0], &installed[1]],
+                            )?;
+                        }
                         None => return Err(non_deferrable_lokr_error(&path)),
                     }
                 } else {
+                    let base = dense_base(lin)?;
+                    let mut widths = kron_chain(factor);
+                    widths.extend(linear_merge(base.dtype()));
+                    let scratch = crate::quantum::adapter_install_bytes(
+                        crate::quantum::elements(&base),
+                        &widths,
+                        products,
+                        unread(&base),
+                    );
+                    mlx_gen::ios_quantum::before(crate::quantum::ADAPTER_MERGE, scratch)?;
                     let delta = reconstruct_lokr_delta(
                         alpha,
                         rank,
@@ -579,6 +818,10 @@ fn merge_one_lokr(
                     // ⇒ δ·0 ⇒ a bit-exact no-op merge).
                     let delta = multiply(&delta, scalar(scale))?;
                     lin.merge_dense_delta(&delta)?;
+                    mlx_gen::ios_quantum::finish(
+                        crate::quantum::ADAPTER_MERGE,
+                        &[&dense_base(lin)?],
+                    )?;
                 }
                 report.merged += 1;
             }
@@ -595,6 +838,7 @@ fn merge_thirdparty_delta(
     unet: &mut UNet2DConditionModel,
     path: Option<&str>,
     delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    (chain, small): (&[u64], u64),
     scale: f32,
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
@@ -612,17 +856,14 @@ fn merge_thirdparty_delta(
     match unet.adaptable_mut(&parts) {
         Some(lin) => {
             let base_shape = lin.base_shape();
+            // Built lazily (no buffer exists until the guarded install materializes it).
             let delta = delta_at(&base_shape)?;
             let delta = multiply(&delta, scalar(scale))?;
-            if lin.is_quantized() {
-                // Packed base (sc-10734): third-party LoKr/LoHa have no single structured form here
-                // (a LoHa in particular is not Kronecker-deferrable), so ride the reconstructed delta
-                // as a forward-time `Adapter::Lokr` residual (`x·δᵀ`, scale already folded in). These
-                // third-party files are rare and their `[out,in]` deltas small relative to the UNet.
-                lin.push(Adapter::Lokr { delta, scale: 1.0 });
-            } else {
-                lin.merge_dense_delta(&delta)?;
-            }
+            // Packed base (sc-10734): third-party LoKr/LoHa have no single structured form here
+            // (a LoHa in particular is not Kronecker-deferrable), so the reconstructed delta rides
+            // as a forward-time `Adapter::Lokr` residual (`x·δᵀ`, scale already folded in) and
+            // stays resident; a dense base merges it (`install_delta`).
+            install_delta(lin, delta, chain, small)?;
             report.merged += 1;
         }
         None => report.skipped_keys += 1,
@@ -642,10 +883,25 @@ fn merge_one_lokr_thirdparty(
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     for (raw, g) in &parse_lokr_thirdparty(w)? {
+        let (factor, small) = factor_stats(w, raw, &LOKR_TP_SUFFIXES);
+        let products = product_bytes(
+            &[
+                (
+                    w.get(&format!("{raw}.lokr_w1_a")),
+                    w.get(&format!("{raw}.lokr_w1_b")),
+                ),
+                (
+                    w.get(&format!("{raw}.lokr_w2_a")),
+                    w.get(&format!("{raw}.lokr_w2_b")),
+                ),
+            ],
+            factor,
+        );
         merge_thirdparty_delta(
             unet,
             resolve_lokr_path(raw, table),
             |bs| g.delta(bs, Dtype::Float32),
+            (&kron_chain(factor), small.saturating_add(products)),
             scale,
             report,
         )?;
@@ -664,10 +920,12 @@ fn merge_one_loha_thirdparty(
     report: &mut SdxlLoraReport,
 ) -> Result<()> {
     for (raw, g) in &parse_loha_thirdparty(w)? {
+        let (factor, small) = factor_stats(w, raw, &LOHA_TP_SUFFIXES);
         merge_thirdparty_delta(
             unet,
             resolve_lokr_path(raw, table),
             |bs| g.delta(bs, Dtype::Float32),
+            (&hadamard_chain(factor), small),
             scale,
             report,
         )?;
@@ -715,6 +973,11 @@ pub fn apply_sdxl_adapters_with(
 
     let mut report = SdxlLoraReport::default();
     for spec in specs {
+        // sc-26270: the adapter file's header floor is checked before it is read (no-op off device).
+        mlx_gen::ios_quantum::before_load(
+            crate::quantum::ADAPTER_LOAD,
+            std::slice::from_ref(&spec.path),
+        )?;
         let w = Weights::from_file(&spec.path)?;
         // Adapter tensors are lazy too. Materialize their source payload before the prepared-file
         // guard around the provider phase performs its post-read identity check.

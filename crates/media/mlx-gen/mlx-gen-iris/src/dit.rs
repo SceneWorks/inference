@@ -16,9 +16,11 @@ use mlx_gen::{Error, Result};
 use mlx_rs::nn::{gelu, sigmoid, silu};
 use mlx_rs::{Array, Dtype};
 
+use crate::retention::{Attention, Kind, NormInput, Retention};
+
 use crate::nn::{
-    attention_at_site, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears, BackboneQuant,
-    Linear, Loader, RmsNorm, Rope,
+    attention_at_site, barrier, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears,
+    BackboneQuant, Linear, Loader, RmsNorm, Rope,
 };
 
 /// `SwiGLU`: `w2(silu(w1 x) · w3 x)`, bias-free.
@@ -110,6 +112,7 @@ impl SelfAttention {
             q = rope.apply(&q)?;
             k = rope.apply(&k)?;
         }
+        barrier(&[&q, &k, &v])?;
         self.proj
             .forward(&attention_at_site(&q, &k, &v, compute, mask, plan, site)?)
     }
@@ -259,6 +262,24 @@ impl Block {
             Block::Single(b) => (b.norm1.width(), b.mlp.hidden()),
         }
     }
+
+    /// `(separate q / k / v projections, text path, down-projection input padding)` of THIS
+    /// block's loaded modules — the iOS quantum accounting's layout inputs.
+    fn layout(&self) -> (bool, bool, u64) {
+        match self {
+            Block::Dual(b) => {
+                let pad = b.text.as_ref().map_or(b.mlp_x.w2.input_pad(), |t| {
+                    b.mlp_x.w2.input_pad().max(t.mlp.w2.input_pad())
+                });
+                (matches!(b.qkv_x, Qkv::Split { .. }), b.text.is_some(), pad)
+            }
+            Block::Single(b) => (
+                matches!(b.qkv, Qkv::Split { .. }),
+                b.text_out,
+                b.mlp.w2.input_pad(),
+            ),
+        }
+    }
 }
 
 /// Labels of the iOS execution quanta of one backbone forward, in forward order.
@@ -274,42 +295,52 @@ pub(crate) mod quanta {
     pub const OUTPUT: &str = "Iris output projection";
 }
 
-/// Counted live buffers of one block phase, by tensor class, at one compute width. Each class is
-/// priced over its own shape by the site (`hidden` = the block's `[.., tokens, width]`, `kv` = its
-/// grouped k/v width, `ff` = its MLP width); the counts are proven against MLX's measured peak in
-/// `crate::quantum_proofs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Live {
-    pub f32_hidden: u64,
-    pub cw_hidden: u64,
-    pub f32_kv: u64,
-    pub cw_kv: u64,
-    pub cw_ff: u64,
+/// The geometry of one trunk block quantum (see [`IrisDiT::trunk_block_scratch`]): the request's
+/// token counts and plan over the loaded block's widths.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrunkGeometry {
+    pub compute_bytes: u64,
+    pub batch: u64,
+    /// Image (patch) tokens per batch row.
+    pub img_tokens: u64,
+    /// Text tokens per batch row.
+    pub txt_tokens: u64,
+    pub dim: u64,
+    pub heads: u64,
+    pub kv_heads: u64,
+    /// The block's widest SwiGLU hidden width.
+    pub ff: u64,
+    /// Query rows per SDPA call (the plan's block; all tokens when unbounded).
+    pub query_rows: u64,
+    pub eval_per_chunk: bool,
+    /// Grouped-query attention's separate q / k / v projections (else one fused qkv).
+    pub split_qkv: bool,
+    /// Dual-stream: the block has a text path. Single-stream: the block returns updated text.
+    pub text: bool,
+    /// Zero columns appended to the SwiGLU down projection's input (an unaligned packed base).
+    pub down_pad: u64,
+    /// Bytes per element of the image stream entering the block: the compute width at the first
+    /// block (the patch embedding's output), f32 after it (every residual sum promotes to f32).
+    pub img_stream_bytes: u64,
 }
 
-impl Live {
-    const fn of(f32_hidden: u64, cw_hidden: u64, f32_kv: u64, cw_kv: u64, cw_ff: u64) -> Self {
-        Self {
-            f32_hidden,
-            cw_hidden,
-            f32_kv,
-            cw_kv,
-            cw_ff,
-        }
-    }
-
-    /// Bytes of these buffers over `hidden`, `kv` and `ff` elements at compute width `cw`.
-    fn bytes(self, cw: u64, hidden: u64, kv: u64, ff: u64) -> u64 {
-        [
-            self.f32_hidden * 4 * hidden,
-            self.cw_hidden * cw * hidden,
-            self.f32_kv * 4 * kv,
-            self.cw_kv * cw * kv,
-            self.cw_ff * cw * ff,
-        ]
-        .iter()
-        .fold(0u64, |a, b| a.saturating_add(*b))
-    }
+/// The widths of the patch / timestep embedding quantum (see [`IrisDiT::embed_scratch`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbedGeometry {
+    pub compute_bytes: u64,
+    pub batch: u64,
+    pub patches: u64,
+    /// `p² · C`, the patch embedding's input width.
+    pub patch_in: u64,
+    pub hidden: u64,
+    /// The timestep sinusoid width (`cos ‖ sin`, the first timestep projection's input).
+    pub sinusoid: u64,
+    /// The first timestep projection's output width.
+    pub t_hidden: u64,
+    /// The second timestep projection's output width (`t_emb`).
+    pub t_out: u64,
+    /// Both modulation cores' output widths summed.
+    pub cores: u64,
 }
 
 /// The widths of one PiT block quantum (see [`IrisDiT::pixel_block_scratch`]).
@@ -329,77 +360,32 @@ pub(crate) struct PixelBlockGeometry {
     pub fc1_width: u64,
     pub heads: u64,
     pub query_rows: u64,
+    pub eval_per_chunk: bool,
 }
 
-/// The counts of one block, under an f32 compute (`[0]`) and a bf16 one (`[1]`): the two differ
-/// because a bf16 compute adds the compute-width copies of f32 streams and frees the f32 operands
-/// earlier.
-pub(crate) struct BlockCounts {
-    /// The attention phase (the gate branch, which MLX evaluates ahead of the attention, included).
-    pub attention: [Live; 2],
-    /// Added when the plan chunks the query rows: the chunk outputs and their concatenation, plus
-    /// what the per-chunk evaluation materializes while the block's own bindings still hold it.
-    pub chunked: [Live; 2],
-    /// The MLP phase.
-    pub mlp: [Live; 2],
+/// The geometry of one text-adapter block quantum: a layerwise block (`masked == false`: attention
+/// over each token's `tokens` encoder layers, no QK-norm) or a refiner block (`masked`: masked-key
+/// attention over the text tokens, QK-norm, SwiGLU).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextBlockGeometry {
+    pub compute_bytes: u64,
+    /// Attention batch rows (`B · T` for a layerwise block, `B` for a refiner block).
+    pub batch: u64,
+    /// Tokens per row (encoder layers, or text tokens).
+    pub tokens: u64,
+    pub dim: u64,
+    pub heads: u64,
+    pub ff: u64,
+    pub query_rows: u64,
+    pub eval_per_chunk: bool,
+    /// Refiner block: QK-norm, an additive key mask and a SwiGLU MLP (else the layerwise block's
+    /// plain attention and `mlp.0 → SiLU → mlp.2`).
+    pub refiner: bool,
+    pub down_pad: u64,
+    /// Bytes per element of the residual stream: f32 through the layerwise blocks (the f32
+    /// encoder states), the compute width through the refiner (the pool's projection output).
+    pub stream_bytes: u64,
 }
-
-fn width_index(cw: u64) -> usize {
-    usize::from(cw < 4)
-}
-
-/// Single-stream trunk block.
-///
-/// Attention: f32 `[B, T, D]` — the token concatenation, the modulated norm `h`, q after its
-/// QK-norm, q after RoPE (concatenated) and one RoPE working buffer; f32 `[B, T, kv]` — k after its
-/// QK-norm and after RoPE; compute-width `[B, T, D]` — the q projection, the gate projection and its
-/// sigmoid, the attention output, its `[B, T, D]` re-layout and the gated product (bf16: the gate
-/// and q projections read compute-width casts of `h` in place of the f32 operands); compute-width
-/// `[B, T, kv]` — the k and v projections and (f32) the cast of k the attention reads.
-/// MLP: the f32 residual and modulated norm, the compute-width cast and down projection, and the
-/// w1 / SiLU (in place) / w3 / gate·up `[B, T, F]` outputs.
-pub(crate) const SINGLE_BLOCK: BlockCounts = BlockCounts {
-    attention: [Live::of(5, 6, 2, 3, 0), Live::of(5, 5, 2, 2, 0)],
-    chunked: [Live::of(0, 1, 0, 0, 0), Live::of(0, 5, 0, 0, 0)],
-    mlp: [Live::of(2, 2, 0, 0, 3), Live::of(2, 2, 0, 0, 3)],
-};
-
-/// Dual-stream trunk block: the single block's classes over both streams, without the token
-/// concatenation (each stream keeps its own `h`), and with the x then y post-attention halves and
-/// MLPs run one after the other. Under bf16 the f32 q/k are released once cast for the attention
-/// and the unbounded graph releases each stream's projections before the joint attention, while a
-/// chunking plan's per-chunk evaluation holds the projections, their casts and the chunk outputs
-/// and their concatenation (seven `[B, T, D]` at the compute width).
-pub(crate) const DUAL_BLOCK: BlockCounts = BlockCounts {
-    attention: [Live::of(4, 5, 1, 3, 0), Live::of(2, 2, 2, 2, 0)],
-    chunked: [Live::of(0, 1, 0, 0, 0), Live::of(0, 7, 0, 0, 0)],
-    mlp: [Live::of(2, 2, 0, 0, 3), Live::of(2, 2, 0, 0, 3)],
-};
-
-/// Layerwise text-adapter block (MHA, fused qkv, no QK-norm or RoPE).
-///
-/// Attention: the f32 input norm (and, f32, the residual sum); the fused qkv (three
-/// `[R, L, D]`), the attention output, its re-layout and the projection (bf16: the norm's
-/// compute-width cast replaces the residual). MLP: the f32 residual and norm, the down projection
-/// (bf16: and the norm's cast), and mlp.0 / SiLU (bf16: and SiLU's working copy).
-pub(crate) const LAYER_BLOCK: BlockCounts = BlockCounts {
-    attention: [Live::of(2, 6, 0, 0, 0), Live::of(1, 5, 0, 0, 0)],
-    chunked: [Live::of(0, 0, 0, 0, 0), Live::of(0, 1, 0, 0, 0)],
-    mlp: [Live::of(2, 1, 0, 0, 2), Live::of(2, 2, 0, 0, 3)],
-};
-
-/// Text-refiner block (MHA, fused qkv, QK-norm, masked keys).
-///
-/// Attention: f32 — the input norm (bf16: and q, k after QK-norm, until cast); compute width — the
-/// fused qkv (three), the attention output and the projection. Chunked: the chunk outputs, their
-/// concatenation and the re-layout of q (f32) or the casts of q and k (bf16) the per-chunk
-/// evaluation materializes. MLP: the f32 residual and norm, the down
-/// projection, and w1 / w3 / gate·up (bf16: one more `[B, T, F]` working copy).
-pub(crate) const REFINER_BLOCK: BlockCounts = BlockCounts {
-    attention: [Live::of(1, 5, 0, 0, 0), Live::of(3, 5, 0, 0, 0)],
-    chunked: [Live::of(0, 3, 0, 0, 0), Live::of(0, 3, 0, 0, 0)],
-    mlp: [Live::of(2, 1, 0, 0, 2), Live::of(2, 1, 0, 0, 3)],
-};
 
 /// `PiTBlock` with `modulation="post"`.
 struct PitBlock {
@@ -832,12 +818,13 @@ impl IrisDiT {
 
     // ---- iOS execution quanta (pass-through everywhere but a physical iOS device) ----------
     //
-    // Every figure below is COUNTED: the live tensors at each phase's peak of the quantum's body,
-    // by tensor class (the counts are the `*_BLOCK` tables above and the per-site lists below),
-    // over the loaded tensors' widths (projection shapes, gain widths, head counts of the built
-    // modules) and the actual request geometry. Weights are consumed in place (dense in the compute
-    // dtype, or packed and read by `quantized_matmul`), so no quantum prices a weight copy. Every
-    // count is proven against MLX's measured peak at small shapes in `crate::quantum_proofs`.
+    // Every figure below is COUNTED under MLX's retention ([`crate::retention`]): every buffer a
+    // quantum's body allocates, phase by phase between its sub-layer barriers
+    // ([`crate::nn::barrier`]), over the loaded tensors' widths (projection shapes, gain widths,
+    // head counts of the built modules) and the actual request geometry. Weights are consumed in
+    // place (dense in the compute dtype, or packed and read by `quantized_matmul`), so no quantum
+    // prices a weight copy. Every count is proven against MLX's measured peak at small shapes in
+    // `crate::quantum_proofs`.
 
     fn query_rows(plan: mlx_gen::AttentionPlan<'_>, batch: i32, heads: i32, tokens: i32) -> u64 {
         plan.budget.query_block(batch, heads, tokens, tokens).max(0) as u64
@@ -847,52 +834,7 @@ impl IrisDiT {
         crate::nn::dtype_bytes(self.compute)
     }
 
-    /// One attention block from its counts: `max(attention phase, MLP phase)`, the attention phase
-    /// adding the scores ([`crate::nn::sdpa_scores`]), the CPU fallback's own copies (`q · scale`,
-    /// and under GQA the k and v broadcasts over the query groups — each `[.., tokens, D]`) and,
-    /// for a chunking plan, the chunked counts.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn block_bytes(
-        counts: &BlockCounts,
-        cw: u64,
-        batch: u64,
-        tokens: u64,
-        dim: u64,
-        kv: u64,
-        ff: u64,
-        heads: u64,
-        query_rows: u64,
-        masked: bool,
-    ) -> u64 {
-        use mlx_gen::ios_quantum::{scores_bytes, tensor_bytes};
-        let w = width_index(cw);
-        let hidden = batch.saturating_mul(tokens).saturating_mul(dim);
-        let kv_elements = batch.saturating_mul(tokens).saturating_mul(kv);
-        let ff_elements = batch.saturating_mul(tokens).saturating_mul(ff);
-        let scores = crate::nn::sdpa_scores(dim / heads.max(1), query_rows, cw, masked);
-        let fallback = if crate::nn::sdpa_falls_back(scores) {
-            1 + if kv < dim { 2 } else { 0 }
-        } else {
-            0
-        };
-        let mut attention = counts.attention[w]
-            .bytes(cw, hidden, kv_elements, ff_elements)
-            .saturating_add(fallback * tensor_bytes(cw, &[hidden]))
-            .saturating_add(scores_bytes(scores, batch, heads, query_rows, tokens));
-        if query_rows < tokens {
-            attention = attention.saturating_add(counts.chunked[w].bytes(
-                cw,
-                hidden,
-                kv_elements,
-                ff_elements,
-            ));
-        }
-        attention.max(counts.mlp[w].bytes(cw, hidden, kv_elements, ff_elements))
-    }
-
-    /// Trunk block `i` over `n_patches` image and `n_txt` text tokens: the joint attention spans
-    /// both streams (text-first concatenation), so both count as tokens ([`SINGLE_BLOCK`],
-    /// [`DUAL_BLOCK`]).
+    /// Trunk block `i` over `n_patches` image and `n_txt` text tokens.
     pub(crate) fn trunk_block_scratch(
         &self,
         i: usize,
@@ -901,42 +843,242 @@ impl IrisDiT {
         n_txt: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        let (dim, ff_hidden) = self.blocks[i].widths();
+        let (dim, ff) = self.blocks[i].widths();
         let tokens = (n_patches + n_txt).max(0);
         let heads = self.cfg.num_heads as i32;
         let kv_heads = self.cfg.num_kv_heads.unwrap_or(self.cfg.num_heads) as u64;
-        let counts = match self.blocks[i] {
-            Block::Dual(_) => &DUAL_BLOCK,
-            Block::Single(_) => &SINGLE_BLOCK,
-        };
-        Self::block_bytes(
-            counts,
-            self.compute_bytes(),
-            batch.max(0) as u64,
-            tokens as u64,
+        let (split_qkv, text, down_pad) = self.blocks[i].layout();
+        let g = TrunkGeometry {
+            compute_bytes: self.compute_bytes(),
+            batch: batch.max(0) as u64,
+            img_tokens: n_patches.max(0) as u64,
+            txt_tokens: n_txt.max(0) as u64,
             dim,
-            dim / heads.max(1) as u64 * kv_heads,
-            ff_hidden,
-            heads as u64,
-            Self::query_rows(plan, batch, heads, tokens),
-            false,
-        )
+            heads: heads as u64,
+            kv_heads,
+            ff,
+            query_rows: Self::query_rows(plan, batch, heads, tokens),
+            eval_per_chunk: plan.budget.eval_per_chunk(),
+            split_qkv,
+            text,
+            down_pad,
+            img_stream_bytes: if i == 0 { self.compute_bytes() } else { 4 },
+        };
+        match self.blocks[i] {
+            Block::Dual(_) => Self::dual_block_bytes(&g, crate::retention::unfused()),
+            Block::Single(_) => Self::single_block_bytes(&g, crate::retention::unfused()),
+        }
     }
 
-    /// PiT block `i` over `n_patches` patches of `p²` pixels: three widths per patch — the pixel
-    /// plane (`p² · pixel width`), the compact attention width (`compress`'s output) and the MLP
-    /// plane (`p² · fc1 width`).
-    ///
-    /// Held through the block: the adaLN modulation (`adaln`'s `4 · p² · pixel` output at the
-    /// compute width; bf16: and the compute-width cast of the f32 conditioning it reads).
-    /// Attention: the f32 norm plane; over the plane at the compute width the expand output and the
-    /// modulation's scaled and shifted terms and the residual sum; over the compact width the f32 q
-    /// and k after QK-norm and after RoPE, and at the compute width the compressed tokens, the fused
-    /// qkv (three), the attention output, its re-layout and the projection; plus the scores and the
-    /// CPU fallback's `q · scale`. Chunked: the chunk outputs, their concatenation and (f32) the
-    /// rotated q, k the per-chunk evaluation materializes. MLP: the f32 norm plane, the residual
-    /// (f32: and the fc2 output), and over the MLP plane fc1's output (bf16: and GELU's working
-    /// copies — x/√2, erf, 1 + erf — before the product).
+    /// One grouped-query (or fused) q / k / v projection of `rows` tokens from an f32 input,
+    /// each output held.
+    fn project_qkv(r: &mut Retention, g: &TrunkGeometry, rows: u64) {
+        let (d, kvw) = (g.dim, g.dim / g.heads.max(1) * g.kv_heads);
+        let narrow = r.narrow();
+        if g.split_qkv {
+            r.linear(rows, d, d, narrow, 0, Kind::Named)
+                .linear(rows, d, kvw, narrow, 0, Kind::Named)
+                .linear(rows, d, kvw, narrow, 0, Kind::Named);
+        } else {
+            r.linear(rows, d, d + 2 * kvw, narrow, 0, Kind::Named);
+        }
+    }
+
+    /// A SwiGLU MLP over `rows` tokens of an f32 input (`w1` / `w3` read their own compute-width
+    /// casts; SiLU and the gate product donate), and its output norm when `post_norm`. `bound`: the
+    /// block binds the MLP output (held to the end; its norm reads a held input), else the output is
+    /// a temporary the norm's result can reuse.
+    fn swiglu(
+        r: &mut Retention,
+        rows: u64,
+        d: u64,
+        ff: u64,
+        pad: u64,
+        post_norm: bool,
+        bound: bool,
+    ) {
+        let narrow = r.narrow();
+        let out_kind = if bound { Kind::Named } else { Kind::Temp };
+        r.linear(rows, d, ff, narrow, 0, Kind::Temp)
+            .linear(rows, d, ff, narrow, 0, Kind::Temp)
+            .linear(rows, ff, d, false, pad, out_kind);
+        if post_norm {
+            let input = match (narrow, bound) {
+                (true, _) => NormInput::Cast,
+                (false, true) => NormInput::Held,
+                (false, false) => NormInput::Donor,
+            };
+            r.norm(rows * d, rows, input, Kind::Temp);
+        }
+    }
+
+    /// The attention half of a trunk block's joint attention over `tokens` per row: the SDPA call
+    /// on the f32 roped q / k and the compute-width v, its result held.
+    fn trunk_attention(r: &mut Retention, g: &TrunkGeometry) {
+        let narrow = r.narrow();
+        let tokens = g.img_tokens + g.txt_tokens;
+        r.attention(&Attention {
+            batch: g.batch,
+            tokens,
+            heads: g.heads,
+            kv_heads: g.kv_heads,
+            head_dim: g.dim / g.heads.max(1),
+            query_rows: g.query_rows,
+            eval_per_chunk: g.eval_per_chunk,
+            q_dense: true,
+            q_cast: narrow,
+            k_cast: narrow,
+            v_cast: false,
+            mask: None,
+            out_kind: Kind::Named,
+        });
+    }
+
+    /// `single`: one weight set over `cat([text, image])`. Phase 1 (to the q / k / v barrier): the
+    /// modulation core's f32 sum, the token concatenation, the modulated norm `h`, the q / k / v
+    /// projections, the QK-norms and RoPE (four applications), the q and k concatenations. Phase 2
+    /// (to the residual barrier): the attention, the gate projection (its sigmoid and the gated
+    /// product donate), the output projection and its post-norm, the gated residual. Phase 3: the
+    /// modulated norm, the SwiGLU and its post-norm (the residual sum donates). Every bound handle
+    /// is held to the end.
+    pub(crate) fn single_block_bytes(g: &TrunkGeometry, unfused: bool) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused);
+        let narrow = r.narrow();
+        let (b, d) = (g.batch, g.dim);
+        let kvw = d / g.heads.max(1) * g.kv_heads;
+        let rows = b * (g.img_tokens + g.txt_tokens);
+        let h = rows * d;
+        let kv = rows * kvw;
+        let qk_in = if narrow {
+            NormInput::Cast
+        } else {
+            NormInput::Held
+        };
+        // Phase 1 (a compute-width image stream is cast to f32 for the concatenation).
+        if g.img_stream_bytes < 4 {
+            r.temp(4, b * g.img_tokens * d);
+        }
+        r.named(4, b * 6 * d)
+            .named(4, h)
+            .norm(h, rows, NormInput::Held, Kind::Named)
+            .temp(4, b * d);
+        Self::project_qkv(&mut r, g, rows);
+        r.norm(h, rows * g.heads, qk_in, Kind::Named)
+            .norm(kv, rows * g.kv_heads, qk_in, Kind::Named)
+            .rope(b * g.txt_tokens * d, Kind::Temp)
+            .rope(b * g.img_tokens * d, Kind::Temp)
+            .rope(b * g.txt_tokens * kvw, Kind::Temp)
+            .rope(b * g.img_tokens * kvw, Kind::Temp)
+            .named(4, h)
+            .named(4, kv)
+            .barrier();
+        // Phase 2 — over the image tokens alone when the block drops the text stream.
+        Self::trunk_attention(&mut r, g);
+        let rows_o = if g.text { rows } else { b * g.img_tokens };
+        let h_o = rows_o * d;
+        let proj_kind = if narrow {
+            Kind::Temp
+        } else {
+            r.donor(Kind::Named)
+        };
+        let post_in = if narrow {
+            NormInput::Cast
+        } else {
+            NormInput::Donor
+        };
+        r.linear(rows_o, d, d, narrow, 0, Kind::Named)
+            .linear(rows_o, d, d, false, 0, proj_kind)
+            .norm(h_o, rows_o, post_in, Kind::Named)
+            .named(4, h_o)
+            .barrier();
+        // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
+        // modulation sum and the residual stream.
+        r.last_phase()
+            .hold(4, b * 6 * d)
+            .hold(4, h_o)
+            .norm(h_o, rows_o, NormInput::Held, Kind::Temp)
+            .temp(4, b * d);
+        Self::swiglu(&mut r, rows_o, d, g.ff, g.down_pad, true, true);
+        r.price()
+    }
+
+    /// `dual`: separate image / text weights, text-first joint attention. Phase 1: both streams'
+    /// modulation sums and modulated norms, their q / k / v projections, the four QK-norms and RoPE
+    /// applications, the q / k / v concatenations. Phase 2: the attention and the image half's gate,
+    /// output projection, post-norm and residual. Phase 3: the image MLP. Phases 4 and 5: the text
+    /// half's, when the block has a text path. Every bound handle is held to the end.
+    pub(crate) fn dual_block_bytes(g: &TrunkGeometry, unfused: bool) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused);
+        let narrow = r.narrow();
+        let (b, d) = (g.batch, g.dim);
+        let kvw = d / g.heads.max(1) * g.kv_heads;
+        let (rows_x, rows_y) = (b * g.img_tokens, b * g.txt_tokens);
+        let rows = rows_x + rows_y;
+        let qk_in = if narrow {
+            NormInput::Cast
+        } else {
+            NormInput::Held
+        };
+        let post_in = qk_in;
+        let img_narrow = g.img_stream_bytes < 4;
+        // Phase 1.
+        r.named(4, b * 6 * d).named(4, b * 6 * d);
+        for (stream, narrow_in) in [(rows_x, img_narrow), (rows_y, false)] {
+            let input = if narrow_in {
+                NormInput::Cast
+            } else {
+                NormInput::Held
+            };
+            r.norm(stream * d, stream, input, Kind::Named)
+                .temp(4, b * d);
+            Self::project_qkv(&mut r, g, stream);
+        }
+        for stream in [rows_x, rows_y] {
+            r.norm(stream * d, stream * g.heads, qk_in, Kind::Temp)
+                .rope(stream * d, Kind::Named)
+                .norm(stream * kvw, stream * g.kv_heads, qk_in, Kind::Temp)
+                .rope(stream * kvw, Kind::Named);
+        }
+        let cw = r.cw;
+        r.named(4, rows * d)
+            .named(4, rows * kvw)
+            .named(cw, rows * kvw)
+            .barrier();
+        // Phase 2: the attention, then the image half's post-attention.
+        Self::trunk_attention(&mut r, g);
+        let halves: &[u64] = if g.text { &[rows_x, rows_y] } else { &[rows_x] };
+        for (k, &stream) in halves.iter().enumerate() {
+            if k > 0 {
+                // Phase 4: the text half's post-attention.
+                r.barrier();
+            }
+            r.linear(stream, d, d, narrow, 0, Kind::Named)
+                .linear(stream, d, d, false, 0, Kind::Named)
+                .norm(stream * d, stream, post_in, Kind::Named);
+            if k == 0 && img_narrow {
+                // The compute-width image stream's f32 cast for the residual sum.
+                r.temp(4, stream * d);
+            }
+            if k == 1 {
+                // Phase 5: the text MLP is the returned graph, run after the block's bindings are
+                // gone — it reads the text modulation sum, the text residual stream and (returned
+                // with it) the image stream.
+                r.last_phase()
+                    .hold(4, b * 6 * d)
+                    .hold(4, rows_y * d)
+                    .hold(4, rows_x * d);
+            } else {
+                // Phase 3: the image MLP, evaluated by the block.
+                r.barrier();
+            }
+            r.norm(stream * d, stream, NormInput::Held, Kind::Named)
+                .temp(4, b * d);
+            Self::swiglu(&mut r, stream, d, g.ff, g.down_pad, true, false);
+        }
+        r.price()
+    }
+
+    /// PiT block `i` over `n_patches` patches of `p²` pixels.
     pub(crate) fn pixel_block_scratch(
         &self,
         i: usize,
@@ -946,59 +1088,126 @@ impl IrisDiT {
     ) -> u64 {
         let blk = &self.pixel_blocks[i];
         let heads = blk.attn.heads;
-        Self::pixel_block_bytes(PixelBlockGeometry {
-            compute_bytes: self.compute_bytes(),
-            batch: batch.max(0) as u64,
-            patches: n_patches.max(0) as u64,
-            patch_pixels: (self.cfg.patch_size * self.cfg.patch_size) as u64,
-            pixel_width: blk.norm1.width(),
-            compact_width: blk.compress.out_features(),
-            modulation_width: blk.adaln.out_features(),
-            condition_width: blk.adaln.logical_shape()[1] as u64,
-            fc1_width: blk.fc1.out_features(),
-            heads: heads as u64,
-            query_rows: Self::query_rows(plan, batch, heads, n_patches),
-        })
+        Self::pixel_block_bytes(
+            PixelBlockGeometry {
+                compute_bytes: self.compute_bytes(),
+                batch: batch.max(0) as u64,
+                patches: n_patches.max(0) as u64,
+                patch_pixels: (self.cfg.patch_size * self.cfg.patch_size) as u64,
+                pixel_width: blk.norm1.width(),
+                compact_width: blk.compress.out_features(),
+                modulation_width: blk.adaln.out_features(),
+                condition_width: blk.adaln.logical_shape()[1] as u64,
+                fc1_width: blk.fc1.out_features(),
+                heads: heads as u64,
+                query_rows: Self::query_rows(plan, batch, heads, n_patches),
+                eval_per_chunk: plan.budget.eval_per_chunk(),
+            },
+            crate::retention::unfused(),
+        )
     }
 
-    /// [`Self::pixel_block_scratch`] from the block's widths alone.
-    pub(crate) fn pixel_block_bytes(g: PixelBlockGeometry) -> u64 {
-        use mlx_gen::ios_quantum::{scores_bytes, tensor_bytes};
+    /// [`Self::pixel_block_scratch`] from the block's widths alone. Phase 1 (to the attention's
+    /// q / k / v barrier): the adaLN modulation (held), the norm of the compute-width pixel plane,
+    /// the compressed tokens (held), the fused qkv, the QK-norms and RoPE (q and k held into the
+    /// attention). Phase 2 (to the residual barrier): the attention, its projection, the expanded
+    /// plane (held) and the modulated residual. Phase 3: the norm, `fc1` (GELU donates; bf16: its
+    /// result is f32, which `fc2` casts back), `fc2` (held) and the modulated residual.
+    pub(crate) fn pixel_block_bytes(g: PixelBlockGeometry, unfused: bool) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused);
+        let narrow = r.narrow();
         let cw = g.compute_bytes;
-        let bf16 = cw < 4;
-        let (b, n) = (g.batch, g.patches);
-        let plane = b * n * g.patch_pixels * g.pixel_width;
-        let compact = b * n * g.compact_width;
-        let mlp = b * n * g.patch_pixels * g.fc1_width;
-        let held = tensor_bytes(cw, &[b, n, g.modulation_width]).saturating_add(if bf16 {
-            tensor_bytes(cw, &[b, n, g.condition_width])
+        let rows = g.batch * g.patches;
+        let plane = rows * g.patch_pixels * g.pixel_width;
+        let compact = rows * g.compact_width;
+        let plane_in = if narrow {
+            NormInput::Cast
         } else {
-            0
-        });
-        let scores =
-            crate::nn::sdpa_scores(g.compact_width / g.heads.max(1), g.query_rows, cw, false);
-        let fallback = u64::from(crate::nn::sdpa_falls_back(scores));
-        let mut attention = [
-            4 * plane,
-            4 * cw * plane,
-            4 * 4 * compact,
-            (7 + fallback) * cw * compact,
-            scores_bytes(scores, b, g.heads, g.query_rows, n),
-        ]
-        .iter()
-        .fold(0u64, |a, x| a.saturating_add(*x));
-        if g.query_rows < n {
-            attention =
-                attention.saturating_add(if bf16 { cw * compact } else { 3 * cw * compact });
+            NormInput::Held
+        };
+        // Phase 1.
+        r.linear(
+            rows,
+            g.condition_width,
+            g.modulation_width,
+            narrow,
+            0,
+            Kind::Named,
+        )
+        .norm(plane, rows * g.patch_pixels, plane_in, Kind::Temp)
+        .linear(
+            rows,
+            g.patch_pixels * g.pixel_width,
+            g.compact_width,
+            narrow,
+            0,
+            Kind::Named,
+        )
+        .linear(
+            rows,
+            g.compact_width,
+            3 * g.compact_width,
+            false,
+            0,
+            Kind::Named,
+        )
+        .norm(compact, rows * g.heads, plane_in, Kind::Temp)
+        .rope(compact, Kind::Named)
+        .norm(compact, rows * g.heads, plane_in, Kind::Temp)
+        .rope(compact, Kind::Named)
+        .barrier();
+        // Phase 2.
+        r.attention(&Attention {
+            batch: g.batch,
+            tokens: g.patches,
+            heads: g.heads,
+            kv_heads: g.heads,
+            head_dim: g.compact_width / g.heads.max(1),
+            query_rows: g.query_rows,
+            eval_per_chunk: g.eval_per_chunk,
+            q_dense: true,
+            q_cast: narrow,
+            k_cast: narrow,
+            v_cast: false,
+            mask: None,
+            out_kind: Kind::Temp,
+        })
+        .linear(
+            rows,
+            g.compact_width,
+            g.compact_width,
+            false,
+            0,
+            Kind::Named,
+        )
+        .linear(
+            rows,
+            g.compact_width,
+            g.patch_pixels * g.pixel_width,
+            false,
+            0,
+            Kind::Named,
+        )
+        .named(cw, plane);
+        // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
+        // modulation and the residual stream.
+        let mlp_rows = rows * g.patch_pixels;
+        r.last_phase()
+            .hold(cw, rows * g.modulation_width)
+            .hold(cw, plane)
+            .norm(plane, mlp_rows, plane_in, Kind::Temp)
+            .linear(mlp_rows, g.pixel_width, g.fc1_width, narrow, 0, Kind::Temp);
+        if narrow {
+            // MLX's GELU divides by f32 constants: a bf16 input's result is a new f32 buffer.
+            r.temp(4, mlp_rows * g.fc1_width);
         }
-        let mlp_phase = 4 * plane
-            + if bf16 { cw * plane } else { 2 * cw * plane }
-            + if bf16 { 4 * cw * mlp } else { cw * mlp };
-        held.saturating_add(attention.max(mlp_phase))
+        r.linear(mlp_rows, g.fc1_width, g.pixel_width, narrow, 0, Kind::Named)
+            .temp(cw, plane);
+        r.price()
     }
 
-    /// Text-adapter layer block `i` ([`LAYER_BLOCK`]): attention over the `layers` encoder states
-    /// of each of the `rows = B · T` tokens.
+    /// Text-adapter layer block `i`: attention over the `layers` encoder states of each of the
+    /// `rows = B · T` tokens.
     pub(crate) fn text_layer_block_scratch(
         &self,
         i: usize,
@@ -1007,23 +1216,25 @@ impl IrisDiT {
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
         let blk = &self.y_embedder.layer_blocks[i];
-        let dim = blk.norm1.width();
-        Self::block_bytes(
-            &LAYER_BLOCK,
-            self.compute_bytes(),
-            rows.max(0) as u64,
-            layers.max(0) as u64,
-            dim,
-            dim,
-            blk.mlp0.out_features(),
-            blk.attn.heads as u64,
-            Self::query_rows(plan, rows, blk.attn.heads, layers),
-            false,
+        Self::text_block_bytes(
+            TextBlockGeometry {
+                compute_bytes: self.compute_bytes(),
+                batch: rows.max(0) as u64,
+                tokens: layers.max(0) as u64,
+                dim: blk.norm1.width(),
+                heads: blk.attn.heads as u64,
+                ff: blk.mlp0.out_features(),
+                query_rows: Self::query_rows(plan, rows, blk.attn.heads, layers),
+                eval_per_chunk: plan.budget.eval_per_chunk(),
+                refiner: false,
+                down_pad: blk.mlp2.input_pad(),
+                stream_bytes: 4,
+            },
+            crate::retention::unfused(),
         )
     }
 
-    /// Text-refiner block `i` over `t` masked-key text tokens ([`REFINER_BLOCK`]), plus the
-    /// `[B, 1, T, T]` additive key mask's compute-width copy made inside the attention.
+    /// Text-refiner block `i` over `t` masked-key text tokens.
     pub(crate) fn text_refiner_block_scratch(
         &self,
         i: usize,
@@ -1032,22 +1243,97 @@ impl IrisDiT {
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
         let blk = &self.y_embedder.blocks[i];
-        let dim = blk.norm1.width();
-        let cw = self.compute_bytes();
-        let (b, tokens) = (batch.max(0) as u64, t.max(0) as u64);
-        Self::block_bytes(
-            &REFINER_BLOCK,
-            cw,
-            b,
-            tokens,
-            dim,
-            dim,
-            blk.mlp.hidden(),
-            blk.attn.heads as u64,
-            Self::query_rows(plan, batch, blk.attn.heads, t),
-            true,
+        Self::text_block_bytes(
+            TextBlockGeometry {
+                compute_bytes: self.compute_bytes(),
+                batch: batch.max(0) as u64,
+                tokens: t.max(0) as u64,
+                dim: blk.norm1.width(),
+                heads: blk.attn.heads as u64,
+                ff: blk.mlp.hidden(),
+                query_rows: Self::query_rows(plan, batch, blk.attn.heads, t),
+                eval_per_chunk: plan.budget.eval_per_chunk(),
+                refiner: true,
+                down_pad: blk.mlp.w2.input_pad(),
+                stream_bytes: self.compute_bytes(),
+            },
+            crate::retention::unfused(),
         )
-        .saturating_add(mlx_gen::ios_quantum::tensor_bytes(cw, &[b, tokens, tokens]))
+    }
+
+    /// One text-adapter block from its widths. Phase 1 (to the attention's q / k / v barrier): the
+    /// input norm, the fused qkv (held into the attention) and, in a refiner block, the QK-norms
+    /// (held). Phase 2 (to the residual barrier): the attention (refiner: under the compute-width
+    /// key mask), its projection (bound) and the residual sum (a new buffer at the stream's width:
+    /// the projection is bound, or its f32 cast is the sum). Phase 3: the norm, the MLP
+    /// (`mlp.0 → SiLU → mlp.2`, or the SwiGLU) and the residual.
+    pub(crate) fn text_block_bytes(g: TextBlockGeometry, unfused: bool) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, unfused);
+        let narrow = r.narrow();
+        let rows = g.batch * g.tokens;
+        let h = rows * g.dim;
+        let narrow_in = |narrow: bool| {
+            if narrow {
+                NormInput::Cast
+            } else {
+                NormInput::Held
+            }
+        };
+        let stream_in = narrow_in(g.stream_bytes < 4);
+        // Phase 1. The normed input is the attention call's argument: a chunking plan evaluates its
+        // chunks inside that call, while the argument is still held.
+        let input_kind = if g.query_rows < g.tokens {
+            Kind::Named
+        } else {
+            Kind::Temp
+        };
+        r.norm(h, rows, stream_in, input_kind).linear(
+            rows,
+            g.dim,
+            3 * g.dim,
+            narrow,
+            0,
+            Kind::Named,
+        );
+        if g.refiner {
+            r.norm(h, rows * g.heads, narrow_in(narrow), Kind::Named)
+                .norm(h, rows * g.heads, narrow_in(narrow), Kind::Named);
+        }
+        r.barrier();
+        // Phase 2.
+        r.attention(&Attention {
+            batch: g.batch,
+            tokens: g.tokens,
+            heads: g.heads,
+            kv_heads: g.heads,
+            head_dim: g.dim / g.heads.max(1),
+            query_rows: g.query_rows,
+            eval_per_chunk: g.eval_per_chunk,
+            q_dense: g.refiner,
+            q_cast: g.refiner && narrow,
+            k_cast: g.refiner && narrow,
+            v_cast: false,
+            mask: g.refiner.then_some((g.batch * g.tokens * g.tokens, narrow)),
+            out_kind: Kind::Temp,
+        })
+        .linear(rows, g.dim, g.dim, false, 0, Kind::Named)
+        .named(g.stream_bytes, h);
+        // Phase 3: the returned graph, run after the block's bindings are gone — it reads the
+        // residual stream.
+        r.last_phase()
+            .hold(g.stream_bytes, h)
+            .norm(h, rows, stream_in, Kind::Temp);
+        if g.refiner {
+            // The SwiGLU output is a temporary: the residual sum reuses it.
+            Self::swiglu(&mut r, rows, g.dim, g.ff, g.down_pad, false, false);
+        } else {
+            // `mlp.2`'s output is bound, so the residual sum is a new buffer (bf16: its operand's
+            // f32 cast, which the sum reuses).
+            r.linear(rows, g.dim, g.ff, narrow, 0, Kind::Temp)
+                .linear(rows, g.ff, g.dim, false, g.down_pad, Kind::Named)
+                .temp(g.stream_bytes, h);
+        }
+        r.price()
     }
 
     /// What the first trunk block materializes besides itself: the image and text RoPE tables and
@@ -1073,50 +1359,46 @@ impl IrisDiT {
             ))
     }
 
-    /// The patch/timestep embedding and both modulation cores: the patch vectors' `[B, N, p²·C]`
-    /// re-layout (f32; bf16: read straight into its compute-width cast), the embedded tokens
-    /// `[B, N, D]`, and per batch row the timestep path — the f32 `cos ‖ sin` bank, the two
-    /// timestep-MLP outputs and both cores' `6·D` outputs (counted at 4 B: the path mixes f32
-    /// sinusoids with compute-width projections).
+    /// The patch/timestep embedding and both modulation cores.
     pub(crate) fn embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
         let [hidden, patch_in] = self.s_embedder.logical_shape();
-        let [_, freqs] = self.t_mlp0.logical_shape();
-        let rows = self.t_mlp0.out_features()
-            + self.t_mlp2.out_features()
-            + self.core_img.out_features()
-            + self.core_txt.as_ref().map_or(0, Linear::out_features);
-        Self::embed_bytes(
-            self.compute_bytes(),
-            batch.max(0) as u64,
-            n_patches.max(0) as u64,
-            patch_in as u64,
-            hidden as u64,
-            freqs as u64,
-            rows,
-        )
+        let [_, sinusoid] = self.t_mlp0.logical_shape();
+        Self::embed_bytes(EmbedGeometry {
+            compute_bytes: self.compute_bytes(),
+            batch: batch.max(0) as u64,
+            patches: n_patches.max(0) as u64,
+            patch_in: patch_in as u64,
+            hidden: hidden as u64,
+            sinusoid: sinusoid as u64,
+            t_hidden: self.t_mlp0.out_features(),
+            t_out: self.t_mlp2.out_features(),
+            cores: self.core_img.out_features()
+                + self.core_txt.as_ref().map_or(0, Linear::out_features),
+        })
     }
 
-    /// [`Self::embed_scratch`] from the widths alone: `patch_in = p²·C`, `freqs` the sinusoid bank,
-    /// `rows` the timestep MLP and core output widths summed.
-    pub(crate) fn embed_bytes(
-        cw: u64,
-        b: u64,
-        n: u64,
-        patch_in: u64,
-        hidden: u64,
-        freqs: u64,
-        rows: u64,
-    ) -> u64 {
-        use mlx_gen::ios_quantum::tensor_bytes;
-        tensor_bytes(cw, &[b, n, patch_in])
-            .saturating_add(tensor_bytes(cw, &[b, n, hidden]))
-            .saturating_add(tensor_bytes(4, &[b, freqs]))
-            .saturating_add(tensor_bytes(4, &[b, rows]))
+    /// [`Self::embed_scratch`] from the widths alone (one phase): the patch vectors' re-layout copy
+    /// (f32) and the patch projection (held: the embedded tokens); the timestep path — the
+    /// frequency table, the f32 phase, its cosine and sine and their concatenation, the first
+    /// timestep projection (SiLU donates) and the second (held: `t_emb`); the conditioning SiLU of
+    /// the held `t_emb`, and both cores' outputs (held).
+    pub(crate) fn embed_bytes(g: EmbedGeometry) -> u64 {
+        let mut r = Retention::on(g.compute_bytes, false);
+        let narrow = r.narrow();
+        let (b, freqs) = (g.batch, g.sinusoid / 2);
+        r.temp(4, b * g.patches * g.patch_in)
+            .linear(b * g.patches, g.patch_in, g.hidden, narrow, 0, Kind::Named)
+            .temp(4, freqs)
+            .alloc(Kind::Temp, 3, 4, b * freqs)
+            .temp(4, b * g.sinusoid)
+            .linear(b, g.sinusoid, g.t_hidden, narrow, 0, Kind::Temp)
+            .linear(b, g.t_hidden, g.t_out, false, 0, Kind::Named)
+            .temp(g.compute_bytes, b * g.t_out)
+            .named(g.compute_bytes, b * g.cores);
+        r.price()
     }
 
-    /// The layer pool and the refiner's input projection over `[B·T, layers, Dt]` states: the
-    /// transposed states' contiguous copy the pool reads (bf16: and its compute-width cast), the
-    /// pooled `[B, T, Dt]` and the projection `[B, T, D]`.
+    /// The layer pool and the refiner's input projection over `[B·T, layers, Dt]` states.
     pub(crate) fn text_pool_scratch(&self, batch: i32, t: i32, layers: i32, text_dim: i32) -> u64 {
         Self::text_pool_bytes(
             self.compute_bytes(),
@@ -1128,7 +1410,9 @@ impl IrisDiT {
         )
     }
 
-    /// [`Self::text_pool_scratch`] from the widths alone.
+    /// [`Self::text_pool_scratch`] from the widths alone (one phase): the pool reads the
+    /// layer-transposed states through a row-contiguous copy (bf16: of its compute-width cast, which
+    /// keeps the transposed layout), the pooled `[B·T, Dt]` and the projection `[B, T, D]`.
     pub(crate) fn text_pool_bytes(
         cw: u64,
         b: u64,
@@ -1137,37 +1421,39 @@ impl IrisDiT {
         text_dim: u64,
         out: u64,
     ) -> u64 {
-        use mlx_gen::ios_quantum::tensor_bytes;
-        let copies = if cw < 4 { 2 } else { 1 };
-        (copies * tensor_bytes(cw, &[b, t, layers, text_dim]))
-            .saturating_add(tensor_bytes(cw, &[b, t, text_dim]))
-            .saturating_add(tensor_bytes(cw, &[b, t, out]))
+        let mut r = Retention::on(cw, false);
+        let copies = if r.narrow() { 2 } else { 1 };
+        r.alloc(Kind::Temp, copies, cw, b * t * layers * text_dim)
+            .temp(cw, b * t * text_dim)
+            .named(cw, b * t * out);
+        r.price()
     }
 
-    /// The refiner's final norm over `[B, T, D]`: its f32 output (bf16: and the f32 copy of the
-    /// compute-width stream it normalizes) and the per-row mean square and reciprocal root
-    /// (`[B, T]` f32 each).
+    /// The refiner's final norm over `[B, T, D]` (one phase).
     pub(crate) fn text_output_scratch(&self, batch: i32, t: i32) -> u64 {
         Self::text_output_bytes(
             self.compute_bytes(),
             batch.max(0) as u64,
             t.max(0) as u64,
             self.y_embedder.norm.width(),
+            crate::retention::unfused(),
         )
     }
 
-    /// [`Self::text_output_scratch`] from the widths alone.
-    pub(crate) fn text_output_bytes(cw: u64, b: u64, t: u64, width: u64) -> u64 {
-        use mlx_gen::ios_quantum::tensor_bytes;
-        let planes = if cw < 4 { 2 } else { 1 };
-        (planes * tensor_bytes(4, &[b, t, width])).saturating_add(2 * tensor_bytes(4, &[b, t]))
+    /// [`Self::text_output_scratch`] from the widths alone: the refiner's stream (compute width)
+    /// is held, so its norm's result is a new buffer (bf16: of its f32 cast).
+    pub(crate) fn text_output_bytes(cw: u64, b: u64, t: u64, width: u64, unfused: bool) -> u64 {
+        let mut r = Retention::on(cw, unfused);
+        let input = if r.narrow() {
+            NormInput::Cast
+        } else {
+            NormInput::Held
+        };
+        r.norm(b * t * width, b * t, input, Kind::Named);
+        r.price()
     }
 
-    /// The timestep re-fusion and the per-pixel embedding over an `h × w` input: over `[B, N, D]`
-    /// the f32 sum and its SiLU; over the `[B, H, W, pixel]` plane the projection and the
-    /// position-table sum (the re-layout into patches reuses the sum); the projection's contiguous
-    /// compute-width copy of the transposed `[B, H, W, C]` input; and the f32 position table (built
-    /// once per size and cached — bf16: plus its compute-width cast).
+    /// The timestep re-fusion and the per-pixel embedding over an `h × w` input.
     pub(crate) fn pixel_embed_scratch(&self, batch: i32, h: i32, w: i32) -> u64 {
         let [pixel_width, channels] = self.pixel_proj.logical_shape();
         Self::pixel_embed_bytes(
@@ -1182,7 +1468,13 @@ impl IrisDiT {
         )
     }
 
-    /// [`Self::pixel_embed_scratch`] from the widths alone.
+    /// [`Self::pixel_embed_scratch`] from the widths alone (one phase): the f32 `t_emb + s` (SiLU
+    /// donates; it is the held per-patch conditioning; bf16: plus the broadcast `t_emb`'s f32 cast);
+    /// the projection's row-contiguous copy of the transposed `[B, H, W, C]` input (bf16: and the
+    /// compute-width cast it copies); the projection over the `[B, H, W, pixel]` plane (the
+    /// position-table sum donates); the f32 position table (built once per size and cached; bf16:
+    /// plus its per-call compute-width cast); and the per-patch re-layout copy (held: the pixel
+    /// stream).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pixel_embed_bytes(
         cw: u64,
@@ -1194,20 +1486,25 @@ impl IrisDiT {
         pixel_width: u64,
         channels: u64,
     ) -> u64 {
-        use mlx_gen::ios_quantum::tensor_bytes;
+        let mut r = Retention::on(cw, false);
+        let narrow = r.narrow();
         let n = (h / patch.max(1)) * (w / patch.max(1));
-        let table = [h, w, pixel_width];
-        (2 * tensor_bytes(4, &[b, n, hidden]))
-            .saturating_add(2 * tensor_bytes(cw, &[b, h, w, pixel_width]))
-            .saturating_add(tensor_bytes(cw, &[b, h, w, channels]))
-            .saturating_add(tensor_bytes(4, &table))
-            .saturating_add(if cw < 4 { tensor_bytes(cw, &table) } else { 0 })
+        let pixels = b * h * w;
+        if narrow {
+            r.temp(4, b * hidden).temp(cw, pixels * channels);
+        }
+        r.named(4, b * n * hidden)
+            .temp(cw, pixels * channels)
+            .temp(cw, pixels * pixel_width)
+            .temp(4, h * w * pixel_width);
+        if narrow {
+            r.temp(cw, h * w * pixel_width);
+        }
+        r.named(cw, pixels * pixel_width);
+        r.price()
     }
 
-    /// The final norm, the final projection and the fold back to `[B, C, H, W]` f32: the f32 norm
-    /// plane over `[B·N, p², pixel]` (bf16: and the f32 copy of the compute-width stream it
-    /// normalizes), and over `[B·N, p², C]` the projection, its fold copy and the f32 output
-    /// (counted at 4 B).
+    /// The final norm, the final projection and the fold back to `[B, C, H, W]` f32.
     pub(crate) fn output_scratch(&self, batch: i32, n_patches: i32) -> u64 {
         let [out, input] = self.final_linear.logical_shape();
         Self::output_bytes(
@@ -1217,15 +1514,37 @@ impl IrisDiT {
             (self.cfg.patch_size * self.cfg.patch_size) as u64,
             input as u64,
             out as u64,
+            crate::retention::unfused(),
         )
     }
 
-    /// [`Self::output_scratch`] from the widths alone.
-    pub(crate) fn output_bytes(cw: u64, b: u64, n: u64, ppp: u64, input: u64, out: u64) -> u64 {
-        use mlx_gen::ios_quantum::tensor_bytes;
-        let planes = if cw < 4 { 2 } else { 1 };
-        (planes * tensor_bytes(4, &[b, n, ppp * input]))
-            .saturating_add(3 * tensor_bytes(4, &[b, n, ppp * out]))
+    /// [`Self::output_scratch`] from the widths alone (one phase): the norm of the compute-width
+    /// pixel stream, the projection to `[B·N, p², C]` (bf16: of its compute-width cast), the fold's
+    /// re-layout copy and (bf16) its f32 cast, the output.
+    pub(crate) fn output_bytes(
+        cw: u64,
+        b: u64,
+        n: u64,
+        ppp: u64,
+        input: u64,
+        out: u64,
+        unfused: bool,
+    ) -> u64 {
+        let mut r = Retention::on(cw, unfused);
+        let narrow = r.narrow();
+        let rows = b * n * ppp;
+        let input_kind = if narrow {
+            NormInput::Cast
+        } else {
+            NormInput::Held
+        };
+        r.norm(rows * input, rows, input_kind, Kind::Temp)
+            .linear(rows, input, out, narrow, 0, Kind::Temp)
+            .named(cw, rows * out);
+        if narrow {
+            r.named(4, rows * out);
+        }
+        r.price()
     }
 
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
@@ -1308,6 +1627,7 @@ impl IrisDiT {
             "adapter",
         )?;
         let y = y.add(&h)?;
+        barrier(&[&y])?;
         let m = block
             .mlp2
             .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
@@ -1342,6 +1662,7 @@ impl IrisDiT {
             "refiner",
         )?;
         let y = y.add(&h)?;
+        barrier(&[&y])?;
         Ok(y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?)
     }
 
@@ -1664,6 +1985,7 @@ impl IrisDiT {
         let q = cat(&[&qy, &qx], 1)?;
         let k = cat(&[&ky, &kx], 1)?;
         let v = cat(&[&vy, &vx], 1)?;
+        barrier(&[&q, &k, &v])?;
         let out = attention_at_site(&q, &k, &v, compute, None, plan, "dual")?;
         let n_txt = y.shape()[1];
         let mut halves = out.split_axis(&[n_txt], 1)?;
@@ -1673,14 +1995,17 @@ impl IrisDiT {
         let out_x = out_x.multiply(&sigmoid(blk.gate_x.forward(&hx)?)?)?;
         let attn_x = blk.proj_x.forward(&out_x)?;
         let mut x = x.add(&mx[2].multiply(&blk.attn_post_norm_x.forward(&attn_x)?)?)?;
+        barrier(&[&x])?;
         let mlp_in = modulate(&blk.norm_x2.forward(&x)?, &mx[3], &mx[4])?;
         x = x.add(&mx[5].multiply(&blk.mlp_post_norm_x.forward(&blk.mlp_x.forward(&mlp_in)?)?)?)?;
+        barrier(&[&x])?;
         let Some(text) = &blk.text else {
             return Ok((x, y.clone()));
         };
         let out_y = out_y.multiply(&sigmoid(text.gate.forward(&hy)?)?)?;
         let attn_y = text.proj.forward(&out_y)?;
         let mut y = y.add(&my[2].multiply(&text.attn_post_norm.forward(&attn_y)?)?)?;
+        barrier(&[&y])?;
         let mlp_in = modulate(&text.norm2.forward(&y)?, &my[3], &my[4])?;
         y = y.add(&my[5].multiply(&text.mlp_post_norm.forward(&text.mlp.forward(&mlp_in)?)?)?)?;
         Ok((x, y))
@@ -1712,6 +2037,7 @@ impl IrisDiT {
         let (kx, ky) = (ks.swap_remove(1), ks.swap_remove(0));
         let q = cat(&[&rope_txt.apply(&qy)?, &rope_img.apply(&qx)?], 1)?;
         let k = cat(&[&rope_txt.apply(&ky)?, &rope_img.apply(&kx)?], 1)?;
+        barrier(&[&q, &k, &v])?;
         let mut attn = attention_at_site(&q, &k, &v, compute, None, plan, "single")?;
         let (mut h, mut tokens) = (h, tokens);
         if !blk.text_out {
@@ -1722,6 +2048,7 @@ impl IrisDiT {
         let attn = attn.multiply(&sigmoid(blk.attn_gate.forward(&h)?)?)?;
         let attn = blk.attn_post_norm.forward(&blk.attn_proj.forward(&attn)?)?;
         let tokens = tokens.add(&m[2].multiply(&attn)?)?;
+        barrier(&[&tokens])?;
         let mlp = blk
             .mlp
             .forward(&modulate(&blk.norm2.forward(&tokens)?, &m[3], &m[4])?)?;
@@ -1767,6 +2094,7 @@ impl IrisDiT {
             .forward(&attn.reshape(&[rows, -1])?)?
             .reshape(&[rows, ppp, pix])?;
         let x = x.add(&modulate(&expanded, &m[1], &m[0])?)?;
+        barrier(&[&x])?;
         let mlp = blk
             .fc2
             .forward(&gelu(blk.fc1.forward(&blk.norm2.forward(&x)?)?)?)?;

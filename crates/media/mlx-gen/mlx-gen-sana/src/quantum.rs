@@ -92,8 +92,9 @@ pub struct SanaBlockQuantum {
     pub qk_norm: bool,
     /// Activation width (4: the trunk runs at the f32 latent's dtype).
     pub element_bytes: u64,
-    /// Largest single weight copy a forward creates (a stored-narrower dense weight promoted to the
-    /// activation width by its op); 0 when every weight is used in place.
+    /// Every weight copy a forward creates, summed (a stored-narrower dense weight promoted to the
+    /// activation width by its op; all are live together under MLX's encode-ahead — see
+    /// `SanaBlock::quantum`); 0 when every weight is used in place.
     pub weight_bytes: u64,
 }
 
@@ -237,7 +238,7 @@ pub struct SanaEntryQuantum {
     /// Element width of the incoming caption (Gemma's dtype).
     pub caption_element_bytes: u64,
     pub element_bytes: u64,
-    /// Largest single promoted weight copy among the entry's dense projections and patch conv.
+    /// The promoted weight copies of the entry's dense projections and patch conv, summed.
     pub weight_bytes: u64,
 }
 
@@ -253,15 +254,16 @@ const ENTRY_TIMESTEP_DIMS: u64 = 16;
 /// `weight_bytes + patchify + caption projection + timestep buffers`. The four outputs are one
 /// graph whose patchify and caption chains are independent, so MLX may interleave them: their
 /// transients are SUMMED, not maxed. Patchify: the 1x1 conv's output and its bias sum (2 hidden)
-/// over the NHWC latent's transposed copy plus its explicit-GEMM workspace
-/// ([`conv_workspace_bytes`]). Caption: [`ENTRY_CAPTION_LIVE`] `[B, M, dim]` buffers plus, for a
+/// plus its input workspace ([`conv_workspace_bytes`]): the CPU reads the transposed (NHWC view of
+/// the NCHW) latent straight into its zero-padded copy and unfolds that; Metal makes the view
+/// row-contiguous and unfolds (or runs implicit GEMM on) that copy. At padding 0 both are two
+/// latent-sized f32 buffers, so the workspace bounds both without a separate transposed copy. Caption: `ENTRY_CAPTION_LIVE` `[B, M, dim]` buffers plus, for a
 /// caption narrower than f32, the f32 copy its projection's mixed-dtype matmul widens it to.
 pub fn entry_bytes(q: SanaEntryQuantum) -> u64 {
     let side = q.tokens; // workspace priced over N positions as a 1 x N plane
     let latent_positions = side.saturating_mul(q.patch).saturating_mul(q.patch);
     let patch = sum(&[
         tensor_bytes(q.element_bytes, &[2, q.batch, q.tokens, q.dim]),
-        tensor_bytes(4, &[q.batch, latent_positions, q.latent_channels]),
         conv_workspace_bytes(
             q.batch,
             (1, latent_positions),
@@ -773,6 +775,8 @@ mod reachable_sizes {
                 let enc_bytes = sum_where(&vae, |k| k.starts_with("encoder."));
                 // The Sequential img2img heavy bundle never builds the encoder (its reference was
                 // encoded in its own phase), so the heavy load prices transformer + decoder only.
+                // Every promoted weight copy of a block (and of the entry) is summed: the whole
+                // quantum's ops fit MLX's in-flight command-buffer window (`SanaBlock::quantum`).
                 let block_weight = ["ff.conv_inverted", "ff.conv_depth", "ff.conv_point"]
                     .iter()
                     .map(|c| {
@@ -797,8 +801,7 @@ mod reachable_sizes {
                         .iter()
                         .map(|l| promoted(&dit, &format!("transformer_blocks.0.{l}"))),
                     )
-                    .max()
-                    .unwrap();
+                    .sum::<u64>();
                 let ts = if cfg.guidance_embeds {
                     "time_embed.timestep_embedder"
                 } else {
@@ -816,8 +819,7 @@ mod reachable_sizes {
                 ]
                 .iter()
                 .map(|b| promoted(&dit, b))
-                .max()
-                .unwrap();
+                .sum::<u64>();
                 println!(
                     "\n{model} {tier}: text_encoder {} MiB, transformer {} MiB, vae decoder {} MiB, vae encoder {} MiB; Gemma tokens {gemma_tokens}",
                     te_bytes / MIB,

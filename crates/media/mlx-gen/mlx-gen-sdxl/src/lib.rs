@@ -41,6 +41,9 @@ pub mod quant;
 pub(crate) mod quantum;
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_tests;
+// sc-26270 (E2): the Mac default txt2img/img2img path pinned to a pre-epic golden.
+#[cfg(all(test, target_os = "macos"))]
+mod default_path_golden;
 pub mod sampler;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]

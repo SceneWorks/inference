@@ -230,7 +230,8 @@ class CampaignTests(unittest.TestCase):
 
     def capture_row(self, key, status):
         row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
-                   evidence_key={"machine": "iPhone17,2", "provider": "fake"}, run_id="fixture-run")
+                   evidence_key={"machine": "iPhone17,2", "provider": "fake"}, run_id="fixture-run",
+                   baseline_phys_footprint_bytes=40)
         if status == "capture_refused":
             row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
         return row
@@ -288,11 +289,13 @@ class CampaignTests(unittest.TestCase):
         key = self.keys[0]
         rows = [self.capture_row(key, "diagnostic_success"), self.capture_row(key, "capture_refused"),
                 dict(self.capture_row(key, "diagnostic_success"), kernel_lifetime_phys_footprint_peak_bytes=None),
+                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=None),
+                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=150),
                 dict(self.success(key), evidence_key={"machine": "x"})]
         out = campaign.evidence_rows(rows)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(set(out[0]), {"key", "footprint_bytes", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds", "evidence_class", "run_id", "build_sha"})
-        self.assertEqual(out[0]["footprint_bytes"], 150)
+        self.assertEqual(len(out), 1, "no row without a capture baseline below the peak")
+        self.assertEqual(set(out[0]), {"key", "footprint_bytes", "baseline_footprint_bytes", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds", "evidence_class", "run_id", "build_sha"})
+        self.assertEqual((out[0]["footprint_bytes"], out[0]["baseline_footprint_bytes"]), (150, 40))
         self.assertEqual(out[0]["evidence_class"], "device_capture")
         source = self.root / "capture.jsonl"
         source.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")

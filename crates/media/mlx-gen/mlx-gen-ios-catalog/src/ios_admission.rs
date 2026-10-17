@@ -15,7 +15,7 @@
 //!    rejection over the budget is [`RefusalKind::Capacity`], any other is `Strategy`;
 //! 6. seals the source inventory and an exact work binding for the bound wrappers' lifetime check.
 //!
-//! [`capture_permit`] is the explicitly labelled, NON-circular evidence path: it performs 1, 2 and 4
+//! `capture_permit` (feature `device-capture`) is the explicitly labelled, NON-circular evidence path: it performs 1, 2 and 4
 //! but needs no row, and is only granted where every quantum of the model is bounded by live OS
 //! headroom before its graph is constructed (`mlx_gen::ios_quantum::enabled()`: a physical iOS
 //! device, or the CPU test fixture). A capture never changes admission: its output is a candidate
@@ -444,11 +444,13 @@ pub struct Admission {
     pub(crate) index: usize,
     pub(crate) provider: String,
     pub(crate) footprint_bytes: u64,
+    /// The render's own demand: the capture's peak minus the capture process's starting footprint.
+    pub(crate) demand_bytes: u64,
     pub(crate) spec: LoadSpec,
     pub(crate) context: MemoryRunContext,
     pub(crate) binding: [u8; 32],
     pub(crate) key: EvidenceKey,
-    /// `true` only for a [`capture_permit`]: execution bounded per quantum, no evidence row.
+    /// `true` only for a `capture_permit`: execution bounded per quantum, no evidence row.
     pub(crate) capture: bool,
 }
 
@@ -462,6 +464,12 @@ impl Admission {
     /// The captured footprint this admission was granted on (0 for a capture permit).
     pub fn footprint_bytes(&self) -> u64 {
         self.footprint_bytes
+    }
+    /// What the admitted work itself adds to a process: the capture's peak minus its starting
+    /// footprint (0 for a capture permit). This, never the absolute peak, is charged against live
+    /// headroom, and only its not-yet-realized part on a recheck.
+    pub fn demand_bytes(&self) -> u64 {
+        self.demand_bytes
     }
     pub fn footprint_mib(&self) -> u32 {
         u32::try_from(self.footprint_bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX)
@@ -507,8 +515,8 @@ fn admit_one(
     let guard = SourceInventory::capture(&candidate.spec)?;
     guard.read_unchanged(|| -> AdmissionResult<Admission> {
         let key = key_unchecked(candidate, machine, route.clone())?;
-        let footprint_bytes = match rows {
-            None => 0,
+        let (footprint_bytes, demand_bytes) = match rows {
+            None => (0, 0),
             Some(rows) => {
                 let row = evidence::lookup(rows, &key).ok_or_else(|| {
                     AdmissionError::refused(
@@ -516,7 +524,11 @@ fn admit_one(
                         format!("no reviewed device capture in {EVIDENCE_TABLE_PATH} for {key:?}"),
                     )
                 })?;
-                row.footprint_bytes
+                (
+                    row.footprint_bytes,
+                    row.footprint_bytes
+                        .saturating_sub(row.baseline_footprint_bytes),
+                )
             }
         };
         let contract = registry
@@ -579,7 +591,9 @@ fn admit_one(
         let mut context = candidate.context.clone();
         if rows.is_some() {
             context.budget = budget;
-            context.predicted_peak_bytes = footprint_bytes.saturating_sub(budget.committed_bytes);
+            // The render's own growth; what the process already holds is the budget's committed
+            // bytes and is never credited as reusable.
+            context.predicted_peak_bytes = demand_bytes;
             context.evidence_revision = format!("ios-device-capture:{}", key.layout_sha256);
             if let MemorySafetyDecision::Reject { reason } =
                 (registration.safety_check)(&candidate.spec, &contract, &context)
@@ -600,6 +614,7 @@ fn admit_one(
             index,
             provider: candidate.provider.clone(),
             footprint_bytes,
+            demand_bytes,
             spec,
             context,
             binding: work_binding(&candidate.work),
@@ -671,6 +686,7 @@ pub fn admit(
 /// circular) and none is created. Granted only where `mlx_gen::ios_quantum` bounds every quantum of
 /// this model by live OS headroom BEFORE its graph is constructed; a refusal at quantum k of size N
 /// is the "next size refused before jetsam" evidence. Never raises the cap.
+#[cfg(feature = "device-capture")]
 pub fn capture_permit(
     registry: &ProviderRegistry,
     candidate: &IosCandidate,
@@ -732,7 +748,7 @@ impl Admission {
         load: impl FnOnce(&LoadSpec) -> Result<Box<dyn mlx_gen::gen_core::Generator>>,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
     ) -> Result<crate::bound::BoundGenerator> {
-        capacity(self.footprint_bytes)?;
+        capacity(self.demand_bytes)?;
         let inner = self
             .spec
             .read_prepared_files_unchanged(|| load(&self.spec))?;
@@ -741,7 +757,7 @@ impl Admission {
             self.spec,
             self.context,
             self.binding,
-            self.footprint_bytes,
+            self.demand_bytes,
             capacity,
         ))
     }
@@ -753,7 +769,7 @@ impl Admission {
         capacity: impl Fn(u64) -> Result<()> + 'static,
     ) -> Result<crate::bound::BoundTransform> {
         self.check_kind("restoration")?;
-        capacity(self.footprint_bytes)?;
+        capacity(self.demand_bytes)?;
         let provider = self.provider.clone();
         let inner = self
             .spec
@@ -762,7 +778,7 @@ impl Admission {
             inner,
             self.spec,
             self.binding,
-            self.footprint_bytes,
+            self.demand_bytes,
             Box::new(capacity),
         ))
     }
@@ -773,7 +789,7 @@ impl Admission {
         capacity: impl Fn(u64) -> Result<()> + 'static,
     ) -> Result<crate::bound::BoundDepth> {
         self.check_kind("depth")?;
-        capacity(self.footprint_bytes)?;
+        capacity(self.demand_bytes)?;
         let inner = self.spec.read_prepared_files_unchanged(|| {
             mlx_gen_iris::depth::load_depth(&self.spec).map_err(Error::from)
         })?;
@@ -781,7 +797,7 @@ impl Admission {
             Box::new(inner),
             self.spec,
             self.binding,
-            self.footprint_bytes,
+            self.demand_bytes,
             Box::new(capacity),
         ))
     }

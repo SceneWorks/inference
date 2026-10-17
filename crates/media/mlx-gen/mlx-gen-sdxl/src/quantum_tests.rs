@@ -500,7 +500,7 @@ fn block_and_resnet_floors_come_from_loaded_tensors_and_grow_with_geometry() {
     let conv2 = Array::zeros::<f32>(&[64, 3, 3, 64]).unwrap();
     assert_eq!(
         checked(&small, UNET_RESNET)[4],
-        resnet_bytes(&[1, 4, 4, 64], 4, &conv1, &conv2, Backend::Cpu)
+        resnet_bytes(&[1, 4, 4, 64], 4, 4, &conv1, &conv2, Backend::Cpu)
     );
     // A bounded attention plan is priced at its chunk's query rows: at a 16x16 latent the attention
     // grid is 64 tokens; 160 scores per chunk gives 16 cross-attention (5 keys x 2 heads) rows and
@@ -824,7 +824,7 @@ fn vae_dense_and_evaluated_decode_are_bounded_and_identical() {
         // tokens fit one chunk, so it scores all of them against each other.
         assert_eq!(
             checked(&events, VAE_ATTENTION),
-            [vae_attention_bytes(1, 72, 32, 72, 4)]
+            [vae_attention_bytes(1, 72, 32, 72, 4, Backend::Cpu)]
         );
         assert!(assert_refusals(&events, |headroom| observe(
             headroom, decode
@@ -1596,8 +1596,8 @@ fn vae_attention_query_chunks_meet_the_tiled_parity_standard_and_are_ios_only() 
     // f32 scores are 64 MiB per chunk, not the 1 GiB of the full 16384² score tensor.
     assert_eq!(ios.budget.query_block(1, 1, 16384, 16384), 1024);
     assert!(
-        vae_attention_bytes(1, 16384, 512, 1024, 4)
-            < vae_attention_bytes(1, 16384, 512, 16384, 4) / 4
+        vae_attention_bytes(1, 16384, 512, 1024, 4, Backend::Metal)
+            < vae_attention_bytes(1, 16384, 512, 16384, 4, Backend::Metal) / 4
     );
 }
 
@@ -1616,16 +1616,26 @@ mod proofs {
     /// The stated bound: a counted price may exceed the measurement by at most 1.5x.
     const MAX_RATIO: f64 = 1.5;
 
-    /// Measure `run` (after one warm-up run that materializes lazy weights and kernel state) and
-    /// prove `formula` tracks it. Prints the ratio for the record.
+    /// Measurements per proof; the WORST (largest) peak is the one the formula must cover.
+    const RUNS: usize = 5;
+
+    /// Measure `run` (after one warm-up run that materializes lazy weights and kernel state)
+    /// [`RUNS`] times, UNTHROTTLED (no memory limit is ever set; the fixture only enables the iOS
+    /// guards and barriers), and prove `formula` tracks the worst measured peak. Prints the ratio for
+    /// the record.
     fn prove(label: &str, formula: u64, run: impl Fn() -> Result<Vec<Array>>) -> f64 {
         let warm = run().unwrap();
         mlx_rs::transforms::eval(warm.iter()).unwrap();
         drop(warm);
         // Measured on the iOS path: the CPU fixture enables every guard and barrier the device runs.
-        let measured = with_cpu_diagnostic_headroom(PLENTY, || measured_peak_bytes(&run)).unwrap();
+        let measured = (0..RUNS)
+            .map(|_| with_cpu_diagnostic_headroom(PLENTY, || measured_peak_bytes(&run)).unwrap())
+            .max()
+            .unwrap();
         let ratio = formula as f64 / measured as f64;
-        eprintln!("PROOF {label}: formula {formula} B, measured {measured} B, ratio {ratio:.3}");
+        eprintln!(
+            "PROOF {label}: formula {formula} B, worst of {RUNS} measured {measured} B, ratio {ratio:.3}"
+        );
         assert_tracks_measured(label, formula, measured, MAX_RATIO);
         ratio
     }
@@ -1708,13 +1718,13 @@ mod proofs {
 
         // Resnet: the down/mid shape and the up path's skip concatenation.
         let plain = crate::unet::ResnetBlock2D::from_weights(&w, "plain").unwrap();
-        prove(UNET_RESNET, plain.quantum_scratch(&x), || {
+        prove(UNET_RESNET, plain.quantum_scratch(&x, Some(&temb)), || {
             Ok(vec![plain.forward_quantum(&x, None, Some(&temb), plan)?])
         });
         let up = crate::unet::ResnetBlock2D::from_weights(&w, "up").unwrap();
         prove(
             &format!("{UNET_RESNET} (skip concat)"),
-            up.quantum_scratch(&x),
+            up.quantum_scratch(&x, Some(&temb)),
             || {
                 Ok(vec![up.forward_quantum(
                     &x,
@@ -1805,14 +1815,14 @@ mod proofs {
         // Batched / plain forward: one latent row, the text memory at that row.
         prove(
             TRANSFORMER_BLOCK,
-            block.quantum_scratch(1, 1, 256, 7, false, 4, unbounded.attention),
+            block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float32, unbounded.attention),
             || Ok(vec![block.forward_ip(&y, &memory, None, unbounded)?]),
         );
         // Sequential CFG half: the latent at ONE row, the text k/v projected at the pair's two.
         let half = unbounded.with_cfg_row(Some(1));
         prove(
             &format!("{TRANSFORMER_BLOCK} (sequential CFG half)"),
-            block.quantum_scratch(1, 2, 256, 7, false, 4, half.attention),
+            block.quantum_scratch(1, 2, 256, 7, false, Dtype::Float32, half.attention),
             || Ok(vec![block.forward_ip(&y, &pair_memory, None, half)?]),
         );
         // Bounded attention: 64 query rows per self-attention chunk, each chunk evaluated.
@@ -1823,7 +1833,7 @@ mod proofs {
         assert_eq!(budget.query_block(1, heads, 256, 256), 64);
         prove(
             &format!("{TRANSFORMER_BLOCK} (bounded attention)"),
-            block.quantum_scratch(1, 1, 256, 7, false, 4, bounded.attention),
+            block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float32, bounded.attention),
             || Ok(vec![block.forward_ip(&y, &memory, None, bounded)?]),
         );
 
@@ -1895,6 +1905,484 @@ mod proofs {
                     &scale,
                 )?])
             },
+        );
+    }
+
+    // -- f16 activations (the device's compute dtype) -------------------------------------------
+    //
+    // The device runs the U-Net, its ControlNets and both CLIP encoders at `model::DTYPE` (fp16):
+    // every dense float leaf loads as f16 (`loader::cast_for_load`; the SceneWorks snapshots store
+    // the U-Net norms, convs and dense linears as F16 already) and only a packed snapshot's
+    // `.scales`/`.biases` keep their stored BF16. These proofs measure the same quanta at f16
+    // activations over f16 weights, so every f16 -> f32 promotion inside them (the f32 sinusoidal
+    // timestep table, the f32 im2col of the CPU convolution, the composed norms' f32 statistics,
+    // the softmax) is inside the measurement, not assumed away.
+
+    /// Every float tensor of `w` at f16 (production's dense load), materialized.
+    fn half_weights(w: Weights) -> Weights {
+        let mut w = w;
+        w.cast_all(Dtype::Float16).unwrap();
+        w.materialize().unwrap();
+        w
+    }
+
+    fn half(a: &Array) -> Array {
+        evaluated(a.as_dtype(Dtype::Float16).unwrap())
+    }
+
+    /// [`conv_weight`] stored f16, as the U-Net's convs load.
+    fn half_conv_weight(out: i32, k: i32, inp: i32, seed: u64) -> Array {
+        let nchw = half(&rnd(
+            &[out, inp, k, k],
+            seed,
+            (1.0 / (inp * k * k) as f32).sqrt(),
+        ));
+        crate::unet::nchw_to_nhwc(&nchw).unwrap()
+    }
+
+    /// Re-store every dense linear `{p}.weight` of `w` named by `linears` as the packed Q4 triple a
+    /// pre-quantized SceneWorks snapshot carries: u32 codes, BF16 `.scales`/`.biases`.
+    fn packed(mut map: HashMap<String, Array>, linears: &[String]) -> Weights {
+        for p in linears {
+            let dense = map.remove(&format!("{p}.weight")).unwrap();
+            let (wq, scales, biases) =
+                mlx_rs::ops::quantize(&dense, crate::quant::GROUP_SIZE, 4).unwrap();
+            let bf16 = |a: Array| evaluated(a.as_dtype(Dtype::Bfloat16).unwrap());
+            map.insert(format!("{p}.weight"), evaluated(wq));
+            map.insert(format!("{p}.scales"), bf16(scales));
+            map.insert(format!("{p}.biases"), bf16(biases));
+        }
+        Weights::from_map(map)
+    }
+
+    #[test]
+    fn f16_unet_quanta_track_their_measured_peaks() {
+        if !cpu_child("proofs::f16_unet_quanta_track_their_measured_peaks") {
+            return;
+        }
+        let cpu = Backend::Cpu;
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED;
+        let mut g = Gen::new(8000);
+        g.resnet("plain", 64, 64, Some(128));
+        g.resnet("up", 128, 64, Some(128));
+        let w = half_weights(g.weights());
+        let temb = half(&rnd(&[1, 128], 1, 1.0));
+        let x = half(&rnd(&[1, 32, 32, 64], 2, 1.0));
+        let skip = half(&rnd(&[1, 32, 32, 64], 3, 1.0));
+
+        let plain = crate::unet::ResnetBlock2D::from_weights(&w, "plain").unwrap();
+        let out = plain.forward_quantum(&x, None, Some(&temb), plan).unwrap();
+        assert_eq!(out.dtype(), Dtype::Float16, "the f16 resnet stays f16");
+        prove(
+            &format!("{UNET_RESNET} (f16)"),
+            plain.quantum_scratch(&x, Some(&temb)),
+            || Ok(vec![plain.forward_quantum(&x, None, Some(&temb), plan)?]),
+        );
+        let up = crate::unet::ResnetBlock2D::from_weights(&w, "up").unwrap();
+        prove(
+            &format!("{UNET_RESNET} (f16, skip concat)"),
+            up.quantum_scratch(&x, Some(&temb)),
+            || {
+                Ok(vec![up.forward_quantum(
+                    &x,
+                    Some(skip.clone()),
+                    Some(&temb),
+                    plan,
+                )?])
+            },
+        );
+
+        let wd = half_conv_weight(64, 3, 64, 4);
+        let bd = half(&rnd(&[64], 5, 0.02));
+        let call = ConvCall::new(x.shape(), 2, &wd, 2, 1);
+        prove(
+            &format!("{UNET_DOWNSAMPLE} (f16)"),
+            single_conv_bytes(&call, 0, 0, cpu),
+            || Ok(vec![mlx_gen::nn::conv2d(&x, &wd, Some(&bd), 2, 1)?]),
+        );
+        let small = half(&rnd(&[1, 16, 16, 64], 6, 1.0));
+        let call = ConvCall::new(&[1, 32, 32, 64], 2, &wd, 1, 1);
+        prove(
+            &format!("{UNET_UPSAMPLE} (f16)"),
+            single_conv_bytes(&call, 1, 0, cpu),
+            || {
+                Ok(vec![mlx_gen::nn::conv2d(
+                    &mlx_gen::nn::upsample_nearest(&small, 2)?,
+                    &wd,
+                    Some(&bd),
+                    1,
+                    1,
+                )?])
+            },
+        );
+        let (gw, gb) = (
+            half(&Array::ones::<f32>(&[64]).unwrap()),
+            half(&rnd(&[64], 7, 0.02)),
+        );
+        let wo = half_conv_weight(4, 3, 64, 8);
+        let bo = half(&rnd(&[4], 9, 0.02));
+        let call = ConvCall::new(x.shape(), 2, &wo, 1, 1);
+        prove(
+            &format!("{UNET_CONV_OUT} (f16)"),
+            norm_conv_bytes(&call, cpu),
+            || {
+                let y = mlx_gen::nn::group_norm(&x, &gw, &gb, 32, 1e-5)?;
+                let y = crate::silu_glue(&y)?;
+                Ok(vec![mlx_gen::nn::conv2d(&y, &wo, Some(&bo), 1, 1)?])
+            },
+        );
+
+        // Stem at the f16 compute dtype: the f32 sinusoidal tables cast to f16, the f16 embedding
+        // MLPs, conv_in over the curated route's lazily scaled and CFG-concatenated f16 latent.
+        let mut unet = crate::test_support::tiny_unet(7).unwrap();
+        unet.cast_weights(Dtype::Float16).unwrap();
+        let (latent, ctx, pooled, ids) = unet_inputs(2, 32, 32);
+        let (latent, ctx, pooled) = (half(&latent), half(&ctx), half(&pooled));
+        let one = half(&rnd(&[1, 32, 32, 4], 10, 1.0));
+        let lazy_x = || -> Result<Array> {
+            let scaled =
+                mlx_rs::ops::multiply(&one, Array::from_f32(0.5).as_dtype(Dtype::Float16)?)?;
+            Ok(mlx_rs::ops::concatenate_axis(&[&scaled, &scaled], 0)?)
+        };
+        let (stem_x, stem_temb, _) = unet
+            .stem(
+                &lazy_x().unwrap(),
+                500.0,
+                &ctx,
+                &pooled,
+                &ids,
+                plan,
+                2,
+                Dtype::Float16,
+            )
+            .unwrap();
+        assert_eq!(
+            (stem_x.dtype(), stem_temb.dtype()),
+            (Dtype::Float16, Dtype::Float16)
+        );
+        prove(
+            &format!("{UNET_STEM} (f16)"),
+            unet.stem_scratch_for_test(&latent, &ctx),
+            || {
+                let (x, temb, _) = unet.stem(
+                    &lazy_x()?,
+                    500.0,
+                    &ctx,
+                    &pooled,
+                    &ids,
+                    plan,
+                    2,
+                    Dtype::Float16,
+                )?;
+                Ok(vec![x, temb])
+            },
+        );
+    }
+
+    /// The packed tier's promotions: a pre-quantized snapshot's `time_emb_proj` (BF16 scales) turns
+    /// the f16 resnet's second half f32 (the projected f32 time embedding widens the sum); after it
+    /// the U-Net carries f32 activations through f16 convolutions, whose weights MLX casts up.
+    #[test]
+    fn packed_tier_resnet_and_conv_promotions_track_their_measured_peaks() {
+        if !cpu_child("proofs::packed_tier_resnet_and_conv_promotions_track_their_measured_peaks") {
+            return;
+        }
+        let cpu = Backend::Cpu;
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED;
+        let mut g = Gen::new(8300);
+        g.resnet("r", 64, 64, Some(128));
+        let mut map = g.map;
+        for v in map.values_mut() {
+            *v = half(v);
+        }
+        let w = packed(map, &["r.time_emb_proj".to_string()]);
+        let resnet = crate::unet::ResnetBlock2D::from_weights(&w, "r").unwrap();
+        let x16 = half(&rnd(&[1, 32, 32, 64], 1, 1.0));
+        let temb32 = evaluated(rnd(&[1, 128], 2, 1.0));
+        let out = resnet
+            .forward_quantum(&x16, None, Some(&temb32), plan)
+            .unwrap();
+        assert_eq!(
+            out.dtype(),
+            Dtype::Float32,
+            "the packed temb widens the resnet"
+        );
+        prove(
+            &format!("{UNET_RESNET} (f16 in, packed f32 temb)"),
+            resnet.quantum_scratch(&x16, Some(&temb32)),
+            || {
+                Ok(vec![resnet.forward_quantum(
+                    &x16,
+                    None,
+                    Some(&temb32),
+                    plan,
+                )?])
+            },
+        );
+        // The promoted half is priced at f32 (on the CPU the GroupNorms' f32 working copies hide
+        // the difference in the measurement above; on Metal they do not exist).
+        let conv = |k: &str| crate::unet::nchw_to_nhwc(w.require(k).unwrap()).unwrap();
+        let (c1, c2) = (conv("r.conv1.weight"), conv("r.conv2.weight"));
+        assert_eq!(
+            resnet.quantum_scratch(&x16, Some(&temb32)),
+            resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Cpu)
+        );
+        assert!(
+            resnet_bytes(x16.shape(), 2, 4, &c1, &c2, Backend::Metal)
+                > resnet_bytes(x16.shape(), 2, 2, &c1, &c2, Backend::Metal)
+        );
+        // Downstream: f32 activations through the f16 resnet's convolutions.
+        let x32 = evaluated(rnd(&[1, 32, 32, 64], 3, 1.0));
+        prove(
+            &format!("{UNET_RESNET} (f32 activations, f16 convs)"),
+            resnet.quantum_scratch(&x32, Some(&temb32)),
+            || {
+                Ok(vec![resnet.forward_quantum(
+                    &x32,
+                    None,
+                    Some(&temb32),
+                    plan,
+                )?])
+            },
+        );
+        let wo = half_conv_weight(4, 3, 64, 4);
+        let bo = half(&rnd(&[4], 5, 0.02));
+        let (gw, gb) = (
+            half(&Array::ones::<f32>(&[64]).unwrap()),
+            half(&rnd(&[64], 6, 0.02)),
+        );
+        let call = ConvCall::new(x32.shape(), 4, &wo, 1, 1);
+        prove(
+            &format!("{UNET_CONV_OUT} (f32 activations, f16 conv)"),
+            norm_conv_bytes(&call, cpu),
+            || {
+                let y = mlx_gen::nn::group_norm(&x32, &gw, &gb, 32, 1e-5)?;
+                let y = crate::silu_glue(&y)?;
+                Ok(vec![mlx_gen::nn::conv2d(&y, &wo, Some(&bo), 1, 1)?])
+            },
+        );
+        // The Metal kernel's weight copy is at the activation width when it is wider: MLX's
+        // `conv2d` casts the f16 weight up, and that cast is the row-contiguous copy.
+        let narrow = ConvCall::new(x16.shape(), 2, &wo, 1, 1);
+        assert_eq!(
+            call.transient(Backend::Metal) - narrow.transient(Backend::Metal),
+            call.weight_elements_for_test() * 2
+        );
+    }
+
+    /// Both CLIP text encoders run f16 on the device; a packed snapshot's BF16 scales make each
+    /// layer's projections, and so its residual stream, f32.
+    #[test]
+    fn f16_and_packed_clip_layers_track_their_measured_peaks() {
+        if !cpu_child("proofs::f16_and_packed_clip_layers_track_their_measured_peaks") {
+            return;
+        }
+        let cfg = ClipTextConfig {
+            num_layers: 1,
+            model_dims: 128,
+            num_heads: 2,
+            max_length: 77,
+            vocab_size: 40,
+            projection_dim: None,
+            hidden_act: ClipActivation::Gelu,
+        };
+        let mut g = Gen::new(8400);
+        g.put(
+            "text_model.embeddings.token_embedding.weight".into(),
+            &[40, 128],
+            0.5,
+        );
+        g.put(
+            "text_model.embeddings.position_embedding.weight".into(),
+            &[77, 128],
+            0.1,
+        );
+        g.clip_layers("text_model", 1, 128, 3 * 128);
+        g.ln("text_model.final_layer_norm", 128);
+        let mut map = g.map;
+        for v in map.values_mut() {
+            *v = half(v);
+        }
+        let x = half(&rnd(&[2, 77, 128], 1, 1.0));
+        let dense = crate::text_encoder::ClipTextEncoder::from_weights(
+            &Weights::from_map(map.clone()),
+            "text_model",
+            &cfg,
+        )
+        .unwrap();
+        let (scratch, body) = dense.layer_quantum_for_test(0, &x);
+        assert_eq!(body().unwrap().dtype(), Dtype::Float16);
+        prove(&format!("{CLIP_LAYER} (f16)"), scratch, || {
+            Ok(vec![body()?])
+        });
+        let linears: Vec<String> = ["q_proj", "k_proj", "v_proj", "out_proj"]
+            .iter()
+            .map(|p| format!("text_model.encoder.layers.0.self_attn.{p}"))
+            .chain(
+                ["fc1", "fc2"]
+                    .iter()
+                    .map(|p| format!("text_model.encoder.layers.0.mlp.{p}")),
+            )
+            .collect();
+        let packed_te = crate::text_encoder::ClipTextEncoder::from_weights(
+            &packed(map, &linears),
+            "text_model",
+            &cfg,
+        )
+        .unwrap();
+        let (scratch, body) = packed_te.layer_quantum_for_test(0, &x);
+        assert_eq!(
+            body().unwrap().dtype(),
+            Dtype::Float32,
+            "the packed layer runs f32"
+        );
+        prove(
+            &format!("{CLIP_LAYER} (f16 in, packed Q4 / BF16 scales)"),
+            scratch,
+            || Ok(vec![body()?]),
+        );
+    }
+
+    #[test]
+    fn f16_transformer_quanta_track_their_measured_peaks() {
+        if !cpu_child("proofs::f16_transformer_quanta_track_their_measured_peaks") {
+            return;
+        }
+        let (dim, ctx_dim, ff, heads) = (128, 64, 512, 2);
+        let mut g = Gen::new(8100);
+        g.block("b", dim, ctx_dim, ff);
+        g.ln("t.norm", dim);
+        g.linear("t.proj_in", dim, dim, true);
+        g.linear("t.proj_out", dim, dim, true);
+        let linears: Vec<String> = ["attn1", "attn2"]
+            .iter()
+            .flat_map(|a| {
+                ["to_q", "to_k", "to_v", "to_out.0"]
+                    .iter()
+                    .map(move |p| format!("b.{a}.{p}"))
+            })
+            .chain(["b.ff.net.0.proj".into(), "b.ff.net.2".into()])
+            .collect();
+        let mut map = g.map;
+        for v in map.values_mut() {
+            *v = half(v);
+        }
+        let w = Weights::from_map(map.clone());
+        let mut block =
+            crate::unet::transformer::TransformerBlock::from_weights(&w, "b", dim, heads).unwrap();
+        let y = half(&rnd(&[1, 256, dim], 1, 1.0));
+        let memory = half(&rnd(&[1, 7, ctx_dim], 2, 1.0));
+        let pair_memory = half(&rnd(&[2, 7, ctx_dim], 3, 1.0));
+        let long_memory = half(&rnd(&[2, 308, ctx_dim], 4, 1.0));
+        let unbounded = crate::plan::SdxlForwardPlan::UNBOUNDED;
+        let out = block.forward_ip(&y, &memory, None, unbounded).unwrap();
+        assert_eq!(out.dtype(), Dtype::Float16, "the f16 block stays f16");
+
+        prove(
+            &format!("{TRANSFORMER_BLOCK} (f16)"),
+            block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, unbounded.attention),
+            || Ok(vec![block.forward_ip(&y, &memory, None, unbounded)?]),
+        );
+        let half_plan = unbounded.with_cfg_row(Some(1));
+        prove(
+            &format!("{TRANSFORMER_BLOCK} (f16, sequential CFG half)"),
+            block.quantum_scratch(1, 2, 256, 7, false, Dtype::Float16, half_plan.attention),
+            || Ok(vec![block.forward_ip(&y, &pair_memory, None, half_plan)?]),
+        );
+        let budget = mlx_gen::attention::AttentionBudget::from_score_elements(2 * 64 * 256, true);
+        let bounded = crate::plan::SdxlForwardPlan::with_attention(
+            mlx_gen::attention::AttentionPlan::budgeted(budget),
+        );
+        prove(
+            &format!("{TRANSFORMER_BLOCK} (f16, bounded attention)"),
+            block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, bounded.attention),
+            || Ok(vec![block.forward_ip(&y, &memory, None, bounded)?]),
+        );
+
+        // Cross-attention-dominated: 256 latent tokens against a four-window long prompt's 308 text
+        // keys at the guided pair's batch + 16 IP tokens (sequential CFG half, IP branch on), so the
+        // cross-attention phase is the block's widest.
+        let ip_k = half(&rnd(&[dim, ctx_dim], 5, 0.1));
+        let ip_v = half(&rnd(&[dim, ctx_dim], 6, 0.1));
+        block.set_ip_projections(
+            mlx_gen::adapters::AdaptableLinear::dense(ip_k, None),
+            mlx_gen::adapters::AdaptableLinear::dense(ip_v, None),
+        );
+        let few = half(&rnd(&[1, 256, dim], 7, 1.0));
+        let tokens = half(&rnd(&[2, 16, ctx_dim], 8, 1.0));
+        let cross = block.quantum_scratch(
+            1,
+            2,
+            256,
+            308 + 16,
+            true,
+            Dtype::Float16,
+            half_plan.attention,
+        );
+        prove(
+            &format!("{TRANSFORMER_BLOCK} (f16, cross-attention + IP, CFG half)"),
+            cross,
+            || {
+                Ok(vec![block.forward_ip(
+                    &few,
+                    &long_memory,
+                    Some((&tokens, 0.6)),
+                    half_plan,
+                )?])
+            },
+        );
+
+        // proj_in / proj_out at f16.
+        let mut tmap = map.clone();
+        tmap.retain(|k, _| k.starts_with("t."));
+        let mut g = Gen::new(8200);
+        g.block("t.transformer_blocks.0", dim, ctx_dim, ff);
+        for (k, v) in g.map {
+            tmap.insert(k, half(&v));
+        }
+        let t = crate::unet::transformer::Transformer2D::from_weights(
+            &Weights::from_map(tmap),
+            "t",
+            dim,
+            heads,
+            1,
+        )
+        .unwrap();
+        let x = half(&rnd(&[1, 16, 16, dim], 9, 1.0));
+        let (proj_in, proj_out) = t.projection_scratch(&x);
+        prove(&format!("{TRANSFORMER_PROJ_IN} (f16)"), proj_in, || {
+            Ok(vec![t.proj_in_body(&x)?])
+        });
+        let hidden = half(&rnd(&[1, 256, dim], 10, 1.0));
+        prove(&format!("{TRANSFORMER_PROJ_OUT} (f16)"), proj_out, || {
+            Ok(vec![t.proj_out_body(&hidden, &x)?])
+        });
+
+        // A pre-quantized (Q4) snapshot's block: u32 codes with BF16 scales/biases against f16
+        // activations — the device's packed tier.
+        let packed_w = packed(map, &linears);
+        let packed_block =
+            crate::unet::transformer::TransformerBlock::from_weights(&packed_w, "b", dim, heads)
+                .unwrap();
+        // MLX promotes the f16 activations through the BF16-scaled projections: the block runs f32.
+        let out = packed_block
+            .forward_ip(&y, &memory, None, unbounded)
+            .unwrap();
+        assert_eq!(out.dtype(), Dtype::Float32);
+        assert_eq!(packed_block.activation_bytes(Dtype::Float16), 4);
+        assert_eq!(block.activation_bytes(Dtype::Float16), 2);
+        // Entered at f16, its self-attention q/k/v each cast the f16 LayerNorm output to f32
+        // (three hidden-sized f32 copies an f32 entry does not make; on the CPU the measurement
+        // below does not separate them from the f32 block's other buffers).
+        let scratch = |x| packed_block.quantum_scratch(1, 1, 256, 7, false, x, unbounded.attention);
+        assert_eq!(
+            scratch(Dtype::Float16) - scratch(Dtype::Float32),
+            3 * 256 * dim as u64 * 4 + 3 * PAGE_BYTES
+        );
+        prove(
+            &format!("{TRANSFORMER_BLOCK} (f16, packed Q4 / BF16 scales)"),
+            packed_block.quantum_scratch(1, 1, 256, 7, false, Dtype::Float16, unbounded.attention),
+            || Ok(vec![packed_block.forward_ip(&y, &memory, None, unbounded)?]),
         );
     }
 
@@ -2022,7 +2510,7 @@ mod proofs {
         // A temb-free resnet (`resnet_quantum`'s lazy body).
         let resnet = crate::unet::ResnetBlock2D::from_weights(&w, "r").unwrap();
         let x = rand(&[1, 32, 32, 64], 1);
-        prove(VAE_RESNET, resnet.quantum_scratch(&x), || {
+        prove(VAE_RESNET, resnet.quantum_scratch(&x, None), || {
             Ok(vec![resnet.forward(&x, None)?])
         });
 
@@ -2032,7 +2520,7 @@ mod proofs {
         let small = rand(&[1, 16, 16, 64], 2);
         prove(
             VAE_ATTENTION,
-            vae_attention_bytes(1, 256, 64, 256, 4),
+            vae_attention_bytes(1, 256, 64, 256, 4, Backend::Cpu),
             || Ok(vec![attn.forward(&small)?]),
         );
         let budget = mlx_gen::attention::AttentionBudget::from_score_elements(128 * 1024, true);
@@ -2040,7 +2528,7 @@ mod proofs {
         let chunked = mlx_gen::attention::AttentionPlan::budgeted(budget);
         prove(
             &format!("{VAE_ATTENTION} (query-chunked)"),
-            vae_attention_bytes(1, 1024, 64, 128, 4),
+            vae_attention_bytes(1, 1024, 64, 128, 4, Backend::Cpu),
             || Ok(vec![attn.forward_planned(&x, chunked)?]),
         );
 
@@ -2205,8 +2693,9 @@ mod proofs {
 // ---------------------------------------------------------------------------------------------
 // Reachable-sizes prediction (sc-26270 round 3, item 7). Host-derived PREDICTIONS, not evidence:
 // resident bytes per phase from the on-disk safetensors headers under the iOS load-cast rule, the
-// largest counted quantum of that phase at production shapes (Metal backend, f16 activations,
-// sequential CFG, fused U-Net SDPA, the fp16-fix VAE with the chunked mid attention), and whether
+// largest counted quantum of that phase at production shapes (Metal backend, f16 activations —
+// f32 through a packed tier's U-Net and text encoders, whose BF16 scales promote them — sequential
+// CFG, fused U-Net SDPA, the fp16-fix VAE with the chunked mid attention), and whether
 // resident + scratch + the 512 MiB reserve fits the 6142 MiB entitled launch headroom.
 // ---------------------------------------------------------------------------------------------
 
@@ -2287,13 +2776,30 @@ mod reachable {
             .unwrap()
     }
 
+    /// The activation width a component file's projections run its f16 inputs at: f32 when its
+    /// packed projections carry scales of another dtype (MLX promotes the quantized matmul to
+    /// `result_type(x, scales)`), else f16.
+    fn activation_width(file: &std::path::Path) -> u64 {
+        let promotes = safetensors_path_tensor_headers(file)
+            .unwrap()
+            .iter()
+            .any(|h| h.name.ends_with(".scales") && h.dtype != Stored::F16);
+        if promotes {
+            4
+        } else {
+            HALF
+        }
+    }
+
     fn worst(quanta: &[(String, u64)]) -> (String, u64) {
         quanta.iter().max_by_key(|q| q.1).cloned().unwrap()
     }
 
     /// Every counted quantum of one SDXL U-Net forward at latent edge `l` (sequential CFG: one
-    /// latent row, the pair's text memory), `ip` IP tokens.
-    fn unet_quanta(l: i32, ip: i32) -> Vec<(String, u64)> {
+    /// latent row, the pair's text memory), `ip` IP tokens, its activations at `act` bytes from the
+    /// first resnet's time-embedding sum on (the stem and that resnet's first half run the f16
+    /// latent).
+    fn unet_quanta(l: i32, ip: i32, act: u64) -> Vec<(String, u64)> {
         let m = Backend::Metal;
         let mut q = Vec::new();
         let x = Array::zeros::<f32>(&[1, l, l, 4])
@@ -2324,21 +2830,29 @@ mod reachable {
             (l, 640, 960, 320),
             (l, 320, 640, 320),
         ];
-        for (h, cx, cin, cout) in resnets {
+        for (i, (h, cx, cin, cout)) in resnets.into_iter().enumerate() {
+            let act_in = if i == 0 { HALF } else { act };
             q.push((
                 format!("{UNET_RESNET} {cin}->{cout} @{h}"),
-                resnet_bytes(&[1, h, h, cx], HALF, &w(cout, 3, cin), &w(cout, 3, cout), m),
+                resnet_bytes(
+                    &[1, h, h, cx],
+                    act_in,
+                    act,
+                    &w(cout, 3, cin),
+                    &w(cout, 3, cout),
+                    m,
+                ),
             ));
         }
         for (h, c) in [(l, 320), (l1, 640)] {
-            let call = ConvCall::new(&[1, h, h, c], HALF, &w(c, 3, c), 2, 1);
+            let call = ConvCall::new(&[1, h, h, c], act, &w(c, 3, c), 2, 1);
             q.push((
                 format!("{UNET_DOWNSAMPLE} @{h}"),
                 single_conv_bytes(&call, 0, 0, m),
             ));
         }
         for (h, c) in [(l2, 1280), (l1, 640)] {
-            let call = ConvCall::new(&[1, 2 * h, 2 * h, c], HALF, &w(c, 3, c), 1, 1);
+            let call = ConvCall::new(&[1, 2 * h, 2 * h, c], act, &w(c, 3, c), 1, 1);
             q.push((
                 format!("{UNET_UPSAMPLE} @{h}"),
                 single_conv_bytes(&call, 1, 0, m),
@@ -2359,17 +2873,17 @@ mod reachable {
                     4 * dim,
                     tokens,
                     ip > 0,
-                    HALF,
+                    act,
                     m,
                 ),
             ));
-            let plane = |c: u64| (tokens as u64) * c * HALF;
+            let plane = |c: u64| (tokens as u64) * c * act;
             q.push((
                 format!("{TRANSFORMER_PROJ_IN} @{h}"),
                 plane(dim) * (GROUP_NORM_BUFFERS + 1) + page_slack(GROUP_NORM_BUFFERS + 1),
             ));
         }
-        let call = ConvCall::new(&[1, l, l, 320], HALF, &w(4, 3, 320), 1, 1);
+        let call = ConvCall::new(&[1, l, l, 320], act, &w(4, 3, 320), 1, 1);
         q.push((UNET_CONV_OUT.into(), norm_conv_bytes(&call, m)));
         q
     }
@@ -2412,7 +2926,14 @@ mod reachable {
         q.push((VAE_DECODE_IN.into(), single_conv_bytes(&call, 2, 0, m)));
         q.push((
             format!("{VAE_RESNET} mid @{l}"),
-            resnet_bytes(&[1, l, l, 512], HALF, &w(512, 3, 512), &w(512, 3, 512), m),
+            resnet_bytes(
+                &[1, l, l, 512],
+                HALF,
+                HALF,
+                &w(512, 3, 512),
+                &w(512, 3, 512),
+                m,
+            ),
         ));
         let n = l * l;
         let rows = mlx_gen::attention::AttentionBudget::from_score_elements(
@@ -2422,7 +2943,7 @@ mod reachable {
         .query_block(1, 1, n, n);
         q.push((
             format!("{VAE_ATTENTION} ({rows}-row chunks)"),
-            vae_attention_bytes(1, n, 512, rows, HALF),
+            vae_attention_bytes(1, n, 512, rows, HALF, m),
         ));
         // (input grid, cin, cout, upsample after)
         let blocks = [
@@ -2447,6 +2968,7 @@ mod reachable {
                     match tile {
                         None => resnet_bytes(
                             &[1, h, h, ci],
+                            HALF,
                             HALF,
                             &w(cout, 3, ci),
                             &w(cout, 3, cout),
@@ -2545,6 +3067,7 @@ mod reachable {
                 resnet_bytes(
                     &[1, h, h, cin],
                     HALF,
+                    HALF,
                     &w(cout, 3, cin),
                     &w(cout, 3, cout),
                     m,
@@ -2570,7 +3093,7 @@ mod reachable {
         .query_block(1, 1, n, n);
         q.push((
             VAE_ATTENTION.into(),
-            vae_attention_bytes(1, n, 512, rows, HALF),
+            vae_attention_bytes(1, n, 512, rows, HALF, m),
         ));
         let call = ConvCall::new(&[1, l, l, 512], HALF, &w(8, 3, 512), 1, 1);
         q.push((
@@ -2636,7 +3159,14 @@ mod reachable {
         }
         q.push((
             format!("{VAE_RESNET} mid @{l}"),
-            resnet_bytes(&[1, l, l, 512], HALF, &w(512, 3, 512), &w(512, 3, 512), m),
+            resnet_bytes(
+                &[1, l, l, 512],
+                HALF,
+                HALF,
+                &w(512, 3, 512),
+                &w(512, 3, 512),
+                m,
+            ),
         ));
         let n = l * l;
         let rows = mlx_gen::attention::AttentionBudget::from_score_elements(
@@ -2646,7 +3176,7 @@ mod reachable {
         .query_block(1, 1, n, n);
         q.push((
             VAE_ATTENTION.into(),
-            vae_attention_bytes(1, n, 512, rows, HALF),
+            vae_attention_bytes(1, n, 512, rows, HALF, m),
         ));
         let call = ConvCall::new(&[1, l, l, 512], HALF, &w(8, 3, 512), 1, 1);
         q.push((
@@ -2719,17 +3249,23 @@ mod reachable {
                 "<!-- {tier}: text encoders {:.0} MiB, U-Net {:.0} MiB, ControlNet-tile {:.0} MiB, IP (config) {:.0} MiB -->",
                 te as f64 / MIB as f64, unet as f64 / MIB as f64, control as f64 / MIB as f64, ip_resident as f64 / MIB as f64
             );
+            let te_act = activation_width(&file("text_encoder", "model"))
+                .max(activation_width(&file("text_encoder_2", "model")));
             let text = [
                 (
                     CLIP_LAYER.to_string() + " L",
-                    clip_layer_bytes(2, 77, 768, 3072, 12, 64, true, HALF, Backend::Metal),
+                    clip_layer_bytes(2, 77, 768, 3072, 12, 64, true, te_act, Backend::Metal),
                 ),
                 (
                     CLIP_LAYER.to_string() + " bigG",
-                    clip_layer_bytes(2, 77, 1280, 5120, 20, 64, true, HALF, Backend::Metal),
+                    clip_layer_bytes(2, 77, 1280, 5120, 20, 64, true, te_act, Backend::Metal),
                 ),
             ];
             let unet_file = file("unet", "diffusion_pytorch_model");
+            let act = activation_width(&unet_file);
+            println!(
+                "<!-- {tier}: U-Net activations {act} B, text-encoder activations {te_act} B -->"
+            );
             // Staged loads: the text encoders load into an empty process; the U-Net (its floor =
             // its resident bytes + its largest tensor) loads after they are shed, the VAE beside it.
             let te_floor = te + largest(&file("text_encoder_2", "model"));
@@ -2771,7 +3307,7 @@ mod reachable {
                     edge,
                     "denoise",
                     unet + vae,
-                    worst(&unet_quanta(l, 0)),
+                    worst(&unet_quanta(l, 0, act)),
                 );
                 row(
                     "txt2img",
@@ -2808,7 +3344,7 @@ mod reachable {
                     unet + vae,
                     worst(&encode_tiled_quanta(l, crate::vae::IOS_ENCODE_TILE_PX)),
                 );
-                let mut cq = unet_quanta(l, 0);
+                let mut cq = unet_quanta(l, 0, act);
                 cq.extend(controlnet_quanta(l));
                 row(
                     "controlnet",
@@ -2834,9 +3370,461 @@ mod reachable {
                     edge,
                     "denoise",
                     unet + vae + ip_resident,
-                    worst(&unet_quanta(l, 16)),
+                    worst(&unet_quanta(l, 16, act)),
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adapter (LoRA / LoKr / LoHa) reads and installs (sc-26270 round 4, item 2).
+// ---------------------------------------------------------------------------------------------
+
+mod adapters {
+    use super::*;
+    use mlx_gen::adapters::AdaptableHost;
+    use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+    use crate::adapters::{apply_sdxl_adapters_with, LoraCoverage};
+
+    const Q: &str = "down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q";
+    const PROJ_IN: &str = "down_blocks.1.attentions.0.proj_in";
+    const CONV: &str = "down_blocks.1.resnets.0.conv2";
+    const SHORTCUT: &str = "up_blocks.0.resnets.0.conv_shortcut";
+
+    fn flat(dotted: &str) -> String {
+        format!("lora_unet_{}", dotted.replace('.', "_"))
+    }
+
+    fn dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sdxl-adapter-quanta-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write `tensors` (f16 unless already typed) to `name` in the scratch dir with `meta`.
+    fn write(
+        name: &str,
+        tensors: Vec<(String, Array)>,
+        meta: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let path = dir().join(name);
+        let meta: HashMap<String, String> = meta
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let named: Vec<(String, Array)> = tensors
+            .into_iter()
+            .map(|(k, a)| (k, evaluated(a)))
+            .collect();
+        Array::save_safetensors(named.iter().map(|(k, a)| (k.as_str(), a)), &meta, &path).unwrap();
+        path
+    }
+
+    fn evaluated(a: Array) -> Array {
+        a.eval().unwrap();
+        a
+    }
+
+    fn half(a: Array) -> Array {
+        a.as_dtype(Dtype::Float16).unwrap()
+    }
+
+    /// A kohya LoRA pair for the linear `dotted` (`[out, in]`), rank `r`, f16 factors.
+    fn lora_linear(dotted: &str, out: i32, inp: i32, r: i32, seed: u64) -> Vec<(String, Array)> {
+        let k = flat(dotted);
+        vec![
+            (
+                format!("{k}.lora_down.weight"),
+                half(rnd(&[r, inp], seed, 0.1)),
+            ),
+            (
+                format!("{k}.lora_up.weight"),
+                half(rnd(&[out, r], seed + 1, 0.1)),
+            ),
+            (format!("{k}.alpha"), Array::from_f32(r as f32)),
+        ]
+    }
+
+    /// A kohya conv LoRA pair for `dotted` (`[out, in, k, k]`), rank `r`, f16 factors.
+    fn lora_conv(
+        dotted: &str,
+        out: i32,
+        inp: i32,
+        kk: i32,
+        r: i32,
+        seed: u64,
+    ) -> Vec<(String, Array)> {
+        let k = flat(dotted);
+        vec![
+            (
+                format!("{k}.lora_down.weight"),
+                half(rnd(&[r, inp, kk, kk], seed, 0.1)),
+            ),
+            (
+                format!("{k}.lora_up.weight"),
+                half(rnd(&[out, r, 1, 1], seed + 1, 0.1)),
+            ),
+            (format!("{k}.alpha"), Array::from_f32(r as f32)),
+        ]
+    }
+
+    fn spec(path: std::path::PathBuf, kind: AdapterKind) -> AdapterSpec {
+        AdapterSpec::new(path, 0.8, kind)
+    }
+
+    /// The adapter-proof U-Net: 32/256 channels, so its targets are 64K-590K elements; f16 like the
+    /// device's, materialized (the production route) unless `lazy` (the fused-LDM route, whose U-Net
+    /// is still the file's lazy arrays when the adapters merge); `packed` packs the linear targets
+    /// at Q4.
+    fn proof_unet(lazy: bool, packed: bool) -> crate::unet::UNet2DConditionModel {
+        let mut cfg = crate::test_support::tiny_unet_config();
+        cfg.block_out_channels = vec![32, 256];
+        cfg.num_attention_heads = vec![1, 4];
+        let mut w = crate::test_support::tiny_unet_weights_for(&cfg, 21).unwrap();
+        w.cast_all(Dtype::Float16).unwrap();
+        let w = if lazy {
+            let path = dir().join("proof-unet.safetensors");
+            if !path.exists() {
+                super::save(&w, &path);
+            }
+            Weights::from_file(&path).unwrap()
+        } else {
+            w.materialize().unwrap();
+            w
+        };
+        let mut unet = crate::unet::UNet2DConditionModel::from_weights(&w, &cfg).unwrap();
+        if packed {
+            // Pack the adapter targets (the fixture's 16-wide context projections cannot pack).
+            for target in [Q, PROJ_IN] {
+                let parts: Vec<&str> = target.split('.').collect();
+                crate::quant::quantize_linear(unet.adaptable_mut(&parts).unwrap(), 4).unwrap();
+            }
+        }
+        unet
+    }
+
+    fn weight_of(unet: &mut crate::unet::UNet2DConditionModel, dotted: &str) -> Array {
+        let parts: Vec<&str> = dotted.split('.').collect();
+        if let Some(conv) = unet.adaptable_conv_mut(&parts) {
+            return conv.weight().clone();
+        }
+        let lin = unet.adaptable_mut(&parts).unwrap();
+        lin.dense_weight().map(|(w, _)| w.clone()).unwrap()
+    }
+
+    /// One adapter file's measured proof: the guarded apply's adapter-load floor plus its largest
+    /// install price, against MLX's worst-of-N measured peak of the whole apply (the file's tensors
+    /// stay live while it installs), on a fresh U-Net per run.
+    fn prove_install(
+        label: &str,
+        unet: impl Fn() -> crate::unet::UNet2DConditionModel,
+        file: &std::path::Path,
+        kind: AdapterKind,
+        coverage: LoraCoverage,
+    ) -> f64 {
+        let specs = [spec(file.to_path_buf(), kind)];
+        let (r, events) = observe(PLENTY, || {
+            apply_sdxl_adapters_with(&mut unet(), &specs, coverage)
+        });
+        assert!(r.unwrap().merged >= 1);
+        let load: u64 = checked(&events, ADAPTER_LOAD).iter().sum();
+        let merge = checked(&events, ADAPTER_MERGE).into_iter().max().unwrap();
+        let formula = load + merge;
+        let measured = (0..5)
+            .map(|_| {
+                let mut u = unet();
+                with_cpu_diagnostic_headroom(PLENTY, || {
+                    measured_peak_bytes(|| {
+                        apply_sdxl_adapters_with(&mut u, &specs, coverage)?;
+                        Ok(vec![])
+                    })
+                })
+                .unwrap()
+            })
+            .max()
+            .unwrap();
+        let ratio = formula as f64 / measured as f64;
+        eprintln!(
+            "PROOF {ADAPTER_MERGE} {label}: formula {formula} B (load {load} + install {merge}), \
+             worst of 5 measured {measured} B, ratio {ratio:.3}"
+        );
+        assert_tracks_measured(label, formula, measured, 1.5);
+        ratio
+    }
+
+    #[test]
+    fn adapter_installs_track_their_measured_peaks() {
+        if !cpu_child("adapters::adapter_installs_track_their_measured_peaks") {
+            return;
+        }
+        let dense = || proof_unet(false, false);
+        let lazy = || proof_unet(true, false);
+        let packed = || proof_unet(false, true);
+        let complete = LoraCoverage::Complete;
+        let lora = write("lora.safetensors", lora_linear(Q, 256, 256, 16, 1), &[]);
+        prove_install(
+            "LoRA, dense f16 base",
+            dense,
+            &lora,
+            AdapterKind::Lora,
+            complete,
+        );
+        prove_install(
+            "LoRA, lazily read base",
+            lazy,
+            &lora,
+            AdapterKind::Lora,
+            complete,
+        );
+        let wide = write(
+            "lora-wide.safetensors",
+            lora_linear(PROJ_IN, 256, 256, 256, 3),
+            &[],
+        );
+        prove_install(
+            "LoRA, packed base",
+            packed,
+            &wide,
+            AdapterKind::Lora,
+            complete,
+        );
+        let conv = write("conv.safetensors", lora_conv(CONV, 256, 256, 3, 16, 5), &[]);
+        prove_install(
+            "conv LoRA, f16 conv",
+            dense,
+            &conv,
+            AdapterKind::Lora,
+            complete,
+        );
+        prove_install(
+            "conv LoRA, lazily read conv",
+            lazy,
+            &conv,
+            AdapterKind::Lora,
+            complete,
+        );
+        let shortcut = write(
+            "shortcut.safetensors",
+            lora_conv(SHORTCUT, 256, 512, 1, 16, 7),
+            &[],
+        );
+        prove_install(
+            "1x1 shortcut LoRA",
+            dense,
+            &shortcut,
+            AdapterKind::Lora,
+            complete,
+        );
+
+        // peft LoKr (networkType stamp, global alpha/rank metadata).
+        let lokr_meta = [("networkType", "lokr"), ("rank", "4"), ("alpha", "4")];
+        let peft = write(
+            "lokr.safetensors",
+            vec![
+                (format!("{Q}.lokr_w1"), half(rnd(&[16, 16], 9, 0.3))),
+                (format!("{Q}.lokr_w2"), half(rnd(&[16, 16], 10, 0.3))),
+            ],
+            &lokr_meta,
+        );
+        prove_install(
+            "peft LoKr, dense base",
+            dense,
+            &peft,
+            AdapterKind::Lokr,
+            complete,
+        );
+        let structured = write(
+            "lokr-structured.safetensors",
+            vec![
+                (format!("{Q}.lokr_w1"), half(rnd(&[1, 1], 11, 0.3))),
+                (format!("{Q}.lokr_w2"), half(rnd(&[256, 256], 12, 0.3))),
+            ],
+            &lokr_meta,
+        );
+        prove_install(
+            "peft LoKr, packed base (structured)",
+            packed,
+            &structured,
+            AdapterKind::Lokr,
+            complete,
+        );
+
+        // Third-party LyCORIS LoKr and LoHa (kohya keys, per-module alpha, no stamp).
+        let k = flat(Q);
+        let tp_lokr = write(
+            "tp-lokr.safetensors",
+            vec![
+                (format!("{k}.lokr_w1"), half(rnd(&[16, 16], 13, 0.3))),
+                (format!("{k}.lokr_w2_a"), half(rnd(&[16, 4], 14, 0.3))),
+                (format!("{k}.lokr_w2_b"), half(rnd(&[4, 16], 15, 0.3))),
+                (format!("{k}.alpha"), Array::from_f32(4.0)),
+            ],
+            &[],
+        );
+        prove_install(
+            "third-party LoKr, dense base",
+            dense,
+            &tp_lokr,
+            AdapterKind::Lora,
+            complete,
+        );
+        prove_install(
+            "third-party LoKr, packed base",
+            packed,
+            &tp_lokr,
+            AdapterKind::Lora,
+            complete,
+        );
+        let loha = write(
+            "loha.safetensors",
+            vec![
+                (format!("{k}.hada_w1_a"), half(rnd(&[256, 8], 16, 0.1))),
+                (format!("{k}.hada_w1_b"), half(rnd(&[8, 256], 17, 0.1))),
+                (format!("{k}.hada_w2_a"), half(rnd(&[256, 8], 18, 0.1))),
+                (format!("{k}.hada_w2_b"), half(rnd(&[8, 256], 19, 0.1))),
+                (format!("{k}.alpha"), Array::from_f32(8.0)),
+            ],
+            &[],
+        );
+        prove_install(
+            "LoHa, dense base",
+            dense,
+            &loha,
+            AdapterKind::Lora,
+            complete,
+        );
+        prove_install(
+            "LoHa, packed base",
+            packed,
+            &loha,
+            AdapterKind::Lora,
+            complete,
+        );
+    }
+
+    /// Every adapter file is checked (header floor) before it is read and every target's install
+    /// is its own checked-then-synchronized quantum; with zero headroom the first file's read
+    /// refuses and nothing merges; at a headroom that admits the read but not the first install,
+    /// the install refuses before it is built and the U-Net is untouched; guarded installs are
+    /// byte-identical to the host's.
+    #[test]
+    fn adapter_reads_and_installs_refuse_before_they_run_and_stay_identical() {
+        if !cpu_child(
+            "adapters::adapter_reads_and_installs_refuse_before_they_run_and_stay_identical",
+        ) {
+            return;
+        }
+        let lora_file = {
+            let mut t = lora_linear(Q, 256, 256, 8, 31);
+            t.extend(lora_linear(PROJ_IN, 256, 256, 8, 33));
+            t.extend(lora_conv(CONV, 256, 256, 3, 8, 35));
+            write("multi.safetensors", t, &[])
+        };
+        let k = flat(PROJ_IN);
+        let loha_file = write(
+            "multi-loha.safetensors",
+            vec![
+                (format!("{k}.hada_w1_a"), half(rnd(&[256, 4], 37, 0.1))),
+                (format!("{k}.hada_w1_b"), half(rnd(&[4, 256], 38, 0.1))),
+                (format!("{k}.hada_w2_a"), half(rnd(&[256, 4], 39, 0.1))),
+                (format!("{k}.hada_w2_b"), half(rnd(&[4, 256], 40, 0.1))),
+            ],
+            &[],
+        );
+        let specs = [
+            spec(lora_file, AdapterKind::Lora),
+            spec(loha_file, AdapterKind::Lora),
+        ];
+        let targets = [Q, PROJ_IN, CONV];
+        let apply = |unet: &mut crate::unet::UNet2DConditionModel| {
+            apply_sdxl_adapters_with(unet, &specs, LoraCoverage::Complete)
+        };
+        let snapshot = |unet: &mut crate::unet::UNet2DConditionModel| -> Vec<Vec<u32>> {
+            targets.iter().map(|t| bits(&weight_of(unet, t))).collect()
+        };
+
+        // Host (no guard) vs guarded: identical merged weights.
+        let mut host = proof_unet(false, false);
+        let base = snapshot(&mut host);
+        let report = apply(&mut host).unwrap();
+        assert_eq!(report.merged, 4);
+        let merged = snapshot(&mut host);
+        assert_ne!(merged, base, "the fixture must merge");
+        let mut guarded = proof_unet(false, false);
+        let (r, events) = observe(PLENTY, || apply(&mut guarded));
+        assert_eq!(r.unwrap(), report);
+        assert_eq!(
+            snapshot(&mut guarded),
+            merged,
+            "guarded installs must be byte-identical"
+        );
+
+        // Ordering: each file's read check, then one checked + synchronized install per target.
+        let expected_shape: Vec<(bool, &str)> = [
+            (true, ADAPTER_LOAD),
+            (true, ADAPTER_MERGE),
+            (false, ADAPTER_MERGE),
+            (true, ADAPTER_MERGE),
+            (false, ADAPTER_MERGE),
+            (true, ADAPTER_MERGE),
+            (false, ADAPTER_MERGE),
+            (true, ADAPTER_LOAD),
+            (true, ADAPTER_MERGE),
+            (false, ADAPTER_MERGE),
+        ]
+        .into();
+        let shape: Vec<(bool, &str)> = events
+            .iter()
+            .map(|e| match e {
+                Ev::Checked(l, _) => (true, l.as_str()),
+                Ev::Synced(l) => (false, l.as_str()),
+            })
+            .collect();
+        assert_eq!(shape, expected_shape, "{events:?}");
+        let floor =
+            mlx_gen::ios_quantum::load_floor_bytes(std::slice::from_ref(&specs[0].path), |_| true)
+                .unwrap();
+        assert_eq!(checked(&events, ADAPTER_LOAD)[0], floor);
+
+        // Zero headroom: the first read refuses; nothing is read, built or merged.
+        let _ = take_refusal();
+        let mut refused = proof_unet(false, false);
+        let (r, events) = observe(0, || apply(&mut refused));
+        assert!(r.is_err());
+        assert_eq!(
+            take_refusal().map(|r| r.label),
+            Some(ADAPTER_LOAD.to_string())
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(snapshot(&mut refused), base);
+
+        // A headroom that admits the read but not the first install: that install refuses before
+        // it is built (no synchronization, the U-Net untouched).
+        let mut refused = proof_unet(false, false);
+        let (r, events) = observe(PROCESS_RESERVE_BYTES + floor, || apply(&mut refused));
+        assert!(r.is_err());
+        let record = take_refusal().unwrap();
+        assert_eq!(record.label, ADAPTER_MERGE);
+        assert!(record.scratch_bytes > floor);
+        assert_eq!(events, vec![Ev::Checked(ADAPTER_LOAD.into(), floor)]);
+        assert_eq!(snapshot(&mut refused), base);
+
+        // Packed base: the residual installs are guarded and the forward stays byte-identical.
+        let x = rnd(&[1, 7, 256], 41, 1.0).as_dtype(Dtype::Float16).unwrap();
+        let forward = |unet: &mut crate::unet::UNet2DConditionModel| {
+            let parts: Vec<&str> = Q.split('.').collect();
+            bits(&unet.adaptable_mut(&parts).unwrap().forward(&x).unwrap())
+        };
+        let mut host = proof_unet(false, true);
+        apply(&mut host).unwrap();
+        let mut guarded = proof_unet(false, true);
+        let (r, events) = observe(PLENTY, || apply(&mut guarded));
+        r.unwrap();
+        assert_eq!(forward(&mut guarded), forward(&mut host));
+        assert_eq!(checked(&events, ADAPTER_MERGE).len(), 4);
+        assert_eq!(synced(&events, ADAPTER_MERGE), 4);
     }
 }

@@ -55,6 +55,8 @@ fn row(registry: &ProviderRegistry, c: &IosCandidate, bytes: u64) -> EvidenceRow
     EvidenceRow {
         key: evidence_key(registry, c, DEVICE).unwrap(),
         footprint_bytes: bytes,
+        // Synthetic rows: a zero capture baseline makes the demand the whole figure.
+        baseline_footprint_bytes: 0,
         mlx_peak_bytes: bytes,
         min_headroom_mib: 1.0,
         elapsed_seconds: 1.0,
@@ -438,6 +440,7 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
 
 /// Finding 1: the capture permit is NON-circular (no evidence row consulted, the table stays
 /// empty) but only exists where quanta are bounded; it is labelled and never an admission.
+#[cfg(feature = "device-capture")]
 #[test]
 fn capture_permit_needs_bounded_quanta_not_evidence() {
     let registry = crate::provider_registry().unwrap();
@@ -500,4 +503,73 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     })
     .unwrap();
     assert_eq!(refused, Some(RefusalKind::Strategy));
+}
+
+/// E4: the evidence peak is the CAPTURE process's absolute peak, including its own baseline. Only
+/// the render's growth (peak - capture baseline) is charged, and what this process already holds
+/// is committed, never credited: an unrelated resident (e.g. another generator) makes a load that
+/// would fit an empty process a typed capacity refusal.
+#[test]
+fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
+    let registry = crate::provider_registry().unwrap();
+    let root = crate::sdxl::tests::fixture();
+    let candidate = crate::sdxl::tests::candidate(
+        &registry,
+        root.path(),
+        "sdxl",
+        512,
+        Some(mlx_gen::gen_core::Quant::Q4),
+        "text_to_image",
+    );
+    const MIB: u64 = 1 << 20;
+    let mut row = row(&registry, &candidate, 3600 * MIB);
+    row.baseline_footprint_bytes = 200 * MIB; // the harness's own baseline at capture start
+    let rows = [row];
+    let budget = |held: u64, available: u64| {
+        let mut b = capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
+        b.reserved_headroom_bytes = 512 * MIB;
+        b
+    };
+    // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + reserve fits.
+    let admitted = admit_with_rows(
+        &registry,
+        std::slice::from_ref(&candidate),
+        DEVICE,
+        budget(200, 5900),
+        &rows,
+    )
+    .unwrap();
+    assert_eq!(admitted.demand_bytes(), 3400 * MIB);
+    // SANA (~2 GB) still resident: 2400 MiB available (1888 after the reserve). The absolute-peak
+    // arithmetic would credit the resident 2200 MiB (3600 - 2200 = 1400 <= 1888) and admit; the
+    // growth is 3400 MiB: refused.
+    assert_eq!(
+        kind(admit_with_rows(
+            &registry,
+            std::slice::from_ref(&candidate),
+            DEVICE,
+            budget(2200, 2400),
+            &rows
+        )),
+        Some(RefusalKind::Capacity)
+    );
+    // The reserve is part of the boundary: growth + reserve must fit, not growth alone.
+    assert_eq!(
+        kind(admit_with_rows(
+            &registry,
+            std::slice::from_ref(&candidate),
+            DEVICE,
+            budget(200, 3400 + 511),
+            &rows
+        )),
+        Some(RefusalKind::Capacity)
+    );
+    admit_with_rows(
+        &registry,
+        std::slice::from_ref(&candidate),
+        DEVICE,
+        budget(200, 3400 + 512),
+        &rows,
+    )
+    .unwrap();
 }

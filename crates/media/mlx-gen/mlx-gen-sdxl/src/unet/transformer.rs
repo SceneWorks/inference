@@ -391,7 +391,8 @@ impl TransformerBlock {
     /// to `context_tokens` keys (text memory plus any IP tokens) projected at `context_batch` rows (a
     /// sequential CFG half projects the pair's conditioning at the pair's batch, then keeps its row
     /// — only those k/v buffers are pair-sized). Width, heads and FFN width come from the loaded
-    /// block, the activation width from `act`, `query_rows` from the request's attention plan, the
+    /// block, the activation width from `x`'s dtype as the block's projections promote it
+    /// ([`Self::activation_bytes`]), `query_rows` from the request's attention plan, the
     /// score handling from the running backend ([`crate::quantum::transformer_block_bytes`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn quantum_scratch(
@@ -401,10 +402,20 @@ impl TransformerBlock {
         tokens: i32,
         context_tokens: i32,
         ip: bool,
-        act: u64,
+        x: Dtype,
         attention: mlx_gen::attention::AttentionPlan<'_>,
     ) -> u64 {
         let heads = self.attn1.num_heads;
+        let act = self.activation_bytes(x);
+        let dim = self.norm1_w.shape()[0] as u64;
+        // Entered narrower than the projections promote to: the self-attention's q/k/v each cast
+        // the narrow LayerNorm output up (`quantized_matmul`'s `astype(x, result_type)`).
+        let casts = if act > crate::quantum::dtype_bytes(x) {
+            mlx_gen::ios_quantum::tensor_bytes(act, &[3, batch.max(1) as u64, tokens as u64, dim])
+                .saturating_add(crate::quantum::page_slack(3))
+        } else {
+            0
+        };
         // The two attentions are planned independently by `sdpa_budgeted_bhsd`; the self-attention
         // (the larger key axis) has the smaller chunk, the cross-attention the larger — each prices
         // at its own rows, so take the plan of the larger score domain (rows × keys).
@@ -423,11 +434,11 @@ impl TransformerBlock {
         } else {
             cross_rows
         };
-        crate::quantum::transformer_block_bytes(
+        casts.saturating_add(crate::quantum::transformer_block_bytes(
             batch,
             context_batch,
             tokens,
-            self.norm1_w.shape()[0] as u64,
+            dim,
             heads,
             self.attn1.head_dim,
             context_tokens,
@@ -436,7 +447,30 @@ impl TransformerBlock {
             ip && self.has_ip(),
             act,
             crate::quantum::Backend::current(),
-        )
+        ))
+    }
+
+    /// The dtype this block's hidden state runs at for `x`-typed input: `x`'s, promoted by the
+    /// projections it runs through (a packed snapshot's BF16 scales against f16 activations make
+    /// every projection output, and so the residual stream, f32 —
+    /// [`crate::quantum::linear_output_dtype`]).
+    pub(crate) fn activation_dtype(&self, x: Dtype) -> Dtype {
+        [
+            &self.attn1.q,
+            &self.attn1.out,
+            &self.attn2.q,
+            &self.linear1,
+            &self.linear3,
+        ]
+        .iter()
+        .fold(x, |d, linear| {
+            Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+        })
+    }
+
+    /// [`Self::activation_dtype`]'s bytes per element: the activation width the block is priced at.
+    pub(crate) fn activation_bytes(&self, x: Dtype) -> u64 {
+        crate::quantum::dtype_bytes(self.activation_dtype(x))
     }
 
     /// The cross-attention key count this block sees for `memory` (+ IP tokens when this block
@@ -725,23 +759,44 @@ impl Transformer2D {
     /// iOS scratch (sc-26270) of the `(proj_in, proj_out)` quanta over NHWC `x`, counted as new
     /// buffers under `quantum::conv_sum`'s retention model at the block grid, `x`'s width and the
     /// loaded projection widths. proj_in: the composed GroupNorm
-    /// (`quantum::GROUP_NORM_BUFFERS`, input width) and the projection's output; proj_out: the
+    /// (`quantum::group_norm_buffers`, input width) and the projection's output; proj_out: the
     /// projection's output (the reshape is a view, the residual sum donates). Projections run on
     /// the resident weights in place (no weight copy).
     pub(crate) fn projection_scratch(&self, x: &Array) -> (u64, u64) {
         let sh = x.shape();
         let act = crate::quantum::element_bytes(x);
-        let plane = |c: u64| {
-            mlx_gen::ios_quantum::tensor_bytes(act, &[sh[0] as u64, sh[1] as u64, sh[2] as u64, c])
+        let plane = |width: u64, c: u64| {
+            mlx_gen::ios_quantum::tensor_bytes(
+                width,
+                &[sh[0] as u64, sh[1] as u64, sh[2] as u64, c],
+            )
         };
         let c = sh[3] as u64;
-        let groups = crate::quantum::GROUP_NORM_BUFFERS;
-        let proj_in = plane(c)
+        let groups = crate::quantum::group_norm_buffers(crate::quantum::Backend::current(), act);
+        // proj_in's output, and the hidden state proj_out reads, at their promoted dtypes.
+        let entered = crate::quantum::linear_output_dtype(&self.proj_in, x.dtype());
+        let hidden = self
+            .blocks
+            .iter()
+            .fold(entered, |d, block| block.activation_dtype(d));
+        let projected = crate::quantum::linear_output_dtype(&self.proj_out, hidden);
+        let summed = Dtype::from_promoting_types(projected, x.dtype());
+        let (entered, projected, summed) = (
+            crate::quantum::dtype_bytes(entered),
+            crate::quantum::dtype_bytes(projected),
+            crate::quantum::dtype_bytes(summed),
+        );
+        let proj_in = plane(act, c)
             .saturating_mul(groups)
-            .saturating_add(plane(crate::quantum::linear_out(&self.proj_in)))
+            .saturating_add(plane(entered, crate::quantum::linear_out(&self.proj_in)))
             .saturating_add(crate::quantum::page_slack(groups + 1));
-        let proj_out = plane(crate::quantum::linear_out(&self.proj_out))
-            .saturating_add(crate::quantum::page_slack(1));
+        // The projection's output (the reshape is a view); the residual sum donates it unless the
+        // sum is wider (an f32 residual over a narrower projection).
+        let out = crate::quantum::linear_out(&self.proj_out);
+        let widened = u64::from(summed > projected);
+        let proj_out = plane(projected, out)
+            .saturating_add(plane(summed, out).saturating_mul(widened))
+            .saturating_add(crate::quantum::page_slack(1 + widened));
         (proj_in, proj_out)
     }
 
@@ -764,7 +819,7 @@ impl Transformer2D {
             y.shape()[1],
             block.context_tokens(encoder_x, ip),
             ip.is_some(),
-            crate::quantum::element_bytes(y),
+            y.dtype(),
             plan.attention,
         )
     }

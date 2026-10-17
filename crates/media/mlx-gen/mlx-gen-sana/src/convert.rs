@@ -462,6 +462,23 @@ mod tests {
 
     #[test]
     fn converter_embedding_is_consumed_by_gemma_at_both_packed_tiers() {
+        // The default device is process-wide: switching it to the CPU in the shared test process
+        // leaked into every later test (`a_single_query_row_chunk_is_not_bit_exact…` then ran on
+        // the CPU, where one query row is bit-exact). Run in a child, like the other CPU tests.
+        const CHILD: &str = "SANA_CONVERT_EMBEDDING_CPU_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "convert::tests::converter_embedding_is_consumed_by_gemma_at_both_packed_tiers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "CPU converter child failed: {status}");
+            return;
+        }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         for bits in [4, 8] {
             let source = Array::from_slice(
@@ -518,6 +535,19 @@ mod tests {
 
     #[test]
     fn mixed_tier_preserves_packed_projections_and_packs_only_dense_embedding() {
+        // The default device is process-wide: switching it to the CPU in the shared test process
+        // leaked into every later test (`a_single_query_row_chunk_is_not_bit_exact…` then ran on
+        // the CPU, where one query row is bit-exact). Run in a child, like the other CPU tests.
+        const CHILD: &str = "SANA_CONVERT_MIXED_TIER_CPU_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "convert::tests::mixed_tier_preserves_packed_projections_and_packs_only_dense_embedding", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "CPU converter child failed: {status}");
+            return;
+        }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         for bits in [4, 8] {
             let dense = Array::from_slice(

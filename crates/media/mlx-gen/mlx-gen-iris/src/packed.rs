@@ -18,10 +18,13 @@
 //!   `model.safetensors`, and a `text_config.quantization` block in `config.json` — the
 //!   pre-quantized layout `mlx_llm` loads as stored.
 //!
-//! **The tier is read from the layout**: [`artifact_tier`] from the backbone's `.scales` /
-//! codes shapes, [`text_encoder_tier`] from the tower's `quantization` block. A load whose
-//! requested tier is not the artifact's is refused by the encoder-free loaders and publishes no
-//! calibration identity on every route ([`crate::memory_strategy`]).
+//! **The tier is recorded and checked against the layout**: every packed `model.safetensors`
+//! records [`BITS_METADATA`] and [`GROUP_SIZE_METADATA`] in its `__metadata__` (the text encoder
+//! also in its `quantization` block). [`artifact_tier`] and [`text_encoder_tier`] refuse a packed
+//! file without them, a recorded group that is not the loader's, a `.scales` / codes pair whose
+//! shapes do not pack at the recorded bits under the recorded group, and a partially packed file.
+//! A load whose requested tier is not the artifact's is refused by the encoder-free loaders and
+//! publishes no calibration identity on every route ([`crate::memory_strategy`]).
 //!
 //! The dense FP32 release and its quantize-at-load path are untouched: a dense artifact loads
 //! exactly as before.
@@ -63,57 +66,203 @@ pub fn quant_bits(quant: Quant) -> Result<i32> {
     }
 }
 
-/// The tier of the backbone weight file at `path`, from its tensor headers alone: `None` for a
-/// dense file, else the one width every `{p}.scales` / `{p}.weight` pair packs at
-/// (`bits = codes columns · 32 / (scales columns · group)`). Fails closed on a scales tensor
-/// without codes, a ratio that is not an exact 4- or 8-bit pack, or two widths in one file.
-pub fn artifact_tier(path: &Path) -> Result<Option<Quant>> {
-    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+/// `__metadata__` key of a packed artifact's safetensors: the affine bits every packed projection
+/// is stored at (`"4"` / `"8"`), written by the converter beside [`GROUP_SIZE_METADATA`].
+pub const BITS_METADATA: &str = "quantization_bits";
+/// `__metadata__` key of a packed artifact's safetensors: the affine group size every packed
+/// projection is stored at (the backbone's [`QUANT_GROUP_SIZE`], the text tower's
+/// [`crate::text_encoder::text_encoder_quant_group`]).
+pub const GROUP_SIZE_METADATA: &str = "quantization_group_size";
+
+/// The `__metadata__` the converter writes into a packed safetensors file.
+fn pack_metadata(bits: i32, group_size: i32) -> HashMap<String, String> {
+    HashMap::from([
+        (BITS_METADATA.to_owned(), bits.to_string()),
+        (GROUP_SIZE_METADATA.to_owned(), group_size.to_string()),
+    ])
+}
+
+/// Validate the packed layout of the safetensors file at `path` (header and `__metadata__` only)
+/// and return its tier, `None` when it stores no packed projection. Only tensors `in_scope` are
+/// considered; `is_target(name, shape, bits)` names a dense `.weight` the converter would have
+/// packed at `bits`.
+///
+/// A packed file must record [`BITS_METADATA`] and [`GROUP_SIZE_METADATA`]; the recorded group must
+/// be `group` (the one the loader unpacks at) and every `{p}.scales` / `{p}.weight` pair must pack
+/// at exactly the recorded bits under the recorded group
+/// (`bits = codes columns · 32 / (scales columns · group)`); and every target projection must be
+/// packed (no partially packed file). Every violation is a typed [`Error::Unsupported`].
+fn validate_packed_file(
+    path: &Path,
+    group: u64,
+    in_scope: impl Fn(&str) -> bool,
+    is_target: impl Fn(&str, &[usize], i32) -> bool,
+) -> Result<Option<Quant>> {
+    use mlx_gen::gen_core::weightsmeta;
+    let headers = weightsmeta::safetensors_path_tensor_headers(path)
         .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", path.display())))?;
+    let headers: Vec<_> = headers.iter().filter(|h| in_scope(&h.name)).collect();
     let shapes: HashMap<&str, &[usize]> = headers
         .iter()
         .map(|h| (h.name.as_str(), h.shape.as_slice()))
         .collect();
-    let mut tier = None;
-    for header in &headers {
-        let Some(base) = header.name.strip_suffix(".scales") else {
-            continue;
-        };
-        let fail = |detail: &str| {
-            Error::Unsupported(format!(
-                "iris: {} — packed projection `{base}` {detail}",
-                path.display()
+    let refuse = |detail: String| {
+        Error::Unsupported(format!(
+            "iris: {} — {detail}; re-run the converter (`crate::packed`)",
+            path.display()
+        ))
+    };
+    let packs: Vec<&str> = headers
+        .iter()
+        .filter_map(|h| h.name.strip_suffix(".scales"))
+        .collect();
+    if packs.is_empty() {
+        return Ok(None);
+    }
+    let metadata = weightsmeta::safetensors_file_metadata(path)
+        .map_err(|e| Error::Msg(format!("iris: reading {}: {e}", path.display())))?;
+    let recorded = |key: &str| -> Result<u64> {
+        let value = metadata.get(key).ok_or_else(|| {
+            refuse(format!(
+                "a packed artifact without `{key}` metadata (the tier cannot be read from shapes \
+                 alone)"
             ))
-        };
+        })?;
+        value
+            .parse::<u64>()
+            .map_err(|_| refuse(format!("`{key}` metadata `{value}` is not an integer")))
+    };
+    let (bits, recorded_group) = (recorded(BITS_METADATA)?, recorded(GROUP_SIZE_METADATA)?);
+    if recorded_group != group {
+        return Err(refuse(format!(
+            "packed at group size {recorded_group}, but this loader unpacks at group size {group}"
+        )));
+    }
+    let quant = quant_of(bits).ok_or_else(|| {
+        refuse(format!(
+            "packed at {bits} bits; the packed tiers are q8 and q4"
+        ))
+    })?;
+    for base in &packs {
+        let fail = |detail: &str| refuse(format!("packed projection `{base}` {detail}"));
         let codes = shapes
             .get(format!("{base}.weight").as_str())
             .ok_or_else(|| fail("has scales but no codes"))?;
-        let (&[out, code_cols], &[scale_rows, scale_cols]) = (*codes, header.shape.as_slice())
-        else {
+        let scales = shapes[format!("{base}.scales").as_str()];
+        let (&[out, code_cols], &[scale_rows, scale_cols]) = (*codes, scales) else {
             return Err(fail("is not a 2-D pack"));
         };
-        let group = QUANT_GROUP_SIZE as u64;
-        let width = (scale_cols as u64) * group;
+        let width = (scale_cols as u64) * recorded_group;
         let packed = (code_cols as u64) * 32;
         if out != scale_rows || width == 0 || !packed.is_multiple_of(width) {
             return Err(fail("is not an exact affine pack"));
         }
-        let quant = quant_of(packed / width).ok_or_else(|| fail("is not a 4- or 8-bit pack"))?;
-        match tier {
-            None => tier = Some(quant),
-            Some(seen) if seen == quant => {}
-            Some(_) => {
-                return Err(fail(
-                    "packs at a different width than an earlier projection",
-                ))
-            }
+        if packed / width != bits {
+            return Err(fail(&format!(
+                "packs at {} bits under the recorded group size {recorded_group}, not the \
+                 recorded {bits}",
+                packed / width
+            )));
         }
     }
-    Ok(tier)
+    for h in &headers {
+        let Some(base) = h.name.strip_suffix(".weight") else {
+            continue;
+        };
+        if shapes.contains_key(format!("{base}.scales").as_str()) {
+            continue;
+        }
+        if h.dtype == weightsmeta::Dtype::U32 || is_target(&h.name, &h.shape, bits as i32) {
+            return Err(refuse(format!(
+                "partially packed: the projection `{}` is stored dense",
+                h.name
+            )));
+        }
+    }
+    Ok(Some(quant))
 }
 
-/// The tier of the text-encoder snapshot at `dir`: its `text_config.quantization` bits (the
-/// pre-quantized layout `mlx_llm` loads as stored), `None` for a dense snapshot.
+/// The load-boundary twin of [`artifact_tier`] for projection `prefix` of a
+/// [`crate::nn::Loader`]'s map: `bits` is the width its stored pack decodes to at
+/// [`QUANT_GROUP_SIZE`] (`None` when it is stored dense).
+///
+/// A packed projection must agree with the map's recorded [`BITS_METADATA`] /
+/// [`GROUP_SIZE_METADATA`] (a map rebuilt without the file's metadata — the depth loader's split
+/// backbone — was validated by [`artifact_tier`] on the file it was read from). A dense projection
+/// the converter would have packed is refused when the map holds any packed projection: a
+/// partially packed backbone never loads. Both refusals are typed [`Error::Unsupported`].
+pub(crate) fn check_loaded_projection(
+    weights: &Weights,
+    prefix: &str,
+    bits: Option<i32>,
+) -> Result<()> {
+    let refuse = |detail: String| {
+        Error::Unsupported(format!(
+            "iris: the packed projection {prefix} {detail}; re-run the converter (`crate::packed`)"
+        ))
+    };
+    let Some(bits) = bits else {
+        let dense_target = weights.get(&format!("{prefix}.weight")).is_some_and(|w| {
+            w.ndim() == 2
+                && matches!(
+                    ProjectionLayout::of(
+                        *w.shape().last().unwrap_or(&0) as usize,
+                        Some(BackboneQuant { bits: 8 })
+                    ),
+                    ProjectionLayout::Quantized { .. }
+                )
+        });
+        if dense_target && weights.keys().any(|k| k.ends_with(".scales")) {
+            return Err(refuse(
+                "is stored dense in a packed backbone (partially packed)".into(),
+            ));
+        }
+        return Ok(());
+    };
+    match (
+        weights.metadata(BITS_METADATA),
+        weights.metadata(GROUP_SIZE_METADATA),
+    ) {
+        (None, None) => Ok(()),
+        (Some(recorded_bits), Some(group))
+            if recorded_bits == bits.to_string() && group == QUANT_GROUP_SIZE.to_string() =>
+        {
+            Ok(())
+        }
+        (recorded_bits, group) => Err(refuse(format!(
+            "decodes at {bits} bits under group size {QUANT_GROUP_SIZE}, but the artifact records \
+             {BITS_METADATA} {recorded_bits:?} / {GROUP_SIZE_METADATA} {group:?}"
+        ))),
+    }
+}
+
+/// The tier of the backbone weight file at `path`, from its tensor headers and `__metadata__`
+/// alone: `None` for a dense file, else the recorded tier, validated by `validate_packed_file`
+/// at [`QUANT_GROUP_SIZE`] with every projection [`ProjectionLayout::of`] quantizes as a target
+/// (the converter's rule). Fails closed (typed [`Error::Unsupported`]) on missing or disagreeing
+/// metadata, another group size, an inexact pack, or a partially packed file.
+pub fn artifact_tier(path: &Path) -> Result<Option<Quant>> {
+    validate_packed_file(
+        path,
+        QUANT_GROUP_SIZE as u64,
+        |_| true,
+        |_, shape, bits| {
+            shape.len() == 2
+                && matches!(
+                    ProjectionLayout::of(shape[1], Some(BackboneQuant { bits })),
+                    ProjectionLayout::Quantized { .. }
+                )
+        },
+    )
+}
+
+/// The tier of the text-encoder snapshot at `dir`: `None` for a dense snapshot, else its
+/// `text_config.quantization` bits (the pre-quantized layout `mlx_llm` loads as stored), validated
+/// against the tower: the block's group size must be
+/// [`crate::text_encoder::text_encoder_quant_group`], and every weight file must record the same
+/// bits and group in its `__metadata__` and pack every tower projection at them
+/// (`validate_packed_file`; the embedding and an untied head stay dense, as the converter keeps
+/// them). Every mismatch is a typed [`Error::Unsupported`].
 pub fn text_encoder_tier(dir: &Path) -> Result<Option<Quant>> {
     let cfg = mlx_llm::ModelConfig::from_dir(dir).map_err(|e| {
         Error::Msg(format!(
@@ -121,16 +270,57 @@ pub fn text_encoder_tier(dir: &Path) -> Result<Option<Quant>> {
             dir.display()
         ))
     })?;
-    match cfg.quantization {
-        None => Ok(None),
-        Some(spec) => quant_of(spec.bits as u64).map(Some).ok_or_else(|| {
-            Error::Unsupported(format!(
-                "iris: the text encoder at {} is packed at {} bits; the tiers are q8 and q4",
-                dir.display(),
-                spec.bits
-            ))
-        }),
+    let Some(spec) = cfg.quantization else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| {
+        Error::Unsupported(format!(
+            "iris: the text encoder at {} {detail}",
+            dir.display()
+        ))
+    };
+    let quant = quant_of(spec.bits as u64).ok_or_else(|| {
+        refuse(format!(
+            "is packed at {} bits; the tiers are q8 and q4",
+            spec.bits
+        ))
+    })?;
+    let group = crate::text_encoder::text_encoder_quant_group(&cfg);
+    if group != Some(spec.group_size) {
+        return Err(refuse(format!(
+            "records group size {} in config.json, but the tower's group size is {group:?}",
+            spec.group_size
+        )));
     }
+    let untied = !cfg.tie_word_embeddings;
+    let embedding = format!(
+        "{}embed_tokens.weight",
+        crate::text_encoder::LANGUAGE_TOWER_PREFIX
+    );
+    for file in crate::text_encoder::weight_shards(dir, untied)? {
+        let stored = validate_packed_file(
+            &file,
+            spec.group_size as u64,
+            |name| crate::text_encoder::is_text_tower_tensor(name, untied),
+            |name, shape, _| text_tower_packs(name, shape.len(), &embedding),
+        )?;
+        if stored != Some(quant) {
+            return Err(refuse(format!(
+                "records {quant:?} in config.json, but {} stores {stored:?}",
+                file.display()
+            )));
+        }
+    }
+    Ok(Some(quant))
+}
+
+/// Whether the converter packs the text-tower tensor `name` of rank `rank`: every 2-D language
+/// tower `.weight` but the token embedding.
+fn text_tower_packs(name: &str, rank: usize, embedding: &str) -> bool {
+    rank == 2
+        && name.ends_with(".weight")
+        && name != embedding
+        && name.starts_with(crate::text_encoder::LANGUAGE_TOWER_PREFIX)
 }
 
 /// Refuse a load whose requested tier is not the packed artifact's: a packed artifact loads only
@@ -200,10 +390,10 @@ fn pack_dense(weight: &Array, bits: i32) -> Result<(Array, Array, Array, Option<
     Ok((codes, scales, biases, (in_pad > 0).then_some(in_features)))
 }
 
-fn save(path: &Path, tensors: &HashMap<String, Array>) -> Result<()> {
+fn save(path: &Path, tensors: &HashMap<String, Array>, bits: i32, group_size: i32) -> Result<()> {
     let mut entries: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
     entries.sort_unstable_by_key(|(k, _)| *k);
-    Array::save_safetensors(entries, None::<&HashMap<String, String>>, path)?;
+    Array::save_safetensors(entries, Some(&pack_metadata(bits, group_size)), path)?;
     Ok(())
 }
 
@@ -275,6 +465,8 @@ pub fn prequantize_export(src: &Path, dst: &Path, bits: i32, prefix: &str) -> Re
     save(
         &dst.join(mlx_gen::gen_core::iris::BACKBONE_WEIGHTS_FILE),
         &out,
+        bits,
+        QUANT_GROUP_SIZE as i32,
     )?;
     drop(out);
     for sidecar in ["config.yaml", "empty_prompt.safetensors"] {
@@ -325,11 +517,7 @@ pub fn prequantize_text_encoder(src: &Path, dst: &Path, bits: i32) -> Result<()>
             let array = tensors.remove(&name).expect("listed");
             mlx_rs::transforms::eval_pending_loads([&array])?;
             let dense = array.as_dtype(Dtype::Bfloat16)?;
-            let packs = dense.ndim() == 2
-                && name.ends_with(".weight")
-                && name != embedding
-                && name.starts_with(crate::text_encoder::LANGUAGE_TOWER_PREFIX);
-            if packs {
+            if text_tower_packs(&name, dense.ndim(), &embedding) {
                 let base = name.strip_suffix(".weight").expect("checked");
                 let (codes, scales, biases) = mlx_llm::primitives::quant::quantize_on_stored_grid(
                     &dense,
@@ -348,7 +536,12 @@ pub fn prequantize_text_encoder(src: &Path, dst: &Path, bits: i32) -> Result<()>
         }
     }
     std::fs::create_dir_all(dst)?;
-    save(&dst.join("model.safetensors"), &out)?;
+    save(
+        &dst.join("model.safetensors"),
+        &out,
+        spec.bits,
+        spec.group_size,
+    )?;
     drop(out);
     let mut config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(src.join("config.json"))

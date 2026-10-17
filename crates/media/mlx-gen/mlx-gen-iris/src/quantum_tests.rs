@@ -339,38 +339,45 @@ fn checkpoint_rows(w: &Weights, key: &str) -> u64 {
 }
 
 fn scratch_geometry_body() {
-    use crate::dit::{DUAL_BLOCK, LAYER_BLOCK, REFINER_BLOCK, SINGLE_BLOCK};
+    use crate::dit::{TextBlockGeometry, TrunkGeometry};
     let (dit, config) = tiny_backbone();
     let m = &config.model;
     let w = Weights::from_file(backbone_dir().join("model.safetensors")).unwrap();
     let unbounded = AttentionPlan::UNBOUNDED;
-    let tokens = |hp: i32, wp: i32| (hp * wp + m.text_len as i32) as u64;
-    let kv = (m.hidden_size / m.num_heads * m.num_kv_heads.unwrap()) as u64;
+    let unfused = crate::retention::unfused();
+    let kv_heads = m.num_kv_heads.unwrap() as u64;
     for i in 0..dit.trunk_depth() {
-        let (mlp, counts) = if i < m.dual_depth {
-            ("mlp_x", &DUAL_BLOCK)
-        } else {
-            ("mlp", &SINGLE_BLOCK)
-        };
+        let dual = i < m.dual_depth;
+        let mlp = if dual { "mlp_x" } else { "mlp" };
         // The price is the block's counts over the CHECKPOINT's widths and the request geometry.
-        let expected = IrisDiT::block_bytes(
-            counts,
-            4,
-            2,
-            tokens(4, 6),
-            m.hidden_size as u64,
-            kv,
-            checkpoint_rows(&w, &format!("blocks.{i}.{mlp}.w1.weight")),
-            m.num_heads as u64,
-            tokens(4, 6),
-            false,
-        );
+        let g = TrunkGeometry {
+            compute_bytes: 4,
+            batch: 2,
+            img_tokens: 24,
+            txt_tokens: m.text_len as u64,
+            dim: m.hidden_size as u64,
+            heads: m.num_heads as u64,
+            kv_heads,
+            ff: checkpoint_rows(&w, &format!("blocks.{i}.{mlp}.w1.weight")),
+            query_rows: 24 + m.text_len as u64,
+            eval_per_chunk: false,
+            split_qkv: kv_heads != m.num_heads as u64,
+            text: true,
+            down_pad: 0,
+            // f32 compute: the first block's compute-width image stream is f32 as well.
+            img_stream_bytes: 4,
+        };
+        let expected = if dual {
+            IrisDiT::dual_block_bytes(&g, unfused)
+        } else {
+            IrisDiT::single_block_bytes(&g, unfused)
+        };
         assert_eq!(
             dit.trunk_block_scratch(i, 2, 24, m.text_len as i32, unbounded),
             expected,
             "trunk block {i}"
         );
-        // More tokens, more scratch; a chunked plan prices its query rows, not the whole score.
+        // More tokens, more scratch.
         assert!(
             dit.trunk_block_scratch(i, 2, 64, m.text_len as i32, unbounded)
                 > dit.trunk_block_scratch(i, 2, 24, m.text_len as i32, unbounded)
@@ -384,35 +391,43 @@ fn scratch_geometry_body() {
     }
     let layers = config.text_encoder.hidden_layers.len() as u64;
     for i in 0..2 {
-        let expected = IrisDiT::block_bytes(
-            &LAYER_BLOCK,
-            4,
-            2 * m.text_len as u64,
-            layers,
-            m.text_dim as u64,
-            m.text_dim as u64,
-            checkpoint_rows(&w, &format!("y_embedder.layer_blocks.{i}.mlp.0.weight")),
-            m.text_lap_num_heads as u64,
-            layers,
-            false,
+        let expected = IrisDiT::text_block_bytes(
+            TextBlockGeometry {
+                compute_bytes: 4,
+                batch: 2 * m.text_len as u64,
+                tokens: layers,
+                dim: m.text_dim as u64,
+                heads: m.text_lap_num_heads as u64,
+                ff: checkpoint_rows(&w, &format!("y_embedder.layer_blocks.{i}.mlp.0.weight")),
+                query_rows: layers,
+                eval_per_chunk: false,
+                refiner: false,
+                down_pad: 0,
+                stream_bytes: 4,
+            },
+            unfused,
         );
         assert_eq!(
             dit.text_layer_block_scratch(i, 2 * m.text_len as i32, layers as i32, unbounded),
             expected
         );
         let t = m.text_len as u64;
-        let expected = IrisDiT::block_bytes(
-            &REFINER_BLOCK,
-            4,
-            2,
-            t,
-            m.hidden_size as u64,
-            m.hidden_size as u64,
-            checkpoint_rows(&w, &format!("y_embedder.refiner.blocks.{i}.mlp.w1.weight")),
-            m.num_heads as u64,
-            t,
-            true,
-        ) + 2 * t * t * 4;
+        let expected = IrisDiT::text_block_bytes(
+            TextBlockGeometry {
+                compute_bytes: 4,
+                batch: 2,
+                tokens: t,
+                dim: m.hidden_size as u64,
+                heads: m.num_heads as u64,
+                ff: checkpoint_rows(&w, &format!("y_embedder.refiner.blocks.{i}.mlp.w1.weight")),
+                query_rows: t,
+                eval_per_chunk: false,
+                refiner: true,
+                down_pad: 0,
+                stream_bytes: 4,
+            },
+            unfused,
+        );
         assert_eq!(
             dit.text_refiner_block_scratch(i, 2, m.text_len as i32, unbounded),
             expected

@@ -68,9 +68,11 @@ impl LayerGeometry {
         })
     }
 
-    /// The layer's counted geometry. The attention is `mlx_rs::fast::scaled_dot_product_attention`
-    /// with the additive causal/padding mask at `head_dim` 128, which the fused Metal kernel serves:
-    /// scores are [`mlx_gen::ios_quantum::Scores::Fused`]. The width is f32: the f32 RoPE tables
+    /// The layer's counted geometry. The attention is one unchunked
+    /// `mlx_rs::fast::scaled_dot_product_attention` with the additive causal/padding mask over the
+    /// GQA-repeated k/v; its score treatment on `backend` is [`crate::transformer::sdpa_scores`] of
+    /// the loaded head dim (128 in Qwen3-0.6B, which the fused Metal kernel serves), the width and
+    /// the token count. The width is f32: the f32 RoPE tables
     /// promote the rotated q/k and everything after them, so every layer after the first runs f32
     /// (see [`layer_element_bytes`]).
     ///
@@ -99,7 +101,9 @@ impl LayerGeometry {
         batch: i32,
         tokens: i32,
         element_bytes: u64,
+        backend: crate::transformer::Backend,
     ) -> mlx_gen::ios_quantum::AttentionBlockGeometry {
+        let n = tokens.max(0) as u64;
         let units = |width: u64| width.div_ceil(self.hidden.max(1));
         let (q, kv, inter) = (
             units(self.q_width),
@@ -122,14 +126,30 @@ impl LayerGeometry {
             },
             attn_hidden_live: 10 + 8 * q + 5 * kv + 3 * inter,
             context_live: 0,
-            scores: mlx_gen::ios_quantum::Scores::Fused,
+            scores: crate::transformer::sdpa_scores(
+                backend,
+                self.head_dim,
+                element_bytes,
+                &[(n, n, n)],
+            ),
             mlp_hidden_live: 0,
             ff_live: 0,
         }
     }
 
-    fn scratch(self, batch: i32, tokens: i32, element_bytes: u64) -> u64 {
-        mlx_gen::ios_quantum::attention_block_bytes(self.geometry(batch, tokens, element_bytes))
+    fn scratch(
+        self,
+        batch: i32,
+        tokens: i32,
+        element_bytes: u64,
+        backend: crate::transformer::Backend,
+    ) -> u64 {
+        mlx_gen::ios_quantum::attention_block_bytes(self.geometry(
+            batch,
+            tokens,
+            element_bytes,
+            backend,
+        ))
     }
 }
 
@@ -212,10 +232,11 @@ impl AnimaQwen3 {
         batch: i32,
         tokens: i32,
         element_bytes: u64,
+        backend: crate::transformer::Backend,
     ) -> (&EncoderLayer, u64) {
         (
             &self.layers[i],
-            self.layer_geometry[i].scratch(batch, tokens, element_bytes),
+            self.layer_geometry[i].scratch(batch, tokens, element_bytes, backend),
         )
     }
 
@@ -302,9 +323,11 @@ impl AnimaQwen3 {
         mlx_gen::ios_quantum::finish(TE_EMBED_QUANTUM, &[&h, &cos, &sin, &mask])?;
         for (layer, geometry) in self.layers.iter().zip(&self.layer_geometry) {
             let eb = layer_element_bytes(&h, &cos);
-            h = mlx_gen::ios_quantum::run(TE_LAYER_QUANTUM, geometry.scratch(b, s, eb), || {
-                layer.forward(&h, &cos, &sin, &mask)
-            })?;
+            h = mlx_gen::ios_quantum::run(
+                TE_LAYER_QUANTUM,
+                geometry.scratch(b, s, eb, crate::transformer::Backend::current()),
+                || layer.forward(&h, &cos, &sin, &mask),
+            )?;
         }
         // last_hidden_state = final RMSNorm applied to the last layer (unlike z-image's [-2] un-normed).
         let eb = h.item_size() as u64;

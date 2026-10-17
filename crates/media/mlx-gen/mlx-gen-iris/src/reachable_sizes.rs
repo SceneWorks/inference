@@ -19,9 +19,7 @@ use mlx_gen::gen_core::iris::{IrisConfig, PROMPT_PREFIX, PROMPT_SUFFIX};
 use mlx_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::{Precision, Quant};
 
-use crate::dit::{
-    IrisDiT, PixelBlockGeometry, DUAL_BLOCK, LAYER_BLOCK, REFINER_BLOCK, SINGLE_BLOCK,
-};
+use crate::dit::{EmbedGeometry, IrisDiT, PixelBlockGeometry, TextBlockGeometry, TrunkGeometry};
 
 /// The entitled launch headroom of the target phone (MiB).
 const ENTITLED_MIB: u64 = 6142;
@@ -54,8 +52,21 @@ impl Backbone {
         header(&self.file, &format!("{}{name}", self.prefix))[0] as u64
     }
 
-    /// The largest denoise-phase quantum of one forward over an `h × w` batch of `b`.
-    fn forward_peak(&self, b: u64, h: u64, w: u64) -> (u64, &'static str) {
+    /// Zero columns a `tier` load pads the `[out, in]` projection `name`'s input by.
+    fn pad(&self, name: &str, tier: Option<Quant>) -> u64 {
+        let input = header(&self.file, &format!("{}{name}", self.prefix))[1];
+        match crate::nn::ProjectionLayout::of(
+            input,
+            crate::nn::BackboneQuant::for_load(tier).unwrap(),
+        ) {
+            crate::nn::ProjectionLayout::Quantized { padded_in, .. } => (padded_in - input) as u64,
+            crate::nn::ProjectionLayout::Dense => 0,
+        }
+    }
+
+    /// The largest denoise-phase quantum of one forward over an `h × w` batch of `b` at `tier`,
+    /// priced for the device (fused norm and attention kernels).
+    fn forward_peak(&self, b: u64, h: u64, w: u64, tier: Option<Quant>) -> (u64, &'static str) {
         let m = &self.cfg.model;
         let p = m.patch_size as u64;
         let n = (h / p) * (w / p);
@@ -63,111 +74,136 @@ impl Backbone {
         let tokens = n + t;
         let hidden = m.hidden_size as u64;
         let heads = m.num_heads as u64;
-        let kv = hidden / heads * m.num_kv_heads.unwrap_or(m.num_heads) as u64;
-        let ff = self.rows("blocks.0.mlp_x.w1.weight");
-        let single_ff = self.rows(&format!("blocks.{}.mlp.w1.weight", m.depth - 1));
+        let kv_heads = m.num_kv_heads.unwrap_or(m.num_heads) as u64;
         let layers = self.cfg.text_encoder.hidden_layers.len() as u64;
         let text_dim = m.text_dim as u64;
+        let last = m.depth - 1;
+        let trunk = |ff: u64, text: bool, down_pad: u64| TrunkGeometry {
+            compute_bytes: CW,
+            batch: b,
+            img_tokens: n,
+            txt_tokens: t,
+            dim: hidden,
+            heads,
+            kv_heads,
+            ff,
+            query_rows: tokens,
+            eval_per_chunk: false,
+            split_qkv: kv_heads != heads,
+            text,
+            down_pad,
+            img_stream_bytes: 4,
+        };
+        let dual = TrunkGeometry {
+            img_stream_bytes: CW,
+            ..trunk(
+                self.rows("blocks.0.mlp_x.w1.weight"),
+                true,
+                self.pad("blocks.0.mlp_x.w2.weight", tier),
+            )
+        };
+        let single = trunk(
+            self.rows(&format!("blocks.{last}.mlp.w1.weight")),
+            true,
+            self.pad(&format!("blocks.{last}.mlp.w2.weight"), tier),
+        );
+        let text_block = |refiner: bool| {
+            let (batch, tokens, dim, heads, ff, pad) = if refiner {
+                (
+                    b,
+                    t,
+                    hidden,
+                    heads,
+                    self.rows("y_embedder.refiner.blocks.0.mlp.w1.weight"),
+                    self.pad("y_embedder.refiner.blocks.0.mlp.w2.weight", tier),
+                )
+            } else {
+                (
+                    b * t,
+                    layers,
+                    text_dim,
+                    m.text_lap_num_heads as u64,
+                    self.rows("y_embedder.layer_blocks.0.mlp.0.weight"),
+                    self.pad("y_embedder.layer_blocks.0.mlp.2.weight", tier),
+                )
+            };
+            IrisDiT::text_block_bytes(
+                TextBlockGeometry {
+                    compute_bytes: CW,
+                    batch,
+                    tokens,
+                    dim,
+                    heads,
+                    ff,
+                    query_rows: tokens,
+                    eval_per_chunk: false,
+                    refiner,
+                    down_pad: pad,
+                    stream_bytes: if refiner { CW } else { 4 },
+                },
+                false,
+            )
+        };
         let mut quanta: Vec<(u64, &'static str)> = vec![
             (
-                IrisDiT::block_bytes(
-                    &DUAL_BLOCK,
-                    CW,
-                    b,
-                    tokens,
-                    hidden,
-                    kv,
-                    ff,
-                    heads,
-                    tokens,
-                    false,
-                ) + IrisDiT::trunk_entry_bytes(b, n, t, hidden / heads, hidden),
+                IrisDiT::dual_block_bytes(&dual, false)
+                    + IrisDiT::trunk_entry_bytes(b, n, t, hidden / heads, hidden),
                 "first (dual) trunk block + RoPE/positional entry",
             ),
             (
-                IrisDiT::block_bytes(
-                    &SINGLE_BLOCK,
-                    CW,
-                    b,
-                    tokens,
-                    hidden,
-                    kv,
-                    single_ff,
-                    heads,
-                    tokens,
-                    false,
-                ),
+                IrisDiT::single_block_bytes(&single, false),
                 "single trunk block",
             ),
             (
-                IrisDiT::pixel_block_bytes(PixelBlockGeometry {
-                    compute_bytes: CW,
-                    batch: b,
-                    patches: n,
-                    patch_pixels: p * p,
-                    pixel_width: m.pixel.hidden_size as u64,
-                    compact_width: m.pixel.attn_hidden_size as u64,
-                    modulation_width: self.rows("pixel_blocks.0.adaln.weight"),
-                    condition_width: hidden,
-                    fc1_width: self.rows("pixel_blocks.0.mlp.fc1.weight"),
-                    heads: m.pixel.num_heads as u64,
-                    query_rows: n,
-                }),
+                IrisDiT::pixel_block_bytes(
+                    PixelBlockGeometry {
+                        compute_bytes: CW,
+                        batch: b,
+                        patches: n,
+                        patch_pixels: p * p,
+                        pixel_width: m.pixel.hidden_size as u64,
+                        compact_width: m.pixel.attn_hidden_size as u64,
+                        modulation_width: self.rows("pixel_blocks.0.adaln.weight"),
+                        condition_width: hidden,
+                        fc1_width: self.rows("pixel_blocks.0.mlp.fc1.weight"),
+                        heads: m.pixel.num_heads as u64,
+                        query_rows: n,
+                        eval_per_chunk: false,
+                    },
+                    false,
+                ),
                 "pixel block",
             ),
             (
-                IrisDiT::embed_bytes(
-                    CW,
-                    b,
-                    n,
-                    header(
+                IrisDiT::embed_bytes(EmbedGeometry {
+                    compute_bytes: CW,
+                    batch: b,
+                    patches: n,
+                    patch_in: header(
                         &self.file,
                         &format!("{}s_embedder.proj.weight", self.prefix),
                     )[1] as u64,
                     hidden,
-                    header(
+                    sinusoid: header(
                         &self.file,
                         &format!("{}t_embedder.mlp.0.weight", self.prefix),
                     )[1] as u64,
-                    2 * hidden + 2 * self.rows("modulation_cores.adaln_img.weight"),
-                ) + mlx_gen::ios_quantum::sampler_step_bytes(b * m.in_channels as u64 * h * w),
+                    t_hidden: self.rows("t_embedder.mlp.0.weight"),
+                    t_out: self.rows("t_embedder.mlp.2.weight"),
+                    cores: 2 * self.rows("modulation_cores.adaln_img.weight"),
+                }) + mlx_gen::ios_quantum::sampler_step_bytes(b * m.in_channels as u64 * h * w),
                 "embed + sampler allowance",
             ),
-            (
-                IrisDiT::block_bytes(
-                    &LAYER_BLOCK,
-                    CW,
-                    b * t,
-                    layers,
-                    text_dim,
-                    text_dim,
-                    self.rows("y_embedder.layer_blocks.0.mlp.0.weight"),
-                    m.text_lap_num_heads as u64,
-                    layers,
-                    false,
-                ),
-                "text adapter layer block",
-            ),
-            (
-                IrisDiT::block_bytes(
-                    &REFINER_BLOCK,
-                    CW,
-                    b,
-                    t,
-                    hidden,
-                    hidden,
-                    self.rows("y_embedder.refiner.blocks.0.mlp.w1.weight"),
-                    heads,
-                    t,
-                    true,
-                ) + mlx_gen::ios_quantum::tensor_bytes(CW, &[b, t, t]),
-                "text refiner block",
-            ),
+            (text_block(false), "text adapter layer block"),
+            (text_block(true), "text refiner block"),
             (
                 IrisDiT::text_pool_bytes(CW, b, t, layers, text_dim, hidden),
                 "text pool",
             ),
-            (IrisDiT::text_output_bytes(CW, b, t, hidden), "text output"),
+            (
+                IrisDiT::text_output_bytes(CW, b, t, hidden, false),
+                "text output",
+            ),
             (
                 IrisDiT::pixel_embed_bytes(
                     CW,
@@ -192,6 +228,7 @@ impl Backbone {
                     p * p,
                     m.pixel.hidden_size as u64,
                     m.in_channels as u64,
+                    false,
                 ),
                 "output",
             ),
@@ -307,7 +344,7 @@ fn print_the_reachable_sizes_prediction() {
                 );
                 // Denoise: the backbone, every conditioning and their CFG batch.
                 let resident = bb + (prompts + 1) * conditioning + b * conditioning;
-                let (scratch, what) = generation.forward_peak(b, edge, edge);
+                let (scratch, what) = generation.forward_peak(b, edge, edge, tier);
                 row(&route, label, edge, "denoise", resident, scratch, what);
                 let image = crate::model::image_scratch(prompts * 3 * edge * edge);
                 row(&route, label, edge, "decode", bb, image, "RGB8 conversion");
@@ -332,7 +369,7 @@ fn print_the_reachable_sizes_prediction() {
             } else {
                 (p.tile as u64, p.tile as u64)
             };
-            let (forward, what) = restore.forward_peak(1, th, tw);
+            let (forward, what) = restore.forward_peak(1, th, tw, tier);
             let host = crate::restoration::host_plane_bytes(&p);
             row(
                 "iris_3b_restore",
@@ -356,7 +393,7 @@ fn print_the_reachable_sizes_prediction() {
         // Depth: the depth export at the request's model resolution.
         let db = depth.resident(tier) + conditioning;
         for edge in [512u64, 768, 1024] {
-            let (forward, what) = depth.forward_peak(1, edge, edge);
+            let (forward, what) = depth.forward_peak(1, edge, edge, tier);
             let input = crate::depth::depth_input_scratch(1, edge as i32, edge as i32);
             let reducer = crate::depth::depth_reducer_bytes(3 * edge * edge, 3, CW);
             row(

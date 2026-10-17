@@ -46,12 +46,6 @@ pub(crate) mod quanta {
 
 /// Activation width of the shared decoder (`mlx_llm` computes in bf16 whatever the file stores).
 const DECODER_COMPUTE_BYTES: u64 = 2;
-// Counted live buffers of one decoder layer (see [`IrisTextEncoder::layer_scratch`]).
-const DECODER_ATTN_HIDDEN: u64 = 2;
-const DECODER_ATTN_Q: u64 = 5;
-const DECODER_ATTN_KV: u64 = 2;
-const DECODER_MLP_HIDDEN: u64 = 2;
-const DECODER_MLP_FF: u64 = 4;
 
 /// One prompt's conditioning, as `TextEncoding` upstream.
 pub struct TextConditioning {
@@ -190,49 +184,130 @@ pub fn text_encoder_quant_spec(
 
 /// [`IrisTextEncoder::conditioning_scratch`] from the conditioning contract alone.
 pub(crate) fn conditioning_bytes(layers: u64, max_length: u64, dim: u64, real: i32) -> u64 {
-    use mlx_gen::ios_quantum::tensor_bytes;
+    use crate::retention::{Kind, Retention};
     let real = real.max(0) as u64;
     let pad = max_length.saturating_sub(real);
-    let picked = tensor_bytes(4, &[layers, real, dim]);
-    let stacked = tensor_bytes(4, &[real, layers, dim]);
-    let padded = if pad > 0 {
-        tensor_bytes(4, &[pad, layers, dim])
-            .saturating_add(tensor_bytes(4, &[max_length, layers, dim]))
-    } else {
-        0
-    };
-    picked.saturating_add(stacked).saturating_add(padded)
+    let mut r = Retention::on(4, false);
+    r.alloc(Kind::Temp, layers, 4, real * dim)
+        .temp(4, real * layers * dim);
+    if pad > 0 {
+        r.temp(4, pad * layers * dim)
+            .temp(4, max_length * layers * dim);
+    }
+    r.price()
 }
 
-/// [`IrisTextEncoder::layer_scratch_parts`] from the tower's config alone.
+/// [`IrisTextEncoder::layer_scratch_parts`] from the tower's config alone, on the current device.
 pub(crate) fn decoder_layer_parts(cfg: &ModelConfig, n: i32, k: usize) -> (u64, u64) {
-    use mlx_gen::ios_quantum::{scores_bytes, tensor_bytes};
-    let width = DECODER_COMPUTE_BYTES;
+    decoder_layer_parts_on(cfg, n, k, crate::retention::unfused())
+}
+
+/// [`decoder_layer_parts`] pricing the unfused fallbacks when `unfused`.
+///
+/// One `mlx_llm` decoder layer is one graph (no barrier inside), so every buffer it allocates is
+/// counted under MLX's retention ([`crate::retention`]), at the decoder's bf16 compute width over
+/// `n` tokens:
+/// * each RMSNorm (input, post-attention, QK): fused, its result (a QK-norm's operand is a
+///   single-consumer projection, which it reuses); unfused, the f32 cast, `square`, the f32
+///   product (its operand is still read by the `square` in flight), the per-row mean and the bf16
+///   result;
+/// * the q / k / v projections, and per RoPE (q and k, NeoX halves) the negated half, the rotated
+///   concatenation and `x·cos` (the sine product and the sum donate);
+/// * the layer's K/V cache block — `mlx_llm`'s contiguous cache allocates
+///   [`mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS`]-position zero blocks the slice-update
+///   writes into;
+/// * the attention: fused, its `[B, N, H, D]` output (the merge is a view); unfused, the scaled
+///   query, its head-split copy (it keeps the roped query's transposed layout), the key and value
+///   copies (broadcast over the query groups), the scores (the causal `where` and the softmax
+///   donate) with the causal mask's comparison and its two position ranges, the output and its
+///   merged copy;
+/// * the o-projection (both residual sums reuse their operand: the layer's bindings are gone when
+///   its graph runs), the gate and up projections (SiLU and their product donate) and the down
+///   projection.
+///
+/// Held: the `k + 1` hidden states already returned (`[n, hidden]` each) and `k` layers' K/V cache
+/// blocks.
+pub(crate) fn decoder_layer_parts_on(
+    cfg: &ModelConfig,
+    n: i32,
+    k: usize,
+    unfused: bool,
+) -> (u64, u64) {
+    use crate::retention::{allocated, Kind, Retention};
+    use mlx_gen::ios_quantum::tensor_bytes;
+    let cw = DECODER_COMPUTE_BYTES;
     let n = n.max(0) as u64;
-    let hidden = cfg.hidden_size.max(0) as u64;
+    let hidden = n * cfg.hidden_size.max(0) as u64;
     let heads = cfg.num_heads.max(0) as u64;
+    let kv_heads = cfg.num_kv_heads.max(0) as u64;
     let head_dim = cfg.head_dim.max(0) as u64;
-    let kv = cfg.num_kv_heads.max(0) as u64 * head_dim;
-    let ff = cfg.intermediate_size.max(0) as u64;
+    let q = n * heads * head_dim;
+    let kv = n * kv_heads * head_dim;
+    let ff = n * cfg.intermediate_size.max(0) as u64;
     let block = mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS as u64;
-    let cache_block = 2 * tensor_bytes(width, &[n.div_ceil(block) * block, kv]);
-    let attention = (DECODER_ATTN_HIDDEN * tensor_bytes(width, &[n, hidden]))
-        .saturating_add(DECODER_ATTN_Q * tensor_bytes(width, &[n, heads * head_dim]))
-        .saturating_add(DECODER_ATTN_KV * tensor_bytes(width, &[n, kv]))
-        .saturating_add(cache_block)
-        .saturating_add(scores_bytes(
-            crate::nn::sdpa_scores(head_dim, n, width, false),
-            1,
-            heads,
-            n,
-            n,
-        ));
-    let mlp = (DECODER_MLP_HIDDEN * tensor_bytes(width, &[n, hidden]))
-        .saturating_add(DECODER_MLP_FF * tensor_bytes(width, &[n, ff]));
+    let cache_block = 2 * allocated(cw * n.div_ceil(block) * block * kv_heads * head_dim);
+    let mut r = Retention::on(cw, unfused);
+    decoder_norm(&mut r, hidden, n, false);
+    r.temp(cw, q).temp(cw, kv).temp(cw, kv);
+    decoder_norm(&mut r, q, n * heads, true);
+    decoder_norm(&mut r, kv, n * kv_heads, true);
+    decoder_rope(&mut r, q);
+    decoder_rope(&mut r, kv);
+    r.temp_bytes(cache_block);
+    decoder_attention(&mut r, n, heads, head_dim);
+    r.temp(cw, hidden);
+    decoder_norm(&mut r, hidden, n, false);
+    r.alloc(Kind::Temp, 2, cw, ff).temp(cw, hidden);
     let held = (k as u64 + 1)
-        .saturating_mul(tensor_bytes(width, &[n, hidden]))
+        .saturating_mul(tensor_bytes(cw, &[hidden]))
         .saturating_add((k as u64).saturating_mul(cache_block));
-    (attention.max(mlp), held)
+    (r.price(), held)
+}
+
+/// One `mlx_llm` RMSNorm over a bf16 `elements` in `rows` rows (see [`decoder_layer_parts_on`]);
+/// `donor`: its operand is a single-consumer temporary (the fused kernel reuses it).
+pub(crate) fn decoder_norm(
+    r: &mut crate::retention::Retention,
+    elements: u64,
+    rows: u64,
+    donor: bool,
+) {
+    use crate::retention::Kind;
+    let cw = r.cw;
+    if r.unfused {
+        r.alloc(Kind::Temp, 3, 4, elements)
+            .temp(4, rows)
+            .temp(cw, elements);
+    } else if !donor {
+        r.temp(cw, elements);
+    }
+}
+
+/// One `mlx_llm` NeoX RoPE over a bf16 `elements` (see [`decoder_layer_parts_on`]).
+pub(crate) fn decoder_rope(r: &mut crate::retention::Retention, elements: u64) {
+    let cw = r.cw;
+    r.temp(cw, elements / 2)
+        .alloc(crate::retention::Kind::Temp, 2, cw, elements);
+}
+
+/// One `mlx_llm` causal GQA attention over `n` tokens and its merged output (see
+/// [`decoder_layer_parts_on`]).
+pub(crate) fn decoder_attention(
+    r: &mut crate::retention::Retention,
+    n: u64,
+    heads: u64,
+    head_dim: u64,
+) {
+    use crate::retention::Kind;
+    let cw = r.cw;
+    let q = n * heads * head_dim;
+    if r.unfused {
+        r.alloc(Kind::Temp, 5, cw, q)
+            .temp(cw, heads * n * n)
+            .temp(1, n * n)
+            .alloc(Kind::Temp, 2, 4, n);
+    }
+    r.temp(cw, q);
 }
 
 impl IrisTextEncoder {
@@ -309,10 +384,11 @@ impl IrisTextEncoder {
         // the decoder builds it like any dense one; a dense tower is packed at load when a tier is
         // asked for.
         let quant = match model_cfg.quantization {
-            Some(stored) => {
+            // `text_encoder_tier` validates the stored pack: the recorded bits and group of the
+            // config and every weight file agree, the group is the tower's, every projection packed.
+            Some(_) => {
                 let tier = crate::packed::text_encoder_tier(dir)?;
                 crate::packed::check_requested("the text encoder", tier, quant)?;
-                let _ = stored;
                 None
             }
             None => text_encoder_quant_spec(&model_cfg, quant)?,
@@ -459,17 +535,8 @@ impl IrisTextEncoder {
         layer.saturating_add(held)
     }
 
-    /// [`Self::layer_scratch`] as `(one decoder layer, what the walk holds)`.
-    ///
-    /// Counted from `mlx_llm`'s decoder layer at its compute width (bf16): the attention phase holds
-    /// the normed input and the o-projection output (`[n, hidden]`); q, its QK-norm and RoPE output,
-    /// the attention output and its merged re-layout (`[n, heads·head_dim]`); the rotated k and v (`[n, kv_heads·head_dim]`)
-    /// — and the layer's K/V cache block, which `mlx_llm`'s contiguous cache allocates in
-    /// [`mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS`]-position steps — plus the scores
-    /// ([`crate::nn::sdpa_scores`]: fused on the iOS GPU at head width 128). The MLP phase holds the
-    /// residual sum and its norm (`[n, hidden]`) and gate / SiLU / up / their product
-    /// (`[n, intermediate]`). Held: the `k + 1` hidden states already returned (`[n, hidden]` each)
-    /// and `k` layers' K/V cache blocks.
+    /// [`Self::layer_scratch`] as `(one decoder layer, what the walk holds)` — counted from
+    /// `mlx_llm`'s decoder layer over the LOADED tower's geometry ([`decoder_layer_parts_on`]).
     pub(crate) fn layer_scratch_parts(&self, n: i32, k: usize) -> (u64, u64) {
         decoder_layer_parts(self.lm.config(), n, k)
     }

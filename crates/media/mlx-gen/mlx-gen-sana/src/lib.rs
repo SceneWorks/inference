@@ -42,6 +42,17 @@
 
 pub(crate) mod block_stream;
 pub mod config;
+/// The tiny CPU fixture the base-rev (`91ffb4a81`) goldens were generated from, shared verbatim
+/// with the generator (see `golden_fixture_items.rs`).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod golden_fixture {
+    use crate::config::{BlockType, DcAeConfig, SanaTransformerConfig};
+    use crate::pipeline::SanaConditioning;
+    use mlx_gen::Image;
+    use mlx_rs::Array;
+    use std::collections::HashMap;
+    include!("golden_fixture_items.rs");
+}
 pub mod convert;
 pub mod dc_ae;
 pub mod memory_strategy;

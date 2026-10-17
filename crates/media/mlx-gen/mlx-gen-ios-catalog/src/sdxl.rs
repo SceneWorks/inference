@@ -187,6 +187,8 @@ pub(crate) mod tests {
         EvidenceRow {
             key: evidence_key(registry, candidate, DEVICE).unwrap(),
             footprint_bytes: bytes,
+            // Synthetic rows: a zero capture baseline makes the demand the whole figure.
+            baseline_footprint_bytes: 0,
             mlx_peak_bytes: bytes,
             min_headroom_mib: 1.0,
             elapsed_seconds: 1.0,

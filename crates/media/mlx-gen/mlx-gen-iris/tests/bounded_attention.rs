@@ -380,3 +380,175 @@ fn default_request() {
     }
     diagnostics::reset();
 }
+
+/// E2 against the BASE rev, not just new-vs-new: the default (no memory block) generation path —
+/// CFG off and on — and the depth and restoration task defaults, on the miniature fixtures, match
+/// `iris_default_base_91ffb4a81.safetensors`, produced by this same [`default_path_cases`] run on
+/// `mlx-gen-iris` at inference `91ffb4a81` (before bounded attention, its plans and the packed
+/// tiers existed) in a CPU child, FP32.
+///
+/// Tolerance: the runs are MLX CPU-stream FP32, whose GEMMs go through the host BLAS — the same
+/// binary on another Apple CPU generation may pick a different kernel and so a different summation
+/// order (~1e-5 relative, the `dit_parity` FP32 distance). That moves an RGB8 output by at most one
+/// level where a value sits on a rounding boundary (the restoration parity rule), so images allow
+/// `max |Δ| <= 1` level on at most 1% of their bytes, and the f32 depth map 1e-4 of peak. Exact
+/// equality would be a property of one machine, not of the code. A changed default path (seed,
+/// guidance, steps, schedule, a dropped or extra op) moves many bytes by many levels.
+///
+/// *Mutations that red this:* any change to what the default request computes — measured: the
+/// generation noise seed offset by one (255 levels), the depth output scaled by 1.001 (9e-4 of
+/// peak), the restoration velocity scaled by 1.01 (one level on 20% of the bytes). A default that
+/// merely chunks attention stays numerically the unbounded image and is not this test's to catch:
+/// `the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path` asserts the plan.
+#[test]
+fn the_default_paths_match_the_base_rev_golden() {
+    crate::common::cpu_process(
+        "bounded_attention::the_default_paths_match_the_base_rev_golden",
+        default_paths_golden,
+    );
+}
+
+fn default_paths_golden() {
+    let golden = crate::common::fixture("iris_default_base_91ffb4a81.safetensors");
+    let cases = default_path_cases();
+    let names: Vec<_> = cases.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "default_g1",
+            "default_g3",
+            "depth_default",
+            "restore_default"
+        ]
+    );
+    for (name, shape, got) in cases {
+        let want = golden.require(&name).unwrap();
+        assert_eq!(want.shape(), shape.as_slice(), "{name}: shape");
+        if name == "depth_default" {
+            let got = Array::from_slice(&got, &shape);
+            crate::common::assert_close(&name, &got, want, 1e-4);
+            continue;
+        }
+        let want = crate::common::host_f32(want);
+        assert!(want.iter().any(|v| *v != want[0]), "{name}: flat golden");
+        let levels: Vec<f32> = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).collect();
+        let max = levels.iter().fold(0f32, |m, d| m.max(*d));
+        let off = levels.iter().filter(|d| **d > 0.0).count();
+        eprintln!("{name}: RGB8 max|Δ|={max} differing={off}/{}", want.len());
+        assert!(
+            max <= 1.0,
+            "{name}: RGB8 differs from the base rev by {max} levels"
+        );
+        assert!(
+            off * 100 <= want.len(),
+            "{name}: {off}/{} bytes differ from the base rev",
+            want.len()
+        );
+    }
+}
+
+/// The default production paths on the miniature fixtures, as `(case, shape, values)`. Every case
+/// is one fixed request with no memory block: generation (CFG off and on), depth and restoration.
+fn default_path_cases() -> Vec<(String, Vec<i32>, Vec<f32>)> {
+    use mlx_gen::gen_core::iris::depth::{DepthRequest, DepthResolution};
+    use mlx_gen::gen_core::iris::TEXT_ENCODER_COMPONENT;
+    use mlx_gen::{Image, LoadSpec, Precision, TargetSize, TransformRequest, WeightsSource};
+    let fixtures = crate::common::fixtures();
+    let rgb = |width: u32, height: u32| {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height as u64 {
+            for x in 0..width as u64 {
+                for c in 0..3u64 {
+                    pixels.push(((x * 7 + y * 13 + c * 101 + (x * y) % 97) % 256) as u8);
+                }
+            }
+        }
+        Image {
+            width,
+            height,
+            pixels,
+        }
+    };
+    let fp32 = |dir: std::path::PathBuf| {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(dir));
+        spec.precision = Precision::Fp32;
+        spec
+    };
+    let bytes = |image: &Image| {
+        image
+            .pixels
+            .iter()
+            .map(|&p| f32::from(p))
+            .collect::<Vec<_>>()
+    };
+    let mut cases = Vec::new();
+
+    let mut spec = fp32(crate::common::tiny_backbone());
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        WeightsSource::Dir(crate::common::tiny_text_encoder()),
+    );
+    let generator = mlx_gen_iris::provider_registry()
+        .unwrap()
+        .load("iris_3b", &spec)
+        .unwrap();
+    for (name, guidance) in [("default_g1", 1.0), ("default_g3", 3.0)] {
+        let req = mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 32,
+            height: 16,
+            steps: Some(2),
+            seed: Some(7),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let mlx_gen::GenerationOutput::Images(images) =
+            generator.generate(&req, &mut |_| {}).unwrap()
+        else {
+            panic!("expected images");
+        };
+        assert_eq!(images.len(), 1);
+        let image = &images[0];
+        cases.push((
+            name.to_owned(),
+            vec![image.height as i32, image.width as i32, 3],
+            bytes(image),
+        ));
+    }
+
+    let depth = mlx_gen_iris::depth::load(&fp32(fixtures.join("tiny-depth"))).unwrap();
+    let out = depth
+        .estimate(
+            &DepthRequest {
+                image: rgb(20, 14),
+                resolution: DepthResolution::Native,
+                cancel: Default::default(),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    cases.push((
+        "depth_default".to_owned(),
+        vec![out.map.height as i32, out.map.width as i32],
+        out.map.values,
+    ));
+
+    let restorer =
+        mlx_gen_iris::restoration::load(&fp32(fixtures.join("tiny-snapshot/upscaler"))).unwrap();
+    let image = restorer
+        .apply(
+            &TransformRequest {
+                image: rgb(24, 16),
+                target: TargetSize::Scale(2.0),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    cases.push((
+        "restore_default".to_owned(),
+        vec![image.height as i32, image.width as i32, 3],
+        bytes(&image),
+    ));
+    cases
+}

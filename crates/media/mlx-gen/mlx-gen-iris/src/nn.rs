@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::gen_core::iris;
-use mlx_gen::ios_quantum::Scores;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 use mlx_rs::fast::rms_norm;
@@ -162,6 +161,7 @@ impl Loader<'_> {
     fn packed(&self, prefix: &str, bias: bool) -> Result<Option<(AdaptableLinear, i32)>> {
         let scales_key = format!("{prefix}.scales");
         if !self.has(&scales_key) {
+            crate::packed::check_loaded_projection(self.weights, prefix, None)?;
             return Ok(None);
         }
         let codes = self.require(&format!("{prefix}.weight"))?.clone();
@@ -177,6 +177,7 @@ impl Loader<'_> {
         };
         let group = QUANT_GROUP_SIZE as i32;
         let bits = mlx_gen::quant::packed_bits(&codes, &scales, group)?;
+        crate::packed::check_loaded_projection(self.weights, prefix, Some(bits))?;
         let padded_in = scales.shape()[1] * group;
         let in_key = format!("{prefix}{}", crate::packed::IN_FEATURES_SUFFIX);
         let in_features = if self.has(&in_key) {
@@ -395,6 +396,11 @@ impl Linear {
     pub fn out_features(&self) -> u64 {
         self.logical_shape()[0] as u64
     }
+
+    /// Zero columns appended to the input before an unaligned packed base (`0` otherwise).
+    pub fn input_pad(&self) -> u64 {
+        self.in_pad.max(0) as u64
+    }
 }
 
 /// `iris3b.nn.norms.RMSNorm`: f32 normalisation, f32 gain.
@@ -531,38 +537,13 @@ pub fn attention_budgeted(
     Ok(out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?)
 }
 
-/// How the scores of one [`attention_budgeted`] call over `query_rows` queries at `head_dim` exist
-/// in memory on the CURRENT default device — the iOS quantum accounting's score term.
-///
-/// Every Iris attention calls `mlx_rs::fast::scaled_dot_product_attention` (once, or once per
-/// query chunk). On the GPU, MLX 0.32 runs it as a fused kernel that streams the scores —
-/// `sdpa_full` for more than 8 query rows at head widths 64/80/128, `sdpa_vector` for at most 8
-/// rows at 64/96/128/256 — so no score tensor exists ([`Scores::Fused`]); Iris's real head widths
-/// are 128 (trunk, refiner, PiT, the Qwen3-VL tower) and 80 (layerwise adapter), all fused.
-/// Anywhere else (the CPU, or a width the kernels reject) MLX falls back to `q·kᵀ → softmax → ·v`:
-/// the logits `[B, H, rows, keys]` at the compute width, the softmax running in place on them
-/// (one buffer), plus the masked copy of the logits when `masked`.
-pub fn sdpa_scores(head_dim: u64, query_rows: u64, compute_bytes: u64, masked: bool) -> Scores {
-    let gpu = mlx_rs::Device::try_default().is_ok_and(|d| d != mlx_rs::Device::cpu());
-    let fused = if query_rows > 8 {
-        matches!(head_dim, 64 | 80 | 128)
-    } else {
-        matches!(head_dim, 64 | 96 | 128 | 256)
-    };
-    if gpu && fused {
-        Scores::Fused
-    } else {
-        Scores::Materialized {
-            live: 1 + u64::from(masked),
-            element_bytes: compute_bytes,
-        }
-    }
-}
-
-/// Whether [`sdpa_scores`] prices the CPU fallback (which also materializes `q · scale`, and
-/// under grouped-query attention broadcasts k and v over the query groups).
-pub fn sdpa_falls_back(scores: Scores) -> bool {
-    matches!(scores, Scores::Materialized { .. })
+/// Whether the current default device runs MLX's fused kernels (`rms_norm`, SDPA) — any device but
+/// the CPU, whose backend runs their unfused fallbacks. On the GPU, MLX 0.32 runs every Iris
+/// attention as a fused kernel that streams its scores (`sdpa_full` above 8 query rows at head
+/// widths 64/80/128, `sdpa_vector` at most 8 at 64/96/128/256; Iris's are 128 — trunk, refiner,
+/// PiT, the Qwen3-VL tower — and 80, the layerwise adapter), so no score tensor exists there.
+pub fn fused_kernels() -> bool {
+    mlx_rs::Device::try_default().is_ok_and(|d| d != mlx_rs::Device::cpu())
 }
 
 /// Bytes per element of a compute dtype (f32 4, bf16/f16 2).
@@ -571,6 +552,33 @@ pub fn dtype_bytes(dtype: Dtype) -> u64 {
         Dtype::Float32 => 4,
         _ => 2,
     }
+}
+
+/// A sub-layer barrier of one iOS block quantum (sc-26270): on a physical iOS device (and in the
+/// CPU fixture that runs its guards) `arrays` are materialized before the block builds its next
+/// sub-layer. MLX allocates an op's output when it encodes it and keeps the op's inputs alive until
+/// its command buffer completes — with up to ten command buffers encoded ahead — so one lazy block
+/// graph can hold every intermediate of the block at once; these barriers bound a block quantum's
+/// peak to its widest sub-layer, which is what the counted prices in [`crate::dit`] sum. An eval
+/// never changes a value, and off device the graph is exactly the historical one.
+pub(crate) fn barrier(arrays: &[&Array]) -> Result<()> {
+    if mlx_gen::ios_quantum::enabled() {
+        mlx_rs::transforms::eval(arrays.iter().copied())?;
+        #[cfg(test)]
+        BARRIER_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run after every sub-layer barrier's evaluation — the quantum proofs' seam to measure each
+    /// sub-layer from its own start (`crate::quantum_proofs`). Test builds only.
+    pub(crate) static BARRIER_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
 /// One named production attention site. Debug observations report the *executed* shared kernel

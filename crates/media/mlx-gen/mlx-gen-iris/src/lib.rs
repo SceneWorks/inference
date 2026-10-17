@@ -47,6 +47,7 @@ pub mod nn;
 pub mod packed;
 pub mod pipeline;
 pub mod restoration;
+pub(crate) mod retention;
 pub mod solver;
 pub mod text_encoder;
 #[cfg(feature = "training")]

@@ -627,6 +627,9 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             std::fs::write(docs.join(super::RENDERS_MANIFEST), "").map_err(|e| e.to_string())?;
         }
         mlx_rs::memory::reset_peak_memory();
+        // The capture's starting footprint, before any of this case's loads: an evidence row's
+        // demand is its peak minus this baseline (admission never credits a product's residents).
+        let baseline_footprint = phys_footprint().map(|(current, _)| current);
         let sampler = Sampler::start();
         let deadline = Deadline::start(
             adapter.cancel.clone(),
@@ -650,6 +653,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
+            "baseline_phys_footprint_bytes":baseline_footprint,
             "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,
             "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),

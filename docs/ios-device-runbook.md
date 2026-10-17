@@ -138,7 +138,10 @@ python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json
   --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
   --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
 # Candidate rows for the single reviewed table. PRINTED for review; a human commits
-# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json.
+# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json
+# (schema 2: each row carries the capture's starting `baseline_footprint_bytes`; admission
+# charges only peak - baseline, credits only growth realized since admission, and keeps the
+# 512 MiB reserve, so a product's unrelated residents are never counted as free headroom).
 python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
 python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
 ```

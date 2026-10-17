@@ -447,7 +447,12 @@ def evidence_rows(rows):
         values = [peak, r.get("mlx_peak_bytes"), r.get("min_headroom_mib"), r.get("elapsed_seconds")]
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values) or not peak:
             continue
-        out.append({"key": key, "footprint_bytes": int(peak), "mlx_peak_bytes": int(r["mlx_peak_bytes"]),
+        # The capture's starting footprint: required, nonzero and below the peak (schema 2), so
+        # admission charges only the render's own growth. Without it there is no row.
+        baseline = r.get("baseline_phys_footprint_bytes")
+        if isinstance(baseline, bool) or not isinstance(baseline, int) or not 0 < baseline < peak:
+            continue
+        out.append({"key": key, "footprint_bytes": int(peak), "baseline_footprint_bytes": baseline, "mlx_peak_bytes": int(r["mlx_peak_bytes"]),
                     "min_headroom_mib": float(r["min_headroom_mib"]), "elapsed_seconds": float(r["elapsed_seconds"]),
                     "evidence_class": "device_capture", "run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or "")})
     return out

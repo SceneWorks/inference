@@ -4045,6 +4045,21 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(
             any("cargo test --locked --lib -p runtime-ios --features device-capture" in run for run in metal)
         )
+        # The capture-gating doctests run both ways (the `--lib` steps never run doctests).
+        lines = {
+            line.strip()
+            for step in jobs["macos-metal"]["steps"]
+            if "run" in step
+            for line in step["run"].splitlines()
+        }
+        for doc in (
+            "cargo test --locked --doc -p runtime-ios --features device-capture",
+            "cargo test --locked --doc -p runtime-ios",
+        ):
+            self.assertIn(doc, lines)
+        self.assertTrue(
+            any("cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture" in run for run in metal)
+        )
         self.assertTrue(
             any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)
         )

@@ -1,20 +1,22 @@
-//! The measured proof of every counted Iris iOS quantum price (epic 16774, round 3).
+//! The measured proof of every counted Iris iOS quantum price (epic 16774, rounds 3–4).
 //!
 //! Each body below builds the REAL module (the committed miniature exports), materializes the
 //! quantum's inputs, then measures MLX's peak allocation while exactly that quantum's body builds
-//! and evaluates ([`mlx_gen::ios_quantum::measured_peak_bytes`]) and asserts the counted formula is
-//! at least the measurement and at most [`PROOF_MAX`] times it
-//! ([`mlx_gen::ios_quantum::assert_tracks_measured`]). Shapes are small, so the CPU's own attention
-//! fallback (materialized logits and softmax) is priced as such through
-//! [`crate::nn::sdpa_scores`]; the iOS GPU runs those attentions fused. Every body runs at the f32
-//! and the bf16 compute width, and the attention sites under both an unbounded and a chunking plan.
+//! and evaluates — UNTHROTTLED, natural and stalled, the worst of several runs ([`measure`]) — and
+//! asserts the counted formula ([`crate::retention`]) is at least the measurement and at most
+//! [`PROOF_MAX`] times it ([`mlx_gen::ios_quantum::assert_tracks_measured`]). Shapes are small, so
+//! the CPU's unfused fallbacks (RMSNorm, attention with materialized scores) are priced as such
+//! ([`crate::retention::unfused`]); the iOS GPU runs those fused. Every body runs at the f32 and
+//! the bf16 compute width, and the attention sites under both an unbounded and a chunking plan.
 //! All in a CPU child with Metal trapped.
 
 use std::path::PathBuf;
 
 use mlx_gen::gen_core::iris::downstream::TaskExport;
 use mlx_gen::gen_core::iris::{DpmStep, DpmUpdate, IrisConfig, IrisTask, Prediction};
-use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+use mlx_gen::ios_quantum::{
+    assert_tracks_measured, measured_peak_bytes, with_cpu_diagnostic_headroom,
+};
 use mlx_gen::{AttentionBudget, AttentionPlan};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
@@ -74,10 +76,15 @@ fn prove_within(label: &str, formula: u64, measured: u64, max: f64) {
     }
 }
 
-/// The solver step's bound: one count per update order serves every batch, and MLX's buffer
-/// donation leaves a second-order step at 4 live states for one image and 5⅓ for two (measured),
-/// so the six-state count sits at 1.5x of the former plus its scalar coefficients.
-const SOLVER_PROOF_MAX: f64 = 1.55;
+/// The decoder layer's bound. The counted price is the whole `mlx_llm` layer under retention —
+/// what the device can hold: it encodes up to ten command buffers of up to 20 ops ahead (phone),
+/// more than the layer's ~40 fused ops. The CPU's unfused layer is ~80 ops, but MLX's CPU encoder
+/// runs at most ten tasks of ten dispatches (two per op) ahead, so a CPU measurement retains only
+/// the last ~50 of them (measured: a chain of independent temporaries plateaus at 24 two-op
+/// iterations). The CPU measurement therefore sits below the counted whole by the retention the CPU
+/// cannot reach — measured 1.53x to 1.56x at the proof shapes — while every component of the count is proven
+/// against its own CPU measurement at the plain [`PROOF_MAX`] below.
+const DECODER_PROOF_MAX: f64 = 1.7;
 
 fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
     let a = random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap()))
@@ -91,28 +98,129 @@ fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
 /// Runs of every measurement; a proof holds against the largest.
 const RUNS: usize = 5;
 
-/// Measure `run`'s peak (the largest of [`RUNS`] runs) and hand back its outputs for the next
-/// quantum.
-///
-/// MLX's CPU scheduler encodes ahead of execution (an op's output is allocated when it is encoded,
-/// its inputs released when it has run), so an unconstrained measurement swings with thread timing.
-/// Each run is measured with MLX's memory limit at one byte, under which MLX waits for the work in
-/// flight before it encodes the next op: the peak is then the graph's LIVE set — what the counted
-/// formulas price. Buffer donation still depends on timing, hence the largest of several runs.
+/// The CPU fixture's headroom: every guard passes.
+const PLENTY: u64 = 1 << 34;
+
+/// Queue a long CPU kernel ahead of the measured body on the same stream and hand it back (the
+/// caller holds it until the body has evaluated). See [`measure`].
+fn stall() -> Array {
+    thread_local! {
+        static OPERAND: Array = {
+            let a = random::normal::<f32>(&[STALL_EDGE, STALL_EDGE], None, None, Some(&random::key(99).unwrap())).unwrap();
+            eval([&a]).unwrap();
+            a
+        };
+    }
+    OPERAND.with(|a| {
+        let s = a.matmul(a).unwrap();
+        mlx_rs::transforms::async_eval([&s]).unwrap();
+        s
+    })
+}
+
+/// The stall kernel's edge: one `[E, E]` f32 product (~137 GFLOP at 4096, its one output allocated
+/// before the measurement starts) keeps the CPU stream's worker busy far longer than building and
+/// encoding any quantum's graph takes.
+const STALL_EDGE: i32 = 4096;
+
+/// Measure `run`'s peak, unthrottled, as the largest of [`RUNS`] natural runs and [`RUNS`] stalled
+/// ones ([`measure_once`]), and hand back its outputs for the next quantum. No warm-up: the first
+/// run of a size builds what the device's first quantum of that size builds (the pixel position
+/// table), which its price carries.
 fn measure(run: impl Fn() -> mlx_gen::Result<Vec<Array>>) -> (u64, Vec<Array>) {
     let mut kept = Vec::new();
     let mut worst = 0;
-    for _ in 0..RUNS {
-        let previous = mlx_rs::memory::set_memory_limit(1);
-        let peak = measured_peak_bytes(|| {
-            let outputs = run()?;
-            kept = outputs.clone();
-            Ok(outputs)
-        });
-        mlx_rs::memory::set_memory_limit(previous);
-        worst = worst.max(peak.unwrap());
+    for stalled in [false, true] {
+        for _ in 0..RUNS {
+            // The previous run's outputs are released BEFORE the measurement: released during it,
+            // they would deflate the peak.
+            kept.clear();
+            let (peak, outputs) = measure_once(&run, stalled);
+            kept = outputs;
+            worst = worst.max(peak);
+        }
     }
     (worst, kept)
+}
+
+/// One measurement of `run` on the iOS path — the CPU fixture enables every guard and sub-layer
+/// barrier the device runs, and the device's quantum scope (no buffer cache, so a freed buffer is
+/// never handed back larger than asked for).
+///
+/// MLX's scheduler encodes ahead of execution: an op's output is allocated when it is encoded
+/// (on the encoding thread), its inputs stay referenced until its queued task (CPU: up to ten tasks
+/// of ten dispatches in flight) or command buffer (Metal) completes, and an operand a queued task
+/// still references cannot be donated. A sub-layer's intermediates can therefore all be live at
+/// once — the retention model every counted price follows ([`crate::retention`]). A natural run
+/// reaches it only as far as the worker happens to lag. A STALLED run queues a long kernel
+/// ([`stall`]) on the same stream ahead of every sub-layer (at the start, and after each barrier
+/// through [`crate::nn::BARRIER_HOOK`]), so each sub-layer is encoded — its buffers allocated, none
+/// released — before its first op runs: the retention worst case, realized on the CPU. Each
+/// sub-layer's peak is read from its own start, net of the stall kernels' outputs. Never measured
+/// under a memory limit, which would drain the work in flight before each op and measure only the
+/// minimal live set.
+fn measure_once(run: &dyn Fn() -> mlx_gen::Result<Vec<Array>>, stalled: bool) -> (u64, Vec<Array>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Stalls {
+        ahead: Vec<Array>,
+        /// Bytes the stall kernels' outputs hold.
+        offset: u64,
+        base: u64,
+        worst: u64,
+    }
+    impl Stalls {
+        fn issue(&mut self) {
+            let before = mlx_rs::memory::get_active_memory() as u64;
+            self.ahead.push(stall());
+            self.offset += (mlx_rs::memory::get_active_memory() as u64).saturating_sub(before);
+            mlx_rs::memory::reset_peak_memory();
+        }
+        fn record(&mut self) {
+            let peak = mlx_rs::memory::get_peak_memory() as u64;
+            self.worst = self.worst.max(peak.saturating_sub(self.base + self.offset));
+        }
+    }
+
+    with_cpu_diagnostic_headroom(PLENTY, || {
+        let _scope = mlx_gen::ios_quantum::Scope::new();
+        if !stalled {
+            let mut outputs = Vec::new();
+            let peak = measured_peak_bytes(|| {
+                outputs = run()?;
+                Ok(outputs.clone())
+            })?;
+            return Ok((peak, outputs));
+        }
+        mlx_rs::memory::clear_cache();
+        let state = Rc::new(RefCell::new(Stalls {
+            base: mlx_rs::memory::get_active_memory() as u64,
+            ..Stalls::default()
+        }));
+        state.borrow_mut().issue();
+        let hooked = Rc::clone(&state);
+        crate::nn::BARRIER_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut stalls = hooked.borrow_mut();
+                stalls.record();
+                stalls.issue();
+            }));
+        });
+        let outputs = run();
+        let evaluated = outputs
+            .as_ref()
+            .map_err(|e| mlx_gen::Error::Msg(e.to_string()))
+            .and_then(|o| Ok(eval(o.iter())?));
+        crate::nn::BARRIER_HOOK.with(|hook| hook.borrow_mut().take());
+        let outputs = outputs?;
+        evaluated?;
+        state.borrow_mut().record();
+        let worst = state.borrow().worst;
+        Ok((worst, outputs))
+    })
+    .unwrap()
 }
 
 const CHUNKING: AttentionBudget = AttentionBudget::from_score_elements(300, true);
@@ -254,24 +362,112 @@ fn text_encoder_body() {
         let ids = Array::from_slice(&ids, &[1, n]);
         for k in [0usize, 1, 5] {
             // One decoder layer: the states before it (and their K/V) materialized first, then the
-            // next state alone — a fresh graph per run.
+            // next state alone — a fresh graph per run, natural and stalled (see [`measure`]).
             let mut worst = 0;
-            for _ in 0..RUNS {
-                let mut cache = te.lm().new_cache();
-                let states = te.lm().hidden_states(&ids, &mut cache, 0).unwrap();
-                for state in &states[..=k] {
-                    eval([state]).unwrap();
+            for stalled in [false, true] {
+                // Twice the runs: the layer outruns the CPU's encode-ahead window (see
+                // [`DECODER_PROOF_MAX`]), so how much of it a run retains swings with timing.
+                for _ in 0..2 * RUNS {
+                    let peak = with_cpu_diagnostic_headroom(PLENTY, || {
+                        let _scope = mlx_gen::ios_quantum::Scope::new();
+                        let mut cache = te.lm().new_cache();
+                        let states = te.lm().hidden_states(&ids, &mut cache, 0).unwrap();
+                        for state in &states[..=k] {
+                            eval([state]).unwrap();
+                        }
+                        let next = states[k + 1].clone();
+                        drop(states);
+                        let ahead = stalled.then(stall);
+                        let peak = measured_peak_bytes(|| Ok(vec![next]));
+                        drop(ahead);
+                        peak
+                    })
+                    .unwrap();
+                    worst = worst.max(peak);
                 }
-                let next = states[k + 1].clone();
-                drop(states);
-                let previous = mlx_rs::memory::set_memory_limit(1);
-                let peak = measured_peak_bytes(|| Ok(vec![next])).unwrap();
-                mlx_rs::memory::set_memory_limit(previous);
-                worst = worst.max(peak);
             }
             let (layer, _held) = te.layer_scratch_parts(n, k + 1);
-            prove(&format!("text decoder layer {k} n{n}"), layer, worst);
+            prove_within(
+                &format!("text decoder layer {k} n{n}"),
+                layer,
+                worst,
+                DECODER_PROOF_MAX,
+            );
         }
+    }
+    // The decoder layer's counted components, each a graph short enough for the CPU to retain
+    // whole (so each is held to the plain bound): its bf16 RMSNorm, its NeoX RoPE and its causal
+    // grouped-query attention, through `mlx_llm`'s own functions.
+    use crate::retention::Retention;
+    use crate::text_encoder::{decoder_attention, decoder_norm, decoder_rope};
+    let llm = |e: mlx_llm::Error| mlx_gen::Error::Msg(e.to_string());
+    let cfg = te.lm().config();
+    let (hidden, heads, kv_heads, hd) = (
+        cfg.hidden_size,
+        cfg.num_heads,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+    );
+    for n in [48, 96] {
+        let price = |f: &dyn Fn(&mut Retention)| {
+            let mut r = Retention::on(2, true);
+            f(&mut r);
+            r.price()
+        };
+        let x = rand(&[1, n, hidden], 11, Dtype::Bfloat16);
+        let w = rand(&[hidden], 12, Dtype::Bfloat16);
+        let (peak, _) = measure(|| {
+            Ok(vec![
+                mlx_llm::primitives::nn::rms_norm(&x, &w, 1e-6).map_err(llm)?
+            ])
+        });
+        let (n64, rows) = (n as u64, n as u64);
+        prove(
+            &format!("text decoder norm n{n}"),
+            price(&|r| decoder_norm(r, n64 * hidden as u64, rows, false)),
+            peak,
+        );
+        let q = rand(&[1, n, heads, hd], 13, Dtype::Bfloat16);
+        let cos = rand(&[1, n, hd], 14, Dtype::Bfloat16);
+        let sin = rand(&[1, n, hd], 15, Dtype::Bfloat16);
+        let (peak, _) = measure(|| {
+            Ok(vec![mlx_llm::primitives::rope::apply_rope(
+                &q, &cos, &sin, false,
+            )
+            .map_err(llm)?])
+        });
+        prove(
+            &format!("text decoder rope n{n}"),
+            price(&|r| decoder_rope(r, n64 * (heads * hd) as u64)),
+            peak,
+        );
+        // q is the roped query's transposed view; k / v are views of the layer's cache block.
+        let qt = q.transpose_axes(&[0, 2, 1, 3]).unwrap();
+        let block = mlx_llm::primitives::kv_cache::KV_BLOCK_TOKENS;
+        let cache_k = rand(&[1, kv_heads, block, hd], 16, Dtype::Bfloat16);
+        let cache_v = rand(&[1, kv_heads, block, hd], 17, Dtype::Bfloat16);
+        let kt = cache_k.split_axis(&[n], 2).unwrap().swap_remove(0);
+        let vt = cache_v.split_axis(&[n], 2).unwrap().swap_remove(0);
+        let (peak, _) = measure(|| {
+            let out = mlx_llm::primitives::attention::sdpa(
+                &qt,
+                &kt,
+                &vt,
+                1.0 / (hd as f32).sqrt(),
+                mlx_llm::primitives::attention::AttnMask::Causal,
+            )
+            .map_err(llm)?;
+            Ok(vec![out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                1,
+                n,
+                heads * hd,
+            ])?])
+        });
+        prove(
+            &format!("text decoder attention n{n}"),
+            price(&|r| decoder_attention(r, n64, heads as u64, hd as u64)),
+            peak,
+        );
     }
     // The conditioning quantum over a real window, short (padded) and the full budget.
     for prompt in ["a fox", "a red fox in the snow at golden hour"] {
@@ -329,11 +525,10 @@ fn small_steps_body() {
                     crate::solver::step_update(&x, &out, &step, Prediction::Velocity, Some(&prev))?;
                 Ok(vec![next, x0])
             });
-            prove_within(
+            prove(
                 &format!("solver step {update:?} b{b} {h}x{w}"),
                 crate::solver::step_scratch(x.size() as u64, &update),
                 peak,
-                SOLVER_PROOF_MAX,
             );
         }
     }

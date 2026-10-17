@@ -749,6 +749,13 @@ jobs:
         run: |
           cargo clippy --locked -p runtime-ios --features device-capture --all-targets -- -D warnings
           cargo test --locked --lib -p runtime-ios --features device-capture
+          cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture
+      # The compile_fail doctests that keep `capture_permit` out of a product build (and the
+      # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
+      - name: Doctest runtime-ios capture gating
+        run: |
+          cargo test --locked --doc -p runtime-ios
+          cargo test --locked --doc -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()

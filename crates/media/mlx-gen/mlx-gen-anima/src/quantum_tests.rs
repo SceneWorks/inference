@@ -21,7 +21,9 @@ use crate::conditioner::{
 };
 use crate::config::{ConditionerConfig, DitConfig, Qwen3Config};
 use crate::text_encoder::{AnimaQwen3, TE_EMBED_QUANTUM, TE_LAYER_QUANTUM, TE_NORM_QUANTUM};
-use crate::transformer::{CosmosDiT, DIT_BLOCK_QUANTUM, DIT_EMBED_QUANTUM, DIT_OUTPUT_QUANTUM};
+use crate::transformer::{
+    sdpa_scores, Backend, CosmosDiT, DIT_BLOCK_QUANTUM, DIT_EMBED_QUANTUM, DIT_OUTPUT_QUANTUM,
+};
 
 const CHILD: &str = "ANIMA_IOS_QUANTUM_CPU_CHILD";
 /// Far above every tiny fixture's scratch + the 512 MiB reserve: every guard passes.
@@ -687,7 +689,11 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
             weight_bytes: 0,
             attn_hidden_live: crate::transformer::BLOCK_ATTN_HIDDEN_LIVE,
             context_live: crate::transformer::BLOCK_CONTEXT_LIVE,
-            scores: mlx_gen::ios_quantum::Scores::Fused,
+            // The CPU child's SDPA is the unfused fallback: logits + softmax, f32.
+            scores: mlx_gen::ios_quantum::Scores::Materialized {
+                live: 2,
+                element_bytes: 4,
+            },
             mlp_hidden_live: crate::transformer::BLOCK_MLP_HIDDEN_LIVE,
             ff_live: crate::transformer::BLOCK_FF_LIVE,
         })
@@ -696,9 +702,10 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
         dit_block(dit_cfg(1, 2.0), 16) > base,
         "more tokens, more scratch"
     );
-    // Where the MLP phase binds (x9 and wider here), a wider loaded MLP costs more scratch.
+    // Where the MLP phase binds (x12 and wider here, above the attention phase with the CPU's
+    // materialized scores), a wider loaded MLP costs more scratch.
     assert!(
-        dit_block(dit_cfg(1, 10.0), 8) > dit_block(dit_cfg(1, 9.0), 8),
+        dit_block(dit_cfg(1, 13.0), 8) > dit_block(dit_cfg(1, 12.0), 8),
         "a wider loaded MLP, more scratch"
     );
 
@@ -732,7 +739,11 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
         weight_bytes: 0,
         attn_hidden_live: 10 + 8 * 2 + 5 + 3 * 3,
         context_live: 0,
-        scores: mlx_gen::ios_quantum::Scores::Fused,
+        // The CPU child's SDPA is the unfused fallback: logits + softmax, f32.
+        scores: mlx_gen::ios_quantum::Scores::Materialized {
+            live: 2,
+            element_bytes: 4,
+        },
         mlp_hidden_live: 0,
         ff_live: 0,
     };
@@ -767,7 +778,11 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
             weight_bytes: 0,
             attn_hidden_live: crate::conditioner::COND_ATTN_HIDDEN_LIVE,
             context_live: crate::conditioner::COND_CONTEXT_LIVE,
-            scores: mlx_gen::ios_quantum::Scores::Fused,
+            // The CPU child's SDPA is the unfused fallback: logits + softmax, f32.
+            scores: mlx_gen::ios_quantum::Scores::Materialized {
+                live: 2,
+                element_bytes: 4,
+            },
             mlp_hidden_live: crate::conditioner::COND_MLP_HIDDEN_LIVE,
             ff_live: crate::conditioner::COND_FF_LIVE,
         })
@@ -775,6 +790,75 @@ fn scratch_derives_from_loaded_tensors_and_grows_with_geometry() {
     assert!(cond_block(4.0, 12) > cond_block(4.0, 5));
     // Where the MLP phase binds (x9 and wider here), a wider loaded MLP costs more scratch.
     assert!(cond_block(10.0, 5) < cond_block(12.0, 5));
+
+    // Each production call site prices the scores of the backend it RUNS on: at head dim 64, which
+    // the Metal kernel serves (fused, no score term), the CPU child's checked scratch is the
+    // materialized pricing — a call site hard-coding the device treatment would check less.
+    let distinct = |label: &str, checked: u64, at: &dyn Fn(Backend) -> u64| {
+        assert!(
+            at(Backend::Metal) < at(Backend::Cpu),
+            "{label}: head dim 64 is fused on Metal"
+        );
+        assert_eq!(checked, at(Backend::Cpu), "{label}");
+    };
+    {
+        let cfg = DitConfig {
+            num_attention_heads: 1,
+            attention_head_dim: 64,
+            ..dit_cfg(1, 2.0)
+        };
+        let dit = CosmosDiT::synthetic(cfg, 11);
+        let (latents, sigma, encoder) = dit_inputs(&cfg, 8, 6);
+        let (result, events) = observed(AMPLE, || {
+            dit.forward(&latents, &sigma, &encoder, Dtype::Float32)
+        });
+        result.unwrap();
+        let block = &dit.blocks()[0];
+        distinct(
+            DIT_BLOCK_QUANTUM,
+            scratch_of(&events, DIT_BLOCK_QUANTUM),
+            &|backend| block.quantum_scratch(1, 16, 6, AttentionPlan::UNBOUNDED, 4, 0, backend),
+        );
+    }
+    {
+        let cfg = ConditionerConfig {
+            target_dim: 64,
+            model_dim: 64,
+            num_attention_heads: 1,
+            ..conditioner_cfg(4.0)
+        };
+        let cond = AnimaTextConditioner::synthetic(cfg, 21);
+        let (source, ids) = conditioner_inputs(&cfg, 7, 12);
+        let (result, events) = observed(AMPLE, || cond.forward(&source, &ids, Dtype::Float32));
+        result.unwrap();
+        let block = &cond.blocks()[0];
+        distinct(
+            CONDITIONER_BLOCK_QUANTUM,
+            scratch_of(&events, CONDITIONER_BLOCK_QUANTUM),
+            &|backend| block.quantum_scratch(1, 12, 7, 4, backend),
+        );
+    }
+    {
+        let cfg = Qwen3Config {
+            head_dim: 64,
+            ..tiny_qwen3_cfg(1)
+        };
+        let te = AnimaQwen3::from_weights_dtype(
+            &tiny_qwen3_weights(&cfg, 18),
+            "model",
+            &cfg,
+            Dtype::Float32,
+        )
+        .unwrap();
+        let (ids, mask) = qwen3_inputs(12);
+        let (result, events) = observed(AMPLE, || te.forward(&ids, &mask));
+        result.unwrap();
+        distinct(
+            TE_LAYER_QUANTUM,
+            scratch_of(&events, TE_LAYER_QUANTUM),
+            &|backend| te.layer(0, 1, 12, 4, backend).1,
+        );
+    }
 }
 
 // ---- Pre-load floors -----------------------------------------------------------------------------
@@ -933,8 +1017,10 @@ fn phase_loads_check_the_header_floor_before_construction() {
 const MAX_RATIO: f64 = 1.5;
 
 /// Runs per measurement. MLX's CPU stream retires buffers asynchronously, so one quantum's peak
-/// varies run to run; the proof takes the worst of several.
-const MEASURE_RUNS: usize = 3;
+/// varies run to run — by whole buffers (the final norm's measured peak has been seen to halve) —
+/// and the proof takes the worst of several: enough that the worst run reaches the counted
+/// retention (3 left the ratio bound flaky).
+const MEASURE_RUNS: usize = 10;
 
 fn measured(body: impl Fn() -> Result<Array>) -> u64 {
     measured_many(|| Ok(vec![body()?]))
@@ -978,24 +1064,82 @@ fn proof_dit_cfg() -> DitConfig {
     }
 }
 
-/// CPU has no fused SDPA kernel: MLX's CPU fallback materializes each attention's scores
-/// (`[B, H, Sq, Sk]`), which the device's fused kernel never allocates. The CPU proof therefore
-/// prices them on top of the device formula (the logits and their softmax: 2 f32 score tensors,
-/// for the self- and the cross-attention), so what the proof checks is the device formula's counted
-/// hidden buffers.
-fn cpu_fallback_scores(batch: u64, heads: u64, q: u64, keys: &[u64]) -> u64 {
-    keys.iter().fold(0u64, |total, &k| {
-        total.saturating_add(mlx_gen::ios_quantum::scores_bytes(
-            mlx_gen::ios_quantum::Scores::Materialized {
-                live: 2,
-                element_bytes: 4,
-            },
-            batch,
-            heads,
-            q,
-            k,
-        ))
-    })
+/// The proofs run on MLX's CPU backend, which has no fused SDPA kernel: its fallback materializes
+/// each attention's scores (`[B, H, Sq, Sk]`, the logits and their softmax), which the device's
+/// fused kernel never allocates. Each proof prices its formula on the backend it measures —
+/// `Backend::current()`, the CPU here — so [`crate::transformer::sdpa_scores`] adds exactly those
+/// scores to the device formula's counted hidden buffers (and never twice).
+fn proof_backend() -> Backend {
+    let backend = Backend::current();
+    assert_eq!(backend, Backend::Cpu, "the proofs measure on the CPU");
+    backend
+}
+
+/// The score treatment follows MLX 0.32's Metal `use_fallback`: fused only on Metal, at a
+/// kernel-instantiated width (f32/bf16/f16), for head dims `sdpa_full` (more than 8 rows: 64/80/128)
+/// or `sdpa_vector` (at most 8 rows, no more than the keys: 64/96/128/256) serves — for every call,
+/// including a chunked attention's remainder. Pure arithmetic: no device is touched.
+#[test]
+fn sdpa_scores_follow_the_metal_kernel_support() {
+    use mlx_gen::ios_quantum::Scores;
+    let fused = |backend, head_dim, eb, attentions: &[(u64, u64, u64)]| {
+        sdpa_scores(backend, head_dim, eb, attentions) == Scores::Fused
+    };
+    let one = |rows: u64, keys: u64| [(rows, rows, keys)];
+    // sdpa_full (> 8 query rows): head dims 64/80/128 at f32 and bf16; 96/256/32/384 fall back.
+    for d in [64, 80, 128] {
+        for eb in [4, 2] {
+            assert!(
+                fused(Backend::Metal, d, eb, &one(4096, 4608)),
+                "full d={d} eb={eb}"
+            );
+        }
+    }
+    for d in [32, 96, 256, 384] {
+        assert!(!fused(Backend::Metal, d, 4, &one(4096, 4608)), "full d={d}");
+    }
+    // sdpa_vector (<= 8 query rows, rows <= keys): 64/96/128/256; 80 falls back, as do more rows
+    // than keys.
+    for d in [64, 96, 128, 256] {
+        assert!(fused(Backend::Metal, d, 2, &one(8, 512)), "vector d={d}");
+    }
+    assert!(!fused(Backend::Metal, 80, 2, &one(8, 512)));
+    assert!(!fused(Backend::Metal, 128, 4, &one(8, 7)));
+    // A width no kernel is instantiated for (f64) falls back.
+    assert!(!fused(Backend::Metal, 128, 8, &one(4096, 4096)));
+    // The CPU never fuses, whatever the shape.
+    assert!(!fused(Backend::Cpu, 128, 4, &one(4096, 4608)));
+    // A chunked attention: 100 queries in 32-row calls leaves a 4-row remainder, which
+    // sdpa_vector serves at 128 but not at 80; an even split has no remainder call.
+    assert!(fused(Backend::Metal, 128, 4, &[(100, 32, 100)]));
+    assert!(!fused(Backend::Metal, 80, 4, &[(100, 32, 100)]));
+    assert!(fused(Backend::Metal, 80, 4, &[(96, 32, 96)]));
+    // One falling-back attention of a block (cross-attention over fewer keys than its 4 queries)
+    // prices the block's scores as materialized.
+    assert!(!fused(Backend::Metal, 64, 4, &[(4, 4, 4), (4, 4, 3)]));
+    // The materialized treatment: logits + softmax at the compute width.
+    assert_eq!(
+        sdpa_scores(Backend::Cpu, 128, 2, &one(16, 16)),
+        Scores::Materialized {
+            live: 2,
+            element_bytes: 2
+        }
+    );
+    // The shipped geometry on the device: DiT (128) and the Qwen3 tower (128) at f32 over 4096
+    // and 512 tokens, the conditioner (64) over 512 T5 x 512 Qwen3 tokens — all fused.
+    assert!(fused(
+        Backend::Metal,
+        128,
+        4,
+        &[(4096, 4096, 4096), (4096, 4096, 512)]
+    ));
+    assert!(fused(Backend::Metal, 128, 4, &one(512, 512)));
+    assert!(fused(
+        Backend::Metal,
+        64,
+        4,
+        &[(512, 512, 512), (512, 512, 512)]
+    ));
 }
 
 #[test]
@@ -1088,8 +1232,8 @@ fn dit_formulas_track_the_measured_peak() {
                 "bf16 weights are promoted"
             );
         }
-        let cpu_scores = cpu_fallback_scores(1, 2, t as u64, &[t as u64, ctx as u64]);
-        let formula = block.quantum_scratch(b, t, ctx, unbounded, eb, 0) + cpu_scores;
+        let cpu = proof_backend();
+        let formula = block.quantum_scratch(b, t, ctx, unbounded, eb, 0, cpu);
         prove(
             &tag("Anima DiT block (bf16 in)"),
             formula,
@@ -1104,12 +1248,13 @@ fn dit_formulas_track_the_measured_peak() {
         // Rung 3: a query-chunked plan (each chunk evaluated before the next).
         let chunked =
             AttentionPlan::budgeted(AttentionBudget::from_score_elements(2 * 16 * 64, true));
-        let rows = block.quantum_geometry(b, t, ctx, chunked, eb, 0).query_rows;
+        let rows = block
+            .quantum_geometry(b, t, ctx, chunked, eb, 0, cpu)
+            .query_rows;
         assert!(rows < t as u64, "the plan must genuinely chunk: {rows}");
-        let chunked_scores = cpu_fallback_scores(1, 2, rows, &[t as u64, ctx as u64]);
         prove(
             &tag("Anima DiT block (chunked attention)"),
-            block.quantum_scratch(b, t, ctx, chunked, eb, 0) + chunked_scores,
+            block.quantum_scratch(b, t, ctx, chunked, eb, 0, cpu),
             measured(|| run(&f32_hidden, chunked)),
         );
 
@@ -1134,7 +1279,7 @@ fn dit_formulas_track_the_measured_peak() {
         );
         prove(
             &tag("Anima DiT block (streamed)"),
-            streamed.quantum_scratch(b, t, ctx, unbounded, eb, stored) + cpu_scores,
+            streamed.quantum_scratch(b, t, ctx, unbounded, eb, stored, cpu),
             measured(|| {
                 streamed.forward(
                     &f32_hidden,
@@ -1295,10 +1440,9 @@ fn conditioner_formulas_track_the_measured_peak() {
         out.eval().unwrap();
         let eb = out.item_size() as u64;
         assert_eq!(eb, 4);
-        let cpu_scores = cpu_fallback_scores(1, 2, st as u64, &[st as u64, ss as u64]);
         prove(
             &tag(CONDITIONER_BLOCK_QUANTUM),
-            block.quantum_scratch(1, st, ss, eb) + cpu_scores,
+            block.quantum_scratch(1, st, ss, eb, proof_backend()),
             measured(|| block.forward(&out, &source, (&tc, &ts), (&sc, &sn))),
         );
         let weights = vec![1.25f32; st as usize];
@@ -1373,19 +1517,18 @@ fn text_encoder_formulas_track_the_measured_peak() {
         eval_all(&[&h, &cos, &sin, &m]);
         let eb = crate::text_encoder::layer_element_bytes(&h, &cos);
         assert_eq!(eb, 4, "the f32 RoPE tables promote the layer to f32");
-        let (layer, scratch) = te.layer(0, 1, s, eb);
+        let (layer, scratch) = te.layer(0, 1, s, eb, proof_backend());
         let out = layer.forward(&h, &cos, &sin, &m).unwrap();
         out.eval().unwrap();
         assert_eq!(out.dtype(), Dtype::Float32);
-        let cpu_scores = cpu_fallback_scores(1, 2, s as u64, &[s as u64]);
         prove(
             &tag("Anima Qwen3 layer (bf16 in)"),
-            scratch + cpu_scores,
+            scratch,
             measured(|| layer.forward(&h, &cos, &sin, &m)),
         );
         prove(
             &tag(TE_LAYER_QUANTUM),
-            scratch + cpu_scores,
+            scratch,
             measured(|| layer.forward(&out, &cos, &sin, &m)),
         );
         prove(
@@ -1693,7 +1836,7 @@ fn reachable_sizes_prediction() {
                 let s = 512i32;
                 let text = max_of(vec![
                     (TE_EMBED_QUANTUM, te.embed_body_bytes(1, s)),
-                    (TE_LAYER_QUANTUM, te.layer(0, 1, s, 4).1),
+                    (TE_LAYER_QUANTUM, te.layer(0, 1, s, 4, Backend::Metal).1),
                     (TE_NORM_QUANTUM, te.norm_bytes(1, s, 4)),
                     (
                         crate::model::CONDITIONING_INPUTS_QUANTUM,
@@ -1711,7 +1854,7 @@ fn reachable_sizes_prediction() {
                     ),
                     (
                         CONDITIONER_BLOCK_QUANTUM,
-                        cond.blocks()[0].quantum_scratch(1, 512, 512, 4),
+                        cond.blocks()[0].quantum_scratch(1, 512, 512, 4, Backend::Metal),
                     ),
                     (
                         CONDITIONER_OUTPUT_QUANTUM,
@@ -1726,12 +1869,19 @@ fn reachable_sizes_prediction() {
                         DIT_BLOCK_QUANTUM,
                         // The snapshot is bf16: a packed tier's projections are consumed in
                         // place, so its blocks carry no promoted f32 copies.
-                        block.quantum_scratch(1, tokens as i32, 512, plan, 4, weight)
-                            - if bits.is_some() {
-                                block.promoted_weight_bytes(4)
-                            } else {
-                                0
-                            },
+                        block.quantum_scratch(
+                            1,
+                            tokens as i32,
+                            512,
+                            plan,
+                            4,
+                            weight,
+                            Backend::Metal,
+                        ) - if bits.is_some() {
+                            block.promoted_weight_bytes(4)
+                        } else {
+                            0
+                        },
                     ),
                     (
                         DIT_OUTPUT_QUANTUM,

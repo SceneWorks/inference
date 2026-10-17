@@ -16,7 +16,7 @@
 //! Every registered model and mode is admitted through ONE seam, [`ios_admission`]: the provider's
 //! registered safety check fed by a row of the single reviewed device-evidence table
 //! ([`evidence`], `evidence/ios_device_evidence.json`), fail-closed with a typed [`RefusalKind`].
-//! The table is filled only from explicitly labelled device captures ([`capture_permit`]), which are
+//! The table is filled only from explicitly labelled device captures (`capture_permit`, feature `device-capture`), which are
 //! safe without evidence because every quantum of every registered model checks live OS headroom
 //! before constructing its graph (`mlx_gen::ios_quantum`). Host peaks and the historical iPhone 17
 //! SANA observations below are PLANNING data (tile choice, what to capture first), never admission.
@@ -52,10 +52,13 @@ pub mod ios_admission;
 mod layout;
 mod refusal;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
+/// The labelled bounded device-capture permit; compiled only for the device harness.
+#[cfg(feature = "device-capture")]
+pub use ios_admission::capture_permit;
 pub use ios_admission::{
-    admit, build_candidate, capacity_budget, capture_permit, evidence_key, execution_key,
-    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, IosCandidate,
-    IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+    admit, build_candidate, capacity_budget, evidence_key, execution_key, tier_label, token_window,
+    validate_actual, work_binding, work_mode, Admission, IosCandidate, IosWork, IRIS_DEPTH_ID,
+    IRIS_RESTORE_ID,
 };
 pub use layout::{artifact_layout_digest, hex};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads

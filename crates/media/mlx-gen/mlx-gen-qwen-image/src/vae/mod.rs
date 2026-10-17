@@ -165,7 +165,7 @@ impl Decoder3D {
     /// the SiLU (1 full width) and `conv_out`.
     pub(super) fn output_quantum_bytes(&self, x: [u64; 5], eb: u64) -> u64 {
         channel_norm_bytes(x, eb)
-            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(eb, &x))
+            .saturating_add(mlx_gen::ios_quantum::allocated_tensor_bytes(eb, &x))
             .saturating_add(self.conv_out.quantum_bytes(x, eb))
     }
 }
@@ -226,7 +226,7 @@ impl QwenVae {
     /// Bytes [`Self::decode_head`] allocates over an `[B, 16, T, H, W]` latent: the denormalized
     /// product and sum (2 latents), `post_quant_conv` and `conv_in`.
     pub(super) fn head_quantum_bytes(&self, l: [u64; 5], eb: u64) -> u64 {
-        (2 * mlx_gen::ios_quantum::tensor_bytes(eb, &l))
+        (2 * mlx_gen::ios_quantum::allocated_tensor_bytes(eb, &l))
             .saturating_add(self.post_quant_conv.quantum_bytes(l, eb))
             .saturating_add(self.decoder.conv_in.quantum_bytes(l, eb))
     }
@@ -349,17 +349,22 @@ impl LatentDecoder for QwenVae {
 /// outputs `[B, 3, F, 8H, 8W]` (proven in `quantum_tests::tile_fold_formula_tracks_the_measured_peak`).
 pub fn tile_fold_bytes([b, _, f, h, w]: [u64; 5]) -> u64 {
     let scale = VaeTiling::QWEN_IMAGE.spatial_scale as u64;
-    3 * mlx_gen::ios_quantum::tensor_bytes(4, &[b, 3, f, h * scale, w * scale])
+    3 * mlx_gen::ios_quantum::allocated_tensor_bytes(4, &[b, 3, f, h * scale, w * scale])
 }
 
 /// The final-normalization quantum over a `[B, C, F, H, W]` latent: the separable coverage
-/// normalizer built as one f32 `[B, 1, F, 8H, 8W]` plane from its three per-axis vectors. Its clamp
-/// and the quotient are elementwise outputs MLX donates into the normalizer and into the folded
-/// output, whose last handle is released before the graph runs.
+/// normalizer built as one f32 `[B, 1, F, 8H, 8W]` plane from its three per-axis vectors and the
+/// clamp's f32 `1e-8` floor scalar. Its clamp and the quotient are elementwise outputs MLX donates
+/// into the normalizer and into the folded output, whose last handle is released before the graph
+/// runs.
 pub fn final_normalize_bytes([b, _, f, h, w]: [u64; 5]) -> u64 {
     let scale = VaeTiling::QWEN_IMAGE.spatial_scale as u64;
-    let tb = mlx_gen::ios_quantum::tensor_bytes;
-    tb(4, &[b, 1, f, h * scale, w * scale]).saturating_add(tb(4, &[f + (h + w) * scale]))
+    // The plane is one (page-rounded) allocation; the per-axis vectors and the scalar are sub-page.
+    mlx_gen::ios_quantum::allocated_tensor_bytes(4, &[b, 1, f, h * scale, w * scale])
+        .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
+            4,
+            &[f + (h + w) * scale + 1],
+        ))
 }
 
 impl QwenVae {
@@ -846,11 +851,14 @@ mod quantum_tests {
     /// the worst of three runs, since MLX's CPU stream retires buffers asynchronously and one
     /// quantum's peak varies run to run.
     fn measured(body: impl Fn() -> Result<Array>) -> u64 {
-        (0..3)
+        (0..MEASURE_RUNS)
             .map(|_| mlx_gen::ios_quantum::measured_peak_bytes(|| Ok(vec![body()?])).unwrap())
             .max()
             .unwrap()
     }
+
+    /// Runs per measurement; each proof takes the worst (largest) peak.
+    const MEASURE_RUNS: usize = 3;
 
     /// The largest ratio any counted VAE formula may hold over its measured peak.
     const MAX_RATIO: f64 = 1.5;
@@ -922,7 +930,23 @@ mod quantum_tests {
             vae.decoder.output_quantum_bytes(shape, 4),
             measured(|| vae.decoder.forward_output(&x)),
         );
-        assert_eq!(ratios.borrow().len(), 6);
+        // The causal 3-D convolution every stage formula sums, on its own: a narrow (3-channel)
+        // and a full-width (C-channel) conv, whose padded staging copy and im2col buffer are each
+        // one page-rounded allocation (`allocated_tensor_bytes`); the exact byte count
+        // under-prices them at these extents.
+        let act = values(&[1, c, 1, hw, hw], 0.3, 1.0);
+        act.eval().unwrap();
+        prove(
+            "Qwen VAE causal conv (3 channels out)",
+            vae.decoder.conv_out.quantum_bytes(shape, 4),
+            measured(|| vae.decoder.conv_out.forward(&act)),
+        );
+        prove(
+            "Qwen VAE causal conv (C channels out)",
+            resnet.conv1().quantum_bytes(shape, 4),
+            measured(|| resnet.conv1().forward(&act)),
+        );
+        assert_eq!(ratios.borrow().len(), 8);
     }
 
     /// The query-chunked mid-block attention computes the same attention as the historical single
@@ -1016,37 +1040,54 @@ mod quantum_tests {
         let latent = latents(16);
         let tiling = TilingConfig::spatial_only(64, 16);
         assert!(tiling.needs_tiling(VaeTiling::QWEN_IMAGE, 1, 16, 16));
-        let peaks: Rc<RefCell<Vec<(String, u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-        let sink = peaks.clone();
-        let baseline = std::cell::Cell::new(0u64);
-        let result = with_cpu_diagnostic_headroom(AMPLE, || {
-            with_cpu_diagnostic_observer(
-                move |e| match e {
-                    QuantumEvent::Checked { label, scratch }
-                        if label == DECODE_TILE_FOLD_QUANTUM
-                            || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
-                    {
-                        mlx_rs::memory::clear_cache();
-                        baseline.set(mlx_rs::memory::get_active_memory() as u64);
-                        mlx_rs::memory::reset_peak_memory();
-                        sink.borrow_mut().push((label.clone(), *scratch, 0));
-                    }
-                    QuantumEvent::Synchronized { label, .. }
-                        if label == DECODE_TILE_FOLD_QUANTUM
-                            || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
-                    {
-                        let peak = mlx_rs::memory::get_peak_memory() as u64;
-                        if let Some(last) = sink.borrow_mut().last_mut() {
-                            last.2 = peak.saturating_sub(baseline.get());
+        // One in-situ decode per run; each fold's peak is the worst of the runs (MLX's CPU stream
+        // retires buffers asynchronously, so one quantum's peak varies run to run).
+        let run_once = || {
+            let peaks: Rc<RefCell<Vec<(String, u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+            let sink = peaks.clone();
+            let baseline = std::cell::Cell::new(0u64);
+            let result = with_cpu_diagnostic_headroom(AMPLE, || {
+                with_cpu_diagnostic_observer(
+                    move |e| match e {
+                        QuantumEvent::Checked { label, scratch }
+                            if label == DECODE_TILE_FOLD_QUANTUM
+                                || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
+                        {
+                            mlx_rs::memory::clear_cache();
+                            baseline.set(mlx_rs::memory::get_active_memory() as u64);
+                            mlx_rs::memory::reset_peak_memory();
+                            sink.borrow_mut().push((label.clone(), *scratch, 0));
                         }
-                    }
-                    _ => {}
-                },
-                || vae.decode_tiled(&latent, &tiling, None),
-            )
-        });
-        result.unwrap();
-        let peaks = peaks.borrow();
+                        QuantumEvent::Synchronized { label, .. }
+                            if label == DECODE_TILE_FOLD_QUANTUM
+                                || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
+                        {
+                            let peak = mlx_rs::memory::get_peak_memory() as u64;
+                            if let Some(last) = sink.borrow_mut().last_mut() {
+                                last.2 = peak.saturating_sub(baseline.get());
+                            }
+                        }
+                        _ => {}
+                    },
+                    || vae.decode_tiled(&latent, &tiling, None),
+                )
+            });
+            result.unwrap();
+            peaks.take()
+        };
+        let mut peaks = run_once();
+        for _ in 1..MEASURE_RUNS {
+            let again = run_once();
+            assert_eq!(again.len(), peaks.len(), "every run folds the same tiles");
+            for (worst, p) in peaks.iter_mut().zip(again) {
+                assert_eq!(
+                    (&worst.0, worst.1),
+                    (&p.0, p.1),
+                    "same quantum, same formula"
+                );
+                worst.2 = worst.2.max(p.2);
+            }
+        }
         assert!(
             peaks.len() > 2,
             "the fixture must fold several tiles: {peaks:?}"

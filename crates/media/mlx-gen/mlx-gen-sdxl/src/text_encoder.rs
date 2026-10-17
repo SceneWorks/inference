@@ -120,12 +120,33 @@ impl ClipEncoderLayer {
         }
     }
 
-    /// iOS quantum scratch (sc-26270) of this layer over `b` rows of `n` tokens at `act` bytes per
-    /// element, from the loaded widths: hidden from `layer_norm1`, MLP width from `fc1`,
-    /// heads/head_dim from the config ([`crate::quantum::clip_layer_bytes`]). The causal mask is an
-    /// additive array mask, which MLX's fused Metal SDPA accepts at head dim 64.
-    fn quantum_scratch(&self, b: i32, n: i32, act: u64) -> u64 {
-        crate::quantum::clip_layer_bytes(
+    /// iOS quantum scratch (sc-26270) of this layer over `b` rows of `n` tokens of `x`-typed
+    /// input, from the loaded widths: hidden from `layer_norm1`, MLP width from `fc1`,
+    /// heads/head_dim from the config ([`crate::quantum::clip_layer_bytes`]), at the activation
+    /// width the layer's projections promote `x` to (a packed snapshot's BF16 scales make an f16
+    /// layer's every projection output and its residual f32 —
+    /// [`crate::quantum::linear_output_dtype`]). The causal mask is an additive array mask, which
+    /// MLX's fused Metal SDPA accepts at head dim 64.
+    fn quantum_scratch(&self, b: i32, n: i32, x: Dtype) -> u64 {
+        let act = crate::quantum::dtype_bytes(
+            [&self.q, &self.out, &self.linear1, &self.linear2]
+                .iter()
+                .fold(x, |d, linear| {
+                    Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+                }),
+        );
+        // A promoting layer entered at a narrower width: each of q/k/v casts the narrow LayerNorm
+        // output up (`quantized_matmul`'s `astype(x, result_type)`) — three hidden-sized copies.
+        let casts = if act > crate::quantum::dtype_bytes(x) {
+            mlx_gen::ios_quantum::tensor_bytes(
+                act,
+                &[3, b as u64, n as u64, self.ln1_w.shape()[0] as u64],
+            )
+            .saturating_add(crate::quantum::page_slack(3))
+        } else {
+            0
+        };
+        casts.saturating_add(crate::quantum::clip_layer_bytes(
             b,
             n,
             self.ln1_w.shape()[0] as u64,
@@ -135,7 +156,7 @@ impl ClipEncoderLayer {
             true,
             act,
             crate::quantum::Backend::current(),
-        )
+        ))
     }
 
     /// `x`: `[B, N, D]`; `mask`: additive causal `[1, 1, N, N]`.
@@ -263,7 +284,7 @@ impl ClipTextEncoder {
     ) -> (u64, impl Fn() -> Result<Array> + '_) {
         let s = x.shape();
         let layer = &self.layers[index];
-        let scratch = layer.quantum_scratch(s[0], s[1], crate::quantum::element_bytes(x));
+        let scratch = layer.quantum_scratch(s[0], s[1], x.dtype());
         let (n, dtype) = (s[1], x.dtype());
         let x = x.clone();
         (scratch, move || layer.forward(&x, &causal_mask(n, dtype)?))
@@ -313,16 +334,20 @@ impl ClipTextEncoder {
         for layer in &self.layers {
             x = mlx_gen::ios_quantum::run(
                 crate::quantum::CLIP_LAYER,
-                layer.quantum_scratch(b, n, crate::quantum::element_bytes(&x)),
+                layer.quantum_scratch(b, n, x.dtype()),
                 || layer.forward(&x, &mask),
             )?;
             hidden_states.push(x.clone());
         }
-        // Counted: the final LayerNorm output (the pooled gather and its projection are rows).
-        let pooled_rows = mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, 2 * dim as u64]);
+        // Counted: the final LayerNorm output (the pooled gather and its projection are rows), at
+        // the width the layers left the hidden state (f32 after a packed layer's promotion).
+        let wide = crate::quantum::element_bytes(&x).max(act);
+        let final_hidden =
+            mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, n as u64, dim as u64]);
+        let pooled_rows = mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, 2 * dim as u64]);
         mlx_gen::ios_quantum::before(
             crate::quantum::CLIP_POOLED,
-            hidden.saturating_add(pooled_rows),
+            final_hidden.saturating_add(pooled_rows),
         )?;
         let last_hidden_state =
             layer_norm(&x, Some(&self.final_ln_w), Some(&self.final_ln_b), LN_EPS)?;

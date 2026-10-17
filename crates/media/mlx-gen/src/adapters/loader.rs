@@ -2438,8 +2438,9 @@ mod tests {
         assert!(refused.is_err());
         let record = crate::ios_quantum::take_refusal().expect("typed refusal");
         assert_eq!(record.label, ADAPTER_LOAD_QUANTUM);
-        // Header floor: both tensors' stored bytes plus the larger as read scratch.
-        assert_eq!(record.scratch_bytes, 32 + 32 + 32);
+        // Header floor: both tensors' stored bytes — a load peaks at exactly what it stores
+        // (`ios_quantum_budget::load_floor_bytes`, proven by measurement), no extra read scratch.
+        assert_eq!(record.scratch_bytes, 32 + 32);
         assert!(
             host.lin.adapters().is_empty(),
             "nothing applied past the refusal"
