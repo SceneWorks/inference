@@ -972,6 +972,65 @@ mod tests {
         assert!(Linear::from_packed_qtensor(odd, NativeDitStorage::GgmlQ4_1, DType::F32).is_err());
     }
 
+    /// CUDA: the GGML Q4_1/Q8_0 packed path stays packed ON DEVICE (a `QMatMul::QTensor` with CUDA
+    /// storage, never a dequantized dense weight) and matches the dense dequantized reference up to
+    /// the Q8_1 activation quantization the CUDA kernels apply (same bound as the CPU test).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_packed_ggml_path_stays_packed_and_matches_the_dequantized_reference() {
+        let dev = Device::new_cuda(0).expect("CUDA device 0 (CUDA_VISIBLE_DEVICES selects GPU1)");
+        let (n, k) = (48, 128);
+        let w = seeded(n, k, 0.3);
+        let x = seeded(7, k, 1.7);
+        for storage in [NativeDitStorage::GgmlQ4_1, NativeDitStorage::GgmlQ8_0] {
+            let ggml = crate::convert::ggml_dtype(storage).unwrap();
+            let q_cpu = QTensor::quantize(&w, ggml).unwrap();
+            let dequant = QTensor::dequantize(&q_cpu, &Device::Cpu).unwrap();
+            let bytes = q_cpu.data().unwrap().into_owned();
+            let q_gpu = candle_gen::candle_core::quantized::ggml_file::qtensor_from_ggml(
+                ggml,
+                &bytes,
+                vec![n, k],
+                &dev,
+            )
+            .unwrap();
+            for compute in [DType::F32, DType::BF16] {
+                let linear = Linear::from_packed_qtensor(
+                    candle_gen::candle_core::quantized::ggml_file::qtensor_from_ggml(
+                        ggml,
+                        &bytes,
+                        vec![n, k],
+                        &dev,
+                    )
+                    .unwrap(),
+                    storage,
+                    compute,
+                )
+                .unwrap();
+                let Base::Ggml { matmul, device, .. } = &linear.base else {
+                    panic!("packed base")
+                };
+                assert!(device.is_cuda());
+                match matmul {
+                    QMatMul::QTensor(t) => assert!(t.device().is_cuda(), "packed codes on device"),
+                    _ => panic!("{storage:?}: the packed path must not hold a dense weight"),
+                }
+                let y = linear
+                    .forward(&x.to_device(&dev).unwrap())
+                    .unwrap()
+                    .to_device(&Device::Cpu)
+                    .unwrap();
+                assert_eq!(y.dtype(), compute);
+                let xr = to(&x, compute).unwrap().to_dtype(DType::F32).unwrap();
+                let reference = xr.matmul(&dequant.t().unwrap()).unwrap();
+                let err = peak_relative(&y, &reference);
+                eprintln!("cuda {storage:?}/{compute:?}: peak-relative error {err:e}");
+                assert!(err < 0.02, "{storage:?}/{compute:?}: {err}");
+            }
+            drop(q_gpu);
+        }
+    }
+
     /// Row chunking changes no bit: every row's activation quantization is independent.
     #[test]
     fn row_chunked_packed_forward_is_bit_identical() {

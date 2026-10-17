@@ -1944,7 +1944,9 @@ mod cuda_impl {
                 },
                 _ => candle_core::bail!("flux3 fp8r: activation is not on CUDA"),
             };
-            let mut q = unsafe { self.stream.alloc::<f32>(m * k) }.map_err(drv_err)?;
+            // The kernel writes E4M3 bytes directly into the FP8 operand buffer: no backend
+            // f32 -> F8E4M3 cast kernel is involved (candle builds those only for sm_89+ arches).
+            let mut q = unsafe { self.stream.alloc::<float8::F8E4M3>(m * k) }.map_err(drv_err)?;
             let mut sa = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
             let (mi, ki, ni) = (m as i32, k as i32, n as i32);
             unsafe {
@@ -1963,18 +1965,11 @@ mod cuda_impl {
                     .map_err(drv_err)?;
             }
             drop(x_storage);
-            // The quantized values are exact E4M3 grid points, so the F8E4M3 cast is lossless.
-            let q = Tensor::from_storage(
-                Storage::Cuda(CudaStorage {
-                    slice: CudaStorageSlice::F32(q),
-                    device: self.device.clone(),
-                }),
-                (m, k),
-                BackpropOp::none(),
-                false,
-            )
-            .to_dtype(DType::F8E4M3)?;
-            let xq = DevFp8::stage(self, &q)?;
+            let xq = DevFp8 {
+                buf: q,
+                rows: m,
+                cols: k,
+            };
             let mut acc = unsafe { self.stream.alloc::<f32>(m * n) }.map_err(drv_err)?;
             let one_a = self.upload_scalar(1.0)?;
             let one_b = self.upload_scalar(1.0)?;

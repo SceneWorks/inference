@@ -140,3 +140,6 @@ mod tests {
 
 #[cfg(test)]
 mod kernel_oracle_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_tests;

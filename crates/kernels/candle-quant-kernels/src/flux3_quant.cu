@@ -69,11 +69,11 @@ __device__ __forceinline__ unsigned short f3_bf16_bits(float x) {
     return (unsigned short)((b + round) >> 16);
 }
 
-// ---- FP8R activation: one CTA (256 threads) per row. Writes the DECODED on-grid E4M3 value as f32
-// (exactly representable, so a later f32 -> F8E4M3 cast is lossless) and the row scale.
+// ---- FP8R activation: one CTA (256 threads) per row. Writes the E4M3 BYTES (sign in bit 7) and the
+// row scale, so no backend fp8 cast kernel is needed (those exist only on sm_89+ builds).
 __global__ void flux3_fp8_rowwise_quantize_f32(
     const float* __restrict__ x,   // [m, k]
-    float* __restrict__ q,         // [m, k] on-grid E4M3 values (signed)
+    unsigned char* __restrict__ q, // [m, k] E4M3 codes
     float* __restrict__ scales,    // [m]
     int m, int k)
 {
@@ -91,11 +91,11 @@ __global__ void flux3_fp8_rowwise_quantize_f32(
     }
     float scale = fmaxf(red[0] / 448.0f, 1e-12f);
     if (threadIdx.x == 0) scales[r] = scale;
-    float* out = q + (long)r * k;
+    unsigned char* out = q + (long)r * k;
     for (int c = threadIdx.x; c < k; c += blockDim.x) {
         float v = row[c] / scale;
-        float mag = f3_e4m3_round(fabsf(v));
-        out[c] = signbit(v) ? -mag : mag;
+        unsigned int byte = f3_e4m3_byte_from_decoded(f3_e4m3_round(fabsf(v)));
+        out[c] = (unsigned char)(signbit(v) ? (byte | 0x80u) : byte);
     }
 }
 
