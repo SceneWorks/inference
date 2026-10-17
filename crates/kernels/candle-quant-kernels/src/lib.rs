@@ -47,6 +47,7 @@
 
 pub mod cublaslt;
 pub mod decode_attention;
+pub mod flux3_quant;
 pub mod fused_decode;
 pub mod moe_gemv;
 pub mod nvfp4;
@@ -116,6 +117,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     FUSED_DECODE_SRC,
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
+    flux3_quant::FLUX3_QUANT_SRC,
     DECODE_ATTENTION_SRC,
     MOE_GEMV_SRC,
     yue2_stable_conv::YUE2_STABLE_CONV_SRC,

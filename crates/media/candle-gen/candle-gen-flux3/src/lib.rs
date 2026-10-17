@@ -137,3 +137,6 @@ mod tests {
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 2);
     }
 }
+
+#[cfg(test)]
+mod kernel_oracle_tests;
