@@ -1,13 +1,18 @@
 //! **Anima Turbo** (`anima_turbo`) on iOS: the load defaults and the memory-ladder selection a phone
 //! renders it with (sc-26265).
 //!
-//! Nothing here restates the provider's ladder. The rungs, their parameter domains and their
-//! prerequisites are `mlx-gen-anima`'s own contract, and every admission goes through the safety
-//! check the provider registers — which is `standard_memory_strategy_safety_check` plus Anima's route
-//! gate. This module only supplies what admission needs and the provider does not own: the
-//! **predicted peak** of each candidate, from measurements, and the iOS budget it is checked against.
+//! **PLANNING ONLY.** Product admission of Anima Turbo is the single evidence-table seam in
+//! [`crate::ios_admission`], exactly like SANA and SDXL: device-captured, artifact/device-bound
+//! rows, the live budget, the limits-bound precondition and the provider's registered safety
+//! check. Nothing in this module admits a load. It chooses WHICH selection to try (and to capture
+//! first), from host numbers that are not device evidence.
 //!
-//! # Evidence
+//! Nothing here restates the provider's ladder. The rungs, their parameter domains and their
+//! prerequisites are `mlx-gen-anima`'s own contract; the planning decision runs the safety check
+//! the provider registers — `standard_memory_strategy_safety_check` plus Anima's route gate — with
+//! a host-derived predicted peak.
+//!
+//! # Planning data
 //!
 //! There is no device measurement of Anima yet. What exists is the provider's host sweep
 //! ([`ANIMA_HOST_REQUEST_PEAKS`]): `anima_base`, bf16, 1024², a CFG pair, MLX allocator high-water.
@@ -192,14 +197,15 @@ fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     }
 }
 
-/// Admit or refuse `selection` for an `anima_turbo` text-to-image render of `image_edge`² under
-/// `budget`, before anything loads.
+/// PLANNING decision for `selection` at `image_edge`² under `budget`: would the host-derived bound
+/// fit? This never admits a load (see [`crate::ios_admission::admit`]); it ranks what to try and
+/// capture first.
 ///
 /// The decision is the provider's registered safety check (`standard_memory_strategy_safety_check`
-/// and Anima's route gate), fed the candidate's footprint bound as its predicted peak. On top of it
-/// only the evidence rules apply: no host row refuses, and a floor that fits still refuses, because a
-/// floor says nothing about how much more the request costs.
-pub fn anima_turbo_admission(
+/// and Anima's route gate), fed the candidate's host-derived bound as its predicted peak. On top of
+/// it: no host row refuses, and a floor that fits still refuses, because a floor says nothing about
+/// how much more the request costs.
+pub fn anima_turbo_planning_decision(
     registry: &ProviderRegistry,
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -239,8 +245,8 @@ pub fn anima_turbo_admission(
         },
     )?;
     context.selection = *selection;
-    // A host measurement carried to the device under a stated bound: an estimate, not a
-    // calibration of this device.
+    // A host measurement carried to the device under a stated bound: a planning estimate, not a
+    // calibration of this device and never admission authority.
     context.optimization_authority = if selection.strategy.is_optimized() {
         MemoryOptimizationAuthority::Estimated
     } else {
@@ -312,9 +318,10 @@ fn candidate_selections(
     candidates
 }
 
-/// The iOS memory selection for an `anima_turbo` render of `image_edge`² under `budget`: of every
-/// selection the provider publishes for this load, the admitted one ([`anima_turbo_admission`]) with
-/// the most headroom, ties to the larger decode tile. An error names why nothing was admitted.
+/// The PLANNED iOS memory selection for an `anima_turbo` render of `image_edge`² under `budget`: of
+/// every selection the provider publishes for this load, the one the planning decision
+/// ([`anima_turbo_planning_decision`]) accepts with the most headroom, ties to the larger decode
+/// tile. An error names why nothing fits the plan. Admission of the planned selection is separate.
 pub fn anima_turbo_memory_selection(
     registry: &ProviderRegistry,
     spec: &LoadSpec,
@@ -325,7 +332,9 @@ pub fn anima_turbo_memory_selection(
     let mut admitted = Vec::new();
     let mut refusals = Vec::new();
     for selection in candidate_selections(spec, contract) {
-        match anima_turbo_admission(registry, spec, contract, &selection, image_edge, budget)? {
+        match anima_turbo_planning_decision(
+            registry, spec, contract, &selection, image_edge, budget,
+        )? {
             MemorySafetyDecision::Accept => {
                 let bound = anima_host_request_peak(&selection, image_edge)
                     .map(AnimaHostRequestPeak::footprint_bound_bytes)
@@ -449,7 +458,7 @@ mod tests {
             .representative_selection(MemoryStrategy::Resident, loaded_tier(&spec), false)
             .expect("resident is always a selection");
 
-        let decision = anima_turbo_admission(
+        let decision = anima_turbo_planning_decision(
             &registry,
             &spec,
             &contract,
@@ -481,7 +490,7 @@ mod tests {
             .filter(|candidate| candidate.strategy != MemoryStrategy::BoundedTransformerResidency)
         {
             tiled += usize::from(candidate.parameters.decode_tile_edge.is_some());
-            let decision = anima_turbo_admission(
+            let decision = anima_turbo_planning_decision(
                 &registry,
                 &spec,
                 &contract,
@@ -523,6 +532,68 @@ mod tests {
         let error = anima_turbo_ios_selection(&registry, &spec, &contract)
             .expect_err("nothing measured fits 4 GiB without the DiT window");
         assert!(error.to_string().contains("nothing fits"), "{error}");
+    }
+
+    /// Finding 5: a selection the host plan accepts is still REFUSED by product admission until a
+    /// reviewed device row exists; host numbers never admit. The refusal is typed `no_evidence`.
+    #[test]
+    fn the_planned_selection_is_refused_by_admission_without_a_device_row() {
+        let registry = crate::provider_registry().expect("iOS media catalog builds");
+        let root = tempfile::tempdir().unwrap();
+        for component in ["diffusion_models", "text_encoders", "vae"] {
+            crate::sdxl::tests::write_tensor(
+                &root
+                    .path()
+                    .join("split_files")
+                    .join(component)
+                    .join("fixture.safetensors"),
+                "F16",
+                8,
+            );
+        }
+        let spec = anima_turbo_load_spec(WeightsSource::Dir(root.path().to_owned()));
+        let contract = contract(&registry, &spec);
+        let planned = anima_turbo_ios_selection(&registry, &spec, &contract).unwrap();
+        assert_eq!(
+            anima_turbo_planning_decision(
+                &registry,
+                &spec,
+                &contract,
+                &planned,
+                1024,
+                ios_memory_budget()
+            )
+            .unwrap(),
+            MemorySafetyDecision::Accept,
+            "the host plan accepts it"
+        );
+        let candidate = crate::ios_admission::build_candidate(
+            &registry,
+            ANIMA_TURBO_ID,
+            spec,
+            Some(planned),
+            planned.strategy,
+            crate::ios_admission::IosWork::Generate(mlx_gen::gen_core::GenerationRequest {
+                prompt: "p".into(),
+                width: 1024,
+                height: 1024,
+                count: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let refused = crate::ios_admission::admit(
+            &registry,
+            std::slice::from_ref(&candidate),
+            "iPhone17,2",
+            ios_memory_budget(),
+        )
+        .expect_err("host numbers must never admit a device load");
+        assert_eq!(
+            refused.refusal_kind(),
+            Some(crate::RefusalKind::NoEvidence),
+            "{refused}"
+        );
     }
 
     /// The table converts the provider's published GiB figures exactly and in the right direction.

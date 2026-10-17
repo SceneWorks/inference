@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "about": "The ONE source-controlled iOS device evidence table (epic 16774, E4/E7). iOS admission reads only this file, compiled in. Each row is a reviewed iPhone device capture (`scripts/ios/campaign.py capture` then `evidence`), keyed on hardware, provider, route, tier, a path-free artifact layout digest, mode, geometry, reference count, execution levers and token window. A request with no matching row is refused (no_evidence). Capture output never changes admission at runtime: only a human-reviewed commit of this file does. Mac host peaks and launch headroom are never rows.",
+  "rows": []
+}

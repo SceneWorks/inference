@@ -1,5 +1,11 @@
-//! SANA/Gemma iOS diagnostic quantum accounting. These are conservative tensor scratch floors,
-//! not a total-process or Metal-driver upper bound. They never authorize production admission.
+//! iOS quantum accounting primitives. Every figure is COUNTED from the ops of one quantum — how
+//! many tensors of each shape are live at that quantum's peak — by its call site, and each call
+//! site proves its counts with a CPU test that measures MLX's peak for a small shape
+//! ([`measured_peak_bytes`]) and asserts the formula is at least the measurement and within a
+//! stated factor of it ([`assert_tracks_measured`]). No blanket multipliers: a floor that
+//! over-prices refuses sizes the phone could run, and a campaign would then record the guard's
+//! arithmetic instead of the device. These remain floors for one materialized quantum, not a
+//! process or Metal-driver bound, and they never authorize production admission.
 
 pub const PROCESS_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -10,60 +16,173 @@ fn sum(values: &[u64]) -> u64 {
     values.iter().fold(0u64, |a, b| a.saturating_add(*b))
 }
 
-/// Eight score-sized buffers cover scale/softcap/mask/softmax conversions; 24 hidden,
-/// eight MLP and twelve QKV buffers cover norm, residual, gated activation and GQA copies.
-/// Also price full f32 projection copies, even when packed kernels do not need them.
-pub fn gemma_layer_bytes(b: u64, l: u64, h: u64, intermediate: u64, heads: u64, hd: u64) -> u64 {
-    sum(&[
-        product(&[8, b, heads, l, l, 4]),
-        product(&[24, b, l, h, 4]),
-        product(&[8, b, l, intermediate, 4]),
-        product(&[12, b, l, heads, hd, 4]),
-        product(&[4, h, heads, hd, 4]),
-        product(&[3, h, intermediate, 4]),
-    ])
+/// Bytes of one tensor of `dims` at `element_bytes` per element.
+pub fn tensor_bytes(element_bytes: u64, dims: &[u64]) -> u64 {
+    product(&[product(dims), element_bytes])
 }
 
-/// Actual configured geometry of one SANA transformer block, derived from its loaded tensors.
+/// How an attention's scores exist in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SanaBlockGeometry {
+pub enum Scores {
+    /// Fused SDPA (`mlx_rs::fast::scaled_dot_product_attention`): no score tensor materializes;
+    /// only q/k/v/out, which the call site counts among its live hidden/context buffers.
+    Fused,
+    /// Scores materialized as `[B, H, query_rows, keys]` at `element_bytes`, `live` at once (e.g.
+    /// the logits and their softmax), by an explicit-softmax or query-chunked path.
+    Materialized { live: u64, element_bytes: u64 },
+}
+
+/// Score bytes of one attention over `keys` keys, `query_rows` queries at a time.
+pub fn scores_bytes(scores: Scores, batch: u64, heads: u64, query_rows: u64, keys: u64) -> u64 {
+    match scores {
+        Scores::Fused => 0,
+        Scores::Materialized {
+            live,
+            element_bytes,
+        } => product(&[live, batch, heads, query_rows, keys, element_bytes]),
+    }
+}
+
+/// One attention block (DiT, UNet spatial transformer, text-encoder layer, VAE mid-attention) from
+/// loaded tensors, the request, and the call site's COUNTED live tensors at each phase's peak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionBlockGeometry {
     pub batch: u64,
+    /// Tokens attended over (image/latent tokens, or text tokens for a text layer).
     pub tokens: u64,
-    /// Block model width (`heads * head_dim`).
+    /// Block width.
     pub dim: u64,
-    pub caption_tokens: u64,
-    /// GLUMBConv expanded channels (`2 * int(mlp_ratio * dim)`).
-    pub ff_channels: u64,
-    /// Cross-attention heads whose `[B, H, N, M]` f32 score tensor is materialized.
-    pub cross_heads: u64,
-    /// Elements of every GLUMBConv weight and bias (inverted, depthwise, point).
-    pub conv_weight_elements: u64,
+    pub heads: u64,
+    /// Cross-attention context tokens (0 for self-attention only).
+    pub context_tokens: u64,
+    /// MLP hidden width (0 for an attention-only quantum).
+    pub ff_hidden: u64,
+    /// Query rows scored at once: `tokens` unchunked, the chunk under a bounded plan.
+    pub query_rows: u64,
+    /// Activation storage width in bytes (2 for f16/bf16 compute, 4 for f32).
+    pub element_bytes: u64,
+    /// Bytes of weight COPIES this quantum creates (dequantize/promote/cast); 0 when the resident
+    /// weights are consumed in place.
+    pub weight_bytes: u64,
+    /// Live `[B, tokens, dim]` buffers at the attention phase's peak (residual, normed input,
+    /// q/k/v/out as counted for this site).
+    pub attn_hidden_live: u64,
+    /// Live `[B, context_tokens, dim]` buffers at the attention phase's peak (cross k/v, ...).
+    pub context_live: u64,
+    pub scores: Scores,
+    /// Live `[B, tokens, dim]` buffers at the MLP phase's peak.
+    pub mlp_hidden_live: u64,
+    /// Live `[B, tokens, ff_hidden]` buffers at the MLP phase's peak.
+    pub ff_live: u64,
 }
 
-/// Full F32 copies of every GLUMBConv weight/bias, ADDITIONAL to the resident (possibly F16) copy.
-pub fn sana_promoted_conv_bytes(conv_weight_elements: u64) -> u64 {
-    product(&[4, conv_weight_elements])
+/// `weight_bytes + max(attention phase, MLP phase)`: the phases run one after the other, so their
+/// intermediates are not live together.
+pub fn attention_block_bytes(g: AttentionBlockGeometry) -> u64 {
+    let hidden = tensor_bytes(g.element_bytes, &[g.batch, g.tokens, g.dim]);
+    let attention = sum(&[
+        product(&[g.attn_hidden_live, hidden]),
+        product(&[
+            g.context_live,
+            tensor_bytes(g.element_bytes, &[g.batch, g.context_tokens, g.dim]),
+        ]),
+        scores_bytes(
+            g.scores,
+            g.batch,
+            g.heads,
+            g.query_rows,
+            g.tokens.saturating_add(g.context_tokens),
+        ),
+    ]);
+    let mlp = sum(&[
+        product(&[g.mlp_hidden_live, hidden]),
+        product(&[
+            g.ff_live,
+            tensor_bytes(g.element_bytes, &[g.batch, g.tokens, g.ff_hidden]),
+        ]),
+    ]);
+    g.weight_bytes.saturating_add(attention.max(mlp))
 }
 
-/// Promoted convolution copies, eight attention-projection copies, eight score-sized
-/// softmax buffers, 32 expanded-activation buffers and eight caption-sized buffers. Per-block
-/// materialization prevents multiplying this scratch by the stack depth.
-pub fn sana_block_bytes(g: SanaBlockGeometry) -> u64 {
+/// One convolutional stage (resnet, up/downsample, conv in/out) at its spatial extent, with the
+/// call site's COUNTED live input-width and output-width activations at its peak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvStageGeometry {
+    pub batch: u64,
+    pub height: u64,
+    pub width: u64,
+    pub in_channels: u64,
+    pub out_channels: u64,
+    pub element_bytes: u64,
+    /// Live `[B, H, W, in_channels]` buffers at the peak.
+    pub in_live: u64,
+    /// Live `[B, H, W, out_channels]` buffers at the peak.
+    pub out_live: u64,
+    /// Bytes of weight copies this quantum creates (promotion/cast); 0 when used in place.
+    pub weight_bytes: u64,
+}
+
+pub fn conv_stage_bytes(g: ConvStageGeometry) -> u64 {
+    let plane = product(&[g.batch, g.height, g.width, g.element_bytes]);
     sum(&[
-        sana_promoted_conv_bytes(g.conv_weight_elements),
-        product(&[8, g.dim, g.dim, 4]),
-        product(&[32, g.batch, g.tokens, g.ff_channels, 4]),
-        product(&[8, g.batch, g.cross_heads, g.tokens, g.caption_tokens, 4]),
-        product(&[8, g.batch, g.caption_tokens, g.dim, 4]),
+        g.weight_bytes,
+        product(&[g.in_live, plane, g.in_channels]),
+        product(&[g.out_live, plane, g.out_channels]),
     ])
 }
 
-/// A DC-AE substage: 32 full activation-sized f32 buffers, and a conservative 64*C*C
-/// f32 weight/copy allowance covering GLUMBConv (12*C*C), QKV, multiscale and conv scratch.
-/// Upsample callers price the DOUBLED spatial extent before constructing that graph.
-pub fn dcae_stage_bytes(b: u64, h: u64, w: u64, c: u64) -> u64 {
-    sum(&[product(&[32, b, h, w, c, 4]), product(&[64, c, c, 4])])
+/// MLX's peak allocation while `run` builds and evaluates one quantum, above what was live before
+/// it (inputs already materialized do not count; the outputs do). For host CPU proofs of a call
+/// site's counted formula; the device enforces only the formula.
+#[cfg(not(target_os = "ios"))]
+pub fn measured_peak_bytes(
+    run: impl FnOnce() -> crate::Result<Vec<mlx_rs::Array>>,
+) -> crate::Result<u64> {
+    mlx_rs::memory::clear_cache();
+    let before = mlx_rs::memory::get_active_memory() as u64;
+    mlx_rs::memory::reset_peak_memory();
+    let outputs = run()?;
+    mlx_rs::transforms::eval(outputs.iter())?;
+    let peak = mlx_rs::memory::get_peak_memory() as u64;
+    drop(outputs);
+    Ok(peak.saturating_sub(before))
 }
+
+/// The proof every counted formula carries: never below the measured peak (it must not admit a
+/// quantum that allocates more), and at most `max_ratio` times it (it must not refuse sizes that
+/// fit). Panics with both figures otherwise.
+pub fn assert_tracks_measured(label: &str, formula: u64, measured: u64, max_ratio: f64) {
+    assert!(
+        formula >= measured,
+        "{label}: formula {formula} B is BELOW the measured peak {measured} B"
+    );
+    assert!(
+        (formula as f64) <= max_ratio * measured as f64,
+        "{label}: formula {formula} B over-prices the measured peak {measured} B by more than {max_ratio}x"
+    );
+}
+
+/// Latent-sized elementwise work BETWEEN denoiser forwards (classifier-free-guidance combine and
+/// the sampler update). It is lazy, so it materializes inside the NEXT guarded quantum, whose
+/// scratch carries this allowance: CFG combine holds both branch predictions, their difference,
+/// the guidance-scaled term and the sum (5 buffers); the sampler update holds the previous sample,
+/// the model output, the scaled step, the noise and the new sample (5); plus up to 6 dtype-cast
+/// copies = 16 f32 latent-sized buffers.
+pub fn sampler_step_bytes(latent_elements: u64) -> u64 {
+    product(&[16, latent_elements, 4])
+}
+
+/// Rotary tables built for `positions` at `head_dim`: f32 cos and sin plus their broadcast copies.
+pub fn rope_table_bytes(positions: u64, head_dim: u64) -> u64 {
+    product(&[4, positions, head_dim, 4])
+}
+
+/// `copies` f32 buffers of `elements` each: a small elementwise pass (mask multiply, positional
+/// add, concatenation) folded into the guarded quantum that materializes it.
+pub fn elementwise_bytes(elements: u64, copies: u64) -> u64 {
+    product(&[copies, elements, 4])
+}
+
 pub fn check_headroom(
     available: Option<u64>,
     scratch: u64,
@@ -162,79 +281,78 @@ mod tests {
         assert_eq!(result, Err("eval failed"));
     }
 
-    fn sana_geometry(dim: u64, ratio_num: u64, ratio_den: u64, heads: u64) -> SanaBlockGeometry {
-        let hidden = dim * ratio_num / ratio_den;
-        SanaBlockGeometry {
+    #[test]
+    fn counted_attention_takes_the_larger_phase_and_fused_scores_cost_nothing() {
+        let g = AttentionBlockGeometry {
             batch: 1,
             tokens: 64,
-            dim,
-            caption_tokens: 300,
-            ff_channels: 2 * hidden,
-            cross_heads: heads,
-            conv_weight_elements: 2 * hidden * dim
-                + 2 * hidden
-                + 2 * hidden * 9
-                + 2 * hidden
-                + dim * hidden,
-        }
-    }
-
-    #[test]
-    fn f16_convolution_promotion_is_charged_as_full_f32_scratch_not_half_storage() {
-        let production = sana_geometry(2240, 5, 2, 20);
-        assert_eq!(
-            sana_promoted_conv_bytes(production.conv_weight_elements),
-            4 * production.conv_weight_elements
-        );
-        assert!(sana_block_bytes(production) >= 4 * production.conv_weight_elements);
-        let larger = SanaBlockGeometry {
-            tokens: 1024,
-            ..production
+            dim: 32,
+            heads: 4,
+            context_tokens: 7,
+            ff_hidden: 96,
+            query_rows: 64,
+            element_bytes: 2,
+            weight_bytes: 1000,
+            attn_hidden_live: 5,
+            context_live: 2,
+            scores: Scores::Fused,
+            mlp_hidden_live: 2,
+            ff_live: 2,
         };
-        assert!(sana_block_bytes(larger) > sana_block_bytes(production));
-    }
-
-    #[test]
-    fn sana_floor_uses_configured_ffn_expansion_and_cross_heads() {
-        // Non-production geometry: mlp_ratio 3 and seven heads. A formula hardcoding 5*dim
-        // or 20 heads cannot satisfy both exact deltas.
-        let base = sana_geometry(96, 3, 1, 7);
-        let more_heads = SanaBlockGeometry {
-            cross_heads: 8,
-            ..base
+        let attn = 5 * 64 * 32 * 2 + 2 * 7 * 32 * 2;
+        let mlp = 2 * 64 * 32 * 2 + 2 * 64 * 96 * 2;
+        assert_eq!(attention_block_bytes(g), 1000 + attn.max(mlp));
+        let materialized = AttentionBlockGeometry {
+            scores: Scores::Materialized {
+                live: 2,
+                element_bytes: 4,
+            },
+            query_rows: 16,
+            ..g
         };
         assert_eq!(
-            sana_block_bytes(more_heads) - sana_block_bytes(base),
-            8 * base.tokens * base.caption_tokens * 4
+            attention_block_bytes(materialized),
+            1000 + (attn + 2 * 4 * 16 * 71 * 4).max(mlp)
         );
-        let wider_ffn = SanaBlockGeometry {
-            ff_channels: base.ff_channels + 2,
-            ..base
-        };
         assert_eq!(
-            sana_block_bytes(wider_ffn) - sana_block_bytes(base),
-            32 * base.tokens * 2 * 4
+            attention_block_bytes(AttentionBlockGeometry {
+                batch: u64::MAX,
+                ..g
+            }),
+            u64::MAX
         );
-        let expected = 4 * base.conv_weight_elements
-            + 8 * 96 * 96 * 4
-            + 32 * 64 * 576 * 4
-            + 8 * 7 * 64 * 300 * 4
-            + 8 * 300 * 96 * 4;
-        assert_eq!(sana_block_bytes(base), expected);
+        let conv = ConvStageGeometry {
+            batch: 1,
+            height: 8,
+            width: 8,
+            in_channels: 4,
+            out_channels: 6,
+            element_bytes: 4,
+            in_live: 2,
+            out_live: 1,
+            weight_bytes: 10,
+        };
+        assert_eq!(conv_stage_bytes(conv), 10 + 2 * 64 * 4 * 4 + 64 * 6 * 4);
     }
 
     #[test]
-    fn gemma_scores_use_padded_tokens_and_do_not_shrink_with_image_geometry() {
-        let floor = gemma_layer_bytes(1, 506, 2304, 9216, 8, 256);
-        assert!(floor >= 8 * 506 * 506 * 4 + 506 * 9216 * 4);
-        assert!(gemma_layer_bytes(1, 507, 2304, 9216, 8, 256) > floor);
-        assert!(gemma_layer_bytes(u64::MAX, 506, 2304, 9216, 8, 256) == u64::MAX);
+    #[should_panic(expected = "over-prices")]
+    fn a_formula_ten_times_the_measurement_fails_its_proof() {
+        assert_tracks_measured("x", 1000, 100, 1.5);
     }
 
     #[test]
-    fn dcae_tiles_and_channels_control_the_floor_without_wrapping() {
-        assert!(dcae_stage_bytes(1, 128, 128, 128) >= 32 * 128 * 128 * 128 * 4);
-        assert!(dcae_stage_bytes(1, 256, 256, 128) > dcae_stage_bytes(1, 128, 128, 128));
-        assert_eq!(dcae_stage_bytes(u64::MAX, 128, 128, 128), u64::MAX);
+    #[should_panic(expected = "BELOW")]
+    fn a_formula_under_the_measurement_fails_its_proof() {
+        assert_tracks_measured("x", 99, 100, 1.5);
+    }
+
+    #[test]
+    fn small_step_allowances_are_shape_derived_and_saturating() {
+        // 1x4x64x64 latent: 16 f32 buffers.
+        assert_eq!(sampler_step_bytes(4 * 64 * 64), 16 * 4 * 64 * 64 * 4);
+        assert_eq!(rope_table_bytes(4096, 128), 4 * 4096 * 128 * 4);
+        assert_eq!(elementwise_bytes(1000, 3), 12_000);
+        assert_eq!(sampler_step_bytes(u64::MAX), u64::MAX);
     }
 }

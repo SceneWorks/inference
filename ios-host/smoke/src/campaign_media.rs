@@ -1,6 +1,17 @@
-//! Catalog-driven device campaign adapter. Enumeration is weights-free. Execution is never
-//! authorized by a host peak, launch headroom, a directory name, or the diagnostic flag.
-use super::campaign::{self, AdmissionError, Case, Provider, Status, Surface};
+//! Catalog-driven device campaign adapter. Enumeration is weights-free.
+//!
+//! Two execution paths, never mixed:
+//! * ADMITTED (default): runtime-ios's admitted facades against the single reviewed evidence table;
+//!   a refusal carries a typed kind (capacity / no_evidence / mode / strategy / artifact).
+//! * CAPTURE (`--diagnostic`): an explicitly labelled, bounded device capture through
+//!   `runtime_ios::media::capture_permit`. No evidence row is needed (that would be circular); every
+//!   quantum checks live OS headroom before constructing its graph, so the first quantum that does
+//!   not fit refuses BEFORE allocating, and that typed refusal is the "next size refused before
+//!   jetsam" evidence. A capture row is never a production pass and never changes admission: a
+//!   human reviews it into `evidence/ios_device_evidence.json`.
+//!
+//! Execution is never authorized by a host peak, launch headroom or a directory name.
+use super::campaign::{self, AdmissionError, Case, ExecuteError, Provider, Status, Surface};
 use runtime_ios::gen_core::*;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -9,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 #[path = "campaign_support.rs"]
 mod support;
-use support::{case_timeout, classify_admission_error, hex, Deadline};
+use support::{case_timeout, classify, Deadline};
 #[path = "campaign_primitive.rs"]
 mod primitive;
 
@@ -33,6 +44,11 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
         );
         if d.capabilities.supports_prompt_batch {
             modes.push("prompt_batch".into());
+        }
+        // SDXL's IP-Adapter is a distinct memory route (an image encoder + per-block IP keys),
+        // reached with a reference image and a provisioned `ip_adapter` component.
+        if d.id == "sdxl" {
+            modes.push("ip_adapter".into());
         }
         let routes = if d.id == "sdxl" {
             runtime_ios::media::sdxl::SDXL_FAMILY_ROUTES
@@ -94,6 +110,104 @@ fn tier(case: &Case) -> MemoryNumericTier {
     }
 }
 
+/// A deterministic, non-constant synthetic RGB image: conditioning/task input for capture and
+/// admitted cases. Pixels never enter an evidence key (geometry and mode do).
+fn synthetic_image(edge: u32) -> Image {
+    Image {
+        width: edge,
+        height: edge,
+        pixels: (0..edge as usize * edge as usize * 3)
+            .map(|i| ((i * 37) % 251) as u8)
+            .collect(),
+    }
+}
+
+/// Providers that pad their text to a fixed window get a window-filling prompt, so a capture
+/// prices the full encoder; SDXL keys the exact CLIP window count, so it uses one window.
+fn prompt(provider: &str) -> String {
+    const SHORT: &str = "A red ceramic teapot on a wooden table in daylight";
+    if provider == "sdxl" {
+        SHORT.into()
+    } else {
+        std::iter::repeat_n(
+            "A red ceramic teapot on a wooden table in warm afternoon daylight, soft shadows, \
+             detailed glaze reflections, a linen cloth, a window with green plants behind,",
+            12,
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+}
+
+/// The actual work of a case's mode. Every registered mode has a carrier; a mode the provider
+/// does not serve is refused by admission with a typed `mode` kind, never dropped here.
+fn work(c: &Case, cancel: &CancelFlag) -> Result<runtime_ios::media::IosWork, AdmissionError> {
+    use runtime_ios::media::IosWork;
+    let image = || synthetic_image(c.edge);
+    let mut request = GenerationRequest {
+        prompt: prompt(&c.provider),
+        width: c.edge,
+        height: c.edge,
+        seed: Some(16774),
+        count: 1,
+        cancel: cancel.clone(),
+        ..Default::default()
+    };
+    match c.mode.as_str() {
+        "text" => {}
+        "prompt_batch" => {
+            request.prompt_batch = vec![
+                std::mem::take(&mut request.prompt),
+                "A blue glass vase beside a window at sunset".into(),
+            ];
+        }
+        "reference" | "ip_adapter" => {
+            request.conditioning = vec![Conditioning::Reference {
+                image: image(),
+                strength: Some(0.6),
+            }]
+        }
+        // Inpainting carries its source image and the mask.
+        "mask" => {
+            request.conditioning = vec![
+                Conditioning::Reference {
+                    image: image(),
+                    strength: Some(0.6),
+                },
+                Conditioning::Mask { image: image() },
+            ]
+        }
+        "control" => {
+            request.conditioning = vec![Conditioning::Control {
+                image: image(),
+                kind: ControlKind::Other("tile".into()),
+                scale: Some(1.0),
+            }]
+        }
+        "restore" => {
+            return Ok(IosWork::Restore(TransformRequest {
+                image: image(),
+                seed: Some(16774),
+                cancel: cancel.clone(),
+                ..Default::default()
+            }))
+        }
+        "depth" => {
+            return Ok(IosWork::Depth(runtime_ios::iris_depth::DepthRequest {
+                image: image(),
+                cancel: cancel.clone(),
+                ..Default::default()
+            }))
+        }
+        other => {
+            return Err(AdmissionError::Refused(format!(
+                "{other}: no request carrier for this registered task"
+            )))
+        }
+    }
+    Ok(IosWork::Generate(request))
+}
+
 fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
     let path = root.join(&c.route).join(&c.tier);
     if !path.is_dir() {
@@ -149,8 +263,25 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             {
                 return Err("component paths must be confined relative paths".into());
             }
-            spec.components
-                .insert(key, WeightsSource::Dir(path.join(rel)));
+            let target = path.join(rel);
+            // A single-file artifact is a File source; a directory is a Dir source.
+            let source = if target.is_file() {
+                WeightsSource::File(target)
+            } else {
+                WeightsSource::Dir(target)
+            };
+            // The SDXL ControlNet and IP-Adapter are typed load-spec roles, not named components,
+            // attached only for their own mode: a loaded IP-Adapter takes the reference image
+            // (so an image-to-image case would silently become IP-Adapter), and either adds
+            // weights the other routes do not run.
+            match key.as_str() {
+                "control" if c.mode == "control" => spec.control = Some(source),
+                "ip_adapter" if c.mode == "ip_adapter" => spec.ip_adapter = Some(source),
+                "control" | "ip_adapter" => {}
+                _ => {
+                    spec.components.insert(key, source);
+                }
+            }
         }
     }
     Ok(spec)
@@ -164,22 +295,25 @@ struct DeviceProvider<'a> {
     cancel: CancelFlag,
     deadline: Instant,
     root: PathBuf,
-    spec: Option<LoadSpec>,
-    context: Option<MemoryRunContext>,
-    request: Option<GenerationRequest>,
+    candidate: Option<runtime_ios::media::IosCandidate>,
+    /// The memory-relevant evidence key of this case's actual work on this artifact/device.
+    evidence_key: Option<runtime_ios::media::evidence::EvidenceKey>,
+    /// A bounded capture permit (diagnostic runs only).
+    permit: Option<(ProviderRegistry, runtime_ios::media::Admission)>,
+    /// The typed pre-construction quantum refusal, when a capture stopped at one.
+    refused_quantum: Option<Value>,
     refusal_only: bool,
-    sdxl: Option<runtime_ios::media::sdxl::SdxlCandidate>,
 }
 impl DeviceProvider<'_> {
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
         let spec = snapshot(&self.root, c)?;
-        if c.provider.starts_with("sana_") {
-            let p = runtime_ios::media::sana_snapshot_profile(&spec).map_err(|e| e.to_string())?;
-            self.artifact = json!({"layout_sha256": hex(&p.layout_sha256)});
-        } else if c.provider == "sdxl" {
-            let p = runtime_ios::media::sdxl::sdxl_snapshot_profile(&spec)
-                .map_err(|e| e.to_string())?;
-            self.artifact = json!({"profile_sha256": hex(&p)});
+        // A control / IP-Adapter case without its provisioned component would silently run as
+        // another route: a provisioning failure, never admission or refusal evidence.
+        if c.provider == "sdxl" && c.mode == "control" && spec.control.is_none() {
+            return Err("SDXL control case needs a provisioned `control` component (components.json); not admission/refusal evidence".into());
+        }
+        if c.mode == "ip_adapter" && spec.ip_adapter.is_none() {
+            return Err("IP-Adapter case needs a provisioned `ip_adapter` component (components.json); not admission/refusal evidence".into());
         }
         let contract = self
             .registry
@@ -197,67 +331,185 @@ impl DeviceProvider<'_> {
                 c.rung
             )));
         }
-        let calibration = contract
-            .calibration
-            .as_ref()
-            .ok_or("no provider calibration identity")?;
         let selection = contract
-            .representative_selection(MemoryStrategy::ALL[usize::from(c.rung)], tier(c), false)
+            .representative_selection(strategy, tier(c), false)
             .map_err(|e| {
                 self.refusal_kind = Some("strategy");
                 AdmissionError::Refused(e.to_string())
             })?;
-        let mut request = GenerationRequest {
-            prompt: "A red ceramic teapot on a wooden table in daylight".into(),
-            width: c.edge,
-            height: c.edge,
-            seed: Some(16774),
-            count: 1,
-            cancel: self.cancel.clone(),
-            memory: contract.generation_memory(&selection),
-            ..Default::default()
-        };
-        if c.mode == "prompt_batch" {
-            request.prompt_batch = vec![
-                std::mem::take(&mut request.prompt),
-                "A blue glass vase beside a window at sunset".into(),
-            ];
-        }
-        // Conditioning/task cases are retained and refused until device-bound evidence covers
-        // their exact carrier. Never replace an edit/depth/restoration request with text-to-image.
-        let mode = if c.mode == "text" || c.mode == "prompt_batch" {
-            MemoryMode::TextToImage
-        } else {
-            MemoryMode::Other(c.mode.clone())
-        };
-        let context = MemoryRunContext {
-            selection,
-            optimization_authority: MemoryOptimizationAuthority::Calibrated,
-            calibration_abi: calibration.abi,
-            calibration_fingerprint: calibration.fingerprint.clone(),
-            load_shape: spec.load_shape,
-            mode,
-            has_reference: false,
-            use_pid: false,
-            has_phases: true,
-            geometry: MemoryGeometry {
-                width: c.edge,
-                height: c.edge,
-                batch: if c.mode == "prompt_batch" { 2 } else { 1 },
-                frames: 1,
-                reference_count: 0,
-            },
-            overlay: None,
-            budget: runtime_ios::media::ios_memory_budget(),
-            // Unknown is NOT zero. No fabricated estimate is ever supplied to admission.
-            predicted_peak_bytes: u64::MAX,
-            cache_state: MemoryCacheState::Cold,
-            evidence_revision: "no-device-capture".into(),
-        };
-        self.spec = Some(spec);
-        self.context = Some(context);
-        self.request = Some(request);
+        let work = work(c, &self.cancel)?;
+        let candidate = runtime_ios::media::build_candidate(
+            self.registry,
+            &c.provider,
+            spec,
+            Some(selection),
+            strategy,
+            work,
+        )
+        .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        // The memory-relevant key (path-free layout digest, mode, geometry, execution, token
+        // window). A malformed artifact is a failure here, before any evidence question.
+        let key = runtime_ios::media::evidence_key(
+            self.registry,
+            &candidate,
+            &runtime_ios::device_machine(),
+        )
+        .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        self.artifact = json!({"layout_sha256": key.layout_sha256});
+        self.evidence_key = Some(key);
+        self.candidate = Some(candidate);
         Ok(())
+    }
+
+    fn run_work(
+        &mut self,
+        c: &Case,
+        load: Option<runtime_ios::media::Admission>,
+        registry: &ProviderRegistry,
+    ) -> Result<(), ExecuteError> {
+        use runtime_ios::media::{capture_capacity, IosWork};
+        let candidate = self.candidate.as_ref().ok_or("no exact work")?;
+        let docs = super::dirs_documents().ok_or("no Documents directory")?;
+        // A stale record from an earlier call must never be read as this run's refusal.
+        let _ = runtime_ios::media::ios_quantum::take_refusal();
+        let _ = runtime_ios::media::take_capacity_refusal();
+        // A facade refusal keeps its typed kind; anything else is a message.
+        enum Stop {
+            Refused(&'static str, String),
+            Failed(String),
+        }
+        impl From<String> for Stop {
+            fn from(e: String) -> Self {
+                Self::Failed(e)
+            }
+        }
+        impl From<&str> for Stop {
+            fn from(e: &str) -> Self {
+                Self::Failed(e.into())
+            }
+        }
+        let refused = |e: runtime_ios::media::AdmissionError| match e {
+            runtime_ios::media::AdmissionError::Refused(r) => {
+                Stop::Refused(r.kind.label(), r.reason)
+            }
+            runtime_ios::media::AdmissionError::Failed(e) => Stop::Failed(e.to_string()),
+        };
+        let outcome = (|| -> Result<(), Stop> {
+            match (&candidate.work, load) {
+                (IosWork::Generate(request), permit) => {
+                    let generator: Box<dyn Generator> = match permit {
+                        Some(permit) => Box::new(
+                            permit
+                                .load_generator(registry, capture_capacity)
+                                .map_err(|e| e.to_string())?,
+                        ),
+                        None => {
+                            let one = std::slice::from_ref(candidate);
+                            let loaded = match c.provider.as_str() {
+                                "sdxl" => runtime_ios::media::load_sdxl(one),
+                                "anima_turbo" => runtime_ios::media::load_anima_turbo(one),
+                                "iris_3b" => runtime_ios::media::load_iris(one),
+                                _ => runtime_ios::media::load_sana(one),
+                            };
+                            Box::new(loaded.map_err(refused)?.1)
+                        }
+                    };
+                    generator.validate(request).map_err(|e| e.to_string())?;
+                    let GenerationOutput::Images(images) = generator
+                        .generate(request, &mut |_| {})
+                        .map_err(|e| e.to_string())?
+                    else {
+                        return Err("expected image output".into());
+                    };
+                    let expected = request.prompt_batch.len().max(1);
+                    if images.len() != expected {
+                        return Err("wrong output count".into());
+                    }
+                    Ok(support::persist_images(&docs, c, &images, Some(c.edge))?)
+                }
+                (IosWork::Restore(request), permit) => {
+                    let restorer = match permit {
+                        Some(permit) => permit
+                            .load_restorer(registry, capture_capacity)
+                            .map_err(|e| e.to_string())?,
+                        None => {
+                            runtime_ios::media::load_iris_restore(std::slice::from_ref(candidate))
+                                .map_err(refused)?
+                                .1
+                        }
+                    };
+                    let image = restorer
+                        .apply(request, &mut |_| {})
+                        .map_err(|e| e.to_string())?;
+                    Ok(support::persist_images(&docs, c, &[image], None)?)
+                }
+                (IosWork::Depth(request), permit) => {
+                    use runtime_ios::iris_depth::IrisDepthEstimator;
+                    let depth = match permit {
+                        Some(permit) => permit
+                            .load_depth(capture_capacity)
+                            .map_err(|e| e.to_string())?,
+                        None => {
+                            runtime_ios::media::load_iris_depth(std::slice::from_ref(candidate))
+                                .map_err(refused)?
+                                .1
+                        }
+                    };
+                    let output = depth
+                        .estimate(request, &mut |_| {})
+                        .map_err(|e| e.to_string())?;
+                    let map = &output.map;
+                    if (map.width, map.height) != (c.edge, c.edge)
+                        || map.values.iter().any(|v| !v.is_finite())
+                    {
+                        return Err("depth map has the wrong geometry or non-finite values".into());
+                    }
+                    let (lo, hi) = map
+                        .values
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                    let pixels = map
+                        .values
+                        .iter()
+                        .flat_map(|v| {
+                            let g = (((v - lo) / (hi - lo).max(f32::EPSILON)) * 255.0) as u8;
+                            [g, g, g]
+                        })
+                        .collect();
+                    let image = Image {
+                        width: map.width,
+                        height: map.height,
+                        pixels,
+                    };
+                    Ok(support::persist_images(&docs, c, &[image], Some(c.edge))?)
+                }
+            }
+        })();
+        let error = match outcome {
+            Ok(()) => return Ok(()),
+            Err(Stop::Refused(kind, reason)) => {
+                self.refusal_kind = Some(kind);
+                return Err(ExecuteError::Refused(reason));
+            }
+            Err(Stop::Failed(error)) => error,
+        };
+        // Typed by the quantum mechanism / the capacity recheck, never by the message.
+        if let Some(refusal) = runtime_ios::media::ios_quantum::take_refusal() {
+            self.refusal_kind = Some("capacity");
+            self.refused_quantum = Some(json!({
+                "label": refusal.label,
+                "scratch_bytes": refusal.scratch_bytes,
+                "reserve_bytes": refusal.reserve_bytes,
+                "available_bytes": refusal.available_bytes,
+                "edge": c.edge,
+            }));
+            return Err(ExecuteError::QuantumRefused(error));
+        }
+        if runtime_ios::media::take_capacity_refusal() {
+            self.refusal_kind = Some("capacity");
+            return Err(ExecuteError::Refused(error));
+        }
+        Err(ExecuteError::Failure(error))
     }
 }
 impl Provider for DeviceProvider<'_> {
@@ -266,144 +518,56 @@ impl Provider for DeviceProvider<'_> {
             return Err("campaign execution requires a real iOS device; host/simulator are listing/build only".into());
         }
         self.prepare(c)?;
+        let candidate = self.candidate.as_ref().ok_or("no exact work")?;
         if diagnostic {
-            return Err("UNADMITTED diagnostic refused: no independently bounded primitive permit for this case; --diagnostic is not permission to load weights or raise the cap".into());
-        }
-        if c.mode != "text" && c.mode != "prompt_batch" {
-            self.refusal_kind = Some("mode");
-            return Err(AdmissionError::Refused(format!("{} remains registered; no artifact/device/carrier-bound footprint authorizes this mode before load", c.mode)));
-        }
-        let spec = self.spec.as_ref().unwrap();
-        let context = self.context.as_mut().unwrap();
-        let request = self.request.as_ref().unwrap();
-        if c.provider == "sdxl" {
-            self.sdxl = Some(runtime_ios::media::sdxl::SdxlCandidate {
-                spec: spec.clone(),
-                context: context.clone(),
-                execution: request.memory.unwrap_or_default(),
-                request: request.clone(),
-            });
-            runtime_ios::media::sdxl::validate_actual(self.sdxl.as_ref().unwrap())
-                .map_err(|e| e.to_string())?;
-            self.artifact["request_key"] = json!(runtime_ios::media::sdxl::request_key(
-                self.sdxl.as_ref().unwrap()
-            ));
-            // This API selects and seals the actual request/source, rechecks live capacity before
-            // load and every deferred generation. No raw registry shortcut.
-            let live = super::available_memory_mib().map(|m| (m * 1048576.0) as u64);
-            let budget = runtime_ios::media::sdxl::capacity_budget(
-                u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB) << 20,
-                0,
-                live,
-            );
-            let admitted = runtime_ios::media::sdxl::select_sdxl_candidate(
-                self.registry,
-                std::slice::from_ref(self.sdxl.as_ref().unwrap()),
-                &runtime_ios::device_machine(),
-                budget,
-            )
-            .map_err(|e| classify_admission_error(&mut self.refusal_kind, e.to_string()))?;
-            if admitted.index() != 0 {
-                return Err("admission silently changed the selected case".into());
-            }
+            // CAPTURE: labelled, bounded per quantum, no evidence row consulted or created.
+            let permit = runtime_ios::media::capture_permit(candidate)
+                .map_err(|e| classify(&mut self.refusal_kind, e))?;
+            self.permit = Some(permit);
             return Ok(());
         }
-        if c.provider.starts_with("sana_") {
-            let memory = request.memory.unwrap_or_default();
-            if !memory.tile_vae_decode {
-                self.refusal_kind = Some("no_evidence");
-                return Err(AdmissionError::Refused(
-                    "SANA whole-image decode has no applicable device footprint".into(),
-                ));
-            }
-            let tile = memory
-                .decode_tile_edge
-                .ok_or("selected decode has no explicit tile edge")?;
-            let bound = runtime_ios::media::sana_snapshot_footprint_bound(
-                &c.provider,
-                spec,
-                &runtime_ios::device_machine(),
-                c.edge,
-                tile,
-            )
-            .map_err(|e| classify_admission_error(&mut self.refusal_kind, e.to_string()))?;
-            context.evidence_revision = format!(
-                "artifact-bound-sana:{}:{}:{tile}:{bound:?}",
-                self.artifact["layout_sha256"], c.edge
-            );
-            let estimate = runtime_ios::admit_sana_snapshot(&c.provider, spec, c.edge, tile)
-                .map_err(|e| classify_admission_error(&mut self.refusal_kind, e.to_string()))?;
-            context.predicted_peak_bytes = u64::from(estimate) << 20;
-            let contract = self
-                .registry
-                .memory_strategy_contract(&c.provider, spec)
-                .map_err(|e| e.to_string())?
-                .ok_or("missing contract")?;
-            let registration = self
-                .registry
-                .memory_strategy_registrations()
-                .find(|r| r.provider_id == c.provider)
-                .ok_or("missing registered safety check")?;
-            match (registration.safety_check)(spec, &contract, context) {
-                MemorySafetyDecision::Accept => (),
-                MemorySafetyDecision::Reject { reason } => {
-                    self.refusal_kind = Some("strategy");
-                    return Err(AdmissionError::Refused(reason));
-                }
-            }
-            return Ok(());
+        // ADMITTED: the same single seam the facades use, against the reviewed table, before load.
+        // What this process already holds is committed exactly once (the facades do the same).
+        let now = runtime_ios::process_memory();
+        let budget = runtime_ios::media::capacity_budget(
+            u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB) << 20,
+            now.footprint.unwrap_or(0),
+            now.available,
+        );
+        let admitted = runtime_ios::media::admit(
+            self.registry,
+            std::slice::from_ref(candidate),
+            &runtime_ios::device_machine(),
+            budget,
+        )
+        .map_err(|e| classify(&mut self.refusal_kind, e))?;
+        if admitted.index() != 0 {
+            return Err("admission silently changed the selected case".into());
         }
-        // Anima host allocator peaks are not device phys_footprint; Iris has no iPhone capture.
-        // The public raw catalog is a diagnostic surface, never an implicit admitted facade.
-        self.refusal_kind = Some("no_evidence");
-        Err(AdmissionError::Refused(format!("{} registered; no artifact/device-bound total footprint and admitted task facade; refused before weight load", c.provider)))
+        Ok(())
     }
-    fn execute(&mut self, c: &Case) -> Result<(), String> {
+    fn execute(&mut self, c: &Case) -> Result<(), ExecuteError> {
         if self.refusal_only {
             return Err("next-up was admitted but refusal-only probe forbids weight loading; no refusal proven".into());
         }
         if self.cancel.is_cancelled() || Instant::now() >= self.deadline {
             return Err("cooperative case deadline reached before loading".into());
         }
-        let request = self.request.as_ref().ok_or("no exact request")?;
-        let generator: Box<dyn Generator> = if let Some(candidate) = &self.sdxl {
-            let (_, bound) = runtime_ios::media::load_sdxl(std::slice::from_ref(candidate))
-                .map_err(|e| e.to_string())?;
-            Box::new(bound)
-        } else {
-            let spec = self.spec.as_ref().ok_or("missing admitted source")?;
-            let tile = request
-                .memory
-                .and_then(|m| m.decode_tile_edge)
-                .ok_or("missing admitted tile")?;
-            runtime_ios::media::load_sana(&c.provider, spec, c.edge, tile)
-                .map_err(|e| e.to_string())?
-        };
-        generator.validate(request).map_err(|e| e.to_string())?;
-        let result = generator
-            .generate(request, &mut |_| {})
-            .map_err(|e| e.to_string())?;
-        let GenerationOutput::Images(images) = result else {
-            return Err("expected image output".into());
-        };
-        let expected = if request.prompt_batch.is_empty() {
-            1
-        } else {
-            request.prompt_batch.len()
-        };
-        if images.len() != expected {
-            return Err("wrong output count".into());
+        match self.permit.take() {
+            Some((registry, permit)) => self.run_work(c, Some(permit), &registry),
+            None => {
+                let registry = self.registry;
+                self.run_work(c, None, registry)
+            }
         }
-        let docs = super::dirs_documents().ok_or("no Documents directory")?;
-        support::persist_images(&docs, c, &images)?;
-        Ok(())
     }
 }
 
-// Darwin task_vm_info's stable prefix: current phys_footprint at words 36–37 and the exact
-// ledger lifetime peak at 42–43 (iOS 26.5 SDK). A shorter kernel reply leaves peak unavailable.
-// Neither is RSS or MLX allocator accounting. Unavailable readings stay null, never zero evidence.
-fn phys_footprint() -> Option<(u64, Option<u64>)> {
+// Darwin `task_vm_info`, requested at its full SDK count (`support::TASK_VM_INFO_COUNT`): current
+// `phys_footprint` and the exact `ledger_phys_footprint_peak`, which only a REV3+ reply carries. A
+// shorter reply is an explicit `PeakReading::Unavailable`. Neither is RSS or MLX allocator
+// accounting. Unavailable readings stay null in the row, never zero evidence.
+fn phys_footprint() -> Option<(u64, support::PeakReading)> {
     #[cfg(target_vendor = "apple")]
     {
         support::read_footprint(|words, count| {
@@ -450,11 +614,11 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             cancel: CancelFlag::new(),
             deadline: started + Duration::from_secs(case_timeout()?),
             root,
-            spec: None,
-            context: None,
-            request: None,
+            candidate: None,
+            evidence_key: None,
+            permit: None,
+            refused_quantum: None,
             refusal_only: std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"),
-            sdxl: None,
         };
         // Bind before any source inspection/load. This does not create footprint evidence.
         runtime_ios::bound_mlx_to_platform_limits()
@@ -486,10 +650,11 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
-            "selected_parameters":adapter.context.as_ref().map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
-            "evidence_revision":adapter.context.as_ref().map(|c| &c.evidence_revision),
+            "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,
+            "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
+            "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),
             "refusal_kind":adapter.refusal_kind, "refusal_only":adapter.refusal_only,
-            "expected_render_count":adapter.request.as_ref().map(|r| r.prompt_batch.len().max(1)),
+            "expected_render_count":adapter.candidate.as_ref().map(|c| match &c.work { runtime_ios::media::IosWork::Generate(r) => r.prompt_batch.len().max(1), _ => 1 }),
             "build_sha":option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
             "entitlement":std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok(),
             "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() });
@@ -543,6 +708,8 @@ pub(super) struct Extrema {
     pub footprint: Option<u64>,
     pub min_headroom_mib: Option<f64>,
     pub lifetime_peak: Option<u64>,
+    /// The kernel's reply word count when it lacked the lifetime peak (below REV3).
+    pub peak_unavailable_words: Option<u32>,
 }
 impl Extrema {
     fn sample(&mut self) {
@@ -555,8 +722,13 @@ impl Extrema {
         self.combined = self.combined.max(active + cache);
         if let Some((current, peak)) = phys_footprint() {
             self.footprint = Some(self.footprint.unwrap_or(0).max(current));
-            if let Some(peak) = peak {
-                self.lifetime_peak = Some(self.lifetime_peak.unwrap_or(0).max(peak));
+            match peak {
+                support::PeakReading::Read(peak) => {
+                    self.lifetime_peak = Some(self.lifetime_peak.unwrap_or(0).max(peak));
+                }
+                support::PeakReading::Unavailable { returned_words } => {
+                    self.peak_unavailable_words = Some(returned_words);
+                }
             }
         }
         if let Some(a) = super::available_memory_mib() {
@@ -570,6 +742,9 @@ impl Extrema {
         row["phys_footprint_peak_bytes"] = json!(self.footprint);
         row["min_headroom_mib"] = json!(self.min_headroom_mib);
         row["kernel_lifetime_phys_footprint_peak_bytes"] = json!(self.lifetime_peak);
+        row["kernel_lifetime_peak_unavailable"] = json!(self.peak_unavailable_words.map(|w| {
+            json!({"returned_words": w, "required_words": support::TASK_VM_INFO_REV3_COUNT})
+        }));
     }
 }
 

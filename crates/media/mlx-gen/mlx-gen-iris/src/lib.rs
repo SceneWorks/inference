@@ -44,12 +44,25 @@ pub mod dit;
 pub mod memory_strategy;
 pub mod model;
 pub mod nn;
+pub mod packed;
 pub mod pipeline;
 pub mod restoration;
 pub mod solver;
 pub mod text_encoder;
 #[cfg(feature = "training")]
 pub mod train;
+
+#[cfg(all(test, target_os = "macos"))]
+mod packed_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_proofs;
+#[cfg(all(test, target_os = "macos", debug_assertions))]
+mod quantum_tests;
+#[cfg(test)]
+mod reachable_sizes;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 
 pub use dit::{IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{

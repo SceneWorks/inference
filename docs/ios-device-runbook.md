@@ -56,7 +56,7 @@ python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
 | SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
 | Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
 | Geometry | 512², 768², 1024²; future registered Supra2: 256² |
-| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, registered restoration/depth; no edit-to-text downgrade |
+| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade |
 | Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
 
 Provision complete caller-owned snapshots into a distinct slot for every
@@ -71,8 +71,21 @@ checks and admitted request binding are preserved.
 ```sh
 # After the host app has been installed (no campaign is started by pushing):
 scripts/ios/push_model.sh "$SNAPSHOT" --campaign-route iris_3b --tier q8 --device "$DEVICE"
+# A q8/q4 slot must hold a PACKED artifact: a dense snapshot requested at q8/q4 is refused by
+# admission (typed `artifact`), never quantized on the phone. Produce packed tiers on the host CPU
+# (external RSS guard required; no downloads, Metal trapped), then push each tier into its slot:
+cargo run -p mlx-gen-sana --example sana_prequant_cpu -- "$SANA_BF16" "$SANA_Q8" 8 "$TENSOR_BUDGET_MIB"
+scripts/ios/push_model.sh "$SANA_Q8" --campaign-route sana_1600m --tier q8 --device "$DEVICE"
+cargo run -p mlx-gen-iris --example iris_prequant_cpu -- generation "$IRIS_DENSE" "$IRIS_Q8" 8 "$TENSOR_BUDGET_MIB"
+cargo run -p mlx-gen-iris --example iris_prequant_cpu -- text-encoder "$QWEN3_VL" "$IRIS_Q8/text_encoder" 8 "$TENSOR_BUDGET_MIB"
 # Same mechanism for every route and tier in the actual listing:
 scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route illustrious_xl_v2 --tier q4 --device "$DEVICE"
+# SDXL `control` and `ip_adapter` cases need their component in the slot. --control/--ip-adapter
+# place it beside the snapshot and map the `control` / `ip_adapter` roles in components.json onto
+# the load spec's ControlNet / IP-Adapter sources (attached only for that case's own mode). A case
+# without its component is a provisioning failure, never admission or refusal evidence.
+scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route sdxl --tier q4 \
+  --control "$CONTROLNET_TILE_SDXL" --ip-adapter "$IP_ADAPTER_SDXL" --device "$DEVICE"
 ```
 
 The following are **future session recipes, not instructions to run now**. Phone
@@ -115,20 +128,32 @@ python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
 python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
   --case sdxl/sdxl/q4/1024/text/2 --next-edge 1280 --device "$DEVICE" \
   --output "$EVIDENCE/sdxl-next-up.jsonl"
-# Diagnostic selection is supported, but currently refuses every full-model case
-# until an independently bounded primitive permit exists. Never reports prod PASS.
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case anima_turbo/anima_turbo/q4/512/text/4 --diagnostic --device "$DEVICE" \
-  --output "$EVIDENCE/anima-diagnostic.jsonl"
+# Bounded DEVICE CAPTURE (labelled diagnostic, never production): no evidence row is
+# needed, because every quantum of every registered model checks live OS headroom
+# BEFORE constructing its graph. Each model/route/tier/mode/rung ladder is walked
+# 512 -> 768 -> 1024 and stops at the first case that is not a completed capture;
+# a `capture_refused` row names the refused quantum (the next-size-refused-before-
+# jetsam evidence). No retries; the cap is never raised.
+python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
+  --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
+  --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
+# Candidate rows for the single reviewed table. PRINTED for review; a human commits
+# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json.
+python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
 python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
 ```
 
 Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
 active/cache/active+cache peaks, MLX allocator peak, sampled Darwin
 `TASK_VM_INFO.phys_footprint` peak (words 36–37), the kernel's exact lifetime
-`ledger_phys_footprint_peak` (words 42–43, requested count 44), and minimum
-`os_proc_available_memory()` headroom. Rows also carry SANA layout identity or
-SDXL profile/request key, selected strategy parameters, evidence revision,
+`ledger_phys_footprint_peak` (words 42–43; the full SDK `TASK_VM_INFO_COUNT` of 93 words
+is requested, because only a REV3+ reply of at least 84 words carries the peak — a shorter reply
+is recorded as an explicit `kernel_lifetime_peak_unavailable` reading, never a silent null), and minimum
+`os_proc_available_memory()` headroom. Rows also carry the path-free artifact
+layout identity, the full memory-relevant `evidence_key` (hardware, provider,
+route, tier, layout, mode, geometry, references, execution levers, token window;
+never prompt/seed/path), `evidence_class` (`admitted` or `capture`), any typed
+`refused_quantum`, selected strategy parameters, evidence revision,
 entitlement, refusal-only marker, per-launch nonce, compiled build SHA and iOS
 version. The nonce prevents a previous report with the same case/SHA from passing
 freshness checks. Render
@@ -137,18 +162,20 @@ image of a real two-prompt batch. **RSS and MLX active+cache are not kernel
 physical footprint.** Sampling is 20 ms and can miss transients; these are
 observations, not an independent instantaneous working-set proof. Unavailable
 readings are null, never fabricated zeros. Statuses are `successful` (admitted
-image only), `admitted_refused`, `diagnostic_success` (never production),
-`diagnostic_failure`, or `skipped` (explicit host case budget). Missing/stale
+image only), `admitted_refused`, `diagnostic_success` (a completed capture, never
+production), `capture_refused` (a capture whose quantum refused before
+construction), `diagnostic_failure`, or `skipped` (explicit host case budget). Missing/stale
 reports, timeout, malformed output or a terminated process cannot prove admission
 refusal. Missing physical-footprint/headroom telemetry cannot yield production
 success. Noncompletion returns nonzero; a successful listing is not a render.
 The table includes the largest **admitted** completed edge per route/tier/mode/
 strategy, active/cache/combined columns and probe markers. Refusals have typed
-`refusal_kind`: `capacity`, `no_evidence`, `mode`, or `strategy`. Only an
-artifact-bound **capacity** refusal proves the next-up condition; missing
-footprint evidence, unsupported modes/rungs, malformed sources and termination
-never prove it. SANA profile errors and SDXL profile/request-binding errors are
-failures before admission, not capacity refusals.
+`refusal_kind`: `capacity`, `no_evidence`, `mode`, `strategy`, or `artifact`,
+taken from runtime-ios's typed refusal, never parsed from a message. Only a
+**capacity** refusal proves the next-up condition (an admitted capacity refusal,
+or a capture's typed quantum refusal); missing footprint evidence, unsupported
+modes/rungs, malformed sources and termination never prove it. Layout-profile
+and request-binding errors are failures before admission, not capacity refusals.
 Commit the actual measured table only after the terminal campaign, not this
 harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
 readings remain unvalidated diagnostics, and no cap/table is invented here.
@@ -164,12 +191,13 @@ like `conv_inverted`, so MLX materializes the F32-promoted weight copy inside
 `ios_quantum::run` (live headroom recheck, eval, stream synchronize, zero-cache
 drain). Before **any** allocation it refuses unless live
 `os_proc_available_memory()` covers the requirement derived from the budget
-module: `sana_block_bytes(configured_block_geometry(sana_1600m, 1, 8, 8, 300))`
+module: `mlx_gen_sana::quantum::block_bytes(configured_block_quantum(sana_1600m, 1, 8, 8, 300, UNBOUNDED))`
 + the probe's resident activation/weight bytes + `PROCESS_RESERVE_BYTES` =
-416.876 + 48.398 + 512 = **977.275 MiB** (1,024,746,752 bytes). Residents are
+119.043 + 48.398 + 512 = **679.441 MiB** (712,445,952 bytes). Residents are
 charged because they are allocated before the quantum's own live recheck of
-floor + reserve. The floor counts the loaded block's conv biases; a bias-free
-count gives 416.791.
+floor + reserve. The floor is the counted SANA block (sc-26270): the promoted
+f32 copy of the F16 inverted conv plus the largest of the self-attention,
+cross-attention and score-plus-Mix-FFN phases at 64 tokens.
 
 The row (`evidence_class: primitive_characterization`,
 `model_admission_evidence: false`, `diagnostic: true`) records `before`,

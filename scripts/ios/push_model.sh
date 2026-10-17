@@ -10,6 +10,12 @@
 #   scripts/ios/push_model.sh ~/models/ios-eval/Qwen3-4B-Instruct-2507-q4
 #   scripts/ios/push_model.sh ~/models/ios-eval/Sana_q4_embedq4 sana
 #
+# Campaign slots (--campaign-route R --tier T) can also carry an SDXL ControlNet and IP-Adapter:
+#   scripts/ios/push_model.sh "$SDXL" --campaign-route sdxl --tier q4 \
+#       --control ~/models/controlnet-tile-sdxl --ip-adapter ~/models/ip-adapter-sdxl
+# They land beside the snapshot as control/ and ip_adapter/, and the slot's components.json maps the
+# `control` / `ip_adapter` roles onto them (merged with any components.json the snapshot carries).
+#
 # With no <remote-subdir> the snapshot's CONTENTS land directly in Documents/, which is where
 # `find_snapshot` looks for the LLM (a root `config.json`). With one, they land in
 # Documents/<subdir>/, which is where `find_media_snapshot` looks for the SANA component tree.
@@ -31,12 +37,16 @@ DEVICE=""
 SIMULATOR=""
 CAMPAIGN_ROUTE=""
 CAMPAIGN_TIER=""
+CONTROL=""
+IP_ADAPTER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --device) DEVICE="$2"; shift 2 ;;
     --simulator) SIMULATOR="$2"; shift 2 ;;
     --campaign-route) CAMPAIGN_ROUTE="$2"; shift 2 ;;
     --tier) CAMPAIGN_TIER="$2"; shift 2 ;;
+    --control) CONTROL="$2"; shift 2 ;;
+    --ip-adapter) IP_ADAPTER="$2"; shift 2 ;;
     -*) echo "unknown argument: $1" >&2; exit 2 ;;
     *)
       if [ -z "$SRC" ]; then SRC="$1"; else REMOTE="$1"; fi
@@ -55,6 +65,32 @@ case "/$REMOTE/" in *'/../'*|*'/./'*|*'//'*) [ -z "$REMOTE" ] || { echo "remote 
 [ -d "$SRC" ] || { echo "not a directory: $SRC" >&2; exit 1; }
 
 say() { printf '\n=== %s\n' "$1"; }
+
+# --- campaign ControlNet / IP-Adapter roles ---------------------------------------------------
+# Compose a symlinked slot (dereferenced by the staging copy below) with control/ and ip_adapter/
+# entries and a components.json mapping the roles onto them. Nothing is downloaded.
+if [ -n "$CONTROL$IP_ADAPTER" ]; then
+  [ -n "$CAMPAIGN_ROUTE" ] || { echo "--control/--ip-adapter need --campaign-route/--tier" >&2; exit 2; }
+  for extra in "$CONTROL" "$IP_ADAPTER"; do
+    [ -z "$extra" ] || [ -e "$extra" ] || { echo "not found: $extra" >&2; exit 1; }
+  done
+  COMPOSE=$(mktemp -d)
+  trap 'rm -rf "${COMPOSE:-}"' EXIT
+  for entry in "$SRC"/*; do
+    [ "$(basename "$entry")" = components.json ] || ln -s "$(cd "$(dirname "$entry")" && pwd)/$(basename "$entry")" "$COMPOSE/"
+  done
+  [ -z "$CONTROL" ] || ln -s "$(cd "$(dirname "$CONTROL")" && pwd)/$(basename "$CONTROL")" "$COMPOSE/control"
+  [ -z "$IP_ADAPTER" ] || ln -s "$(cd "$(dirname "$IP_ADAPTER")" && pwd)/$(basename "$IP_ADAPTER")" "$COMPOSE/ip_adapter"
+  python3 -I - "$SRC/components.json" "$COMPOSE/components.json" "${CONTROL:+control}" "${IP_ADAPTER:+ip_adapter}" <<'PY'
+import json, pathlib, sys
+source, dest, *roles = sys.argv[1:]
+data = json.loads(pathlib.Path(source).read_text()) if pathlib.Path(source).is_file() else {}
+for role in filter(None, roles):
+    data[role] = role
+pathlib.Path(dest).write_text(json.dumps(data, sort_keys=True))
+PY
+  SRC="$COMPOSE"
+fi
 
 # --- simulator --------------------------------------------------------------------------------
 # A simulator's container is a host directory, so this is a dereferencing copy plus a byte-exact
@@ -100,7 +136,7 @@ say "device $DEVICE"
 STAGE=""
 if [ -n "$(find "$SRC" -type l -print -quit)" ]; then
   STAGE=$(mktemp -d)
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm -rf "$STAGE" "${COMPOSE:-}"' EXIT
   say "resolving $(find "$SRC" -type l | wc -l | tr -d ' ') symlink(s) into a staging copy"
   cp -RL "$SRC" "$STAGE/payload"
   SRC="$STAGE/payload"

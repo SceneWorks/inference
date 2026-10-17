@@ -24,6 +24,17 @@ use mlx_gen::Result;
 
 use crate::config::ConditionerConfig;
 
+/// iOS execution-quantum labels (see [`mlx_gen::ios_quantum`]).
+pub(crate) const CONDITIONER_EMBED_QUANTUM: &str = "Anima conditioner embed";
+pub(crate) const CONDITIONER_BLOCK_QUANTUM: &str = "Anima conditioner block";
+pub(crate) const CONDITIONER_OUTPUT_QUANTUM: &str = "Anima conditioner output";
+
+/// Counted live buffers of one conditioner block quantum; see `Block::quantum_geometry`.
+pub(crate) const COND_ATTN_HIDDEN_LIVE: u64 = 25;
+pub(crate) const COND_CONTEXT_LIVE: u64 = 5;
+pub(crate) const COND_MLP_HIDDEN_LIVE: u64 = 6;
+pub(crate) const COND_FF_LIVE: u64 = 3;
+
 fn lin(w: &Weights, name: &str, bias: bool) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, name, bias, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
@@ -145,7 +156,7 @@ impl Attention {
 }
 
 /// `AnimaTextConditionerBlock`: pre-RMSNorm self-attn → cross-attn → GELU MLP (all residual).
-struct Block {
+pub(crate) struct Block {
     norm_self_attn: Array,
     self_attn: Attention,
     norm_cross_attn: Array,
@@ -175,7 +186,104 @@ impl Block {
         self.cross_attn.set_sdpa_checkpoint(on);
     }
 
-    fn forward(
+    /// The geometry of one forward of THIS block from its loaded tensors: `St` target (T5 query)
+    /// tokens attend over themselves and cross-attend over `Ss` source (Qwen3) tokens; the MLP
+    /// runs over the `St` tokens. Both attentions call `mlx_rs::fast::scaled_dot_product_attention`
+    /// at `head_dim` 64, which the fused Metal kernel serves, so scores are
+    /// [`mlx_gen::ios_quantum::Scores::Fused`].
+    ///
+    /// The width is f32: the f32 RoPE tables promote the rotated q/k and everything after them
+    /// (and in production the Qwen3 states arrive f32 already).
+    ///
+    /// Weight copies ([`Self::promoted_weight_bytes`]): every dense bf16 projection fed the f32
+    /// stream is promoted to an f32 copy for its matmul; all of the block's are priced (measured,
+    /// 38 of the 64 f32-copy units at the proof's shape are live at once).
+    ///
+    /// Counted live buffers (MLX holds an op's buffers until its stream catches up; elementwise
+    /// outputs it donates into a consumed input are not counted; an RMSNorm is counted with the
+    /// temporaries of MLX's composed non-Metal fallback):
+    ///
+    /// * attention phase, `[B, St, dim]` ([`COND_ATTN_HIDDEN_LIVE`] = 25): the self-attention — its
+    ///   RMSNorm (3), q/k/v (3), the per-head q/k RMSNorms (2), the RoPE rotate-half and product
+    ///   for q and for k (4), the scaled q, the output, its merge, `o_proj` and the residual sum
+    ///   (5) = 17 — and, live with its tail, the cross-attention's RMSNorm (3), q, its norm, its
+    ///   rotation (2) and the scaled q = 8;
+    /// * cross-attention context, `[B, Ss, dim]` ([`COND_CONTEXT_LIVE`] = 5): k, v, the k RMSNorm
+    ///   and the k rotation (2);
+    /// * MLP phase: the RMSNorm (3), `mlp.2` and its bias sum, the residual sum = 6 hidden
+    ///   ([`COND_MLP_HIDDEN_LIVE`]); `mlp.0`, its bias sum and the compiled exact GELU (3
+    ///   `[B, St, ff]`, [`COND_FF_LIVE`]).
+    ///
+    pub(crate) fn quantum_geometry(
+        &self,
+        batch: i32,
+        target_tokens: i32,
+        source_tokens: i32,
+        element_bytes: u64,
+    ) -> mlx_gen::ios_quantum::AttentionBlockGeometry {
+        let tokens = target_tokens.max(0) as u64;
+        mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch.max(0) as u64,
+            tokens,
+            dim: self.norm_self_attn.size() as u64,
+            heads: self.self_attn.heads.max(0) as u64,
+            context_tokens: source_tokens.max(0) as u64,
+            ff_hidden: self.mlp_in.base_shape()[0].max(0) as u64,
+            query_rows: tokens,
+            element_bytes,
+            weight_bytes: self.promoted_weight_bytes(element_bytes),
+            attn_hidden_live: COND_ATTN_HIDDEN_LIVE,
+            context_live: COND_CONTEXT_LIVE,
+            scores: mlx_gen::ios_quantum::Scores::Fused,
+            mlp_hidden_live: COND_MLP_HIDDEN_LIVE,
+            ff_live: COND_FF_LIVE,
+        }
+    }
+
+    /// The f32 copies a forward makes of this block's dense projection weights when the stream is
+    /// wider than their storage (bf16 weights, f32 stream): every q/k/v/o of both attentions and
+    /// both MLP projections, with their biases. `0` for packed projections.
+    pub(crate) fn promoted_weight_bytes(&self, element_bytes: u64) -> u64 {
+        use crate::transformer::{dense_weight_elements, dtype_bytes};
+        let narrower = self
+            .self_attn
+            .o_proj
+            .weight_dtype()
+            .is_some_and(|dtype| dtype_bytes(dtype) < element_bytes);
+        if !narrower {
+            return 0;
+        }
+        let attention: u64 = [&self.self_attn, &self.cross_attn]
+            .iter()
+            .map(|attn| {
+                [QkvPart::Q, QkvPart::K, QkvPart::V]
+                    .into_iter()
+                    .map(|part| dense_weight_elements(&attn.qkv.part_facts(part)))
+                    .sum::<u64>()
+                    + dense_weight_elements(&LinearFacts::of(&attn.o_proj))
+            })
+            .sum();
+        let mlp = dense_weight_elements(&LinearFacts::of(&self.mlp_in))
+            + dense_weight_elements(&LinearFacts::of(&self.mlp_out));
+        attention.saturating_add(mlp).saturating_mul(element_bytes)
+    }
+
+    pub(crate) fn quantum_scratch(
+        &self,
+        batch: i32,
+        target_tokens: i32,
+        source_tokens: i32,
+        element_bytes: u64,
+    ) -> u64 {
+        mlx_gen::ios_quantum::attention_block_bytes(self.quantum_geometry(
+            batch,
+            target_tokens,
+            source_tokens,
+            element_bytes,
+        ))
+    }
+
+    pub(crate) fn forward(
         &self,
         hidden: &Array,
         encoder: &Array,
@@ -264,6 +372,12 @@ impl AnimaTextConditioner {
     /// `comfy/model_base.py:1470`). The Qwen source path is untouched (its weights are pinned to
     /// `1.0` upstream), and an all-`1.0` weight vector is a strict no-op (identical to
     /// [`Self::forward`]).
+    /// Allowance for the lazy Qwen3 mask-multiply feeding `source_hidden`: the states, the cast
+    /// mask broadcast and the product (three source-sized f32 buffers).
+    pub(crate) fn mask_multiply_bytes(source_hidden: &Array) -> u64 {
+        mlx_gen::ios_quantum::elementwise_bytes(source_hidden.size() as u64, 3)
+    }
+
     pub fn forward_weighted(
         &self,
         source_hidden: &Array,
@@ -274,20 +388,129 @@ impl AnimaTextConditioner {
         let ssh = source_hidden.shape();
         let (b, ss) = (ssh[0], ssh[1]);
         let st = target_ids.shape()[1];
-
-        // learned query tokens from T5 ids (in_proj is Identity: model_dim == target_dim).
-        let mut hidden = self.embed.forward(target_ids)?.as_dtype(dtype)?; // [B, St, D]
-
-        let (t_cos, t_sin) = self.rope.forward(st)?; // target positions
-        let (s_cos, s_sin) = self.rope.forward(ss)?; // source positions
+        let eb = crate::transformer::dtype_bytes(dtype);
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        // The entry quantum: its own counted body plus the caller's lazy Qwen3 mask-multiply
+        // (states, cast mask, product), which is materialized in this quantum.
+        mlx_gen::ios_quantum::before(
+            CONDITIONER_EMBED_QUANTUM,
+            self.embed_body_bytes(b, st, ss, eb)
+                .saturating_add(Self::mask_multiply_bytes(source_hidden)),
+        )?;
+        let (mut hidden, (t_cos, t_sin), (s_cos, s_sin)) = self.embed(target_ids, ss, dtype)?;
+        mlx_gen::ios_quantum::finish(
+            CONDITIONER_EMBED_QUANTUM,
+            &[&hidden, &t_cos, &t_sin, &s_cos, &s_sin, source_hidden],
+        )?;
         let target_rope = (&t_cos, &t_sin);
         let source_rope = (&s_cos, &s_sin);
 
         for block in &self.blocks {
-            hidden = block.forward(&hidden, source_hidden, target_rope, source_rope)?;
+            // The f32 RoPE tables promote the rotated q/k and everything after them to f32.
+            let block_eb = eb.max(t_cos.item_size() as u64);
+            hidden = mlx_gen::ios_quantum::run(
+                CONDITIONER_BLOCK_QUANTUM,
+                block.quantum_scratch(b, st, ss, block_eb),
+                || block.forward(&hidden, source_hidden, target_rope, source_rope),
+            )?;
         }
+        mlx_gen::ios_quantum::run(
+            CONDITIONER_OUTPUT_QUANTUM,
+            self.output_quantum_scratch(b, st, hidden.item_size() as u64),
+            || self.output(&hidden, b, st, target_weights, dtype),
+        )
+    }
+
+    /// The entry quantum's body: the learned T5 query tokens (`in_proj` is Identity: model_dim ==
+    /// target_dim) and the target/source RoPE tables. Returns `(hidden, target_rope, source_rope)`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn embed(
+        &self,
+        target_ids: &Array,
+        source_tokens: i32,
+        dtype: Dtype,
+    ) -> Result<(Array, (Array, Array), (Array, Array))> {
+        let hidden = self.embed.forward(target_ids)?.as_dtype(dtype)?; // [B, St, D]
+        let target = self.rope.forward(target_ids.shape()[1])?; // target positions
+        let source = self.rope.forward(source_tokens)?; // source positions
+        Ok((hidden, target, source))
+    }
+
+    /// The entry quantum's counted body ([`Self::embed`]): the gathered query rows (priced at f32,
+    /// the width a packed embedding dequantizes to), `TokenEmbedding`'s f32 cast and, when the
+    /// compute dtype is narrower, the cast to it (`[B, St, model_dim]` each), plus the shared
+    /// [`mlx_gen::ios_quantum::rope_table_bytes`] allowance for both position tables.
+    /// Proven in `quantum_tests::conditioner_formulas_track_the_measured_peak`.
+    pub(crate) fn embed_body_bytes(
+        &self,
+        batch: i32,
+        target_tokens: i32,
+        source_tokens: i32,
+        element_bytes: u64,
+    ) -> u64 {
+        let (b, st) = (batch.max(0) as u64, target_tokens.max(0) as u64);
+        let d = self.cfg.model_dim as u64;
+        let hd = self.cfg.head_dim() as u64;
+        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        // The compute-dtype cast allocates only when it narrows the f32 rows.
+        let cast = if element_bytes < 4 {
+            tb(element_bytes, &[b, st, d])
+        } else {
+            0
+        };
+        (2 * tb(4, &[b, st, d]))
+            .saturating_add(cast)
+            .saturating_add(mlx_gen::ios_quantum::rope_table_bytes(st, hd))
+            .saturating_add(mlx_gen::ios_quantum::rope_table_bytes(
+                source_tokens.max(0) as u64,
+                hd,
+            ))
+    }
+
+    /// The output quantum's counted body ([`Self::output`]) over the blocks' `element_bytes`-wide
+    /// output: `out_proj`, the RMSNorm's square and output (3 `[B, St, target_dim]`; the bias sum
+    /// and the prompt-weight product are donated), the zero padding (`[B, 512 - St, ..]`), the
+    /// padded concat (`[B, 512, ..]`), and `out_proj`'s f32 weight copy when it is dense and
+    /// narrower than the stream. Proven in
+    /// `quantum_tests::conditioner_formulas_track_the_measured_peak`.
+    pub(crate) fn output_quantum_scratch(
+        &self,
+        batch: i32,
+        target_tokens: i32,
+        element_bytes: u64,
+    ) -> u64 {
+        let (b, st) = (batch.max(0) as u64, target_tokens.max(0) as u64);
+        let min = self.cfg.min_sequence_length as u64;
+        let d = self.cfg.target_dim as u64;
+        let tb = mlx_gen::ios_quantum::tensor_bytes;
+        let promoted = if self
+            .out_proj
+            .weight_dtype()
+            .is_some_and(|dtype| crate::transformer::dtype_bytes(dtype) < element_bytes)
+        {
+            crate::transformer::dense_weight_elements(&LinearFacts::of(&self.out_proj))
+                .saturating_mul(element_bytes)
+        } else {
+            0
+        };
+        (3 * tb(element_bytes, &[b, st, d]))
+            .saturating_add(tb(element_bytes, &[b, min.saturating_sub(st), d]))
+            .saturating_add(tb(element_bytes, &[b, min.max(st), d]))
+            .saturating_add(promoted)
+    }
+
+    /// `out_proj` + RMSNorm, the optional T5 prompt weighting, and the right-pad to
+    /// `min_sequence_length` — the conditioner's post-block quantum.
+    pub(crate) fn output(
+        &self,
+        hidden: &Array,
+        b: i32,
+        st: i32,
+        target_weights: Option<&[f32]>,
+        dtype: Dtype,
+    ) -> Result<Array> {
         let mut hidden = rms_norm(
-            &self.out_proj.forward(&hidden)?,
+            &self.out_proj.forward(hidden)?,
             &self.norm,
             self.cfg.norm_eps,
         )?;
@@ -315,6 +538,12 @@ impl AnimaTextConditioner {
         } else {
             Ok(hidden)
         }
+    }
+
+    /// The blocks (the CPU proofs run one block's quantum body directly).
+    #[cfg(test)]
+    pub(crate) fn blocks(&self) -> &[Block] {
+        &self.blocks
     }
 
     pub fn config(&self) -> &ConditionerConfig {
@@ -487,7 +716,7 @@ mod structural {
 /// Real-weight conditioner for the grad-parity test (sc-10576): a dimension-parametric build with
 /// small random weights so the 6-block conditioner forward+backward runs on Metal without the licensed
 /// checkpoint. Mirrors [`CosmosDiT::synthetic`]. `cfg` sets every dim; use a tiny `cfg` for speed.
-#[cfg(all(test, feature = "training"))]
+#[cfg(test)]
 pub(crate) mod synthetic {
     use super::*;
     use mlx_rs::random;

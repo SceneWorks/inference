@@ -11,6 +11,16 @@
 //! one is an edit here *and* to this crate's ordered surface test, exactly as the platform
 //! catalogs work — a provider crate existing in the workspace does not mean it ships.
 //!
+//! # Admission (epic 16774, E4/E5/E7)
+//!
+//! Every registered model and mode is admitted through ONE seam, [`ios_admission`]: the provider's
+//! registered safety check fed by a row of the single reviewed device-evidence table
+//! ([`evidence`], `evidence/ios_device_evidence.json`), fail-closed with a typed [`RefusalKind`].
+//! The table is filled only from explicitly labelled device captures ([`capture_permit`]), which are
+//! safe without evidence because every quantum of every registered model checks live OS headroom
+//! before constructing its graph (`mlx_gen::ios_quantum`). Host peaks and the historical iPhone 17
+//! SANA observations below are PLANNING data (tile choice, what to capture first), never admission.
+//!
 //! # What ships
 //!
 //! **SANA** (`mlx-gen-sana`), base and sprint — text conditioning reused from `mlx-gen-pid`'s
@@ -22,18 +32,36 @@
 //!
 //! **Anima Turbo** (`mlx-gen-anima`, `anima_turbo` only — not Base or Aesthetic), compiled without
 //! the crate's `training` feature, so no trainer and no `mlx-gen-perceptual` reaches the bundle. Its
-//! ladder is the provider's contract too; [`anima`] supplies the measured peaks admission checks and
-//! picks the iOS selection — staged residency with a tiled decode — through the provider's registered
-//! safety check. Its Qwen-Image VAE brings `mlx-gen-qwen-image`, and with it `mlx-gen-wan` (Qwen's
+//! ladder is the provider's contract too; [`anima`] PLANS the iOS selection — staged residency with
+//! a tiled decode — from host peaks; admission is the shared evidence seam. Its Qwen-Image VAE brings `mlx-gen-qwen-image`, and with it `mlx-gen-wan` (Qwen's
 //! optional single-frame decoder), as compiled code only: no Qwen-Image or Wan generator is
 //! registered here.
 //!
 //! **SDXL family** (`sdxl`, Illustrious v1/v2, RealVisXL and Lightning checkpoints): one complete
-//! generator, no trainer even under feature unification. [`sdxl`] keeps source/device/route-bound
-//! admission separate from the Mac engine measurements; unverified iPhone artifacts are refused.
+//! generator, no trainer even under feature unification. Evidence is keyed per route; Mac engine
+//! measurements are never rows.
+//!
+//! **Iris 3B** (`iris_3b` generation incl. prompt batches, the `iris_3b_restore` transform and the
+//! `iris_3b_depth` task), inference only.
 
 mod admission;
-pub use admission::{sana_snapshot_footprint_bound, sana_snapshot_profile, SanaSnapshotProfile};
+pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
+mod bound;
+pub mod evidence;
+pub mod ios_admission;
+mod layout;
+mod refusal;
+pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
+pub use ios_admission::{
+    admit, build_candidate, capacity_budget, capture_permit, evidence_key, execution_key,
+    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, IosCandidate,
+    IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+};
+pub use layout::{artifact_layout_digest, hex};
+/// The bounded-quantum mechanism (live headroom before every graph): a capture reads
+/// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
+pub use mlx_gen::ios_quantum;
+pub use refusal::{AdmissionError, AdmissionResult, Refusal, RefusalKind};
 
 use mlx_gen::gen_core::{
     Error, GenerationMemory, LoadSpec, OffloadPolicy, ProviderRegistry, ProviderRegistryBuilder,
@@ -47,12 +75,10 @@ use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVER
 pub mod anima;
 pub mod iris_depth;
 pub mod sdxl;
-mod sdxl_bound;
 pub use anima::{
-    anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
-    anima_turbo_memory_selection, ios_memory_budget, ANIMA_TURBO_ID,
+    anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
+    anima_turbo_planning_decision, ios_memory_budget, ANIMA_TURBO_ID,
 };
-pub use sdxl_bound::BoundSdxlGenerator;
 
 /// Add the iOS image generators to an explicit media registry builder, in catalog order.
 ///
@@ -165,7 +191,7 @@ impl FootprintBound {
 
 /// Historical planning bound for `image_edge`² decoded at `tile_edge`. NOT product admission:
 /// the source snapshot identity is missing and the capture device was an iPhone 17 Pro Max.
-/// Use [`sana_snapshot_footprint_bound`] for admission against an actual snapshot/device.
+/// Admission is [`ios_admission::admit`] against the reviewed evidence table.
 ///
 /// An exact device record is [`FootprintBound::Measured`]. Otherwise the bound is
 /// [`FootprintBound::Inferred`] from the smallest record at the **same tile edge and a larger

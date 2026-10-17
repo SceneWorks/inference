@@ -750,6 +750,8 @@ dependencies = [
  "mlx-gen-iris",
  "mlx-gen-sana",
  "mlx-gen-sdxl",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -760,6 +762,7 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]
@@ -1273,6 +1276,7 @@ dependencies = [
 name = "runtime-ios"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "mlx-gen-ios-catalog",
  "mlx-llm",
  "pmetal-mlx-rs",

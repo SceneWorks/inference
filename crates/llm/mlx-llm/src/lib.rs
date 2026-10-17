@@ -54,6 +54,7 @@ pub mod image;
 pub mod joycaption;
 pub mod kv_capture;
 mod kv_policy;
+pub mod layer_gate;
 mod load_memory;
 pub mod models;
 pub mod prepare;

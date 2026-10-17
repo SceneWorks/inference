@@ -4027,6 +4027,44 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     entry["metallib_triple"], f"air64-apple-ios{floor.group(1)}.0{suffix}"
                 )
 
+    def test_ios_device_harness_is_built_linted_and_tested_without_the_gpu_smoke(self) -> None:
+        """Epic 16774 E3: `ios-host/smoke` is outside the workspace, so only these steps reach it."""
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        manifest = "--manifest-path ios-host/smoke/Cargo.toml"
+
+        def runs(job: str) -> list[str]:
+            return [" ".join(step["run"].split()) for step in jobs[job]["steps"] if "run" in step]
+
+        metal = runs("macos-metal")
+        tests = [run for run in metal if " test " in f" {run} " and manifest in run]
+        self.assertEqual(len(tests), 1, tests)
+        # The whole-device smoke drives Metal; the shared hosted runner runs only the
+        # weights-free tests. MLX has no CPU-default switch, so the skip is the guard.
+        self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
+        # The device-capture surface is tested and linted on the host lane.
+        self.assertTrue(
+            any("cargo test --locked --lib -p runtime-ios --features device-capture" in run for run in metal)
+        )
+        self.assertTrue(
+            any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)
+        )
+
+        ios = runs("ios-build")
+        target = "--target ${{ matrix.target }}"
+        for expected in (
+            f"cargo build --locked {target} -p runtime-ios --no-default-features",
+            f"cargo clippy --locked {target} -p runtime-ios --all-targets -- -D warnings",
+            f"cargo clippy --locked {target} -p runtime-ios --no-default-features --all-targets -- -D warnings",
+            f"cargo clippy --locked {target} -p runtime-ios --features device-capture --all-targets -- -D warnings",
+            f"build --locked {target} {manifest} --features media",
+            f"clippy --locked {target} {manifest} --all-targets -- -D warnings",
+            f"clippy --locked {target} {manifest} --features media --all-targets -- -D warnings",
+            f"build --locked {target} {manifest} --features zimage",
+            f"clippy --locked {target} {manifest} --features zimage --all-targets -- -D warnings",
+        ):
+            with self.subTest(command=expected):
+                self.assertTrue(any(expected in run for run in ios), expected)
+
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
         job = jobs["windows-cuda"]

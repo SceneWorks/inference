@@ -13,6 +13,9 @@ mlx-llm = { workspace = true }
 # is MLX and that the platform caps a process well below device RAM, so it is the only place that can
 # reconcile the two — and doing so needs MLX's memory API directly, not through an engine crate.
 mlx-rs = { workspace = true }
+# `task_info(TASK_VM_INFO)` for the process's own `phys_footprint` on iOS: admitted loads recheck
+# only the INCREMENTAL demand (evidence peak minus what the process already holds).
+libc = { workspace = true }
 
 # The iOS image lane. NOT `mlx-gen-catalog`: that composes every provider crate including the video
 # families (wan, ltx, mochi, svd), none validated on iOS and none shaped for a device with a hard
@@ -31,6 +34,9 @@ mlx-gen-ios-catalog = { workspace = true }
 # LLM-only product disables default features and does not compile the image graph at all.
 default = ["media"]
 media = ["dep:mlx-gen-ios-catalog"]
+# The labelled bounded DEVICE CAPTURE path (`media::capture_permit` / `capture_capacity`). Never in
+# a product build: only `ios-host/smoke` (the device harness) enables it.
+device-capture = ["media"]
 
 # NOTE: no `audio` feature, and that is deliberate rather than an omission: the Candle audio lane's
 # cross-backend seam (sc-12835) is a sanctioned exception for the platforms that ship it and is not

@@ -386,18 +386,118 @@ impl Resampler {
                 self.dim
             )));
         }
+        // sc-26270: proj_in, each perceiver layer, and proj_out + norm are guarded iOS quanta
+        // (pass-throughs off device), each counted from its own ops: proj_in's output (+ its
+        // bias add); each layer per `layer_scratch`; proj_out's output, its bias add and the
+        // LayerNorm output.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let nx = image_features.shape()[1];
+        let act = crate::quantum::element_bytes(&self.latents);
+        let rows = |n: i32, width: u64| {
+            mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, width])
+        };
         let mut latents = broadcast_to(&self.latents, &[b, self.num_queries, self.dim])?;
-        let x = self.proj_in.forward(image_features)?;
+        let proj_in_scratch = 2 * rows(nx, crate::quantum::linear_out(&self.proj_in));
+        let x =
+            mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_IN, proj_in_scratch, || {
+                self.proj_in.forward(image_features)
+            })?;
         for (attn, ff) in &self.layers {
-            latents = add(&attn.forward(&x, &latents)?, &latents)?;
-            latents = add(&ff.forward(&latents)?, &latents)?;
+            latents = mlx_gen::ios_quantum::run(
+                crate::quantum::RESAMPLER_LAYER,
+                self.layer_scratch(attn, ff, b, nx),
+                || Self::layer_body(attn, ff, &x, &latents),
+            )?;
         }
-        let out = self.proj_out.forward(&latents)?;
-        Ok(layer_norm(
-            &out,
-            Some(&self.norm_out_w),
-            Some(&self.norm_out_b),
-            LN_EPS,
-        )?)
+        let proj_out_scratch =
+            3 * rows(self.num_queries, crate::quantum::linear_out(&self.proj_out));
+        mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_OUT, proj_out_scratch, || {
+            let out = self.proj_out.forward(&latents)?;
+            Ok(layer_norm(
+                &out,
+                Some(&self.norm_out_w),
+                Some(&self.norm_out_b),
+                LN_EPS,
+            )?)
+        })
+    }
+
+    /// One perceiver layer: attention over `[x, latents]` + residual, then the FFN + residual.
+    fn layer_body(
+        attn: &PerceiverAttention,
+        ff: &ResamplerFeedForward,
+        x: &Array,
+        latents: &Array,
+    ) -> Result<Array> {
+        let latents = add(&attn.forward(x, latents)?, latents)?;
+        Ok(add(&ff.forward(&latents)?, &latents)?)
+    }
+
+    /// One layer's guarded quantum body and price (sc-26270 proof tests), over projected image
+    /// features `x` `[B, nx, dim]` and the `[B, Nq, dim]` latents.
+    #[cfg(test)]
+    pub(crate) fn layer_quantum_for_test<'a>(
+        &'a self,
+        index: usize,
+        x: &Array,
+        latents: &Array,
+    ) -> (u64, impl Fn() -> Result<Array> + 'a) {
+        let (attn, ff) = &self.layers[index];
+        let s = x.shape();
+        let scratch = self.layer_scratch(attn, ff, s[0], s[1]);
+        let (x, latents) = (x.clone(), latents.clone());
+        (scratch, move || Self::layer_body(attn, ff, &x, &latents))
+    }
+
+    /// iOS quantum scratch (sc-26270) of one perceiver layer over `nx` image tokens plus the
+    /// `Nq` queries, from the loaded widths (`to_q`/`to_kv` rows, the FFN's `fc1` rows), counted as
+    /// new buffers under `quantum::conv_sum`'s retention model: key side (`S = nx + Nq` rows) — the
+    /// LayerNormed image tokens, the `[x, latents]` concatenation, the `to_kv` output (two inner
+    /// widths) and the head-split reshape copies of its two strided halves (+ the unfused
+    /// fallback's row-contiguous k/v copies); query side (`Nq` rows) — both LayerNorm outputs, q,
+    /// the attention output and its reshape copy, the projection, the FFN's LayerNorm and `fc2`
+    /// (+ the fallback's scaled q), `fc1` and its GELU; plus the scores on the running backend.
+    /// Each query-side LayerNorm is `quantum::layer_norm_buffers` of its input.
+    fn layer_scratch(
+        &self,
+        attn: &PerceiverAttention,
+        ff: &ResamplerFeedForward,
+        b: i32,
+        nx: i32,
+    ) -> u64 {
+        let act = crate::quantum::element_bytes(&self.latents);
+        let (b, nq) = (b as u64, self.num_queries as u64);
+        let s = nx as u64 + nq;
+        let width = (self.dim as u64).max(crate::quantum::linear_out(&attn.to_q));
+        let ffw = crate::quantum::linear_out(&ff.fc1);
+        let scores = crate::quantum::scores(
+            crate::quantum::Backend::current(),
+            attn.dim_head,
+            self.num_queries,
+            act,
+        );
+        let fallback = u64::from(matches!(
+            scores,
+            mlx_gen::ios_quantum::Scores::Materialized { .. }
+        ));
+        let ln = crate::quantum::layer_norm_buffers(crate::quantum::Backend::current());
+        // The key side's LayerNorm counts its output only: the concatenation consumes it before
+        // `to_kv`'s output exists, so a CPU fallback's centred/squared temporaries are already
+        // released (measured); on Metal the fused LayerNorm writes only its output anyway.
+        let key_units = 6 + 2 * fallback;
+        let query_units = 5 + 3 * ln + fallback;
+        mlx_gen::ios_quantum::tensor_bytes(act, &[key_units, b, s, width])
+            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
+                act,
+                &[b, nq, query_units * width + 2 * ffw],
+            ))
+            .saturating_add(crate::quantum::page_slack(key_units + query_units + 4))
+            .saturating_add(mlx_gen::ios_quantum::scores_bytes(
+                scores,
+                b,
+                attn.heads as u64,
+                nq,
+                s,
+            ))
     }
 }

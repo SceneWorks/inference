@@ -4,7 +4,6 @@
 //! `scaling_factor` is **0.13025** (not SD-2.1's 0.18215). Latents are scaled by it on encode and
 //! divided by it on decode.
 
-use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::{add, multiply, pad};
 use mlx_rs::{Array, Dtype};
 
@@ -123,7 +122,7 @@ const VAE_TILING: mlx_gen::tiling::VaeTiling = mlx_gen::tiling::VaeTiling {
 };
 
 /// Single-head spatial self-attention used in the VAE mid block (the vendored `vae.Attention`).
-struct VaeAttention {
+pub(crate) struct VaeAttention {
     gn_w: Array,
     gn_b: Array,
     q: AdaptableLinear,
@@ -133,7 +132,7 @@ struct VaeAttention {
 }
 
 impl VaeAttention {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let lin = |n: &str| -> Result<AdaptableLinear> {
             Ok(AdaptableLinear::dense(
                 w.require(&format!("{prefix}.{n}.weight"))?.clone(),
@@ -150,8 +149,75 @@ impl VaeAttention {
         })
     }
 
+    /// The query-row chunk plan of this attention over `n` tokens (sc-26270). On iOS (the device,
+    /// or the host CPU fixture that exercises its barriers) the attention runs query-chunked so a
+    /// chunk's `[B, 1, rows, N]` scores stay within
+    /// [`crate::quantum::VAE_ATTENTION_SCORE_ELEMENTS`] and each chunk is materialized before the
+    /// next — the SDXL VAE's head dim (512) is never a fused Metal SDPA shape, so the unchunked
+    /// call materializes `N²` scores (1 GiB per f32 score tensor at a 1024² decode's 16384 latent
+    /// tokens). Everywhere else the plan is unbounded: one SDPA call, the historical host path,
+    /// byte for byte.
+    pub(crate) fn plan() -> mlx_gen::attention::AttentionPlan<'static> {
+        if mlx_gen::ios_quantum::enabled() {
+            Self::bounded_plan()
+        } else {
+            mlx_gen::attention::AttentionPlan::UNBOUNDED
+        }
+    }
+
+    /// [`Self::forward`] as one guarded iOS quantum (sc-26270), priced per query chunk
+    /// ([`crate::quantum::vae_attention_bytes`]).
+    pub(crate) fn forward_quantum(&self, x: &Array) -> Result<Array> {
+        self.forward_quantum_planned(x, Self::plan())
+    }
+
+    /// The query-chunked plan the bounded (tiled) encode runs on every backend: the same score
+    /// budget as the iOS plan, each chunk materialized before the next.
+    pub(crate) fn bounded_plan() -> mlx_gen::attention::AttentionPlan<'static> {
+        mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(
+                crate::quantum::VAE_ATTENTION_SCORE_ELEMENTS,
+                true,
+            ),
+        )
+    }
+
+    /// [`Self::forward_quantum`] under an explicit `plan`.
+    pub(crate) fn forward_quantum_planned(
+        &self,
+        x: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let tokens = s[1] * s[2];
+        let rows = plan.budget.query_block(s[0], 1, tokens, tokens);
+        let scratch = crate::quantum::vae_attention_bytes(
+            s[0],
+            tokens,
+            s[3],
+            rows,
+            crate::quantum::element_bytes(x),
+        );
+        mlx_gen::ios_quantum::run(crate::quantum::VAE_ATTENTION, scratch, || {
+            self.forward_planned(x, plan)
+        })
+    }
+
     /// `x`: NHWC `[B, H, W, C]`. Single-head attention over the H·W positions, residual.
-    fn forward(&self, x: &Array) -> Result<Array> {
+    #[cfg(test)]
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
+        self.forward_planned(x, mlx_gen::attention::AttentionPlan::UNBOUNDED)
+    }
+
+    /// The attention under `plan`: [`mlx_gen::attention::sdpa_budgeted_bhsd`] is exactly the single
+    /// `scaled_dot_product_attention` call when `plan` is unbounded (or the whole call fits), and
+    /// otherwise the same single-head attention one query chunk at a time — each chunk's rows see
+    /// every key, so the result is the same math row for row.
+    pub(crate) fn forward_planned(
+        &self,
+        x: &Array,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.gn_w, &self.gn_b, GN_GROUPS, GN_EPS)?;
@@ -159,8 +225,15 @@ impl VaeAttention {
         let q = to_seq(self.q.forward(&y)?)?;
         let k = to_seq(self.k.forward(&y)?)?;
         let v = to_seq(self.v.forward(&y)?)?;
+        // sc-26270: on iOS the projections are materialized before the attention is built, so the
+        // GroupNorm's buffers are released before any score tensor exists (MLX keeps an encoded
+        // op's inputs alive until its command buffer completes). Values are unchanged; off device
+        // the graph is exactly the historical one.
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_rs::transforms::eval([&q, &k, &v])?;
+        }
         let scale = (c as f32).powf(-0.5);
-        let o = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
+        let o = mlx_gen::attention::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, plan)?;
         let o = self.out.forward(&o.reshape(&[b, h, w_, c])?)?;
         Ok(add(x, &o)?)
     }
@@ -207,18 +280,31 @@ impl EncoderDecoderBlock2D {
         })
     }
 
+    /// sc-26270: each resnet and each sampler is one guarded iOS quantum (pass-through off device).
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         for r in &self.resnets {
-            x = r.forward(&x, None)?;
+            x = resnet_quantum(r, &x, false)?;
         }
         if let Some((cw, cb)) = &self.downsample {
-            // Asymmetric (right/bottom) pad then stride-2, pad-0 conv (the SD downsample).
-            x = pad(&x, &[(0, 0), (0, 1), (0, 1), (0, 0)][..], None, None)?;
-            x = conv2d(&x, cw, Some(cb), 2, 0)?;
+            // The asymmetric pad's copy (input width, one row/column larger), the stride-2
+            // convolution's output (+ its bias add) and kernel transient.
+            let s = x.shape();
+            let padded = [s[0], s[1] + 1, s[2] + 1, s[3]];
+            let call =
+                crate::quantum::ConvCall::new(&padded, crate::quantum::element_bytes(&x), cw, 2, 0);
+            let scratch =
+                crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::Backend::current());
+            x = mlx_gen::ios_quantum::run(crate::quantum::VAE_DOWNSAMPLE, scratch, || {
+                // Asymmetric (right/bottom) pad then stride-2, pad-0 conv (the SD downsample).
+                let padded = pad(&x, &[(0, 0), (0, 1), (0, 1), (0, 0)][..], None, None)?;
+                conv2d(&padded, cw, Some(cb), 2, 0)
+            })?;
         }
         if let Some((cw, cb)) = &self.upsample {
-            x = conv2d(&upsample_nearest(&x, 2)?, cw, Some(cb), 1, 1)?;
+            x = upsample_quantum(&x, cw, || {
+                conv2d(&upsample_nearest(&x, 2)?, cw, Some(cb), 1, 1)
+            })?;
         }
         Ok(x)
     }
@@ -253,16 +339,31 @@ impl EncoderDecoderBlock2D {
 
 /// The VAE upsample convolution has no normalization between nearest-neighbor expansion and
 /// convolution: unlike a resnet's normalized inputs its activation can be ~2000 (sc-26268).
-fn upsample_tiled(
+pub(crate) fn upsample_tiled(
     x: &Array,
     weight: &Array,
     bias: &Array,
     tile: i32,
     cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    // sc-26270: one tiled iOS stage at the doubled extent; each conv tile is checked on its own.
+    // The stage also holds the nearest-2x copy of the input (input width at the doubled extent).
+    let s = x.shape();
+    let (cin, cout) = crate::quantum::conv_channels(weight);
+    let act = crate::quantum::element_bytes(x);
+    let up = [s[0], 2 * s[1], 2 * s[2], s[3]];
+    let f32_accum = x.dtype() == Dtype::Float16;
+    mlx_gen::ios_quantum::before(
+        crate::quantum::VAE_TILED_STAGE,
+        if f32_accum {
+            crate::quantum::tiled_stage_f32_accum(&up, weight, bias, act)
+        } else {
+            crate::quantum::tiled_stage_bytes(&up, cin, cout, act, false)
+        },
+    )?;
     let up = upsample_nearest(x, 2)?;
     trace_decode_stage("upsample.nearest", &up)?;
-    if x.dtype() == Dtype::Float16 {
+    let out = if x.dtype() == Dtype::Float16 {
         // Half storage, wide accumulation: only this unnormalized convolution is sensitive to
         // partial-sum overflow. The helper promotes one crop and casts each core back before
         // assembling the image, so no full-resolution f32 activation is introduced.
@@ -272,13 +373,140 @@ fn upsample_tiled(
             Some(bias),
             tile,
             cancel,
-            |tile| Ok(tile.clone()),
-        )
+            |tile| {
+                crate::quantum::before_tile(tile, weight, true)?;
+                Ok(tile.clone())
+            },
+        )?
     } else {
         mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(&up, weight, Some(bias), tile, cancel, |tile| {
+            crate::quantum::before_tile(tile, weight, false)?;
             Ok(tile.clone())
-        })
+        })?
+    };
+    mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+    Ok(out)
+}
+
+/// The encoder's asymmetric-pad stride-2 downsample (`pad (0,1)·(0,1)` then a 3x3 stride-2 pad-0
+/// convolution) over output cores of at most `tile` pixels a side, as the bounded encode runs it
+/// (sc-26270). Output pixel `r` reads padded input rows `2r ..= 2r + 2`, so a core `[y0, y1)` reads
+/// input rows `[2·y0, 2·y1]`: the crop is cut from the unpadded input and zero-padded at the bottom
+/// / right edge only where it reaches the padding row or column — the exact halo, so every output
+/// pixel convolves exactly the values the whole-image call does. Each core is evaluated (and, on
+/// iOS, synchronized) before the next tile is built; rows are assembled, then the image. One tiled
+/// iOS stage ([`crate::quantum::downsample_stage_bytes`]); every tile is checked before its graph
+/// ([`crate::quantum::downsample_tile_bytes`]).
+pub(crate) fn downsample_tiled(
+    x: &Array,
+    weight: &Array,
+    bias: &Array,
+    tile: i32,
+    cancel: Option<&CancelFlag>,
+) -> Result<Array> {
+    use mlx_gen::attention::slice_axis;
+    let s = x.shape();
+    let (h, w) = (s[1], s[2]);
+    // Padded extent H+1, k3, stride 2, pad 0.
+    let (oh, ow) = ((h - 2) / 2 + 1, (w - 2) / 2 + 1);
+    let core = tile.max(1);
+    let act = crate::quantum::element_bytes(x);
+    mlx_gen::ios_quantum::before(
+        crate::quantum::VAE_TILED_STAGE,
+        crate::quantum::downsample_stage_bytes(&[s[0], oh, ow, weight.shape()[0]], act),
+    )?;
+    let mut rows = Vec::new();
+    let mut y0 = 0;
+    while y0 < oh {
+        let y1 = (y0 + core).min(oh);
+        let (in_y0, need_h) = (2 * y0, 2 * (y1 - y0) + 1);
+        let have_h = need_h.min(h - in_y0);
+        let mut cores = Vec::new();
+        let mut x0 = 0;
+        while x0 < ow {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
+            let x1 = (x0 + core).min(ow);
+            let (in_x0, need_w) = (2 * x0, 2 * (x1 - x0) + 1);
+            let have_w = need_w.min(w - in_x0);
+            let crop_shape = [s[0], need_h, need_w, s[3]];
+            mlx_gen::ios_quantum::before(
+                crate::quantum::VAE_TILE,
+                crate::quantum::downsample_tile_bytes(
+                    &crop_shape,
+                    act,
+                    weight,
+                    crate::quantum::Backend::current(),
+                ),
+            )?;
+            let crop = slice_axis(&slice_axis(x, 1, in_y0, have_h)?, 2, in_x0, have_w)?;
+            let crop = pad(
+                &crop,
+                &[(0, 0), (0, need_h - have_h), (0, need_w - have_w), (0, 0)][..],
+                None,
+                None,
+            )?;
+            let out = conv2d(&crop, weight, Some(bias), 2, 0)?;
+            out.eval()?;
+            mlx_gen::ios_quantum::finish("tiled conv core", &[&out])?;
+            cores.push(out);
+            x0 = x1;
+        }
+        let refs: Vec<&Array> = cores.iter().collect();
+        let row = mlx_rs::ops::concatenate_axis(&refs, 2)?;
+        row.eval()?;
+        rows.push(row);
+        y0 = y1;
     }
+    let refs: Vec<&Array> = rows.iter().collect();
+    let out = mlx_rs::ops::concatenate_axis(&refs, 1)?;
+    out.eval()?;
+    mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+    Ok(out)
+}
+
+/// One VAE resnet as a guarded iOS quantum (sc-26270): `evaluated` selects the dense-reference
+/// [`ResnetBlock2D::forward_evaluated_vae`], else the lazy temb-free forward.
+fn resnet_quantum(resnet: &ResnetBlock2D, x: &Array, evaluated: bool) -> Result<Array> {
+    mlx_gen::ios_quantum::run(
+        crate::quantum::VAE_RESNET,
+        resnet.quantum_scratch(x),
+        || {
+            if evaluated {
+                resnet.forward_evaluated_vae(x)
+            } else {
+                resnet.forward(x, None)
+            }
+        },
+    )
+}
+
+/// A nearest-2x upsample + conv (`build`) over `x` as one guarded iOS quantum (sc-26270): the
+/// nearest-2x copy (input width at the doubled extent), the convolution's output (+ its bias add)
+/// and kernel transient, at `weight`'s loaded channels.
+fn upsample_quantum(
+    x: &Array,
+    weight: &Array,
+    build: impl FnOnce() -> Result<Array>,
+) -> Result<Array> {
+    let s = x.shape();
+    let call = crate::quantum::ConvCall::new(
+        &[s[0], 2 * s[1], 2 * s[2], s[3]],
+        crate::quantum::element_bytes(x),
+        weight,
+        1,
+        1,
+    );
+    let scratch =
+        crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::Backend::current());
+    mlx_gen::ios_quantum::run(crate::quantum::VAE_UPSAMPLE, scratch, build)
+}
+
+/// Activation element bytes of `x` (the divisor that turns an activation-width byte count into
+/// elements, for the f32 output-cast terms).
+fn call_act(x: &Array) -> u64 {
+    crate::quantum::element_bytes(x).max(1)
 }
 
 /// The decoder (latent → image).
@@ -339,11 +567,41 @@ impl Decoder {
     /// 1024² it is a `[1, 128, 128, 512]` f32 activation (32 MiB), three orders of magnitude under the
     /// full-resolution tail it protects. So the head runs once on the full latent and only the tail
     /// tiles, which is the same split `mlx_gen_qwen_image`'s `decode_tiled` uses.
+    ///
+    /// sc-26270: `conv_in` (which also materializes the caller's lazy de-normalization and
+    /// `post_quant_conv`), each mid resnet and the mid attention are guarded iOS quanta.
     fn head(&self, z: &Array) -> Result<Array> {
-        let mut x = conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
-        x = self.mid_resnet0.forward(&x, None)?;
-        x = self.mid_attn.forward(&x)?;
-        self.mid_resnet1.forward(&x, None)
+        // `conv_in`'s output (+ its bias add) and kernel transient, plus the caller's lazy latent
+        // de-normalization and `post_quant_conv` (two latent-sized buffers) materialized here.
+        let call = crate::quantum::ConvCall::new(
+            z.shape(),
+            crate::quantum::element_bytes(z),
+            &self.conv_in_w,
+            1,
+            1,
+        );
+        let scratch =
+            crate::quantum::single_conv_bytes(&call, 2, 0, crate::quantum::Backend::current());
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::VAE_DECODE_IN, scratch, || {
+            conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)
+        })?;
+        x = resnet_quantum(&self.mid_resnet0, &x, false)?;
+        x = self.mid_attn.forward_quantum(&x)?;
+        resnet_quantum(&self.mid_resnet1, &x, false)
+    }
+
+    /// iOS scratch (sc-26270) of the output GroupNorm + SiLU + `conv_out` over `x`
+    /// ([`crate::quantum::norm_conv_bytes`]). A half-precision VAE's f32 output cast happens after
+    /// this quantum and is materialized (and priced) by `DECODED_TO_IMAGE`.
+    fn conv_out_scratch(&self, x: &Array) -> u64 {
+        let call = crate::quantum::ConvCall::new(
+            x.shape(),
+            crate::quantum::element_bytes(x),
+            &self.conv_out_w,
+            1,
+            1,
+        );
+        crate::quantum::norm_conv_bytes(&call, crate::quantum::Backend::current())
     }
 
     /// The dense upsample half of the decode: the four `up_blocks` (×8 nearest+conv upsample) and
@@ -355,8 +613,14 @@ impl Decoder {
         for ub in &self.up_blocks {
             x = ub.forward(&x)?;
         }
-        let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
-        conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VAE_DECODE_OUT,
+            self.conv_out_scratch(&x),
+            || {
+                let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+                conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+            },
+        )
     }
 
     /// Untiled inference tail with explicit lifetime boundaries. Every convolution and GroupNorm
@@ -369,26 +633,36 @@ impl Decoder {
         let mut x = x.clone();
         for up in &self.up_blocks {
             for resnet in &up.resnets {
-                x = resnet.forward_evaluated_vae(&x)?;
+                x = resnet_quantum(resnet, &x, true)?;
             }
             if let Some((cw, cb)) = &up.upsample {
-                let enlarged = upsample_nearest(&x, 2)?;
-                enlarged.eval()?;
-                // Drop the previous-resolution activation before allocating convolution scratch.
-                x = enlarged;
-                x = conv2d(&x, cw, Some(cb), 1, 1)?;
-                x.eval()?;
+                let previous = x;
+                let probe = previous.clone();
+                // The previous-resolution activation moves into the quantum so it is still dropped
+                // before the convolution scratch is allocated (sc-26270 keeps that ordering).
+                x = upsample_quantum(&probe, cw, move || {
+                    let enlarged = upsample_nearest(&previous, 2)?;
+                    enlarged.eval()?;
+                    // Drop the previous-resolution activation before allocating convolution scratch.
+                    drop(previous);
+                    let out = conv2d(&enlarged, cw, Some(cb), 1, 1)?;
+                    out.eval()?;
+                    Ok(out)
+                })?;
             }
         }
-        let norm = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
-        norm.eval()?;
-        drop(x);
-        let activated = silu(&norm)?;
-        activated.eval()?;
-        drop(norm);
-        let out = conv2d(&activated, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)?;
-        out.eval()?;
-        Ok(out)
+        let scratch = self.conv_out_scratch(&x);
+        mlx_gen::ios_quantum::run(crate::quantum::VAE_DECODE_OUT, scratch, move || {
+            let norm = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+            norm.eval()?;
+            drop(x);
+            let activated = silu(&norm)?;
+            activated.eval()?;
+            drop(norm);
+            let out = conv2d(&activated, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)?;
+            out.eval()?;
+            Ok(out)
+        })
     }
 
     /// Layer-wise bounded tail with dense-image GroupNorm semantics (sc-19753).
@@ -430,6 +704,18 @@ impl Decoder {
         if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
             return Err(mlx_gen::Error::Canceled);
         }
+        // sc-26270: the tiled output convolution is one iOS stage; each tile is checked on its own.
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_out_w);
+        mlx_gen::ios_quantum::before(
+            crate::quantum::VAE_TILED_STAGE,
+            crate::quantum::tiled_stage_bytes(
+                x.shape(),
+                cin,
+                cout,
+                crate::quantum::element_bytes(&x),
+                false,
+            ),
+        )?;
         let norm = mlx_gen::vae_tiling::GlobalGroupNorm::new(
             &x,
             &self.norm_out_w,
@@ -437,14 +723,19 @@ impl Decoder {
             GN_GROUPS,
             GN_EPS,
         )?;
-        mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
+        let out = mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
             &x,
             &self.conv_out_w,
             Some(&self.conv_out_b),
             output_tile_edge.max(3),
             cancel,
-            |tile| silu(&norm.apply(tile)?),
-        )
+            |tile| {
+                crate::quantum::before_tile(tile, &self.conv_out_w, false)?;
+                silu(&norm.apply(tile)?)
+            },
+        )?;
+        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+        Ok(out)
     }
 }
 
@@ -491,18 +782,114 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let mut x = conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
+    /// sc-26270: `conv_in`, every resnet / downsample / mid attention are guarded iOS quanta. The
+    /// output GroupNorm + `conv_out` is the caller's quantum ([`Autoencoder::encode_mean`]), so it
+    /// materializes together with `quant_conv` and the mean selection.
+    fn forward_body(&self, x: &Array) -> Result<Array> {
+        // `conv_in`'s output (+ its bias add) and kernel transient, plus a half-precision VAE's
+        // compute-dtype cast of the image materialized here.
+        let call = crate::quantum::ConvCall::new(
+            x.shape(),
+            crate::quantum::element_bytes(x),
+            &self.conv_in_w,
+            1,
+            1,
+        );
+        let scratch =
+            crate::quantum::single_conv_bytes(&call, 1, 1, crate::quantum::Backend::current());
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::VAE_ENCODE_IN, scratch, || {
+            conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)
+        })?;
         for db in &self.down_blocks {
             x = db.forward(&x)?;
         }
-        x = self.mid_resnet0.forward(&x, None)?;
-        x = self.mid_attn.forward(&x)?;
-        x = self.mid_resnet1.forward(&x, None)?;
-        let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+        x = resnet_quantum(&self.mid_resnet0, &x, false)?;
+        x = self.mid_attn.forward_quantum(&x)?;
+        resnet_quantum(&self.mid_resnet1, &x, false)
+    }
+
+    /// The bounded encoder body (sc-26270): every full-resolution layer runs layer-wise tiled with
+    /// exact halos — `conv_in` and each resnet's 3x3 convolutions through
+    /// `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc` (the resnets' GroupNorms keep whole-image
+    /// statistics, as in the tiled decode), each downsample through [`downsample_tiled`] — at
+    /// `tile` input pixels a side scaled to each layer's resolution. The mid block runs at latent
+    /// resolution like the decode head: dense resnets and the query-chunked attention.
+    fn forward_body_tiled(
+        &self,
+        x: &Array,
+        tile: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_in_w);
+        mlx_gen::ios_quantum::before(
+            crate::quantum::VAE_TILED_STAGE,
+            crate::quantum::tiled_stage_bytes(
+                &[s[0], s[1], s[2], cout],
+                cin,
+                cout,
+                crate::quantum::element_bytes(x),
+                false,
+            ),
+        )?;
+        let mut x = mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
+            x,
+            &self.conv_in_w,
+            Some(&self.conv_in_b),
+            tile.max(3),
+            cancel,
+            |t| {
+                crate::quantum::before_tile(t, &self.conv_in_w, false)?;
+                Ok(t.clone())
+            },
+        )?;
+        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&x])?;
+        let mut scale = 1;
+        for db in &self.down_blocks {
+            let edge = ((tile + scale - 1) / scale).max(3);
+            for r in &db.resnets {
+                x = r.forward_tiled_vae(&x, edge, cancel)?;
+            }
+            if let Some((cw, cb)) = &db.downsample {
+                scale *= 2;
+                x = downsample_tiled(&x, cw, cb, ((tile + scale - 1) / scale).max(1), cancel)?;
+            }
+        }
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        x = resnet_quantum(&self.mid_resnet0, &x, false)?;
+        x = self
+            .mid_attn
+            .forward_quantum_planned(&x, VaeAttention::bounded_plan())?;
+        resnet_quantum(&self.mid_resnet1, &x, false)
+    }
+
+    /// The output GroupNorm + SiLU + `conv_out` over the body's output.
+    fn forward_out(&self, x: &Array) -> Result<Array> {
+        let x = group_norm(x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
     }
+
+    /// iOS scratch (sc-26270) of [`Self::forward_out`] over `x`
+    /// ([`crate::quantum::norm_conv_bytes`]) plus the `quant_conv` moments, the mean gather and its
+    /// scaling (+ a half-precision VAE's f32 cast) — four f32 output-width buffers.
+    fn out_scratch(&self, x: &Array) -> u64 {
+        let call = crate::quantum::ConvCall::new(
+            x.shape(),
+            crate::quantum::element_bytes(x),
+            &self.conv_out_w,
+            1,
+            1,
+        );
+        crate::quantum::norm_conv_bytes(&call, crate::quantum::Backend::current())
+            .saturating_add(call.out_bytes() / call_act(x) * 4 * 4)
+    }
 }
+
+/// The input-pixel tile edge of the bounded encode on iOS (sc-26270): every full-resolution encoder
+/// convolution works on at most this many pixels a side (plus its halo) at a time.
+pub const IOS_ENCODE_TILE_PX: i32 = 256;
 
 /// The SDXL autoencoder. `decode` reconstructs an image from latents; `encode` produces the latent
 /// mean (used to seed img2img).
@@ -583,6 +970,7 @@ impl Autoencoder {
 
     /// Decode latents `[B, H/8, W/8, 4]` (NHWC) → image tensor `[B, H, W, 3]` in roughly `[-1, 1]`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -595,6 +983,7 @@ impl Autoencoder {
     /// generation; this is NOT a tiled reference and does not change convolution geometry.
     /// Do not use under autograd (evaluation intentionally releases the lazy graph).
     pub fn decode_evaluated(&self, latents: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -642,6 +1031,7 @@ impl Autoencoder {
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
         }
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -664,15 +1054,82 @@ impl Autoencoder {
     /// Encode an image `[B, 3, ...]`-normalized NHWC `[B, H, W, 3]` → latent **mean** `[B, H/8, W/8,
     /// 4]` (scaled by `scaling_factor`). Mirrors the vendored `Autoencoder.encode` (returns the mean;
     /// img2img seeds from the mean, not a sample).
+    ///
+    /// On iOS (sc-26270) the encode is the bounded [`encode_tiled`](Self::encode_tiled) at
+    /// [`IOS_ENCODE_TILE_PX`]; everywhere else it is the historical whole-image encode, byte for
+    /// byte.
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {
+        if mlx_gen::ios_quantum::enabled() {
+            return self.encode_tiled(x, IOS_ENCODE_TILE_PX, None);
+        }
+        self.encode_dense(x)
+    }
+
+    /// The historical whole-image encode.
+    fn encode_dense(&self, x: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let x = self.to_compute(x)?;
-        let moments = self.quant_proj.forward(&self.encoder.forward(&x)?)?;
+        let body = self.encoder.forward_body(&x)?;
+        // sc-26270: output norm/conv, `quant_conv`, the mean selection and scaling are one quantum.
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VAE_ENCODE_OUT,
+            self.encoder.out_scratch(&body),
+            || self.encode_out(&body),
+        )
+    }
+
+    /// The **bounded encode** (sc-26270), the encoder twin of [`decode_tiled`](Self::decode_tiled):
+    /// every full-resolution layer runs layer-wise tiled with exact halos at `tile_px` input pixels
+    /// a side (scaled to each layer), GroupNorms keep whole-image statistics, and the mid attention
+    /// runs query-chunked. Equal to [`encode_mean`](Self::encode_mean)'s whole-image encode up to
+    /// float reassociation of the tiled convolutions. An image that fits one tile (both sides
+    /// `<= tile_px`) takes the exact whole-image encode, as `decode_tiled` does. Selected on iOS
+    /// and by the bounded-decode rung's tiling (`pipeline::encode_init_latents_tiled`); `cancel` is
+    /// checked between tiles.
+    pub fn encode_tiled(
+        &self,
+        x: &Array,
+        tile_px: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let s = x.shape();
+        if s.len() != 4 {
+            return Err(Error::Msg(format!(
+                "sdxl tiled encode expects NHWC images [B, H, W, C], got {s:?}"
+            )));
+        }
+        if s[1] <= tile_px && s[2] <= tile_px {
+            return self.encode_dense(x);
+        }
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let x = self.to_compute(x)?;
+        let body = self.encoder.forward_body_tiled(&x, tile_px, cancel)?;
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VAE_ENCODE_OUT,
+            self.encoder.out_scratch(&body),
+            || self.encode_out(&body),
+        )
+    }
+
+    /// The encoder's output head over the body's output: GroupNorm + SiLU + `conv_out`,
+    /// `quant_conv`, the mean half of the moments, scaled.
+    pub(crate) fn encode_out(&self, body: &Array) -> Result<Array> {
+        let moments = self.quant_proj.forward(&self.encoder.forward_out(body)?)?;
         // split into (mean, logvar) along the channel axis; keep the mean · scaling_factor.
         let c = moments.shape()[3];
         let half = c / 2;
         let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
         let mean = moments.take_axis(&idx, 3)?;
         self.to_output(multiply(&mean, self.scale(self.scaling_factor)?)?)
+    }
+
+    /// The encoder body (through the mid block) and the encode-out quantum's price over it
+    /// (sc-26270 proof tests).
+    #[cfg(test)]
+    pub(crate) fn encode_body_for_test(&self, x: &Array) -> Result<(Array, u64)> {
+        let body = self.encoder.forward_body(&self.to_compute(x)?)?;
+        let scratch = self.encoder.out_scratch(&body);
+        Ok((body, scratch))
     }
 }
 

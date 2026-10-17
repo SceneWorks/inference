@@ -123,7 +123,7 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
         assert!(status.success());
         return;
     }
-    use mlx_gen::ios_quantum::{QuantumEvent, SanaBlockGeometry};
+    use mlx_gen::ios_quantum::QuantumEvent;
     assert!(quantum_metal_guard::forbid_metal());
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     let golden = Weights::from_file(concat!(
@@ -137,21 +137,45 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
     let latent = golden.require("input.latent").unwrap();
     let caption = golden.require("input.caption").unwrap();
     let timestep = golden.require("input.timestep").unwrap();
+    // The f32 golden stores no weight narrower than the f32 activations: no promoted copies.
+    assert_eq!(
+        golden
+            .require("w.transformer_blocks.0.ff.conv_inverted.weight")
+            .unwrap()
+            .dtype(),
+        Dtype::Float32
+    );
     let dim = cfg.inner_dim() as u64;
     let hidden = (cfg.mlp_ratio * cfg.inner_dim() as f32) as u64;
-    let expected = mlx_gen::ios_quantum::sana_block_bytes(SanaBlockGeometry {
+    let tokens = (latent.shape()[2] * latent.shape()[3]) as u64;
+    let expected = mlx_gen_sana::quantum::block_bytes(mlx_gen_sana::quantum::SanaBlockQuantum {
         batch: 1,
-        tokens: (latent.shape()[2] * latent.shape()[3]) as u64,
+        tokens,
         dim,
+        self_heads: cfg.num_attention_heads as u64,
+        self_head_dim: cfg.attention_head_dim as u64,
         caption_tokens: caption.shape()[1] as u64,
-        ff_channels: 2 * hidden,
         cross_heads: cfg.num_cross_attention_heads as u64,
-        conv_weight_elements: 2 * hidden * dim
-            + 2 * hidden
-            + 2 * hidden * 9
-            + 2 * hidden
-            + dim * hidden,
+        query_rows: tokens,
+        ff_channels: 2 * hidden,
+        qk_norm: false,
+        element_bytes: 4,
+        weight_bytes: 0,
     });
+    let entry_expected =
+        mlx_gen_sana::quantum::entry_bytes(mlx_gen_sana::quantum::SanaEntryQuantum {
+            batch: 1,
+            latent_channels: latent.shape()[1] as u64,
+            tokens,
+            patch: cfg.patch_size as u64,
+            dim,
+            caption_tokens: caption.shape()[1] as u64,
+            caption_channels: caption.shape()[2] as u64,
+            caption_element_bytes: 4,
+            element_bytes: 4,
+            weight_bytes: 0,
+        });
+    assert_eq!(caption.dtype(), Dtype::Float32);
     let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let sink = seen.clone();
     mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
@@ -170,6 +194,20 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
         })
         .collect();
     assert_eq!(block_checks, vec![expected; cfg.num_layers as usize]);
+    // The entry quantum is the counted patchify/caption/timestep scratch plus the lazy CFG combine +
+    // sampler update of the previous step that can materialize inside it: 16 latent-sized f32
+    // buffers (`sampler_step_bytes`).
+    let entry: Vec<u64> = seen
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            QuantumEvent::Checked { label, scratch } if label == "SANA patch/caption/timestep" => {
+                Some(*scratch)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entry, vec![entry_expected + 16 * latent.size() as u64 * 4]);
 
     let cancel = mlx_gen::CancelFlag::new();
     let observed = cancel.clone();
@@ -344,4 +382,109 @@ fn trunk_matches_diffusers_real() {
         mean < 3.4e-2,
         "mean_rel {mean} above the per-step drift band"
     );
+}
+
+/// The Sprint sampler's latent evaluations happen inside guarded quanta (item: latent evals were
+/// outside any quantum): each per-step materialization is checked as `SANA SCM step` with the
+/// counted SCM-step scratch BEFORE its graph is evaluated, the final division as `SANA SCM final`,
+/// and a refusal leaves the loop before any trunk work. Arithmetic is unchanged by the guards.
+#[cfg(target_os = "macos")]
+#[test]
+fn sprint_latent_evaluations_are_guarded_quanta() {
+    const CHILD: &str = "SANA_SPRINT_LATENT_GUARD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transformer_parity::sprint_latent_evaluations_are_guarded_quanta",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    use mlx_gen::ios_quantum::QuantumEvent;
+    assert!(quantum_metal_guard::forbid_metal());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let sprint = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_sprint_trunk_golden.safetensors"
+    ))
+    .unwrap();
+    let model =
+        SanaTransformer::from_weights(&weights_with_w_prefix(&sprint), tiny_sprint_config())
+            .unwrap();
+    let latent = sprint.require("input.latent").unwrap();
+    let caption = sprint.require("input.caption").unwrap();
+    let scheduler = mlx_gen_sana::ScmScheduler::new(2);
+    let run = || {
+        mlx_gen_sana::denoise_sprint(
+            &model,
+            &scheduler,
+            7,
+            latent.clone(),
+            caption,
+            None,
+            4.5,
+            0.1,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_| {},
+        )
+    };
+    let lazy = run().unwrap();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let guarded = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_observer(
+            move |event| sink.borrow_mut().push(event.clone()),
+            run,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        peak_rel(&guarded, &lazy),
+        0.0,
+        "guards change lifetime, not arithmetic"
+    );
+    let step_scratch = mlx_gen_sana::quantum::scm_step_bytes(latent.size() as u64);
+    let checks = |want: &str| -> Vec<u64> {
+        seen.borrow()
+            .iter()
+            .filter_map(|e| match e {
+                QuantumEvent::Checked { label, scratch } if label == want => Some(*scratch),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(checks("SANA SCM step"), vec![step_scratch; 2]);
+    assert_eq!(
+        checks("SANA SCM final"),
+        vec![step_scratch + 4 * latent.size() as u64]
+    );
+    // Each step check precedes that step's trunk entry.
+    let order: Vec<String> = seen
+        .borrow()
+        .iter()
+        .filter_map(|e| match e {
+            QuantumEvent::Checked { label, .. }
+                if label == "SANA SCM step" || label == "SANA patch/caption/timestep" =>
+            {
+                Some(label.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "SANA SCM step",
+            "SANA patch/caption/timestep",
+            "SANA SCM step",
+            "SANA patch/caption/timestep"
+        ]
+    );
+    let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(step_scratch, run);
+    assert!(refused.unwrap_err().to_string().contains("SANA SCM step"));
 }

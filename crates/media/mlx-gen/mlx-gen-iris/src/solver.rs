@@ -9,6 +9,9 @@ use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
+/// Label of one solver update's iOS execution quantum.
+pub(crate) const STEP_QUANTUM: &str = "Iris solver step";
+
 /// Integrate `z` along `plan`. `model_out(x, step)` returns the raw (CFG-combined) network output
 /// at `step.s` in f32, read as `prediction` (`_pred_x0`: velocity `x0 = x − s·out`, or the clean
 /// image `x0 = out`); `on_step(i, x0)` fires after step `i` (1-based) completes with that step's
@@ -29,30 +32,60 @@ pub fn sample(
             return Err(Error::Canceled);
         }
         let out = model_out(&x, step)?.as_dtype(Dtype::Float32)?;
-        let x0 = match prediction {
-            // v-prediction: x0 = x − s·v
-            Prediction::Velocity => x.subtract(&out.multiply(Array::from_f32(step.s_f32()))?)?,
-            Prediction::Clean => out,
-        };
-        x = match step.update {
-            DpmUpdate::First { cx, c0 } => x
-                .multiply(Array::from_f32(cx))?
-                .subtract(&x0.multiply(Array::from_f32(c0))?)?,
-            DpmUpdate::Second { cx, c0, c1, r0 } => {
-                let prev = prev_x0.as_ref().ok_or_else(|| {
-                    Error::Msg("iris solver: a second-order step needs the previous x0".into())
-                })?;
-                let d = x0.subtract(prev)?.divide(Array::from_f32(r0))?;
-                x.multiply(Array::from_f32(cx))?
-                    .subtract(&x0.multiply(Array::from_f32(c0))?)?
-                    .subtract(&d.multiply(Array::from_f32(c1))?)?
-            }
-        };
+        mlx_gen::ios_quantum::before(STEP_QUANTUM, step_scratch(x.size() as u64, &step.update))?;
+        let (next, x0) = step_update(&x, &out, step, prediction, prev_x0.as_ref())?;
+        x = next;
         eval([&x, &x0])?;
+        mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[&x, &x0])?;
         on_step(i + 1, &x0);
         prev_x0 = Some(x0);
     }
     Ok(x)
+}
+
+/// iOS floor of one solver update over `state_elements` f32 elements, counted from
+/// [`step_update`] together with the lazy CFG combine it materializes. Live at once (`[B, C, H, W]`
+/// f32 each): a first-order step holds four — of the combine's difference, scaled difference and
+/// sum, `s·out`, `x0` and the update's two scaled terms and new state, MLX releasing (and
+/// donating) each operand as its consumer runs; a second-order step adds the difference to the
+/// previous `x0` and its scaled copy. Plus the update's scalar coefficients (four, six; 4 B each).
+pub(crate) fn step_scratch(state_elements: u64, update: &DpmUpdate) -> u64 {
+    let (states, scalars) = match update {
+        DpmUpdate::First { .. } => (4, 4),
+        DpmUpdate::Second { .. } => (6, 6),
+    };
+    mlx_gen::ios_quantum::tensor_bytes(4, &[states, state_elements]).saturating_add(4 * scalars)
+}
+
+/// One FlowDPM-Solver++ update of `x` from the network output `out` (both f32): returns the new
+/// state and this step's predicted clean image `x0` (the body of one [`STEP_QUANTUM`]).
+pub(crate) fn step_update(
+    x: &Array,
+    out: &Array,
+    step: &DpmStep,
+    prediction: Prediction,
+    prev_x0: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let x0 = match prediction {
+        // v-prediction: x0 = x − s·v
+        Prediction::Velocity => x.subtract(&out.multiply(Array::from_f32(step.s_f32()))?)?,
+        Prediction::Clean => out.clone(),
+    };
+    let next = match step.update {
+        DpmUpdate::First { cx, c0 } => x
+            .multiply(Array::from_f32(cx))?
+            .subtract(&x0.multiply(Array::from_f32(c0))?)?,
+        DpmUpdate::Second { cx, c0, c1, r0 } => {
+            let prev = prev_x0.ok_or_else(|| {
+                Error::Msg("iris solver: a second-order step needs the previous x0".into())
+            })?;
+            let d = x0.subtract(prev)?.divide(Array::from_f32(r0))?;
+            x.multiply(Array::from_f32(cx))?
+                .subtract(&x0.multiply(Array::from_f32(c0))?)?
+                .subtract(&d.multiply(Array::from_f32(c1))?)?
+        }
+    };
+    Ok((next, x0))
 }
 
 /// `out_uncond + scale · (out_cond − out_uncond)` in f32.

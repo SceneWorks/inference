@@ -189,6 +189,84 @@ class SelectLanesTests(unittest.TestCase):
             with self.subTest(crate=crate_dir):
                 self.assertTrue(select_lanes([f"{crate_dir}/src/lib.rs"])["ios_build"])
 
+    def test_ios_host_selects_the_harness_lanes_only(self) -> None:
+        # The device harness is cross-built and iOS-Clippied on `ios_build`; its weights-free tests
+        # and host Clippy run on `macos_metal`. No shipped crate depends on `ios-host/`, so it is
+        # classified rather than taking the fail-safe-to-all an unknown top-level path would.
+        for path in (
+            "ios-host/smoke/src/lib.rs",
+            "ios-host/smoke/src/campaign.rs",
+            "ios-host/smoke/src/campaign_media.rs",
+            "ios-host/smoke/src/campaign_admission_tests.rs",
+            "ios-host/smoke/Cargo.lock",
+            "ios-host/smoke/examples/campaign_catalog.rs",
+            "ios-host/project.yml",
+        ):
+            with self.subTest(path=path):
+                selected = {lane for lane, enabled in select_lanes([path]).items() if enabled}
+                self.assertEqual(selected, {"workspace", "ios_build", "macos_metal"})
+        # Like every manifest, the harness manifest also selects `release`; nothing else.
+        selected = {
+            lane
+            for lane, enabled in select_lanes(["ios-host/smoke/Cargo.toml"]).items()
+            if enabled
+        }
+        self.assertEqual(selected, {"workspace", "ios_build", "macos_metal", "release"})
+
+    def test_ios_device_scripts_select_the_ios_build_lane(self) -> None:
+        for path in ("scripts/ios/run_smoke.sh", "scripts/ios/campaign.py"):
+            with self.subTest(path=path):
+                lanes = select_lanes([path])
+                self.assertTrue(lanes["ios_build"])
+                self.assertTrue(lanes["macos_metal"])
+
+    def test_every_crate_on_the_harness_graph_selects_both_harness_lanes(self) -> None:
+        """Every crate the device harness compiles must select both lanes that build it.
+
+        The harness (`ios-host/smoke`) is its own cargo workspace with a wider graph than
+        runtime-ios (core-llm-testkit, and z-image behind `zimage`), so a crate on it but not on
+        runtime-ios's graph would otherwise reach neither the harness cross-build nor its tests.
+        """
+        if shutil.which("cargo") is None:
+            self.skipTest("cargo is not installed")
+        result = subprocess.run(
+            [
+                "cargo",
+                "tree",
+                "--locked",
+                "--manifest-path",
+                "ios-host/smoke/Cargo.toml",
+                "--features",
+                "media,zimage",
+                "--target",
+                "aarch64-apple-ios",
+                "-e",
+                "normal,build",
+                "--prefix",
+                "none",
+                "--format",
+                "{p}",
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+        )
+        root = REPO_ROOT.resolve()
+        crate_dirs = set()
+        for match in re.finditer(r"\((/[^)]+)\)", result.stdout):
+            path = Path(match.group(1)).resolve()
+            if path.is_relative_to(root):
+                crate_dirs.add(path.relative_to(root).as_posix())
+        self.assertIn("ios-host/smoke", crate_dirs)
+        self.assertIn("crates/contracts/core-llm/core-llm-testkit", crate_dirs)
+        self.assertIn("crates/media/mlx-gen/mlx-gen-z-image", crate_dirs)
+        for crate_dir in sorted(crate_dirs):
+            with self.subTest(crate=crate_dir):
+                lanes = select_lanes([f"{crate_dir}/src/lib.rs"])
+                self.assertTrue(lanes["ios_build"])
+                self.assertTrue(lanes["macos_metal"])
+
     def test_docs_only_does_not_build_backends(self) -> None:
         lanes = select_lanes(["docs/migration/PHASE_2_CHECKPOINT.md"])
         self.assertTrue(lanes["workspace"])

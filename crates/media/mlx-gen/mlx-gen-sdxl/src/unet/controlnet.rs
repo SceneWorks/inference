@@ -50,6 +50,49 @@ impl Conv2dLayer {
     fn forward(&self, x: &Array) -> Result<Array> {
         conv2d(x, &self.weight, Some(&self.bias), self.stride, self.pad)
     }
+
+    /// This layer's convolution over `x`, for its iOS price.
+    fn call(&self, x: &Array) -> crate::quantum::ConvCall {
+        crate::quantum::ConvCall::new(
+            x.shape(),
+            crate::quantum::element_bytes(x),
+            &self.weight,
+            self.stride,
+            self.pad,
+        )
+    }
+
+    /// Run `build` (this layer applied to `x`, plus any epilogue) as one guarded iOS conditioning-
+    /// embedding quantum (sc-26270): the convolution's output, the SiLU epilogue's sigmoid when
+    /// `silu` (its product and the bias add donate), and the kernel transient.
+    fn quantum(
+        &self,
+        x: &Array,
+        silu: bool,
+        build: impl FnOnce() -> Result<Array>,
+    ) -> Result<Array> {
+        let scratch = crate::quantum::single_conv_bytes(
+            &self.call(x),
+            0,
+            u64::from(silu),
+            crate::quantum::Backend::current(),
+        );
+        mlx_gen::ios_quantum::run(crate::quantum::CONTROL_COND_CONV, scratch, build)
+    }
+
+    /// One 1x1 zero-conv head scaled by `s`, as a guarded iOS quantum (sc-26270): the output (its
+    /// bias add and the scale donate) and the kernel transient.
+    fn zero_quantum(&self, x: &Array, s: &Array) -> Result<Array> {
+        let scratch = crate::quantum::single_conv_bytes(
+            &self.call(x),
+            0,
+            0,
+            crate::quantum::Backend::current(),
+        );
+        mlx_gen::ios_quantum::run(crate::quantum::CONTROL_ZERO_CONV, scratch, || {
+            Ok(multiply(&self.forward(x)?, s)?)
+        })
+    }
 }
 
 /// `ControlNetConditioningEmbedding`: `conv_in(3→16) → SiLU → [block → SiLU]×6 → conv_out(256→320)`.
@@ -81,12 +124,18 @@ impl CondEmbedding {
     }
 
     /// `control`: NHWC `[B, H, W, 3]` in `[0,1]` → `[B, H/8, W/8, 320]`.
+    ///
+    /// sc-26270: every convolution of the stack is one guarded iOS quantum at its output extent.
     fn forward(&self, control: &Array) -> Result<Array> {
-        let mut e = silu(&self.conv_in.forward(control)?)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut e = self
+            .conv_in
+            .quantum(control, true, || silu(&self.conv_in.forward(control)?))?;
         for b in &self.blocks {
-            e = silu(&b.forward(&e)?)?;
+            e = b.quantum(&e, true, || silu(&b.forward(&e)?))?;
         }
-        self.conv_out.forward(&e)
+        self.conv_out
+            .quantum(&e, false, || self.conv_out.forward(&e))
     }
 }
 
@@ -273,9 +322,20 @@ impl ControlNet {
         scale: f32,
         plan: crate::plan::SdxlForwardPlan<'_>,
     ) -> Result<ControlResiduals> {
-        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_row(plan.cfg_row);
+        // The branch keeps the request's sequential-CFG row and its bounded attention plan (rung 3
+        // bounds the encoder copy's attention exactly as it bounds the U-Net's); never a block
+        // window — the ControlNet arms no block stream, so its stacks are always resident.
+        let plan =
+            crate::plan::SdxlForwardPlan::with_attention(plan.attention).with_cfg_row(plan.cfg_row);
         let batch = x.shape()[0];
         let dtype = x.dtype();
+        // sc-26270: the branch runs as guarded iOS quanta — stem, then the shared resnet /
+        // transformer / sampler quanta of the encoder copy, then each zero-conv head.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        mlx_gen::ios_quantum::before(
+            crate::quantum::CONTROL_STEM,
+            self.stem_scratch(x, encoder_x),
+        )?;
 
         // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) up front, before
         // any cross-attention (diffusers applies `encoder_hid_proj` once). No-op for SDXL ControlNets.
@@ -305,6 +365,7 @@ impl ControlNet {
         // conv_in + conditioning embedding (precomputed once per run — step-invariant, F-069).
         let mut x = self.conv_in.forward(x)?;
         x = add(&x, cond_embed)?;
+        mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_STEM, &[&x, &temb, encoder_x])?;
 
         // Down — collect skip residuals (starting with the stem+cond output).
         let mut residuals: Vec<Array> = vec![x.clone()];
@@ -315,9 +376,13 @@ impl ControlNet {
         }
 
         // Mid.
-        x = self.mid_resnet0.forward_planned(&x, Some(&temb), plan)?;
+        x = self
+            .mid_resnet0
+            .forward_quantum(&x, None, Some(&temb), plan)?;
         x = self.mid_transformer.forward_ip(&x, encoder_x, None, plan)?;
-        x = self.mid_resnet1.forward_planned(&x, Some(&temb), plan)?;
+        x = self
+            .mid_resnet1
+            .forward_quantum(&x, None, Some(&temb), plan)?;
 
         // Zero-conv heads + scale. Each collected skip residual must pair with exactly one zero-conv;
         // assert the geometry before the `zip` so a count mismatch points at the real cause here,
@@ -326,10 +391,24 @@ impl ControlNet {
         let s = scalar(scale).as_dtype(dtype)?;
         let mut down = Vec::with_capacity(residuals.len());
         for (r, z) in residuals.iter().zip(&self.down_zero) {
-            down.push(multiply(&z.forward(r)?, &s)?);
+            down.push(z.zero_quantum(r, &s)?);
         }
-        let mid = multiply(&self.mid_zero.forward(&x)?, &s)?;
+        let mid = self.mid_zero.zero_quantum(&x, &s)?;
         Ok(ControlResiduals { down, mid })
+    }
+
+    /// iOS scratch (sc-26270) of the stem quantum: the U-Net stem's count
+    /// ([`super::stem_bytes`]) over this branch's loaded `conv_in` and Kolors projection (the
+    /// conditioning-embedding add donates its convolution operand).
+    fn stem_scratch(&self, x: &Array, encoder_x: &Array) -> u64 {
+        super::stem_bytes(
+            x,
+            encoder_x,
+            &self.conv_in.weight,
+            self.encoder_hid_proj.as_ref(),
+            0,
+            crate::quantum::Backend::current(),
+        )
     }
 
     /// Quantize the encoder-copy Linears (down/mid attention + FFN + time/add embeddings). The

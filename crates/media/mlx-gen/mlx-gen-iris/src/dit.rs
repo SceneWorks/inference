@@ -46,6 +46,10 @@ impl SwiGlu {
             .flat_map(Linear::arrays)
             .collect()
     }
+    /// The loaded gated width (`w1`'s output).
+    fn hidden(&self) -> u64 {
+        self.w1.out_features()
+    }
 }
 
 /// `SelfAttention`: fused qkv, optional per-head QK RMSNorm, optional RoPE, optional key mask.
@@ -240,6 +244,163 @@ enum Block {
     Single(Box<SingleBlock>),
 }
 
+impl Block {
+    /// `(model width, widest MLP hidden)` of THIS block's loaded tensors — the iOS quantum
+    /// accounting's inputs, never production constants.
+    fn widths(&self) -> (u64, u64) {
+        match self {
+            Block::Dual(b) => {
+                let ff_hidden = b
+                    .text
+                    .as_ref()
+                    .map_or(b.mlp_x.hidden(), |t| b.mlp_x.hidden().max(t.mlp.hidden()));
+                (b.norm_x1.width(), ff_hidden)
+            }
+            Block::Single(b) => (b.norm1.width(), b.mlp.hidden()),
+        }
+    }
+}
+
+/// Labels of the iOS execution quanta of one backbone forward, in forward order.
+pub(crate) mod quanta {
+    pub const EMBED: &str = "Iris patch/timestep embed";
+    pub const TEXT_LAYER_BLOCK: &str = "Iris text adapter layer block";
+    pub const TEXT_POOL: &str = "Iris text adapter pool";
+    pub const TEXT_REFINER_BLOCK: &str = "Iris text refiner block";
+    pub const TEXT_OUTPUT: &str = "Iris text adapter output";
+    pub const TRUNK_BLOCK: &str = "Iris trunk block";
+    pub const PIXEL_EMBED: &str = "Iris pixel embed";
+    pub const PIXEL_BLOCK: &str = "Iris pixel block";
+    pub const OUTPUT: &str = "Iris output projection";
+}
+
+/// Counted live buffers of one block phase, by tensor class, at one compute width. Each class is
+/// priced over its own shape by the site (`hidden` = the block's `[.., tokens, width]`, `kv` = its
+/// grouped k/v width, `ff` = its MLP width); the counts are proven against MLX's measured peak in
+/// `crate::quantum_proofs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Live {
+    pub f32_hidden: u64,
+    pub cw_hidden: u64,
+    pub f32_kv: u64,
+    pub cw_kv: u64,
+    pub cw_ff: u64,
+}
+
+impl Live {
+    const fn of(f32_hidden: u64, cw_hidden: u64, f32_kv: u64, cw_kv: u64, cw_ff: u64) -> Self {
+        Self {
+            f32_hidden,
+            cw_hidden,
+            f32_kv,
+            cw_kv,
+            cw_ff,
+        }
+    }
+
+    /// Bytes of these buffers over `hidden`, `kv` and `ff` elements at compute width `cw`.
+    fn bytes(self, cw: u64, hidden: u64, kv: u64, ff: u64) -> u64 {
+        [
+            self.f32_hidden * 4 * hidden,
+            self.cw_hidden * cw * hidden,
+            self.f32_kv * 4 * kv,
+            self.cw_kv * cw * kv,
+            self.cw_ff * cw * ff,
+        ]
+        .iter()
+        .fold(0u64, |a, b| a.saturating_add(*b))
+    }
+}
+
+/// The widths of one PiT block quantum (see [`IrisDiT::pixel_block_scratch`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PixelBlockGeometry {
+    pub compute_bytes: u64,
+    pub batch: u64,
+    pub patches: u64,
+    /// `p²` pixels per patch.
+    pub patch_pixels: u64,
+    pub pixel_width: u64,
+    pub compact_width: u64,
+    /// `adaln`'s output width (`4 · p² · pixel width`).
+    pub modulation_width: u64,
+    /// `adaln`'s input width (the per-patch conditioning).
+    pub condition_width: u64,
+    pub fc1_width: u64,
+    pub heads: u64,
+    pub query_rows: u64,
+}
+
+/// The counts of one block, under an f32 compute (`[0]`) and a bf16 one (`[1]`): the two differ
+/// because a bf16 compute adds the compute-width copies of f32 streams and frees the f32 operands
+/// earlier.
+pub(crate) struct BlockCounts {
+    /// The attention phase (the gate branch, which MLX evaluates ahead of the attention, included).
+    pub attention: [Live; 2],
+    /// Added when the plan chunks the query rows: the chunk outputs and their concatenation, plus
+    /// what the per-chunk evaluation materializes while the block's own bindings still hold it.
+    pub chunked: [Live; 2],
+    /// The MLP phase.
+    pub mlp: [Live; 2],
+}
+
+fn width_index(cw: u64) -> usize {
+    usize::from(cw < 4)
+}
+
+/// Single-stream trunk block.
+///
+/// Attention: f32 `[B, T, D]` — the token concatenation, the modulated norm `h`, q after its
+/// QK-norm, q after RoPE (concatenated) and one RoPE working buffer; f32 `[B, T, kv]` — k after its
+/// QK-norm and after RoPE; compute-width `[B, T, D]` — the q projection, the gate projection and its
+/// sigmoid, the attention output, its `[B, T, D]` re-layout and the gated product (bf16: the gate
+/// and q projections read compute-width casts of `h` in place of the f32 operands); compute-width
+/// `[B, T, kv]` — the k and v projections and (f32) the cast of k the attention reads.
+/// MLP: the f32 residual and modulated norm, the compute-width cast and down projection, and the
+/// w1 / SiLU (in place) / w3 / gate·up `[B, T, F]` outputs.
+pub(crate) const SINGLE_BLOCK: BlockCounts = BlockCounts {
+    attention: [Live::of(5, 6, 2, 3, 0), Live::of(5, 5, 2, 2, 0)],
+    chunked: [Live::of(0, 1, 0, 0, 0), Live::of(0, 5, 0, 0, 0)],
+    mlp: [Live::of(2, 2, 0, 0, 3), Live::of(2, 2, 0, 0, 3)],
+};
+
+/// Dual-stream trunk block: the single block's classes over both streams, without the token
+/// concatenation (each stream keeps its own `h`), and with the x then y post-attention halves and
+/// MLPs run one after the other. Under bf16 the f32 q/k are released once cast for the attention
+/// and the unbounded graph releases each stream's projections before the joint attention, while a
+/// chunking plan's per-chunk evaluation holds the projections, their casts and the chunk outputs
+/// and their concatenation (seven `[B, T, D]` at the compute width).
+pub(crate) const DUAL_BLOCK: BlockCounts = BlockCounts {
+    attention: [Live::of(4, 5, 1, 3, 0), Live::of(2, 2, 2, 2, 0)],
+    chunked: [Live::of(0, 1, 0, 0, 0), Live::of(0, 7, 0, 0, 0)],
+    mlp: [Live::of(2, 2, 0, 0, 3), Live::of(2, 2, 0, 0, 3)],
+};
+
+/// Layerwise text-adapter block (MHA, fused qkv, no QK-norm or RoPE).
+///
+/// Attention: the f32 input norm (and, f32, the residual sum); the fused qkv (three
+/// `[R, L, D]`), the attention output, its re-layout and the projection (bf16: the norm's
+/// compute-width cast replaces the residual). MLP: the f32 residual and norm, the down projection
+/// (bf16: and the norm's cast), and mlp.0 / SiLU (bf16: and SiLU's working copy).
+pub(crate) const LAYER_BLOCK: BlockCounts = BlockCounts {
+    attention: [Live::of(2, 6, 0, 0, 0), Live::of(1, 5, 0, 0, 0)],
+    chunked: [Live::of(0, 0, 0, 0, 0), Live::of(0, 1, 0, 0, 0)],
+    mlp: [Live::of(2, 1, 0, 0, 2), Live::of(2, 2, 0, 0, 3)],
+};
+
+/// Text-refiner block (MHA, fused qkv, QK-norm, masked keys).
+///
+/// Attention: f32 — the input norm (bf16: and q, k after QK-norm, until cast); compute width — the
+/// fused qkv (three), the attention output and the projection. Chunked: the chunk outputs, their
+/// concatenation and the re-layout of q (f32) or the casts of q and k (bf16) the per-chunk
+/// evaluation materializes. MLP: the f32 residual and norm, the down
+/// projection, and w1 / w3 / gate·up (bf16: one more `[B, T, F]` working copy).
+pub(crate) const REFINER_BLOCK: BlockCounts = BlockCounts {
+    attention: [Live::of(1, 5, 0, 0, 0), Live::of(3, 5, 0, 0, 0)],
+    chunked: [Live::of(0, 3, 0, 0, 0), Live::of(0, 3, 0, 0, 0)],
+    mlp: [Live::of(2, 1, 0, 0, 2), Live::of(2, 1, 0, 0, 3)],
+};
+
 /// `PiTBlock` with `modulation="post"`.
 struct PitBlock {
     norm1: RmsNorm,
@@ -297,6 +458,15 @@ pub struct IrisDiT {
     final_norm: RmsNorm,
     final_linear: Linear,
     pos_cache: Mutex<HashMap<(usize, usize), Array>>,
+}
+
+/// What the embed quantum produces: the patch tokens, the timestep embedding and both modulation
+/// cores' outputs.
+pub(crate) struct Embedded {
+    pub s: Array,
+    pub t_emb: Array,
+    pub core_img: Array,
+    pub core_txt: Option<Array>,
 }
 
 /// Shape of one forward's text conditioning.
@@ -660,6 +830,404 @@ impl IrisDiT {
         out
     }
 
+    // ---- iOS execution quanta (pass-through everywhere but a physical iOS device) ----------
+    //
+    // Every figure below is COUNTED: the live tensors at each phase's peak of the quantum's body,
+    // by tensor class (the counts are the `*_BLOCK` tables above and the per-site lists below),
+    // over the loaded tensors' widths (projection shapes, gain widths, head counts of the built
+    // modules) and the actual request geometry. Weights are consumed in place (dense in the compute
+    // dtype, or packed and read by `quantized_matmul`), so no quantum prices a weight copy. Every
+    // count is proven against MLX's measured peak at small shapes in `crate::quantum_proofs`.
+
+    fn query_rows(plan: mlx_gen::AttentionPlan<'_>, batch: i32, heads: i32, tokens: i32) -> u64 {
+        plan.budget.query_block(batch, heads, tokens, tokens).max(0) as u64
+    }
+
+    fn compute_bytes(&self) -> u64 {
+        crate::nn::dtype_bytes(self.compute)
+    }
+
+    /// One attention block from its counts: `max(attention phase, MLP phase)`, the attention phase
+    /// adding the scores ([`crate::nn::sdpa_scores`]), the CPU fallback's own copies (`q · scale`,
+    /// and under GQA the k and v broadcasts over the query groups — each `[.., tokens, D]`) and,
+    /// for a chunking plan, the chunked counts.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_bytes(
+        counts: &BlockCounts,
+        cw: u64,
+        batch: u64,
+        tokens: u64,
+        dim: u64,
+        kv: u64,
+        ff: u64,
+        heads: u64,
+        query_rows: u64,
+        masked: bool,
+    ) -> u64 {
+        use mlx_gen::ios_quantum::{scores_bytes, tensor_bytes};
+        let w = width_index(cw);
+        let hidden = batch.saturating_mul(tokens).saturating_mul(dim);
+        let kv_elements = batch.saturating_mul(tokens).saturating_mul(kv);
+        let ff_elements = batch.saturating_mul(tokens).saturating_mul(ff);
+        let scores = crate::nn::sdpa_scores(dim / heads.max(1), query_rows, cw, masked);
+        let fallback = if crate::nn::sdpa_falls_back(scores) {
+            1 + if kv < dim { 2 } else { 0 }
+        } else {
+            0
+        };
+        let mut attention = counts.attention[w]
+            .bytes(cw, hidden, kv_elements, ff_elements)
+            .saturating_add(fallback * tensor_bytes(cw, &[hidden]))
+            .saturating_add(scores_bytes(scores, batch, heads, query_rows, tokens));
+        if query_rows < tokens {
+            attention = attention.saturating_add(counts.chunked[w].bytes(
+                cw,
+                hidden,
+                kv_elements,
+                ff_elements,
+            ));
+        }
+        attention.max(counts.mlp[w].bytes(cw, hidden, kv_elements, ff_elements))
+    }
+
+    /// Trunk block `i` over `n_patches` image and `n_txt` text tokens: the joint attention spans
+    /// both streams (text-first concatenation), so both count as tokens ([`SINGLE_BLOCK`],
+    /// [`DUAL_BLOCK`]).
+    pub(crate) fn trunk_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        n_patches: i32,
+        n_txt: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let (dim, ff_hidden) = self.blocks[i].widths();
+        let tokens = (n_patches + n_txt).max(0);
+        let heads = self.cfg.num_heads as i32;
+        let kv_heads = self.cfg.num_kv_heads.unwrap_or(self.cfg.num_heads) as u64;
+        let counts = match self.blocks[i] {
+            Block::Dual(_) => &DUAL_BLOCK,
+            Block::Single(_) => &SINGLE_BLOCK,
+        };
+        Self::block_bytes(
+            counts,
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            tokens as u64,
+            dim,
+            dim / heads.max(1) as u64 * kv_heads,
+            ff_hidden,
+            heads as u64,
+            Self::query_rows(plan, batch, heads, tokens),
+            false,
+        )
+    }
+
+    /// PiT block `i` over `n_patches` patches of `p²` pixels: three widths per patch — the pixel
+    /// plane (`p² · pixel width`), the compact attention width (`compress`'s output) and the MLP
+    /// plane (`p² · fc1 width`).
+    ///
+    /// Held through the block: the adaLN modulation (`adaln`'s `4 · p² · pixel` output at the
+    /// compute width; bf16: and the compute-width cast of the f32 conditioning it reads).
+    /// Attention: the f32 norm plane; over the plane at the compute width the expand output and the
+    /// modulation's scaled and shifted terms and the residual sum; over the compact width the f32 q
+    /// and k after QK-norm and after RoPE, and at the compute width the compressed tokens, the fused
+    /// qkv (three), the attention output, its re-layout and the projection; plus the scores and the
+    /// CPU fallback's `q · scale`. Chunked: the chunk outputs, their concatenation and (f32) the
+    /// rotated q, k the per-chunk evaluation materializes. MLP: the f32 norm plane, the residual
+    /// (f32: and the fc2 output), and over the MLP plane fc1's output (bf16: and GELU's working
+    /// copies — x/√2, erf, 1 + erf — before the product).
+    pub(crate) fn pixel_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        n_patches: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.pixel_blocks[i];
+        let heads = blk.attn.heads;
+        Self::pixel_block_bytes(PixelBlockGeometry {
+            compute_bytes: self.compute_bytes(),
+            batch: batch.max(0) as u64,
+            patches: n_patches.max(0) as u64,
+            patch_pixels: (self.cfg.patch_size * self.cfg.patch_size) as u64,
+            pixel_width: blk.norm1.width(),
+            compact_width: blk.compress.out_features(),
+            modulation_width: blk.adaln.out_features(),
+            condition_width: blk.adaln.logical_shape()[1] as u64,
+            fc1_width: blk.fc1.out_features(),
+            heads: heads as u64,
+            query_rows: Self::query_rows(plan, batch, heads, n_patches),
+        })
+    }
+
+    /// [`Self::pixel_block_scratch`] from the block's widths alone.
+    pub(crate) fn pixel_block_bytes(g: PixelBlockGeometry) -> u64 {
+        use mlx_gen::ios_quantum::{scores_bytes, tensor_bytes};
+        let cw = g.compute_bytes;
+        let bf16 = cw < 4;
+        let (b, n) = (g.batch, g.patches);
+        let plane = b * n * g.patch_pixels * g.pixel_width;
+        let compact = b * n * g.compact_width;
+        let mlp = b * n * g.patch_pixels * g.fc1_width;
+        let held = tensor_bytes(cw, &[b, n, g.modulation_width]).saturating_add(if bf16 {
+            tensor_bytes(cw, &[b, n, g.condition_width])
+        } else {
+            0
+        });
+        let scores =
+            crate::nn::sdpa_scores(g.compact_width / g.heads.max(1), g.query_rows, cw, false);
+        let fallback = u64::from(crate::nn::sdpa_falls_back(scores));
+        let mut attention = [
+            4 * plane,
+            4 * cw * plane,
+            4 * 4 * compact,
+            (7 + fallback) * cw * compact,
+            scores_bytes(scores, b, g.heads, g.query_rows, n),
+        ]
+        .iter()
+        .fold(0u64, |a, x| a.saturating_add(*x));
+        if g.query_rows < n {
+            attention =
+                attention.saturating_add(if bf16 { cw * compact } else { 3 * cw * compact });
+        }
+        let mlp_phase = 4 * plane
+            + if bf16 { cw * plane } else { 2 * cw * plane }
+            + if bf16 { 4 * cw * mlp } else { cw * mlp };
+        held.saturating_add(attention.max(mlp_phase))
+    }
+
+    /// Text-adapter layer block `i` ([`LAYER_BLOCK`]): attention over the `layers` encoder states
+    /// of each of the `rows = B · T` tokens.
+    pub(crate) fn text_layer_block_scratch(
+        &self,
+        i: usize,
+        rows: i32,
+        layers: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.y_embedder.layer_blocks[i];
+        let dim = blk.norm1.width();
+        Self::block_bytes(
+            &LAYER_BLOCK,
+            self.compute_bytes(),
+            rows.max(0) as u64,
+            layers.max(0) as u64,
+            dim,
+            dim,
+            blk.mlp0.out_features(),
+            blk.attn.heads as u64,
+            Self::query_rows(plan, rows, blk.attn.heads, layers),
+            false,
+        )
+    }
+
+    /// Text-refiner block `i` over `t` masked-key text tokens ([`REFINER_BLOCK`]), plus the
+    /// `[B, 1, T, T]` additive key mask's compute-width copy made inside the attention.
+    pub(crate) fn text_refiner_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        t: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.y_embedder.blocks[i];
+        let dim = blk.norm1.width();
+        let cw = self.compute_bytes();
+        let (b, tokens) = (batch.max(0) as u64, t.max(0) as u64);
+        Self::block_bytes(
+            &REFINER_BLOCK,
+            cw,
+            b,
+            tokens,
+            dim,
+            dim,
+            blk.mlp.hidden(),
+            blk.attn.heads as u64,
+            Self::query_rows(plan, batch, blk.attn.heads, t),
+            true,
+        )
+        .saturating_add(mlx_gen::ios_quantum::tensor_bytes(cw, &[b, tokens, tokens]))
+    }
+
+    /// What the first trunk block materializes besides itself: the image and text RoPE tables and
+    /// the text positional add (states, sliced table, sum).
+    pub(crate) fn trunk_entry_allowance(&self, batch: i32, n_patches: i32, n_txt: i32) -> u64 {
+        let cfg = &self.cfg;
+        Self::trunk_entry_bytes(
+            batch.max(0) as u64,
+            n_patches.max(0) as u64,
+            n_txt.max(0) as u64,
+            (cfg.hidden_size / cfg.num_heads) as u64,
+            cfg.hidden_size as u64,
+        )
+    }
+
+    /// [`Self::trunk_entry_allowance`] from the widths alone.
+    pub(crate) fn trunk_entry_bytes(b: u64, n: u64, n_txt: u64, head_dim: u64, hidden: u64) -> u64 {
+        mlx_gen::ios_quantum::rope_table_bytes(n, head_dim)
+            .saturating_add(mlx_gen::ios_quantum::rope_table_bytes(n_txt, head_dim))
+            .saturating_add(mlx_gen::ios_quantum::elementwise_bytes(
+                b.saturating_mul(n_txt).saturating_mul(hidden),
+                3,
+            ))
+    }
+
+    /// The patch/timestep embedding and both modulation cores: the patch vectors' `[B, N, p²·C]`
+    /// re-layout (f32; bf16: read straight into its compute-width cast), the embedded tokens
+    /// `[B, N, D]`, and per batch row the timestep path — the f32 `cos ‖ sin` bank, the two
+    /// timestep-MLP outputs and both cores' `6·D` outputs (counted at 4 B: the path mixes f32
+    /// sinusoids with compute-width projections).
+    pub(crate) fn embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
+        let [hidden, patch_in] = self.s_embedder.logical_shape();
+        let [_, freqs] = self.t_mlp0.logical_shape();
+        let rows = self.t_mlp0.out_features()
+            + self.t_mlp2.out_features()
+            + self.core_img.out_features()
+            + self.core_txt.as_ref().map_or(0, Linear::out_features);
+        Self::embed_bytes(
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            n_patches.max(0) as u64,
+            patch_in as u64,
+            hidden as u64,
+            freqs as u64,
+            rows,
+        )
+    }
+
+    /// [`Self::embed_scratch`] from the widths alone: `patch_in = p²·C`, `freqs` the sinusoid bank,
+    /// `rows` the timestep MLP and core output widths summed.
+    pub(crate) fn embed_bytes(
+        cw: u64,
+        b: u64,
+        n: u64,
+        patch_in: u64,
+        hidden: u64,
+        freqs: u64,
+        rows: u64,
+    ) -> u64 {
+        use mlx_gen::ios_quantum::tensor_bytes;
+        tensor_bytes(cw, &[b, n, patch_in])
+            .saturating_add(tensor_bytes(cw, &[b, n, hidden]))
+            .saturating_add(tensor_bytes(4, &[b, freqs]))
+            .saturating_add(tensor_bytes(4, &[b, rows]))
+    }
+
+    /// The layer pool and the refiner's input projection over `[B·T, layers, Dt]` states: the
+    /// transposed states' contiguous copy the pool reads (bf16: and its compute-width cast), the
+    /// pooled `[B, T, Dt]` and the projection `[B, T, D]`.
+    pub(crate) fn text_pool_scratch(&self, batch: i32, t: i32, layers: i32, text_dim: i32) -> u64 {
+        Self::text_pool_bytes(
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            t.max(0) as u64,
+            layers.max(0) as u64,
+            text_dim.max(0) as u64,
+            self.y_embedder.proj.out_features(),
+        )
+    }
+
+    /// [`Self::text_pool_scratch`] from the widths alone.
+    pub(crate) fn text_pool_bytes(
+        cw: u64,
+        b: u64,
+        t: u64,
+        layers: u64,
+        text_dim: u64,
+        out: u64,
+    ) -> u64 {
+        use mlx_gen::ios_quantum::tensor_bytes;
+        let copies = if cw < 4 { 2 } else { 1 };
+        (copies * tensor_bytes(cw, &[b, t, layers, text_dim]))
+            .saturating_add(tensor_bytes(cw, &[b, t, text_dim]))
+            .saturating_add(tensor_bytes(cw, &[b, t, out]))
+    }
+
+    /// The refiner's final norm over `[B, T, D]`: its f32 output (bf16: and the f32 copy of the
+    /// compute-width stream it normalizes) and the per-row mean square and reciprocal root
+    /// (`[B, T]` f32 each).
+    pub(crate) fn text_output_scratch(&self, batch: i32, t: i32) -> u64 {
+        Self::text_output_bytes(
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            t.max(0) as u64,
+            self.y_embedder.norm.width(),
+        )
+    }
+
+    /// [`Self::text_output_scratch`] from the widths alone.
+    pub(crate) fn text_output_bytes(cw: u64, b: u64, t: u64, width: u64) -> u64 {
+        use mlx_gen::ios_quantum::tensor_bytes;
+        let planes = if cw < 4 { 2 } else { 1 };
+        (planes * tensor_bytes(4, &[b, t, width])).saturating_add(2 * tensor_bytes(4, &[b, t]))
+    }
+
+    /// The timestep re-fusion and the per-pixel embedding over an `h × w` input: over `[B, N, D]`
+    /// the f32 sum and its SiLU; over the `[B, H, W, pixel]` plane the projection and the
+    /// position-table sum (the re-layout into patches reuses the sum); the projection's contiguous
+    /// compute-width copy of the transposed `[B, H, W, C]` input; and the f32 position table (built
+    /// once per size and cached — bf16: plus its compute-width cast).
+    pub(crate) fn pixel_embed_scratch(&self, batch: i32, h: i32, w: i32) -> u64 {
+        let [pixel_width, channels] = self.pixel_proj.logical_shape();
+        Self::pixel_embed_bytes(
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            h.max(0) as u64,
+            w.max(0) as u64,
+            self.cfg.patch_size as u64,
+            self.core_img.logical_shape()[1] as u64,
+            pixel_width as u64,
+            channels as u64,
+        )
+    }
+
+    /// [`Self::pixel_embed_scratch`] from the widths alone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pixel_embed_bytes(
+        cw: u64,
+        b: u64,
+        h: u64,
+        w: u64,
+        patch: u64,
+        hidden: u64,
+        pixel_width: u64,
+        channels: u64,
+    ) -> u64 {
+        use mlx_gen::ios_quantum::tensor_bytes;
+        let n = (h / patch.max(1)) * (w / patch.max(1));
+        let table = [h, w, pixel_width];
+        (2 * tensor_bytes(4, &[b, n, hidden]))
+            .saturating_add(2 * tensor_bytes(cw, &[b, h, w, pixel_width]))
+            .saturating_add(tensor_bytes(cw, &[b, h, w, channels]))
+            .saturating_add(tensor_bytes(4, &table))
+            .saturating_add(if cw < 4 { tensor_bytes(cw, &table) } else { 0 })
+    }
+
+    /// The final norm, the final projection and the fold back to `[B, C, H, W]` f32: the f32 norm
+    /// plane over `[B·N, p², pixel]` (bf16: and the f32 copy of the compute-width stream it
+    /// normalizes), and over `[B·N, p², C]` the projection, its fold copy and the f32 output
+    /// (counted at 4 B).
+    pub(crate) fn output_scratch(&self, batch: i32, n_patches: i32) -> u64 {
+        let [out, input] = self.final_linear.logical_shape();
+        Self::output_bytes(
+            self.compute_bytes(),
+            batch.max(0) as u64,
+            n_patches.max(0) as u64,
+            (self.cfg.patch_size * self.cfg.patch_size) as u64,
+            input as u64,
+            out as u64,
+        )
+    }
+
+    /// [`Self::output_scratch`] from the widths alone.
+    pub(crate) fn output_bytes(cw: u64, b: u64, n: u64, ppp: u64, input: u64, out: u64) -> u64 {
+        use mlx_gen::ios_quantum::tensor_bytes;
+        let planes = if cw < 4 { 2 } else { 1 };
+        (planes * tensor_bytes(4, &[b, n, ppp * input]))
+            .saturating_add(3 * tensor_bytes(4, &[b, n, ppp * out]))
+    }
+
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
     fn timestep_embedding(&self, t: &Array) -> Result<Array> {
@@ -693,47 +1261,93 @@ impl IrisDiT {
                 "iris: text mask must be [{b}, {t}] for states {sh:?}"
             )));
         }
-        let y_ad = &self.y_embedder;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let mut y = text
             .states
             .as_dtype(Dtype::Float32)?
             .reshape(&[b * t, layers, dt])?;
-        for block in &y_ad.layer_blocks {
-            let h = block.attn.forward(
-                &block.norm1.forward(&y)?,
-                None,
-                None,
-                self.compute,
-                plan,
-                "adapter",
-            )?;
-            y = y.add(&h)?;
-            let m = block
-                .mlp2
-                .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
-            y = y.add(&m)?;
+        for i in 0..self.y_embedder.layer_blocks.len() {
+            let scratch = self.text_layer_block_scratch(i, b * t, layers, plan);
+            y = mlx_gen::ios_quantum::run(quanta::TEXT_LAYER_BLOCK, scratch, || {
+                self.text_layer_body(i, &y, plan)
+            })?;
         }
-        // layer_pool: Linear(L → 1) over the layer axis.
+        // layer_pool: Linear(L → 1) over the layer axis, then the refiner's input projection.
+        let mut y = mlx_gen::ios_quantum::run(
+            quanta::TEXT_POOL,
+            self.text_pool_scratch(b, t, layers, dt),
+            || self.text_pool_body(&y, b, t, dt),
+        )?;
+        // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
+        let key_mask = key_padding_mask(text.mask, t as usize);
+        for i in 0..self.y_embedder.blocks.len() {
+            let scratch = self.text_refiner_block_scratch(i, b, t, plan);
+            y = mlx_gen::ios_quantum::run(quanta::TEXT_REFINER_BLOCK, scratch, || {
+                self.text_refiner_body(i, &y, &key_mask, plan)
+            })?;
+        }
+        mlx_gen::ios_quantum::run(quanta::TEXT_OUTPUT, self.text_output_scratch(b, t), || {
+            self.text_output_body(&y)
+        })
+    }
+
+    /// Body of text-adapter layer block `i` over `y` `[B·T, layers, Dt]` (one quantum).
+    pub(crate) fn text_layer_body(
+        &self,
+        i: usize,
+        y: &Array,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let block = &self.y_embedder.layer_blocks[i];
+        let h = block.attn.forward(
+            &block.norm1.forward(y)?,
+            None,
+            None,
+            self.compute,
+            plan,
+            "adapter",
+        )?;
+        let y = y.add(&h)?;
+        let m = block
+            .mlp2
+            .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
+        Ok(y.add(&m)?)
+    }
+
+    /// Body of the layer pool and the refiner's input projection (one quantum).
+    pub(crate) fn text_pool_body(&self, y: &Array, b: i32, t: i32, dt: i32) -> Result<Array> {
+        let y_ad = &self.y_embedder;
         let pooled = y_ad
             .layer_pool
             .forward(&y.transpose_axes(&[0, 2, 1])?)?
             .reshape(&[b, t, dt])?;
-        // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
-        let key_mask = key_padding_mask(text.mask, t as usize);
-        let mut y = y_ad.proj.forward(&pooled)?;
-        for block in &y_ad.blocks {
-            let h = block.attn.forward(
-                &block.norm1.forward(&y)?,
-                None,
-                Some(&key_mask),
-                self.compute,
-                plan,
-                "refiner",
-            )?;
-            y = y.add(&h)?;
-            y = y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?;
-        }
-        y_ad.norm.forward(&y)
+        y_ad.proj.forward(&pooled)
+    }
+
+    /// Body of text-refiner block `i` over `y` `[B, T, D]` under the additive key mask (one quantum).
+    pub(crate) fn text_refiner_body(
+        &self,
+        i: usize,
+        y: &Array,
+        key_mask: &Array,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let block = &self.y_embedder.blocks[i];
+        let h = block.attn.forward(
+            &block.norm1.forward(y)?,
+            None,
+            Some(key_mask),
+            self.compute,
+            plan,
+            "refiner",
+        )?;
+        let y = y.add(&h)?;
+        Ok(y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?)
+    }
+
+    /// Body of the refiner's final norm (one quantum).
+    pub(crate) fn text_output_body(&self, y: &Array) -> Result<Array> {
+        self.y_embedder.norm.forward(y)
     }
 
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
@@ -792,6 +1406,155 @@ impl IrisDiT {
         self.forward_budgeted_hooked(x, t, text, &mut NoHooks, plan)
     }
 
+    /// Body of the patch/timestep embedding and both modulation cores over `x` `[B, C, H, W]`
+    /// (one quantum).
+    pub(crate) fn embed_body(&self, x: &Array, t: &Array) -> Result<Embedded> {
+        let sh = x.shape();
+        let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+        let p = self.cfg.patch_size as i32;
+        let (hp, wp) = (h / p, w / p);
+        // F.unfold(x, p, stride=p).transpose(1, 2): channel-major patch vectors, row-major patches.
+        let patches = x
+            .reshape(&[b, c, hp, p, wp, p])?
+            .transpose_axes(&[0, 2, 4, 1, 3, 5])?
+            .reshape(&[b, hp * wp, c * p * p])?;
+        let s = self.s_embedder.forward(&patches)?;
+        let t_emb = self.timestep_embedding(t)?;
+        let cond = silu(&t_emb)?;
+        let core_img = self.core_img.forward(&cond)?;
+        let core_txt = self
+            .core_txt
+            .as_ref()
+            .map(|core| core.forward(&cond))
+            .transpose()?;
+        Ok(Embedded {
+            s,
+            t_emb,
+            core_img,
+            core_txt,
+        })
+    }
+
+    /// The text tokens `[B, T, D]` plus the absolute text position table (lazy: it materializes
+    /// inside the first trunk block's quantum, whose entry allowance carries it).
+    pub(crate) fn text_positions(&self, y: &Array) -> Result<Array> {
+        let n_txt = y.shape()[1];
+        let pos = self
+            .y_pos_embedding
+            .reshape(&[1, -1, self.cfg.hidden_size as i32])?
+            .split_axis(&[n_txt], 1)?
+            .swap_remove(0);
+        Ok(y.add(&pos)?)
+    }
+
+    /// What every trunk block of one forward reads besides its weights.
+    pub(crate) fn trunk_ctx<'a>(
+        &self,
+        hp: i32,
+        wp: i32,
+        n_txt: i32,
+        plan: mlx_gen::AttentionPlan<'a>,
+    ) -> TrunkCtx<'a> {
+        let cfg = &self.cfg;
+        let head_dim = cfg.hidden_size / cfg.num_heads;
+        let square = cfg.rope_aspect == "square";
+        let rope_img = Rope::grid_2d_aspect(
+            head_dim,
+            hp as usize,
+            wp as usize,
+            cfg.rope_theta as f32,
+            cfg.rope_scale as f32,
+            square,
+        );
+        let rope_txt = Rope::line_1d(head_dim, n_txt as usize, cfg.text_rope_theta as f32);
+        TrunkCtx {
+            compute: self.compute,
+            plan,
+            rope_img,
+            rope_txt,
+            heads: cfg.num_heads as i32,
+            kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32,
+        }
+    }
+
+    /// Body of the timestep re-fusion and the per-pixel embedding (one quantum): returns the
+    /// per-patch conditioning `[B·N, D]` and the pixel stream `[B·N, p², pixel width]`.
+    pub(crate) fn pixel_embed_body(
+        &self,
+        x: &Array,
+        t_emb: &Array,
+        s: &Array,
+    ) -> Result<(Array, Array)> {
+        let cfg = &self.cfg;
+        let sh = x.shape();
+        let (b, h, w) = (sh[0], sh[2], sh[3]);
+        let p = cfg.patch_size as i32;
+        let (hp, wp) = (h / p, w / p);
+        let n_patches = hp * wp;
+        // timestep re-fused into every patch token
+        let s = silu(&t_emb.add(s)?)?;
+        let s_cond = s.reshape(&[b * n_patches, -1])?;
+
+        // PixelEmbedder: per-pixel Linear + full-resolution sincos, grouped per patch.
+        let tokens = self.pixel_proj.forward(&x.transpose_axes(&[0, 2, 3, 1])?)?;
+        let tokens = tokens.add(
+            &self
+                .pixel_pos(h as usize, w as usize)?
+                .as_dtype(tokens.dtype())?,
+        )?;
+        let pix = cfg.pixel.hidden_size as i32;
+        let pixels = tokens
+            .reshape(&[b, hp, p, wp, p, pix])?
+            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+            .reshape(&[b * n_patches, p * p, pix])?;
+        Ok((s_cond, pixels))
+    }
+
+    /// What every PiT block of one forward reads besides its weights.
+    pub(crate) fn pixel_ctx<'a>(
+        &self,
+        batch: i32,
+        hp: i32,
+        wp: i32,
+        plan: mlx_gen::AttentionPlan<'a>,
+    ) -> PixelCtx<'a> {
+        let cfg = &self.cfg;
+        let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
+        let rope_pix = Rope::grid_2d_aspect(
+            pix_head,
+            hp as usize,
+            wp as usize,
+            cfg.rope_theta as f32,
+            cfg.rope_scale as f32,
+            cfg.rope_aspect == "square",
+        );
+        PixelCtx {
+            compute: self.compute,
+            plan,
+            rope_pix,
+            batch,
+            n_patches: hp * wp,
+        }
+    }
+
+    /// Body of the final norm, the final projection and the fold back to `[B, C, H, W]` f32 (one
+    /// quantum).
+    pub(crate) fn output_body(&self, pixels: &Array, b: i32, h: i32, w: i32) -> Result<Array> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size as i32;
+        let (hp, wp) = (h / p, w / p);
+        let out = self
+            .final_linear
+            .forward(&self.final_norm.forward(pixels)?)?;
+        // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
+        let c_out = cfg.in_channels as i32;
+        Ok(out
+            .reshape(&[b, hp, wp, p, p, c_out])?
+            .transpose_axes(&[0, 5, 1, 3, 2, 4])?
+            .reshape(&[b, c_out, h, w])?
+            .as_dtype(Dtype::Float32)?)
+    }
+
     fn forward_budgeted_hooked(
         &self,
         x: &Array,
@@ -825,99 +1588,53 @@ impl IrisDiT {
             )));
         }
 
-        // F.unfold(x, p, stride=p).transpose(1, 2): channel-major patch vectors, row-major patches.
-        let patches = x
-            .reshape(&[b, c, hp, p, wp, p])?
-            .transpose_axes(&[0, 2, 4, 1, 3, 5])?
-            .reshape(&[b, n_patches, c * p * p])?;
-        let mut s = self.s_embedder.forward(&patches)?;
-        let t_emb = self.timestep_embedding(t)?;
-        let cond = silu(&t_emb)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        // The previous step's guidance combine + solver arithmetic is lazy and materializes here.
+        mlx_gen::ios_quantum::before(
+            quanta::EMBED,
+            self.embed_scratch(b, n_patches)
+                .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(x.size() as u64)),
+        )?;
+        let Embedded {
+            mut s,
+            t_emb,
+            core_img,
+            core_txt,
+        } = self.embed_body(x, t)?;
+        let mut embedded = vec![&s, &t_emb, &core_img];
+        embedded.extend(core_txt.as_ref());
+        mlx_gen::ios_quantum::finish(quanta::EMBED, &embedded)?;
 
         let mut y = self.text_adapter_budgeted(text, plan)?;
         let n_txt = y.shape()[1];
-        let pos = self
-            .y_pos_embedding
-            .reshape(&[1, -1, cfg.hidden_size as i32])?
-            .split_axis(&[n_txt], 1)?
-            .swap_remove(0);
-        y = y.add(&pos)?;
+        y = self.text_positions(&y)?;
 
-        let head_dim = cfg.hidden_size / cfg.num_heads;
-        let square = cfg.rope_aspect == "square";
-        let rope_img = Rope::grid_2d_aspect(
-            head_dim,
-            hp as usize,
-            wp as usize,
-            cfg.rope_theta as f32,
-            cfg.rope_scale as f32,
-            square,
-        );
-        let rope_txt = Rope::line_1d(head_dim, n_txt as usize, cfg.text_rope_theta as f32);
-
-        let core_img = self.core_img.forward(&cond)?;
-        let core_txt = self
-            .core_txt
-            .as_ref()
-            .map(|core| core.forward(&cond))
-            .transpose()?;
-        let ctx = TrunkCtx {
-            compute: self.compute,
-            plan,
-            rope_img,
-            rope_txt,
-            heads: cfg.num_heads as i32,
-            kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32,
-        };
+        let ctx = self.trunk_ctx(hp, wp, n_txt, plan);
+        // The text positional add and both RoPE tables are lazy and materialize inside the FIRST
+        // trunk block's quantum, whose scratch carries them.
+        let entry_extra = self.trunk_entry_allowance(b, n_patches, n_txt);
         for i in 0..self.blocks.len() {
+            let scratch = self
+                .trunk_block_scratch(i, b, n_patches, n_txt, plan)
+                .saturating_add(if i == 0 { entry_extra } else { 0 });
+            mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
             (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
+            mlx_gen::ios_quantum::finish(quanta::TRUNK_BLOCK, &[&s, &y])?;
         }
 
-        // timestep re-fused into every patch token
-        let s = silu(&t_emb.add(&s)?)?;
-        let s_cond = s.reshape(&[b * n_patches, -1])?;
-
-        // PixelEmbedder: per-pixel Linear + full-resolution sincos, grouped per patch.
-        let tokens = self.pixel_proj.forward(&x.transpose_axes(&[0, 2, 3, 1])?)?;
-        let tokens = tokens.add(
-            &self
-                .pixel_pos(h as usize, w as usize)?
-                .as_dtype(tokens.dtype())?,
-        )?;
-        let pix = cfg.pixel.hidden_size as i32;
-        let mut pixels = tokens
-            .reshape(&[b, hp, p, wp, p, pix])?
-            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[b * n_patches, p * p, pix])?;
-        let pix_head = cfg.pixel.attn_hidden_size / cfg.pixel.num_heads;
-        let rope_pix = Rope::grid_2d_aspect(
-            pix_head,
-            hp as usize,
-            wp as usize,
-            cfg.rope_theta as f32,
-            cfg.rope_scale as f32,
-            square,
-        );
-        let pctx = PixelCtx {
-            compute: self.compute,
-            plan,
-            rope_pix,
-            batch: b,
-            n_patches,
-        };
+        mlx_gen::ios_quantum::before(quanta::PIXEL_EMBED, self.pixel_embed_scratch(b, h, w))?;
+        let (s_cond, mut pixels) = self.pixel_embed_body(x, &t_emb, &s)?;
+        let pctx = self.pixel_ctx(b, hp, wp, plan);
+        mlx_gen::ios_quantum::finish(quanta::PIXEL_EMBED, &[&s_cond, &pixels])?;
         for i in 0..self.pixel_blocks.len() {
-            pixels = hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)?;
+            let scratch = self.pixel_block_scratch(i, b, n_patches, plan);
+            pixels = mlx_gen::ios_quantum::run(quanta::PIXEL_BLOCK, scratch, || {
+                hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)
+            })?;
         }
-        let out = self
-            .final_linear
-            .forward(&self.final_norm.forward(&pixels)?)?;
-        // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
-        let c_out = cfg.in_channels as i32;
-        Ok(out
-            .reshape(&[b, hp, wp, p, p, c_out])?
-            .transpose_axes(&[0, 5, 1, 3, 2, 4])?
-            .reshape(&[b, c_out, h, w])?
-            .as_dtype(Dtype::Float32)?)
+        mlx_gen::ios_quantum::run(quanta::OUTPUT, self.output_scratch(b, n_patches), || {
+            self.output_body(&pixels, b, h, w)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -15,13 +15,17 @@
 //! the sandbox, and the compiled-in `METAL_PATH` points into the cargo target directory, which is
 //! not shipped. `pmetal-mlx-sys` publishes the built metallib's path as `DEP_MLX_METALLIB`.
 //!
-//! # Admission (epic 16774, E4)
+//! # Admission (epic 16774, E4/E5/E7)
 //!
-//! [`load_admitted`] is the generic estimate/cap guard: it refuses, before the loader runs,
-//! an absent estimate or one above [`IOS_APP_MEMORY_CAP_MIB`] or live process headroom.
-//! `media::load_sana` adds SANA's source applicability checks. `media::load_sdxl` additionally
-//! retains source inventory and an actual-request binding across deferred execution, with live
-//! capacity rechecked before generation. Other raw load surfaces are not admitted:
+//! [`load_admitted`] is the generic estimate/cap guard: it refuses, before the loader runs, an
+//! absent estimate or one above [`IOS_APP_MEMORY_CAP_MIB`] or live process headroom. Every image
+//! model and mode loads through ONE admitted facade per surface in [`media`] — `load_sana`,
+//! `load_sdxl`, `load_anima_turbo`, `load_iris`, `load_iris_restore`, `load_iris_depth` — each of
+//! which requires the platform limits to be bound, admits through the catalog's single
+//! evidence-table seam (the provider's registered `standard_memory_strategy_safety_check`, a
+//! reviewed device row, the cap and the live budget), refuses with a typed [`media::RefusalKind`],
+//! and returns a request-bound wrapper that rechecks the exact work, live capacity and source pins
+//! before every provider call. Other raw load surfaces are not admitted:
 //!
 //! * [`llm`] re-exports `mlx-llm` whole, and its loaders (`load_for_model`, …) do **not** admit.
 //!   MLX LLMs carry no footprint estimate yet, so the admitted answer for an LLM load today is a
@@ -30,11 +34,10 @@
 //! * [`catalog`]'s registries are a composition/snapshot surface (the shared
 //!   [`RuntimeCatalog`] contract) and load unadmitted. A product loads through
 //!   the model's admitted facade, not through them.
-//! * `media` deliberately does not re-export the catalog's `provider_registry`, so the
-//!   unadmitted registry load is not this bundle's default image surface. The one unadmitted image
-//!   loader, `media::load_sana_unadmitted_for_diagnostics`, is named for what it is.
-//! * `iris_depth` exposes the callable provider-specific depth task, with an explicitly named
-//!   unadmitted diagnostic loader. It supplies no footprint evidence or admitted-load shortcut.
+//! * `media` deliberately does not re-export the catalog's `provider_registry`.
+//! * `media::capture_permit` is the explicitly labelled evidence-collection path: no evidence
+//!   row, but only where every quantum is bounded by live OS headroom before construction (a
+//!   physical device). It is never an admission and never changes one.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,79 +48,229 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```compile_fail
 /// let _ = runtime_ios::media::provider_registry();
 /// ```
+///
+/// Nor, in a product build, the device-capture path (only the `device-capture` feature, which
+/// only `ios-host/smoke` enables, compiles it):
+/// ```compile_fail
+/// let _ = runtime_ios::media::capture_permit;
+/// ```
+/// ```compile_fail
+/// let _ = runtime_ios::media::capture_capacity;
+/// ```
 #[cfg(feature = "media")]
 pub mod media {
+    pub use mlx_gen_ios_catalog::admit;
+    #[cfg(feature = "device-capture")]
+    use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::{
-        anima, anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
-        anima_turbo_memory_selection, ios_memory_budget, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec,
-        sana_snapshot_footprint_bound, sana_snapshot_profile, sdxl, FootprintBound,
-        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
-        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
+        anima, anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
+        anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
+        ios_memory_budget, ios_quantum, sana_decode_plan, sana_decode_tile_edge,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
+        Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
+        FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind, SanaDeviceFootprint,
+        SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
+        IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
         SANA_DEVICE_FOOTPRINTS,
     };
 
-    /// Load SANA generator `sana_id` for a render of `image_edge`² decoded at `tile_edge`, through
-    /// [`crate::admit_sana_snapshot`] and [`crate::load_admitted`]: a refused render never touches its
-    /// weights.
-    pub fn load_sana(
-        sana_id: &str,
-        spec: &crate::gen_core::LoadSpec,
-        image_edge: u32,
-        tile_edge: u32,
-    ) -> crate::gen_core::Result<Box<dyn crate::gen_core::Generator>> {
-        let estimate = crate::admit_sana_snapshot(sana_id, spec, image_edge, tile_edge)?;
-        crate::load_admitted(Some(estimate), || {
-            mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
-        })
+    use crate::gen_core::{Error, ProviderRegistry, Result};
+
+    fn require_limits_bound() -> AdmissionResult<()> {
+        if super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(AdmissionError::Failed(Error::Unsupported(
+                "iOS admission requires bound_mlx_to_platform_limits first".into(),
+            )))
+        }
     }
 
-    /// Select the caller's highest-preference SDXL candidate using artifact/device-bound evidence
-    /// and the provider's registered shared safety check, BEFORE any tensor payload is loaded.
-    /// Returns the selected candidate index along with the generator so the caller retains its
-    /// selected geometry/tier/execution controls rather than silently rendering another candidate.
-    /// Every SDXL-family checkpoint and route remains registered, but no current iPhone capture
-    /// authorizes a product load. Raw catalog access remains diagnostic, not admission authority.
-    pub fn load_sdxl(
-        candidates: &[sdxl::SdxlCandidate],
-    ) -> crate::gen_core::Result<(usize, mlx_gen_ios_catalog::BoundSdxlGenerator)> {
-        if !super::PLATFORM_LIMITS_BOUND.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(crate::gen_core::Error::Unsupported(
-                "iOS SDXL admission requires platform allocator/cache limits bound first".into(),
+    /// The capacity recheck at admission, before load and before every bound call. The evidence
+    /// footprint is the capture process's absolute lifetime peak; what is still to come is that
+    /// peak minus what this process already holds (weights loaded since admission are in the
+    /// current footprint AND already gone from live headroom, so comparing the absolute peak with
+    /// live headroom would count them twice). `at_admission` is the reading taken when this load
+    /// was admitted, used to derive the current footprint if the kernel reading is unavailable.
+    pub(crate) fn incremental_capacity(
+        evidence_bytes: u64,
+        now: super::ProcessMemory,
+        at_admission: super::ProcessMemory,
+    ) -> Result<()> {
+        let estimate = u32::try_from(evidence_bytes.div_ceil(1 << 20))
+            .map_err(|_| Error::Unsupported("iOS footprint exceeds runtime range".into()))?;
+        super::admit_estimate_mib(Some(estimate)).inspect_err(|_| record_capacity_refusal())?;
+        let Some(available) = now.available else {
+            // Off-iOS / no live reading: nothing to refuse on beyond the cap.
+            return Ok(());
+        };
+        let footprint =
+            now.footprint
+                .or_else(|| match (at_admission.footprint, at_admission.available) {
+                    (Some(p0), Some(a0)) => Some(p0.saturating_add(a0.saturating_sub(available))),
+                    _ => None,
+                });
+        // Without any footprint reading, fall back to the conservative absolute comparison.
+        let demand = footprint.map_or(evidence_bytes, |held| evidence_bytes.saturating_sub(held));
+        if demand > available {
+            record_capacity_refusal();
+            return Err(Error::Unsupported(format!(
+                "iOS admission: {} MiB still to come (evidence {} MiB, process holds {} MiB) \
+                 exceeds the {} MiB of per-process headroom left",
+                demand >> 20,
+                evidence_bytes >> 20,
+                footprint.unwrap_or(0) >> 20,
+                available >> 20
+            )));
+        }
+        Ok(())
+    }
+
+    static CAPACITY_REFUSED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn record_capacity_refusal() {
+        CAPACITY_REFUSED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Take (and clear) whether a bound call's live capacity recheck refused since the last take:
+    /// errors from a bound generator cross provider seams as messages, so the refusal is ALSO
+    /// recorded here, typed, for callers (the campaign) that must keep its `capacity` kind.
+    pub fn take_capacity_refusal() -> bool {
+        CAPACITY_REFUSED.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The per-load capacity check: readings at admission are captured once.
+    fn capacity_from(at_admission: super::ProcessMemory) -> impl Fn(u64) -> Result<()> + 'static {
+        move |bytes| incremental_capacity(bytes, super::process_memory(), at_admission)
+    }
+
+    /// Admit the caller's highest-preference candidate for one of `providers` (the facade's own
+    /// surface; a candidate for another provider is a typed `mode` refusal).
+    fn admitted(
+        providers: &[&str],
+        candidates: &[IosCandidate],
+    ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
+        require_limits_bound()?;
+        if let Some(c) = candidates
+            .iter()
+            .find(|c| !providers.contains(&c.provider.as_str()))
+        {
+            return Err(AdmissionError::refused(
+                RefusalKind::Mode,
+                format!(
+                    "{} is not served by this facade ({providers:?})",
+                    c.provider
+                ),
             ));
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        // No existing process bytes are credited: compare absolute captured process footprints
-        // conservatively to BOTH fixed cap and current live capacity during candidate selection.
-        let live = super::os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64);
-        let budget = sdxl::capacity_budget(u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20, 0, live);
-        let admitted =
-            sdxl::select_sdxl_candidate(&registry, candidates, &super::device_machine(), budget)?;
-        let index = admitted.index();
-        // Recheck live capacity before loading AND every actual generate; retain the sealed source
-        // inventory and actual-request binding instead of returning an unguarded inner Generator.
-        let bound = admitted.load(&registry, |bytes| {
-            let estimate = u32::try_from(bytes.div_ceil(1 << 20)).map_err(|_| {
-                crate::gen_core::Error::Unsupported("SDXL footprint exceeds runtime range".into())
-            })?;
-            super::admit_estimate_mib(Some(estimate))?;
-            super::admit_within_headroom(estimate, super::os_proc_available_mib())?;
-            Ok(())
-        })?;
-        Ok((index, bound))
+        // The captured footprint is an absolute process peak: what this process already holds is
+        // committed (subtracted from the prediction exactly once), and the total is the smaller of
+        // the fixed cap and what the process could reach now.
+        let now = super::process_memory();
+        let budget = mlx_gen_ios_catalog::capacity_budget(
+            u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
+            now.footprint.unwrap_or(0),
+            now.available,
+        );
+        let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
+        // The cap/headroom check the generic guard runs, BEFORE any weight payload.
+        incremental_capacity(admission.footprint_bytes(), now, now)
+            .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
+        Ok((registry, admission, now))
     }
 
-    /// Load SANA **without** admission. For a diagnostic run whose purpose is to execute a render
-    /// admission would refuse (the harness's untiled experiment); never a product path.
-    pub fn load_sana_unadmitted_for_diagnostics(
-        sana_id: &str,
-        spec: &crate::gen_core::LoadSpec,
-    ) -> crate::gen_core::Result<Box<dyn crate::gen_core::Generator>> {
-        mlx_gen_ios_catalog::provider_registry()?.load(sana_id, spec)
+    fn generator(
+        providers: &[&str],
+        candidates: &[IosCandidate],
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        let (registry, admission, at) = admitted(providers, candidates)?;
+        let index = admission.index();
+        Ok((
+            index,
+            admission.load_generator(&registry, capacity_from(at))?,
+        ))
+    }
+
+    /// SANA (`sana_1600m`, `sana_sprint_1600m`): text-to-image and image-to-image. Returns the
+    /// admitted candidate's index and a wrapper bound to its exact request (geometry, decode tile,
+    /// mode, prompt, execution), which rechecks live capacity before every call.
+    pub fn load_sana(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&["sana_1600m", "sana_sprint_1600m"], candidates)
+    }
+
+    /// The SDXL family (every checkpoint route): text, image-to-image, edit/inpaint, control and
+    /// IP-adapter.
+    pub fn load_sdxl(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[sdxl::SDXL_ID], candidates)
+    }
+
+    /// Anima Turbo. The host-planned selection ([`anima_turbo_ios_selection`]) is what to offer;
+    /// only a reviewed device row admits it.
+    pub fn load_anima_turbo(
+        candidates: &[IosCandidate],
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&[ANIMA_TURBO_ID], candidates)
+    }
+
+    /// Iris 3B generation, including prompt batches.
+    pub fn load_iris(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(&["iris_3b"], candidates)
+    }
+
+    /// The Iris 3B restoration transform.
+    pub fn load_iris_restore(
+        candidates: &[IosCandidate],
+    ) -> AdmissionResult<(usize, BoundTransform)> {
+        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates)?;
+        let index = admission.index();
+        Ok((
+            index,
+            admission.load_restorer(&registry, capacity_from(at))?,
+        ))
+    }
+
+    /// The Iris 3B depth task.
+    pub fn load_iris_depth(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundDepth)> {
+        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates)?;
+        let index = admission.index();
+        Ok((index, admission.load_depth(capacity_from(at))?))
+    }
+
+    /// Explicitly labelled DEVICE CAPTURE permit for one candidate of any registered model/mode.
+    /// Compiled only with the non-default `device-capture` feature (the device harness).
+    /// Not admission: no evidence row is consulted or created. Granted only where every quantum is
+    /// bounded by live OS headroom before its graph is constructed, and (on iOS) once the platform
+    /// limits are bound. Load with the permit's `load_generator`/`load_restorer`/`load_depth`; a
+    /// quantum refusal is then readable as `ios_quantum::take_refusal()`.
+    #[cfg(feature = "device-capture")]
+    pub fn capture_permit(
+        candidate: &IosCandidate,
+    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+        if cfg!(target_os = "ios") {
+            require_limits_bound()?;
+        }
+        let registry = mlx_gen_ios_catalog::provider_registry()?;
+        let permit = catalog_capture_permit(&registry, candidate, &super::device_machine())?;
+        Ok((registry, permit))
+    }
+
+    /// The bounded-execution check a capture load and every capture call run: the quanta are only
+    /// bounded while `ios_quantum` is active.
+    #[cfg(feature = "device-capture")]
+    pub fn capture_capacity(_: u64) -> Result<()> {
+        if ios_quantum::enabled() {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "iOS capture requires bounded per-quantum execution".into(),
+            ))
+        }
     }
 }
-/// Callable Iris depth API, independent of the image registry and the admitted media facade.
-/// The only load entry point is explicitly named unadmitted diagnostics; no fitting claim.
+/// Callable Iris depth types. Loads go through `media::load_iris_depth` (admitted) or
+/// `media::capture_permit` (bounded device capture); there is no unadmitted depth loader.
 #[cfg(feature = "media")]
 pub use mlx_gen_ios_catalog::iris_depth;
 pub use mlx_llm as llm;
@@ -279,44 +432,9 @@ pub fn load_admitted<T>(
 }
 
 /// Set once [`bound_mlx_to_platform_limits`] has capped MLX's buffer cache in this process — the
-/// precondition for every [`mlx_gen_ios_catalog::FootprintBound::Inferred`] bound.
+/// precondition for every admitted image load (a captured footprint was measured with the cache
+/// capped; an uncapped process could exceed it).
 static PLATFORM_LIMITS_BOUND: AtomicBool = AtomicBool::new(false);
-
-/// Legacy geometry-only entry point, now fail-closed: dimensions alone do not identify a
-/// snapshot, component precision, hardware, or applicable footprint evidence.
-/// Use [`admit_sana_snapshot`] or the load-bound [`media::load_sana`] entry point.
-///
-/// Checks the cap and the live per-process headroom, like [`load_admitted`]. An **inferred** bound
-/// (`live_peak + IOS_MLX_CACHE_LIMIT_CAP_MIB`) is valid only once [`bound_mlx_to_platform_limits`]
-/// has capped the cache, so it is refused until then — off-device and on the simulator that is
-/// always, because there is no per-process cap to bind to. Both kinds require artifact/device binding.
-#[cfg(feature = "media")]
-pub fn admit_sana_render(_image_edge: u32, _tile_edge: u32) -> gen_core::Result<u32> {
-    Err(gen_core::Error::Unsupported(
-        "iOS SANA admission requires the actual snapshot and hardware; use admit_sana_snapshot"
-            .into(),
-    ))
-}
-
-/// Admit using the actual component tensor layout, stored precision and hardware identity.
-/// Historical geometry-only observations cannot authorize an arbitrary q4-named directory.
-#[cfg(feature = "media")]
-pub fn admit_sana_snapshot(
-    sana_id: &str,
-    spec: &gen_core::LoadSpec,
-    image_edge: u32,
-    tile_edge: u32,
-) -> gen_core::Result<u32> {
-    let bound = mlx_gen_ios_catalog::sana_snapshot_footprint_bound(
-        sana_id,
-        spec,
-        &device_machine(),
-        image_edge,
-        tile_edge,
-    )?;
-    let estimate = sana_bound_estimate(bound, PLATFORM_LIMITS_BOUND.load(Ordering::Acquire))?;
-    admit_within_headroom(estimate, os_proc_available_mib())
-}
 
 /// Hardware identity is independent of total RAM and launch-time available memory.
 #[cfg(feature = "media")]
@@ -353,26 +471,6 @@ pub fn device_machine() -> String {
     #[cfg(not(all(target_os = "ios", not(target_abi = "sim"))))]
     {
         "non-device-host".into()
-    }
-}
-
-/// [`admit_sana_snapshot`]'s cap decision with the binding state passed in, so both states are
-/// testable without mutating the process-global flag.
-#[cfg(feature = "media")]
-fn sana_bound_estimate(
-    bound: mlx_gen_ios_catalog::FootprintBound,
-    limits_bound: bool,
-) -> gen_core::Result<u32> {
-    use mlx_gen_ios_catalog::FootprintBound;
-    match bound {
-        FootprintBound::Inferred(mib) if !limits_bound => {
-            Err(gen_core::Error::Unsupported(format!(
-                "iOS admission: render has only an inferred bound ({mib} MiB), \
-                 which holds only after bound_mlx_to_platform_limits capped MLX's cache; it has not \
-                 in this process"
-            )))
-        }
-        bound => admit_estimate_mib(Some(bound.mib())),
     }
 }
 
@@ -440,6 +538,51 @@ pub fn bound_mlx_to_platform_limits() -> Option<MlxLimits> {
         memory_limit_mib: memory_mib,
         cache_limit_mib: cache_mib,
     })
+}
+
+/// One reading of this process's memory: the kernel `phys_footprint` and the live per-process
+/// headroom (`os_proc_available_memory`), bytes. Both `None` off-iOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessMemory {
+    pub footprint: Option<u64>,
+    pub available: Option<u64>,
+}
+
+/// Read [`ProcessMemory`] now.
+pub fn process_memory() -> ProcessMemory {
+    ProcessMemory {
+        footprint: phys_footprint_bytes(),
+        available: os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64),
+    }
+}
+
+/// `TASK_VM_INFO.phys_footprint` (mach/task_info.h, `#pragma pack(4)`: words 36-37, present from
+/// REV1). The reply below REV1 or a failed call is `None`.
+fn phys_footprint_bytes() -> Option<u64> {
+    #[cfg(target_os = "ios")]
+    {
+        const TASK_VM_INFO: i32 = 22;
+        const PHYS_FOOTPRINT_WORD: usize = 36;
+        let mut words = [0u32; 128];
+        let mut count = words.len() as u32;
+        #[allow(deprecated)]
+        let status = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_VM_INFO as u32,
+                words.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        (status == 0 && count as usize >= PHYS_FOOTPRINT_WORD + 2).then(|| {
+            u64::from(words[PHYS_FOOTPRINT_WORD])
+                | (u64::from(words[PHYS_FOOTPRINT_WORD + 1]) << 32)
+        })
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        None
+    }
 }
 
 /// `os_proc_available_memory()` in MiB, or `None` where it does not exist or reports no budget.
@@ -571,94 +714,281 @@ mod tests {
         );
     }
 
+    /// Tiny weights-free (header-only) fixtures for every admitted facade's surface.
     #[cfg(feature = "media")]
-    #[test]
-    fn source_aware_admission_precedes_even_a_deferred_sequential_load() {
-        let root = tempfile::tempdir().unwrap();
-        let spec = mlx_gen_ios_catalog::sana_load_spec(super::gen_core::WeightsSource::Dir(
-            root.path().to_path_buf(),
-        ));
-        assert!(super::admit_sana_snapshot("sana_1600m", &spec, 1024, 192).is_err());
-        assert!(super::media::load_sana("sana_1600m", &spec, 1024, 192).is_err());
-        assert!(super::admit_sana_render(1024, 192).is_err());
-    }
+    pub(crate) mod fixtures {
+        use crate::gen_core::{GenerationRequest, Image, MemoryStrategy, WeightsSource};
+        use crate::media::{build_candidate, IosCandidate, IosWork};
+        use std::path::{Path, PathBuf};
 
-    #[cfg(feature = "media")]
-    #[test]
-    fn sdxl_product_load_refuses_before_loading_an_unverified_source() {
-        // No device capture exists. Even a caller supplying no candidates must not reach loading;
-        // no host peak or unadmitted registry is exposed as this facade's default SDXL loader.
-        assert!(super::media::load_sdxl(&[]).is_err());
-        let registry = super::catalog().unwrap().snapshot();
-        assert!(registry.generator_ids.contains(&"sdxl".to_string()));
-        assert!(registry.trainer_ids.is_empty());
-    }
+        pub fn tensor(path: &Path, key: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let header = format!(
+                "{{\"{key}\":{{\"dtype\":\"F32\",\"shape\":[8,8],\"data_offsets\":[0,256]}}}}"
+            );
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header.as_bytes());
+            bytes.resize(bytes.len() + 256, 0);
+            std::fs::write(path, bytes).unwrap();
+        }
 
-    /// SANA admission reads the catalog's bound and compares it to the cap (whatever value the
-    /// cap is filled in with); a pair with no bound (1024²/256) is refused.
-    #[cfg(feature = "media")]
-    #[test]
-    fn sana_admission_uses_the_catalog_footprint_bound() {
-        for (image, tile) in [(1024, 192), (512, 192), (1024, 128), (512, 256)] {
-            let bound = mlx_gen_ios_catalog::sana_footprint_bound(image, tile)
-                .expect("bounded pair")
-                .mib();
-            assert_eq!(
-                super::sana_bound_estimate(
-                    mlx_gen_ios_catalog::sana_footprint_bound(image, tile).unwrap(),
-                    true
+        fn tokenizer(dir: &Path) {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut vocab = String::from("{");
+            for (i, c) in ('a'..='z').enumerate() {
+                vocab += &format!("\"{c}\":{},\"{c}</w>\":{},", 2 * i, 2 * i + 1);
+            }
+            vocab += "\"<|startoftext|>\":49406,\"<|endoftext|>\":49407}";
+            std::fs::write(dir.join("vocab.json"), vocab).unwrap();
+            std::fs::write(dir.join("merges.txt"), "#version: 0.2\n").unwrap();
+        }
+
+        pub fn iris_fixtures() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../media/mlx-gen/mlx-gen-iris/tests/fixtures")
+        }
+
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.path().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        fn request(edge: u32) -> GenerationRequest {
+            GenerationRequest {
+                prompt: "p".into(),
+                width: edge,
+                height: edge,
+                count: 1,
+                ..Default::default()
+            }
+        }
+
+        fn image(edge: u32) -> Image {
+            Image {
+                width: edge,
+                height: edge,
+                pixels: (0..edge * edge * 3).map(|i| (i % 251) as u8).collect(),
+            }
+        }
+
+        /// One candidate per admitted facade, keyed by provider id.
+        pub fn candidates(root: &Path) -> Vec<IosCandidate> {
+            let registry = mlx_gen_ios_catalog::provider_registry().unwrap();
+            let sana = root.join("sana");
+            tensor(&sana.join("transformer/a.safetensors"), "proj.weight");
+            tensor(
+                &sana.join("text_encoder/gemma-2-2b-it.safetensors"),
+                "model.embed_tokens.weight",
+            );
+            tensor(&sana.join("vae/a.safetensors"), "conv.weight");
+            let sdxl = root.join("sdxl");
+            for c in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+                tensor(&sdxl.join(c).join("model.safetensors"), "x");
+            }
+            tokenizer(&sdxl.join("tokenizer"));
+            tokenizer(&sdxl.join("tokenizer_2"));
+            let anima = root.join("anima");
+            for c in ["diffusion_models", "text_encoders", "vae"] {
+                tensor(
+                    &anima.join("split_files").join(c).join("f.safetensors"),
+                    "x",
+                );
+            }
+            let iris = root.join("iris");
+            copy_tree(&iris_fixtures().join("tiny-snapshot/iris"), &iris);
+            let mut iris_spec = crate::gen_core::LoadSpec::new(WeightsSource::Dir(iris));
+            iris_spec.components.insert(
+                "text_encoder".into(),
+                WeightsSource::Dir(iris_fixtures().join("tiny-snapshot/text_encoder")),
+            );
+            let restore = crate::gen_core::LoadSpec::new(WeightsSource::Dir(
+                iris_fixtures().join("tiny-snapshot/upscaler"),
+            ));
+            let depth = crate::gen_core::LoadSpec::new(WeightsSource::Dir(
+                iris_fixtures().join("tiny-depth"),
+            ));
+            let gen = |provider: &str, spec, strategy| {
+                build_candidate(
+                    &registry,
+                    provider,
+                    spec,
+                    None,
+                    strategy,
+                    IosWork::Generate(request(512)),
                 )
-                .ok(),
-                (bound <= super::IOS_APP_MEMORY_CAP_MIB).then_some(bound),
-                "{image}²/{tile}: bound {bound} MiB vs cap {}",
-                super::IOS_APP_MEMORY_CAP_MIB
-            );
+                .unwrap_or_else(|e| panic!("{provider}: {e}"))
+            };
+            vec![
+                gen(
+                    "sana_1600m",
+                    crate::media::sana_load_spec(WeightsSource::Dir(sana)),
+                    MemoryStrategy::BoundedDecode,
+                ),
+                gen(
+                    "sdxl",
+                    crate::media::sdxl::sdxl_load_spec("sdxl", WeightsSource::Dir(sdxl)).unwrap(),
+                    MemoryStrategy::BoundedDecode,
+                ),
+                gen(
+                    "anima_turbo",
+                    crate::media::anima_turbo_load_spec(WeightsSource::Dir(anima)),
+                    MemoryStrategy::BoundedDecode,
+                ),
+                gen("iris_3b", iris_spec, MemoryStrategy::Resident),
+                build_candidate(
+                    &registry,
+                    crate::media::IRIS_RESTORE_ID,
+                    restore,
+                    None,
+                    MemoryStrategy::Resident,
+                    IosWork::Restore(crate::gen_core::TransformRequest {
+                        image: image(16),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap(),
+                build_candidate(
+                    &registry,
+                    crate::media::IRIS_DEPTH_ID,
+                    depth,
+                    None,
+                    MemoryStrategy::Resident,
+                    IosWork::Depth(crate::iris_depth::DepthRequest {
+                        image: image(16),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap(),
+            ]
         }
-        assert!(super::admit_sana_render(1024, 256).is_err());
     }
 
-    /// An inferred bound assumes the capped cache, so it is refused until the limits are bound; a
-    /// measured bound is admitted either way. Off-iOS nothing ever binds, so the public entry point
-    /// is the unbound case.
+    /// Findings 3/4: every image surface has an admitted facade; each requires the platform limits
+    /// bound (a typed failure, before evidence), then refuses with the typed `no_evidence` kind
+    /// while the reviewed table has no row — before any weight load. A candidate offered to the
+    /// wrong facade is a typed `mode` refusal, never silently routed elsewhere.
     #[cfg(feature = "media")]
     #[test]
-    fn inferred_sana_bounds_are_refused_until_the_cache_is_capped() {
-        use mlx_gen_ios_catalog::{sana_footprint_bound, FootprintBound};
-        let inferred = (512, 192);
-        let measured = (1024, 192);
-        assert!(matches!(
-            sana_footprint_bound(inferred.0, inferred.1),
-            Some(FootprintBound::Inferred(_))
-        ));
-        assert!(matches!(
-            sana_footprint_bound(measured.0, measured.1),
-            Some(FootprintBound::Measured(_))
-        ));
-
-        assert!(super::sana_bound_estimate(
-            sana_footprint_bound(inferred.0, inferred.1).unwrap(),
-            false
-        )
-        .is_err());
-        assert!(super::sana_bound_estimate(
-            sana_footprint_bound(inferred.0, inferred.1).unwrap(),
-            true
-        )
-        .is_ok());
-        assert!(super::sana_bound_estimate(
-            sana_footprint_bound(measured.0, measured.1).unwrap(),
-            false
-        )
-        .is_ok());
-
-        #[cfg(not(target_os = "ios"))]
-        {
-            assert!(super::admit_sana_render(inferred.0, inferred.1).is_err());
-            assert!(
-                super::admit_sana_render(measured.0, measured.1).is_err(),
-                "geometry alone is not artifact evidence"
+    fn every_admitted_facade_requires_bound_limits_and_refuses_without_evidence() {
+        use crate::media::{self, AdmissionError, RefusalKind};
+        let root = tempfile::tempdir().unwrap();
+        let candidates = fixtures::candidates(root.path());
+        type Facade = fn(&[media::IosCandidate]) -> Result<usize, AdmissionError>;
+        let facades: [(&str, Facade); 6] = [
+            ("sana_1600m", |c| media::load_sana(c).map(|r| r.0)),
+            ("sdxl", |c| media::load_sdxl(c).map(|r| r.0)),
+            ("anima_turbo", |c| media::load_anima_turbo(c).map(|r| r.0)),
+            ("iris_3b", |c| media::load_iris(c).map(|r| r.0)),
+            ("iris_3b_restore", |c| {
+                media::load_iris_restore(c).map(|r| r.0)
+            }),
+            ("iris_3b_depth", |c| media::load_iris_depth(c).map(|r| r.0)),
+        ];
+        let kind = |r: Result<usize, AdmissionError>| match r {
+            Err(AdmissionError::Refused(r)) => Some(r.kind),
+            Err(AdmissionError::Failed(_)) => None,
+            Ok(_) => panic!("admitted without evidence"),
+        };
+        super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
+        for ((id, facade), candidate) in facades.iter().zip(&candidates) {
+            assert_eq!(candidate.provider, *id);
+            assert_eq!(
+                kind(facade(std::slice::from_ref(candidate))),
+                None,
+                "{id}: limits must be bound first"
             );
         }
+        super::PLATFORM_LIMITS_BOUND.store(true, super::Ordering::Release);
+        for ((id, facade), candidate) in facades.iter().zip(&candidates) {
+            assert_eq!(
+                kind(facade(std::slice::from_ref(candidate))),
+                Some(RefusalKind::NoEvidence),
+                "{id}"
+            );
+            let other = candidates.iter().find(|c| c.provider != *id).unwrap();
+            assert_eq!(
+                kind(facade(std::slice::from_ref(other))),
+                Some(RefusalKind::Mode),
+                "{id} accepted a {} candidate",
+                other.provider
+            );
+        }
+        super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
+    }
+
+    /// The per-call recheck charges only the demand still to come: weights loaded since admission
+    /// are in the process footprint and already absent from live headroom, so they are not counted
+    /// twice. First and second renders on a loaded generator fit; a genuinely short headroom and an
+    /// over-cap footprint still refuse.
+    #[cfg(feature = "media")]
+    #[test]
+    fn the_loaded_generator_recheck_charges_only_incremental_demand() {
+        use super::media::incremental_capacity;
+        use super::ProcessMemory;
+        const MIB: u64 = 1 << 20;
+        let evidence = 3500 * MIB; // under the 4096 MiB provisional cap
+        let read = |footprint: u64, available: u64| ProcessMemory {
+            footprint: Some(footprint * MIB),
+            available: Some(available * MIB),
+        };
+        let admission = read(200, 5900);
+        // Admission itself: 3300 MiB still to come, 5900 available.
+        incremental_capacity(evidence, admission, admission).unwrap();
+        // First render after a 2 GiB weight load: the absolute check (3500 > 3000) would refuse.
+        let first = read(2200, 3000);
+        assert!(
+            evidence > first.available.unwrap(),
+            "fixture must defeat the absolute check"
+        );
+        incremental_capacity(evidence, first, admission).unwrap();
+        // Second render: headroom did not recover (1200 MiB left), the process holds 3400 MiB.
+        let second = read(3400, 1200);
+        incremental_capacity(evidence, second, admission).unwrap();
+        // The kernel footprint unavailable: derived from the admission reading and the headroom
+        // consumed since (200 + (5900 - 1200) = 4900 MiB held).
+        let derived = ProcessMemory {
+            footprint: None,
+            available: Some(1200 * MIB),
+        };
+        incremental_capacity(evidence, derived, admission).unwrap();
+        // Genuinely short: 3000 MiB still to come, 2000 available — and recorded, typed.
+        let _ = super::media::take_capacity_refusal();
+        assert!(incremental_capacity(evidence, read(500, 2000), admission).is_err());
+        assert!(super::media::take_capacity_refusal());
+        assert!(!super::media::take_capacity_refusal(), "taking clears it");
+        // No footprint reading at all: the conservative absolute comparison.
+        let blind = ProcessMemory {
+            footprint: None,
+            available: Some(3000 * MIB),
+        };
+        assert!(incremental_capacity(evidence, blind, ProcessMemory::default()).is_err());
+        // Over the single cap: refused whatever the headroom.
+        assert!(incremental_capacity(4097 * MIB, read(0, 9000), admission).is_err());
+        // Off-device (no live reading): only the cap applies.
+        incremental_capacity(evidence, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+    }
+
+    /// The capture permit is not an admission and is unavailable off-device: without bounded
+    /// quanta it is a typed failure before any load.
+    #[cfg(all(feature = "device-capture", not(target_os = "ios")))]
+    #[test]
+    fn capture_permit_requires_bounded_quanta() {
+        let root = tempfile::tempdir().unwrap();
+        for candidate in fixtures::candidates(root.path()) {
+            assert!(matches!(
+                crate::media::capture_permit(&candidate),
+                Err(crate::media::AdmissionError::Failed(_))
+            ));
+        }
+        assert!(crate::media::capture_capacity(0).is_err());
     }
 
     #[cfg(feature = "media")]
@@ -680,10 +1010,11 @@ mod tests {
             super::media::ios_memory_budget().total_bytes,
             u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20
         );
-        // Keep the S4 facade reachable without re-exposing the unadmitted provider registry.
-        let _ = super::media::anima_turbo_admission;
+        // Planning stays reachable; admission is the evidence facade (`load_anima_turbo`).
+        let _ = super::media::anima_turbo_planning_decision;
         let _ = super::media::anima_turbo_ios_selection;
         let _ = super::media::anima_turbo_memory_selection;
+        let _ = super::media::load_anima_turbo;
         assert!(!super::media::anima::ANIMA_HOST_REQUEST_PEAKS.is_empty());
     }
 
@@ -789,11 +1120,11 @@ mod tests {
 
 // This bundle-only consumer imports no provider crate. Keep the CPU subprocess/Metal guard so
 // the miniature callable task test cannot contend with the host GPU.
-#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[cfg(all(test, feature = "device-capture", target_os = "macos"))]
 #[path = "../../../media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
 mod iris_cpu_guard;
 
-#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[cfg(all(test, feature = "device-capture", target_os = "macos"))]
 #[test]
 fn bundle_only_consumer_executes_iris_depth() {
     use crate::{gen_core, iris_depth};
@@ -820,11 +1151,12 @@ fn bundle_only_consumer_executes_iris_depth() {
     mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
     iris_cpu_guard::forbid_metal();
     assert!(iris_cpu_guard::metal_forbidden());
-    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+    // The bundle's ONLY depth load paths are admitted or a bounded capture; this drives the capture
+    // path end to end on CPU, with the bounded-quantum fixture standing in for a device's headroom.
+    crate::media::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../media/mlx-gen/mlx-gen-iris/tests/fixtures/tiny-depth");
         let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(path));
-        let model = iris_depth::load_depth_unadmitted_for_diagnostics(&spec).unwrap();
         let req = iris_depth::DepthRequest {
             image: gen_core::Image {
                 width: 16,
@@ -834,10 +1166,31 @@ fn bundle_only_consumer_executes_iris_depth() {
             resolution: iris_depth::DepthResolution::Native,
             ..Default::default()
         };
+        let registry = mlx_gen_ios_catalog::provider_registry().unwrap();
+        let candidate = crate::media::build_candidate(
+            &registry,
+            crate::media::IRIS_DEPTH_ID,
+            spec,
+            None,
+            gen_core::MemoryStrategy::Resident,
+            crate::media::IosWork::Depth(req.clone()),
+        )
+        .unwrap();
+        let (_, permit) = crate::media::capture_permit(&candidate).unwrap();
+        assert!(permit.is_capture());
+        let model = permit.load_depth(crate::media::capture_capacity).unwrap();
         let output = model.estimate(&req, &mut |_| {}).unwrap();
         assert_eq!((output.map.width, output.map.height), (16, 16));
         assert_eq!(output.map.values.len(), 256);
         assert!(output.map.values.iter().all(|v| v.is_finite()));
+        let mut other = req.clone();
+        other.image.pixels[0] = 0;
+        assert!(
+            model.estimate(&other, &mut |_| {}).is_err(),
+            "the capture is bound to its exact work"
+        );
         println!("iris-depth-body-complete");
-    });
+        Ok(())
+    })
+    .unwrap();
 }

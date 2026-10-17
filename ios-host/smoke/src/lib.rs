@@ -1109,9 +1109,10 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     };
 
     use runtime_ios::gen_core::{
-        GenerationMemory, GenerationOutput, GenerationRequest, OffloadPolicy, Progress,
-        WeightsSource,
+        GenerationOutput, GenerationRequest, MemoryNumericTier, MemoryStrategy, OffloadPolicy,
+        Progress, WeightsSource,
     };
+    let media_catalog = runtime_ios::catalog();
 
     /// The base (non-Sprint) SANA id. Pinned as a literal on purpose: if the catalog ever stops
     /// registering it, this check must fail loudly rather than quietly pick whatever is first.
@@ -1298,24 +1299,82 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 return Check { name: NAME, passed: false, detail: format!("capture payload exceeds provisional cap/live headroom; refused before load: {}", details.join(" | ")) };
             }
         }
-        let admission = match tile {
-            Some(t) if t > 0 => runtime_ios::admit_sana_snapshot(SANA_ID, &admission_spec, edge, t),
-            _ => runtime_ios::admit_estimate_mib(None),
+        // One candidate per configuration, built from the provider's own contract: a tiled config is
+        // BoundedDecode at its tile; the untiled experiment is the Resident selection.
+        let request = GenerationRequest {
+            prompt: "a lighthouse on a rocky coast at dawn".to_string(),
+            width: edge,
+            height: edge,
+            count: 1,
+            steps: Some(4),
+            seed: Some(0),
+            ..Default::default()
         };
-        if let Err(refusal) = &admission {
-            if diagnostic {
-                let line = format!("{label}: ADMISSION BYPASSED (diagnostic lane): {refusal}");
-                append_breadcrumb("sana-progress.txt", &line);
-                details.push(line);
-            } else {
-                let line = format!(
-                    "{label}: refused before load (cap {} MiB, PROVISIONAL): {refusal}",
-                    runtime_ios::IOS_APP_MEMORY_CAP_MIB
-                );
+        let candidate = (|| -> Result<runtime_ios::media::IosCandidate, String> {
+            let registry = media_catalog.as_ref().map_err(|e| e.to_string())?.media();
+            let contract = registry
+                .memory_strategy_contract(SANA_ID, &admission_spec)
+                .map_err(|e| e.to_string())?
+                .ok_or("SANA exposes no memory contract")?;
+            let tier = MemoryNumericTier {
+                precision: admission_spec.precision,
+                quant: admission_spec.quantize,
+                component_precision_floors: &[],
+            };
+            let (strategy, selection) = match tile {
+                Some(t) if t > 0 => {
+                    let mut selection = contract
+                        .representative_selection(MemoryStrategy::BoundedDecode, tier, false)
+                        .map_err(|e| e.to_string())?;
+                    selection.parameters.decode_tile_edge = Some(t);
+                    (MemoryStrategy::BoundedDecode, selection)
+                }
+                _ => (
+                    MemoryStrategy::Resident,
+                    contract
+                        .representative_selection(MemoryStrategy::Resident, tier, false)
+                        .map_err(|e| e.to_string())?,
+                ),
+            };
+            runtime_ios::media::build_candidate(
+                registry,
+                SANA_ID,
+                admission_spec.clone(),
+                Some(selection),
+                strategy,
+                runtime_ios::media::IosWork::Generate(request.clone()),
+            )
+            .map_err(|e| e.to_string())
+        })();
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let line = format!("{label}: no candidate: {error}");
                 append_breadcrumb("sana-progress.txt", &line);
                 details.push(line);
                 continue;
             }
+        };
+        // Admitted lane: the evidence facade. Diagnostic lanes: the labelled bounded capture permit
+        // (every quantum checks live headroom before construction), never an unadmitted load.
+        let admission = if diagnostic {
+            runtime_ios::media::capture_permit(&candidate).map(|_| ())
+        } else {
+            runtime_ios::media::load_sana(std::slice::from_ref(&candidate)).map(|_| ())
+        };
+        if let Err(refusal) = &admission {
+            let line = format!(
+                "{label}: refused before load (cap {} MiB, PROVISIONAL; {}): {refusal}",
+                runtime_ios::IOS_APP_MEMORY_CAP_MIB,
+                if diagnostic {
+                    "bounded capture"
+                } else {
+                    "admitted"
+                }
+            );
+            append_breadcrumb("sana-progress.txt", &line);
+            details.push(line);
+            continue;
         }
 
         mlx_rs::memory::clear_cache();
@@ -1332,39 +1391,28 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
             // Sequential is the whole point: it is what sheds the Gemma encoder after conditioning
             // and (since the staged-decode change) the DiT before decode.
             // The catalog's iOS load spec (Sequential), not a hand-built copy of it.
-            let spec = runtime_ios::media::sana_load_spec(WeightsSource::Dir(dir.to_path_buf()));
-            debug_assert_eq!(spec.offload_policy, OffloadPolicy::Sequential);
-            // Through the REGISTRY, not a direct loader — the same reasoning as the LLM checks
-            // taking the bundle rather than `mlx-llm`. This is the path a product takes, so it
-            // exercises catalog composition and provider resolution, not just the engine.
-            let generator = match (admission.is_ok(), tile) {
-                (true, Some(t)) => runtime_ios::media::load_sana(SANA_ID, &spec, edge, t),
-                _ => runtime_ios::media::load_sana_unadmitted_for_diagnostics(SANA_ID, &spec),
-            }
-            .map_err(|e| format!("{label}: load failed: {e}"))?;
-
-            // Tiling asked for through the CONTRACT, not the env var.
-            //
-            // SANA now honours `GenerationMemory::tile_vae_decode` (the rung-2 signal) — until
-            // today it did not, silently, so a caller could set the field and still get the
-            // whole-image decode that was measured at 9177 MiB and jetsam-killed on device. Driving
-            // the harness through the contract is what makes that path exercised on real hardware
-            // rather than only unit-tested, and it is how a product would ask.
-            //
-            // `None` is the untiled control: absence of the signal, rather than a magic `0`.
-            let request = GenerationRequest {
-                prompt: "a lighthouse on a rocky coast at dawn".to_string(),
-                width: edge,
-                height: edge,
-                count: 1,
-                steps: Some(4),
-                seed: Some(0),
-                memory: tile.filter(|&t| t > 0).map(|t| GenerationMemory {
-                    tile_vae_decode: true,
-                    decode_tile_edge: Some(t),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            debug_assert_eq!(candidate.spec.offload_policy, OffloadPolicy::Sequential);
+            // Through the REGISTRY via the bundle's facades, not a direct loader: this is the path a
+            // product takes. The returned generator is bound to this exact request.
+            let generator: Box<dyn runtime_ios::gen_core::Generator> = if diagnostic {
+                let (registry, permit) = runtime_ios::media::capture_permit(&candidate)
+                    .map_err(|e| format!("{label}: capture refused: {e}"))?;
+                Box::new(
+                    permit
+                        .load_generator(&registry, runtime_ios::media::capture_capacity)
+                        .map_err(|e| format!("{label}: load failed: {e}"))?,
+                )
+            } else {
+                Box::new(
+                    runtime_ios::media::load_sana(std::slice::from_ref(&candidate))
+                        .map_err(|e| format!("{label}: load failed: {e}"))?
+                        .1,
+                )
+            };
+            // Tiling asked for through the CONTRACT (the candidate wrote the provider's ladder
+            // execution onto the request), not the env var.
+            let runtime_ios::media::IosWork::Generate(request) = &candidate.work else {
+                return Err(format!("{label}: SANA candidate is not a generation"));
             };
             // What the provider DECIDED, and which of the three inputs decided it. Printed rather
             // than inferred: the label says what was asked for, and today that has been wrong three
@@ -1389,7 +1437,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
                 })
             };
             let out = generator
-                .generate(&request, &mut on_progress)
+                .generate(request, &mut on_progress)
                 .map_err(|e| format!("{label}: generate failed: {e}"))?;
 
             let image = match out {

@@ -122,13 +122,40 @@ pub const fn provider_id(task: IrisTask) -> &'static str {
     }
 }
 
-/// The calibration fingerprint of `task`'s contract.
+/// The retained calibration fingerprint of `task`'s DENSE bf16 contract (the strings both backends'
+/// consumers already key on). Every other tier has its own identity: [`calibration_fingerprint_for`].
 pub const fn calibration_fingerprint(task: IrisTask) -> &'static str {
     match task {
         IrisTask::Generation => MEMORY_CALIBRATION_FINGERPRINT,
         IrisTask::Depth => DEPTH_MEMORY_CALIBRATION_FINGERPRINT,
         IrisTask::Restoration => RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
     }
+}
+
+/// The calibration identity of `task` at the tier the artifact stores and the load computes in,
+/// keyed on **(task, artifact tier)** — the sc-22731 rule SANA follows. One string per task across
+/// tiers would let a q8 record satisfy a q4 request (and vice versa), though the packed widths and
+/// so the footprints differ. The dense bf16 cell keeps its retained string byte-for-byte; the
+/// fp32 dense reference and the q8/q4 packed tiers each get their own.
+pub fn calibration_fingerprint_for(
+    task: IrisTask,
+    precision: Precision,
+    quant: Option<gen_core::Quant>,
+) -> String {
+    let tier = match (quant, precision) {
+        (None, Precision::Bf16) => return calibration_fingerprint(task).to_owned(),
+        (None, Precision::Fp32) => "fp32",
+        (Some(gen_core::Quant::Q8), _) => "q8",
+        (Some(gen_core::Quant::Q4), _) => "q4",
+        // Refused before any contract is built (`refuse_unloadable_quant`); never published.
+        (Some(_), _) => "unsupported",
+    };
+    let route = match task {
+        IrisTask::Generation => "iris-3b",
+        IrisTask::Depth => "iris-3b-depth",
+        IrisTask::Restoration => "iris-3b-restore",
+    };
+    format!("{route}-{tier}-mlx-derived-2026-10-12-v1")
 }
 
 /// The request surface `task`'s evidence is keyed on. Optimized evidence never transfers between
@@ -152,12 +179,13 @@ fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     }
 }
 
-/// The numeric tier of an already-loaded encoder-free model, which holds its precision but no
-/// spec: the same tier [`loaded_tier`] names for the spec it was loaded from.
-const fn dense_tier(precision: Precision) -> MemoryNumericTier {
+/// The numeric tier of an already-loaded encoder-free model, which holds its precision and the
+/// packed tier of the export it loaded (`None`: the dense export) but no spec: the same tier
+/// [`loaded_tier`] names for the spec it was loaded from.
+const fn export_tier(precision: Precision, quant: Option<gen_core::Quant>) -> MemoryNumericTier {
     MemoryNumericTier {
         precision,
-        quant: None,
+        quant,
         component_precision_floors: &[],
     }
 }
@@ -209,14 +237,11 @@ pub(crate) fn refuse_unloadable_quant(id: &str, spec: &LoadSpec) -> CoreResult<(
 fn refuse_unloadable_spec(task: IrisTask, spec: &LoadSpec) -> CoreResult<()> {
     let id = provider_id(task);
     refuse_deferred_load_shape(id, spec)?;
-    if task.uses_text_encoder() {
-        refuse_unloadable_quant(id, spec)?;
-    } else if spec.quantize.is_some() {
-        return Err(CoreError::Unsupported(format!(
-            "{id}: this Iris-3B task ships one dense tier; LoadSpec::quantize is refused at load, \
-             so there is no quantized memory contract"
-        )));
-    }
+    // Every task names the q8 / q4 tiers: generation quantizes a dense release at load or reads a
+    // packed artifact; the encoder-free tasks read a packed export only (`crate::packed`). Which
+    // one the resources on disk are decides the calibration identity (see
+    // [`production_calibration_identity`]).
+    refuse_unloadable_quant(id, spec)?;
     if !task.uses_text_encoder() && !spec.adapters.is_empty() {
         return Err(CoreError::Unsupported(format!(
             "{id}: LoadSpec::adapters is refused at load on this task, so there is no adapter \
@@ -267,6 +292,7 @@ fn architecture_facts(
 fn base_contract(
     task: IrisTask,
     precision: Precision,
+    quant: Option<gen_core::Quant>,
     config: Option<&IrisConfig>,
 ) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -288,7 +314,7 @@ fn base_contract(
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.architecture_facts = architecture_facts(config, precision);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        calibration_fingerprint(task),
+        calibration_fingerprint_for(task, precision, quant),
         LoadShape::EagerMaterialization,
     ));
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
@@ -380,7 +406,7 @@ pub fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     let task = task_of(provider_id)?;
     refuse_unloadable_spec(task, spec)?;
-    Ok(base_contract(task, spec.precision, None))
+    Ok(base_contract(task, spec.precision, spec.quantize, None))
 }
 
 /// The executable contract for a real load: the declaration plus the resident bytes of what the
@@ -399,11 +425,16 @@ pub fn memory_strategy_contract(
         }
         IrisTask::Depth => {
             let export = TaskExport::from_spec(spec, IrisTask::Depth, DEPTH_MODEL_ID)?;
-            export_contract(IrisTask::Depth, spec.precision, &export)
+            export_contract(IrisTask::Depth, spec.precision, spec.quantize, &export)
         }
         IrisTask::Restoration => {
             let resources = RestorationResources::from_spec(spec, RESTORE_MODEL_ID)?;
-            export_contract(IrisTask::Restoration, spec.precision, &resources.export)
+            export_contract(
+                IrisTask::Restoration,
+                spec.precision,
+                spec.quantize,
+                &resources.export,
+            )
         }
     }
 }
@@ -416,7 +447,17 @@ pub(crate) fn generation_contract(
 ) -> CoreResult<MemoryProviderContract> {
     refuse_unloadable_spec(IrisTask::Generation, spec)?;
     let precision = spec.precision;
-    let mut contract = base_contract(IrisTask::Generation, precision, Some(config));
+    // The whole pipeline runs one tier: both artifacts must store the tier the load asks for (a
+    // packed artifact asked for with no tier IS that tier). A dense release asked for at q8/q4 is a
+    // load-time requantization no capture measured, and publishes no identity.
+    let backbone_tier = crate::packed::artifact_tier(
+        &resources
+            .backbone_dir
+            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+    )?;
+    let text_tier = crate::packed::text_encoder_tier(&resources.text_encoder_dir)?;
+    let requested = spec.quantize.or(backbone_tier).or(text_tier);
+    let mut contract = base_contract(IrisTask::Generation, precision, requested, Some(config));
     let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
     let transformer = backbone_bytes(
         &resources
@@ -426,6 +467,9 @@ pub(crate) fn generation_contract(
         quant,
     )?;
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir, spec.quantize)?;
+    if !production_calibration_identity(&[backbone_tier, text_tier], requested) {
+        contract.calibration = None;
+    }
     let overlays = adapter_overlay_components(spec, precision)?;
     let overlay_bytes = overlays
         .iter()
@@ -473,9 +517,14 @@ pub(crate) fn generation_contract(
 pub(crate) fn export_contract(
     task: IrisTask,
     precision: Precision,
+    requested: Option<gen_core::Quant>,
     export: &TaskExport,
 ) -> CoreResult<MemoryProviderContract> {
-    let mut contract = base_contract(task, precision, Some(&export.config));
+    let tier = crate::packed::artifact_tier(&export.weights_path())?;
+    let mut contract = base_contract(task, precision, requested.or(tier), Some(&export.config));
+    if !production_calibration_identity(&[tier], requested.or(tier)) {
+        contract.calibration = None;
+    }
     // The export's `model.safetensors`: the backbone (under `pixel.` plus the 1×1 reducer for
     // depth), every matrix cast to the compute dtype.
     let transformer = backbone_bytes(&export.weights_path(), precision, None)?;
@@ -498,6 +547,18 @@ pub(crate) fn export_contract(
     Ok(contract)
 }
 
+/// Whether a load publishes its calibration identity: only when every artifact it reads stores the
+/// tier it asks for (`requested`, `None` = dense). A dense artifact asked for at q8/q4 would be a
+/// load-time requantization whose peak no anchor measured, and a packed artifact asked for at the
+/// other packed tier is not a shipped load either — both publish no identity, which the iOS
+/// catalog refuses as an `artifact` refusal before pricing anything.
+pub(crate) fn production_calibration_identity(
+    artifacts: &[Option<gen_core::Quant>],
+    requested: Option<gen_core::Quant>,
+) -> bool {
+    artifacts.iter().all(|tier| *tier == requested)
+}
+
 /// Resident bytes of a backbone checkpoint, priced the way the loaders hold it: every projection
 /// weight (a rank-2 `.weight`) as [`crate::nn::ProjectionLayout::of`] holds it under `quant` —
 /// in the compute dtype on the dense tier, packed (over its zero-padded input) on a quantized one;
@@ -505,18 +566,39 @@ pub(crate) fn export_contract(
 /// dtype; vectors (norm gains, biases) and that table as stored. The rule is the one in
 /// [`crate::model::load_backbone_quantized`] and [`crate::depth::load_depth_export`] (whose keys
 /// carry a `pixel.` prefix, hence the suffix match).
-fn backbone_bytes(
+pub(crate) fn backbone_bytes(
     weights: &Path,
     precision: Precision,
     quant: Option<crate::nn::BackboneQuant>,
 ) -> CoreResult<u64> {
     let width = u64::from(compute_width(precision));
     let mut total = 0_u64;
-    for header in gen_core::weightsmeta::safetensors_path_tensor_headers(weights)? {
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
+    // A packed artifact (`crate::packed`) is resident exactly as stored: its codes, scales,
+    // biases and logical-width markers.
+    let packed: std::collections::HashSet<&str> = headers
+        .iter()
+        .filter_map(|h| h.name.strip_suffix(".scales"))
+        .collect();
+    for header in &headers {
         let position_table =
             header.name == "y_pos_embedding" || header.name.ends_with(".y_pos_embedding");
         let elements = header.shape.iter().map(|&d| d as u64).product::<u64>();
+        let packed_part = [
+            ".weight",
+            ".scales",
+            ".biases",
+            crate::packed::IN_FEATURES_SUFFIX,
+        ]
+        .iter()
+        .any(|suffix| {
+            header
+                .name
+                .strip_suffix(suffix)
+                .is_some_and(|base| packed.contains(base))
+        });
         let bytes = match header.shape.as_slice() {
+            _ if packed_part => header.data_bytes,
             [out, input] if header.name.ends_with(".weight") => crate::nn::ProjectionLayout::of(
                 *input, quant,
             )
@@ -531,10 +613,7 @@ fn backbone_bytes(
     Ok(total)
 }
 
-/// Key prefix of the Qwen3-VL language tower inside the VLM checkpoint.
-const LANGUAGE_TOWER_PREFIX: &str = "model.language_model.";
-/// The untied output head, at the checkpoint root.
-const LANGUAGE_HEAD_KEY: &str = "lm_head.weight";
+use crate::text_encoder::{LANGUAGE_HEAD_KEY, LANGUAGE_TOWER_PREFIX};
 
 /// Resident bytes of the text encoder as [`crate::text_encoder::IrisTextEncoder::load_quantized`]
 /// builds it at `quant`.
@@ -547,16 +626,28 @@ const LANGUAGE_HEAD_KEY: &str = "lm_head.weight";
 /// bf16. The vision tower (`model.visual.*`) rides along on disk and is materialized by nothing on
 /// this route. The file list is the loader's own ([`crate::text_encoder::weight_shards`]), so a
 /// stray safetensors beside the shards is not priced.
-fn text_encoder_bytes(dir: &Path, quant: Option<gen_core::Quant>) -> CoreResult<u64> {
+pub(crate) fn text_encoder_bytes(dir: &Path, quant: Option<gen_core::Quant>) -> CoreResult<u64> {
     let config = mlx_llm::ModelConfig::from_dir(dir)
         .map_err(|e| CoreError::Msg(format!("{MODEL_ID}: reading the text encoder config: {e}")))?;
     let untied_head = !config.tie_word_embeddings;
-    let packed = crate::text_encoder::text_encoder_quant_spec(&config, quant)?;
+    // A pre-quantized tower (`crate::packed`) is resident as stored; a dense one is packed at load
+    // when a tier is asked for.
+    let stored = config.quantization.is_some();
+    let packed = if stored {
+        None
+    } else {
+        crate::text_encoder::text_encoder_quant_spec(&config, quant)?
+    };
     let embedding = format!("{LANGUAGE_TOWER_PREFIX}embed_tokens.weight");
     let mut total = 0_u64;
-    for shard in crate::text_encoder::weight_shards(dir)? {
+    for shard in crate::text_encoder::weight_shards(dir, untied_head)? {
         let bytes = projected_safetensors_bytes(&shard, |header| {
-            if header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
+            let packed_part = header.name.ends_with(".scales")
+                || header.name.ends_with(".biases")
+                || header.dtype == gen_core::weightsmeta::Dtype::U32;
+            if stored && packed_part && header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
+                ResidentProjection::Stored
+            } else if header.name.starts_with(LANGUAGE_TOWER_PREFIX) {
                 match packed {
                     Some(spec)
                         if header.shape.len() == 2
@@ -739,10 +830,11 @@ pub fn safety_check(
 /// holds its precision rather than a spec: the same check against the same tier.
 pub(crate) fn loaded_safety_check(
     precision: Precision,
+    quant: Option<gen_core::Quant>,
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    safety_check_at(dense_tier(precision), contract, context)
+    safety_check_at(export_tier(precision, quant), contract, context)
 }
 
 fn safety_check_at(
@@ -1201,7 +1293,14 @@ mod tests {
                 assert_eq!(contract.provider_id, provider_id(task));
                 assert_eq!(contract.load_shape, surface.spec.load_shape);
                 let calibration = contract.calibration.as_ref().unwrap();
-                assert_eq!(calibration.fingerprint, calibration_fingerprint(task));
+                assert_eq!(
+                    calibration.fingerprint,
+                    calibration_fingerprint_for(
+                        task,
+                        surface.spec.precision,
+                        surface.spec.quantize
+                    )
+                );
                 assert_eq!(calibration.load_shape, surface.spec.load_shape);
                 assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
 
@@ -1273,11 +1372,100 @@ mod tests {
         );
     }
 
-    /// Only generation packs a quantized tier — Q4/Q8 under bf16 compute (sc-26266) — and only
-    /// generation installs adapters, so every other spec has no contract, weights-free or loaded.
+    /// sc-22731 for Iris: the calibration identity is keyed on (task, artifact tier). A context
+    /// recorded against one tier's contract never passes the registered safety check of another
+    /// tier's load (q8 never satisfies q4 and vice versa), while the same tier passes. Dense bf16
+    /// keeps its retained string; every tier string is valid and distinct.
+    #[test]
+    fn a_record_of_one_tier_never_satisfies_another_tiers_request() {
+        use gen_core::{
+            standard_memory_behavior_context, MemoryBehaviorRoute, MemoryNumericTier, Quant,
+        };
+        for task in TASKS {
+            let mut seen = std::collections::BTreeSet::new();
+            for (precision, quant) in [
+                (Precision::Bf16, None),
+                (Precision::Fp32, None),
+                (Precision::Bf16, Some(Quant::Q8)),
+                (Precision::Bf16, Some(Quant::Q4)),
+            ] {
+                let fingerprint = calibration_fingerprint_for(task, precision, quant);
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+                assert!(
+                    seen.insert(fingerprint),
+                    "{task:?}: tiers share an identity"
+                );
+            }
+            assert_eq!(
+                calibration_fingerprint_for(task, Precision::Bf16, None),
+                calibration_fingerprint(task),
+                "the dense bf16 cell keeps its retained string"
+            );
+            let spec = |quant: Option<Quant>| {
+                let mut spec = sentinel();
+                spec.quantize = quant;
+                spec
+            };
+            let contract = |quant| {
+                weights_free_memory_strategy_contract(provider_id(task), &spec(quant)).unwrap()
+            };
+            let record = |quant| {
+                standard_memory_behavior_context(
+                    &contract(quant),
+                    MemoryStrategy::Resident,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    },
+                    MemoryBehaviorRoute {
+                        mode: memory_mode(task),
+                        reference_count: 0,
+                        use_pid: false,
+                        has_phases: task.uses_text_encoder(),
+                        overlay: None,
+                    },
+                )
+                .unwrap()
+            };
+            // The published contract identity IS the per-tier one, so persisted evidence keyed on
+            // it can never be matched across tiers.
+            let identity = |quant: Option<Quant>| contract(quant).calibration.unwrap().fingerprint;
+            for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+                assert_eq!(
+                    identity(quant),
+                    calibration_fingerprint_for(task, Precision::Bf16, quant)
+                );
+            }
+            assert_ne!(identity(Some(Quant::Q8)), identity(Some(Quant::Q4)));
+            let check = |record_tier, request_tier| {
+                safety_check(
+                    &spec(request_tier),
+                    &contract(request_tier),
+                    &record(record_tier),
+                )
+            };
+            for (a, b) in [
+                (Some(Quant::Q8), Some(Quant::Q4)),
+                (Some(Quant::Q4), Some(Quant::Q8)),
+            ] {
+                assert!(
+                    matches!(check(a, b), MemorySafetyDecision::Reject { .. }),
+                    "{task:?}: a {a:?} record satisfied a {b:?} request"
+                );
+                assert_eq!(check(b, b), MemorySafetyDecision::Accept, "{task:?} {b:?}");
+            }
+        }
+    }
+
+    /// Every route names the Q4/Q8 tiers under bf16 compute only (sc-26266; the encoder-free tasks
+    /// through their packed exports, epic 16774), and only generation installs adapters. A dense
+    /// encoder-free export asked for at a packed tier has a contract with NO calibration identity
+    /// (its loader refuses it; the iOS catalog refuses it as an artifact). Every other spec has no
+    /// contract, weights-free or loaded.
     ///
-    /// *Mutations that red this:* dropping either arm of `refuse_unloadable_spec`; dropping either
-    /// arm of `refuse_unloadable_quant`.
+    /// *Mutations that red this:* dropping either arm of `refuse_unloadable_quant`; dropping the
+    /// identity check in `export_contract`.
     #[test]
     fn a_spec_no_loader_opens_has_no_contract() {
         let refused =
@@ -1304,12 +1492,13 @@ mod tests {
                 let weights_free =
                     weights_free_memory_strategy_contract(id, &sentinel().with_quant(quant));
                 let loaded = memory_strategy_contract(id, &resources.clone().with_quant(quant));
-                if task == IrisTask::Generation {
-                    gen_core_testkit::memory_strategy_conformance(&weights_free.unwrap());
-                    gen_core_testkit::memory_strategy_conformance(&loaded.unwrap());
-                } else {
-                    refused(id, weights_free, "quantize");
-                    refused(id, loaded, "quantize");
+                gen_core_testkit::memory_strategy_conformance(&weights_free.unwrap());
+                let loaded = loaded.unwrap();
+                if task != IrisTask::Generation {
+                    assert!(
+                        loaded.calibration.is_none(),
+                        "{id}: the dense export at {quant:?} must publish no identity"
+                    );
                 }
             }
             refused(
@@ -1322,11 +1511,7 @@ mod tests {
             refused(
                 id,
                 weights_free_memory_strategy_contract(id, &fp32),
-                if task == IrisTask::Generation {
-                    "precision"
-                } else {
-                    "quantize"
-                },
+                "precision",
             );
             let mut adapted = sentinel();
             adapted.adapters = vec![AdapterSpec::new(
@@ -1548,11 +1733,11 @@ mod tests {
             let contract = weights_free(task);
             let own = context(task, &contract, MemoryStrategy::Resident);
             assert_eq!(
-                loaded_safety_check(Precision::Bf16, &contract, &own),
+                loaded_safety_check(Precision::Bf16, None, &contract, &own),
                 MemorySafetyDecision::Accept
             );
             assert!(matches!(
-                loaded_safety_check(Precision::Fp32, &contract, &own),
+                loaded_safety_check(Precision::Fp32, None, &contract, &own),
                 MemorySafetyDecision::Reject { .. }
             ));
         }

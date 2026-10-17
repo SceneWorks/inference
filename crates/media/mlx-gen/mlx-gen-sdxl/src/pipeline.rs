@@ -837,6 +837,13 @@ fn denoise_core(
                 d.plan,
             )?
         };
+        // sc-26270: the CFG combine above, the sampler update and the inpaint blend materialize
+        // together in the per-step eval below — one guarded iOS quantum, checked before the update's
+        // graph is built (the combine's is lazy, unallocated). A pass-through off device.
+        mlx_gen::ios_quantum::before(
+            crate::quantum::SAMPLER_STEP,
+            crate::quantum::sampler_step_bytes(&latents, inpaint.is_some()),
+        )?;
         latents = d.sampler.step(&eps, &latents, i)?;
         // Legacy inpaint blend (sc-3057): pin the kept region to the init noised to this step's σ,
         // keep the repaint region freely denoised. No RNG draw → ancestral stream unperturbed.
@@ -848,6 +855,7 @@ fn denoise_core(
         // stream is byte-identical to the reference — leaving it lazy across all steps perturbs the
         // draws and re-introduces the chaotic divergence (sc-2400 S5).
         latents.eval()?;
+        mlx_gen::ios_quantum::finish(crate::quantum::SAMPLER_STEP, &[&latents])?;
         on_progress(Progress::Step {
             current: i as u32 + 1,
             total,
@@ -1179,17 +1187,46 @@ pub fn encode_init_latents(
     target_width: u32,
     target_height: u32,
 ) -> Result<Array> {
+    encode_init_latents_tiled(vae, image, target_width, target_height, None, None)
+}
+
+/// [`encode_init_latents`] under the request's bounded-decode rung (sc-26270): when the rung
+/// selected a native spatial tiling, the encode runs [`Autoencoder::encode_tiled`] at the same
+/// pixel tile edge (the encoder twin of the tiled decode); without one it is the whole-image encode
+/// — which on iOS is itself the bounded encode ([`Autoencoder::encode_mean`]).
+pub fn encode_init_latents_tiled(
+    vae: &Autoencoder,
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+    tiling: Option<&mlx_gen::tiling::TilingConfig>,
+    cancel: Option<&CancelFlag>,
+) -> Result<Array> {
     let nhwc = preprocess_init_image(image, target_width, target_height)?;
-    vae.encode_mean(&nhwc)
+    match tiling.and_then(|cfg| cfg.spatial.as_ref()) {
+        Some(spatial) => vae.encode_tiled(&nhwc, spatial.tile_px, cancel),
+        None => vae.encode_mean(&nhwc),
+    }
 }
 
 /// Convert a VAE-decoded NHWC tensor `[1, H, W, 3]` (≈`[-1, 1]`) to an RGB8 [`Image`]:
 /// `clip(x·0.5 + 0.5, 0, 1) · 255` (the vendored `StableDiffusion.decode` + txt2image recipe).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let half = scalar(0.5);
-    let x = add(&multiply(decoded, &half)?, &half)?;
-    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
-    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
+    // sc-26270: the full-resolution clamp/scale/round chain is one guarded iOS quantum; a
+    // pass-through off device. Counted: ONE f32 image-sized buffer — the first scale's output (or
+    // a half-precision VAE's lazy f32 output cast, which that scale then donates into); every
+    // later op of the chain donates its single-consumer operand (measured). Plus its page.
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+    let x = mlx_gen::ios_quantum::run(
+        crate::quantum::DECODED_TO_IMAGE,
+        crate::quantum::decoded_to_image_bytes(decoded),
+        || {
+            let half = scalar(0.5);
+            let x = add(&multiply(decoded, &half)?, &half)?;
+            let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
+            Ok(round(&multiply(&x, scalar(255.0))?, 0)?)
+        },
+    )?;
     let sh = x.shape();
     // One image per call (the pipeline loops with B==1): reject B>1 instead of silently keeping only
     // batch 0, and size in usize / flatten via -1 to avoid the u32/i32 product overflow (F-053).

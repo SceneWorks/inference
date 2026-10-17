@@ -58,9 +58,10 @@ and applicable device/artifact evidence. They solve different questions. SANA's
 header-only profile binds component membership, keys, shapes and storage dtypes;
 a directory called q4 does not establish that its embedding or every other
 component is packed. `runtime_ios::media::load_sana` checks the actual snapshot
-before loading. No target-bound SANA evidence is installed, so its present
-product result is refusal. The explicitly named diagnostic loader is not a
-fallback product path.
+before loading. No target-bound evidence row is installed for any model (the
+single table is `mlx-gen-ios-catalog/evidence/ios_device_evidence.json`), so the
+present product result is a typed `no_evidence` refusal. The bounded capture
+permit that produces rows is not a fallback product path.
 
 Call `bound_mlx_to_platform_limits()` before allocating models and serialize MLX
 work on the owning execution thread. Allocator/cache limits reduce growth; they
