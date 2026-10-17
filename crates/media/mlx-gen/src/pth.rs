@@ -644,7 +644,11 @@ pub fn load_pth_f32_filtered(
         .map_err(|e| Error::Msg(format!("read zip {}: {e}", path.display())))?;
 
     // Locate `<prefix>data.pkl` and derive the storage-blob prefix.
-    let names: Vec<String> = zip.file_names().map(String::from).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Msg(format!("read zip names {}: {e}", path.display())))?;
     let pkl_name = names
         .iter()
         .find(|n| n.ends_with("data.pkl"))
