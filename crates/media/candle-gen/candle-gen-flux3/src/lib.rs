@@ -37,6 +37,7 @@
 //!
 //! [`gen_core::flux3`]: candle_gen::gen_core::flux3
 
+pub mod adapters;
 pub mod autoencoder;
 pub mod dit;
 pub mod memory_strategy;
@@ -54,7 +55,8 @@ pub use candle_gen::gen_core::flux3::{
 };
 pub use dit::{Flux3Dit, SampleTokens};
 pub use model::{
-    compute_dtype, descriptor, load, load_autoencoder, load_dit, Flux3Klein, MODEL_ID,
+    compute_dtype, descriptor, descriptor_base, load, load_autoencoder, load_base, load_dit,
+    Flux3Klein, MODEL_ID,
 };
 pub use pipeline::{
     decode_tokens, denoise_flow_map, denoise_one, float_image_to_rgb8, generate_one, image_ids,
@@ -70,7 +72,11 @@ pub use text_encoder::{Flux3TextEncoder, TextConditioning};
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(registry.register_generator(model::REGISTRATION))
+    register_memory_contract_surfaces(
+        registry
+            .register_generator(model::REGISTRATION)
+            .register_generator(model::BASE_REGISTRATION),
+    )
 }
 
 /// The shared-ladder registrations of the route: strategy, weights-free contract fixture and
@@ -80,6 +86,9 @@ pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
     registry
+        .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
+        .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR_REGISTRATION)
@@ -119,9 +128,9 @@ mod tests {
             .generators()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(ids, ["flux3_klein"]);
+        assert_eq!(ids, ["flux3_klein", "flux3_klein_base"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
-        assert_eq!(registry.memory_strategy_registrations().len(), 1);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 1);
+        assert_eq!(registry.memory_strategy_registrations().len(), 2);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 2);
     }
 }

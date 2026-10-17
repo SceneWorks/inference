@@ -19,7 +19,7 @@ use candle_gen::{CandleError as Error, Result};
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
-use crate::pipeline::{decode_tokens, denoise_one};
+use crate::pipeline::{decode_tokens, denoise_one_conditioned};
 use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
 
 /// Registry id (the SceneWorks worker's `payload.model`) — the same id as the MLX twin, bound to
@@ -58,8 +58,8 @@ pub fn descriptor() -> ModelDescriptor {
             // alpha is fixed, so no scheduler is advertised.
             samplers: SAMPLERS.to_vec(),
             schedulers: Vec::new(),
-            // LoRA loading is sc-26239 (with the base checkpoint).
-            supports_lora: false,
+            // Compatible LoRA stacks are admitted by exact base/revision, rank/alpha and target mapping (S6).
+            supports_lora: true,
             supports_lokr: false,
             // No per-step preview: the packed latent has no fitted RGB projection and the
             // autoencoder decode is the only exact view of a step.
@@ -81,6 +81,17 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// Base checkpoint public surface: CFG and independently encoded negative conditioning.
+pub fn descriptor_base() -> ModelDescriptor {
+    let mut descriptor = descriptor();
+    descriptor.id = gen_core::flux3::BASE_MODEL_ID;
+    descriptor.capabilities.supports_guidance = true;
+    // CFG uses the standard guidance axis; the separate true_cfg control is not consumed.
+    descriptor.capabilities.supports_true_cfg = false;
+    descriptor.capabilities.supports_negative_prompt = true;
+    descriptor
+}
+
 /// The heavy half: the DiT and the autoencoder.
 pub struct Heavy {
     pub dit: Flux3Dit,
@@ -90,6 +101,7 @@ pub struct Heavy {
 /// A loaded distilled generator.
 pub struct Flux3Klein {
     descriptor: ModelDescriptor,
+    adapter_reports: Vec<gen_core::AdapterApplyReport>,
     config: Flux3Config,
     device: Device,
     residency: Residency<Flux3TextEncoder, Heavy>,
@@ -134,9 +146,8 @@ pub fn load_autoencoder(path: &Path, device: &Device) -> Result<Flux3AutoEncoder
 
 pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
-    let refusals: [(&str, bool); 8] = [
+    let refusals: [(&str, bool); 7] = [
         ("quantize", spec.quantize.is_some()),
-        ("adapters", !spec.adapters.is_empty()),
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -164,15 +175,14 @@ pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 /// its admitted `GenerationMemory::stage_residency` is set. Everything runs on the build's device
 /// ([`candle_gen::default_device`]: `cuda:0` on a CUDA build).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    gen_core::reject_unsupported_adapters(
-        MODEL_ID,
-        &descriptor().capabilities,
-        spec.adapters.len(),
-    )?;
-    Ok(Box::new(load_inner(spec)?))
+    Ok(Box::new(load_inner(spec, false)?))
 }
 
-fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
+pub fn load_base(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    Ok(Box::new(load_inner(spec, true)?))
+}
+
+fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     refuse_unsupported_spec(spec)?;
     let package_dir = match &spec.weights {
         gen_core::WeightsSource::Dir(dir) => dir.clone(),
@@ -185,13 +195,22 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     };
     let config = Flux3Config::from_dir(&package_dir)?;
     config.validate_supported()?;
-    if !config.dit.flow_map {
-        return Err(Error::Unsupported(format!(
-            "{MODEL_ID}: {} is a CFG checkpoint; this route serves the distilled flow map (the \
-             base checkpoint is sc-26239)",
-            config.model
-        )));
+    if config.dit.flow_map == base {
+        return Err(Error::Unsupported(format!("flux3: selected {} route but package {} has flow_map={}; select the matching CFG checkpoint or distilled flow-map route", if base { "base CFG" } else { "distilled flow-map" }, config.model, config.dit.flow_map)));
     }
+    crate::adapters::validate(&spec.adapters, &config.dit)?;
+    let adapter_reports = spec
+        .adapters
+        .iter()
+        .map(|adapter| {
+            Ok(gen_core::AdapterApplyReport {
+                adapter_path: adapter.path.clone(),
+                applied: gen_core::flux3::adapters::inspect(adapter, &config.dit)?.len(),
+                skipped: Vec::new(),
+            })
+        })
+        .collect::<gen_core::Result<Vec<_>>>()?;
+
     let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
     // Priced from the resources' tensor headers BEFORE any weight is read, so a spec the
     // registration refuses is the same refusal through `load` on every offload policy
@@ -212,12 +231,14 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
     let dit_path = resources.dit_weights();
     let ae_path = resources.autoencoder_file.clone();
     let heavy_cfg = config.clone();
+    let adapters = spec.adapters.clone();
     let heavy_device = device.clone();
     let residency = Residency::from_policy(
         spec.offload_policy,
         move || Flux3TextEncoder::load(&te_dir, &te_cfg, text_in, &te_device),
         move |_use_pid| {
-            let dit = load_dit(&dit_path, &heavy_cfg, compute, &heavy_device)?;
+            let mut dit = load_dit(&dit_path, &heavy_cfg, compute, &heavy_device)?;
+            crate::adapters::install(&mut dit, &adapters)?;
             let ae = load_autoencoder(&ae_path, &heavy_device)?;
             if ae.latent_channels() != heavy_cfg.dit.image_in_channels {
                 return Err(Error::Msg(format!(
@@ -232,7 +253,12 @@ fn load_inner(spec: &LoadSpec) -> Result<Flux3Klein> {
         },
     )?;
     Ok(Flux3Klein {
-        descriptor: descriptor(),
+        adapter_reports,
+        descriptor: if base {
+            descriptor_base()
+        } else {
+            descriptor()
+        },
         config,
         device,
         residency,
@@ -309,8 +335,7 @@ impl Flux3Klein {
             &req.cancel,
             on_progress,
             |on_progress| -> Result<GenerationParams> {
-                // The shared driver evicts a staged warm pair BEFORE this separate VLM runs.
-                // Upsampling still precedes BOTH effective-caption seeding and text encoding.
+                // Staged warm components are evicted under the exclusive lifecycle BEFORE PUP.
                 let outcome =
                     crate::pup::effective_prompt(self.prompt_upsampler.as_ref(), req, on_progress)?;
                 let mut effective = req.clone();
@@ -323,12 +348,23 @@ impl Flux3Klein {
             },
             |te: &Flux3TextEncoder,
              params: GenerationParams|
-             -> Result<(TextConditioning, GenerationParams)> {
+             -> Result<(TextConditioning, Option<TextConditioning>, GenerationParams)> {
                 let text = te.encode(&params.prompt)?;
-                Ok((text, params))
+                let negative = if params.guidance.is_some() {
+                    Some(te.encode(&params.negative_prompt)?)
+                } else {
+                    None
+                };
+                Ok((text, negative, params))
             },
             encoder_materialization_boundary(|| Ok(self.device.synchronize()?)),
-            |heavy: &Heavy, (text, params): (TextConditioning, GenerationParams), on_progress| {
+            |heavy: &Heavy,
+             (text, negative, params): (
+                TextConditioning,
+                Option<TextConditioning>,
+                GenerationParams,
+            ),
+             on_progress| {
                 let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
@@ -336,9 +372,10 @@ impl Flux3Klein {
                 for c in 0..req.count {
                     let done = c * params.steps;
                     let seed = candle_gen::image_seed(params.seed, c);
-                    tokens.push(denoise_one(
+                    tokens.push(denoise_one_conditioned(
                         &heavy.dit,
                         &text,
+                        negative.as_ref(),
                         &params,
                         seed,
                         &req.cancel,
@@ -372,8 +409,8 @@ impl Flux3Klein {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         self.descriptor
             .capabilities
-            .validate_request(MODEL_ID, req)?;
-        validate_generation_request(MODEL_ID, req, &self.config)?;
+            .validate_request(self.descriptor.id, req)?;
+        validate_generation_request(self.descriptor.id, req, &self.config)?;
         refuse_unhonored_memory(req)?;
         Ok(())
     }
@@ -407,6 +444,10 @@ fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
 }
 
 impl Generator for Flux3Klein {
+    fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
+        self.adapter_reports.clone()
+    }
+
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
     }
@@ -460,6 +501,10 @@ impl Generator for Flux3Klein {
 
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
+}
+
+candle_gen::register_generators! {
+    pub(crate) const BASE_REGISTRATION = descriptor_base => load_base
 }
 
 #[cfg(test)]
@@ -716,7 +761,7 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_true_cfg);
-        assert!(!d.capabilities.supports_lora && !d.capabilities.supports_lokr);
+        assert!(d.capabilities.supports_lora && !d.capabilities.supports_lokr);
         assert!(!d.capabilities.supports_preview);
         assert!(d.required_components.is_empty());
         assert_eq!(
@@ -738,14 +783,6 @@ mod tests {
         let sentinel = || LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()));
         let mut quant = sentinel();
         quant.quantize = Some(gen_core::Quant::Q4);
-        let mut adapters = sentinel();
-        adapters.adapters.push(gen_core::AdapterSpec {
-            path: "/lora-not-on-disk".into(),
-            scale: 1.0,
-            kind: gen_core::AdapterKind::Lora,
-            pass_scales: None,
-            moe_expert: None,
-        });
         let mut pid = sentinel();
         pid.pid = Some(gen_core::PidWeights {
             checkpoint: WeightsSource::File("/pid-not-on-disk.safetensors".into()),
@@ -753,7 +790,6 @@ mod tests {
         });
         for (field, spec) in [
             ("quantize", quant),
-            ("adapters", adapters),
             ("pid", pid),
             (
                 "load_shape",

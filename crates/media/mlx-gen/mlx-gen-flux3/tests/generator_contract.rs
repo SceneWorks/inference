@@ -291,3 +291,47 @@ fn components_override_the_bundled_copies_body() {
         other => panic!("expected a typed refusal, got {:?}", other.err()),
     }
 }
+
+#[test]
+fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
+    crate::common::cpu_process("generator_contract::base_cfg_adapter_loads_through_the_public_provider_for_both_residencies", || {
+        crate::common::on_cpu(|| {
+
+    use mlx_gen::gen_core::{AdapterSpec, AdapterKind, Precision};
+    let fixture = crate::common::fixtures();
+    let registry = mlx_gen_flux3::provider_registry().unwrap();
+    for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+        let mut loaded = LoadSpec::new(WeightsSource::Dir(fixture.join("tiny-base-snapshot"))).with_offload_policy(policy);
+        loaded.precision = Precision::Fp32;
+        loaded.components.insert(TEXT_ENCODER_COMPONENT.into(), WeightsSource::Dir(tiny_text_encoder()));
+        loaded.components.insert(AUTOENCODER_COMPONENT.into(), WeightsSource::File(tiny_autoencoder()));
+        loaded.adapters.push(AdapterSpec::new(fixture.join("flux3_base_lora.safetensors"), -0.25, AdapterKind::Lora));
+        let generator = registry.load("flux3_klein_base", &loaded).unwrap();
+        assert_eq!(generator.descriptor().id, "flux3_klein_base");
+        assert!(generator.descriptor().capabilities.supports_guidance);
+        assert!(!generator.descriptor().capabilities.supports_true_cfg);
+        assert!(generator.descriptor().capabilities.supports_negative_prompt);
+        assert!(generator.descriptor().capabilities.supports_lora);
+        assert_eq!(generator.memory_strategy_contract().unwrap().provider_id, "flux3_klein_base");
+        let request = GenerationRequest { guidance: Some(2.25), negative_prompt: Some("a cat on a roof".into()), ..request() };
+        generator.validate(&request).unwrap();
+        for guidance in [0.0f32, 1.0, 3.5] {
+            let mut standard = request.clone(); standard.guidance = Some(guidance);
+            generator.validate(&standard).unwrap();
+        }
+        let mut separate = request.clone(); separate.true_cfg = Some(4.25);
+        assert!(matches!(generator.validate(&separate), Err(CoreError::Unsupported(_))));
+        let mut progress = Vec::new();
+        let GenerationOutput::Images(images) = generator.generate(&request, &mut |p| progress.push(p)).unwrap() else { panic!("image output required") };
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].width, images[0].height), (80,64));
+        assert_eq!(images[0].pixels.len(), 80*64*3);
+        assert!(progress.iter().any(|p| matches!(p, Progress::Step {current:3,total:3})));
+        let reports = generator.adapter_apply_reports();
+        assert_eq!(reports.len(), 1); assert_eq!(reports[0].applied, 6); assert!(reports[0].skipped.is_empty());
+        loaded.adapters[0].scale = f32::NAN;
+        assert!(matches!(registry.load("flux3_klein_base", &loaded), Err(CoreError::Unsupported(_))));
+    }
+        });
+    });
+}

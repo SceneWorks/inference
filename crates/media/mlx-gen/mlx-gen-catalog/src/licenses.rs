@@ -231,6 +231,14 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
             "flux3_image_klein_pup",
         ],
     },
+    ProviderComponents {
+        provider_id: "flux3_klein_base",
+        components: &[
+            "flux3_image_klein_base",
+            "qwen3_vl_4b_instruct",
+            "flux3_image_klein_pup",
+        ],
+    },
     // --- ideogram ----------------------------------------------------------------------------
     // `ideogram_4_turbo` is the same base weights plus the bundled TurboTime LoRA and no
     // unconditional DiT (`mlx-gen-ideogram/src/config.rs:15`).
@@ -952,8 +960,9 @@ mod tests {
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
         // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
-        assert_eq!(registered.len(), 76, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 66);
+        // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
+        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 67);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1020,11 +1029,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            27,
+            28,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900, flux3_klein in sc-26234)"
+             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {

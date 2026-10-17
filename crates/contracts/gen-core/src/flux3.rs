@@ -23,8 +23,8 @@
 //!   [`TEXT_ENCODER_UPSTREAM_REPO`] @ [`TEXT_ENCODER_UPSTREAM_REVISION`] (same LFS sha256 for both
 //!   shards, same tokenizer and config), which is why that snapshot may be provisioned as the
 //!   `text_encoder` component and why the licence row is Qwen's.
-//! * The base checkpoint (`flux-3-image-klein-base`, CFG sampling) is sc-26239's; references
-//!   and boxes are sc-26236/7's. Nothing here pins them. The prompt upsampler
+//! * The base checkpoint (`flux-3-image-klein-base`, sc-26239) is pinned separately below and
+//!   samples with CFG50/3.5. References and boxes are sc-26236/7's. The prompt upsampler
 //!   (`flux-3-image-klein-pup`, sc-26238) is the [`pup`] submodule: a separate, optional
 //!   package named by the [`pup::UPSAMPLER_COMPONENT`] component.
 
@@ -36,6 +36,7 @@ use crate::generator::GenerationRequest;
 use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
+pub mod adapters;
 pub mod image_input;
 pub mod pup;
 
@@ -71,6 +72,20 @@ pub const TEXT_ENCODER_UPSTREAM_REVISION: &str = "ebb281ec70b05090aa6165b016eac8
 
 /// Registry id of the distilled text-to-image route (the SceneWorks worker's `payload.model`).
 pub const DISTILLED_MODEL_ID: &str = "flux3_klein";
+/// Registry id of the CFG base checkpoint.
+pub const BASE_MODEL_ID: &str = "flux3_klein_base";
+/// Frozen base package (same bundled encoder and autoencoder identities as distilled).
+pub const BASE_WEIGHTS_REPO: &str = "black-forest-labs/flux-3-image-klein-base";
+pub const BASE_WEIGHTS_REVISION: &str = "1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4";
+/// Pinned Hub API LFS SHA256 (metadata identity, not a local-download attestation).
+pub const BASE_DIT_SHA256: &str =
+    "5c921759dc03663dbb67df11d8e3d317d2d5b893b31b969c95dc77ebf861b19c";
+/// Same LFS object as distilled; the fourteen encoder files also have identical git blob ids.
+pub const BASE_AUTOENCODER_SHA256: &str = DISTILLED_AUTOENCODER_SHA256;
+/// Frozen `pipeline.MODELS["base"]` sampling defaults.
+pub const BASE_DEFAULT_STEPS: u32 = 50;
+/// Frozen base CFG scale.
+pub const BASE_DEFAULT_GUIDANCE: f32 = 3.5;
 /// Descriptor family shared by every FLUX 3 Image Klein route and backend.
 pub const FAMILY: &str = "flux3";
 
@@ -482,6 +497,20 @@ impl Flux3Config {
                 self.dit.flow_map, self.sampler.guidance
             )));
         }
+        // The base checkpoint's defaults are the frozen source's `pipeline.MODELS["base"]`
+        // (50 steps, CFG 3.5), not whatever a package's descriptive config.json claims. A config
+        // that disagrees is not the pinned release, so refuse it rather than pick either value.
+        if !self.dit.flow_map
+            && (self.sampler.steps != BASE_DEFAULT_STEPS
+                || self.sampler.guidance != Some(f64::from(BASE_DEFAULT_GUIDANCE)))
+        {
+            return Err(Error::Unsupported(format!(
+                "flux3: base config.json sampler = {} steps / guidance {:?}, but the frozen base \
+                 defaults are {BASE_DEFAULT_STEPS} steps / guidance {BASE_DEFAULT_GUIDANCE}; this is \
+                 not the pinned base package",
+                self.sampler.steps, self.sampler.guidance
+            )));
+        }
         Ok(())
     }
 
@@ -829,10 +858,14 @@ pub fn flow_map_schedule(steps: u32, alpha: f32) -> Result<Vec<f32>> {
 // Generation control surface
 // ---------------------------------------------------------------------------------------------
 
-/// The resolved parameters of one distilled text-to-image request.
+/// The resolved parameters of one distilled flow-map or base CFG text-to-image request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationParams {
     pub prompt: String,
+    /// CFG scale for the base checkpoint; absent for the distilled flow map.
+    pub guidance: Option<f32>,
+    /// Unconditional row's caption (empty by default), encoded independently of the prompt.
+    pub negative_prompt: String,
     pub steps: u32,
     pub alpha: f32,
     pub seed: u64,
@@ -851,7 +884,8 @@ pub fn prompt_seed(prompt: &str) -> u64 {
 }
 
 impl GenerationParams {
-    /// Resolve a request against the loaded package. The distilled checkpoint is a flow map:
+    /// Resolve a request against the loaded package. Base CFG consumes guidance (default3.5)
+    /// and independently encoded negative conditioning; distilled is a flow map:
     /// any guidance is refused (upstream `generate`: "samples without CFG; drop the guidance"; the
     /// descriptor advertises no guidance axis, so `1.0` is not a special case), as is a negative
     /// prompt (nothing would consume it); the sampler is
@@ -861,22 +895,19 @@ impl GenerationParams {
         default_seed: u64,
         config: &Flux3Config,
     ) -> Result<Self> {
-        if !config.dit.flow_map {
-            return Err(Error::Unsupported(format!(
-                "flux3: {} is a CFG checkpoint; the distilled text-to-image route samples a flow \
-                 map only (the base checkpoint is sc-26239)",
-                config.model
-            )));
+        if req.true_cfg.is_some() {
+            return Err(Error::Unsupported("flux3: the separate true_cfg axis is not supported; use guidance for the base checkpoint's CFG scale".into()));
         }
-        if let Some(g) = req.guidance {
+        if let Some(g) = req.guidance.filter(|_| config.dit.flow_map) {
             return Err(Error::Unsupported(format!(
                 "flux3: the distilled checkpoint samples without CFG; drop the guidance (got {g})"
             )));
         }
-        if req
-            .negative_prompt
-            .as_deref()
-            .is_some_and(|n| !n.is_empty())
+        if config.dit.flow_map
+            && req
+                .negative_prompt
+                .as_deref()
+                .is_some_and(|n| !n.is_empty())
         {
             return Err(Error::Unsupported(
                 "flux3: the distilled checkpoint samples without CFG, so a negative prompt has no \
@@ -903,13 +934,32 @@ impl GenerationParams {
                  by the release"
             )));
         }
-        let steps = req.steps.unwrap_or(config.sampler.steps);
+        let guidance = if config.dit.flow_map {
+            None
+        } else {
+            // Frozen `pipeline.MODELS["base"]`; validate_supported refuses a disagreeing config.
+            let g = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
+            if !g.is_finite() || g < 0.0 {
+                return Err(Error::Unsupported(
+                    "flux3: CFG guidance must be finite and non-negative".into(),
+                ));
+            }
+            Some(g)
+        };
+        let default_steps = if config.dit.flow_map {
+            config.sampler.steps
+        } else {
+            BASE_DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps);
         if steps == 0 {
             return Err(Error::Msg("flux3: steps must be >= 1".into()));
         }
         latent_shape(req.width, req.height)?;
         Ok(Self {
             prompt: req.prompt.clone(),
+            guidance,
+            negative_prompt: req.negative_prompt.clone().unwrap_or_default(),
             steps,
             alpha: config.sampler.alpha as f32,
             seed: req.seed.unwrap_or(default_seed),
@@ -1207,6 +1257,74 @@ mod tests {
     }
 
     #[test]
+    fn base_config_disagreeing_with_frozen_defaults_is_refused() {
+        let mut base = release();
+        base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
+        base.sampler.guidance = Some(3.5);
+        base.validate_supported().unwrap();
+        for (steps, guidance) in [(16, Some(3.5)), (50, Some(4.0)), (28, Some(2.5))] {
+            let mut wrong = base.clone();
+            wrong.sampler.steps = steps;
+            wrong.sampler.guidance = guidance;
+            assert!(
+                matches!(wrong.validate_supported(), Err(Error::Unsupported(_))),
+                "{steps}/{guidance:?}"
+            );
+        }
+        // Defaults come from the frozen constants even when the config field is ignored.
+        let mut drifted = base.clone();
+        drifted.sampler.steps = 7;
+        drifted.sampler.guidance = Some(9.0);
+        let p = GenerationParams::resolve(&request(), 0, &drifted).unwrap();
+        assert_eq!(
+            (p.steps, p.guidance),
+            (BASE_DEFAULT_STEPS, Some(BASE_DEFAULT_GUIDANCE))
+        );
+    }
+
+    #[test]
+    fn base_uses_cfg_defaults_and_explicit_negative_conditioning() {
+        let mut base = release();
+        base.dit.flow_map = false;
+        base.sampler.steps = 50;
+        base.sampler.guidance = Some(3.5);
+        let p = GenerationParams::resolve(&request(), 19, &base).unwrap();
+        assert_eq!(p.steps, 50);
+        assert_eq!(p.guidance, Some(3.5));
+        assert_eq!(p.negative_prompt, "");
+        assert_eq!(p.schedule().unwrap().len(), 51);
+        let explicit = GenerationRequest {
+            steps: Some(7),
+            guidance: Some(1.0),
+            negative_prompt: Some("blur, watermark".into()),
+            ..request()
+        };
+        let p = GenerationParams::resolve(&explicit, 19, &base).unwrap();
+        assert_eq!(p.steps, 7);
+        assert_eq!(p.guidance, Some(1.0));
+        assert_eq!(p.negative_prompt, "blur, watermark");
+        let separate_true_cfg = GenerationRequest {
+            true_cfg: Some(4.25),
+            ..request()
+        };
+        assert!(matches!(
+            GenerationParams::resolve(&separate_true_cfg, 19, &base),
+            Err(Error::Unsupported(_))
+        ));
+        for guidance in [f32::NAN, f32::INFINITY, -1.0] {
+            let req = GenerationRequest {
+                guidance: Some(guidance),
+                ..request()
+            };
+            assert!(matches!(
+                GenerationParams::resolve(&req, 0, &base),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
     fn params_resolve_the_release_defaults() {
         let p = GenerationParams::resolve(&request(), 7, &release()).unwrap();
         assert_eq!(p.steps, 16);
@@ -1301,12 +1419,15 @@ mod tests {
         ));
         let mut base = release();
         base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
         base.sampler.guidance = Some(3.5);
         base.validate_supported().unwrap();
-        assert!(matches!(
-            GenerationParams::resolve(&request(), 0, &base),
-            Err(Error::Unsupported(_))
-        ));
+        assert_eq!(
+            GenerationParams::resolve(&request(), 0, &base)
+                .unwrap()
+                .guidance,
+            Some(3.5)
+        );
     }
 
     #[test]
