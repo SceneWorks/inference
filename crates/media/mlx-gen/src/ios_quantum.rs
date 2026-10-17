@@ -11,12 +11,73 @@ use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
 pub use budget::{
-    check_headroom, dcae_stage_bytes, gemma_layer_bytes, sana_block_bytes, PROCESS_RESERVE_BYTES,
+    check_headroom, dcae_stage_bytes, gemma_layer_bytes, sana_block_bytes,
+    sana_promoted_conv_bytes, SanaBlockGeometry, PROCESS_RESERVE_BYTES,
 };
+
+/// One observed quantum boundary in a CPU diagnostic fixture.
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuantumEvent {
+    /// A pre-construction headroom check passed for `scratch` bytes.
+    Checked { label: String, scratch: u64 },
+    /// A completed quantum synchronized MLX stream index `stream`.
+    Synchronized { label: String, stream: i32 },
+}
+
+#[cfg(not(target_os = "ios"))]
+type QuantumObserver = Box<dyn FnMut(&QuantumEvent)>;
 
 #[cfg(not(target_os = "ios"))]
 thread_local! {
     static CPU_FIXTURE_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static CPU_FIXTURE_OBSERVER: std::cell::RefCell<Option<QuantumObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe checks/synchronizations of a CPU diagnostic fixture. Unavailable on iOS.
+#[cfg(not(target_os = "ios"))]
+pub fn with_cpu_diagnostic_observer<T>(
+    observer: impl FnMut(&QuantumEvent) + 'static,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Restore(Option<QuantumObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CPU_FIXTURE_OBSERVER.with(|s| *s.borrow_mut() = previous);
+        }
+    }
+    let previous = CPU_FIXTURE_OBSERVER.with(|s| s.borrow_mut().replace(Box::new(observer)));
+    let _restore = Restore(previous);
+    body()
+}
+
+fn notify(_event: impl FnOnce() -> QuantumEventArg) {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let Some(mut observer) = CPU_FIXTURE_OBSERVER.with(|s| s.borrow_mut().take()) else {
+            return;
+        };
+        let event = match _event() {
+            QuantumEventArg::Checked(label, scratch) => QuantumEvent::Checked { label, scratch },
+            QuantumEventArg::Synchronized(label, stream) => {
+                QuantumEvent::Synchronized { label, stream }
+            }
+        };
+        observer(&event);
+        CPU_FIXTURE_OBSERVER.with(|s| {
+            let mut slot = s.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(observer);
+            }
+        });
+    }
+}
+
+enum QuantumEventArg {
+    Checked(String, u64),
+    #[cfg_attr(target_os = "ios", allow(dead_code))]
+    Synchronized(String, i32),
 }
 
 /// Exercise the exact physical-iOS barriers on tiny CPU models, with deterministic headroom.
@@ -98,27 +159,31 @@ pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
         check_headroom(available_bytes(), scratch, PROCESS_RESERVE_BYTES)
             .map_err(|e| Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)")))?;
+        notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
     }
     Ok(())
 }
 
 /// Explicit C API synchronization is needed in addition to eval: completed graph values must not
-/// leave earlier command-buffer resources live across the next headroom check.
-fn synchronize() -> Result<()> {
-    let stream = mlx_rs::Stream::new();
+/// leave earlier command-buffer resources live across the next headroom check. Synchronize the
+/// stream this quantum executed on: a caller-installed task-local stream, else the default.
+fn synchronize(label: &str) -> Result<()> {
+    let stream = mlx_rs::Stream::task_local_or_default();
     let status = unsafe { mlx_sys::mlx_synchronize(stream.as_ptr()) };
     if status != 0 {
         return Err(Error::Msg(
             "iOS quantum stream synchronization failed".into(),
         ));
     }
+    let index = stream.get_index().unwrap_or(-1);
+    notify(|| QuantumEventArg::Synchronized(label.to_string(), index));
     Ok(())
 }
 
-pub fn finish(arrays: &[&Array]) -> Result<()> {
+pub fn finish(label: &str, arrays: &[&Array]) -> Result<()> {
     if enabled() {
         mlx_rs::transforms::eval(arrays.iter().copied())?;
-        synchronize()?;
+        synchronize(label)?;
         crate::residency::drain_allocator_cache();
     }
     Ok(())
@@ -128,14 +193,19 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
     if !enabled() {
         return build();
     }
-    budget::guarded(
+    let checked = std::cell::Cell::new(false);
+    let result = budget::guarded(
         available_bytes(),
         scratch,
         PROCESS_RESERVE_BYTES,
-        build,
+        || {
+            checked.set(true);
+            notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
+            build()
+        },
         |value| {
             mlx_rs::transforms::eval([value])?;
-            synchronize()
+            synchronize(label)
         },
         || {
             crate::residency::drain_allocator_cache();
@@ -143,13 +213,15 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
     )
     .map_err(|error: Error| match error {
         Error::Msg(reason)
-            if reason.starts_with("iOS quantum refused")
-                || reason == "iOS quantum accounting overflow" =>
+            if !checked.get()
+                && (reason.starts_with("iOS quantum refused")
+                    || reason == "iOS quantum accounting overflow") =>
         {
             Error::Unsupported(format!("{label}: {reason}"))
         }
         other => other,
-    })
+    });
+    result
 }
 
 /// Pre-load floor from the actual safetensors inventory, plus the largest tensor as read/copy
@@ -179,7 +251,7 @@ pub fn before_load(label: &str, components: &[std::path::PathBuf]) -> Result<()>
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../mlx-gen-iris/tests/common/metal_guard.rs"]
-mod quantum_metal_guard;
+pub(crate) mod quantum_metal_guard;
 
 #[cfg(all(test, target_os = "macos"))]
 #[test]
@@ -224,7 +296,15 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         let weight = Array::ones::<f32>(&[40, 1, 1, 8])?.as_dtype(mlx_rs::Dtype::Float16)?;
         let promoted = run(
             "tiny F16 convolution",
-            sana_block_bytes(1, 16, 8, 5),
+            sana_block_bytes(SanaBlockGeometry {
+                batch: 1,
+                tokens: 16,
+                dim: 8,
+                caption_tokens: 5,
+                ff_channels: 40,
+                cross_heads: 2,
+                conv_weight_elements: 40 * 8,
+            }),
             || {
                 Ok(mlx_rs::ops::conv2d(
                     &input,
@@ -251,4 +331,56 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
     });
     assert!(refused.is_err());
     assert!(!constructed.get());
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn cpu_quantum_synchronizes_the_installed_non_default_stream() {
+    const CHILD: &str = "MLX_IOS_QUANTUM_STREAM_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ios_quantum::cpu_quantum_synchronizes_the_installed_non_default_stream",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
+    let installed = mlx_rs::Stream::new_with_device(&mlx_rs::Device::cpu());
+    let default_index = mlx_rs::Stream::new().get_index().unwrap();
+    let installed_index = installed.get_index().unwrap();
+    assert_ne!(
+        installed_index, default_index,
+        "fixture needs a genuinely non-default stream"
+    );
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+        with_cpu_diagnostic_observer(
+            move |event| sink.borrow_mut().push(event.clone()),
+            || {
+                mlx_rs::with_new_default_stream(installed.clone(), || {
+                    let a = Array::from_slice(&[1.0f32; 4], &[4]);
+                    run("non-default stream", 4096, || Ok(mlx_rs::ops::add(&a, &a)?))?;
+                    finish("non-default finish", &[&a])
+                })
+            },
+        )
+    })
+    .unwrap();
+    let synchronized: Vec<i32> = seen
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            QuantumEvent::Synchronized { stream, .. } => Some(*stream),
+            QuantumEvent::Checked { .. } => None,
+        })
+        .collect();
+    assert_eq!(synchronized, [installed_index, installed_index]);
 }

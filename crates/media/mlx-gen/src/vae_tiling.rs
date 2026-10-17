@@ -593,9 +593,35 @@ pub fn tiled_decode_with_hooks(
     plan: &TilePlan,
     axes: [i32; 3],
     cancel: Option<&CancelFlag>,
+    decode_tile: impl FnMut(&Array) -> Result<Array>,
+    materialize: impl FnMut(&[&Array]) -> Result<()>,
+    release: impl FnMut(),
+) -> Result<Array> {
+    tiled_decode_with_finalizer(
+        denorm,
+        plan,
+        axes,
+        cancel,
+        decode_tile,
+        materialize,
+        release,
+        |_| Ok(()),
+    )
+}
+
+/// [`tiled_decode_with_hooks`] plus `before_finalize`, called once with the folded output after the
+/// last tile and BEFORE the normalizer/maximum/division/contiguous graph is constructed. Its error
+/// returns without building that final graph. Cancellation is also observed at this boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn tiled_decode_with_finalizer(
+    denorm: &Array,
+    plan: &TilePlan,
+    axes: [i32; 3],
+    cancel: Option<&CancelFlag>,
     mut decode_tile: impl FnMut(&Array) -> Result<Array>,
     mut materialize: impl FnMut(&[&Array]) -> Result<()>,
     mut release: impl FnMut(),
+    before_finalize: impl FnOnce(&Array) -> Result<()>,
 ) -> Result<Array> {
     let [t_ax, h_ax, w_ax] = axes;
     let mut coverage = AxisCoverage::new(plan);
@@ -738,6 +764,10 @@ pub fn tiled_decode_with_hooks(
     }
 
     let output = t_acc.ok_or_else(|| Error::Msg("vae tiled decode: plan had no tiles".into()))?;
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    before_finalize(&output)?;
     let normalizer = coverage.normalizer(output.shape().len(), axes)?;
     // sc-12748: int64-safe contiguity (the assembled output can exceed i32::MAX — a single-dim
     // reshape(-1) would raise; `array::contiguous` flattens via a 2-D split instead).
@@ -1536,6 +1566,80 @@ mod tests {
             x.as_slice::<f32>()[0..4],
             "offset 4 holds x row 0 again"
         );
+    }
+
+    /// sc-16780: the final normalizer/maximum/division/contiguous graph is built only after a
+    /// separate pre-finalization check on the completed fold, and a refusal returns no output.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn finalizer_runs_once_after_the_last_tile_and_refuses_before_normalization() {
+        const CHILD: &str = "MLX_TILED_FINALIZER_CPU_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae_tiling::tests::finalizer_runs_once_after_the_last_tile_and_refuses_before_normalization",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::ios_quantum::quantum_metal_guard::forbid_metal());
+        let (denorm, plan, axes) = ragged_video_plan();
+        let tiles = plan.t.len() * plan.h.len() * plan.w.len();
+        let events = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let refused = tiled_decode_with_finalizer(
+            &denorm,
+            &plan,
+            axes,
+            None,
+            |tile| {
+                events.borrow_mut().push("tile");
+                seam_bearing_decode(tile)
+            },
+            |accumulators| {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                Ok(())
+            },
+            || {},
+            |output| {
+                assert_eq!(output.shape()[axes[0] as usize], plan.out_f);
+                assert_eq!(output.shape()[axes[1] as usize], plan.out_h);
+                assert_eq!(output.shape()[axes[2] as usize], plan.out_w);
+                events.borrow_mut().push("finalize");
+                Err(Error::Unsupported("final headroom".into()))
+            },
+        );
+        assert!(matches!(refused, Err(Error::Unsupported(ref m)) if m == "final headroom"));
+        let events = events.into_inner();
+        assert_eq!(events.len(), tiles + 1);
+        assert_eq!(events.last(), Some(&"finalize"));
+        assert_eq!(events.iter().filter(|e| **e == "finalize").count(), 1);
+
+        let cancel = CancelFlag::new();
+        let canceled = tiled_decode_with_finalizer(
+            &denorm,
+            &plan,
+            axes,
+            Some(&cancel),
+            seam_bearing_decode,
+            |accumulators| {
+                cancel.cancel();
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                Ok(())
+            },
+            || {},
+            |_| panic!("cancelled decode must not reach finalization"),
+        );
+        assert!(matches!(canceled, Err(Error::Canceled)));
     }
 
     /// sc-18320: the point of the fold. A full-output-shaped accumulator must not exist until the

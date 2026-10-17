@@ -38,12 +38,17 @@ use crate::config::{BlockType, DcAeConfig};
 const F32: Dtype = Dtype::Float32;
 
 fn quantum(
+    cancel: &CancelFlag,
     label: &str,
     x: &Array,
     channels: u64,
     spatial_growth: u64,
     build: impl FnOnce() -> Result<Array>,
 ) -> Result<Array> {
+    // Observe cancellation before constructing every subsequent DC-AE quantum.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     let sh = x.shape();
     let scratch = mlx_gen::ios_quantum::dcae_stage_bytes(
         sh[0] as u64,
@@ -469,7 +474,7 @@ impl DcAeDecoder {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        self.decode_tail(&self.decode_head(latent_nchw)?)
+        self.decode_tail_cancellable(&self.decode_head_cancellable(latent_nchw, cancel)?, cancel)
     }
 
     /// Number of shallow (high-resolution) decoder stages that are attention-free
@@ -511,9 +516,19 @@ impl DcAeDecoder {
     ///
     /// Must run once on the whole latent: this is where every global-token-sum attention lives.
     pub fn decode_head(&self, latent_nchw: &Array) -> Result<Array> {
+        self.decode_head_cancellable(latent_nchw, &CancelFlag::default())
+    }
+
+    /// [`Self::decode_head`], checking `cancel` before each bounded quantum.
+    pub fn decode_head_cancellable(
+        &self,
+        latent_nchw: &Array,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let mut h = quantum(
+            cancel,
             "DC-AE head input",
             &latent,
             *self.cfg.block_out_channels.last().unwrap_or(&1024) as u64,
@@ -526,12 +541,12 @@ impl DcAeDecoder {
         let tail = self.num_tail_stages();
         for stage in self.stages[tail..].iter().rev() {
             if let Some(up) = &stage.upsample {
-                h = quantum("DC-AE upsample", &h, h.shape()[3] as u64, 2, || {
+                h = quantum(cancel, "DC-AE upsample", &h, h.shape()[3] as u64, 2, || {
                     up.forward(&h)
                 })?;
             }
             for block in &stage.blocks {
-                h = quantum("DC-AE block", &h, h.shape()[3] as u64, 1, || {
+                h = quantum(cancel, "DC-AE block", &h, h.shape()[3] as u64, 1, || {
                     block.forward(&h)
                 })?;
             }
@@ -545,22 +560,27 @@ impl DcAeDecoder {
     /// crop of the head feature map is exact up to convolution padding at the crop boundary, which
     /// the trapezoidal overlap blend absorbs.
     pub fn decode_tail(&self, head_nhwc: &Array) -> Result<Array> {
+        self.decode_tail_cancellable(head_nhwc, &CancelFlag::default())
+    }
+
+    /// [`Self::decode_tail`], checking `cancel` before each bounded quantum.
+    pub fn decode_tail_cancellable(&self, head_nhwc: &Array, cancel: &CancelFlag) -> Result<Array> {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let mut h = head_nhwc.clone();
         let tail = self.num_tail_stages();
         for stage in self.stages[..tail].iter().rev() {
             if let Some(up) = &stage.upsample {
-                h = quantum("DC-AE upsample", &h, h.shape()[3] as u64, 2, || {
+                h = quantum(cancel, "DC-AE upsample", &h, h.shape()[3] as u64, 2, || {
                     up.forward(&h)
                 })?;
             }
             for block in &stage.blocks {
-                h = quantum("DC-AE block", &h, h.shape()[3] as u64, 1, || {
+                h = quantum(cancel, "DC-AE block", &h, h.shape()[3] as u64, 1, || {
                     block.forward(&h)
                 })?;
             }
         }
-        quantum("DC-AE output", &h, h.shape()[3] as u64, 1, || {
+        quantum(cancel, "DC-AE output", &h, h.shape()[3] as u64, 1, || {
             let h = rms_norm(&h, &self.norm_out_w, &self.norm_out_b, self.cfg.norm_eps)?;
             let h = relu(&h)?;
             self.conv_out.forward(&h)
@@ -707,6 +727,7 @@ impl DcAeEncoder {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let mut h = quantum(
+            cancel,
             "DC-AE encoder input",
             &x,
             self.conv_in.w.shape()[0] as u64,
@@ -715,12 +736,13 @@ impl DcAeEncoder {
         )?;
         for stage in &self.stages {
             for block in &stage.blocks {
-                h = quantum("DC-AE block", &h, h.shape()[3] as u64, 1, || {
+                h = quantum(cancel, "DC-AE block", &h, h.shape()[3] as u64, 1, || {
                     block.forward(&h)
                 })?;
             }
             if let Some(down) = &stage.downsample {
                 h = quantum(
+                    cancel,
                     "DC-AE downsample",
                     &h,
                     (h.shape()[3] as u64).saturating_mul(2),
@@ -730,11 +752,18 @@ impl DcAeEncoder {
             }
         }
         // out_shortcut: conv_out(h) + mean_group(h → latent_channels).
-        quantum("DC-AE encoder output", &h, h.shape()[3] as u64, 1, || {
-            let shortcut = avg_group(&h, self.out_shortcut_groups)?;
-            let latent_nhwc = add(&self.conv_out.forward(&h)?, &shortcut)?;
-            Ok(latent_nhwc.transpose_axes(&[0, 3, 1, 2])?)
-        })
+        quantum(
+            cancel,
+            "DC-AE encoder output",
+            &h,
+            h.shape()[3] as u64,
+            1,
+            || {
+                let shortcut = avg_group(&h, self.out_shortcut_groups)?;
+                let latent_nhwc = add(&self.conv_out.forward(&h)?, &shortcut)?;
+                Ok(latent_nhwc.transpose_axes(&[0, 3, 1, 2])?)
+            },
+        )
     }
 }
 

@@ -349,7 +349,7 @@ impl Gemma2 {
 
         let (cos, sin) = rope_tables(self.cfg.head_dim, l, self.cfg.rope_theta);
         let mask = causal_mask(b, l, pad_mask)?;
-        mlx_gen::ios_quantum::finish(&[&x, &cos, &sin, &mask])?;
+        mlx_gen::ios_quantum::finish("Gemma embedding/mask", &[&x, &cos, &sin, &mask])?;
         for layer in &self.layers {
             x = mlx_gen::ios_quantum::run("Gemma layer", scratch, || {
                 layer.forward(&x, &cos, &sin, &mask)

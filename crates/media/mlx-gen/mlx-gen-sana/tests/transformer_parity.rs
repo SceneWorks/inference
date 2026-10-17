@@ -109,6 +109,113 @@ fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         .contains("before construction"));
 }
 
+/// The SANA block floor is derived from the loaded block's actual GLUMBConv tensors and cross-head
+/// geometry. The tiny golden is not the production 2240/20-head trunk, so a fixed production
+/// expansion or head count produces a different scratch value here.
+#[cfg(target_os = "macos")]
+#[test]
+fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
+    const CHILD: &str = "SANA_QUANTUM_GEOMETRY_CANCEL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "transformer_parity::sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks", "--nocapture"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    use mlx_gen::ios_quantum::{QuantumEvent, SanaBlockGeometry};
+    assert!(quantum_metal_guard::forbid_metal());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let golden = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_transformer_golden.safetensors"
+    ))
+    .unwrap();
+    let cfg = tiny_config();
+    let model =
+        SanaTransformer::from_weights(&weights_with_w_prefix(&golden), cfg.clone()).unwrap();
+    let latent = golden.require("input.latent").unwrap();
+    let caption = golden.require("input.caption").unwrap();
+    let timestep = golden.require("input.timestep").unwrap();
+    let dim = cfg.inner_dim() as u64;
+    let hidden = (cfg.mlp_ratio * cfg.inner_dim() as f32) as u64;
+    let expected = mlx_gen::ios_quantum::sana_block_bytes(SanaBlockGeometry {
+        batch: 1,
+        tokens: (latent.shape()[2] * latent.shape()[3]) as u64,
+        dim,
+        caption_tokens: caption.shape()[1] as u64,
+        ff_channels: 2 * hidden,
+        cross_heads: cfg.num_cross_attention_heads as u64,
+        conv_weight_elements: 2 * hidden * dim
+            + 2 * hidden
+            + 2 * hidden * 9
+            + 2 * hidden
+            + dim * hidden,
+    });
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_observer(
+            move |event| sink.borrow_mut().push(event.clone()),
+            || model.forward(latent, caption, timestep),
+        )
+    })
+    .unwrap();
+    let block_checks: Vec<u64> = seen
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            QuantumEvent::Checked { label, scratch } if label == "SANA block" => Some(*scratch),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(block_checks, vec![expected; cfg.num_layers as usize]);
+
+    let cancel = mlx_gen::CancelFlag::new();
+    let observed = cancel.clone();
+    let blocks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = blocks.clone();
+    let scheduler =
+        mlx_gen::FlowMatchEuler::for_static_shift(1, mlx_gen_sana::pipeline::SCHEDULE_SHIFT);
+    let result = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+        mlx_gen::ios_quantum::with_cpu_diagnostic_observer(
+            move |event| {
+                if matches!(event, QuantumEvent::Synchronized { label, .. } if label == "SANA block")
+                {
+                    count.set(count.get() + 1);
+                    observed.cancel();
+                }
+            },
+            || {
+                mlx_gen_sana::pipeline::denoise_cfg(
+                    &model,
+                    &scheduler,
+                    None,
+                    0,
+                    0,
+                    latent.clone(),
+                    caption,
+                    None,
+                    None,
+                    None,
+                    1.0,
+                    &cancel,
+                    &mut |_| {},
+                )
+            },
+        )
+    });
+    assert!(
+        matches!(result, Err(mlx_gen::Error::Canceled)),
+        "{result:?}"
+    );
+    assert_eq!(
+        blocks.get(),
+        1,
+        "a SANA block quantum ran after cancellation"
+    );
+}
+
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
 }

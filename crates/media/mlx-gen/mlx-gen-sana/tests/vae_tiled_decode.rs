@@ -262,6 +262,32 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         0.0,
         "barriers preserve DC-AE arithmetic"
     );
+    let encoder = encoder();
+    let image = rand(&[1, 3, 24, 24], 9876);
+    let lazy_encoder = encoder.encode(&image, &cancel).unwrap();
+    lazy_encoder.eval().unwrap();
+    let bounded_encoder =
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+            encoder.encode(&image, &cancel)
+        })
+        .unwrap();
+    assert_eq!(
+        max_abs(&bounded_encoder, &lazy_encoder),
+        0.0,
+        "img2img encoder barriers preserve arithmetic"
+    );
+    assert!(
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || encoder.encode(&image, &cancel))
+            .is_err()
+    );
+    let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || dec.decode(&z, &cancel));
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("before construction"));
+}
+
+fn encoder() -> mlx_gen_sana::DcAeEncoder {
     let cfg = config();
     let mut encoder_weights = Weights::empty();
     let mut seed = 7654;
@@ -309,29 +335,72 @@ fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
         true,
         &mut seed,
     );
-    let encoder = mlx_gen_sana::DcAeEncoder::from_weights(&encoder_weights, cfg).unwrap();
+    mlx_gen_sana::DcAeEncoder::from_weights(&encoder_weights, cfg).unwrap()
+}
+
+/// Cancellation is observed before each subsequent DC-AE quantum, not only at entry. The observer
+/// cancels after the first completed quantum; no further quantum may synchronize, and the RAII
+/// zero-cache scope must restore the caller's policy on the cancellation error path.
+#[cfg(target_os = "macos")]
+#[test]
+fn dcae_quanta_observe_cancellation_between_blocks_and_restore_cache() {
+    const CHILD: &str = "DCAE_QUANTUM_CANCEL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vae_tiled_decode::dcae_quanta_observe_cancellation_between_blocks_and_restore_cache", "--nocapture"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert!(quantum_metal_guard::forbid_metal());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let dec = decoder();
+    let enc = encoder();
+    let z = latent(3, 3);
     let image = rand(&[1, 3, 24, 24], 9876);
-    let lazy_encoder = encoder.encode(&image, &cancel).unwrap();
-    lazy_encoder.eval().unwrap();
-    let bounded_encoder =
-        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
-            encoder.encode(&image, &cancel)
-        })
-        .unwrap();
-    assert_eq!(
-        max_abs(&bounded_encoder, &lazy_encoder),
-        0.0,
-        "img2img encoder barriers preserve arithmetic"
-    );
-    assert!(
-        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || encoder.encode(&image, &cancel))
-            .is_err()
-    );
-    let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || dec.decode(&z, &cancel));
-    assert!(refused
-        .unwrap_err()
-        .to_string()
-        .contains("before construction"));
+    // Built before observation so the tail case counts only tail quanta.
+    let head = dec.decode_head(&z).unwrap();
+    head.eval().unwrap();
+    type Run<'a> = Box<dyn Fn(&CancelFlag) -> mlx_gen::Result<Array> + 'a>;
+    let cases: [(&str, Run); 3] = [
+        ("decoder", Box::new(|c: &CancelFlag| dec.decode(&z, c))),
+        (
+            "decoder tail",
+            Box::new(|c: &CancelFlag| dec.decode_tail_cancellable(&head, c)),
+        ),
+        ("encoder", Box::new(|c: &CancelFlag| enc.encode(&image, c))),
+    ];
+    for (name, run) in cases {
+        let cancel = CancelFlag::new();
+        let observed = cancel.clone();
+        let synced = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = synced.clone();
+        let previous = mlx_rs::memory::set_cache_limit(7_654_321);
+        let result = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+            mlx_gen::ios_quantum::with_cpu_diagnostic_observer(
+                move |event| {
+                    if matches!(
+                        event,
+                        mlx_gen::ios_quantum::QuantumEvent::Synchronized { .. }
+                    ) {
+                        count.set(count.get() + 1);
+                        observed.cancel();
+                    }
+                },
+                || run(&cancel),
+            )
+        });
+        assert!(
+            matches!(result, Err(mlx_gen::Error::Canceled)),
+            "{name}: {result:?}"
+        );
+        assert_eq!(synced.get(), 1, "{name}: a quantum ran after cancellation");
+        assert_eq!(
+            mlx_rs::memory::set_cache_limit(previous),
+            7_654_321,
+            "{name}: cache policy not restored"
+        );
+    }
 }
 
 fn decoder() -> DcAeDecoder {

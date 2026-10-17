@@ -423,7 +423,7 @@ fn decode_tiled(
     if decoder.num_tail_stages() == 0 {
         return decoder.decode(latent, cancel);
     }
-    let head = decoder.decode_head(latent)?; // NHWC, at the tail's input resolution
+    let head = decoder.decode_head_cancellable(latent, cancel)?; // NHWC, tail input resolution
     let shape = head.shape();
     let (height, width, channels) = (shape[1], shape[2], shape[3]);
     let vae = VaeTiling {
@@ -433,34 +433,34 @@ fn decode_tiled(
         full_res_channels: 3,
     };
     if !tiling.needs_tiling(vae, 1, height, width) {
-        return decoder.decode_tail(&head);
+        return decoder.decode_tail_cancellable(&head, cancel);
     }
     let plan = tiling.plan(vae, 1, height, width);
     let lifted = head.reshape(&[1, 1, height, width, channels])?;
     let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-    // Eight full RGB f32 outputs cover the live fold stages, placement, blend and final normalize.
-    let assembly = (height as u64)
+    // One full RGB f32 output. A tile fold holds the accumulator, the padded placement and their sum
+    // (3 outputs); finalization holds output, normalizer, maximum, quotient and contiguous copy (5).
+    let output_bytes = (height as u64)
         .saturating_mul(width as u64)
         .saturating_mul(decoder.tail_scale() as u64)
         .saturating_mul(decoder.tail_scale() as u64)
-        .saturating_mul(3 * 4 * 8);
-    let out = mlx_gen::vae_tiling::tiled_decode_with_hooks(
+        .saturating_mul(3 * 4);
+    let out = mlx_gen::vae_tiling::tiled_decode_with_finalizer(
         &lifted,
         &plan,
         [1, 2, 3],
         Some(cancel),
         |tile| {
-            mlx_gen::ios_quantum::before("DC-AE tile assembly", assembly)?;
             let shape = tile.shape();
             let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
-            let decoded = decoder.decode_tail(&tile)?;
-            mlx_gen::ios_quantum::before("DC-AE tile fold", assembly)?;
+            let decoded = decoder.decode_tail_cancellable(&tile, cancel)?;
+            mlx_gen::ios_quantum::before("DC-AE tile fold", output_bytes.saturating_mul(3))?;
             let shape = decoded.shape();
             Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
         },
         |accumulators| {
             if mlx_gen::ios_quantum::enabled() {
-                mlx_gen::ios_quantum::finish(accumulators)
+                mlx_gen::ios_quantum::finish("DC-AE tile fold", accumulators)
             } else {
                 for accumulator in accumulators {
                     accumulator.eval()?;
@@ -473,8 +473,9 @@ fn decode_tiled(
                 mlx_gen::residency::drain_allocator_cache();
             }
         },
+        |_| mlx_gen::ios_quantum::before("DC-AE final normalize", output_bytes.saturating_mul(5)),
     )?;
-    mlx_gen::ios_quantum::finish(&[&out])?;
+    mlx_gen::ios_quantum::finish("DC-AE final normalize", &[&out])?;
     let shape = out.shape();
     Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }
@@ -1801,5 +1802,116 @@ mod tests {
         for (got, want) in s.sigmas.iter().zip(expected) {
             assert!((got - want).abs() < 1e-5, "got {got} want {want}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests {
+    use super::*;
+    use crate::config::BlockType;
+    use mlx_gen::ios_quantum::{
+        with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
+    };
+    use mlx_gen::weights::Weights;
+
+    fn rand(shape: &[i32], seed: u64) -> Array {
+        random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap())).unwrap()
+    }
+
+    fn tiny_all_res_decoder() -> DcAeDecoder {
+        let cfg = DcAeConfig {
+            in_channels: 3,
+            latent_channels: 4,
+            attention_head_dim: 4,
+            block_out_channels: vec![6, 8],
+            layers_per_block: vec![1, 1],
+            encoder_layers_per_block: vec![1, 1],
+            block_types: vec![BlockType::Res, BlockType::Res],
+            qkv_multiscales: vec![5],
+            upsample_interpolate: true,
+            norm_eps: 1e-5,
+            attn_eps: 1e-15,
+            scaling_factor: 0.41407,
+        };
+        let mut w = Weights::empty();
+        let mut seed = 31_000;
+        let mut conv = |w: &mut Weights, prefix: &str, o: i32, i: i32, bias: bool| {
+            w.insert(format!("{prefix}.weight"), rand(&[o, i, 3, 3], seed));
+            seed += 1;
+            if bias {
+                w.insert(format!("{prefix}.bias"), rand(&[o], seed));
+                seed += 1;
+            }
+        };
+        conv(&mut w, "decoder.conv_in", 8, 4, true);
+        conv(&mut w, "decoder.up_blocks.0.0.conv", 6, 8, true);
+        for (prefix, ch) in [("decoder.up_blocks.0.1", 6), ("decoder.up_blocks.1.0", 8)] {
+            conv(&mut w, &format!("{prefix}.conv1"), ch, ch, true);
+            conv(&mut w, &format!("{prefix}.conv2"), ch, ch, false);
+            w.insert(
+                format!("{prefix}.norm.weight"),
+                Array::ones::<f32>(&[ch]).unwrap(),
+            );
+            w.insert(
+                format!("{prefix}.norm.bias"),
+                Array::zeros::<f32>(&[ch]).unwrap(),
+            );
+        }
+        w.insert("decoder.norm_out.weight", Array::ones::<f32>(&[6]).unwrap());
+        w.insert("decoder.norm_out.bias", Array::zeros::<f32>(&[6]).unwrap());
+        conv(&mut w, "decoder.conv_out", 3, 6, true);
+        DcAeDecoder::from_weights(&w, cfg).unwrap()
+    }
+
+    #[test]
+    fn tiled_sana_decode_checks_final_normalization_after_last_fold() {
+        const CHILD: &str = "SANA_TILED_FINALIZER_CPU_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pipeline::quantum_tests::tiled_sana_decode_checks_final_normalization_after_last_fold", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        let decoder = tiny_all_res_decoder();
+        let latent = rand(&[1, 4, 6, 6], 77);
+        let tiling = TilingConfig::spatial_only(4 * decoder.tail_scale(), decoder.tail_scale());
+        let cancel = CancelFlag::new();
+        let lazy = decode_tiled(&decoder, &latent, &tiling, &cancel).unwrap();
+        lazy.eval().unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let bounded = with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(
+                move |e| sink.borrow_mut().push(e.clone()),
+                || decode_tiled(&decoder, &latent, &tiling, &cancel),
+            )
+        })
+        .unwrap();
+        assert_eq!(bounded.shape(), lazy.shape());
+        let events = events.borrow();
+        let final_check = events
+            .iter()
+            .position(|e| matches!(e, QuantumEvent::Checked { label, .. } if label == "DC-AE final normalize"))
+            .expect("finalization must be checked before construction");
+        let last_fold = events
+            .iter()
+            .rposition(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE tile fold"))
+            .unwrap();
+        let final_sync = events
+            .iter()
+            .position(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE final normalize"))
+            .unwrap();
+        assert!(
+            last_fold < final_check && final_check < final_sync,
+            "{events:?}"
+        );
+        let folds = events
+            .iter()
+            .filter(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE tile fold"))
+            .count();
+        assert!(folds > 1, "fixture must genuinely tile: {events:?}");
     }
 }

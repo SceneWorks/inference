@@ -321,8 +321,7 @@ pub fn prequantize_turnkey_cpu(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
-mod metal_guard;
+use crate::test_metal_guard as metal_guard;
 
 #[cfg(test)]
 mod tests {

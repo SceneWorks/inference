@@ -24,26 +24,37 @@ pub fn gemma_layer_bytes(b: u64, l: u64, h: u64, intermediate: u64, heads: u64, 
     ])
 }
 
-/// Price all three GLUMBConv f32 copies while the ORIGINAL F16 weights remain resident,
-/// eight attention projection copies, score softmax scratch and 32 activation-sized buffers.
-/// Per-block materialization prevents multiplying this scratch by the 20-block stack.
-pub fn sana_promoted_conv_bytes(dim: u64) -> u64 {
-    let expanded = dim.saturating_mul(5);
-    sum(&[
-        product(&[4, expanded, dim]),
-        product(&[4, expanded / 2, dim]),
-        product(&[4, 9, expanded]),
-    ])
+/// Actual configured geometry of one SANA transformer block, derived from its loaded tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SanaBlockGeometry {
+    pub batch: u64,
+    pub tokens: u64,
+    /// Block model width (`heads * head_dim`).
+    pub dim: u64,
+    pub caption_tokens: u64,
+    /// GLUMBConv expanded channels (`2 * int(mlp_ratio * dim)`).
+    pub ff_channels: u64,
+    /// Cross-attention heads whose `[B, H, N, M]` f32 score tensor is materialized.
+    pub cross_heads: u64,
+    /// Elements of every GLUMBConv weight and bias (inverted, depthwise, point).
+    pub conv_weight_elements: u64,
 }
 
-pub fn sana_block_bytes(b: u64, tokens: u64, dim: u64, caption_tokens: u64) -> u64 {
-    let expanded = dim.saturating_mul(5);
+/// Full F32 copies of every GLUMBConv weight/bias, ADDITIONAL to the resident (possibly F16) copy.
+pub fn sana_promoted_conv_bytes(conv_weight_elements: u64) -> u64 {
+    product(&[4, conv_weight_elements])
+}
+
+/// Promoted convolution copies, eight attention-projection copies, eight score-sized
+/// softmax buffers, 32 expanded-activation buffers and eight caption-sized buffers. Per-block
+/// materialization prevents multiplying this scratch by the stack depth.
+pub fn sana_block_bytes(g: SanaBlockGeometry) -> u64 {
     sum(&[
-        sana_promoted_conv_bytes(dim),
-        product(&[8, dim, dim, 4]),
-        product(&[32, b, tokens, expanded, 4]),
-        product(&[8, b, 20, tokens, caption_tokens, 4]),
-        product(&[8, b, caption_tokens, dim, 4]),
+        sana_promoted_conv_bytes(g.conv_weight_elements),
+        product(&[8, g.dim, g.dim, 4]),
+        product(&[32, g.batch, g.tokens, g.ff_channels, 4]),
+        product(&[8, g.batch, g.cross_heads, g.tokens, g.caption_tokens, 4]),
+        product(&[8, g.batch, g.caption_tokens, g.dim, 4]),
     ])
 }
 
@@ -151,14 +162,65 @@ mod tests {
         assert_eq!(result, Err("eval failed"));
     }
 
+    fn sana_geometry(dim: u64, ratio_num: u64, ratio_den: u64, heads: u64) -> SanaBlockGeometry {
+        let hidden = dim * ratio_num / ratio_den;
+        SanaBlockGeometry {
+            batch: 1,
+            tokens: 64,
+            dim,
+            caption_tokens: 300,
+            ff_channels: 2 * hidden,
+            cross_heads: heads,
+            conv_weight_elements: 2 * hidden * dim
+                + 2 * hidden
+                + 2 * hidden * 9
+                + 2 * hidden
+                + dim * hidden,
+        }
+    }
+
     #[test]
     fn f16_convolution_promotion_is_charged_as_full_f32_scratch_not_half_storage() {
-        let dim = 2240;
-        // Both original F16 weights remain resident; their FULL promoted F32 copies are additional.
-        let conv_copies = 4 * (5 * dim * dim + (5 * dim / 2) * dim + 9 * 5 * dim);
-        assert_eq!(sana_promoted_conv_bytes(dim), conv_copies);
-        assert!(sana_block_bytes(1, 64, dim, 300) >= conv_copies);
-        assert!(sana_block_bytes(1, 1024, dim, 300) > sana_block_bytes(1, 64, dim, 300));
+        let production = sana_geometry(2240, 5, 2, 20);
+        assert_eq!(
+            sana_promoted_conv_bytes(production.conv_weight_elements),
+            4 * production.conv_weight_elements
+        );
+        assert!(sana_block_bytes(production) >= 4 * production.conv_weight_elements);
+        let larger = SanaBlockGeometry {
+            tokens: 1024,
+            ..production
+        };
+        assert!(sana_block_bytes(larger) > sana_block_bytes(production));
+    }
+
+    #[test]
+    fn sana_floor_uses_configured_ffn_expansion_and_cross_heads() {
+        // Non-production geometry: mlp_ratio 3 and seven heads. A formula hardcoding 5*dim
+        // or 20 heads cannot satisfy both exact deltas.
+        let base = sana_geometry(96, 3, 1, 7);
+        let more_heads = SanaBlockGeometry {
+            cross_heads: 8,
+            ..base
+        };
+        assert_eq!(
+            sana_block_bytes(more_heads) - sana_block_bytes(base),
+            8 * base.tokens * base.caption_tokens * 4
+        );
+        let wider_ffn = SanaBlockGeometry {
+            ff_channels: base.ff_channels + 2,
+            ..base
+        };
+        assert_eq!(
+            sana_block_bytes(wider_ffn) - sana_block_bytes(base),
+            32 * base.tokens * 2 * 4
+        );
+        let expected = 4 * base.conv_weight_elements
+            + 8 * 96 * 96 * 4
+            + 32 * 64 * 576 * 4
+            + 8 * 7 * 64 * 300 * 4
+            + 8 * 300 * 96 * 4;
+        assert_eq!(sana_block_bytes(base), expected);
     }
 
     #[test]

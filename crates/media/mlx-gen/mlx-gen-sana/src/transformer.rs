@@ -499,6 +499,15 @@ impl GluMbConv {
         })
     }
 
+    /// `(expanded channels, every conv weight/bias element)` from the loaded tensors.
+    fn quantum_geometry(&self) -> (u64, u64) {
+        let elements = [&self.conv_inverted, &self.conv_depth, &self.conv_point]
+            .into_iter()
+            .map(|conv| conv.w.size() as u64 + conv.b.as_ref().map_or(0, |b| b.size() as u64))
+            .sum();
+        (2 * self.hidden as u64, elements)
+    }
+
     /// `x` is NHWC `[B, H, W, inner]`. Returns NHWC `[B, H, W, out]`.
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.conv_inverted.forward(x)?;
@@ -523,6 +532,26 @@ pub(crate) struct SanaBlock {
 }
 
 impl SanaBlock {
+    /// Scratch geometry from THIS block's loaded tensors, not production constants.
+    pub(crate) fn quantum_geometry(
+        &self,
+        batch: i32,
+        h: i32,
+        w: i32,
+        caption_tokens: i32,
+    ) -> mlx_gen::ios_quantum::SanaBlockGeometry {
+        let (ff_channels, conv_weight_elements) = self.ff.quantum_geometry();
+        mlx_gen::ios_quantum::SanaBlockGeometry {
+            batch: batch as u64,
+            tokens: (h as u64).saturating_mul(w as u64),
+            dim: self.scale_shift_table.shape()[1] as u64,
+            caption_tokens: caption_tokens as u64,
+            ff_channels,
+            cross_heads: self.attn2.heads as u64,
+            conv_weight_elements,
+        }
+    }
+
     pub(crate) fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
         Ok(Self {
             scale_shift_table: w.require(&format!("{prefix}.scale_shift_table"))?.clone(),
@@ -550,12 +579,12 @@ impl SanaBlock {
     ) -> Result<Array> {
         let dim = self.scale_shift_table.shape()[1];
         let b = hidden.shape()[0];
-        let scratch = mlx_gen::ios_quantum::sana_block_bytes(
-            b as u64,
-            (h as u64).saturating_mul(w as u64),
-            dim as u64,
-            caption.shape()[1] as u64,
-        );
+        let scratch = mlx_gen::ios_quantum::sana_block_bytes(self.quantum_geometry(
+            b,
+            h,
+            w,
+            caption.shape()[1],
+        ));
         mlx_gen::ios_quantum::run("SANA block", scratch, || {
             // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
             let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
@@ -675,6 +704,39 @@ impl SanaTransformer {
         self
     }
 
+    /// Largest block-quantum floor for this trunk's actual block tensors. A rung-4 load without
+    /// resident blocks falls back to the configured geometry; both paths read no fixed SANA size.
+    fn quantum_scratch(&self, batch: i32, h: i32, w: i32, caption_tokens: i32) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| {
+                mlx_gen::ios_quantum::sana_block_bytes(block.quantum_geometry(
+                    batch,
+                    h,
+                    w,
+                    caption_tokens,
+                ))
+            })
+            .max()
+            .unwrap_or_else(|| {
+                let dim = self.cfg.inner_dim() as u64;
+                let hidden = (self.cfg.mlp_ratio * self.cfg.inner_dim() as f32) as u64;
+                mlx_gen::ios_quantum::sana_block_bytes(mlx_gen::ios_quantum::SanaBlockGeometry {
+                    batch: batch as u64,
+                    tokens: (h as u64).saturating_mul(w as u64),
+                    dim,
+                    caption_tokens: caption_tokens as u64,
+                    ff_channels: 2 * hidden,
+                    cross_heads: self.cfg.num_cross_attention_heads as u64,
+                    conv_weight_elements: 2 * hidden * dim
+                        + 2 * hidden
+                        + 2 * hidden * 9
+                        + 2 * hidden
+                        + dim * hidden,
+                })
+            })
+    }
+
     /// The number of `transformer_blocks` this trunk runs — the rung-4 plan's `n_blocks`.
     pub(crate) fn n_blocks(&self) -> usize {
         self.blocks.len()
@@ -746,12 +808,7 @@ impl SanaTransformer {
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        let scratch = mlx_gen::ios_quantum::sana_block_bytes(
-            b as u64,
-            (ph as u64).saturating_mul(pw as u64),
-            dim as u64,
-            caption.shape()[1] as u64,
-        );
+        let scratch = self.quantum_scratch(b, ph, pw, caption.shape()[1]);
         mlx_gen::ios_quantum::before("SANA patch/caption/timestep", scratch)?;
 
         // 1. Patch embed (NHWC). [B,C,H,W] → NHWC → conv → [B,ph,pw,dim] → tokens [B,N,dim].
@@ -796,13 +853,20 @@ impl SanaTransformer {
         let cap = self.caption_proj_2.forward(&gelu_tanh(&cap)?)?;
         let cap = cap.reshape(&[b, -1, dim])?;
         let caption = rms_norm(&cap, &self.caption_norm, cfg.caption_norm_eps)?;
-        mlx_gen::ios_quantum::finish(&[&hidden, &caption, &temb, &emb])?;
+        mlx_gen::ios_quantum::finish(
+            "SANA patch/caption/timestep",
+            &[&hidden, &caption, &temb, &emb],
+        )?;
 
         // 4. Transformer blocks. The caption padding mask (if any) applies unchanged to every block's
         // attn2 — the per-token caption projection above preserves the M (=300) axis it indexes.
         hidden = match plan.window {
             None => {
                 for block in &self.blocks {
+                    // Observe cancellation before constructing each subsequent block quantum.
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     hidden = block.forward(
                         &hidden,
                         &caption,
@@ -829,6 +893,9 @@ impl SanaTransformer {
         };
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         mlx_gen::ios_quantum::before("SANA output projection", scratch)?;
         let ss = self.scale_shift_table.reshape(&[1, 2, dim])?;
         let modg = add(&ss, &emb.reshape(&[b, 1, dim])?)?; // [B,2,dim]
@@ -847,7 +914,7 @@ impl SanaTransformer {
         let out = out.reshape(&[b, ph, pw, p, p, oc])?;
         let out = out.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
         let out = out.reshape(&[b, oc, ph * p, pw * p])?;
-        mlx_gen::ios_quantum::finish(&[&out])?;
+        mlx_gen::ios_quantum::finish("SANA output projection", &[&out])?;
         Ok(out)
     }
 
@@ -900,6 +967,9 @@ impl SanaTransformer {
                 let mut cur = state;
                 for index in range {
                     let block = stream.materialize(view, index)?;
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     cur = block.forward(&cur, caption, caption_mask, temb, h, w, budget)?;
                 }
                 Ok(cur)
@@ -955,6 +1025,41 @@ mod tests {
         }
         let weights = Weights::from_map(map);
         (CrossAttn::load(&weights, "attn2", &cfg).unwrap(), cfg)
+    }
+
+    /// sc-16780: the quantum floor's FFN geometry comes from the loaded GLUMBConv, here at a
+    /// non-production `mlp_ratio = 3` where a fixed `5 * dim` expansion would be wrong.
+    #[test]
+    fn glumbconv_quantum_geometry_uses_loaded_nondefault_expansion() {
+        let cfg = SanaTransformerConfig {
+            num_attention_heads: 2,
+            attention_head_dim: 8,
+            mlp_ratio: 3.0,
+            ..SanaTransformerConfig::sana_1600m()
+        };
+        let inner = cfg.inner_dim();
+        let hidden = 48;
+        let mut map = std::collections::HashMap::new();
+        let zeros = |shape: &[i32]| Array::zeros::<f32>(shape).unwrap();
+        map.insert(
+            "ff.conv_inverted.weight".to_string(),
+            zeros(&[2 * hidden, inner, 1, 1]),
+        );
+        map.insert("ff.conv_inverted.bias".to_string(), zeros(&[2 * hidden]));
+        map.insert(
+            "ff.conv_depth.weight".to_string(),
+            zeros(&[2 * hidden, 1, 3, 3]),
+        );
+        map.insert("ff.conv_depth.bias".to_string(), zeros(&[2 * hidden]));
+        map.insert(
+            "ff.conv_point.weight".to_string(),
+            zeros(&[inner, hidden, 1, 1]),
+        );
+        let ff = GluMbConv::load(&Weights::from_map(map), "ff", &cfg).unwrap();
+        let (channels, elements) = ff.quantum_geometry();
+        assert_eq!(channels, 96);
+        assert_ne!(channels, 5 * inner as u64);
+        assert_eq!(elements, (96 * 16 + 96 + 96 * 9 + 96 + 16 * 48) as u64);
     }
 
     pub(super) fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
