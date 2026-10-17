@@ -143,6 +143,29 @@ impl VisionEncoderLayer {
         })
     }
 
+    /// iOS quantum scratch (sc-26270) of this layer over `b` rows of `n` tokens, from the loaded
+    /// widths (hidden from `layer_norm1`, MLP width from `fc1`).
+    fn quantum_scratch(&self, b: i32, n: i32) -> u64 {
+        crate::quantum::clip_layer(
+            b,
+            n,
+            self.ln1_w.shape()[0] as u64,
+            crate::quantum::linear_out(&self.fc1),
+            self.num_heads,
+            self.head_dim,
+        )
+    }
+
+    /// The layer as one guarded iOS quantum (sc-26270); a pass-through off device.
+    fn forward_quantum(&self, x: &Array) -> Result<Array> {
+        let s = x.shape();
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VISION_LAYER,
+            self.quantum_scratch(s[0], s[1]),
+            || self.forward(x),
+        )
+    }
+
     /// `x`: `[B, N, D]`. No mask (bidirectional).
     fn forward(&self, x: &Array) -> Result<Array> {
         let y = layer_norm(x, Some(&self.ln1_w), Some(&self.ln1_b), LN_EPS)?;
@@ -257,14 +280,39 @@ impl ClipVisionEncoder {
     /// L{n-1}_out]` (length `num_layers + 1`). IP-Adapter "plus" reads `[-2]` (= the penultimate
     /// layer's output).
     pub fn hidden_states(&self, pixel_values: &Array) -> Result<Vec<Array>> {
-        let mut x = self.embed(pixel_values)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut x = self.embed_quantum(pixel_values)?;
         let mut states = Vec::with_capacity(self.layers.len() + 1);
         states.push(x.clone());
         for layer in &self.layers {
-            x = layer.forward(&x)?;
+            x = layer.forward_quantum(&x)?;
             states.push(x.clone());
         }
         Ok(states)
+    }
+
+    /// [`Self::embed`] as one guarded iOS quantum (sc-26270), priced at the widest layer's floor
+    /// over the token count the patch grid produces for this input.
+    fn embed_quantum(&self, pixel_values: &Array) -> Result<Array> {
+        let s = pixel_values.shape();
+        let grid_h = s[1] / self.patch;
+        let grid_w = s[2] / self.patch;
+        let tokens = grid_h * grid_w + 1;
+        let scratch = self
+            .layers
+            .iter()
+            .map(|layer| layer.quantum_scratch(s[0], tokens))
+            .max()
+            .unwrap_or(0)
+            .max(crate::quantum::conv_stage(
+                s[0],
+                grid_h,
+                grid_w,
+                &[self.hidden, s[3]],
+            ));
+        mlx_gen::ios_quantum::run(crate::quantum::VISION_EMBEDDINGS, scratch, || {
+            self.embed(pixel_values)
+        })
     }
 
     /// The penultimate hidden state `[B, num_positions, hidden]` — the IP-Adapter "plus" image
@@ -274,10 +322,11 @@ impl ClipVisionEncoder {
     /// so forwarding the whole tower and discarding the last layer + every intermediate state was
     /// wasted work (one ViT-H layer + the retained states; F-076).
     pub fn penultimate(&self, pixel_values: &Array) -> Result<Array> {
-        let mut x = self.embed(pixel_values)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut x = self.embed_quantum(pixel_values)?;
         let keep = self.layers.len().saturating_sub(1);
         for layer in &self.layers[..keep] {
-            x = layer.forward(&x)?;
+            x = layer.forward_quantum(&x)?;
         }
         Ok(x)
     }

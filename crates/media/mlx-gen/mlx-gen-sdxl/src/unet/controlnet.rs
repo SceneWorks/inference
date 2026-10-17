@@ -50,6 +50,27 @@ impl Conv2dLayer {
     fn forward(&self, x: &Array) -> Result<Array> {
         conv2d(x, &self.weight, Some(&self.bias), self.stride, self.pad)
     }
+
+    /// Run `build` (this layer applied to `x`, plus any epilogue) as one guarded iOS conditioning-
+    /// embedding quantum priced at this layer's output extent and loaded channels (sc-26270).
+    fn quantum(&self, x: &Array, build: impl FnOnce() -> Result<Array>) -> Result<Array> {
+        let s = x.shape();
+        let k = self.weight.shape()[1];
+        let out = |n: i32| (n + 2 * self.pad - k) / self.stride + 1;
+        let (cin, cout) = crate::quantum::conv_channels(&self.weight);
+        let scratch = crate::quantum::conv_stage(s[0], out(s[1]), out(s[2]), &[cin, cout]);
+        mlx_gen::ios_quantum::run(crate::quantum::CONTROL_COND_CONV, scratch, build)
+    }
+
+    /// One 1x1 zero-conv head scaled by `s`, as a guarded iOS quantum (sc-26270).
+    fn zero_quantum(&self, x: &Array, s: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.weight);
+        let scratch = crate::quantum::conv_stage(sh[0], sh[1], sh[2], &[cin, cout]);
+        mlx_gen::ios_quantum::run(crate::quantum::CONTROL_ZERO_CONV, scratch, || {
+            Ok(multiply(&self.forward(x)?, s)?)
+        })
+    }
 }
 
 /// `ControlNetConditioningEmbedding`: `conv_in(3→16) → SiLU → [block → SiLU]×6 → conv_out(256→320)`.
@@ -81,12 +102,17 @@ impl CondEmbedding {
     }
 
     /// `control`: NHWC `[B, H, W, 3]` in `[0,1]` → `[B, H/8, W/8, 320]`.
+    ///
+    /// sc-26270: every convolution of the stack is one guarded iOS quantum at its output extent.
     fn forward(&self, control: &Array) -> Result<Array> {
-        let mut e = silu(&self.conv_in.forward(control)?)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut e = self
+            .conv_in
+            .quantum(control, || silu(&self.conv_in.forward(control)?))?;
         for b in &self.blocks {
-            e = silu(&b.forward(&e)?)?;
+            e = b.quantum(&e, || silu(&b.forward(&e)?))?;
         }
-        self.conv_out.forward(&e)
+        self.conv_out.quantum(&e, || self.conv_out.forward(&e))
     }
 }
 
@@ -276,6 +302,13 @@ impl ControlNet {
         let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_row(plan.cfg_row);
         let batch = x.shape()[0];
         let dtype = x.dtype();
+        // sc-26270: the branch runs as guarded iOS quanta — stem, then the shared resnet /
+        // transformer / sampler quanta of the encoder copy, then each zero-conv head.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        mlx_gen::ios_quantum::before(
+            crate::quantum::CONTROL_STEM,
+            self.stem_scratch(x, encoder_x),
+        )?;
 
         // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) up front, before
         // any cross-attention (diffusers applies `encoder_hid_proj` once). No-op for SDXL ControlNets.
@@ -305,6 +338,7 @@ impl ControlNet {
         // conv_in + conditioning embedding (precomputed once per run — step-invariant, F-069).
         let mut x = self.conv_in.forward(x)?;
         x = add(&x, cond_embed)?;
+        mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_STEM, &[&x, &temb, encoder_x])?;
 
         // Down — collect skip residuals (starting with the stem+cond output).
         let mut residuals: Vec<Array> = vec![x.clone()];
@@ -315,9 +349,13 @@ impl ControlNet {
         }
 
         // Mid.
-        x = self.mid_resnet0.forward_planned(&x, Some(&temb), plan)?;
+        x = self
+            .mid_resnet0
+            .forward_quantum(&x, None, Some(&temb), plan)?;
         x = self.mid_transformer.forward_ip(&x, encoder_x, None, plan)?;
-        x = self.mid_resnet1.forward_planned(&x, Some(&temb), plan)?;
+        x = self
+            .mid_resnet1
+            .forward_quantum(&x, None, Some(&temb), plan)?;
 
         // Zero-conv heads + scale. Each collected skip residual must pair with exactly one zero-conv;
         // assert the geometry before the `zip` so a count mismatch points at the real cause here,
@@ -326,10 +364,29 @@ impl ControlNet {
         let s = scalar(scale).as_dtype(dtype)?;
         let mut down = Vec::with_capacity(residuals.len());
         for (r, z) in residuals.iter().zip(&self.down_zero) {
-            down.push(multiply(&z.forward(r)?, &s)?);
+            down.push(z.zero_quantum(r, &s)?);
         }
-        let mid = multiply(&self.mid_zero.forward(&x)?, &s)?;
+        let mid = self.mid_zero.zero_quantum(&x, &s)?;
         Ok(ControlResiduals { down, mid })
+    }
+
+    /// iOS scratch (sc-26270) of the stem quantum: `conv_in` at the latent extent and its loaded
+    /// channels, plus the Kolors context projection (when loaded) over the request's context.
+    fn stem_scratch(&self, x: &Array, encoder_x: &Array) -> u64 {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_in.weight);
+        let conv = crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout]);
+        let context = match &self.encoder_hid_proj {
+            Some(proj) => {
+                let e = encoder_x.shape();
+                let rows = (e[0] as u64).saturating_mul(e[1] as u64);
+                crate::quantum::linear_elements(proj)
+                    .saturating_add(rows.saturating_mul(crate::quantum::linear_out(proj)))
+                    .saturating_mul(4)
+            }
+            None => 0,
+        };
+        conv.saturating_add(context)
     }
 
     /// Quantize the encoder-copy Linears (down/mid attention + FFN + time/add embeddings). The

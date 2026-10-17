@@ -42,8 +42,9 @@ def _is_sa3_reference_fixture(path: str) -> bool:
 # aarch64-apple-ios`), plus the bundle itself. A change under any of them can change what the iOS
 # cross-build compiles or the metallib it emits, so it selects the `ios_build` lane. The mlx-rs pin
 # (Cargo.toml / Cargo.lock), `.cargo/`, scripts/ci and the workflows already select every lane.
-# test_select_lanes asserts the live `cargo tree -p runtime-ios` graph is a subset of this set, so a
-# new iOS dependency cannot be left out silently (over-selecting is harmless).
+# test_select_lanes asserts the live `cargo tree -p runtime-ios` graph, and the device harness's
+# (`ios-host/smoke`, every feature), are subsets of this set, so a new iOS dependency cannot be left
+# out silently (over-selecting is harmless).
 IOS_BOUND_PATHS = (
     "crates/bundles/runtime-ios",
     "crates/bundles/runtime-catalog",
@@ -114,6 +115,14 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
     for path in normalized:
         if _is_ios_bound(path):
             lanes["ios_build"] = True
+
+        # `ios-host/` is the device harness (`ios-host/smoke`, its own cargo workspace and lockfile)
+        # plus the Xcode host app. `ios_build` cross-builds and iOS-Clippies the harness; its
+        # weights-free unit tests and host Clippy ride `macos_metal`. No shipped crate depends on
+        # it, so no other lane can observe a change here.
+        if _under(path, "ios-host"):
+            lanes.update(ios_build=True, macos_metal=True)
+            continue
 
         # SA3's non-ignored parity/oracle targets read committed safetensors/JSON artifacts from
         # these migration subdirectories. A fixture-only edit is executable Rust test input, not a

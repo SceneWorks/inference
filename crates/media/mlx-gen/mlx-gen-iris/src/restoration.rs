@@ -60,6 +60,13 @@ pub(crate) fn capabilities(mac_only: bool) -> TransformCapabilities {
     }
 }
 
+/// Labels of the restoration task's own iOS execution quanta (the backbone's are
+/// [`crate::dit`]'s).
+pub(crate) mod quanta {
+    pub const LOAD: &str = "Iris restoration load";
+    pub const TILE: &str = "Iris restoration tile";
+}
+
 /// A loaded Iris-3B restorer.
 pub struct IrisRestorer {
     descriptor: TransformDescriptor,
@@ -108,6 +115,13 @@ impl IrisRestorer {
     pub fn load(spec: &LoadSpec) -> Result<Self> {
         refuse_unsupported_spec(spec)?;
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
+        mlx_gen::ios_quantum::before_load(
+            quanta::LOAD,
+            &[
+                resources.export.weights_path(),
+                resources.export.empty_prompt_path(),
+            ],
+        )?;
         let prompt = resources.empty_prompt()?;
         let dit = load_backbone(
             &resources.export.dir,
@@ -169,6 +183,10 @@ impl IrisRestorer {
     /// One tile's velocity: `[3, h, w]` CHW f32 in `[-1, 1]` → `v` (same layout, f32), the backbone
     /// run once at `sigma · num_train_timesteps` on the empty-prompt states.
     pub fn velocity(&self, tile: &[f32], height: usize, width: usize) -> Result<Vec<f32>> {
+        // The tile, its velocity, the f32 copy and the host readback: four tile-sized buffers held
+        // across the backbone forward (whose own blocks are checked inside it).
+        let tile_bytes = (tile.len() as u64).saturating_mul(4 * 4);
+        mlx_gen::ios_quantum::before(quanta::TILE, tile_bytes)?;
         let x = Array::from_slice(tile, &[1, 3, height as i32, width as i32]);
         let t = Array::from_slice(&[self.settings.model_time(&self.config)], &[1]);
         let text = TextBatch {
@@ -177,6 +195,7 @@ impl IrisRestorer {
         };
         let v = self.dit.forward(&x, &t, &text)?.as_dtype(Dtype::Float32)?;
         eval([&v])?;
+        mlx_gen::ios_quantum::finish(quanta::TILE, &[&v])?;
         let n = v.shape().iter().product::<i32>();
         Ok(v.reshape(&[n])?.as_slice::<f32>().to_vec())
     }
@@ -187,6 +206,7 @@ impl IrisRestorer {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let plan = self.plan(req)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let image = restore(
             &req.image,
             &plan,

@@ -8,6 +8,9 @@ repository = "https://github.com/SceneWorks/inference"
 
 [dependencies]
 sha2 = { workspace = true }
+# The reviewed device-evidence table (`evidence/ios_device_evidence.json`) is parsed at runtime.
+serde = { workspace = true }
+serde_json = { workspace = true }
 mlx-gen = { path = ".." }
 # SANA, Anima Turbo, the SDXL family and all Iris inference tasks only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
 # the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for

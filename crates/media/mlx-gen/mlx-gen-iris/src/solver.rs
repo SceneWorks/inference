@@ -9,6 +9,9 @@ use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
+/// Label of one solver update's iOS execution quantum.
+pub(crate) const STEP_QUANTUM: &str = "Iris solver step";
+
 /// Integrate `z` along `plan`. `model_out(x, step)` returns the raw (CFG-combined) network output
 /// at `step.s` in f32, read as `prediction` (`_pred_x0`: velocity `x0 = x − s·out`, or the clean
 /// image `x0 = out`); `on_step(i, x0)` fires after step `i` (1-based) completes with that step's
@@ -29,6 +32,10 @@ pub fn sample(
             return Err(Error::Canceled);
         }
         let out = model_out(&x, step)?.as_dtype(Dtype::Float32)?;
+        // The update holds the state, the output, both clean images, their difference and the
+        // scaled terms: eight state-sized f32 buffers.
+        let state_bytes = (x.size() as u64).saturating_mul(4);
+        mlx_gen::ios_quantum::before(STEP_QUANTUM, state_bytes.saturating_mul(8))?;
         let x0 = match prediction {
             // v-prediction: x0 = x − s·v
             Prediction::Velocity => x.subtract(&out.multiply(Array::from_f32(step.s_f32()))?)?,
@@ -49,6 +56,7 @@ pub fn sample(
             }
         };
         eval([&x, &x0])?;
+        mlx_gen::ios_quantum::finish(STEP_QUANTUM, &[&x, &x0])?;
         on_step(i + 1, &x0);
         prev_x0 = Some(x0);
     }

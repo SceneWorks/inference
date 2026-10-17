@@ -386,18 +386,57 @@ impl Resampler {
                 self.dim
             )));
         }
+        // sc-26270: proj_in, each perceiver layer, and proj_out + norm are guarded iOS quanta
+        // (pass-throughs off device); the projections take the widest layer's floor.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let nx = image_features.shape()[1];
+        let scratch = self
+            .layers
+            .iter()
+            .map(|(attn, ff)| self.layer_scratch(attn, ff, b, nx))
+            .max()
+            .unwrap_or(0);
         let mut latents = broadcast_to(&self.latents, &[b, self.num_queries, self.dim])?;
-        let x = self.proj_in.forward(image_features)?;
+        let x = mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_IN, scratch, || {
+            self.proj_in.forward(image_features)
+        })?;
         for (attn, ff) in &self.layers {
-            latents = add(&attn.forward(&x, &latents)?, &latents)?;
-            latents = add(&ff.forward(&latents)?, &latents)?;
+            latents = mlx_gen::ios_quantum::run(
+                crate::quantum::RESAMPLER_LAYER,
+                self.layer_scratch(attn, ff, b, nx),
+                || {
+                    let latents = add(&attn.forward(&x, &latents)?, &latents)?;
+                    Ok(add(&ff.forward(&latents)?, &latents)?)
+                },
+            )?;
         }
-        let out = self.proj_out.forward(&latents)?;
-        Ok(layer_norm(
-            &out,
-            Some(&self.norm_out_w),
-            Some(&self.norm_out_b),
-            LN_EPS,
-        )?)
+        mlx_gen::ios_quantum::run(crate::quantum::RESAMPLER_PROJ_OUT, scratch, || {
+            let out = self.proj_out.forward(&latents)?;
+            Ok(layer_norm(
+                &out,
+                Some(&self.norm_out_w),
+                Some(&self.norm_out_b),
+                LN_EPS,
+            )?)
+        })
+    }
+
+    /// iOS quantum scratch (sc-26270) of one perceiver layer over `nx` image tokens plus the
+    /// queries, from the loaded widths (`to_q` rows, the FFN's `fc1` rows).
+    fn layer_scratch(
+        &self,
+        attn: &PerceiverAttention,
+        ff: &ResamplerFeedForward,
+        b: i32,
+        nx: i32,
+    ) -> u64 {
+        crate::quantum::clip_layer(
+            b,
+            nx + self.num_queries,
+            (self.dim as u64).max(crate::quantum::linear_out(&attn.to_q)),
+            crate::quantum::linear_out(&ff.fc1),
+            attn.heads,
+            attn.dim_head,
+        )
     }
 }

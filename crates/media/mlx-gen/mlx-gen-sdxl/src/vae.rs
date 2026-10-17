@@ -150,6 +150,20 @@ impl VaeAttention {
         })
     }
 
+    /// [`Self::forward`] as one guarded iOS quantum (sc-26270): single-head scores over every
+    /// `H·W` token at the loaded width, plus full f32 copies of the four projections.
+    fn forward_quantum(&self, x: &Array) -> Result<Array> {
+        let s = x.shape();
+        let weights = [&self.q, &self.k, &self.v, &self.out]
+            .into_iter()
+            .map(crate::quantum::linear_elements)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(crate::quantum::elements(&self.gn_w))
+            .saturating_add(crate::quantum::elements(&self.gn_b));
+        let scratch = crate::quantum::vae_attention(s[0], s[1], s[2], s[3], weights);
+        mlx_gen::ios_quantum::run(crate::quantum::VAE_ATTENTION, scratch, || self.forward(x))
+    }
+
     /// `x`: NHWC `[B, H, W, C]`. Single-head attention over the H·W positions, residual.
     fn forward(&self, x: &Array) -> Result<Array> {
         let sh = x.shape();
@@ -207,18 +221,27 @@ impl EncoderDecoderBlock2D {
         })
     }
 
+    /// sc-26270: each resnet and each sampler is one guarded iOS quantum (pass-through off device).
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut x = x.clone();
         for r in &self.resnets {
-            x = r.forward(&x, None)?;
+            x = resnet_quantum(r, &x, false)?;
         }
         if let Some((cw, cb)) = &self.downsample {
-            // Asymmetric (right/bottom) pad then stride-2, pad-0 conv (the SD downsample).
-            x = pad(&x, &[(0, 0), (0, 1), (0, 1), (0, 0)][..], None, None)?;
-            x = conv2d(&x, cw, Some(cb), 2, 0)?;
+            let s = x.shape();
+            let (cin, cout) = crate::quantum::conv_channels(cw);
+            let scratch =
+                crate::quantum::conv_stage(s[0], (s[1] + 1) / 2, (s[2] + 1) / 2, &[cin, cout]);
+            x = mlx_gen::ios_quantum::run(crate::quantum::VAE_DOWNSAMPLE, scratch, || {
+                // Asymmetric (right/bottom) pad then stride-2, pad-0 conv (the SD downsample).
+                let padded = pad(&x, &[(0, 0), (0, 1), (0, 1), (0, 0)][..], None, None)?;
+                conv2d(&padded, cw, Some(cb), 2, 0)
+            })?;
         }
         if let Some((cw, cb)) = &self.upsample {
-            x = conv2d(&upsample_nearest(&x, 2)?, cw, Some(cb), 1, 1)?;
+            x = upsample_quantum(x.shape(), cw, || {
+                conv2d(&upsample_nearest(&x, 2)?, cw, Some(cb), 1, 1)
+            })?;
         }
         Ok(x)
     }
@@ -260,9 +283,16 @@ fn upsample_tiled(
     tile: i32,
     cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    // sc-26270: one tiled iOS stage at the doubled extent; each conv tile is checked on its own.
+    let s = x.shape();
+    let (cin, cout) = crate::quantum::conv_channels(weight);
+    mlx_gen::ios_quantum::before(
+        crate::quantum::VAE_TILED_STAGE,
+        crate::quantum::tiled_stage(s[0], 2 * s[1], 2 * s[2], &[cin, cout]),
+    )?;
     let up = upsample_nearest(x, 2)?;
     trace_decode_stage("upsample.nearest", &up)?;
-    if x.dtype() == Dtype::Float16 {
+    let out = if x.dtype() == Dtype::Float16 {
         // Half storage, wide accumulation: only this unnormalized convolution is sensitive to
         // partial-sum overflow. The helper promotes one crop and casts each core back before
         // assembling the image, so no full-resolution f32 activation is introduced.
@@ -272,13 +302,49 @@ fn upsample_tiled(
             Some(bias),
             tile,
             cancel,
-            |tile| Ok(tile.clone()),
-        )
+            |tile| {
+                crate::quantum::before_tile(tile, weight)?;
+                Ok(tile.clone())
+            },
+        )?
     } else {
         mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(&up, weight, Some(bias), tile, cancel, |tile| {
+            crate::quantum::before_tile(tile, weight)?;
             Ok(tile.clone())
-        })
-    }
+        })?
+    };
+    mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+    Ok(out)
+}
+
+/// One VAE resnet as a guarded iOS quantum (sc-26270): `evaluated` selects the dense-reference
+/// [`ResnetBlock2D::forward_evaluated_vae`], else the lazy temb-free forward.
+fn resnet_quantum(resnet: &ResnetBlock2D, x: &Array, evaluated: bool) -> Result<Array> {
+    let s = x.shape();
+    mlx_gen::ios_quantum::run(
+        crate::quantum::VAE_RESNET,
+        resnet.quantum_scratch(s[0], s[1], s[2]),
+        || {
+            if evaluated {
+                resnet.forward_evaluated_vae(x)
+            } else {
+                resnet.forward(x, None)
+            }
+        },
+    )
+}
+
+/// A nearest-2x upsample + conv (`build`) as one guarded iOS quantum priced at the doubled extent
+/// and `weight`'s loaded channels (sc-26270).
+fn upsample_quantum(
+    input_shape: &[i32],
+    weight: &Array,
+    build: impl FnOnce() -> Result<Array>,
+) -> Result<Array> {
+    let s = input_shape;
+    let (cin, cout) = crate::quantum::conv_channels(weight);
+    let scratch = crate::quantum::conv_stage(s[0], 2 * s[1], 2 * s[2], &[cin, cout]);
+    mlx_gen::ios_quantum::run(crate::quantum::VAE_UPSAMPLE, scratch, build)
 }
 
 /// The decoder (latent → image).
@@ -339,11 +405,26 @@ impl Decoder {
     /// 1024² it is a `[1, 128, 128, 512]` f32 activation (32 MiB), three orders of magnitude under the
     /// full-resolution tail it protects. So the head runs once on the full latent and only the tail
     /// tiles, which is the same split `mlx_gen_qwen_image`'s `decode_tiled` uses.
+    ///
+    /// sc-26270: `conv_in` (which also materializes the caller's lazy de-normalization and
+    /// `post_quant_conv`), each mid resnet and the mid attention are guarded iOS quanta.
     fn head(&self, z: &Array) -> Result<Array> {
-        let mut x = conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
-        x = self.mid_resnet0.forward(&x, None)?;
-        x = self.mid_attn.forward(&x)?;
-        self.mid_resnet1.forward(&x, None)
+        let s = z.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_in_w);
+        let scratch = crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout]);
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::VAE_DECODE_IN, scratch, || {
+            conv2d(z, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)
+        })?;
+        x = resnet_quantum(&self.mid_resnet0, &x, false)?;
+        x = self.mid_attn.forward_quantum(&x)?;
+        resnet_quantum(&self.mid_resnet1, &x, false)
+    }
+
+    /// iOS scratch (sc-26270) of the output GroupNorm + SiLU + `conv_out` at `x`'s extent.
+    fn conv_out_scratch(&self, x: &Array) -> u64 {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_out_w);
+        crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout])
     }
 
     /// The dense upsample half of the decode: the four `up_blocks` (×8 nearest+conv upsample) and
@@ -355,8 +436,14 @@ impl Decoder {
         for ub in &self.up_blocks {
             x = ub.forward(&x)?;
         }
-        let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
-        conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VAE_DECODE_OUT,
+            self.conv_out_scratch(&x),
+            || {
+                let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+                conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+            },
+        )
     }
 
     /// Untiled inference tail with explicit lifetime boundaries. Every convolution and GroupNorm
@@ -369,26 +456,36 @@ impl Decoder {
         let mut x = x.clone();
         for up in &self.up_blocks {
             for resnet in &up.resnets {
-                x = resnet.forward_evaluated_vae(&x)?;
+                x = resnet_quantum(resnet, &x, true)?;
             }
             if let Some((cw, cb)) = &up.upsample {
-                let enlarged = upsample_nearest(&x, 2)?;
-                enlarged.eval()?;
-                // Drop the previous-resolution activation before allocating convolution scratch.
-                x = enlarged;
-                x = conv2d(&x, cw, Some(cb), 1, 1)?;
-                x.eval()?;
+                let shape = x.shape().to_vec();
+                let previous = x;
+                // The previous-resolution activation moves into the quantum so it is still dropped
+                // before the convolution scratch is allocated (sc-26270 keeps that ordering).
+                x = upsample_quantum(&shape, cw, move || {
+                    let enlarged = upsample_nearest(&previous, 2)?;
+                    enlarged.eval()?;
+                    // Drop the previous-resolution activation before allocating convolution scratch.
+                    drop(previous);
+                    let out = conv2d(&enlarged, cw, Some(cb), 1, 1)?;
+                    out.eval()?;
+                    Ok(out)
+                })?;
             }
         }
-        let norm = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
-        norm.eval()?;
-        drop(x);
-        let activated = silu(&norm)?;
-        activated.eval()?;
-        drop(norm);
-        let out = conv2d(&activated, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)?;
-        out.eval()?;
-        Ok(out)
+        let scratch = self.conv_out_scratch(&x);
+        mlx_gen::ios_quantum::run(crate::quantum::VAE_DECODE_OUT, scratch, move || {
+            let norm = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+            norm.eval()?;
+            drop(x);
+            let activated = silu(&norm)?;
+            activated.eval()?;
+            drop(norm);
+            let out = conv2d(&activated, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)?;
+            out.eval()?;
+            Ok(out)
+        })
     }
 
     /// Layer-wise bounded tail with dense-image GroupNorm semantics (sc-19753).
@@ -430,6 +527,13 @@ impl Decoder {
         if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
             return Err(mlx_gen::Error::Canceled);
         }
+        // sc-26270: the tiled output convolution is one iOS stage; each tile is checked on its own.
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_out_w);
+        mlx_gen::ios_quantum::before(
+            crate::quantum::VAE_TILED_STAGE,
+            crate::quantum::tiled_stage(s[0], s[1], s[2], &[cin, cout]),
+        )?;
         let norm = mlx_gen::vae_tiling::GlobalGroupNorm::new(
             &x,
             &self.norm_out_w,
@@ -437,14 +541,19 @@ impl Decoder {
             GN_GROUPS,
             GN_EPS,
         )?;
-        mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
+        let out = mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
             &x,
             &self.conv_out_w,
             Some(&self.conv_out_b),
             output_tile_edge.max(3),
             cancel,
-            |tile| silu(&norm.apply(tile)?),
-        )
+            |tile| {
+                crate::quantum::before_tile(tile, &self.conv_out_w)?;
+                silu(&norm.apply(tile)?)
+            },
+        )?;
+        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+        Ok(out)
     }
 }
 
@@ -491,16 +600,35 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let mut x = conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
+    /// sc-26270: `conv_in`, every resnet / downsample / mid attention are guarded iOS quanta. The
+    /// output GroupNorm + `conv_out` is the caller's quantum ([`Autoencoder::encode_mean`]), so it
+    /// materializes together with `quant_conv` and the mean selection.
+    fn forward_body(&self, x: &Array) -> Result<Array> {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_in_w);
+        let scratch = crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout]);
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::VAE_ENCODE_IN, scratch, || {
+            conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)
+        })?;
         for db in &self.down_blocks {
             x = db.forward(&x)?;
         }
-        x = self.mid_resnet0.forward(&x, None)?;
-        x = self.mid_attn.forward(&x)?;
-        x = self.mid_resnet1.forward(&x, None)?;
-        let x = group_norm(&x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
+        x = resnet_quantum(&self.mid_resnet0, &x, false)?;
+        x = self.mid_attn.forward_quantum(&x)?;
+        resnet_quantum(&self.mid_resnet1, &x, false)
+    }
+
+    /// The output GroupNorm + SiLU + `conv_out` over the body's output.
+    fn forward_out(&self, x: &Array) -> Result<Array> {
+        let x = group_norm(x, &self.norm_out_w, &self.norm_out_b, GN_GROUPS, GN_EPS)?;
         conv2d(&silu(&x)?, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+    }
+
+    /// iOS scratch (sc-26270) of [`Self::forward_out`] at `x`'s extent and the loaded channels.
+    fn out_scratch(&self, x: &Array) -> u64 {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(&self.conv_out_w);
+        crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout])
     }
 }
 
@@ -583,6 +711,7 @@ impl Autoencoder {
 
     /// Decode latents `[B, H/8, W/8, 4]` (NHWC) → image tensor `[B, H, W, 3]` in roughly `[-1, 1]`.
     pub fn decode(&self, latents: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -595,6 +724,7 @@ impl Autoencoder {
     /// generation; this is NOT a tiled reference and does not change convolution geometry.
     /// Do not use under autograd (evaluation intentionally releases the lazy graph).
     pub fn decode_evaluated(&self, latents: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -642,6 +772,7 @@ impl Autoencoder {
         if !cfg.needs_tiling(VAE_TILING, 1, hl, wl) {
             return self.decode(latents);
         }
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let latents = self.to_compute(latents)?;
         let z = multiply(&latents, self.scale(1.0 / self.scaling_factor)?)?;
         let z = self.post_quant_proj.forward(&z)?;
@@ -665,14 +796,23 @@ impl Autoencoder {
     /// 4]` (scaled by `scaling_factor`). Mirrors the vendored `Autoencoder.encode` (returns the mean;
     /// img2img seeds from the mean, not a sample).
     pub fn encode_mean(&self, x: &Array) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let x = self.to_compute(x)?;
-        let moments = self.quant_proj.forward(&self.encoder.forward(&x)?)?;
-        // split into (mean, logvar) along the channel axis; keep the mean · scaling_factor.
-        let c = moments.shape()[3];
-        let half = c / 2;
-        let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
-        let mean = moments.take_axis(&idx, 3)?;
-        self.to_output(multiply(&mean, self.scale(self.scaling_factor)?)?)
+        let body = self.encoder.forward_body(&x)?;
+        // sc-26270: output norm/conv, `quant_conv`, the mean selection and scaling are one quantum.
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VAE_ENCODE_OUT,
+            self.encoder.out_scratch(&body),
+            || {
+                let moments = self.quant_proj.forward(&self.encoder.forward_out(&body)?)?;
+                // split into (mean, logvar) along the channel axis; keep the mean · scaling_factor.
+                let c = moments.shape()[3];
+                let half = c / 2;
+                let idx = Array::from_slice(&(0..half).collect::<Vec<i32>>(), &[half]);
+                let mean = moments.take_axis(&idx, 3)?;
+                self.to_output(multiply(&mean, self.scale(self.scaling_factor)?)?)
+            },
+        )
     }
 }
 

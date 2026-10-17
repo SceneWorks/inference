@@ -312,6 +312,11 @@ fn tiled_conv2d_3x3_impl(
             // Cast per core, not after concatenate: the full assembled image stays at storage width.
             let core = to_storage(core)?;
             core.eval()?;
+            // iOS: synchronize and drain each core before the next tile's graph is built (a no-op
+            // off device, where `core.eval()` above is the whole barrier).
+            if crate::ios_quantum::enabled() {
+                crate::ios_quantum::finish("tiled conv core", &[&core])?;
+            }
             cores.push(core);
             x0 = x1;
         }

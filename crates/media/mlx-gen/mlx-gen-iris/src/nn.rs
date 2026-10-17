@@ -327,6 +327,18 @@ impl Linear {
     pub fn is_quantized(&self) -> bool {
         self.inner.is_quantized()
     }
+
+    /// Elements of the checkpoint's weight and bias, whatever the projection is held as — what a
+    /// full f32 dequantize/promotion copy of it holds (the iOS quantum accounting's input).
+    pub fn logical_elements(&self) -> u64 {
+        let [out, input] = self.logical_shape();
+        (out as u64) * (input as u64) + self.inner.bias().map_or(0, |b| b.size() as u64)
+    }
+
+    /// Output width of the loaded projection.
+    pub fn out_features(&self) -> u64 {
+        self.logical_shape()[0] as u64
+    }
 }
 
 /// `iris3b.nn.norms.RMSNorm`: f32 normalisation, f32 gain.
@@ -346,6 +358,11 @@ impl RmsNorm {
 
     pub fn arrays(&self) -> Vec<&Array> {
         vec![&self.weight]
+    }
+
+    /// Width of the loaded gain (the normalized axis).
+    pub fn width(&self) -> u64 {
+        self.weight.size() as u64
     }
 }
 

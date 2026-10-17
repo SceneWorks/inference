@@ -750,6 +750,8 @@ dependencies = [
  "mlx-gen-iris",
  "mlx-gen-sana",
  "mlx-gen-sdxl",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

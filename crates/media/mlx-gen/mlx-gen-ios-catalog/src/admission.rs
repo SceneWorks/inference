@@ -1,11 +1,13 @@
-//! Artifact applicability is separate from measurement currency. No revision/pin freshness gate:
-//! memory evidence applies only to the hardware, provider and actual stored tensor layout measured.
+//! SANA's path-free snapshot layout identity, the `layout_sha256` of SANA evidence keys in the
+//! single table ([`crate::evidence`]). Artifact applicability is separate from measurement
+//! currency: no revision/pin freshness gate; evidence applies only to the hardware, provider and
+//! actual stored tensor layout measured.
 
 use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype};
 use mlx_gen::gen_core::{Error, LoadSpec, Precision, Result, WeightsSource};
 use sha2::{Digest, Sha256};
 
-use crate::{FootprintBound, IOS_OFFLOAD_POLICY};
+use crate::IOS_OFFLOAD_POLICY;
 
 /// Header-only memory-layout identity, independent of directory/file names and weight values.
 /// All tensor keys, shapes, storage dtypes and component membership are hashed, not just the
@@ -110,63 +112,6 @@ pub fn sana_snapshot_profile(spec: &LoadSpec) -> Result<SanaSnapshotProfile> {
     })
 }
 
-/// A capture binds its OWN footprint rows, never silently borrows historical rows. Private so an
-/// arbitrary caller/sidecar cannot manufacture admission authority from its own snapshot profile.
-struct SanaDeviceEvidence<'a> {
-    machine: &'a str,
-    provider: &'a str,
-    layout_sha256: [u8; 32],
-    footprints: &'a [(u32, u32, FootprintBound)],
-}
-
-fn applicable_bound(
-    profile: &SanaSnapshotProfile,
-    machine: &str,
-    provider: &str,
-    evidence: Option<&SanaDeviceEvidence<'_>>,
-    image: u32,
-    tile: u32,
-) -> Option<FootprintBound> {
-    let evidence = evidence?;
-    if evidence.machine != machine
-        || evidence.provider != provider
-        || evidence.layout_sha256 != profile.layout_sha256
-    {
-        return None;
-    }
-    evidence
-        .footprints
-        .iter()
-        .find(|(edge, decode, _)| *edge == image && *decode == tile)
-        .map(|(_, _, bound)| *bound)
-}
-
-/// Product admission checks the actual snapshot AND hardware/provider before returning a bound.
-/// Historical iPhone 17 observations have no recoverable artifact layout identity, so currently
-/// no product snapshot is authorized. Preserve them as planning data, not target-device evidence.
-/// A new validated capture can populate an owned, artifact-bound record here; the explicitly
-/// UNADMITTED diagnostic route is retained to collect it. Launch headroom is not such a capture.
-pub fn sana_snapshot_footprint_bound(
-    provider: &str,
-    spec: &LoadSpec,
-    machine: &str,
-    image: u32,
-    tile: u32,
-) -> Result<FootprintBound> {
-    let profile = sana_snapshot_profile(spec)?;
-    applicable_bound(&profile, machine, provider, None, image, tile).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "iOS SANA admission: no artifact-bound device footprint for {provider} on {machine}; \
-             layout {:02x?}, component bytes {:?}, embedding {:?} {:?}. Historical iPhone17 \
-             observations do not authorize this snapshot/device",
-            profile.layout_sha256,
-            profile.component_bytes,
-            profile.embedding_dtype,
-            profile.embedding_shape
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,84 +163,34 @@ mod tests {
         std::fs::write(path, file).unwrap();
     }
 
+    /// Evidence keys are exact on `layout_sha256`, so a profile that differs can never borrow
+    /// another artifact's row: dense/larger/different-dtype/different-shape/different-component
+    /// storage all change the identity, even under the same paths and the same requested q4 label.
     #[test]
     fn dense_larger_or_different_component_cannot_borrow_packed_evidence() {
         let fixture = Fixture::new();
         fixture.embedding("U32", "[7,16]", 448);
         let packed = sana_snapshot_profile(&fixture.spec()).unwrap();
-        let rows = [(1024, 192, FootprintBound::Measured(3000))];
-        let evidence = SanaDeviceEvidence {
-            machine: "iPhone17,2",
-            provider: "sana_1600m",
-            layout_sha256: packed.layout_sha256,
-            footprints: &rows,
+        let mut seen = vec![packed.layout_sha256];
+        let mut differs = |profile: SanaSnapshotProfile| {
+            assert!(
+                !seen.contains(&profile.layout_sha256),
+                "{profile:?} collides with an earlier layout"
+            );
+            seen.push(profile.layout_sha256);
         };
-        let bound = |profile: &SanaSnapshotProfile, machine, provider| {
-            applicable_bound(profile, machine, provider, Some(&evidence), 1024, 192)
-        };
-        assert_eq!(
-            bound(&packed, "iPhone17,2", "sana_1600m"),
-            Some(FootprintBound::Measured(3000))
-        );
-        assert_eq!(bound(&packed, "iPhone18,2", "sana_1600m"), None);
-        assert_eq!(bound(&packed, "iPhone17,2", "sana_sprint_1600m"), None);
-        assert_eq!(
-            applicable_bound(
-                &packed,
-                "iPhone17,2",
-                "sana_1600m",
-                Some(&evidence),
-                512,
-                192
-            ),
-            None
-        );
-        assert!(
-            sana_snapshot_footprint_bound("sana_1600m", &fixture.spec(), "iPhone17,2", 1024, 192)
-                .is_err(),
-            "unbound historical evidence cannot authorize even packed storage"
-        );
-        // Same paths and a requested q4 label cannot hide the much larger dense embedding.
         fixture.embedding("BF16", "[7,128]", 1792);
         let dense = sana_snapshot_profile(&fixture.spec()).unwrap();
         assert!(dense.component_bytes[1] > packed.component_bytes[1]);
-        assert_eq!(bound(&dense, "iPhone17,2", "sana_1600m"), None);
-        assert!(sana_snapshot_footprint_bound(
-            "sana_1600m",
-            &fixture.spec(),
-            "iPhone17,2",
-            1024,
-            192
-        )
-        .is_err());
+        differs(dense);
         fixture.embedding("F32", "[7,16]", 448); // same byte count and shape, different precision
-        assert_eq!(
-            bound(
-                &sana_snapshot_profile(&fixture.spec()).unwrap(),
-                "iPhone17,2",
-                "sana_1600m"
-            ),
-            None
-        );
+        differs(sana_snapshot_profile(&fixture.spec()).unwrap());
         fixture.embedding("U32", "[14,8]", 448); // same byte count and dtype, different shape
-        assert_eq!(
-            bound(
-                &sana_snapshot_profile(&fixture.spec()).unwrap(),
-                "iPhone17,2",
-                "sana_1600m"
-            ),
-            None
-        );
+        differs(sana_snapshot_profile(&fixture.spec()).unwrap());
         fixture.embedding("U32", "[7,32]", 896); // q8-shaped storage, not q4
-        assert_eq!(
-            bound(
-                &sana_snapshot_profile(&fixture.spec()).unwrap(),
-                "iPhone17,2",
-                "sana_1600m"
-            ),
-            None
-        );
+        differs(sana_snapshot_profile(&fixture.spec()).unwrap());
         fixture.embedding("U32", "[7,16]", 448);
+        assert_eq!(sana_snapshot_profile(&fixture.spec()).unwrap(), packed);
         write_tensor(
             &fixture.0.path().join("vae/a.safetensors"),
             "conv.weight",
@@ -303,13 +198,19 @@ mod tests {
             "[8,8]",
             128,
         );
+        differs(sana_snapshot_profile(&fixture.spec()).unwrap());
+    }
+
+    /// The identity is path-free: the same snapshot under another install directory keeps it.
+    #[test]
+    fn install_path_is_not_identity() {
+        let a = Fixture::new();
+        let b = Fixture::new();
+        a.embedding("U32", "[7,16]", 448);
+        b.embedding("U32", "[7,16]", 448);
         assert_eq!(
-            bound(
-                &sana_snapshot_profile(&fixture.spec()).unwrap(),
-                "iPhone17,2",
-                "sana_1600m"
-            ),
-            None
+            sana_snapshot_profile(&a.spec()).unwrap(),
+            sana_snapshot_profile(&b.spec()).unwrap()
         );
     }
 
@@ -336,9 +237,6 @@ mod tests {
         // SANA's quantize knob is advisory; the loader auto-detects actual on-disk storage.
         // It neither changes the memory identity nor manufactures evidence for a dense artifact.
         assert_eq!(sana_snapshot_profile(&spec).unwrap(), profile);
-        assert!(
-            sana_snapshot_footprint_bound("sana_1600m", &spec, "iPhone17,2", 1024, 192).is_err()
-        );
         write_tensor(
             &fixture.0.path().join("transformer/duplicate.safetensors"),
             "proj.weight",

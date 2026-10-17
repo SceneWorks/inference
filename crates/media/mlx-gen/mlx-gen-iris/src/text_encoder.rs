@@ -33,6 +33,17 @@ use mlx_rs::ops::{concatenate_axis, stack_axis, zeros};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
+/// Labels of the text encoder's iOS execution quanta.
+pub(crate) mod quanta {
+    pub const LOAD: &str = "Iris text encoder load";
+    pub const TOWER: &str = "Iris text tower";
+    pub const EMBEDDING: &str = "Iris text embedding";
+    pub const LAYER: &str = "Iris text layer";
+    /// Checked from inside the shared decoder stack before each layer's graph is built.
+    pub const DECODER_LAYER: &str = "Iris text decoder layer";
+    pub const CONDITIONING: &str = "Iris text conditioning";
+}
+
 /// One prompt's conditioning, as `TextEncoding` upstream.
 pub struct TextConditioning {
     /// `[1, max_length, layers, dim]` f32, pad rows zero.
@@ -180,14 +191,15 @@ impl IrisTextEncoder {
         }
 
         let files = weight_shards(dir)?;
+        if let Some(missing) = files.iter().find(|file| !file.is_file()) {
+            return Err(Error::Msg(format!(
+                "iris: the text encoder resource is incomplete — shard {} is missing",
+                missing.display()
+            )));
+        }
+        mlx_gen::ios_quantum::before_load(quanta::LOAD, &files)?;
         let mut tensors = HashMap::new();
         for file in &files {
-            if !file.is_file() {
-                return Err(Error::Msg(format!(
-                    "iris: the text encoder resource is incomplete — shard {} is missing",
-                    file.display()
-                )));
-            }
             let part = Array::load_safetensors(file).map_err(|e| {
                 Error::Msg(format!(
                     "iris: loading text-encoder shard {}: {e}",
@@ -332,43 +344,110 @@ impl IrisTextEncoder {
         Ok((self.encode_window(&window)?, warning))
     }
 
+    /// iOS floor of evaluating hidden state `k` (0 = the embedding) of an `n`-token window: one
+    /// full-attention decoder layer of the LOADED tower's geometry, plus the `k + 1` hidden states
+    /// the walk holds alive by then.
+    pub(crate) fn layer_scratch(&self, n: i32, k: usize) -> u64 {
+        let cfg = self.lm.config();
+        let hidden = cfg.hidden_size.max(0) as u64;
+        let held = (k as u64 + 1)
+            .saturating_mul(n.max(0) as u64)
+            .saturating_mul(hidden)
+            .saturating_mul(4);
+        mlx_gen::ios_quantum::transformer_layer_bytes(
+            1,
+            n.max(0) as u64,
+            hidden,
+            cfg.intermediate_size.max(0) as u64,
+            cfg.num_heads.max(0) as u64,
+            cfg.head_dim.max(0) as u64,
+        )
+        .saturating_add(held)
+    }
+
+    /// Decoder layers in the loaded tower (each one gated before construction on iOS).
+    #[cfg(test)]
+    pub(crate) fn lm_config_layers(&self) -> usize {
+        self.lm.config().num_layers
+    }
+
     /// Run the tower over an assembled window.
     pub fn encode_window(&self, window: &TextWindow) -> Result<TextConditioning> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let n = window.input_ids.len() as i32;
         let ids = Array::from_slice(&window.input_ids, &[1, n]);
-        let mut cache = self.lm.new_cache();
-        let states = self
-            .lm
-            .hidden_states(&ids, &mut cache, 0)
-            .map_err(from_llm)?;
-        // One command buffer per layer: the returned handles are a single lazy graph.
         let deepest = *self.hidden_layers.last().unwrap_or(&0);
-        for state in states.iter().take(deepest + 1) {
-            eval([state])?;
+        // The whole walk's floor (one layer plus every state it holds), checked before the shared
+        // decoder builds anything: a window longer than the decoder's prefill checkpoint
+        // (`mlx_llm`'s 256 rows) is evaluated layer by layer INSIDE `hidden_states`, before the
+        // per-layer checks below can run.
+        mlx_gen::ios_quantum::before(quanta::TOWER, self.layer_scratch(n, deepest))?;
+        let mut cache = self.lm.new_cache();
+        // Every decoder layer is ALSO checked against live headroom before its graph is built, from
+        // inside the shared decoder stack (which evaluates long windows layer by layer itself).
+        let states = if mlx_gen::ios_quantum::enabled() {
+            let scratch: Vec<u64> = (0..=self.lm.config().num_layers)
+                .map(|k| self.layer_scratch(n, k + 1))
+                .collect();
+            mlx_llm::layer_gate::with_layer_gate(
+                move |layer| {
+                    mlx_gen::ios_quantum::before(
+                        quanta::DECODER_LAYER,
+                        scratch.get(layer).copied().unwrap_or(u64::MAX),
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                || self.lm.hidden_states(&ids, &mut cache, 0),
+            )
+        } else {
+            self.lm.hidden_states(&ids, &mut cache, 0)
         }
+        .map_err(from_llm)?;
+        // One command buffer per layer: the returned handles are a single lazy graph. On a
+        // physical iOS device each layer is also a checked, synchronized and drained quantum.
+        for (k, state) in states.iter().take(deepest + 1).enumerate() {
+            let label = if k == 0 {
+                quanta::EMBEDDING
+            } else {
+                quanta::LAYER
+            };
+            mlx_gen::ios_quantum::before(label, self.layer_scratch(n, k))?;
+            eval([state])?;
+            mlx_gen::ios_quantum::finish(label, &[state])?;
+        }
+        mlx_gen::ios_quantum::finish(quanta::TOWER, &[])?;
         let start = window.prefix_len as i32;
-        let picked: Vec<Array> = self
-            .hidden_layers
-            .iter()
-            .map(|&k| -> Result<Array> {
-                let state = states
-                    .get(k)
-                    .ok_or_else(|| Error::Msg(format!("iris: hidden state {k} not returned")))?;
-                Ok(state
-                    .split_axis(&[start], 1)?
-                    .swap_remove(1)
-                    .as_dtype(Dtype::Float32)?)
-            })
-            .collect::<Result<_>>()?;
-        let stacked = stack_axis(&picked, 2)?; // [1, real, layers, dim]
         let real = window.window_tokens() as i32;
         let pad = self.max_length as i32 - real;
-        let states = if pad > 0 {
-            let zeros = zeros::<f32>(&[1, pad, self.hidden_layers.len() as i32, self.dim as i32])?;
-            concatenate_axis(&[&stacked, &zeros], 1)?
-        } else {
-            stacked
-        };
+        let layers = self.hidden_layers.len() as u64;
+        // The picked f32 slices, their stack, the zero pad and the padded copy: four windows.
+        let conditioning_bytes = (self.max_length as u64)
+            .saturating_mul(layers)
+            .saturating_mul(self.dim as u64)
+            .saturating_mul(4 * 4);
+        let states = mlx_gen::ios_quantum::run(quanta::CONDITIONING, conditioning_bytes, || {
+            let picked: Vec<Array> = self
+                .hidden_layers
+                .iter()
+                .map(|&k| -> Result<Array> {
+                    let state = states.get(k).ok_or_else(|| {
+                        Error::Msg(format!("iris: hidden state {k} not returned"))
+                    })?;
+                    Ok(state
+                        .split_axis(&[start], 1)?
+                        .swap_remove(1)
+                        .as_dtype(Dtype::Float32)?)
+                })
+                .collect::<Result<_>>()?;
+            let stacked = stack_axis(&picked, 2)?; // [1, real, layers, dim]
+            Ok(if pad > 0 {
+                let zeros =
+                    zeros::<f32>(&[1, pad, self.hidden_layers.len() as i32, self.dim as i32])?;
+                concatenate_axis(&[&stacked, &zeros], 1)?
+            } else {
+                stacked
+            })
+        })?;
         eval([&states])?;
         Ok(TextConditioning {
             states,

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Catalog-driven, cold-process iOS evidence collection. Listing never launches a device."""
+"""Catalog-driven, cold-process iOS evidence collection. Listing never launches a device.
+
+`run` exercises ADMISSION against the reviewed evidence table. `capture` is the explicitly
+labelled bounded DEVICE CAPTURE (no evidence needed; every quantum checks live headroom before
+constructing its graph): it walks each selected model/route/tier/mode/rung up the edge ladder and
+stops at the first case that is not a completed capture. A `capture_refused` row is the typed
+"next size refused before jetsam" evidence. `evidence` turns completed capture rows into candidate
+rows for crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json; it only
+prints them. Admission changes only through a human-reviewed commit of that table."""
 import argparse
 import json
 import math
@@ -15,7 +23,9 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 TIERS = ("q4", "q8", "bf16")
 EDGES = (256, 512, 768, 1024, 1280)
-STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "skipped"}
+STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
+REFUSAL_KINDS = ("capacity", "no_evidence", "mode", "strategy", "artifact")
+EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json"
 
 
 def case_key(value):
@@ -39,7 +49,7 @@ def positive(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("list", "run", "table"))
+    p.add_argument("action", choices=("list", "run", "table", "capture", "evidence"))
     p.add_argument("--catalog", type=Path)
     for name in ("provider", "route", "mode"):
         p.add_argument("--" + name)
@@ -132,10 +142,12 @@ def parse_report(text, key):
     if row.get("schema") != 1 or row.get("case") != key or not isinstance(status, str) or status not in STATUSES:
         return failure(key, "stale or malformed case identity/status")
     success = status == "successful"
-    if row.get("production_success") is not success or (row.get("diagnostic") and success) or (status == "diagnostic_success" and row.get("diagnostic") is not True):
+    if row.get("production_success") is not success or (row.get("diagnostic") and success) or (status in ("diagnostic_success", "capture_refused") and row.get("diagnostic") is not True):
         return failure(key, "inconsistent status/admission accounting")
-    if status == "admitted_refused" and row.get("refusal_kind") not in ("capacity", "no_evidence", "mode", "strategy"):
+    if status == "admitted_refused" and row.get("refusal_kind") not in REFUSAL_KINDS:
         return failure(key, "missing typed refusal kind")
+    if status == "capture_refused" and (row.get("refusal_kind") != "capacity" or not isinstance(row.get("refused_quantum"), dict) or row.get("evidence_class") != "capture"):
+        return failure(key, "capture refusal without its typed quantum record")
     if success:
         for name in ("elapsed_seconds", "mlx_active_peak_bytes", "mlx_cache_peak_bytes", "mlx_active_cache_peak_bytes", "mlx_peak_bytes", "phys_footprint_peak_bytes", "kernel_lifetime_phys_footprint_peak_bytes", "min_headroom_mib"):
             value = row.get(name)
@@ -294,6 +306,9 @@ def render(rows):
             return "unavailable" if v is None else f"{v / scale:.2f}"
         cols = [metric("elapsed_seconds")] + [metric(n, 1048576) for n in ("mlx_active_peak_bytes", "mlx_cache_peak_bytes", "mlx_active_cache_peak_bytes", "mlx_peak_bytes", "phys_footprint_peak_bytes", "kernel_lifetime_phys_footprint_peak_bytes")] + [metric("min_headroom_mib")]
         lines.append("| " + " | ".join([r["case"], "yes" if r.get("refusal_only") else "no", r["status"] + "/" + str(r.get("refusal_kind")), *cols]) + " |")
+        quantum = r.get("refused_quantum")
+        if isinstance(quantum, dict):
+            lines.append(f"|   refused before construction: {quantum.get('label')} needs {quantum.get('scratch_bytes')} + reserve {quantum.get('reserve_bytes')} B, live {quantum.get('available_bytes')} B | | | | | | | | | | |")
     groups = {}
     for r in rows:
         fields = r["case"].split("/")
@@ -302,12 +317,78 @@ def render(rows):
             groups[group] = max(groups.get(group, 0), int(fields[3]))
     lines.append("\nLargest admitted completed edges (diagnostics excluded): " + json.dumps(groups, sort_keys=True))
     lines.append("Capacity-refused next-up probes: " + json.dumps([r["case"] for r in rows if r.get("refusal_only") and capacity_refusal(r)]))
+    captured = {}
+    for r in rows:
+        fields = r["case"].split("/")
+        group = "/".join(fields[:3] + fields[4:])
+        if r["status"] == "diagnostic_success" and r.get("evidence_class") == "capture":
+            captured.setdefault(group, {})["largest_completed_edge"] = max(captured.get(group, {}).get("largest_completed_edge", 0), int(fields[3]))
+        elif r["status"] == "capture_refused":
+            captured.setdefault(group, {})["refused_before_jetsam_edge"] = int(fields[3])
+    lines.append("CAPTURE (diagnostic, not admission) ladders: " + json.dumps(captured, sort_keys=True))
     return "\n".join(lines)
+
+
+def ladders(keys):
+    """Selected keys grouped by everything but the edge, each group ascending by edge."""
+    groups = {}
+    for key in keys:
+        fields = key.split("/")
+        groups.setdefault(tuple(fields[:3] + fields[4:]), []).append(key)
+    return [sorted(group, key=lambda k: int(k.split("/")[3])) for _, group in sorted(groups.items())]
+
+
+def capture(args, keys, output):
+    """Walk each ladder upward; stop a ladder at its first case that is not a completed capture.
+    A quantum refusal there is the next-size-refused evidence; a failure stops it too. No retries,
+    no cap change."""
+    rows = []
+    session = DeviceSession(args)
+    session.install()
+    executed = 0
+    for ladder in ladders(keys):
+        for key in ladder:
+            if executed >= args.max_cases or session.blocked:
+                row = dict(failure(key, "execution budget reached or prior device exit unverified"), status="skipped")
+            else:
+                executed += 1
+                row = invoke(session, key)
+            output.write(json.dumps(row) + "\n")
+            output.flush()
+            rows.append(row)
+            if row["status"] != "diagnostic_success":
+                break
+    return rows
+
+
+def evidence_rows(rows):
+    """Candidate evidence-table rows from COMPLETED captures with full device telemetry. Printed for
+    review; never written to the table."""
+    out = []
+    for r in rows:
+        key = r.get("evidence_key")
+        peak = r.get("kernel_lifetime_phys_footprint_peak_bytes")
+        if r.get("status") != "diagnostic_success" or r.get("evidence_class") != "capture" or not isinstance(key, dict):
+            continue
+        values = [peak, r.get("mlx_peak_bytes"), r.get("min_headroom_mib"), r.get("elapsed_seconds")]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values) or not peak:
+            continue
+        out.append({"key": key, "footprint_bytes": int(peak), "mlx_peak_bytes": int(r["mlx_peak_bytes"]),
+                    "min_headroom_mib": float(r["min_headroom_mib"]), "elapsed_seconds": float(r["elapsed_seconds"]),
+                    "evidence_class": "device_capture", "run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or "")})
+    return out
 
 
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    if args.action == "evidence":
+        if not args.input:
+            p.error("evidence requires --input (capture output)")
+        rows = [json.loads(line) for line in args.input.read_text(encoding="utf-8").splitlines() if line]
+        print(f"# Candidate rows for {EVIDENCE_TABLE}. Review, then commit by hand; capture never changes admission.")
+        print(json.dumps(evidence_rows(rows), indent=2))
+        return 0
     if args.action == "table":
         if not args.input:
             p.error("table requires --input")
@@ -324,6 +405,14 @@ def main(argv=None):
         p.error("run requires explicit --device and new --output")
     if not args.all_cases and not args.case and not any((args.provider, args.route, args.tier, args.edge, args.mode, args.rung is not None)):
         p.error("run requires selectors or --all-cases")
+    if args.action == "capture":
+        if args.next_edge is not None or args.edge is not None or args.case:
+            p.error("capture walks the edge ladder itself; no --edge/--case/--next-edge")
+        args.diagnostic = True
+        with args.output.open("x", encoding="utf-8") as output:
+            rows = capture(args, keys, output)
+        print(render(rows))
+        return 0 if rows and all(r["status"] in ("diagnostic_success", "capture_refused") for r in rows) else 2
     if args.next_edge is not None and args.diagnostic:
         p.error("next-up refusal proof must use admitted mode, not diagnostics")
     if args.next_edge is not None and any(args.next_edge <= int(key.split("/")[3]) for key in keys):

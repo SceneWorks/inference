@@ -25,6 +25,7 @@ use std::path::Path;
 
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
+use mlx_gen::gen_core::sdxl_ldm::SdxlComponent as SdxlLdmComponent;
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
 
 use crate::config::{DiffusionConfig, UNetConfig};
@@ -423,23 +424,50 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             &[LDM_TOKENIZER_COMPONENT, loader::VAE_FP16_FIX_COMPONENT],
             MODEL_ID,
         )?;
-        let tokenizer_root = match spec.components.get(LDM_TOKENIZER_COMPONENT) {
-            Some(WeightsSource::Dir(path)) => path,
-            Some(WeightsSource::File(path)) => {
-                return Err(Error::Msg(format!(
-                    "sdxl: imported fused checkpoint component '{LDM_TOKENIZER_COMPONENT}' must be a directory, got {}",
-                    path.display()
-                )))
-            }
-            None => {
-                return Err(Error::Msg(format!(
-                    "sdxl: imported fused checkpoint requires caller-staged '{LDM_TOKENIZER_COMPONENT}' tokenizer assets"
-                )))
-            }
-        };
-        return load_from_ldm_file(spec, tokenizer_root);
+        return load_from_ldm_file(spec, tokenizer_root(spec)?);
     }
     Ok(Box::new(load_concrete(spec)?))
+}
+
+/// The directory whose `tokenizer/` the generator [`load`]ed for `spec` reads: the snapshot root
+/// of a diffusers directory, or the caller-staged [`LDM_TOKENIZER_COMPONENT`] directory of a fused
+/// single-file checkpoint. The one resolution both [`load`] and [`conditioning_window_count`] use.
+fn tokenizer_root(spec: &LoadSpec) -> Result<&Path> {
+    match &spec.weights {
+        WeightsSource::Dir(root) => Ok(root),
+        WeightsSource::File(_) => match spec.components.get(LDM_TOKENIZER_COMPONENT) {
+            Some(WeightsSource::Dir(path)) => Ok(path),
+            Some(WeightsSource::File(path)) => Err(Error::Msg(format!(
+                "sdxl: imported fused checkpoint component '{LDM_TOKENIZER_COMPONENT}' must be a directory, got {}",
+                path.display()
+            ))),
+            None => Err(Error::Msg(format!(
+                "sdxl: imported fused checkpoint requires caller-staged '{LDM_TOKENIZER_COMPONENT}' tokenizer assets"
+            ))),
+        },
+    }
+}
+
+/// How many 77-token CLIP windows a generate under `spec` encodes `prompt` (and, when CFG is on,
+/// `negative`) into — the long-prompt window count (sc-20528) the iOS admission keys evidence on
+/// (sc-26270). Pass `negative` exactly as `generate` does: `Some(negative_prompt or "")` when the
+/// request's guidance enables CFG, `None` otherwise.
+///
+/// Weights-free: it reads only the tokenizer's `vocab.json` / `merges.txt`, resolved exactly as the
+/// generator's load path resolves them for `spec`, never a tensor payload, and builds no array.
+pub fn conditioning_window_count(
+    spec: &LoadSpec,
+    prompt: &str,
+    negative: Option<&str>,
+) -> Result<u32> {
+    let tokenizer = loader::load_tokenizer(tokenizer_root(spec)?)?;
+    let mut rows = vec![tokenizer.tokenize(prompt)?];
+    if let Some(negative) = negative {
+        rows.push(tokenizer.tokenize(negative)?);
+    }
+    let plan = crate::long_prompt::ChunkPlan::from_tokenizer(&tokenizer)?;
+    u32::try_from(crate::long_prompt::common_chunks(&plan, &rows))
+        .map_err(|_| Error::Msg("sdxl: CLIP window count overflows u32".into()))
 }
 
 /// Construct the concrete generator for the correctness-only production-latent admission harness.
@@ -595,6 +623,11 @@ pub(crate) fn build_ldm_residency(
         move || {
             warm_spec.read_prepared_files_unchanged(|| {
                 warm_file.read_unchanged(|file| {
+                    crate::ldm::before_component_load(
+                        "SDXL LDM text load",
+                        file,
+                        &[SdxlLdmComponent::ClipL, SdxlLdmComponent::ClipBigG],
+                    )?;
                     let crate::ldm::LdmComponents {
                         unet,
                         clip_l,
@@ -602,6 +635,11 @@ pub(crate) fn build_ldm_residency(
                         vae,
                     } = crate::ldm::split_ldm_checkpoint(file)?;
                     let text = build_ldm_text(clip_l, clip_bigg, warm_spec.quantize)?;
+                    crate::ldm::before_component_load(
+                        "SDXL LDM UNet+VAE load",
+                        file,
+                        ldm_heavy_components(&warm_spec),
+                    )?;
                     let heavy = build_ldm_heavy(&warm_spec, unet, vae, true)?;
                     Ok::<_, Error>((text, heavy))
                 })
@@ -609,6 +647,11 @@ pub(crate) fn build_ldm_residency(
         },
         move || {
             text_file.read_unchanged(|file| {
+                crate::ldm::before_component_load(
+                    "SDXL LDM text load",
+                    file,
+                    &[SdxlLdmComponent::ClipL, SdxlLdmComponent::ClipBigG],
+                )?;
                 let crate::ldm::LdmComponents {
                     clip_l, clip_bigg, ..
                 } = crate::ldm::split_ldm_checkpoint(file)?;
@@ -618,6 +661,11 @@ pub(crate) fn build_ldm_residency(
         move |load_pid| {
             heavy_spec.read_prepared_files_unchanged(|| {
                 heavy_file.read_unchanged(|file| {
+                    crate::ldm::before_component_load(
+                        "SDXL LDM UNet+VAE load",
+                        file,
+                        ldm_heavy_components(&heavy_spec),
+                    )?;
                     let crate::ldm::LdmComponents { unet, vae, .. } =
                         crate::ldm::split_ldm_checkpoint(file)?;
                     build_ldm_heavy(&heavy_spec, unet, vae, load_pid)
@@ -625,6 +673,16 @@ pub(crate) fn build_ldm_residency(
             })
         },
     )
+}
+
+/// The fused-file components the heavy LDM phase constructs: the U-Net always, and the fused VAE
+/// only when no staged fp16-fix VAE replaces it (that one is checked by its own loader).
+fn ldm_heavy_components(spec: &LoadSpec) -> &'static [SdxlLdmComponent] {
+    if spec.components.contains_key(loader::VAE_FP16_FIX_COMPONENT) {
+        &[SdxlLdmComponent::Unet]
+    } else {
+        &[SdxlLdmComponent::Unet, SdxlLdmComponent::Vae]
+    }
 }
 
 fn build_ldm_text(
@@ -1037,6 +1095,9 @@ impl Sdxl {
         mut final_latent_observer: Option<FinalLatentObserver<'_>>,
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // sc-26270: the request's iOS quantum scope (cache policy for the whole generate, every
+        // component load and quantum inside it). A no-op off device.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
 
         let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
         let is_accel = ACCEL_SAMPLERS.contains(&sampler_name);

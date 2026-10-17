@@ -120,6 +120,19 @@ impl ClipEncoderLayer {
         }
     }
 
+    /// iOS quantum scratch (sc-26270) of this layer over `b` rows of `n` tokens, from the loaded
+    /// widths: hidden from `layer_norm1`, MLP width from `fc1`, heads/head_dim from the config.
+    fn quantum_scratch(&self, b: i32, n: i32) -> u64 {
+        crate::quantum::clip_layer(
+            b,
+            n,
+            self.ln1_w.shape()[0] as u64,
+            crate::quantum::linear_out(&self.linear1),
+            self.num_heads,
+            self.head_dim,
+        )
+    }
+
     /// `x`: `[B, N, D]`; `mask`: additive causal `[1, 1, N, N]`.
     fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
         // Self-attention (pre-norm, residual).
@@ -249,23 +262,39 @@ impl ClipTextEncoder {
                 "sdxl clip: sequence length {n} exceeds position-embedding capacity {max_pos}"
             )));
         }
+        // sc-26270: embeddings, each layer, and the final norm + pooled token are guarded iOS
+        // quanta (pass-throughs off device). The non-layer quanta take the widest layer's floor.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let scratch = self
+            .layers
+            .iter()
+            .map(|layer| layer.quantum_scratch(b, n))
+            .max()
+            .unwrap_or_else(|| crate::quantum::clip_layer(b, n, dim as u64, 0, 0, 0));
 
         // Token + position embeddings. `position_embedding.weight[:N]` broadcast over the batch.
-        let ids_flat = input_ids.reshape(&[b * n])?;
-        let tok = self
-            .token_embedding
-            .take_axis(&ids_flat, 0)?
-            .reshape(&[b, n, dim])?;
-        let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-        let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
-        let mut x = add(&tok, &pos.reshape(&[1, n, dim])?)?;
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, scratch, || {
+            let ids_flat = input_ids.reshape(&[b * n])?;
+            let tok = self
+                .token_embedding
+                .take_axis(&ids_flat, 0)?
+                .reshape(&[b, n, dim])?;
+            let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+            let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
+            Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
+        })?;
 
         let mask = causal_mask(n, x.dtype())?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            x = layer.forward(&x, &mask)?;
+            x = mlx_gen::ios_quantum::run(
+                crate::quantum::CLIP_LAYER,
+                layer.quantum_scratch(b, n),
+                || layer.forward(&x, &mask),
+            )?;
             hidden_states.push(x.clone());
         }
+        mlx_gen::ios_quantum::before(crate::quantum::CLIP_POOLED, scratch)?;
         let last_hidden_state =
             layer_norm(&x, Some(&self.final_ln_w), Some(&self.final_ln_b), LN_EPS)?;
 
@@ -285,6 +314,7 @@ impl ClipTextEncoder {
             Some(p) => p.forward(&pooled)?,
             None => pooled,
         };
+        mlx_gen::ios_quantum::finish(crate::quantum::CLIP_POOLED, &[&last_hidden_state, &pooled])?;
 
         Ok(ClipOutput {
             last_hidden_state,

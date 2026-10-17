@@ -21,6 +21,36 @@ use mlx_gen::Result;
 /// `vae` module imports this rather than redefining it.
 pub(super) const NORM_EPS: f32 = 1e-12;
 
+/// iOS decode-quantum labels (see [`mlx_gen::ios_quantum`]). Stable identifiers: a capture reads
+/// them off a typed refusal.
+pub const DECODE_RESNET_QUANTUM: &str = "Qwen VAE decode resnet";
+pub const DECODE_ATTENTION_QUANTUM: &str = "Qwen VAE decode attention";
+pub const DECODE_UPSAMPLE_QUANTUM: &str = "Qwen VAE decode upsample";
+
+/// One decoder sub-stage as an iOS execution quantum: [`mlx_gen::ios_quantum::conv_stage_bytes`] at
+/// the stage's OUTPUT spatial extent (`spatial_growth` = 2 for an upsampler) and its widest channel
+/// count (input or the loaded output width), plus `extra` (an attention's score floor). `x` is
+/// NCTHW, so batch·frames is the conv batch. Checked BEFORE `build` constructs the graph; a
+/// pass-through everywhere except a physical iOS device or the CPU diagnostic fixture.
+pub(super) fn decode_quantum(
+    label: &str,
+    x: &Array,
+    out_channels: i32,
+    spatial_growth: u64,
+    extra: u64,
+    build: impl FnOnce() -> Result<Array>,
+) -> Result<Array> {
+    let sh = x.shape();
+    let scratch = mlx_gen::ios_quantum::conv_stage_bytes(
+        (sh[0].max(0) as u64).saturating_mul(sh[2].max(0) as u64),
+        (sh[3].max(0) as u64).saturating_mul(spatial_growth),
+        (sh[4].max(0) as u64).saturating_mul(spatial_growth),
+        sh[1].max(out_channels).max(0) as u64,
+    )
+    .saturating_add(extra);
+    mlx_gen::ios_quantum::run(label, scratch, build)
+}
+
 /// Channel-L2 normalization over axis 1: `x / max(‖x‖₂ over C, eps) · √C · weight`.
 /// `weight` is 1-D `(C,)`; `x` is any rank with the channel axis at index 1 (NCTHW or NCHW).
 pub fn rms_norm_channels(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
@@ -54,6 +84,11 @@ impl CausalConv3d {
             b: w.require(&format!("{prefix}.conv3d.bias"))?.clone(),
             padding,
         })
+    }
+
+    /// Output channels of the loaded kernel (`[out, kD, kH, kW, in]`).
+    pub(super) fn out_channels(&self) -> i32 {
+        self.w.shape()[0]
     }
 
     pub fn forward(&self, x_ncthw: &Array) -> Result<Array> {
@@ -106,6 +141,18 @@ impl ResBlock3D {
         })
     }
 
+    /// [`forward`](Self::forward) as one decode quantum.
+    fn forward_decode(&self, x: &Array) -> Result<Array> {
+        decode_quantum(
+            DECODE_RESNET_QUANTUM,
+            x,
+            self.conv2.out_channels(),
+            1,
+            0,
+            || self.forward(x),
+        )
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let h = rms_norm_channels(x, &self.norm1, NORM_EPS)?;
         let h = self.conv1.forward(&silu(&h)?)?;
@@ -138,6 +185,36 @@ impl AttentionBlock3D {
             proj_w: w.require(&format!("{prefix}.proj.weight"))?.clone(),
             proj_b: w.require(&format!("{prefix}.proj.bias"))?.clone(),
         })
+    }
+
+    /// [`forward`](Self::forward) as one decode quantum: the conv-stage floor plus the single-head
+    /// `H·W x H·W` score floor of this block's loaded projections.
+    fn forward_decode(&self, x_ncthw: &Array) -> Result<Array> {
+        let sh = x_ncthw.shape();
+        let tokens = (sh[3].max(0) as u64).saturating_mul(sh[4].max(0) as u64);
+        let scores = mlx_gen::ios_quantum::attention_block_bytes(
+            mlx_gen::ios_quantum::AttentionBlockGeometry {
+                batch: (sh[0].max(0) as u64).saturating_mul(sh[2].max(0) as u64),
+                tokens,
+                dim: sh[1].max(0) as u64,
+                heads: 1,
+                context_tokens: 0,
+                ff_hidden: 0,
+                query_rows: tokens,
+                weight_elements: [&self.qkv_w, &self.qkv_b, &self.proj_w, &self.proj_b]
+                    .iter()
+                    .map(|a| a.size() as u64)
+                    .sum(),
+            },
+        );
+        decode_quantum(
+            DECODE_ATTENTION_QUANTUM,
+            x_ncthw,
+            self.proj_w.shape()[0],
+            1,
+            scores,
+            || self.forward(x_ncthw),
+        )
     }
 
     pub fn forward(&self, x_ncthw: &Array) -> Result<Array> {
@@ -189,6 +266,18 @@ impl Resample3d {
         })
     }
 
+    /// [`forward`](Self::forward) as one decode quantum, priced at the resampled extent.
+    fn forward_decode(&self, x_ncthw: &Array) -> Result<Array> {
+        decode_quantum(
+            DECODE_UPSAMPLE_QUANTUM,
+            x_ncthw,
+            self.conv_w.shape()[0],
+            if self.upsample { 2 } else { 1 },
+            0,
+            || self.forward(x_ncthw),
+        )
+    }
+
     pub fn forward(&self, x_ncthw: &Array) -> Result<Array> {
         let sh = x_ncthw.shape();
         let (b, c, t, h, w) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
@@ -233,6 +322,13 @@ impl MidBlock3D {
         let x = self.resnet0.forward(x)?;
         let x = self.attn.forward(&x)?;
         self.resnet1.forward(&x)
+    }
+
+    /// The decoder's [`forward`](Self::forward), one iOS quantum per resnet/attention.
+    pub(super) fn forward_decode(&self, x: &Array) -> Result<Array> {
+        let x = self.resnet0.forward_decode(x)?;
+        let x = self.attn.forward_decode(&x)?;
+        self.resnet1.forward_decode(&x)
     }
 }
 
@@ -322,6 +418,18 @@ impl UpBlock3D {
         }
         if let Some(u) = &self.upsampler {
             x = u.forward(&x)?;
+        }
+        Ok(x)
+    }
+
+    /// The decoder's [`forward`](Self::forward), one iOS quantum per resnet/upsampler.
+    pub(super) fn forward_decode(&self, x: &Array) -> Result<Array> {
+        let mut x = x.clone();
+        for r in &self.resnets {
+            x = r.forward_decode(&x)?;
+        }
+        if let Some(u) = &self.upsampler {
+            x = u.forward_decode(&x)?;
         }
         Ok(x)
     }

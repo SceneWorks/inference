@@ -35,6 +35,13 @@ const BACKBONE_PREFIX: &str = "pixel.";
 const REDUCER_WEIGHT: &str = "depth_reducer.weight";
 const REDUCER_BIAS: &str = "depth_reducer.bias";
 
+/// Labels of the depth task's own iOS execution quanta (the backbone's are [`crate::dit`]'s).
+pub(crate) mod quanta {
+    pub const LOAD: &str = "Iris depth load";
+    pub const INPUT: &str = "Iris depth input";
+    pub const REDUCER: &str = "Iris depth reducer";
+}
+
 /// A loaded Iris-3B depth model.
 pub struct IrisDepth {
     export: TaskExport,
@@ -87,6 +94,7 @@ pub fn load_depth(spec: &LoadSpec) -> Result<IrisDepth> {
 pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth> {
     let model = &export.config.model;
     let path = export.weights_path();
+    mlx_gen::ios_quantum::before_load(quanta::LOAD, &[path.clone(), export.empty_prompt_path()])?;
     let mut source = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     let mut keys: Vec<String> = source.keys().map(str::to_owned).collect();
@@ -202,6 +210,22 @@ pub fn depth_forward_hooked(
 ) -> Result<Array> {
     let sh = rgb.shape();
     let (b, h, w) = (sh[0], sh[2], sh[3]);
+    let channels = sh[1] + DEPTH_EXTRA_INPUT_CHANNELS as i32;
+    let e = parts.embeddings.shape();
+    // The f32 RGB copy, the zero channel and their concatenation; the broadcast prompt states.
+    let pixel_elements = [b, channels, h, w]
+        .iter()
+        .map(|&d| d.max(0) as u64)
+        .product::<u64>();
+    let state_elements = [b, e[1], e[2], e[3]]
+        .iter()
+        .map(|&d| d.max(0) as u64)
+        .product::<u64>();
+    let input_bytes = pixel_elements
+        .saturating_mul(3)
+        .saturating_add(state_elements)
+        .saturating_mul(4);
+    mlx_gen::ios_quantum::before(quanta::INPUT, input_bytes)?;
     let x = concatenate_axis(
         &[
             &rgb.as_dtype(Dtype::Float32)?,
@@ -211,8 +235,8 @@ pub fn depth_forward_hooked(
     )?;
     let t_model = parts.num_train_timesteps as f32;
     let t = Array::from_slice(&vec![t_model; b as usize], &[b]);
-    let e = parts.embeddings.shape();
     let states = mlx_rs::ops::broadcast_to(parts.embeddings, &[b, e[1], e[2], e[3]])?;
+    mlx_gen::ios_quantum::finish(quanta::INPUT, &[&x, &states])?;
     let mask = vec![parts.mask.to_vec(); b as usize];
     let out = parts.dit.forward_hooked(
         &x,
@@ -226,18 +250,25 @@ pub fn depth_forward_hooked(
     // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
     // runs in the compute dtype like every other projection.
     let c = out.shape()[1];
-    let pixels = out
-        .transpose_axes(&[0, 2, 3, 1])?
-        .reshape(&[-1, c])?
-        .as_dtype(parts.dit.compute_dtype())?;
-    let reduced = addmm(
-        parts.reducer_bias,
-        &pixels,
-        parts.reducer_weight.t(),
-        1.0,
-        1.0,
-    )?;
-    Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
+    // The transposed and cast pixel rows, the reduced map and its f32 copy.
+    let reducer_bytes = (out.size() as u64)
+        .saturating_mul(3)
+        .saturating_add((parts.reducer_weight.size() + parts.reducer_bias.size()) as u64)
+        .saturating_mul(4);
+    mlx_gen::ios_quantum::run(quanta::REDUCER, reducer_bytes, || {
+        let pixels = out
+            .transpose_axes(&[0, 2, 3, 1])?
+            .reshape(&[-1, c])?
+            .as_dtype(parts.dit.compute_dtype())?;
+        let reduced = addmm(
+            parts.reducer_bias,
+            &pixels,
+            parts.reducer_weight.t(),
+            1.0,
+            1.0,
+        )?;
+        Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
+    })
 }
 
 impl IrisDepth {
@@ -291,6 +322,7 @@ impl IrisDepth {
             Dtype::Float32 => "float32",
             _ => "bfloat16",
         };
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         estimate_with(
             req,
             self.export.config.model.patch_size,

@@ -109,6 +109,51 @@ pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
     })
 }
 
+/// iOS pre-load floor (sc-26270) for constructing `components` out of the fused checkpoint at
+/// `path`: the stored bytes of every tensor that remaps into one of them (plus the VAE's f32 cast
+/// copies), plus the largest such tensor as read/copy scratch — `mlx_gen::ios_quantum::before_load`'s accounting, restricted to the
+/// components this phase actually builds (a fused file also carries the others). Header-only; a
+/// no-op (no file read) off device.
+pub(crate) fn before_component_load(
+    label: &str,
+    path: &Path,
+    components: &[SdxlComponent],
+) -> Result<()> {
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let mut total = 0u64;
+    let mut largest = 0u64;
+    for header in mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|e| Error::Msg(e.to_string()))?
+    {
+        let component = match remap_sdxl_ldm_key(&header.name) {
+            Some(
+                TensorRemap::Rename(component, _)
+                | TensorRemap::Transpose(component, _)
+                | TensorRemap::Squeeze(component, _)
+                | TensorRemap::SplitQkv(component, _),
+            ) => component,
+            None => continue,
+        };
+        if components.contains(&component) {
+            total = total.saturating_add(header.data_bytes);
+            largest = largest.max(header.data_bytes);
+            // The VAE is upcast to f32 after it is read (`load_vae_from_weights`): its f32 copy
+            // is live beside the stored tensor.
+            if component == SdxlComponent::Vae {
+                let cast = header
+                    .shape
+                    .iter()
+                    .fold(4u64, |a, &d| a.saturating_mul(d as u64));
+                total = total.saturating_add(cast);
+                largest = largest.max(cast);
+            }
+        }
+    }
+    mlx_gen::ios_quantum::before(label, total.saturating_add(largest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

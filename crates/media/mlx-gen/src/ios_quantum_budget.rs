@@ -1,4 +1,5 @@
-//! SANA/Gemma iOS diagnostic quantum accounting. These are conservative tensor scratch floors,
+//! iOS diagnostic quantum accounting (SANA/Gemma, and the generic transformer/attention/conv
+//! floors Anima, Iris and SDXL price their quanta with). These are conservative tensor scratch floors,
 //! not a total-process or Metal-driver upper bound. They never authorize production admission.
 
 pub const PROCESS_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -14,6 +15,20 @@ fn sum(values: &[u64]) -> u64 {
 /// eight MLP and twelve QKV buffers cover norm, residual, gated activation and GQA copies.
 /// Also price full f32 projection copies, even when packed kernels do not need them.
 pub fn gemma_layer_bytes(b: u64, l: u64, h: u64, intermediate: u64, heads: u64, hd: u64) -> u64 {
+    transformer_layer_bytes(b, l, h, intermediate, heads, hd)
+}
+
+/// One full-attention transformer layer of any text encoder (Gemma, Qwen3, CLIP, T5-style): the
+/// Gemma accounting above, which already prices `L x L` scores, every hidden/MLP/QKV copy and
+/// full f32 projection copies.
+pub fn transformer_layer_bytes(
+    b: u64,
+    l: u64,
+    h: u64,
+    intermediate: u64,
+    heads: u64,
+    hd: u64,
+) -> u64 {
     sum(&[
         product(&[8, b, heads, l, l, 4]),
         product(&[24, b, l, h, 4]),
@@ -62,7 +77,55 @@ pub fn sana_block_bytes(g: SanaBlockGeometry) -> u64 {
 /// f32 weight/copy allowance covering GLUMBConv (12*C*C), QKV, multiscale and conv scratch.
 /// Upsample callers price the DOUBLED spatial extent before constructing that graph.
 pub fn dcae_stage_bytes(b: u64, h: u64, w: u64, c: u64) -> u64 {
+    conv_stage_bytes(b, h, w, c)
+}
+
+/// Any convolutional VAE/UNet substage (resnet, attention-in-conv, up/downsample) at its OUTPUT
+/// spatial extent and widest channel count: the DC-AE accounting above. 32 activation-sized f32
+/// buffers cover group-norm/activation/conv/residual copies; 64*C*C covers promoted 3x3 weights.
+pub fn conv_stage_bytes(b: u64, h: u64, w: u64, c: u64) -> u64 {
     sum(&[product(&[32, b, h, w, c, 4]), product(&[64, c, c, 4])])
+}
+
+/// Actual geometry of one attention block of a DiT or UNet transformer, from loaded tensors and the
+/// request (never production constants).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionBlockGeometry {
+    pub batch: u64,
+    /// Image/latent tokens attended over.
+    pub tokens: u64,
+    /// Block model width.
+    pub dim: u64,
+    /// Attention heads whose `[B, H, rows, keys]` f32 scores may be materialized.
+    pub heads: u64,
+    /// Cross-attention context tokens (0 for a self-attention-only block).
+    pub context_tokens: u64,
+    /// MLP hidden width.
+    pub ff_hidden: u64,
+    /// Query rows scored at once: `tokens` unchunked, the chunk size under a bounded-attention plan.
+    pub query_rows: u64,
+    /// Elements of every weight in the block, priced as full f32 copies (dequantize/promotion).
+    pub weight_elements: u64,
+}
+
+/// Promoted f32 weight copies, 24 hidden-sized buffers (norm/modulation/QKV/residual), eight MLP
+/// buffers, eight score-sized buffers per query chunk over self AND cross keys, and eight
+/// context-sized projections. A floor for one materialized block, not a process bound.
+pub fn attention_block_bytes(g: AttentionBlockGeometry) -> u64 {
+    sum(&[
+        product(&[4, g.weight_elements]),
+        product(&[24, g.batch, g.tokens, g.dim, 4]),
+        product(&[8, g.batch, g.tokens, g.ff_hidden, 4]),
+        product(&[
+            8,
+            g.batch,
+            g.heads,
+            g.query_rows,
+            g.tokens.saturating_add(g.context_tokens),
+            4,
+        ]),
+        product(&[8, g.batch, g.context_tokens, g.dim, 4]),
+    ])
 }
 pub fn check_headroom(
     available: Option<u64>,
@@ -229,6 +292,49 @@ mod tests {
         assert!(floor >= 8 * 506 * 506 * 4 + 506 * 9216 * 4);
         assert!(gemma_layer_bytes(1, 507, 2304, 9216, 8, 256) > floor);
         assert!(gemma_layer_bytes(u64::MAX, 506, 2304, 9216, 8, 256) == u64::MAX);
+    }
+
+    #[test]
+    fn attention_floor_prices_chunked_scores_context_and_weights_exactly() {
+        let base = AttentionBlockGeometry {
+            batch: 1,
+            tokens: 64,
+            dim: 32,
+            heads: 4,
+            context_tokens: 7,
+            ff_hidden: 96,
+            query_rows: 64,
+            weight_elements: 1000,
+        };
+        let expected =
+            4 * 1000 + 24 * 64 * 32 * 4 + 8 * 64 * 96 * 4 + 8 * 4 * 64 * 71 * 4 + 8 * 7 * 32 * 4;
+        assert_eq!(attention_block_bytes(base), expected);
+        let chunked = AttentionBlockGeometry {
+            query_rows: 16,
+            ..base
+        };
+        assert_eq!(
+            attention_block_bytes(base) - attention_block_bytes(chunked),
+            8 * 4 * (64 - 16) * 71 * 4
+        );
+        let bigger = AttentionBlockGeometry {
+            tokens: 4096,
+            query_rows: 4096,
+            ..base
+        };
+        assert!(attention_block_bytes(bigger) > attention_block_bytes(base));
+        assert_eq!(
+            attention_block_bytes(AttentionBlockGeometry {
+                batch: u64::MAX,
+                ..base
+            }),
+            u64::MAX
+        );
+        assert_eq!(
+            transformer_layer_bytes(1, 77, 768, 3072, 12, 64),
+            gemma_layer_bytes(1, 77, 768, 3072, 12, 64)
+        );
+        assert_eq!(conv_stage_bytes(1, 8, 8, 4), dcae_stage_bytes(1, 8, 8, 4));
     }
 
     #[test]

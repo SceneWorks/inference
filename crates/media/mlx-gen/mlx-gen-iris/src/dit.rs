@@ -46,6 +46,23 @@ impl SwiGlu {
             .flat_map(Linear::arrays)
             .collect()
     }
+    fn weight_elements(&self) -> u64 {
+        linear_elements(&[&self.w1, &self.w2, &self.w3])
+    }
+    /// The loaded gated width (`w1`'s output).
+    fn hidden(&self) -> u64 {
+        self.w1.out_features()
+    }
+}
+
+/// Checkpoint elements of `linears` (weight + bias, whatever they are held as).
+fn linear_elements(linears: &[&Linear]) -> u64 {
+    linears.iter().map(|l| l.logical_elements()).sum()
+}
+
+/// Gain elements of `norms`.
+fn norm_elements(norms: &[&RmsNorm]) -> u64 {
+    norms.iter().map(|n| n.width()).sum()
 }
 
 /// `SelfAttention`: fused qkv, optional per-head QK RMSNorm, optional RoPE, optional key mask.
@@ -117,6 +134,16 @@ impl SelfAttention {
         out.extend(self.proj.arrays());
         out
     }
+
+    fn weight_elements(&self) -> u64 {
+        linear_elements(&[&self.qkv, &self.proj])
+            + self
+                .q_norm
+                .iter()
+                .chain(&self.k_norm)
+                .map(RmsNorm::width)
+                .sum::<u64>()
+    }
 }
 
 /// Q/K/V projections of one stream: fused under full MHA, separate under GQA.
@@ -172,6 +199,13 @@ impl Qkv {
         match self {
             Qkv::Fused(l) => l.arrays(),
             Qkv::Split { q, k, v } => [q, k, v].into_iter().flat_map(Linear::arrays).collect(),
+        }
+    }
+
+    fn weight_elements(&self) -> u64 {
+        match self {
+            Qkv::Fused(l) => l.logical_elements(),
+            Qkv::Split { q, k, v } => linear_elements(&[q, k, v]),
         }
     }
 }
@@ -238,6 +272,84 @@ struct SingleBlock {
 enum Block {
     Dual(Box<DualBlock>),
     Single(Box<SingleBlock>),
+}
+
+impl Block {
+    /// `(model width, widest MLP hidden, weight elements)` of THIS block's loaded tensors — the
+    /// iOS quantum accounting's inputs, never production constants.
+    fn quantum_tensors(&self) -> (u64, u64, u64) {
+        match self {
+            Block::Dual(b) => {
+                let mut weights = b.qkv_x.weight_elements()
+                    + b.qkv_y.weight_elements()
+                    + linear_elements(&[&b.proj_x, &b.gate_x])
+                    + b.mlp_x.weight_elements()
+                    + norm_elements(&[
+                        &b.norm_x1,
+                        &b.norm_x2,
+                        &b.norm_y1,
+                        &b.q_norm_x,
+                        &b.k_norm_x,
+                        &b.q_norm_y,
+                        &b.k_norm_y,
+                        &b.attn_post_norm_x,
+                        &b.mlp_post_norm_x,
+                    ])
+                    + (b.mod_img.bias.size() + b.mod_txt.bias.size()) as u64;
+                let mut ff_hidden = b.mlp_x.hidden();
+                if let Some(t) = &b.text {
+                    weights += linear_elements(&[&t.proj, &t.gate])
+                        + t.mlp.weight_elements()
+                        + norm_elements(&[&t.norm2, &t.attn_post_norm, &t.mlp_post_norm]);
+                    ff_hidden = ff_hidden.max(t.mlp.hidden());
+                }
+                (b.norm_x1.width(), ff_hidden, weights)
+            }
+            Block::Single(b) => {
+                let weights = b.qkv.weight_elements()
+                    + linear_elements(&[&b.attn_gate, &b.attn_proj])
+                    + b.mlp.weight_elements()
+                    + norm_elements(&[
+                        &b.norm1,
+                        &b.norm2,
+                        &b.q_norm,
+                        &b.k_norm,
+                        &b.attn_post_norm,
+                        &b.mlp_post_norm,
+                    ])
+                    + b.modulation.bias.size() as u64;
+                (b.norm1.width(), b.mlp.hidden(), weights)
+            }
+        }
+    }
+}
+
+/// Labels of the iOS execution quanta of one backbone forward, in forward order.
+pub(crate) mod quanta {
+    pub const EMBED: &str = "Iris patch/timestep embed";
+    pub const TEXT_LAYER_BLOCK: &str = "Iris text adapter layer block";
+    pub const TEXT_POOL: &str = "Iris text adapter pool";
+    pub const TEXT_REFINER_BLOCK: &str = "Iris text refiner block";
+    pub const TEXT_OUTPUT: &str = "Iris text adapter output";
+    pub const TRUNK_BLOCK: &str = "Iris trunk block";
+    pub const PIXEL_EMBED: &str = "Iris pixel embed";
+    pub const PIXEL_BLOCK: &str = "Iris pixel block";
+    pub const OUTPUT: &str = "Iris output projection";
+}
+
+/// The iOS floor of a projection-only quantum over `tokens` rows of width `dim`: the attention
+/// block accounting with no score or MLP term.
+fn projection_quantum_bytes(batch: u64, tokens: u64, dim: u64, weight_elements: u64) -> u64 {
+    mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+        batch,
+        tokens,
+        dim,
+        heads: 0,
+        context_tokens: 0,
+        ff_hidden: 0,
+        query_rows: 0,
+        weight_elements,
+    })
 }
 
 /// `PiTBlock` with `modulation="post"`.
@@ -660,6 +772,172 @@ impl IrisDiT {
         out
     }
 
+    // ---- iOS execution quanta (pass-through everywhere but a physical iOS device) ----------
+    //
+    // Every figure below reads the LOADED tensors (projection shapes, gain widths, head counts of
+    // the built modules) and the actual request geometry; none is a production constant.
+
+    fn query_rows(plan: mlx_gen::AttentionPlan<'_>, batch: i32, heads: i32, tokens: i32) -> u64 {
+        plan.budget.query_block(batch, heads, tokens, tokens).max(0) as u64
+    }
+
+    /// Floor of trunk block `i` over `n_patches` image and `n_txt` text tokens: the joint
+    /// attention spans both streams (text-first concatenation), so both count as tokens.
+    pub(crate) fn trunk_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        n_patches: i32,
+        n_txt: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let (dim, ff_hidden, weight_elements) = self.blocks[i].quantum_tensors();
+        let tokens = n_patches + n_txt;
+        let heads = self.cfg.num_heads as i32;
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch as u64,
+            tokens: tokens as u64,
+            dim,
+            heads: heads as u64,
+            context_tokens: 0,
+            ff_hidden,
+            query_rows: Self::query_rows(plan, batch, heads, tokens),
+            weight_elements,
+        })
+    }
+
+    /// Floor of PiT block `i`: patch-granular attention over `n_patches` compact tokens, whose
+    /// hidden buffers are the per-patch pixel stream (`patch² · pixel width`) or the compact
+    /// attention width, whichever is wider; the MLP runs per pixel (`patch² · fc1 width`).
+    pub(crate) fn pixel_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        n_patches: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.pixel_blocks[i];
+        let ppp = (self.cfg.patch_size * self.cfg.patch_size) as u64;
+        let weight_elements =
+            linear_elements(&[&blk.adaln, &blk.compress, &blk.expand, &blk.fc1, &blk.fc2])
+                + blk.attn.weight_elements()
+                + norm_elements(&[&blk.norm1, &blk.norm2]);
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch as u64,
+            tokens: n_patches as u64,
+            dim: (ppp * blk.norm1.width()).max(blk.compress.out_features()),
+            heads: blk.attn.heads as u64,
+            context_tokens: 0,
+            ff_hidden: ppp * blk.fc1.out_features(),
+            query_rows: Self::query_rows(plan, batch, blk.attn.heads, n_patches),
+            weight_elements,
+        })
+    }
+
+    /// Floor of text-adapter layer block `i`: attention over the `layers` encoder states of each of
+    /// the `rows = B · T` tokens.
+    pub(crate) fn text_layer_block_scratch(
+        &self,
+        i: usize,
+        rows: i32,
+        layers: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.y_embedder.layer_blocks[i];
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: rows as u64,
+            tokens: layers as u64,
+            dim: blk.norm1.width(),
+            heads: blk.attn.heads as u64,
+            context_tokens: 0,
+            ff_hidden: blk.mlp0.out_features(),
+            query_rows: Self::query_rows(plan, rows, blk.attn.heads, layers),
+            weight_elements: blk.attn.weight_elements()
+                + linear_elements(&[&blk.mlp0, &blk.mlp2])
+                + norm_elements(&[&blk.norm1, &blk.norm2]),
+        })
+    }
+
+    /// Floor of text-refiner block `i` over `t` (masked-key) text tokens.
+    pub(crate) fn text_refiner_block_scratch(
+        &self,
+        i: usize,
+        batch: i32,
+        t: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let blk = &self.y_embedder.blocks[i];
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch as u64,
+            tokens: t as u64,
+            dim: blk.norm1.width(),
+            heads: blk.attn.heads as u64,
+            context_tokens: 0,
+            ff_hidden: blk.mlp.hidden(),
+            query_rows: Self::query_rows(plan, batch, blk.attn.heads, t),
+            weight_elements: blk.attn.weight_elements()
+                + blk.mlp.weight_elements()
+                + norm_elements(&[&blk.norm1, &blk.norm2]),
+        })
+    }
+
+    /// Floor of the patch/timestep embedding and both modulation cores: the patch vectors and
+    /// their embedding (`[B, N, max(D, patch² · C)]`).
+    pub(crate) fn embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
+        let [hidden, patch_in] = self.s_embedder.logical_shape();
+        let mut weights =
+            linear_elements(&[&self.s_embedder, &self.t_mlp0, &self.t_mlp2, &self.core_img]);
+        weights += self.core_txt.as_ref().map_or(0, Linear::logical_elements);
+        projection_quantum_bytes(
+            batch as u64,
+            n_patches as u64,
+            hidden.max(patch_in) as u64,
+            weights,
+        )
+    }
+
+    /// Floor of the layer pool and refiner input projection over `[B·T, layers, Dt]` states.
+    fn text_pool_scratch(&self, batch: i32, t: i32, layers: i32, text_dim: i32) -> u64 {
+        let y = &self.y_embedder;
+        projection_quantum_bytes(
+            batch as u64,
+            t as u64,
+            ((layers * text_dim) as u64).max(y.proj.out_features()),
+            linear_elements(&[&y.layer_pool, &y.proj]),
+        )
+    }
+
+    /// Floor of the refiner's final norm over `[B, T, D]`.
+    fn text_output_scratch(&self, batch: i32, t: i32) -> u64 {
+        let norm = &self.y_embedder.norm;
+        projection_quantum_bytes(batch as u64, t as u64, norm.width(), norm.width())
+    }
+
+    /// Floor of the timestep re-fusion and the per-pixel embedding (`[B, H, W, pixel width]` plus
+    /// its f32 sincos table, grouped per patch).
+    fn pixel_embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
+        let ppp = (self.cfg.patch_size * self.cfg.patch_size) as u64;
+        let pixel_width = self.pixel_proj.out_features();
+        projection_quantum_bytes(
+            batch as u64,
+            n_patches as u64,
+            (ppp * pixel_width).max(self.core_img.logical_shape()[1] as u64),
+            self.pixel_proj.logical_elements(),
+        )
+    }
+
+    /// Floor of the final norm, the final projection and the fold back to `[B, C, H, W]` f32.
+    fn output_scratch(&self, batch: i32, n_patches: i32) -> u64 {
+        let ppp = (self.cfg.patch_size * self.cfg.patch_size) as u64;
+        let [out, input] = self.final_linear.logical_shape();
+        projection_quantum_bytes(
+            batch as u64,
+            n_patches as u64,
+            ppp * (out.max(input) as u64),
+            self.final_linear.logical_elements() + self.final_norm.width(),
+        )
+    }
+
     /// `TimestepEmbedder`: sinusoid bank (period `timestep_max_period`, 256 frequencies, cos‖sin)
     /// → Linear → SiLU → Linear. `t` is model time `[B]` f32 → `[B, 1, D]`.
     fn timestep_embedding(&self, t: &Array) -> Result<Array> {
@@ -694,46 +972,61 @@ impl IrisDiT {
             )));
         }
         let y_ad = &self.y_embedder;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let mut y = text
             .states
             .as_dtype(Dtype::Float32)?
             .reshape(&[b * t, layers, dt])?;
-        for block in &y_ad.layer_blocks {
-            let h = block.attn.forward(
-                &block.norm1.forward(&y)?,
-                None,
-                None,
-                self.compute,
-                plan,
-                "adapter",
-            )?;
-            y = y.add(&h)?;
-            let m = block
-                .mlp2
-                .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
-            y = y.add(&m)?;
+        for (i, block) in y_ad.layer_blocks.iter().enumerate() {
+            let scratch = self.text_layer_block_scratch(i, b * t, layers, plan);
+            y = mlx_gen::ios_quantum::run(quanta::TEXT_LAYER_BLOCK, scratch, || {
+                let h = block.attn.forward(
+                    &block.norm1.forward(&y)?,
+                    None,
+                    None,
+                    self.compute,
+                    plan,
+                    "adapter",
+                )?;
+                let y = y.add(&h)?;
+                let m = block
+                    .mlp2
+                    .forward(&silu(block.mlp0.forward(&block.norm2.forward(&y)?)?)?)?;
+                Ok(y.add(&m)?)
+            })?;
         }
-        // layer_pool: Linear(L → 1) over the layer axis.
-        let pooled = y_ad
-            .layer_pool
-            .forward(&y.transpose_axes(&[0, 2, 1])?)?
-            .reshape(&[b, t, dt])?;
+        // layer_pool: Linear(L → 1) over the layer axis, then the refiner's input projection.
+        let mut y = mlx_gen::ios_quantum::run(
+            quanta::TEXT_POOL,
+            self.text_pool_scratch(b, t, layers, dt),
+            || {
+                let pooled = y_ad
+                    .layer_pool
+                    .forward(&y.transpose_axes(&[0, 2, 1])?)?
+                    .reshape(&[b, t, dt])?;
+                y_ad.proj.forward(&pooled)
+            },
+        )?;
         // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
         let key_mask = key_padding_mask(text.mask, t as usize);
-        let mut y = y_ad.proj.forward(&pooled)?;
-        for block in &y_ad.blocks {
-            let h = block.attn.forward(
-                &block.norm1.forward(&y)?,
-                None,
-                Some(&key_mask),
-                self.compute,
-                plan,
-                "refiner",
-            )?;
-            y = y.add(&h)?;
-            y = y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?;
+        for (i, block) in y_ad.blocks.iter().enumerate() {
+            let scratch = self.text_refiner_block_scratch(i, b, t, plan);
+            y = mlx_gen::ios_quantum::run(quanta::TEXT_REFINER_BLOCK, scratch, || {
+                let h = block.attn.forward(
+                    &block.norm1.forward(&y)?,
+                    None,
+                    Some(&key_mask),
+                    self.compute,
+                    plan,
+                    "refiner",
+                )?;
+                let y = y.add(&h)?;
+                Ok(y.add(&block.mlp.forward(&block.norm2.forward(&y)?)?)?)
+            })?;
         }
-        y_ad.norm.forward(&y)
+        mlx_gen::ios_quantum::run(quanta::TEXT_OUTPUT, self.text_output_scratch(b, t), || {
+            y_ad.norm.forward(&y)
+        })
     }
 
     /// The fixed full-resolution 2D sincos table of `PixelEmbedder` (`[H, W, hidden]` f32), cached.
@@ -825,6 +1118,8 @@ impl IrisDiT {
             )));
         }
 
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        mlx_gen::ios_quantum::before(quanta::EMBED, self.embed_scratch(b, n_patches))?;
         // F.unfold(x, p, stride=p).transpose(1, 2): channel-major patch vectors, row-major patches.
         let patches = x
             .reshape(&[b, c, hp, p, wp, p])?
@@ -833,6 +1128,15 @@ impl IrisDiT {
         let mut s = self.s_embedder.forward(&patches)?;
         let t_emb = self.timestep_embedding(t)?;
         let cond = silu(&t_emb)?;
+        let core_img = self.core_img.forward(&cond)?;
+        let core_txt = self
+            .core_txt
+            .as_ref()
+            .map(|core| core.forward(&cond))
+            .transpose()?;
+        let mut embedded = vec![&s, &t_emb, &core_img];
+        embedded.extend(core_txt.as_ref());
+        mlx_gen::ios_quantum::finish(quanta::EMBED, &embedded)?;
 
         let mut y = self.text_adapter_budgeted(text, plan)?;
         let n_txt = y.shape()[1];
@@ -855,12 +1159,6 @@ impl IrisDiT {
         );
         let rope_txt = Rope::line_1d(head_dim, n_txt as usize, cfg.text_rope_theta as f32);
 
-        let core_img = self.core_img.forward(&cond)?;
-        let core_txt = self
-            .core_txt
-            .as_ref()
-            .map(|core| core.forward(&cond))
-            .transpose()?;
         let ctx = TrunkCtx {
             compute: self.compute,
             plan,
@@ -870,9 +1168,13 @@ impl IrisDiT {
             kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32,
         };
         for i in 0..self.blocks.len() {
+            let scratch = self.trunk_block_scratch(i, b, n_patches, n_txt, plan);
+            mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
             (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
+            mlx_gen::ios_quantum::finish(quanta::TRUNK_BLOCK, &[&s, &y])?;
         }
 
+        mlx_gen::ios_quantum::before(quanta::PIXEL_EMBED, self.pixel_embed_scratch(b, n_patches))?;
         // timestep re-fused into every patch token
         let s = silu(&t_emb.add(&s)?)?;
         let s_cond = s.reshape(&[b * n_patches, -1])?;
@@ -898,6 +1200,7 @@ impl IrisDiT {
             cfg.rope_scale as f32,
             square,
         );
+        mlx_gen::ios_quantum::finish(quanta::PIXEL_EMBED, &[&s_cond, &pixels])?;
         let pctx = PixelCtx {
             compute: self.compute,
             plan,
@@ -906,18 +1209,23 @@ impl IrisDiT {
             n_patches,
         };
         for i in 0..self.pixel_blocks.len() {
-            pixels = hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)?;
+            let scratch = self.pixel_block_scratch(i, b, n_patches, plan);
+            pixels = mlx_gen::ios_quantum::run(quanta::PIXEL_BLOCK, scratch, || {
+                hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)
+            })?;
         }
-        let out = self
-            .final_linear
-            .forward(&self.final_norm.forward(&pixels)?)?;
-        // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
-        let c_out = cfg.in_channels as i32;
-        Ok(out
-            .reshape(&[b, hp, wp, p, p, c_out])?
-            .transpose_axes(&[0, 5, 1, 3, 2, 4])?
-            .reshape(&[b, c_out, h, w])?
-            .as_dtype(Dtype::Float32)?)
+        mlx_gen::ios_quantum::run(quanta::OUTPUT, self.output_scratch(b, n_patches), || {
+            let out = self
+                .final_linear
+                .forward(&self.final_norm.forward(&pixels)?)?;
+            // fold: [B·L, p·p, C] → [B, C, H, W] (C = model.in_channels, whatever x carried)
+            let c_out = cfg.in_channels as i32;
+            Ok(out
+                .reshape(&[b, hp, wp, p, p, c_out])?
+                .transpose_axes(&[0, 5, 1, 3, 2, 4])?
+                .reshape(&[b, c_out, h, w])?
+                .as_dtype(Dtype::Float32)?)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

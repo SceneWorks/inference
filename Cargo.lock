@@ -2581,6 +2581,8 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
 ]

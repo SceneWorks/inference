@@ -1,28 +1,19 @@
 use super::*;
 
-pub(super) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Only known evidence/capacity answers are refusals. Inventory, binding and request errors
-/// remain diagnostic failures, including provider errors wrapped as Unsupported.
-pub(super) fn classify_admission_error(
+/// Typed refusal kinds straight from runtime-ios; no message is parsed. Failures (inventory,
+/// binding, malformed request, provider errors) stay diagnostic failures.
+pub(super) fn classify(
     kind: &mut Option<&'static str>,
-    reason: String,
+    error: runtime_ios::media::AdmissionError,
 ) -> AdmissionError {
-    if reason.starts_with("unsupported: iOS SANA admission: no artifact-bound device footprint")
-        || reason.ends_with("unsupported: no applicable device/request capture (source unopened)")
-        || reason.ends_with("unsupported: no applicable artifact/device/request capture")
-    {
-        *kind = Some("no_evidence");
-        AdmissionError::Refused(reason)
-    } else if reason.starts_with("unsupported: iOS admission: estimated footprint")
-        && reason.contains("exceeds")
-    {
-        *kind = Some("capacity");
-        AdmissionError::Refused(reason)
-    } else {
-        AdmissionError::Failure(reason)
+    match error {
+        runtime_ios::media::AdmissionError::Refused(refusal) => {
+            *kind = Some(refusal.kind.label());
+            AdmissionError::Refused(refusal.reason)
+        }
+        runtime_ios::media::AdmissionError::Failed(error) => {
+            AdmissionError::Failure(error.to_string())
+        }
     }
 }
 
@@ -85,11 +76,19 @@ impl Drop for Deadline {
     }
 }
 
-pub(super) fn persist_images(docs: &Path, c: &Case, images: &[Image]) -> Result<(), String> {
+/// Persist case outputs. `edge` is the expected square geometry, or `None` for a task whose output
+/// size is the provider's (restoration's model-default scale).
+pub(super) fn persist_images(
+    docs: &Path,
+    c: &Case,
+    images: &[Image],
+    edge: Option<u32>,
+) -> Result<(), String> {
     for (index, image) in images.iter().enumerate() {
-        if image.width != c.edge
-            || image.height != c.edge
-            || image.pixels.len() != (c.edge as usize).pow(2) * 3
+        if edge.is_some_and(|edge| image.width != edge || image.height != edge)
+            || image.width == 0
+            || image.height == 0
+            || image.pixels.len() != image.width as usize * image.height as usize * 3
             || image.pixels.iter().min() == image.pixels.iter().max()
         {
             return Err("wrong geometry or constant image".into());

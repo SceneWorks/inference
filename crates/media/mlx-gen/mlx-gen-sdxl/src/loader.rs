@@ -126,6 +126,8 @@ fn load_clip_dtype(
     dtype: Dtype,
 ) -> Result<ClipTextEncoder> {
     let file = resolve_weight_file(root, subdir, "model", dtype)?;
+    // sc-26270: iOS header-only pre-load floor before this encoder is constructed.
+    mlx_gen::ios_quantum::before_load(&format!("SDXL {subdir} load"), std::slice::from_ref(&file))?;
     let mut w = Weights::from_file(&file)?;
     // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
     cast_for_load(&mut w, dtype)?;
@@ -226,6 +228,8 @@ pub fn load_unet_with_config_streamed(
     streamed: bool,
 ) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
+    // sc-26270: iOS header-only pre-load floor before the U-Net is constructed.
+    mlx_gen::ios_quantum::before_load("SDXL UNet load", std::slice::from_ref(&file))?;
     let mut w = Weights::from_file(&file)?;
     // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
     cast_for_load(&mut w, dtype)?;
@@ -275,6 +279,12 @@ pub fn load_controlnet(
     src: &mlx_gen::WeightsSource,
     dtype: Dtype,
 ) -> Result<crate::unet::ControlNet> {
+    // sc-26270: iOS header-only pre-load floor before the branch is constructed (a directory
+    // source counts every safetensors file it holds, as `Weights::from_dir` reads them all).
+    let source_path = match src {
+        mlx_gen::WeightsSource::File(p) | mlx_gen::WeightsSource::Dir(p) => p.clone(),
+    };
+    mlx_gen::ios_quantum::before_load("SDXL ControlNet load", &[source_path])?;
     let mut w = match src {
         mlx_gen::WeightsSource::File(p) => Weights::from_file(p)?,
         mlx_gen::WeightsSource::Dir(p) => Weights::from_dir(p)?,
@@ -313,6 +323,11 @@ pub fn load_ip_adapter(
     use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
+    // sc-26270: iOS header-only pre-load floors before each IP component is constructed.
+    mlx_gen::ios_quantum::before_load(
+        "SDXL IP image encoder load",
+        &[dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE)],
+    )?;
     let mut enc_w = Weights::from_file(dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE))?;
     // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
     cast_for_load(&mut enc_w, dtype)?;
@@ -330,6 +345,7 @@ pub fn load_ip_adapter(
                 dir.display()
             ))
         })?;
+    mlx_gen::ios_quantum::before_load("SDXL IP adapter load", std::slice::from_ref(&ip_file))?;
     let mut ip_w = Weights::from_file(&ip_file)?;
     // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
     cast_for_load(&mut ip_w, dtype)?;
@@ -349,6 +365,9 @@ pub fn load_ip_adapter(
 /// VAE; fetch `vae/diffusion_pytorch_model.safetensors` for an exact decode).
 pub fn load_vae(root: &Path) -> Result<Autoencoder> {
     let file = resolve_vae_weight_file(root)?;
+    // sc-26270: iOS header-only pre-load floor before the VAE is constructed.
+    // The loader upcasts every tensor to f32, so the stored and widened copies coexist.
+    mlx_gen::ios_quantum::before_load_cast("SDXL VAE load", std::slice::from_ref(&file), 4)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     let vae = Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())?;
@@ -409,7 +428,18 @@ pub fn resolve_vae_fp16_fix_file(source: &mlx_gen::WeightsSource) -> Result<Path
 
 /// Load the staged fp16-fix VAE at [`VAE_FP16_FIX_DTYPE`].
 pub fn load_vae_fp16_fix(source: &mlx_gen::WeightsSource) -> Result<Autoencoder> {
-    let mut w = Weights::from_file(resolve_vae_fp16_fix_file(source)?)?;
+    let file = resolve_vae_fp16_fix_file(source)?;
+    // sc-26270: iOS header-only pre-load floor before the fp16-fix VAE is constructed.
+    // Cast to VAE_FP16_FIX_DTYPE after reading: stored and cast copies coexist.
+    mlx_gen::ios_quantum::before_load_cast(
+        "SDXL fp16-fix VAE load",
+        std::slice::from_ref(&file),
+        match VAE_FP16_FIX_DTYPE {
+            Dtype::Float32 => 4,
+            _ => 2,
+        },
+    )?;
+    let mut w = Weights::from_file(file)?;
     w.cast_all(VAE_FP16_FIX_DTYPE)?;
     let vae = Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())?;
     // Materialize at load (sc-24245; see [`load_unet_with_config_streamed`]).

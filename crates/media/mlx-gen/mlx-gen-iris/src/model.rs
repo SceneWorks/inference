@@ -90,6 +90,11 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// Label of the backbone's iOS pre-load check.
+pub(crate) const BACKBONE_LOAD_QUANTUM: &str = "Iris backbone load";
+/// Label of one solved batch's RGB8 conversion quantum.
+pub(crate) const IMAGE_QUANTUM: &str = "Iris image conversion";
+
 /// The backbone half of the generation task.
 pub struct Heavy {
     pub dit: IrisDiT,
@@ -162,6 +167,7 @@ pub fn load_backbone_quantized(
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
     let quant = BackboneQuant::for_load(quant)?;
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    mlx_gen::ios_quantum::before_load(BACKBONE_LOAD_QUANTUM, std::slice::from_ref(&path))?;
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     // The release ships FP32. Cast every matrix to the compute dtype ONE TENSOR AT A TIME and
@@ -286,6 +292,7 @@ impl Iris3b {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
         let rows = params.prompts.len() as u32;
         let total = (params.steps as u32) * req.count;
@@ -336,7 +343,11 @@ impl Iris3b {
                 }
                 let mut out = Vec::with_capacity((rows * req.count) as usize);
                 for x in &images {
+                    // The f32 batch, its clamp/scale/round copies and the RGB8 readback.
+                    let bytes = (x.size() as u64).saturating_mul(4 * 4);
+                    mlx_gen::ios_quantum::before(IMAGE_QUANTUM, bytes)?;
                     out.extend(to_images(x)?);
+                    mlx_gen::ios_quantum::finish(IMAGE_QUANTUM, &[])?;
                 }
                 mlx_rs::memory::clear_cache();
                 Ok((out, conditioning.warnings))

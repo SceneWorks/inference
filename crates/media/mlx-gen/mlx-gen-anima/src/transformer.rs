@@ -41,6 +41,12 @@ const NORM_EPS: f32 = 1e-6;
 /// Sinusoidal timestep-embedding `max_period` (`Timesteps` default).
 const TIME_MAX_PERIOD: f64 = 10000.0;
 
+/// iOS execution-quantum labels (see [`mlx_gen::ios_quantum`]). A capture reads these off a typed
+/// refusal, so they are stable identifiers rather than prose.
+pub(crate) const DIT_EMBED_QUANTUM: &str = "Anima DiT patch/time embed";
+pub(crate) const DIT_BLOCK_QUANTUM: &str = "Anima DiT block";
+pub(crate) const DIT_OUTPUT_QUANTUM: &str = "Anima DiT output projection";
+
 /// Dense linear (no bias) — adapter-ready (`AdaptableLinear`); auto-detects a packed Q4/Q8 base.
 fn lin(w: &Weights, name: &str) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, name, false, mlx_gen::quant::DEFAULT_GROUP_SIZE)
@@ -428,6 +434,87 @@ impl Block {
         self.attn2.set_sdpa_checkpoint(on);
     }
 
+    /// Every weight element of THIS block's loaded projections and q/k norms (logical `[out, in]`
+    /// shapes, so a packed tier is priced at its dequantized f32 size).
+    fn quantum_weight_elements(&self) -> u64 {
+        fn elements(shape: &[i32]) -> u64 {
+            shape
+                .iter()
+                .fold(1u64, |a, &d| a.saturating_mul(d.max(0) as u64))
+        }
+        let mut total = 0u64;
+        for attn in [&self.attn1, &self.attn2] {
+            for part in [QkvPart::Q, QkvPart::K, QkvPart::V] {
+                total = total.saturating_add(elements(&attn.qkv.part_facts(part).base_shape));
+            }
+            total = total
+                .saturating_add(elements(&attn.to_out.base_shape()))
+                .saturating_add(attn.norm_q.size() as u64)
+                .saturating_add(attn.norm_k.size() as u64);
+        }
+        for norm in [&self.norm1, &self.norm2, &self.norm3] {
+            for linear in [&norm.linear_1, &norm.linear_2] {
+                total = total.saturating_add(elements(&linear.base_shape()));
+            }
+        }
+        for linear in [&self.ff.proj_in, &self.ff.proj_out] {
+            total = total.saturating_add(elements(&linear.base_shape()));
+        }
+        total
+    }
+
+    /// iOS quantum scratch for one forward of THIS block, from its loaded tensors and the request:
+    /// `tokens` image tokens, `context_tokens` conditioner tokens (the encoder's sequence axis), and
+    /// the query rows the attention plan actually scores at once (the larger of the self- and
+    /// cross-attention chunks; `tokens` when unbounded).
+    pub(crate) fn quantum_scratch(
+        &self,
+        batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> u64 {
+        let heads = self.attn1.heads;
+        let query_rows = plan
+            .budget
+            .query_block(batch, heads, tokens, tokens)
+            .max(
+                plan.budget
+                    .query_block(batch, heads, tokens, context_tokens),
+            )
+            .min(tokens);
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch.max(0) as u64,
+            tokens: tokens.max(0) as u64,
+            dim: self.attn1.to_out.base_shape()[0].max(0) as u64,
+            heads: heads.max(0) as u64,
+            context_tokens: context_tokens.max(0) as u64,
+            ff_hidden: self.ff.proj_in.base_shape()[0].max(0) as u64,
+            query_rows: query_rows.max(0) as u64,
+            weight_elements: self.quantum_weight_elements(),
+        })
+    }
+
+    /// [`forward`](Self::forward) as one iOS execution quantum: the headroom check runs BEFORE the
+    /// block's graph is constructed and the result is materialized before return. A pass-through
+    /// (exactly `forward`) everywhere except a physical iOS device or the CPU diagnostic fixture.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_quantum(
+        &self,
+        hidden: &Array,
+        encoder: &Array,
+        embedded: &Array,
+        temb: &Array,
+        rope: (&Array, &Array),
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+        tokens: i32,
+    ) -> Result<Array> {
+        let scratch = self.quantum_scratch(hidden.shape()[0], tokens, encoder.shape()[1], plan);
+        mlx_gen::ios_quantum::run(DIT_BLOCK_QUANTUM, scratch, || {
+            self.forward(hidden, encoder, embedded, temb, rope, plan)
+        })
+    }
+
     pub(crate) fn forward(
         &self,
         hidden: &Array,
@@ -618,6 +705,13 @@ impl CosmosDiT {
         let (b, _c, t, hl, wl) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
         let (pt, ph, pw) = self.cfg.patch_size;
         let (pe_t, pe_h, pe_w) = (t / pt as i32, hl / ph as i32, wl / pw as i32);
+        let tokens = pe_t * pe_h * pe_w;
+        // iOS: the pre-block quantum is checked against the largest block floor (it must leave room
+        // for the first block anyway), before any graph below is constructed.
+        mlx_gen::ios_quantum::before(
+            DIT_EMBED_QUANTUM,
+            self.quantum_scratch(b, tokens, encoder.shape()[1], plan),
+        )?;
 
         // 1. concat the (all-zeros, full-res-resized-to-latent) padding mask channel -> [B,17,1,Hl,Wl].
         let hidden = if self.cfg.concat_padding_mask {
@@ -635,6 +729,10 @@ impl CosmosDiT {
 
         // 4. time embedding.
         let (temb, embedded) = self.time_embed.forward(sigma, dtype)?;
+        mlx_gen::ios_quantum::finish(
+            DIT_EMBED_QUANTUM,
+            &[&hidden, &temb, &embedded, &rope.cos, &rope.sin],
+        )?;
 
         // 5. transformer blocks (all, or the first `num_blocks` for the stage-4 localization golden).
         let take = num_blocks.unwrap_or(self.blocks.len());
@@ -649,18 +747,21 @@ impl CosmosDiT {
                         "anima: the partial-stack golden hook cannot be windowed".to_owned(),
                     ));
                 }
-                self.run_windowed_blocks(hidden, encoder, &embedded, &temb, &rope, plan, window)?
+                self.run_windowed_blocks(
+                    hidden, encoder, &embedded, &temb, &rope, plan, window, tokens,
+                )?
             }
             None => {
                 let mut hidden = hidden;
                 for block in self.blocks.iter().take(take) {
-                    hidden = block.forward(
+                    hidden = block.forward_quantum(
                         &hidden,
                         encoder,
                         &embedded,
                         &temb,
                         (&rope.cos, &rope.sin),
                         plan,
+                        tokens,
                     )?;
                 }
                 hidden
@@ -686,6 +787,7 @@ impl CosmosDiT {
         rope: &crate::rope::CosmosRope,
         plan: mlx_gen::attention::AttentionPlan<'_>,
         window: crate::block_stream::BlockWindow<'_>,
+        tokens: i32,
     ) -> Result<Array> {
         let stream = self.block_stream.as_ref().ok_or_else(|| {
             mlx_gen::Error::Unsupported(
@@ -708,14 +810,17 @@ impl CosmosDiT {
             || stream.open(),
             |mut hidden, view, range| {
                 for index in range {
+                    // Materializing builds lazy weight handles only; the quantum is priced from
+                    // this streamed block's own tensors and checked before its forward is built.
                     let block = stream.materialize(view, index)?;
-                    hidden = block.forward(
+                    hidden = block.forward_quantum(
                         &hidden,
                         encoder,
                         embedded,
                         temb,
                         (&rope.cos, &rope.sin),
                         plan,
+                        tokens,
                     )?;
                 }
                 Ok(hidden)
@@ -758,12 +863,38 @@ impl CosmosDiT {
         plan: mlx_gen::attention::AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let (hidden, (pe_t, pe_h, pe_w), embedded, temb) =
             self.run_blocks(latents, sigma, encoder, dtype, None, plan, window)?;
         // 6. output norm + projection + unpatchify.
-        let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
-        let hidden = self.proj_out.forward(&hidden)?;
-        self.unpatchify(&hidden, pe_t, pe_h, pe_w)
+        let scratch = self.quantum_scratch(
+            hidden.shape()[0],
+            hidden.shape()[1],
+            encoder.shape()[1],
+            plan,
+        );
+        mlx_gen::ios_quantum::run(DIT_OUTPUT_QUANTUM, scratch, || {
+            let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
+            let hidden = self.proj_out.forward(&hidden)?;
+            self.unpatchify(&hidden, pe_t, pe_h, pe_w)
+        })
+    }
+
+    /// The largest per-block iOS quantum floor over this DiT's resident block tensors (the streamed
+    /// rung-4 blocks are built by the same constructor from the same checkpoint keys). Prices the
+    /// pre- and post-block quanta, which must leave room for a block either side of them.
+    fn quantum_scratch(
+        &self,
+        batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| block.quantum_scratch(batch, tokens, context_tokens, plan))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-10576) on every DiT block's self- + cross-attn.
@@ -996,6 +1127,7 @@ impl CosmosDiT {
         dtype: Dtype,
         num_blocks: Option<usize>,
     ) -> Result<Array> {
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         Ok(self
             .run_blocks(
                 latents,

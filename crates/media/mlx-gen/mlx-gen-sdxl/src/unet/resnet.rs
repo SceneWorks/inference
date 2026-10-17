@@ -201,6 +201,34 @@ impl ResnetBlock2D {
         Ok(out)
     }
 
+    /// iOS quantum scratch (sc-26270) for this resnet at output extent `[b, h, w]`: the widest of
+    /// its loaded `conv1` input (post-concat on the up path) and output channels.
+    pub(crate) fn quantum_scratch(&self, b: i32, h: i32, w: i32) -> u64 {
+        let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
+        crate::quantum::conv_stage(b, h, w, &[cin, cout])
+    }
+
+    /// [`forward_planned`](Self::forward_planned) as one guarded iOS quantum (sc-26270). `skip`
+    /// (the up path's popped residual) is concatenated INSIDE the quantum, so the concat is checked
+    /// and materialized with the resnet that consumes it. A pass-through off device.
+    pub(crate) fn forward_quantum(
+        &self,
+        x: &Array,
+        skip: Option<Array>,
+        temb: Option<&Array>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let scratch = self.quantum_scratch(s[0], s[1], s[2]);
+        mlx_gen::ios_quantum::run(crate::quantum::UNET_RESNET, scratch, || {
+            let input = match skip {
+                Some(skip) => mlx_rs::ops::concatenate_axis(&[x, &skip], -1)?,
+                None => x.clone(),
+            };
+            self.forward_planned(&input, temb, plan)
+        })
+    }
+
     /// VAE-only, normalization-correct bounded forward (sc-19753).
     ///
     /// The U-Net continues to use [`Self::forward`]. VAE resnets carry no time embedding, allowing
@@ -219,6 +247,14 @@ impl ResnetBlock2D {
                 "forward_tiled_vae called on a time-conditioned U-Net resnet".into(),
             ));
         }
+        // sc-26270: the tiled layer is one iOS stage quantum (full-resolution input, both conv
+        // outputs, shortcut and sum), inside which every conv tile is checked on its own.
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
+        mlx_gen::ios_quantum::before(
+            crate::quantum::VAE_TILED_STAGE,
+            crate::quantum::tiled_stage(s[0], s[1], s[2], &[cin, cout]),
+        )?;
         let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
             x,
@@ -226,7 +262,11 @@ impl ResnetBlock2D {
             self.conv1.bias(),
             tile_edge,
             cancel,
-            |tile| silu_glue(&norm1.apply(tile)?),
+            |tile| {
+                // sc-26270: each tile is checked before its norm/conv graph is constructed.
+                crate::quantum::before_tile(tile, self.conv1.weight())?;
+                silu_glue(&norm1.apply(tile)?)
+            },
         )?;
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
@@ -239,7 +279,10 @@ impl ResnetBlock2D {
             self.conv2.bias(),
             tile_edge,
             cancel,
-            |tile| silu_glue(&norm2.apply(tile)?),
+            |tile| {
+                crate::quantum::before_tile(tile, self.conv2.weight())?;
+                silu_glue(&norm2.apply(tile)?)
+            },
         )?;
         crate::vae::trace_decode_stage("resnet.conv2", &y)?;
         let residual = match &self.shortcut {
@@ -248,6 +291,7 @@ impl ResnetBlock2D {
         };
         let out = add(&residual, &y)?;
         out.eval()?;
+        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
         Ok(out)
     }
 

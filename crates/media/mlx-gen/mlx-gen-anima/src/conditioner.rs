@@ -24,6 +24,11 @@ use mlx_gen::Result;
 
 use crate::config::ConditionerConfig;
 
+/// iOS execution-quantum labels (see [`mlx_gen::ios_quantum`]).
+pub(crate) const CONDITIONER_EMBED_QUANTUM: &str = "Anima conditioner embed";
+pub(crate) const CONDITIONER_BLOCK_QUANTUM: &str = "Anima conditioner block";
+pub(crate) const CONDITIONER_OUTPUT_QUANTUM: &str = "Anima conditioner output";
+
 fn lin(w: &Weights, name: &str, bias: bool) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, name, bias, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
@@ -175,6 +180,20 @@ impl Block {
         self.cross_attn.set_sdpa_checkpoint(on);
     }
 
+    /// iOS quantum scratch for one forward of THIS block from its loaded tensors. The block scores
+    /// `St x St` (self) and `St x Ss` (cross), so a full-attention layer over `max(St, Ss)` tokens
+    /// prices both.
+    fn quantum_scratch(&self, batch: i32, tokens: i32) -> u64 {
+        mlx_gen::ios_quantum::transformer_layer_bytes(
+            batch.max(0) as u64,
+            tokens.max(0) as u64,
+            self.norm_self_attn.size() as u64,
+            self.mlp_in.base_shape()[0].max(0) as u64,
+            self.self_attn.heads.max(0) as u64,
+            self.self_attn.head_dim.max(0) as u64,
+        )
+    }
+
     fn forward(
         &self,
         hidden: &Array,
@@ -274,20 +293,61 @@ impl AnimaTextConditioner {
         let ssh = source_hidden.shape();
         let (b, ss) = (ssh[0], ssh[1]);
         let st = target_ids.shape()[1];
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        // Pre/post quanta are checked against the largest block floor; the padded 512-token output
+        // is priced as one more layer over `max(St, Ss, 512)` tokens.
+        let scratch = self
+            .blocks
+            .iter()
+            .map(|block| block.quantum_scratch(b, st.max(ss)))
+            .max()
+            .unwrap_or(0);
+        mlx_gen::ios_quantum::before(CONDITIONER_EMBED_QUANTUM, scratch)?;
 
         // learned query tokens from T5 ids (in_proj is Identity: model_dim == target_dim).
         let mut hidden = self.embed.forward(target_ids)?.as_dtype(dtype)?; // [B, St, D]
 
         let (t_cos, t_sin) = self.rope.forward(st)?; // target positions
         let (s_cos, s_sin) = self.rope.forward(ss)?; // source positions
+        mlx_gen::ios_quantum::finish(
+            CONDITIONER_EMBED_QUANTUM,
+            &[&hidden, &t_cos, &t_sin, &s_cos, &s_sin],
+        )?;
         let target_rope = (&t_cos, &t_sin);
         let source_rope = (&s_cos, &s_sin);
 
         for block in &self.blocks {
-            hidden = block.forward(&hidden, source_hidden, target_rope, source_rope)?;
+            hidden = mlx_gen::ios_quantum::run(
+                CONDITIONER_BLOCK_QUANTUM,
+                block.quantum_scratch(b, st.max(ss)),
+                || block.forward(&hidden, source_hidden, target_rope, source_rope),
+            )?;
         }
+        let output_scratch = self
+            .blocks
+            .iter()
+            .map(|block| {
+                block.quantum_scratch(b, st.max(ss).max(self.cfg.min_sequence_length as i32))
+            })
+            .max()
+            .unwrap_or(0);
+        mlx_gen::ios_quantum::run(CONDITIONER_OUTPUT_QUANTUM, output_scratch, || {
+            self.output(&hidden, b, st, target_weights, dtype)
+        })
+    }
+
+    /// `out_proj` + RMSNorm, the optional T5 prompt weighting, and the right-pad to
+    /// `min_sequence_length` — the conditioner's post-block quantum.
+    fn output(
+        &self,
+        hidden: &Array,
+        b: i32,
+        st: i32,
+        target_weights: Option<&[f32]>,
+        dtype: Dtype,
+    ) -> Result<Array> {
         let mut hidden = rms_norm(
-            &self.out_proj.forward(&hidden)?,
+            &self.out_proj.forward(hidden)?,
             &self.norm,
             self.cfg.norm_eps,
         )?;
@@ -487,7 +547,7 @@ mod structural {
 /// Real-weight conditioner for the grad-parity test (sc-10576): a dimension-parametric build with
 /// small random weights so the 6-block conditioner forward+backward runs on Metal without the licensed
 /// checkpoint. Mirrors [`CosmosDiT::synthetic`]. `cfg` sets every dim; use a tiny `cfg` for speed.
-#[cfg(all(test, feature = "training"))]
+#[cfg(test)]
 pub(crate) mod synthetic {
     use super::*;
     use mlx_rs::random;

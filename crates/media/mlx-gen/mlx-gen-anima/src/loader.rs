@@ -32,6 +32,11 @@ const PREFIX_ANCHOR: &str = ".x_embedder.proj.1.weight";
 const TEXT_ENCODER_FILE: &str = "text_encoders/qwen_3_06b_base.safetensors";
 const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
 
+/// iOS pre-load quantum labels (see [`mlx_gen::ios_quantum::before_load`]).
+pub(crate) const TEXT_LOAD_QUANTUM: &str = "Anima text load";
+pub(crate) const HEAVY_LOAD_QUANTUM: &str = "Anima heavy load";
+pub(crate) const CONDITIONING_LOAD_QUANTUM: &str = "Anima conditioning load";
+
 /// Detect the DiT root prefix (`net` or `model.diffusion_model`) from the checkpoint keys.
 fn detect_dit_prefix(w: &Weights) -> Result<String> {
     w.keys()
@@ -154,6 +159,8 @@ pub fn load_text_phase(
     _variant: Variant,
 ) -> Result<(AnimaQwen3, AnimaTokenizers)> {
     let root = resolve_split_files(source)?;
+    // iOS: header-only pre-load floor, checked BEFORE the tower is constructed (no-op elsewhere).
+    mlx_gen::ios_quantum::before_load(TEXT_LOAD_QUANTUM, &[root.join(TEXT_ENCODER_FILE)])?;
     let te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
     let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &Qwen3Config::anima())?;
     // Materialize at load (sc-24245; see `load_heavy_phase_with_stream`).
@@ -202,6 +209,14 @@ pub fn load_heavy_phase_with_stream(
             dit_path.display()
         )));
     }
+
+    // iOS: header-only pre-load floor over the DiT + bundled conditioner file AND the VAE, checked
+    // BEFORE any of them is constructed (no-op elsewhere). A streamable load still counts the whole
+    // DiT file: the resident block handles are built even when a window later re-reads them.
+    mlx_gen::ios_quantum::before_load(
+        HEAVY_LOAD_QUANTUM,
+        &[dit_path.clone(), root.join(VAE_FILE)],
+    )?;
 
     // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
     // `net` (base) or `model.diffusion_model` (turbo/aesthetic) — detect it.
@@ -281,6 +296,11 @@ pub fn load_conditioning_at_dtype(
             dit_path.display()
         )));
     }
+    // iOS: header-only pre-load floor before either module is constructed (no-op elsewhere).
+    mlx_gen::ios_quantum::before_load(
+        CONDITIONING_LOAD_QUANTUM,
+        &[dit_path.clone(), root.join(TEXT_ENCODER_FILE)],
+    )?;
     let dit_weights = Weights::from_file(&dit_path)?;
     let prefix = detect_dit_prefix(&dit_weights)?;
     let cond_weights = cast_subset(&dit_weights, ADAPTER_MARKER, dtype)?;

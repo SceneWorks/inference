@@ -386,6 +386,84 @@ impl TransformerBlock {
         Ok(())
     }
 
+    /// iOS quantum scratch (sc-26270) for this block over `tokens` latent tokens at `batch` rows,
+    /// cross-attending to `context_tokens` keys (text memory plus any IP tokens), at
+    /// `context_batch` rows (a sequential CFG half projects the pair's conditioning at the pair's
+    /// batch). Width, heads, FFN width and every weight element come from the loaded block;
+    /// `query_rows` from the request's attention plan.
+    pub(crate) fn quantum_scratch(
+        &self,
+        batch: i32,
+        context_batch: i32,
+        tokens: i32,
+        context_tokens: i32,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> u64 {
+        use crate::quantum::{elements, linear_elements, linear_out};
+        let heads = self.attn1.num_heads;
+        let batch = batch.max(context_batch);
+        let rows = attention
+            .budget
+            .query_block(batch, heads, tokens, tokens)
+            .max(
+                attention
+                    .budget
+                    .query_block(batch, heads, tokens, context_tokens),
+            )
+            .clamp(0, tokens.max(0));
+        let projections = [
+            &self.attn1.q,
+            &self.attn1.k,
+            &self.attn1.v,
+            &self.attn1.out,
+            &self.attn2.q,
+            &self.attn2.k,
+            &self.attn2.v,
+            &self.attn2.out,
+            &self.linear1,
+            &self.linear2,
+            &self.linear3,
+        ];
+        let ip = [&self.attn2.to_k_ip, &self.attn2.to_v_ip];
+        let weight_elements = projections
+            .into_iter()
+            .chain(ip.into_iter().flatten())
+            .map(linear_elements)
+            .chain(
+                [
+                    &self.norm1_w,
+                    &self.norm1_b,
+                    &self.norm2_w,
+                    &self.norm2_b,
+                    &self.norm3_w,
+                    &self.norm3_b,
+                ]
+                .into_iter()
+                .map(elements),
+            )
+            .fold(0u64, u64::saturating_add);
+        mlx_gen::ios_quantum::attention_block_bytes(mlx_gen::ios_quantum::AttentionBlockGeometry {
+            batch: batch as u64,
+            tokens: tokens as u64,
+            dim: self.norm1_w.shape()[0] as u64,
+            heads: heads as u64,
+            context_tokens: context_tokens as u64,
+            ff_hidden: linear_out(&self.linear1),
+            query_rows: rows as u64,
+            weight_elements,
+        })
+    }
+
+    /// The cross-attention key count this block sees for `memory` (+ IP tokens when this block
+    /// carries IP projections and the request supplied tokens).
+    pub(crate) fn context_tokens(&self, memory: &Array, ip: Option<(&Array, f32)>) -> i32 {
+        let ip_tokens = match ip {
+            Some((tokens, _)) if self.has_ip() => tokens.shape()[1],
+            _ => 0,
+        };
+        memory.shape()[1] + ip_tokens
+    }
+
     /// Run the block. The cross-attention (`attn2`) also injects the IP-Adapter branch when `ip` is
     /// supplied (sc-3059); self-attention never gets IP. (No no-IP wrapper — callers always thread
     /// the `Option`, passing `None` when there's no IP-Adapter.)
@@ -589,8 +667,27 @@ impl Transformer2D {
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
-        let y = group_norm(x, &self.norm_w, &self.norm_b, GN_GROUPS, GN_EPS)?;
-        let y = self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)?;
+        // sc-26270: GroupNorm + proj_in, each block, and proj_out + residual are guarded iOS
+        // quanta (pass-throughs off device). The projections are priced as a conv stage at the
+        // block grid and the loaded projection widths.
+        let projection_scratch = crate::quantum::conv_stage(
+            b,
+            h,
+            w_,
+            &[
+                c,
+                crate::quantum::linear_out(&self.proj_in) as i32,
+                crate::quantum::linear_out(&self.proj_out) as i32,
+            ],
+        );
+        let y = mlx_gen::ios_quantum::run(
+            crate::quantum::TRANSFORMER_PROJ_IN,
+            projection_scratch,
+            || {
+                let y = group_norm(x, &self.norm_w, &self.norm_b, GN_GROUPS, GN_EPS)?;
+                self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)
+            },
+        )?;
         // An armed load keeps its resident `transformer_blocks.*` lazy (never read at load), so a
         // request that selected no window still runs through the stream, one window covering this
         // sub-stack — bit-identical, and no forward ever waits on an unread safetensors `Load`
@@ -609,13 +706,45 @@ impl Transformer2D {
             None => {
                 let mut y = y;
                 for block in &self.blocks {
-                    y = block.forward_ip(&y, encoder_x, ip, plan)?;
+                    let scratch = self.block_scratch(block, &y, encoder_x, ip, plan);
+                    y = mlx_gen::ios_quantum::run(
+                        crate::quantum::TRANSFORMER_BLOCK,
+                        scratch,
+                        || block.forward_ip(&y, encoder_x, ip, plan),
+                    )?;
                 }
                 y
             }
         };
-        let y = self.proj_out.forward(&y)?.reshape(&[b, h, w_, c])?;
-        Ok(add(&y, x)?)
+        mlx_gen::ios_quantum::run(
+            crate::quantum::TRANSFORMER_PROJ_OUT,
+            projection_scratch,
+            || {
+                let y = self.proj_out.forward(&y)?.reshape(&[b, h, w_, c])?;
+                Ok(add(&y, x)?)
+            },
+        )
+    }
+
+    /// iOS quantum scratch for `block` over the hidden tokens `y` `[B, N, C]` (sc-26270).
+    fn block_scratch(
+        &self,
+        block: &TransformerBlock,
+        y: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+    ) -> u64 {
+        if !mlx_gen::ios_quantum::enabled() {
+            return 0;
+        }
+        block.quantum_scratch(
+            y.shape()[0],
+            encoder_x.shape()[0],
+            y.shape()[1],
+            block.context_tokens(encoder_x, ip),
+            plan.attention,
+        )
     }
 
     /// Rung 4's block loop for this sub-stack: walk its blocks in windows, materializing each
@@ -664,8 +793,18 @@ impl Transformer2D {
             || stream.open(),
             |mut y, view, range| {
                 for index in range {
-                    let block = stream.materialize(view, index)?;
-                    y = block.forward_ip(&y, encoder_x, ip, inner)?;
+                    // sc-26270: the check precedes the block's materialization from the snapshot
+                    // and its graph. Geometry comes from the resident twin's (lazy, unread)
+                    // tensors, which carry the same shapes the streamed block is rebuilt with.
+                    let scratch = self.block_scratch(&self.blocks[index], &y, encoder_x, ip, inner);
+                    y = mlx_gen::ios_quantum::run(
+                        crate::quantum::TRANSFORMER_BLOCK,
+                        scratch,
+                        || {
+                            let block = stream.materialize(view, index)?;
+                            block.forward_ip(&y, encoder_x, ip, inner)
+                        },
+                    )?;
                 }
                 Ok(y)
             },

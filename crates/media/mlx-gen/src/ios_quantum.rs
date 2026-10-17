@@ -11,9 +11,40 @@ use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
 pub use budget::{
-    check_headroom, dcae_stage_bytes, gemma_layer_bytes, sana_block_bytes,
-    sana_promoted_conv_bytes, SanaBlockGeometry, PROCESS_RESERVE_BYTES,
+    attention_block_bytes, check_headroom, conv_stage_bytes, dcae_stage_bytes, gemma_layer_bytes,
+    sana_block_bytes, sana_promoted_conv_bytes, transformer_layer_bytes, AttentionBlockGeometry,
+    SanaBlockGeometry, PROCESS_RESERVE_BYTES,
 };
+
+/// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross
+/// provider/contract seams that may stringify them, so the refusal is ALSO recorded here, where a
+/// device capture reads it without parsing any message. Capacity evidence, never a cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumRefusal {
+    pub label: String,
+    pub scratch_bytes: u64,
+    pub reserve_bytes: u64,
+    /// Live `os_proc_available_memory` at the check; `None` when the OS reported none.
+    pub available_bytes: Option<u64>,
+}
+
+static LAST_REFUSAL: std::sync::Mutex<Option<QuantumRefusal>> = std::sync::Mutex::new(None);
+
+fn record_refusal(label: &str, scratch: u64, available: Option<u64>) {
+    if let Ok(mut slot) = LAST_REFUSAL.lock() {
+        *slot = Some(QuantumRefusal {
+            label: label.to_string(),
+            scratch_bytes: scratch,
+            reserve_bytes: PROCESS_RESERVE_BYTES,
+            available_bytes: available,
+        });
+    }
+}
+
+/// Take (and clear) the most recent pre-construction quantum refusal in this process.
+pub fn take_refusal() -> Option<QuantumRefusal> {
+    LAST_REFUSAL.lock().ok().and_then(|mut slot| slot.take())
+}
 
 /// One observed quantum boundary in a CPU diagnostic fixture.
 #[cfg(not(target_os = "ios"))]
@@ -74,9 +105,10 @@ fn notify(_event: impl FnOnce() -> QuantumEventArg) {
     }
 }
 
+// Fields are only read by the host CPU-fixture observer; on iOS `notify` discards them.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 enum QuantumEventArg {
     Checked(String, u64),
-    #[cfg_attr(target_os = "ios", allow(dead_code))]
     Synchronized(String, i32),
 }
 
@@ -157,8 +189,11 @@ impl Drop for Scope {
 
 pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
-        check_headroom(available_bytes(), scratch, PROCESS_RESERVE_BYTES)
-            .map_err(|e| Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)")))?;
+        let available = available_bytes();
+        check_headroom(available, scratch, PROCESS_RESERVE_BYTES).map_err(|e| {
+            record_refusal(label, scratch, available);
+            Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)"))
+        })?;
         notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
     }
     Ok(())
@@ -194,8 +229,9 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
         return build();
     }
     let checked = std::cell::Cell::new(false);
+    let available = available_bytes();
     let result = budget::guarded(
-        available_bytes(),
+        available,
         scratch,
         PROCESS_RESERVE_BYTES,
         || {
@@ -217,6 +253,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
                 && (reason.starts_with("iOS quantum refused")
                     || reason == "iOS quantum accounting overflow") =>
         {
+            record_refusal(label, scratch, available);
             Error::Unsupported(format!("{label}: {reason}"))
         }
         other => other,
@@ -247,6 +284,42 @@ pub fn before_load(label: &str, components: &[std::path::PathBuf]) -> Result<()>
         .checked_add(largest)
         .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
     before(label, scratch)
+}
+
+/// [`before_load`] for a component whose loader CASTS every tensor to a `bytes_per_element`-wide
+/// dtype after reading it (e.g. SDXL's VAE, upcast to f32): the stored bytes AND the cast copies
+/// are live together, plus the largest cast tensor as scratch. Header-only; a no-op off device.
+pub fn before_load_cast(
+    label: &str,
+    components: &[std::path::PathBuf],
+    bytes_per_element: u64,
+) -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let overflow = || Error::Unsupported("iOS load accounting overflow".into());
+    let mut total = 0u64;
+    let mut largest = 0u64;
+    for component in components {
+        for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
+            .map_err(|e| Error::Msg(e.to_string()))?
+        {
+            let elements = header
+                .shape
+                .iter()
+                .try_fold(1u64, |a, &d| a.checked_mul(d as u64))
+                .ok_or_else(overflow)?;
+            let cast = elements
+                .checked_mul(bytes_per_element)
+                .ok_or_else(overflow)?;
+            total = total
+                .checked_add(header.data_bytes)
+                .and_then(|t| t.checked_add(cast))
+                .ok_or_else(overflow)?;
+            largest = largest.max(cast);
+        }
+    }
+    before(label, total.checked_add(largest).ok_or_else(overflow)?)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -331,6 +404,53 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
     });
     assert!(refused.is_err());
     assert!(!constructed.get());
+    // The refusal is typed for a capture, independent of how the error string is propagated.
+    let record = take_refusal().expect("a pre-construction refusal is recorded");
+    assert_eq!(record.label, "refused");
+    assert_eq!(record.scratch_bytes, 4096);
+    assert_eq!(record.available_bytes, Some(0));
+    assert_eq!(take_refusal(), None, "taking clears the record");
+    let before_refused = with_cpu_diagnostic_headroom(1, || before("before refused", 8));
+    assert!(before_refused.is_err());
+    assert_eq!(
+        take_refusal().map(|r| (r.label, r.available_bytes)),
+        Some(("before refused".to_string(), Some(1)))
+    );
+    // A casting load prices stored bytes + the widened copies + the largest widened tensor.
+    let dir = std::env::temp_dir().join(format!("ios-quantum-cast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("vae.safetensors");
+    let header = r#"{"w":{"dtype":"F16","shape":[4,8],"data_offsets":[0,64]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header.as_bytes());
+    bytes.resize(bytes.len() + 64, 0);
+    std::fs::write(&file, bytes).unwrap();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    with_cpu_diagnostic_headroom(1 << 30, || {
+        with_cpu_diagnostic_observer(
+            move |e| sink.borrow_mut().push(e.clone()),
+            || {
+                before_load("stored", std::slice::from_ref(&file))?;
+                before_load_cast("cast", std::slice::from_ref(&file), 4)
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        [
+            QuantumEvent::Checked {
+                label: "stored".into(),
+                scratch: 64 + 64
+            },
+            QuantumEvent::Checked {
+                label: "cast".into(),
+                scratch: 64 + 128 + 128
+            },
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -51,6 +51,9 @@ pub mod text_encoder;
 #[cfg(feature = "training")]
 pub mod train;
 
+#[cfg(all(test, target_os = "macos", debug_assertions))]
+mod quantum_tests;
+
 pub use dit::{IrisDiT, TextBatch};
 pub use mlx_gen::gen_core::iris::{
     IrisTask, TEXT_ENCODER_COMPONENT, TEXT_ENCODER_REPO, TEXT_ENCODER_REVISION,

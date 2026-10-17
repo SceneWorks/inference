@@ -1186,10 +1186,18 @@ pub fn encode_init_latents(
 /// Convert a VAE-decoded NHWC tensor `[1, H, W, 3]` (≈`[-1, 1]`) to an RGB8 [`Image`]:
 /// `clip(x·0.5 + 0.5, 0, 1) · 255` (the vendored `StableDiffusion.decode` + txt2image recipe).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
-    let half = scalar(0.5);
-    let x = add(&multiply(decoded, &half)?, &half)?;
-    let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
-    let x = round(&multiply(&x, scalar(255.0))?, 0)?;
+    // sc-26270: the full-resolution clamp/scale/round chain is one guarded iOS quantum (input plus
+    // five elementwise temporaries); a pass-through off device.
+    let x = mlx_gen::ios_quantum::run(
+        crate::quantum::DECODED_TO_IMAGE,
+        crate::quantum::elementwise_bytes(&[decoded], 6),
+        || {
+            let half = scalar(0.5);
+            let x = add(&multiply(decoded, &half)?, &half)?;
+            let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
+            Ok(round(&multiply(&x, scalar(255.0))?, 0)?)
+        },
+    )?;
     let sh = x.shape();
     // One image per call (the pipeline loops with B==1): reject B>1 instead of silently keeping only
     // batch 0, and size in usize / flatten via -1 to avoid the u32/i32 product overflow (F-053).

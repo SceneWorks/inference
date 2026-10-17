@@ -37,7 +37,14 @@ pub mod pipeline;
 pub mod plan;
 pub mod preview;
 pub mod quant;
+// iOS bounded execution quanta (sc-26270): labels and loaded-tensor scratch geometry.
+pub(crate) mod quantum;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests;
 pub mod sampler;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 #[doc(hidden)]
 pub mod test_support;
 pub mod text_encoder;
@@ -88,8 +95,9 @@ pub use loader::{
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    descriptor, load, load_concrete, load_from_ldm_file, snapshot_component_footprint,
-    DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, descriptor, load, load_concrete, load_from_ldm_file,
+    snapshot_component_footprint, DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID,
+    PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,

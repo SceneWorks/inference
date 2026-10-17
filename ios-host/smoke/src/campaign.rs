@@ -97,6 +97,9 @@ pub enum Status {
     AdmittedRefused,
     DiagnosticSuccess,
     DiagnosticFailure,
+    /// A bounded DEVICE CAPTURE whose quantum refused before constructing its graph: the
+    /// "next size refused before jetsam" evidence. Never a production pass.
+    CaptureRefused,
     Skipped,
 }
 impl Status {
@@ -106,6 +109,7 @@ impl Status {
             Self::AdmittedRefused => "admitted_refused",
             Self::DiagnosticSuccess => "diagnostic_success",
             Self::DiagnosticFailure => "diagnostic_failure",
+            Self::CaptureRefused => "capture_refused",
             Self::Skipped => "skipped",
         }
     }
@@ -132,9 +136,29 @@ impl From<&str> for AdmissionError {
     }
 }
 
+/// Why execution stopped. A quantum refusal is typed by the bounded-quantum mechanism itself
+/// (`ios_quantum::take_refusal`), never by parsing the error message.
+#[derive(Debug)]
+pub enum ExecuteError {
+    QuantumRefused(String),
+    Failure(String),
+}
+impl From<String> for ExecuteError {
+    fn from(e: String) -> Self {
+        Self::Failure(e)
+    }
+}
+impl From<&str> for ExecuteError {
+    fn from(e: &str) -> Self {
+        Self::Failure(e.into())
+    }
+}
+
 pub trait Provider {
+    /// `diagnostic` selects the bounded CAPTURE path: no evidence row is required, only bounded
+    /// per-quantum execution. Otherwise admission against the reviewed evidence table.
     fn admit(&mut self, case: &Case, diagnostic: bool) -> Result<(), AdmissionError>;
-    fn execute(&mut self, case: &Case) -> Result<(), String>;
+    fn execute(&mut self, case: &Case) -> Result<(), ExecuteError>;
 }
 pub fn run(provider: &mut impl Provider, case: &Case, diagnostic: bool) -> (Status, String) {
     if let Err(error) = provider.admit(case, diagnostic) {
@@ -159,7 +183,12 @@ pub fn run(provider: &mut impl Provider, case: &Case, diagnostic: bool) -> (Stat
             },
             "completed".into(),
         ),
-        Err(e) => (Status::DiagnosticFailure, e),
+        Err(ExecuteError::QuantumRefused(e)) if diagnostic => (Status::CaptureRefused, e),
+        Err(ExecuteError::QuantumRefused(e)) => (
+            Status::DiagnosticFailure,
+            format!("admitted case hit a quantum refusal (admission evidence is stale): {e}"),
+        ),
+        Err(ExecuteError::Failure(e)) => (Status::DiagnosticFailure, e),
     }
 }
 
@@ -217,6 +246,7 @@ mod tests {
     struct Fake {
         admitted: bool,
         fail: bool,
+        quantum: bool,
         loads: usize,
     }
     impl Provider for Fake {
@@ -227,9 +257,11 @@ mod tests {
                 Err(AdmissionError::Refused("no bound".into()))
             }
         }
-        fn execute(&mut self, _: &Case) -> Result<(), String> {
+        fn execute(&mut self, _: &Case) -> Result<(), ExecuteError> {
             self.loads += 1;
-            if self.fail {
+            if self.quantum {
+                Err(ExecuteError::QuantumRefused("SANA block refused".into()))
+            } else if self.fail {
                 Err("bad output".into())
             } else {
                 Ok(())
@@ -242,6 +274,7 @@ mod tests {
         let mut p = Fake {
             admitted: false,
             fail: false,
+            quantum: false,
             loads: 0,
         };
         assert_eq!(run(&mut p, &c, false).0, Status::AdmittedRefused);
@@ -257,5 +290,22 @@ mod tests {
         p.fail = true;
         assert_eq!(run(&mut p, &c, false).0, Status::DiagnosticFailure);
         assert!(!Status::Skipped.production_success());
+    }
+    #[test]
+    fn a_capture_quantum_refusal_is_typed_capture_evidence_never_a_pass() {
+        let c = enumerate(&[surface()]).remove(0);
+        let mut p = Fake {
+            admitted: true,
+            fail: false,
+            quantum: true,
+            loads: 0,
+        };
+        let (status, reason) = run(&mut p, &c, true);
+        assert_eq!(status, Status::CaptureRefused);
+        assert_eq!(status.label(), "capture_refused");
+        assert!(!status.production_success());
+        assert!(reason.contains("SANA block refused"));
+        // In admitted (product) mode the same refusal means the evidence was stale: a failure.
+        assert_eq!(run(&mut p, &c, false).0, Status::DiagnosticFailure);
     }
 }

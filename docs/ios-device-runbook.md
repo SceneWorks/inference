@@ -115,11 +115,18 @@ python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
 python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
   --case sdxl/sdxl/q4/1024/text/2 --next-edge 1280 --device "$DEVICE" \
   --output "$EVIDENCE/sdxl-next-up.jsonl"
-# Diagnostic selection is supported, but currently refuses every full-model case
-# until an independently bounded primitive permit exists. Never reports prod PASS.
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case anima_turbo/anima_turbo/q4/512/text/4 --diagnostic --device "$DEVICE" \
-  --output "$EVIDENCE/anima-diagnostic.jsonl"
+# Bounded DEVICE CAPTURE (labelled diagnostic, never production): no evidence row is
+# needed, because every quantum of every registered model checks live OS headroom
+# BEFORE constructing its graph. Each model/route/tier/mode/rung ladder is walked
+# 512 -> 768 -> 1024 and stops at the first case that is not a completed capture;
+# a `capture_refused` row names the refused quantum (the next-size-refused-before-
+# jetsam evidence). No retries; the cap is never raised.
+python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
+  --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
+  --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
+# Candidate rows for the single reviewed table. PRINTED for review; a human commits
+# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json.
+python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
 python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
 ```
 
@@ -127,8 +134,11 @@ Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
 active/cache/active+cache peaks, MLX allocator peak, sampled Darwin
 `TASK_VM_INFO.phys_footprint` peak (words 36–37), the kernel's exact lifetime
 `ledger_phys_footprint_peak` (words 42–43, requested count 44), and minimum
-`os_proc_available_memory()` headroom. Rows also carry SANA layout identity or
-SDXL profile/request key, selected strategy parameters, evidence revision,
+`os_proc_available_memory()` headroom. Rows also carry the path-free artifact
+layout identity, the full memory-relevant `evidence_key` (hardware, provider,
+route, tier, layout, mode, geometry, references, execution levers, token window;
+never prompt/seed/path), `evidence_class` (`admitted` or `capture`), any typed
+`refused_quantum`, selected strategy parameters, evidence revision,
 entitlement, refusal-only marker, per-launch nonce, compiled build SHA and iOS
 version. The nonce prevents a previous report with the same case/SHA from passing
 freshness checks. Render
@@ -137,18 +147,20 @@ image of a real two-prompt batch. **RSS and MLX active+cache are not kernel
 physical footprint.** Sampling is 20 ms and can miss transients; these are
 observations, not an independent instantaneous working-set proof. Unavailable
 readings are null, never fabricated zeros. Statuses are `successful` (admitted
-image only), `admitted_refused`, `diagnostic_success` (never production),
-`diagnostic_failure`, or `skipped` (explicit host case budget). Missing/stale
+image only), `admitted_refused`, `diagnostic_success` (a completed capture, never
+production), `capture_refused` (a capture whose quantum refused before
+construction), `diagnostic_failure`, or `skipped` (explicit host case budget). Missing/stale
 reports, timeout, malformed output or a terminated process cannot prove admission
 refusal. Missing physical-footprint/headroom telemetry cannot yield production
 success. Noncompletion returns nonzero; a successful listing is not a render.
 The table includes the largest **admitted** completed edge per route/tier/mode/
 strategy, active/cache/combined columns and probe markers. Refusals have typed
-`refusal_kind`: `capacity`, `no_evidence`, `mode`, or `strategy`. Only an
-artifact-bound **capacity** refusal proves the next-up condition; missing
-footprint evidence, unsupported modes/rungs, malformed sources and termination
-never prove it. SANA profile errors and SDXL profile/request-binding errors are
-failures before admission, not capacity refusals.
+`refusal_kind`: `capacity`, `no_evidence`, `mode`, `strategy`, or `artifact`,
+taken from runtime-ios's typed refusal, never parsed from a message. Only a
+**capacity** refusal proves the next-up condition (an admitted capacity refusal,
+or a capture's typed quantum refusal); missing footprint evidence, unsupported
+modes/rungs, malformed sources and termination never prove it. Layout-profile
+and request-binding errors are failures before admission, not capacity refusals.
 Commit the actual measured table only after the terminal campaign, not this
 harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
 readings remain unvalidated diagnostics, and no cap/table is invented here.

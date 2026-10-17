@@ -243,6 +243,9 @@ impl Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // iOS: one cache-limit scope for the whole request (loads, encode, denoise, decode); inert
+        // on every other target.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let variant = self.variant;
