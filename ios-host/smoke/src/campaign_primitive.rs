@@ -31,7 +31,11 @@ pub(super) struct Plan {
     /// OHWI 1x1 weight `[2*hidden, 1, 1, dim]`, F16.
     pub weight_shape: [i32; 4],
     pub scratch_bytes: u64,
+    /// f32 activation + F16 weight, resident BEFORE the quantum's own live recheck.
+    pub resident_bytes: u64,
     pub reserve_bytes: u64,
+    /// scratch + resident + reserve: passing this guarantees the inner recheck also passes
+    /// unless OS headroom moves for reasons outside the probe.
     pub required_bytes: u64,
 }
 
@@ -45,14 +49,23 @@ pub(super) fn plan() -> Result<Plan, String> {
     let channels = i32::try_from(geometry.ff_channels).map_err(|_| "probe channel overflow")?;
     let scratch_bytes = ios_quantum::sana_block_bytes(geometry);
     let reserve_bytes = PROCESS_RESERVE_BYTES;
+    let activation_shape = [1, side, side, dim];
+    let weight_shape = [channels, 1, 1, dim];
+    let elements = |shape: &[i32; 4]| shape.iter().map(|d| *d as u64).product::<u64>();
+    let resident_bytes = elements(&activation_shape)
+        .checked_mul(4)
+        .and_then(|a| elements(&weight_shape).checked_mul(2)?.checked_add(a))
+        .ok_or("probe resident overflow")?;
     let required_bytes = scratch_bytes
-        .checked_add(reserve_bytes)
+        .checked_add(resident_bytes)
+        .and_then(|b| b.checked_add(reserve_bytes))
         .ok_or("probe requirement overflow")?;
     Ok(Plan {
         geometry,
-        activation_shape: [1, side, side, dim],
-        weight_shape: [channels, 1, 1, dim],
+        activation_shape,
+        weight_shape,
         scratch_bytes,
+        resident_bytes,
         reserve_bytes,
         required_bytes,
     })
@@ -100,7 +113,7 @@ pub(super) fn characterize(device: &mut impl ProbeDevice, diagnostic: bool) -> V
         "weight_shape": plan.weight_shape, "weight_dtype": "float16",
         "geometry": {"batch": g.batch, "tokens": g.tokens, "dim": g.dim, "caption_tokens": g.caption_tokens,
             "ff_channels": g.ff_channels, "cross_heads": g.cross_heads, "conv_weight_elements": g.conv_weight_elements},
-        "scratch_floor_bytes": plan.scratch_bytes, "engineering_reserve_bytes": plan.reserve_bytes,
+        "scratch_floor_bytes": plan.scratch_bytes, "resident_bytes": plan.resident_bytes, "engineering_reserve_bytes": plan.reserve_bytes,
         "required_headroom_bytes": plan.required_bytes});
     if !diagnostic {
         return failed(
@@ -110,17 +123,18 @@ pub(super) fn characterize(device: &mut impl ProbeDevice, diagnostic: bool) -> V
     }
     let before = device.read();
     row["before"] = before.json();
+    // Residents are allocated before the quantum's live recheck, so they are charged here too.
     if let Err(reason) = ios_quantum::check_headroom(
         before.available_bytes,
-        plan.scratch_bytes,
+        plan.scratch_bytes + plan.resident_bytes,
         plan.reserve_bytes,
     ) {
         row["refused_before_allocation"] = json!(true);
         return failed(
             row,
             format!(
-                "{reason}: requires {} bytes (SANA block floor {} + engineering reserve {}), live {:?}",
-                plan.required_bytes, plan.scratch_bytes, plan.reserve_bytes, before.available_bytes
+                "{reason}: requires {} bytes (SANA block floor {} + residents {} + engineering reserve {}), live {:?}",
+                plan.required_bytes, plan.scratch_bytes, plan.resident_bytes, plan.reserve_bytes, before.available_bytes
             ),
         );
     }

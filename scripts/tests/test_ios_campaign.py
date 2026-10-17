@@ -234,7 +234,8 @@ class CampaignTests(unittest.TestCase):
         row = campaign.failure(campaign.PRIMITIVE_KEY, "primitive characterized")
         row.update(status="diagnostic_success", production_success=False, diagnostic=True, cap_validated=False,
                    evidence_class=campaign.PRIMITIVE_CLASS, model_admission_evidence=False, build_sha="test-sha",
-                   run_id="fixture-run", nonce="fixture-run",
+                   run_id="fixture-run", nonce="fixture-run", entitlement="YES",
+                   allocation_attempted=True, refused_before_allocation=False,
                    primitive={"required_headroom_bytes": 974_000_000, "scratch_floor_bytes": 437_000_000, "engineering_reserve_bytes": 512 << 20},
                    before=dict(reading), resident=dict(reading, mlx_active_bytes=48 << 20),
                    after=dict(reading, kernel_lifetime_peak_bytes=200 << 20, mlx_peak_bytes=144 << 20),
@@ -255,6 +256,9 @@ class CampaignTests(unittest.TestCase):
             "bool": dict(row, before=dict(row["before"], mlx_peak_bytes=True)),
             "below": dict(row, before=dict(row["before"], available_bytes=974_000_000 - 1)),
             "requirement": dict(row, primitive={}),
+            "not-attempted": dict(row, allocation_attempted=False),
+            "refused": dict(row, refused_before_allocation=True),
+            "entitlement": dict(row, entitlement=None),
         }
         for name, candidate in bad.items():
             with self.subTest(name=name):
@@ -272,6 +276,7 @@ class CampaignTests(unittest.TestCase):
             seen.update(key=key, kw=kw)
             return self.primitive_row()
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake_invoke):
+            cls.return_value.run_id = "fixture-run"
             with contextlib.redirect_stdout(io.StringIO()) as printed:
                 # No --catalog: consulting the catalog would start cargo and trip the Popen trap.
                 self.assertEqual(campaign.main(["primitive", "--device", "fake", "--output", str(output)]), 0)
@@ -288,6 +293,18 @@ class CampaignTests(unittest.TestCase):
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.main(["primitive", "--device", "fake", "--output", str(self.root / "x.jsonl"), *extra])
 
+    def test_primitive_nonce_is_checked_against_the_host_launch_not_the_row(self):
+        # Row is self-consistent (run_id == nonce) but belongs to a different launch.
+        stale = dict(self.primitive_row(), run_id="previous-launch", nonce="previous-launch")
+        output = self.root / "stale.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", return_value=stale):
+            cls.return_value.run_id = "fixture-run"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(campaign.main(["primitive", "--device", "fake", "--output", str(output)]), 2)
+        row = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertIn("nonce", row["reason"])
+
     def test_primitive_through_the_real_session_launch_path(self):
         session = self.fake_session(self.primitive_row())
         session.args.diagnostic = True
@@ -296,7 +313,8 @@ class CampaignTests(unittest.TestCase):
         launched = session.device.call_args.args[0]
         variables = json.loads(launched[launched.index("--environment-variables") + 1])
         self.assertEqual((variables["IOS_CAMPAIGN_CASE"], variables["IOS_CAMPAIGN_DIAGNOSTIC"]), (campaign.PRIMITIVE_KEY, "1"))
-        self.assertEqual(campaign.validate_primitive(row, row["run_id"])["status"], "diagnostic_success")
+        self.assertEqual(session.run_id, "fixture-run")
+        self.assertEqual(campaign.validate_primitive(row, session.run_id)["status"], "diagnostic_success")
 
 
 if __name__ == "__main__":

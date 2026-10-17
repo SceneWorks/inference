@@ -166,6 +166,10 @@ def validate_primitive(row, run_id):
         return reject("nonce does not match this launch")
     if row.get("status") != "diagnostic_success":
         return row
+    if row.get("allocation_attempted") is not True or row.get("refused_before_allocation") is not False:
+        return reject("success without an attempted, unrefused allocation")
+    if not isinstance(row.get("entitlement"), str) or not row["entitlement"]:
+        return reject("entitlement marker missing")
     primitive = row.get("primitive")
     if not isinstance(primitive, dict) or not _count(primitive.get("required_headroom_bytes")):
         return reject("missing derived headroom requirement")
@@ -208,7 +212,8 @@ def run_primitive(args):
         session = DeviceSession(args)
         session.install()
         row = invoke(session, PRIMITIVE_KEY)
-        row = validate_primitive(row, row.get("run_id"))
+        # The HOST's launch nonce, never the row's own claim.
+        row = validate_primitive(row, getattr(session, "run_id", None))
         output.write(json.dumps(row) + "\n")
     print(render_primitive(row))
     return 0 if row.get("status") == "diagnostic_success" else 2
@@ -283,6 +288,7 @@ class DeviceSession:
         artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / (key.replace("/", "-") + ("-probe" if refusal_only else ""))
         launcher_code = None
         run_id = uuid.uuid4().hex
+        self.run_id = run_id
         try:
             artifact.mkdir(parents=True, exist_ok=False)
             if not self.exited():

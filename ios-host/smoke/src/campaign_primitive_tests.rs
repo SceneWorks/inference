@@ -77,9 +77,15 @@ fn requirement_is_the_budget_modules_sana_block_floor_plus_reserve() {
     assert_eq!(plan.geometry, geometry);
     assert_eq!(plan.scratch_bytes, ios_quantum::sana_block_bytes(geometry));
     assert_eq!(plan.reserve_bytes, PROCESS_RESERVE_BYTES);
+    // Residents are the probe's own tensors at their stored dtypes: f32 activation, F16 weight.
+    let elements = |shape: &[i32; 4]| shape.iter().map(|d| *d as u64).product::<u64>();
+    assert_eq!(
+        plan.resident_bytes,
+        4 * elements(&plan.activation_shape) + 2 * elements(&plan.weight_shape)
+    );
     assert_eq!(
         plan.required_bytes,
-        plan.scratch_bytes + PROCESS_RESERVE_BYTES
+        plan.scratch_bytes + plan.resident_bytes + PROCESS_RESERVE_BYTES
     );
     // Shapes are the block's own: [1, H, W, dim] activation, [2*hidden, 1, 1, dim] weight.
     assert_eq!(plan.activation_shape, [1, side, side, cfg.inner_dim()]);
@@ -94,8 +100,12 @@ fn requirement_is_the_budget_modules_sana_block_floor_plus_reserve() {
 
 #[test]
 fn insufficient_or_unavailable_headroom_refuses_before_any_allocation() {
-    let required = plan().unwrap().required_bytes;
-    for available in [None, Some(0), Some(required - 1)] {
+    let plan = plan().unwrap();
+    let required = plan.required_bytes;
+    // `scratch + reserve` alone is the window where the inner live recheck would refuse only
+    // AFTER residents were allocated; the pre-check must close it.
+    let without_residents = plan.scratch_bytes + plan.reserve_bytes;
+    for available in [None, Some(0), Some(without_residents), Some(required - 1)] {
         let mut device = Fixture::new(available);
         let row = characterize(&mut device, true);
         assert_eq!(device.allocations.get(), 0, "{available:?}");
@@ -253,20 +263,53 @@ fn cpu_real_primitive_runs_at_the_requirement_and_allocates_nothing_below_it() {
     assert!(metal_guard::forbid_metal());
     assert!(metal_guard::metal_forbidden());
     let plan = plan().unwrap();
-    let below = ios_quantum::with_cpu_diagnostic_headroom(plan.required_bytes - 1, || {
-        let active = mlx_rs::memory::get_active_memory();
-        let row = characterize(&mut Device, true);
-        assert_eq!(mlx_rs::memory::get_active_memory(), active);
-        Ok(row)
-    })
-    .unwrap();
+    use ios_quantum::QuantumEvent;
+    use std::{cell::RefCell, rc::Rc};
+    let observe = |headroom: u64| {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let row = ios_quantum::with_cpu_diagnostic_headroom(headroom, || {
+            ios_quantum::with_cpu_diagnostic_observer(
+                move |event| sink.borrow_mut().push(event.clone()),
+                || {
+                    let active = mlx_rs::memory::get_active_memory();
+                    let row = characterize(&mut Device, true);
+                    if row["allocation_attempted"] == false {
+                        assert_eq!(mlx_rs::memory::get_active_memory(), active);
+                    }
+                    Ok(row)
+                },
+            )
+        })
+        .unwrap();
+        let events = events.borrow().clone();
+        (row, events)
+    };
+    let (below, events) = observe(plan.required_bytes - 1);
     assert_eq!(below["refused_before_allocation"], true);
     assert_eq!(below["allocation_attempted"], false);
-    let row = ios_quantum::with_cpu_diagnostic_headroom(plan.required_bytes, || {
-        Ok(characterize(&mut Device, true))
-    })
-    .unwrap();
+    assert!(events.is_empty(), "{events:?}");
+    let (row, events) = observe(plan.required_bytes);
     assert_eq!(row["status"], "diagnostic_success", "{row}");
+    // The quantum went through the engine's guard API: exactly one pre-construction check for
+    // the block floor and one stream synchronization, both under the probe's label.
+    let checked: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, QuantumEvent::Checked { .. }))
+        .collect();
+    assert_eq!(
+        checked,
+        [&QuantumEvent::Checked {
+            label: LABEL.into(),
+            scratch: plan.scratch_bytes
+        }],
+        "{events:?}"
+    );
+    let synchronized = events
+        .iter()
+        .filter(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == LABEL))
+        .count();
+    assert_eq!(synchronized, 1, "{events:?}");
     // F16 weight resident at its half size, then the quantum's peak includes the F32 promotion.
     let weight_elements = plan.weight_shape.iter().map(|d| *d as u64).product::<u64>();
     let resident = row["resident"]["mlx_active_bytes"].as_u64().unwrap();

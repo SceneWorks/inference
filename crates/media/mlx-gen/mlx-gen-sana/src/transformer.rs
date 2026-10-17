@@ -532,7 +532,7 @@ pub(crate) struct SanaBlock {
 }
 
 /// Block-quantum geometry from the CONFIGURATION alone (no tensors): the rung-4 fallback when no
-/// block is resident, and the iOS synthetic primitive probe. Matches [`SanaBlock::quantum_geometry`]
+/// block is resident, and the iOS synthetic primitive probe. Matches `SanaBlock::quantum_geometry`
 /// for a loaded block: inverted 1x1 (+bias), depthwise 3x3 (+bias), point 1x1 (no bias).
 pub fn configured_block_geometry(
     cfg: &SanaTransformerConfig,

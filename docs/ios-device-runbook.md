@@ -165,8 +165,11 @@ like `conv_inverted`, so MLX materializes the F32-promoted weight copy inside
 drain). Before **any** allocation it refuses unless live
 `os_proc_available_memory()` covers the requirement derived from the budget
 module: `sana_block_bytes(configured_block_geometry(sana_1600m, 1, 8, 8, 300))`
-+ `PROCESS_RESERVE_BYTES` = 416.876 + 512 = **928.876 MiB** (973,997,312 bytes).
-The floor counts the loaded block's conv biases; a bias-free count gives 416.791.
++ the probe's resident activation/weight bytes + `PROCESS_RESERVE_BYTES` =
+416.876 + 48.398 + 512 = **977.275 MiB** (1,024,746,752 bytes). Residents are
+charged because they are allocated before the quantum's own live recheck of
+floor + reserve. The floor counts the loaded block's conv biases; a bias-free
+count gives 416.791.
 
 The row (`evidence_class: primitive_characterization`,
 `model_admission_evidence: false`, `diagnostic: true`) records `before`,
