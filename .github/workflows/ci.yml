@@ -914,12 +914,22 @@ jobs:
           cargo --config 'profile.dev.package."*".opt-level=3'
           build --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml
           --features media
+      # The harness's third feature, the Z-Image go/no-go (`run_smoke.sh --zimage`), so every
+      # harness feature compiles for the device in CI.
+      - name: Build iOS device harness (zimage) for ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          cargo --config 'profile.dev.package."*".opt-level=3'
+          build --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml
+          --features zimage
       - name: Clippy iOS device harness for ${{ matrix.target }}
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --all-targets -- -D warnings
           cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features media --all-targets -- -D warnings
+          cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features zimage --all-targets -- -D warnings
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)

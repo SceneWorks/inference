@@ -283,6 +283,12 @@ impl AnimaTextConditioner {
     /// `comfy/model_base.py:1470`). The Qwen source path is untouched (its weights are pinned to
     /// `1.0` upstream), and an all-`1.0` weight vector is a strict no-op (identical to
     /// [`Self::forward`]).
+    /// Allowance for the lazy Qwen3 mask-multiply feeding `source_hidden`: the states, the cast
+    /// mask broadcast and the product (three source-sized f32 buffers).
+    pub(crate) fn mask_multiply_bytes(source_hidden: &Array) -> u64 {
+        mlx_gen::ios_quantum::elementwise_bytes(source_hidden.size() as u64, 3)
+    }
+
     pub fn forward_weighted(
         &self,
         source_hidden: &Array,
@@ -302,7 +308,12 @@ impl AnimaTextConditioner {
             .map(|block| block.quantum_scratch(b, st.max(ss)))
             .max()
             .unwrap_or(0);
-        mlx_gen::ios_quantum::before(CONDITIONER_EMBED_QUANTUM, scratch)?;
+        // The caller's Qwen3 mask-multiply (states, cast mask, product) is lazy and is materialized
+        // in this quantum.
+        mlx_gen::ios_quantum::before(
+            CONDITIONER_EMBED_QUANTUM,
+            scratch.saturating_add(Self::mask_multiply_bytes(source_hidden)),
+        )?;
 
         // learned query tokens from T5 ids (in_proj is Identity: model_dim == target_dim).
         let mut hidden = self.embed.forward(target_ids)?.as_dtype(dtype)?; // [B, St, D]
@@ -311,7 +322,7 @@ impl AnimaTextConditioner {
         let (s_cos, s_sin) = self.rope.forward(ss)?; // source positions
         mlx_gen::ios_quantum::finish(
             CONDITIONER_EMBED_QUANTUM,
-            &[&hidden, &t_cos, &t_sin, &s_cos, &s_sin],
+            &[&hidden, &t_cos, &t_sin, &s_cos, &s_sin, source_hidden],
         )?;
         let target_rope = (&t_cos, &t_sin);
         let source_rope = (&s_cos, &s_sin);

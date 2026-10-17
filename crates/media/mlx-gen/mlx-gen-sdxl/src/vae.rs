@@ -276,7 +276,7 @@ impl EncoderDecoderBlock2D {
 
 /// The VAE upsample convolution has no normalization between nearest-neighbor expansion and
 /// convolution: unlike a resnet's normalized inputs its activation can be ~2000 (sc-26268).
-fn upsample_tiled(
+pub(crate) fn upsample_tiled(
     x: &Array,
     weight: &Array,
     bias: &Array,
@@ -288,7 +288,11 @@ fn upsample_tiled(
     let (cin, cout) = crate::quantum::conv_channels(weight);
     mlx_gen::ios_quantum::before(
         crate::quantum::VAE_TILED_STAGE,
-        crate::quantum::tiled_stage(s[0], 2 * s[1], 2 * s[2], &[cin, cout]),
+        if x.dtype() == Dtype::Float16 {
+            crate::quantum::tiled_stage_f32_accum(s[0], 2 * s[1], 2 * s[2], weight, bias)
+        } else {
+            crate::quantum::tiled_stage(s[0], 2 * s[1], 2 * s[2], &[cin, cout])
+        },
     )?;
     let up = upsample_nearest(x, 2)?;
     trace_decode_stage("upsample.nearest", &up)?;

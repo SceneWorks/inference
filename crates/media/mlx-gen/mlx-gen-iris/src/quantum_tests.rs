@@ -285,6 +285,37 @@ fn dit_forward_guarded_body() {
             checks(&events).len(),
             9 + dit.trunk_depth() + dit.pixel_depth()
         );
+        // Lazy small work is priced where it materializes. The entry quantum carries the previous
+        // step's guidance combine + solver arithmetic (16 latent-sized f32 buffers); the FIRST trunk
+        // block carries both RoPE tables (4 tables each) and the text positional add (3 buffers).
+        let m = &config.model;
+        let p = m.patch_size as i32;
+        let (b, n_patches, n_txt) = (2, (16 / p) * (24 / p), m.text_len as i32);
+        let plan = AttentionPlan::budgeted(budget);
+        let head_dim = (m.hidden_size / m.num_heads) as u64;
+        let of = |label: &str| -> Vec<u64> {
+            checks(&events)
+                .into_iter()
+                .filter(|c| c.0 == label)
+                .map(|c| c.1)
+                .collect()
+        };
+        assert_eq!(
+            of(dit_q::EMBED),
+            [dit.embed_scratch(b, n_patches) + 16 * case.x.size() as u64 * 4]
+        );
+        let entry = 4 * n_patches as u64 * head_dim * 4
+            + 4 * n_txt as u64 * head_dim * 4
+            + 3 * (b * n_txt) as u64 * m.hidden_size as u64 * 4;
+        let trunk = of(dit_q::TRUNK_BLOCK);
+        for (i, scratch) in trunk.iter().enumerate() {
+            let floor = dit.trunk_block_scratch(i, b, n_patches, n_txt, plan);
+            assert_eq!(
+                *scratch,
+                floor + if i == 0 { entry } else { 0 },
+                "trunk {i}"
+            );
+        }
         let mid = assert_refusals(&events, |headroom| {
             observed(headroom, || case.forward(&dit, budget))
         });

@@ -156,10 +156,29 @@ pub fn build_candidate(
     selection: Option<MemorySelection>,
     strategy: mlx_gen::gen_core::MemoryStrategy,
     mut work: IosWork,
-) -> Result<IosCandidate> {
+) -> AdmissionResult<IosCandidate> {
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
-        .ok_or_else(|| Error::Unsupported(format!("{provider}: no memory contract")))?;
+        .ok_or_else(|| {
+            AdmissionError::refused(
+                RefusalKind::Strategy,
+                format!("{provider}: no memory contract"),
+            )
+        })?;
+    // A provider publishes no calibration identity when the requested tier is not the tier the
+    // artifact actually stores (SANA: a dense snapshot requested as q4/q8 would be a load-time
+    // requantization no capture measured). That is an ARTIFACT refusal, typed, before any key or
+    // price is computed for the wrong tier.
+    if contract.calibration.is_none() {
+        return Err(AdmissionError::refused(
+            RefusalKind::Artifact,
+            format!(
+                "{provider}: the requested tier {} does not match the artifact's stored tier \
+                 (the provider publishes no calibration identity for this load)",
+                tier_label(&spec)
+            ),
+        ));
+    }
     let geometry = work_geometry(&work);
     let mut context = standard_memory_behavior_context(
         &contract,

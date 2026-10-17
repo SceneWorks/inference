@@ -679,6 +679,12 @@ impl UNet2DConditionModel {
     /// iOS scratch (sc-26270) of the stem quantum: `conv_in` at the latent extent and its loaded
     /// channels, plus full f32 copies of the Kolors context projection (when loaded) and its
     /// output over the request's context tokens.
+    /// The stem convolution's weight (test arithmetic for the stem quantum).
+    #[cfg(test)]
+    pub(crate) fn conv_in_weight(&self) -> &Array {
+        self.conv_in.weight()
+    }
+
     fn stem_scratch(&self, x: &Array, encoder_x: &Array) -> u64 {
         let s = x.shape();
         let (cin, cout) = crate::quantum::conv_channels(self.conv_in.weight());
@@ -693,7 +699,13 @@ impl UNet2DConditionModel {
             }
             None => 0,
         };
+        // Lazy work materialized in this quantum: the previous step's CFG combine + sampler update
+        // (+ inpaint blend) over the latent, and the conditioning concatenation (inputs + result).
+        let step = mlx_gen::ios_quantum::sampler_step_bytes(x.size() as u64);
+        let concat = mlx_gen::ios_quantum::elementwise_bytes(encoder_x.size() as u64, 2);
         conv.saturating_add(context)
+            .saturating_add(step)
+            .saturating_add(concat)
     }
 
     /// Training forward with **per-block gradient checkpointing** (sc-4941 — the `gradient_checkpointing`

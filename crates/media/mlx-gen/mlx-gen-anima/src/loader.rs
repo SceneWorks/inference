@@ -211,12 +211,29 @@ pub fn load_heavy_phase_with_stream(
     }
 
     // iOS: header-only pre-load floor over the DiT + bundled conditioner file AND the VAE, checked
-    // BEFORE any of them is constructed (no-op elsewhere). A streamable load still counts the whole
-    // DiT file: the resident block handles are built even when a window later re-reads them.
-    mlx_gen::ios_quantum::before_load(
-        HEAVY_LOAD_QUANTUM,
-        &[dit_path.clone(), root.join(VAE_FILE)],
-    )?;
+    // BEFORE any of them is constructed (no-op elsewhere). A streamable (rung-4) load reads only the
+    // non-block DiT tensors and the conditioner here; the `{prefix}.blocks.*` bodies stay lazy
+    // handles and are read per window inside each block's own priced quantum (its full weight
+    // elements at f32), so they are not resident at load and are not priced here.
+    if streamable && mlx_gen::ios_quantum::enabled() {
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&dit_path)
+            .map_err(|e| Error::Msg(e.to_string()))?;
+        let prefix = headers
+            .iter()
+            .find_map(|h| h.name.strip_suffix(PREFIX_ANCHOR))
+            .ok_or_else(|| Error::Msg("anima: DiT root prefix not found in headers".into()))?;
+        let blocks = format!("{prefix}.blocks.");
+        mlx_gen::ios_quantum::before_load_where(
+            HEAVY_LOAD_QUANTUM,
+            &[dit_path.clone(), root.join(VAE_FILE)],
+            |name| !name.starts_with(&blocks),
+        )?;
+    } else {
+        mlx_gen::ios_quantum::before_load(
+            HEAVY_LOAD_QUANTUM,
+            &[dit_path.clone(), root.join(VAE_FILE)],
+        )?;
+    }
 
     // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
     // `net` (base) or `model.diffusion_model` (turbo/aesthetic) — detect it.

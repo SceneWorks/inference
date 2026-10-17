@@ -170,6 +170,19 @@ fn sana_block_floor_uses_actual_block_geometry_and_cancels_between_blocks() {
         })
         .collect();
     assert_eq!(block_checks, vec![expected; cfg.num_layers as usize]);
+    // The entry quantum is the block floor plus the lazy CFG combine + sampler update of the
+    // previous step that materializes inside it: 16 latent-sized f32 buffers.
+    let entry: Vec<u64> = seen
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            QuantumEvent::Checked { label, scratch } if label == "SANA patch/caption/timestep" => {
+                Some(*scratch)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entry, vec![expected + 16 * latent.size() as u64 * 4]);
 
     let cancel = mlx_gen::CancelFlag::new();
     let observed = cancel.clone();

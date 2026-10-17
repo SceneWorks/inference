@@ -149,6 +149,30 @@ impl Generator for ProbeGenerator {
     }
 }
 
+/// A dense SANA snapshot requested as q4 has no provider calibration identity: a typed ARTIFACT
+/// refusal at candidate construction, before any evidence key or price exists.
+#[test]
+fn a_dense_snapshot_requested_as_q4_is_a_typed_artifact_refusal() {
+    let registry = crate::provider_registry().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = sana(root.path());
+    spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
+    let refused = build_candidate(
+        &registry,
+        "sana_1600m",
+        spec,
+        None,
+        MemoryStrategy::BoundedDecode,
+        generation(512, vec![]),
+    )
+    .expect_err("dense-as-q4 has no calibrated identity");
+    assert_eq!(
+        refused.refusal_kind(),
+        Some(RefusalKind::Artifact),
+        "{refused}"
+    );
+}
+
 /// The key records the LOADED tier (never a default), alongside the layout digest.
 #[test]
 fn the_loaded_tier_is_recorded_in_the_key() {

@@ -883,6 +883,24 @@ impl IrisDiT {
 
     /// Floor of the patch/timestep embedding and both modulation cores: the patch vectors and
     /// their embedding (`[B, N, max(D, patch² · C)]`).
+    /// What the first trunk block materializes besides itself: the image and text RoPE tables and
+    /// the text positional add (states, sliced table, sum).
+    pub(crate) fn trunk_entry_allowance(&self, batch: i32, n_patches: i32, n_txt: i32) -> u64 {
+        let cfg = &self.cfg;
+        let head_dim = (cfg.hidden_size / cfg.num_heads) as u64;
+        mlx_gen::ios_quantum::rope_table_bytes(n_patches.max(0) as u64, head_dim)
+            .saturating_add(mlx_gen::ios_quantum::rope_table_bytes(
+                n_txt.max(0) as u64,
+                head_dim,
+            ))
+            .saturating_add(mlx_gen::ios_quantum::elementwise_bytes(
+                (batch.max(0) as u64)
+                    .saturating_mul(n_txt.max(0) as u64)
+                    .saturating_mul(cfg.hidden_size as u64),
+                3,
+            ))
+    }
+
     pub(crate) fn embed_scratch(&self, batch: i32, n_patches: i32) -> u64 {
         let [hidden, patch_in] = self.s_embedder.logical_shape();
         let mut weights =
@@ -1119,7 +1137,12 @@ impl IrisDiT {
         }
 
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        mlx_gen::ios_quantum::before(quanta::EMBED, self.embed_scratch(b, n_patches))?;
+        // The previous step's guidance combine + solver arithmetic is lazy and materializes here.
+        mlx_gen::ios_quantum::before(
+            quanta::EMBED,
+            self.embed_scratch(b, n_patches)
+                .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(x.size() as u64)),
+        )?;
         // F.unfold(x, p, stride=p).transpose(1, 2): channel-major patch vectors, row-major patches.
         let patches = x
             .reshape(&[b, c, hp, p, wp, p])?
@@ -1167,8 +1190,13 @@ impl IrisDiT {
             heads: cfg.num_heads as i32,
             kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads) as i32,
         };
+        // The text positional add and both RoPE tables are lazy and materialize inside the FIRST
+        // trunk block's quantum, whose scratch carries them.
+        let entry_extra = self.trunk_entry_allowance(b, n_patches, n_txt);
         for i in 0..self.blocks.len() {
-            let scratch = self.trunk_block_scratch(i, b, n_patches, n_txt, plan);
+            let scratch = self
+                .trunk_block_scratch(i, b, n_patches, n_txt, plan)
+                .saturating_add(if i == 0 { entry_extra } else { 0 });
             mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
             (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
             mlx_gen::ios_quantum::finish(quanta::TRUNK_BLOCK, &[&s, &y])?;

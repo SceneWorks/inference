@@ -80,6 +80,18 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
             assert!(p.evidence_key.is_some(), "the memory key is recorded");
         }
     }
+    // A dense snapshot requested as q4 is a typed ARTIFACT refusal (the provider publishes no
+    // calibration for a load-time requantization), never an untyped failure or a wrong price.
+    copy_tree(&root, &temp.path().join("sana_1600m/q4"));
+    let case = Case::parse("sana_1600m/sana_1600m/q4/512/text/2").unwrap();
+    let mut p = adapter(catalog.media(), temp.path().into());
+    let result = campaign::run(&mut p, &case, false);
+    assert_eq!(result.0, Status::AdmittedRefused, "{result:?}");
+    assert_eq!(p.refusal_kind, Some("artifact"), "{result:?}");
+    assert!(
+        p.evidence_key.is_none(),
+        "no key/price is computed for the wrong tier"
+    );
     std::fs::write(
         root.join("text_encoder/gemma-2-2b-it.safetensors"),
         b"malformed",

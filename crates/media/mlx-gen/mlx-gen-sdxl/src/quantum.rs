@@ -177,3 +177,14 @@ pub(crate) fn tiled_stage(b: i32, h: i32, w: i32, channels: &[i32]) -> u64 {
         .iter()
         .fold(1u64, |n, d| n.saturating_mul(*d))
 }
+
+/// [`tiled_stage`] for the f16-storage upsample convolution that accumulates in f32
+/// (`tiled_conv2d_3x3_nhwc_f32_accum`, the fp16-fix VAE path): the f32 copies of the conv weight
+/// and bias are built once and stay live across every tile of the stage, on top of the stage's
+/// activations. Each tile's own promoted crop and f32 output are priced by [`before_tile`].
+pub(crate) fn tiled_stage_f32_accum(b: i32, h: i32, w: i32, weight: &Array, bias: &Array) -> u64 {
+    let (cin, cout) = conv_channels(weight);
+    tiled_stage(b, h, w, &[cin, cout])
+        .saturating_add(elements(weight).saturating_mul(4))
+        .saturating_add(elements(bias).saturating_mul(4))
+}

@@ -314,7 +314,7 @@ impl DeviceProvider<'_> {
             strategy,
             work,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| classify(&mut self.refusal_kind, e))?;
         // The memory-relevant key (path-free layout digest, mode, geometry, execution, token
         // window). A malformed artifact is a failure here, before any evidence question.
         let key = runtime_ios::media::evidence_key(

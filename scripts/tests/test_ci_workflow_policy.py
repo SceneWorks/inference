@@ -4054,6 +4054,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             f"build --locked {target} {manifest} --features media",
             f"clippy --locked {target} {manifest} --all-targets -- -D warnings",
             f"clippy --locked {target} {manifest} --features media --all-targets -- -D warnings",
+            f"build --locked {target} {manifest} --features zimage",
+            f"clippy --locked {target} {manifest} --features zimage --all-targets -- -D warnings",
         ):
             with self.subTest(command=expected):
                 self.assertTrue(any(expected in run for run in ios), expected)

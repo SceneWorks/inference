@@ -809,7 +809,13 @@ impl SanaTransformer {
         let dt = latent_nchw.dtype();
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let scratch = self.quantum_scratch(b, ph, pw, caption.shape()[1]);
-        mlx_gen::ios_quantum::before("SANA patch/caption/timestep", scratch)?;
+        // The previous step's CFG combine + sampler update is lazy and materializes here.
+        mlx_gen::ios_quantum::before(
+            "SANA patch/caption/timestep",
+            scratch.saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
+                latent_nchw.size() as u64
+            )),
+        )?;
 
         // 1. Patch embed (NHWC). [B,C,H,W] → NHWC → conv → [B,ph,pw,dim] → tokens [B,N,dim].
         let x = latent_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC

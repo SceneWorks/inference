@@ -11,9 +11,10 @@ use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
 pub use budget::{
-    attention_block_bytes, check_headroom, conv_stage_bytes, dcae_stage_bytes, gemma_layer_bytes,
-    sana_block_bytes, sana_promoted_conv_bytes, transformer_layer_bytes, AttentionBlockGeometry,
-    SanaBlockGeometry, PROCESS_RESERVE_BYTES,
+    attention_block_bytes, check_headroom, conv_stage_bytes, dcae_stage_bytes, elementwise_bytes,
+    gemma_layer_bytes, rope_table_bytes, sampler_step_bytes, sana_block_bytes,
+    sana_promoted_conv_bytes, transformer_layer_bytes, AttentionBlockGeometry, SanaBlockGeometry,
+    PROCESS_RESERVE_BYTES,
 };
 
 /// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross
@@ -265,6 +266,17 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
 /// scratch. Called BEFORE model construction. Counts the entire VAE file even for txt2img.
 /// Not a process upper bound: conversion or a backend operation can need more than this floor.
 pub fn before_load(label: &str, components: &[std::path::PathBuf]) -> Result<()> {
+    before_load_where(label, components, |_| true)
+}
+
+/// [`before_load`] over only the tensors `resident(name)` keeps: for a load that constructs just
+/// part of a file up front (e.g. a rung-4 streamed DiT, whose block bodies are read per window by
+/// that window's own priced quantum). Header-only; a no-op off device.
+pub fn before_load_where(
+    label: &str,
+    components: &[std::path::PathBuf],
+    resident: impl Fn(&str) -> bool,
+) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
@@ -274,6 +286,9 @@ pub fn before_load(label: &str, components: &[std::path::PathBuf]) -> Result<()>
         for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
             .map_err(|e| Error::Msg(e.to_string()))?
         {
+            if !resident(&header.name) {
+                continue;
+            }
             total = total
                 .checked_add(header.data_bytes)
                 .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;

@@ -708,9 +708,11 @@ impl CosmosDiT {
         let tokens = pe_t * pe_h * pe_w;
         // iOS: the pre-block quantum is checked against the largest block floor (it must leave room
         // for the first block anyway), before any graph below is constructed.
+        // Plus what materializes inside this quantum: the previous step's CFG combine + sampler
+        // update (lazy, latent-sized) and this grid's RoPE tables.
         mlx_gen::ios_quantum::before(
             DIT_EMBED_QUANTUM,
-            self.quantum_scratch(b, tokens, encoder.shape()[1], plan),
+            self.embed_quantum_scratch(&latents, encoder.shape()[1], plan),
         )?;
 
         // 1. concat the (all-zeros, full-res-resized-to-latent) padding mask channel -> [B,17,1,Hl,Wl].
@@ -883,6 +885,27 @@ impl CosmosDiT {
     /// The largest per-block iOS quantum floor over this DiT's resident block tensors (the streamed
     /// rung-4 blocks are built by the same constructor from the same checkpoint keys). Prices the
     /// pre- and post-block quanta, which must leave room for a block either side of them.
+    /// The DiT entry quantum: the largest block floor plus the sampler-step allowance over the
+    /// incoming latent and the RoPE tables for its token grid.
+    pub(crate) fn embed_quantum_scratch(
+        &self,
+        latents: &Array,
+        context_tokens: i32,
+        plan: mlx_gen::attention::AttentionPlan<'_>,
+    ) -> u64 {
+        let sh = latents.shape();
+        let (pt, ph, pw) = self.cfg.patch_size;
+        let tokens = (sh[2] / pt as i32) * (sh[3] / ph as i32) * (sh[4] / pw as i32);
+        self.quantum_scratch(sh[0], tokens, context_tokens, plan)
+            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
+                latents.size() as u64
+            ))
+            .saturating_add(mlx_gen::ios_quantum::rope_table_bytes(
+                tokens.max(0) as u64,
+                self.cfg.attention_head_dim as u64,
+            ))
+    }
+
     fn quantum_scratch(
         &self,
         batch: i32,

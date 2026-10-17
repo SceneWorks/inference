@@ -86,6 +86,16 @@ fn checked(events: &[QuantumEvent], label: &str) -> usize {
         .count()
 }
 
+fn scratch_of(events: &[QuantumEvent], label: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            QuantumEvent::Checked { label: l, scratch } if l == label => Some(*scratch),
+            _ => None,
+        })
+        .collect()
+}
+
 fn synchronized(events: &[QuantumEvent]) -> usize {
     events
         .iter()
@@ -202,6 +212,18 @@ fn dit_resident_blocks_are_guarded_quanta() {
         .collect();
     assert_eq!(labels.first(), Some(&DIT_EMBED_QUANTUM));
     assert_eq!(labels.last(), Some(&DIT_OUTPUT_QUANTUM));
+    // The entry quantum also materializes the previous step's CFG combine + sampler update and this
+    // grid's RoPE tables: the largest block floor + 16 latent-sized f32 buffers + 4 tables.
+    let sh = latents.shape();
+    let (pt, ph, pw) = cfg.patch_size;
+    let tokens = (sh[2] / pt as i32) * (sh[3] / ph as i32) * (sh[4] / pw as i32);
+    let block_floor = *scratch_of(&events, DIT_BLOCK_QUANTUM).iter().max().unwrap();
+    assert_eq!(
+        scratch_of(&events, DIT_EMBED_QUANTUM),
+        [block_floor
+            + 16 * latents.size() as u64 * 4
+            + 4 * tokens as u64 * cfg.attention_head_dim as u64 * 4]
+    );
 
     // A bounded attention plan is priced (fewer query rows) and still byte-identical when guarded.
     let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(64, true));
@@ -453,6 +475,16 @@ fn conditioner_blocks_are_guarded_quanta() {
     assert_eq!(checked(&events, CONDITIONER_BLOCK_QUANTUM), cfg.num_layers);
     assert_eq!(checked(&events, CONDITIONER_EMBED_QUANTUM), 1);
     assert_eq!(checked(&events, CONDITIONER_OUTPUT_QUANTUM), 1);
+    // The entry quantum materializes the caller's lazy Qwen3 mask-multiply: the largest block
+    // floor + three source-sized f32 buffers (states, cast mask, product).
+    let block_floor = *scratch_of(&events, CONDITIONER_BLOCK_QUANTUM)
+        .iter()
+        .max()
+        .unwrap();
+    assert_eq!(
+        scratch_of(&events, CONDITIONER_EMBED_QUANTUM),
+        [block_floor + 3 * source.size() as u64 * 4]
+    );
 
     take_refusal();
     let (refused, refused_events) = observed(0, run);
@@ -736,6 +768,45 @@ fn phase_loads_check_the_header_floor_before_construction() {
     let refusal = take_refusal().unwrap();
     assert_eq!(refusal.label, crate::loader::HEAVY_LOAD_QUANTUM);
     assert_eq!(refusal.scratch_bytes, floor(&[&dit_path, &vae_path]));
+    assert!(events.is_empty(), "{events:?}");
+
+    // A streamed (rung-4) load prices only what it makes resident: the DiT's non-block tensors and
+    // the conditioner, plus the VAE. Block bodies are priced per window by each block's quantum.
+    let resident_floor = {
+        let mut sizes: Vec<u64> = Vec::new();
+        let dit_headers =
+            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&dit_path).unwrap();
+        let prefix = dit_headers
+            .iter()
+            .find_map(|h| h.name.strip_suffix(".x_embedder.proj.1.weight"))
+            .unwrap()
+            .to_string();
+        let mut block_bytes = 0;
+        for h in dit_headers {
+            if h.name.starts_with(&format!("{prefix}.blocks.")) {
+                block_bytes += h.data_bytes;
+            } else {
+                sizes.push(h.data_bytes);
+            }
+        }
+        assert!(block_bytes > 0, "the fixture must carry block bodies");
+        sizes.extend(
+            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&vae_path)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.data_bytes),
+        );
+        sizes.iter().sum::<u64>() + sizes.iter().copied().max().unwrap()
+    };
+    assert!(resident_floor < floor(&[&dit_path, &vae_path]));
+    let (refused, events) = observed(0, || {
+        crate::loader::load_heavy_phase_with_stream(&source, crate::config::Variant::Turbo, true)
+            .map(|_| ())
+    });
+    assert!(refused.is_err());
+    let refusal = take_refusal().unwrap();
+    assert_eq!(refusal.label, crate::loader::HEAVY_LOAD_QUANTUM);
+    assert_eq!(refusal.scratch_bytes, resident_floor);
     assert!(events.is_empty(), "{events:?}");
 
     // With headroom the floor passes and is observed as a checked boundary before the load runs.

@@ -73,6 +73,27 @@ pub fn sana_block_bytes(g: SanaBlockGeometry) -> u64 {
     ])
 }
 
+/// Latent-sized elementwise work BETWEEN denoiser forwards (classifier-free-guidance combine and
+/// the sampler update). It is lazy, so it materializes inside the NEXT guarded quantum, whose
+/// scratch carries this allowance: CFG combine holds both branch predictions, their difference,
+/// the guidance-scaled term and the sum (5 buffers); the sampler update holds the previous sample,
+/// the model output, the scaled step, the noise and the new sample (5); plus up to 6 dtype-cast
+/// copies = 16 f32 latent-sized buffers.
+pub fn sampler_step_bytes(latent_elements: u64) -> u64 {
+    product(&[16, latent_elements, 4])
+}
+
+/// Rotary tables built for `positions` at `head_dim`: f32 cos and sin plus their broadcast copies.
+pub fn rope_table_bytes(positions: u64, head_dim: u64) -> u64 {
+    product(&[4, positions, head_dim, 4])
+}
+
+/// `copies` f32 buffers of `elements` each: a small elementwise pass (mask multiply, positional
+/// add, concatenation) folded into the guarded quantum that materializes it.
+pub fn elementwise_bytes(elements: u64, copies: u64) -> u64 {
+    product(&[copies, elements, 4])
+}
+
 /// A DC-AE substage: 32 full activation-sized f32 buffers, and a conservative 64*C*C
 /// f32 weight/copy allowance covering GLUMBConv (12*C*C), QKV, multiscale and conv scratch.
 /// Upsample callers price the DOUBLED spatial extent before constructing that graph.
@@ -335,6 +356,15 @@ mod tests {
             gemma_layer_bytes(1, 77, 768, 3072, 12, 64)
         );
         assert_eq!(conv_stage_bytes(1, 8, 8, 4), dcae_stage_bytes(1, 8, 8, 4));
+    }
+
+    #[test]
+    fn small_step_allowances_are_shape_derived_and_saturating() {
+        // 1x4x64x64 latent: 16 f32 buffers.
+        assert_eq!(sampler_step_bytes(4 * 64 * 64), 16 * 4 * 64 * 64 * 4);
+        assert_eq!(rope_table_bytes(4096, 128), 4 * 4096 * 128 * 4);
+        assert_eq!(elementwise_bytes(1000, 3), 12_000);
+        assert_eq!(sampler_step_bytes(u64::MAX), u64::MAX);
     }
 
     #[test]

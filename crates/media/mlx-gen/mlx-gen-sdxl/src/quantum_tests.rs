@@ -255,6 +255,16 @@ fn unet_forward_is_bounded_identical_and_refuses_before_construction() {
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
     assert_well_ordered(&events);
     assert_unet_counts(&events, &unet, &cfg);
+    // The stem also materializes the previous step's CFG combine + sampler update (16 latent-sized
+    // f32 buffers) and the conditioning concatenation (inputs + result: 2 context-sized buffers).
+    let s = x.shape();
+    let (cin, cout) = conv_channels(unet.conv_in_weight());
+    assert_eq!(
+        checked(&events, UNET_STEM),
+        [conv_stage(s[0], s[1], s[2], &[cin, cout])
+            + 16 * x.size() as u64 * 4
+            + 2 * ctx.size() as u64 * 4]
+    );
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
     )));
@@ -1128,5 +1138,33 @@ fn conditioning_window_count_matches_the_encode_path() {
     assert_eq!(
         crate::conditioning_window_count(&fused, &long, None).unwrap(),
         2
+    );
+}
+
+/// The f16-storage upsample convolution accumulates in f32 (`tiled_conv2d_3x3_nhwc_f32_accum`): its
+/// stage prices the stage activations PLUS the f32 weight and bias copies that stay live across all
+/// of the stage's tiles. The f32 path has no such copies.
+#[test]
+fn half_upsample_stage_prices_its_f32_accumulation_copies() {
+    if !cpu_child("half_upsample_stage_prices_its_f32_accumulation_copies") {
+        return;
+    }
+    let (b, h, w, cin, cout) = (1, 6, 6, 4, 8);
+    let x = Array::ones::<f32>(&[b, h, w, cin]).unwrap();
+    let weight = Array::ones::<f32>(&[cout, 3, 3, cin]).unwrap();
+    let bias = Array::zeros::<f32>(&[cout]).unwrap();
+    let stage = |x: &Array, weight: &Array, bias: &Array| {
+        let (_, events) = observe(PLENTY, || {
+            crate::vae::upsample_tiled(x, weight, bias, 8, None)
+        });
+        checked(&events, VAE_TILED_STAGE)
+    };
+    let activations = 4 * (b * 2 * h * 2 * w * cout) as u64 * 4;
+    assert_eq!(stage(&x, &weight, &bias), [activations]);
+    let half = |a: &Array| a.as_dtype(Dtype::Float16).unwrap();
+    let wide_copies = (cout * 9 * cin) as u64 * 4 + cout as u64 * 4;
+    assert_eq!(
+        stage(&half(&x), &half(&weight), &half(&bias)),
+        [activations + wide_copies]
     );
 }
