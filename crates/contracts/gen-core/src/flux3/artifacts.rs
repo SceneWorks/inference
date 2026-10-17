@@ -143,7 +143,7 @@ impl NativeDitStorage {
     pub fn validate_selection(self, requested: Option<Quant>, precision: Precision) -> Result<()> {
         self.validate_parameters()?;
         if self.quant()? != requested {
-            return Err(invalid(format!("selected {requested:?}, but artifact is {}; install/convert the exact requested native tier (no model/tier fallback)",self.key()?)));
+            return Err(invalid(format!("selected {requested:?}, but the package quantization is {}; install/convert the exact requested native tier (no model/tier fallback)",self.key()?)));
         }
         if matches!(
             self,
@@ -233,9 +233,7 @@ impl NativeDitStorage {
                     }
                 }
                 Self::GgmlQ4_1 | Self::GgmlQ8_0 => {
-                    if !k.is_multiple_of(32) {
-                        return Err(invalid(format!("{name}: GGML contraction width must divide into complete 32-element blocks")));
-                    }
+                    self.check_contraction_width(&name, k)?;
                     let block = if self == Self::GgmlQ4_1 { 20 } else { 34 };
                     let bytes = (k / 32)
                         .checked_mul(block)
@@ -252,6 +250,76 @@ impl NativeDitStorage {
             }
         }
         Ok(tensors)
+    }
+
+    /// Whether a packed `[n, k]` projection's contraction width is representable AND computable
+    /// by this storage's kernels. GGML rows are whole 32-element blocks; Candle's CPU Q4_1 dot
+    /// kernel additionally consumes blocks in PAIRS (only a `debug_assert` guards it, so a release
+    /// build would silently drop work), so Q4_1 needs `k % 64 == 0`. A width that fails is a typed
+    /// refusal; no target is silently kept dense or padded.
+    pub fn check_contraction_width(self, name: &str, k: usize) -> Result<()> {
+        let multiple = match self {
+            Self::GgmlQ4_1 => 64,
+            Self::GgmlQ8_0 => 32,
+            Self::MlxAffine { group_size, .. } => group_size as usize,
+            Self::Publisher(DitFormat::Nvfp4) => 16,
+            Self::Publisher(_) => 1,
+        };
+        if k == 0 || !k.is_multiple_of(multiple) {
+            return Err(invalid(format!(
+                "{name}: contraction width {k} is not a multiple of {multiple} for {}",
+                self.key()?
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `<name>.weight` tensors this storage holds PACKED; every other tensor is stored dense
+    /// as the source shipped it. Derived from the same source target partition as
+    /// [`Self::expected_tensors`], never re-guessed by a loader.
+    pub fn packed_targets(self, cfg: &DitConfig) -> Result<std::collections::BTreeSet<String>> {
+        let packed = match self {
+            Self::Publisher(DitFormat::Dense) => return Ok(Default::default()),
+            Self::Publisher(DitFormat::Fp8Rowwise) => Dtype::F8_E4M3,
+            Self::Publisher(DitFormat::Nvfp4) | Self::GgmlQ4_1 | Self::GgmlQ8_0 => Dtype::U8,
+            Self::MlxAffine { .. } => Dtype::U32,
+        };
+        Ok(self
+            .expected_tensors(cfg)?
+            .into_iter()
+            .filter(|(name, spec)| spec.dtype == packed && name.ends_with(".weight"))
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// `(algorithm, bits, group_size)` exactly as a conversion receipt records it.
+    pub fn receipt_algorithm(self) -> Result<(&'static str, Option<u32>, Option<u32>)> {
+        self.validate_parameters()?;
+        Ok(match self {
+            Self::Publisher(DitFormat::Dense) => {
+                return Err(invalid("a dense package is not a conversion output"))
+            }
+            Self::Publisher(DitFormat::Fp8Rowwise) => ("bfl-fp8r", None, None),
+            Self::Publisher(DitFormat::Nvfp4) => ("bfl-nvfp4-import", None, None),
+            Self::MlxAffine { bits, group_size } => ("mlx-affine", Some(bits), Some(group_size)),
+            Self::GgmlQ4_1 => ("ggml-q4_1", Some(4), Some(32)),
+            Self::GgmlQ8_0 => ("ggml-q8_0", Some(8), Some(32)),
+        })
+    }
+
+    /// The exact storage a package's raw `config.json` declares. The parsed
+    /// [`super::Flux3Config::quantization`] keeps only a compact name, so loaders that need
+    /// bits/group read the marker itself through here.
+    pub fn from_package(dir: &std::path::Path) -> Result<Self> {
+        let path = dir.join(super::CONFIG_FILE);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| invalid(format!("read {}: {e}", path.display())))?;
+        let root: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+        let marker = root
+            .get("quantization")
+            .ok_or_else(|| invalid(format!("{}: missing `quantization`", path.display())))?;
+        Self::from_marker(marker)
     }
 
     pub fn validate_headers(

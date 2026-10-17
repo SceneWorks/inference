@@ -215,3 +215,91 @@ fn historically_valid_dense_f32_remains_dense_not_a_quantized_fallback() {
         .validate_selection(Some(Quant::Fp8Rowwise), Precision::Fp32)
         .is_err());
 }
+
+/// The packed set is the source FP8 target partition for every native format, and each format's
+/// receipt identity is exact (no width-only alias). 234 matches the HEADER-ONLY distilled FP8R
+/// inventory of the frozen checkpoint (234 F8 weights).
+#[test]
+fn packed_targets_and_receipt_identity_follow_the_source_partition() {
+    let fp8 = NativeDitStorage::Publisher(DitFormat::Fp8Rowwise)
+        .packed_targets(&cfg())
+        .unwrap();
+    assert_eq!(fp8.len(), 234);
+    for storage in [
+        NativeDitStorage::GgmlQ4_1,
+        NativeDitStorage::GgmlQ8_0,
+        NativeDitStorage::MlxAffine {
+            bits: 4,
+            group_size: 64,
+        },
+    ] {
+        assert_eq!(storage.packed_targets(&cfg()).unwrap(), fp8, "{storage:?}");
+    }
+    assert!(fp8.contains("single_blocks.0.q_proj.weight"));
+    assert!(!fp8.contains("txt_in.weight"), "BFL keeps txt_in dense");
+    assert!(NativeDitStorage::Publisher(DitFormat::Dense)
+        .packed_targets(&cfg())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        NativeDitStorage::GgmlQ4_1.receipt_algorithm().unwrap(),
+        ("ggml-q4_1", Some(4), Some(32))
+    );
+    assert_eq!(
+        NativeDitStorage::GgmlQ8_0.receipt_algorithm().unwrap(),
+        ("ggml-q8_0", Some(8), Some(32))
+    );
+    assert!(NativeDitStorage::Publisher(DitFormat::Dense)
+        .receipt_algorithm()
+        .is_err());
+}
+
+#[test]
+fn package_marker_is_read_exactly_from_raw_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |marker: serde_json::Value| {
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"quantization": marker})).unwrap(),
+        )
+        .unwrap();
+    };
+    write(NativeDitStorage::GgmlQ8_0.marker().unwrap());
+    assert_eq!(
+        NativeDitStorage::from_package(dir.path()).unwrap(),
+        NativeDitStorage::GgmlQ8_0
+    );
+    write(serde_json::Value::Null);
+    assert_eq!(
+        NativeDitStorage::from_package(dir.path()).unwrap(),
+        NativeDitStorage::Publisher(DitFormat::Dense)
+    );
+    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+    assert!(NativeDitStorage::from_package(dir.path()).is_err());
+}
+
+/// Candle's CPU Q4_1 dot kernel consumes block PAIRS behind a `debug_assert` only: an odd block
+/// count must be refused, never computed (silently wrong in release).
+#[test]
+fn ggml_q4_1_requires_even_block_pairs_q8_0_whole_blocks() {
+    assert!(NativeDitStorage::GgmlQ4_1
+        .check_contraction_width("w", 128)
+        .is_ok());
+    assert!(NativeDitStorage::GgmlQ4_1
+        .check_contraction_width("w", 96)
+        .is_err());
+    assert!(NativeDitStorage::GgmlQ8_0
+        .check_contraction_width("w", 96)
+        .is_ok());
+    assert!(NativeDitStorage::GgmlQ8_0
+        .check_contraction_width("w", 48)
+        .is_err());
+    assert!(NativeDitStorage::GgmlQ8_0
+        .check_contraction_width("w", 0)
+        .is_err());
+    for k in [3072, 9216] {
+        NativeDitStorage::GgmlQ4_1
+            .check_contraction_width("flux3", k)
+            .unwrap();
+    }
+}

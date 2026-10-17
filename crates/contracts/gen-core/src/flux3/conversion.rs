@@ -31,7 +31,7 @@ pub enum ComponentRole {
     PromptUpsampler,
 }
 impl ComponentRole {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Dit => "dit",
             Self::TextEncoder => "text_encoder",
@@ -56,9 +56,35 @@ pub struct OutputFile {
     pub sha256: String,
 }
 
+/// Where a component's runtime files live. A converted package owns its rewritten DiT;
+/// an UNCHANGED encoder/AE/PUP may stay in the original immutable source root instead of being
+/// copied. External files are full-hash verified against that root by
+/// [`ConversionReceipt::verify_external`]; they are never part of the owned output inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentPlacement {
+    Owned,
+    External,
+}
+impl ComponentPlacement {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::External => "external",
+        }
+    }
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "owned" => Ok(Self::Owned),
+            "external" => Ok(Self::External),
+            _ => Err(invalid(format!("unknown component placement {name}"))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentInventory {
     pub role: ComponentRole,
+    pub placement: ComponentPlacement,
     pub source_repository: String,
     pub source_revision: String,
     pub source_artifacts: BTreeMap<String, String>,
@@ -128,6 +154,8 @@ impl ConversionReceipt {
             "mlx-affine"
                 if matches!(self.bits, Some(4 | 8))
                     && matches!(self.group_size, Some(32 | 64 | 128)) => {}
+            "ggml-q4_1" if self.bits == Some(4) && self.group_size == Some(32) => {}
+            "ggml-q8_0" if self.bits == Some(8) && self.group_size == Some(32) => {}
             "bfl-fp8r" | "bfl-nvfp4-import" if self.bits.is_none() && self.group_size.is_none() => {
             }
             _ => {
@@ -163,6 +191,13 @@ impl ConversionReceipt {
             {
                 return Err(invalid(
                     "missing or mismatched component source identity/checksum",
+                ));
+            }
+            if component.role == ComponentRole::Dit
+                && component.placement != ComponentPlacement::Owned
+            {
+                return Err(invalid(
+                    "the converted DiT must be owned by the conversion output",
                 ));
             }
             required_component_files(component)?;
@@ -206,7 +241,7 @@ impl ConversionReceipt {
     pub fn to_json(&self) -> Result<Value> {
         self.validate()?;
         Ok(
-            json!({"format_version":RECEIPT_VERSION,"source_repository":self.source_repository,"source_revision":self.source_revision,"source_artifacts":self.source_artifacts,"algorithm":self.algorithm,"algorithm_version":self.algorithm_version,"bits":self.bits,"group_size":self.group_size,"components":self.components.iter().map(|c|json!({"role":c.role.name(),"source_repository":c.source_repository,"source_revision":c.source_revision,"source_artifacts":c.source_artifacts,"representation":c.representation,"files":files_json(&c.files),"quantized_targets":c.quantized_targets,"dense_targets":c.dense_targets})).collect::<Vec<_>>(),"package_files":files_json(&self.package_files)}),
+            json!({"format_version":RECEIPT_VERSION,"source_repository":self.source_repository,"source_revision":self.source_revision,"source_artifacts":self.source_artifacts,"algorithm":self.algorithm,"algorithm_version":self.algorithm_version,"bits":self.bits,"group_size":self.group_size,"components":self.components.iter().map(|c|json!({"role":c.role.name(),"placement":c.placement.name(),"source_repository":c.source_repository,"source_revision":c.source_revision,"source_artifacts":c.source_artifacts,"representation":c.representation,"files":files_json(&c.files),"quantized_targets":c.quantized_targets,"dense_targets":c.dense_targets})).collect::<Vec<_>>(),"package_files":files_json(&self.package_files)}),
         )
     }
 
@@ -227,6 +262,7 @@ impl ConversionReceipt {
             .map(|c| {
                 Ok(ComponentInventory {
                     role: ComponentRole::parse(&string(&c["role"])?)?,
+                    placement: ComponentPlacement::parse(&string(&c["placement"])?)?,
                     source_repository: string(&c["source_repository"])?,
                     source_revision: string(&c["source_revision"])?,
                     source_artifacts: c["source_artifacts"]
@@ -257,10 +293,57 @@ impl ConversionReceipt {
         Ok(receipt)
     }
 
+    /// Files the conversion OUTPUT owns: package files plus every owned component. External
+    /// components live in the original source root and are verified there.
     fn files(&self) -> impl Iterator<Item = (&String, &OutputFile)> {
-        self.package_files
+        self.package_files.iter().chain(
+            self.components
+                .iter()
+                .filter(|c| c.placement == ComponentPlacement::Owned)
+                .flat_map(|c| c.files.iter()),
+        )
+    }
+
+    /// Full-byte verification of every EXTERNAL component against `source_root` (the original
+    /// immutable package the conversion read). Run at install/open alongside
+    /// [`Self::verify_outputs`]; a mismatch means the external files are not the converted
+    /// source and the package must not load.
+    pub fn verify_external(&self, source_root: &Path) -> Result<()> {
+        self.verify_external_with(|_, path| Ok(source_root.join(path)))
+    }
+
+    /// [`Self::verify_external`] where each component is resolved where the LOADER reads it
+    /// (e.g. a `text_encoder` component override directory). `resolve` maps a recorded
+    /// source-relative path of one role to the file actually opened.
+    pub fn verify_external_with(
+        &self,
+        resolve: impl Fn(ComponentRole, &str) -> Result<PathBuf>,
+    ) -> Result<()> {
+        self.validate()?;
+        for component in self
+            .components
             .iter()
-            .chain(self.components.iter().flat_map(|c| c.files.iter()))
+            .filter(|c| c.placement == ComponentPlacement::External)
+        {
+            for (path, want) in &component.files {
+                let got = hash_file(&resolve(component.role, path)?)?;
+                if &got != want {
+                    return Err(invalid(format!(
+                        "external {} file {path} does not match the recorded source checksum",
+                        component.role.name()
+                    )));
+                }
+            }
+            check_shard_index(component, &|path| resolve(component.role, path))?;
+        }
+        Ok(())
+    }
+
+    /// Whether any component stays in the original source root.
+    pub fn has_external_components(&self) -> bool {
+        self.components
+            .iter()
+            .any(|c| c.placement == ComponentPlacement::External)
     }
 
     /// Full-byte integrity verification occurs at conversion/install/open, not on
@@ -281,72 +364,92 @@ impl ConversionReceipt {
         }
         for (path, want) in self.files() {
             let path = root.join(path);
-            let mut file = File::open(&path)?;
-            if file.metadata()?.len() != want.bytes {
-                return Err(invalid(format!("{}: output size mismatch", path.display())));
-            }
-            let mut hash = Sha256::new();
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buf[..n]);
-            }
-            if format!("{:x}", hash.finalize()) != want.sha256 {
+            if &hash_file(&path)? != want {
                 return Err(invalid(format!(
-                    "{}: output checksum mismatch",
+                    "{}: output size or checksum mismatch",
                     path.display()
                 )));
             }
         }
-        for component in &self.components {
-            if component.role == ComponentRole::TextEncoder {
-                let index_path = "text_encoder/model.safetensors.index.json";
-                if component.files.contains_key(index_path) {
-                    if component
-                        .files
-                        .contains_key("text_encoder/model.safetensors")
-                    {
-                        return Err(invalid("ambiguous single-file and sharded text encoder"));
-                    }
-                    let bytes = fs::read(root.join(index_path))?;
-                    let index: Value = serde_json::from_slice(&bytes).map_err(invalid)?;
-                    let map = index["weight_map"]
-                        .as_object()
-                        .filter(|m| !m.is_empty())
-                        .ok_or_else(|| invalid("empty or torn text-encoder shard index"))?;
-                    let mut shards = BTreeSet::new();
-                    for value in map.values() {
-                        let name = string(value)?;
-                        if !safe_relative(&name) || !name.ends_with(".safetensors") {
-                            return Err(invalid("invalid shard path"));
-                        }
-                        let path = format!("text_encoder/{name}");
-                        if !component.files.contains_key(&path) {
-                            return Err(invalid(format!(
-                                "shard index names unowned/missing {path}"
-                            )));
-                        }
-                        shards.insert(path);
-                    }
-                    let inventoried: BTreeSet<_> = component
-                        .files
-                        .keys()
-                        .filter(|p| p.ends_with(".safetensors"))
-                        .cloned()
-                        .collect();
-                    if shards != inventoried {
-                        return Err(invalid(
-                            "shard index and component shard inventory disagree",
-                        ));
-                    }
-                }
-            }
+        for component in self
+            .components
+            .iter()
+            .filter(|c| c.placement == ComponentPlacement::Owned)
+        {
+            check_shard_index(component, &|path| Ok(root.join(path)))?;
         }
         Ok(())
     }
+}
+
+/// Full-file size + SHA-256 of `path` (a regular file, never a symlink).
+pub fn hash_file(path: &Path) -> Result<OutputFile> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(invalid(format!("{} is not a regular file", path.display())));
+    }
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut bytes = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        hash.update(&buf[..n]);
+    }
+    Ok(OutputFile {
+        bytes,
+        sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
+fn check_shard_index(
+    component: &ComponentInventory,
+    resolve: &dyn Fn(&str) -> Result<PathBuf>,
+) -> Result<()> {
+    if component.role == ComponentRole::TextEncoder {
+        let index_path = "text_encoder/model.safetensors.index.json";
+        if component.files.contains_key(index_path) {
+            if component
+                .files
+                .contains_key("text_encoder/model.safetensors")
+            {
+                return Err(invalid("ambiguous single-file and sharded text encoder"));
+            }
+            let bytes = fs::read(resolve(index_path)?)?;
+            let index: Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+            let map = index["weight_map"]
+                .as_object()
+                .filter(|m| !m.is_empty())
+                .ok_or_else(|| invalid("empty or torn text-encoder shard index"))?;
+            let mut shards = BTreeSet::new();
+            for value in map.values() {
+                let name = string(value)?;
+                if !safe_relative(&name) || !name.ends_with(".safetensors") {
+                    return Err(invalid("invalid shard path"));
+                }
+                let path = format!("text_encoder/{name}");
+                if !component.files.contains_key(&path) {
+                    return Err(invalid(format!("shard index names unowned/missing {path}")));
+                }
+                shards.insert(path);
+            }
+            let inventoried: BTreeSet<_> = component
+                .files
+                .keys()
+                .filter(|p| p.ends_with(".safetensors"))
+                .cloned()
+                .collect();
+            if shards != inventoried {
+                return Err(invalid(
+                    "shard index and component shard inventory disagree",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn required_component_files(component: &ComponentInventory) -> Result<()> {

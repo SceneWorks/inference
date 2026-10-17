@@ -37,13 +37,17 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
 pub mod adapters;
+pub mod affine;
 pub mod artifacts;
 pub mod conversion;
 pub mod image_input;
+pub mod native_convert;
+pub mod packed_gemm;
 pub mod phase_resource;
 pub mod pup;
 pub mod quantization;
 pub mod references;
+pub mod safetensors_stream;
 pub mod training;
 
 // ---------------------------------------------------------------------------------------------

@@ -19,6 +19,7 @@ fn receipt() -> ConversionReceipt {
                 source_revision: super::super::DISTILLED_WEIGHTS_REVISION.into(),
                 source_artifacts: BTreeMap::from([("model.safetensors".into(), digest(b"source"))]),
                 role: ComponentRole::Dit,
+                placement: ComponentPlacement::Owned,
                 representation: "mlx-affine-q4-g64/bf16-compute".into(),
                 files: BTreeMap::from([(
                     "model.safetensors".into(),
@@ -35,6 +36,7 @@ fn receipt() -> ConversionReceipt {
                 source_revision: super::super::DISTILLED_WEIGHTS_REVISION.into(),
                 source_artifacts: BTreeMap::from([("model.safetensors".into(), digest(b"source"))]),
                 role: ComponentRole::TextEncoder,
+                placement: ComponentPlacement::Owned,
                 representation: "bf16-language-tower".into(),
                 files: BTreeMap::from([
                     (
@@ -74,6 +76,7 @@ fn receipt() -> ConversionReceipt {
                 source_revision: super::super::DISTILLED_WEIGHTS_REVISION.into(),
                 source_artifacts: BTreeMap::from([("model.safetensors".into(), digest(b"source"))]),
                 role: ComponentRole::Autoencoder,
+                placement: ComponentPlacement::Owned,
                 representation: "f32".into(),
                 files: BTreeMap::from([(
                     "ae.safetensors".into(),
@@ -234,4 +237,75 @@ fn torn_shard_index_never_publishes_ready() {
     assert!(result.is_err());
     assert!(!target.exists());
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn ggml_algorithms_require_their_exact_block_parameters() {
+    for (algorithm, bits) in [("ggml-q4_1", 4), ("ggml-q8_0", 8)] {
+        let mut r = receipt();
+        r.algorithm = algorithm.into();
+        r.bits = Some(bits);
+        r.group_size = Some(32);
+        r.validate().unwrap();
+        r.group_size = Some(64);
+        assert!(
+            r.validate().is_err(),
+            "{algorithm}: GGML blocks are 32 wide"
+        );
+        r.group_size = Some(32);
+        r.bits = Some(12 - bits);
+        assert!(r.validate().is_err(), "{algorithm}: bits never alias");
+    }
+}
+
+/// External encoder/AE files stay in the original root: they are excluded from the owned output
+/// inventory, full-hash verified against the source root, and a DiT is never external.
+///
+/// *Mutations that red this:* counting external files in `verify_outputs`; skipping the
+/// checksum in `verify_external`; allowing an external DiT.
+#[test]
+fn external_components_are_verified_in_the_source_root_not_the_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    populate(&source).unwrap();
+    let mut r = receipt();
+    for component in &mut r.components {
+        if component.role != ComponentRole::Dit {
+            component.placement = ComponentPlacement::External;
+        }
+    }
+    assert!(r.has_external_components());
+    assert_eq!(
+        ConversionReceipt::from_json(&r.to_json().unwrap()).unwrap(),
+        r
+    );
+    let target = temp.path().join("converted");
+    let ext = r.clone();
+    publish_conversion(&target, move |dir| {
+        for (p, bytes) in [
+            ("model.safetensors", b"packed".as_slice()),
+            ("config.json", b"{}".as_slice()),
+            ("LICENSE.md", b"{}".as_slice()),
+            ("NOTICE.md", b"{}".as_slice()),
+        ] {
+            fs::write(dir.join(p), bytes)?;
+        }
+        Ok(ext)
+    })
+    .unwrap();
+    assert!(!target.join("ae.safetensors").exists(), "nothing copied");
+    assert_eq!(open_conversion(&target).unwrap(), r);
+    r.verify_external(&source).unwrap();
+    fs::write(source.join("ae.safetensors"), b"zz").unwrap();
+    assert!(
+        r.verify_external(&source).is_err(),
+        "a changed source AE is refused"
+    );
+    let mut bad = r.clone();
+    bad.components[0].placement = ComponentPlacement::External;
+    assert!(bad.validate().is_err());
+    let mut json = r.to_json().unwrap();
+    json["components"][0]["placement"] = serde_json::json!("copied");
+    assert!(ConversionReceipt::from_json(&json).is_err());
 }
