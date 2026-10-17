@@ -437,13 +437,44 @@ fn decode_tiled(
     }
     let plan = tiling.plan(vae, 1, height, width);
     let lifted = head.reshape(&[1, 1, height, width, channels])?;
-    let out = mlx_gen::vae_tiling::tiled_decode(&lifted, &plan, [1, 2, 3], Some(cancel), |tile| {
-        let shape = tile.shape();
-        let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
-        let decoded = decoder.decode_tail(&tile)?;
-        let shape = decoded.shape();
-        Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
-    })?;
+    let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+    // Eight full RGB f32 outputs cover the live fold stages, placement, blend and final normalize.
+    let assembly = (height as u64)
+        .saturating_mul(width as u64)
+        .saturating_mul(decoder.tail_scale() as u64)
+        .saturating_mul(decoder.tail_scale() as u64)
+        .saturating_mul(3 * 4 * 8);
+    let out = mlx_gen::vae_tiling::tiled_decode_with_hooks(
+        &lifted,
+        &plan,
+        [1, 2, 3],
+        Some(cancel),
+        |tile| {
+            mlx_gen::ios_quantum::before("DC-AE tile assembly", assembly)?;
+            let shape = tile.shape();
+            let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
+            let decoded = decoder.decode_tail(&tile)?;
+            mlx_gen::ios_quantum::before("DC-AE tile fold", assembly)?;
+            let shape = decoded.shape();
+            Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
+        },
+        |accumulators| {
+            if mlx_gen::ios_quantum::enabled() {
+                mlx_gen::ios_quantum::finish(accumulators)
+            } else {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                Ok(())
+            }
+        },
+        || {
+            if mlx_gen::ios_quantum::enabled() {
+                mlx_gen::residency::drain_allocator_cache();
+            }
+        },
+    )?;
+    mlx_gen::ios_quantum::finish(&[&out])?;
     let shape = out.shape();
     Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }

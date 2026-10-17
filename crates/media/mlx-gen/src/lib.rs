@@ -43,6 +43,7 @@ pub mod capability;
 pub mod coherence;
 pub mod error;
 pub mod img2img;
+pub mod ios_quantum;
 pub mod logical_weights;
 pub mod memory;
 pub mod mllm;

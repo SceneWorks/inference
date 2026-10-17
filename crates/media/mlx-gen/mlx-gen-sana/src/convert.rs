@@ -236,6 +236,8 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     std::fs::create_dir_all(&tr_dst)?;
     let tr = quantize_map(load_map(&tr_src)?, bits, GROUP_SIZE, is_transformer_target)?;
     save_map(&tr_dst.join(TRANSFORMER_FILE), &tr)?;
+    drop(tr);
+    mlx_gen::residency::drain_allocator_cache();
 
     // Text encoder: pack the Gemma-2 projections and token embedding, keep tokenizer.json.
     let te_src = src_root.join("text_encoder");
@@ -249,6 +251,8 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     std::fs::create_dir_all(&te_dst)?;
     let te = quantize_map(load_map(&te_src)?, bits, GROUP_SIZE, is_te_target)?;
     save_map(&te_dst.join(TE_FILE), &te)?;
+    drop(te);
+    mlx_gen::residency::drain_allocator_cache();
     copy_sidecars(&te_src, &te_dst)?;
 
     // DC-AE decoder stays dense (all-conv) — mirror verbatim.
@@ -258,11 +262,141 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     copy_turnkey_assets(src_root, dst_root)
 }
 
+/// Tensor-storage envelope for CPU conversion, computed from headers before reading payloads.
+/// Components are released separately. Two component copies plus the largest tensor account for
+/// source/output maps, casts/contiguous copies and serialization scratch. This is not a process RSS
+/// bound; the standalone CPU command must also have an external RSS guard.
+pub fn cpu_conversion_tensor_bytes(src_root: &Path) -> Result<u64> {
+    let mut peak = 0;
+    for component in ["transformer", "text_encoder"] {
+        let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(
+            src_root.join(component),
+        )
+        .map_err(|e| Error::Msg(e.to_string()))?;
+        let mut total = 0u64;
+        let mut largest = 0;
+        for h in headers {
+            total = total
+                .checked_add(h.data_bytes)
+                .ok_or_else(|| Error::Msg("CPU conversion bytes overflow".into()))?;
+            largest = largest.max(h.data_bytes);
+        }
+        let bytes = total
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(largest))
+            .ok_or_else(|| Error::Msg("CPU conversion bytes overflow".into()))?;
+        peak = peak.max(bytes);
+    }
+    Ok(peak)
+}
+
+/// Explicit CPU-only conversion. The original entry point keeps the caller's default device.
+/// Checks the operator's tensor budget before constructing arrays, scopes BOTH device and stream,
+/// and restores the previous device on errors. Serialize this offline API with other MLX callers.
+/// The CLI additionally traps Metal submissions and requires an external process RSS guard.
+pub fn prequantize_turnkey_cpu(
+    src_root: &Path,
+    dst_root: &Path,
+    bits: i32,
+    tensor_budget: u64,
+) -> Result<()> {
+    if !matches!(bits, 4 | 8) {
+        return Err(Error::Msg("CPU SANA conversion requires Q4 or Q8".into()));
+    }
+    let required = cpu_conversion_tensor_bytes(src_root)?;
+    if required > tensor_budget {
+        return Err(Error::Unsupported(format!("CPU SANA conversion refused before load: tensor envelope {required} exceeds {tensor_budget} bytes")));
+    }
+    struct RestoreDevice(mlx_rs::Device);
+    impl Drop for RestoreDevice {
+        fn drop(&mut self) {
+            mlx_rs::Device::set_default(&self.0);
+        }
+    }
+    let _restore = RestoreDevice(mlx_rs::Device::try_default()?);
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        prequantize_turnkey(src_root, dst_root, bits)
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+mod metal_guard;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_rs::ops::{eq, quantize};
     use mlx_rs::{Array, Dtype};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cpu_converter_fixture_refuses_before_load_and_never_submits_metal() {
+        const CHILD: &str = "SANA_CPU_CONVERTER_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "convert::tests::cpu_converter_fixture_refuses_before_load_and_never_submits_metal", "--nocapture"])
+                .env(CHILD,"1").status().unwrap();
+            assert!(
+                status.success(),
+                "CPU-only converter child failed: {status}"
+            );
+            return;
+        }
+        assert!(metal_guard::forbid_metal());
+        assert!(metal_guard::metal_forbidden());
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        for bits in [4, 8] {
+            let source = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            let source = source.path();
+            std::fs::create_dir_all(source.join("transformer")).unwrap();
+            std::fs::create_dir_all(source.join("text_encoder")).unwrap();
+            std::fs::create_dir_all(source.join("vae")).unwrap();
+            let dense = Array::from_slice(
+                &(0..5 * 128).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+                &[5, 128],
+            );
+            let tr = quantize_map(
+                HashMap::from([(
+                    "transformer_blocks.0.attn1.to_q.weight".into(),
+                    dense.clone(),
+                )]),
+                bits,
+                GROUP_SIZE,
+                is_transformer_target,
+            )
+            .unwrap();
+            save_map(&source.join("transformer").join(TRANSFORMER_FILE), &tr).unwrap();
+            save_map(
+                &source.join("text_encoder").join(TE_FILE),
+                &HashMap::from([("model.embed_tokens.weight".into(), dense)]),
+            )
+            .unwrap();
+            std::fs::write(source.join("vae/config.json"), "{}").unwrap();
+            let destination = output.path().join("packed");
+            assert!(cpu_conversion_tensor_bytes(source).unwrap() > 0);
+            assert!(prequantize_turnkey_cpu(source, &destination, bits, 0).is_err());
+            assert!(
+                !destination.exists(),
+                "refusal must precede destination creation and model loading"
+            );
+            // Override a GPU default device without constructing a GPU command stream. Even an empty
+            // GPU stream commits on C++ teardown, which the submission trap correctly rejects.
+            mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+            prequantize_turnkey_cpu(source, &destination, bits, 1024 * 1024).unwrap();
+            assert!(mlx_rs::Device::try_default().unwrap() == mlx_rs::Device::gpu());
+            mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+            let packed = load_map(&destination.join("text_encoder")).unwrap();
+            assert_eq!(packed["model.embed_tokens.weight"].dtype(), Dtype::Uint32);
+            let actual_tr = load_map(&destination.join("transformer")).unwrap();
+            for (key, value) in &tr {
+                assert!(byte_equal(value, &actual_tr[key]));
+            }
+            assert!(destination.join("vae/config.json").exists());
+        }
+    }
 
     #[test]
     fn transformer_predicate_matches_trunk_linears_only() {

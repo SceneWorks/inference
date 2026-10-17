@@ -8,6 +8,56 @@ use mlx_gen_pid::{Gemma2, Gemma2Config};
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
+#[cfg(target_os = "macos")]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+mod quantum_metal_guard;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
+    const CHILD: &str = "GEMMA_QUANTUM_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gemma_parity::gemma_quantum_cpu_matches_lazy_and_refuses_low_headroom",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert!(quantum_metal_guard::forbid_metal());
+    assert!(quantum_metal_guard::metal_forbidden());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let w = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gemma2_tiny.safetensors"
+    ))
+    .unwrap();
+    let model = Gemma2::from_weights(&w, "", &tiny_cfg()).unwrap();
+    let ids = w.require("__io__.ids").unwrap();
+    let lazy = model.forward(ids, None).unwrap();
+    lazy.eval().unwrap();
+    let guarded = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+        model.forward(ids, None)
+    })
+    .unwrap();
+    assert_eq!(
+        max_abs(&subtract(&guarded, &lazy).unwrap()),
+        0.0,
+        "barriers change lifetime, not Gemma arithmetic"
+    );
+    let refused =
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || model.forward(ids, None));
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("before construction"));
+}
+
 fn max_abs(a: &Array) -> f32 {
     max(abs(a).unwrap(), None).unwrap().item::<f32>()
 }

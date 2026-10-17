@@ -550,31 +550,39 @@ impl SanaBlock {
     ) -> Result<Array> {
         let dim = self.scale_shift_table.shape()[1];
         let b = hidden.shape()[0];
-        // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
-        let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
-        let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
-        let mc = split_sections(&modg, &[1, 2, 3, 4, 5], 1)?; // 6 × [B,1,dim]
-        let chunk = |i: usize| -> Result<Array> { Ok(mc[i].reshape(&[b, 1, dim])?) };
-        let (shift_msa, scale_msa, gate_msa) = (chunk(0)?, chunk(1)?, chunk(2)?);
-        let (shift_mlp, scale_mlp, gate_mlp) = (chunk(3)?, chunk(4)?, chunk(5)?);
+        let scratch = mlx_gen::ios_quantum::sana_block_bytes(
+            b as u64,
+            (h as u64).saturating_mul(w as u64),
+            dim as u64,
+            caption.shape()[1] as u64,
+        );
+        mlx_gen::ios_quantum::run("SANA block", scratch, || {
+            // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
+            let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
+            let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
+            let mc = split_sections(&modg, &[1, 2, 3, 4, 5], 1)?; // 6 × [B,1,dim]
+            let chunk = |i: usize| -> Result<Array> { Ok(mc[i].reshape(&[b, 1, dim])?) };
+            let (shift_msa, scale_msa, gate_msa) = (chunk(0)?, chunk(1)?, chunk(2)?);
+            let (shift_mlp, scale_mlp, gate_mlp) = (chunk(3)?, chunk(4)?, chunk(5)?);
 
-        // 2. Self linear-attention.
-        let norm_h = layer_norm(hidden, None, None, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_msa, &shift_msa)?;
-        let attn_out = self.attn1.forward(&norm_h)?;
-        let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
+            // 2. Self linear-attention.
+            let norm_h = layer_norm(hidden, None, None, self.norm_eps)?;
+            let norm_h = modulate(&norm_h, &scale_msa, &shift_msa)?;
+            let attn_out = self.attn1.forward(&norm_h)?;
+            let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
 
-        // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption, caption_mask, budget)?;
-        let hidden = add(&cross, &hidden)?;
+            // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
+            let cross = self.attn2.forward(&hidden, caption, caption_mask, budget)?;
+            let hidden = add(&cross, &hidden)?;
 
-        // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
-        let norm_h = layer_norm(&hidden, None, None, self.norm_eps)?;
-        let norm_h = modulate(&norm_h, &scale_mlp, &shift_mlp)?;
-        let grid = norm_h.reshape(&[b, h, w, dim])?; // [B,N,dim] → NHWC (channels-last)
-        let ff = self.ff.forward(&grid)?;
-        let ff = ff.reshape(&[b, h * w, dim])?;
-        Ok(add(&hidden, &multiply(&gate_mlp, &ff)?)?)
+            // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
+            let norm_h = layer_norm(&hidden, None, None, self.norm_eps)?;
+            let norm_h = modulate(&norm_h, &scale_mlp, &shift_mlp)?;
+            let grid = norm_h.reshape(&[b, h, w, dim])?; // [B,N,dim] → NHWC (channels-last)
+            let ff = self.ff.forward(&grid)?;
+            let ff = ff.reshape(&[b, h * w, dim])?;
+            Ok(add(&hidden, &multiply(&gate_mlp, &ff)?)?)
+        })
     }
 }
 
@@ -737,6 +745,14 @@ impl SanaTransformer {
         let p = cfg.patch_size;
         let (ph, pw) = (height / p, width / p);
         let dt = latent_nchw.dtype();
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let scratch = mlx_gen::ios_quantum::sana_block_bytes(
+            b as u64,
+            (ph as u64).saturating_mul(pw as u64),
+            dim as u64,
+            caption.shape()[1] as u64,
+        );
+        mlx_gen::ios_quantum::before("SANA patch/caption/timestep", scratch)?;
 
         // 1. Patch embed (NHWC). [B,C,H,W] → NHWC → conv → [B,ph,pw,dim] → tokens [B,N,dim].
         let x = latent_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
@@ -780,6 +796,7 @@ impl SanaTransformer {
         let cap = self.caption_proj_2.forward(&gelu_tanh(&cap)?)?;
         let cap = cap.reshape(&[b, -1, dim])?;
         let caption = rms_norm(&cap, &self.caption_norm, cfg.caption_norm_eps)?;
+        mlx_gen::ios_quantum::finish(&[&hidden, &caption, &temb, &emb])?;
 
         // 4. Transformer blocks. The caption padding mask (if any) applies unchanged to every block's
         // attn2 — the per-token caption projection above preserves the M (=300) axis it indexes.
@@ -812,6 +829,7 @@ impl SanaTransformer {
         };
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.
+        mlx_gen::ios_quantum::before("SANA output projection", scratch)?;
         let ss = self.scale_shift_table.reshape(&[1, 2, dim])?;
         let modg = add(&ss, &emb.reshape(&[b, 1, dim])?)?; // [B,2,dim]
         let parts = split_sections(&modg, &[1], 1)?; // 2 × [B,1,dim]
@@ -828,7 +846,9 @@ impl SanaTransformer {
         let oc = cfg.out_channels;
         let out = out.reshape(&[b, ph, pw, p, p, oc])?;
         let out = out.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
-        Ok(out.reshape(&[b, oc, ph * p, pw * p])?)
+        let out = out.reshape(&[b, oc, ph * p, pw * p])?;
+        mlx_gen::ios_quantum::finish(&[&out])?;
+        Ok(out)
     }
 
     /// Rung 4: walk the 20 `transformer_blocks` in windows, rebuilding each window's weights from the

@@ -320,6 +320,16 @@ impl Gemma2 {
         let sh = ids.shape();
         let (b, l) = (sh[0], sh[1]);
         let hidden = self.cfg.hidden_size;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let scratch = mlx_gen::ios_quantum::gemma_layer_bytes(
+            b as u64,
+            l as u64,
+            hidden as u64,
+            self.cfg.intermediate_size as u64,
+            self.cfg.num_heads as u64,
+            self.cfg.head_dim as u64,
+        );
+        mlx_gen::ios_quantum::before("Gemma embedding/mask", scratch)?;
 
         // embed + √hidden scale (cast to embedding dtype, per the reference)
         let flat = ids.reshape(&[b * l])?;
@@ -339,10 +349,15 @@ impl Gemma2 {
 
         let (cos, sin) = rope_tables(self.cfg.head_dim, l, self.cfg.rope_theta);
         let mask = causal_mask(b, l, pad_mask)?;
+        mlx_gen::ios_quantum::finish(&[&x, &cos, &sin, &mask])?;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, &mask)?;
+            x = mlx_gen::ios_quantum::run("Gemma layer", scratch, || {
+                layer.forward(&x, &cos, &sin, &mask)
+            })?;
         }
-        rms(&x, &self.norm, self.cfg.rms_eps)
+        mlx_gen::ios_quantum::run("Gemma final norm", scratch, || {
+            rms(&x, &self.norm, self.cfg.rms_eps)
+        })
     }
 }
 

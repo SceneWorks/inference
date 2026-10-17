@@ -225,6 +225,115 @@ fn mean_rel(got: &Array, want: &Array) -> f64 {
     num / den.max(1e-9)
 }
 
+#[cfg(target_os = "macos")]
+use crate::common::quantum_metal_guard;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
+    const CHILD: &str = "DCAE_QUANTUM_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vae_tiled_decode::dcae_quantum_cpu_matches_lazy_and_refuses_low_headroom",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert!(quantum_metal_guard::forbid_metal());
+    assert!(quantum_metal_guard::metal_forbidden());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let dec = decoder();
+    let z = latent(3, 3);
+    let cancel = CancelFlag::new();
+    let lazy = dec.decode(&z, &cancel).unwrap();
+    lazy.eval().unwrap();
+    let bounded = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+        dec.decode(&z, &cancel)
+    })
+    .unwrap();
+    assert_eq!(
+        max_abs(&bounded, &lazy),
+        0.0,
+        "barriers preserve DC-AE arithmetic"
+    );
+    let cfg = config();
+    let mut encoder_weights = Weights::empty();
+    let mut seed = 7654;
+    conv(
+        &mut encoder_weights,
+        "encoder.conv_in",
+        cfg.block_out_channels[0],
+        3,
+        3,
+        true,
+        &mut seed,
+    );
+    for i in 0..cfg.num_stages() {
+        let c = cfg.block_out_channels[i];
+        for j in 0..cfg.encoder_layers_per_block[i] {
+            let prefix = format!("encoder.down_blocks.{i}.{j}");
+            match cfg.block_types[i] {
+                BlockType::Res => res_block(&mut encoder_weights, &prefix, c, &mut seed),
+                BlockType::EfficientVit => {
+                    evit_block(&mut encoder_weights, &prefix, c, &cfg, &mut seed)
+                }
+            }
+        }
+        if i + 1 < cfg.num_stages() {
+            conv(
+                &mut encoder_weights,
+                &format!(
+                    "encoder.down_blocks.{i}.{}.conv",
+                    cfg.encoder_layers_per_block[i]
+                ),
+                cfg.block_out_channels[i + 1],
+                c,
+                3,
+                true,
+                &mut seed,
+            );
+        }
+    }
+    conv(
+        &mut encoder_weights,
+        "encoder.conv_out",
+        cfg.latent_channels,
+        *cfg.block_out_channels.last().unwrap(),
+        3,
+        true,
+        &mut seed,
+    );
+    let encoder = mlx_gen_sana::DcAeEncoder::from_weights(&encoder_weights, cfg).unwrap();
+    let image = rand(&[1, 3, 24, 24], 9876);
+    let lazy_encoder = encoder.encode(&image, &cancel).unwrap();
+    lazy_encoder.eval().unwrap();
+    let bounded_encoder =
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+            encoder.encode(&image, &cancel)
+        })
+        .unwrap();
+    assert_eq!(
+        max_abs(&bounded_encoder, &lazy_encoder),
+        0.0,
+        "img2img encoder barriers preserve arithmetic"
+    );
+    assert!(
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || encoder.encode(&image, &cancel))
+            .is_err()
+    );
+    let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || dec.decode(&z, &cancel));
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("before construction"));
+}
+
 fn decoder() -> DcAeDecoder {
     let cfg = config();
     DcAeDecoder::from_weights(&weights(&cfg), cfg).expect("build synthetic DC-AE decoder")

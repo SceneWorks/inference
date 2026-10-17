@@ -29,6 +29,86 @@ use crate::common;
 
 use common::{tiny_config, tiny_sprint_config};
 
+#[cfg(target_os = "macos")]
+use crate::common::quantum_metal_guard;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sana_quantum_cpu_matches_lazy_and_refuses_low_headroom() {
+    const CHILD: &str = "SANA_QUANTUM_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transformer_parity::sana_quantum_cpu_matches_lazy_and_refuses_low_headroom",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    assert!(quantum_metal_guard::forbid_metal());
+    assert!(quantum_metal_guard::metal_forbidden());
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    let golden = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_transformer_golden.safetensors"
+    ))
+    .unwrap();
+    let model =
+        SanaTransformer::from_weights(&weights_with_w_prefix(&golden), tiny_config()).unwrap();
+    let latent = golden.require("input.latent").unwrap();
+    let caption = golden.require("input.caption").unwrap();
+    let timestep = golden.require("input.timestep").unwrap();
+    let lazy = model.forward(latent, caption, timestep).unwrap();
+    lazy.eval().unwrap();
+    let bounded = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, || {
+        model.forward(latent, caption, timestep)
+    })
+    .unwrap();
+    assert_eq!(
+        peak_rel(&bounded, &lazy),
+        0.0,
+        "barriers change lifetime, not SANA arithmetic"
+    );
+    let sprint = Weights::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_sprint_trunk_golden.safetensors"
+    ))
+    .unwrap();
+    let sprint_model =
+        SanaTransformer::from_weights(&weights_with_w_prefix(&sprint), tiny_sprint_config())
+            .unwrap();
+    let sprint_forward = || {
+        sprint_model.forward_with_guidance(
+            sprint.require("input.latent").unwrap(),
+            sprint.require("input.caption").unwrap(),
+            sprint.require("input.timestep").unwrap(),
+            Some(sprint.require("input.guidance").unwrap()),
+            None,
+        )
+    };
+    let lazy_sprint = sprint_forward().unwrap();
+    lazy_sprint.eval().unwrap();
+    let bounded_sprint =
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1024 * 1024 * 1024, sprint_forward)
+            .unwrap();
+    assert_eq!(
+        peak_rel(&bounded_sprint, &lazy_sprint),
+        0.0,
+        "Sprint keeps embedded guidance and qk-norm arithmetic"
+    );
+    let refused = mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(0, || {
+        model.forward(latent, caption, timestep)
+    });
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("before construction"));
+}
+
 fn f32(x: &Array) -> Array {
     x.as_dtype(Dtype::Float32).unwrap()
 }
