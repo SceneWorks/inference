@@ -12,6 +12,7 @@ oracle (`crates/media/mlx-gen/tools/dump_flux3_*.py`), never at runtime.
 | --- | --- | --- |
 | Inference code (`dit.py`, `autoencoder.py`, `text_encoder.py`, `sampling.py`, `pipeline.py`) | `black-forest-labs/flux-3-image-klein` (GitHub) | `45e57c9fb06f9751cdced29a65c5d2171003be05` |
 | Distilled package: `config.json`, `model.safetensors` (5.6B flow-map DiT, bf16), `ae.safetensors` (f32), `text_encoder/` | `black-forest-labs/flux-3-image-klein` (Hugging Face, gated) | `8454017f9ebaada30c998fccd9f67a80c7580f68` |
+| Base CFG package (S6): native DiT without target-time embedder; 50 steps, CFG 3.5 | `black-forest-labs/flux-3-image-klein-base` (Hugging Face, gated) | `1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4` |
 | The bundled `text_encoder/` is byte-identical to this snapshot (same LFS sha256 of both shards, same tokenizer and config) | `Qwen/Qwen3-VL-4B-Instruct` (Hugging Face) | `ebb281ec70b05090aa6165b016eac8ec08e71b17` |
 
 Licences: the inference code is Apache-2.0; the FLUX 3 weights (DiT + autoencoder) are under the
@@ -32,7 +33,9 @@ Every row of the MLX twin's coverage table marked S1 is ported here one-to-one, 
 | Flow-map Euler, `dt · velocity` rounded to the compute dtype, f32 state | `pipeline.rs` (written against `gen_core::flux3::flow_map_schedule`, not the shared sigma-convention sampler driver) |
 | Output `clamp(−1, 1)` → RGB8 (truncating cast) | `pipeline::float_image_to_rgb8` |
 | Default seed `sha256(caption)` when the request carries none | `gen_core::flux3::prompt_seed` |
-| CFG sampling (base checkpoint), references, boxes, upsampler, quantized variants, LoRA | typed `Unsupported` refusals (sc-26239, sc-26236/7/8, sc-26241) |
+| Base CFG50/3.5, explicit negative conditioning, additive identity-checked LoRA | `pipeline::denoise_cfg`, `adapters.rs`, native `AdaptLinear` residuals (S6) |
+| Optional prompt upsampler | separate `pup.rs` model and shared four-mode contract (S5) |
+| References, boxes, quantized variants | typed `Unsupported` refusals (sc-26236/7, sc-26241) |
 
 ## Deliberate differences from the MLX twin
 

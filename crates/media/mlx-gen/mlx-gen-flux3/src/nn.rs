@@ -66,6 +66,18 @@ impl Linear {
         self.inner.forward(&x)
     }
 
+    /// Attach a preflight-validated additive bottleneck without fusing the base.
+    pub fn push_lora(&mut self, down: Array, up: Array, scale: f64) -> Result<()> {
+        let adapter = mlx_gen::adapters::Adapter::Lora {
+            a: down.transpose_axes(&[1, 0])?.as_dtype(self.compute)?,
+            b: up.transpose_axes(&[1, 0])?.as_dtype(self.compute)?,
+            scale: scale as f32,
+        };
+        adapter.materialize()?;
+        self.inner.push(adapter);
+        Ok(())
+    }
+
     /// `[out, in]` of the dense base.
     pub fn out_in(&self) -> Result<(i32, i32)> {
         let (weight, _) = self

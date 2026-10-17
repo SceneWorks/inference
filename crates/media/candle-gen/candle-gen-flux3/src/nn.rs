@@ -141,19 +141,26 @@ impl Loader<'_> {
                 weight.rank()
             )));
         }
-        Ok(Linear { weight })
+        Ok(Linear {
+            weight,
+            adapted: None,
+        })
     }
 }
 
 /// `nn.Linear(bias=False)`: `x · Wᵀ` in the compute dtype (the weight's).
 pub struct Linear {
     weight: Tensor,
+    adapted: Option<candle_gen::quant::AdaptLinear>,
 }
 
 impl Linear {
     /// A linear layer from an already-shaped `[out, in]` weight, stored as given.
     pub fn from_weight(weight: Tensor) -> Self {
-        Self { weight }
+        Self {
+            weight,
+            adapted: None,
+        }
     }
 
     /// `x` of any leading shape `[.., in]` → `[.., out]` in the weight's dtype.
@@ -170,9 +177,30 @@ impl Linear {
         let gemm = gemm_dtype(&self.weight);
         let y = to(&flat, gemm)?.matmul(&to(&self.weight, gemm)?.t()?)?;
         let y = to(&y, dtype)?;
+        let y = if let Some(adapted) = &self.adapted {
+            adapted.apply_residuals(&to(&flat, gemm)?, y)?
+        } else {
+            y
+        };
         let mut shape = lead.to_vec();
         shape.push(out_dim);
         Ok(y.reshape(shape)?)
+    }
+
+    /// Attach a validated bottleneck residual without mutating the base weight.
+    pub fn push_lora(&mut self, down: Tensor, up: Tensor, scale: f64) -> Result<()> {
+        if self.adapted.is_none() {
+            let (output, input) = self.out_in()?;
+            self.adapted = Some(candle_gen::quant::AdaptLinear::from_dense(
+                candle_gen::candle_nn::Linear::new(self.weight.clone(), None),
+                input,
+                output,
+            ));
+        }
+        self.adapted
+            .as_mut()
+            .expect("initialized")
+            .push_lora_checked(down.t()?.contiguous()?, up.t()?.contiguous()?, scale)
     }
 
     /// `[out, in]` of the weight.

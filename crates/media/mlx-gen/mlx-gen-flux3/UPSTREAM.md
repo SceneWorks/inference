@@ -8,6 +8,7 @@ Python appears only in the offline oracle (`../tools/dump_flux3_*.py`), never at
 | --- | --- | --- |
 | Inference code (`dit.py`, `autoencoder.py`, `text_encoder.py`, `sampling.py`, `pipeline.py`) | `black-forest-labs/flux-3-image-klein` (GitHub) | `45e57c9fb06f9751cdced29a65c5d2171003be05` |
 | Distilled package: `config.json`, `model.safetensors` (5.6B flow-map DiT, bf16), `ae.safetensors` (f32), `text_encoder/` | `black-forest-labs/flux-3-image-klein` (Hugging Face, gated) | `8454017f9ebaada30c998fccd9f67a80c7580f68` |
+| Base CFG package (S6): native DiT without target-time embedder; 50 steps, CFG 3.5 | `black-forest-labs/flux-3-image-klein-base` (Hugging Face, gated) | `1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4` |
 | The bundled `text_encoder/` is byte-identical to this snapshot (same LFS sha256 of both shards, same tokenizer and config) | `Qwen/Qwen3-VL-4B-Instruct` (Hugging Face) | `ebb281ec70b05090aa6165b016eac8ec08e71b17` |
 | Prompt upsampler code (`pup.py`, `bbox.py`, `pup_prompts.json`; sc-26238) | `black-forest-labs/flux-3-image-klein` (GitHub) | `45e57c9fb06f9751cdced29a65c5d2171003be05` (`pup.py` sha256 `e3561ae3…`, `bbox.py` `fbea10c1…`) |
 | Prompt upsampler package: `config.json` (`qwen3_5`), `model.safetensors` (9B VLM, bf16, 18.8 GB, sha256 `f5062a1f…`), tokenizer + `chat_template.jinja`, `system_prompts.json` (sha256 `b5da3ed8…`, identical to `pup_prompts.json`) | `black-forest-labs/flux-3-image-klein-pup` (Hugging Face, ungated, Apache-2.0) | `8b069751eb5dcab23829d9c5eccb470eb8b8a4ed` |
@@ -22,8 +23,7 @@ commercial-output exception for Qualifying Users under US$5M revenue, content-fi
 attribution obligations); the text encoder is Apache-2.0 (Qwen). See `NOTICE` and the catalog's
 licence rows (`gen_core::license`).
 
-The base checkpoint (`flux-3-image-klein-base`), reference images and boxes are later stories of
-the epic (sc-26239, sc-26236/7); nothing here pins them. The prompt upsampler is sc-26238 (the
+S6 registers the base checkpoint separately as `flux3_klein_base`; reference images and boxes remain sc-26236/7. The prompt upsampler is sc-26238 (the
 `pup` module here and `gen_core::flux3::pup`): an **optional** co-requisite, loaded only when the
 `prompt_upsampler` component names its package and accounted separately from the image model and
 its text encoder.
@@ -79,8 +79,9 @@ typed refusal until sc-26241.
 | Noise `torch.randn(...).to(bf16).float()` | `pipeline.generate` | seeded MLX normal, rounded through bf16 (not bit-reproducible with torch; parity uses injected noise) | S1 |
 | Output `clamp(−1, 1)` → RGB8 | `pipeline.to_pil` | `mlx_gen::image::decoded_to_image` | S1 |
 | Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core::flux3::prompt_seed` | S1 |
-| CFG sampling (base checkpoint) | `sampling.denoise` | — | sc-26239 |
-| Reference images (`image_cond`), boxes in the DiT prompt, quantized variants, LoRA | `pipeline.encode_references`, `fp8.py`/`nvfp4.py` | — | sc-26236/7, sc-26241, sc-26239 |
+| CFG sampling (base checkpoint): [unconditional, conditional], default 50/3.5, no target-time; explicit negative caption independently encoded | `sampling.denoise` | `pipeline::denoise_cfg`, shared request resolver | S6 |
+| Additive LoRA with explicit finite scale and base/revision/rank/alpha/target admission | frozen diffusers converter at `7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941` | `gen_core::flux3::adapters`, `adapters.rs`, existing native residual hosts | S6 |
+| Reference images (`image_cond`), boxes, quantized variants | `pipeline.encode_references`, `fp8.py`/`nvfp4.py` | — | sc-26236/7, sc-26241 |
 | **Prompt upsampler (sc-26238)** — four modes by system prompt (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`): `bbox.plan` (passed boxes → canvas rows; a table already in the prompt locks by itself), the `ORIGINAL PROMPT:` / `LOCKED BOUNDING-BOX ANNOTATIONS` input, the two `I2I_SCAFFOLD`s, the chat template with `enable_thinking=False`, greedy `top_p 0.95 / top_k 20 / max_tokens 3584`, presence penalty 1.5 (t2i) / 0.0 (i2i), `max_model_len 8192`, `bbox.reconcile` (IoU ≥ 0.9 rename, locked rows verbatim adopting the desc, valid cited rows appended), `generate.py`'s `--no-pup` caption and finished-answer skip | `pup.py`, `bbox.py` | `gen_core::flux3::pup` (tensor-neutral, byte-for-byte text), `pup.rs` (the engine) | S5 |
 | Upsampler reference policy: EXIF transpose, alpha over white, `reference_size` budget (1 MP / 724² / 512² by reference count, multiples of 32, aspect ≤ 200:1 else the prompt as typed), Pillow `LANCZOS`, JPEG q92 | `pup.policy_reference` | `gen_core::flux3::pup::policy_reference` (bit-exact Pillow RGB/alpha/LANCZOS and libjpeg's q92 integer 4:2:0 round trip, pixel-equality fixtures) | S5 |
 | Qwen3.5 VLM serving (hybrid linear/full attention, Qwen3-VL ViT, `<\|image_pad\|>` expansion by the processor's `smart_resize`) | vLLM | shared `mlx_llm` provider (`mlx-llama`, `qwen3_5`) | S5 |
@@ -113,3 +114,28 @@ logit margins), produced by `../tools/dump_flux3_pup_golden.py`, which also writ
 goldens and the Pillow policy fixture read by `gen-core/tests/flux3_pup.rs`. The real-weight case
 `real_weights::real_prompt_upsampler_rewrites_the_readme_request` reads the pinned package from
 `FLUX3_PUP_DIR`.
+
+## S6 adapter identity and mapping
+
+`LoadSpec::adapters` carries the explicit user scale. Safetensors metadata must name
+`base_model` (the canonical base or distilled Hub repo) and its frozen `base_revision`. An explicit
+finite positive global alpha is read from native `alpha` / `lora_alpha` / `ss_network_alpha` or
+standard JSON `lora_adapter_metadata`; duplicate declarations must agree, never fall back to rank.
+Every declared native/PEFT rank must match the actual factors. Plain native and diffusers A/B
+adapters are supported; rsLoRA/DoRA, fan-in/fan-out and nonempty rank/alpha patterns are typed
+refusals rather than silently applying the wrong gain. Only complete `lora_A.weight` /
+`lora_B.weight` pairs are admitted; all tensors must map, and LoKr/pass/expert overrides fail typed.
+The mapping is the explicit inverse of diffusers' pinned FLUX3 converter, not FLUX2 aliases:
+`mode_blocks` ↔ `content_mode_blocks`, `single_transformer_blocks` ↔ `single_blocks`,
+`txt_mode_blocks` unchanged; `attn.to_q/to_k/to_v/to_out.0` ↔ `q_proj/k_proj/v_proj/attn_out`,
+`ff.linear_in/linear_out` ↔ `mlp_in/mlp_out`. Residual scale is user scale × alpha/rank.
+
+`base-hub-identity.json` records pinned API metadata: base DiT LFS SHA256
+`5c921759dc03663dbb67df11d8e3d317d2d5b893b31b969c95dc77ebf861b19c`, the same AE LFS object
+as distilled, and all fourteen identical encoder git blob ids. LICENSE.md git blob id
+`044cf48568c278150d132a7479ea237a79766ea7` also equals distilled. These are metadata identity
+claims, not successful base-file download or locally hashed weight receipts; actual pinned
+base config access returned HTTP403 for the authenticated account on 2026-10-16.
+`dump_flux3_base_golden.py` runs only CPU tiny fixtures through the hash-verified frozen source:
+CFG0/1/3.5, nonempty negative conditioning, and six-projection additive adapter on/off.
+MLX requires hosted macOS execution; Windows CPU fixture success is not MLX verification.

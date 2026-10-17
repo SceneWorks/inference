@@ -1012,6 +1012,7 @@ mod tests {
             "qwen_image_2_1_turbo",
             // sc-26234: the distilled FLUX 3 route publishes a derived model and no anchor.
             "flux3_klein",
+            "flux3_klein_base",
             "sana_1600m",
             "anima_turbo",
             "sensenova_u1_8b_fast",
@@ -1899,6 +1900,7 @@ mod tests {
                 "flux2_dev_edit",
                 "flux2_dev_control",
                 "flux3_klein",
+                "flux3_klein_base",
                 "ideogram_4",
                 "ideogram_4_turbo",
                 "iris_3b",
@@ -2007,7 +2009,7 @@ mod tests {
         // 74 / 64.
         // sc-25900 adds `qwen_image_2_1_turbo` (a generator with its own complete row): 75 / 65.
         // sc-26234 adds `flux3_klein` (a generator with its own complete row): 76 / 66.
-        assert_eq!(distinct.len(), 76);
+        assert_eq!(distinct.len(), 77);
         assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 66);
     }
 
