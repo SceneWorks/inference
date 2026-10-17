@@ -12,6 +12,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+serde_json = { workspace = true }
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
@@ -26,7 +27,6 @@ sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }
 # PNG dump of the real-weight render for the evidence artifact.
 image = { workspace = true }
-serde_json = { workspace = true }
 # Real-weight case: the package's two weight files must hash to the pinned sha256s.
 sha2 = { workspace = true }
 
