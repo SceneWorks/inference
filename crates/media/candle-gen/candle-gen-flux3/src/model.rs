@@ -525,9 +525,7 @@ mod tests {
         }
         impl Drop for Component {
             fn drop(&mut self) {
-                self.events
-                    .lock()
-                    .unwrap()
+                candle_gen::lock_recover(&self.events)
                     .push(format!("drop-{}-{}", self.kind, self.id));
             }
         }
@@ -545,7 +543,7 @@ mod tests {
                     gen_core::OffloadPolicy::Resident,
                     move || {
                         let id = tc.fetch_add(1, Ordering::SeqCst);
-                        te.lock().unwrap().push(format!("load-text-{id}"));
+                        candle_gen::lock_recover(&te).push(format!("load-text-{id}"));
                         Ok(Component {
                             kind: "text",
                             id,
@@ -554,7 +552,7 @@ mod tests {
                     },
                     move |_| {
                         let id = hc.fetch_add(1, Ordering::SeqCst);
-                        he.lock().unwrap().push(format!("load-heavy-{id}"));
+                        candle_gen::lock_recover(&he).push(format!("load-heavy-{id}"));
                         Ok(Component {
                             kind: "heavy",
                             id,
@@ -563,8 +561,10 @@ mod tests {
                     },
                 )
                 .unwrap()
-                .with_staged_advisory(move || advisory.lock().unwrap().push("stage".into()));
-                events.lock().unwrap().clear(); // The old resident pair is already warm.
+                .with_staged_advisory(move || {
+                    candle_gen::lock_recover(&advisory).push("stage".into())
+                });
+                candle_gen::lock_recover(&events).clear(); // The old resident pair is already warm.
                 let cancel = gen_core::CancelFlag::new();
                 let result = prepared_image_request(
                     &residency,
@@ -572,26 +572,26 @@ mod tests {
                     &cancel,
                     &mut |_| {},
                     |_| {
-                        events.lock().unwrap().push("pup".into());
+                        candle_gen::lock_recover(&events).push("pup".into());
                         if cancel_prepare {
                             cancel.cancel();
                         }
                         Ok(17)
                     },
                     |_: &Component, prepared| {
-                        events.lock().unwrap().push("encode".into());
+                        candle_gen::lock_recover(&events).push("encode".into());
                         Ok(prepared)
                     },
                     encoder_materialization_boundary(|| {
-                        events.lock().unwrap().push("sync".into());
+                        candle_gen::lock_recover(&events).push("sync".into());
                         Ok(())
                     }),
                     |_: &Component, encoded, _| {
-                        events.lock().unwrap().push("render".into());
+                        candle_gen::lock_recover(&events).push("render".into());
                         Ok(encoded)
                     },
                 );
-                let seen = events.lock().unwrap().clone();
+                let seen = candle_gen::lock_recover(&events).clone();
                 let pup = seen.iter().position(|s| s == "pup").unwrap();
                 assert_eq!(
                     seen.iter().filter(|s| s.as_str() == "stage").count(),
@@ -678,7 +678,7 @@ mod tests {
         struct Text(Arc<Mutex<Vec<&'static str>>>);
         impl Drop for Text {
             fn drop(&mut self) {
-                self.0.lock().unwrap().push("text-drop");
+                candle_gen::lock_recover(&self.0).push("text-drop");
             }
         }
         for (encode_fails, sync_fails) in
@@ -690,11 +690,11 @@ mod tests {
             let residency = Residency::from_policy(
                 gen_core::OffloadPolicy::Sequential,
                 move || {
-                    load_events.lock().unwrap().push("text-load");
+                    candle_gen::lock_recover(&load_events).push("text-load");
                     Ok(Text(load_events.clone()))
                 },
                 move |_| {
-                    heavy_events.lock().unwrap().push("heavy-load");
+                    candle_gen::lock_recover(&heavy_events).push("heavy-load");
                     Ok(())
                 },
             )
@@ -706,7 +706,7 @@ mod tests {
                 false,
                 &mut |_| {},
                 |_: &Text| {
-                    events.lock().unwrap().push("encode");
+                    candle_gen::lock_recover(&events).push("encode");
                     if encode_fails {
                         Err(Error::Msg("primary-encoding-error".into()))
                     } else {
@@ -714,7 +714,7 @@ mod tests {
                     }
                 },
                 encoder_materialization_boundary(|| {
-                    events.lock().unwrap().push("synchronize");
+                    candle_gen::lock_recover(&events).push("synchronize");
                     if sync_fails {
                         Err(Error::Msg("synchronization-error".into()))
                     } else {
@@ -722,11 +722,11 @@ mod tests {
                     }
                 }),
                 |_: &(), encoded, _| {
-                    events.lock().unwrap().push("render");
+                    candle_gen::lock_recover(&events).push("render");
                     Ok(encoded)
                 },
             );
-            let seen = events.lock().unwrap();
+            let seen = candle_gen::lock_recover(&events);
             assert_eq!(
                 &seen[..4],
                 &["text-load", "encode", "synchronize", "text-drop"]
