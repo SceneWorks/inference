@@ -71,6 +71,13 @@ checks and admitted request binding are preserved.
 ```sh
 # After the host app has been installed (no campaign is started by pushing):
 scripts/ios/push_model.sh "$SNAPSHOT" --campaign-route iris_3b --tier q8 --device "$DEVICE"
+# A q8/q4 slot must hold a PACKED artifact: a dense snapshot requested at q8/q4 is refused by
+# admission (typed `artifact`), never quantized on the phone. Produce packed tiers on the host CPU
+# (external RSS guard required; no downloads, Metal trapped), then push each tier into its slot:
+cargo run -p mlx-gen-sana --example sana_prequant_cpu -- "$SANA_BF16" "$SANA_Q8" 8 "$TENSOR_BUDGET_MIB"
+scripts/ios/push_model.sh "$SANA_Q8" --campaign-route sana_1600m --tier q8 --device "$DEVICE"
+cargo run -p mlx-gen-iris --example iris_prequant_cpu -- generation "$IRIS_DENSE" "$IRIS_Q8" 8 "$TENSOR_BUDGET_MIB"
+cargo run -p mlx-gen-iris --example iris_prequant_cpu -- text-encoder "$QWEN3_VL" "$IRIS_Q8/text_encoder" 8 "$TENSOR_BUDGET_MIB"
 # Same mechanism for every route and tier in the actual listing:
 scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route illustrious_xl_v2 --tier q4 --device "$DEVICE"
 # SDXL `control` and `ip_adapter` cases need their component in the slot. --control/--ip-adapter

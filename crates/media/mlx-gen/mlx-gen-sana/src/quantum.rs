@@ -514,13 +514,13 @@ pub fn tile_finalize_bytes(out_h: u64, out_w: u64) -> u64 {
 }
 
 /// **Reachable-sizes prediction** (host-derived; a prediction, never evidence): for `sana_1600m`
-/// and `sana_sprint_1600m` at q4/bf16 × 512/768/1024, text-to-image and img2img, under the iOS
+/// and `sana_sprint_1600m` at q4/q8/bf16 × 512/768/1024, text-to-image and img2img, under the iOS
 /// ladder (Sequential residency — text, then for img2img the reference encode with ONLY the DC-AE
 /// encoder resident, then the trunk + decoder, then the decoder alone — bounded DC-AE decode AND
 /// encode at the 192-pixel tile, unbounded attention), print each phase's resident bytes (from the snapshot's safetensors HEADERS), its
 /// largest counted quantum scratch, and whether `resident + scratch + 512 MiB reserve` fits the
 /// 6142 MiB entitled launch headroom. Header-only reads of the on-disk snapshot (`SANA_SNAPSHOT`
-/// / `SANA_SPRINT_SNAPSHOT`, defaulting to the Hugging Face cache) plus the Gemma tokenizer for
+/// / `SANA_SPRINT_SNAPSHOT`, caller-provided snapshot roots) plus the Gemma tokenizer for
 /// the CHI-prompt token count.
 ///
 /// `cargo test -p mlx-gen-sana --lib reachable_sizes -- --ignored --nocapture`
@@ -736,7 +736,8 @@ mod reachable_sizes {
                 println!("{model}: no snapshot on disk; skipped");
                 continue;
             };
-            for tier in ["q4", "bf16"] {
+            // Every advertised tier (`supported_quants: [Q4, Q8]` plus the dense bf16 source).
+            for tier in ["q4", "q8", "bf16"] {
                 let dir = root.join(tier);
                 let te = headers(&dir.join("text_encoder/gemma-2-2b-it.safetensors"));
                 let dit = headers(&dir.join("transformer/diffusion_pytorch_model.safetensors"));

@@ -122,13 +122,40 @@ pub const fn provider_id(task: IrisTask) -> &'static str {
     }
 }
 
-/// The calibration fingerprint of `task`'s contract.
+/// The retained calibration fingerprint of `task`'s DENSE bf16 contract (the strings both backends'
+/// consumers already key on). Every other tier has its own identity: [`calibration_fingerprint_for`].
 pub const fn calibration_fingerprint(task: IrisTask) -> &'static str {
     match task {
         IrisTask::Generation => MEMORY_CALIBRATION_FINGERPRINT,
         IrisTask::Depth => DEPTH_MEMORY_CALIBRATION_FINGERPRINT,
         IrisTask::Restoration => RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
     }
+}
+
+/// The calibration identity of `task` at the tier the artifact stores and the load computes in,
+/// keyed on **(task, artifact tier)** — the sc-22731 rule SANA follows. One string per task across
+/// tiers would let a q8 record satisfy a q4 request (and vice versa), though the packed widths and
+/// so the footprints differ. The dense bf16 cell keeps its retained string byte-for-byte; the
+/// fp32 dense reference and the q8/q4 packed tiers each get their own.
+pub fn calibration_fingerprint_for(
+    task: IrisTask,
+    precision: Precision,
+    quant: Option<gen_core::Quant>,
+) -> String {
+    let tier = match (quant, precision) {
+        (None, Precision::Bf16) => return calibration_fingerprint(task).to_owned(),
+        (None, Precision::Fp32) => "fp32",
+        (Some(gen_core::Quant::Q8), _) => "q8",
+        (Some(gen_core::Quant::Q4), _) => "q4",
+        // Refused before any contract is built (`refuse_unloadable_quant`); never published.
+        (Some(_), _) => "unsupported",
+    };
+    let route = match task {
+        IrisTask::Generation => "iris-3b",
+        IrisTask::Depth => "iris-3b-depth",
+        IrisTask::Restoration => "iris-3b-restore",
+    };
+    format!("{route}-{tier}-mlx-derived-2026-10-12-v1")
 }
 
 /// The request surface `task`'s evidence is keyed on. Optimized evidence never transfers between
@@ -265,6 +292,7 @@ fn architecture_facts(
 fn base_contract(
     task: IrisTask,
     precision: Precision,
+    quant: Option<gen_core::Quant>,
     config: Option<&IrisConfig>,
 ) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -286,7 +314,7 @@ fn base_contract(
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.architecture_facts = architecture_facts(config, precision);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
-        calibration_fingerprint(task),
+        calibration_fingerprint_for(task, precision, quant),
         LoadShape::EagerMaterialization,
     ));
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
@@ -378,7 +406,7 @@ pub fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     let task = task_of(provider_id)?;
     refuse_unloadable_spec(task, spec)?;
-    Ok(base_contract(task, spec.precision, None))
+    Ok(base_contract(task, spec.precision, spec.quantize, None))
 }
 
 /// The executable contract for a real load: the declaration plus the resident bytes of what the
@@ -419,16 +447,6 @@ pub(crate) fn generation_contract(
 ) -> CoreResult<MemoryProviderContract> {
     refuse_unloadable_spec(IrisTask::Generation, spec)?;
     let precision = spec.precision;
-    let mut contract = base_contract(IrisTask::Generation, precision, Some(config));
-    let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
-    let transformer = backbone_bytes(
-        &resources
-            .backbone_dir
-            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
-        precision,
-        quant,
-    )?;
-    let conditioning = text_encoder_bytes(&resources.text_encoder_dir, spec.quantize)?;
     // The whole pipeline runs one tier: both artifacts must store the tier the load asks for (a
     // packed artifact asked for with no tier IS that tier). A dense release asked for at q8/q4 is a
     // load-time requantization no capture measured, and publishes no identity.
@@ -439,6 +457,16 @@ pub(crate) fn generation_contract(
     )?;
     let text_tier = crate::packed::text_encoder_tier(&resources.text_encoder_dir)?;
     let requested = spec.quantize.or(backbone_tier).or(text_tier);
+    let mut contract = base_contract(IrisTask::Generation, precision, requested, Some(config));
+    let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
+    let transformer = backbone_bytes(
+        &resources
+            .backbone_dir
+            .join(gen_core::iris::BACKBONE_WEIGHTS_FILE),
+        precision,
+        quant,
+    )?;
+    let conditioning = text_encoder_bytes(&resources.text_encoder_dir, spec.quantize)?;
     if !production_calibration_identity(&[backbone_tier, text_tier], requested) {
         contract.calibration = None;
     }
@@ -492,8 +520,8 @@ pub(crate) fn export_contract(
     requested: Option<gen_core::Quant>,
     export: &TaskExport,
 ) -> CoreResult<MemoryProviderContract> {
-    let mut contract = base_contract(task, precision, Some(&export.config));
     let tier = crate::packed::artifact_tier(&export.weights_path())?;
+    let mut contract = base_contract(task, precision, requested.or(tier), Some(&export.config));
     if !production_calibration_identity(&[tier], requested.or(tier)) {
         contract.calibration = None;
     }
@@ -1265,7 +1293,14 @@ mod tests {
                 assert_eq!(contract.provider_id, provider_id(task));
                 assert_eq!(contract.load_shape, surface.spec.load_shape);
                 let calibration = contract.calibration.as_ref().unwrap();
-                assert_eq!(calibration.fingerprint, calibration_fingerprint(task));
+                assert_eq!(
+                    calibration.fingerprint,
+                    calibration_fingerprint_for(
+                        task,
+                        surface.spec.precision,
+                        surface.spec.quantize
+                    )
+                );
                 assert_eq!(calibration.load_shape, surface.spec.load_shape);
                 assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
 
@@ -1335,6 +1370,92 @@ mod tests {
                 "iris-3b-restore-mlx-derived-2026-10-12-v1",
             ]
         );
+    }
+
+    /// sc-22731 for Iris: the calibration identity is keyed on (task, artifact tier). A context
+    /// recorded against one tier's contract never passes the registered safety check of another
+    /// tier's load (q8 never satisfies q4 and vice versa), while the same tier passes. Dense bf16
+    /// keeps its retained string; every tier string is valid and distinct.
+    #[test]
+    fn a_record_of_one_tier_never_satisfies_another_tiers_request() {
+        use gen_core::{
+            standard_memory_behavior_context, MemoryBehaviorRoute, MemoryNumericTier, Quant,
+        };
+        for task in TASKS {
+            let mut seen = std::collections::BTreeSet::new();
+            for (precision, quant) in [
+                (Precision::Bf16, None),
+                (Precision::Fp32, None),
+                (Precision::Bf16, Some(Quant::Q8)),
+                (Precision::Bf16, Some(Quant::Q4)),
+            ] {
+                let fingerprint = calibration_fingerprint_for(task, precision, quant);
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+                assert!(
+                    seen.insert(fingerprint),
+                    "{task:?}: tiers share an identity"
+                );
+            }
+            assert_eq!(
+                calibration_fingerprint_for(task, Precision::Bf16, None),
+                calibration_fingerprint(task),
+                "the dense bf16 cell keeps its retained string"
+            );
+            let spec = |quant: Option<Quant>| {
+                let mut spec = sentinel();
+                spec.quantize = quant;
+                spec
+            };
+            let contract = |quant| {
+                weights_free_memory_strategy_contract(provider_id(task), &spec(quant)).unwrap()
+            };
+            let record = |quant| {
+                standard_memory_behavior_context(
+                    &contract(quant),
+                    MemoryStrategy::Resident,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    },
+                    MemoryBehaviorRoute {
+                        mode: memory_mode(task),
+                        reference_count: 0,
+                        use_pid: false,
+                        has_phases: task.uses_text_encoder(),
+                        overlay: None,
+                    },
+                )
+                .unwrap()
+            };
+            // The published contract identity IS the per-tier one, so persisted evidence keyed on
+            // it can never be matched across tiers.
+            let identity = |quant: Option<Quant>| contract(quant).calibration.unwrap().fingerprint;
+            for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+                assert_eq!(
+                    identity(quant),
+                    calibration_fingerprint_for(task, Precision::Bf16, quant)
+                );
+            }
+            assert_ne!(identity(Some(Quant::Q8)), identity(Some(Quant::Q4)));
+            let check = |record_tier, request_tier| {
+                safety_check(
+                    &spec(request_tier),
+                    &contract(request_tier),
+                    &record(record_tier),
+                )
+            };
+            for (a, b) in [
+                (Some(Quant::Q8), Some(Quant::Q4)),
+                (Some(Quant::Q4), Some(Quant::Q8)),
+            ] {
+                assert!(
+                    matches!(check(a, b), MemorySafetyDecision::Reject { .. }),
+                    "{task:?}: a {a:?} record satisfied a {b:?} request"
+                );
+                assert_eq!(check(b, b), MemorySafetyDecision::Accept, "{task:?} {b:?}");
+            }
+        }
     }
 
     /// Every route names the Q4/Q8 tiers under bf16 compute only (sc-26266; the encoder-free tasks

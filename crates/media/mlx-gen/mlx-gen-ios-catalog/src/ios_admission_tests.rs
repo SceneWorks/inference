@@ -155,22 +155,27 @@ impl Generator for ProbeGenerator {
 fn a_dense_snapshot_requested_as_q4_is_a_typed_artifact_refusal() {
     let registry = crate::provider_registry().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let mut spec = sana(root.path());
-    spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
-    let refused = build_candidate(
-        &registry,
-        "sana_1600m",
-        spec,
-        None,
-        MemoryStrategy::BoundedDecode,
-        generation(512, vec![]),
-    )
-    .expect_err("dense-as-q4 has no calibrated identity");
-    assert_eq!(
-        refused.refusal_kind(),
-        Some(RefusalKind::Artifact),
-        "{refused}"
-    );
+    // Both advertised packed tiers (`supported_quants: [Q4, Q8]`), base and Sprint.
+    for provider in ["sana_1600m", "sana_sprint_1600m"] {
+        for quant in [mlx_gen::gen_core::Quant::Q4, mlx_gen::gen_core::Quant::Q8] {
+            let mut spec = sana(root.path());
+            spec.quantize = Some(quant);
+            let refused = build_candidate(
+                &registry,
+                provider,
+                spec,
+                None,
+                MemoryStrategy::BoundedDecode,
+                generation(512, vec![]),
+            )
+            .expect_err("dense-as-packed has no calibrated identity");
+            assert_eq!(
+                refused.refusal_kind(),
+                Some(RefusalKind::Artifact),
+                "{provider} {quant:?}: {refused}"
+            );
+        }
+    }
 }
 
 /// The key records the LOADED tier (never a default), alongside the layout digest.

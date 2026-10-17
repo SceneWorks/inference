@@ -823,7 +823,7 @@ composed routes.
 | BoundedDecode | not applicable (pixel space) | not applicable | not applicable |
 | BoundedAttention | missing | missing | missing |
 | BoundedTransformerResidency | missing | missing | missing |
-| Calibration fingerprint | `iris-3b-mlx-derived-2026-10-12-v1` | `iris-3b-depth-mlx-derived-2026-10-12-v1` | `iris-3b-restore-mlx-derived-2026-10-12-v1` |
+| Calibration fingerprint (dense bf16; other tiers `{route}-{fp32,q8,q4}-mlx-derived-2026-10-12-v1`, keyed per (task, artifact tier) — sc-22731 rule, sc-26270) | `iris-3b-mlx-derived-2026-10-12-v1` | `iris-3b-depth-mlx-derived-2026-10-12-v1` | `iris-3b-restore-mlx-derived-2026-10-12-v1` |
 | Witnessed load surfaces | `{bf16,q8,q4}:{resident,sequential}:eager` (sc-26266) | `bf16:resident:eager`, `bf16:sequential:eager` | same as depth |
 | Admission geometry | request width × height; batch = prompts × count | `depth_memory_geometry(plan)` (the model grid) | `restoration_memory_geometry(plan)` (the processing size); `restoration_forward_pixels(plan)` is the one-tile forward bound |
 | Resident bytes (materialized snapshot) | text tower (`model.language_model.*` + untied `lm_head`, bf16; attention/MLP projections packed at a quantized tier) + backbone at the compute dtype (projections packed at a quantized tier) + adapter overlays | `empty_prompt.safetensors` (stored f32) + backbone and reducer at the compute dtype | `empty_prompt.safetensors` + backbone at the compute dtype |
