@@ -19,6 +19,10 @@ publish = false
 # staticlib for linking into the .app; rlib so `cargo test` can exercise the same code on macOS.
 crate-type = ["staticlib", "rlib"]
 
+[[example]]
+name = "campaign_catalog"
+required-features = ["media"]
+
 [features]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
@@ -42,6 +46,7 @@ runtime-ios = { path = "../../crates/bundles/runtime-ios" }
 core-llm-testkit = { path = "../../crates/contracts/core-llm/core-llm-testkit" }
 # getrusage for the peak-RSS number the memory story (E4) needs.
 libc = "0.2"
+serde_json = "1"
 # PNG encoding for the E5 image check, so a device-generated render can be pulled off the phone and
 # LOOKED at. A pixel-range assertion proves the decode produced content; only the image proves it
 # produced the right content, and "SANA runs on iPhone" is a claim worth being able to see.
@@ -58,3 +63,6 @@ mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = tr
 # `get_peak_memory` omits. Same path crate the provider already links, so this adds no code to the
 # binary, only a name to read it by.
 mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
