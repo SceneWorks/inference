@@ -23,6 +23,7 @@ pub mod providers {
     pub use candle_gen_face as face;
     pub use candle_gen_flux as flux;
     pub use candle_gen_flux2 as flux2;
+    pub use candle_gen_flux3 as flux3;
     pub use candle_gen_ideogram as ideogram;
     pub use candle_gen_instantid as instantid;
     pub use candle_gen_iris as iris;
@@ -101,6 +102,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_clip::register_providers(registry);
     let registry = candle_gen_flux::register_providers(registry);
     let registry = candle_gen_flux2::register_providers(registry);
+    let registry = candle_gen_flux3::register_providers(registry);
     let registry = candle_gen_ideogram::register_providers(registry);
     let registry = candle_gen_iris::register_providers(registry);
     let registry = candle_gen_joycaption::register_providers(registry);
@@ -882,15 +884,23 @@ mod preview_advertising {
     ///
     /// `qwen_image_2_1_turbo` (sc-25901) is the same descriptor over the same latent space under a
     /// second id, so it is deferred on the same story for the same reason.
+    ///
+    /// `flux3_klein` (sc-26235) is deferred, **not** a no-go: FLUX 3's packed 16× latent (its own
+    /// autoencoder's 2×2-patchified, BatchNorm-normalized 128-channel tokens) is a space no linear
+    /// RGB fit has been measured for. Epic sc-26233 measures once, at its end, on its terminal
+    /// integration/measurement story sc-26243 — the single epic-end resource campaign is where an
+    /// RGB fit for this space would be measured — so the descriptor advertises
+    /// `supports_preview: false` on both backends until then.
     const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[
         ("qwen_image_2_1", "sc-24111"),
         ("qwen_image_2_1_turbo", "sc-24111"),
+        ("flux3_klein", "sc-26243"),
     ];
 
     /// The epics that own the deferred routes above. An epic is a container, not the unit of work
     /// that wires a preview, so a deferred route that names one of these instead of a story has
     /// not actually recorded who wires it.
-    const PREVIEW_DEFERRED_ROUTE_EPICS: &[&str] = &["sc-24107", "sc-25678"];
+    const PREVIEW_DEFERRED_ROUTE_EPICS: &[&str] = &["sc-24107", "sc-25678", "sc-26233"];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1083,6 +1093,17 @@ mod preview_advertising {
                     dark: &[],
                 },
             ],
+        },
+        ProviderCrate {
+            dir: "candle-gen-flux3",
+            register: candle_gen_flux3::register_providers,
+            // sc-26235: the flow-map Euler loop is written against `gen_core::flux3` (its
+            // `(t, t_ref)` target-time conditioning has no shared-driver expression), so there is no
+            // hooked site; it emits nothing (`supports_preview: false`, no fitted RGB projection
+            // for the packed 16× latent) and is carried in PREVIEW_DEFERRED_ROUTE_IDS rather than
+            // pinning a per-file inventory.
+            denoise: Denoise::Bespoke,
+            routes: &[],
         },
         ProviderCrate {
             dir: "candle-gen-ideogram",
@@ -3505,6 +3526,14 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_flux2::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
+        // sc-26235: the distilled FLUX 3 route — staged residency implemented, the three bounded
+        // rungs declared `Missing` until sc-26241 (the same ladder as the MLX twin).
+        MemoryRouteCrate {
+            dir: "candle-gen-flux3",
+            register_providers: candle_gen_flux3::register_providers,
+            register_surfaces: Some(candle_gen_flux3::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
         // sc-25690: the three Iris inference routes — generation (staged residency + bounded
         // attention), and the generator-less depth and restoration routes (resident, composed).
         MemoryRouteCrate {
@@ -5172,6 +5201,9 @@ mod tests {
                 "stable-diffusion-3" => Some(&SD3_LATENT_SPACE),
                 "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
                 "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                // FLUX 3's packed 16× latent (its own autoencoder with BatchNorm-stat tokens)
+                // has no shared decoder consumer, so nothing is advertised (sc-26235).
+                "flux3" => None,
                 "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
                 "mage_flow" => Some(&MAGE_LATENT_SPACE),
                 "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
@@ -5874,6 +5906,7 @@ mod tests {
                 "flux1_dev",
                 "flux2_klein_9b",
                 "flux2_dev",
+                "flux3_klein",
                 "ideogram_4",
                 "ideogram_4_turbo",
                 "iris_3b",
@@ -5960,7 +5993,8 @@ mod tests {
         // `iris_3b` trainer reuses the generator's row and adds no id; the sc-25687 `iris_3b_depth`
         // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
         // trainer reuses the transform's id and row and adds no id; sc-25901 adds
-        // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55).
+        // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55; sc-26235 adds
+        // `flux3_klein`, a generator with its own complete row: 66 / 56).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -5974,8 +6008,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 65);
-        assert_eq!(super::provider_components().len(), 55);
+        assert_eq!(distinct.len(), 66);
+        assert_eq!(super::provider_components().len(), 56);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

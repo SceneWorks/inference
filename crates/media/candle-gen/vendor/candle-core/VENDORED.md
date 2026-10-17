@@ -71,6 +71,19 @@ evidence.
    rows / columns a floor-division pool drops zero gradient. See *Max-pool backward routes the
    window gradient* below.
 
+7. `Cargo.toml` — security-only dependency update (sc-26235): `zip` 7.2.0 → 9.0.0 to fix
+   RUSTSEC-2026-0367 (privileged extraction permissions), RUSTSEC-2026-0368 (escaping symlink
+   targets), and RUSTSEC-2026-0369 (permissions applied through symlinks). Default features remain
+   disabled; only `deflate-flate2-zlib-rs` is enabled for compressed NPZ and torch archive reads
+   (no zopfli writer or other codecs). STORED archives
+   and NPZ writes remain supported. This changes no Candle git revision, tensor math or kernel.
+8. `src/npy.rs`, `src/pickle.rs` — minimal zip 9 API adaptation: archive entry names are now
+   fallible `Result<Cow<str>, ZipError>` values. Propagate decoding failures through the existing
+   typed `Error::Zip` conversion and retain owned names for later lookups, rather than ignoring
+   invalid names or using lossy decoding. No extraction-to-disk API is introduced.
+   CPU regressions in `candle-audio-kokoro/src/weights.rs` exercise this vendored reader/writer
+   through STORED NPZ round trips, DEFLATE NPZ reads, and torch archive loading.
+
 Everything else (`src/**`, `tests/**`, `benches/**`, `examples/**`, `README.md`, `LICENSE`) is
 byte-for-byte upstream. Diff against an upstream checkout to confirm these are the sole deltas.
 
