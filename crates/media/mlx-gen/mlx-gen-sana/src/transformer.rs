@@ -531,6 +531,33 @@ pub(crate) struct SanaBlock {
     norm_eps: f32,
 }
 
+/// Block-quantum geometry from the CONFIGURATION alone (no tensors): the rung-4 fallback when no
+/// block is resident, and the iOS synthetic primitive probe. Matches `SanaBlock::quantum_geometry`
+/// for a loaded block: inverted 1x1 (+bias), depthwise 3x3 (+bias), point 1x1 (no bias).
+pub fn configured_block_geometry(
+    cfg: &SanaTransformerConfig,
+    batch: i32,
+    h: i32,
+    w: i32,
+    caption_tokens: i32,
+) -> mlx_gen::ios_quantum::SanaBlockGeometry {
+    let dim = cfg.inner_dim() as u64;
+    let hidden = (cfg.mlp_ratio * cfg.inner_dim() as f32) as u64;
+    mlx_gen::ios_quantum::SanaBlockGeometry {
+        batch: batch as u64,
+        tokens: (h as u64).saturating_mul(w as u64),
+        dim,
+        caption_tokens: caption_tokens as u64,
+        ff_channels: 2 * hidden,
+        cross_heads: cfg.num_cross_attention_heads as u64,
+        conv_weight_elements: 2 * hidden * dim
+            + 2 * hidden
+            + 2 * hidden * 9
+            + 2 * hidden
+            + dim * hidden,
+    }
+}
+
 impl SanaBlock {
     /// Scratch geometry from THIS block's loaded tensors, not production constants.
     pub(crate) fn quantum_geometry(
@@ -719,21 +746,13 @@ impl SanaTransformer {
             })
             .max()
             .unwrap_or_else(|| {
-                let dim = self.cfg.inner_dim() as u64;
-                let hidden = (self.cfg.mlp_ratio * self.cfg.inner_dim() as f32) as u64;
-                mlx_gen::ios_quantum::sana_block_bytes(mlx_gen::ios_quantum::SanaBlockGeometry {
-                    batch: batch as u64,
-                    tokens: (h as u64).saturating_mul(w as u64),
-                    dim,
-                    caption_tokens: caption_tokens as u64,
-                    ff_channels: 2 * hidden,
-                    cross_heads: self.cfg.num_cross_attention_heads as u64,
-                    conv_weight_elements: 2 * hidden * dim
-                        + 2 * hidden
-                        + 2 * hidden * 9
-                        + 2 * hidden
-                        + dim * hidden,
-                })
+                mlx_gen::ios_quantum::sana_block_bytes(configured_block_geometry(
+                    &self.cfg,
+                    batch,
+                    h,
+                    w,
+                    caption_tokens,
+                ))
             })
     }
 
@@ -1060,6 +1079,18 @@ mod tests {
         assert_eq!(channels, 96);
         assert_ne!(channels, 5 * inner as u64);
         assert_eq!(elements, (96 * 16 + 96 + 96 * 9 + 96 + 16 * 48) as u64);
+        // The tensor-free configured geometry (rung-4 fallback, iOS primitive probe) must price
+        // exactly what the loaded block prices.
+        let configured = configured_block_geometry(&cfg, 1, 8, 8, 300);
+        assert_eq!(
+            (configured.ff_channels, configured.conv_weight_elements),
+            (channels, elements)
+        );
+        assert_eq!(
+            (configured.dim, configured.tokens, configured.caption_tokens),
+            (16, 64, 300)
+        );
+        assert_eq!(configured.cross_heads, cfg.num_cross_attention_heads as u64);
     }
 
     pub(super) fn tokens(b: i32, n: i32, inner: i32, seed: f32) -> Array {
