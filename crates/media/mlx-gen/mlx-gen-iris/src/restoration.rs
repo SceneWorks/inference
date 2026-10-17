@@ -65,6 +65,10 @@ pub(crate) fn capabilities(mac_only: bool) -> TransformCapabilities {
 pub(crate) mod quanta {
     pub const LOAD: &str = "Iris restoration load";
     pub const TILE: &str = "Iris restoration tile";
+    /// The driver's host planes, checked before the first tile.
+    pub const HOST_PLANES: &str = "Iris restoration host planes";
+    /// The post-tile phase's new host planes, checked when the last tile returns.
+    pub const POST_TILE: &str = "Iris restoration post-tile planes";
 }
 
 /// A loaded Iris-3B restorer.
@@ -82,13 +86,15 @@ pub struct IrisRestorer {
     memory_strategy: gen_core::MemoryProviderContract,
     /// The precision this restorer computes in — the numeric tier its safety check binds to.
     precision: mlx_gen::Precision,
+    /// The packed tier of the loaded export (`None`: the dense export).
+    tier: Option<mlx_gen::Quant>,
 }
 
 /// Refuse every load knob the restoration route does not implement, by name.
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
-    let refusals: [(&str, bool); 8] = [
-        ("quantize", spec.quantize.is_some()),
+    crate::memory_strategy::refuse_unloadable_quant(MODEL_ID, spec)?;
+    let refusals: [(&str, bool); 7] = [
         ("adapters", !spec.adapters.is_empty()),
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
@@ -115,6 +121,9 @@ impl IrisRestorer {
     pub fn load(spec: &LoadSpec) -> Result<Self> {
         refuse_unsupported_spec(spec)?;
         let resources = RestorationResources::from_spec(spec, MODEL_ID)?;
+        let weights = resources.export.weights_path();
+        crate::packed::refuse_dense_requested_as_packed(MODEL_ID, &weights, spec.quantize)?;
+        let tier = crate::packed::artifact_tier(&weights)?;
         mlx_gen::ios_quantum::before_load(
             quanta::LOAD,
             &[
@@ -134,11 +143,13 @@ impl IrisRestorer {
         let memory_strategy = crate::memory_strategy::export_contract(
             gen_core::iris::IrisTask::Restoration,
             spec.precision,
+            tier,
             &resources.export,
         )?;
         Ok(Self {
             memory_strategy,
             precision: spec.precision,
+            tier,
             descriptor: descriptor(),
             config: resources.export.config,
             settings: resources.settings,
@@ -162,7 +173,12 @@ impl IrisRestorer {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::loaded_safety_check(self.precision, &self.memory_strategy, context)
+        crate::memory_strategy::loaded_safety_check(
+            self.precision,
+            self.tier,
+            &self.memory_strategy,
+            context,
+        )
     }
 
     /// The export's `task` settings (`sigma`, `tile`) the restorer runs with.
@@ -183,21 +199,24 @@ impl IrisRestorer {
     /// One tile's velocity: `[3, h, w]` CHW f32 in `[-1, 1]` → `v` (same layout, f32), the backbone
     /// run once at `sigma · num_train_timesteps` on the empty-prompt states.
     pub fn velocity(&self, tile: &[f32], height: usize, width: usize) -> Result<Vec<f32>> {
-        // The tile, its velocity, the f32 copy and the host readback: four tile-sized buffers held
-        // across the backbone forward (whose own blocks are checked inside it).
-        let tile_bytes = (tile.len() as u64).saturating_mul(4 * 4);
-        mlx_gen::ios_quantum::before(quanta::TILE, tile_bytes)?;
+        mlx_gen::ios_quantum::before(quanta::TILE, tile_scratch(tile.len() as u64))?;
+        let v = self.velocity_body(tile, height, width)?;
+        eval([&v])?;
+        mlx_gen::ios_quantum::finish(quanta::TILE, &[&v])?;
+        let n = v.shape().iter().product::<i32>();
+        Ok(v.reshape(&[n])?.as_slice::<f32>().to_vec())
+    }
+
+    /// The body of one tile quantum: the tile's upload and the backbone forward (whose own blocks
+    /// are checked inside it) to the f32 velocity.
+    pub(crate) fn velocity_body(&self, tile: &[f32], height: usize, width: usize) -> Result<Array> {
         let x = Array::from_slice(tile, &[1, 3, height as i32, width as i32]);
         let t = Array::from_slice(&[self.settings.model_time(&self.config)], &[1]);
         let text = TextBatch {
             states: &self.states,
             mask: &self.mask,
         };
-        let v = self.dit.forward(&x, &t, &text)?.as_dtype(Dtype::Float32)?;
-        eval([&v])?;
-        mlx_gen::ios_quantum::finish(quanta::TILE, &[&v])?;
-        let n = v.shape().iter().product::<i32>();
-        Ok(v.reshape(&[n])?.as_slice::<f32>().to_vec())
+        Ok(self.dit.forward(&x, &t, &text)?.as_dtype(Dtype::Float32)?)
     }
 
     fn apply_impl(
@@ -207,16 +226,103 @@ impl IrisRestorer {
     ) -> Result<Image> {
         let plan = self.plan(req)?;
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        // The driver's host planes (f32 canvases on the CPU heap, which count toward the iOS
+        // footprint like any MLX buffer): the whole route's peak is checked before anything is
+        // built, and the post-tile phase's new planes again — against live headroom — once the
+        // last tile has returned, before the driver allocates them.
+        let host = host_plane_bytes(&plan);
+        mlx_gen::ios_quantum::before(quanta::HOST_PLANES, host.peak())?;
+        let tiles = plan.forward_count();
+        let mut done = 0usize;
         let image = restore(
             &req.image,
             &plan,
             self.settings.sigma,
             &req.cancel,
             on_progress,
-            &mut |tile, h, w| self.velocity(tile, h, w).map_err(Into::into),
+            &mut |tile, h, w| {
+                let v = self.velocity(tile, h, w)?;
+                done += 1;
+                if done == tiles {
+                    mlx_gen::ios_quantum::before(quanta::POST_TILE, host.post_tile_new())?;
+                }
+                Ok(v)
+            },
         );
         mlx_rs::memory::clear_cache();
         Ok(image?)
+    }
+}
+
+/// The tile quantum over a `[3, h, w]` tile of `elements` values: its f32 upload and the f32
+/// velocity the forward returns (the forward's blocks are checked inside it), plus the host
+/// readback `Vec<f32>` made right after the quantum synchronizes.
+pub(crate) fn tile_scratch(elements: u64) -> u64 {
+    mlx_gen::ios_quantum::tensor_bytes(4, &[3, elements])
+}
+
+/// The restoration driver's host planes ([`gen_core::iris::restoration`]'s `run_restoration`),
+/// counted from its allocations. Every plane is f32 (4 B) over `O` output, `R` processing and `P`
+/// padded pixels (three channels: `3·O` …); a tile is `t²` pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostPlanes {
+    /// The tile phase. Tiled: the bicubic reference (3·O), the padded input (3·P), the fused
+    /// canvas (3·P), its weight plane (P), the Gaussian window (t²) and, per tile, the crop, the
+    /// velocity readback and the restored crop (3·t² each). Single pass: the reference, the padded
+    /// input, its velocity readback and the restored canvas built from it (3·P each).
+    pub tile_phase: u64,
+    /// What is still allocated when the last tile's velocity returns — the reference, the padded
+    /// input and either the fused canvas and its weight plane (tiled) or the readback (single pass).
+    pub live_at_last_tile: u64,
+    /// The post-tile peak, the largest of: the single pass's restored canvas beside its readback
+    /// (3·O + 9·P); the `(y + 1) / 2` crop (3·R) beside the reference and the fused canvas;
+    /// when enlarged, the resize's working copy and first-pass output (6·R) beside the reference
+    /// and the crop; under the colour fix, its three concurrent channel workers' planes (the kept
+    /// high plane, the second split's high / low / blur: 4·O each, 12·O) beside the reference and
+    /// the content (3·O each); and the final RGB8 image (3·O bytes) beside the restored planes.
+    pub post_tile_peak: u64,
+}
+
+impl HostPlanes {
+    /// The host peak of the whole route (checked before the first tile).
+    pub fn peak(&self) -> u64 {
+        self.tile_phase.max(self.post_tile_peak)
+    }
+
+    /// What the post-tile phase allocates beyond what is live when the last tile returns
+    /// (checked then, against live headroom).
+    pub fn post_tile_new(&self) -> u64 {
+        self.post_tile_peak.saturating_sub(self.live_at_last_tile)
+    }
+}
+
+pub(crate) fn host_plane_bytes(plan: &RestorationPlan) -> HostPlanes {
+    let px = |d: gen_core::iris::restoration::Dims| d.width as u64 * d.height as u64;
+    let (o, r, p) = (px(plan.output), px(plan.processing), px(plan.padded));
+    let t2 = plan.tile as u64 * plan.tile as u64;
+    let f = 4u64;
+    let (tile_phase, live_at_last_tile, single) = if plan.single_pass() {
+        let single = f * (3 * o + 9 * p);
+        (single, f * (3 * o + 6 * p), single)
+    } else {
+        (f * (3 * o + 7 * p + t2 + 9 * t2), f * (3 * o + 7 * p), 0)
+    };
+    let crop = f * (3 * o + 3 * p + 3 * r);
+    let resize = if plan.enlarged {
+        f * (3 * o + 3 * r + 6 * r)
+    } else {
+        0
+    };
+    let colour_fix = if plan.color_fix {
+        f * (3 * o + 3 * o + 12 * o)
+    } else {
+        0
+    };
+    let rgb8 = f * 3 * o + 3 * o;
+    HostPlanes {
+        tile_phase,
+        live_at_last_tile,
+        post_tile_peak: single.max(crop).max(resize).max(colour_fix).max(rgb8),
     }
 }
 
@@ -262,13 +368,93 @@ mod tests {
         assert_eq!(c.input_budget, Some(INPUT_BUDGET));
     }
 
+    /// The host planes are counted from the driver's allocations, per plan shape.
+    ///
+    /// *Mutation that reds this:* dropping any term of `host_plane_bytes` (e.g. the colour fix's
+    /// worker planes, the padded input, or the single pass's restored canvas).
+    #[test]
+    fn host_planes_are_counted_from_the_drivers_allocations() {
+        use gen_core::iris::restoration::{plan, Dims, RestorationOptions};
+        use mlx_gen::InputSizing;
+        let options = |scale: f64, color_fix: bool| RestorationOptions {
+            scale,
+            input_sizing: InputSizing::Original,
+            color_fix,
+        };
+        // 4x of 512² → 2048² output, tiled (9 release tiles), not enlarged, colour fix on.
+        let tiled = plan(
+            Dims::new(512, 512),
+            &options(4.0, true),
+            TileGeometry::RELEASE,
+            MODEL_ID,
+        )
+        .unwrap();
+        assert!(!tiled.single_pass() && !tiled.enlarged);
+        let (o, p, t2) = (2048u64 * 2048, 2048u64 * 2048, 1024u64 * 1024);
+        let h = host_plane_bytes(&tiled);
+        assert_eq!(h.tile_phase, 4 * (3 * o + 7 * p + 10 * t2));
+        assert_eq!(h.live_at_last_tile, 4 * (3 * o + 7 * p));
+        // The colour fix's three workers (4 planes each) beside the reference and the content.
+        assert_eq!(h.post_tile_peak, 4 * (3 * o + 3 * o + 12 * o));
+        assert_eq!(h.peak(), h.post_tile_peak.max(h.tile_phase));
+        assert_eq!(
+            h.post_tile_new(),
+            h.post_tile_peak.saturating_sub(h.live_at_last_tile)
+        );
+        // Without the colour fix the crop (beside the reference and the fused canvas) is the
+        // post-tile peak.
+        let plain = host_plane_bytes(
+            &plan(
+                Dims::new(512, 512),
+                &options(4.0, false),
+                TileGeometry::RELEASE,
+                MODEL_ID,
+            )
+            .unwrap(),
+        );
+        assert_eq!(plain.post_tile_peak, 4 * (3 * o + 3 * p + 3 * o));
+        // 1x of 300×200: enlarged to a one-tile short side, padded, single pass.
+        let small = plan(
+            Dims::new(300, 200),
+            &options(1.0, false),
+            TileGeometry::RELEASE,
+            MODEL_ID,
+        )
+        .unwrap();
+        assert!(small.enlarged);
+        let px = |d: Dims| d.width as u64 * d.height as u64;
+        let (o, r, p) = (px(small.output), px(small.processing), px(small.padded));
+        let h = host_plane_bytes(&small);
+        if small.single_pass() {
+            assert_eq!(h.tile_phase, 4 * (3 * o + 9 * p));
+        }
+        // The resize's working copy and first pass (6·R) beside the reference and the crop.
+        assert!(h.post_tile_peak >= 4 * (3 * o + 3 * r + 6 * r));
+    }
+
+    /// A tier this task cannot load is refused by name before any resource is read (NVFP4; a
+    /// packed tier under the f32 reference compute), and the dense export asked for at a packed
+    /// tier is refused rather than requantized at load.
+    ///
+    /// *Mutation that reds this:* dropping `refuse_unloadable_quant` or
+    /// `refuse_dense_requested_as_packed` from the load.
     #[test]
     fn unsupported_spec_fields_are_typed_refusals() {
-        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
-        spec.quantize = Some(mlx_gen::Quant::Q4);
-        match IrisRestorer::load(&spec) {
-            Err(Error::Unsupported(m)) => assert!(m.contains("quantize"), "{m}"),
+        let refused = |spec: &LoadSpec, field: &str| match IrisRestorer::load(spec) {
+            Err(Error::Unsupported(m)) => assert!(m.contains(field), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),
-        }
+        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
+        spec.quantize = Some(mlx_gen::Quant::Nvfp4);
+        refused(&spec, "quantize");
+        spec.quantize = Some(mlx_gen::Quant::Q4);
+        spec.precision = mlx_gen::Precision::Fp32;
+        refused(&spec, "precision");
+        let mut dense = LoadSpec::new(WeightsSource::Dir(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/tiny-snapshot/upscaler"),
+        ));
+        dense.quantize = Some(mlx_gen::Quant::Q4);
+        refused(&dense, "quantize");
     }
 }

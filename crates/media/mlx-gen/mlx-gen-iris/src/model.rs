@@ -95,6 +95,17 @@ pub(crate) const BACKBONE_LOAD_QUANTUM: &str = "Iris backbone load";
 /// Label of one solved batch's RGB8 conversion quantum.
 pub(crate) const IMAGE_QUANTUM: &str = "Iris image conversion";
 
+/// The RGB8 conversion (`mlx_gen::image::decoded_to_image`, one row at a time) of a solved
+/// `[B, 3, H, W]` batch of `elements` values: the `x · 0.5 + 0.5` clamp, the `· 255` rounding and
+/// the NHWC re-layout keep four f32 copies of a row live (priced over the whole batch), plus the
+/// conversion's four f32 scalars and the u8 host pixels of every image (one byte per element),
+/// which stay allocated.
+pub(crate) fn image_scratch(elements: u64) -> u64 {
+    mlx_gen::ios_quantum::tensor_bytes(4, &[4, elements])
+        .saturating_add(16)
+        .saturating_add(elements)
+}
+
 /// The backbone half of the generation task.
 pub struct Heavy {
     pub dit: IrisDiT,
@@ -165,8 +176,21 @@ pub fn load_backbone_quantized(
     base_model: &str,
     quant: Option<Quant>,
 ) -> Result<(IrisDiT, Vec<AdapterApplyReport>)> {
+    let requested = quant;
     let quant = BackboneQuant::for_load(quant)?;
     let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    // A pre-quantized artifact (`crate::packed`) is read packed — no dense transient, no load-time
+    // quantization — and only at its own tier, under the bf16 compute its scales are stored at.
+    // A dense artifact keeps the release path below unchanged.
+    let artifact = crate::packed::artifact_tier(&path)?;
+    crate::packed::check_requested("the backbone", artifact, requested)?;
+    if artifact.is_some() && compute != Dtype::Bfloat16 {
+        return Err(Error::Unsupported(format!(
+            "iris: {} is a packed {artifact:?} artifact, which runs under the bf16 compute policy",
+            path.display()
+        )));
+    }
+    let quant = if artifact.is_some() { None } else { quant };
     mlx_gen::ios_quantum::before_load(BACKBONE_LOAD_QUANTUM, std::slice::from_ref(&path))?;
     let mut weights = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
@@ -184,11 +208,12 @@ pub fn load_backbone_quantized(
         // Metal command buffer wait on the disk, which on a cold page cache trips the GPU watchdog
         // (sc-24245).
         mlx_rs::transforms::eval_pending_loads([&array])?;
-        let array = if array.ndim() >= 2 && key != "y_pos_embedding" {
-            array.as_dtype(compute)?
-        } else {
-            array
-        };
+        let array =
+            if array.ndim() >= 2 && key != "y_pos_embedding" && !is_packed_part(&key, &array) {
+                array.as_dtype(compute)?
+            } else {
+                array
+            };
         eval([&array])?;
         weights.insert(key, array);
     }
@@ -207,6 +232,12 @@ pub fn load_backbone_quantized(
     }
     drop(weights);
     Ok((dit, reports))
+}
+
+/// Whether `key` is part of a packed projection ([`crate::packed`]): its u32 codes or its stored
+/// scales / biases, which every loader keeps exactly as stored.
+pub(crate) fn is_packed_part(key: &str, array: &mlx_rs::Array) -> bool {
+    array.dtype() == Dtype::Uint32 || key.ends_with(".scales") || key.ends_with(".biases")
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
@@ -343,9 +374,7 @@ impl Iris3b {
                 }
                 let mut out = Vec::with_capacity((rows * req.count) as usize);
                 for x in &images {
-                    // The f32 batch, its clamp/scale/round copies and the RGB8 readback.
-                    let bytes = (x.size() as u64).saturating_mul(4 * 4);
-                    mlx_gen::ios_quantum::before(IMAGE_QUANTUM, bytes)?;
+                    mlx_gen::ios_quantum::before(IMAGE_QUANTUM, image_scratch(x.size() as u64))?;
                     out.extend(to_images(x)?);
                     mlx_gen::ios_quantum::finish(IMAGE_QUANTUM, &[])?;
                 }

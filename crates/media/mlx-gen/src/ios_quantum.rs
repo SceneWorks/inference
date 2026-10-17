@@ -10,11 +10,12 @@ use crate::{Error, Result};
 use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
+#[cfg(not(target_os = "ios"))]
+pub use budget::measured_peak_bytes;
 pub use budget::{
-    attention_block_bytes, check_headroom, conv_stage_bytes, dcae_stage_bytes, elementwise_bytes,
-    gemma_layer_bytes, rope_table_bytes, sampler_step_bytes, sana_block_bytes,
-    sana_promoted_conv_bytes, transformer_layer_bytes, AttentionBlockGeometry, SanaBlockGeometry,
-    PROCESS_RESERVE_BYTES,
+    assert_tracks_measured, attention_block_bytes, check_headroom, conv_stage_bytes,
+    elementwise_bytes, rope_table_bytes, sampler_step_bytes, scores_bytes, tensor_bytes,
+    AttentionBlockGeometry, ConvStageGeometry, Scores, PROCESS_RESERVE_BYTES,
 };
 
 /// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross
@@ -280,30 +281,34 @@ pub fn before_load_where(
     if !enabled() {
         return Ok(());
     }
+    before(label, load_floor_bytes(components, resident)?)
+}
+
+/// Header-only load floor: the stored bytes of every kept tensor. Proven against MLX's measured
+/// peak while a file is read (`cpu_quantum_materializes_before_return_refuses_before_build_and_
+/// restores_cache`): the bytes land once, with no extra per-tensor read copy.
+pub fn load_floor_bytes(
+    components: &[std::path::PathBuf],
+    resident: impl Fn(&str) -> bool,
+) -> Result<u64> {
     let mut total = 0u64;
-    let mut largest = 0u64;
     for component in components {
         for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
             .map_err(|e| Error::Msg(e.to_string()))?
         {
-            if !resident(&header.name) {
-                continue;
+            if resident(&header.name) {
+                total = total
+                    .checked_add(header.data_bytes)
+                    .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
             }
-            total = total
-                .checked_add(header.data_bytes)
-                .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
-            largest = largest.max(header.data_bytes);
         }
     }
-    let scratch = total
-        .checked_add(largest)
-        .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
-    before(label, scratch)
+    Ok(total)
 }
 
 /// [`before_load`] for a component whose loader CASTS every tensor to a `bytes_per_element`-wide
-/// dtype after reading it (e.g. SDXL's VAE, upcast to f32): the stored bytes AND the cast copies
-/// are live together, plus the largest cast tensor as scratch. Header-only; a no-op off device.
+/// dtype after reading it (e.g. an upcast to f32): the stored bytes AND the cast copies are live
+/// together (proven against the measured peak of a read + cast). Header-only; a no-op off device.
 pub fn before_load_cast(
     label: &str,
     components: &[std::path::PathBuf],
@@ -314,7 +319,6 @@ pub fn before_load_cast(
     }
     let overflow = || Error::Unsupported("iOS load accounting overflow".into());
     let mut total = 0u64;
-    let mut largest = 0u64;
     for component in components {
         for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
             .map_err(|e| Error::Msg(e.to_string()))?
@@ -331,10 +335,9 @@ pub fn before_load_cast(
                 .checked_add(header.data_bytes)
                 .and_then(|t| t.checked_add(cast))
                 .ok_or_else(overflow)?;
-            largest = largest.max(cast);
         }
     }
-    before(label, total.checked_add(largest).ok_or_else(overflow)?)
+    before(label, total)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -384,14 +387,17 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         let weight = Array::ones::<f32>(&[40, 1, 1, 8])?.as_dtype(mlx_rs::Dtype::Float16)?;
         let promoted = run(
             "tiny F16 convolution",
-            sana_block_bytes(SanaBlockGeometry {
+            // Promoted F32 weights (40*8 elements) plus the f32 output, counted for this op.
+            conv_stage_bytes(ConvStageGeometry {
                 batch: 1,
-                tokens: 16,
-                dim: 8,
-                caption_tokens: 5,
-                ff_channels: 40,
-                cross_heads: 2,
-                conv_weight_elements: 40 * 8,
+                height: 4,
+                width: 4,
+                in_channels: 8,
+                out_channels: 40,
+                element_bytes: 4,
+                in_live: 1,
+                out_live: 1,
+                weight_bytes: 40 * 8 * 4,
             }),
             || {
                 Ok(mlx_rs::ops::conv2d(
@@ -431,6 +437,67 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         take_refusal().map(|r| (r.label, r.available_bytes)),
         Some(("before refused".to_string(), Some(1)))
     );
+    // The measurement every counted formula is proven against: two 256x256 f32 inputs built
+    // inside the quantum plus their sum = three live 256 KiB tensors at the peak.
+    let measured = measured_peak_bytes(|| {
+        let a = Array::ones::<f32>(&[256, 256])?;
+        let b = Array::ones::<f32>(&[256, 256])?;
+        Ok(vec![mlx_rs::ops::add(&a, &b)?])
+    })
+    .unwrap();
+    let three = 3 * tensor_bytes(4, &[256, 256]);
+    assert_tracks_measured("ones + ones", three, measured, 1.5);
+    // The load floor is proven against MLX's peak while a safetensors file is read: the stored
+    // bytes land once, with no extra per-tensor copy (no "largest tensor" scratch on top).
+    {
+        let dir = std::env::temp_dir().join(format!("ios-quantum-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.safetensors");
+        let a = Array::ones::<f32>(&[256, 1024]).unwrap();
+        let b = Array::ones::<f32>(&[512, 1024]).unwrap();
+        let c = Array::ones::<f32>(&[1024, 1024]).unwrap();
+        Array::save_safetensors(vec![("a", &a), ("b", &b), ("c", &c)], None, &file).unwrap();
+        let measured = measured_peak_bytes(|| {
+            let w = crate::weights::Weights::from_file(&file)?;
+            Ok(["a", "b", "c"]
+                .iter()
+                .map(|k| w.require(k).unwrap().clone())
+                .collect())
+        })
+        .unwrap();
+        // Read + upcast: stored f16 bytes and the f32 copies are live together.
+        let half = dir.join("h.safetensors");
+        let h = [&a, &b, &c].map(|x| x.as_dtype(mlx_rs::Dtype::Float16).unwrap());
+        Array::save_safetensors(vec![("a", &h[0]), ("b", &h[1]), ("c", &h[2])], None, &half)
+            .unwrap();
+        let cast_measured = measured_peak_bytes(|| {
+            let w = crate::weights::Weights::from_file(&half)?;
+            Ok(["a", "b", "c"]
+                .iter()
+                .map(|k| {
+                    w.require(k)
+                        .unwrap()
+                        .as_dtype(mlx_rs::Dtype::Float32)
+                        .unwrap()
+                })
+                .collect())
+        })
+        .unwrap();
+        let stored_half = (256 + 512 + 1024) * 1024 * 2;
+        assert_tracks_measured(
+            "safetensors load + f32 cast",
+            stored_half + 2 * stored_half,
+            cast_measured,
+            1.5,
+        );
+        assert_tracks_measured(
+            "safetensors load",
+            load_floor_bytes(std::slice::from_ref(&file), |_| true).unwrap(),
+            measured,
+            1.5,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     // A casting load prices stored bytes + the widened copies + the largest widened tensor.
     let dir = std::env::temp_dir().join(format!("ios-quantum-cast-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -457,11 +524,11 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         [
             QuantumEvent::Checked {
                 label: "stored".into(),
-                scratch: 64 + 64
+                scratch: 64
             },
             QuantumEvent::Checked {
                 label: "cast".into(),
-                scratch: 64 + 128 + 128
+                scratch: 64 + 128
             },
         ]
     );

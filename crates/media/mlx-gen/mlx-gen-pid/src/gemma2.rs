@@ -250,6 +250,27 @@ impl Layer {
         })
     }
 
+    /// Bytes of the single largest dense projection weight that a forward at `compute` must
+    /// promote (its stored dtype differs from the activations). Packed projections run
+    /// `quantized_matmul` on the stored codes and same-dtype dense weights are used in place: 0.
+    fn promoted_weight_bytes(&self, compute: Dtype) -> u64 {
+        [
+            &self.attn.q,
+            &self.attn.k,
+            &self.attn.v,
+            &self.attn.o,
+            &self.mlp.gate,
+            &self.mlp.up,
+            &self.mlp.down,
+        ]
+        .into_iter()
+        .filter_map(|lin| lin.dense_weight())
+        .filter(|(w, _)| w.dtype() != compute)
+        .map(|(w, _)| w.size() as u64 * dtype_bytes(w.dtype()).max(dtype_bytes(compute)))
+        .max()
+        .unwrap_or(0)
+    }
+
     fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let h = self
             .attn
@@ -258,6 +279,121 @@ impl Layer {
         let h = self.mlp.forward(&rms(&x, &self.pre_ff_ln, self.eps)?)?;
         Ok(add(&x, &rms(&h, &self.post_ff_ln, self.eps)?)?)
     }
+}
+
+fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Float16 | Dtype::Bfloat16 => 2,
+        _ => 4,
+    }
+}
+
+/// Live `[B, L, hidden]` buffers of one [`rms`], in units of its `element_bytes`-wide input: the
+/// `fast::rms_norm` evaluation holds two f32 buffers at once (MLX's unfused CPU fallback computes
+/// `x²`, then its mean-normalized product; the Metal kernel is fused and holds only the output, so
+/// the CPU count bounds both). A narrower input adds its f32 widened copy and the cast back; for f32
+/// both casts are the input itself.
+fn rms_live(element_bytes: u64) -> u64 {
+    if element_bytes >= 4 {
+        2
+    } else {
+        // widened copy (2 units) + two f32 buffers (4 units) + narrow cast (1 unit), plus one
+        // unit for the reduction temporaries the CPU fallback allocates around the widened input
+        // (measured 7.37 units at 192x64 bf16).
+        8
+    }
+}
+
+/// One Gemma-2 decoder layer quantum (norm sandwich → GQA soft-capped attention → norm sandwich →
+/// gelu-tanh MLP), COUNTED from [`Layer::forward`] at the activation width `element_bytes`.
+///
+/// Attention phase, in `[B, L, hidden]` buffers (q/k/v widths `heads·head_dim` and
+/// `kv_heads·head_dim` never exceed `hidden` for Gemma-2, so each is priced at hidden width): the
+/// residual `x`, the input-norm output plus its f32 transients ([`rms_live`]), the q/k/v projections
+/// (3), the RoPE'd q and k with one `rotate_half` concat/negate transient each (4), and the two
+/// `repeat_kv` broadcast copies (2). Scores are MATERIALIZED (soft-capping blocks fused SDPA):
+/// `[B, heads, L, L]` with three f32-wide buffers live at once: each scale/softcap/cast/mask step
+/// consumes its predecessor, but the softmax reads the masked logits while writing its output and
+/// a third buffer (the narrow logits still referenced by their f32 widening, or the CPU backend's
+/// softmax/GEMM temporary at f32) is live with them — measured up to 3.0 score buffers. MLP phase: the residual, the pre-ff norm output and its
+/// transients, and the post-ff norm on the down projection; `[B, L, intermediate]` buffers: the
+/// gate projection (held to gelu-tanh's final product), the gelu chain's cube/inner/tanh term and
+/// its `0.5·x` factor (the chain's elementwise steps reuse their predecessor, so two live), the
+/// output, and the up projection (5 live). `weight_bytes` is
+/// [`Layer::promoted_weight_bytes`].
+pub fn gemma_layer_bytes(
+    cfg: &Gemma2Config,
+    batch: u64,
+    tokens: u64,
+    element_bytes: u64,
+    weight_bytes: u64,
+) -> u64 {
+    use mlx_gen::ios_quantum::{attention_block_bytes, AttentionBlockGeometry, Scores};
+    attention_block_bytes(AttentionBlockGeometry {
+        batch,
+        tokens,
+        dim: cfg.hidden_size as u64,
+        heads: cfg.num_heads as u64,
+        context_tokens: 0,
+        ff_hidden: cfg.intermediate_size as u64,
+        query_rows: tokens,
+        element_bytes,
+        weight_bytes,
+        attn_hidden_live: GEMMA_ATTN_HIDDEN_LIVE + rms_live(element_bytes),
+        context_live: 0,
+        scores: Scores::Materialized {
+            live: 3,
+            element_bytes: 4,
+        },
+        mlp_hidden_live: 2 + rms_live(element_bytes),
+        ff_live: GEMMA_FF_LIVE,
+    })
+}
+
+const GEMMA_ATTN_HIDDEN_LIVE: u64 = 1 + 3 + 4 + 2;
+const GEMMA_FF_LIVE: u64 = 5;
+
+/// The embedding/mask quantum: the rows gathered at the stored width, their f32 widening (the
+/// shared embedding's output), the native cast back and the `sqrt(hidden)`-scaled copy — for f32
+/// storage the widening and the cast are the gathered rows themselves, leaving two buffers; the two host-built f32 RoPE tables `[L, head_dim]`;
+/// and ONE f32 `[B, 1, L, L]` causal mask — the padding term is a `[B, 1, 1, L]` row and its sum
+/// with the causal table reuses the table's buffer (its only reference), plus that row.
+pub fn gemma_embedding_bytes(
+    cfg: &Gemma2Config,
+    batch: u64,
+    tokens: u64,
+    element_bytes: u64,
+) -> u64 {
+    use mlx_gen::ios_quantum::{elementwise_bytes, tensor_bytes};
+    let hidden = cfg.hidden_size as u64;
+    let rows = batch.saturating_mul(tokens).saturating_mul(hidden);
+    let native_copies = if element_bytes >= 4 { 1 } else { 3 };
+    elementwise_bytes(rows, 1)
+        .saturating_add(tensor_bytes(element_bytes, &[native_copies, rows]))
+        .saturating_add(tensor_bytes(4, &[2, tokens, cfg.head_dim as u64]))
+        .saturating_add(tensor_bytes(4, &[batch, tokens, tokens]))
+        .saturating_add(tensor_bytes(4, &[batch, tokens]))
+}
+
+/// The final-norm quantum: [`rms_live`] `[B, L, hidden]` buffers at the activation width plus the
+/// f32 per-row `[B, L, 1]` mean square and its reciprocal root (both live at the normalize).
+pub fn gemma_final_norm_bytes(
+    cfg: &Gemma2Config,
+    batch: u64,
+    tokens: u64,
+    element_bytes: u64,
+) -> u64 {
+    use mlx_gen::ios_quantum::tensor_bytes;
+    tensor_bytes(
+        element_bytes,
+        &[
+            rms_live(element_bytes),
+            batch,
+            tokens,
+            cfg.hidden_size as u64,
+        ],
+    )
+    .saturating_add(tensor_bytes(4, &[2, batch, tokens]))
 }
 
 /// Validate the exact affine embedding layout before constructing any gather graph.
@@ -314,50 +450,76 @@ impl Gemma2 {
         })
     }
 
-    /// `ids`: `[B, L]` (i32). `pad_mask`: optional `[B, L]` (1 = real, 0 = pad). Returns the
-    /// last-hidden states `[B, L, hidden]` in the embedding dtype.
-    pub fn forward(&self, ids: &Array, pad_mask: Option<&Array>) -> Result<Array> {
+    /// The activation dtype of the forward: the stored embedding dtype (dense weight, or the packed
+    /// table's scales), which every layer then keeps.
+    pub fn compute_dtype(&self) -> Dtype {
+        match &self.embed {
+            TokenEmbedding::Dense(w) => w.dtype(),
+            TokenEmbedding::Quantized { scales, .. } => scales.dtype(),
+        }
+    }
+
+    /// The embedding/mask quantum body: scaled token embeddings `[B, L, hidden]` in `dtype`, the
+    /// RoPE tables and the additive causal (+ padding) mask.
+    fn embed_inputs(
+        &self,
+        ids: &Array,
+        pad_mask: Option<&Array>,
+        dtype: Dtype,
+    ) -> Result<(Array, Array, Array, Array)> {
         let sh = ids.shape();
         let (b, l) = (sh[0], sh[1]);
         let hidden = self.cfg.hidden_size;
-        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        let scratch = mlx_gen::ios_quantum::gemma_layer_bytes(
-            b as u64,
-            l as u64,
-            hidden as u64,
-            self.cfg.intermediate_size as u64,
-            self.cfg.num_heads as u64,
-            self.cfg.head_dim as u64,
-        );
-        mlx_gen::ios_quantum::before("Gemma embedding/mask", scratch)?;
-
         // embed + √hidden scale (cast to embedding dtype, per the reference)
         let flat = ids.reshape(&[b * l])?;
         // TokenEmbedding gathers packed rows BEFORE dequantizing, never the full vocabulary.
         // Its common forward returns f32; Gemma must retain the stored embedding dtype.
-        let dtype = match &self.embed {
-            TokenEmbedding::Dense(w) => w.dtype(),
-            TokenEmbedding::Quantized { scales, .. } => scales.dtype(),
-        };
         let emb = self
             .embed
             .forward(&flat)?
             .as_dtype(dtype)?
             .reshape(&[b, l, hidden])?;
         let normalizer = scalar((hidden as f32).sqrt()).as_dtype(emb.dtype())?;
-        let mut x = multiply(&emb, &normalizer)?;
+        let x = multiply(&emb, &normalizer)?;
 
         let (cos, sin) = rope_tables(self.cfg.head_dim, l, self.cfg.rope_theta);
         let mask = causal_mask(b, l, pad_mask)?;
+        Ok((x, cos, sin, mask))
+    }
+
+    /// `ids`: `[B, L]` (i32). `pad_mask`: optional `[B, L]` (1 = real, 0 = pad). Returns the
+    /// last-hidden states `[B, L, hidden]` in the embedding dtype.
+    pub fn forward(&self, ids: &Array, pad_mask: Option<&Array>) -> Result<Array> {
+        let sh = ids.shape();
+        let (b, l) = (sh[0], sh[1]);
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let dtype = self.compute_dtype();
+        let element_bytes = dtype_bytes(dtype);
+        let (b64, l64) = (b as u64, l as u64);
+        mlx_gen::ios_quantum::before(
+            "Gemma embedding/mask",
+            gemma_embedding_bytes(&self.cfg, b64, l64, element_bytes),
+        )?;
+
+        let (mut x, cos, sin, mask) = self.embed_inputs(ids, pad_mask, dtype)?;
         mlx_gen::ios_quantum::finish("Gemma embedding/mask", &[&x, &cos, &sin, &mask])?;
         for layer in &self.layers {
+            let scratch = gemma_layer_bytes(
+                &self.cfg,
+                b64,
+                l64,
+                element_bytes,
+                layer.promoted_weight_bytes(dtype),
+            );
             x = mlx_gen::ios_quantum::run("Gemma layer", scratch, || {
                 layer.forward(&x, &cos, &sin, &mask)
             })?;
         }
-        mlx_gen::ios_quantum::run("Gemma final norm", scratch, || {
-            rms(&x, &self.norm, self.cfg.rms_eps)
-        })
+        mlx_gen::ios_quantum::run(
+            "Gemma final norm",
+            gemma_final_norm_bytes(&self.cfg, b64, l64, element_bytes),
+            || rms(&x, &self.norm, self.cfg.rms_eps),
+        )
     }
 }
 
@@ -475,6 +637,182 @@ mod embedding_tests {
                         .unwrap()
                         .item::<f32>();
                     assert!(delta < 1e-6, "q{bits} {dtype:?} {prefix:?}: {delta}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+mod quantum_metal_guard;
+
+/// Measured-peak proofs of the counted Gemma quanta (layer, embedding/mask, final norm) on the MLX
+/// CPU device, Metal trapped, in a child process. Real modules at small shapes where activations
+/// dominate; each at an attention-dominated and an MLP-dominated shape, in f32 and bf16.
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_proofs {
+    use super::*;
+    use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+    use std::collections::HashMap;
+
+    /// Maximum formula/measurement ratio every Gemma proof accepts.
+    const MAX_RATIO: f64 = 1.5;
+
+    fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
+        mlx_rs::random::normal::<f32>(shape, None, None, Some(&mlx_rs::random::key(seed).unwrap()))
+            .unwrap()
+            .multiply(scalar(0.05))
+            .unwrap()
+            .as_dtype(dtype)
+            .unwrap()
+    }
+
+    fn model(cfg: &Gemma2Config, vocab: i32, dtype: Dtype) -> Gemma2 {
+        let (h, q, kv, i) = (
+            cfg.hidden_size,
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            cfg.intermediate_size,
+        );
+        let mut m = HashMap::new();
+        let mut seed = 500;
+        let mut put = |m: &mut HashMap<String, Array>, k: String, shape: &[i32]| {
+            seed += 1;
+            m.insert(k, rand(shape, seed, dtype));
+        };
+        put(&mut m, "embed_tokens.weight".into(), &[vocab, h]);
+        put(&mut m, "norm.weight".into(), &[h]);
+        for l in 0..cfg.num_layers {
+            let p = format!("layers.{l}");
+            for n in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ] {
+                put(&mut m, format!("{p}.{n}.weight"), &[h]);
+            }
+            put(&mut m, format!("{p}.self_attn.q_proj.weight"), &[q, h]);
+            put(&mut m, format!("{p}.self_attn.k_proj.weight"), &[kv, h]);
+            put(&mut m, format!("{p}.self_attn.v_proj.weight"), &[kv, h]);
+            put(&mut m, format!("{p}.self_attn.o_proj.weight"), &[h, q]);
+            put(&mut m, format!("{p}.mlp.gate_proj.weight"), &[i, h]);
+            put(&mut m, format!("{p}.mlp.up_proj.weight"), &[i, h]);
+            put(&mut m, format!("{p}.mlp.down_proj.weight"), &[h, i]);
+        }
+        let arrays: Vec<&Array> = m.values().collect();
+        mlx_rs::transforms::eval(arrays).unwrap();
+        let model = Gemma2::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+        // Materialize the derived `(1 + w)` norm weights so no load work lands in a measurement.
+        for layer in &model.layers {
+            mlx_rs::transforms::eval([
+                &layer.input_ln,
+                &layer.post_attn_ln,
+                &layer.pre_ff_ln,
+                &layer.post_ff_ln,
+            ])
+            .unwrap();
+        }
+        model.norm.eval().unwrap();
+        model
+    }
+
+    fn cfg(hidden: i32, heads: i32, kv: i32, hd: i32, inter: i32) -> Gemma2Config {
+        Gemma2Config {
+            hidden_size: hidden,
+            num_layers: 1,
+            num_heads: heads,
+            num_kv_heads: kv,
+            head_dim: hd,
+            intermediate_size: inter,
+            query_pre_attn_scalar: hd as f32,
+            ..Gemma2Config::gemma_2_2b()
+        }
+    }
+
+    #[test]
+    fn gemma_quanta_track_their_measured_peaks() {
+        const CHILD: &str = "GEMMA_QUANTUM_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gemma2::quantum_proofs::gemma_quanta_track_their_measured_peaks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(quantum_metal_guard::forbid_metal());
+        assert!(quantum_metal_guard::metal_forbidden());
+        // (label, config, tokens, prove the embedding/final-norm quanta here): scores dominate the
+        // first layer, the MLP the second; the third sizes the norm/embedding tensors well above
+        // the allocator's small-buffer granularity. At the MLP-dominated shape the norm/embedding
+        // tensors are 16-32 KiB, where the CPU executor's asynchronous release order alone moves
+        // the measured peak by ~40% run to run, so those two quanta are proven at the other shapes.
+        let cases = [
+            ("attention-dominated", cfg(128, 4, 2, 32, 256), 256, true),
+            ("mlp-dominated", cfg(128, 4, 2, 32, 4096), 64, false),
+            ("norm-scale", cfg(512, 4, 2, 128, 512), 512, true),
+        ];
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            for (name, cfg, tokens, small_quanta) in &cases {
+                let model = model(cfg, 97, dtype);
+                let ids = Array::from_slice(
+                    &(0..*tokens).map(|t| t % 97).collect::<Vec<i32>>(),
+                    &[1, *tokens],
+                );
+                let pad = Array::from_slice(
+                    &(0..*tokens)
+                        .map(|t| if t < tokens - 3 { 1.0 } else { 0.0 })
+                        .collect::<Vec<f32>>(),
+                    &[1, *tokens],
+                );
+                ids.eval().unwrap();
+                pad.eval().unwrap();
+                let eb = dtype_bytes(dtype);
+                let t = *tokens as u64;
+                let measured = measured_peak_bytes(|| {
+                    let (x, cos, sin, mask) = model.embed_inputs(&ids, Some(&pad), dtype)?;
+                    Ok(vec![x, cos, sin, mask])
+                })
+                .unwrap();
+                let formula = gemma_embedding_bytes(cfg, 1, t, eb);
+                println!(
+                    "[gemma embedding {name} {dtype:?}] formula {formula} measured {measured} ratio {:.3}",
+                    formula as f64 / measured as f64
+                );
+                if *small_quanta {
+                    assert_tracks_measured("gemma embedding", formula, measured, MAX_RATIO);
+                }
+
+                let (x, cos, sin, mask) = model.embed_inputs(&ids, Some(&pad), dtype).unwrap();
+                mlx_rs::transforms::eval([&x, &cos, &sin, &mask]).unwrap();
+                let layer = &model.layers[0];
+                let measured =
+                    measured_peak_bytes(|| Ok(vec![layer.forward(&x, &cos, &sin, &mask)?]))
+                        .unwrap();
+                let formula = gemma_layer_bytes(cfg, 1, t, eb, layer.promoted_weight_bytes(dtype));
+                println!(
+                    "[gemma layer {name} {dtype:?}] formula {formula} measured {measured} ratio {:.3}",
+                    formula as f64 / measured as f64
+                );
+                assert_tracks_measured("gemma layer", formula, measured, MAX_RATIO);
+
+                let measured =
+                    measured_peak_bytes(|| Ok(vec![rms(&x, &model.norm, cfg.rms_eps)?])).unwrap();
+                let formula = gemma_final_norm_bytes(cfg, 1, t, eb);
+                println!(
+                    "[gemma final norm {name} {dtype:?}] formula {formula} measured {measured} ratio {:.3}",
+                    formula as f64 / measured as f64
+                );
+                if *small_quanta {
+                    assert_tracks_measured("gemma final norm", formula, measured, MAX_RATIO);
                 }
             }
         }

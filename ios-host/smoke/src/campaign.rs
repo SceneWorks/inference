@@ -141,6 +141,8 @@ impl From<&str> for AdmissionError {
 #[derive(Debug)]
 pub enum ExecuteError {
     QuantumRefused(String),
+    /// A post-admission facade/capacity refusal; the provider records its typed kind.
+    Refused(String),
     Failure(String),
 }
 impl From<String> for ExecuteError {
@@ -188,7 +190,10 @@ pub fn run(provider: &mut impl Provider, case: &Case, diagnostic: bool) -> (Stat
             Status::DiagnosticFailure,
             format!("admitted case hit a quantum refusal (admission evidence is stale): {e}"),
         ),
-        Err(ExecuteError::Failure(e)) => (Status::DiagnosticFailure, e),
+        Err(ExecuteError::Refused(e)) if !diagnostic => (Status::AdmittedRefused, e),
+        Err(ExecuteError::Refused(e)) | Err(ExecuteError::Failure(e)) => {
+            (Status::DiagnosticFailure, e)
+        }
     }
 }
 
@@ -247,6 +252,7 @@ mod tests {
         admitted: bool,
         fail: bool,
         quantum: bool,
+        refused: bool,
         loads: usize,
     }
     impl Provider for Fake {
@@ -259,7 +265,11 @@ mod tests {
         }
         fn execute(&mut self, _: &Case) -> Result<(), ExecuteError> {
             self.loads += 1;
-            if self.quantum {
+            if self.refused {
+                Err(ExecuteError::Refused(
+                    "live capacity recheck refused".into(),
+                ))
+            } else if self.quantum {
                 Err(ExecuteError::QuantumRefused("SANA block refused".into()))
             } else if self.fail {
                 Err("bad output".into())
@@ -275,6 +285,7 @@ mod tests {
             admitted: false,
             fail: false,
             quantum: false,
+            refused: false,
             loads: 0,
         };
         assert_eq!(run(&mut p, &c, false).0, Status::AdmittedRefused);
@@ -298,6 +309,7 @@ mod tests {
             admitted: true,
             fail: false,
             quantum: true,
+            refused: false,
             loads: 0,
         };
         let (status, reason) = run(&mut p, &c, true);
@@ -307,5 +319,9 @@ mod tests {
         assert!(reason.contains("SANA block refused"));
         // In admitted (product) mode the same refusal means the evidence was stale: a failure.
         assert_eq!(run(&mut p, &c, false).0, Status::DiagnosticFailure);
+        // A post-admission facade/capacity refusal stays a typed admitted refusal.
+        p.refused = true;
+        assert_eq!(run(&mut p, &c, false).0, Status::AdmittedRefused);
+        assert_eq!(run(&mut p, &c, true).0, Status::DiagnosticFailure);
     }
 }

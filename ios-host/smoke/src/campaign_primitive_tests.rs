@@ -68,15 +68,19 @@ fn requirement_is_the_budget_modules_sana_block_floor_plus_reserve() {
     let plan = plan().unwrap();
     let cfg = mlx_gen_sana::SanaTransformerConfig::sana_1600m();
     let side = (EDGE / mlx_gen_sana::pipeline::SPATIAL_SCALE) as i32;
-    let geometry = mlx_gen_sana::transformer::configured_block_geometry(
+    let geometry = mlx_gen_sana::transformer::configured_block_quantum(
         &cfg,
         1,
         side,
         side,
         mlx_gen_sana::text_encoder::MAX_SEQUENCE_LENGTH,
+        AttentionBudget::UNBOUNDED,
     );
     assert_eq!(plan.geometry, geometry);
-    assert_eq!(plan.scratch_bytes, ios_quantum::sana_block_bytes(geometry));
+    assert_eq!(
+        plan.scratch_bytes,
+        mlx_gen_sana::quantum::block_bytes(geometry)
+    );
     assert_eq!(plan.reserve_bytes, PROCESS_RESERVE_BYTES);
     // Residents are the probe's own tensors at their stored dtypes: f32 activation, F16 weight.
     let elements = |shape: &[i32; 4]| shape.iter().map(|d| *d as u64).product::<u64>();
@@ -93,9 +97,10 @@ fn requirement_is_the_budget_modules_sana_block_floor_plus_reserve() {
     let hidden = (cfg.mlp_ratio * cfg.inner_dim() as f32) as i32;
     assert_eq!(plan.weight_shape, [2 * hidden, 1, 1, cfg.inner_dim()]);
     assert_eq!(geometry.tokens, (side * side) as u64);
-    // The floor charges the FULL f32 promotion of every GLUMBConv tensor, which strictly exceeds
-    // the probe's own promoted weight copy.
+    // The counted block charges the promoted f32 copy of the F16 inverted 1x1 conv — exactly the
+    // probe's own weight — plus the block's activations, so it strictly exceeds that copy.
     let probe_weight_elements = plan.weight_shape.iter().map(|d| *d as u64).product::<u64>();
+    assert_eq!(geometry.weight_bytes, 4 * probe_weight_elements);
     assert!(plan.scratch_bytes > 4 * probe_weight_elements);
 }
 

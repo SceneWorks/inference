@@ -743,6 +743,12 @@ jobs:
       # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos -p runtime-ios
+      # The non-default `device-capture` surface (`media::capture_permit`), which only the device
+      # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
+      - name: Test runtime-ios device-capture surface
+        run: |
+          cargo clippy --locked -p runtime-ios --features device-capture --all-targets -- -D warnings
+          cargo test --locked --lib -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()
@@ -902,6 +908,7 @@ jobs:
         run: |
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --all-targets -- -D warnings
           cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --features device-capture --all-targets -- -D warnings
       # The device harness `ios-host/smoke` (own `[workspace]` and Cargo.lock) is what
       # `scripts/ios/run_smoke.sh` links into the app: the default (LLM smoke) and `media` profiles.
       # It shares this job's `target/` (`CARGO_TARGET_DIR`), and `--config` supplies the root

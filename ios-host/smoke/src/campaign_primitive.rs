@@ -7,7 +7,9 @@
 //! It is NOT a render, NOT admission evidence for any model, and NOT a cap. Its only consumer is
 //! the engineering reserve: a measured per-quantum overhead may replace the unvalidated 512 MiB.
 use super::Sampler;
-use mlx_gen::ios_quantum::{self, SanaBlockGeometry, PROCESS_RESERVE_BYTES};
+use mlx_gen::attention::AttentionBudget;
+use mlx_gen::ios_quantum::{self, PROCESS_RESERVE_BYTES};
+use mlx_gen_sana::quantum::SanaBlockQuantum;
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -25,7 +27,7 @@ const EDGE: u32 = 256;
 /// Everything derived from code before any allocation: geometry, shapes and the requirement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
-    pub geometry: SanaBlockGeometry,
+    pub geometry: SanaBlockQuantum,
     /// NHWC activation `[B, H, W, dim]`, f32.
     pub activation_shape: [i32; 4],
     /// OHWI 1x1 weight `[2*hidden, 1, 1, dim]`, F16.
@@ -43,11 +45,17 @@ pub(super) fn plan() -> Result<Plan, String> {
     let cfg = mlx_gen_sana::SanaTransformerConfig::sana_1600m();
     let side = (EDGE / mlx_gen_sana::pipeline::SPATIAL_SCALE) as i32;
     let caption = mlx_gen_sana::text_encoder::MAX_SEQUENCE_LENGTH;
-    let geometry =
-        mlx_gen_sana::transformer::configured_block_geometry(&cfg, 1, side, side, caption);
+    let geometry = mlx_gen_sana::transformer::configured_block_quantum(
+        &cfg,
+        1,
+        side,
+        side,
+        caption,
+        AttentionBudget::UNBOUNDED,
+    );
     let dim = i32::try_from(geometry.dim).map_err(|_| "probe dim overflow")?;
     let channels = i32::try_from(geometry.ff_channels).map_err(|_| "probe channel overflow")?;
-    let scratch_bytes = ios_quantum::sana_block_bytes(geometry);
+    let scratch_bytes = mlx_gen_sana::quantum::block_bytes(geometry);
     let reserve_bytes = PROCESS_RESERVE_BYTES;
     let activation_shape = [1, side, side, dim];
     let weight_shape = [channels, 1, 1, dim];
@@ -116,7 +124,9 @@ pub(super) fn characterize(device: &mut impl ProbeDevice, diagnostic: bool) -> V
     row["primitive"] = json!({"edge": EDGE, "activation_shape": plan.activation_shape, "activation_dtype": "float32",
         "weight_shape": plan.weight_shape, "weight_dtype": "float16",
         "geometry": {"batch": g.batch, "tokens": g.tokens, "dim": g.dim, "caption_tokens": g.caption_tokens,
-            "ff_channels": g.ff_channels, "cross_heads": g.cross_heads, "conv_weight_elements": g.conv_weight_elements},
+            "ff_channels": g.ff_channels, "cross_heads": g.cross_heads, "query_rows": g.query_rows,
+            "self_heads": g.self_heads, "self_head_dim": g.self_head_dim, "qk_norm": g.qk_norm,
+            "element_bytes": g.element_bytes, "promoted_weight_bytes": g.weight_bytes},
         "scratch_floor_bytes": plan.scratch_bytes, "resident_bytes": plan.resident_bytes, "engineering_reserve_bytes": plan.reserve_bytes,
         "required_headroom_bytes": plan.required_bytes});
     if !diagnostic {

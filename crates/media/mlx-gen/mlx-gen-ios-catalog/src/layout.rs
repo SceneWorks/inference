@@ -5,8 +5,9 @@
 //! named components, ...), never by absolute path: the same artifact installed under another
 //! directory has the same identity, so a capture binds the artifact rather than one install. Within
 //! a directory source, tensors are keyed by their relative component directory and tensor name
-//! (header dtype/shape/bytes, never payload); small config/tokenizer files (`json`/`txt`) are
-//! hashed by relative path and content; other files by relative path and length. Tensor payloads
+//! (header dtype/shape/bytes, never payload); config and tokenizer files (json/yaml configs,
+//! merges/vocab/tokenizer files) are hashed by relative path and content; every other file
+//! (README, license, model card, image) is outside the identity. Tensor payloads
 //! are never read. Replacement after admission is caught separately by the retained
 //! `SourceInventory` pins, not by this digest.
 
@@ -47,6 +48,22 @@ fn relative(root: &Path, path: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// The non-tensor files that shape memory: model/scheduler configs and tokenizer inputs (they set
+/// architecture, packed-tier markers and sequence shape). Documentation and other files are not
+/// part of the identity, so adding a README never changes an evidence key.
+fn is_config_or_tokenizer(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json" | "yaml" | "yml" | "model" | "tiktoken") => true,
+        Some("txt") => name == "merges.txt" || name == "vocab.txt" || name.contains("tokenizer"),
+        _ => false,
+    }
 }
 
 /// Hash one role's source; returns how many tensor headers it contributed.
@@ -96,12 +113,11 @@ fn source(digest: &mut Sha256, role: &str, source: &WeightsSource) -> Result<usi
                     }
                 }
             }
-            Some("json" | "txt") => {
+            _ if is_config_or_tokenizer(&file) => {
                 other.insert(rel, std::fs::read(&file)?);
             }
-            _ => {
-                other.insert(rel, std::fs::metadata(&file)?.len().to_le_bytes().to_vec());
-            }
+            // READMEs, licenses, model cards, images, caches: not memory identity.
+            _ => {}
         }
     }
     let count = tensors.len();
@@ -252,6 +268,17 @@ mod tests {
         std::fs::write(b.path().join("unet/config.json"), b"{\"a\":2}").unwrap();
         assert_ne!(reference, artifact_layout_digest(&spec(b.path())).unwrap());
         snapshot(b.path());
+        // Documentation is not identity; configs (yaml too) and tokenizer files are.
+        std::fs::write(b.path().join("README.md"), b"# card").unwrap();
+        std::fs::write(b.path().join("LICENSE.txt"), b"terms").unwrap();
+        std::fs::write(b.path().join("unet/notes.txt"), b"notes").unwrap();
+        assert_eq!(reference, artifact_layout_digest(&spec(b.path())).unwrap());
+        std::fs::write(b.path().join("config.yaml"), b"a: 1").unwrap();
+        assert_ne!(reference, artifact_layout_digest(&spec(b.path())).unwrap());
+        std::fs::remove_file(b.path().join("config.yaml")).unwrap();
+        std::fs::write(b.path().join("merges.txt"), b"#version").unwrap();
+        assert_ne!(reference, artifact_layout_digest(&spec(b.path())).unwrap());
+        std::fs::remove_file(b.path().join("merges.txt")).unwrap();
         write_tensor(&b.path().join("extra/model.safetensors"), "F16", 8);
         assert_ne!(reference, artifact_layout_digest(&spec(b.path())).unwrap());
         // Load settings and overlays participate by role.

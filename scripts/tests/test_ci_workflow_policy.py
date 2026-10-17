@@ -4041,6 +4041,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # The whole-device smoke drives Metal; the shared hosted runner runs only the
         # weights-free tests. MLX has no CPU-default switch, so the skip is the guard.
         self.assertIn("--features media --lib -- --skip smoke_passes_on_the_host", tests[0])
+        # The device-capture surface is tested and linted on the host lane.
+        self.assertTrue(
+            any("cargo test --locked --lib -p runtime-ios --features device-capture" in run for run in metal)
+        )
         self.assertTrue(
             any(" clippy " in run and manifest in run and run.endswith("-- -D warnings") for run in metal)
         )
@@ -4051,6 +4055,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             f"cargo build --locked {target} -p runtime-ios --no-default-features",
             f"cargo clippy --locked {target} -p runtime-ios --all-targets -- -D warnings",
             f"cargo clippy --locked {target} -p runtime-ios --no-default-features --all-targets -- -D warnings",
+            f"cargo clippy --locked {target} -p runtime-ios --features device-capture --all-targets -- -D warnings",
             f"build --locked {target} {manifest} --features media",
             f"clippy --locked {target} {manifest} --all-targets -- -D warnings",
             f"clippy --locked {target} {manifest} --features media --all-targets -- -D warnings",

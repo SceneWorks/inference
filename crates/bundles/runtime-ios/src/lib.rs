@@ -48,12 +48,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ```compile_fail
 /// let _ = runtime_ios::media::provider_registry();
 /// ```
+///
+/// Nor, in a product build, the device-capture path (only the `device-capture` feature, which
+/// only `ios-host/smoke` enables, compiles it):
+/// ```compile_fail
+/// let _ = runtime_ios::media::capture_permit;
+/// ```
+/// ```compile_fail
+/// let _ = runtime_ios::media::capture_capacity;
+/// ```
 #[cfg(feature = "media")]
 pub mod media {
-    use mlx_gen_ios_catalog::{admit, capture_permit as catalog_capture_permit};
+    pub use mlx_gen_ios_catalog::admit;
+    #[cfg(feature = "device-capture")]
+    use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
-        anima_turbo_planning_decision, build_candidate, evidence, evidence_key, ios_admission,
+        anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
         ios_memory_budget, ios_quantum, sana_decode_plan, sana_decode_tile_edge,
         sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
         Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
@@ -75,14 +86,63 @@ pub mod media {
         }
     }
 
-    /// The capacity recheck every admitted load and every bound call runs: the captured absolute
-    /// footprint against the single cap and the live per-process headroom.
-    fn capacity(bytes: u64) -> Result<()> {
-        let estimate = u32::try_from(bytes.div_ceil(1 << 20))
+    /// The capacity recheck at admission, before load and before every bound call. The evidence
+    /// footprint is the capture process's absolute lifetime peak; what is still to come is that
+    /// peak minus what this process already holds (weights loaded since admission are in the
+    /// current footprint AND already gone from live headroom, so comparing the absolute peak with
+    /// live headroom would count them twice). `at_admission` is the reading taken when this load
+    /// was admitted, used to derive the current footprint if the kernel reading is unavailable.
+    pub(crate) fn incremental_capacity(
+        evidence_bytes: u64,
+        now: super::ProcessMemory,
+        at_admission: super::ProcessMemory,
+    ) -> Result<()> {
+        let estimate = u32::try_from(evidence_bytes.div_ceil(1 << 20))
             .map_err(|_| Error::Unsupported("iOS footprint exceeds runtime range".into()))?;
-        super::admit_estimate_mib(Some(estimate))?;
-        super::admit_within_headroom(estimate, super::os_proc_available_mib())?;
+        super::admit_estimate_mib(Some(estimate)).inspect_err(|_| record_capacity_refusal())?;
+        let Some(available) = now.available else {
+            // Off-iOS / no live reading: nothing to refuse on beyond the cap.
+            return Ok(());
+        };
+        let footprint =
+            now.footprint
+                .or_else(|| match (at_admission.footprint, at_admission.available) {
+                    (Some(p0), Some(a0)) => Some(p0.saturating_add(a0.saturating_sub(available))),
+                    _ => None,
+                });
+        // Without any footprint reading, fall back to the conservative absolute comparison.
+        let demand = footprint.map_or(evidence_bytes, |held| evidence_bytes.saturating_sub(held));
+        if demand > available {
+            record_capacity_refusal();
+            return Err(Error::Unsupported(format!(
+                "iOS admission: {} MiB still to come (evidence {} MiB, process holds {} MiB) \
+                 exceeds the {} MiB of per-process headroom left",
+                demand >> 20,
+                evidence_bytes >> 20,
+                footprint.unwrap_or(0) >> 20,
+                available >> 20
+            )));
+        }
         Ok(())
+    }
+
+    static CAPACITY_REFUSED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn record_capacity_refusal() {
+        CAPACITY_REFUSED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Take (and clear) whether a bound call's live capacity recheck refused since the last take:
+    /// errors from a bound generator cross provider seams as messages, so the refusal is ALSO
+    /// recorded here, typed, for callers (the campaign) that must keep its `capacity` kind.
+    pub fn take_capacity_refusal() -> bool {
+        CAPACITY_REFUSED.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The per-load capacity check: readings at admission are captured once.
+    fn capacity_from(at_admission: super::ProcessMemory) -> impl Fn(u64) -> Result<()> + 'static {
+        move |bytes| incremental_capacity(bytes, super::process_memory(), at_admission)
     }
 
     /// Admit the caller's highest-preference candidate for one of `providers` (the facade's own
@@ -90,7 +150,7 @@ pub mod media {
     fn admitted(
         providers: &[&str],
         candidates: &[IosCandidate],
-    ) -> AdmissionResult<(ProviderRegistry, Admission)> {
+    ) -> AdmissionResult<(ProviderRegistry, Admission, super::ProcessMemory)> {
         require_limits_bound()?;
         if let Some(c) = candidates
             .iter()
@@ -105,28 +165,32 @@ pub mod media {
             ));
         }
         let registry = mlx_gen_ios_catalog::provider_registry()?;
-        // No existing process bytes are credited: compare absolute captured footprints to BOTH the
-        // fixed cap and the current live capacity.
-        let live = super::os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64);
+        // The captured footprint is an absolute process peak: what this process already holds is
+        // committed (subtracted from the prediction exactly once), and the total is the smaller of
+        // the fixed cap and what the process could reach now.
+        let now = super::process_memory();
         let budget = mlx_gen_ios_catalog::capacity_budget(
             u64::from(super::IOS_APP_MEMORY_CAP_MIB) << 20,
-            0,
-            live,
+            now.footprint.unwrap_or(0),
+            now.available,
         );
         let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
-        capacity(admission.footprint_bytes())
+        incremental_capacity(admission.footprint_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
-        Ok((registry, admission))
+        Ok((registry, admission, now))
     }
 
     fn generator(
         providers: &[&str],
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundGenerator)> {
-        let (registry, admission) = admitted(providers, candidates)?;
+        let (registry, admission, at) = admitted(providers, candidates)?;
         let index = admission.index();
-        Ok((index, admission.load_generator(&registry, capacity)?))
+        Ok((
+            index,
+            admission.load_generator(&registry, capacity_from(at))?,
+        ))
     }
 
     /// SANA (`sana_1600m`, `sana_sprint_1600m`): text-to-image and image-to-image. Returns the
@@ -159,23 +223,28 @@ pub mod media {
     pub fn load_iris_restore(
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundTransform)> {
-        let (registry, admission) = admitted(&[IRIS_RESTORE_ID], candidates)?;
+        let (registry, admission, at) = admitted(&[IRIS_RESTORE_ID], candidates)?;
         let index = admission.index();
-        Ok((index, admission.load_restorer(&registry, capacity)?))
+        Ok((
+            index,
+            admission.load_restorer(&registry, capacity_from(at))?,
+        ))
     }
 
     /// The Iris 3B depth task.
     pub fn load_iris_depth(candidates: &[IosCandidate]) -> AdmissionResult<(usize, BoundDepth)> {
-        let (_, admission) = admitted(&[IRIS_DEPTH_ID], candidates)?;
+        let (_, admission, at) = admitted(&[IRIS_DEPTH_ID], candidates)?;
         let index = admission.index();
-        Ok((index, admission.load_depth(capacity)?))
+        Ok((index, admission.load_depth(capacity_from(at))?))
     }
 
     /// Explicitly labelled DEVICE CAPTURE permit for one candidate of any registered model/mode.
+    /// Compiled only with the non-default `device-capture` feature (the device harness).
     /// Not admission: no evidence row is consulted or created. Granted only where every quantum is
     /// bounded by live OS headroom before its graph is constructed, and (on iOS) once the platform
     /// limits are bound. Load with the permit's `load_generator`/`load_restorer`/`load_depth`; a
     /// quantum refusal is then readable as `ios_quantum::take_refusal()`.
+    #[cfg(feature = "device-capture")]
     pub fn capture_permit(
         candidate: &IosCandidate,
     ) -> AdmissionResult<(ProviderRegistry, Admission)> {
@@ -189,6 +258,7 @@ pub mod media {
 
     /// The bounded-execution check a capture load and every capture call run: the quanta are only
     /// bounded while `ios_quantum` is active.
+    #[cfg(feature = "device-capture")]
     pub fn capture_capacity(_: u64) -> Result<()> {
         if ios_quantum::enabled() {
             Ok(())
@@ -468,6 +538,51 @@ pub fn bound_mlx_to_platform_limits() -> Option<MlxLimits> {
         memory_limit_mib: memory_mib,
         cache_limit_mib: cache_mib,
     })
+}
+
+/// One reading of this process's memory: the kernel `phys_footprint` and the live per-process
+/// headroom (`os_proc_available_memory`), bytes. Both `None` off-iOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessMemory {
+    pub footprint: Option<u64>,
+    pub available: Option<u64>,
+}
+
+/// Read [`ProcessMemory`] now.
+pub fn process_memory() -> ProcessMemory {
+    ProcessMemory {
+        footprint: phys_footprint_bytes(),
+        available: os_proc_available_mib().map(|mib| (mib * 1048576.0).floor() as u64),
+    }
+}
+
+/// `TASK_VM_INFO.phys_footprint` (mach/task_info.h, `#pragma pack(4)`: words 36-37, present from
+/// REV1). The reply below REV1 or a failed call is `None`.
+fn phys_footprint_bytes() -> Option<u64> {
+    #[cfg(target_os = "ios")]
+    {
+        const TASK_VM_INFO: i32 = 22;
+        const PHYS_FOOTPRINT_WORD: usize = 36;
+        let mut words = [0u32; 128];
+        let mut count = words.len() as u32;
+        #[allow(deprecated)]
+        let status = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_VM_INFO as u32,
+                words.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        (status == 0 && count as usize >= PHYS_FOOTPRINT_WORD + 2).then(|| {
+            u64::from(words[PHYS_FOOTPRINT_WORD])
+                | (u64::from(words[PHYS_FOOTPRINT_WORD + 1]) << 32)
+        })
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        None
+    }
 }
 
 /// `os_proc_available_memory()` in MiB, or `None` where it does not exist or reports no budget.
@@ -809,9 +924,61 @@ mod tests {
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
     }
 
+    /// The per-call recheck charges only the demand still to come: weights loaded since admission
+    /// are in the process footprint and already absent from live headroom, so they are not counted
+    /// twice. First and second renders on a loaded generator fit; a genuinely short headroom and an
+    /// over-cap footprint still refuse.
+    #[cfg(feature = "media")]
+    #[test]
+    fn the_loaded_generator_recheck_charges_only_incremental_demand() {
+        use super::media::incremental_capacity;
+        use super::ProcessMemory;
+        const MIB: u64 = 1 << 20;
+        let evidence = 3500 * MIB; // under the 4096 MiB provisional cap
+        let read = |footprint: u64, available: u64| ProcessMemory {
+            footprint: Some(footprint * MIB),
+            available: Some(available * MIB),
+        };
+        let admission = read(200, 5900);
+        // Admission itself: 3300 MiB still to come, 5900 available.
+        incremental_capacity(evidence, admission, admission).unwrap();
+        // First render after a 2 GiB weight load: the absolute check (3500 > 3000) would refuse.
+        let first = read(2200, 3000);
+        assert!(
+            evidence > first.available.unwrap(),
+            "fixture must defeat the absolute check"
+        );
+        incremental_capacity(evidence, first, admission).unwrap();
+        // Second render: headroom did not recover (1200 MiB left), the process holds 3400 MiB.
+        let second = read(3400, 1200);
+        incremental_capacity(evidence, second, admission).unwrap();
+        // The kernel footprint unavailable: derived from the admission reading and the headroom
+        // consumed since (200 + (5900 - 1200) = 4900 MiB held).
+        let derived = ProcessMemory {
+            footprint: None,
+            available: Some(1200 * MIB),
+        };
+        incremental_capacity(evidence, derived, admission).unwrap();
+        // Genuinely short: 3000 MiB still to come, 2000 available — and recorded, typed.
+        let _ = super::media::take_capacity_refusal();
+        assert!(incremental_capacity(evidence, read(500, 2000), admission).is_err());
+        assert!(super::media::take_capacity_refusal());
+        assert!(!super::media::take_capacity_refusal(), "taking clears it");
+        // No footprint reading at all: the conservative absolute comparison.
+        let blind = ProcessMemory {
+            footprint: None,
+            available: Some(3000 * MIB),
+        };
+        assert!(incremental_capacity(evidence, blind, ProcessMemory::default()).is_err());
+        // Over the single cap: refused whatever the headroom.
+        assert!(incremental_capacity(4097 * MIB, read(0, 9000), admission).is_err());
+        // Off-device (no live reading): only the cap applies.
+        incremental_capacity(evidence, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+    }
+
     /// The capture permit is not an admission and is unavailable off-device: without bounded
     /// quanta it is a typed failure before any load.
-    #[cfg(all(feature = "media", not(target_os = "ios")))]
+    #[cfg(all(feature = "device-capture", not(target_os = "ios")))]
     #[test]
     fn capture_permit_requires_bounded_quanta() {
         let root = tempfile::tempdir().unwrap();
@@ -953,11 +1120,11 @@ mod tests {
 
 // This bundle-only consumer imports no provider crate. Keep the CPU subprocess/Metal guard so
 // the miniature callable task test cannot contend with the host GPU.
-#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[cfg(all(test, feature = "device-capture", target_os = "macos"))]
 #[path = "../../../media/mlx-gen/mlx-gen-iris/tests/common/metal_guard.rs"]
 mod iris_cpu_guard;
 
-#[cfg(all(test, feature = "media", target_os = "macos"))]
+#[cfg(all(test, feature = "device-capture", target_os = "macos"))]
 #[test]
 fn bundle_only_consumer_executes_iris_depth() {
     use crate::{gen_core, iris_depth};

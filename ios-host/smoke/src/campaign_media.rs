@@ -45,6 +45,11 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
         if d.capabilities.supports_prompt_batch {
             modes.push("prompt_batch".into());
         }
+        // SDXL's IP-Adapter is a distinct memory route (an image encoder + per-block IP keys),
+        // reached with a reference image and a provisioned `ip_adapter` component.
+        if d.id == "sdxl" {
+            modes.push("ip_adapter".into());
+        }
         let routes = if d.id == "sdxl" {
             runtime_ios::media::sdxl::SDXL_FAMILY_ROUTES
                 .iter()
@@ -156,7 +161,7 @@ fn work(c: &Case, cancel: &CancelFlag) -> Result<runtime_ios::media::IosWork, Ad
                 "A blue glass vase beside a window at sunset".into(),
             ];
         }
-        "reference" => {
+        "reference" | "ip_adapter" => {
             request.conditioning = vec![Conditioning::Reference {
                 image: image(),
                 strength: Some(0.6),
@@ -258,8 +263,25 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             {
                 return Err("component paths must be confined relative paths".into());
             }
-            spec.components
-                .insert(key, WeightsSource::Dir(path.join(rel)));
+            let target = path.join(rel);
+            // A single-file artifact is a File source; a directory is a Dir source.
+            let source = if target.is_file() {
+                WeightsSource::File(target)
+            } else {
+                WeightsSource::Dir(target)
+            };
+            // The SDXL ControlNet and IP-Adapter are typed load-spec roles, not named components,
+            // attached only for their own mode: a loaded IP-Adapter takes the reference image
+            // (so an image-to-image case would silently become IP-Adapter), and either adds
+            // weights the other routes do not run.
+            match key.as_str() {
+                "control" if c.mode == "control" => spec.control = Some(source),
+                "ip_adapter" if c.mode == "ip_adapter" => spec.ip_adapter = Some(source),
+                "control" | "ip_adapter" => {}
+                _ => {
+                    spec.components.insert(key, source);
+                }
+            }
         }
     }
     Ok(spec)
@@ -285,6 +307,14 @@ struct DeviceProvider<'a> {
 impl DeviceProvider<'_> {
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
         let spec = snapshot(&self.root, c)?;
+        // A control / IP-Adapter case without its provisioned component would silently run as
+        // another route: a provisioning failure, never admission or refusal evidence.
+        if c.provider == "sdxl" && c.mode == "control" && spec.control.is_none() {
+            return Err("SDXL control case needs a provisioned `control` component (components.json); not admission/refusal evidence".into());
+        }
+        if c.mode == "ip_adapter" && spec.ip_adapter.is_none() {
+            return Err("IP-Adapter case needs a provisioned `ip_adapter` component (components.json); not admission/refusal evidence".into());
+        }
         let contract = self
             .registry
             .memory_strategy_contract(&c.provider, &spec)
@@ -342,7 +372,29 @@ impl DeviceProvider<'_> {
         let docs = super::dirs_documents().ok_or("no Documents directory")?;
         // A stale record from an earlier call must never be read as this run's refusal.
         let _ = runtime_ios::media::ios_quantum::take_refusal();
-        let outcome = (|| -> Result<(), String> {
+        let _ = runtime_ios::media::take_capacity_refusal();
+        // A facade refusal keeps its typed kind; anything else is a message.
+        enum Stop {
+            Refused(&'static str, String),
+            Failed(String),
+        }
+        impl From<String> for Stop {
+            fn from(e: String) -> Self {
+                Self::Failed(e)
+            }
+        }
+        impl From<&str> for Stop {
+            fn from(e: &str) -> Self {
+                Self::Failed(e.into())
+            }
+        }
+        let refused = |e: runtime_ios::media::AdmissionError| match e {
+            runtime_ios::media::AdmissionError::Refused(r) => {
+                Stop::Refused(r.kind.label(), r.reason)
+            }
+            runtime_ios::media::AdmissionError::Failed(e) => Stop::Failed(e.to_string()),
+        };
+        let outcome = (|| -> Result<(), Stop> {
             match (&candidate.work, load) {
                 (IosWork::Generate(request), permit) => {
                     let generator: Box<dyn Generator> = match permit {
@@ -359,7 +411,7 @@ impl DeviceProvider<'_> {
                                 "iris_3b" => runtime_ios::media::load_iris(one),
                                 _ => runtime_ios::media::load_sana(one),
                             };
-                            Box::new(loaded.map_err(|e| e.to_string())?.1)
+                            Box::new(loaded.map_err(refused)?.1)
                         }
                     };
                     generator.validate(request).map_err(|e| e.to_string())?;
@@ -373,7 +425,7 @@ impl DeviceProvider<'_> {
                     if images.len() != expected {
                         return Err("wrong output count".into());
                     }
-                    support::persist_images(&docs, c, &images, Some(c.edge))
+                    Ok(support::persist_images(&docs, c, &images, Some(c.edge))?)
                 }
                 (IosWork::Restore(request), permit) => {
                     let restorer = match permit {
@@ -382,14 +434,14 @@ impl DeviceProvider<'_> {
                             .map_err(|e| e.to_string())?,
                         None => {
                             runtime_ios::media::load_iris_restore(std::slice::from_ref(candidate))
-                                .map_err(|e| e.to_string())?
+                                .map_err(refused)?
                                 .1
                         }
                     };
                     let image = restorer
                         .apply(request, &mut |_| {})
                         .map_err(|e| e.to_string())?;
-                    support::persist_images(&docs, c, &[image], None)
+                    Ok(support::persist_images(&docs, c, &[image], None)?)
                 }
                 (IosWork::Depth(request), permit) => {
                     use runtime_ios::iris_depth::IrisDepthEstimator;
@@ -399,7 +451,7 @@ impl DeviceProvider<'_> {
                             .map_err(|e| e.to_string())?,
                         None => {
                             runtime_ios::media::load_iris_depth(std::slice::from_ref(candidate))
-                                .map_err(|e| e.to_string())?
+                                .map_err(refused)?
                                 .1
                         }
                     };
@@ -429,27 +481,35 @@ impl DeviceProvider<'_> {
                         height: map.height,
                         pixels,
                     };
-                    support::persist_images(&docs, c, &[image], Some(c.edge))
+                    Ok(support::persist_images(&docs, c, &[image], Some(c.edge))?)
                 }
             }
         })();
-        outcome.map_err(
-            |error| match runtime_ios::media::ios_quantum::take_refusal() {
-                // Typed by the quantum mechanism, never by the message.
-                Some(refusal) => {
-                    self.refusal_kind = Some("capacity");
-                    self.refused_quantum = Some(json!({
-                        "label": refusal.label,
-                        "scratch_bytes": refusal.scratch_bytes,
-                        "reserve_bytes": refusal.reserve_bytes,
-                        "available_bytes": refusal.available_bytes,
-                        "edge": c.edge,
-                    }));
-                    ExecuteError::QuantumRefused(error)
-                }
-                None => ExecuteError::Failure(error),
-            },
-        )
+        let error = match outcome {
+            Ok(()) => return Ok(()),
+            Err(Stop::Refused(kind, reason)) => {
+                self.refusal_kind = Some(kind);
+                return Err(ExecuteError::Refused(reason));
+            }
+            Err(Stop::Failed(error)) => error,
+        };
+        // Typed by the quantum mechanism / the capacity recheck, never by the message.
+        if let Some(refusal) = runtime_ios::media::ios_quantum::take_refusal() {
+            self.refusal_kind = Some("capacity");
+            self.refused_quantum = Some(json!({
+                "label": refusal.label,
+                "scratch_bytes": refusal.scratch_bytes,
+                "reserve_bytes": refusal.reserve_bytes,
+                "available_bytes": refusal.available_bytes,
+                "edge": c.edge,
+            }));
+            return Err(ExecuteError::QuantumRefused(error));
+        }
+        if runtime_ios::media::take_capacity_refusal() {
+            self.refusal_kind = Some("capacity");
+            return Err(ExecuteError::Refused(error));
+        }
+        Err(ExecuteError::Failure(error))
     }
 }
 impl Provider for DeviceProvider<'_> {
@@ -467,13 +527,14 @@ impl Provider for DeviceProvider<'_> {
             return Ok(());
         }
         // ADMITTED: the same single seam the facades use, against the reviewed table, before load.
-        let live = super::available_memory_mib().map(|m| (m * 1048576.0) as u64);
-        let budget = runtime_ios::media::ios_admission::capacity_budget(
+        // What this process already holds is committed exactly once (the facades do the same).
+        let now = runtime_ios::process_memory();
+        let budget = runtime_ios::media::capacity_budget(
             u64::from(runtime_ios::IOS_APP_MEMORY_CAP_MIB) << 20,
-            0,
-            live,
+            now.footprint.unwrap_or(0),
+            now.available,
         );
-        let admitted = runtime_ios::media::ios_admission::admit(
+        let admitted = runtime_ios::media::admit(
             self.registry,
             std::slice::from_ref(candidate),
             &runtime_ios::device_machine(),

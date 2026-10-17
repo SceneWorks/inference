@@ -551,10 +551,10 @@ mod tests {
     }
 
     /// sc-26268 review: a **packed** snapshot whose producer wrote its dense leaves (norms, linear
-    /// biases) at f32 — the shape of the published `realvisxl`/`illustrious-xl` q4/q8 U-Nets. The
-    /// resident load casts those leaves to the compute dtype (`loader::cast_for_load`); a streamed
-    /// block must come back with the same dtypes and run the same forward, bit for bit, or the
-    /// window promotes its activations to f32 and stops being the resident block's twin.
+    /// biases) at f32 — the shape of the published `realvisxl`/`illustrious-xl` q4/q8 U-Nets. On iOS
+    /// the resident load casts those leaves to the compute dtype (`loader::cast_for_load`); on the
+    /// host it leaves them stored (sc-26270 E2: host bits unchanged). Either way a streamed block
+    /// must come back with its resident twin's dtypes and run the same forward, bit for bit.
     #[test]
     fn a_streamed_packed_block_casts_its_dense_leaves_like_the_resident_block() {
         let _cpu = crate::test_device::cpu_only();
@@ -593,70 +593,90 @@ mod tests {
         let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
 
-        // Resident twin: the production load rule at f16.
-        let mut w = Weights::from_file(&path).unwrap();
-        crate::loader::cast_for_load(&mut w, Dtype::Float16).unwrap();
-        let mut resident =
-            TransformerBlock::from_weights(&w, "attentions.0.transformer_blocks.0", DIMS, HEADS)
-                .unwrap();
+        // The production load rule at f16, on the host (packed leaves untouched — sc-26270 E2) and
+        // under the iOS CPU fixture (dense leaves cast to the compute dtype).
+        let check = |ios: bool| -> mlx_gen::Result<()> {
+            // Resident twin.
+            let mut w = Weights::from_file(&path).unwrap();
+            crate::loader::cast_for_load(&mut w, Dtype::Float16).unwrap();
+            let mut resident = TransformerBlock::from_weights(
+                &w,
+                "attentions.0.transformer_blocks.0",
+                DIMS,
+                HEADS,
+            )
+            .unwrap();
 
-        // Streamed block: armed at the same compute dtype.
-        let s = SdxlBlockStream::new(
-            WeightsSource::File(path.clone()),
-            "attentions.0",
-            DIMS,
-            HEADS,
-            1,
-            Dtype::Float16,
-            None,
-        );
-        let mut view = s.open().unwrap();
-        let mut streamed = s.materialize(&mut view, 0).unwrap();
-        assert!(
-            streamed
-                .adaptable_mut(&["attn1", "to_q"])
-                .unwrap()
-                .is_quantized(),
-            "the fixture must load packed"
-        );
+            // Streamed block: armed at the same compute dtype.
+            let s = SdxlBlockStream::new(
+                WeightsSource::File(path.clone()),
+                "attentions.0",
+                DIMS,
+                HEADS,
+                1,
+                Dtype::Float16,
+                None,
+            );
+            let mut view = s.open().unwrap();
+            let mut streamed = s.materialize(&mut view, 0).unwrap();
+            assert!(
+                streamed
+                    .adaptable_mut(&["attn1", "to_q"])
+                    .unwrap()
+                    .is_quantized(),
+                "the fixture must load packed"
+            );
 
-        let resident_dtypes = resident.dense_leaf_dtypes();
-        assert!(
-            resident_dtypes.len() > 6,
-            "the probe must cover the linear biases, not just the norms"
-        );
-        assert!(
-            resident_dtypes.iter().all(|(_, d)| *d == Dtype::Float16),
-            "resident dense leaves follow the compute dtype: {resident_dtypes:?}"
-        );
-        assert_eq!(
-            streamed.dense_leaf_dtypes(),
-            resident_dtypes,
-            "a streamed block's dense leaves must carry its resident twin's dtypes"
-        );
+            let resident_dtypes = resident.dense_leaf_dtypes();
+            assert!(
+                resident_dtypes.len() > 6,
+                "the probe must cover the linear biases, not just the norms"
+            );
+            let leaf = if ios { Dtype::Float16 } else { Dtype::Float32 };
+            assert!(
+                resident_dtypes.iter().all(|(_, d)| *d == leaf),
+                "ios={ios}: resident dense leaves must be {leaf:?}: {resident_dtypes:?}"
+            );
+            assert_eq!(
+                streamed.dense_leaf_dtypes(),
+                resident_dtypes,
+                "a streamed block's dense leaves must carry its resident twin's dtypes"
+            );
 
-        let ramp = |shape: &[i32], phase: f32| {
-            let n = shape.iter().product::<i32>();
-            let v: Vec<f32> = (0..n).map(|i| ((i as f32 + phase) * 0.37).sin()).collect();
-            Array::from_slice(&v, shape)
-                .as_dtype(Dtype::Float16)
-                .unwrap()
+            let ramp = |shape: &[i32], phase: f32| {
+                let n = shape.iter().product::<i32>();
+                let v: Vec<f32> = (0..n).map(|i| ((i as f32 + phase) * 0.37).sin()).collect();
+                Array::from_slice(&v, shape)
+                    .as_dtype(Dtype::Float16)
+                    .unwrap()
+            };
+            let x = ramp(&[1, 16, DIMS], 0.0);
+            let memory = ramp(&[1, 7, DIMS], 3.0);
+            let plan = crate::plan::SdxlForwardPlan::default();
+            let r = resident.forward_ip(&x, &memory, None, plan).unwrap();
+            let t = streamed.forward_ip(&x, &memory, None, plan).unwrap();
+            // iOS: the f16 leaves keep the window at f16 (on the host the stored leaves decide it,
+            // exactly as every release before sc-26268).
+            if ios {
+                assert_eq!(
+                    r.dtype(),
+                    Dtype::Float16,
+                    "the iOS resident window stays at f16"
+                );
+            }
+            assert_eq!(
+                t.dtype(),
+                r.dtype(),
+                "the streamed window must match its twin"
+            );
+            assert!(
+                mlx_rs::ops::array_eq(&r, &t, false).unwrap().item::<bool>(),
+                "a streamed block must run bit-identically to its resident twin"
+            );
+            Ok(())
         };
-        let x = ramp(&[1, 16, DIMS], 0.0);
-        let memory = ramp(&[1, 7, DIMS], 3.0);
-        let plan = crate::plan::SdxlForwardPlan::default();
-        let r = resident.forward_ip(&x, &memory, None, plan).unwrap();
-        let t = streamed.forward_ip(&x, &memory, None, plan).unwrap();
-        assert_eq!(
-            r.dtype(),
-            Dtype::Float16,
-            "the resident window stays at f16"
-        );
-        assert_eq!(t.dtype(), r.dtype(), "the streamed window must not promote");
-        assert!(
-            mlx_rs::ops::array_eq(&r, &t, false).unwrap().item::<bool>(),
-            "a streamed block must run bit-identically to its resident twin"
-        );
+        check(false).unwrap();
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 34, || check(true)).unwrap();
     }
 
     /// Captured residual adapters travel onto a materialized block, per block — a LoRA installed on

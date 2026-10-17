@@ -37,6 +37,9 @@ use mlx_rs::{Array, Dtype};
 
 use crate::nn::AdaptedLinears;
 
+/// Label of one adapter file's iOS pre-read check.
+pub(crate) const ADAPTER_LOAD_QUANTUM: &str = "Iris adapter load";
+
 /// Every 2-D `‹path›.weight` of the checkpoint as an [`AdaptableLinear`] (with its `‹path›.bias`),
 /// addressable by dotted module path — the install's host.
 struct ProjectionHost {
@@ -67,6 +70,30 @@ impl ProjectionHost {
                 continue;
             };
             if weight.ndim() != 2 {
+                continue;
+            }
+            // A packed artifact's projection ([`crate::packed`]): the install sees a zero-stride
+            // placeholder of its LOGICAL `[out, in]` shape (a broadcast scalar — never a dense
+            // copy), and [`crate::nn::Loader::linear`] moves the installed adapters onto the
+            // stored pack. The adapters never read the base, so this is the dense install exactly.
+            if let Some(scales) = peek(weights, &format!("{path}.scales")) {
+                let group = crate::nn::QUANT_GROUP_SIZE as i32;
+                let padded_in = scales.shape()[1] * group;
+                let in_features = match peek(
+                    weights,
+                    &format!("{path}{}", crate::packed::IN_FEATURES_SUFFIX),
+                ) {
+                    Some(width) => width.item::<i32>(),
+                    None => padded_in,
+                };
+                let placeholder = mlx_rs::ops::broadcast_to(
+                    Array::from_f32(0.0).as_dtype(compute)?,
+                    &[weight.shape()[0], in_features],
+                )?;
+                let bias = peek(weights, &format!("{path}.bias"))
+                    .map(|b| b.as_dtype(compute))
+                    .transpose()?;
+                linears.insert(path.to_owned(), AdaptableLinear::dense(placeholder, bias));
                 continue;
             }
             let bias = peek(weights, &format!("{path}.bias"))
@@ -132,6 +159,11 @@ pub fn install(
         return Ok(None);
     }
     for spec in specs {
+        // Every file is opened here and its factors read eagerly by the install below: on a
+        // physical iOS device that read is priced from the file's headers (its stored bytes plus
+        // the largest tensor) against live headroom BEFORE the file is first opened. A no-op off
+        // device.
+        mlx_gen::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;
         check_adapter_identity(&adapter_identity(&spec.path)?, task, base_model, &spec.path)?;
         if spec.pass_scales.is_some() || spec.moe_expert.is_some() {
             return Err(Error::Unsupported(format!(

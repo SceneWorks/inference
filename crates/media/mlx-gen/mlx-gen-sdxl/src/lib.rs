@@ -106,8 +106,9 @@ pub use pipeline::{
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
-    encode_conditioning_windows, encode_init_latents, preprocess_control_image,
-    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
+    encode_conditioning_windows, encode_init_latents, encode_init_latents_tiled,
+    preprocess_control_image, preprocess_init_image, seeded_prior, text_time_ids, ControlContext,
+    Denoiser,
 };
 pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;

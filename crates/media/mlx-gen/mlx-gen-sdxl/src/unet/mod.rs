@@ -77,6 +77,46 @@ pub(crate) fn inject_control_mid_residual(
     }
 }
 
+/// iOS scratch (sc-26270) of a U-Net / ControlNet stem quantum over the latent `x` and the context
+/// `encoder_x` (at the conditioning batch), counted from the code:
+///
+/// * `conv_in` at the loaded weight: its output (the bias add donates), `extra_out` more
+///   output-width buffers, and the kernel transient;
+/// * the Kolors `encoder_hid_proj` output `[Bc, S, out]` at the context's width, when loaded;
+/// * the timestep / `text_time` embedding MLPs at the conditioning batch: the sinusoid, the two
+///   `time_embedding` linears and SiLU, the `add_embedding` input concat and its two linears and the
+///   sum — eight f32 rows of `time_embed_dim` (diffusers' `4 · block_out_channels[0]`, i.e. four
+///   times `conv_in`'s output width);
+/// * the latent-sized lazy work this quantum is the first to materialize: the sampler's model-input
+///   scaling, the compute-dtype cast and the batched-CFG `[x, x]` concatenation — three f32 buffers of
+///   the forward's latent.
+pub(crate) fn stem_bytes(
+    x: &Array,
+    encoder_x: &Array,
+    conv_in: &Array,
+    encoder_hid_proj: Option<&AdaptableLinear>,
+    extra_out: u64,
+    backend: crate::quantum::Backend,
+) -> u64 {
+    let call =
+        crate::quantum::ConvCall::new(x.shape(), crate::quantum::element_bytes(x), conv_in, 1, 1);
+    let conv = crate::quantum::single_conv_bytes(&call, 0, extra_out, backend);
+    let e = encoder_x.shape();
+    let context = encoder_hid_proj.map_or(0, |proj| {
+        (e[0].max(0) as u64)
+            .saturating_mul(e[1].max(0) as u64)
+            .saturating_mul(crate::quantum::linear_out(proj))
+            .saturating_mul(crate::quantum::element_bytes(encoder_x))
+    });
+    let temb_width = 4 * crate::quantum::conv_channels(conv_in).1.max(0) as u64;
+    let temb =
+        mlx_gen::ios_quantum::elementwise_bytes((e[0].max(0) as u64).saturating_mul(temb_width), 8);
+    let upstream = mlx_gen::ios_quantum::elementwise_bytes(x.size() as u64, 3);
+    conv.saturating_add(context)
+        .saturating_add(temb)
+        .saturating_add(upstream)
+}
+
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
     Ok(w.transpose_axes(&[0, 2, 3, 1])?)
@@ -580,15 +620,104 @@ impl UNet2DConditionModel {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         mlx_gen::ios_quantum::before(crate::quantum::UNET_STEM, self.stem_scratch(x, encoder_x))?;
 
+        let (mut x, temb, projected) = self.stem(
+            x, timestep, encoder_x, text_emb, time_ids, plan, batch, dtype,
+        )?;
+        let encoder_x = projected.as_ref().unwrap_or(encoder_x);
+        mlx_gen::ios_quantum::finish(crate::quantum::UNET_STEM, &[&x, &temb, encoder_x])?;
+
+        // Down path — collect skip residuals (starting with the stem output).
+        let mut residuals: Vec<Array> = vec![x.clone()];
+        for block in &self.down_blocks {
+            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, ip, plan)?;
+            x = out;
+            residuals.extend(res);
+        }
+
+        // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
+        if control.is_some() {
+            // One new sum per skip residual; both operands are already materialized.
+            let live: Vec<&Array> = residuals.iter().collect();
+            mlx_gen::ios_quantum::before(
+                crate::quantum::CONTROL_DOWN_INJECTION,
+                crate::quantum::elementwise_bytes(&live, 1),
+            )?;
+        }
+        inject_control_down_residuals(&mut residuals, control)?;
+        if control.is_some() {
+            let refs: Vec<&Array> = residuals.iter().collect();
+            mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_DOWN_INJECTION, &refs)?;
+        }
+
+        // Mid.
+        x = self
+            .mid_resnet0
+            .forward_quantum(&x, None, Some(&temb), plan)?;
+        x = self.mid_transformer.forward_ip(&x, encoder_x, ip, plan)?;
+        x = self
+            .mid_resnet1
+            .forward_quantum(&x, None, Some(&temb), plan)?;
+        // ControlNet: add the (scaled) control mid residual to the mid output.
+        x = match control {
+            Some(_) => mlx_gen::ios_quantum::run(
+                crate::quantum::CONTROL_MID_INJECTION,
+                crate::quantum::elementwise_bytes(&[&x], 1),
+                || inject_control_mid_residual(x.clone(), control),
+            )?,
+            None => x,
+        };
+
+        // Up path — each block pops its skip residuals.
+        for block in &self.up_blocks {
+            let (out, _) =
+                block.forward_ip(&x, encoder_x, &temb, Some(&mut residuals), ip, plan)?;
+            x = out;
+        }
+
+        // Conv head.
+        let head_scratch = crate::quantum::norm_conv_bytes(
+            &crate::quantum::ConvCall::new(
+                x.shape(),
+                crate::quantum::element_bytes(&x),
+                self.conv_out.weight(),
+                1,
+                1,
+            ),
+            crate::quantum::Backend::current(),
+        );
+        mlx_gen::ios_quantum::run(crate::quantum::UNET_CONV_OUT, head_scratch, || {
+            let x = group_norm(
+                &x,
+                &self.conv_norm_out_w,
+                &self.conv_norm_out_b,
+                GN_GROUPS,
+                GN_EPS,
+            )?;
+            let x = silu_glue(&x)?;
+            conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
+        })
+    }
+
+    /// The stem quantum's body: the Kolors context projection (when loaded), the timestep +
+    /// `text_time` embedding at the conditioning batch, and `conv_in`. Returns
+    /// `(conv_in(x), temb, projected context)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stem(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        batch: i32,
+        dtype: Dtype,
+    ) -> Result<(Array, Array, Option<Array>)> {
         // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) before any
         // cross-attention (diffusers applies `encoder_hid_proj` once, up front). No-op for SDXL.
-        let projected;
-        let encoder_x = match &self.encoder_hid_proj {
-            Some(proj) => {
-                projected = proj.forward(encoder_x)?;
-                &projected
-            }
-            None => encoder_x,
+        let projected = match &self.encoder_hid_proj {
+            Some(proj) => Some(proj.forward(encoder_x)?),
+            None => None,
         };
 
         // Timestep + SDXL `text_time` micro-conditioning embedding (shared verbatim with
@@ -608,104 +737,33 @@ impl UNet2DConditionModel {
         )?;
 
         // Conv stem.
-        let mut x = conv2d(x, self.conv_in.weight(), self.conv_in.bias(), 1, 1)?;
-        mlx_gen::ios_quantum::finish(crate::quantum::UNET_STEM, &[&x, &temb, encoder_x])?;
-
-        // Down path — collect skip residuals (starting with the stem output).
-        let mut residuals: Vec<Array> = vec![x.clone()];
-        for block in &self.down_blocks {
-            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, ip, plan)?;
-            x = out;
-            residuals.extend(res);
-        }
-
-        // ControlNet (sc-3058): add the (scaled) control down residuals to the skip connections.
-        if let Some(control) = control {
-            let mut live: Vec<&Array> = residuals.iter().collect();
-            live.extend(control.down.iter());
-            mlx_gen::ios_quantum::before(
-                crate::quantum::CONTROL_DOWN_INJECTION,
-                crate::quantum::elementwise_bytes(&live, 2),
-            )?;
-        }
-        inject_control_down_residuals(&mut residuals, control)?;
-        if control.is_some() {
-            let refs: Vec<&Array> = residuals.iter().collect();
-            mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_DOWN_INJECTION, &refs)?;
-        }
-
-        // Mid.
-        x = self
-            .mid_resnet0
-            .forward_quantum(&x, None, Some(&temb), plan)?;
-        x = self.mid_transformer.forward_ip(&x, encoder_x, ip, plan)?;
-        x = self
-            .mid_resnet1
-            .forward_quantum(&x, None, Some(&temb), plan)?;
-        // ControlNet: add the (scaled) control mid residual to the mid output.
-        x = match control {
-            Some(c) => mlx_gen::ios_quantum::run(
-                crate::quantum::CONTROL_MID_INJECTION,
-                crate::quantum::elementwise_bytes(&[&x, &c.mid], 2),
-                || inject_control_mid_residual(x.clone(), control),
-            )?,
-            None => x,
-        };
-
-        // Up path — each block pops its skip residuals.
-        for block in &self.up_blocks {
-            let (out, _) =
-                block.forward_ip(&x, encoder_x, &temb, Some(&mut residuals), ip, plan)?;
-            x = out;
-        }
-
-        // Conv head.
-        let s = x.shape();
-        let (head_in, head_out) = crate::quantum::conv_channels(self.conv_out.weight());
-        let head_scratch = crate::quantum::conv_stage(s[0], s[1], s[2], &[head_in, head_out]);
-        mlx_gen::ios_quantum::run(crate::quantum::UNET_CONV_OUT, head_scratch, || {
-            let x = group_norm(
-                &x,
-                &self.conv_norm_out_w,
-                &self.conv_norm_out_b,
-                GN_GROUPS,
-                GN_EPS,
-            )?;
-            let x = silu_glue(&x)?;
-            conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
-        })
+        let x = conv2d(x, self.conv_in.weight(), self.conv_in.bias(), 1, 1)?;
+        Ok((x, temb, projected))
     }
 
-    /// iOS scratch (sc-26270) of the stem quantum: `conv_in` at the latent extent and its loaded
-    /// channels, plus full f32 copies of the Kolors context projection (when loaded) and its
-    /// output over the request's context tokens.
+    /// The stem quantum's price (sc-26270 proof tests).
+    #[cfg(test)]
+    pub(crate) fn stem_scratch_for_test(&self, x: &Array, encoder_x: &Array) -> u64 {
+        self.stem_scratch(x, encoder_x)
+    }
+
     /// The stem convolution's weight (test arithmetic for the stem quantum).
     #[cfg(test)]
     pub(crate) fn conv_in_weight(&self) -> &Array {
         self.conv_in.weight()
     }
 
+    /// iOS scratch (sc-26270) of the stem quantum, from [`stem_bytes`] over this U-Net's loaded
+    /// `conv_in` and Kolors context projection.
     fn stem_scratch(&self, x: &Array, encoder_x: &Array) -> u64 {
-        let s = x.shape();
-        let (cin, cout) = crate::quantum::conv_channels(self.conv_in.weight());
-        let conv = crate::quantum::conv_stage(s[0], s[1], s[2], &[cin, cout]);
-        let context = match &self.encoder_hid_proj {
-            Some(proj) => {
-                let e = encoder_x.shape();
-                let rows = (e[0] as u64).saturating_mul(e[1] as u64);
-                crate::quantum::linear_elements(proj)
-                    .saturating_add(rows.saturating_mul(crate::quantum::linear_out(proj)))
-                    .saturating_mul(4)
-            }
-            None => 0,
-        };
-        // Lazy work materialized in this quantum: the previous step's CFG combine + sampler update
-        // (+ inpaint blend) over the latent, and the conditioning concatenation (inputs + result).
-        let step = mlx_gen::ios_quantum::sampler_step_bytes(x.size() as u64);
-        let concat = mlx_gen::ios_quantum::elementwise_bytes(encoder_x.size() as u64, 2);
-        conv.saturating_add(context)
-            .saturating_add(step)
-            .saturating_add(concat)
+        stem_bytes(
+            x,
+            encoder_x,
+            self.conv_in.weight(),
+            self.encoder_hid_proj.as_ref(),
+            0,
+            crate::quantum::Backend::current(),
+        )
     }
 
     /// Training forward with **per-block gradient checkpointing** (sc-4941 — the `gradient_checkpointing`

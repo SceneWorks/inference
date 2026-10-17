@@ -57,12 +57,14 @@ pub struct IrisDepth {
     memory_strategy: gen_core::MemoryProviderContract,
     /// The precision this model computes in — the numeric tier its safety check binds to.
     precision: mlx_gen::Precision,
+    /// The packed tier of the loaded export (`None`: the dense export).
+    tier: Option<mlx_gen::Quant>,
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(DEPTH_MODEL_ID, spec)?;
-    let refusals: [(&str, bool); 7] = [
-        ("quantize", spec.quantize.is_some()),
+    crate::memory_strategy::refuse_unloadable_quant(DEPTH_MODEL_ID, spec)?;
+    let refusals: [(&str, bool); 6] = [
         ("adapters", !spec.adapters.is_empty()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -87,6 +89,11 @@ fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
 pub fn load_depth(spec: &LoadSpec) -> Result<IrisDepth> {
     refuse_unsupported_spec(spec)?;
     let export = TaskExport::from_spec(spec, IrisTask::Depth, DEPTH_MODEL_ID)?;
+    crate::packed::refuse_dense_requested_as_packed(
+        DEPTH_MODEL_ID,
+        &export.weights_path(),
+        spec.quantize,
+    )?;
     load_depth_export(export, compute_dtype(spec))
 }
 
@@ -94,6 +101,16 @@ pub fn load_depth(spec: &LoadSpec) -> Result<IrisDepth> {
 pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth> {
     let model = &export.config.model;
     let path = export.weights_path();
+    // A packed export (`crate::packed`) is read packed, under the bf16 compute its scales are
+    // stored at; the dense export loads as before.
+    let artifact = crate::packed::artifact_tier(&path)?;
+    if artifact.is_some() && compute != Dtype::Bfloat16 {
+        return Err(Error::Unsupported(format!(
+            "{DEPTH_MODEL_ID}: {} is a packed {artifact:?} export, which runs under the bf16 \
+             compute policy",
+            path.display()
+        )));
+    }
     mlx_gen::ios_quantum::before_load(quanta::LOAD, &[path.clone(), export.empty_prompt_path()])?;
     let mut source = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
@@ -112,7 +129,10 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
         // (sc-24245).
         mlx_rs::transforms::eval_pending_loads([&array])?;
         if let Some(name) = key.strip_prefix(BACKBONE_PREFIX) {
-            let array = if array.ndim() >= 2 && name != "y_pos_embedding" {
+            let array = if array.ndim() >= 2
+                && name != "y_pos_embedding"
+                && !crate::model::is_packed_part(name, &array)
+            {
                 array.as_dtype(compute)?
             } else {
                 array
@@ -167,10 +187,11 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
         _ => mlx_gen::Precision::Bf16,
     };
     let memory_strategy =
-        crate::memory_strategy::export_contract(IrisTask::Depth, precision, &export)?;
+        crate::memory_strategy::export_contract(IrisTask::Depth, precision, artifact, &export)?;
     Ok(IrisDepth {
         memory_strategy,
         precision,
+        tier: artifact,
         dit,
         reducer_weight,
         reducer_bias,
@@ -210,32 +231,8 @@ pub fn depth_forward_hooked(
 ) -> Result<Array> {
     let sh = rgb.shape();
     let (b, h, w) = (sh[0], sh[2], sh[3]);
-    let channels = sh[1] + DEPTH_EXTRA_INPUT_CHANNELS as i32;
-    let e = parts.embeddings.shape();
-    // The f32 RGB copy, the zero channel and their concatenation; the broadcast prompt states.
-    let pixel_elements = [b, channels, h, w]
-        .iter()
-        .map(|&d| d.max(0) as u64)
-        .product::<u64>();
-    let state_elements = [b, e[1], e[2], e[3]]
-        .iter()
-        .map(|&d| d.max(0) as u64)
-        .product::<u64>();
-    let input_bytes = pixel_elements
-        .saturating_mul(3)
-        .saturating_add(state_elements)
-        .saturating_mul(4);
-    mlx_gen::ios_quantum::before(quanta::INPUT, input_bytes)?;
-    let x = concatenate_axis(
-        &[
-            &rgb.as_dtype(Dtype::Float32)?,
-            &zeros::<f32>(&[b, DEPTH_EXTRA_INPUT_CHANNELS as i32, h, w])?,
-        ],
-        1,
-    )?;
-    let t_model = parts.num_train_timesteps as f32;
-    let t = Array::from_slice(&vec![t_model; b as usize], &[b]);
-    let states = mlx_rs::ops::broadcast_to(parts.embeddings, &[b, e[1], e[2], e[3]])?;
+    mlx_gen::ios_quantum::before(quanta::INPUT, depth_input_scratch(b, h, w))?;
+    let (x, t, states) = depth_input_body(parts, rgb)?;
     mlx_gen::ios_quantum::finish(quanta::INPUT, &[&x, &states])?;
     let mask = vec![parts.mask.to_vec(); b as usize];
     let out = parts.dit.forward_hooked(
@@ -247,28 +244,89 @@ pub fn depth_forward_hooked(
         },
         hooks,
     )?;
-    // depth_reducer: a 1×1 conv over the channels — under upstream's autocast a bf16 conv, so it
-    // runs in the compute dtype like every other projection.
-    let c = out.shape()[1];
-    // The transposed and cast pixel rows, the reduced map and its f32 copy.
-    let reducer_bytes = (out.size() as u64)
-        .saturating_mul(3)
-        .saturating_add((parts.reducer_weight.size() + parts.reducer_bias.size()) as u64)
-        .saturating_mul(4);
-    mlx_gen::ios_quantum::run(quanta::REDUCER, reducer_bytes, || {
-        let pixels = out
-            .transpose_axes(&[0, 2, 3, 1])?
-            .reshape(&[-1, c])?
-            .as_dtype(parts.dit.compute_dtype())?;
-        let reduced = addmm(
-            parts.reducer_bias,
-            &pixels,
-            parts.reducer_weight.t(),
-            1.0,
-            1.0,
-        )?;
-        Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
-    })
+    mlx_gen::ios_quantum::run(
+        quanta::REDUCER,
+        depth_reducer_scratch(&out, parts.dit.compute_dtype()),
+        || depth_reducer_body(parts, &out),
+    )
+}
+
+/// The depth input quantum over a `[B, 3, H, W]` input: the f32 RGB ‖ zero-channel
+/// concatenation (`[B, 4, H, W]`), the zero channel itself and its f32 fill scalar, and the `[B]`
+/// model times. The prompt states are broadcast to the batch as a view, so they allocate nothing.
+pub(crate) fn depth_input_scratch(b: i32, h: i32, w: i32) -> u64 {
+    use mlx_gen::ios_quantum::tensor_bytes;
+    let d = |v: i32| v.max(0) as u64;
+    let channels = 3 + DEPTH_EXTRA_INPUT_CHANNELS as u64;
+    tensor_bytes(4, &[d(b), channels, d(h), d(w)])
+        .saturating_add(tensor_bytes(
+            4,
+            &[d(b), DEPTH_EXTRA_INPUT_CHANNELS as u64, d(h), d(w)],
+        ))
+        .saturating_add(tensor_bytes(4, &[d(b)]))
+        .saturating_add(4)
+}
+
+/// The body of the depth input quantum: RGB ‖ zero channel, the model time, and the broadcast
+/// empty-prompt states.
+pub(crate) fn depth_input_body(parts: &DepthParts, rgb: &Array) -> Result<(Array, Array, Array)> {
+    let sh = rgb.shape();
+    let (b, h, w) = (sh[0], sh[2], sh[3]);
+    let e = parts.embeddings.shape();
+    let x = concatenate_axis(
+        &[
+            &rgb.as_dtype(Dtype::Float32)?,
+            &zeros::<f32>(&[b, DEPTH_EXTRA_INPUT_CHANNELS as i32, h, w])?,
+        ],
+        1,
+    )?;
+    let t_model = parts.num_train_timesteps as f32;
+    let t = Array::from_slice(&vec![t_model; b as usize], &[b]);
+    let states = mlx_rs::ops::broadcast_to(parts.embeddings, &[b, e[1], e[2], e[3]])?;
+    Ok((x, t, states))
+}
+
+/// The depth reducer quantum over the backbone's `[B, C, H, W]` f32 output: the `[B·H·W, C]`
+/// re-layout (f32), and the reduced `[B·H·W, 1]` map — under bf16 also the re-layout's
+/// compute-width cast and the map's f32 copy.
+pub(crate) fn depth_reducer_scratch(out: &Array, compute: Dtype) -> u64 {
+    depth_reducer_bytes(
+        out.size() as u64,
+        out.shape().get(1).copied().unwrap_or(1).max(1) as u64,
+        crate::nn::dtype_bytes(compute),
+    )
+}
+
+/// [`depth_reducer_scratch`] over `n` output elements of `c` channels at compute width `cw`.
+pub(crate) fn depth_reducer_bytes(n: u64, c: u64, cw: u64) -> u64 {
+    use mlx_gen::ios_quantum::tensor_bytes;
+    let c = c.max(1);
+    tensor_bytes(4, &[n])
+        .saturating_add(tensor_bytes(cw, &[n / c]))
+        .saturating_add(if cw < 4 {
+            tensor_bytes(cw, &[n]).saturating_add(tensor_bytes(4, &[n / c]))
+        } else {
+            0
+        })
+}
+
+/// The body of the depth reducer quantum: a 1×1 conv over the channels — under upstream's
+/// autocast a bf16 conv, so it runs in the compute dtype like every other projection.
+pub(crate) fn depth_reducer_body(parts: &DepthParts, out: &Array) -> Result<Array> {
+    let sh = out.shape();
+    let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+    let pixels = out
+        .transpose_axes(&[0, 2, 3, 1])?
+        .reshape(&[-1, c])?
+        .as_dtype(parts.dit.compute_dtype())?;
+    let reduced = addmm(
+        parts.reducer_bias,
+        &pixels,
+        parts.reducer_weight.t(),
+        1.0,
+        1.0,
+    )?;
+    Ok(reduced.reshape(&[b, 1, h, w])?.as_dtype(Dtype::Float32)?)
 }
 
 impl IrisDepth {
@@ -294,23 +352,30 @@ impl IrisDepth {
         &self,
         context: &gen_core::MemoryRunContext,
     ) -> gen_core::MemorySafetyDecision {
-        crate::memory_strategy::loaded_safety_check(self.precision, &self.memory_strategy, context)
+        crate::memory_strategy::loaded_safety_check(
+            self.precision,
+            self.tier,
+            &self.memory_strategy,
+            context,
+        )
+    }
+
+    /// The pieces of this model's forward.
+    pub(crate) fn parts(&self) -> DepthParts<'_> {
+        DepthParts {
+            dit: &self.dit,
+            reducer_weight: &self.reducer_weight,
+            reducer_bias: &self.reducer_bias,
+            embeddings: &self.embeddings,
+            mask: &self.mask,
+            num_train_timesteps: self.export.config.flow.num_train_timesteps,
+        }
     }
 
     /// `IrisDepth.forward`: `[B, 3, H, W]` RGB in `[-1, 1]` (f32, H and W on the patch grid) →
     /// `[B, 1, H, W]` relative log depth (f32).
     pub fn forward(&self, rgb: &Array) -> Result<Array> {
-        depth_forward(
-            &DepthParts {
-                dit: &self.dit,
-                reducer_weight: &self.reducer_weight,
-                reducer_bias: &self.reducer_bias,
-                embeddings: &self.embeddings,
-                mask: &self.mask,
-                num_train_timesteps: self.export.config.flow.num_train_timesteps,
-            },
-            rgb,
-        )
+        depth_forward(&self.parts(), rgb)
     }
 
     fn estimate_impl(
@@ -380,13 +445,28 @@ mod tests {
     use super::*;
     use mlx_gen::WeightsSource;
 
+    /// A tier this task cannot load is refused by name before any resource is read (NVFP4; a
+    /// packed tier under the f32 reference compute), and the dense export asked for at a packed
+    /// tier is refused rather than requantized at load.
+    ///
+    /// *Mutation that reds this:* dropping `refuse_unloadable_quant` or
+    /// `refuse_dense_requested_as_packed` from the load.
     #[test]
     fn unsupported_spec_fields_are_typed_refusals() {
-        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-depth-not-on-disk".into()));
-        spec.quantize = Some(mlx_gen::Quant::Q4);
-        match load_depth(&spec) {
-            Err(Error::Unsupported(m)) => assert!(m.contains("quantize"), "{m}"),
+        let refused = |spec: &LoadSpec, field: &str| match load_depth(spec) {
+            Err(Error::Unsupported(m)) => assert!(m.contains(field), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),
-        }
+        };
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()));
+        spec.quantize = Some(mlx_gen::Quant::Nvfp4);
+        refused(&spec, "quantize");
+        spec.quantize = Some(mlx_gen::Quant::Q4);
+        spec.precision = mlx_gen::Precision::Fp32;
+        refused(&spec, "precision");
+        let mut dense = LoadSpec::new(WeightsSource::Dir(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-depth"),
+        ));
+        dense.quantize = Some(mlx_gen::Quant::Q4);
+        refused(&dense, "quantize");
     }
 }

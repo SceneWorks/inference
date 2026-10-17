@@ -168,7 +168,19 @@ impl AnimaBlockStream {
 
     /// Materialize block `index` out of `view`, adapted exactly like its resident twin, then drain
     /// the view of precisely the tensors that block read.
+    #[cfg(test)]
     pub(crate) fn materialize(&self, view: &mut Weights, index: usize) -> Result<Block> {
+        Ok(self.materialize_counted(view, index)?.0)
+    }
+
+    /// [`Self::materialize`], also returning the stored bytes of exactly the tensors the block read
+    /// (dtype x shape off the lazy handles, never read here): what its iOS quantum loads from disk
+    /// inside itself, and so what that quantum is priced with.
+    pub(crate) fn materialize_counted(
+        &self,
+        view: &mut Weights,
+        index: usize,
+    ) -> Result<(Block, u64)> {
         if index >= self.n_blocks {
             return Err(Error::Msg(format!(
                 "anima block stream: block {index} is out of range for a {}-block stack",
@@ -177,6 +189,12 @@ impl AnimaBlockStream {
         }
         let prefix = format!("{}.{index}", self.base);
         let mut block = Block::from_weights(view, &prefix, &self.cfg)?;
+        let stored_bytes = view
+            .accessed_entries()
+            .iter()
+            .fold(0u64, |total, (_, array)| {
+                total.saturating_add(array.nbytes() as u64)
+            });
         // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
         // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
         // real release rather than a no-op that still produces correct images.
@@ -184,7 +202,7 @@ impl AnimaBlockStream {
         if let Some(adapters) = self.adapters.get(index) {
             adapters.install(&mut block)?;
         }
-        Ok(block)
+        Ok((block, stored_bytes))
     }
 }
 

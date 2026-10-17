@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::gen_core::iris;
+use mlx_gen::ios_quantum::Scores;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Quant, Result};
 use mlx_rs::fast::rms_norm;
@@ -150,6 +151,51 @@ impl Loader<'_> {
         self.weights.require(key)
     }
 
+    fn has(&self, key: &str) -> bool {
+        self.weights.keys().any(|k| k == key)
+    }
+
+    /// The pre-quantized projection `prefix` of a packed artifact ([`crate::packed`]): the stored
+    /// codes / scales / biases and the bias at bf16 — exactly what [`pack_projection`] builds from
+    /// the dense weight at load — and the zero columns its input is padded by. `None` when the
+    /// projection is stored dense.
+    fn packed(&self, prefix: &str, bias: bool) -> Result<Option<(AdaptableLinear, i32)>> {
+        let scales_key = format!("{prefix}.scales");
+        if !self.has(&scales_key) {
+            return Ok(None);
+        }
+        let codes = self.require(&format!("{prefix}.weight"))?.clone();
+        let scales = self.require(&scales_key)?.clone();
+        let biases = self.require(&format!("{prefix}.biases"))?.clone();
+        let bias = if bias {
+            Some(
+                self.require(&format!("{prefix}.bias"))?
+                    .as_dtype(Dtype::Bfloat16)?,
+            )
+        } else {
+            None
+        };
+        let group = QUANT_GROUP_SIZE as i32;
+        let bits = mlx_gen::quant::packed_bits(&codes, &scales, group)?;
+        let padded_in = scales.shape()[1] * group;
+        let in_key = format!("{prefix}{}", crate::packed::IN_FEATURES_SUFFIX);
+        let in_features = if self.has(&in_key) {
+            self.require(&in_key)?.item::<i32>()
+        } else {
+            padded_in
+        };
+        if in_features <= 0 || in_features > padded_in {
+            return Err(Error::Msg(format!(
+                "iris: the packed projection {prefix} records {in_features} input features over \
+                 a {padded_in}-wide pack"
+            )));
+        }
+        Ok(Some((
+            AdaptableLinear::from_quantized_parts(codes, scales, biases, bias, group, bits),
+            padded_in - in_features,
+        )))
+    }
+
     /// A tensor kept in f32 (norm gains, adaLN biases, the text position table).
     pub fn f32(&self, key: &str) -> Result<Array> {
         Ok(self.require(key)?.as_dtype(Dtype::Float32)?)
@@ -172,6 +218,16 @@ impl Loader<'_> {
                 // Every adapter factor is read and evaluated here, at the load boundary, so no
                 // forward ever waits on a lazy adapter read.
                 inner.materialize_adapters()?;
+                // A packed artifact's base is stored packed: the install acted on a zero-stride
+                // placeholder of its logical shape, and the adapters ride on the stored pack.
+                if let Some((mut packed, in_pad)) = self.packed(prefix, bias)? {
+                    packed.set_adapters(inner.adapters().to_vec());
+                    return Ok(Linear {
+                        inner: packed,
+                        compute: self.compute,
+                        in_pad,
+                    });
+                }
                 // The adapters stay forward-time residuals over the packed base, reading the
                 // checkpoint-width input; an unaligned base is rebuilt over its zero-padded input
                 // with the same adapter stack ([`Linear::forward`] feeds each its own width).
@@ -201,6 +257,13 @@ impl Loader<'_> {
                     in_pad,
                 });
             }
+        }
+        if let Some((inner, in_pad)) = self.packed(prefix, bias)? {
+            return Ok(Linear {
+                inner,
+                compute: self.compute,
+                in_pad,
+            });
         }
         let weight = self
             .require(&format!("{prefix}.weight"))?
@@ -326,13 +389,6 @@ impl Linear {
     /// Whether the base is affine-packed.
     pub fn is_quantized(&self) -> bool {
         self.inner.is_quantized()
-    }
-
-    /// Elements of the checkpoint's weight and bias, whatever the projection is held as — what a
-    /// full f32 dequantize/promotion copy of it holds (the iOS quantum accounting's input).
-    pub fn logical_elements(&self) -> u64 {
-        let [out, input] = self.logical_shape();
-        (out as u64) * (input as u64) + self.inner.bias().map_or(0, |b| b.size() as u64)
     }
 
     /// Output width of the loaded projection.
@@ -473,6 +529,48 @@ pub fn attention_budgeted(
     let mask = mask.map(|m| m.as_dtype(compute)).transpose()?;
     let out = mlx_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, mask.as_ref(), plan)?;
     Ok(out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?)
+}
+
+/// How the scores of one [`attention_budgeted`] call over `query_rows` queries at `head_dim` exist
+/// in memory on the CURRENT default device — the iOS quantum accounting's score term.
+///
+/// Every Iris attention calls `mlx_rs::fast::scaled_dot_product_attention` (once, or once per
+/// query chunk). On the GPU, MLX 0.32 runs it as a fused kernel that streams the scores —
+/// `sdpa_full` for more than 8 query rows at head widths 64/80/128, `sdpa_vector` for at most 8
+/// rows at 64/96/128/256 — so no score tensor exists ([`Scores::Fused`]); Iris's real head widths
+/// are 128 (trunk, refiner, PiT, the Qwen3-VL tower) and 80 (layerwise adapter), all fused.
+/// Anywhere else (the CPU, or a width the kernels reject) MLX falls back to `q·kᵀ → softmax → ·v`:
+/// the logits `[B, H, rows, keys]` at the compute width, the softmax running in place on them
+/// (one buffer), plus the masked copy of the logits when `masked`.
+pub fn sdpa_scores(head_dim: u64, query_rows: u64, compute_bytes: u64, masked: bool) -> Scores {
+    let gpu = mlx_rs::Device::try_default().is_ok_and(|d| d != mlx_rs::Device::cpu());
+    let fused = if query_rows > 8 {
+        matches!(head_dim, 64 | 80 | 128)
+    } else {
+        matches!(head_dim, 64 | 96 | 128 | 256)
+    };
+    if gpu && fused {
+        Scores::Fused
+    } else {
+        Scores::Materialized {
+            live: 1 + u64::from(masked),
+            element_bytes: compute_bytes,
+        }
+    }
+}
+
+/// Whether [`sdpa_scores`] prices the CPU fallback (which also materializes `q · scale`, and
+/// under grouped-query attention broadcasts k and v over the query groups).
+pub fn sdpa_falls_back(scores: Scores) -> bool {
+    matches!(scores, Scores::Materialized { .. })
+}
+
+/// Bytes per element of a compute dtype (f32 4, bf16/f16 2).
+pub fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Float32 => 4,
+        _ => 2,
+    }
 }
 
 /// One named production attention site. Debug observations report the *executed* shared kernel

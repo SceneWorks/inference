@@ -35,8 +35,8 @@ use crate::loader;
 use crate::pipeline::{
     denoise_cfgpp_with_preview, denoise_curated_with_preview, denoise_inpaint_with_preview,
     denoise_ip_with_preview, denoise_multi_control_with_preview, denoise_with_preview,
-    encode_conditioning_windows, encode_init_latents, preprocess_control_image, text_time_ids,
-    ControlContext, Denoiser,
+    encode_conditioning_windows, encode_init_latents_tiled, preprocess_control_image,
+    text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -84,7 +84,7 @@ fn curated_strength_schedule(full_sigmas: &[f32], steps: usize, strength: f32) -
 /// reference `StableDiffusionXL(float16=True)`); the VAE loads f32 inside its own loader. Shared by
 /// the eager (`Resident`) load and the per-generation (`Sequential`) component loaders so both build
 /// byte-identical components.
-const DTYPE: Dtype = Dtype::Float16;
+pub(crate) const DTYPE: Dtype = Dtype::Float16;
 
 /// SDXL-base-1.0 production defaults (the SceneWorks `MlxSdxlAdapter`): 30 inference steps,
 /// CFG 7.0, native 1024². Used when a request omits the corresponding field (consumed by the
@@ -1314,8 +1314,14 @@ impl Sdxl {
         // too (F-068). `init_latents` is Some exactly for the ancestral img2img/inpaint paths — a
         // Reference that is neither an accel run nor an IP image prompt; `mask_latent` adds the mask.
         let init_latents = match reference {
-            Some((image, _)) if !is_accel && !ip_mode => Some(encode_init_latents(
-                heavy.vae, image, req.width, req.height,
+            // sc-26270: the bounded-decode rung's tiling bounds the encode too.
+            Some((image, _)) if !is_accel && !ip_mode => Some(encode_init_latents_tiled(
+                heavy.vae,
+                image,
+                req.width,
+                req.height,
+                decode_tiling.as_ref(),
+                Some(&req.cancel),
             )?),
             _ => None,
         };

@@ -56,7 +56,7 @@ python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
 | SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
 | Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
 | Geometry | 512², 768², 1024²; future registered Supra2: 256² |
-| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, registered restoration/depth; no edit-to-text downgrade |
+| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade |
 | Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
 
 Provision complete caller-owned snapshots into a distinct slot for every
@@ -73,6 +73,12 @@ checks and admitted request binding are preserved.
 scripts/ios/push_model.sh "$SNAPSHOT" --campaign-route iris_3b --tier q8 --device "$DEVICE"
 # Same mechanism for every route and tier in the actual listing:
 scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route illustrious_xl_v2 --tier q4 --device "$DEVICE"
+# SDXL `control` and `ip_adapter` cases need their component in the slot. --control/--ip-adapter
+# place it beside the snapshot and map the `control` / `ip_adapter` roles in components.json onto
+# the load spec's ControlNet / IP-Adapter sources (attached only for that case's own mode). A case
+# without its component is a provisioning failure, never admission or refusal evidence.
+scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route sdxl --tier q4 \
+  --control "$CONTROLNET_TILE_SDXL" --ip-adapter "$IP_ADAPTER_SDXL" --device "$DEVICE"
 ```
 
 The following are **future session recipes, not instructions to run now**. Phone
@@ -178,12 +184,13 @@ like `conv_inverted`, so MLX materializes the F32-promoted weight copy inside
 `ios_quantum::run` (live headroom recheck, eval, stream synchronize, zero-cache
 drain). Before **any** allocation it refuses unless live
 `os_proc_available_memory()` covers the requirement derived from the budget
-module: `sana_block_bytes(configured_block_geometry(sana_1600m, 1, 8, 8, 300))`
+module: `mlx_gen_sana::quantum::block_bytes(configured_block_quantum(sana_1600m, 1, 8, 8, 300, UNBOUNDED))`
 + the probe's resident activation/weight bytes + `PROCESS_RESERVE_BYTES` =
-416.876 + 48.398 + 512 = **977.275 MiB** (1,024,746,752 bytes). Residents are
+119.043 + 48.398 + 512 = **679.441 MiB** (712,445,952 bytes). Residents are
 charged because they are allocated before the quantum's own live recheck of
-floor + reserve. The floor counts the loaded block's conv biases; a bias-free
-count gives 416.791.
+floor + reserve. The floor is the counted SANA block (sc-26270): the promoted
+f32 copy of the F16 inverted conv plus the largest of the self-attention,
+cross-attention and score-plus-Mix-FFN phases at 64 tokens.
 
 The row (`evidence_class: primitive_characterization`,
 `model_admission_evidence: false`, `diagnostic: true`) records `before`,

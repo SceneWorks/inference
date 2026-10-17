@@ -201,11 +201,18 @@ impl ResnetBlock2D {
         Ok(out)
     }
 
-    /// iOS quantum scratch (sc-26270) for this resnet at output extent `[b, h, w]`: the widest of
-    /// its loaded `conv1` input (post-concat on the up path) and output channels.
-    pub(crate) fn quantum_scratch(&self, b: i32, h: i32, w: i32) -> u64 {
-        let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
-        crate::quantum::conv_stage(b, h, w, &[cin, cout])
+    /// iOS quantum scratch (sc-26270) for this resnet over its (pre-concat) input `x`, counted by
+    /// [`crate::quantum::resnet_bytes`] from the loaded `conv1`/`conv2` weights (whose `conv1`
+    /// input width tells whether the up path's skip concatenation runs inside the quantum) and
+    /// `x`'s dtype, on the running backend.
+    pub(crate) fn quantum_scratch(&self, x: &Array) -> u64 {
+        crate::quantum::resnet_bytes(
+            x.shape(),
+            crate::quantum::element_bytes(x),
+            self.conv1.weight(),
+            self.conv2.weight(),
+            crate::quantum::Backend::current(),
+        )
     }
 
     /// [`forward_planned`](Self::forward_planned) as one guarded iOS quantum (sc-26270). `skip`
@@ -218,8 +225,7 @@ impl ResnetBlock2D {
         temb: Option<&Array>,
         plan: crate::plan::SdxlForwardPlan<'_>,
     ) -> Result<Array> {
-        let s = x.shape();
-        let scratch = self.quantum_scratch(s[0], s[1], s[2]);
+        let scratch = self.quantum_scratch(x);
         mlx_gen::ios_quantum::run(crate::quantum::UNET_RESNET, scratch, || {
             let input = match skip {
                 Some(skip) => mlx_rs::ops::concatenate_axis(&[x, &skip], -1)?,
@@ -253,7 +259,7 @@ impl ResnetBlock2D {
         let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
         mlx_gen::ios_quantum::before(
             crate::quantum::VAE_TILED_STAGE,
-            crate::quantum::tiled_stage(s[0], s[1], s[2], &[cin, cout]),
+            crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
         )?;
         let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
@@ -264,7 +270,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| {
                 // sc-26270: each tile is checked before its norm/conv graph is constructed.
-                crate::quantum::before_tile(tile, self.conv1.weight())?;
+                crate::quantum::before_tile(tile, self.conv1.weight(), false)?;
                 silu_glue(&norm1.apply(tile)?)
             },
         )?;
@@ -280,7 +286,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(tile, self.conv2.weight())?;
+                crate::quantum::before_tile(tile, self.conv2.weight(), false)?;
                 silu_glue(&norm2.apply(tile)?)
             },
         )?;

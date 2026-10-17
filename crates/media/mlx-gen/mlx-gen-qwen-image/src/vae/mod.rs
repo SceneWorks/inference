@@ -21,7 +21,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, LatentDecoder, Result};
 
 use blocks::{
-    decode_quantum, rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS,
+    channel_norm_bytes, decode_quantum, element_bytes, ncthw, rms_norm_channels, CausalConv3d,
+    DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS,
 };
 
 /// iOS decode-quantum labels (see [`mlx_gen::ios_quantum`]); the per-resnet/attention/upsample
@@ -110,15 +111,15 @@ impl Decoder3D {
     /// The **pre-upsample head**: `conv_in → mid_block` (the mid-block carries a *global* per-frame
     /// spatial self-attention over all H·W tokens). Runs at LATENT resolution and is spatially GLOBAL,
     /// so a tiled decode (sc-11747) must run this ONCE on the full latent — tiling it would make each
-    /// tile attend only within itself, changing the whole image. It is also cheap (latent res, fused
-    /// SDPA), so running it full adds no meaningful memory over the single-pass decode.
+    /// tile attend only within itself, changing the whole image. It runs at latent resolution, but its
+    /// single 384-wide head is not one the fused SDPA kernel serves, so its `H·W x H·W` scores
+    /// materialize; on a physical iOS device the attention is therefore query-chunked
+    /// (`AttentionBlock3D::forward_bounded`), bounding the scores per chunk without changing what any
+    /// query attends over.
     pub(super) fn forward_pre_upsample(&self, x: &Array) -> Result<Array> {
         let x = decode_quantum(
             DECODE_HEAD_QUANTUM,
-            x,
-            self.conv_in.out_channels(),
-            1,
-            0,
+            self.conv_in.quantum_bytes(ncthw(x), element_bytes(x)),
             || self.conv_in.forward(x),
         )?;
         self.mid_block.forward_decode(&x)
@@ -149,15 +150,23 @@ impl Decoder3D {
         }
         decode_quantum(
             DECODE_OUTPUT_QUANTUM,
-            &x,
-            self.conv_out.out_channels(),
-            1,
-            0,
-            || {
-                let x = rms_norm_channels(&x, &self.norm_out, NORM_EPS)?;
-                self.conv_out.forward(&silu(&x)?)
-            },
+            self.output_quantum_bytes(ncthw(&x), element_bytes(&x)),
+            || self.forward_output(&x),
         )
+    }
+
+    /// The output head: `norm_out → SiLU → conv_out`.
+    pub(super) fn forward_output(&self, x: &Array) -> Result<Array> {
+        let x = rms_norm_channels(x, &self.norm_out, NORM_EPS)?;
+        self.conv_out.forward(&silu(&x)?)
+    }
+
+    /// Bytes [`Self::forward_output`] allocates over an `[B, C, T, H, W]` input: the channel norm,
+    /// the SiLU (1 full width) and `conv_out`.
+    pub(super) fn output_quantum_bytes(&self, x: [u64; 5], eb: u64) -> u64 {
+        channel_norm_bytes(x, eb)
+            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(eb, &x))
+            .saturating_add(self.conv_out.quantum_bytes(x, eb))
     }
 }
 
@@ -191,25 +200,35 @@ impl QwenVae {
 
     /// The decode **head** at LATENT resolution: denormalize (`·std + mean`) → `post_quant_conv` →
     /// decoder `conv_in` → mid-block. The mid-block carries a *global* per-frame spatial self-attention,
-    /// so a tiled decode (sc-11747) must run this ONCE on the full latent — it is cheap (latent res,
-    /// fused SDPA) and spatially global, so tiling it would corrupt the whole image. Output is the
+    /// so a tiled decode (sc-11747) must run this ONCE on the full latent — it is spatially global, so
+    /// tiling it would corrupt the whole image (on iOS its scores are bounded by query chunking
+    /// instead; see `Decoder3D::forward_pre_upsample`). Output is the
     /// pre-upsample feature map `[B, C, T, H, W]` (spatially unchanged from the latent).
     pub fn decode_pre_upsample(&self, latents: &Array) -> Result<Array> {
         let l = to_5d(latents)?;
         // One iOS head quantum: denormalize → `post_quant_conv` → decoder `conv_in`.
         let x = decode_quantum(
             DECODE_HEAD_QUANTUM,
-            &l,
-            self.decoder.conv_in.out_channels(),
-            1,
-            0,
-            || {
-                let l = add(&multiply(&l, &self.std)?, &self.mean)?;
-                let l = self.post_quant_conv.forward(&l)?;
-                self.decoder.conv_in.forward(&l)
-            },
+            self.head_quantum_bytes(ncthw(&l), element_bytes(&l)),
+            || self.decode_head(&l),
         )?;
         self.decoder.mid_block.forward_decode(&x)
+    }
+
+    /// The decode head quantum's body: denormalize (`·std + mean`) → `post_quant_conv` → decoder
+    /// `conv_in`, over a 5-D latent.
+    pub(super) fn decode_head(&self, l: &Array) -> Result<Array> {
+        let l = add(&multiply(l, &self.std)?, &self.mean)?;
+        let l = self.post_quant_conv.forward(&l)?;
+        self.decoder.conv_in.forward(&l)
+    }
+
+    /// Bytes [`Self::decode_head`] allocates over an `[B, 16, T, H, W]` latent: the denormalized
+    /// product and sum (2 latents), `post_quant_conv` and `conv_in`.
+    pub(super) fn head_quantum_bytes(&self, l: [u64; 5], eb: u64) -> u64 {
+        (2 * mlx_gen::ios_quantum::tensor_bytes(eb, &l))
+            .saturating_add(self.post_quant_conv.quantum_bytes(l, eb))
+            .saturating_add(self.decoder.conv_in.quantum_bytes(l, eb))
     }
 
     /// The decode **upsample tail**: `up_blocks → norm_out → SiLU → conv_out`, taking the
@@ -265,17 +284,10 @@ impl QwenVae {
         }
         // iOS: each tile's tail stages are their own quanta (inside `decode_upsample_tail`); the
         // fold of a decoded tile into the full-size accumulators and the final normalization are
-        // checked against the full f32 RGB output before their graphs are built. A fold holds the
-        // accumulator, the padded placement and their sum (3 outputs); finalization holds output,
-        // normalizer, maximum, quotient and contiguous copy (5) — the SANA `decode_tiled` accounting.
-        let scale = VaeTiling::QWEN_IMAGE.spatial_scale as u64;
-        let output_bytes = (l.shape()[0].max(0) as u64)
-            .saturating_mul(f.max(0) as u64)
-            .saturating_mul(h.max(0) as u64)
-            .saturating_mul(w.max(0) as u64)
-            .saturating_mul(scale)
-            .saturating_mul(scale)
-            .saturating_mul(3 * 4);
+        // checked before their graphs are built ([`tile_fold_bytes`], [`final_normalize_bytes`]).
+        let latent = ncthw(&l);
+        let output_bytes = tile_fold_bytes(latent);
+        let normalize_bytes = final_normalize_bytes(latent);
         let out = tiled_decode_with_finalizer(
             &head,
             &plan,
@@ -283,22 +295,14 @@ impl QwenVae {
             cancel,
             |tile| {
                 let decoded = self.decode_upsample_tail(tile)?;
-                mlx_gen::ios_quantum::before(
-                    DECODE_TILE_FOLD_QUANTUM,
-                    output_bytes.saturating_mul(3),
-                )?;
+                mlx_gen::ios_quantum::before(DECODE_TILE_FOLD_QUANTUM, output_bytes)?;
                 Ok(decoded)
             },
             |accumulators| mlx_gen::ios_quantum::finish(DECODE_TILE_FOLD_QUANTUM, accumulators),
             || {
                 mlx_gen::residency::drain_allocator_cache();
             },
-            |_| {
-                mlx_gen::ios_quantum::before(
-                    DECODE_FINAL_NORMALIZE_QUANTUM,
-                    output_bytes.saturating_mul(5),
-                )
-            },
+            |_| mlx_gen::ios_quantum::before(DECODE_FINAL_NORMALIZE_QUANTUM, normalize_bytes),
         )?;
         mlx_gen::ios_quantum::finish(DECODE_FINAL_NORMALIZE_QUANTUM, &[&out])?;
         Ok(out)
@@ -337,6 +341,93 @@ impl LatentDecoder for QwenVae {
             return Err(mlx_gen::Error::Canceled);
         }
         QwenVae::decode_tiled(self, latents, tiling, cancel)
+    }
+}
+
+/// The tile-fold quantum over a `[B, C, F, H, W]` latent: a fold pads the weighted tile into the
+/// full-size slab, sums it into the slab accumulator and the slab into the output — 3 f32 RGB
+/// outputs `[B, 3, F, 8H, 8W]` (proven in `quantum_tests::tile_fold_formula_tracks_the_measured_peak`).
+pub fn tile_fold_bytes([b, _, f, h, w]: [u64; 5]) -> u64 {
+    let scale = VaeTiling::QWEN_IMAGE.spatial_scale as u64;
+    3 * mlx_gen::ios_quantum::tensor_bytes(4, &[b, 3, f, h * scale, w * scale])
+}
+
+/// The final-normalization quantum over a `[B, C, F, H, W]` latent: the separable coverage
+/// normalizer built as one f32 `[B, 1, F, 8H, 8W]` plane from its three per-axis vectors. Its clamp
+/// and the quotient are elementwise outputs MLX donates into the normalizer and into the folded
+/// output, whose last handle is released before the graph runs.
+pub fn final_normalize_bytes([b, _, f, h, w]: [u64; 5]) -> u64 {
+    let scale = VaeTiling::QWEN_IMAGE.spatial_scale as u64;
+    let tb = mlx_gen::ios_quantum::tensor_bytes;
+    tb(4, &[b, 1, f, h * scale, w * scale]).saturating_add(tb(4, &[f + (h + w) * scale]))
+}
+
+impl QwenVae {
+    /// Every decode quantum's counted scratch for a `[B, 16, F, H, W]` latent at `element_bytes`,
+    /// from the loaded module shapes alone (no tensor is read): the head, the mid-block at the full
+    /// latent (its attention under `attention`), the upsample tail at the largest tile `tiling`
+    /// cuts (the full latent when it does not tile), and the tile fold and final normalization when
+    /// it does. Labels are the quanta's own. For planning predictions; a decode checks each quantum
+    /// itself.
+    pub fn decode_quanta(
+        &self,
+        latent: [u64; 5],
+        tiling: Option<&TilingConfig>,
+        attention: mlx_gen::attention::AttentionPlan<'_>,
+        element_bytes: u64,
+    ) -> Vec<(&'static str, u64)> {
+        let eb = element_bytes;
+        let [b, _, f, h, w] = latent;
+        let mut out = vec![(DECODE_HEAD_QUANTUM, self.head_quantum_bytes(latent, eb))];
+        let conv_in = self.decoder.conv_in.out_channels().max(0) as u64;
+        let mid =
+            self.decoder
+                .mid_block
+                .decode_quanta([b, conv_in, f, h, w], eb, attention, &mut out);
+        let dim = |x: u64| x.min(i32::MAX as u64) as i32;
+        let tiled =
+            tiling.filter(|cfg| cfg.needs_tiling(VaeTiling::QWEN_IMAGE, dim(f), dim(h), dim(w)));
+        let (th, tw) = match tiled {
+            Some(cfg) => {
+                let plan = cfg.plan(VaeTiling::QWEN_IMAGE, dim(f), dim(h), dim(w));
+                let largest = |tiles: &[mlx_gen::tiling::AxisTile]| {
+                    tiles
+                        .iter()
+                        .map(|t| (t.end - t.start).max(0) as u64)
+                        .max()
+                        .unwrap_or(0)
+                };
+                (largest(&plan.h), largest(&plan.w))
+            }
+            None => (h, w),
+        };
+        let mut x = [b, mid[1], f, th, tw];
+        for block in &self.decoder.up_blocks {
+            x = block.decode_quanta(x, eb, &mut out);
+        }
+        out.push((
+            DECODE_OUTPUT_QUANTUM,
+            self.decoder.output_quantum_bytes(x, eb),
+        ));
+        if tiled.is_some() {
+            out.push((DECODE_TILE_FOLD_QUANTUM, tile_fold_bytes(latent)));
+            out.push((
+                DECODE_FINAL_NORMALIZE_QUANTUM,
+                final_normalize_bytes(latent),
+            ));
+        }
+        out
+    }
+
+    /// The attention plan an iOS decode runs the mid-block attention under (the query-chunked
+    /// plan; see `AttentionBlock3D::forward_bounded`), for [`Self::decode_quanta`].
+    pub fn ios_decode_attention_plan() -> mlx_gen::attention::AttentionPlan<'static> {
+        mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(
+                blocks::DECODE_ATTENTION_SCORE_ELEMENTS,
+                true,
+            ),
+        )
     }
 }
 
@@ -685,18 +776,307 @@ mod quantum_tests {
                 .unwrap()
                 .1
         };
-        // The first mid-block resnet at latent extent: exactly the conv-stage floor of its input.
+        // The first mid-block resnet at latent extent: exactly its counted bytes.
+        let vae8 = vae(8);
+        let (resnet, _) = vae8.decoder.mid_block.parts();
         assert_eq!(
             first(8, 4, DECODE_RESNET_QUANTUM),
-            mlx_gen::ios_quantum::conv_stage_bytes(1, 4, 4, 8)
+            resnet.quantum_bytes([1, 8, 1, 4, 4], 4)
         );
         assert!(first(8, 8, DECODE_RESNET_QUANTUM) > first(8, 4, DECODE_RESNET_QUANTUM));
         assert!(first(12, 4, DECODE_RESNET_QUANTUM) > first(8, 4, DECODE_RESNET_QUANTUM));
         // An upsampler is priced at its doubled output extent.
+        let up = vae8.decoder.up_blocks[0].upsampler().unwrap();
         assert_eq!(
             first(8, 4, DECODE_UPSAMPLE_QUANTUM),
-            mlx_gen::ios_quantum::conv_stage_bytes(1, 8, 8, 8)
+            up.quantum_bytes([1, 8, 1, 4, 4], 4)
         );
         assert!(first(8, 8, DECODE_ATTENTION_QUANTUM) > first(8, 4, DECODE_ATTENTION_QUANTUM));
+    }
+
+    /// The shape-only decode-quantum predictor matches what a decode actually checks: the exact
+    /// sequence for a single-pass decode, and every label's largest check for a tiled one.
+    #[test]
+    fn decode_quanta_predicts_the_checked_scratch() {
+        if !in_cpu_child("decode_quanta_predicts_the_checked_scratch") {
+            return;
+        }
+        let vae = vae(8);
+        let plan = QwenVae::ios_decode_attention_plan();
+        let latent = latents(8);
+        let (result, events) = observed(AMPLE, || vae.decode(&latent));
+        result.unwrap();
+        let predicted = vae.decode_quanta([1, 16, 1, 8, 8], None, plan, 4);
+        let predicted: Vec<(String, u64)> = predicted
+            .into_iter()
+            .map(|(l, b)| (l.to_string(), b))
+            .collect();
+        assert_eq!(checks(&events), predicted);
+
+        let tiling = TilingConfig::spatial_only(32, 8);
+        let (result, events) = observed(AMPLE, || vae.decode_tiled(&latent, &tiling, None));
+        result.unwrap();
+        let predicted = vae.decode_quanta([1, 16, 1, 8, 8], Some(&tiling), plan, 4);
+        let largest = |list: &[(String, u64)], label: &str| {
+            list.iter().filter(|(l, _)| l == label).map(|c| c.1).max()
+        };
+        let predicted: Vec<(String, u64)> = predicted
+            .into_iter()
+            .map(|(l, b)| (l.to_string(), b))
+            .collect();
+        let observed_checks = checks(&events);
+        for label in [
+            DECODE_HEAD_QUANTUM,
+            DECODE_RESNET_QUANTUM,
+            DECODE_ATTENTION_QUANTUM,
+            DECODE_UPSAMPLE_QUANTUM,
+            DECODE_OUTPUT_QUANTUM,
+            DECODE_TILE_FOLD_QUANTUM,
+            DECODE_FINAL_NORMALIZE_QUANTUM,
+        ] {
+            assert_eq!(
+                largest(&observed_checks, label),
+                largest(&predicted, label),
+                "{label}"
+            );
+        }
+    }
+
+    /// MLX's peak while `body` runs, above what was live before it (inputs pre-materialized):
+    /// the worst of three runs, since MLX's CPU stream retires buffers asynchronously and one
+    /// quantum's peak varies run to run.
+    fn measured(body: impl Fn() -> Result<Array>) -> u64 {
+        (0..3)
+            .map(|_| mlx_gen::ios_quantum::measured_peak_bytes(|| Ok(vec![body()?])).unwrap())
+            .max()
+            .unwrap()
+    }
+
+    /// The largest ratio any counted VAE formula may hold over its measured peak.
+    const MAX_RATIO: f64 = 1.5;
+
+    /// Every decode quantum type's counted formula, proven against MLX's measured peak on the REAL
+    /// stage modules at a shape where activations dominate the (pre-materialized, used-in-place)
+    /// weights: head, resnet, attention (unchunked and query-chunked), upsample and output.
+    #[test]
+    fn decode_stage_formulas_track_the_measured_peak() {
+        if !in_cpu_child("decode_stage_formulas_track_the_measured_peak") {
+            return;
+        }
+        let c = 32;
+        let vae = vae(c);
+        let hw = 16;
+        let latent = latents(hw);
+        let x = values(&[1, c, 1, hw, hw], 0.7, 1.0);
+        let shape = [1, c as u64, 1, hw as u64, hw as u64];
+        let ratios = std::cell::RefCell::new(Vec::new());
+        let prove = |label: &str, formula: u64, measured: u64| {
+            println!(
+                "{label}: formula {formula} B, measured {measured} B, ratio {:.3}",
+                formula as f64 / measured as f64
+            );
+            mlx_gen::ios_quantum::assert_tracks_measured(label, formula, measured, MAX_RATIO);
+            ratios.borrow_mut().push(label.to_string());
+        };
+
+        prove(
+            DECODE_HEAD_QUANTUM,
+            vae.head_quantum_bytes(ncthw(&latent), 4),
+            measured(|| vae.decode_head(&latent)),
+        );
+        let (resnet, attn) = vae.decoder.mid_block.parts();
+        prove(
+            DECODE_RESNET_QUANTUM,
+            resnet.quantum_bytes(shape, 4),
+            measured(|| resnet.forward(&x)),
+        );
+        let unbounded = mlx_gen::attention::AttentionPlan::UNBOUNDED;
+        prove(
+            "Qwen VAE decode attention (unchunked)",
+            mlx_gen::ios_quantum::attention_block_bytes(attn.quantum_geometry(shape, 4, unbounded)),
+            measured(|| attn.forward_bounded(&x, unbounded)),
+        );
+        let tokens = (hw * hw) as u64;
+        let chunked = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(tokens * tokens / 4, true),
+        );
+        let geometry = attn.quantum_geometry(shape, 4, chunked);
+        assert_eq!(
+            geometry.query_rows,
+            tokens / 4,
+            "the fixture must genuinely chunk"
+        );
+        prove(
+            "Qwen VAE decode attention (chunked)",
+            mlx_gen::ios_quantum::attention_block_bytes(geometry),
+            measured(|| attn.forward_bounded(&x, chunked)),
+        );
+        let up = vae.decoder.up_blocks[0].upsampler().unwrap();
+        prove(
+            DECODE_UPSAMPLE_QUANTUM,
+            up.quantum_bytes(shape, 4),
+            measured(|| up.forward(&x)),
+        );
+        prove(
+            DECODE_OUTPUT_QUANTUM,
+            vae.decoder.output_quantum_bytes(shape, 4),
+            measured(|| vae.decoder.forward_output(&x)),
+        );
+        assert_eq!(ratios.borrow().len(), 6);
+    }
+
+    /// The query-chunked mid-block attention computes the same attention as the historical single
+    /// call (each query row's softmax is over every key either way), checked on CPU; the unbounded
+    /// plan IS the historical single call, and a decode off device takes it.
+    #[test]
+    fn chunked_decode_attention_matches_the_single_call() {
+        if !in_cpu_child("chunked_decode_attention_matches_the_single_call") {
+            return;
+        }
+        let c = 16;
+        let vae = vae(c);
+        let (_, attn) = vae.decoder.mid_block.parts();
+        let x = values(&[1, c, 1, 12, 12], 0.4, 1.5);
+        // The historical path is one SDPA call: `forward` is `forward_bounded(UNBOUNDED)`, whose
+        // unbounded branch is that single `scaled_dot_product_attention` (no chunk loop).
+        mlx_gen::attention::reset_chunk_count();
+        let single = bytes(&attn.forward(&x).unwrap());
+        assert_eq!(mlx_gen::attention::last_chunk_count(), 1);
+        // 144 tokens, 1000 scores per chunk -> 6 query rows per chunk, 24 chunks.
+        let chunked_plan = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(1000, true),
+        );
+        let chunked = bytes(&attn.forward_bounded(&x, chunked_plan).unwrap());
+        assert_eq!(mlx_gen::attention::last_chunk_count(), 24);
+        let max_abs = single
+            .iter()
+            .zip(&chunked)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let scale = single.iter().map(|a| a.abs()).fold(0f32, f32::max);
+        println!("chunked vs single: max |delta| {max_abs:e} over max |x| {scale}");
+        assert!(max_abs <= 1e-5 * scale.max(1.0), "max |delta| {max_abs}");
+
+        // The decode routes through the chunked plan exactly when the iOS quanta are live: a 72 x 72
+        // latent (5184 tokens) chunks at DECODE_ATTENTION_SCORE_ELEMENTS, and the decode under the
+        // fixture still matches the host (single-call) decode.
+        let vae = self::vae(4);
+        let big = latents(72);
+        mlx_gen::attention::reset_chunk_count();
+        let host = bytes(&vae.decode(&big).unwrap());
+        assert_eq!(
+            mlx_gen::attention::last_chunk_count(),
+            1,
+            "off device the decode attention is the single historical call"
+        );
+        let (guarded, events) = observed(AMPLE, || vae.decode(&big));
+        let guarded = bytes(&guarded.unwrap());
+        assert!(
+            mlx_gen::attention::last_chunk_count() > 1,
+            "under the iOS quanta the decode attention is query-chunked"
+        );
+        assert_eq!(count(&events, DECODE_ATTENTION_QUANTUM), 1);
+        // ... and is priced per chunk: the checked scratch is the chunked geometry's.
+        let (_, attn) = vae.decoder.mid_block.parts();
+        let plan = mlx_gen::attention::AttentionPlan::budgeted(
+            mlx_gen::attention::AttentionBudget::from_score_elements(
+                super::blocks::DECODE_ATTENTION_SCORE_ELEMENTS,
+                true,
+            ),
+        );
+        let geometry = attn.quantum_geometry([1, 4, 1, 72, 72], 4, plan);
+        assert!(geometry.query_rows < 5184, "{geometry:?}");
+        let attention_scratch = checks(&events)
+            .into_iter()
+            .find(|(l, _)| l == DECODE_ATTENTION_QUANTUM)
+            .unwrap()
+            .1;
+        assert_eq!(
+            attention_scratch,
+            mlx_gen::ios_quantum::attention_block_bytes(geometry)
+        );
+        let max_abs = host
+            .iter()
+            .zip(&guarded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("iOS (chunked) vs host decode at 72x72 latent: max |delta| {max_abs:e}");
+        assert!(max_abs <= 1e-4, "max |delta| {max_abs}");
+    }
+
+    /// The tile fold and the final normalization are the shared tiling loop's own quanta: each is
+    /// measured in situ, between its pre-construction check and its synchronization, and its
+    /// counted formula proven against that peak.
+    #[test]
+    fn tile_fold_formula_tracks_the_measured_peak() {
+        if !in_cpu_child("tile_fold_formula_tracks_the_measured_peak") {
+            return;
+        }
+        let vae = vae(4);
+        let latent = latents(16);
+        let tiling = TilingConfig::spatial_only(64, 16);
+        assert!(tiling.needs_tiling(VaeTiling::QWEN_IMAGE, 1, 16, 16));
+        let peaks: Rc<RefCell<Vec<(String, u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = peaks.clone();
+        let baseline = std::cell::Cell::new(0u64);
+        let result = with_cpu_diagnostic_headroom(AMPLE, || {
+            with_cpu_diagnostic_observer(
+                move |e| match e {
+                    QuantumEvent::Checked { label, scratch }
+                        if label == DECODE_TILE_FOLD_QUANTUM
+                            || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
+                    {
+                        mlx_rs::memory::clear_cache();
+                        baseline.set(mlx_rs::memory::get_active_memory() as u64);
+                        mlx_rs::memory::reset_peak_memory();
+                        sink.borrow_mut().push((label.clone(), *scratch, 0));
+                    }
+                    QuantumEvent::Synchronized { label, .. }
+                        if label == DECODE_TILE_FOLD_QUANTUM
+                            || label == DECODE_FINAL_NORMALIZE_QUANTUM =>
+                    {
+                        let peak = mlx_rs::memory::get_peak_memory() as u64;
+                        if let Some(last) = sink.borrow_mut().last_mut() {
+                            last.2 = peak.saturating_sub(baseline.get());
+                        }
+                    }
+                    _ => {}
+                },
+                || vae.decode_tiled(&latent, &tiling, None),
+            )
+        });
+        result.unwrap();
+        let peaks = peaks.borrow();
+        assert!(
+            peaks.len() > 2,
+            "the fixture must fold several tiles: {peaks:?}"
+        );
+        for (label, formula, measured) in peaks.iter() {
+            println!(
+                "{label}: formula {formula} B, measured {measured} B, ratio {:.3}",
+                *formula as f64 / (*measured).max(1) as f64
+            );
+        }
+        let largest = |label: &str| {
+            peaks
+                .iter()
+                .filter(|p| p.0 == label)
+                .max_by_key(|p| p.2)
+                .cloned()
+                .unwrap()
+        };
+        for label in [DECODE_TILE_FOLD_QUANTUM, DECODE_FINAL_NORMALIZE_QUANTUM] {
+            let (_, formula, measured) = largest(label);
+            // Every fold must stay under its formula; the largest must be tracked within MAX_RATIO.
+            for p in peaks.iter().filter(|p| p.0 == label) {
+                assert!(
+                    p.1 >= p.2,
+                    "{label}: formula {} below measured {}",
+                    p.1,
+                    p.2
+                );
+            }
+            mlx_gen::ios_quantum::assert_tracks_measured(label, formula, measured, MAX_RATIO);
+        }
     }
 }

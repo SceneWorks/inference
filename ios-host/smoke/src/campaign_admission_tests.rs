@@ -387,3 +387,72 @@ fn campaign_capture_requires_bounded_quanta_and_skips_evidence() {
     assert_eq!(p.refusal_kind, None);
     assert!(p.permit.is_none());
 }
+
+/// SDXL ControlNet and IP-Adapter are provisioned through components.json roles onto the load
+/// spec's typed `control` / `ip_adapter` sources; `ip_adapter` is an enumerated SDXL mode, and a
+/// case missing its component is a provisioning failure, never evidence.
+#[test]
+fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let sdxl = surfaces(catalog.media())
+        .into_iter()
+        .find(|s| s.provider == "sdxl")
+        .unwrap();
+    assert!(sdxl.modes.contains(&"ip_adapter".to_string()));
+    assert!(sdxl.modes.contains(&"control".to_string()));
+    let temp = tempfile::tempdir().unwrap();
+    let slot = temp.path().join("sdxl/q4");
+    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+        tensor(&slot.join(component).join("model.safetensors"), "x");
+    }
+    tokenizer(&slot.join("tokenizer"));
+    tokenizer(&slot.join("tokenizer_2"));
+    for mode in ["control", "ip_adapter"] {
+        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let (status, reason) = campaign::run(&mut p, &case, false);
+        assert_eq!(status, Status::DiagnosticFailure, "{mode}: {reason}");
+        assert!(reason.contains("provisioned"), "{reason}");
+        assert_eq!(p.refusal_kind, None);
+    }
+    tensor(&slot.join("control/model.safetensors"), "x");
+    tensor(&slot.join("ip_adapter.safetensors"), "x");
+    std::fs::write(
+        slot.join("components.json"),
+        r#"{"control":"control","ip_adapter":"ip_adapter.safetensors"}"#,
+    )
+    .unwrap();
+    let spec = |mode: &str| {
+        snapshot(
+            temp.path(),
+            &Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        spec("control").control,
+        Some(WeightsSource::Dir(_))
+    ));
+    assert!(spec("control").ip_adapter.is_none());
+    assert!(matches!(
+        spec("ip_adapter").ip_adapter,
+        Some(WeightsSource::File(_))
+    ));
+    assert!(spec("ip_adapter").control.is_none());
+    // An image-to-image case never loads the IP-Adapter (it would take the reference image).
+    let img2img = spec("reference");
+    assert!(img2img.ip_adapter.is_none() && img2img.control.is_none());
+    assert!(
+        img2img.components.is_empty(),
+        "roles are not named components"
+    );
+    // Provisioned: both reach admission and are refused for EVIDENCE under their own routes.
+    for mode in ["control", "ip_adapter"] {
+        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let (status, reason) = campaign::run(&mut p, &case, false);
+        assert_eq!(status, Status::AdmittedRefused, "{mode}: {reason}");
+        assert_eq!(p.refusal_kind, Some("no_evidence"), "{mode}: {reason}");
+        assert_eq!(p.evidence_key.as_ref().unwrap().mode, mode);
+    }
+}

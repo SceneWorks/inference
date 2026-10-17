@@ -35,6 +35,7 @@ const VAE_FILE: &str = "vae/qwen_image_vae.safetensors";
 /// iOS pre-load quantum labels (see [`mlx_gen::ios_quantum::before_load`]).
 pub(crate) const TEXT_LOAD_QUANTUM: &str = "Anima text load";
 pub(crate) const HEAVY_LOAD_QUANTUM: &str = "Anima heavy load";
+pub(crate) const VAE_LOAD_QUANTUM: &str = "Anima VAE load";
 pub(crate) const CONDITIONING_LOAD_QUANTUM: &str = "Anima conditioning load";
 
 /// Detect the DiT root prefix (`net` or `model.diffusion_model`) from the checkpoint keys.
@@ -210,11 +211,12 @@ pub fn load_heavy_phase_with_stream(
         )));
     }
 
-    // iOS: header-only pre-load floor over the DiT + bundled conditioner file AND the VAE, checked
-    // BEFORE any of them is constructed (no-op elsewhere). A streamable (rung-4) load reads only the
-    // non-block DiT tensors and the conditioner here; the `{prefix}.blocks.*` bodies stay lazy
-    // handles and are read per window inside each block's own priced quantum (its full weight
-    // elements at f32), so they are not resident at load and are not priced here.
+    // iOS: header-only pre-load floor over the DiT + bundled conditioner file, checked BEFORE either
+    // is constructed (no-op elsewhere). A streamable (rung-4) load reads only the non-block DiT
+    // tensors and the conditioner here; the `{prefix}.blocks.*` bodies stay lazy handles and are read
+    // per window inside each block's own priced quantum, so they are not resident at load and are
+    // not priced here. The VAE file is checked separately, right before it is read: its loader casts
+    // every tensor to f32 (`load_vae`), so it is priced at stored + cast bytes.
     if streamable && mlx_gen::ios_quantum::enabled() {
         let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&dit_path)
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -225,14 +227,11 @@ pub fn load_heavy_phase_with_stream(
         let blocks = format!("{prefix}.blocks.");
         mlx_gen::ios_quantum::before_load_where(
             HEAVY_LOAD_QUANTUM,
-            &[dit_path.clone(), root.join(VAE_FILE)],
+            std::slice::from_ref(&dit_path),
             |name| !name.starts_with(&blocks),
         )?;
     } else {
-        mlx_gen::ios_quantum::before_load(
-            HEAVY_LOAD_QUANTUM,
-            &[dit_path.clone(), root.join(VAE_FILE)],
-        )?;
+        mlx_gen::ios_quantum::before_load(HEAVY_LOAD_QUANTUM, std::slice::from_ref(&dit_path))?;
     }
 
     // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
@@ -270,8 +269,17 @@ pub fn load_heavy_phase_with_stream(
         dit_weights.materialize_accessed()?;
     }
 
+    check_vae_load(&root)?;
     let vae = load_vae(root.join(VAE_FILE))?;
     Ok((dit, conditioner, vae))
+}
+
+/// iOS: the VAE's pre-load floor, checked right before it is read — after the DiT + conditioner
+/// are materialized, so the live headroom already carries them. [`load_vae`] casts every tensor
+/// to f32, so it is priced at its stored bytes, their f32 cast copies and the largest cast tensor
+/// (header-only; a no-op off device).
+pub(crate) fn check_vae_load(root: &Path) -> Result<()> {
+    mlx_gen::ios_quantum::before_load_cast(VAE_LOAD_QUANTUM, &[root.join(VAE_FILE)], 4)
 }
 
 /// Build a `Weights` holding an fp-cast copy of ONLY the keys containing `marker` (avoids

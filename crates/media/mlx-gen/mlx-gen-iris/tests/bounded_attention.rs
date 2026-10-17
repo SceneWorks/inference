@@ -271,3 +271,112 @@ fn generator_request() {
     }
     diagnostics::reset();
 }
+
+/// E2: bounded attention being SELECTABLE on the Mac changes nothing by default. A request with no
+/// memory block, or an all-off one, runs every attention site unbounded in one call (never
+/// chunked), and its image is bit-identical to the legacy unbounded pipeline
+/// (`pipeline::denoise`, which predates the request-selected plan).
+///
+/// *Mutation that reds this:* making `attention_budget` return any budget but
+/// `AttentionBudget::UNBOUNDED` for a request without `chunk_attention`.
+#[cfg(debug_assertions)]
+#[test]
+fn the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path() {
+    crate::common::cpu_process(
+        "bounded_attention::the_default_mac_request_runs_unbounded_and_bit_identical_to_the_legacy_path",
+        default_request,
+    );
+}
+
+#[cfg(debug_assertions)]
+fn default_request() {
+    use mlx_gen::gen_core::iris::{GenerationParams, TEXT_ENCODER_COMPONENT};
+    use mlx_gen::gen_core::GenerationMemory;
+    use mlx_gen_iris::nn::diagnostics;
+    use mlx_gen_iris::{encode, pipeline, IrisTextEncoder};
+    let config = crate::common::tiny_config();
+    let mut spec =
+        mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(crate::common::tiny_backbone()));
+    spec.precision = mlx_gen::Precision::Fp32;
+    spec.components.insert(
+        TEXT_ENCODER_COMPONENT.into(),
+        mlx_gen::WeightsSource::Dir(crate::common::tiny_text_encoder()),
+    );
+    let generator = mlx_gen_iris::provider_registry()
+        .unwrap()
+        .load("iris_3b", &spec)
+        .unwrap();
+    let pixels = |output: mlx_gen::GenerationOutput| match output {
+        mlx_gen::GenerationOutput::Images(images) => {
+            images.into_iter().map(|i| i.pixels).collect::<Vec<_>>()
+        }
+        _ => panic!("expected images"),
+    };
+    for guidance in [1.0, 3.0] {
+        let base = mlx_gen::GenerationRequest {
+            prompt: "a fox".into(),
+            width: 32,
+            height: 16,
+            steps: Some(2),
+            seed: Some(7),
+            guidance: Some(guidance),
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        for memory in [None, Some(GenerationMemory::default())] {
+            let req = mlx_gen::GenerationRequest {
+                memory,
+                ..base.clone()
+            };
+            diagnostics::reset();
+            images.push(pixels(generator.generate(&req, &mut |_| {}).unwrap()));
+            let observed = diagnostics::observations();
+            assert!(!observed.is_empty());
+            for row in observed {
+                assert_eq!(
+                    row.budget,
+                    AttentionBudget::UNBOUNDED,
+                    "CFG {guidance}: {} ran under a budget by default",
+                    row.site
+                );
+                assert_eq!(
+                    row.chunks, 1,
+                    "CFG {guidance}: {} chunked by default",
+                    row.site
+                );
+            }
+        }
+        assert_eq!(images[0], images[1]);
+        // The legacy unbounded pipeline, driven directly.
+        let dit =
+            mlx_gen_iris::load_backbone(&crate::common::tiny_backbone(), &config, Dtype::Float32)
+                .unwrap();
+        let te = IrisTextEncoder::load(&crate::common::tiny_text_encoder(), &config.text_encoder)
+            .unwrap();
+        let params = GenerationParams::resolve(&base, 0, &config).unwrap();
+        let conditioning = encode(&te, &params).unwrap();
+        let noise =
+            pipeline::noise_batch(&[params.seed], config.model.in_channels, 32, 16).unwrap();
+        let x = pipeline::denoise(
+            &dit,
+            &config.flow,
+            &conditioning,
+            &noise,
+            &params,
+            &mlx_gen::CancelFlag::new(),
+            |_| {},
+            &mlx_gen::PreviewSink::default(),
+        )
+        .unwrap();
+        let legacy: Vec<Vec<u8>> = pipeline::to_images(&x)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.pixels)
+            .collect();
+        assert_eq!(
+            images[0], legacy,
+            "CFG {guidance}: the default request left the legacy path"
+        );
+    }
+    diagnostics::reset();
+}

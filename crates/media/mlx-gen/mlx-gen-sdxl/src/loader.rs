@@ -53,12 +53,75 @@ fn is_packed(w: &Weights) -> bool {
 /// `pub(crate)` for ladder rung 4: [`crate::block_stream::SdxlBlockStream::open`] applies this same
 /// rule to every re-read window, so a streamed block's dense leaves carry the dtype its resident twin
 /// was cast to rather than the file's stored width.
+///
+/// **The packed-leaf cast is iOS-only** (sc-26270, epic requirement E2): on the host a packed
+/// snapshot keeps every stored dtype exactly as every release before sc-26268 did, so macOS output
+/// bits do not move; on iOS (and the host CPU fixture that exercises the iOS path) the dense leaves
+/// follow the compute dtype — the resident bytes the iOS memory contract prices at 16-bit.
 pub(crate) fn cast_for_load(w: &mut Weights, dtype: Dtype) -> Result<()> {
     if is_packed(w) {
-        w.cast_unpacked_floats(dtype)
+        if casts_packed_dense_leaves() {
+            w.cast_unpacked_floats(dtype)
+        } else {
+            Ok(())
+        }
     } else {
         w.cast_all(dtype)
     }
+}
+
+/// Whether [`cast_for_load`] casts a packed snapshot's dense leaves: on iOS (device or simulator),
+/// or under the host CPU fixture that runs the iOS quantum path. Never on a host render.
+pub(crate) fn casts_packed_dense_leaves() -> bool {
+    cfg!(target_os = "ios") || mlx_gen::ios_quantum::enabled()
+}
+
+/// iOS pre-load floor (sc-26270) for a component `files` that [`cast_for_load`] casts to `dtype`
+/// after reading: every tensor's resident bytes after the cast (its `dtype` copy exactly where
+/// `cast_for_load` casts it — all differing tensors of a dense snapshot; on a packed one the dense
+/// float leaves, never the codes or their `.scales`/`.biases`) plus the largest tensor's transient
+/// (source and copy, or one read). Header-only; a no-op off device.
+fn before_cast_for_load(label: &str, files: &[PathBuf], dtype: Dtype) -> Result<()> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let target = match dtype {
+        Dtype::Float16 => Stored::F16,
+        Dtype::Bfloat16 => Stored::BF16,
+        Dtype::Float32 => Stored::F32,
+        other => {
+            return Err(Error::Msg(format!(
+                "sdxl load: unsupported compute dtype {other:?}"
+            )))
+        }
+    };
+    let width = match target {
+        Stored::F32 => 4,
+        _ => 2,
+    };
+    let mut packed = false;
+    for file in files {
+        packed |= mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
+            .map_err(|e| Error::Msg(e.to_string()))?
+            .iter()
+            .any(|h| h.name.ends_with(".scales"));
+    }
+    let packed_leaves = casts_packed_dense_leaves();
+    crate::quantum::before_cast_load(label, files, width, |name, stored| {
+        if stored == target {
+            return false;
+        }
+        if !packed {
+            return true;
+        }
+        let floating = matches!(
+            stored,
+            Stored::F16 | Stored::BF16 | Stored::F32 | Stored::F64
+        );
+        let companion = name.ends_with(".scales") || name.ends_with(".biases");
+        packed_leaves && floating && !companion
+    })
 }
 
 /// Refuse a trainer load whose `components` include a **pre-quantized** (packed Q4/Q8) tier.
@@ -126,8 +189,13 @@ fn load_clip_dtype(
     dtype: Dtype,
 ) -> Result<ClipTextEncoder> {
     let file = resolve_weight_file(root, subdir, "model", dtype)?;
-    // sc-26270: iOS header-only pre-load floor before this encoder is constructed.
-    mlx_gen::ios_quantum::before_load(&format!("SDXL {subdir} load"), std::slice::from_ref(&file))?;
+    // sc-26270: iOS header-only pre-load floor before this encoder is constructed, including the
+    // load-time cast's copies.
+    before_cast_for_load(
+        &format!("SDXL {subdir} load"),
+        std::slice::from_ref(&file),
+        dtype,
+    )?;
     let mut w = Weights::from_file(&file)?;
     // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
     cast_for_load(&mut w, dtype)?;
@@ -229,7 +297,8 @@ pub fn load_unet_with_config_streamed(
 ) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
     // sc-26270: iOS header-only pre-load floor before the U-Net is constructed.
-    mlx_gen::ios_quantum::before_load("SDXL UNet load", std::slice::from_ref(&file))?;
+    // The load-time cast's copies are priced with the stored tensors they replace.
+    before_cast_for_load("SDXL UNet load", std::slice::from_ref(&file), dtype)?;
     let mut w = Weights::from_file(&file)?;
     // Packs keep their on-disk dtypes; every dense leaf follows `dtype` (sc-26268).
     cast_for_load(&mut w, dtype)?;
@@ -284,7 +353,7 @@ pub fn load_controlnet(
     let source_path = match src {
         mlx_gen::WeightsSource::File(p) | mlx_gen::WeightsSource::Dir(p) => p.clone(),
     };
-    mlx_gen::ios_quantum::before_load("SDXL ControlNet load", &[source_path])?;
+    before_cast_for_load("SDXL ControlNet load", &[source_path], dtype)?;
     let mut w = match src {
         mlx_gen::WeightsSource::File(p) => Weights::from_file(p)?,
         mlx_gen::WeightsSource::Dir(p) => Weights::from_dir(p)?,
@@ -324,9 +393,10 @@ pub fn load_ip_adapter(
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
     // sc-26270: iOS header-only pre-load floors before each IP component is constructed.
-    mlx_gen::ios_quantum::before_load(
+    before_cast_for_load(
         "SDXL IP image encoder load",
         &[dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE)],
+        dtype,
     )?;
     let mut enc_w = Weights::from_file(dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE))?;
     // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
@@ -345,7 +415,11 @@ pub fn load_ip_adapter(
                 dir.display()
             ))
         })?;
-    mlx_gen::ios_quantum::before_load("SDXL IP adapter load", std::slice::from_ref(&ip_file))?;
+    before_cast_for_load(
+        "SDXL IP adapter load",
+        std::slice::from_ref(&ip_file),
+        dtype,
+    )?;
     let mut ip_w = Weights::from_file(&ip_file)?;
     // F-082 / sc-26268: packs keep their stored dtypes; every dense leaf follows `dtype`.
     cast_for_load(&mut ip_w, dtype)?;
@@ -365,9 +439,9 @@ pub fn load_ip_adapter(
 /// VAE; fetch `vae/diffusion_pytorch_model.safetensors` for an exact decode).
 pub fn load_vae(root: &Path) -> Result<Autoencoder> {
     let file = resolve_vae_weight_file(root)?;
-    // sc-26270: iOS header-only pre-load floor before the VAE is constructed.
-    // The loader upcasts every tensor to f32, so the stored and widened copies coexist.
-    mlx_gen::ios_quantum::before_load_cast("SDXL VAE load", std::slice::from_ref(&file), 4)?;
+    // sc-26270: iOS header-only pre-load floor before the VAE is constructed, with the f32 upcast's
+    // copies of every non-f32 tensor (a no-op cast of the f32 master costs nothing).
+    before_cast_for_load("SDXL VAE load", std::slice::from_ref(&file), Dtype::Float32)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     let vae = Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())?;
@@ -429,15 +503,12 @@ pub fn resolve_vae_fp16_fix_file(source: &mlx_gen::WeightsSource) -> Result<Path
 /// Load the staged fp16-fix VAE at [`VAE_FP16_FIX_DTYPE`].
 pub fn load_vae_fp16_fix(source: &mlx_gen::WeightsSource) -> Result<Autoencoder> {
     let file = resolve_vae_fp16_fix_file(source)?;
-    // sc-26270: iOS header-only pre-load floor before the fp16-fix VAE is constructed.
-    // Cast to VAE_FP16_FIX_DTYPE after reading: stored and cast copies coexist.
-    mlx_gen::ios_quantum::before_load_cast(
+    // sc-26270: iOS header-only pre-load floor before the fp16-fix VAE is constructed, with the
+    // cast copies of every tensor not already at VAE_FP16_FIX_DTYPE.
+    before_cast_for_load(
         "SDXL fp16-fix VAE load",
         std::slice::from_ref(&file),
-        match VAE_FP16_FIX_DTYPE {
-            Dtype::Float32 => 4,
-            _ => 2,
-        },
+        VAE_FP16_FIX_DTYPE,
     )?;
     let mut w = Weights::from_file(file)?;
     w.cast_all(VAE_FP16_FIX_DTYPE)?;

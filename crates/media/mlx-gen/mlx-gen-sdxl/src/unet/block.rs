@@ -192,10 +192,16 @@ impl UNetBlock2D {
             output_states.push(x.clone());
         }
         if let Some(c) = &self.downsample {
-            let s = x.shape();
-            let (cin, cout) = crate::quantum::conv_channels(c.weight());
+            // The stride-2 convolution's output (+ its bias add) and kernel transient.
+            let call = crate::quantum::ConvCall::new(
+                x.shape(),
+                crate::quantum::element_bytes(&x),
+                c.weight(),
+                2,
+                1,
+            );
             let scratch =
-                crate::quantum::conv_stage(s[0], (s[1] + 1) / 2, (s[2] + 1) / 2, &[cin, cout]);
+                crate::quantum::single_conv_bytes(&call, 0, 0, crate::quantum::Backend::current());
             x = mlx_gen::ios_quantum::run(crate::quantum::UNET_DOWNSAMPLE, scratch, || {
                 conv2d(&x, c.weight(), c.bias(), 2, 1)
             })?;
@@ -203,8 +209,17 @@ impl UNetBlock2D {
         }
         if let Some(c) = &self.upsample {
             let s = x.shape();
-            let (cin, cout) = crate::quantum::conv_channels(c.weight());
-            let scratch = crate::quantum::conv_stage(s[0], 2 * s[1], 2 * s[2], &[cin, cout]);
+            // The nearest-2x copy (input width at the doubled extent), the convolution's output
+            // (+ its bias add) and kernel transient.
+            let call = crate::quantum::ConvCall::new(
+                &[s[0], 2 * s[1], 2 * s[2], s[3]],
+                crate::quantum::element_bytes(&x),
+                c.weight(),
+                1,
+                1,
+            );
+            let scratch =
+                crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::Backend::current());
             x = mlx_gen::ios_quantum::run(crate::quantum::UNET_UPSAMPLE, scratch, || {
                 conv2d(&upsample_nearest(&x, 2)?, c.weight(), c.bias(), 1, 1)
             })?;
