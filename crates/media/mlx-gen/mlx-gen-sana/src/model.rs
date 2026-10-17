@@ -284,6 +284,7 @@ pub(crate) fn build_residency(
 /// Load the Gemma-2 CHI text encoder (`text_encoder/`) — the phase-A component dropped first under
 /// `Sequential`. Bundles the gemma weights + `tokenizer.json` (the un-gated mirror, epic 7840).
 fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
+    mlx_gen::ios_quantum::before_load("SANA text load", &[root.join("text_encoder")])?;
     SanaTextEncoder::from_snapshot(root.join("text_encoder"))
 }
 
@@ -299,6 +300,10 @@ fn load_heavy(
     needs_encoder: bool,
     streamable: bool,
 ) -> Result<SanaHeavy> {
+    mlx_gen::ios_quantum::before_load(
+        "SANA heavy load",
+        &[root.join("transformer"), root.join("vae")],
+    )?;
     let transformer_dir = root.join("transformer");
     let trunk_w = Weights::from_dir(&transformer_dir)?;
     let dcfg = DcAeConfig::sana_f32c32();
@@ -544,6 +549,7 @@ impl Sana {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         // SC-15523: a request-scoped memory selection is refused HERE, on the production path, not
         // only at shared-contract admission — a caller that sets `req.memory` directly must not be
         // able to execute an unmeasured tile edge, score budget or block cadence.

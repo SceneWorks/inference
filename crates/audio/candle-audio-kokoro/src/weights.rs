@@ -113,7 +113,16 @@ impl VoicePack {
             AudioError::Msg(format!("voice {}: not a torch zip: {e}", path.display()))
         })?;
 
-        let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+        let names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.map(|name| name.into_owned()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| {
+                AudioError::Msg(format!(
+                    "voice {}: invalid zip entry name: {e}",
+                    path.display()
+                ))
+            })?;
         if let Some(byteorder) = names.iter().find(|n| n.ends_with("/byteorder")) {
             let mut s = String::new();
             zip.by_name(byteorder)

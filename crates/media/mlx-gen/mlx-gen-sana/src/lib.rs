@@ -50,6 +50,9 @@ pub mod pipeline;
 pub mod preview;
 pub(crate) mod quant;
 pub mod scm;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 pub mod text_encoder;
 pub mod transformer;
 
