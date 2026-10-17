@@ -28,19 +28,111 @@ pub(super) fn case_timeout() -> Result<u64, String> {
     Ok(seconds)
 }
 
-/// Stable task_vm_info prefix through ledger_phys_footprint_peak. The injected query keeps
-/// the exact request count and field decoding testable without calling an OS or accelerator.
+/// Mirror of the iPhoneOS/macOS SDK `struct task_vm_info` (`mach/task_info.h`, declared under
+/// `#pragma pack(push, 4)`), through REV7. Its layout is the source of every word offset and count
+/// below; `task_vm_info_layout_matches_the_sdk_header` checks it against the installed SDK header.
+#[repr(C, packed(4))]
+#[allow(dead_code)]
+pub(super) struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    // rev1
+    phys_footprint: u64,
+    // rev2
+    min_address: u64,
+    max_address: u64,
+    // rev3
+    ledger_phys_footprint_peak: i64,
+    ledger_purgeable_nonvolatile: i64,
+    ledger_purgeable_novolatile_compressed: i64,
+    ledger_purgeable_volatile: i64,
+    ledger_purgeable_volatile_compressed: i64,
+    ledger_tag_network_nonvolatile: i64,
+    ledger_tag_network_nonvolatile_compressed: i64,
+    ledger_tag_network_volatile: i64,
+    ledger_tag_network_volatile_compressed: i64,
+    ledger_tag_media_footprint: i64,
+    ledger_tag_media_footprint_compressed: i64,
+    ledger_tag_media_nofootprint: i64,
+    ledger_tag_media_nofootprint_compressed: i64,
+    ledger_tag_graphics_footprint: i64,
+    ledger_tag_graphics_footprint_compressed: i64,
+    ledger_tag_graphics_nofootprint: i64,
+    ledger_tag_graphics_nofootprint_compressed: i64,
+    ledger_tag_neural_footprint: i64,
+    ledger_tag_neural_footprint_compressed: i64,
+    ledger_tag_neural_nofootprint: i64,
+    ledger_tag_neural_nofootprint_compressed: i64,
+    // rev4
+    limit_bytes_remaining: u64,
+    // rev5
+    decompressions: i32,
+    // rev6
+    ledger_swapins: i64,
+    // rev7
+    ledger_tag_neural_nofootprint_total: i64,
+    ledger_tag_neural_nofootprint_peak: i64,
+}
+
+const WORD: usize = std::mem::size_of::<u32>();
+/// `TASK_VM_INFO_COUNT`: the full struct, in `natural_t` words. This is what is requested.
+pub(super) const TASK_VM_INFO_COUNT: u32 = (std::mem::size_of::<TaskVmInfo>() / WORD) as u32;
+/// `TASK_VM_INFO_REV1_COUNT`: the smallest reply carrying `phys_footprint`.
+pub(super) const TASK_VM_INFO_REV1_COUNT: u32 =
+    (std::mem::offset_of!(TaskVmInfo, min_address) / WORD) as u32;
+/// `TASK_VM_INFO_REV3_COUNT`: the smallest reply carrying `ledger_phys_footprint_peak`.
+pub(super) const TASK_VM_INFO_REV3_COUNT: u32 =
+    (std::mem::offset_of!(TaskVmInfo, limit_bytes_remaining) / WORD) as u32;
+const PHYS_FOOTPRINT_WORD: usize = std::mem::offset_of!(TaskVmInfo, phys_footprint) / WORD;
+const LEDGER_PEAK_WORD: usize = std::mem::offset_of!(TaskVmInfo, ledger_phys_footprint_peak) / WORD;
+
+/// The kernel lifetime footprint peak, or why it is absent. Never a silent `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PeakReading {
+    Read(u64),
+    /// The kernel replied with fewer words than `TASK_VM_INFO_REV3_COUNT`.
+    Unavailable {
+        returned_words: u32,
+    },
+}
+
+/// The injected query keeps the exact request count and field decoding testable without calling
+/// an OS or accelerator. `None` only when the call failed or the reply lacks `phys_footprint`.
 pub(super) fn read_footprint(
-    query: impl FnOnce(&mut [u32; 44], &mut u32) -> i32,
-) -> Option<(u64, Option<u64>)> {
-    let mut words = [0u32; 44];
-    let mut count = 44;
+    query: impl FnOnce(&mut [u32], &mut u32) -> i32,
+) -> Option<(u64, PeakReading)> {
+    let mut words = vec![0u32; TASK_VM_INFO_COUNT as usize];
+    let mut count = TASK_VM_INFO_COUNT;
     let status = query(&mut words, &mut count);
-    if status != 0 || count < 38 {
+    if status != 0 || !(TASK_VM_INFO_REV1_COUNT..=TASK_VM_INFO_COUNT).contains(&count) {
         return None;
     }
-    let current = u64::from(words[36]) | (u64::from(words[37]) << 32);
-    let peak = (count >= 44).then(|| u64::from(words[42]) | (u64::from(words[43]) << 32));
+    let word64 = |at: usize| u64::from(words[at]) | (u64::from(words[at + 1]) << 32);
+    let current = word64(PHYS_FOOTPRINT_WORD);
+    let peak = if count >= TASK_VM_INFO_REV3_COUNT {
+        PeakReading::Read(word64(LEDGER_PEAK_WORD))
+    } else {
+        PeakReading::Unavailable {
+            returned_words: count,
+        }
+    };
     Some((current, peak))
 }
 

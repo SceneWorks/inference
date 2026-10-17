@@ -182,26 +182,95 @@ fn campaign_oversized_component_manifest_fails_without_full_allocation() {
 }
 #[test]
 fn campaign_kernel_ledger_uses_exact_peak_not_sampled_current() {
-    let (current, peak) = support::read_footprint(|words, count| {
-        assert_eq!(*count, 44);
+    use support::{PeakReading, TASK_VM_INFO_COUNT, TASK_VM_INFO_REV3_COUNT};
+    // The SDK layout: phys_footprint at words 36-37, ledger_phys_footprint_peak at 42-43, REV2 = 42
+    // words, REV3 = 84, the full REV7 struct = 93.
+    assert_eq!((TASK_VM_INFO_REV3_COUNT, TASK_VM_INFO_COUNT), (84, 93));
+    let fill = |words: &mut [u32]| {
         words[36] = 123;
         words[37] = 1;
         words[40] = 999;
         words[42] = 456;
         words[43] = 2;
+    };
+    // REV3+ reply (the kernel returns its own count): the exact lifetime peak.
+    for returned in [TASK_VM_INFO_REV3_COUNT, TASK_VM_INFO_COUNT] {
+        let (current, peak) = support::read_footprint(|words, count| {
+            assert_eq!(*count, TASK_VM_INFO_COUNT, "request the full struct");
+            assert_eq!(words.len(), TASK_VM_INFO_COUNT as usize);
+            fill(words);
+            *count = returned;
+            0
+        })
+        .unwrap();
+        assert_eq!(current, (1u64 << 32) + 123);
+        assert_eq!(peak, PeakReading::Read((2u64 << 32) + 456));
+    }
+    // A REV2-sized reply (42 words) carries no peak: an explicit typed reading, not a silent None.
+    let (current, peak) = support::read_footprint(|words, count| {
+        fill(words);
+        *count = 42;
         0
     })
     .unwrap();
     assert_eq!(current, (1u64 << 32) + 123);
-    assert_eq!(peak, Some((2u64 << 32) + 456));
-    let (_, peak) = support::read_footprint(|words, count| {
-        words[36] = 321;
-        *count = 38;
+    assert_eq!(peak, PeakReading::Unavailable { returned_words: 42 });
+    assert!(support::read_footprint(|_, count| {
+        *count = 30;
         0
     })
-    .unwrap();
-    assert_eq!(peak, None);
+    .is_none());
     assert!(support::read_footprint(|_, _| -1).is_none());
+}
+/// The mirrored layout must equal the installed SDK's `struct task_vm_info` (macOS hosts with
+/// Xcode; skipped elsewhere): same field order and widths under `#pragma pack(4)`.
+#[cfg(target_os = "macos")]
+#[test]
+fn task_vm_info_layout_matches_the_sdk_header() {
+    let sdk = std::process::Command::new("xcrun")
+        .args(["--sdk", "iphoneos", "--show-sdk-path"])
+        .output();
+    let Some(sdk) = sdk
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        eprintln!("no iPhoneOS SDK; layout cross-check skipped");
+        return;
+    };
+    let header = std::fs::read_to_string(format!("{sdk}/usr/include/mach/task_info.h")).unwrap();
+    assert!(header.contains("#pragma pack(push, 4)"));
+    let body = header
+        .split("struct task_vm_info {")
+        .nth(1)
+        .unwrap()
+        .split("};")
+        .next()
+        .unwrap();
+    let mut words = 0usize;
+    let mut offsets = std::collections::HashMap::new();
+    for line in body.lines() {
+        let line = line.split("/*").next().unwrap().trim();
+        let Some(decl) = line.strip_suffix(';') else {
+            continue;
+        };
+        let mut parts = decl.split_whitespace();
+        let ty = parts.next().unwrap();
+        let name = parts.last().unwrap().to_string();
+        offsets.insert(name, words);
+        words += match ty {
+            "integer_t" => 1,
+            "mach_vm_size_t" | "mach_vm_address_t" | "int64_t" | "uint64_t" => 2,
+            other => panic!("unmapped task_vm_info field type {other}"),
+        };
+    }
+    assert_eq!(words as u32, support::TASK_VM_INFO_COUNT);
+    assert_eq!(offsets["phys_footprint"], 36);
+    assert_eq!(offsets["ledger_phys_footprint_peak"], 42);
+    assert_eq!(
+        offsets["limit_bytes_remaining"] as u32,
+        support::TASK_VM_INFO_REV3_COUNT
+    );
 }
 #[test]
 fn campaign_sdxl_malformed_shard_is_failure_before_missing_evidence() {

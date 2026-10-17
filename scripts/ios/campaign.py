@@ -23,6 +23,9 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 TIERS = ("q4", "q8", "bf16")
 EDGES = (256, 512, 768, 1024, 1280)
+# Reserved synthetic primitive key: never a catalog case, never admission evidence.
+PRIMITIVE_KEY = "primitive/sana_block_quantum"
+PRIMITIVE_CLASS = "primitive_characterization"
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
 REFUSAL_KINDS = ("capacity", "no_evidence", "mode", "strategy", "artifact")
 EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json"
@@ -49,7 +52,7 @@ def positive(value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("list", "run", "table", "capture", "evidence"))
+    p.add_argument("action", choices=("list", "run", "table", "capture", "evidence", "primitive"))
     p.add_argument("--catalog", type=Path)
     for name in ("provider", "route", "mode"):
         p.add_argument("--" + name)
@@ -158,6 +161,76 @@ def parse_report(text, key):
     return row
 
 
+def _count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_primitive(row, run_id):
+    """Primitive rows are characterization only. Anything claiming more, or missing a reading
+    a characterization needs, is rejected rather than reported."""
+    def reject(reason):
+        return dict(row, status="diagnostic_failure", production_success=False, reason="primitive row rejected: " + reason + "; " + str(row.get("reason")))
+    if row.get("evidence_class") != PRIMITIVE_CLASS or row.get("model_admission_evidence") is not False:
+        return reject("not labelled primitive characterization / claims model admission")
+    if row.get("production_success") is not False or row.get("cap_validated", False) is not False:
+        return reject("claims production success or a validated cap")
+    if row.get("nonce") != run_id:
+        return reject("nonce does not match this launch")
+    if row.get("status") != "diagnostic_success":
+        return row
+    if row.get("allocation_attempted") is not True or row.get("refused_before_allocation") is not False:
+        return reject("success without an attempted, unrefused allocation")
+    if not isinstance(row.get("entitlement"), str) or not row["entitlement"]:
+        return reject("entitlement marker missing")
+    primitive = row.get("primitive")
+    if not isinstance(primitive, dict) or not _count(primitive.get("required_headroom_bytes")):
+        return reject("missing derived headroom requirement")
+    for phase in ("before", "resident", "after"):
+        reading = row.get(phase)
+        if not isinstance(reading, dict):
+            return reject("missing " + phase + " reading")
+        for name in ("available_bytes", "footprint_bytes", "kernel_lifetime_peak_bytes", "mlx_active_bytes", "mlx_cache_bytes", "mlx_peak_bytes"):
+            if not _count(reading.get(name)):
+                return reject(f"{phase}.{name} is not a finite device reading")
+        if reading["footprint_bytes"] == 0:
+            return reject("zero physical footprint is not a device measurement")
+    if row["before"]["available_bytes"] < primitive["required_headroom_bytes"]:
+        return reject("ran below the derived headroom requirement")
+    return row
+
+
+def render_primitive(row):
+    def mib(value):
+        return "unavailable" if not _count(value) else f"{value / 1048576:.3f}"
+    lines = ["PRIMITIVE CHARACTERIZATION ONLY - not a model render, not admission evidence, not a cap",
+             f"status: {row.get('status')} ({row.get('reason')})"]
+    primitive = row.get("primitive") or {}
+    lines.append("required headroom MiB: " + mib(primitive.get("required_headroom_bytes")) + " (floor " + mib(primitive.get("scratch_floor_bytes")) + " + reserve " + mib(primitive.get("engineering_reserve_bytes")) + ")")
+    lines.append("| Phase | Available MiB | Footprint MiB | Kernel lifetime peak MiB | MLX active MiB | MLX cache MiB | MLX peak MiB |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for phase in ("before", "resident", "after"):
+        r = row.get(phase) or {}
+        lines.append("| " + " | ".join([phase] + [mib(r.get(n)) for n in ("available_bytes", "footprint_bytes", "kernel_lifetime_peak_bytes", "mlx_active_bytes", "mlx_cache_bytes", "mlx_peak_bytes")]) + " |")
+    lines.append("quantum peak over baseline MiB: " + mib(row.get("quantum_peak_over_baseline_bytes")))
+    unaccounted = row.get("unaccounted_by_mlx_peak_bytes")
+    lines.append("unaccounted by MLX peak MiB: " + ("unavailable" if not isinstance(unaccounted, int) or isinstance(unaccounted, bool) else f"{unaccounted / 1048576:.3f}"))
+    return "\n".join(lines)
+
+
+def run_primitive(args):
+    """One cold launch of the reserved primitive key through the same DeviceSession."""
+    args.diagnostic = True
+    with args.output.open("x", encoding="utf-8") as output:
+        session = DeviceSession(args)
+        session.install()
+        row = invoke(session, PRIMITIVE_KEY)
+        # The HOST's launch nonce, never the row's own claim.
+        row = validate_primitive(row, getattr(session, "run_id", None))
+        output.write(json.dumps(row) + "\n")
+    print(render_primitive(row))
+    return 0 if row.get("status") == "diagnostic_success" else 2
+
+
 def capacity_refusal(row):
     artifact = row.get("artifact_identity")
     if not isinstance(artifact, dict):
@@ -227,6 +300,7 @@ class DeviceSession:
         artifact = self.args.output.parent / (self.args.output.stem + ".artifacts") / (key.replace("/", "-") + ("-probe" if refusal_only else ""))
         launcher_code = None
         run_id = uuid.uuid4().hex
+        self.run_id = run_id
         try:
             artifact.mkdir(parents=True, exist_ok=False)
             if not self.exited():
@@ -394,6 +468,12 @@ def main(argv=None):
             p.error("table requires --input")
         print(render([json.loads(line) for line in args.input.read_text(encoding="utf-8").splitlines() if line]))
         return 0
+    if args.action == "primitive":
+        if not args.device or not args.output:
+            p.error("primitive requires explicit --device and new --output")
+        if any(v is not None for v in (args.case, args.provider, args.route, args.tier, args.edge, args.mode, args.rung, args.next_edge)) or args.all_cases:
+            p.error("primitive takes no catalog selectors")
+        return run_primitive(args)
     data = catalog(args)
     keys = [k for k in data["cases"] if selected(args, k)]
     if not keys:

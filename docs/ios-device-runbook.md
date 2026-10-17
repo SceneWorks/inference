@@ -133,7 +133,9 @@ python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
 Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
 active/cache/active+cache peaks, MLX allocator peak, sampled Darwin
 `TASK_VM_INFO.phys_footprint` peak (words 36–37), the kernel's exact lifetime
-`ledger_phys_footprint_peak` (words 42–43, requested count 44), and minimum
+`ledger_phys_footprint_peak` (words 42–43; the full SDK `TASK_VM_INFO_COUNT` of 93 words
+is requested, because only a REV3+ reply of at least 84 words carries the peak — a shorter reply
+is recorded as an explicit `kernel_lifetime_peak_unavailable` reading, never a silent null), and minimum
 `os_proc_available_memory()` headroom. Rows also carry the path-free artifact
 layout identity, the full memory-relevant `evidence_key` (hardware, provider,
 route, tier, layout, mode, geometry, references, execution levers, token window;
@@ -164,6 +166,44 @@ and request-binding errors are failures before admission, not capacity refusals.
 Commit the actual measured table only after the terminal campaign, not this
 harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
 readings remain unvalidated diagnostics, and no cap/table is invented here.
+
+### Bounded synthetic primitive characterization (sc-16780)
+
+**Primitive characterization only: not a model render, not admission evidence
+for any model, not a cap.** The reserved key `primitive/sana_block_quantum` is
+not a catalog case and opens no model file or snapshot. One cold launch runs one
+SANA-block quantum boundary: a synthetic f32 activation `[1,8,8,2240]` (256 px
+latent) against a resident F16 1x1 convolution weight `[11200,1,1,2240]` shaped
+like `conv_inverted`, so MLX materializes the F32-promoted weight copy inside
+`ios_quantum::run` (live headroom recheck, eval, stream synchronize, zero-cache
+drain). Before **any** allocation it refuses unless live
+`os_proc_available_memory()` covers the requirement derived from the budget
+module: `sana_block_bytes(configured_block_geometry(sana_1600m, 1, 8, 8, 300))`
++ the probe's resident activation/weight bytes + `PROCESS_RESERVE_BYTES` =
+416.876 + 48.398 + 512 = **977.275 MiB** (1,024,746,752 bytes). Residents are
+charged because they are allocated before the quantum's own live recheck of
+floor + reserve. The floor counts the loaded block's conv biases; a bias-free
+count gives 416.791.
+
+The row (`evidence_class: primitive_characterization`,
+`model_admission_evidence: false`, `diagnostic: true`) records `before`,
+`resident` (weights materialized) and `after` readings — available bytes, current
+phys_footprint, exact kernel lifetime peak, MLX active/cache/peak — plus the
+sampled extrema, entitlement, build SHA, iOS version and nonce.
+`quantum_peak_over_baseline_bytes` is the new lifetime peak minus the pre-probe
+footprint (null when an earlier excursion masks it), and
+`unaccounted_by_mlx_peak_bytes` subtracts MLX's own peak: the device/driver
+overhead the 512 MiB engineering reserve currently guesses. The host validates
+the label, nonce and every reading, or rejects the row.
+
+```sh
+# ~5-10 min install (cargo ios build + xcodebuild), then one launch of seconds.
+# Requires the phone unlocked; the increased-memory-limit entitlement is on.
+SMOKE_BUNDLE_ID=com.michaeltrefry.SceneWorksSmoke DEVELOPMENT_TEAM=R2526H7YN9 \
+  python3 scripts/ios/campaign.py primitive \
+  --device 2EB6F380-7996-5CA7-9C12-39199D18199F --memory-entitlement on \
+  --output "/tmp/ios-primitive-$(date +%Y%m%d-%H%M%S).jsonl"
+```
 
 ## 1. Prerequisites and checkout
 

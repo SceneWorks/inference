@@ -303,6 +303,94 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("never changes admission", printed.getvalue())
         self.assertEqual(table.read_bytes(), before, "evidence output is printed, never written")
 
+    def primitive_row(self):
+        reading = {"available_bytes": 6000 << 20, "footprint_bytes": 40 << 20, "kernel_lifetime_peak_bytes": 60 << 20,
+                   "mlx_active_bytes": 0, "mlx_cache_bytes": 0, "mlx_peak_bytes": 0}
+        row = campaign.failure(campaign.PRIMITIVE_KEY, "primitive characterized")
+        row.update(status="diagnostic_success", production_success=False, diagnostic=True, cap_validated=False,
+                   evidence_class=campaign.PRIMITIVE_CLASS, model_admission_evidence=False, build_sha="test-sha",
+                   run_id="fixture-run", nonce="fixture-run", entitlement="YES",
+                   allocation_attempted=True, refused_before_allocation=False,
+                   primitive={"required_headroom_bytes": 974_000_000, "scratch_floor_bytes": 437_000_000, "engineering_reserve_bytes": 512 << 20},
+                   before=dict(reading), resident=dict(reading, mlx_active_bytes=48 << 20),
+                   after=dict(reading, kernel_lifetime_peak_bytes=200 << 20, mlx_peak_bytes=144 << 20),
+                   quantum_peak_over_baseline_bytes=160 << 20, unaccounted_by_mlx_peak_bytes=16 << 20)
+        return row
+
+    def test_primitive_rows_are_characterization_only_and_fully_measured(self):
+        row = self.primitive_row()
+        self.assertEqual(campaign.validate_primitive(row, "fixture-run")["status"], "diagnostic_success")
+        bad = {
+            "class": dict(row, evidence_class="model"),
+            "admission": dict(row, model_admission_evidence=True),
+            "production": dict(row, production_success=True),
+            "cap": dict(row, cap_validated=True),
+            "nonce": dict(row, nonce="other-launch"),
+            "missing": dict(row, after={k: v for k, v in row["after"].items() if k != "footprint_bytes"}),
+            "zero": dict(row, resident=dict(row["resident"], footprint_bytes=0)),
+            "bool": dict(row, before=dict(row["before"], mlx_peak_bytes=True)),
+            "below": dict(row, before=dict(row["before"], available_bytes=974_000_000 - 1)),
+            "requirement": dict(row, primitive={}),
+            "not-attempted": dict(row, allocation_attempted=False),
+            "refused": dict(row, refused_before_allocation=True),
+            "entitlement": dict(row, entitlement=None),
+        }
+        for name, candidate in bad.items():
+            with self.subTest(name=name):
+                out = campaign.validate_primitive(candidate, "fixture-run")
+                self.assertEqual(out["status"], "diagnostic_failure")
+                self.assertIn("primitive row rejected", out["reason"])
+        # A device-side refusal stays a failure with its own reason, never upgraded.
+        refused = dict(row, status="diagnostic_failure", reason="refused before construction")
+        self.assertEqual(campaign.validate_primitive(refused, "fixture-run")["reason"], "refused before construction")
+
+    def test_primitive_action_reuses_device_session_without_catalog_and_forces_diagnostic(self):
+        output = self.root / "primitive.jsonl"
+        seen = {}
+        def fake_invoke(session, key, **kw):
+            seen.update(key=key, kw=kw)
+            return self.primitive_row()
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake_invoke):
+            cls.return_value.run_id = "fixture-run"
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                # No --catalog: consulting the catalog would start cargo and trip the Popen trap.
+                self.assertEqual(campaign.main(["primitive", "--device", "fake", "--output", str(output)]), 0)
+            cls.return_value.install.assert_called_once()
+            self.assertTrue(cls.call_args.args[0].diagnostic)
+        self.assertEqual(seen, {"key": campaign.PRIMITIVE_KEY, "kw": {}})
+        self.assertIn("not admission evidence", printed.getvalue())
+        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["evidence_class"], campaign.PRIMITIVE_CLASS)
+        with self.assertRaises(FileExistsError):
+            campaign.main(["primitive", "--device", "fake", "--output", str(output)])
+        for extra in (("--case", self.keys[0]), ("--all-cases",), ("--tier", "q4")):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                campaign.main(["primitive", "--device", "fake", "--output", str(self.root / "x.jsonl"), *extra])
+
+    def test_primitive_nonce_is_checked_against_the_host_launch_not_the_row(self):
+        # Row is self-consistent (run_id == nonce) but belongs to a different launch.
+        stale = dict(self.primitive_row(), run_id="previous-launch", nonce="previous-launch")
+        output = self.root / "stale.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", return_value=stale):
+            cls.return_value.run_id = "fixture-run"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(campaign.main(["primitive", "--device", "fake", "--output", str(output)]), 2)
+        row = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertIn("nonce", row["reason"])
+
+    def test_primitive_through_the_real_session_launch_path(self):
+        session = self.fake_session(self.primitive_row())
+        session.args.diagnostic = True
+        row = session.run_case(campaign.PRIMITIVE_KEY)
+        self.assertEqual(row["status"], "diagnostic_success", row.get("reason"))
+        launched = session.device.call_args.args[0]
+        variables = json.loads(launched[launched.index("--environment-variables") + 1])
+        self.assertEqual((variables["IOS_CAMPAIGN_CASE"], variables["IOS_CAMPAIGN_DIAGNOSTIC"]), (campaign.PRIMITIVE_KEY, "1"))
+        self.assertEqual(session.run_id, "fixture-run")
+        self.assertEqual(campaign.validate_primitive(row, session.run_id)["status"], "diagnostic_success")
+
 
 if __name__ == "__main__":
     unittest.main()
