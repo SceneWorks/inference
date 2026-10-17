@@ -1,9 +1,11 @@
-"""CPU-only campaign CLI tests; no cargo, devicectl, simulator, weights or accelerator."""
+"""CPU-only campaign tests. Every subprocess is globally trapped: mutations cannot launch tools."""
 import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -23,19 +25,54 @@ class CampaignTests(unittest.TestCase):
         self.keys = [f"fake/fake/{tier}/{edge}/{mode}/{rung}" for tier in campaign.TIERS for edge in (512, 768, 1024) for mode in ("text", "reference", "restore", "depth") for rung in range(5)]
         self.catalog = self.root / "catalog.json"
         self.catalog.write_text(json.dumps({"schema": 1, "cases": self.keys}), encoding="utf-8")
+        self.guard = mock.patch.object(campaign.subprocess, "Popen", side_effect=AssertionError("TEST MUST NOT START ANY REAL PROCESS"))
+        self.guard.start()
+        self.addCleanup(self.guard.stop)
+        self.addCleanup(mock.patch.stopall)
+        self.sleeper = mock.patch.object(campaign.time, "sleep")
+        self.sleeper.start()
+        mock.patch.object(campaign.uuid, "uuid4", return_value=mock.Mock(hex="fixture-run")).start()
 
     def main(self, *args):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return campaign.main([*args, "--catalog", str(self.catalog)])
 
-    def test_public_cli_lists_without_invoking_device_or_compiler(self):
-        with mock.patch.object(campaign.subprocess, "run", side_effect=AssertionError("must be pure")):
-            self.assertEqual(self.main("list", "--tier", "q8", "--edge", "768", "--mode", "restore", "--rung", "4"), 0)
+    def success(self, key=None):
+        row = campaign.failure(key or self.keys[0], "render")
+        row.update(status="successful", production_success=True, elapsed_seconds=1.25,
+                   mlx_active_peak_bytes=10, mlx_cache_peak_bytes=20, mlx_active_cache_peak_bytes=30,
+                   mlx_peak_bytes=15, phys_footprint_peak_bytes=123,
+                   kernel_lifetime_phys_footprint_peak_bytes=150, min_headroom_mib=456,
+                   diagnostic=False, build_sha="test-sha", expected_render_count=1)
+        return row
+
+    def fake_session(self, row, entitlement="YES"):
+        row.setdefault("run_id", "fixture-run")
+        args = campaign.parser().parse_args(["run", "--device", "fixture-device", "--timeout-seconds", "77", "--output", str(self.root / "run.jsonl")])
+        session = object.__new__(campaign.DeviceSession)
+        session.args, session.bundle, session.blocked, session.sha, session.env = args, "fixture.bundle", False, "test-sha", {}
+        session.exited = mock.Mock(return_value=True)
+        session.device = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+        def copy(remote, local):
+            if remote == "smoke-report.txt":
+                local.write_text("CAMPAIGN_JSON " + json.dumps(row), encoding="utf-8")
+            elif remote == "launch-memory.txt":
+                local.write_text("launch: increased-memory-limit = " + entitlement, encoding="utf-8")
+            elif remote == "renders.txt":
+                local.write_text("campaign-" + row["case"].replace("/", "-") + "-0.png\n", encoding="utf-8")
+            else:
+                local.write_bytes(b"fixture PNG")
+            return subprocess.CompletedProcess([], 0, "", "")
+        session.copy = mock.Mock(side_effect=copy)
+        return session
+
+    def test_public_cli_listing_is_pure_and_rung_zero_is_selected(self):
+        self.assertEqual(self.main("list", "--tier", "q8", "--edge", "768", "--mode", "restore", "--rung", "4"), 0)
         args = campaign.parser().parse_args(["list", "--rung", "0"])
         self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1"))
         self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0"))
 
-    def test_public_cli_rejects_invalid_and_unbounded_inputs(self):
+    def test_invalid_finite_budgets_and_cases(self):
         for options in (("--case", "p/../q4/512/text/0"), ("--timeout-seconds", "0"), ("--max-cases", "20001"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5")):
             with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.parser().parse_args(["run", *options])
@@ -43,77 +80,153 @@ class CampaignTests(unittest.TestCase):
             self.main("run", "--device", "fake", "--output", str(self.root / "not-written"))
         self.assertFalse((self.root / "not-written").exists())
 
-    def test_default_admission_refusal_is_not_a_pass_and_has_all_status_rows(self):
+    def test_install_once_budget_and_all_explicit_status_rows(self):
         output = self.root / "evidence.jsonl"
-        refusal = lambda args, key: dict(campaign.failure(key, "no device footprint"), status="admitted_refused")
-        with mock.patch.object(campaign, "invoke", side_effect=refusal) as invoke:
-            rc = self.main("run", "--all-cases", "--device", "fake", "--output", str(output), "--max-cases", "2")
-        self.assertEqual(rc, 2)
-        self.assertEqual(invoke.call_count, 2)
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: dict(campaign.failure(key, "no capture"), status="admitted_refused", refusal_kind="no_evidence")) as invoke:
+            cls.return_value.blocked = False
+            self.assertEqual(self.main("run", "--all-cases", "--device", "fake", "--output", str(output), "--max-cases", "2"), 2)
+            cls.return_value.install.assert_called_once()
+            self.assertEqual(invoke.call_count, 2)
         rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
         self.assertEqual([r["case"] for r in rows], self.keys)
-        self.assertEqual(rows[0]["status"], "admitted_refused")
         self.assertTrue(all(r["status"] == "skipped" for r in rows[2:]))
         self.assertTrue(all(r["production_success"] is False for r in rows))
         with self.assertRaises(FileExistsError):
             self.main("run", "--all-cases", "--device", "fake", "--output", str(output))
 
-    def test_report_identity_and_diagnostics_fail_closed(self):
+    def test_next_edge_rewrite_and_probes_count_toward_max_cases(self):
         key = self.keys[0]
-        self.assertEqual(campaign.parse_report("SMOKE: PASS\n", key)["status"], "diagnostic_failure")
-        for status in campaign.STATUSES:
-            row = dict(campaign.failure(key, "fixture"), status=status, production_success=status == "successful", elapsed_seconds=1.25, mlx_active_peak_bytes=10, mlx_cache_peak_bytes=20, mlx_active_cache_peak_bytes=30, mlx_peak_bytes=15, phys_footprint_peak_bytes=123, min_headroom_mib=456)
-            encoded = "CAMPAIGN_JSON " + json.dumps(row)
-            self.assertEqual(campaign.parse_report(encoded, key)["status"], status)
-            self.assertEqual(campaign.parse_report(encoded, "wrong/wrong/q4/512/text/0")["status"], "diagnostic_failure")
-        row.update(status="successful", production_success=True, min_headroom_mib=float("nan"))
-        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), key)["status"], "diagnostic_failure")
-        row.update(status="diagnostic_success", production_success=True)
-        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), key)["status"], "diagnostic_failure")
-        row.update(status="successful", diagnostic=True)
-        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), key)["status"], "diagnostic_failure")
+        for budget, expected_calls in ((1, 1), (2, 2)):
+            output = self.root / f"next-{budget}.jsonl"
+            with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, current, **kw: self.success(current)) as run:
+                cls.return_value.blocked = False
+                self.main("run", "--case", key, "--next-edge", "768", "--device", "fake", "--output", str(output), "--max-cases", str(budget))
+                self.assertEqual(run.call_count, expected_calls)
+                if budget == 2:
+                    self.assertEqual(run.call_args.args[1], key.replace("/512/", "/768/"))
+                    self.assertEqual(run.call_args.kwargs, {"refusal_only": True})
+            rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 2)
+            if budget == 1:
+                self.assertEqual(rows[-1]["status"], "skipped")
 
-    def test_one_cold_process_per_case_drops_legacy_bypasses(self):
+    def test_probe_consumes_budget_before_the_next_base_case(self):
+        output = self.root / "probe-budget.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, current, **kw: self.success(current)) as run:
+            cls.return_value.blocked = False
+            self.main("run", "--provider", "fake", "--tier", "q4", "--edge", "512", "--mode", "text", "--next-edge", "768", "--max-cases", "2", "--device", "fake", "--output", str(output))
+            self.assertEqual(run.call_count, 2)
+        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[2]["status"], "skipped")
+
+    def test_next_edge_cannot_use_diagnostics(self):
+        with self.assertRaises(SystemExit):
+            self.main("run", "--case", self.keys[0], "--next-edge", "768", "--diagnostic", "--device", "fake", "--output", str(self.root / "bad.jsonl"))
+
+    def test_next_edge_must_exceed_selection(self):
+        for edge in (256, 512):
+            with self.assertRaises(SystemExit):
+                self.main("run", "--case", self.keys[0], "--next-edge", str(edge), "--device", "fake", "--output", str(self.root / "bad.jsonl"))
+
+    def test_refusal_only_requires_capacity_not_missing_evidence(self):
         key = self.keys[0]
-        args = campaign.parser().parse_args(["run", "--device", "explicit-device", "--case", key])
-        report = dict(campaign.failure(key, "no capture"), status="admitted_refused")
-        with mock.patch.dict(campaign.os.environ, {"IOS_SMOKE_UNADMITTED": "1", "IOS_SMOKE_SANA_CAPTURE": "1"}), mock.patch.object(campaign.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "CAMPAIGN_JSON " + json.dumps(report))) as run:
-            row = campaign.invoke(args, key, refusal_only=True)
-        self.assertEqual(row["status"], "admitted_refused")
-        self.assertIn("--campaign-case", run.call_args.args[0])
-        self.assertEqual(run.call_args.kwargs["env"]["IOS_CAMPAIGN_REFUSAL_ONLY"], "1")
-        self.assertNotIn("IOS_SMOKE_UNADMITTED", run.call_args.kwargs["env"])
-        self.assertEqual(run.call_args.kwargs["timeout"], 1800)
+        for kind in ("no_evidence", "mode", "strategy", "capacity"):
+            row = dict(campaign.failure(key, "no capture"), status="admitted_refused", refusal_kind=kind, build_sha="test-sha", refusal_only=True, artifact_identity={"layout_sha256": "a" * 64}, evidence_revision="fixture-capture", selected_parameters={"decode_tile_edge": 192})
+            session = self.fake_session(row)
+            out = session.run_case(key, refusal_only=True)
+            self.assertEqual(out["status"], "admitted_refused" if kind == "capacity" else "diagnostic_failure")
+            # Separate temp directory for the next fixture, never overwrite artifacts.
+            session.args.output = self.root / (kind + ".jsonl")
+            for artifact in (self.root / "run.artifacts").glob("*"):
+                # No removal needed: subsequent session output gets a new parent.
+                self.assertTrue(artifact.is_dir())
+            self.root = self.root / kind
+            self.root.mkdir()
 
-    def test_next_up_is_refusal_only_and_a_kill_is_not_refusal(self):
-        key = self.keys[0]
-        output = self.root / "next-up.jsonl"
-        def invoke(args, current, refusal_only=False):
-            if refusal_only:
-                return dict(campaign.failure(current, "no capture"), status="admitted_refused")
-            return dict(campaign.failure(current, "render"), status="successful", production_success=True)
-        with mock.patch.object(campaign, "invoke", side_effect=invoke) as run:
-            self.main("run", "--case", key, "--next-edge", "768", "--device", "fake", "--output", str(output))
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args.kwargs, {"refusal_only": True})
-        args = campaign.parser().parse_args(["run", "--device", "fake", "--case", key])
-        with mock.patch.object(campaign.subprocess, "run", side_effect=subprocess.TimeoutExpired("fake", 1)):
-            self.assertEqual(campaign.invoke(args, key, True)["status"], "diagnostic_failure")
+    def test_zero_footprint_rejects_otherwise_valid_success(self):
+        row = self.success()
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "successful")
+        row["phys_footprint_peak_bytes"] = 0
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "diagnostic_failure")
 
-    def test_table_excludes_diagnostics_from_largest_completed(self):
-        row = dict(campaign.failure(self.keys[0], "render"), status="diagnostic_success")
+    def test_diagnostic_success_requires_explicit_diagnostic_lane(self):
+        row = dict(self.success(), status="diagnostic_success", production_success=False, diagnostic=False)
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "diagnostic_failure")
+        row["diagnostic"] = True
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "diagnostic_success")
+
+    def test_typed_status_and_finite_metric_errors_never_abort(self):
+        for status in ([], {}, None, "unknown"):
+            row = dict(self.success(), status=status)
+            self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "diagnostic_failure")
+        for value in (float("nan"), -1, None, True):
+            row = dict(self.success(), min_headroom_mib=value)
+            self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(row), self.keys[0])["status"], "diagnostic_failure")
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON []", self.keys[0])["status"], "diagnostic_failure")
+
+    def test_legacy_capture_and_unadmitted_flags_are_stripped(self):
+        with mock.patch.dict(os.environ, {"IOS_SMOKE_SANA_CAPTURE": "1", "IOS_SMOKE_UNADMITTED": "1", "IOS_CAMPAIGN_DIAGNOSTIC": "1"}):
+            env = campaign.clean_environment()
+        self.assertNotIn("IOS_SMOKE_SANA_CAPTURE", env)
+        self.assertNotIn("IOS_SMOKE_UNADMITTED", env)
+        self.assertNotIn("IOS_CAMPAIGN_DIAGNOSTIC", env)
+
+    def test_host_timeout_owns_process_group(self):
+        child = mock.Mock(pid=12345)
+        child.communicate.side_effect = [subprocess.TimeoutExpired("fixture", 1), subprocess.TimeoutExpired("fixture", 3), ("", "")]
+        with mock.patch.object(campaign.subprocess, "Popen", return_value=child) as popen, mock.patch.object(campaign.os, "killpg") as kill, self.assertRaises(subprocess.TimeoutExpired):
+            campaign.command(["fixture-only"], 1)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(kill.call_args_list, [mock.call(12345, signal.SIGTERM), mock.call(12345, signal.SIGKILL)])
+
+    def test_device_deadline_exit_code_entitlement_and_artifact_copy(self):
+        session = self.fake_session(self.success())
+        result = session.run_case(self.keys[0])
+        self.assertEqual(result["status"], "successful")
+        self.assertEqual(result["launcher_exit_code"], 0)
+        self.assertTrue(result["device_exited"])
+        launched = session.device.call_args.args[0]
+        self.assertNotIn("--terminate-existing", launched)
+        variables = json.loads(launched[launched.index("--environment-variables") + 1])
+        self.assertEqual(variables["IOS_CAMPAIGN_TIMEOUT_SECONDS"], "77")
+        self.assertTrue(any(call.args[0] == "campaign-" + self.keys[0].replace("/", "-") + "-0.png" for call in session.copy.call_args_list))
+        session = self.fake_session(self.success(), entitlement="NO")
+        session.args.output = self.root / "wrong-entitlement.jsonl"
+        self.assertEqual(session.run_case(self.keys[0])["status"], "diagnostic_failure")
+
+    def test_stale_launch_identity_cannot_pass_even_with_matching_case_and_sha(self):
+        session = self.fake_session(dict(self.success(), run_id="previous-launch"))
+        row = session.run_case(self.keys[0])
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertIn("different case launch", row["reason"])
+
+    def test_live_device_process_blocks_new_case_without_killing(self):
+        session = self.fake_session(self.success())
+        session.exited.return_value = False
+        row = session.run_case(self.keys[0])
+        self.assertEqual(row["status"], "diagnostic_failure")
+        self.assertFalse(row["device_exited"])
+        self.assertTrue(session.blocked)
+        session.device.assert_not_called()
+
+    def test_install_is_separate_from_case_launch(self):
+        session = self.fake_session(self.success())
+        with mock.patch.object(campaign, "command", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            session.install()
+        self.assertIn("--install-only", run.call_args.args[0])
+        self.assertNotIn("--campaign-case", run.call_args.args[0])
+
+    def test_table_has_all_metrics_and_no_diagnostic_largest_edge(self):
+        row = dict(self.success(), status="diagnostic_success", production_success=False, diagnostic=True)
         table = campaign.render([row])
         self.assertIn("diagnostics excluded): {}", table)
-        self.assertIn("unavailable", table)
-        row.update(status="successful", production_success=True)
-        self.assertIn('"fake/fake/q4/text/0": 512', campaign.render([row]))
-
-    def test_push_campaign_validation_precedes_any_device_call(self):
-        script = MODULE.parent / "push_model.sh"
-        for flags in (("--campaign-route", "../escape", "--tier", "q4"), ("--campaign-route", "iris_3b", "--tier", "q5")):
-            result = subprocess.run(["bash", str(script), str(self.root), *flags], capture_output=True, text=True, encoding="utf-8", check=False)
-            self.assertEqual(result.returncode, 2)
-            self.assertNotIn("device ", result.stdout)
+        self.assertIn("Active MiB | Cache MiB | Combined MiB", table)
+        row.update(status="admitted_refused", refusal_only=True, refusal_kind="no_evidence")
+        self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
+        row.update(refusal_kind="capacity", artifact_identity={"layout_sha256": "a" * 64}, evidence_revision="fixture-capture", selected_parameters={"decode_tile_edge": 192})
+        self.assertIn(self.keys[0], campaign.render([row]).split("Capacity-refused next-up probes:")[-1])
+        row["evidence_revision"] = "no-device-capture"
+        self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
 
 
 if __name__ == "__main__":

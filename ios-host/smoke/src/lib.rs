@@ -1899,6 +1899,10 @@ fn find_zimage_snapshot() -> Option<std::path::PathBuf> {
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
 /// parsing the body.
 pub fn run_report() -> String {
+    #[cfg(all(target_os = "ios", not(target_abi = "sim")))]
+    if let Some(docs) = dirs_documents() {
+        let _ = std::fs::remove_file(docs.join(RENDERS_MANIFEST));
+    }
     // Campaign dispatch is FIRST: no LLM checks, GEMMs, legacy skip-as-success accounting or
     // preceding render may consume the cold process budget of a selected case.
     if let Ok(case) = std::env::var("IOS_CAMPAIGN_CASE") {

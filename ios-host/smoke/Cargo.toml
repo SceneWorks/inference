@@ -63,3 +63,6 @@ mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = tr
 # `get_peak_memory` omits. Same path crate the provider already links, so this adds no code to the
 # binary, only a name to read it by.
 mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

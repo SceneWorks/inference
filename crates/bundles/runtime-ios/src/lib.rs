@@ -50,8 +50,9 @@ pub mod media {
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_admission, anima_turbo_ios_selection, anima_turbo_load_spec,
         anima_turbo_memory_selection, ios_memory_budget, sana_decode_plan, sana_decode_tile_edge,
-        sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
-        FootprintBound, SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
+        sana_footprint_bound, sana_generation_memory, sana_load_spec,
+        sana_snapshot_footprint_bound, sana_snapshot_profile, sdxl, FootprintBound,
+        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
         IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
         SANA_DEVICE_FOOTPRINTS,
     };

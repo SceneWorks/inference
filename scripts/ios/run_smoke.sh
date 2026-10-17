@@ -28,6 +28,7 @@ DEVICE=""
 SIMULATOR=""
 MEMORY_ENTITLEMENT=on
 CARGO_FEATURES=""
+INSTALL_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --debug)  PROFILE=debug; CARGO_PROFILE_FLAG=""; shift ;;
@@ -53,6 +54,8 @@ while [ $# -gt 0 ]; do
     --campaign-case)
       [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung" >&2; exit 2; }
       export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
+    --install-only) INSTALL_ONLY=1; shift ;;
+    --campaign-timeout) export IOS_CAMPAIGN_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --campaign-list) export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
     --campaign-diagnostic) export IOS_CAMPAIGN_DIAGNOSTIC=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -65,6 +68,19 @@ if [ -n "${IOS_CAMPAIGN_CASE:-}${IOS_CAMPAIGN_LIST:-}" ]; then
   [ -z "$SIMULATOR" ] || [ -n "${IOS_CAMPAIGN_LIST:-}" ] || { echo "campaign execution requires a real device; simulator is build/list only" >&2; exit 2; }
 fi
 [ -z "${IOS_CAMPAIGN_DIAGNOSTIC:-}" ] || [ -n "${IOS_CAMPAIGN_CASE:-}" ] || { echo "--campaign-diagnostic needs --campaign-case" >&2; exit 2; }
+
+# Campaign flags always use the bounded session driver. They must never reach this script's
+# legacy reinstall/terminate-existing smoke path.
+if [ -n "${IOS_CAMPAIGN_LIST:-}" ]; then
+  exec python3 "$ROOT/scripts/ios/campaign.py" list
+fi
+if [ -n "${IOS_CAMPAIGN_CASE:-}" ] && [ "$INSTALL_ONLY" -eq 0 ]; then
+  [ -n "$DEVICE" ] || { echo "campaign requires explicit --device" >&2; exit 2; }
+  OUTPUT=${IOS_CAMPAIGN_OUTPUT:-/tmp/ios-campaign-$(date +%s)-$$.jsonl}
+  CAMPAIGN_ARGS=(run --case "$IOS_CAMPAIGN_CASE" --device "$DEVICE" --output "$OUTPUT" --timeout-seconds "${IOS_CAMPAIGN_TIMEOUT_SECONDS:-1800}" --memory-entitlement "$MEMORY_ENTITLEMENT")
+  if [ "${IOS_CAMPAIGN_DIAGNOSTIC:-}" = 1 ]; then CAMPAIGN_ARGS+=(--diagnostic); fi
+  exec python3 "$ROOT/scripts/ios/campaign.py" "${CAMPAIGN_ARGS[@]}"
+fi
 
 say() { printf '\n=== %s\n' "$1"; }
 
@@ -156,7 +172,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
-  for var in IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+  for var in IOS_CAMPAIGN_TIMEOUT_SECONDS IOS_CAMPAIGN_BUILD_SHA IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
     val=$(printenv "$var" || true)
     if [ -n "$val" ]; then export "SIMCTL_CHILD_$var=$val"; say "forwarding $var=$val"; fi
   done
@@ -250,6 +266,9 @@ else
 fi
 say "increased-memory-limit entitlement: $MEMORY_ENTITLEMENT (${ENTITLEMENT_OVERRIDES[*]})"
 
+# Stamp the exact compiled checkout, not a caller label on a stale installed app.
+export IOS_CAMPAIGN_BUILD_SHA=$(git rev-parse HEAD)
+
 # --- rust staticlib ---------------------------------------------------------------------------
 # No IPHONEOS_DEPLOYMENT_TARGET here on purpose: .cargo/config.toml floors the iOS triples (per-target
 # rustflags, not [env] -- see the note there), and this script is
@@ -320,7 +339,8 @@ test -f "$APP/mlx.metallib" \
 say "bundled metallib: $(du -h "$APP/mlx.metallib" | cut -f1)"
 
 say "installing"
-INSTALL_LOG=$(xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1) || true
+INSTALL_STATUS=0
+INSTALL_LOG=$(xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1) || INSTALL_STATUS=$?
 echo "$INSTALL_LOG" | tail -5
 
 # A team change makes the install fail with MismatchedApplicationIdentifierEntitlement, because
@@ -342,6 +362,13 @@ if echo "$INSTALL_LOG" | grep -q "MismatchedApplicationIdentifierEntitlement"; t
   exit 1
 fi
 
+# Campaigns install once, then use the Python session's non-terminating per-case launcher.
+[ "$INSTALL_STATUS" -eq 0 ] || { echo "install failed (exit $INSTALL_STATUS)" >&2; exit "$INSTALL_STATUS"; }
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+  say "installed only; no app launch requested"
+  exit 0
+fi
+
 # The device must be UNLOCKED to launch an app: SpringBoard denies the request with
 # FBSOpenApplicationErrorDomain 7 otherwise, after a successful build and install. Say so plainly
 # rather than letting a 40-line CoreDevice error explain it.
@@ -354,7 +381,7 @@ LAUNCH_ENV="{}"
 # produced a 216.3 s "rung 4 disabled" run whose MLX peak (2901 MiB) was byte-identical to the
 # rung-4-ENABLED run, when the host A/B moves that peak by 1662 MiB. The measurement was a no-op
 # wearing the name of an experiment. If you add a knob to the harness, add it here in the same edit.
-for var in IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+for var in IOS_CAMPAIGN_TIMEOUT_SECONDS IOS_CAMPAIGN_BUILD_SHA IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "
@@ -404,7 +431,8 @@ if [ -n "$CARGO_FEATURES" ]; then POLL_TRIES=${POLL_TRIES_MEDIA:-100}; fi
 say "waiting for the on-device report (up to ~$((POLL_TRIES * 6))s)"
 REPORT=/tmp/ios-smoke-report.txt
 rm -f "$REPORT"
-for _ in $(seq 1 "$POLL_TRIES"); do
+POLL_END=$((LAUNCHED_AT + ${IOS_CAMPAIGN_TIMEOUT_SECONDS:-$((POLL_TRIES * 6))}))
+while [ "$(date +%s)" -lt "$POLL_END" ]; do
   sleep 3
   rm -f "$REPORT"
   xcrun devicectl device copy from --device "$DEVICE" \
@@ -433,6 +461,11 @@ if xcrun devicectl device copy from --device "$DEVICE" \
   if ! grep -q "increased-memory-limit = $EXPECTED_LIMIT\$" "$LAUNCH_MEMORY"; then
     echo "launch-memory.txt does not report increased-memory-limit = $EXPECTED_LIMIT;" \
       "the installed build is not the --memory-entitlement $MEMORY_ENTITLEMENT one" >&2
+    exit 1
+  fi
+else
+  if [ -n "${IOS_CAMPAIGN_CASE:-}" ]; then
+    echo "campaign requires fresh launch-memory.txt entitlement verification" >&2
     exit 1
   fi
 fi

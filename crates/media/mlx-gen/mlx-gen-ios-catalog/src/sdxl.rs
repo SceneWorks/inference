@@ -145,7 +145,8 @@ pub(crate) fn actual_request_key(request: &mlx_gen::gen_core::GenerationRequest)
     Sha256::digest(format!("{normalized:?}").as_bytes()).into()
 }
 
-fn request_key(candidate: &SdxlCandidate) -> String {
+/// Exact provider-owned key for auditing a campaign request. Grants no admission.
+pub fn request_key(candidate: &SdxlCandidate) -> String {
     let c = &candidate.context;
     format!(
         "{:?}:{:?}:{:?}:{:?}:{}:{}:{:?}:{:?}:{:?}",
@@ -225,7 +226,8 @@ impl SdxlAdmission {
     }
 }
 
-fn validate_actual(candidate: &SdxlCandidate) -> Result<()> {
+/// Validate the actual request binding before a campaign interprets any refusal.
+pub fn validate_actual(candidate: &SdxlCandidate) -> Result<()> {
     use mlx_gen::gen_core::{Conditioning, MemoryMode};
     let req = &candidate.request;
     let c = &candidate.context;

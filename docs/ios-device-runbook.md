@@ -81,7 +81,23 @@ directory and save the checkout SHA, OS, entitlement, conversion/source receipts
 and catalog JSON. Every selected case starts a fresh app process, before legacy
 LLM checks or kernel smokes consume memory. The default is admitted, never
 inherited `IOS_SMOKE_UNADMITTED`. Execute only after the relevant safety criteria
-are independently met.
+are independently met. The session builds/installs **once**, then launches one-shot
+cases without `--terminate-existing`. `--timeout-seconds` (default 1800) is passed
+to the device's cooperative `CancelFlag` deadline and controls host polling, not
+an unrelated 600-second media loop. After a case returns, the app writes its
+report and exits itself; the host verifies exit before advancing or finishing.
+On deadline/cancellation failure it records a harness failure and stops further
+launches if exit cannot be proved. It never hard-kills an active device render.
+Timed-out host commands own a new process group, so cargo/xcodebuild/devicectl
+children are terminated together rather than orphaned. Cleanup/exit verification
+has a separate bounded grace window. Launch exit codes are retained.
+
+`--memory-entitlement on|off` applies to the once-installed build. Every case
+requires a fresh matching `launch-memory.txt`; missing copies are failures.
+Each case/probe has its own host artifact directory alongside the JSONL file.
+`--max-cases` counts both renders and next-up probes; exhausted cells are explicit
+skips. Direct `run_smoke.sh --campaign-case` flags delegate to this same driver,
+never to the legacy reinstall/terminate-existing path.
 
 ```sh
 # One exact cold case (JSONL output must not already exist):
@@ -109,8 +125,15 @@ python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
 
 Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
 active/cache/active+cache peaks, MLX allocator peak, sampled Darwin
-`TASK_VM_INFO_REV1.phys_footprint` peak, and minimum
-`os_proc_available_memory()` headroom. **RSS and MLX active+cache are not kernel
+`TASK_VM_INFO.phys_footprint` peak (words 36–37), the kernel's exact lifetime
+`ledger_phys_footprint_peak` (words 42–43, requested count 44), and minimum
+`os_proc_available_memory()` headroom. Rows also carry SANA layout identity or
+SDXL profile/request key, selected strategy parameters, evidence revision,
+entitlement, refusal-only marker, per-launch nonce, compiled build SHA and iOS
+version. The nonce prevents a previous report with the same case/SHA from passing
+freshness checks. Render
+filenames are case-specific and registered in `renders.txt`, including each
+image of a real two-prompt batch. **RSS and MLX active+cache are not kernel
 physical footprint.** Sampling is 20 ms and can miss transients; these are
 observations, not an independent instantaneous working-set proof. Unavailable
 readings are null, never fabricated zeros. Statuses are `successful` (admitted
@@ -120,7 +143,12 @@ reports, timeout, malformed output or a terminated process cannot prove admissio
 refusal. Missing physical-footprint/headroom telemetry cannot yield production
 success. Noncompletion returns nonzero; a successful listing is not a render.
 The table includes the largest **admitted** completed edge per route/tier/mode/
-strategy and does not infer next-up refusal from termination or missing evidence.
+strategy, active/cache/combined columns and probe markers. Refusals have typed
+`refusal_kind`: `capacity`, `no_evidence`, `mode`, or `strategy`. Only an
+artifact-bound **capacity** refusal proves the next-up condition; missing
+footprint evidence, unsupported modes/rungs, malformed sources and termination
+never prove it. SANA profile errors and SDXL profile/request-binding errors are
+failures before admission, not capacity refusals.
 Commit the actual measured table only after the terminal campaign, not this
 harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
 readings remain unvalidated diagnostics, and no cap/table is invented here.
