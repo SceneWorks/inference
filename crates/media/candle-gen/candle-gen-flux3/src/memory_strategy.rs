@@ -39,6 +39,8 @@
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
+use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+use candle_gen::gen_core::flux3::quantization::DitFormat;
 use candle_gen::gen_core::flux3::{Flux3Config, GenerationResources, TextEncoderConfig};
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
@@ -48,7 +50,7 @@ use candle_gen::gen_core::{
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
     MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
-    Precision, ResidentRequestMemory, Result as CoreResult,
+    Precision, Quant, ResidentRequestMemory, Result as CoreResult,
 };
 
 use crate::model::MODEL_ID;
@@ -77,8 +79,9 @@ pub const TRANSFORMER_WINDOW_NOT_ENABLED: &str =
     "the FLUX 3 loader materializes the whole DiT at load; there is no deferred-materialization \
      load shape or block-window inference loader";
 
-/// The numeric tier a spec loads: the precision it names and no quantization (the loader refuses
-/// `LoadSpec::quantize`). No component is resident above the selected width.
+/// The numeric tier a spec loads: its precision and its DiT storage tier (`None` dense, or the
+/// GGML Q4_1 / Q8_0 package `LoadSpec::quantize` selects). No component is resident above the
+/// selected width; the encoder and autoencoder keep their own representations.
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
@@ -103,13 +106,35 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 /// Refuse the spec axes that would make a contract describe a load that cannot happen.
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
-    if spec.quantize.is_some() {
-        return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: the distilled route ships one dense tier; LoadSpec::quantize is refused \
-             at load (sc-26241), so there is no quantized memory contract"
-        )));
-    }
-    Ok(())
+    selected_storage(spec.quantize).map(|_| ())
+}
+
+/// The Candle native DiT storage a `LoadSpec::quantize` selects: dense, or the GGML Q4_1 / Q8_0
+/// packages converted from the ORIGINAL dense checkpoint. Publisher FP8R/NVFP4 have no Candle
+/// FLUX3 kernel on this build yet: a typed refusal, never a dequantized or dense substitute.
+pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
+    Ok(match quant {
+        None => NativeDitStorage::Publisher(DitFormat::Dense),
+        Some(Quant::Q4) => NativeDitStorage::GgmlQ4_1,
+        Some(Quant::Q8) => NativeDitStorage::GgmlQ8_0,
+        Some(other) => {
+            return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID}: LoadSpec::quantize {} has no Candle FLUX3 kernel on this build; the \
+                 native Candle tiers are q4 (GGML Q4_1) and q8 (GGML Q8_0) converted from the \
+                 original dense package",
+                other.key()
+            )))
+        }
+    })
+}
+
+/// The calibration identity of one numeric tier. A packed tier is a different stored footprint
+/// and a different GEMM, so it never inherits the dense tier's identity.
+pub fn tier_fingerprint(base: &str, quant: Option<Quant>) -> CoreResult<String> {
+    Ok(match selected_storage(quant)? {
+        NativeDitStorage::Publisher(DitFormat::Dense) => base.to_owned(),
+        storage => format!("{base}-{}", storage.key()?.replace('_', "-")),
+    })
 }
 
 // ================================================================================================
@@ -167,6 +192,57 @@ pub fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
             },
         )
     }))
+}
+
+/// Resident DiT bytes for an explicit native storage, as `Flux3Dit::load_with_storage` holds it:
+///
+/// * each packed target at its EXACT stored GGML bytes (the block scales live inside the blocks,
+///   so the header byte count is codes + scales, with no dequantized copy anywhere);
+/// * every other matrix at the compute width and every vector at f32, exactly as the dense path;
+/// * plus the bounded per-launch packed-GEMM transient (f32 activation copy, Q8 activation
+///   blocks, f32 output and its rounding), which the row-chunk planner caps at
+///   [`gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`] per projection call. Charged as
+///   that cap: an upper bound, not a measurement.
+pub fn native_dit_bytes(
+    weights: &Path,
+    precision: Precision,
+    storage: NativeDitStorage,
+    cfg: &gen_core::flux3::DitConfig,
+) -> CoreResult<u64> {
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        return dit_bytes(weights, precision);
+    }
+    let headers = safetensors_path_tensor_headers(weights)?;
+    storage.validate_headers(cfg, &headers)?;
+    let targets = storage.packed_targets(cfg)?;
+    let compute_width = compute_width(precision) as u64;
+    let weights = checked_sum(headers.iter().map(|header| {
+        if targets.contains(&header.name) {
+            Ok(header.data_bytes)
+        } else {
+            tensor_bytes(
+                header,
+                if header.shape.len() >= 2 {
+                    compute_width
+                } else {
+                    4
+                },
+            )
+        }
+    }))?;
+    weights
+        .checked_add(gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET)
+        .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: DiT byte overflow")))
+}
+
+fn apply_tier_fingerprint(
+    contract: &mut MemoryProviderContract,
+    quant: Option<Quant>,
+) -> CoreResult<()> {
+    if let Some(calibration) = &mut contract.calibration {
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, quant)?;
+    }
+    Ok(())
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
@@ -266,11 +342,6 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
     // loaded policy: warm for a `Resident` load, staged for a `Sequential` one.
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
-    // After the conditioning release the DiT + autoencoder are the one heavy bundle, through the
-    // decode.
-    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
-        gen_core::StagedWeightSchedule::TwoStage,
-    ));
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -337,6 +408,7 @@ pub fn weights_free_memory_strategy_contract(
             variables.push(MemoryFormulaVariable::BatchCount);
         }
     }
+    apply_tier_fingerprint(&mut contract, spec.quantize)?;
     Ok(contract)
 }
 
@@ -396,7 +468,19 @@ pub(crate) fn generation_contract(
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let transformer = dit_bytes(&resources.dit_weights(), precision)?;
+    let storage = selected_storage(spec.quantize)?;
+    let package_storage = NativeDitStorage::from_package(&resources.package_dir)?;
+    if package_storage != storage {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: selected {} but the package quantization marker is {}; install the \
+             exact requested native tier (no tier or model fallback)",
+            storage.key()?,
+            package_storage.key()?
+        )));
+    }
+    storage.validate_selection(spec.quantize, precision)?;
+    apply_tier_fingerprint(&mut contract, spec.quantize)?;
+    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
     let conditioning = text_encoder_bytes(
         &resources.text_encoder_dir,
         production_tower_dtype(&config.text_encoder)?.size_in_bytes() as u64,
@@ -479,7 +563,8 @@ pub(crate) fn upsampler_residency(
             gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
                 precomputed_in: gen_core::MemoryPhase::Conditioning,
                 retained_bytes: 0,
-                evidence: "candle_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \n                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                evidence: "candle_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
+                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
                     .into(),
             }
         }
@@ -626,15 +711,19 @@ pub(crate) fn registered_begin_request(
     ))
 }
 
-/// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,
-/// under both offload policies. No loader accepts a quantized tier or has a deferred load shape,
-/// so neither is witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the route witnesses: the dense tier and the two native GGML tiers
+/// (q4 = Q4_1, q8 = Q8_0), eagerly materialized, under both offload policies. NVFP4 and the
+/// deferred load shape have no Candle FLUX3 loader, so neither is witnessed.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::candle_memory_contract_surface_specs()
         .into_iter()
         .filter(|surface| {
-            surface.selector.tier == MemoryContractSurfaceTier::Bf16
-                && surface.selector.load_shape == LoadShape::EagerMaterialization
+            matches!(
+                surface.selector.tier,
+                MemoryContractSurfaceTier::Bf16
+                    | MemoryContractSurfaceTier::Q4
+                    | MemoryContractSurfaceTier::Q8
+            ) && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
 }
@@ -847,17 +936,32 @@ mod tests {
         let surfaces = memory_contract_surface_specs();
         assert_eq!(
             surfaces.len(),
-            2,
-            "one dense tier, eager, x 2 offload policies"
+            6,
+            "dense + GGML q4/q8 tiers, eager, x 2 offload policies"
         );
-        let selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
-        assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
+        let mut selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
+        selectors.sort();
+        assert_eq!(
+            selectors,
+            [
+                "bf16:resident:eager",
+                "bf16:sequential:eager",
+                "q4:resident:eager",
+                "q4:sequential:eager",
+                "q8:resident:eager",
+                "q8:sequential:eager"
+            ]
+        );
         for surface in &surfaces {
             let contract = weights_free_memory_strategy_contract(MODEL_ID, &surface.spec).unwrap();
             gen_core_testkit::memory_strategy_conformance(&contract);
             assert_eq!(contract.provider_id, MODEL_ID);
             let calibration = contract.calibration.as_ref().unwrap();
-            assert_eq!(calibration.fingerprint, MEMORY_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                calibration.fingerprint,
+                tier_fingerprint(MEMORY_CALIBRATION_FINGERPRINT, surface.spec.quantize).unwrap()
+            );
+            gen_core::validate_calibration_fingerprint(&calibration.fingerprint).unwrap();
             assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
             let declared: Vec<&str> = MemoryStrategy::ALL
                 .into_iter()
@@ -905,7 +1009,8 @@ mod tests {
             moe_expert: None,
         });
         for spec in [
-            sentinel().with_quant(Quant::Q4),
+            sentinel().with_quant(Quant::Nvfp4),
+            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
             adapters,
         ] {

@@ -39,6 +39,7 @@
 
 pub mod adapters;
 pub mod autoencoder;
+pub mod convert;
 pub mod dit;
 pub mod memory_strategy;
 pub mod model;

@@ -23,6 +23,7 @@
 //! what a bf16 GEMM computes (f32 accumulation, one rounding of the result) — the same rule the
 //! sibling `candle-gen-iris` applies ([`gemm_dtype`]).
 
+use candle_gen::candle_core::quantized::QMatMul;
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
@@ -109,6 +110,47 @@ pub struct Loader<'a> {
     pub vb: &'a VarBuilder<'static>,
     pub compute: DType,
     pub device: &'a Device,
+    /// Native GGML targets of a converted package; `None` for the dense package.
+    pub packed: Option<&'a PackedSource>,
+}
+
+/// The raw GGML rows of a converted package's packed targets, read straight into a `QTensor`
+/// (never through the compute-dtype `VarBuilder`, which would cast the code bytes as numbers).
+pub struct PackedSource {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) targets: std::collections::BTreeSet<String>,
+    pub(crate) ggml: candle_gen::candle_core::quantized::GgmlDType,
+    pub(crate) storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+}
+
+impl PackedSource {
+    /// The GGML `storage` rows of `path`; `targets` is the storage's exact packed partition.
+    pub fn new(
+        path: &std::path::Path,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        targets: std::collections::BTreeSet<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            targets,
+            ggml: crate::convert::ggml_dtype(storage)?,
+            storage,
+        })
+    }
+
+    /// The raw U8 block rows of one packed target, through the audited loader seam.
+    fn rows(&self, key: &str) -> Result<(Vec<u8>, usize, usize)> {
+        let t = candle_gen::load_one_tensor(&self.path, key, DType::U8, &Device::Cpu, "flux3")?;
+        let (n, bytes_per_row) = t.dims2()?;
+        let block = self.ggml.type_size();
+        if bytes_per_row % block != 0 {
+            return Err(Error::Msg(format!(
+                "flux3: {key} rows are {bytes_per_row} B, not whole {block}-byte GGML blocks"
+            )));
+        }
+        let k = bytes_per_row / block * self.ggml.block_size();
+        Ok((t.flatten_all()?.to_vec1::<u8>()?, n, k))
+    }
 }
 
 impl Loader<'_> {
@@ -132,9 +174,14 @@ impl Loader<'_> {
         to(&self.take(key)?, DType::F32)
     }
 
-    /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`), stored in the compute dtype.
+    /// A bias-less `nn.Linear` (`{prefix}.weight`, `[out, in]`). Dense packages store it in the
+    /// compute dtype; a converted package's packed target is held as its GGML `QTensor`.
     pub fn linear(&self, prefix: &str) -> Result<Linear> {
-        let weight = to(&self.take(&format!("{prefix}.weight"))?, self.compute)?;
+        let key = format!("{prefix}.weight");
+        if let Some(packed) = self.packed.filter(|p| p.targets.contains(&key)) {
+            return Linear::from_ggml_rows(packed, &key, self.compute, self.device);
+        }
+        let weight = to(&self.take(&key)?, self.compute)?;
         if weight.rank() != 2 {
             return Err(Error::Msg(format!(
                 "flux3: {prefix}.weight is rank {}, a Linear needs [out, in]",
@@ -142,15 +189,30 @@ impl Loader<'_> {
             )));
         }
         Ok(Linear {
-            weight,
+            base: Base::Dense(weight),
             adapted: None,
         })
     }
 }
 
-/// `nn.Linear(bias=False)`: `x · Wᵀ` in the compute dtype (the weight's).
+enum Base {
+    Dense(Tensor),
+    /// A native GGML projection. The `QMatMul` is constructed DIRECTLY as its `QTensor` arm:
+    /// `QMatMul::from_arc` would honour `CANDLE_DEQUANTIZE_ALL[_F16]` and silently swap in a
+    /// dense weight. Activations stay row-independent, so row chunking is exact.
+    Ggml {
+        matmul: QMatMul,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        out: usize,
+        input: usize,
+        compute: DType,
+        device: Device,
+    },
+}
+
+/// `nn.Linear(bias=False)`: `x · Wᵀ` in the compute dtype.
 pub struct Linear {
-    weight: Tensor,
+    base: Base,
     adapted: Option<candle_gen::quant::AdaptLinear>,
 }
 
@@ -158,25 +220,105 @@ impl Linear {
     /// A linear layer from an already-shaped `[out, in]` weight, stored as given.
     pub fn from_weight(weight: Tensor) -> Self {
         Self {
-            weight,
+            base: Base::Dense(weight),
             adapted: None,
         }
     }
 
-    /// `x` of any leading shape `[.., in]` → `[.., out]` in the weight's dtype.
+    fn from_ggml_rows(
+        packed: &PackedSource,
+        key: &str,
+        compute: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let (bytes, out, input) = packed.rows(key)?;
+        packed
+            .storage
+            .check_contraction_width(key, input)
+            .map_err(|e| Error::Unsupported(e.to_string()))?;
+        let qtensor = candle_gen::candle_core::quantized::ggml_file::qtensor_from_ggml(
+            packed.ggml,
+            &bytes,
+            vec![out, input],
+            device,
+        )?;
+        Ok(Self {
+            base: Base::Ggml {
+                matmul: QMatMul::QTensor(std::sync::Arc::new(qtensor)),
+                storage: packed.storage,
+                out,
+                input,
+                compute,
+                device: device.clone(),
+            },
+            adapted: None,
+        })
+    }
+
+    /// A packed projection over an in-memory `QTensor` (tests and converters).
+    pub fn from_packed_qtensor(
+        qtensor: candle_gen::candle_core::quantized::QTensor,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        compute: DType,
+    ) -> Result<Self> {
+        let (out, input) = qtensor.shape().dims2()?;
+        storage
+            .check_contraction_width("packed projection", input)
+            .map_err(|e| Error::Unsupported(e.to_string()))?;
+        let device = qtensor.device();
+        Ok(Self {
+            base: Base::Ggml {
+                matmul: QMatMul::QTensor(std::sync::Arc::new(qtensor)),
+                storage,
+                out,
+                input,
+                compute,
+                device,
+            },
+            adapted: None,
+        })
+    }
+
+    /// `x` of any leading shape `[.., in]` → `[.., out]` in the compute dtype.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = self.weight.dtype();
+        let dtype = self.dtype();
         let x = to(x, dtype)?;
         let dims = x.dims().to_vec();
         let (last, lead) = dims
             .split_last()
             .ok_or_else(|| Error::Msg("flux3: a Linear input needs at least one axis".into()))?;
         let rows: usize = lead.iter().product();
-        let out_dim = self.weight.dim(0)?;
+        let (out_dim, _) = self.out_in()?;
         let flat = x.reshape((rows, *last))?;
-        let gemm = gemm_dtype(&self.weight);
-        let y = to(&flat, gemm)?.matmul(&to(&self.weight, gemm)?.t()?)?;
-        let y = to(&y, dtype)?;
+        let gemm = kernel_dtype(flat.device(), dtype);
+        let y = match &self.base {
+            Base::Dense(weight) => {
+                let y = to(&flat, gemm)?.matmul(&to(weight, gemm)?.t()?)?;
+                to(&y, dtype)?
+            }
+            Base::Ggml {
+                matmul,
+                storage,
+                out,
+                input,
+                compute,
+                ..
+            } => {
+                if *last != *input {
+                    return Err(Error::Msg(format!(
+                        "flux3: packed Linear expects [.., {input}], got [.., {last}]"
+                    )));
+                }
+                packed_forward(
+                    matmul,
+                    *storage,
+                    &flat,
+                    *out,
+                    *compute,
+                    candle_gen::gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
+                )?
+            }
+        };
         let y = if let Some(adapted) = &self.adapted {
             adapted.apply_residuals(&to(&flat, gemm)?, y)?
         } else {
@@ -187,25 +329,43 @@ impl Linear {
         Ok(y.reshape(shape)?)
     }
 
-    /// Attach a validated bottleneck residual without mutating the base weight.
-    pub fn push_lora(&mut self, down: Tensor, up: Tensor, scale: f64) -> Result<()> {
+    fn adapted_mut(&mut self) -> Result<&mut candle_gen::quant::AdaptLinear> {
         if self.adapted.is_none() {
             let (output, input) = self.out_in()?;
-            self.adapted = Some(candle_gen::quant::AdaptLinear::from_dense(
-                candle_gen::candle_nn::Linear::new(self.weight.clone(), None),
-                input,
-                output,
-            ));
+            self.adapted = Some(match &self.base {
+                Base::Dense(weight) => candle_gen::quant::AdaptLinear::from_dense(
+                    candle_gen::candle_nn::Linear::new(weight.clone(), None),
+                    input,
+                    output,
+                ),
+                // Residual storage only: the packed base is never dequantized or folded.
+                Base::Ggml {
+                    compute, device, ..
+                } => candle_gen::quant::AdaptLinear::for_external_base(
+                    input, output, *compute, device,
+                )?,
+            });
         }
-        self.adapted
-            .as_mut()
-            .expect("initialized")
+        Ok(self.adapted.as_mut().expect("initialized"))
+    }
+
+    /// Attach a validated bottleneck residual without mutating the base weight. On a packed
+    /// base it rides as an additive residual over the strict packed GEMM output.
+    pub fn push_lora(&mut self, down: Tensor, up: Tensor, scale: f64) -> Result<()> {
+        self.adapted_mut()?
             .push_lora_checked(down.t()?.contiguous()?, up.t()?.contiguous()?, scale)
     }
 
     /// Training-only storage-sharing factors. Unlike inference's prepared-factor cache,
     /// `TrainableLora` reads the Var leaves on EVERY forward and transposes inside that graph.
     pub fn push_trainable_lora(&mut self, down: Tensor, up: Tensor, scale: f64) -> Result<()> {
+        if self.is_quantized() {
+            return Err(Error::Unsupported(
+                "flux3 training: a packed GGML base projection has no differentiable dense weight; \
+                 train on the original dense package"
+                    .into(),
+            ));
+        }
         let (output, input) = self.out_in()?;
         let rank = down.dim(0)?;
         if down.dims() != [rank, input]
@@ -217,31 +377,77 @@ impl Linear {
                 "flux3 training: invalid trainable LoRA shape/gain".into(),
             ));
         }
-        if self.adapted.is_none() {
-            self.adapted = Some(candle_gen::quant::AdaptLinear::from_dense(
-                candle_gen::candle_nn::Linear::new(self.weight.clone(), None),
-                input,
-                output,
-            ));
-        }
-        self.adapted
-            .as_mut()
-            .expect("initialized")
-            .push_trainable_lora(down, up, scale);
+        self.adapted_mut()?.push_trainable_lora(down, up, scale);
         Ok(())
     }
 
-    /// `[out, in]` of the weight.
+    /// `[out, in]` of the projection.
     pub fn out_in(&self) -> Result<(usize, usize)> {
-        Ok(self.weight.dims2()?)
+        match &self.base {
+            Base::Dense(weight) => Ok(weight.dims2()?),
+            Base::Ggml { out, input, .. } => Ok((*out, *input)),
+        }
     }
 
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
+    /// The dense weight. A packed base has none; it is never dequantized to answer this.
+    pub fn weight(&self) -> Result<&Tensor> {
+        match &self.base {
+            Base::Dense(weight) => Ok(weight),
+            Base::Ggml { storage, .. } => Err(Error::Unsupported(format!(
+                "flux3: {} projection has no dense weight; dequantizing it is refused",
+                storage
+                    .key()
+                    .map_err(|e| Error::Unsupported(e.to_string()))?
+            ))),
+        }
     }
 
+    /// Whether the base is held in a packed native format.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self.base, Base::Ggml { .. })
+    }
+
+    /// The compute (input and output) dtype.
     pub fn dtype(&self) -> DType {
-        self.weight.dtype()
+        match &self.base {
+            Base::Dense(weight) => weight.dtype(),
+            Base::Ggml { compute, .. } => *compute,
+        }
+    }
+}
+
+/// The strict packed GEMM: the compute-dtype rows widened exactly to f32 (the quantized kernels'
+/// input dtype), run in planned row chunks, and rounded ONCE to the compute dtype.
+fn packed_forward(
+    matmul: &QMatMul,
+    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    flat: &Tensor,
+    out: usize,
+    compute: DType,
+    budget: u64,
+) -> Result<Tensor> {
+    use candle_gen::candle_core::Module;
+    use candle_gen::gen_core::flux3::packed_gemm;
+    let (rows, input) = flat.dims2()?;
+    let per_row =
+        packed_gemm::transient_bytes_per_row(storage, input, out, compute.size_in_bytes() as u64)
+            .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let plan = packed_gemm::plan_row_chunks(rows, input, out, per_row, budget)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let wide = to(flat, DType::F32)?;
+    let mut parts = Vec::with_capacity(plan.len());
+    for (start, len) in plan {
+        let chunk = if len == rows {
+            wide.contiguous()?
+        } else {
+            wide.narrow(0, start, len)?.contiguous()?
+        };
+        parts.push(to(&matmul.forward(&chunk)?, compute)?);
+    }
+    match parts.len() {
+        0 => Ok(Tensor::zeros((0, out), compute, flat.device())?),
+        1 => Ok(parts.pop().expect("one chunk")),
+        _ => Ok(Tensor::cat(&parts, 0)?),
     }
 }
 
@@ -428,6 +634,183 @@ pub fn expect_shape(name: &str, a: &Tensor, want: &[usize]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
+    use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+
+    fn seeded(n: usize, k: usize, salt: f32) -> Tensor {
+        let data: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.37 + salt).sin() * 0.8 + (i as f32 * 0.011).cos() * 0.2)
+            .collect();
+        Tensor::from_vec(data, (n, k), &Device::Cpu).unwrap()
+    }
+
+    fn peak_relative(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.to_dtype(DType::F32).unwrap();
+        let b = b.to_dtype(DType::F32).unwrap();
+        let diff = (&a - &b).unwrap().abs().unwrap().max_all().unwrap();
+        let peak = b.abs().unwrap().max_all().unwrap();
+        diff.to_scalar::<f32>().unwrap() / peak.to_scalar::<f32>().unwrap()
+    }
+
+    fn packed(w: &Tensor, storage: NativeDitStorage, compute: DType) -> (Linear, Tensor) {
+        let ggml = crate::convert::ggml_dtype(storage).unwrap();
+        let q = QTensor::quantize(w, ggml).unwrap();
+        let dequant = QTensor::dequantize(&q, &Device::Cpu).unwrap();
+        (
+            Linear::from_packed_qtensor(q, storage, compute).unwrap(),
+            dequant,
+        )
+    }
+
+    /// The packed GEMM is the dense GEMM over the dequantized weight up to the dynamic Q8
+    /// activation quantization the GGML kernels apply — and returns the compute dtype.
+    ///
+    /// *Mutations that red this:* skipping the f32 widening (CPU qmatmul rejects bf16), dropping
+    /// the final rounding to the compute dtype, or transposing the packed weight.
+    #[test]
+    fn packed_forward_matches_the_dense_dequantized_reference() {
+        let (n, k) = (48, 128);
+        let w = seeded(n, k, 0.3);
+        let x = seeded(7, k, 1.7).reshape((1, 7, k)).unwrap();
+        for storage in [NativeDitStorage::GgmlQ4_1, NativeDitStorage::GgmlQ8_0] {
+            for compute in [DType::F32, DType::BF16] {
+                let (linear, dequant) = packed(&w, storage, compute);
+                let y = linear.forward(&x).unwrap();
+                assert_eq!(y.dims(), &[1, 7, n]);
+                assert_eq!(y.dtype(), compute);
+                let xr = to(&x, compute).unwrap().to_dtype(DType::F32).unwrap();
+                let reference = xr
+                    .reshape((7, k))
+                    .unwrap()
+                    .matmul(&dequant.t().unwrap())
+                    .unwrap()
+                    .reshape((1, 7, n))
+                    .unwrap();
+                let err = peak_relative(&y, &reference);
+                assert!(err < 0.02, "{storage:?}/{compute:?}: {err}");
+                assert!(linear.is_quantized());
+                assert!(linear.weight().is_err(), "no dequantized dense weight");
+                assert_eq!(linear.out_in().unwrap(), (n, k));
+            }
+        }
+        // Q4_1 at an odd block count is refused, never run through the paired CPU kernel.
+        let odd = QTensor::quantize(&seeded(8, 96, 0.1), GgmlDType::Q4_1).unwrap();
+        assert!(Linear::from_packed_qtensor(odd, NativeDitStorage::GgmlQ4_1, DType::F32).is_err());
+    }
+
+    /// Row chunking changes no bit: every row's activation quantization is independent.
+    #[test]
+    fn row_chunked_packed_forward_is_bit_identical() {
+        let w = seeded(32, 64, 0.9);
+        let x = seeded(10, 64, 2.1);
+        for storage in [NativeDitStorage::GgmlQ4_1, NativeDitStorage::GgmlQ8_0] {
+            let (linear, _) = packed(&w, storage, DType::F32);
+            let Base::Ggml { matmul, .. } = &linear.base else {
+                panic!("packed base")
+            };
+            let per_row = candle_gen::gen_core::flux3::packed_gemm::transient_bytes_per_row(
+                storage, 64, 32, 4,
+            )
+            .unwrap();
+            let whole = packed_forward(matmul, storage, &x, 32, DType::F32, u64::MAX).unwrap();
+            let chunked = packed_forward(matmul, storage, &x, 32, DType::F32, per_row * 3).unwrap();
+            let a = whole.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(a, b);
+            assert!(packed_forward(matmul, storage, &x, 32, DType::F32, per_row - 1).is_err());
+        }
+    }
+
+    /// LoRA on a packed base is an additive residual over the strict packed output; the base is
+    /// never folded, dequantized or trained.
+    #[test]
+    fn lora_on_a_packed_base_is_an_exact_additive_residual() {
+        let (n, k, r) = (32, 64, 4);
+        let w = seeded(n, k, 0.5);
+        let x = seeded(3, k, 0.2);
+        let down = seeded(r, k, 3.3);
+        let up = seeded(n, r, 4.4);
+        let (mut linear, _) = packed(&w, NativeDitStorage::GgmlQ8_0, DType::F32);
+        let base = linear.forward(&x).unwrap();
+        linear.push_lora(down.clone(), up.clone(), 0.75).unwrap();
+        let adapted = linear.forward(&x).unwrap();
+        let residual = (x
+            .matmul(&down.t().unwrap())
+            .unwrap()
+            .matmul(&up.t().unwrap())
+            .unwrap()
+            * 0.75)
+            .unwrap();
+        let want = (&base + &residual).unwrap();
+        assert!(peak_relative(&adapted, &want) < 1e-5);
+        assert!(linear.is_quantized(), "the base stays packed");
+        assert!(matches!(
+            linear.push_trainable_lora(down, up, 1.0),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(linear
+            .push_lora(seeded(r, k + 32, 0.0), seeded(n, r, 0.0), 1.0)
+            .is_err());
+    }
+
+    /// Source guard (sc-26241): nothing in this workspace may flip candle's global DMMV switch
+    /// (`FORCE_DMMV` dequantizes whole weights on CUDA) or route a FLUX3 packed weight through a
+    /// constructor that honours `CANDLE_DEQUANTIZE_ALL`. The pieces are joined at run time so this
+    /// test's own source never matches.
+    #[test]
+    fn no_dmmv_switch_or_dequantizing_qmatmul_constructor_is_reachable() {
+        let force = ["set_force", "_dmmv("].concat();
+        let env = ["CANDLE_DEQUANTIZE", "_ALL"].concat();
+        let banned_here = [
+            ["QMatMul::from", "_arc("].concat(),
+            ["QMatMul::from", "_qtensor("].concat(),
+            [".dequantize", "("].concat(),
+            [".dequantize_f16", "("].concat(),
+            [".forward_via", "_f16("].concat(),
+        ];
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut stack = vec![crates.clone()];
+        let mut scanned = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if name != "vendor" && name != "target" && !name.starts_with('.') {
+                        stack.push(path);
+                    }
+                } else if name.ends_with(".rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    scanned += 1;
+                    assert!(
+                        !text.contains(&force),
+                        "{} flips FORCE_DMMV",
+                        path.display()
+                    );
+                    assert!(
+                        !text.contains(&format!("set_var(\"{env}")),
+                        "{} sets {env}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 100, "the scan must cover the workspace crates");
+        let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(&own).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for banned in &banned_here {
+                    assert!(
+                        !text.contains(banned.as_str()),
+                        "{} uses {banned}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn promotion_follows_torch() {

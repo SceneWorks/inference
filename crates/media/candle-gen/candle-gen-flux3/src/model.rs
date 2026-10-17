@@ -6,6 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
+use candle_gen::gen_core::flux3::artifacts::{ArtifactBackend, NativeDitStorage};
+use candle_gen::gen_core::flux3::conversion::ComponentRole;
+use candle_gen::gen_core::flux3::quantization::DitFormat;
 use candle_gen::gen_core::flux3::{
     prompt_seed, validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
     DISTILLED_MODEL_ID, FAMILY, SAMPLERS, TEXT_ENCODER_COMPONENT,
@@ -79,8 +82,11 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: MAX_SIZE,
             max_count: MAX_COUNT,
             mac_only: false,
-            // Quantized variants are sc-26241.
-            supported_quants: &[],
+            // Native Candle tiers (sc-26241): q4 = GGML Q4_1 and q8 = GGML Q8_0 packages converted
+            // from the ORIGINAL dense checkpoint (`crate::convert`). Distinct from the MLX twin's
+            // affine q4/q8: no cross-backend artifact reuse. Publisher FP8R/NVFP4 have no Candle
+            // FLUX3 kernel on this build and are therefore not advertised.
+            supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
             supports_sequential_offload: true,
             // The optional native VLM resolves the effective caption before encoding.
             supports_prompt_enhancement: true,
@@ -178,10 +184,51 @@ pub fn load_autoencoder(path: &Path, device: &Device) -> Result<Flux3AutoEncoder
     Flux3AutoEncoder::load(path, device)
 }
 
+/// A native package loads only with its conversion receipt: the owned outputs full-hash
+/// verified, the receipt's algorithm identical to the declared storage, and every EXTERNAL
+/// component full-hash verified where this load actually reads it (the resolved text-encoder
+/// directory and autoencoder file). A mismatch is refused before any weight is read.
+fn verify_native_package(
+    package_dir: &Path,
+    storage: NativeDitStorage,
+    config: &Flux3Config,
+    resources: &GenerationResources,
+) -> Result<()> {
+    let receipt = gen_core::flux3::conversion::open_conversion(package_dir)?;
+    let (algorithm, bits, group_size) = storage.receipt_algorithm()?;
+    if receipt.algorithm != algorithm || receipt.bits != bits || receipt.group_size != group_size {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: {} receipt records {} (bits {:?}, group {:?}), not the declared {}",
+            package_dir.display(),
+            receipt.algorithm,
+            receipt.bits,
+            receipt.group_size,
+            storage.key()?
+        )));
+    }
+    let te_prefix = format!("{}/", config.text_encoder.path);
+    receipt.verify_external_with(|role, path| match role {
+        ComponentRole::TextEncoder => path
+            .strip_prefix(&te_prefix)
+            .map(|rest| resources.text_encoder_dir.join(rest))
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(format!("{MODEL_ID}: text-encoder path {path}"))
+            }),
+        ComponentRole::Autoencoder if path == config.vae.path => {
+            Ok(resources.autoencoder_file.clone())
+        }
+        other => Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: external {} file {path} has no resolved load location",
+            other.name()
+        ))),
+    })?;
+    Ok(())
+}
+
 pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
     crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
-    let refusals: [(&str, bool); 7] = [
-        ("quantize", spec.quantize.is_some()),
+    crate::memory_strategy::selected_storage(spec.quantize)?;
+    let refusals: [(&str, bool); 6] = [
         ("text_encoder", spec.text_encoder.is_some()),
         ("control", spec.control.is_some()),
         ("extra_controls", !spec.extra_controls.is_empty()),
@@ -193,8 +240,7 @@ pub(crate) fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
         if set {
             return Err(Error::Unsupported(format!(
                 "{MODEL_ID}: LoadSpec::{field} is not supported by the distilled FLUX 3 route \
-                 (quantized variants are sc-26241, LoRA is sc-26239; the text encoder is the \
-                 '{TEXT_ENCODER_COMPONENT}' component)"
+                 (the text encoder is the '{TEXT_ENCODER_COMPONENT}' component)"
             )));
         }
     }
@@ -228,7 +274,24 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         }
     };
     let config = Flux3Config::from_dir(&package_dir)?;
-    config.validate_supported()?;
+    let storage = crate::memory_strategy::selected_storage(spec.quantize)?;
+    let package_storage = NativeDitStorage::from_package(&package_dir)?;
+    if package_storage != storage {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: selected {} but the quantization marker of {} is {}; install or \
+             convert the exact requested native tier (no tier or model fallback)",
+            storage.key()?,
+            package_dir.display(),
+            package_storage.key()?
+        )));
+    }
+    storage.validate_selection(spec.quantize, spec.precision)?;
+    let dense = storage == NativeDitStorage::Publisher(DitFormat::Dense);
+    if dense {
+        config.validate_supported()?;
+    } else {
+        config.validate_native_storage_graph()?;
+    }
     if config.dit.flow_map == base {
         return Err(Error::Unsupported(format!("flux3: selected {} route but package {} has flow_map={}; select the matching CFG checkpoint or distilled flow-map route", if base { "base CFG" } else { "distilled flow-map" }, config.model, config.dit.flow_map)));
     }
@@ -246,6 +309,9 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         .collect::<gen_core::Result<Vec<_>>>()?;
 
     let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
+    if !dense {
+        verify_native_package(&package_dir, storage, &config, &resources)?;
+    }
     // Priced from the resources' tensor headers BEFORE any weight is read, so a spec the
     // registration refuses is the same refusal through `load` on every offload policy
     // (`Sequential` defers every component to the first render).
@@ -259,6 +325,18 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
          NVIDIA CUDA device and driver, or the native MLX backend on Apple Silicon"
     ))
     })?;
+    if !dense {
+        // GGML blocks run on the Candle CPU and CUDA quantized kernels only (compute capability
+        // is irrelevant to them); Metal is a typed refusal, never a dequantized substitute.
+        let backend = if device.is_cpu() {
+            ArtifactBackend::CandleCpu
+        } else if device.is_metal() {
+            ArtifactBackend::CandleMetal
+        } else {
+            ArtifactBackend::CandleCuda { major: 0, minor: 0 }
+        };
+        storage.check_backend(backend)?;
+    }
     let compute = compute_dtype(spec);
     let te_dir = resources.text_encoder_dir.clone();
     let te_cfg = config.text_encoder.clone();
@@ -278,7 +356,13 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         },
         move |_use_pid| {
             fenced_image_load(&heavy_device, || {
-                let mut dit = load_dit(&dit_path, &heavy_cfg, compute, &heavy_device)?;
+                let mut dit = Flux3Dit::load_with_storage(
+                    &dit_path,
+                    &heavy_cfg.dit,
+                    compute,
+                    &heavy_device,
+                    storage,
+                )?;
                 crate::adapters::install(&mut dit, &adapters)?;
                 let ae = load_autoencoder(&ae_path, &heavy_device)?;
                 if ae.latent_channels() != heavy_cfg.dit.image_in_channels {
@@ -661,6 +745,116 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::WeightsSource;
 
+    fn render(model: &Flux3Klein) -> Vec<u8> {
+        let req = GenerationRequest {
+            prompt: "a red fox in the snow".into(),
+            width: 64,
+            height: 64,
+            steps: Some(2),
+            seed: Some(7),
+            ..Default::default()
+        };
+        match model.generate_impl(&req, &mut |_| {}).unwrap().output {
+            Some(GenerationOutput::Images(images)) => images[0].pixels.clone(),
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    fn mean_abs(a: &[u8], b: &[u8]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    /// A converted GGML package loads ONLY as its exact tier, with its external encoder/AE
+    /// full-hash verified where they are read, and renders through the packed GEMM close to the
+    /// dense package (same steps, size and seed — no quality setting changed).
+    ///
+    /// *Mutations that red this:* accepting a dense request on a packed package (or another
+    /// tier), skipping `verify_native_package`, or loading packed targets as dense.
+    #[test]
+    fn converted_ggml_package_loads_only_as_its_exact_tier_and_renders_close_to_dense() {
+        use gen_core::flux3::AUTOENCODER_COMPONENT;
+        let dir = tempfile::tempdir().unwrap();
+        let source = crate::convert::tests::source_copy(dir.path());
+        let dense = load_inner(
+            &LoadSpec::new(WeightsSource::Dir(source.root.clone())),
+            false,
+        )
+        .unwrap();
+        let dense_pixels = render(&dense);
+        let packed_spec = |root: &Path, quant: Option<gen_core::Quant>, ae: &Path| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+            spec.quantize = quant;
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(source.root.join("text_encoder")),
+            );
+            spec.components.insert(
+                AUTOENCODER_COMPONENT.into(),
+                WeightsSource::File(ae.to_path_buf()),
+            );
+            spec
+        };
+        let source_ae = source.root.join("ae.safetensors");
+        let mut diffs = Vec::new();
+        for (storage, quant) in [
+            (NativeDitStorage::GgmlQ8_0, gen_core::Quant::Q8),
+            (NativeDitStorage::GgmlQ4_1, gen_core::Quant::Q4),
+        ] {
+            let out = dir.path().join(storage.key().unwrap());
+            crate::convert::convert_ggml(&source, storage, &out, &gen_core::CancelFlag::new())
+                .unwrap();
+            let model = load_inner(&packed_spec(&out, Some(quant), &source_ae), false).unwrap();
+            let pixels = render(&model);
+            assert_ne!(
+                pixels, dense_pixels,
+                "{storage:?}: the packed GEMM must actually run"
+            );
+            diffs.push(mean_abs(&pixels, &dense_pixels));
+            assert!(
+                load_inner(&packed_spec(&out, None, &source_ae), false).is_err(),
+                "a dense request never reads packed codes"
+            );
+            let other = if quant == gen_core::Quant::Q8 {
+                gen_core::Quant::Q4
+            } else {
+                gen_core::Quant::Q8
+            };
+            assert!(
+                load_inner(&packed_spec(&out, Some(other), &source_ae), false).is_err(),
+                "no cross-tier load"
+            );
+            let tampered = dir
+                .path()
+                .join(format!("{}-ae.safetensors", storage.key().unwrap()));
+            let mut bytes = std::fs::read(&source_ae).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&tampered, bytes).unwrap();
+            assert!(
+                load_inner(&packed_spec(&out, Some(quant), &tampered), false).is_err(),
+                "an external AE that is not the converted source is refused"
+            );
+        }
+        eprintln!(
+            "mean |packed - dense| per u8 channel: q8 {:.3}, q4 {:.3}",
+            diffs[0], diffs[1]
+        );
+        assert!(diffs[0] < 12.0 && diffs[1] < 32.0, "{diffs:?}");
+        assert!(
+            load_inner(
+                &LoadSpec::new(WeightsSource::Dir(source.root.clone()))
+                    .with_quant(gen_core::Quant::Q8),
+                false
+            )
+            .is_err(),
+            "a q8 request never quantizes a dense package at load"
+        );
+    }
+
     #[test]
     fn actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -989,7 +1183,7 @@ mod tests {
     fn unsupported_spec_fields_are_typed_refusals() {
         let sentinel = || LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()));
         let mut quant = sentinel();
-        quant.quantize = Some(gen_core::Quant::Q4);
+        quant.quantize = Some(gen_core::Quant::Nvfp4);
         let mut pid = sentinel();
         pid.pid = Some(gen_core::PidWeights {
             checkpoint: WeightsSource::File("/pid-not-on-disk.safetensors".into()),
