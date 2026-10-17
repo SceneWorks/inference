@@ -140,13 +140,15 @@ mod tests {
         let sink = reports.clone();
         let req = GenerationRequest {
             prompt: "  original caption\n".into(),
-            prompt_enhancement: PromptEnhancementSink::new(move |r| sink.lock().unwrap().push(r)),
+            prompt_enhancement: PromptEnhancementSink::new(move |r| {
+                candle_gen::lock_recover(&sink).push(r)
+            }),
             ..Default::default()
         };
         let outcome =
             effective_prompt(None, &req, &mut |_| panic!("bypass must not infer")).unwrap();
         assert_eq!(outcome.caption, req.prompt);
-        let recorded = reports.lock().unwrap();
+        let recorded = candle_gen::lock_recover(&reports);
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].effective_prompt, req.prompt);
         assert_eq!(recorded[0].outcome, PromptEnhancementOutcome::Absent);
