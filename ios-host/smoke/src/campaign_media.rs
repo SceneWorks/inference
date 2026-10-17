@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 #[path = "campaign_support.rs"]
 mod support;
 use support::{case_timeout, classify_admission_error, hex, Deadline};
+#[path = "campaign_primitive.rs"]
+mod primitive;
 
 #[cfg(test)]
 #[path = "campaign_admission_tests.rs"]
@@ -419,7 +421,7 @@ fn phys_footprint() -> Option<(u64, Option<u64>)> {
 
 pub fn report(value: &str, diagnostic: bool) -> String {
     let started = Instant::now();
-    let result = (|| -> Result<Value, String> {
+    let model_case = || -> Result<Value, String> {
         let case = Case::parse(value)?;
         let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
         if !campaign::enumerate(&surfaces(catalog.media()))
@@ -461,45 +463,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             std::fs::write(docs.join(super::RENDERS_MANIFEST), "").map_err(|e| e.to_string())?;
         }
         mlx_rs::memory::reset_peak_memory();
-        let extrema = Arc::new(Mutex::new((
-            0usize,
-            0usize,
-            0usize,
-            None::<u64>,
-            None::<f64>,
-            None::<u64>,
-        )));
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let samples = Arc::clone(&extrema);
-        let sample = move || {
-            if let Ok(mut e) = samples.lock() {
-                e.0 = e.0.max(mlx_rs::memory::get_active_memory());
-                e.1 = e.1.max(mlx_rs::memory::get_cache_memory());
-                e.2 = e
-                    .2
-                    .max(mlx_rs::memory::get_active_memory() + mlx_rs::memory::get_cache_memory());
-                if let Some((current, peak)) = phys_footprint() {
-                    e.3 = Some(e.3.unwrap_or(0).max(current));
-                    if let Some(peak) = peak {
-                        e.5 = Some(e.5.unwrap_or(0).max(peak));
-                    }
-                }
-                if let Some(a) = super::available_memory_mib() {
-                    e.4 = Some(e.4.unwrap_or(a).min(a));
-                }
-            }
-        };
-        sample();
-        let thread = std::thread::spawn(move || loop {
-            sample();
-            if !matches!(
-                stop_rx.recv_timeout(Duration::from_millis(20)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ) {
-                sample();
-                break;
-            }
-        });
+        let sampler = Sampler::start();
         let deadline = Deadline::start(
             adapter.cancel.clone(),
             adapter.deadline.saturating_duration_since(Instant::now()),
@@ -510,38 +474,54 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             reason = "device cooperative deadline cancelled the case".into();
         }
         drop(deadline);
-        let _ = stop_tx.send(());
-        let _ = thread.join();
-        let e = extrema.lock().map_err(|_| "sampler poisoned")?;
+        let e = sampler.finish()?;
         let (status, reason) = if status.production_success()
-            && (e.3.is_none() || e.4.is_none() || e.5.is_none())
+            && (e.footprint.is_none() || e.min_headroom_mib.is_none() || e.lifetime_peak.is_none())
         {
             (Status::DiagnosticFailure, "completed but process footprint/headroom telemetry unavailable; not production evidence".into())
         } else {
             (status, reason)
         };
-        Ok(
-            json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
-            "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_active_peak_bytes":e.0, "mlx_cache_peak_bytes":e.1,
-            "mlx_active_cache_peak_bytes":e.2, "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(), "phys_footprint_peak_bytes":e.3,
-            "min_headroom_mib":e.4, "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
-            "cap_validated":false, "diagnostic":diagnostic,
-            "kernel_lifetime_phys_footprint_peak_bytes":e.5, "artifact_identity":adapter.artifact,
+        let mut row = json!({ "schema":1, "case":case.key(), "status":status.label(), "production_success":status.production_success(), "reason":reason,
+            "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
+            "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
+            "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
             "selected_parameters":adapter.context.as_ref().map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.context.as_ref().map(|c| &c.evidence_revision),
             "refusal_kind":adapter.refusal_kind, "refusal_only":adapter.refusal_only,
             "expected_render_count":adapter.request.as_ref().map(|r| r.prompt_batch.len().max(1)),
             "build_sha":option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"),
             "entitlement":std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok(),
-            "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() }),
-        )
-    })();
+            "ios_version":std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok() });
+        e.write(&mut row);
+        Ok(row)
+    };
+    let result = if value == primitive::PROBE_KEY {
+        primitive::report(diagnostic)
+    } else {
+        model_case()
+    };
     let mut row = result.unwrap_or_else(|e| json!({"schema":1,"case":value,"status":Status::DiagnosticFailure.label(),"production_success":false,"reason":e,"elapsed_seconds":started.elapsed().as_secs_f64(),"mlx_active_peak_bytes":null,"mlx_cache_peak_bytes":null,"mlx_active_cache_peak_bytes":null,"mlx_peak_bytes":null,"phys_footprint_peak_bytes":null,"min_headroom_mib":null,"diagnostic":diagnostic}));
     row["run_id"] = json!(std::env::var("IOS_CAMPAIGN_RUN_ID").ok());
     row["build_sha"] = json!(option_env!("IOS_CAMPAIGN_BUILD_SHA").unwrap_or("unknown"));
     row["entitlement"] = json!(std::env::var("IOS_SMOKE_INCREASED_MEMORY_LIMIT").ok());
     row["ios_version"] = json!(std::env::var("IOS_CAMPAIGN_IOS_VERSION").ok());
     row["refusal_only"] = json!(std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"));
+    if value == primitive::PROBE_KEY {
+        // A primitive row is never a smoke/production verdict, so it never prints SMOKE: PASS.
+        row["evidence_class"] = json!(primitive::EVIDENCE_CLASS);
+        row["model_admission_evidence"] = json!(false);
+        row["diagnostic"] = json!(true);
+        row["nonce"] = row["run_id"].clone();
+        if row.get("allocation_attempted").is_none() {
+            row["allocation_attempted"] = json!(false);
+        }
+        return format!(
+            "PRIMITIVE: {}\nCAMPAIGN_JSON {}\n",
+            row["status"].as_str().unwrap_or("diagnostic_failure"),
+            row
+        );
+    }
     format!(
         "SMOKE: {}\nCAMPAIGN_JSON {}\n",
         if row["production_success"] == true {
@@ -551,4 +531,85 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         },
         row
     )
+}
+
+/// Extremes sampled every 20 ms across one case (model case or primitive probe). Unavailable
+/// OS readings stay `None`, never zero evidence.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Extrema {
+    pub active: usize,
+    pub cache: usize,
+    pub combined: usize,
+    pub footprint: Option<u64>,
+    pub min_headroom_mib: Option<f64>,
+    pub lifetime_peak: Option<u64>,
+}
+impl Extrema {
+    fn sample(&mut self) {
+        let (active, cache) = (
+            mlx_rs::memory::get_active_memory(),
+            mlx_rs::memory::get_cache_memory(),
+        );
+        self.active = self.active.max(active);
+        self.cache = self.cache.max(cache);
+        self.combined = self.combined.max(active + cache);
+        if let Some((current, peak)) = phys_footprint() {
+            self.footprint = Some(self.footprint.unwrap_or(0).max(current));
+            if let Some(peak) = peak {
+                self.lifetime_peak = Some(self.lifetime_peak.unwrap_or(0).max(peak));
+            }
+        }
+        if let Some(a) = super::available_memory_mib() {
+            self.min_headroom_mib = Some(self.min_headroom_mib.unwrap_or(a).min(a));
+        }
+    }
+    pub(super) fn write(&self, row: &mut Value) {
+        row["mlx_active_peak_bytes"] = json!(self.active);
+        row["mlx_cache_peak_bytes"] = json!(self.cache);
+        row["mlx_active_cache_peak_bytes"] = json!(self.combined);
+        row["phys_footprint_peak_bytes"] = json!(self.footprint);
+        row["min_headroom_mib"] = json!(self.min_headroom_mib);
+        row["kernel_lifetime_phys_footprint_peak_bytes"] = json!(self.lifetime_peak);
+    }
+}
+
+pub(super) struct Sampler {
+    extrema: Arc<Mutex<Extrema>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+impl Sampler {
+    pub(super) fn start() -> Self {
+        let extrema = Arc::new(Mutex::new(Extrema::default()));
+        if let Ok(mut e) = extrema.lock() {
+            e.sample();
+        }
+        let (stop, stop_rx) = std::sync::mpsc::channel();
+        let samples = Arc::clone(&extrema);
+        let thread = std::thread::spawn(move || loop {
+            if let Ok(mut e) = samples.lock() {
+                e.sample();
+            }
+            if !matches!(
+                stop_rx.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                if let Ok(mut e) = samples.lock() {
+                    e.sample();
+                }
+                break;
+            }
+        });
+        Self {
+            extrema,
+            stop,
+            thread,
+        }
+    }
+    pub(super) fn finish(self) -> Result<Extrema, String> {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+        let e = *self.extrema.lock().map_err(|_| "sampler poisoned")?;
+        Ok(e)
+    }
 }

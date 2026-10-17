@@ -74,9 +74,10 @@ fn notify(_event: impl FnOnce() -> QuantumEventArg) {
     }
 }
 
+// Fields are only read by the host CPU-fixture observer; on iOS `notify` discards them.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 enum QuantumEventArg {
     Checked(String, u64),
-    #[cfg_attr(target_os = "ios", allow(dead_code))]
     Synchronized(String, i32),
 }
 
