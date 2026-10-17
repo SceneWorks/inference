@@ -86,7 +86,17 @@ pub fn descriptor() -> ModelDescriptor {
             // from the ORIGINAL dense checkpoint (`crate::convert`). Distinct from the MLX twin's
             // affine q4/q8: no cross-backend artifact reuse. Publisher FP8R/NVFP4 have no Candle
             // FLUX3 kernel on this build and are therefore not advertised.
+            #[cfg(not(feature = "cuda"))]
             supported_quants: &[gen_core::Quant::Q4, gen_core::Quant::Q8],
+            // The CUDA build also loads the publisher FP8R / NVFP4 artifacts as shipped onto
+            // their frozen-recipe kernels (device floors are checked at load).
+            #[cfg(feature = "cuda")]
+            supported_quants: &[
+                gen_core::Quant::Q4,
+                gen_core::Quant::Q8,
+                gen_core::Quant::Fp8Rowwise,
+                gen_core::Quant::Nvfp4,
+            ],
             supports_sequential_offload: true,
             // The optional native VLM resolves the effective caption before encoding.
             supports_prompt_enhancement: true,
@@ -182,6 +192,32 @@ pub fn load_dit(
 /// Load the autoencoder (f32) onto `device`.
 pub fn load_autoencoder(path: &Path, device: &Device) -> Result<Flux3AutoEncoder> {
     Flux3AutoEncoder::load(path, device)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_backend(device: &Device) -> Result<ArtifactBackend> {
+    let Device::Cuda(cuda) = device else {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: expected a CUDA device"
+        )));
+    };
+    let (major, minor) = candle_quant_kernels::nvrtc::device_compute_cap(cuda).map_err(|e| {
+        Error::Unsupported(format!(
+            "{MODEL_ID}: cannot read the CUDA compute capability: {e}"
+        ))
+    })?;
+    Ok(ArtifactBackend::CandleCuda {
+        major: major as u32,
+        minor: minor as u32,
+    })
+}
+
+/// A non-CUDA build never opens a CUDA device.
+#[cfg(not(feature = "cuda"))]
+fn cuda_backend(_device: &Device) -> Result<ArtifactBackend> {
+    Err(Error::Unsupported(format!(
+        "{MODEL_ID}: this build has no CUDA backend"
+    )))
 }
 
 /// A native package loads only with its conversion receipt: the owned outputs full-hash
@@ -309,7 +345,9 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
         .collect::<gen_core::Result<Vec<_>>>()?;
 
     let resources = GenerationResources::from_spec(spec, &config, MODEL_ID)?;
-    if !dense {
+    // Converted packages carry a receipt; a publisher FP8R/NVFP4 package is the pinned upstream
+    // repository itself, whose identity is the install manifest's, not a conversion's.
+    if !dense && !matches!(storage, NativeDitStorage::Publisher(_)) {
         verify_native_package(&package_dir, storage, &config, &resources)?;
     }
     // Priced from the resources' tensor headers BEFORE any weight is read, so a spec the
@@ -326,14 +364,14 @@ fn load_inner(spec: &LoadSpec, base: bool) -> Result<Flux3Klein> {
     ))
     })?;
     if !dense {
-        // GGML blocks run on the Candle CPU and CUDA quantized kernels only (compute capability
-        // is irrelevant to them); Metal is a typed refusal, never a dequantized substitute.
+        // The device's REAL compute capability: the publisher FP8R/NVFP4 floors depend on it
+        // (GGML ignores it). Metal is a typed refusal, never a dequantized substitute.
         let backend = if device.is_cpu() {
             ArtifactBackend::CandleCpu
         } else if device.is_metal() {
             ArtifactBackend::CandleMetal
         } else {
-            ArtifactBackend::CandleCuda { major: 0, minor: 0 }
+            cuda_backend(&device)?
         };
         storage.check_backend(backend)?;
     }

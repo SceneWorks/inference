@@ -112,6 +112,8 @@ pub struct Loader<'a> {
     pub device: &'a Device,
     /// Native GGML targets of a converted package; `None` for the dense package.
     pub packed: Option<&'a PackedSource>,
+    /// Publisher FP8R/NVFP4 targets of a frozen BFL quantized package (CUDA only).
+    pub publisher: Option<&'a PublisherSource>,
 }
 
 /// The raw GGML rows of a converted package's packed targets, read straight into a `QTensor`
@@ -153,6 +155,217 @@ impl PackedSource {
     }
 }
 
+/// The publisher FP8R / NVFP4 targets of a frozen BFL quantized package, staged AS SHIPPED onto
+/// the frozen-recipe CUDA kernels (`candle_quant_kernels::flux3_quant`). There is no CPU or Metal
+/// path: on those builds construction is a typed refusal, never a dequantized substitute.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub struct PublisherSource {
+    pub(crate) reader: candle_gen::gen_core::flux3::safetensors_stream::SafetensorsSource,
+    pub(crate) targets: std::collections::BTreeSet<String>,
+    pub(crate) storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    pub(crate) device: Device,
+    #[cfg(feature = "cuda")]
+    pub(crate) lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
+}
+
+impl PublisherSource {
+    /// Validate the device for `storage` (CUDA with the format's compute floor) and open `path`.
+    pub fn new(
+        path: &std::path::Path,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+        targets: std::collections::BTreeSet<String>,
+        device: &Device,
+    ) -> Result<Self> {
+        let reader = candle_gen::gen_core::flux3::safetensors_stream::SafetensorsSource::open(path)
+            .map_err(|e| Error::Unsupported(e.to_string()))?;
+        #[cfg(feature = "cuda")]
+        {
+            use candle_gen::gen_core::flux3::quantization::DitFormat;
+            if !device.is_cuda() {
+                return Err(Error::Unsupported(
+                    "flux3: publisher FP8R/NVFP4 kernels run on CUDA only".into(),
+                ));
+            }
+            let lt = std::sync::Arc::new(candle_quant_kernels::cublaslt::CublasLt::new(device)?);
+            let meets = match storage {
+                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+                    DitFormat::Fp8Rowwise,
+                ) => lt.meets_fp8_floor()?,
+                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+                    DitFormat::Nvfp4,
+                ) => lt.meets_nvfp4_floor()?,
+                _ => false,
+            };
+            if !meets {
+                return Err(Error::Unsupported(format!(
+                    "flux3: this CUDA device {:?} is below the {} compute floor; install a tier \
+                     this device runs (no dequantized substitute)",
+                    lt.compute_cap()?,
+                    storage
+                        .key()
+                        .map_err(|e| Error::Unsupported(e.to_string()))?
+                )));
+            }
+            Ok(Self {
+                reader,
+                targets,
+                storage,
+                device: device.clone(),
+                lt,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (reader, targets, device);
+            Err(Error::Unsupported(format!(
+                "flux3: {} publisher kernels need the CUDA build; install the dense or native \
+                 q4/q8 tier on this backend",
+                storage
+                    .key()
+                    .map_err(|e| Error::Unsupported(e.to_string()))?
+            )))
+        }
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn raw(&self, name: &str) -> Result<Vec<u8>> {
+        self.reader
+            .read(name)
+            .map_err(|e| Error::Unsupported(e.to_string()))
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn scalar(&self, name: &str) -> Result<f32> {
+        let bytes = self.raw(name)?;
+        let bytes: [u8; 4] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Unsupported(format!("flux3: {name} is not one f32")))?;
+        Ok(f32::from_le_bytes(bytes))
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn linear(&self, key: &str) -> Result<Linear> {
+        let stem = key
+            .strip_suffix(".weight")
+            .ok_or_else(|| Error::Unsupported(format!("flux3: {key} is not a weight")))?;
+        let shape = self
+            .reader
+            .get(key)
+            .map_err(|e| Error::Unsupported(e.to_string()))?
+            .shape
+            .clone();
+        let (out, input) = match (self.storage, shape.as_slice()) {
+            (
+                candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+                    candle_gen::gen_core::flux3::quantization::DitFormat::Nvfp4,
+                ),
+                [n, half],
+            ) => (*n, half * 2),
+            (_, [n, k]) => (*n, *k),
+            _ => return Err(Error::Unsupported(format!("flux3: {key} is not a matrix"))),
+        };
+        #[cfg(feature = "cuda")]
+        {
+            use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+            use candle_gen::gen_core::flux3::quantization::DitFormat;
+            let kernel = match self.storage {
+                NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) => {
+                    let scales: Vec<f32> = self
+                        .raw(&format!("{stem}.weight_scale"))?
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    PublisherKernel::Fp8 {
+                        weight: self.lt.stage_fp8_bytes(&self.raw(key)?, out, input)?,
+                        scales: self.lt.stage_f32(&scales)?,
+                        lt: self.lt.clone(),
+                    }
+                }
+                NativeDitStorage::Publisher(DitFormat::Nvfp4) => PublisherKernel::Nvfp4 {
+                    weight: self.lt.flux3_stage_nvfp4_weight(
+                        &self.raw(key)?,
+                        &self.raw(&format!("{stem}.weight_scale"))?,
+                        out,
+                        input,
+                        self.scalar(&format!("{stem}.weight_scale_2"))?,
+                    )?,
+                    input_scale: self.scalar(&format!("{stem}.input_scale"))?,
+                    lt: self.lt.clone(),
+                },
+                _ => return Err(Error::Unsupported("flux3: not a publisher storage".into())),
+            };
+            Ok(Linear {
+                base: Base::Publisher(PublisherBase {
+                    kernel,
+                    storage: self.storage,
+                    out,
+                    input,
+                    device: self.device.clone(),
+                }),
+                adapted: None,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (stem, out, input);
+            Err(Error::Unsupported(
+                "flux3: publisher kernels need the CUDA build".into(),
+            ))
+        }
+    }
+}
+
+/// A publisher-format projection on its frozen-recipe CUDA kernel. BF16 in, BF16 out.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct PublisherBase {
+    kernel: PublisherKernel,
+    storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    out: usize,
+    input: usize,
+    device: Device,
+}
+
+#[cfg(feature = "cuda")]
+enum PublisherKernel {
+    Fp8 {
+        lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
+        weight: candle_quant_kernels::cublaslt::DevFp8,
+        scales: candle_gen::candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>,
+    },
+    Nvfp4 {
+        lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
+        weight: candle_quant_kernels::cublaslt::DevNvfp4,
+        input_scale: f32,
+    },
+}
+
+/// Uninhabited off CUDA: no publisher projection can exist there.
+#[cfg(not(feature = "cuda"))]
+enum PublisherKernel {}
+
+impl PublisherBase {
+    fn forward_chunk(&self, chunk: &Tensor) -> Result<Tensor> {
+        match &self.kernel {
+            #[cfg(feature = "cuda")]
+            PublisherKernel::Fp8 { lt, weight, scales } => {
+                Ok(lt.flux3_fp8_rowwise_linear(chunk, weight, scales)?)
+            }
+            #[cfg(feature = "cuda")]
+            PublisherKernel::Nvfp4 {
+                lt,
+                weight,
+                input_scale,
+            } => Ok(lt.flux3_nvfp4_static_linear(chunk, weight, *input_scale)?),
+            #[cfg(not(feature = "cuda"))]
+            _ => {
+                let _ = chunk;
+                unreachable!("PublisherKernel is uninhabited off CUDA")
+            }
+        }
+    }
+}
+
 impl Loader<'_> {
     /// Whether the checkpoint carries `key`.
     pub fn contains(&self, key: &str) -> bool {
@@ -181,6 +394,9 @@ impl Loader<'_> {
         if let Some(packed) = self.packed.filter(|p| p.targets.contains(&key)) {
             return Linear::from_ggml_rows(packed, &key, self.compute, self.device);
         }
+        if let Some(publisher) = self.publisher.filter(|p| p.targets.contains(&key)) {
+            return publisher.linear(&key);
+        }
         let weight = to(&self.take(&key)?, self.compute)?;
         if weight.rank() != 2 {
             return Err(Error::Msg(format!(
@@ -208,6 +424,9 @@ enum Base {
         compute: DType,
         device: Device,
     },
+    /// A publisher FP8R/NVFP4 projection on its frozen-recipe CUDA kernel (BF16 compute).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    Publisher(PublisherBase),
 }
 
 /// `nn.Linear(bias=False)`: `x · Wᵀ` in the compute dtype.
@@ -318,6 +537,15 @@ impl Linear {
                     candle_gen::gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
                 )?
             }
+            Base::Publisher(publisher) => {
+                if *last != publisher.input {
+                    return Err(Error::Msg(format!(
+                        "flux3: packed Linear expects [.., {}], got [.., {last}]",
+                        publisher.input
+                    )));
+                }
+                publisher_forward(publisher, &flat)?
+            }
         };
         let y = if let Some(adapted) = &self.adapted {
             adapted.apply_residuals(&to(&flat, gemm)?, y)?
@@ -343,6 +571,12 @@ impl Linear {
                     compute, device, ..
                 } => candle_gen::quant::AdaptLinear::for_external_base(
                     input, output, *compute, device,
+                )?,
+                Base::Publisher(publisher) => candle_gen::quant::AdaptLinear::for_external_base(
+                    input,
+                    output,
+                    DType::BF16,
+                    &publisher.device,
                 )?,
             });
         }
@@ -386,6 +620,7 @@ impl Linear {
         match &self.base {
             Base::Dense(weight) => Ok(weight.dims2()?),
             Base::Ggml { out, input, .. } => Ok((*out, *input)),
+            Base::Publisher(publisher) => Ok((publisher.out, publisher.input)),
         }
     }
 
@@ -393,18 +628,20 @@ impl Linear {
     pub fn weight(&self) -> Result<&Tensor> {
         match &self.base {
             Base::Dense(weight) => Ok(weight),
-            Base::Ggml { storage, .. } => Err(Error::Unsupported(format!(
-                "flux3: {} projection has no dense weight; dequantizing it is refused",
-                storage
-                    .key()
-                    .map_err(|e| Error::Unsupported(e.to_string()))?
-            ))),
+            Base::Ggml { storage, .. } | Base::Publisher(PublisherBase { storage, .. }) => {
+                Err(Error::Unsupported(format!(
+                    "flux3: {} projection has no dense weight; dequantizing it is refused",
+                    storage
+                        .key()
+                        .map_err(|e| Error::Unsupported(e.to_string()))?
+                )))
+            }
         }
     }
 
     /// Whether the base is held in a packed native format.
     pub fn is_quantized(&self) -> bool {
-        matches!(self.base, Base::Ggml { .. })
+        matches!(self.base, Base::Ggml { .. } | Base::Publisher(_))
     }
 
     /// The compute (input and output) dtype.
@@ -412,7 +649,44 @@ impl Linear {
         match &self.base {
             Base::Dense(weight) => weight.dtype(),
             Base::Ggml { compute, .. } => *compute,
+            Base::Publisher(_) => DType::BF16,
         }
+    }
+}
+
+/// A publisher-format projection over BF16 rows, in the same exact row-chunk plan as the GGML path
+/// (each row's activation quantization is independent, so chunking changes no output bit).
+fn publisher_forward(publisher: &PublisherBase, flat: &Tensor) -> Result<Tensor> {
+    use candle_gen::gen_core::flux3::packed_gemm;
+    let (rows, input) = flat.dims2()?;
+    let per_row = packed_gemm::transient_bytes_per_row(publisher.storage, input, publisher.out, 2)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let plan = packed_gemm::plan_row_chunks(
+        rows,
+        input,
+        publisher.out,
+        per_row,
+        packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
+    )
+    .map_err(|e| Error::Unsupported(e.to_string()))?;
+    let flat = to(flat, DType::BF16)?;
+    let mut parts = Vec::with_capacity(plan.len());
+    for (start, len) in plan {
+        let chunk = if len == rows {
+            flat.contiguous()?
+        } else {
+            flat.narrow(0, start, len)?.contiguous()?
+        };
+        parts.push(publisher.forward_chunk(&chunk)?);
+    }
+    match parts.len() {
+        0 => Ok(Tensor::zeros(
+            (0, publisher.out),
+            DType::BF16,
+            flat.device(),
+        )?),
+        1 => Ok(parts.pop().expect("one chunk")),
+        _ => Ok(Tensor::cat(&parts, 0)?),
     }
 }
 

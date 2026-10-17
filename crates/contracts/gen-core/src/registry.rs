@@ -1184,6 +1184,19 @@ pub fn candle_nvfp4_memory_contract_surface_specs() -> Vec<MemoryContractSurface
     ])
 }
 
+/// Candle CUDA surface for providers that load the publisher FP8R and NVFP4 tiers as shipped
+/// (FLUX3, sc-26241) beside the dense and native q4/q8 tiers. CUDA-only formats are normal: a
+/// backend that cannot run them simply does not advertise this surface.
+pub fn candle_publisher_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
+    registry_memory_contract_surface_specs(&[
+        MemoryContractSurfaceTier::Bf16,
+        MemoryContractSurfaceTier::Q4,
+        MemoryContractSurfaceTier::Q8,
+        MemoryContractSurfaceTier::Nvfp4,
+        MemoryContractSurfaceTier::Fp8Rowwise,
+    ])
+}
+
 /// Provider-owned, weights-free executable fixture for one implemented memory strategy.
 ///
 /// The request is intentionally provider-owned: edit/control routes can supply their real mode and

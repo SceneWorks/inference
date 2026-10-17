@@ -208,9 +208,10 @@ pub use memory_strategy::{
 };
 pub use registry::{
     candle_memory_contract_surface_specs, candle_nvfp4_memory_contract_surface_specs,
-    mlx_memory_contract_surface_specs, ActivationMemoryRegistration, AudioEmbedderRegistration,
-    AudioTransformRegistration, CaptionerRegistration, CheckpointAdapterCapabilityRegistration,
-    CheckpointAdapterRegistration, CheckpointBackend, CheckpointBackendBindingRegistration,
+    candle_publisher_memory_contract_surface_specs, mlx_memory_contract_surface_specs,
+    ActivationMemoryRegistration, AudioEmbedderRegistration, AudioTransformRegistration,
+    CaptionerRegistration, CheckpointAdapterCapabilityRegistration, CheckpointAdapterRegistration,
+    CheckpointBackend, CheckpointBackendBindingRegistration,
     CheckpointBaseCompatibilityRegistration, CheckpointCanonicalMappingRegistration,
     CheckpointComponentRegistration, CheckpointConfigRecoveryRegistration,
     CheckpointDialectRegistration, CheckpointSignatureRegistration,

@@ -31,7 +31,7 @@ use candle_gen::{CandleError as Error, Result};
 use crate::nn::{
     cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
     packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader,
-    PackedSource, Rope,
+    PackedSource, PublisherSource, Rope,
 };
 
 /// `MLPEmbedder`: `out_layer(silu(in_layer(x)))`, bias-free.
@@ -396,28 +396,41 @@ impl Flux3Dit {
                 .validate_headers(cfg, &headers)
                 .map_err(|e| Error::Unsupported(e.to_string()))?;
         }
-        let packed = match storage {
-            NativeDitStorage::Publisher(
-                candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
-            ) => None,
-            NativeDitStorage::GgmlQ4_1 | NativeDitStorage::GgmlQ8_0 => Some(PackedSource::new(
-                path,
-                storage,
-                storage
-                    .packed_targets(cfg)
-                    .map_err(|e| Error::Unsupported(e.to_string()))?,
-            )?),
+        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        let targets = || {
+            storage
+                .packed_targets(cfg)
+                .map_err(|e| Error::Unsupported(e.to_string()))
+        };
+        let (packed, publisher) = match storage {
+            NativeDitStorage::Publisher(DitFormat::Dense) => (None, None),
+            NativeDitStorage::GgmlQ4_1 | NativeDitStorage::GgmlQ8_0 => {
+                (Some(PackedSource::new(path, storage, targets()?)?), None)
+            }
+            // Shipped publisher artifacts load AS SHIPPED onto their frozen-recipe CUDA kernels;
+            // `PublisherSource::new` is the typed refusal on any other backend or device floor.
+            NativeDitStorage::Publisher(DitFormat::Fp8Rowwise | DitFormat::Nvfp4) => (
+                None,
+                Some(PublisherSource::new(path, storage, targets()?, device)?),
+            ),
             other => {
                 return Err(Error::Unsupported(format!(
-                    "flux3: {} DiT storage has no Candle loader on this build; install the \
-                     native GGML tier for Candle or the dense package",
+                    "flux3: {} DiT storage has no Candle loader; install the native GGML tier \
+                     for Candle or the dense package",
                     other.key().map_err(|e| Error::Unsupported(e.to_string()))?
                 )))
             }
         };
         let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], compute, device)
             .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", path.display())))?;
-        Self::from_var_builder_packed(&vb, cfg, compute, device, packed.as_ref())
+        Self::from_var_builder_packed(
+            &vb,
+            cfg,
+            compute,
+            device,
+            packed.as_ref(),
+            publisher.as_ref(),
+        )
     }
 
     /// Build from an already-mapped checkpoint at `compute` dtype.
@@ -427,7 +440,7 @@ impl Flux3Dit {
         compute: DType,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_var_builder_packed(vb, cfg, compute, device, None)
+        Self::from_var_builder_packed(vb, cfg, compute, device, None, None)
     }
 
     fn from_var_builder_packed(
@@ -436,12 +449,14 @@ impl Flux3Dit {
         compute: DType,
         device: &Device,
         packed: Option<&PackedSource>,
+        publisher: Option<&PublisherSource>,
     ) -> Result<Self> {
         let l = Loader {
             vb,
             compute,
             device,
             packed,
+            publisher,
         };
         let hidden = cfg.hidden;
         let emb_in_image = l.linear("emb_in.image")?;

@@ -46,11 +46,11 @@ use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Safeten
 use candle_gen::gen_core::{
     self, Error as CoreError, LoadShape, LoadSpec, MemoryArchitectureFacts, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
-    Precision, Quant, ResidentRequestMemory, Result as CoreResult,
+    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant,
+    ResidentRequestMemory, Result as CoreResult,
 };
 
 use crate::model::MODEL_ID;
@@ -117,6 +117,14 @@ pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
         None => NativeDitStorage::Publisher(DitFormat::Dense),
         Some(Quant::Q4) => NativeDitStorage::GgmlQ4_1,
         Some(Quant::Q8) => NativeDitStorage::GgmlQ8_0,
+        // The frozen publisher artifacts, loaded as shipped onto their CUDA kernels. CUDA-only
+        // formats are normal: other builds refuse them below rather than dequantizing.
+        #[cfg(feature = "cuda")]
+        Some(Quant::Fp8Rowwise) => NativeDitStorage::Publisher(DitFormat::Fp8Rowwise),
+        #[cfg(feature = "cuda")]
+        Some(Quant::Nvfp4) => NativeDitStorage::Publisher(DitFormat::Nvfp4),
+        // Every format has a storage on the CUDA build; this refusal is the other builds'.
+        #[cfg_attr(feature = "cuda", allow(unreachable_patterns))]
         Some(other) => {
             return Err(CoreError::Unsupported(format!(
                 "{MODEL_ID}: LoadSpec::quantize {} has no Candle FLUX3 kernel on this build; the \
@@ -715,15 +723,16 @@ pub(crate) fn registered_begin_request(
 /// (q4 = Q4_1, q8 = Q8_0), eagerly materialized, under both offload policies. NVFP4 and the
 /// deferred load shape have no Candle FLUX3 loader, so neither is witnessed.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
-    gen_core::candle_memory_contract_surface_specs()
+    // The CUDA build additionally witnesses the publisher FP8R/NVFP4 tiers it loads as shipped.
+    #[cfg(feature = "cuda")]
+    let surfaces = gen_core::candle_publisher_memory_contract_surface_specs();
+    #[cfg(not(feature = "cuda"))]
+    let surfaces = gen_core::candle_memory_contract_surface_specs();
+    surfaces
         .into_iter()
         .filter(|surface| {
-            matches!(
-                surface.selector.tier,
-                MemoryContractSurfaceTier::Bf16
-                    | MemoryContractSurfaceTier::Q4
-                    | MemoryContractSurfaceTier::Q8
-            ) && surface.selector.load_shape == LoadShape::EagerMaterialization
+            selected_storage(surface.spec.quantize).is_ok()
+                && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
 }
@@ -934,24 +943,27 @@ mod tests {
     #[test]
     fn the_route_declares_exactly_the_rungs_its_engine_runs() {
         let surfaces = memory_contract_surface_specs();
-        assert_eq!(
-            surfaces.len(),
-            6,
-            "dense + GGML q4/q8 tiers, eager, x 2 offload policies"
-        );
-        let mut selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
+        // Dense + GGML q4/q8 everywhere; the CUDA build adds the publisher fp8r/nvfp4 tiers.
+        let mut tiers = vec!["bf16", "q4", "q8"];
+        if cfg!(feature = "cuda") {
+            tiers.extend(["fp8r", "nvfp4"]);
+        }
+        let mut want: Vec<String> = tiers
+            .iter()
+            .flat_map(|t| {
+                [
+                    format!("{t}:resident:eager"),
+                    format!("{t}:sequential:eager"),
+                ]
+            })
+            .collect();
+        want.sort();
+        let mut selectors: Vec<String> = surfaces
+            .iter()
+            .map(|s| s.selector.id().to_string())
+            .collect();
         selectors.sort();
-        assert_eq!(
-            selectors,
-            [
-                "bf16:resident:eager",
-                "bf16:sequential:eager",
-                "q4:resident:eager",
-                "q4:sequential:eager",
-                "q8:resident:eager",
-                "q8:sequential:eager"
-            ]
-        );
+        assert_eq!(selectors, want, "eager tiers x 2 offload policies");
         for surface in &surfaces {
             let contract = weights_free_memory_strategy_contract(MODEL_ID, &surface.spec).unwrap();
             gen_core_testkit::memory_strategy_conformance(&contract);
