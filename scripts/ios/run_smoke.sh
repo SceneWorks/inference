@@ -50,9 +50,21 @@ while [ $# -gt 0 ]; do
     # refuses them by default (the report says "refused before load"). This runs them UNADMITTED to
     # produce that estimate, and the report's "iOS admission lane" line says so.
     --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;
+    --campaign-case)
+      [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung" >&2; exit 2; }
+      export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
+    --campaign-list) export IOS_CAMPAIGN_LIST=1; CARGO_FEATURES="--features media"; shift ;;
+    --campaign-diagnostic) export IOS_CAMPAIGN_DIAGNOSTIC=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "${IOS_CAMPAIGN_CASE:-}${IOS_CAMPAIGN_LIST:-}" ]; then
+  [ -z "${IOS_SMOKE_UNADMITTED:-}${IOS_SMOKE_SANA_CAPTURE:-}" ] || { echo "campaign cannot inherit legacy unadmitted/capture bypass flags" >&2; exit 2; }
+  [ -z "${IOS_CAMPAIGN_CASE:-}" ] || [ -z "${IOS_CAMPAIGN_LIST:-}" ] || { echo "select a case OR listing" >&2; exit 2; }
+  [ -z "$SIMULATOR" ] || [ -n "${IOS_CAMPAIGN_LIST:-}" ] || { echo "campaign execution requires a real device; simulator is build/list only" >&2; exit 2; }
+fi
+[ -z "${IOS_CAMPAIGN_DIAGNOSTIC:-}" ] || [ -n "${IOS_CAMPAIGN_CASE:-}" ] || { echo "--campaign-diagnostic needs --campaign-case" >&2; exit 2; }
 
 say() { printf '\n=== %s\n' "$1"; }
 
@@ -144,7 +156,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   say "data container $DATA (push a SANA snapshot with: scripts/ios/push_model.sh <dir> sana --simulator $SIMULATOR)"
 
   # simctl forwards SIMCTL_CHILD_<VAR> from the calling environment as <VAR> in the app.
-  for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+  for var in IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
     val=$(printenv "$var" || true)
     if [ -n "$val" ]; then export "SIMCTL_CHILD_$var=$val"; say "forwarding $var=$val"; fi
   done
@@ -175,6 +187,7 @@ if [ "$ON_SIMULATOR" -eq 1 ]; then
   for png in "$DATA"/Documents/*.png; do
     [ -f "$png" ] && cp "$png" "$ARTIFACT_DIR/sim-$(basename "$png")" && echo "  pulled $(basename "$png") -> $ARTIFACT_DIR/sim-$(basename "$png")"
   done
+  if [ "${IOS_CAMPAIGN_LIST:-}" = 1 ] && head -1 "$REPORT" | grep -q '^CAMPAIGN: LIST$'; then say "catalog only (not execution evidence)"; exit 0; fi
   if ! head -1 "$REPORT" | grep -q "SMOKE: PASS"; then say "FAIL"; exit 1; fi
   say "PASS (simulator: packaging + correctness only; no memory/perf thresholds apply)"
   exit 0
@@ -341,7 +354,7 @@ LAUNCH_ENV="{}"
 # produced a 216.3 s "rung 4 disabled" run whose MLX peak (2901 MiB) was byte-identical to the
 # rung-4-ENABLED run, when the host A/B moves that peak by 1662 MiB. The measurement was a no-op
 # wearing the name of an experiment. If you add a knob to the harness, add it here in the same edit.
-for var in IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
+for var in IOS_CAMPAIGN_CASE IOS_CAMPAIGN_LIST IOS_CAMPAIGN_DIAGNOSTIC IOS_CAMPAIGN_REFUSAL_ONLY IOS_SMOKE_UNADMITTED IOS_SMOKE_SANA_CAPTURE IOS_SMOKE_IMAGE_ONLY IOS_SMOKE_ONLY IOS_SMOKE_ZIMAGE_SIZE IOS_SMOKE_ZIMAGE_TILE IOS_SMOKE_ZIMAGE_RUNG4 IOS_SMOKE_SOAK_SECS MLX_GEN_SANA_DECODE_TILE; do
   val=$(printenv "$var" || true)
   if [ -n "$val" ]; then
     LAUNCH_ENV=$(python3 -c "
@@ -447,6 +460,7 @@ fi
 echo
 cat "$REPORT"
 
+if [ "${IOS_CAMPAIGN_LIST:-}" = 1 ] && head -1 "$REPORT" | grep -q '^CAMPAIGN: LIST$'; then say "catalog only (not execution evidence)"; exit 0; fi
 if ! head -1 "$REPORT" | grep -q "SMOKE: PASS"; then
   say "FAIL"
   exit 1

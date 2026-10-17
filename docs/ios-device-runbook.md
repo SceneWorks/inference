@@ -1,8 +1,8 @@
 # iOS device runbook
 
-Updated 2026-10-16 against inference feature head `a54ad6c3a`. These are the S3
-harness commands that exist there, not a claim the epic is on main or that all
-models render on the phone. See [strategy](architecture/ios-strategy.md),
+Updated 2026-10-17 against inference feature base `481b04d6f` plus the sc-26270
+campaign harness. These are implemented harness commands, not a claim the epic
+is on main or that all models render on the phone. See [strategy](architecture/ios-strategy.md),
 [specification](architecture/ios-project-spec.md), and [remaining work](ios-epics.md).
 
 ## Current model and evidence status
@@ -14,15 +14,116 @@ has been recorded. Registration is not admission or demonstrated fit.
 |---|---|---|
 | SANA base/sprint | Registered; source-bound admission and packed Gemma embeddings merged in #1272 (`23c7e3953`) | Admitted loader refuses without applicable capture; 1024/tile192 attempt terminated, cause unconfirmed |
 | Anima Turbo | Registered without training; Base/Aesthetic excluded | No demonstrated phone fit |
-| Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 open | No demonstrated phone fit; depth access is explicitly diagnostic |
-| SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 open | No demonstrated phone fit |
+| Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 merged | No demonstrated phone fit; depth access is explicitly diagnostic |
+| SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 merged | No demonstrated phone fit |
 | Supra2-IMG | sc-26269 requires epic 24212 on inference main; not started | No implementation/fit claim here |
 
-The S3 image harness currently drives SANA. Do not invent `--iris`, `--sdxl`,
-`--anima` or `--supra2` flags: catalog registration does not add harness commands.
-Legacy Z-Image diagnostic support is not part of this epic's supported model set.
-The terminal campaign must cover every required model, tier and mode; missing
-harness coverage is not permission to omit a model.
+The legacy S3 image check drives SANA. The sc-26270 campaign protocol below now
+selects every catalog provider/route/tier/geometry/mode/strategy explicitly. There
+are still no `--iris`, `--sdxl`, `--anima` or `--supra2` shortcut flags. Legacy
+Z-Image diagnostics are not part of this epic's supported model set.
+
+## Campaign protocol and command matrix (sc-26270)
+
+**Mechanism only; no new device measurements are recorded here.** No full-model
+diagnostic is cleared to execute. Independently bounded primitive characterization
+must precede any such experiment; a diagnostic flag, launch headroom, tensor byte
+sum, engineering reserve, MLX allocator limit or a cap increase is not a permit.
+The current empty artifact-bound evidence remains fail-closed. Anima/Iris have no
+admitted iPhone footprint facade; their cases explicitly refuse before loading,
+not via a raw registry bypass. Unsupported strategy/tier/task combinations remain
+visible instead of being silently omitted. Malformed/missing snapshots are
+`diagnostic_failure`, **not** next-up admission-refusal evidence.
+
+Weights-free listing uses the actual `runtime-ios` catalog (including transforms
+and composed task memory registrations), with the SDXL provider's route constant.
+It creates no arrays and loads no model. A new registered provider/task becomes
+visible automatically. Supra2 currently appears in the dependency record, not as
+a fictitious supported provider; once registered it enumerates at 256².
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+# CPU-only catalog exporter; --list alone NEVER launches a device campaign.
+python3 scripts/ios/campaign.py list > /tmp/ios-campaign-catalog.json
+# This is the full, executable menu, not a handwritten campaign population.
+python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
+  --provider iris_3b --tier q8 --edge 768 --rung 3
+```
+
+| Axis | Values / source |
+|---|---|
+| Provider | Catalog generators SANA base/sprint, Anima Turbo, SDXL, Iris; registered restoration and composed depth tasks |
+| SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
+| Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
+| Geometry | 512², 768², 1024²; future registered Supra2: 256² |
+| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, registered restoration/depth; no edit-to-text downgrade |
+| Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
+
+Provision complete caller-owned snapshots into a distinct slot for every
+route/tier. The slot name is not proof of stored precision. Iris generation needs
+its Qwen3-VL encoder, depth/restoration their task exports; SDXL may need its
+fp16-fix VAE. A `components.json` beside the snapshot maps component IDs to
+confined relative directories within that slot, e.g.
+`{"text_encoder":"qwen3_vl","vae":"fp16_fix_vae"}`. Nothing downloads or
+silently resolves a sibling artifact. Existing source inventories, deferred-read
+checks and admitted request binding are preserved.
+
+```sh
+# After the host app has been installed (no campaign is started by pushing):
+scripts/ios/push_model.sh "$SNAPSHOT" --campaign-route iris_3b --tier q8 --device "$DEVICE"
+# Same mechanism for every route and tier in the actual listing:
+scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route illustrious_xl_v2 --tier q4 --device "$DEVICE"
+```
+
+The following are **future session recipes, not instructions to run now**. Phone
+availability alone does not authorize a full-model diagnostic. Use a fresh evidence
+directory and save the checkout SHA, OS, entitlement, conversion/source receipts
+and catalog JSON. Every selected case starts a fresh app process, before legacy
+LLM checks or kernel smokes consume memory. The default is admitted, never
+inherited `IOS_SMOKE_UNADMITTED`. Execute only after the relevant safety criteria
+are independently met.
+
+```sh
+# One exact cold case (JSONL output must not already exist):
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --case sana_1600m/sana_1600m/q4/512/text/2 --device "$DEVICE" \
+  --output "$EVIDENCE/sana-512.jsonl"
+# One selected model/tier ladder, including all its registered modes and rungs:
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --provider iris_3b --tier q8 --device "$DEVICE" --output "$EVIDENCE/iris-q8.jsonl"
+# Full catalog-driven campaign; no hand-maintained model list:
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --all-cases --device "$DEVICE" --output "$EVIDENCE/all.jsonl"
+# Explicit next-up REFUSAL-ONLY probe after an admitted completion. This NEVER
+# loads weights at the larger geometry, even if its metadata preflight admits it.
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --case sdxl/sdxl/q4/1024/text/2 --next-edge 1280 --device "$DEVICE" \
+  --output "$EVIDENCE/sdxl-next-up.jsonl"
+# Diagnostic selection is supported, but currently refuses every full-model case
+# until an independently bounded primitive permit exists. Never reports prod PASS.
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --case anima_turbo/anima_turbo/q4/512/text/4 --diagnostic --device "$DEVICE" \
+  --output "$EVIDENCE/anima-diagnostic.jsonl"
+python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
+```
+
+Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
+active/cache/active+cache peaks, MLX allocator peak, sampled Darwin
+`TASK_VM_INFO_REV1.phys_footprint` peak, and minimum
+`os_proc_available_memory()` headroom. **RSS and MLX active+cache are not kernel
+physical footprint.** Sampling is 20 ms and can miss transients; these are
+observations, not an independent instantaneous working-set proof. Unavailable
+readings are null, never fabricated zeros. Statuses are `successful` (admitted
+image only), `admitted_refused`, `diagnostic_success` (never production),
+`diagnostic_failure`, or `skipped` (explicit host case budget). Missing/stale
+reports, timeout, malformed output or a terminated process cannot prove admission
+refusal. Missing physical-footprint/headroom telemetry cannot yield production
+success. Noncompletion returns nonzero; a successful listing is not a render.
+The table includes the largest **admitted** completed edge per route/tier/mode/
+strategy and does not infer next-up refusal from termination or missing evidence.
+Commit the actual measured table only after the terminal campaign, not this
+harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
+readings remain unvalidated diagnostics, and no cap/table is invented here.
 
 ## 1. Prerequisites and checkout
 

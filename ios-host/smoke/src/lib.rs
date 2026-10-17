@@ -23,6 +23,16 @@ use mlx_rs::ops::{matmul, ones, softmax_axis};
 use mlx_rs::{Array, Dtype};
 use runtime_ios::core_llm::{LoadSpec, Message, Sampling, TextLlmRequest};
 
+pub mod campaign;
+#[cfg(feature = "media")]
+mod campaign_media;
+
+/// Weights-free, catalog-derived campaign listing for host tooling and the device bridge.
+#[cfg(feature = "media")]
+pub fn campaign_catalog_report() -> Result<String, String> {
+    campaign_media::listing()
+}
+
 /// One check's outcome. `detail` carries the observed value, so a failure report is diagnosable
 /// without a debugger attached.
 struct Check {
@@ -1889,6 +1899,26 @@ fn find_zimage_snapshot() -> Option<std::path::PathBuf> {
 /// The first line is `SMOKE: PASS` or `SMOKE: FAIL` so an XCTest can assert on a prefix without
 /// parsing the body.
 pub fn run_report() -> String {
+    // Campaign dispatch is FIRST: no LLM checks, GEMMs, legacy skip-as-success accounting or
+    // preceding render may consume the cold process budget of a selected case.
+    if let Ok(case) = std::env::var("IOS_CAMPAIGN_CASE") {
+        #[cfg(feature = "media")]
+        return campaign_media::report(
+            &case,
+            std::env::var("IOS_CAMPAIGN_DIAGNOSTIC").as_deref() == Ok("1"),
+        );
+        #[cfg(not(feature = "media"))]
+        return format!("SMOKE: FAIL\n  campaign requires --media; selected {case}\n");
+    }
+    if std::env::var("IOS_CAMPAIGN_LIST").as_deref() == Ok("1") {
+        #[cfg(feature = "media")]
+        return match campaign_catalog_report() {
+            Ok(list) => format!("CAMPAIGN: LIST\nCAMPAIGN_CATALOG {list}\n"),
+            Err(e) => format!("SMOKE: FAIL\ncatalog: {e}\n"),
+        };
+        #[cfg(not(feature = "media"))]
+        return "SMOKE: FAIL\ncampaign requires --media\n".into();
+    }
     // `IOS_SMOKE_IMAGE_ONLY=1` skips every LLM check and runs the image lane against a cold
     // process. This exists to settle one specific question, not as a convenience.
     //
@@ -2020,6 +2050,33 @@ pub unsafe extern "C" fn ios_smoke_free(ptr: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn campaign_public_entrypoint_rejects_bad_case_before_legacy_kernels() {
+        let old_case = std::env::var_os("IOS_CAMPAIGN_CASE");
+        let old_list = std::env::var_os("IOS_CAMPAIGN_LIST");
+        std::env::set_var("IOS_CAMPAIGN_CASE", "not-a-valid-case");
+        let bad = super::run_report();
+        std::env::remove_var("IOS_CAMPAIGN_CASE");
+        std::env::set_var("IOS_CAMPAIGN_LIST", "1");
+        let list = super::run_report();
+        for (key, old) in [
+            ("IOS_CAMPAIGN_CASE", old_case),
+            ("IOS_CAMPAIGN_LIST", old_list),
+        ] {
+            if let Some(value) = old {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        assert!(bad.starts_with("SMOKE: FAIL"));
+        assert!(!bad.contains("GEMM"));
+        #[cfg(feature = "media")]
+        assert!(list.starts_with("CAMPAIGN: LIST\nCAMPAIGN_CATALOG "));
+        #[cfg(not(feature = "media"))]
+        assert!(list.starts_with("SMOKE: FAIL"));
+    }
+
     #[cfg(all(feature = "media", not(target_os = "ios")))]
     #[test]
     fn sana_capture_is_device_only_and_never_reported_as_admitted() {

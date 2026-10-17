@@ -29,16 +29,28 @@ SRC=""
 REMOTE=""
 DEVICE=""
 SIMULATOR=""
+CAMPAIGN_ROUTE=""
+CAMPAIGN_TIER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --device) DEVICE="$2"; shift 2 ;;
     --simulator) SIMULATOR="$2"; shift 2 ;;
+    --campaign-route) CAMPAIGN_ROUTE="$2"; shift 2 ;;
+    --tier) CAMPAIGN_TIER="$2"; shift 2 ;;
     -*) echo "unknown argument: $1" >&2; exit 2 ;;
     *)
       if [ -z "$SRC" ]; then SRC="$1"; else REMOTE="$1"; fi
       shift ;;
   esac
 done
+if [ -n "$CAMPAIGN_ROUTE$CAMPAIGN_TIER" ]; then
+  [ -z "$REMOTE" ] || { echo "campaign route/tier cannot combine with remote-subdir" >&2; exit 2; }
+  [[ "$CAMPAIGN_ROUTE" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "invalid campaign route" >&2; exit 2; }
+  case "$CAMPAIGN_TIER" in q4|q8|bf16) ;; *) echo "--tier must be q4, q8 or bf16" >&2; exit 2 ;; esac
+  REMOTE="campaign/$CAMPAIGN_ROUTE/$CAMPAIGN_TIER"
+fi
+case "/$REMOTE/" in *'/../'*|*'/./'*|*'//'*) [ -z "$REMOTE" ] || { echo "remote path must be confined to Documents" >&2; exit 2; } ;; esac
+[[ "$REMOTE" != /* ]] || { echo "remote path must be relative" >&2; exit 2; }
 [ -n "$SRC" ] || { echo "usage: push_model.sh <local-snapshot-dir> [<remote-subdir>]" >&2; exit 2; }
 [ -d "$SRC" ] || { echo "not a directory: $SRC" >&2; exit 1; }
 
