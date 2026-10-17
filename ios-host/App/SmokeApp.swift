@@ -1,4 +1,5 @@
 import SwiftUI
+import Darwin
 
 // The Rust smoke test's C entry points (ios-host/smoke/src/lib.rs).
 @_silgen_name("ios_smoke_run")
@@ -25,6 +26,7 @@ let increasedMemoryLimit =
 func logLaunchMemory() {
     let mib = ios_smoke_available_memory_mib()
     setenv("IOS_SMOKE_INCREASED_MEMORY_LIMIT", increasedMemoryLimit, 1)
+    setenv("IOS_CAMPAIGN_IOS_VERSION", ProcessInfo.processInfo.operatingSystemVersionString, 1)
     let line = String(
         format: "launch: os_proc_available_memory = %.0f MiB, increased-memory-limit = %@\n",
         mib, increasedMemoryLimit)
@@ -105,6 +107,12 @@ struct ContentView: View {
             let result = runSmokeTest()
             print(result)
             writeReport(result)
+            // Campaign cases are one-shot processes. Rust has returned from generation, stopped
+            // its samplers and dropped the provider before we persist and exit. Never signal a
+            // live Metal render from the host just to begin the next case.
+            if ProcessInfo.processInfo.environment["IOS_CAMPAIGN_CASE"] != nil {
+                Darwin.exit(0)
+            }
             DispatchQueue.main.async {
                 report = result
                 running = false

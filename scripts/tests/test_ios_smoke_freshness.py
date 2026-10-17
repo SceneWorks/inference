@@ -17,7 +17,7 @@ class IosSmokeFreshnessTests(unittest.TestCase):
         start = source.index('say "launching (unlock')
         before = source[:start].rfind("LAUNCHED_AT=$(date +%s)")
         start = before if before != -1 else start
-        end = source.index('for _ in $(seq 1 "$POLL_TRIES")', start)
+        end = source.index('while [ "$(date +%s)" -lt "$POLL_END" ]; do', start)
         block = source[start:end].replace('REPORT=/tmp/ios-smoke-report.txt', 'REPORT="$POLL_REPORT"')
         for environment in ["{}", '{"IOS_SMOKE_ONLY":"sana"}']:
             with self.subTest(environment=environment), tempfile.TemporaryDirectory() as temp:
@@ -41,6 +41,15 @@ POLL_TRIES=1
                     capture_output=True, text=True, encoding="utf-8",
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_actual_poll_budget_uses_selected_timeout_not_media_loop_count(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        assignment = next(line for line in source.splitlines() if line.startswith("POLL_END="))
+        result = subprocess.run(["bash", "-c", assignment + '\nprintf "%s" "$POLL_END"'],
+            env={**os.environ, "LAUNCHED_AT": "100", "POLL_TRIES": "100", "IOS_CAMPAIGN_TIMEOUT_SECONDS": "37"},
+            capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "137")
 
     def test_actual_report_guard_accepts_fresh_and_equal_but_rejects_stale(self):
         source = SCRIPT.read_text(encoding="utf-8")
