@@ -1161,3 +1161,60 @@ fn package_checks_are_typed() {
     assert_eq!(package.prompts(), SystemPrompts::builtin());
     assert!(package.dir().join("system_prompts.json").is_file());
 }
+
+#[test]
+fn optional_pup_license_identity_is_separate_and_frozen() {
+    let row =
+        gen_core::resolve_component(gen_core::MEDIA_COMPONENT_LICENSES, "flux3_image_klein_pup")
+            .expect("the optional upsampler has its own shared license row");
+    assert_eq!(
+        row.source_url,
+        "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup"
+    );
+    assert_eq!(row.declared, "apache-2.0");
+    assert_eq!(row.family, "apache-2-0");
+    assert!(!row.gated);
+    assert_eq!(
+        pup::UPSAMPLER_REPO,
+        "black-forest-labs/flux-3-image-klein-pup"
+    );
+    assert_eq!(
+        pup::UPSAMPLER_REVISION,
+        "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
+    );
+}
+
+#[test]
+fn native_request_options_preserve_absence_and_frozen_producer_budget() {
+    let package = tiny_package();
+    let mut request = gen_core::GenerationRequest {
+        prompt: "a fox".to_owned(),
+        enhance_prompt: true,
+        ..Default::default()
+    };
+    let inp = input(&request.prompt, UpsampleMode::Text, vec![], None);
+    for requested in [None, Some(2), Some(3_584)] {
+        request.enhance_max_tokens = requested;
+        let options = UpsampleOptions::from_generation_request(&request);
+        assert_eq!(options.max_tokens, requested);
+        assert_eq!(options.temperature, None);
+        assert_eq!(options.seed, request.seed);
+        let UpsampleDecision::Run(plan) = decide(&inp, &package, &options).unwrap() else {
+            panic!("enabled request must plan a run");
+        };
+        assert_eq!(plan.max_new_tokens, requested.unwrap_or(3_584));
+    }
+    request.enhance_prompt = false;
+    request.enhance_max_tokens = None;
+    let mut bypass = inp;
+    bypass.bypass = true;
+    let UpsampleDecision::Bypass(outcome) = decide(
+        &bypass,
+        &package,
+        &UpsampleOptions::from_generation_request(&request),
+    )
+    .unwrap() else {
+        panic!("disabled request must bypass");
+    };
+    assert_eq!(outcome.caption, request.prompt);
+}

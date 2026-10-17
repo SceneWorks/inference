@@ -1,0 +1,3 @@
+# Raw pixels can be NUL-free; never let text/EOL detection rewrite sample bytes.
+*.rgb binary
+*.rgba binary
