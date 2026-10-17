@@ -279,7 +279,7 @@ fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
                 let mut config = tiny_config();
                 config.dit.flow_map = false;
                 let mut weights =
-                    Weights::from_file(&tiny_package().join("model.safetensors")).unwrap();
+                    Weights::from_file(tiny_package().join("model.safetensors")).unwrap();
                 let remove: Vec<_> = weights
                     .keys()
                     .filter(|key| key.starts_with("ref_time_in."))
