@@ -36,7 +36,12 @@ pub mod model_control;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests;
 pub mod rope_embedder;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 pub mod text_encoder;
 pub mod timestep_embedder;
 #[cfg(feature = "training")]
