@@ -127,13 +127,30 @@ evidence table that needed one measured row per model × route × tier × mode �
 selection (18,450 cells). Michael: "measure the extreme cases, fully resident, and fully
 optimized, and estimate in between."
 
-**Anchor family** = `(device, provider, route, tier, path-free artifact layout digest, mode)`.
+**Anchor family** = `(device, base ARCHITECTURE digest, tier, variant)` — the recorded rule's
+one anchor per (model, tier, lane, VARIANT/decoder), keyed on what actually shapes memory:
+
+* **Architecture**, not route or checkpoint: `layout::architecture_digest` hashes the base
+  components' safetensors HEADERS — tensor names, shapes, dtypes and so packing — and the memory
+  load settings; never values, file names, config content, paths or the route. Checkpoints of one
+  architecture share anchors; any header difference (a distilled U-Net, another VAE, other dense
+  dtypes) is its own family automatically. The per-checkpoint artifact `layout_sha256` stays in
+  the key: an anchor's own key is exact; any other request of the family is derived.
+* **Variant**: `base` for every mode the provider has PROVEN component-additive on its CPU
+  fixtures (`mlx_gen::ios_anchor_law::measure_phases` + `derive`: the measured mode peak never
+  exceeds the peak derived from the text-mode run) — img2img/reference/mask, ControlNet,
+  IP-Adapter, Z-Image control, prompt batches — so those requests derive from the family's TEXT
+  anchor: `C_req` re-adds the mode's resident components and its extra phase (the VAE /
+  control-hint encode) is priced by its guarded counted formula plus the anchor's largest
+  unpriced overhead. A mode whose proof fails is listed explicitly by its provider
+  (`IOS_NON_ADDITIVE_MODES`) and is its own family. <!-- NONADDITIVE -->
+
 Per family at most two anchors (`evidence/ios_device_evidence.json`, schema 3):
 
 | Anchor | Configuration | Captured | Evidence |
 |---|---|---|---|
 | `resident` | rung 0, its first selection | once | completed captures, **or** its typed pre-allocation `capture_refused` quantum (allowed on the 8 GB phone) |
-| `optimized` | the deepest rung the provider implements, its **last (cheapest)** selection — every saving engaged | **3 repeats** | must complete; a refusal is a defect to fix, never evidence |
+| `optimized` | the deepest rung the provider implements, its **last (cheapest)** selection — every saving engaged | **2 repeats** | must complete; a refusal is a defect to fix, never evidence |
 
 Both anchors sit at the **reference geometry 1024²** (Supra2: 256²) and run **2 denoise steps**:
 
@@ -159,10 +176,12 @@ overhead (driver, allocator), scaled by `λ = max(A_request, A_anchor) / A_ancho
 `D_p = C_p(request regime) + overhead × λ + S_p(request) × κ` and `demand = max_p D_p`. At the
 anchor's own configuration this IS the measurement. Requests are derived **upward from the
 optimized anchor** toward resident; a completed resident anchor only prices its own regime at
-other geometries. Not derivable → typed `no_evidence` (fail closed): another mode / tier / route /
-layout (decoder, components) / device; a phase the anchor never ran; a phase whose measured growth
-is below its resident components (outside the law's domain); a provider with no counted pricing
-(only its anchors' own keys admit).
+other geometries. A phase the anchor never ran (an additive mode's encode) is its counted formula
+plus the anchor's largest unpriced overhead. Not derivable → typed `no_evidence` (fail closed):
+another architecture (decoder, base components) / tier / non-additive mode / device; execution
+levers outside the iOS ladder; a configuration the provider's pricing declines (adapters, PiD); a
+phase whose measured growth is below its resident components (outside the law's domain); a
+provider with no counted pricing (only its anchors' own keys admit).
 
 **Self-check.** When both anchors completed, the optimized anchor predicts the resident anchor's
 own configuration. An under-prediction beyond **12.6%** (the measured same-cell MLX recapture
@@ -170,7 +189,7 @@ spread, SceneWorks `MLX_ACTIVE_RECAPTURE_SPREAD`) fails every derivation of the 
 an over-prediction beyond it is flagged (derivations then err large).
 
 **Low end: admission is the measurement.** At the optimized anchor's own key admission charges the
-largest of its 3 repeats' growth (kernel lifetime `phys_footprint` peak − the capture's starting
+largest of its 2 repeats' growth (kernel lifetime `phys_footprint` peak − the capture's starting
 footprint) **plus the margin = the repeats' measured spread (max − min), floored at 32 MiB** (an
 engineering floor so three identical repeats never claim a zero margin; ~0.5% of the 6142 MiB
 launch headroom). No counted-formula scratch and no 512 MiB formula reserve is stacked on a
@@ -198,25 +217,30 @@ provider's `ios_quantum_phase(label)`), glue after a synchronization to the next
 phase is `exact` when the lifetime peak rose inside it, else an upper bound (masked by an earlier
 phase). An unattributed phase is priced at the whole-run peak.
 
-**Campaign size.** `campaign.py list` (the runner's own catalog, never a hand list) currently
-plans **246 cases / 490 cold launches** (122 resident anchors × 1, 122 optimized
-anchors × 3, the two validation cases × 1) — SDXL family 150 cases / 300 launches,
-Z-Image control 36 / 72, Z-Image 12 / 24, SANA base 12 / 24 (+2 validation), SANA
-Sprint 12 / 24, Iris 12 / 24, Iris depth 2 / 4, Iris restore 2 / 4, Anima Turbo 6 / 12;
-four dense-only route/tiers are listed `unserved` — versus 18,450 cells before; the 20,000-case budget is gone by
-construction (`--max-cases` is an optional cap). Estimated phone time (stated assumptions, low
-confidence): a resident anchor ~0.75 min (most refuse at an early load quantum on 8 GB), an
-optimized capture ~2.5 min (cold launch + load from flash + 2 steps + tiled decode at 1024²),
-the two validation cases ~5 min each: about **17 h** of phone time (122 × 0.75 +
-366 × 2.5 + 2 × 5 min, plus one ~10 min install), plausibly 10–25 h.
+**Campaign size.** `campaign.py list --snapshots <dir of the route/tier slots that will be pushed>`
+(the runner's own catalog, never a hand list) groups the catalog into anchor FAMILIES by the
+slots' architecture digests and plans <!-- COUNT --> Without `--snapshots` the listing is
+weights-free and conservative: every route is its own family. The 20,000-case budget is gone by
+construction (`--max-cases` is an optional cap).
+
+Which checkpoints collapse (host header evidence, 2026-10-18, `IOS_CAMPAIGN_SNAPSHOTS` over the
+cached SceneWorks snapshots):
+
+| Collapsed into one family per tier | Kept separate (header evidence) |
+|---|---|
+| SDXL-family fine-tunes `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (identical tensor names, shapes, dtypes; Lightning's distillation changed values only) | `sdxl` base: 1385 dense tensors stored F16 where the fine-tunes store F32 (U-Net 937, text encoders 448) — different resident bytes |
+| `z_image_turbo_control` joins `z_image_turbo` (the ControlNet is a mode-added component; the base architecture is identical) | `sana_sprint_1600m` vs `sana_1600m`: Sprint's transformer carries a guidance embedder (96 extra tensors) and BF16 where base has F16 (228 tensors) |
+| | Anima, Iris (generation, restore, depth): one route each |
 
 **Validation cases (part of the campaign, not optional).** For the first optimized family in
 catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
 captured beside the anchor (`evidence` prints full/short growth, whole run and per phase); and
-`validation_geometry` — the optimized configuration at 512², run **ADMITTED** with
-`campaign.py validate` once the anchors are committed: the row records the anchor law's derived
-demand (`admitted.demand_bytes`, basis `Derived`) and the measured growth, and `validate` prints
-the error.
+`validation_geometry` — the optimized configuration at 512², derived DOWN from the 1024² anchor.
+For the first q4 family deriving a `control` member: `validation_mode` — an SDXL ControlNet
+request at 1024² (the optimized selection), derived from the family's TEXT anchor by the additive-
+mode law. Both admitted cases run with `campaign.py validate` once the anchors are committed: each
+row records the anchor law's derived demand (`admitted.demand_bytes`, basis `Derived`) beside the
+measured growth, and `validate` prints the error.
 
 #### The fully optimized configuration fits every served cell (host-derived prediction)
 
@@ -349,7 +373,9 @@ repeats and next-up probes; exhausted cases are explicit skips. Direct `run_smok
 never to the legacy reinstall/terminate-existing path.
 
 ```sh
-# The anchor campaign. Step 1 — capture every resident, optimized (x3) and validation_steps case
+# The anchor campaign. List the families over the slots that will be pushed (header reads only):
+python3 scripts/ios/campaign.py list --snapshots "$SLOTS" > /tmp/ios-campaign-catalog.json
+# Step 1 — capture every resident, optimized (x2) and validation_steps case
 # as a labelled bounded DEVICE CAPTURE (no evidence needed: every quantum of every registered model
 # checks live OS headroom BEFORE constructing its graph). A resident `capture_refused` row is that
 # anchor's evidence; an optimized anchor that does not complete is a DEFECT (exit 2). No size or
