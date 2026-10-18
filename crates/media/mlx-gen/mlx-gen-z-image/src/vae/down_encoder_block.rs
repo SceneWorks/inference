@@ -20,7 +20,13 @@ impl DownEncoderBlock {
         add_downsample: bool,
     ) -> Result<Self> {
         let resnets = (0..num_layers)
-            .map(|i| ResnetBlock2D::from_weights(w, &format!("{prefix}.resnets.{i}")))
+            .map(|i| {
+                ResnetBlock2D::from_weights_labeled(
+                    w,
+                    &format!("{prefix}.resnets.{i}"),
+                    &crate::quantum::ENCODE_LABELS,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let downsampler = if add_downsample {
             Some(DownSampler::from_weights(
@@ -41,8 +47,7 @@ impl DownEncoderBlock {
         self.downsampler.is_some()
     }
 
-    /// The block's resnets and downsampler (the reachable-sizes prediction prices them).
-    #[cfg(test)]
+    /// The block's resnets and downsampler (the iOS pricing prices them).
     pub(crate) fn parts(&self) -> (&[ResnetBlock2D], Option<&DownSampler>) {
         (&self.resnets, self.downsampler.as_ref())
     }

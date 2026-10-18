@@ -549,14 +549,18 @@ fn assert_checked_before_synchronized(events: &[QuantumEvent]) {
         match e {
             QuantumEvent::Checked { label, .. } => pending.push(label.clone()),
             QuantumEvent::Synchronized { label, .. } => {
-                let want = if label == "tiled conv core" {
-                    crate::quantum::VAE_TILE
-                } else {
-                    label.as_str()
-                };
+                // A tile's core synchronizes as "tiled conv core": it answers its side's tile check.
+                let core = label == "tiled conv core";
                 let at = pending
                     .iter()
-                    .rposition(|l| l == want)
+                    .rposition(|l| {
+                        if core {
+                            l == crate::quantum::VAE_DECODE_TILE
+                                || l == crate::quantum::VAE_ENCODE_TILE
+                        } else {
+                            l == label
+                        }
+                    })
                     .unwrap_or_else(|| panic!("{label} synchronized without a check: {events:?}"));
                 pending.remove(at);
             }
@@ -620,14 +624,16 @@ fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
         crate::quantum::CONTROL_CONTEXT,
         crate::quantum::VAE_DECODE_IN,
         crate::quantum::VAE_ENCODE_IN,
-        crate::quantum::VAE_RESNET,
-        crate::quantum::VAE_ATTENTION,
+        crate::quantum::VAE_DECODE_RESNET,
+        crate::quantum::VAE_ENCODE_RESNET,
+        crate::quantum::VAE_DECODE_ATTENTION,
+        crate::quantum::VAE_ENCODE_ATTENTION,
         crate::quantum::VAE_UPSAMPLE,
         crate::quantum::VAE_DOWNSAMPLE,
         crate::quantum::VAE_DECODE_OUT,
         crate::quantum::VAE_ENCODE_OUT,
-        crate::quantum::VAE_TILE,
-        crate::quantum::VAE_TILED_STAGE,
+        crate::quantum::VAE_DECODE_TILE,
+        crate::quantum::VAE_DECODE_TILED_STAGE,
         crate::quantum::INIT_IMAGE,
         mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
     ] {
@@ -814,7 +820,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let stages: Vec<usize> = all
         .iter()
         .enumerate()
-        .filter(|(_, (l, _))| l == crate::quantum::VAE_TILED_STAGE)
+        .filter(|(_, (l, _))| l == crate::quantum::VAE_ENCODE_TILED_STAGE)
         .map(|(i, _)| i)
         .collect();
     assert_eq!(
@@ -827,7 +833,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
         assert!(
             all[at + 1..end]
                 .iter()
-                .filter(|(l, _)| l == crate::quantum::VAE_TILE)
+                .filter(|(l, _)| l == crate::quantum::VAE_ENCODE_TILE)
                 .count()
                 > 1,
             "stage {n} checks each of its tiles: {all:?}"
@@ -863,7 +869,7 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let (routed, events) = observed(AMPLE, || vae.encode(&big));
     assert!(checks(&events)
         .iter()
-        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+        .any(|(l, _)| l == crate::quantum::VAE_ENCODE_TILED_STAGE));
     assert_eq!(
         bits(&routed.unwrap()),
         bits(
@@ -874,11 +880,13 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let (_, events) = observed(AMPLE, || vae.encode(&image));
     assert!(!checks(&events)
         .iter()
-        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+        .any(|(l, _)| l == crate::quantum::VAE_ENCODE_TILED_STAGE));
     // A tile short of headroom refuses before its graph: nothing after it is checked.
-    let events = assert_refused_at(crate::quantum::VAE_TILE, all[stages[0] + 1].1, || {
-        vae.encode_tiled(&image, 16, None)
-    });
+    let events = assert_refused_at(
+        crate::quantum::VAE_ENCODE_TILE,
+        all[stages[0] + 1].1,
+        || vae.encode_tiled(&image, 16, None),
+    );
     assert_eq!(checks(&events), all[..=stages[0]].to_vec());
 }
 

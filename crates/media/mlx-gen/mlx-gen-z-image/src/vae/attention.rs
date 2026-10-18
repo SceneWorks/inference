@@ -20,10 +20,22 @@ pub struct VaeAttention {
     k: AdaptableLinear,
     v: AdaptableLinear,
     out: AdaptableLinear,
+    /// The quantum label of the side (encoder / decoder) this attention runs on.
+    label: &'static str,
 }
 
 impl VaeAttention {
+    /// A decoder-side attention (the decoder's quantum label).
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::from_weights_labeled(w, prefix, &crate::quantum::DECODE_LABELS)
+    }
+
+    /// An attention whose iOS quantum carries `labels.attention`.
+    pub(crate) fn from_weights_labeled(
+        w: &Weights,
+        prefix: &str,
+        labels: &'static crate::quantum::VaeLabels,
+    ) -> Result<Self> {
         let g = |s: &str| w.require(&format!("{prefix}.{s}")).cloned();
         // Packed-detect (sc-8670): the mid-block attention QKV/out projections load packed from a
         // pre-quantized snapshot or dense otherwise; all carry a bias. They are the only quantizable
@@ -37,6 +49,7 @@ impl VaeAttention {
             k: lin("to_k")?,
             v: lin("to_v")?,
             out: lin("to_out.0")?,
+            label: labels.attention,
         })
     }
 
@@ -83,7 +96,7 @@ impl VaeAttention {
     pub(crate) fn forward_quantum(&self, x_nchw: &Array) -> Result<Array> {
         let plan = Self::plan();
         crate::quantum::conv_quantum(
-            crate::quantum::VAE_ATTENTION,
+            self.label,
             |backend| {
                 let [b, h, w, c] = crate::quantum::nhwc(x_nchw);
                 let n = h * w;

@@ -140,8 +140,7 @@ impl Decoder {
         self.out_quantum(&h)
     }
 
-    /// `(conv_in, mid block, up blocks, conv_out)` (the reachable-sizes prediction walks them).
-    #[cfg(test)]
+    /// `(conv_in, mid block, up blocks, conv_out)` (the iOS pricing walks them).
     pub(crate) fn parts(&self) -> (&ConvLayer, &UNetMidBlock, &[UpDecoderBlock], &ConvLayer) {
         (
             &self.conv_in,
@@ -404,11 +403,17 @@ impl Vae {
         self.decoder.mid_block.forward(&h)
     }
 
+    /// The latent de-normalization's price over `elements` latent elements: its two latent-sized
+    /// products (f32 — the scalars promote).
+    pub(crate) fn denorm_bytes(elements: u64) -> u64 {
+        2 * crate::quantum::tb(4, &[elements])
+    }
+
     /// The latent de-normalization (`z/scale + shift`) and the decoder's `conv_in` as one iOS
     /// quantum: the convolution's price plus the de-normalization's two latent-sized products (f32 —
     /// the scalars promote).
     pub(crate) fn decode_in_quantum(&self, latents4: &Array) -> Result<Array> {
-        let denorm_bytes = 2 * crate::quantum::tb(4, &[latents4.size() as u64]);
+        let denorm_bytes = Self::denorm_bytes(latents4.size() as u64);
         self.decoder
             .conv_in_quantum(latents4, denorm_bytes, |latents4| {
                 let scaled = add(
@@ -468,8 +473,7 @@ impl Vae {
         Ok(out4.reshape(&[os[0], os[1], 1, os[2], os[3]])?)
     }
 
-    /// The img2img encoder, when loaded (the iOS accounting proofs).
-    #[cfg(test)]
+    /// The img2img encoder, when loaded (the iOS pricing and accounting proofs).
     pub(crate) fn encoder(&self) -> Option<&Encoder> {
         self.encoder.as_ref()
     }

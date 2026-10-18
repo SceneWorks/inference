@@ -141,32 +141,64 @@ impl TextEncoderBlockStream {
                 self.cfg.n_layers
             )));
         }
-        let prefix = format!("{}.{index}", self.base);
-        let mut layer = EncoderLayer::from_weights(
+        materialize_layer_counted(
             view,
-            &prefix,
-            self.cfg.n_heads,
-            self.cfg.n_kv_heads,
-            self.cfg.head_dim,
-            self.cfg.rms_norm_eps,
-        )?;
-        // LOAD-BEARING (SC-15750, re-established for this stack by SC-15794): the view keeps its own
-        // refcounted handle to every tensor the constructor cloned. Draining exactly the accessed keys
-        // is what makes the window's drop a real release rather than a no-op that still produces a
-        // correct conditioning tensor. The DiT twin measured 8.0 MiB vs 238.4 MiB on this distinction.
-        let mut extra = view
-            .accessed_entries()
-            .iter()
-            .fold(0u64, |total, (_, array)| {
-                total.saturating_add(array.nbytes() as u64)
-            });
-        view.remove_accessed();
-        if let Some(bits) = self.quant_bits {
-            extra = extra.saturating_add(layer.quantize_bytes(bits));
-            layer.quantize(bits)?;
-        }
-        Ok((layer, extra))
+            &format!("{}.{index}", self.base),
+            &self.cfg,
+            self.quant_bits,
+        )
     }
+}
+
+/// Materialize the encoder layer at `prefix` out of `view`, quantized at `quant_bits` (the replayed
+/// load-time quantization), with [`layer_counted`]'s count.
+fn materialize_layer_counted(
+    view: &mut Weights,
+    prefix: &str,
+    cfg: &ZTextEncoderConfig,
+    quant_bits: Option<i32>,
+) -> Result<(EncoderLayer, u64)> {
+    let (mut layer, extra) = layer_counted(view, prefix, cfg, quant_bits)?;
+    if let Some(bits) = quant_bits {
+        layer.quantize(bits)?;
+    }
+    Ok((layer, extra))
+}
+
+/// Build the encoder layer at `prefix` from `view` (lazy handles: nothing is read), drain the view of
+/// exactly the tensors it read, and return what the layer's iOS quantum adds for having been
+/// materialized there: the stored bytes of those tensors plus, replaying `quant_bits`, the packed
+/// copies the quantization builds. Does not quantize. Shared with the header-only iOS pricing
+/// (`crate::ios_pricing`), which runs it over shape-only handles.
+pub(crate) fn layer_counted(
+    view: &mut Weights,
+    prefix: &str,
+    cfg: &ZTextEncoderConfig,
+    quant_bits: Option<i32>,
+) -> Result<(EncoderLayer, u64)> {
+    let layer = EncoderLayer::from_weights(
+        view,
+        prefix,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.rms_norm_eps,
+    )?;
+    // LOAD-BEARING (SC-15750, re-established for this stack by SC-15794): the view keeps its own
+    // refcounted handle to every tensor the constructor cloned. Draining exactly the accessed keys
+    // is what makes the window's drop a real release rather than a no-op that still produces a
+    // correct conditioning tensor. The DiT twin measured 8.0 MiB vs 238.4 MiB on this distinction.
+    let mut extra = view
+        .accessed_entries()
+        .iter()
+        .fold(0u64, |total, (_, array)| {
+            total.saturating_add(array.nbytes() as u64)
+        });
+    view.remove_accessed();
+    if let Some(bits) = quant_bits {
+        extra = extra.saturating_add(layer.quantize_bytes(bits));
+    }
+    Ok((layer, extra))
 }
 
 /// The encoder's carried state across a window boundary.

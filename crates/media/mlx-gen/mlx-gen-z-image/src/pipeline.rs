@@ -562,7 +562,7 @@ pub(crate) fn init_image_quantum(
     if quanta {
         mlx_gen::ios_quantum::before(
             crate::quantum::INIT_IMAGE,
-            crate::quantum::ab(4, &[target_height as u64, target_width as u64, 3]),
+            init_image_bytes(target_width, target_height),
         )?;
     }
     let image_nchw = preprocess_init_image(image, target_width, target_height)?;
@@ -570,6 +570,11 @@ pub(crate) fn init_image_quantum(
         mlx_gen::ios_quantum::finish(crate::quantum::INIT_IMAGE, &[&image_nchw])?;
     }
     Ok(image_nchw)
+}
+
+/// [`init_image_quantum`]'s price: the uploaded `[H, W, 3]` f32 image.
+pub(crate) fn init_image_bytes(target_width: u32, target_height: u32) -> u64 {
+    crate::quantum::ab(4, &[target_height as u64, target_width as u64, 3])
 }
 
 /// Build the 33-channel VAE-encoded **control context** from a control image (e.g. a rendered
@@ -595,22 +600,9 @@ pub(crate) fn control_context_quantum(control_latents: &Array) -> Result<Array> 
     let control_latents = control_latents.clone();
     let sh = control_latents.shape(); // [16, 1, H/8, W/8]
     let (c, fdim, h, w) = (sh[0], sh[1], sh[2], sh[3]);
-    // iOS: the zero mask / inpaint channels and the 33-channel concatenation are one quantum: the
-    // zero channels' uploads and the concatenation (f32).
-    let plane = |channels: i32| {
-        crate::quantum::ab(
-            4,
-            &[
-                channels.max(0) as u64,
-                fdim.max(0) as u64,
-                h.max(0) as u64,
-                w.max(0) as u64,
-            ],
-        )
-    };
     crate::quantum::conv_quantum(
         crate::quantum::CONTROL_CONTEXT,
-        |_| plane(1) + plane(c) + plane(2 * c + 1),
+        |_| control_context_bytes(c, fdim, h, w),
         || {
             // i64 intermediates before the usize cast — bounded by the validated max resolution
             // today, but a raw i32 product is a latent overflow footgun if the caps change (F-056).
@@ -625,6 +617,23 @@ pub(crate) fn control_context_quantum(control_latents: &Array) -> Result<Array> 
             Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
         },
     )
+}
+
+/// [`control_context_quantum`]'s price over `[c, f, h, w]` control latents: the zero mask and zero
+/// inpaint channels' uploads and the `2c + 1`-channel concatenation (f32).
+pub(crate) fn control_context_bytes(c: i32, f: i32, h: i32, w: i32) -> u64 {
+    let plane = |channels: i32| {
+        crate::quantum::ab(
+            4,
+            &[
+                channels.max(0) as u64,
+                f.max(0) as u64,
+                h.max(0) as u64,
+                w.max(0) as u64,
+            ],
+        )
+    };
+    plane(1) + plane(c) + plane(2 * c + 1)
 }
 
 /// Port of `ZImageLatentCreator.pack_latents`: VAE-encoder latent `[1, C, H/8, W/8]` (or a 5-D
@@ -661,7 +670,25 @@ pub(crate) fn encode_prompt(
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
-    let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
+    encode_tokens(
+        text_encoder,
+        &input_ids,
+        &attention_mask,
+        num_valid,
+        encoder_window,
+    )
+}
+
+/// [`encode_prompt`] after tokenization: the encoder (under `encoder_window`, or resident) over the
+/// padded `[1, S]` ids, then the caption features' valid-token gather ([`caption_quantum`]).
+pub(crate) fn encode_tokens(
+    text_encoder: &TextEncoder,
+    input_ids: &Array,
+    attention_mask: &Array,
+    num_valid: i32,
+    encoder_window: Option<EncoderWindow<'_>>,
+) -> Result<Array> {
+    let enc = EncoderWindow::encode(encoder_window, text_encoder, input_ids, attention_mask)?;
     caption_quantum(&enc, num_valid, |enc| slice_valid(enc, num_valid))
 }
 
@@ -674,21 +701,27 @@ pub(crate) fn caption_quantum(
 ) -> Result<Array> {
     crate::quantum::conv_quantum(
         crate::quantum::CAPTION_FEATURES,
-        |_| {
-            let hidden = enc.shape().last().copied().unwrap_or(0);
-            let n = crate::quantum::u(num_valid);
-            // The gather index and the gathered `[valid, hidden]` rows (f32).
-            crate::quantum::ab(4, &[n]) + crate::quantum::ab(4, &[n, crate::quantum::u(hidden)])
-        },
+        |_| caption_features_bytes(num_valid, enc.shape().last().copied().unwrap_or(0)),
         || build(enc),
     )
+}
+
+/// [`caption_quantum`]'s price: the gather index and the gathered `[valid, hidden]` rows (f32).
+pub(crate) fn caption_features_bytes(num_valid: i32, hidden: i32) -> u64 {
+    let n = crate::quantum::u(num_valid);
+    crate::quantum::ab(4, &[n]) + crate::quantum::ab(4, &[n, crate::quantum::u(hidden)])
+}
+
+/// [`caption_cast_quantum`]'s price over `elements` caption-feature elements: the bf16 copy.
+pub(crate) fn caption_cast_bytes(elements: u64) -> u64 {
+    crate::quantum::ab(2, &[elements])
 }
 
 /// The caption features' bf16 cast (the txt2img DiT conditioning) as one iOS quantum.
 pub(crate) fn caption_cast_quantum(cap: &Array) -> Result<Array> {
     crate::quantum::conv_quantum(
         crate::quantum::CAPTION_FEATURES,
-        |_| crate::quantum::ab(2, &[cap.size() as u64]),
+        |_| caption_cast_bytes(cap.size() as u64),
         || Ok(cap.as_dtype(Dtype::Bfloat16)?),
     )
 }

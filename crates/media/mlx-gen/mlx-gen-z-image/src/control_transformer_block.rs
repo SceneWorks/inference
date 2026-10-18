@@ -93,13 +93,21 @@ impl ZImageControlBlock {
 
     /// The packed bytes [`Self::quantize`] builds from this block's dense projections (0 when packed).
     pub(crate) fn quantize_bytes(&self, bits: i32) -> u64 {
+        self.projections()
+            .into_iter()
+            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+            .sum()
+    }
+
+    /// Every projection [`Self::quantize`] packs: the base block's, `after_proj` and (block 0)
+    /// `before_proj`.
+    pub(crate) fn projections(&self) -> Vec<&AdaptableLinear> {
         self.base
             .projections()
             .into_iter()
             .chain(std::iter::once(&self.after_proj))
             .chain(self.before_proj.iter())
-            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
-            .sum()
+            .collect()
     }
 
     /// The block's iOS quantum price over control state `c` (`[1, L, D]`): the base block's
@@ -136,11 +144,8 @@ impl ZImageControlBlock {
     /// Every weight array the block's projections hold (packed: weight, scales, biases, bias), for
     /// the iOS load-time packing quantum to materialize.
     pub(crate) fn weight_arrays(&self) -> Vec<&Array> {
-        self.base
-            .projections()
+        self.projections()
             .into_iter()
-            .chain(std::iter::once(&self.after_proj))
-            .chain(self.before_proj.iter())
             .flat_map(|lin| match lin.quantized_params() {
                 Some((w, scales, biases, bias, ..)) => {
                     let mut v = vec![w, scales, biases];

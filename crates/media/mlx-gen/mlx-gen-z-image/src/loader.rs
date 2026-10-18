@@ -26,7 +26,25 @@ use crate::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 /// Qwen3 pad token id (`<|endoftext|>`).
 const PAD_TOKEN_ID: i32 = 151643;
 /// Prompts pad to this length (the fork's `padding="max_length"`).
-const MAX_LENGTH: usize = 512;
+pub(crate) const MAX_LENGTH: usize = 512;
+
+/// The tensors a streamable text-encoder load reads up front: everything but the layer stack, whose
+/// layers are read inside their own priced quanta (an eager load reads everything).
+pub(crate) fn te_load_keeps(streamable: bool, name: &str) -> bool {
+    !(streamable && name.starts_with("model.layers."))
+}
+
+/// The tensors a DiT load reads up front: a streamed stack's block bodies are read inside each
+/// block's own priced quantum instead.
+pub(crate) fn dit_load_keeps(streamed: bool, name: &str) -> bool {
+    !(streamed && name.starts_with("layers."))
+}
+
+/// The tensors a ControlNet load reads up front: a streamed control stack's block bodies are read
+/// inside each block's own priced quantum instead.
+pub(crate) fn control_load_keeps(streamed: bool, name: &str) -> bool {
+    !(streamed && name.starts_with("control_layers."))
+}
 
 /// Load the Qwen tokenizer with the Z-Image chat-template + padding policy.
 pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
@@ -73,7 +91,9 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 
 pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<TextEncoder> {
     // iOS: the header-only pre-load floor, checked before any tensor is read.
-    crate::quantum::before_load(crate::quantum::TE_LOAD, source, |_| true)?;
+    crate::quantum::before_load(crate::quantum::TE_LOAD, source, |name| {
+        te_load_keeps(false, name)
+    })?;
     let w = weights_from_source(source)?;
     let encoder = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())?;
     w.materialize_accessed()?;
@@ -103,19 +123,24 @@ pub fn load_text_encoder_streamable(root: &Path) -> Result<TextEncoder> {
 pub(crate) fn load_validated_text_encoder_streamable(
     source: &mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<TextEncoder> {
+    load_validated_text_encoder_streamable_with(source, &ZTextEncoderConfig::z_image())
+}
+
+/// [`load_validated_text_encoder_streamable`] at an explicit encoder geometry (the production one,
+/// or a tiny fixture's).
+pub(crate) fn load_validated_text_encoder_streamable_with(
+    source: &mlx_gen::gen_core::ValidatedEncoderSource,
+    cfg: &ZTextEncoderConfig,
+) -> Result<TextEncoder> {
     source.read_unchanged(|weights| {
         // iOS: only the token embedding is read here; every layer is read inside its own priced
         // quantum when its window materializes it.
         crate::quantum::before_load(crate::quantum::TE_LOAD, weights, |name| {
-            !name.starts_with("model.layers.")
+            te_load_keeps(true, name)
         })?;
         let w = weights_from_source(weights)?;
-        let encoder = TextEncoder::from_validated_streamable_source(
-            &w,
-            source.clone(),
-            "model",
-            &ZTextEncoderConfig::z_image(),
-        )?;
+        let encoder =
+            TextEncoder::from_validated_streamable_source(&w, source.clone(), "model", cfg)?;
         w.materialize_accessed()?;
         Ok(encoder)
     })
@@ -158,16 +183,28 @@ pub(crate) fn load_transformer_with_stream(
     streamable: bool,
     streamed: bool,
 ) -> Result<ZImageTransformer> {
+    load_transformer_with_stream_cfg(root, ZImageTransformerConfig::turbo(), streamable, streamed)
+}
+
+/// [`load_transformer_with_stream`] at an explicit DiT geometry (the production one, or a tiny
+/// fixture's).
+pub(crate) fn load_transformer_with_stream_cfg(
+    root: &Path,
+    cfg: ZImageTransformerConfig,
+    streamable: bool,
+    streamed: bool,
+) -> Result<ZImageTransformer> {
     let dir = root.join("transformer");
     // iOS: the header-only floor of what this load reads (a streamed stack's block bodies are read
     // inside each block's own priced quantum instead).
     crate::quantum::before_load(
         crate::quantum::DIT_LOAD,
         &WeightsSource::Dir(dir.clone()),
-        |name| !(streamed && name.starts_with("layers.")),
+        |name| dit_load_keeps(streamed, name),
     )?;
     let mut w = Weights::from_dir(&dir)?;
-    let transformer = build_transformer(&mut w)?;
+    remap_transformer_keys(&mut w);
+    let transformer = ZImageTransformer::from_weights(&w, "", cfg)?;
     materialize_built(&w, streamed.then_some("layers."))?;
     // SC-15754: a snapshot directory is re-openable, so rung 4 (bounded transformer residency) can
     // rebuild `layers` per window from exactly these files. `remap_transformer_keys` only aliases the
@@ -225,7 +262,24 @@ pub(crate) fn load_control_transformer_with_stream(
     streamable: bool,
     streamed: bool,
 ) -> Result<ZImageControlTransformer> {
-    let base = load_transformer_with_stream(root, streamable, streamed)?;
+    load_control_transformer_with_stream_cfg(
+        root,
+        control,
+        ZImageTransformerConfig::turbo(),
+        streamable,
+        streamed,
+    )
+}
+
+/// [`load_control_transformer_with_stream`] at an explicit DiT geometry.
+pub(crate) fn load_control_transformer_with_stream_cfg(
+    root: &Path,
+    control: &WeightsSource,
+    cfg: ZImageTransformerConfig,
+    streamable: bool,
+    streamed: bool,
+) -> Result<ZImageControlTransformer> {
+    let base = load_transformer_with_stream_cfg(root, cfg, streamable, streamed)?;
     before_control_load(control, streamed)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
@@ -236,6 +290,11 @@ pub(crate) fn load_control_transformer_with_stream(
     // remap), so a streamed control block reads the same names the resident load did.
     let transformer = ZImageControlTransformer::from_weights(base, &control_weights, "")?;
     materialize_built(&control_weights, streamed.then_some("control_layers."))?;
+    let transformer = if streamed {
+        transformer.with_deferred_main_blocks()
+    } else {
+        transformer
+    };
     Ok(if streamable {
         transformer.with_control_block_stream(control.clone(), "")
     } else {
@@ -247,7 +306,7 @@ pub(crate) fn load_control_transformer_with_stream(
 /// stack's block bodies are read inside each block's own priced quantum instead).
 pub(crate) fn before_control_load(control: &WeightsSource, streamed: bool) -> Result<()> {
     crate::quantum::before_load(crate::quantum::CONTROL_LOAD, control, |name| {
-        !(streamed && name.starts_with("control_layers."))
+        control_load_keeps(streamed, name)
     })
 }
 

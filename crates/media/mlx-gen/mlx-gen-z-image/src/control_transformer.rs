@@ -52,7 +52,7 @@ pub const CONTROL_IN_DIM: i32 = 33;
 pub(crate) const CONTROL_LAYERS_PLACES: [usize; 15] =
     [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28];
 /// Base `noise_refiner` indices the 2 control refiner blocks inject into.
-const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
+pub(crate) const CONTROL_REFINER_PLACES: [usize; 2] = [0, 1];
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
@@ -104,6 +104,14 @@ pub struct ZImageControlTransformer {
     /// resident: at ~97 MiB/block it is 2 blocks against the base stack's 30, so windowing it would
     /// buy ~6% of the stack's weights for another 2 re-reads per step.
     control_block_stream: Option<crate::block_stream::ZImageBlockStream>,
+    /// The 15 main blocks were left lazy by a deferred-materialization load (`control_layers` holds
+    /// unread handles; every forward streams them through `control_block_stream`). Such a load must
+    /// not pack them at [`Self::quantize`]: packing would read and hold a packed copy of every
+    /// block that no windowed forward uses (on iOS q8, ~3 GiB beside the per-block stream).
+    deferred_main: bool,
+    /// The load-time bits a deferred stack's lazy main blocks were NOT packed at: a forward that
+    /// would run those resident blocks (no window) is refused rather than run dense.
+    deferred_unpacked_bits: Option<i32>,
 }
 
 impl ZImageControlTransformer {
@@ -160,6 +168,8 @@ impl ZImageControlTransformer {
             control_layers,
             control_noise_refiner,
             control_block_stream: None,
+            deferred_main: false,
+            deferred_unpacked_bits: None,
         })
     }
 
@@ -191,6 +201,17 @@ impl ZImageControlTransformer {
 
     /// Whether rung 4 can execute here — it needs BOTH stacks streamable, because a control forward
     /// runs both and the ladder bounds the transformer as a whole.
+    /// The 2-block control refiner (always resident).
+    pub(crate) fn control_noise_refiner(&self) -> &[ZImageControlBlock] {
+        &self.control_noise_refiner
+    }
+
+    /// Mark the 15 main blocks as left lazy by a deferred-materialization load (see `deferred_main`).
+    pub(crate) fn with_deferred_main_blocks(mut self) -> Self {
+        self.deferred_main = true;
+        self
+    }
+
     pub(crate) fn can_stream_blocks(&self) -> bool {
         self.base.can_stream_blocks() && self.control_block_stream.is_some()
     }
@@ -230,12 +251,15 @@ impl ZImageControlTransformer {
         // The ControlNet checkpoint is published dense only, so on a packed tier its resident blocks
         // are packed here, at load. iOS: one bounded quantum per block (its dense bytes are already
         // resident; the packed copies are checked before they exist and materialized before the
-        // next block, so the dense source is released block by block).
-        for block in self
-            .control_layers
-            .iter_mut()
-            .chain(self.control_noise_refiner.iter_mut())
-        {
+        // next block, so the dense source is released block by block). A deferred load's lazy main
+        // blocks are not resident: each window packs its own block (the stream replays `bits`).
+        let main: &mut [ZImageControlBlock] = if self.deferred_main {
+            self.deferred_unpacked_bits = Some(bits);
+            &mut []
+        } else {
+            &mut self.control_layers
+        };
+        for block in main.iter_mut().chain(self.control_noise_refiner.iter_mut()) {
             block.quantize_quantum(bits)?;
         }
         // Rung 4 replays the same quantization on each materialized control block.
@@ -626,24 +650,30 @@ impl ZImageControlTransformer {
         // Main control pass: thread the (refined) control state + caption through the 15 control
         // layers to produce the hints for the unified main loop.
         let control_unified = self.base.unify_quantum(&threaded_control, &cap_emb)?;
-        let (main_hints, _) = match window {
-            None => self.run_control_blocks(
-                &self.control_layers,
-                control_unified,
-                &unified,
-                &prep.unified_freqs,
-                &t_emb,
-                plan,
-            )?,
-            Some(window) => self.run_control_blocks_windowed(
-                control_unified,
-                &unified,
-                &prep.unified_freqs,
-                &t_emb,
-                plan,
-                window,
-            )?,
-        };
+        let (main_hints, _) =
+            match window {
+                None if self.deferred_unpacked_bits.is_some() => return Err(Error::Unsupported(
+                    "z-image control: a deferred-materialization load streams its control blocks \
+                     (they are packed per window); run it windowed"
+                        .to_owned(),
+                )),
+                None => self.run_control_blocks(
+                    &self.control_layers,
+                    control_unified,
+                    &unified,
+                    &prep.unified_freqs,
+                    &t_emb,
+                    plan,
+                )?,
+                Some(window) => self.run_control_blocks_windowed(
+                    control_unified,
+                    &unified,
+                    &prep.unified_freqs,
+                    &t_emb,
+                    plan,
+                    window,
+                )?,
+            };
         record!("main_hint0", main_hints[0]);
         record!("main_hint_last", main_hints[main_hints.len() - 1]);
 
@@ -881,7 +911,7 @@ fn add_hint(x: &Array, hint: &Array, scale: f32) -> Result<Array> {
 
 /// The control-stack hint index for base-layer `i` (the fork's `*_mapping[i]`), or `None` when no
 /// control block injects there.
-fn hint_index(places: &[usize], i: usize) -> Option<usize> {
+pub(crate) fn hint_index(places: &[usize], i: usize) -> Option<usize> {
     places.iter().position(|&p| p == i)
 }
 
