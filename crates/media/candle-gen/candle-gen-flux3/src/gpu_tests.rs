@@ -158,7 +158,11 @@ fn e2m1_value(nibble: u8) -> f32 {
 /// Element (r, c) of a packed static-NVFP4 operand WITHOUT its global scale.
 fn nvfp4_element(packed: &[u8], block_scales: &[u8], k: usize, r: usize, c: usize) -> f32 {
     let byte = packed[r * k / 2 + c / 2];
-    let nibble = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
+    let nibble = if c.is_multiple_of(2) {
+        byte & 15
+    } else {
+        byte >> 4
+    };
     e2m1_value(nibble) * decode_e4m3(block_scales[r * (k / 16) + c / 16])
 }
 
