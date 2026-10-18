@@ -10,6 +10,11 @@ use crate::{
     Error, GenerationRequest, Image, Result,
 };
 
+// Shared byte authority for both native backends.
+pub use crate::moss_image_assets::{
+    moss_image_asset, verify_moss_image_asset, MossImageAssetIdentity, MOSS_IMAGE_ASSETS,
+};
+
 pub const BASE_REPO: &str = "OpenMOSS-Team/MOSS-Image-Base";
 pub const BASE_REVISION: &str = "1ceede80badddd6a7812069619edaa5633587192";
 pub const SFT_REPO: &str = "OpenMOSS-Team/MOSS-Image-SFT";

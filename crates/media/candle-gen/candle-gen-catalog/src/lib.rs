@@ -34,6 +34,7 @@ pub mod providers {
     pub use candle_gen_mage as mage;
     pub use candle_gen_minimax_h3 as minimax_h3;
     pub use candle_gen_mochi as mochi;
+    pub use candle_gen_moss_image as moss_image;
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
     pub use candle_gen_qwen_image as qwen_image;
@@ -114,6 +115,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     // has no matching generator, so this line was absent while the crate shipped only the contract.
     let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
+    let registry = candle_gen_moss_image::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
     let registry = candle_gen_qwen_image_2_1::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
@@ -695,13 +697,16 @@ mod preview_advertising {
         /// interleaves audio rows that have no picture at all. No holdout R^2 was ever measured for
         /// it and none is quoted.
         MinimaxH3Joint,
+        /// The frozen MOSS pipeline exposes final images/latents only. Its small decoder has no
+        /// authenticated preview projection; another FLUX.2 decoder's coefficients do not transfer.
+        MossImage,
     }
 
     impl NoGo {
         /// Every variant, so a test can quantify over the whole enum rather than over a hand-listed
         /// subset that a new variant silently escapes. `the_recorded_no_go_measurements_stay_labelled_
         /// fit_versus_holdout` iterates this and pins which rows carry numbers.
-        const ALL: [NoGo; 8] = [
+        const ALL: [NoGo; 9] = [
             NoGo::Ltx,
             NoGo::Mage,
             NoGo::Mochi,
@@ -710,6 +715,7 @@ mod preview_advertising {
             NoGo::SvdTemporal,
             NoGo::Seedvr2SuperResolution,
             NoGo::MinimaxH3Joint,
+            NoGo::MossImage,
         ];
 
         /// Exactly the variants epic 16624 put a number on. Kept beside [`NoGo::measured`] so the
@@ -737,7 +743,7 @@ mod preview_advertising {
                      candle-side adjudication sc-16954",
                 ),
                 NoGo::Seedvr2SuperResolution => None,
-                NoGo::MinimaxH3Joint => None,
+                NoGo::MinimaxH3Joint | NoGo::MossImage => None,
             }
         }
 
@@ -757,7 +763,8 @@ mod preview_advertising {
                 | NoGo::WanZ48
                 | NoGo::SvdTemporal
                 | NoGo::Seedvr2SuperResolution
-                | NoGo::MinimaxH3Joint => None,
+                | NoGo::MinimaxH3Joint
+                | NoGo::MossImage => None,
             }
         }
 
@@ -788,6 +795,9 @@ mod preview_advertising {
                         "a temporal video space (AutoencoderKLTemporalDecoder, four channels behind a \
                          temporal decoder) — NEVER measured, same program gate; not SDXL's \
                          four-channel space"
+                    }
+                    NoGo::MossImage => {
+                        "the frozen MOSS author interface returns final images/latents; NEVER measured; no preview projection is published for its exact small decoder, and no fit measurement is claimed (sc-26324)"
                     }
                     NoGo::MinimaxH3Joint => {
                         "MiniMax-H3's joint audio+video space — NEVER measured, and excluded on its \
@@ -844,6 +854,8 @@ mod preview_advertising {
         ("ltx_2_5_distilled", NoGo::Ltx),
         ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
+        ("moss_image_base", NoGo::MossImage),
+        ("moss_image_sft", NoGo::MossImage),
         ("mage_flow", NoGo::Mage),
         ("mage_flow_base", NoGo::Mage),
         ("mage_flow_turbo", NoGo::Mage),
@@ -1229,6 +1241,12 @@ mod preview_advertising {
         ProviderCrate {
             dir: "candle-gen-mochi",
             register: candle_gen_mochi::register_providers,
+            denoise: Denoise::Bespoke,
+            routes: &[],
+        },
+        ProviderCrate {
+            dir: "candle-gen-moss-image",
+            register: candle_gen_moss_image::register_providers,
             denoise: Denoise::Bespoke,
             routes: &[],
         },
@@ -3550,6 +3568,12 @@ mod preview_advertising {
             resident_only_on_cpu: false,
         },
         MemoryRouteCrate {
+            dir: "candle-gen-moss-image",
+            register_providers: candle_gen_moss_image::register_providers,
+            register_surfaces: None,
+            resident_only_on_cpu: true,
+        },
+        MemoryRouteCrate {
             dir: "candle-gen-qwen-image",
             register_providers: candle_gen_qwen_image::register_providers,
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
@@ -4233,6 +4257,7 @@ mod preview_advertising {
                 "candle-gen-mage",
                 "candle-gen-minimax-h3",
                 "candle-gen-mochi",
+                "candle-gen-moss-image",
                 "candle-gen-scail2",
                 "candle-gen-seedvr2",
                 "candle-gen-svd",
@@ -5175,6 +5200,7 @@ mod tests {
                 "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
                 "mage_flow" => Some(&MAGE_LATENT_SPACE),
                 "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
+                "moss_image" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 "sana" => Some(&SANA_LATENT_SPACE),
                 "seedvr2" => Some(&SEEDVR2_VIDEO_LATENT_SPACE),
                 "svd" => Some(&SVD_LATENT_SPACE),
@@ -5894,6 +5920,8 @@ mod tests {
                 "mage_flow_edit_turbo",
                 "minimax_h3",
                 "mochi_1",
+                "moss_image_base",
+                "moss_image_sft",
                 "qwen_image",
                 "qwen_image_2_1",
                 "qwen_image_2_1_turbo",
@@ -5974,8 +6002,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 65);
-        assert_eq!(super::provider_components().len(), 55);
+        assert_eq!(distinct.len(), 67);
+        assert_eq!(super::provider_components().len(), 57);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

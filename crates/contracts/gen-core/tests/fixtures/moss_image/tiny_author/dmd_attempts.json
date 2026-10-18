@@ -1,0 +1,7 @@
+[
+  {
+    "attempt": 1,
+    "status": "failed_diagnostic_probe_only",
+    "reason": "Incorrect merged BF16 leaf diagnostic received FP32 probe; full three-step reference/cast-down/merged runs completed before this diagnostic. Fixed diagnostic to cast probe to the merged BF16 weight dtype. No production source touched."
+  }
+]
