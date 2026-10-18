@@ -46,6 +46,12 @@ impl TimestepEmbedder {
         Ok(())
     }
 
+    /// The two MLP widths (`linear1`, `linear2` out-features), for the iOS embed quantum's price.
+    pub(crate) fn widths(&self) -> [u64; 2] {
+        [&self.linear1, &self.linear2]
+            .map(|lin| lin.base_shape().first().map_or(0, |&d| d.max(0) as u64))
+    }
+
     /// `t`: `(B,)` → `(B, out)`.
     pub fn forward(&self, t: &Array) -> Result<Array> {
         let mut t_freq = self.timestep_embedding(t)?;

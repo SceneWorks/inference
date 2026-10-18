@@ -1537,409 +1537,52 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
     }
 }
 
-/// **Z-Image-Turbo on device (E5 go/no-go).** The second image model, and a different bet from SANA.
-///
-/// # Why this one, and why it might work where SANA's untiled path did not
-///
-/// Z-Image already carries the whole `gen_core::memory_strategy` ladder (rungs 0-4), which SANA does
-/// not. Rung 4 streams the 30-block DiT instead of holding it, so its denoise phase is 1.795 GiB
-/// rather than 4.653, and its request peak becomes decode-bound at **4.363 GiB** — measured on host
-/// against this exact q4 tier, with the full ladder engaged
-/// (`mlx-gen-z-image/tests/block_residency_real_weights.rs`).
-///
-/// That is 73% of this device's measured 6135 MiB cap. It is also, unlike SANA's fatal
-/// configuration, the SHIPPING shape: the number and the thing that runs are the same thing.
-///
-/// # What would make it fail anyway
-///
-/// Host readings are shape-dependently wrong in both directions — they over-read SANA's tiled
-/// configs by ~16% and under-read its untiled one by >1.4 GB, and the untiled decode died because a
-/// *single stage* needed ~1 GB more than the host charged. So 73% is a reason to try, not a
-/// prediction. If z-image dies here, the next question is whether one of its stages has that same
-/// shape, which the breadcrumb + a stage trace would answer.
-///
-/// Untiled is never attempted: z-image untiled is **19.172 GiB** at 1024², three times the cap.
+/// The Z-Image Turbo lane (`--zimage`, sc-26433): one bounded device CAPTURE of a Z-Image campaign
+/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit` — through
+/// the same capture path every catalog model runs (`campaign_media::report` → `capture_permit`, every
+/// quantum checked against live headroom before its graph is built). A quantum refusal is evidence
+/// (the size does not fit) and passes; only a failure fails. The snapshot is the campaign slot
+/// `Documents/campaign/z_image_turbo/<tier>/` (`push_model.sh <tier-dir> --campaign-route
+/// z_image_turbo --tier <tier>`). There is no unadmitted Z-Image loader.
 #[cfg(feature = "zimage")]
-fn check_zimage_generation(dir: Option<&Path>) -> Check {
-    const NAME: &str = "Z-Image-Turbo generation (E5 go/no-go)";
-    let Some(dir) = dir else {
+fn check_zimage_generation() -> Check {
+    const NAME: &str = "Z-Image Turbo bounded capture";
+    let case = std::env::var("IOS_SMOKE_ZIMAGE_CASE").unwrap_or_else(|_| {
+        "z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit".into()
+    });
+    // Capture runs only on a real device, against a provisioned slot; anywhere else the lane skips,
+    // as every snapshot-backed lane does.
+    if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
         return Check {
             name: NAME,
             passed: true,
-            detail:
-                "skipped -- no Z-Image q4 tier in Documents/ (push with scripts/ios/push_model.sh)"
-                    .to_string(),
+            detail: format!("skipped -- {case}: bounded capture runs only on a real iOS device"),
         };
-    };
-    if let Err(refusal) = admit_unestimated() {
+    }
+    if !campaign_media::slot_provisioned(&case) {
         return Check {
             name: NAME,
             passed: true,
-            detail: refusal,
+            detail: format!(
+                "skipped -- {case}: no provisioned Documents/campaign slot (push with scripts/ios/push_model.sh --campaign-route z_image_turbo)"
+            ),
         };
     }
-
-    use runtime_ios::gen_core::{
-        GenerationMemory, GenerationOutput, GenerationRequest, LoadShape, LoadSpec as GenLoadSpec,
-        OffloadPolicy, Progress, WeightsSource,
-    };
-
-    mlx_rs::memory::clear_cache();
-    mlx_rs::memory::reset_peak_memory();
-    let started = Instant::now();
-
-    let run = || -> Result<String, String> {
-        // Three things make rung 4 available, and they are now three separate statements.
-        //
-        // `Sequential` + a `Dir` source were always required — streaming rebuilds blocks from the
-        // snapshot per window, and an in-memory `Weights` has no re-openable source, so z-image
-        // declares rung 4 Missing for single-file/ComfyUI loads.
-        //
-        // `LoadShape::DeferredMaterialization` is the third, and it is new (#340, "decouple deferred
-        // materialization from residency"). It used to be inferred from `Sequential`; it is now asked
-        // for explicitly, because the two are genuinely independent — a Sequential load can still
-        // eagerly materialize its trunk, and a window over an already-materialized stack ADDS memory
-        // instead of bounding it. Without this the generate fails closed:
-        //
-        //   unsupported: z_image_turbo: bounded transformer residency needs a
-        //   deferred-materialization load shape ...
-        //
-        // Failing closed is the right design — the alternative is a silent rung-4 no-op that writes
-        // a "bounded" row into calibration evidence for a run that bounded nothing.
-        let spec = GenLoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
-            .with_offload_policy(OffloadPolicy::Sequential)
-            .with_load_shape(LoadShape::DeferredMaterialization);
-        // Resolution is a knob because the 1024px answer was "killed" and the next question is
-        // where the boundary actually sits. Z-Image is native at 1024, so anything below is a
-        // fit-finding measurement, not a shipping proposal. Bound before the load so the load's own
-        // breadcrumbs can name it.
-        let edge: u32 = std::env::var("IOS_SMOKE_ZIMAGE_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
-        append_breadcrumb(
-            "zimage-progress.txt",
-            &format!(
-                "  [{edge}px] before load — {} MiB avail",
-                available_memory_mib()
-                    .map(|m| format!("{m:.0}"))
-                    .unwrap_or_default()
-            ),
-        );
-        let generator = mlx_gen_z_image::load(&spec).map_err(|e| format!("load failed: {e}"))?;
-        append_breadcrumb(
-            "zimage-progress.txt",
-            &format!(
-                "  [{edge}px] after load — {} MiB avail",
-                available_memory_mib()
-                    .map(|m| format!("{m:.0}"))
-                    .unwrap_or_default()
-            ),
-        );
-
-        // Availability is not engagement: the ladder rungs are request-scoped, so they must be asked
-        // for. `transformer_window_size: Some(1)` is the published production window.
-        let request = GenerationRequest {
-            prompt: "a lighthouse on a rocky coast at dawn".to_string(),
-            width: edge,
-            height: edge,
-            count: 1,
-            steps: Some(4),
-            seed: Some(0),
-            memory: Some(GenerationMemory {
-                tile_vae_decode: true,
-                chunk_attention: true,
-                // Rung 4 is a knob now, because on device it is the prime suspect for a ~2x latency
-                // penalty and it is no longer needed for admission.
-                //
-                // z-image renders at 229 s on device against 15.9 s on an M5 Max — 14.4x. SANA
-                // through the same harness is 5.5-8.1x, which is the honest iPhone-vs-M5-Max GPU
-                // ratio, so z-image carries an extra ~2x that SANA does not.
-                //
-                // Rung 4 is where they differ. Widening the window cannot help — the family's block
-                // loop materializes one block, runs it and drops it before advancing, so residency
-                // is per-BLOCK by construction and `TRANSFORMER_WINDOW_SIZES` is deliberately `[1]`
-                // (memory_strategy.rs:99: windows 2, 4, 8, 15 and 30 all land on the same 1.832
-                // GiB). That means ~30 blocks x 4 steps of materialize-and-drop per render, each
-                // rebuilt from a 3.23 GB snapshot. On a host with the file in page cache that is
-                // free; on device it is real work every time.
-                //
-                // Turning it OFF is only affordable because bounding MLX's cache gave the headroom
-                // back — this exact experiment would have been a guaranteed jetsam kill this morning.
-                stream_transformer_blocks: std::env::var("IOS_SMOKE_ZIMAGE_RUNG4")
-                    .map(|v| v != "0")
-                    .unwrap_or(true),
-                transformer_window_size: Some(1),
-                // The decode tile edge, and the reason it is a knob.
-                //
-                // z-image's published ladder marks every edge below 512 "rejected", because the
-                // REQUEST peak pinned at 4.898 GiB however small the tiles got — finer tiles cost
-                // fidelity and bought no admission. But that ladder was measured WITHOUT rung 4.
-                // With rung 4 carrying denoise down to 1.795 GiB, the decode becomes the binding
-                // phase, so shrinking it moves the request peak for the first time:
-                //
-                //   edge 512 -> decode 4.363 GiB      edge 384 -> 3.896      edge 256 -> 3.544
-                //
-                // The phase trace puts the kill inside a decode that had 5778 MiB available, so the
-                // device charges >1.3 GB more than the host's 4468 for this phase. A smaller edge is
-                // the only lever that acts on that phase without changing the model.
-                decode_tile_edge: std::env::var("IOS_SMOKE_ZIMAGE_TILE")
-                    .ok()
-                    .and_then(|v| v.parse().ok()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        // What the pipeline DECIDED, not what it was asked for.
-        //
-        // The 1024px kill happens inside a decode entered with 6007 MiB free, while the identical
-        // request on the host peaks at 3102 MiB for the whole run. A >6 GB delta in one phase is not
-        // a bounded decode overrunning; it is the shape of this VAE's ~14 GiB untiled 1024²
-        // transient. The cheapest explanation is that the bounded configuration never engaged --
-        // an unset or unparseable `IOS_SMOKE_ZIMAGE_TILE` resolves to `None`, and twice today a knob
-        // that read correctly in source was not the knob the run used. Reading the request back
-        // would only restate what was just constructed, so this asks the provider instead.
-        append_breadcrumb(
-            "zimage-progress.txt",
-            &format!(
-                "  [{edge}px] decode plan — IOS_SMOKE_ZIMAGE_TILE={:?}, resolved {}",
-                std::env::var("IOS_SMOKE_ZIMAGE_TILE").ok(),
-                // Main has no public z-image decode-plan resolver (the branch's
-                // `pipeline::resolved_decode_plan` is gone), so this reports the REQUESTED geometry,
-                // with the provider's published default filled in where the request leaves it.
-                match request.memory {
-                    Some(m) if m.tile_vae_decode => format!(
-                        "requested TILED edge={} overlap={}",
-                        m.decode_tile_edge
-                            .unwrap_or(mlx_gen_z_image::memory_strategy::DECODE_TILE_EDGE),
-                        m.decode_overlap
-                            .unwrap_or(mlx_gen_z_image::memory_strategy::DECODE_OVERLAP),
-                    ),
-                    _ => "UNTILED (whole-image) -- ~14 GiB at 1024², expect jetsam".to_string(),
-                }
-            ),
-        );
-
-        // What MLX believes its budget is, against what iOS will actually allow.
-        //
-        // MLX sizes its memory and cache limits from the system's recommended working-set, which on a
-        // Mac is the right denominator. An iOS app is not bounded by the machine's RAM but by a
-        // per-process jetsam limit far below it, and nothing tells MLX that. If these two numbers
-        // come back near device RAM rather than near `os_proc_available_memory`, then MLX is holding
-        // reclaimable buffers up to a ceiling that does not exist, and the app is killed while
-        // sitting on memory it would have freed on request.
-        append_breadcrumb(
-            "zimage-progress.txt",
-            &format!(
-                "  [{edge}px] MLX budget — memory_limit={:.0} MiB, cache_limit(probe)={:.0} MiB, \
-                 os_available={} MiB",
-                mlx_rs::memory::get_memory_limit() as f64 / (1024.0 * 1024.0),
-                {
-                    // No getter for the cache limit: set it to read it, then restore what was there.
-                    let prev = mlx_rs::memory::set_cache_limit(0);
-                    mlx_rs::memory::set_cache_limit(prev);
-                    prev as f64 / (1024.0 * 1024.0)
-                },
-                available_memory_mib()
-                    .map(|m| format!("{m:.0}"))
-                    .unwrap_or_default()
-            ),
-        );
-
-        // A concurrent sampler, because the interesting failure kills the process mid-decode.
-        //
-        // Every breadcrumb so far is written by the progress callback, which fires on phase CHANGE --
-        // so a phase that dies partway through reports only the headroom it STARTED with, and the
-        // trajectory that would explain the death is exactly the part never written. `Decoding` at
-        // 6007 MiB free is not evidence the decode is cheap; it is the last thing observed before a
-        // 6 GB excursion nobody sampled.
-        let sampler = MemorySampler::start(Some("zimage-progress.txt"), format!("[{edge}px]"));
-
-        // Phase-level breadcrumbs, because the coarse one is not localizing the kill.
-        //
-        // Both 1024 and 768 died with NO breadcrumb at all, and the check only writes one after the
-        // whole generate returns. Since halving the pixel count changed nothing, the decode peak is
-        // probably not what kills it — but "probably not the decode" is not an answer. The provider
-        // already emits phase progress; discarding it into a no-op threw away exactly the signal
-        // needed. Each distinct phase now appends a line WITH the live headroom, so the last line
-        // written names the phase that died and what was left when it started.
-        //
-        // Written on phase CHANGE, not per step: a 4-step denoise would otherwise write four
-        // identical lines and a 30-block window sweep far more.
-        // Steps get their own line, unlike every other phase.
-        //
-        // The collapse-on-change rule exists so a 30-block window sweep does not write hundreds of
-        // identical lines, and for z-image it costs nothing to exempt Step: there are four of them.
-        // What it buys is the split between the FIRST step and the rest. If the extra ~2x is block
-        // materialization from the snapshot, every step pays it and the four are alike; if it is
-        // one-time setup (Metal pipeline compilation, a cold read warming the file), step 1 is an
-        // outlier and steps 2-4 are fast. Those two have different fixes, and a single aggregate
-        // denoise time cannot tell them apart.
-        let mut step_n = 0u32;
-        let mut last_step_at = Instant::now();
-        let mut last_phase = String::new();
-        let mut on_progress = |pr: Progress| {
-            let phase = match pr {
-                Progress::Step { .. } => {
-                    step_n += 1;
-                    let dt = last_step_at.elapsed().as_secs_f64();
-                    last_step_at = Instant::now();
-                    append_breadcrumb(
-                        "zimage-progress.txt",
-                        &format!(
-                            "  [{edge}px] step {step_n} — {dt:.1}s since previous, {} MiB avail",
-                            available_memory_mib()
-                                .map(|m| format!("{m:.0}"))
-                                .unwrap_or_else(|| "n/a".into())
-                        ),
-                    );
-                    "Step".to_string()
-                }
-                other => format!("{other:?}"),
-            };
-            sampler.stage(match pr {
-                Progress::Step { current, total } => format!("Step {current}/{total}"),
-                _ => phase.clone(),
-            });
-            if phase != last_phase {
-                let avail = available_memory_mib()
-                    .map(|m| format!("{m:.0} MiB avail"))
-                    .unwrap_or_else(|| "n/a".to_string());
-                append_breadcrumb(
-                    "zimage-progress.txt",
-                    &format!(
-                        "  [{edge}px] phase {phase} — {avail}, MLX active {:.0} MiB",
-                        mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0)
-                    ),
-                );
-                last_phase = phase;
-            }
-        };
-        let out = generator
-            .generate(&request, &mut on_progress)
-            .map_err(|e| format!("generate failed: {e}"))?;
-        let image = match out {
-            GenerationOutput::Images(mut v) if !v.is_empty() => v.remove(0),
-            _ => return Err("generator returned no image".into()),
-        };
-        if (image.width, image.height) != (edge, edge) {
-            return Err(format!(
-                "got {}x{}, expected {edge}x{edge}",
-                image.width, image.height
-            ));
-        }
-        let (lo, hi) = image
-            .pixels
-            .iter()
-            .fold((255u8, 0u8), |(lo, hi), &p| (lo.min(p), hi.max(p)));
-        if hi - lo < 32 {
-            return Err(format!(
-                "near-constant image (range {lo}..{hi}) -- decode produced nothing"
-            ));
-        }
-
-        if let Some(docs) = dirs_documents() {
-            match image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()) {
-                Some(buf) => {
-                    let name = format!("zimage-{edge}.png");
-                    match buf.save(docs.join(&name)) {
-                        Ok(()) => append_breadcrumb(RENDERS_MANIFEST, &name),
-                        Err(e) => eprintln!("could not write {name}: {e}"),
-                    }
-                }
-                None => eprintln!("zimage pixel buffer does not match dimensions"),
-            }
-        }
-
-        let secs = started.elapsed().as_secs_f64();
-        let mlx_peak = mlx_rs::memory::get_peak_memory() as f64 / (1024.0 * 1024.0);
-        // WHERE the memory went, not just how much peaked.
-        //
-        // `os_proc_available_memory` falls ~2.5 GB across a render and does not come back, while
-        // MLX reports a much smaller peak and `clear_cache()` is already called between configs.
-        // Two candidates, and they need opposite fixes:
-        //
-        //   - MLX's buffer CACHE is holding it -> `set_cache_limit(0)` stops the retention.
-        //   - it is WIRED -> `set_wired_limit` is the lever, and `clear_cache` cannot help
-        //     because wired pages are not evictable and still count against the footprint.
-        //
-        // `get_cache_memory()` distinguishes them. Sampled after the render and again after an
-        // explicit clear, so the clear's actual effect is visible rather than assumed.
-        let cache_before = mlx_rs::memory::get_cache_memory() as f64 / (1024.0 * 1024.0);
-        let active_before = mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0);
-        mlx_rs::memory::clear_cache();
-        let cache_after = mlx_rs::memory::get_cache_memory() as f64 / (1024.0 * 1024.0);
-        let active_after = mlx_rs::memory::get_active_memory() as f64 / (1024.0 * 1024.0);
-        let headroom = available_memory_mib()
-            .map(|m| format!(", {m:.0} MiB still available"))
-            .unwrap_or_default();
-        // The rung-4 state is READ BACK from the request, never asserted by the label. This string
-        // said "rung 4 w=1" unconditionally, so a run with rung 4 disabled reported itself as a
-        // rung-4 run — and since the knob was also not being forwarded to the device, the label was
-        // the only thing claiming an experiment had happened. A summary that describes the
-        // configuration it was asked for rather than the one it ran is worse than no summary.
-        let rung4 = match request.memory.and_then(|m| {
-            m.stream_transformer_blocks
-                .then_some(m.transformer_window_size)
-        }) {
-            Some(Some(w)) => format!("rung 4 w={w}"),
-            Some(None) => "rung 4 default w".to_string(),
-            None => "rung 4 OFF".to_string(),
-        };
-        // Ends the sampler and yields the two numbers `mlx_peak` cannot give: how close the process
-        // came to a kill, and the footprint including the cache. Placed before the line is built so
-        // the report carries them rather than a separate breadcrumb nobody correlates.
-        let sampled = sampler.finish();
-        let line = format!(
-            "{edge}px full ladder ({rung4}): {secs:.1}s, MLX peak {mlx_peak:.0} MiB, \
-             process RSS peak {:.0} MiB{headroom}, pixel range {lo}..{hi} \
-             [host predicted 4468 MiB]{sampled} | cache {cache_before:.0}->{cache_after:.0} MiB, \
-             active {active_before:.0}->{active_after:.0} MiB after clear_cache",
-            peak_rss_mib(),
-        );
-        // Breadcrumb before returning: if this model dies, it dies HERE, and the report never gets
-        // written. Same reasoning as the SANA lane.
-        append_breadcrumb("zimage-progress.txt", &line);
-        Ok(line)
-    };
-
-    match run() {
-        Ok(detail) => Check {
-            name: NAME,
-            passed: true,
-            detail,
-        },
-        Err(e) => {
-            append_breadcrumb("zimage-progress.txt", &format!("FAILED {e}"));
-            Check {
-                name: NAME,
-                passed: false,
-                detail: e,
-            }
-        }
+    let report = campaign_media::report(&case, true);
+    let row: Option<serde_json::Value> = report
+        .lines()
+        .find_map(|l| l.strip_prefix("CAMPAIGN_JSON "))
+        .and_then(|j| serde_json::from_str(j).ok());
+    let status = row
+        .as_ref()
+        .and_then(|r| r["status"].as_str())
+        .unwrap_or("diagnostic_failure")
+        .to_string();
+    Check {
+        name: NAME,
+        passed: matches!(status.as_str(), "diagnostic_success" | "capture_refused"),
+        detail: format!("{case}: {status} | {}", report.trim_end()),
     }
-}
-
-/// The Z-Image q4 tier, if pushed. Identified by its diffusers component tree, like SANA's, but
-/// under a distinct directory name so the two snapshots coexist without either finder claiming the
-/// other's.
-#[cfg(feature = "zimage")]
-fn find_zimage_snapshot() -> Option<std::path::PathBuf> {
-    let docs = dirs_documents()?;
-    let looks_right = |p: &std::path::Path| {
-        p.join("transformer").is_dir() && p.join("vae").is_dir() && p.join("text_encoder").is_dir()
-    };
-    std::fs::read_dir(&docs)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains("zimage"))
-                && looks_right(p)
-        })
 }
 
 /// Run every check and render a human- and test-readable report.
@@ -2045,7 +1688,7 @@ pub fn run_report() -> String {
     // `IOS_SMOKE_ONLY=zimage` to be measurable at all.
     #[cfg(feature = "zimage")]
     if run_zimage {
-        checks.push(check_zimage_generation(find_zimage_snapshot().as_deref()));
+        checks.push(check_zimage_generation());
     }
 
     let failed = checks.iter().filter(|c| !c.passed).count();

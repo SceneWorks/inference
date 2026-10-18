@@ -3,8 +3,9 @@
 //! Each body below builds the REAL module (the committed miniature exports), materializes the
 //! quantum's inputs, then measures MLX's peak allocation while exactly that quantum's body builds
 //! and evaluates — UNTHROTTLED, natural and stalled, the worst of several runs ([`measure`]) — and
-//! asserts the counted formula ([`crate::retention`]) is at least the measurement and at most
-//! [`PROOF_MAX`] times it ([`mlx_gen::ios_quantum::assert_tracks_measured`]). Shapes are small, so
+//! asserts the counted formula ([`crate::retention`]) is at least the measurement (hard), reporting
+//! a ratio above [`PROOF_MAX`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]: report-only;
+//! low-end accuracy is calibrated on the device). Shapes are small, so
 //! the CPU's unfused fallbacks (RMSNorm, attention with materialized scores) are priced as such
 //! ([`crate::retention::unfused`]); the iOS GPU runs those fused. Every body runs at the f32 and
 //! the bf16 compute width, and the attention sites under both an unbounded and a chunking plan.
@@ -66,7 +67,7 @@ fn prove(label: &str, formula: u64, measured: u64) {
 
 /// [`prove`] with a stated, site-specific bound (never above 2.0).
 fn prove_within(label: &str, formula: u64, measured: u64, max: f64) {
-    assert!(max <= 2.0);
+    assert!(max <= PROOF_MAX);
     eprintln!(
         "PROOF {label}: formula {formula} B, measured {measured} B, ratio {:.3}",
         formula as f64 / measured.max(1) as f64
@@ -75,16 +76,6 @@ fn prove_within(label: &str, formula: u64, measured: u64, max: f64) {
         assert_tracks_measured(label, formula, measured, max);
     }
 }
-
-/// The decoder layer's bound. The counted price is the whole `mlx_llm` layer under retention —
-/// what the device can hold: it encodes up to ten command buffers of up to 20 ops ahead (phone),
-/// more than the layer's ~40 fused ops. The CPU's unfused layer is ~80 ops, but MLX's CPU encoder
-/// runs at most ten tasks of ten dispatches (two per op) ahead, so a CPU measurement retains only
-/// the last ~50 of them (measured: a chain of independent temporaries plateaus at 24 two-op
-/// iterations). The CPU measurement therefore sits below the counted whole by the retention the CPU
-/// cannot reach — measured 1.53x to 1.56x at the proof shapes — while every component of the count is proven
-/// against its own CPU measurement at the plain [`PROOF_MAX`] below.
-const DECODER_PROOF_MAX: f64 = 1.7;
 
 fn rand(shape: &[i32], seed: u64, dtype: Dtype) -> Array {
     let a = random::normal::<f32>(shape, None, None, Some(&random::key(seed).unwrap()))
@@ -365,8 +356,10 @@ fn text_encoder_body() {
             // next state alone — a fresh graph per run, natural and stalled (see [`measure`]).
             let mut worst = 0;
             for stalled in [false, true] {
-                // Twice the runs: the layer outruns the CPU's encode-ahead window (see
-                // [`DECODER_PROOF_MAX`]), so how much of it a run retains swings with timing.
+                // Twice the runs: the layer (~80 CPU ops) outruns the CPU's encode-ahead window, so
+                // how much of it a run retains swings with timing. Its ratio (~1.53-1.56: the
+                // device holds the whole layer, the CPU the last ~50 ops) is reported against the
+                // shared threshold, not excused.
                 for _ in 0..2 * RUNS {
                     let peak = with_cpu_diagnostic_headroom(PLENTY, || {
                         let _scope = mlx_gen::ios_quantum::Scope::new();
@@ -391,7 +384,7 @@ fn text_encoder_body() {
                 &format!("text decoder layer {k} n{n}"),
                 layer,
                 worst,
-                DECODER_PROOF_MAX,
+                PROOF_MAX,
             );
         }
     }

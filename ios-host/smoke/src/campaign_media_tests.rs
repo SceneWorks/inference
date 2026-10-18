@@ -12,9 +12,16 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
             .find(|s| s.provider == descriptor.id)
             .unwrap();
         for kind in &descriptor.capabilities.conditioning {
-            assert!(surface
-                .modes
-                .contains(&format!("{kind:?}").to_ascii_lowercase()));
+            let mode = format!("{kind:?}").to_ascii_lowercase();
+            // A control-required route's modes are per accepted control kind (`control_pose`).
+            assert!(
+                surface
+                    .modes
+                    .iter()
+                    .any(|m| *m == mode || m.starts_with(&format!("{mode}_"))),
+                "{}: {mode}",
+                descriptor.id
+            );
         }
         for route in &surface.routes {
             for tier in ["q4", "q8", "bf16"] {
@@ -37,22 +44,23 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     }
     let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
     assert_eq!(listing["schema"], 1);
-    assert!(listing["cases"]
-        .as_array()
+    assert!(listing["cases"].as_array().unwrap().iter().any(|k| k
+        .as_str()
         .unwrap()
-        .iter()
-        .any(|k| k == "iris_3b_depth/iris_3b_depth/q8/768/depth/3"));
-    assert!(listing["cases"]
-        .as_array()
+        .starts_with("iris_3b_depth/iris_3b_depth/q8/768/depth/3/")));
+    assert!(listing["cases"].as_array().unwrap().iter().any(|k| k
+        .as_str()
         .unwrap()
-        .iter()
-        .any(|k| k == "sdxl/illustrious_xl_v2/q4/1024/mask/4"));
+        .starts_with("sdxl/illustrious_xl_v2/q4/1024/mask/4/")));
 }
 #[cfg(not(target_os = "ios"))]
 #[test]
 fn campaign_public_report_host_execution_is_failure_before_allocator_or_load() {
     for diagnostic in [false, true] {
-        let output = report("anima_turbo/anima_turbo/q8/768/text/4", diagnostic);
+        let output = report(
+            &super::admission_tests::cell("anima_turbo/anima_turbo/q8/768/text/4").key(),
+            diagnostic,
+        );
         assert!(output.starts_with("SMOKE: FAIL"));
         let row: Value = serde_json::from_str(
             output
@@ -69,7 +77,7 @@ fn campaign_public_report_host_execution_is_failure_before_allocator_or_load() {
 }
 #[test]
 fn campaign_missing_snapshot_is_not_a_refusal_proof() {
-    let case = Case::parse("iris_3b/iris_3b/q4/768/text/3").unwrap();
+    let case = super::admission_tests::cell("iris_3b/iris_3b/q4/768/text/3");
     assert!(
         snapshot(Path::new("/definitely-not-a-provisioned-campaign"), &case)
             .unwrap_err()

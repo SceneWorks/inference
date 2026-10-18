@@ -16,7 +16,6 @@ use mlx_gen::{
     ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidDecoder, PidEngine};
-use mlx_rs::Dtype;
 use std::path::Path;
 
 use crate::loader;
@@ -659,7 +658,7 @@ impl ZImageTurbo {
                 if is_img2img {
                     Ok(cap)
                 } else {
-                    Ok(cap.as_dtype(Dtype::Bfloat16)?)
+                    pipeline::caption_cast_quantum(&cap)
                 }
             },
             // Materialize `cap` while the encoder is still alive (Sequential only) — MLX is lazy, so an

@@ -18,8 +18,10 @@
 
 use crate::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+use mlx_rs::Array;
 
 pub struct ZImageControlBlock {
     /// The base transformer block (attention + FFN + adaLN) — its `forward` is what
@@ -75,6 +77,82 @@ impl ZImageControlBlock {
             bp.quantize(bits, None)?;
         }
         Ok(())
+    }
+
+    /// [`Self::quantize`] as one iOS quantum: the packed copies ([`Self::quantize_bytes`]) are checked
+    /// before they exist and materialized before return, so the resident dense source is released
+    /// block by block. Exactly `quantize` off device.
+    pub(crate) fn quantize_quantum(&mut self, bits: i32) -> Result<()> {
+        if !mlx_gen::ios_quantum::enabled() {
+            return self.quantize(bits);
+        }
+        mlx_gen::ios_quantum::before(crate::quantum::CONTROL_QUANTIZE, self.quantize_bytes(bits))?;
+        self.quantize(bits)?;
+        mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_QUANTIZE, &self.weight_arrays())
+    }
+
+    /// The packed bytes [`Self::quantize`] builds from this block's dense projections (0 when packed).
+    pub(crate) fn quantize_bytes(&self, bits: i32) -> u64 {
+        self.base
+            .projections()
+            .into_iter()
+            .chain(std::iter::once(&self.after_proj))
+            .chain(self.before_proj.iter())
+            .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+            .sum()
+    }
+
+    /// The block's iOS quantum price over control state `c` (`[1, L, D]`): the base block's
+    /// ([`ZImageTransformerBlock::quantum_scratch`]) plus the `after_proj` hint and, on block 0, the
+    /// `before_proj` output and its sum with the base stream (`[1, L, D]` each, f32 — the control
+    /// branch runs f32), the projections' stream-width weight copies.
+    pub(crate) fn quantum_scratch(
+        &self,
+        c: &Array,
+        x_base: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        let width = if self.before_proj.is_some() {
+            c.item_size().max(x_base.item_size())
+        } else {
+            c.item_size()
+        }
+        .max(freqs_cis.item_size()) as u64;
+        let sh = c.shape();
+        let u = crate::quantum::u;
+        let hidden = crate::quantum::tb(width, &[u(sh[0]), u(sh[1]), u(sh[2])]);
+        let mut projections = vec![&self.after_proj];
+        projections.extend(self.before_proj.iter());
+        let units = 1 + 2 * u64::from(self.before_proj.is_some());
+        self.base
+            .quantum_scratch(c, freqs_cis, plan, backend)
+            .saturating_add(hidden.saturating_mul(units))
+            .saturating_add(crate::quantum::promoted_weight_bytes(&projections, width))
+            .saturating_add(mlx_gen::ios_quantum::page_slack(units))
+    }
+
+    /// Every weight array the block's projections hold (packed: weight, scales, biases, bias), for
+    /// the iOS load-time packing quantum to materialize.
+    pub(crate) fn weight_arrays(&self) -> Vec<&Array> {
+        self.base
+            .projections()
+            .into_iter()
+            .chain(std::iter::once(&self.after_proj))
+            .chain(self.before_proj.iter())
+            .flat_map(|lin| match lin.quantized_params() {
+                Some((w, scales, biases, bias, ..)) => {
+                    let mut v = vec![w, scales, biases];
+                    v.extend(bias);
+                    v
+                }
+                None => lin
+                    .dense_weight()
+                    .map(|(w, b)| std::iter::once(w).chain(b).collect())
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// The block-0 seed projection (`None` for every other block).

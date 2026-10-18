@@ -63,6 +63,16 @@ impl TextAttention {
         Ok(())
     }
 
+    /// The four projections, in `q, k, v, o` order (iOS quantum accounting reads their shapes).
+    pub(crate) fn projections(&self) -> [&AdaptableLinear; 4] {
+        [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj]
+    }
+
+    /// The per-head RMSNorm width (the head dim).
+    pub(crate) fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+
     /// `x`: `[b, s, hidden]`; `cos`/`sin`: `[1, s, head_dim]`; `mask`: additive `[1,1,s,s]`.
     pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
         let sh = x.shape();

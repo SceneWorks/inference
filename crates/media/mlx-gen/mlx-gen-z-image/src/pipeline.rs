@@ -545,9 +545,31 @@ pub fn encode_init_latents(
     target_width: u32,
     target_height: u32,
 ) -> Result<Array> {
-    let image_nchw = preprocess_init_image(image, target_width, target_height)?;
+    let image_nchw = init_image_quantum(image, target_width, target_height)?;
     let encoded = vae.encode(&image_nchw)?; // [1, 16, H/8, W/8]
     pack_latents(&encoded)
+}
+
+/// The img2img / control init image's LANCZOS resize and `[-1, 1]` upload as one iOS quantum: the
+/// uploaded `[H, W, 3]` f32 array (the resize runs on the host heap — see `crate::quantum`). A
+/// pass-through off device.
+pub(crate) fn init_image_quantum(
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    let quanta = mlx_gen::ios_quantum::enabled();
+    if quanta {
+        mlx_gen::ios_quantum::before(
+            crate::quantum::INIT_IMAGE,
+            crate::quantum::ab(4, &[target_height as u64, target_width as u64, 3]),
+        )?;
+    }
+    let image_nchw = preprocess_init_image(image, target_width, target_height)?;
+    if quanta {
+        mlx_gen::ios_quantum::finish(crate::quantum::INIT_IMAGE, &[&image_nchw])?;
+    }
+    Ok(image_nchw)
 }
 
 /// Build the 33-channel VAE-encoded **control context** from a control image (e.g. a rendered
@@ -564,19 +586,45 @@ pub fn encode_control_context(
     target_height: u32,
 ) -> Result<Array> {
     let control_latents = encode_init_latents(vae, control_image, target_width, target_height)?;
+    control_context_quantum(&control_latents)
+}
+
+/// The control context's zero mask / inpaint channels and the 33-channel concatenation as one
+/// iOS quantum: the host zero buffers, their uploads and the concatenation.
+pub(crate) fn control_context_quantum(control_latents: &Array) -> Result<Array> {
+    let control_latents = control_latents.clone();
     let sh = control_latents.shape(); // [16, 1, H/8, W/8]
     let (c, fdim, h, w) = (sh[0], sh[1], sh[2], sh[3]);
-    // i64 intermediates before the usize cast — bounded by the validated max resolution today, but a
-    // raw i32 product is a latent overflow footgun if the caps change (F-056).
-    let mask = Array::from_slice(
-        &vec![0f32; (fdim as i64 * h as i64 * w as i64) as usize],
-        &[1, fdim, h, w],
-    );
-    let inpaint = Array::from_slice(
-        &vec![0f32; (c as i64 * fdim as i64 * h as i64 * w as i64) as usize],
-        &[c, fdim, h, w],
-    );
-    Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
+    // iOS: the zero mask / inpaint channels and the 33-channel concatenation are one quantum: the
+    // zero channels' uploads and the concatenation (f32).
+    let plane = |channels: i32| {
+        crate::quantum::ab(
+            4,
+            &[
+                channels.max(0) as u64,
+                fdim.max(0) as u64,
+                h.max(0) as u64,
+                w.max(0) as u64,
+            ],
+        )
+    };
+    crate::quantum::conv_quantum(
+        crate::quantum::CONTROL_CONTEXT,
+        |_| plane(1) + plane(c) + plane(2 * c + 1),
+        || {
+            // i64 intermediates before the usize cast — bounded by the validated max resolution
+            // today, but a raw i32 product is a latent overflow footgun if the caps change (F-056).
+            let mask = Array::from_slice(
+                &vec![0f32; (fdim as i64 * h as i64 * w as i64) as usize],
+                &[1, fdim, h, w],
+            );
+            let inpaint = Array::from_slice(
+                &vec![0f32; (c as i64 * fdim as i64 * h as i64 * w as i64) as usize],
+                &[c, fdim, h, w],
+            );
+            Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
+        },
+    )
 }
 
 /// Port of `ZImageLatentCreator.pack_latents`: VAE-encoder latent `[1, C, H/8, W/8]` (or a 5-D
@@ -614,7 +662,35 @@ pub(crate) fn encode_prompt(
         return Err(Error::Msg(format!("{id}: empty prompt")));
     }
     let enc = EncoderWindow::encode(encoder_window, text_encoder, &input_ids, &attention_mask)?;
-    slice_valid(&enc, num_valid)
+    caption_quantum(&enc, num_valid, |enc| slice_valid(enc, num_valid))
+}
+
+/// The caption features' valid-token gather (`[valid, hidden]` f32) as one iOS quantum — and, via
+/// [`caption_cast_quantum`], their compute-dtype cast. A pass-through off device.
+pub(crate) fn caption_quantum(
+    enc: &Array,
+    num_valid: i32,
+    build: impl FnOnce(&Array) -> Result<Array>,
+) -> Result<Array> {
+    crate::quantum::conv_quantum(
+        crate::quantum::CAPTION_FEATURES,
+        |_| {
+            let hidden = enc.shape().last().copied().unwrap_or(0);
+            let n = crate::quantum::u(num_valid);
+            // The gather index and the gathered `[valid, hidden]` rows (f32).
+            crate::quantum::ab(4, &[n]) + crate::quantum::ab(4, &[n, crate::quantum::u(hidden)])
+        },
+        || build(enc),
+    )
+}
+
+/// The caption features' bf16 cast (the txt2img DiT conditioning) as one iOS quantum.
+pub(crate) fn caption_cast_quantum(cap: &Array) -> Result<Array> {
+    crate::quantum::conv_quantum(
+        crate::quantum::CAPTION_FEATURES,
+        |_| crate::quantum::ab(2, &[cap.size() as u64]),
+        || Ok(cap.as_dtype(Dtype::Bfloat16)?),
+    )
 }
 
 /// Negative/unconditional caption → `cap_feats` (f32) for the base model's CFG path (sc-8320). Unlike
@@ -914,6 +990,18 @@ pub(crate) fn denoise_batch(
     let mut latents = Vec::with_capacity(req.count as usize);
     for i in 0..req.count {
         let seed = base_seed.wrapping_add(i as u64);
+        // iOS: the seeded noise, its bf16 cast and the img2img blend are one quantum
+        // ([`crate::quantum::latents_bytes`]).
+        let quanta = mlx_gen::ios_quantum::enabled();
+        if quanta {
+            let elements = u64::from(LATENT_CHANNELS as u32)
+                * u64::from(req.height / SPATIAL_SCALE)
+                * u64::from(req.width / SPATIAL_SCALE);
+            mlx_gen::ios_quantum::before(
+                crate::quantum::LATENTS,
+                crate::quantum::latents_bytes(elements, clean.is_some()),
+            )?;
+        }
         let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
         let init = match clean {
             Some(clean) => {
@@ -927,6 +1015,9 @@ pub(crate) fn denoise_batch(
             }
             None => noise,
         };
+        if quanta {
+            mlx_gen::ios_quantum::finish(crate::quantum::LATENTS, &[&init])?;
+        }
         let out = denoise(init, seed, on_progress)?;
         // Materialize so the DiT is no longer referenced through MLX's lazy graph (the caller's shed
         // would otherwise free nothing).
@@ -956,7 +1047,21 @@ pub(crate) fn decode_batch(
             Some(cfg) => decoder.decode_tiled(&unpacked, cfg, Some(cancel))?,
             None => decoder.decode(&unpacked)?,
         };
+        // iOS: the f32 cast and the pixel conversion are one quantum
+        // ([`crate::quantum::zimage_pixel_conversion_bytes`]).
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::before(
+                crate::quantum::DECODED_TO_IMAGE,
+                crate::quantum::zimage_pixel_conversion_bytes(
+                    decoded.size() as u64,
+                    decoded.item_size() as u64,
+                ),
+            )?;
+        }
         images.push(decoded_to_image(&decoded.as_dtype(Dtype::Float32)?)?);
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::DECODED_TO_IMAGE, &[])?;
+        }
     }
     Ok(images)
 }

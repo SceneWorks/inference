@@ -12,7 +12,7 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 mlx-gen = { path = ".." }
-# SANA, Anima Turbo, the SDXL family and all Iris inference tasks only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
+# SANA, Anima Turbo, the SDXL family, all Iris inference tasks and Z-Image Turbo only. This is deliberately NOT mlx-gen-catalog: that composes every provider crate including
 # the video families (wan, ltx, mochi, svd), none of it validated on iOS and none of it shaped for
 # a device with a hard per-app memory cap. Depending on the whole catalog to obtain one small
 # generator would compile a graph the platform cannot run.
@@ -29,6 +29,10 @@ mlx-gen-anima = { path = "../mlx-gen-anima", default-features = false }
 mlx-gen-iris = { path = "../mlx-gen-iris", default-features = false }
 # The complete SDXL family shares one generator; never compile its trainer on iOS.
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl", default-features = false }
+# Z-Image Turbo (`z_image_turbo` and its `z_image_turbo_control` route, sc-26433), inference only:
+# `default-features = false` drops the crate's `training` feature (trainer, perceptual/depth aux
+# losses, dataset decode). The base `z_image` variants are not registered here.
+mlx-gen-z-image = { path = "../mlx-gen-z-image", default-features = false }
 
 [features]
 # The labelled bounded DEVICE CAPTURE permit (`capture_permit`). Never in a product build: only

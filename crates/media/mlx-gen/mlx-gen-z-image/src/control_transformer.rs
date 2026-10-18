@@ -17,13 +17,12 @@
 //! the hints contribute zero — both reproduce the base output exactly (the parity self-check).
 
 use mlx_rs::error::Exception;
-use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::Array;
 
 use crate::control_transformer_block::ZImageControlBlock;
-use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
+use crate::transformer::{apply_pad, ZImageTransformer};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::attention::AttentionPlan;
 use mlx_gen::weights::Weights;
@@ -44,7 +43,7 @@ pub(crate) struct ControlPrepared {
     cap_freqs: Array,
     unified_freqs: Array,
     /// Control embedding, already padded + `expand_dims(0)` — the input to the control refiner.
-    c_emb: Array,
+    pub(crate) c_emb: Array,
 }
 
 /// Channel count of the VAE-encoded control context (16 control latent + 1 mask + 16 inpaint).
@@ -93,12 +92,12 @@ pub fn exercise_retained_compile_inventory(input: &Array) -> Result<()> {
 }
 
 pub struct ZImageControlTransformer {
-    base: ZImageTransformer,
+    pub(crate) base: ZImageTransformer,
     /// `control_all_x_embedder.{patch_size}-{f_patch_size}` — `33·p²·pf → dim`. Kept dense under
     /// Q8 (its in-features, e.g. 132, is not divisible by the group size 64).
     control_x_embedder: AdaptableLinear,
     /// The 15-block main control stack (injects into `base.layers` at `CONTROL_LAYERS_PLACES`).
-    control_layers: Vec<ZImageControlBlock>,
+    pub(crate) control_layers: Vec<ZImageControlBlock>,
     /// The 2-block control refiner (injects into `base.noise_refiner` at `CONTROL_REFINER_PLACES`).
     control_noise_refiner: Vec<ZImageControlBlock>,
     /// Ladder rung 4 (SC-15754) for the 15-block main control stack. The 2-block refiner is left
@@ -228,11 +227,16 @@ impl ZImageControlTransformer {
     /// here the base load + this overlay are both dense, and this quantizes both together.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.base.quantize(bits)?;
-        for block in &mut self.control_layers {
-            block.quantize(bits)?;
-        }
-        for block in &mut self.control_noise_refiner {
-            block.quantize(bits)?;
+        // The ControlNet checkpoint is published dense only, so on a packed tier its resident blocks
+        // are packed here, at load. iOS: one bounded quantum per block (its dense bytes are already
+        // resident; the packed copies are checked before they exist and materialized before the
+        // next block, so the dense source is released block by block).
+        for block in self
+            .control_layers
+            .iter_mut()
+            .chain(self.control_noise_refiner.iter_mut())
+        {
+            block.quantize_quantum(bits)?;
         }
         // Rung 4 replays the same quantization on each materialized control block.
         if let Some(stream) = self.control_block_stream.as_mut() {
@@ -376,10 +380,34 @@ impl ZImageControlTransformer {
         cc: &Array,
     ) -> Result<ControlPrepared> {
         let cfg = &self.base.cfg;
+        let quanta = mlx_gen::ios_quantum::enabled();
+        if quanta {
+            mlx_gen::ios_quantum::before(
+                crate::quantum::DIT_PREPARE,
+                self.base.prepare_bytes(dims, cap_feats),
+            )?;
+        }
         let meta = self.base.patchify_meta(dims, cap_feats)?;
         let x_freqs = self.base.rope.forward(&meta.x_pos_ids)?;
         let cap_freqs = self.base.rope.forward(&meta.cap_pos_ids)?;
         let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
+        if quanta {
+            mlx_gen::ios_quantum::finish(
+                crate::quantum::DIT_PREPARE,
+                &[
+                    &meta.cap_tokens,
+                    &meta.x_keep,
+                    &meta.cap_keep,
+                    &x_freqs,
+                    &cap_freqs,
+                    &unified_freqs,
+                ],
+            )?;
+            mlx_gen::ios_quantum::before(
+                crate::quantum::CONTROL_EMBED,
+                self.control_embed_bytes(cc, meta.img_pad),
+            )?;
+        }
 
         // Control context embedding (the constant the fork re-patchified every step). The control
         // patch embedder runs at the control context's dtype and the embedding is NOT recast —
@@ -398,6 +426,9 @@ impl ZImageControlTransformer {
         let mut c_emb = self.control_x_embedder.forward(&c_tokens)?;
         c_emb = apply_pad(&c_emb, &meta.x_keep, &self.base.x_pad_token)?;
         let c_emb = c_emb.expand_dims(0)?;
+        if quanta {
+            mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_EMBED, &[&c_emb])?;
+        }
 
         Ok(ControlPrepared {
             cap_tokens: meta.cap_tokens,
@@ -410,6 +441,40 @@ impl ZImageControlTransformer {
             unified_freqs,
             c_emb,
         })
+    }
+
+    /// The control embed quantum's counted price over control context `cc` (`[33, F, H, W]`): the
+    /// patch tokens' transposed copy (and, when the count pads, the f32 zero rows and padded
+    /// concatenation); `control_all_x_embedder`'s output and the pad merge's two products (`[N, D]`
+    /// at their promoted widths); the dense embedder's stream-width copy.
+    pub(crate) fn control_embed_bytes(&self, cc: &Array, img_pad: i32) -> u64 {
+        use crate::quantum::{ab, u};
+        let cfg = &self.base.cfg;
+        let sh = cc.shape();
+        let n0 =
+            u((sh[1] / cfg.f_patch_size) * (sh[2] / cfg.patch_size) * (sh[3] / cfg.patch_size));
+        let n = n0 + u(img_pad);
+        let patch = u(cfg.f_patch_size * cfg.patch_size * cfg.patch_size * sh[0]);
+        let cw = cc.item_size() as u64;
+        let tokens = ab(cw, &[n0, patch])
+            + if img_pad > 0 {
+                ab(4, &[u(img_pad), patch]) + ab(4, &[n, patch])
+            } else {
+                0
+            };
+        let emb = crate::quantum::linear_out_dtype(&self.control_x_embedder, cc.dtype());
+        tokens
+            .saturating_add(ab(mlx_gen::ios_quantum::dtype_bytes(emb), &[n, u(cfg.dim)]))
+            .saturating_add(
+                2 * ab(
+                    crate::quantum::pad_width(emb, &self.base.x_pad_token),
+                    &[n, u(cfg.dim)],
+                ),
+            )
+            .saturating_add(crate::quantum::promoted_weight_bytes(
+                &[&self.control_x_embedder],
+                cw.max(4),
+            ))
     }
 
     /// Single-shot control forward: build the [`ControlPrepared`] and run one step. Bit-identical to
@@ -485,7 +550,18 @@ impl ZImageControlTransformer {
             };
         }
 
+        // iOS: every stage is one bounded quantum (see `ZImageTransformer::forward_with_rungs`);
+        // pass-throughs off device.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let backend = mlx_gen::ios_quantum::Backend::current;
+        let quanta = mlx_gen::ios_quantum::enabled();
         let cfg = &self.base.cfg;
+        if quanta {
+            mlx_gen::ios_quantum::before(
+                crate::quantum::DIT_EMBED,
+                self.base.embed_bytes(x, prep.img_pad, backend()),
+            )?;
+        }
         let t = Array::from_slice(&[timestep * cfg.t_scale], &[1]);
         let t_emb = self.base.t_embedder.forward(&t)?;
         record!("t_emb", t_emb);
@@ -497,6 +573,9 @@ impl ZImageControlTransformer {
         let mut x_emb = self.base.x_embedder.forward(&x_tokens)?;
         x_emb = apply_pad(&x_emb, &prep.x_keep, &self.base.x_pad_token)?;
         let mut x_emb = x_emb.expand_dims(0)?;
+        if quanta {
+            mlx_gen::ios_quantum::finish(crate::quantum::DIT_EMBED, &[&t_emb, &x_emb])?;
+        }
         record!("x_emb", x_emb);
 
         // Control refiner pass: reuse the cached control embedding, run the parallel control refiner,
@@ -514,32 +593,39 @@ impl ZImageControlTransformer {
         record!("refiner_hint1", refiner_hints[1]);
         record!("threaded", threaded_control);
 
-        // Noise refiner (with control hints).
+        // Noise refiner (with control hints, each added inside its block's quantum).
         for (i, layer) in self.base.noise_refiner.iter().enumerate() {
-            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, plan)?;
-            if let Some(n) = hint_index(&CONTROL_REFINER_PLACES, i) {
-                x_emb = add_hint(&x_emb, &refiner_hints[n], control_context_scale)?;
-            }
+            let hint = hint_index(&CONTROL_REFINER_PLACES, i);
+            x_emb = layer.forward_quantum(
+                &x_emb,
+                &prep.x_freqs,
+                &t_emb,
+                plan,
+                hint.map_or(0, |_| add_hint_bytes(&x_emb)),
+                |out| match hint {
+                    Some(n) => add_hint(&out, &refiner_hints[n], control_context_scale),
+                    None => Ok(out),
+                },
+            )?;
         }
         record!("x_refined", x_emb);
 
         // Caption stream: RMSNorm → linear → set padded to cap_pad_token → context refiner.
-        let cap_normed = rms_norm(&prep.cap_tokens, &self.base.cap_norm_w, cfg.norm_eps)?;
-        let mut cap_emb = self.base.cap_linear.forward(&cap_normed)?;
-        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.base.cap_pad_token)?;
-        let mut cap_emb = cap_emb.expand_dims(0)?;
+        let mut cap_emb = self
+            .base
+            .caption_quantum_parts(&prep.cap_tokens, &prep.cap_keep)?;
         for layer in &self.base.context_refiner {
-            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, plan)?;
+            cap_emb = layer.forward_quantum(&cap_emb, &prep.cap_freqs, plan)?;
         }
         record!("cap_refined", cap_emb);
 
         // Unify image + caption.
         let x_len = x_emb.shape()[1];
-        let unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+        let unified = self.base.unify_quantum(&x_emb, &cap_emb)?;
 
         // Main control pass: thread the (refined) control state + caption through the 15 control
         // layers to produce the hints for the unified main loop.
-        let control_unified = concatenate_axis(&[&threaded_control, &cap_emb], 1)?;
+        let control_unified = self.base.unify_quantum(&threaded_control, &cap_emb)?;
         let (main_hints, _) = match window {
             None => self.run_control_blocks(
                 &self.control_layers,
@@ -566,11 +652,18 @@ impl ZImageControlTransformer {
         match window {
             None => {
                 for (i, layer) in self.base.layers.iter().enumerate() {
-                    unified =
-                        layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
-                    if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
-                        unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
-                    }
+                    let hint = hint_index(&CONTROL_LAYERS_PLACES, i);
+                    unified = layer.forward_quantum(
+                        &unified,
+                        &prep.unified_freqs,
+                        &t_emb,
+                        plan,
+                        hint.map_or(0, |_| add_hint_bytes(&unified)),
+                        |out| match hint {
+                            Some(n) => add_hint(&out, &main_hints[n], control_context_scale),
+                            None => Ok(out),
+                        },
+                    )?;
                 }
             }
             Some(window) => {
@@ -580,6 +673,9 @@ impl ZImageControlTransformer {
                     &t_emb,
                     plan,
                     window,
+                    &|i: usize, state: &Array| {
+                        hint_index(&CONTROL_LAYERS_PLACES, i).map_or(0, |_| add_hint_bytes(state))
+                    },
                     &mut |state: &Array, i: usize| match hint_index(&CONTROL_LAYERS_PLACES, i) {
                         Some(n) => add_hint(state, &main_hints[n], control_context_scale),
                         None => Ok(state.clone()),
@@ -590,13 +686,8 @@ impl ZImageControlTransformer {
         record!("unified_main", unified);
 
         // Final layer + unpatchify (only the real image tokens survive), negate the velocity.
-        let unified = self.base.final_layer.forward(&unified, &t_emb)?;
-        let embed_dim = unified.shape()[2];
-        let head = unified
-            .reshape(&[unified.shape()[1], embed_dim])?
-            .take_axis(row_indices(x_len), 0)?;
-        let out = self.base.unpatchify(&head, prep.x_size)?;
-        Ok(out.multiply(scalar(-1.0))?)
+        self.base
+            .output_quantum(&unified, &t_emb, x_len, prep.x_size)
     }
 
     /// Run a parallel control stack, returning `(per-block hints, threaded control state)`.
@@ -615,14 +706,10 @@ impl ZImageControlTransformer {
         let mut c = c;
         let mut hints = Vec::with_capacity(blocks.len());
         for (i, block) in blocks.iter().enumerate() {
-            if i == 0 {
-                let bp = block.before_proj().ok_or_else(|| {
-                    Error::Msg("z-image control block 0 is missing before_proj".into())
-                })?;
-                c = add(&bp.forward(&c)?, x_base)?;
-            }
-            c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
-            hints.push(block.after_proj().forward(&c)?);
+            let (next, hint) =
+                control_block_quantum(block, i, c, x_base, freqs_cis, t_emb, plan, 0)?;
+            c = next;
+            hints.push(hint);
         }
         Ok((hints, c))
     }
@@ -680,15 +767,14 @@ impl ZImageControlTransformer {
             || stream.open(),
             |(mut hints, mut c), view, range| {
                 for i in range {
-                    let block = stream.materialize_control(view, i)?;
-                    if i == 0 {
-                        let bp = block.before_proj().ok_or_else(|| {
-                            Error::Msg("z-image control block 0 is missing before_proj".into())
-                        })?;
-                        c = add(&bp.forward(&c)?, x_base)?;
-                    }
-                    c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
-                    hints.push(block.after_proj().forward(&c)?);
+                    // The block's stored bytes (and its replayed packing) are read inside its
+                    // quantum, which is priced with them.
+                    let (block, read_bytes) = stream.materialize_control(view, i)?;
+                    let (next, hint) = control_block_quantum(
+                        &block, i, c, x_base, freqs_cis, t_emb, plan, read_bytes,
+                    )?;
+                    c = next;
+                    hints.push(hint);
                 }
                 Ok((hints, c))
             },
@@ -709,6 +795,66 @@ impl AdaptableHost for ZImageControlTransformer {
         // ControlNet weights, never adapter targets). Delegate the whole path to the composed base.
         self.base.adaptable_mut(path)
     }
+}
+
+/// One ControlNet block as one iOS quantum: (block 0) the `before_proj` seed added to the base
+/// stream, the base block forward over the control state, and the block's `after_proj` hint.
+/// Returns `(threaded control state, hint)`, both materialized on device. `extra_bytes` is a streamed
+/// block's read (and replayed packing). Priced by [`ZImageControlBlock::quantum_scratch`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn control_block_quantum(
+    block: &ZImageControlBlock,
+    index: usize,
+    c: Array,
+    x_base: &Array,
+    freqs_cis: &Array,
+    t_emb: &Array,
+    plan: AttentionPlan<'_>,
+    extra_bytes: u64,
+) -> Result<(Array, Array)> {
+    let quanta = mlx_gen::ios_quantum::enabled();
+    if quanta {
+        let scratch = block.quantum_scratch(
+            &c,
+            x_base,
+            freqs_cis,
+            plan,
+            mlx_gen::ios_quantum::Backend::current(),
+        );
+        mlx_gen::ios_quantum::before(
+            crate::quantum::CONTROL_BLOCK,
+            scratch.saturating_add(extra_bytes),
+        )?;
+    }
+    let mut c = c;
+    if index == 0 {
+        let bp = block
+            .before_proj()
+            .ok_or_else(|| Error::Msg("z-image control block 0 is missing before_proj".into()))?;
+        c = add(&bp.forward(&c)?, x_base)?;
+    }
+    let c = block.base.forward_budgeted(&c, freqs_cis, t_emb, plan)?;
+    let hint = block.after_proj().forward(&c)?;
+    if quanta {
+        mlx_gen::ios_quantum::finish(crate::quantum::CONTROL_BLOCK, &[&c, &hint])?;
+    }
+    Ok((c, hint))
+}
+
+/// What [`add_hint`] adds to a block's quantum over the base stream `x`: the scaled hint and the
+/// sum (`[1, L, D]`, f32 — the f32 hint promotes; one fused buffer under compiled glue).
+pub(crate) fn add_hint_bytes(x: &Array) -> u64 {
+    let sh = x.shape();
+    let hidden = crate::quantum::tb(
+        4,
+        &[
+            crate::quantum::u(sh[0]),
+            crate::quantum::u(sh[1]),
+            crate::quantum::u(sh[2]),
+        ],
+    );
+    let units = if crate::compile_glue() { 1 } else { 2 };
+    hidden * units + mlx_gen::ios_quantum::page_slack(units)
 }
 
 /// `x + hint · scale`, broadcasting the scalar scale over `[1, seq, dim]`. Fused into one kernel

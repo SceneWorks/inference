@@ -22,7 +22,9 @@ class CampaignTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.keys = [f"fake/fake/{tier}/{edge}/{mode}/{rung}" for tier in campaign.TIERS for edge in (512, 768, 1024) for mode in ("text", "reference", "restore", "depth") for rung in range(5)]
+        # Rung 2 declares a quality-first selection space (two decode tiles); the others none.
+        self.selections = {2: ("t768", "t512")}
+        self.keys = [f"fake/fake/{tier}/{edge}/{mode}/{rung}/{sel}" for tier in campaign.TIERS for edge in (512, 768, 1024) for mode in ("text", "reference", "restore", "depth") for rung in range(5) for sel in self.selections.get(rung, ("base",))]
         self.catalog = self.root / "catalog.json"
         self.catalog.write_text(json.dumps({"schema": 1, "cases": self.keys}), encoding="utf-8")
         self.guard = mock.patch.object(campaign.subprocess, "Popen", side_effect=AssertionError("TEST MUST NOT START ANY REAL PROCESS"))
@@ -69,11 +71,14 @@ class CampaignTests(unittest.TestCase):
     def test_public_cli_listing_is_pure_and_rung_zero_is_selected(self):
         self.assertEqual(self.main("list", "--tier", "q8", "--edge", "768", "--mode", "restore", "--rung", "4"), 0)
         args = campaign.parser().parse_args(["list", "--rung", "0"])
-        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1"))
-        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1/base"))
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0/base"))
+        args = campaign.parser().parse_args(["list", "--selection", "t512"])
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/2/t512"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/2/t768"))
 
     def test_invalid_finite_budgets_and_cases(self):
-        for options in (("--case", "p/../q4/512/text/0"), ("--timeout-seconds", "0"), ("--max-cases", "20001"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5")):
+        for options in (("--case", "p/../q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0"), ("--case", "p/p/q4/512/text/0/t5.1"), ("--timeout-seconds", "0"), ("--max-cases", "20001"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5")):
             with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.parser().parse_args(["run", *options])
         with self.assertRaises(SystemExit):
@@ -250,10 +255,15 @@ class CampaignTests(unittest.TestCase):
         ladders = {}
         for key in calls:
             fields = key.split("/")
-            ladders.setdefault(fields[5], []).append(int(fields[3]))
+            ladders.setdefault(fields[5], []).append((int(fields[3]), fields[6]))
         self.assertEqual(set(ladders), {"0", "1", "2", "3", "4"})
-        for edges in ladders.values():
-            self.assertEqual(edges, [512, 768], "never past the refused size, never a retry")
+        for rung, steps in ladders.items():
+            if rung == "2":
+                # Every selection tried at the refused size, quality first; never past it.
+                self.assertEqual(steps, [(512, "t768"), (768, "t768"), (768, "t512")])
+            else:
+                self.assertEqual(steps, [(512, "base"), (768, "base")], "never past the refused size, never a retry")
+        self.assertEqual(len(calls), len(set(calls)), "no cell runs twice")
         rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
         self.assertTrue(all(r["diagnostic"] is True and r["production_success"] is False for r in rows))
         table = campaign.render(rows)
@@ -262,8 +272,47 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("refused before construction: SANA block", table)
         self.assertIn("diagnostics excluded): {}", table)
 
+    def test_capture_steps_to_a_cheaper_selection_and_carries_it_up_the_ladder(self):
+        # The quality selection refuses from 768 up; the cheaper one completes 768 and 1024. At 1024
+        # the ladder starts from the selection that completed 768 (the quality one cannot fit a
+        # larger size), and the cheapest refusing everywhere would stop it.
+        def outcome(edge, sel):
+            if sel == "t768" and edge >= 768:
+                return "capture_refused"
+            return "diagnostic_success"
+        calls = []
+        def fake(session, key, **kw):
+            calls.append(key)
+            fields = key.split("/")
+            return self.capture_row(key, outcome(int(fields[3]), fields[6]))
+        output = self.root / "ladder.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
+            cls.return_value.blocked = False
+            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(output))
+        self.assertEqual(code, 0)
+        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("768", "t768"), ("768", "t512"), ("1024", "t512")])
+        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        table = campaign.render(rows)
+        self.assertIn('"completed_selection": "t512"', table)
+        self.assertIn('"largest_completed_edge": 1024', table)
+        self.assertNotIn("refused_before_jetsam_edge", table, "a size a cheaper selection completed is not a refused size")
+        # Every selection refusing at a size stops the ladder there.
+        calls.clear()
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), self.capture_row(key, "capture_refused"))[1]):
+            cls.return_value.blocked = False
+            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "stop.jsonl"))
+        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("512", "t512")])
+        rows = [json.loads(line) for line in (self.root / "stop.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertIn('"refused_before_jetsam_edge": 512', campaign.render(rows))
+        # A failure (not a capture refusal) at a selection stops the ladder, no cheaper retry.
+        calls.clear()
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), campaign.failure(key, "load failed"))[1]):
+            cls.return_value.blocked = False
+            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "fail2.jsonl"))
+        self.assertEqual(len(calls), 1)
+
     def test_capture_rejects_edge_selectors_and_failure_stops_the_ladder(self):
-        for options in (("--edge", "512"), ("--case", self.keys[0]), ("--next-edge", "1024")):
+        for options in (("--edge", "512"), ("--case", self.keys[0]), ("--next-edge", "1024"), ("--selection", "t512")):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 self.main("capture", "--provider", "fake", "--device", "fake", "--output", str(self.root / "x.jsonl"), *options)
         calls = []

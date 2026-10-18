@@ -15,6 +15,10 @@
 #       --control ~/models/controlnet-tile-sdxl --ip-adapter ~/models/ip-adapter-sdxl
 # They land beside the snapshot as control/ and ip_adapter/, and the slot's components.json maps the
 # `control` / `ip_adapter` roles onto them (merged with any components.json the snapshot carries).
+# Z-Image Turbo: push each published tier dir into the `z_image_turbo` slot; its control route
+# (`z_image_turbo_control`) loads the same slot with the Fun-Controlnet-Union checkpoint as --control:
+#   scripts/ios/push_model.sh "$ZIMAGE_MLX/q4" --campaign-route z_image_turbo --tier q4 \
+#       --control ~/models/Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors
 #
 # With no <remote-subdir> the snapshot's CONTENTS land directly in Documents/, which is where
 # `find_snapshot` looks for the LLM (a root `config.json`). With one, they land in

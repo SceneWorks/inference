@@ -1,5 +1,28 @@
 use super::*;
 
+/// The first (quality-first) enumerated cell of a `provider/route/tier/edge/mode/rung` prefix: the
+/// selection the capture ladder tries first. A prefix outside the enumerated domain (a mode the
+/// provider does not serve, a 256 edge) takes the first selection its provider declares for that
+/// tier and rung, else the parameterless one.
+pub(super) fn cell(prefix: &str) -> Case {
+    static CASES: std::sync::OnceLock<Vec<Case>> = std::sync::OnceLock::new();
+    let cases = CASES
+        .get_or_init(|| campaign::enumerate(&surfaces(runtime_ios::catalog().unwrap().media())));
+    if let Some(c) = cases
+        .iter()
+        .find(|c| c.key().starts_with(&format!("{prefix}/")))
+    {
+        return c.clone();
+    }
+    let mut c = Case::parse(&format!("{prefix}/{}", campaign::BASE_SELECTION)).unwrap();
+    if let Some(same) = cases
+        .iter()
+        .find(|o| o.provider == c.provider && o.tier == c.tier && o.rung == c.rung)
+    {
+        c.selection = same.selection.clone();
+    }
+    c
+}
 fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
     DeviceProvider {
         registry,
@@ -68,7 +91,7 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
         ("control", 2, "mode"),
         ("text", 4, "strategy"),
     ] {
-        let case = Case::parse(&format!("sana_1600m/sana_1600m/bf16/512/{mode}/{rung}")).unwrap();
+        let case = cell(&format!("sana_1600m/sana_1600m/bf16/512/{mode}/{rung}"));
         let mut p = adapter(catalog.media(), temp.path().into());
         let result = campaign::run(&mut p, &case, false);
         assert_eq!(result.0, Status::AdmittedRefused, "{result:?}");
@@ -83,7 +106,7 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
     // A dense snapshot requested as q4 is a typed ARTIFACT refusal (the provider publishes no
     // calibration for a load-time requantization), never an untyped failure or a wrong price.
     copy_tree(&root, &temp.path().join("sana_1600m/q4"));
-    let case = Case::parse("sana_1600m/sana_1600m/q4/512/text/2").unwrap();
+    let case = cell("sana_1600m/sana_1600m/q4/512/text/2");
     let mut p = adapter(catalog.media(), temp.path().into());
     let result = campaign::run(&mut p, &case, false);
     assert_eq!(result.0, Status::AdmittedRefused, "{result:?}");
@@ -98,7 +121,7 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
     )
     .unwrap();
     let mut p = adapter(catalog.media(), temp.path().into());
-    let case = Case::parse("sana_1600m/sana_1600m/bf16/512/text/2").unwrap();
+    let case = cell("sana_1600m/sana_1600m/bf16/512/text/2");
     assert_eq!(
         campaign::run(&mut p, &case, false).0,
         Status::DiagnosticFailure
@@ -141,7 +164,7 @@ fn campaign_injected_device_sdxl_anima_iris_no_evidence_is_not_capacity() {
     )
     .unwrap();
     for provider in ["sdxl", "anima_turbo", "iris_3b"] {
-        let case = Case::parse(&format!("{provider}/{provider}/bf16/512/text/0")).unwrap();
+        let case = cell(&format!("{provider}/{provider}/bf16/512/text/0"));
         let mut p = adapter(catalog.media(), temp.path().into());
         let result = campaign::run(&mut p, &case, false);
         assert_eq!(result.0, Status::AdmittedRefused, "{provider}: {result:?}");
@@ -154,13 +177,13 @@ fn campaign_injected_device_sdxl_anima_iris_no_evidence_is_not_capacity() {
     // Iris prompt batches are admitted-reachable too; a mode Iris does not serve is a typed
     // refusal, never a silent text-to-image substitute.
     for (mode, kind) in [("prompt_batch", "no_evidence"), ("reference", "mode")] {
-        let case = Case::parse(&format!("iris_3b/iris_3b/bf16/512/{mode}/0")).unwrap();
+        let case = cell(&format!("iris_3b/iris_3b/bf16/512/{mode}/0"));
         let mut p = adapter(catalog.media(), temp.path().into());
         let result = campaign::run(&mut p, &case, false);
         assert_eq!(result.0, Status::AdmittedRefused, "{mode}: {result:?}");
         assert_eq!(p.refusal_kind, Some(kind), "{mode}: {result:?}");
     }
-    let case = Case::parse("iris_3b/iris_3b/bf16/512/prompt_batch/0").unwrap();
+    let case = cell("iris_3b/iris_3b/bf16/512/prompt_batch/0");
     let mut p = adapter(catalog.media(), temp.path().into());
     p.prepare(&case).unwrap();
     let runtime_ios::media::IosWork::Generate(request) = &p.candidate.as_ref().unwrap().work else {
@@ -177,7 +200,7 @@ fn campaign_oversized_component_manifest_fails_without_full_allocation() {
     std::fs::create_dir_all(&root).unwrap();
     let file = std::fs::File::create(root.join("components.json")).unwrap();
     file.set_len(1 << 30).unwrap();
-    let case = Case::parse("anima_turbo/anima_turbo/q4/512/text/0").unwrap();
+    let case = cell("anima_turbo/anima_turbo/q4/512/text/0");
     assert!(snapshot(temp.path(), &case).unwrap_err().contains("64 KiB"));
 }
 #[test]
@@ -280,7 +303,7 @@ fn campaign_sdxl_malformed_shard_is_failure_before_missing_evidence() {
     tensor(&path, "x");
     std::fs::write(path, b"invalid").unwrap();
     let mut p = adapter(catalog.media(), root.path().into());
-    let case = Case::parse("sdxl/sdxl/bf16/512/text/2").unwrap();
+    let case = cell("sdxl/sdxl/bf16/512/text/2");
     assert_eq!(
         campaign::run(&mut p, &case, false).0,
         Status::DiagnosticFailure
@@ -290,7 +313,7 @@ fn campaign_sdxl_malformed_shard_is_failure_before_missing_evidence() {
 #[test]
 fn campaign_case_renders_are_unique_and_registered_in_manifest() {
     let root = tempfile::tempdir().unwrap();
-    let mut case = Case::parse("iris_3b/iris_3b/bf16/256/prompt_batch/0").unwrap();
+    let mut case = cell("iris_3b/iris_3b/bf16/256/prompt_batch/0");
     let image = Image {
         width: 256,
         height: 256,
@@ -379,7 +402,7 @@ fn campaign_capture_requires_bounded_quanta_and_skips_evidence() {
     let catalog = runtime_ios::catalog().unwrap();
     let temp = tempfile::tempdir().unwrap();
     sana(&temp.path().join("sana_1600m/bf16"));
-    let case = Case::parse("sana_1600m/sana_1600m/bf16/512/text/2").unwrap();
+    let case = cell("sana_1600m/sana_1600m/bf16/512/text/2");
     let mut p = adapter(catalog.media(), temp.path().into());
     let (status, reason) = campaign::run(&mut p, &case, true);
     assert_eq!(status, Status::DiagnosticFailure, "{reason}");
@@ -408,7 +431,7 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
     tokenizer(&slot.join("tokenizer"));
     tokenizer(&slot.join("tokenizer_2"));
     for mode in ["control", "ip_adapter"] {
-        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let case = cell(&format!("sdxl/sdxl/q4/512/{mode}/2"));
         let mut p = adapter(catalog.media(), temp.path().into());
         let (status, reason) = campaign::run(&mut p, &case, false);
         assert_eq!(status, Status::DiagnosticFailure, "{mode}: {reason}");
@@ -422,13 +445,8 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
         r#"{"control":"control","ip_adapter":"ip_adapter.safetensors"}"#,
     )
     .unwrap();
-    let spec = |mode: &str| {
-        snapshot(
-            temp.path(),
-            &Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap(),
-        )
-        .unwrap()
-    };
+    let spec =
+        |mode: &str| snapshot(temp.path(), &cell(&format!("sdxl/sdxl/q4/512/{mode}/2"))).unwrap();
     assert!(matches!(
         spec("control").control,
         Some(WeightsSource::Dir(_))
@@ -448,11 +466,267 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
     );
     // Provisioned: both reach admission and are refused for EVIDENCE under their own routes.
     for mode in ["control", "ip_adapter"] {
-        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let case = cell(&format!("sdxl/sdxl/q4/512/{mode}/2"));
         let mut p = adapter(catalog.media(), temp.path().into());
         let (status, reason) = campaign::run(&mut p, &case, false);
         assert_eq!(status, Status::AdmittedRefused, "{mode}: {reason}");
         assert_eq!(p.refusal_kind, Some("no_evidence"), "{mode}: {reason}");
         assert_eq!(p.evidence_key.as_ref().unwrap().mode, mode);
     }
+}
+/// Z-Image Turbo's cells: both routes, every mode, refused for evidence (never capacity) on an
+/// injected device before any load; the control route loads the `z_image_turbo` slot with that
+/// slot's provisioned `control` role (and is a provisioning failure without it); a slot whose stored
+/// tier is not the case's is a typed artifact refusal.
+#[test]
+fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let slot = temp.path().join("z_image_turbo/q4");
+    for component in ["transformer", "vae"] {
+        tensor(&slot.join(component).join("model.safetensors"), "x");
+        std::fs::write(
+            slot.join(component).join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+    }
+    gen_core_testkit::write_encoder_contract_fixture_with_quant(
+        &slot.join("text_encoder"),
+        runtime_ios::media::zimage::ENCODER_CONTRACT,
+        Some(4),
+    )
+    .unwrap();
+    let run = |prefix: &str| {
+        let case = cell(prefix);
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let result = campaign::run(&mut p, &case, false);
+        (result, p.refusal_kind)
+    };
+    // No control checkpoint provisioned yet: the control route is a provisioning failure.
+    let ((status, reason), kind) =
+        run("z_image_turbo_control/z_image_turbo_control/q4/512/control_pose/4");
+    assert_eq!(status, Status::DiagnosticFailure, "{reason}");
+    assert!(reason.contains("`control`"), "{reason}");
+    assert_eq!(kind, None);
+    tensor(&slot.join("control.safetensors"), "x");
+    std::fs::write(
+        slot.join("components.json"),
+        r#"{"control":"control.safetensors"}"#,
+    )
+    .unwrap();
+    for key in [
+        "z_image_turbo/z_image_turbo/q4/512/text/4",
+        "z_image_turbo/z_image_turbo/q4/768/reference/4",
+        "z_image_turbo/z_image_turbo/q4/1024/text/0",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/control_pose/4",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/control_canny/4",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/control_depth/4",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/reference_depth/4",
+    ] {
+        let ((status, reason), kind) = run(key);
+        assert_eq!(status, Status::AdmittedRefused, "{key}: {reason}");
+        assert_eq!(kind, Some("no_evidence"), "{key}: {reason}");
+    }
+    // The q4 slot provisioned as the q8 tier: the stored tier is not the case's.
+    copy_tree(&slot, &temp.path().join("z_image_turbo/q8"));
+    let ((status, reason), kind) = run("z_image_turbo/z_image_turbo/q8/512/text/4");
+    assert_eq!(status, Status::AdmittedRefused, "{reason}");
+    assert_eq!(kind, Some("artifact"), "{reason}");
+    // The control route carries its required control image, of the kind its mode names, in every
+    // mode, ahead of a reference mode's init image; the base route never carries one.
+    let carried = |prefix: &str| {
+        let c = cell(prefix);
+        let Ok(runtime_ios::media::IosWork::Generate(r)) =
+            work(&c, &CancelFlag::new(), catalog.media())
+        else {
+            panic!("{prefix}: not a generate request");
+        };
+        r.conditioning
+            .iter()
+            .map(|x| match x {
+                Conditioning::Control { kind, .. } => format!("control:{kind:?}"),
+                Conditioning::Reference { .. } => "reference".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    for (kind, label) in [("pose", "Pose"), ("canny", "Canny"), ("depth", "Depth")] {
+        assert_eq!(
+            carried(&format!(
+                "z_image_turbo_control/z_image_turbo_control/q4/512/control_{kind}/4"
+            )),
+            [format!("control:{label}")]
+        );
+        assert_eq!(
+            carried(&format!(
+                "z_image_turbo_control/z_image_turbo_control/q4/512/reference_{kind}/4"
+            )),
+            [format!("control:{label}"), "reference".to_string()]
+        );
+    }
+    assert_eq!(
+        carried("z_image_turbo/z_image_turbo/q4/512/reference/4"),
+        ["reference"]
+    );
+    assert!(carried("z_image_turbo/z_image_turbo/q4/512/text/4").is_empty());
+    // A mode naming a kind the route does not accept is a typed mode refusal.
+    let mut odd = cell("z_image_turbo_control/z_image_turbo_control/q4/512/control_pose/4");
+    odd.mode = "control_scribble".into();
+    assert!(matches!(
+        work(&odd, &CancelFlag::new(), catalog.media()),
+        Err(AdmissionError::Refused(_))
+    ));
+    // Enumeration: both routes at every tier and edge, one control cell per accepted kind; the
+    // control route has no plain text mode.
+    let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
+    let keys: Vec<&str> = listing["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    for tier in ["q4", "q8", "bf16"] {
+        for edge in [512, 768, 1024] {
+            let mut prefixes = vec![
+                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/text/4/"),
+                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/reference/4/"),
+            ];
+            for kind in ["pose", "canny", "depth"] {
+                for mode in ["control", "reference"] {
+                    prefixes.push(format!(
+                        "z_image_turbo_control/z_image_turbo_control/{tier}/{edge}/{mode}_{kind}/4/"
+                    ));
+                }
+            }
+            for prefix in prefixes {
+                assert!(keys.iter().any(|k| k.starts_with(&prefix)), "{prefix}");
+            }
+        }
+    }
+    assert!(!keys
+        .iter()
+        .any(|k| k.starts_with("z_image_turbo_control/") && k.contains("/text/")));
+}
+
+/// Every cell carries its own selection from the provider's declared space, enumerated quality
+/// first, executed as selected and recorded in the evidence key: a bf16 Z-Image cell can stream the
+/// text encoder (`te` / `both`), a q4 1024 cell can decode at tile 512, an SDXL cell reaches a
+/// non-first tile; a token outside the space is a typed strategy refusal.
+#[test]
+fn campaign_cells_execute_their_own_declared_selection() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let cases = campaign::enumerate(&surfaces(catalog.media()));
+    let tokens = |prefix: &str| {
+        cases
+            .iter()
+            .filter(|c| c.key().starts_with(&format!("{prefix}/")))
+            .map(|c| c.selection.clone())
+            .collect::<Vec<_>>()
+    };
+    // Z-Image rung 4: staging x window scope x tile, quality first (unstaged, DiT-only scope,
+    // largest tile first; staged, both streamed, smallest tile last).
+    let z = tokens("z_image_turbo/z_image_turbo/bf16/1024/text/4");
+    assert_eq!(z.len(), 2 * 3 * 7, "{z:?}");
+    assert_eq!(z[0], "t768_o64_c67108864_w1_dit");
+    assert_eq!(z[1], "t640_o64_c67108864_w1_dit");
+    assert_eq!(z[z.len() - 1], "s_t256_o64_c67108864_w1_both");
+    assert!(z.contains(&"t512_o64_c67108864_w1_te".to_string()));
+    assert!(z.contains(&"s_t512_o64_c67108864_w1_dit".to_string()));
+    // SANA rung 2 enumerates every declared tile (then the same staged); SDXL rung 2 its native
+    // route's tiles.
+    assert_eq!(
+        tokens("sana_1600m/sana_1600m/q4/1024/text/2"),
+        [
+            "t512_o48",
+            "t384_o48",
+            "t256_o48",
+            "t192_o48",
+            "s_t512_o48",
+            "s_t384_o48",
+            "s_t256_o48",
+            "s_t192_o48"
+        ]
+    );
+    let sdxl = tokens("sdxl/sdxl/q4/1024/text/2");
+    assert_eq!(sdxl[0], "t896_o64");
+    assert!(sdxl.contains(&"t512_o64".to_string()));
+
+    // Executed as selected, on provisioned (header-only) slots.
+    let temp = tempfile::tempdir().unwrap();
+    let zslot = |tier: &str, bits: Option<u32>| {
+        let slot = temp.path().join("z_image_turbo").join(tier);
+        for component in ["transformer", "vae"] {
+            tensor(&slot.join(component).join("model.safetensors"), "x");
+            let config = match bits {
+                Some(b) => format!(r#"{{"quantization":{{"bits":{b},"group_size":64}}}}"#),
+                None => "{}".into(),
+            };
+            std::fs::write(slot.join(component).join("config.json"), config).unwrap();
+        }
+        gen_core_testkit::write_encoder_contract_fixture_with_quant(
+            &slot.join("text_encoder"),
+            runtime_ios::media::zimage::ENCODER_CONTRACT,
+            bits.map(|b| b as i32),
+        )
+        .unwrap();
+    };
+    zslot("bf16", None);
+    zslot("q4", Some(4));
+    let prepared = |key: &str| {
+        let case = Case::parse(key).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let result = p.prepare(&case);
+        (result, p)
+    };
+    let selected = |key: &str| {
+        let (result, p) = prepared(key);
+        result.unwrap_or_else(|e| panic!("{key}: {e:?}"));
+        let candidate = p.candidate.unwrap();
+        let execution = p.evidence_key.unwrap().execution;
+        (
+            candidate.context.selection.parameters,
+            candidate.execution,
+            execution,
+        )
+    };
+    for scope in ["te", "both"] {
+        let (parameters, memory, key) = selected(&format!(
+            "z_image_turbo/z_image_turbo/bf16/512/text/4/t768_o64_c67108864_w1_{scope}"
+        ));
+        let want = if scope == "te" {
+            TransformerComponent::TextEncoder
+        } else {
+            TransformerComponent::Both
+        };
+        assert_eq!(parameters.transformer_window_component, Some(want));
+        assert_eq!(memory.transformer_window_component, Some(want));
+        assert!(key.contains(&format!("{want:?}")), "{key}");
+    }
+    let (parameters, memory, key) =
+        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit");
+    assert_eq!(parameters.decode_tile_edge, Some(512));
+    assert_eq!(memory.decode_tile_edge, Some(512));
+    assert!(memory.stage_residency, "the staged selection evicts phases");
+    assert!(key.contains("stage_residency: Some(true)"), "{key}");
+    let (_, _, first) =
+        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/t768_o64_c67108864_w1_dit");
+    assert_ne!(key, first, "the evidence key separates the selections");
+    assert!(key.contains("decode_tile_edge: Some(512)"), "{key}");
+    // SDXL: a non-first native tile.
+    let slot = temp.path().join("sdxl/q4");
+    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+        tensor(&slot.join(component).join("model.safetensors"), "x");
+    }
+    tokenizer(&slot.join("tokenizer"));
+    tokenizer(&slot.join("tokenizer_2"));
+    let (parameters, memory, _) = selected("sdxl/sdxl/q4/1024/text/2/t512_o64");
+    assert_eq!(parameters.decode_tile_edge, Some(512));
+    assert_eq!(memory.decode_tile_edge, Some(512));
+    // A token outside the declared space: typed strategy refusal, nothing built.
+    let (result, p) =
+        prepared("z_image_turbo/z_image_turbo/q4/1024/text/4/t500_o64_c67108864_w1_dit");
+    assert!(matches!(result, Err(AdmissionError::Refused(_))));
+    assert_eq!(p.refusal_kind, Some("strategy"));
+    assert!(p.candidate.is_none());
 }

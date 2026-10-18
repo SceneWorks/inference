@@ -1,11 +1,18 @@
 //! Weights-free campaign protocol. One selected case per fresh process; no implicit fallbacks.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The selection token of a strategy with no declared parameters (and of a rung the provider does
+/// not implement: admission refuses it, typed).
+pub const BASE_SELECTION: &str = "base";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
     pub provider: String,
     pub routes: Vec<String>,
     pub modes: Vec<String>,
+    /// Per `(tier, rung)`, the provider's own declared selection space as tokens, QUALITY FIRST
+    /// (`MemoryProviderContract::selection_space`). Absent: the single [`BASE_SELECTION`].
+    pub selections: BTreeMap<(String, u8), Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,17 +23,20 @@ pub struct Case {
     pub edge: u32,
     pub mode: String,
     pub rung: u8,
+    /// The cell's memory selection (tile edge, overlap, attention chunk, window size and scope) as
+    /// a token of the provider's declared space; executed exactly as selected.
+    pub selection: String,
 }
 impl Case {
     pub fn key(&self) -> String {
         format!(
-            "{}/{}/{}/{}/{}/{}",
-            self.provider, self.route, self.tier, self.edge, self.mode, self.rung
+            "{}/{}/{}/{}/{}/{}/{}",
+            self.provider, self.route, self.tier, self.edge, self.mode, self.rung, self.selection
         )
     }
     pub fn parse(value: &str) -> Result<Self, String> {
         let p: Vec<_> = value.split('/').collect();
-        if p.len() != 6
+        if p.len() != 7
             || p.iter().any(|p| {
                 p.is_empty()
                     || !p
@@ -34,7 +44,7 @@ impl Case {
                         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             })
         {
-            return Err("case must be provider/route/{bf16,q8,q4}/edge/mode/rung".into());
+            return Err("case must be provider/route/{bf16,q8,q4}/edge/mode/rung/selection".into());
         }
         let edge = p[3].parse::<u32>().map_err(|_| "invalid edge")?;
         let rung = p[5].parse::<u8>().map_err(|_| "invalid rung")?;
@@ -51,12 +61,14 @@ impl Case {
             edge,
             mode: p[4].into(),
             rung,
+            selection: p[6].into(),
         })
     }
 }
 
-/// Include every registered mode, even if its adapter/evidence is not yet available. A new
-/// provider is visible automatically; admission, never enumeration, decides whether it can run.
+/// Include every registered mode, even if its adapter/evidence is not yet available, and every
+/// selection the provider declares for each rung, quality first. A new provider is visible
+/// automatically; admission, never enumeration, decides whether it can run.
 pub fn enumerate(surfaces: &[Surface]) -> Vec<Case> {
     let mut cases = Vec::new();
     let mut seen = BTreeSet::new();
@@ -71,16 +83,25 @@ pub fn enumerate(surfaces: &[Surface]) -> Vec<Case> {
                 for &edge in edges {
                     for mode in &s.modes {
                         for rung in 0..=4 {
-                            let c = Case {
-                                provider: s.provider.clone(),
-                                route: route.clone(),
-                                tier: tier.into(),
-                                edge,
-                                mode: mode.clone(),
-                                rung,
-                            };
-                            if seen.insert(c.key()) {
-                                cases.push(c);
+                            let base = [BASE_SELECTION.to_string()];
+                            let selections = s
+                                .selections
+                                .get(&(tier.to_string(), rung))
+                                .filter(|v| !v.is_empty())
+                                .map_or(&base[..], |v| &v[..]);
+                            for selection in selections {
+                                let c = Case {
+                                    provider: s.provider.clone(),
+                                    route: route.clone(),
+                                    tier: tier.into(),
+                                    edge,
+                                    mode: mode.clone(),
+                                    rung,
+                                    selection: selection.clone(),
+                                };
+                                if seen.insert(c.key()) {
+                                    cases.push(c);
+                                }
                             }
                         }
                     }
@@ -205,22 +226,26 @@ mod tests {
             provider: "new_provider".into(),
             routes: vec!["new_provider".into()],
             modes: vec!["text".into(), "reference".into(), "mask".into()],
+            selections: BTreeMap::new(),
         }
     }
     #[test]
     fn public_case_parse_roundtrip_and_finite_budget() {
-        let c = Case::parse("iris_3b/iris_3b/q8/768/reference/4").unwrap();
+        let c = Case::parse("iris_3b/iris_3b/q8/768/reference/4/t512_dit").unwrap();
         assert_eq!(c.edge, 768);
         assert_eq!(c.rung, 4);
         assert_eq!(c.tier, "q8");
+        assert_eq!(c.selection, "t512_dit");
         assert_eq!(Case::parse(&c.key()).unwrap(), c);
         for s in [
-            "p/p/q4/0/text/1",
-            "p/p/q4/999999999/text/1",
-            "p/p/q4/512/text/5",
-            "p/../q4/512/text/0",
-            "p/p/q5/512/text/0",
-            "p/p/q4/512/text/0/extra",
+            "p/p/q4/0/text/1/base",
+            "p/p/q4/999999999/text/1/base",
+            "p/p/q4/512/text/5/base",
+            "p/../q4/512/text/0/base",
+            "p/p/q5/512/text/0/base",
+            "p/p/q4/512/text/0",
+            "p/p/q4/512/text/0/base/extra",
+            "p/p/q4/512/text/0/t5.12",
         ] {
             assert!(Case::parse(s).is_err(), "{s}");
         }
@@ -236,7 +261,7 @@ mod tests {
                 for mode in ["text", "reference", "mask"] {
                     for rung in 0..=4 {
                         assert!(actual.contains(&format!(
-                            "new_provider/new_provider/{tier}/{edge}/{mode}/{rung}"
+                            "new_provider/new_provider/{tier}/{edge}/{mode}/{rung}/base"
                         )));
                     }
                 }
@@ -247,6 +272,24 @@ mod tests {
             ..surface()
         };
         assert!(enumerate(&[supra]).iter().all(|c| c.edge == 256));
+        // A declared selection space yields one cell per selection, in its declared order, for
+        // exactly its (tier, rung).
+        let mut s = surface();
+        s.selections.insert(
+            ("q4".into(), 2),
+            vec!["t768".into(), "t640".into(), "t512".into()],
+        );
+        let cases = enumerate(&[s]);
+        let at = |tier: &str, rung: u8| {
+            cases
+                .iter()
+                .filter(|c| c.tier == tier && c.rung == rung && c.edge == 1024 && c.mode == "text")
+                .map(|c| c.selection.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at("q4", 2), ["t768", "t640", "t512"]);
+        assert_eq!(at("q8", 2), ["base"]);
+        assert_eq!(at("q4", 3), ["base"]);
     }
     struct Fake {
         admitted: bool,

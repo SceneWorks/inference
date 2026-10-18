@@ -40,6 +40,11 @@ impl TextMlp {
         Ok(())
     }
 
+    /// The three projections, in `gate, up, down` order (iOS quantum accounting reads their shapes).
+    pub(crate) fn projections(&self) -> [&AdaptableLinear; 3] {
+        [&self.gate, &self.up, &self.down]
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
         self.down.forward(&gated)

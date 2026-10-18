@@ -72,6 +72,8 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 }
 
 pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<TextEncoder> {
+    // iOS: the header-only pre-load floor, checked before any tensor is read.
+    crate::quantum::before_load(crate::quantum::TE_LOAD, source, |_| true)?;
     let w = weights_from_source(source)?;
     let encoder = TextEncoder::from_weights(&w, "model", &ZTextEncoderConfig::z_image())?;
     w.materialize_accessed()?;
@@ -102,6 +104,11 @@ pub(crate) fn load_validated_text_encoder_streamable(
     source: &mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<TextEncoder> {
     source.read_unchanged(|weights| {
+        // iOS: only the token embedding is read here; every layer is read inside its own priced
+        // quantum when its window materializes it.
+        crate::quantum::before_load(crate::quantum::TE_LOAD, weights, |name| {
+            !name.starts_with("model.layers.")
+        })?;
         let w = weights_from_source(weights)?;
         let encoder = TextEncoder::from_validated_streamable_source(
             &w,
@@ -152,6 +159,13 @@ pub(crate) fn load_transformer_with_stream(
     streamed: bool,
 ) -> Result<ZImageTransformer> {
     let dir = root.join("transformer");
+    // iOS: the header-only floor of what this load reads (a streamed stack's block bodies are read
+    // inside each block's own priced quantum instead).
+    crate::quantum::before_load(
+        crate::quantum::DIT_LOAD,
+        &WeightsSource::Dir(dir.clone()),
+        |name| !(streamed && name.starts_with("layers.")),
+    )?;
     let mut w = Weights::from_dir(&dir)?;
     let transformer = build_transformer(&mut w)?;
     materialize_built(&w, streamed.then_some("layers."))?;
@@ -212,6 +226,7 @@ pub(crate) fn load_control_transformer_with_stream(
     streamed: bool,
 ) -> Result<ZImageControlTransformer> {
     let base = load_transformer_with_stream(root, streamable, streamed)?;
+    before_control_load(control, streamed)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
@@ -228,9 +243,22 @@ pub(crate) fn load_control_transformer_with_stream(
     })
 }
 
+/// iOS: the ControlNet checkpoint's header-only floor of what its load reads (a streamed control
+/// stack's block bodies are read inside each block's own priced quantum instead).
+pub(crate) fn before_control_load(control: &WeightsSource, streamed: bool) -> Result<()> {
+    crate::quantum::before_load(crate::quantum::CONTROL_LOAD, control, |name| {
+        !(streamed && name.starts_with("control_layers."))
+    })
+}
+
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
 /// and transposing conv weights to NHWC. The encoder powers img2img (`Conditioning::Reference`).
 pub fn load_vae(root: &Path) -> Result<Vae> {
+    crate::quantum::before_load(
+        crate::quantum::VAE_LOAD,
+        &WeightsSource::Dir(root.join("vae")),
+        |_| true,
+    )?;
     let mut w = Weights::from_dir(root.join("vae"))?;
     let vae = build_vae(&mut w)?;
     // Materialize at load (sc-24245; see `materialize_built`).
@@ -243,7 +271,7 @@ pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
     build_vae(&mut w)
 }
 
-fn build_vae(w: &mut Weights) -> Result<Vae> {
+pub(crate) fn build_vae(w: &mut Weights) -> Result<Vae> {
     remap_vae_decoder(w)?;
     remap_vae_encoder(w)?;
     Vae::from_weights(w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(

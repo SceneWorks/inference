@@ -5,7 +5,8 @@
 //! that quantum's peak — and each is proven by a CPU test (`quantum_proofs` below) that builds the
 //! real module at a small shape, measures MLX's peak with
 //! [`mlx_gen::ios_quantum::measured_peak_bytes`] and asserts the formula is at least the
-//! measurement and at most [`MAX_RATIO`] times it. These are floors for one materialized quantum,
+//! measurement (hard), reporting a ratio above [`MAX_RATIO`] (report-only: low-end accuracy is
+//! calibrated on the device). These are floors for one materialized quantum,
 //! never a process bound and never production admission.
 //!
 //! **Convolution workspace.** MLX's CPU backend runs every ungrouped convolution as an explicit
@@ -257,8 +258,9 @@ const ENTRY_TIMESTEP_DIMS: u64 = 16;
 /// plus its input workspace ([`conv_workspace_bytes`]): the CPU reads the transposed (NHWC view of
 /// the NCHW) latent straight into its zero-padded copy and unfolds that; Metal makes the view
 /// row-contiguous and unfolds (or runs implicit GEMM on) that copy. At padding 0 both are two
-/// latent-sized f32 buffers, so the workspace bounds both without a separate transposed copy. Caption: `ENTRY_CAPTION_LIVE` `[B, M, dim]` buffers plus, for a
-/// caption narrower than f32, the f32 copy its projection's mixed-dtype matmul widens it to.
+/// latent-sized f32 buffers, so the workspace bounds both without a separate transposed copy. Caption: `ENTRY_CAPTION_LIVE` `[B, M, dim]` buffers or, for a
+/// caption narrower than f32, the f32 copy its projection's mixed-dtype matmul widens it to plus
+/// that projection's output, whichever is larger (the copy is released before the chain).
 pub fn entry_bytes(q: SanaEntryQuantum) -> u64 {
     let side = q.tokens; // workspace priced over N positions as a 1 x N plane
     let latent_positions = side.saturating_mul(q.patch).saturating_mul(q.patch);
@@ -274,14 +276,20 @@ pub fn entry_bytes(q: SanaEntryQuantum) -> u64 {
             0,
         ),
     ]);
-    let caption = sum(&[
-        tensor_bytes(4, &[ENTRY_CAPTION_LIVE, q.batch, q.caption_tokens, q.dim]),
-        if q.caption_element_bytes < 4 {
-            tensor_bytes(4, &[q.batch, q.caption_tokens, q.caption_channels])
-        } else {
-            0
-        },
-    ]);
+    // A caption narrower than f32 is widened to f32 for the first projection's mixed-dtype matmul;
+    // that copy is read only by that matmul and released when it runs, before gelu's chain is
+    // built (measured: a bf16 and an f32 caption peak identically at the chain-dominated proof
+    // shape). It is live with the projection's output only, so the caption term is the larger of
+    // the chain and (copy + projection output) — never their sum.
+    let chain = tensor_bytes(4, &[ENTRY_CAPTION_LIVE, q.batch, q.caption_tokens, q.dim]);
+    let caption = if q.caption_element_bytes < 4 {
+        chain.max(sum(&[
+            tensor_bytes(4, &[q.batch, q.caption_tokens, q.caption_channels]),
+            tensor_bytes(4, &[q.batch, q.caption_tokens, q.dim]),
+        ]))
+    } else {
+        chain
+    };
     sum(&[
         q.weight_bytes,
         patch,

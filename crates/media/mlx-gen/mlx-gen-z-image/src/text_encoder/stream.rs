@@ -126,8 +126,15 @@ impl TextEncoderBlockStream {
     }
 
     /// Materialize encoder layer `index` out of `view`, quantized exactly like its resident twin, then
-    /// drain the view of precisely the tensors that layer read.
-    pub(crate) fn materialize(&self, view: &mut Weights, index: usize) -> Result<EncoderLayer> {
+    /// drain the view of precisely the tensors that layer read. Also returns the stored bytes of
+    /// exactly those tensors (dtype x shape off the lazy handles; the read happens inside the layer's
+    /// iOS quantum, which is priced with them) plus the packed copies of a replayed load-time
+    /// quantization.
+    pub(crate) fn materialize_counted(
+        &self,
+        view: &mut Weights,
+        index: usize,
+    ) -> Result<(EncoderLayer, u64)> {
         if index >= self.cfg.n_layers {
             return Err(Error::Msg(format!(
                 "z-image text-encoder stream: layer {index} is out of range for a {}-layer encoder",
@@ -147,11 +154,18 @@ impl TextEncoderBlockStream {
         // refcounted handle to every tensor the constructor cloned. Draining exactly the accessed keys
         // is what makes the window's drop a real release rather than a no-op that still produces a
         // correct conditioning tensor. The DiT twin measured 8.0 MiB vs 238.4 MiB on this distinction.
+        let mut extra = view
+            .accessed_entries()
+            .iter()
+            .fold(0u64, |total, (_, array)| {
+                total.saturating_add(array.nbytes() as u64)
+            });
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
+            extra = extra.saturating_add(layer.quantize_bytes(bits));
             layer.quantize(bits)?;
         }
-        Ok(layer)
+        Ok((layer, extra))
     }
 }
 
@@ -200,8 +214,8 @@ pub(crate) fn run_windowed_layers(
                 mut second_to_last,
             } = carry;
             for i in range {
-                let layer = stream.materialize(view, i)?;
-                let cur = layer.forward(&prev, cos, sin, mask)?;
+                let (layer, read_bytes) = stream.materialize_counted(view, i)?;
+                let cur = super::encoder::layer_quantum(&layer, &prev, cos, sin, mask, read_bytes)?;
                 // Identical bookkeeping to the resident loop: after this step the hidden-state list
                 // would end [..., prev, cur], so the second-to-last is the old `prev`.
                 second_to_last = std::mem::replace(&mut prev, cur);

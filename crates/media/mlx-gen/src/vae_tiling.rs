@@ -779,6 +779,87 @@ pub fn tiled_decode_with_finalizer(
     crate::array::contiguous(&divide(&output, &maximum(&normalizer, scalar(1e-8))?)?)
 }
 
+/// The encoder's asymmetric-pad stride-2 downsample (`pad (0,1)·(0,1)` then a 3x3 stride-2 pad-0
+/// convolution) over output cores of at most `tile` pixels a side, as the bounded encode runs it
+/// (sc-26270). Output pixel `r` reads padded input rows `2r ..= 2r + 2`, so a core `[y0, y1)` reads
+/// input rows `[2·y0, 2·y1]`: the crop is cut from the unpadded input and zero-padded at the bottom
+/// / right edge only where it reaches the padding row or column — the exact halo, so every output
+/// pixel convolves exactly the values the whole-image call does. Each core is evaluated (and, on
+/// iOS, synchronized) before the next tile is built; rows are assembled, then the image. One tiled
+/// iOS stage `stage_label` ([`crate::ios_quantum::downsample_stage_bytes`]); every tile is checked
+/// as `tile_label` before its graph ([`crate::ios_quantum::downsample_tile_bytes`]). The guards are
+/// pass-throughs off device. Shared by the SDXL and Z-Image bounded encodes.
+pub fn downsample_tiled_nhwc(
+    x: &Array,
+    weight: &Array,
+    bias: &Array,
+    tile: i32,
+    cancel: Option<&CancelFlag>,
+    stage_label: &str,
+    tile_label: &str,
+) -> Result<Array> {
+    use crate::attention::slice_axis;
+    let s = x.shape();
+    let (h, w) = (s[1], s[2]);
+    // Padded extent H+1, k3, stride 2, pad 0.
+    let (oh, ow) = ((h - 2) / 2 + 1, (w - 2) / 2 + 1);
+    let core = tile.max(1);
+    let act = crate::ios_quantum::element_bytes(x);
+    crate::ios_quantum::before(
+        stage_label,
+        crate::ios_quantum::downsample_stage_bytes(&[s[0], oh, ow, weight.shape()[0]], act),
+    )?;
+    let mut rows = Vec::new();
+    let mut y0 = 0;
+    while y0 < oh {
+        let y1 = (y0 + core).min(oh);
+        let (in_y0, need_h) = (2 * y0, 2 * (y1 - y0) + 1);
+        let have_h = need_h.min(h - in_y0);
+        let mut cores = Vec::new();
+        let mut x0 = 0;
+        while x0 < ow {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
+            let x1 = (x0 + core).min(ow);
+            let (in_x0, need_w) = (2 * x0, 2 * (x1 - x0) + 1);
+            let have_w = need_w.min(w - in_x0);
+            let crop_shape = [s[0], need_h, need_w, s[3]];
+            crate::ios_quantum::before(
+                tile_label,
+                crate::ios_quantum::downsample_tile_bytes(
+                    &crop_shape,
+                    act,
+                    weight,
+                    crate::ios_quantum::Backend::current(),
+                ),
+            )?;
+            let crop = slice_axis(&slice_axis(x, 1, in_y0, have_h)?, 2, in_x0, have_w)?;
+            let crop = pad(
+                &crop,
+                &[(0, 0), (0, need_h - have_h), (0, need_w - have_w), (0, 0)][..],
+                None,
+                None,
+            )?;
+            let out = crate::nn::conv2d(&crop, weight, Some(bias), 2, 0)?;
+            out.eval()?;
+            crate::ios_quantum::finish("tiled conv core", &[&out])?;
+            cores.push(out);
+            x0 = x1;
+        }
+        let refs: Vec<&Array> = cores.iter().collect();
+        let row = mlx_rs::ops::concatenate_axis(&refs, 2)?;
+        row.eval()?;
+        rows.push(row);
+        y0 = y1;
+    }
+    let refs: Vec<&Array> = rows.iter().collect();
+    let out = mlx_rs::ops::concatenate_axis(&refs, 1)?;
+    out.eval()?;
+    crate::ios_quantum::finish(stage_label, &[&out])?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

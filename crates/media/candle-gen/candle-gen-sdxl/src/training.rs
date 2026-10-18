@@ -1755,11 +1755,54 @@ mod tests {
             noise: Tensor,
         }
 
+        /// `N(0, std²)` of shape `dims` from the seeded `rng`.
+        fn randn_seeded(rng: &mut StdRng, std: f32, dims: &[usize]) -> Tensor {
+            let n = dims.iter().product();
+            let v: Vec<f32> = candle_gen::seeded_normal_vec(rng, n)
+                .into_iter()
+                .map(|x| x * std)
+                .collect();
+            Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+        }
+
+        /// Seeded: candle's CPU backend ignores `Device::set_seed`, so `Tensor::randn` and the
+        /// `VarMap` init draw from the process-global RNG. About 1 draw in 400 (macOS: 22 of 9,000)
+        /// pushed the tiny random TAESDXL decoder's output outside `[0, 1]` at every pixel. Its
+        /// final clamp then zeroed every adapter gradient, and the depth test failed
+        /// intermittently in CI. Every tensor here now comes from one `StdRng`. Random-init base
+        /// vars are redrawn in name order (the map is a `HashMap`) at candle-nn's own init scale:
+        /// Kaiming-normal weights `√(2/fan_in)` and `±1/√fan_in` biases (std `1/√(3·fan_in)`).
+        /// Constant-init vars (norm γ/β) are left as they are.
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x5d71_2123);
             let vm = VarMap::new();
-            let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-            let mut unet = tiny_unet(vb);
+            let mut unet = tiny_unet(VarBuilder::from_varmap(&vm, DType::F32, &dev));
+            {
+                let data = vm.data().lock().unwrap();
+                let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>() as f32;
+                let mut names: Vec<&String> = data.keys().collect();
+                names.sort();
+                for name in names {
+                    let v = &data[name];
+                    let vals = v
+                        .as_tensor()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    if vals.iter().all(|x| *x == vals[0]) {
+                        continue;
+                    }
+                    let std = if v.dims().len() >= 2 {
+                        (2.0 / fan_in(v.dims())).sqrt()
+                    } else {
+                        let w = &data[&format!("{}weight", name.strip_suffix("bias").unwrap())];
+                        (3.0 * fan_in(w.dims())).sqrt().recip()
+                    };
+                    v.set(&randn_seeded(&mut rng, std, v.dims())).unwrap();
+                }
+            }
             // Same target set as the dense-vs-checkpoint gate (the time embedding is a detached
             // per-step constant on the checkpointed path).
             let paths: Vec<String> = unet
@@ -1770,15 +1813,15 @@ mod tests {
                 .collect();
             let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims()))
                     .unwrap();
             }
             Fixture {
                 unet,
                 vars: set.vars,
-                x0: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
-                cond: Tensor::randn(0f32, 1f32, (1, 7, 64), &dev).unwrap(),
-                noise: Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap(),
+                x0: randn_seeded(&mut rng, 1.0, &[1, 4, 8, 8]),
+                cond: randn_seeded(&mut rng, 1.0, &[1, 7, 64]),
+                noise: randn_seeded(&mut rng, 1.0, &[1, 4, 8, 8]),
             }
         }
 

@@ -3,9 +3,12 @@
 
 `run` exercises ADMISSION against the reviewed evidence table. `capture` is the explicitly
 labelled bounded DEVICE CAPTURE (no evidence needed; every quantum checks live headroom before
-constructing its graph): it walks each selected model/route/tier/mode/rung up the edge ladder and
-stops at the first case that is not a completed capture. A `capture_refused` row is the typed
-"next size refused before jetsam" evidence. `evidence` turns completed capture rows into candidate
+constructing its graph): it walks each selected model/route/tier/mode/rung up the edge ladder. At
+each edge it tries the cell's memory selections (the provider's own declared space: decode tile,
+attention chunk, transformer window and scope) in the catalog's quality-first order, stepping to the
+next cheaper selection only after a capture refusal, and stops the ladder at the first edge where
+even the cheapest selection refuses (or at any failure). A `capture_refused` row is the typed
+"this selection at this size refused before jetsam" evidence. `evidence` turns completed capture rows into candidate
 rows for crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json; it only
 prints them. Admission changes only through a human-reviewed commit of that table."""
 import argparse
@@ -33,8 +36,8 @@ EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_e
 
 def case_key(value):
     p = value.split("/")
-    if len(p) != 6 or any(not s or not all(c.isascii() and (c.isalnum() or c in "_-") for c in s) for s in p):
-        raise argparse.ArgumentTypeError("case must be provider/route/tier/edge/mode/rung")
+    if len(p) != 7 or any(not s or not all(c.isascii() and (c.isalnum() or c in "_-") for c in s) for s in p):
+        raise argparse.ArgumentTypeError("case must be provider/route/tier/edge/mode/rung/selection")
     if p[2] not in TIERS or p[3] not in tuple(map(str, EDGES)) or p[5] not in tuple(map(str, range(5))):
         raise argparse.ArgumentTypeError("case outside finite tier/geometry/rung domain")
     return value
@@ -54,7 +57,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("action", choices=("list", "run", "table", "capture", "evidence", "primitive"))
     p.add_argument("--catalog", type=Path)
-    for name in ("provider", "route", "mode"):
+    for name in ("provider", "route", "mode", "selection"):
         p.add_argument("--" + name)
     p.add_argument("--tier", choices=TIERS)
     p.add_argument("--edge", type=int, choices=EDGES)
@@ -120,7 +123,7 @@ def selected(args, key):
     if args.case:
         return key == args.case
     fields = key.split("/")
-    values = (args.provider, args.route, args.tier, args.edge, args.mode, args.rung)
+    values = (args.provider, args.route, args.tier, args.edge, args.mode, args.rung, args.selection)
     return all(v is None or str(v) == f for v, f in zip(values, fields))
 
 
@@ -386,52 +389,83 @@ def render(rows):
     groups = {}
     for r in rows:
         fields = r["case"].split("/")
-        group = "/".join(fields[:3] + fields[4:])
+        group = "/".join(fields[:3] + fields[4:6])
         if r["status"] == "successful" and r.get("production_success") is True and not r.get("refusal_only"):
             groups[group] = max(groups.get(group, 0), int(fields[3]))
     lines.append("\nLargest admitted completed edges (diagnostics excluded): " + json.dumps(groups, sort_keys=True))
     lines.append("Capacity-refused next-up probes: " + json.dumps([r["case"] for r in rows if r.get("refusal_only") and capacity_refusal(r)]))
-    captured = {}
+    # Per ladder (everything but edge and selection): the largest edge some selection completed (and
+    # which), and the first edge at which EVERY selection tried refused before jetsam.
+    captured, outcomes = {}, {}
     for r in rows:
         fields = r["case"].split("/")
-        group = "/".join(fields[:3] + fields[4:])
+        group, edge = "/".join(fields[:3] + fields[4:6]), int(fields[3])
         if r["status"] == "diagnostic_success" and r.get("evidence_class") == "capture":
-            captured.setdefault(group, {})["largest_completed_edge"] = max(captured.get(group, {}).get("largest_completed_edge", 0), int(fields[3]))
+            outcomes.setdefault(group, {}).setdefault(edge, []).append(("completed", fields[6]))
         elif r["status"] == "capture_refused":
-            captured.setdefault(group, {})["refused_before_jetsam_edge"] = int(fields[3])
+            outcomes.setdefault(group, {}).setdefault(edge, []).append(("refused", fields[6]))
+    for group, edges in outcomes.items():
+        for edge in sorted(edges):
+            completed = [sel for kind, sel in edges[edge] if kind == "completed"]
+            if completed:
+                captured.setdefault(group, {}).update(largest_completed_edge=edge, completed_selection=completed[-1])
+            else:
+                captured.setdefault(group, {})["refused_before_jetsam_edge"] = edge
+                break
     lines.append("CAPTURE (diagnostic, not admission) ladders: " + json.dumps(captured, sort_keys=True))
     return "\n".join(lines)
 
 
 def ladders(keys):
-    """Selected keys grouped by everything but the edge, each group ascending by edge."""
+    """Selected keys grouped by everything but the edge and the selection: each group's edges
+    ascending, each edge's selections in catalog (quality-first) order."""
     groups = {}
     for key in keys:
         fields = key.split("/")
-        groups.setdefault(tuple(fields[:3] + fields[4:]), []).append(key)
-    return [sorted(group, key=lambda k: int(k.split("/")[3])) for _, group in sorted(groups.items())]
+        groups.setdefault(tuple(fields[:3] + fields[4:6]), {}).setdefault(int(fields[3]), []).append(key)
+    return [[edges[edge] for edge in sorted(edges)] for _, edges in sorted(groups.items())]
 
 
 def capture(args, keys, output):
-    """Walk each ladder upward; stop a ladder at its first case that is not a completed capture.
-    A quantum refusal there is the next-size-refused evidence; a failure stops it too. No retries,
-    no cap change."""
+    """Walk each ladder upward. At an edge, try its selections quality first: a completed capture
+    moves the ladder to the next edge (starting from that selection: a cheaper-or-equal selection
+    is what a larger size needs); a capture refusal steps to the next cheaper selection at the same
+    edge; anything else (a failure, a typed admission refusal) stops the ladder. The ladder stops at
+    the first edge where even the cheapest selection refused. Every cell runs at most once (no
+    retries) and the cap never changes."""
     rows = []
     session = DeviceSession(args)
     session.install()
     executed = 0
+
+    def record(row):
+        output.write(json.dumps(row) + "\n")
+        output.flush()
+        rows.append(row)
+
     for ladder in ladders(keys):
-        for key in ladder:
-            if executed >= args.max_cases or session.blocked:
-                row = dict(failure(key, "execution budget reached or prior device exit unverified"), status="skipped")
-            else:
+        start = 0
+        for selections in ladder:
+            completed = None
+            stop = True
+            for index in range(start, len(selections)):
+                key = selections[index]
+                if executed >= args.max_cases or session.blocked:
+                    record(dict(failure(key, "execution budget reached or prior device exit unverified"), status="skipped"))
+                    break
                 executed += 1
                 row = invoke(session, key)
-            output.write(json.dumps(row) + "\n")
-            output.flush()
-            rows.append(row)
-            if row["status"] != "diagnostic_success":
+                record(row)
+                if row["status"] == "diagnostic_success":
+                    completed, stop = index, False
+                    break
+                if row["status"] != "capture_refused":
+                    break
+            if stop:
                 break
+            # A selection that refused at this edge refuses at a larger one: start from the one
+            # that completed.
+            start = completed
     return rows
 
 
@@ -476,7 +510,7 @@ def main(argv=None):
     if args.action == "primitive":
         if not args.device or not args.output:
             p.error("primitive requires explicit --device and new --output")
-        if any(v is not None for v in (args.case, args.provider, args.route, args.tier, args.edge, args.mode, args.rung, args.next_edge)) or args.all_cases:
+        if any(v is not None for v in (args.case, args.provider, args.route, args.tier, args.edge, args.mode, args.rung, args.selection, args.next_edge)) or args.all_cases:
             p.error("primitive takes no catalog selectors")
         return run_primitive(args)
     data = catalog(args)
@@ -488,11 +522,11 @@ def main(argv=None):
         return 0
     if not args.device or not args.output:
         p.error("run requires explicit --device and new --output")
-    if not args.all_cases and not args.case and not any((args.provider, args.route, args.tier, args.edge, args.mode, args.rung is not None)):
+    if not args.all_cases and not args.case and not any((args.provider, args.route, args.tier, args.edge, args.mode, args.selection, args.rung is not None)):
         p.error("run requires selectors or --all-cases")
     if args.action == "capture":
-        if args.next_edge is not None or args.edge is not None or args.case:
-            p.error("capture walks the edge ladder itself; no --edge/--case/--next-edge")
+        if args.next_edge is not None or args.edge is not None or args.case or args.selection:
+            p.error("capture walks the edge and selection ladder itself; no --edge/--case/--selection/--next-edge")
         args.diagnostic = True
         with args.output.open("x", encoding="utf-8") as output:
             rows = capture(args, keys, output)

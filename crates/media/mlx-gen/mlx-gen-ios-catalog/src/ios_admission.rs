@@ -157,6 +157,11 @@ pub fn build_candidate(
     strategy: mlx_gen::gen_core::MemoryStrategy,
     mut work: IosWork,
 ) -> AdmissionResult<IosCandidate> {
+    // Z-Image Turbo's artifact policy (stored tier, inventory, the control route's checkpoint) is
+    // checked from small configs before its contract reads any tensor header.
+    if crate::zimage::is_z_image(provider) {
+        artifact(crate::zimage::check_artifact(provider, &spec))?;
+    }
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
         .ok_or_else(|| {
@@ -192,7 +197,27 @@ pub fn build_candidate(
             overlay: None,
         },
     )?;
+    // A caller-chosen selection (a campaign cell's) must be one the provider's own contract
+    // declares and can execute: a typed strategy refusal otherwise, before any price or key.
     if let Some(selection) = selection {
+        contract.validate_selection(&selection).map_err(|e| {
+            AdmissionError::refused(
+                RefusalKind::Strategy,
+                format!(
+                    "{provider}: selection {:?} is not executable: {e}",
+                    selection.parameters
+                ),
+            )
+        })?;
+        if selection.strategy != strategy {
+            return Err(AdmissionError::refused(
+                RefusalKind::Strategy,
+                format!(
+                    "{provider}: selection is for {:?}, the request for {strategy:?}",
+                    selection.strategy
+                ),
+            ));
+        }
         context.selection = selection;
     }
     context.geometry = geometry;
@@ -332,7 +357,15 @@ pub fn validate_actual(
                     format!("{provider} does not serve prompt batches"),
                 ));
             }
-            if req.memory.unwrap_or_default() != candidate.execution || req.use_pid {
+            // A PiD decode is not an iOS route (no provider's iOS contract offers it): a typed mode
+            // refusal, never an untyped mismatch.
+            if req.use_pid {
+                return Err(AdmissionError::refused(
+                    RefusalKind::Mode,
+                    format!("{provider}: a PiD decode (`use_pid`) is not served on iOS"),
+                ));
+            }
+            if req.memory.unwrap_or_default() != candidate.execution {
                 return Err(mismatch("request execution"));
             }
             caps.validate_request(provider, req)?;
