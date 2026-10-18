@@ -35,7 +35,7 @@
 //!   below". It is written relative to the anchor rather than to a fixed 1024² knee because the
 //!   knee form, applied from an anchor below 1024², holds the overhead flat up to 1024² — which
 //!   the same sweep shows UNDER-predicts 512² → 1024² by 49–70%; anchor-relative linear growth
-//!   over-predicts it instead ([`tests::the_area_law_against_the_measured_desktop_sweep`]).
+//!   over-predicts it instead (test `the_area_law_against_the_measured_desktop_sweep`).
 //! * DOMAIN: a phase whose measured growth is below the components its regime holds resident has
 //!   left the law's domain (the counters did not see the weights) and is NOT derivable — never
 //!   clamped to zero. A request phase the anchor never ran is not derivable either.
