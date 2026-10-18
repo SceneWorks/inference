@@ -358,6 +358,7 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8() {
     assert_eq!(
         events,
         [
+            "ConditioningComplete",
             "Step { current: 1, total: 3 }",
             "Step { current: 2, total: 3 }",
             "Step { current: 3, total: 3 }",
@@ -734,5 +735,37 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
             registry.load("flux3_klein_base", &loaded),
             Err(CoreError::Unsupported(_))
         ));
+    }
+}
+
+#[test]
+fn callback_cancel_at_conditioning_boundary_stops_before_denoise() {
+    for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+        let generator = load(policy);
+        let req = request();
+        let mut events = Vec::new();
+        let result = generator.generate(&req, &mut |event| {
+            events.push(event);
+            if event == Progress::ConditioningComplete {
+                req.cancel.cancel();
+            }
+        });
+        assert!(
+            matches!(result, Err(CoreError::Canceled)),
+            "{policy:?}: {result:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&p| p == Progress::ConditioningComplete)
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|p| matches!(p, Progress::Step { .. } | Progress::Decoding)),
+            "cancellation at the boundary must stop before the first forward: {events:?}"
+        );
     }
 }

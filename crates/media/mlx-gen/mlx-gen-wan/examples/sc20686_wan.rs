@@ -420,6 +420,7 @@ fn main() -> Result<()> {
         Progress::Step { current, total } => eprintln!("[sc20686-wan] step {current}/{total}"),
         Progress::Decoding => eprintln!("[sc20686-wan] decoding"),
         Progress::Loading(phase) => eprintln!("[sc20686-wan] loading {phase:?}"),
+        Progress::ConditioningComplete => {}
         Progress::Upsampling { tokens, max_tokens } => {
             eprintln!("[sc20686-wan] upsampling {tokens}/{max_tokens}")
         }
