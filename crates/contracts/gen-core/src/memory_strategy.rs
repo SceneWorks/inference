@@ -2175,7 +2175,6 @@ impl MemoryProviderContract {
                                         attention_chunk_size: chunk,
                                         transformer_window_size: window,
                                         transformer_window_component: component,
-                                        ..representative.parameters
                                     },
                                     tier,
                                 };
