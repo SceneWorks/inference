@@ -20,8 +20,13 @@ pub const BASE_SELECTION: &str = "base";
 /// checks the claim on one model against the provider's full default schedule.
 pub const ANCHOR_STEPS: u32 = 2;
 
-/// Repeats of each optimized anchor: their spread is the admission margin at the low end.
-pub const OPTIMIZED_REPEATS: u32 = 3;
+/// Repeats of each optimized anchor: their spread is the admission margin at the low end. Two
+/// suffice: the margin is `max(spread, 32 MiB floor)`, so a third repeat could only widen a spread
+/// the floor already backstops, at a third of the campaign's cost.
+pub const OPTIMIZED_REPEATS: u32 = 2;
+
+/// The geometry of the additive-MODE validation case (a ControlNet request, run admitted).
+pub const VALIDATION_MODE_EDGE: u32 = 1024;
 
 /// The second geometry of the low-end validation case (the anchors sit at [`reference_edge`]): the
 /// farthest ladder size from the anchor, derived downward.
@@ -162,6 +167,9 @@ pub enum Purpose {
     /// One model's optimized configuration at [`VALIDATION_EDGE`], run ADMITTED once the anchors are
     /// committed: the anchor law's prediction against the measurement.
     ValidationGeometry,
+    /// A component-additive MODE (a ControlNet request at [`VALIDATION_MODE_EDGE`]) derived from its
+    /// family's text anchor, run ADMITTED: the additive-mode derivation checked on the device.
+    ValidationMode,
 }
 
 impl Purpose {
@@ -171,6 +179,7 @@ impl Purpose {
             Self::Optimized => "optimized",
             Self::ValidationSteps => "validation_steps",
             Self::ValidationGeometry => "validation_geometry",
+            Self::ValidationMode => "validation_mode",
         }
     }
 }
@@ -183,52 +192,126 @@ pub struct Planned {
     pub repeats: u32,
 }
 
-/// The anchor campaign, derived from the runner's own catalog (never a hand list): per provider x
-/// route x SERVED tier ([`Surface::serves`]) x registered mode, the resident and the optimized anchor at the reference
-/// geometry and [`ANCHOR_STEPS`]; plus the two validation cases on the FIRST family (catalog order,
-/// lowest tier) that has an optimized anchor. A family whose provider implements no rung above 0
-/// has only its resident anchor (and so nothing derivable). A new provider/mode is visible
-/// automatically; admission, never enumeration, decides whether it can run.
-pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut validation: Option<Case> = None;
+/// How the runner groups the catalog into anchor FAMILIES: a `(provider, route, tier)` into an
+/// architecture group (on the host, the base-component architecture digest of the provisioned
+/// slot — checkpoints of one architecture share a group; weights-free, every route is its own), and
+/// a `(provider, campaign mode)` into its anchor variant (`base` for a mode the provider proved
+/// component-additive, else the mode itself).
+pub struct Grouping<'a> {
+    pub architecture: &'a dyn Fn(&str, &str, &str) -> String,
+    pub variant: &'a dyn Fn(&str, &str) -> String,
+}
+
+/// One anchor family: its group key, the member `provider/route/mode` cells it prices (all derived
+/// except the anchor's own), and the cell the anchors are captured on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Family {
+    pub architecture: String,
+    pub tier: String,
+    pub variant: String,
+    /// `(provider, route, mode)` the anchors run on: the first text-mode member, else the first.
+    pub anchor: (String, String, String),
+    pub members: Vec<String>,
+}
+
+/// The weights-free grouping: no checkpoint collapse (each `(provider, route)` is its own
+/// architecture group), variants from `variant`.
+pub fn per_route<'a>(variant: &'a dyn Fn(&str, &str) -> String) -> Grouping<'a> {
+    Grouping {
+        architecture: &|provider: &str, route: &str, _tier: &str| format!("{provider}/{route}"),
+        variant,
+    }
+}
+
+/// The anchor families of the catalog under `grouping`, in catalog order.
+pub fn families(surfaces: &[Surface], grouping: &Grouping<'_>) -> Vec<Family> {
+    let mut out: Vec<Family> = Vec::new();
     for s in surfaces {
-        let edge = reference_edge(&s.provider);
         for route in &s.routes {
             for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
+                let architecture = (grouping.architecture)(&s.provider, route, tier);
                 for mode in &s.modes {
-                    let case = |rung: u8, selection: String, steps: u32| Case {
-                        provider: s.provider.clone(),
-                        route: route.clone(),
-                        tier: tier.into(),
-                        edge,
-                        mode: mode.clone(),
-                        rung,
-                        selection,
-                        steps,
-                    };
-                    let mut push = |c: Case, purpose, repeats| {
-                        if seen.insert(c.key()) {
-                            out.push(Planned {
-                                case: c,
-                                purpose,
-                                repeats,
-                            });
+                    let variant = (grouping.variant)(&s.provider, mode);
+                    let member = format!("{}/{route}/{mode}", s.provider);
+                    match out.iter_mut().find(|f| {
+                        f.architecture == architecture && f.tier == tier && f.variant == variant
+                    }) {
+                        Some(f) => {
+                            if mode == "text" && f.anchor.2 != "text" {
+                                f.anchor = (s.provider.clone(), route.clone(), mode.clone());
+                            }
+                            f.members.push(member);
                         }
-                    };
-                    push(
-                        case(0, s.first_selection(tier, 0), ANCHOR_STEPS),
-                        Purpose::Resident,
-                        1,
-                    );
-                    if let Some((rung, selection)) = s.optimized(tier) {
-                        let optimized = case(rung, selection, ANCHOR_STEPS);
-                        validation.get_or_insert_with(|| optimized.clone());
-                        push(optimized, Purpose::Optimized, OPTIMIZED_REPEATS);
+                        None => out.push(Family {
+                            architecture: architecture.clone(),
+                            tier: tier.into(),
+                            variant,
+                            anchor: (s.provider.clone(), route.clone(), mode.clone()),
+                            members: vec![member],
+                        }),
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// The anchor campaign, derived from the runner's own catalog (never a hand list): per anchor
+/// FAMILY ([`families`]) the resident and the optimized anchor at the reference geometry and
+/// [`ANCHOR_STEPS`], on the family's anchor cell; plus the validation cases — the full-steps and
+/// second-geometry cases on the FIRST optimized family, and the additive-MODE case (a ControlNet
+/// request at [`VALIDATION_MODE_EDGE`], run admitted) on the first q4 family that derives a
+/// `control` member. A family whose anchor provider implements no rung above 0 has only its
+/// resident anchor. A new provider/mode is visible automatically.
+pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<Planned>) {
+    let families = families(surfaces, grouping);
+    let surface = |provider: &str| surfaces.iter().find(|s| s.provider == provider);
+    let mut out = Vec::new();
+    let mut validation: Option<Case> = None;
+    let mut mode_validation: Option<Case> = None;
+    for f in &families {
+        let (provider, route, mode) = &f.anchor;
+        let Some(s) = surface(provider) else { continue };
+        let case = |rung: u8, selection: String| Case {
+            provider: provider.clone(),
+            route: route.clone(),
+            tier: f.tier.clone(),
+            edge: reference_edge(provider),
+            mode: mode.clone(),
+            rung,
+            selection,
+            steps: ANCHOR_STEPS,
+        };
+        out.push(Planned {
+            case: case(0, s.first_selection(&f.tier, 0)),
+            purpose: Purpose::Resident,
+            repeats: 1,
+        });
+        if let Some((rung, selection)) = s.optimized(&f.tier) {
+            let optimized = case(rung, selection);
+            validation.get_or_insert_with(|| optimized.clone());
+            if mode_validation.is_none() && f.tier == "q4" {
+                if let Some(member) = f.members.iter().find(|m| m.ends_with("/control")) {
+                    let mut parts = member.splitn(3, '/');
+                    let (p, r) = (
+                        parts.next().unwrap_or_default(),
+                        parts.next().unwrap_or_default(),
+                    );
+                    mode_validation = Some(Case {
+                        provider: p.into(),
+                        route: r.into(),
+                        edge: VALIDATION_MODE_EDGE,
+                        mode: "control".into(),
+                        ..optimized.clone()
+                    });
+                }
+            }
+            out.push(Planned {
+                case: optimized,
+                purpose: Purpose::Optimized,
+                repeats: OPTIMIZED_REPEATS,
+            });
         }
     }
     if let Some(anchor) = validation {
@@ -251,7 +334,21 @@ pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
             });
         }
     }
-    out
+    if let Some(case) = mode_validation {
+        out.push(Planned {
+            case,
+            purpose: Purpose::ValidationMode,
+            repeats: 1,
+        });
+    }
+    (families, out)
+}
+
+/// [`plan`] under the weights-free [`per_route`] grouping with every mode additive (the campaign
+/// shape the unit tests hold).
+pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
+    let variant = |_: &str, _: &str| "base".to_string();
+    plan(surfaces, &per_route(&variant)).1
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,15 +497,23 @@ mod tests {
         }
     }
 
-    /// The campaign is the ANCHOR SHAPE, derived from the catalog: per provider x route x tier x
-    /// mode exactly one resident anchor (rung 0, the first selection) and, where the provider
-    /// implements a rung above 0, exactly one optimized anchor (the deepest such rung, its LAST
-    /// selection, repeated), both at the reference edge with short steps; plus exactly one
-    /// full-steps and one second-geometry validation case on the first optimized family. Nothing
-    /// else — no edge ladder, no selection ladder, no rung in between.
+    /// The campaign is the ANCHOR SHAPE, derived from the catalog: per FAMILY (architecture group
+    /// x tier x variant) exactly one resident anchor (rung 0, first selection, once) and, where the
+    /// anchor provider implements a rung above 0, exactly one optimized anchor (the deepest rung,
+    /// its LAST selection, repeated), both on the family's text member at the reference edge with
+    /// short steps; checkpoints sharing an architecture collapse into one family, additive modes
+    /// join their text family, a non-additive mode is its own; plus exactly one full-steps, one
+    /// second-geometry and one additive-mode validation case. Nothing else.
     #[test]
-    fn the_campaign_enumerates_exactly_the_anchor_cases() {
+    fn the_campaign_enumerates_exactly_the_anchor_families() {
         let mut a = surface();
+        a.routes = vec!["base".into(), "finetune".into(), "distilled".into()];
+        a.modes = vec![
+            "text".into(),
+            "reference".into(),
+            "control".into(),
+            "batch".into(),
+        ];
         for tier in ["q4", "q8", "bf16"] {
             a.selections
                 .insert((tier.into(), 2), vec!["t768".into(), "t512".into()]);
@@ -420,106 +525,160 @@ mod tests {
         let mut supra = surface();
         supra.provider = "supra2_img".into();
         supra.routes = vec!["supra2_img".into()];
-        // Supra2 serves q4 only, at rung 0 only (so it has no optimized anchor).
         supra.selections.retain(|(tier, _), _| tier == "q4");
-        let planned = enumerate(&[a.clone(), a.clone(), supra.clone()]);
+        // `base` and `finetune` share every header; `distilled` does not. `batch` is non-additive.
+        let architecture = |provider: &str, route: &str, _tier: &str| {
+            if route == "distilled" {
+                format!("{provider}/distilled")
+            } else {
+                provider.to_string()
+            }
+        };
+        let variant = |_: &str, mode: &str| {
+            if mode == "batch" {
+                mode.to_string()
+            } else {
+                "base".to_string()
+            }
+        };
+        let grouping = Grouping {
+            architecture: &architecture,
+            variant: &variant,
+        };
+        let (families, planned) = plan(&[a.clone(), supra.clone()], &grouping);
+        // new_provider: {shared, distilled} x 3 tiers x {base, batch}; supra2: 1 tier x 1 variant
+        // (its three additive modes in one family).
         let keys: BTreeSet<_> = planned.iter().map(|p| p.case.key()).collect();
         assert_eq!(keys.len(), planned.len(), "no duplicate case");
-        let anchors: Vec<_> = planned
-            .iter()
-            .filter(|p| matches!(p.purpose, Purpose::Resident | Purpose::Optimized))
-            .collect();
-        // An unserved tier has no family at all.
-        assert!(!planned
-            .iter()
-            .any(|p| p.case.provider == "supra2_img" && p.case.tier != "q4"));
-        for s in [&a, &supra] {
-            for route in &s.routes {
-                for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
-                    for mode in &s.modes {
-                        let family: Vec<_> = anchors
-                            .iter()
-                            .filter(|p| {
-                                p.case.provider == s.provider
-                                    && &p.case.route == route
-                                    && p.case.tier == tier
-                                    && &p.case.mode == mode
-                            })
-                            .collect();
-                        let resident: Vec<_> = family
-                            .iter()
-                            .filter(|p| p.purpose == Purpose::Resident)
-                            .collect();
-                        assert_eq!(resident.len(), 1);
-                        assert_eq!(resident[0].case.rung, 0);
-                        assert_eq!(resident[0].case.selection, s.first_selection(tier, 0));
-                        assert_eq!(resident[0].repeats, 1);
-                        let optimized: Vec<_> = family
-                            .iter()
-                            .filter(|p| p.purpose == Purpose::Optimized)
-                            .collect();
-                        match s.optimized(tier) {
-                            Some((rung, selection)) => {
-                                assert_eq!(optimized.len(), 1);
-                                assert_eq!(optimized[0].case.rung, rung);
-                                assert_eq!(optimized[0].case.selection, selection);
-                                assert_eq!(optimized[0].repeats, OPTIMIZED_REPEATS);
-                            }
-                            None => assert!(optimized.is_empty()),
-                        }
-                        for p in &family {
-                            assert_eq!(p.case.edge, reference_edge(&s.provider));
-                            assert_eq!(p.case.steps, ANCHOR_STEPS);
-                        }
-                    }
+        for f in &families {
+            let anchors: Vec<_> = planned
+                .iter()
+                .filter(|p| {
+                    matches!(p.purpose, Purpose::Resident | Purpose::Optimized)
+                        && (
+                            p.case.provider.clone(),
+                            p.case.route.clone(),
+                            p.case.mode.clone(),
+                        ) == f.anchor
+                        && p.case.tier == f.tier
+                })
+                .collect();
+            let s = if f.anchor.0 == "supra2_img" {
+                &supra
+            } else {
+                &a
+            };
+            let resident: Vec<_> = anchors
+                .iter()
+                .filter(|p| p.purpose == Purpose::Resident)
+                .collect();
+            assert_eq!(resident.len(), 1, "{f:?}");
+            assert_eq!(resident[0].case.rung, 0);
+            assert_eq!(resident[0].repeats, 1);
+            let optimized: Vec<_> = anchors
+                .iter()
+                .filter(|p| p.purpose == Purpose::Optimized)
+                .collect();
+            match s.optimized(&f.tier) {
+                Some((rung, selection)) => {
+                    assert_eq!(optimized.len(), 1);
+                    assert_eq!(
+                        (optimized[0].case.rung, &optimized[0].case.selection),
+                        (rung, &selection)
+                    );
+                    assert_eq!(optimized[0].repeats, OPTIMIZED_REPEATS);
                 }
+                None => assert!(optimized.is_empty()),
+            }
+            for p in &anchors {
+                assert_eq!(p.case.edge, reference_edge(&p.case.provider));
+                assert_eq!(p.case.steps, ANCHOR_STEPS);
+            }
+            // The anchor runs on a text member when the family has one.
+            if f.members.iter().any(|m| m.ends_with("/text")) {
+                assert_eq!(f.anchor.2, "text");
             }
         }
-        // The optimized anchor is the deepest implemented rung at its cheapest selection.
-        assert_eq!(a.optimized("q4"), Some((4, "s_t256_w1".into())));
-        assert_eq!(supra.optimized("q4"), None);
-        assert!(anchors
+        let of = |arch: &str, tier: &str, variant: &str| {
+            families
+                .iter()
+                .find(|f| f.architecture == arch && f.tier == tier && f.variant == variant)
+                .unwrap()
+        };
+        let shared = of("new_provider", "q4", "base");
+        assert_eq!(
+            shared.members,
+            [
+                "new_provider/base/text",
+                "new_provider/base/reference",
+                "new_provider/base/control",
+                "new_provider/finetune/text",
+                "new_provider/finetune/reference",
+                "new_provider/finetune/control"
+            ],
+            "the fine-tune collapses into the base architecture; additive modes join the text family"
+        );
+        assert_eq!(of("new_provider/distilled", "q4", "base").members.len(), 3);
+        assert_eq!(of("new_provider", "q4", "batch").anchor.2, "batch");
+        assert_eq!(families.len(), 2 * 3 * 2 + 1);
+        assert!(planned
             .iter()
-            .all(|p| p.case.provider != "supra2_img" || p.case.edge == 256));
-        // Exactly one of each validation case, both on the FIRST optimized family.
-        let first = anchors
+            .filter(|p| p.case.provider == "supra2_img")
+            .all(|p| p.case.edge == 256 && p.case.tier == "q4"));
+        // Exactly one of each validation case: steps and geometry on the first optimized family,
+        // the additive-mode case on the first q4 family deriving a `control` member.
+        let first = planned
             .iter()
             .find(|p| p.purpose == Purpose::Optimized)
             .unwrap();
-        let of = |purpose| {
-            planned
-                .iter()
-                .filter(|p| p.purpose == purpose)
-                .collect::<Vec<_>>()
+        let only = |purpose| {
+            let v: Vec<_> = planned.iter().filter(|p| p.purpose == purpose).collect();
+            assert_eq!(v.len(), 1, "{purpose:?}");
+            v[0].case.clone()
         };
-        let steps = of(Purpose::ValidationSteps);
-        assert_eq!(steps.len(), 1);
         assert_eq!(
-            steps[0].case,
+            only(Purpose::ValidationSteps),
             Case {
                 steps: 0,
                 ..first.case.clone()
             }
         );
-        let geometry = of(Purpose::ValidationGeometry);
-        assert_eq!(geometry.len(), 1);
         assert_eq!(
-            geometry[0].case,
+            only(Purpose::ValidationGeometry),
             Case {
                 edge: VALIDATION_EDGE,
                 ..first.case.clone()
             }
         );
         assert_eq!(
-            planned.len(),
-            anchors.len() + 2,
-            "anchors and the two validation cases only"
+            only(Purpose::ValidationMode),
+            Case {
+                edge: VALIDATION_MODE_EDGE,
+                mode: "control".into(),
+                ..first.case.clone()
+            }
         );
-        // A catalog with no optimized family has no validation case.
+        let anchors = planned
+            .iter()
+            .filter(|p| matches!(p.purpose, Purpose::Resident | Purpose::Optimized))
+            .count();
+        assert_eq!(
+            planned.len(),
+            anchors + 3,
+            "anchors and the three validation cases only"
+        );
+        // The weights-free grouping never collapses routes.
+        let variant = |_: &str, _: &str| "base".to_string();
+        assert_eq!(families_count(&[a], &per_route(&variant)), 3 * 3);
         assert!(enumerate(&[supra])
             .iter()
             .all(|p| p.purpose == Purpose::Resident));
     }
+
+    fn families_count(surfaces: &[Surface], grouping: &Grouping<'_>) -> usize {
+        families(surfaces, grouping).len()
+    }
+
     struct Fake {
         admitted: bool,
         fail: bool,

@@ -572,40 +572,43 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
         work(&odd, &CancelFlag::new(), catalog.media()),
         Err(AdmissionError::Refused(_))
     ));
-    // Enumeration: both routes have both anchors at every tier, one family per accepted control
-    // kind; the control route has no plain text mode.
-    let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
-    let keys: Vec<&str> = listing["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|k| k["case"].as_str().unwrap())
-        .collect();
+    // Families (weights-free listing: no checkpoint collapse): the base route's text and reference
+    // share its text-anchored family at every tier; the control route's six modes (one per accepted
+    // kind, no plain text mode) share one family of their own; every family has both anchors.
+    let listing: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
+    let families = listing["families"].as_array().unwrap();
     for tier in ["q4", "q8", "bf16"] {
-        let mut prefixes = vec![
-            format!("z_image_turbo/z_image_turbo/{tier}/1024/text/"),
-            format!("z_image_turbo/z_image_turbo/{tier}/1024/reference/"),
-        ];
+        let family = |anchor: &str| {
+            families
+                .iter()
+                .find(|f| f["tier"] == tier && f["anchor"].as_str().unwrap().starts_with(anchor))
+                .unwrap_or_else(|| panic!("{anchor} {tier}"))
+        };
+        let base = family("z_image_turbo/z_image_turbo/");
+        assert_eq!(base["anchor"], "z_image_turbo/z_image_turbo/text");
+        assert_eq!(
+            base["members"],
+            json!([
+                "z_image_turbo/z_image_turbo/text",
+                "z_image_turbo/z_image_turbo/reference"
+            ])
+        );
+        let control = family("z_image_turbo_control/");
+        let members: Vec<&str> = control["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
         for kind in ["pose", "canny", "depth"] {
             for mode in ["control", "reference"] {
-                prefixes.push(format!(
-                    "z_image_turbo_control/z_image_turbo_control/{tier}/1024/{mode}_{kind}/"
+                assert!(members.contains(
+                    &format!("z_image_turbo_control/z_image_turbo_control/{mode}_{kind}").as_str()
                 ));
             }
         }
-        for prefix in prefixes {
-            for rung in ["/0/", "/4/"] {
-                assert!(
-                    keys.iter()
-                        .any(|k| k.starts_with(&prefix) && k[prefix.len() - 1..].starts_with(rung)),
-                    "{prefix}{rung}"
-                );
-            }
-        }
+        assert!(!members.iter().any(|m| m.ends_with("/text")));
     }
-    assert!(!keys
-        .iter()
-        .any(|k| k.starts_with("z_image_turbo_control/") && k.contains("/text/")));
 }
 
 /// Every cell carries its own selection from the provider's declared space, enumerated quality

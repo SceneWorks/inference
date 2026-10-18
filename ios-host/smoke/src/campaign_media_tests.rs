@@ -4,7 +4,8 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     let catalog = runtime_ios::catalog().unwrap();
     let registry = catalog.media();
     let discovered = surfaces(registry);
-    let cases = campaign::enumerate(&discovered);
+    let variant_of = |p: &str, m: &str| variant(p, m);
+    let (families, cases) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
     for registration in registry.generators() {
         let descriptor = (registration.descriptor)();
         let surface = discovered
@@ -23,24 +24,33 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
                 descriptor.id
             );
         }
-        // Every registered mode of every route and tier has its resident anchor, and — the fully
-        // optimized end must exist on the phone — its optimized anchor.
+        // Every registered mode of every route and served tier belongs to exactly one family, and
+        // that family has its resident anchor and — the fully optimized end must exist on the phone —
+        // its optimized anchor.
         for route in &surface.routes {
             for tier in ["q4", "q8", "bf16"] {
                 for mode in &surface.modes {
-                    let family = |purpose| {
+                    let member = format!("{}/{route}/{mode}", descriptor.id);
+                    let homes: Vec<_> = families
+                        .iter()
+                        .filter(|f| f.tier == tier && f.members.contains(&member))
+                        .collect();
+                    assert_eq!(homes.len(), 1, "{member} {tier}");
+                    let anchored = |purpose| {
                         cases.iter().any(|p| {
                             p.purpose == purpose
-                                && p.case.provider == descriptor.id
-                                && p.case.route == *route
+                                && (
+                                    p.case.provider.clone(),
+                                    p.case.route.clone(),
+                                    p.case.mode.clone(),
+                                ) == homes[0].anchor
                                 && p.case.tier == tier
-                                && p.case.mode == *mode
                         })
                     };
-                    assert!(family(campaign::Purpose::Resident), "{route} {tier} {mode}");
+                    assert!(anchored(campaign::Purpose::Resident), "{member} {tier}");
                     assert!(
-                        family(campaign::Purpose::Optimized),
-                        "{route} {tier} {mode}: no fully optimized anchor"
+                        anchored(campaign::Purpose::Optimized),
+                        "{member} {tier}: no fully optimized anchor"
                     );
                 }
             }
@@ -54,7 +64,7 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     for r in registry.memory_strategy_registrations() {
         assert!(discovered.iter().any(|s| s.provider == r.provider_id));
     }
-    let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
+    let listing: Value = serde_json::from_str(&listing_with(None).unwrap()).unwrap();
     assert_eq!(listing["schema"], 2);
     let listed = listing["cases"].as_array().unwrap();
     assert_eq!(listed.len(), cases.len());
@@ -67,7 +77,7 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
             planned.case
         );
     }
-    for purpose in ["validation_steps", "validation_geometry"] {
+    for purpose in ["validation_steps", "validation_geometry", "validation_mode"] {
         assert_eq!(
             listed.iter().filter(|e| e["purpose"] == purpose).count(),
             1,
@@ -92,7 +102,13 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     assert!(listed.iter().any(|e| e["case"]
         .as_str()
         .unwrap()
-        .starts_with("sdxl/illustrious_xl_v2/q4/1024/mask/")));
+        .starts_with("sdxl/illustrious_xl_v2/q4/1024/text/")));
+    // Additive modes never get their own anchors; their family's text member does.
+    assert!(!listed.iter().any(|e| {
+        let c = e["case"].as_str().unwrap();
+        matches!(e["purpose"].as_str(), Some("resident" | "optimized"))
+            && (c.contains("/mask/") || c.contains("/ip_adapter/"))
+    }));
 }
 #[cfg(not(target_os = "ios"))]
 #[test]

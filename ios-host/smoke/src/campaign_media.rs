@@ -110,12 +110,70 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     out
 }
 
-/// The weights-free campaign listing (schema 2): every planned ANCHOR case with its purpose and
-/// repeat count ([`campaign::enumerate`]), derived from the actual runtime catalog.
+/// The `MemoryMode` key a campaign mode runs as (`work_mode`'s mapping).
+pub fn mode_key(mode: &str) -> &str {
+    match mode {
+        "text" | "prompt_batch" => "text_to_image",
+        "reference" => "image_to_image",
+        "mask" => "edit",
+        "restore" => "restoration",
+        m if m == "control" || m.starts_with("control_") || m.starts_with("reference_") => {
+            "control"
+        }
+        other => other,
+    }
+}
+
+/// A campaign mode's anchor variant: the provider's proven additivity (`anchor_variant`).
+pub fn variant(provider: &str, mode: &str) -> String {
+    runtime_ios::media::pricing::anchor_variant(provider, mode_key(mode))
+}
+
+/// The architecture group of `(provider, route, tier)`: on the host, the base-component
+/// ARCHITECTURE digest of the provisioned slot under `snapshots` (the same function admission keys
+/// the device's anchor families on); a slot that is absent or unreadable is its own group.
+fn architecture_group(snapshots: &Path, provider: &str, route: &str, tier: &str) -> String {
+    let case = Case {
+        provider: provider.into(),
+        route: route.into(),
+        tier: tier.into(),
+        edge: campaign::reference_edge(provider),
+        mode: "text".into(),
+        rung: 0,
+        selection: campaign::BASE_SELECTION.into(),
+        steps: 0,
+    };
+    snapshot(snapshots, &case)
+        .ok()
+        .and_then(|spec| runtime_ios::media::architecture_digest(&spec).ok())
+        .map_or_else(
+            || format!("unprovisioned:{provider}/{route}/{tier}"),
+            |d| runtime_ios::media::hex(&d),
+        )
+}
+
+/// The campaign listing (schema 2): every planned ANCHOR case with its purpose and repeat count,
+/// and the anchor FAMILIES ([`campaign::plan`]) — derived from the actual runtime catalog. With
+/// `IOS_CAMPAIGN_SNAPSHOTS=<dir of route/tier slots>` (the slots that will be pushed) families are
+/// grouped by architecture digest, so checkpoints of one architecture share anchors; without it,
+/// every route is its own family (weights-free, conservative).
 pub fn listing() -> Result<String, String> {
+    listing_with(std::env::var_os("IOS_CAMPAIGN_SNAPSHOTS").map(PathBuf::from))
+}
+
+pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
     let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
     let surfaces = surfaces(catalog.media());
-    let planned = campaign::enumerate(&surfaces);
+    let variant_of = |provider: &str, mode: &str| variant(provider, mode);
+    let by_architecture = |provider: &str, route: &str, tier: &str| match &snapshots {
+        Some(root) => architecture_group(root, provider, slot_route_of(provider, route), tier),
+        None => format!("{provider}/{route}"),
+    };
+    let grouping = campaign::Grouping {
+        architecture: &by_architecture,
+        variant: &variant_of,
+    };
+    let (families, planned) = campaign::plan(&surfaces, &grouping);
     // Visible, never silently dropped: every provider/route/tier it does not serve.
     let unserved: Vec<Value> = surfaces
         .iter()
@@ -128,10 +186,23 @@ pub fn listing() -> Result<String, String> {
             })
         })
         .collect();
-    Ok(json!({"schema": 2, "unserved": unserved,
+    Ok(json!({"schema": 2,
+        "grouping": if snapshots.is_some() { "architecture" } else { "per_route" },
+        "families": families.iter().map(|f| json!({"architecture": f.architecture, "tier": f.tier, "variant": f.variant,
+            "anchor": format!("{}/{}/{}", f.anchor.0, f.anchor.1, f.anchor.2), "members": f.members})).collect::<Vec<_>>(),
+        "unserved": unserved,
         "cases": planned.iter().map(|p| json!({"case": p.case.key(), "purpose": p.purpose.label(), "repeats": p.repeats})).collect::<Vec<_>>(),
         "dependencies": [{"provider":"supra2", "epic":24212, "available": planned.iter().any(|p| p.case.provider.contains("supra")), "reason":"requires native engine and iOS catalog registration; absence is not a passing cell"}]
     }).to_string())
+}
+
+/// The slot a `(provider, route)` loads from (Z-Image Turbo's control route loads the base slot).
+fn slot_route_of<'a>(provider: &str, route: &'a str) -> &'a str {
+    if provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID {
+        runtime_ios::media::zimage::Z_IMAGE_TURBO_ID
+    } else {
+        route
+    }
 }
 
 /// The campaign token of a selection's parameters: `t{tile}`, `o{overlap}`, `c{chunk}`,

@@ -66,7 +66,7 @@ pub use ios_admission::{
     tier_label, token_window, validate_actual, work_binding, work_mode, Admission, AdmissionBasis,
     IosCandidate, IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
-pub use layout::{artifact_layout_digest, hex};
+pub use layout::{architecture_digest, artifact_layout_digest, hex};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads
 /// `take_refusal()` from it, and host fixtures use its CPU diagnostic headroom.
 pub use mlx_gen::ios_quantum;

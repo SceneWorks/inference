@@ -69,15 +69,15 @@ pub mod media {
     pub use mlx_gen_ios_catalog::control_required;
     pub use mlx_gen_ios_catalog::{
         anchor, anima, anima_turbo_ios_selection, anima_turbo_load_spec,
-        anima_turbo_memory_selection, anima_turbo_planning_decision, build_candidate,
-        capacity_budget, evidence, evidence_key, ios_memory_budget, ios_quantum, pricing,
-        sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound, sana_generation_memory,
-        sana_load_spec, sana_snapshot_profile, sdxl, zimage, Admission, AdmissionBasis,
-        AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
-        FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind, SanaDeviceFootprint,
-        SanaSnapshotProfile, ANIMA_TURBO_ID, CONTROL_REQUIRED_ROUTES, IOS_IMAGE_EDGES,
-        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID,
-        IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
+        anima_turbo_memory_selection, anima_turbo_planning_decision, architecture_digest,
+        build_candidate, capacity_budget, evidence, evidence_key, hex, ios_memory_budget,
+        ios_quantum, pricing, sana_decode_plan, sana_decode_tile_edge, sana_footprint_bound,
+        sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl, zimage, Admission,
+        AdmissionBasis, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
+        BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
+        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, CONTROL_REQUIRED_ROUTES,
+        IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
+        IRIS_DEPTH_ID, IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
     };
 
     use crate::gen_core::{Error, ProviderRegistry, Result};

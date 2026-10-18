@@ -33,9 +33,10 @@ class CampaignTests(unittest.TestCase):
         for tier in campaign.TIERS:
             for mode in ("text", "reference"):
                 self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/0/base/1", "purpose": "resident", "repeats": 1})
-                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/4/s_t256/1", "purpose": "optimized", "repeats": 3})
+                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/4/s_t256/1", "purpose": "optimized", "repeats": 2})
         self.entries.append({"case": "fake/fake/q4/512/text/4/s_t256/0", "purpose": "validation_steps", "repeats": 1})
         self.entries.append({"case": "fake/fake/q4/1024/text/4/s_t256/1", "purpose": "validation_geometry", "repeats": 1})
+        self.entries.append({"case": "fake/fake/q4/1024/control/4/s_t256/1", "purpose": "validation_mode", "repeats": 1})
         self.keys = [e["case"] for e in self.entries]
         self.catalog = self.root / "catalog.json"
         self.catalog.write_text(json.dumps({"schema": 2, "cases": self.entries}), encoding="utf-8")
@@ -100,7 +101,7 @@ class CampaignTests(unittest.TestCase):
             "schema 1 grid": {"schema": 1, "cases": self.keys},
             "bare key": {"schema": 2, "cases": [self.keys[0]]},
             "unknown purpose": {"schema": 2, "cases": [dict(self.entries[0], purpose="ladder")]},
-            "too few optimized repeats": {"schema": 2, "cases": [dict(self.entries[1], repeats=2)]},
+            "too few optimized repeats": {"schema": 2, "cases": [dict(self.entries[1], repeats=1)]},
             "zero repeats": {"schema": 2, "cases": [dict(self.entries[0], repeats=0)]},
             "seven-field key": {"schema": 2, "cases": [dict(self.entries[0], case="fake/fake/q4/512/text/0/base")]},
             "duplicate": {"schema": 2, "cases": [self.entries[0], self.entries[0]]},
@@ -296,14 +297,14 @@ class CampaignTests(unittest.TestCase):
             cls.return_value.blocked = False
             code = self.main("capture", "--all-cases", "--device", "fake", "--output", str(output))
         self.assertEqual(code, 0)
-        expected = [e["case"] for e in self.entries if e["purpose"] != "validation_geometry" for _ in range(e["repeats"])]
+        expected = [e["case"] for e in self.entries if e["purpose"] not in campaign.ADMITTED_VALIDATIONS for _ in range(e["repeats"])]
         self.assertEqual(calls, expected, "each capture case its listed repeats, in listing order; no ladder, no admitted validation")
         rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
         self.assertTrue(all(r["diagnostic"] is True and r["production_success"] is False for r in rows))
-        self.assertEqual([r["repeat"] for r in rows if r["case"] == self.keys[1]], [0, 1, 2])
+        self.assertEqual([r["repeat"] for r in rows if r["case"] == self.keys[1]], [0, 1])
         table = campaign.render(rows)
         self.assertIn("refused before construction: SANA block", table)
-        self.assertIn('"completed_demand_mib": [0.0, 0.0, 0.0]', table)
+        self.assertIn('"completed_demand_mib": [0.0, 0.0]', table)
 
     def test_an_optimized_anchor_that_does_not_complete_is_a_defect_and_is_not_repeated(self):
         calls = []
@@ -365,9 +366,9 @@ class CampaignTests(unittest.TestCase):
         odd = completed("z", phase_peaks={"decode": {"peak_bytes": 10, "exact": True}, "denoise": {"peak_bytes": 999, "exact": True}})
         self.assertEqual(campaign.capture_of(odd)["phase_peaks"], {})
         # Fewer than three completed optimized repeats: no margin basis, a problem, no row.
-        anchors, problems = campaign.anchor_rows(rows[:2])
+        anchors, problems = campaign.anchor_rows(rows[:1])
         self.assertEqual(anchors, [])
-        self.assertIn("3 needed", problems[0])
+        self.assertIn("2 needed", problems[0])
         # An optimized anchor that only refused is a DEFECT problem, never refusal evidence.
         anchors, problems = campaign.anchor_rows([dict(self.capture_row(opt, "capture_refused"), purpose="optimized")])
         self.assertEqual(anchors, [])
@@ -419,7 +420,7 @@ class CampaignTests(unittest.TestCase):
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", return_value=admitted) as run:
             cls.return_value.blocked = False
             self.assertEqual(self.main("validate", "--all-cases", "--device", "fake", "--output", str(output)), 0)
-            self.assertEqual([c.args[1] for c in run.call_args_list], ["fake/fake/q4/1024/text/4/s_t256/1"])
+            self.assertEqual([c.args[1] for c in run.call_args_list], ["fake/fake/q4/1024/text/4/s_t256/1", "fake/fake/q4/1024/control/4/s_t256/1"])
             self.assertFalse(cls.call_args.args[0].diagnostic, "the geometry validation runs ADMITTED")
 
     def primitive_row(self):

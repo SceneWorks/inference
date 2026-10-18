@@ -39,8 +39,9 @@ pub const DEVICE_CAPTURE_CLASS: &str = "device_capture";
 pub const EVIDENCE_SCHEMA: u32 = 3;
 
 /// An optimized anchor must carry at least this many repeat captures: the margin at the low end is
-/// their measured spread, never a blanket reserve.
-pub const MIN_OPTIMIZED_REPEATS: usize = 3;
+/// their measured spread (floored at [`ANCHOR_MARGIN_FLOOR_BYTES`]), never a blanket reserve. Two
+/// suffice because the floor already backstops a spread two repeats happen to under-sample.
+pub const MIN_OPTIMIZED_REPEATS: usize = 2;
 
 /// Floor of the low-end margin. Three repeats can agree to the byte, and a zero margin would be a
 /// claim that the next render is bit-identical in footprint. This floor is an ENGINEERING choice,

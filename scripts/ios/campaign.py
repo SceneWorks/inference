@@ -36,9 +36,10 @@ EDGES = (256, 512, 768, 1024, 1280)
 PRIMITIVE_KEY = "primitive/sana_block_quantum"
 PRIMITIVE_CLASS = "primitive_characterization"
 STEPS_MAX = 100
-PURPOSES = ("resident", "optimized", "validation_steps", "validation_geometry")
+PURPOSES = ("resident", "optimized", "validation_steps", "validation_geometry", "validation_mode")
+ADMITTED_VALIDATIONS = ("validation_geometry", "validation_mode")
 CAPTURE_PURPOSES = ("resident", "optimized", "validation_steps")
-OPTIMIZED_REPEATS = 3
+OPTIMIZED_REPEATS = 2
 # Mirrors evidence::ANCHOR_MARGIN_FLOOR_BYTES: the low-end margin's floor.
 ANCHOR_MARGIN_FLOOR_BYTES = 32 << 20
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
@@ -92,6 +93,7 @@ def parser():
     p.add_argument("--device")
     p.add_argument("--memory-entitlement", choices=("on", "off"), default="on")
     p.add_argument("--output", type=Path)
+    p.add_argument("--snapshots", type=Path, help="host dir of <route>/<tier> slots (the ones pushed): group anchor families by architecture digest")
     p.add_argument("--input", type=Path)
     p.add_argument("--max-cases", type=positive, help="optional cap on launches (renders, repeats AND probes); the anchor listing is finite by construction")
     p.add_argument("--timeout-seconds", type=seconds, default=1800, help="per-case cooperative device deadline and host polling budget")
@@ -129,6 +131,8 @@ def catalog(args):
         data = json.loads(args.catalog.read_text(encoding="utf-8"))
     else:
         env = dict(os.environ, CARGO_BUILD_JOBS="4")
+        if getattr(args, "snapshots", None):
+            env["IOS_CAMPAIGN_SNAPSHOTS"] = str(args.snapshots.resolve())
         env["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + env.get("PATH", "")
         result = command(["cargo", "run", "--locked", "--offline", "--manifest-path", "ios-host/smoke/Cargo.toml", "--features", "media", "--example", "campaign_catalog", "-j", "4"], args.timeout_seconds, env)
         if result.returncode:
@@ -601,13 +605,13 @@ def geometry_validation(rows):
     ADMITTED validation_geometry run."""
     out = []
     for r in rows:
-        if r.get("purpose") != "validation_geometry":
+        if r.get("purpose") not in ADMITTED_VALIDATIONS:
             continue
         admitted = r.get("admitted") if isinstance(r.get("admitted"), dict) else {}
         peak, baseline = r.get("kernel_lifetime_phys_footprint_peak_bytes"), r.get("baseline_phys_footprint_bytes")
         predicted = admitted.get("demand_bytes")
         measured = peak - baseline if isinstance(peak, int) and isinstance(baseline, int) and 0 < baseline < peak else None
-        out.append({"case": r["case"], "status": r.get("status"), "basis": admitted.get("basis"),
+        out.append({"case": r["case"], "purpose": r.get("purpose"), "status": r.get("status"), "basis": admitted.get("basis"),
                     "predicted_demand_bytes": predicted, "margin_bytes": admitted.get("margin_bytes"),
                     "measured_demand_bytes": measured,
                     "relative_error": round((predicted - measured) / measured, 4) if isinstance(predicted, int) and measured else None})
@@ -662,9 +666,9 @@ def main(argv=None):
         ok = rows and all(r["status"] == "diagnostic_success" or (r["status"] == "capture_refused" and r.get("purpose") == "resident") for r in rows)
         return 0 if ok else 2
     if args.action == "validate":
-        entries = [e for e in entries if e["purpose"] == "validation_geometry"]
+        entries = [e for e in entries if e["purpose"] in ADMITTED_VALIDATIONS]
         if not entries:
-            p.error("validate runs the listing's validation_geometry case(s); none selected")
+            p.error("validate runs the listing's validation_geometry / validation_mode cases; none selected")
         args.diagnostic = False
         rows = []
         with args.output.open("x", encoding="utf-8") as output:
