@@ -75,8 +75,8 @@ fn ordered_reference_edits_match_frozen_source_body() {
         .unwrap();
         let text = fixture("flux3_text_golden.safetensors");
         let conditioning = |name: &str| {
-            let tokens = text.require(&format!("{name}/tokens")).clone();
-            let ids = ids_of(text.require(&format!("{name}/ids")));
+            let tokens = text.require(&format!("{name}/tokens")).unwrap().clone();
+            let ids = ids_of(text.require(&format!("{name}/ids")).unwrap());
             let window = assemble_window(&vec![1; ids.len()], 0, 1, 4096).unwrap();
             TextConditioning {
                 tokens,
@@ -88,7 +88,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
         let negative = conditioning("empty");
         let originals: Vec<Image> = (0..10)
             .map(|i| {
-                let t = golden.require(&format!("input/{i}"));
+                let t = golden.require(&format!("input/{i}")).unwrap();
                 let dims = t.shape();
                 Image {
                     width: dims[1] as u32,
@@ -97,8 +97,8 @@ fn ordered_reference_edits_match_frozen_source_body() {
                 }
             })
             .collect();
-        let ids = ids_of(golden.require("image_ids"));
-        let schedule = host_f32(golden.require("schedule"));
+        let ids = ids_of(golden.require("image_ids").unwrap());
+        let schedule = host_f32(golden.require("schedule").unwrap());
         for (name, order) in [
             ("one", vec![0]),
             ("two", vec![0, 1]),
@@ -122,7 +122,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                                     width: originals[i].width,
                                     height: originals[i].height,
                                     pixels: crate::common::host_f32(
-                                        golden.require(&format!("rgba/{i}")),
+                                        golden.require(&format!("rgba/{i}")).unwrap(),
                                     )
                                     .into_iter()
                                     .map(|v| v as u8)
@@ -154,10 +154,11 @@ fn ordered_reference_edits_match_frozen_source_body() {
             for (position, &i) in order.iter().enumerate() {
                 if i % 2 == 0 {
                     let (_, _, rgb) = pup.references[position].to_rgb8().unwrap();
-                    let expected = crate::common::host_f32(golden.require(&format!("pup_rgb/{i}")))
-                        .into_iter()
-                        .map(|v| v as u8)
-                        .collect::<Vec<_>>();
+                    let expected =
+                        crate::common::host_f32(golden.require(&format!("pup_rgb/{i}")).unwrap())
+                            .into_iter()
+                            .map(|v| v as u8)
+                            .collect::<Vec<_>>();
                     assert_eq!(rgb, expected, "Pillow source alpha-over-white fork");
                 }
             }
@@ -167,18 +168,18 @@ fn ordered_reference_edits_match_frozen_source_body() {
             assert_eq!(references.tokens.dtype(), Dtype::Bfloat16);
             assert_eq!(
                 references.ids,
-                ids_of(golden.require(&format!("{name}/reference_ids")))
+                ids_of(golden.require(&format!("{name}/reference_ids")).unwrap())
             );
             assert_close(
                 "AE reference tokens",
                 &references.tokens,
-                golden.require(&format!("{name}/reference_tokens")),
+                golden.require(&format!("{name}/reference_tokens")).unwrap(),
                 1e-4,
             );
             let out = denoise_flow_map_with_references(
                 &flow,
                 &positive,
-                golden.require("noise"),
+                golden.require("noise").unwrap(),
                 &ids,
                 &schedule,
                 Some(&references),
@@ -189,11 +190,11 @@ fn ordered_reference_edits_match_frozen_source_body() {
             assert_close(
                 name,
                 &out,
-                golden.require(&format!("{name}/flow_tokens")),
+                golden.require(&format!("{name}/flow_tokens")).unwrap(),
                 1e-4,
             );
             let decoded = decode_tokens(&ae, &out, 2, 3).unwrap();
-            let expected = host_f32(golden.require(&format!("{name}/rgb8")))
+            let expected = host_f32(golden.require(&format!("{name}/rgb8")).unwrap())
                 .into_iter()
                 .map(|v| v as u8)
                 .collect::<Vec<_>>();
@@ -212,7 +213,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                         &base,
                         &positive,
                         &negative,
-                        golden.require("noise"),
+                        golden.require("noise").unwrap(),
                         &ids,
                         &schedule,
                         g,
@@ -224,7 +225,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                     assert_close(
                         "base ordered reference CFG",
                         &result,
-                        golden.require(&format!("{name}/cfg_{g:.1}")),
+                        golden.require(&format!("{name}/cfg_{g:.1}")).unwrap(),
                         1e-4,
                     );
                 }
