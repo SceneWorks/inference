@@ -141,9 +141,8 @@ pub(crate) fn contract(v: MossImageVariant, spec: &LoadSpec) -> Result<MemoryPro
     Ok(contract_with_facts(v, facts(&s)?))
 }
 pub(crate) fn fixture(v: MossImageVariant, _: &LoadSpec) -> Result<MemoryProviderContract> {
-    let mut c = contract_with_facts(v, MemoryAssetFacts::default());
-    c.architecture_facts = MemoryArchitectureFacts::default();
-    Ok(c)
+    // The frozen Base/SFT geometry is known without a snapshot; only byte facts are absent.
+    Ok(contract_with_facts(v, MemoryAssetFacts::default()))
 }
 /// Conservative structural workspace, including expanded outputs, context and sequential branches.
 /// This is an estimate, not a measured calibration rung.
@@ -228,6 +227,23 @@ pub(crate) fn surface_specs() -> Vec<MemoryContractSurfaceSpec> {
 
 #[cfg(test)]
 mod cpu_tests {
+    #[test]
+    fn weights_free_surfaces_retain_frozen_geometry_without_claiming_assets_sc26323() {
+        let preset = moss_image::MossImageConfig::default();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-moss-surface".into()));
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            let surface = fixture(variant, &spec).unwrap();
+            assert_eq!(surface.asset_facts, MemoryAssetFacts::default());
+            let facts = surface.architecture_facts;
+            assert_eq!(facts.attention_heads, Some(preset.num_heads as u32));
+            assert_eq!(facts.head_dim, Some((preset.dim / preset.num_heads) as u32));
+            assert_eq!(facts.transformer_blocks, Some(preset.num_layers as u32));
+            assert_eq!(facts.latent_channels, Some(preset.latent_channels as u32));
+            assert_eq!(facts.patch_size, Some(1));
+            assert_eq!(facts.vae_spatial_scale, Some(crate::SIZE_MULTIPLE));
+            assert_eq!(facts.vae_temporal_scale, None);
+        }
+    }
     use super::*;
     #[test]
     fn cached_optional_assets_only_price_the_selected_renderer() {
