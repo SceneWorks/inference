@@ -30,6 +30,7 @@ mlx-gen-ltx = { path = "../mlx-gen-ltx" }
 mlx-gen-mage = { path = "../mlx-gen-mage" }
 mlx-gen-minimax-h3 = { path = "../mlx-gen-minimax-h3" }
 mlx-gen-mochi = { path = "../mlx-gen-mochi" }
+mlx-gen-moss-image = { path = "../mlx-gen-moss-image" }
 mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-gen-pulid = { path = "../mlx-gen-pulid" }
 mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
