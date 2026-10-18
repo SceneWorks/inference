@@ -760,6 +760,7 @@ mod tests {
             exact,
         };
         if let AnchorOutcome::Completed { captures } = &mut row.outcome {
+            captures.push(capture("r2", 1, 1001, &[]));
             captures[0]
                 .quanta
                 .insert("decode tile".into(), q(400, 200, true));
