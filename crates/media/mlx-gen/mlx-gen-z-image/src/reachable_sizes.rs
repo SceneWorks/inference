@@ -733,7 +733,7 @@ fn reachable_sizes() {
                 let fitting = selections().into_iter().find_map(|sel| {
                     let phases = predict(tier, &dense, mode, edge, sel);
                     let (peak, binding) = worst(&phases);
-                    (peak <= limit).then(|| (sel, peak, binding))
+                    (peak <= limit).then_some((sel, peak, binding))
                 });
                 let (fit, fit_peak, fit_binding) = match fitting {
                     Some((sel, peak, binding)) => (sel.token(), mib(peak).to_string(), binding),
