@@ -325,6 +325,11 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let key = evidence_key(&registry, &realvis, DEVICE).unwrap();
     assert_eq!(key.architecture_sha256, rows[0].key.architecture_sha256);
     assert_eq!(key.family(), rows[0].key.family());
+    priced(|| {
+        let admitted = admit_one_of(&registry, &realvis, 8192, &rows).unwrap();
+        assert_eq!(admitted.basis(), AdmissionBasis::Derived { from: AnchorKind::Optimized });
+        assert_eq!(admitted.demand_bytes(), 2500 * MIB);
+    });
     // No pricing: the anchor's own key still admits (a measurement needs no scaling) …
     let big = at(
         &registry,

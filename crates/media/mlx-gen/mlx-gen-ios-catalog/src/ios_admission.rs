@@ -604,9 +604,16 @@ fn price_anchor(
         return Err(no_evidence(format!("{provider}: no counted iOS pricing")));
     };
     let mut spec = candidate.spec.clone();
-    spec.control = None;
-    spec.extra_controls.clear();
-    spec.ip_adapter = None;
+    // A text anchor carries no mode-added components. A proof-backed non-additive mode has its
+    // OWN anchor, whose components must remain present when that anchor is re-priced.
+    if row.key.mode != "control" {
+        spec.control = None;
+        spec.extra_controls.clear();
+    }
+    if row.key.mode != "ip_adapter" {
+        spec.ip_adapter = None;
+    }
+    spec.resolved_route = Some(row.key.route.clone());
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
         .ok_or_else(|| no_evidence(format!("{provider}: no memory contract")))?;
@@ -781,7 +788,7 @@ fn admit_one(
     if let Some(rows) = rows {
         // Cheap pre-check: refuse before opening any source when no anchor can match.
         if !rows.iter().any(|r| {
-            r.key.machine == machine && r.key.provider == candidate.provider && r.key.route == route
+            r.key.machine == machine && r.key.tier == tier_label(&candidate.spec)
         }) {
             return Err(AdmissionError::refused(
                 RefusalKind::NoEvidence,
