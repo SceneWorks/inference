@@ -1,7 +1,7 @@
 # iOS device runbook
 
-Updated 2026-10-17 against inference feature base `481b04d6f` plus the sc-26270
-campaign harness. These are implemented harness commands, not a claim the epic
+Updated 2026-10-18 against inference feature base `509aa1c1b` plus Z-Image (#1290)
+and the sc-26270 ANCHOR campaign (two measured anchors per family + derivation). These are implemented harness commands, not a claim the epic
 is on main or that all models render on the phone. See [strategy](architecture/ios-strategy.md),
 [specification](architecture/ios-project-spec.md), and [remaining work](ios-epics.md).
 
@@ -59,9 +59,9 @@ python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
 | Provider | Catalog generators SANA base/sprint, Anima Turbo, SDXL, Iris, Z-Image Turbo and its control route; registered restoration and composed depth tasks |
 | SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
 | Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
-| Geometry | 512², 768², 1024²; future registered Supra2: 256² |
+| Geometry | Anchors at the 1024² reference geometry (future Supra2: 256²); 512²/768² are derived, never captured (one 512² validation case) |
 | Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade. A route whose control input is required (`z_image_turbo_control`) has no text mode: its `control` and `reference` cells both carry the control image (pose) |
-| Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
+| Strategy | Two anchors per family: rung 0 (resident) and the deepest implemented rung at its cheapest selection (optimized); every rung in between is derived |
 
 Provision complete caller-owned snapshots into a distinct slot for every
 route/tier. The slot name is not proof of stored precision. Iris generation needs
@@ -99,23 +99,115 @@ scripts/ios/push_model.sh "$ZIMAGE_MLX/q4" --campaign-route z_image_turbo --tier
   --control "$ZIMAGE_TURBO_FUN_CONTROLNET_UNION" --device "$DEVICE"
 ```
 
-Campaign case keys are `provider/route/tier/edge/mode/rung/selection`. The
+Campaign case keys are `provider/route/tier/edge/mode/rung/selection/steps`. The
 selection token is the cell's memory selection from the provider's OWN declared
 space (`MemoryProviderContract::selection_space`, read from its weights-free
 contract surface at the campaign's load shape): `s` (optional phase eviction),
 `t<edge>`/`o<overlap>` (decode tile), `c<elements>` (attention chunk), `w<n>`
 (transformer window) and the window scope `dit`/`te`/`both`, `_`-joined; `base`
-when the rung declares no parameter. Every selection is its own cell, executed
-exactly as selected (a token outside the artifact's declared space is a typed
-`strategy` refusal) and recorded in the evidence key's execution levers. The
-listing enumerates them quality first (unstaged before staged; the largest tile,
-chunk and window first; scope `dit` → `te` → `both`); 18,450 cells today.
-Control-required routes (`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) have
-one cell per accepted control kind (`control_pose`, `control_canny`,
-`control_depth`, `reference_pose`, ...) and no plain text mode.
+when the rung declares no parameter. `steps` is the denoise step count the case
+runs (`0` = the provider's own default). A case is executed exactly as selected (a
+token outside the artifact's declared space is a typed `strategy` refusal) and
+recorded in the evidence key's execution levers. The listing (schema 2) names each
+case's `purpose` (`resident`, `optimized`, `validation_steps`,
+`validation_geometry`) and `repeats`, plus every route/tier the provider does not
+serve (`unserved`, never silently dropped). Control-required routes
+(`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) have one family per accepted
+control kind (`control_pose`, `control_canny`, `control_depth`, `reference_pose`,
+...) and no plain text mode.
 
-Z-Image Turbo host-derived reachable sizes (sc-26433) — **predictions, not device
-evidence**. Per mode, tier and edge: the peak of every phase (its resident bytes
+### Anchors and derivation: the recorded memory-anchor rule (epic 16774)
+
+**The campaign measures two extremes per family and derives everything in between.** This is
+the rule SceneWorks already records for its desktop lanes — `docs/memory-strategy-contract.md`:
+"the anchor + analytic derivation is the complete, self-sufficient admission basis", and "every
+non-anchor rung and geometry is now derived analytically from the anchor … rather than measured"
+(`crates/sceneworks-core/src/memory_anchor.rs`, image derivation law). It replaces the exact-match
+evidence table that needed one measured row per model × route × tier × mode × size × rung ×
+selection (18,450 cells). Michael: "measure the extreme cases, fully resident, and fully
+optimized, and estimate in between."
+
+**Anchor family** = `(device, provider, route, tier, path-free artifact layout digest, mode)`.
+Per family at most two anchors (`evidence/ios_device_evidence.json`, schema 3):
+
+| Anchor | Configuration | Captured | Evidence |
+|---|---|---|---|
+| `resident` | rung 0, its first selection | once | completed captures, **or** its typed pre-allocation `capture_refused` quantum (allowed on the 8 GB phone) |
+| `optimized` | the deepest rung the provider implements, its **last (cheapest)** selection — every saving engaged | **3 repeats** | must complete; a refusal is a defect to fix, never evidence |
+
+Both anchors sit at the **reference geometry 1024²** (Supra2: 256²) and run **2 denoise steps**:
+
+* 1024² is the largest ladder size. The fully optimized configuration must fit at every ladder size
+  (see the fit table below), so it completes here by requirement, and this is the tightest cell —
+  where an accurate low end matters — so it is measured, not derived.
+* Derivation from 1024² is safe and tight: SceneWorks `docs/sc-16195` (the desktop MLX activation
+  transient, 7 tiers × 5 geometries) is linear in area above 1024² (≤ 2.0% error from a 1024²
+  anchor) and floored below (a smaller request is never credited, so it errs large). From a 512²
+  anchor the same data shows a fixed-1024²-knee law would **under**-predict 1024² by 49–70%.
+* Two steps, not N: one denoise step's working set is released before the next, so a short run's
+  peak is a long run's; two steps also cross a step-to-step release. The `validation_steps` case
+  checks this on one model.
+
+**Derivation (the anchor law, `mlx-gen-ios-catalog/src/anchor.rs`).** The architecture facts are
+the providers' own COUNTED iOS pricing (`mlx_gen::ios_pricing`): per phase (load, conditioning,
+encode, denoise, decode) the component bytes resident under a regime plus the phase's largest
+counted quantum — the very formulas the per-quantum guards check, read from safetensors headers.
+Per phase `p`: `residue = M_p − C_p(anchor regime)`; the part a formula prices, `s = min(residue,
+S_p(anchor))`, calibrates that formula (`κ = s / S_p(anchor)`, applied only when the request's
+binding quantum IS the anchor's — another quantum gets its formula unscaled); the rest is unpriced
+overhead (driver, allocator), scaled by `λ = max(A_request, A_anchor) / A_anchor`. Then
+`D_p = C_p(request regime) + overhead × λ + S_p(request) × κ` and `demand = max_p D_p`. At the
+anchor's own configuration this IS the measurement. Requests are derived **upward from the
+optimized anchor** toward resident; a completed resident anchor only prices its own regime at
+other geometries. Not derivable → typed `no_evidence` (fail closed): another mode / tier / route /
+layout (decoder, components) / device; a phase the anchor never ran; a phase whose measured growth
+is below its resident components (outside the law's domain); a provider with no counted pricing
+(only its anchors' own keys admit).
+
+**Self-check.** When both anchors completed, the optimized anchor predicts the resident anchor's
+own configuration. An under-prediction beyond **12.6%** (the measured same-cell MLX recapture
+spread, SceneWorks `MLX_ACTIVE_RECAPTURE_SPREAD`) fails every derivation of the family closed;
+an over-prediction beyond it is flagged (derivations then err large).
+
+**Low end: admission is the measurement.** At the optimized anchor's own key admission charges the
+largest of its 3 repeats' growth (kernel lifetime `phys_footprint` peak − the capture's starting
+footprint) **plus the margin = the repeats' measured spread (max − min), floored at 32 MiB** (an
+engineering floor so three identical repeats never claim a zero margin; ~0.5% of the 6142 MiB
+launch headroom). No counted-formula scratch and no 512 MiB formula reserve is stacked on a
+measured anchor: `demand + margin` must fit live headroom (`runtime-ios`'s incremental recheck,
+unchanged: only growth realized since admission is credited). The admitted load and every render
+then run inside that **measured envelope** (`ios_quantum::open_admitted_envelope`): while the
+process stays within it, a quantum guard needs only the envelope's remaining bytes when that is
+less than its formula price; past the envelope every guard is back on its formula (the runtime
+safety net). Captures run on the formula guards alone.
+
+**Per-phase capture.** Every quantum check and synchronization reads the kernel lifetime peak
+(`task_vm_info` REV3); growth inside an opened quantum belongs to that quantum's phase (the
+provider's `ios_quantum_phase(label)`), glue after a synchronization to the next quantum's. A
+phase is `exact` when the lifetime peak rose inside it, else an upper bound (masked by an earlier
+phase). An unattributed phase is priced at the whole-run peak.
+
+**Campaign size.** `campaign.py list` (the runner's own catalog, never a hand list) currently
+plans <!-- CASES --> — versus 18,450 cells before; the 20,000-case budget is gone by
+construction (`--max-cases` is an optional cap). Estimated phone time (stated assumptions, low
+confidence): a resident anchor ~0.75 min (most refuse at an early load quantum on 8 GB), an
+optimized capture ~2.5 min (cold launch + load from flash + 2 steps + tiled decode at 1024²),
+the two validation cases ~5 min each: <!-- PHONE TIME -->.
+
+**Validation cases (part of the campaign, not optional).** For the first optimized family in
+catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
+captured beside the anchor (`evidence` prints full/short growth, whole run and per phase); and
+`validation_geometry` — the optimized configuration at 512², run **ADMITTED** with
+`campaign.py validate` once the anchors are committed: the row records the anchor law's derived
+demand (`admitted.demand_bytes`, basis `Derived`) and the measured growth, and `validate` prints
+the error.
+
+<!-- FITS TABLE -->
+
+Z-Image Turbo host-derived reachable sizes (sc-26433), kept as the pre-anchor
+record of the quality-first selection walk the campaign NO LONGER performs (it
+captures the cheapest selection as the optimized anchor and derives the rest) —
+**predictions, not device evidence**. Per mode, tier and edge: the peak of every phase (its resident bytes
 plus its largest counted quantum's live input and scratch, `Backend::Metal`, plus
 the 512 MiB reserve) against the 6142 MiB entitled launch headroom, under each
 rung-4 selection in the capture ladder's quality-first order. Unstaged cells keep
@@ -201,45 +293,36 @@ has a separate bounded grace window. Launch exit codes are retained.
 `--memory-entitlement on|off` applies to the once-installed build. Every case
 requires a fresh matching `launch-memory.txt`; missing copies are failures.
 Each case/probe has its own host artifact directory alongside the JSONL file.
-`--max-cases` counts both renders and next-up probes; exhausted cells are explicit
-skips. Direct `run_smoke.sh --campaign-case` flags delegate to this same driver,
+`--max-cases` (optional; the anchor listing is finite by construction) counts renders,
+repeats and next-up probes; exhausted cases are explicit skips. Direct `run_smoke.sh --campaign-case` flags delegate to this same driver,
 never to the legacy reinstall/terminate-existing path.
 
 ```sh
-# One exact cold case (JSONL output must not already exist):
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sana_1600m/sana_1600m/q4/512/text/2/t512_o48 --device "$DEVICE" \
-  --output "$EVIDENCE/sana-512.jsonl"
-# One selected model/tier ladder, including all its registered modes and rungs:
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --provider iris_3b --tier q8 --device "$DEVICE" --output "$EVIDENCE/iris-q8.jsonl"
-# Full catalog-driven campaign; no hand-maintained model list:
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --all-cases --device "$DEVICE" --output "$EVIDENCE/all.jsonl"
-# Explicit next-up REFUSAL-ONLY probe after an admitted completion. This NEVER
-# loads weights at the larger geometry, even if its metadata preflight admits it.
-python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sdxl/sdxl/q4/1024/text/2/t896_o64 --next-edge 1280 --device "$DEVICE" \
-  --output "$EVIDENCE/sdxl-next-up.jsonl"
-# Bounded DEVICE CAPTURE (labelled diagnostic, never production): no evidence row is
-# needed, because every quantum of every registered model checks live OS headroom
-# BEFORE constructing its graph. Each model/route/tier/mode/rung ladder is walked
-# 512 -> 768 -> 1024; at each size its selections run quality first, stepping to the
-# next cheaper selection only after a capture refusal (a completed selection carries
-# up to the next size). The ladder stops at the first size where even the cheapest
-# selection refuses, or at any failure; a `capture_refused` row names the refused
-# quantum (the refused-before-jetsam evidence). No cell runs twice; the cap is never
-# raised.
+# The anchor campaign. Step 1 — capture every resident, optimized (x3) and validation_steps case
+# as a labelled bounded DEVICE CAPTURE (no evidence needed: every quantum of every registered model
+# checks live OS headroom BEFORE constructing its graph). A resident `capture_refused` row is that
+# anchor's evidence; an optimized anchor that does not complete is a DEFECT (exit 2). No size or
+# selection ladder is walked and nothing runs that is not in the listing.
 python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
-  --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
-  --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
-# Candidate rows for the single reviewed table. PRINTED for review; a human commits
-# them to crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json
-# (schema 2: each row carries the capture's starting `baseline_footprint_bytes`; admission
-# charges only peak - baseline, credits only growth realized since admission, and keeps the
-# 512 MiB reserve, so a product's unrelated residents are never counted as free headroom).
-python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/sana-q4-text-r2-capture.jsonl"
-python3 scripts/ios/campaign.py table --input "$EVIDENCE/all.jsonl"
+  --all-cases --device "$DEVICE" --output "$EVIDENCE/anchors.jsonl"
+# One family only (e.g. to re-capture after a fix):
+python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
+  --provider sana_1600m --tier q4 --mode text --device "$DEVICE" --output "$EVIDENCE/sana-q4.jsonl"
+# Step 2 — candidate schema-3 ANCHOR rows for the single reviewed table, PRINTED for review (plus
+# the full-steps / short-steps validation and any problem: < 3 completed optimized repeats, a
+# refused optimized anchor). A human commits them to
+# crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json.
+python3 scripts/ios/campaign.py evidence --input "$EVIDENCE/anchors.jsonl"
+# Step 3 — after the anchors are committed and the app rebuilt: the validation_geometry case runs
+# ADMITTED, so its row records the anchor law's derived demand next to the measured growth.
+python3 scripts/ios/campaign.py validate --catalog /tmp/ios-campaign-catalog.json \
+  --all-cases --device "$DEVICE" --output "$EVIDENCE/validate.jsonl"
+# Any configuration of the catalog's domain, ADMITTED (an anchor key admits at its measurement,
+# anything else at its anchor-law derivation):
+python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
+  --case sana_1600m/sana_1600m/q4/768/text/3/s_t192_o48_c1048576/0 --device "$DEVICE" \
+  --output "$EVIDENCE/sana-768.jsonl"
+python3 scripts/ios/campaign.py table --input "$EVIDENCE/anchors.jsonl"
 ```
 
 Each case emits `CAMPAIGN_JSON` and JSONL with elapsed seconds, sampled MLX
@@ -252,7 +335,10 @@ is recorded as an explicit `kernel_lifetime_peak_unavailable` reading, never a s
 layout identity, the full memory-relevant `evidence_key` (hardware, provider,
 route, tier, layout, mode, geometry, references, execution levers, token window;
 never prompt/seed/path), `evidence_class` (`admitted` or `capture`), any typed
-`refused_quantum`, selected strategy parameters, evidence revision,
+`refused_quantum`, selected strategy parameters, the structured `anchor_selection`,
+`steps`, the per-phase `phase_peaks` (`{phase: {peak_bytes, exact}}`, split from the
+kernel lifetime peak through the quantum marks), an admitted case's `admitted`
+price (`demand_bytes`, `margin_bytes`, `basis`: measured anchor or derived), evidence revision,
 entitlement, refusal-only marker, per-launch nonce, compiled build SHA and iOS
 version. The nonce prevents a previous report with the same case/SHA from passing
 freshness checks. Render
@@ -267,16 +353,19 @@ construction), `diagnostic_failure`, or `skipped` (explicit host case budget). M
 reports, timeout, malformed output or a terminated process cannot prove admission
 refusal. Missing physical-footprint/headroom telemetry cannot yield production
 success. Noncompletion returns nonzero; a successful listing is not a render.
-The table includes the largest **admitted** completed edge per route/tier/mode/
-strategy, active/cache/combined columns and probe markers. Refusals have typed
+The table includes each row's purpose, active/cache/combined columns, probe markers,
+any optimized-anchor DEFECT, and per anchor case its completed repeats' demand
+(kernel lifetime peak − capture baseline) or its typed refusal. Refusals have typed
 `refusal_kind`: `capacity`, `no_evidence`, `mode`, `strategy`, or `artifact`,
 taken from runtime-ios's typed refusal, never parsed from a message. Only a
 **capacity** refusal proves the next-up condition (an admitted capacity refusal,
 or a capture's typed quantum refusal); missing footprint evidence, unsupported
 modes/rungs, malformed sources and termination never prove it. Layout-profile
 and request-binding errors are failures before admission, not capacity refusals.
-Commit the actual measured table only after the terminal campaign, not this
-harness change. The 4096 MiB budget remains provisional; 6142/3374 MiB launch
+Commit the actual measured anchors only after the terminal campaign, not this
+harness change. The 4096 MiB budget remains provisional (admission still checks a
+projected absolute footprint against it, so until sc-16780 measures the cap a
+measured demand above it is a typed capacity refusal); 6142/3374 MiB launch
 readings remain unvalidated diagnostics, and no cap/table is invented here.
 
 ### Bounded synthetic primitive characterization (sc-16780)
@@ -600,10 +689,11 @@ its active+cache values are **not** kernel `phys_footprint`, and it is not the
 
 ## 8. Terminal device campaign — not yet measured
 
-sc-26270 owns the model × tier campaign at 512²/768²/1024² (Supra2: 256²), the
-largest completed size and next-size refusal, feature review, pin and main
-integration. Retain every registered mode; report explicit refusals, not missing
-cells. Add real rows here only after captures, with this schema:
+sc-26270 owns the ANCHOR campaign (per served provider route × tier × mode: the
+resident anchor and the 3x optimized anchor at 1024² with 2 steps, plus the two
+validation cases), feature review, pin and main integration. Retain every
+registered mode; report explicit refusals, not missing cells. Add real rows here
+only after captures, with this schema:
 
 | Source SHA / artifact layout and component tiers | Phone / OS / entitlement | Provider / mode / size / strategy | Time | MLX peak | Kernel footprint | Min headroom | Completed / refused / unconfirmed termination | Image / diagnostic receipt |
 |---|---|---|---|---|---|---|---|---|

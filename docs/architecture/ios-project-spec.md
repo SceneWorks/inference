@@ -51,11 +51,14 @@ Every registered image model and mode loads through ONE admission seam
   the admitted index plus a `BoundGenerator`. `load_iris_restore` returns a `BoundTransform`,
   `load_iris_depth` a `BoundDepth`. Each requires `bound_mlx_to_platform_limits()` first, then
   keys the request (hardware, provider, route, tier, path-free layout digest, mode, geometry,
-  reference count, execution levers, token window — never prompt, seed or install path), looks
-  the key up in the single reviewed table
-  `crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json`, runs the provider's
-  registered `standard_memory_strategy_safety_check` with the captured footprint against the
-  provisional cap and live headroom, and only then loads. The bound wrapper rechecks the exact
+  reference count, execution levers, token window — never prompt, seed or install path), prices
+  it from the single reviewed ANCHOR table
+  `crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json` (schema 3: per
+  family a resident and a fully optimized anchor; at an anchor's own key its measured growth, else
+  the anchor-law derivation `mlx-gen-ios-catalog/src/anchor.rs` over the providers' counted
+  pricing), runs the provider's registered `standard_memory_strategy_safety_check` with that demand
+  plus the anchor's measured repeat-spread margin against the provisional cap and live headroom,
+  and only then loads, inside the admission's measured envelope (`ios_quantum`). The bound wrapper rechecks the exact
   request (geometry, tile, mode, conditioning, prompt, execution), live capacity and source pins
   before every provider call and preserves cancellation.
 - Refusals are typed (`media::RefusalKind`: capacity, no_evidence, mode, strategy, artifact). The
@@ -70,7 +73,8 @@ Every registered image model and mode loads through ONE admission seam
   the model checks live OS headroom before constructing its graph (`mlx_gen::ios_quantum`, a
   physical device). A quantum that does not fit refuses before allocating; that typed refusal
   (`ios_quantum::take_refusal`) is the "next size refused before jetsam" evidence. Capture output
-  never changes admission: `scripts/ios/campaign.py evidence` prints candidate rows for review.
+  never changes admission: `scripts/ios/campaign.py evidence` prints candidate anchor rows for
+  review.
   There are no unadmitted image or depth loaders.
 
 ## Evidence and measurement contract
