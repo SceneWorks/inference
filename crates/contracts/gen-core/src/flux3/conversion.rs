@@ -326,7 +326,7 @@ impl ConversionReceipt {
             .filter(|c| c.placement == ComponentPlacement::External)
         {
             for (path, want) in &component.files {
-                let got = hash_file(&resolve(component.role, path)?)?;
+                let got = hash_source_file(&resolve(component.role, path)?)?;
                 if &got != want {
                     return Err(invalid(format!(
                         "external {} file {path} does not match the recorded source checksum",
@@ -380,6 +380,16 @@ impl ConversionReceipt {
         }
         Ok(())
     }
+}
+
+/// [`hash_file`] for a SOURCE input, which may legitimately be a symlink (a Hugging Face cache
+/// snapshot links every file to its content-addressed blob). The link is resolved once and the
+/// REAL file's bytes are hashed; a dangling link or a link to a non-file is refused. Owned
+/// conversion outputs never use this: they must be regular files.
+pub fn hash_source_file(path: &Path) -> Result<OutputFile> {
+    let real = fs::canonicalize(path)
+        .map_err(|e| invalid(format!("resolve source {}: {e}", path.display())))?;
+    hash_file(&real)
 }
 
 /// Full-file size + SHA-256 of `path` (a regular file, never a symlink).
@@ -595,13 +605,49 @@ impl Drop for OwnedOutput {
     }
 }
 
+/// How durable a successful publication is. The rename is the commit point: once it succeeded
+/// the output IS published, so a later failure to fsync the parent directory is a durability
+/// warning, never a failed publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublishStatus {
+    Durable,
+    /// Published (renamed into place), but syncing the parent directory failed with this error.
+    ParentSyncFailed(String),
+}
+
+/// The exact recovery for a lock a crashed conversion left behind. Nothing is deleted
+/// automatically: the lock may belong to a live conversion this process cannot observe.
+fn stale_lock_refusal(
+    lock: &Path,
+    final_dir: &Path,
+    parent: &Path,
+    name: &str,
+    e: &std::io::Error,
+) -> Error {
+    let owner = fs::read_to_string(lock).unwrap_or_default();
+    let owner = if owner.trim().is_empty() {
+        "an unidentified process".to_owned()
+    } else {
+        owner.trim().to_owned()
+    };
+    invalid(format!(
+        "cannot claim output lock {} ({e}; held by {owner}). If no conversion into {} is running, \
+         a previous one crashed: delete {} and every `.{name}.flux3-conversion-*` stage directory \
+         in {}, then retry. Nothing was deleted automatically.",
+        lock.display(),
+        final_dir.display(),
+        lock.display(),
+        parent.display(),
+    ))
+}
+
 /// Publish only to a NEW immutable destination. The lock is create-new: a foreign
 /// or stale lock is an actionable refusal, never permission to delete it. All
 /// cleanup names were created by this call; no sibling wildcard sweep is used.
 pub fn publish_conversion(
     final_dir: &Path,
     write: impl FnOnce(&Path) -> Result<ConversionReceipt>,
-) -> Result<()> {
+) -> Result<PublishStatus> {
     let parent = final_dir
         .parent()
         .ok_or_else(|| invalid("output needs a parent directory"))?;
@@ -611,11 +657,13 @@ pub fn publish_conversion(
         .ok_or_else(|| invalid("invalid output name"))?;
     fs::create_dir_all(parent)?;
     let lock = parent.join(format!(".{name}.flux3-conversion.lock"));
-    let lock_file = OpenOptions::new()
+    let mut lock_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock)
-        .map_err(|e| invalid(format!("cannot claim output lock {}: {e}", lock.display())))?;
+        .map_err(|e| stale_lock_refusal(&lock, final_dir, parent, name, &e))?;
+    // Name the owner, so a stale lock's refusal says which process left it.
+    let _ = writeln!(lock_file, "pid {}", std::process::id());
     let stage = parent.join(format!(
         ".{name}.flux3-conversion-{}-{}",
         std::process::id(),
@@ -659,11 +707,14 @@ pub fn publish_conversion(
         ));
     }
     fs::rename(&owned.stage, final_dir)?;
-    // On platforms that allow opening directories, sync the rename as well.
+    // On platforms that allow opening directories, sync the rename as well. The publish already
+    // happened; a sync failure is reduced durability, not a failed publish.
     if let Ok(dir) = File::open(parent) {
-        dir.sync_all()?;
+        if let Err(e) = dir.sync_all() {
+            return Ok(PublishStatus::ParentSyncFailed(e.to_string()));
+        }
     }
-    Ok(())
+    Ok(PublishStatus::Durable)
 }
 
 pub fn open_conversion(dir: &Path) -> Result<ConversionReceipt> {

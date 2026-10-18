@@ -27,11 +27,19 @@ impl<T> Default for PhaseResourceSlot<T> {
 }
 
 impl<T> PhaseResourceSlot<T> {
+    /// The ownership lock. It is held across load and run, so a panic there poisons it. A
+    /// poisoned slot is recovered rather than bricked: any owner it still holds is marked
+    /// `pending_release`, so the next request fences and drops it before anything reuses it
+    /// (the panicking phase may have left that owner mid-operation).
     fn lock(&self) -> Result<MutexGuard<'_, State<T>>> {
-        self.state.lock().map_err(|_| {
-            Error::Msg(
-                "FLUX3 phase-resource ownership lock poisoned; cleanup cannot be proved".into(),
-            )
+        Ok(match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.state.clear_poison();
+                let mut guard = poisoned.into_inner();
+                guard.pending_release = guard.resource.is_some();
+                guard
+            }
         })
     }
 

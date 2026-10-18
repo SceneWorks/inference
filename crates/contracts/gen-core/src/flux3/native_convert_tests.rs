@@ -161,3 +161,97 @@ fn chains_publisher_targets_cancellation_and_existing_outputs_are_refused() {
     .is_err());
     assert!(!bad.exists());
 }
+
+#[cfg(unix)]
+fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+#[cfg(windows)]
+fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+/// A Hugging Face cache snapshot links every file to a content-addressed blob. Conversion follows
+/// those FILE links, hashes the real bytes, and produces the same receipt as a plain copy; the
+/// external components verify through the links too.
+///
+/// *Mutations that red this:* hashing with the strict `hash_file` (refuses links), or recording
+/// the link target path instead of the package-relative name.
+#[test]
+fn symlinked_snapshot_converts_like_a_plain_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = source_copy(dir.path());
+    let blobs = plain.root.clone();
+    let snapshot = dir.path().join("snapshot");
+    std::fs::create_dir_all(snapshot.join("text_encoder")).unwrap();
+    let mut files = vec![
+        "config.json".to_string(),
+        "model.safetensors".into(),
+        "ae.safetensors".into(),
+        "LICENSE.md".into(),
+        "NOTICE.md".into(),
+    ];
+    for entry in std::fs::read_dir(blobs.join("text_encoder")).unwrap() {
+        files.push(format!(
+            "text_encoder/{}",
+            entry.unwrap().file_name().to_string_lossy()
+        ));
+    }
+    for name in &files {
+        if let Err(e) = link_file(&blobs.join(name), &snapshot.join(name)) {
+            if cfg!(windows) {
+                eprintln!("SKIP: this Windows host cannot create symlinks ({e}); Linux CI runs it");
+                return;
+            }
+            panic!("symlink {name}: {e}");
+        }
+    }
+    let linked = ConversionSource {
+        root: snapshot.clone(),
+        ..plain.clone()
+    };
+    let from_plain =
+        convert_affine(&plain, 4, 64, &dir.path().join("plain"), &CancelFlag::new()).unwrap();
+    let from_links = convert_affine(
+        &linked,
+        4,
+        64,
+        &dir.path().join("links"),
+        &CancelFlag::new(),
+    )
+    .unwrap();
+    assert_eq!(from_plain, from_links);
+    from_links.verify_external(&snapshot).unwrap();
+    // A linked DIRECTORY is still refused: it could escape the package.
+    let escape = dir.path().join("escape");
+    std::fs::create_dir_all(&escape).unwrap();
+    for name in [
+        "config.json",
+        "model.safetensors",
+        "ae.safetensors",
+        "LICENSE.md",
+        "NOTICE.md",
+    ] {
+        std::fs::copy(blobs.join(name), escape.join(name)).unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(blobs.join("text_encoder"), escape.join("text_encoder")).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_dir(blobs.join("text_encoder"), escape.join("text_encoder"))
+        .is_err()
+    {
+        return;
+    }
+    let escaped = ConversionSource {
+        root: escape,
+        ..plain
+    };
+    assert!(convert_affine(
+        &escaped,
+        4,
+        64,
+        &dir.path().join("escaped"),
+        &CancelFlag::new()
+    )
+    .is_err());
+}

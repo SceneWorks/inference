@@ -195,9 +195,35 @@ fn unlisted_or_duplicate_output_and_foreign_lock_are_refused() {
     assert!(bad.is_err());
     assert!(!target.exists());
     let lock = temp.path().join(".converted.flux3-conversion.lock");
-    fs::write(&lock, b"foreign owner").unwrap();
-    assert!(publish_conversion(&target, |_| panic!("foreign lock must be respected")).is_err());
-    assert_eq!(fs::read(&lock).unwrap(), b"foreign owner");
+    fs::write(&lock, b"pid 4242").unwrap();
+    let refusal = publish_conversion(&target, |_| panic!("foreign lock must be respected"))
+        .unwrap_err()
+        .to_string();
+    // A stale lock is never deleted for the caller; the refusal gives the exact recovery.
+    assert!(refusal.contains("pid 4242"), "{refusal}");
+    assert!(refusal.contains("delete"), "{refusal}");
+    assert!(
+        refusal.contains(".converted.flux3-conversion-*"),
+        "{refusal}"
+    );
+    assert_eq!(fs::read(&lock).unwrap(), b"pid 4242");
+    fs::remove_file(&lock).unwrap();
+    assert_eq!(
+        publish_conversion(&target, |dir| {
+            populate(dir)?;
+            Ok(receipt())
+        })
+        .unwrap(),
+        PublishStatus::Durable,
+        "after the documented recovery the publish succeeds"
+    );
+    assert!(
+        !temp
+            .path()
+            .join(".converted.flux3-conversion.lock")
+            .exists(),
+        "a finished conversion releases its own lock"
+    );
     let mut r = receipt();
     r.package_files.insert(
         "ae.safetensors".into(),

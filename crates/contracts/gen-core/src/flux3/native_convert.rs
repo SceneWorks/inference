@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use super::artifacts::NativeDitStorage;
 use super::conversion::{
-    hash_file, publish_conversion, ComponentInventory, ComponentPlacement, ComponentRole,
-    ConversionReceipt, OutputFile,
+    hash_file, hash_source_file, publish_conversion, ComponentInventory, ComponentPlacement,
+    ComponentRole, ConversionReceipt, OutputFile,
 };
 use super::quantization::DitFormat;
 use super::safetensors_stream::{
@@ -50,16 +50,27 @@ pub type Packed = BTreeMap<String, Vec<u8>>;
 /// Every regular file under `root/rel` (sorted, `/`-separated, relative to `root`), hashed.
 fn hash_tree(root: &Path, rel: &str) -> Result<BTreeMap<String, OutputFile>> {
     let mut out = BTreeMap::new();
+    let start = root.join(rel);
+    if std::fs::symlink_metadata(&start)?.file_type().is_symlink() {
+        return Err(invalid(format!("{} links a directory", start.display())));
+    }
     let mut stack = vec![root.join(rel)];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let ty = entry.file_type()?;
             let path = entry.path();
-            if ty.is_symlink() {
-                return Err(invalid(format!("{} is a symlink", path.display())));
-            }
-            if ty.is_dir() {
+            // A snapshot links each FILE to its blob; a linked directory would let the tree escape
+            // the package, so only file links are followed (and hashed by their real bytes).
+            let is_dir = if ty.is_symlink() {
+                if std::fs::metadata(&path)?.is_dir() {
+                    return Err(invalid(format!("{} links a directory", path.display())));
+                }
+                false
+            } else {
+                ty.is_dir()
+            };
+            if is_dir {
                 stack.push(path);
             } else {
                 let name = path
@@ -68,7 +79,7 @@ fn hash_tree(root: &Path, rel: &str) -> Result<BTreeMap<String, OutputFile>> {
                     .to_str()
                     .ok_or_else(|| invalid("non-UTF8 source path"))?
                     .replace('\\', "/");
-                out.insert(name, hash_file(&path)?);
+                out.insert(name, hash_source_file(&path)?);
             }
         }
     }
@@ -98,7 +109,11 @@ pub fn convert_native(
             "publisher FP8R/NVFP4 are imported as shipped, never produced by repacking",
         ));
     }
-    let root = &source.root;
+    // Resolve the root once (it may itself be a linked snapshot directory); every input below is
+    // read and hashed through it, by real bytes.
+    let root_buf = std::fs::canonicalize(&source.root)
+        .map_err(|e| invalid(format!("resolve {}: {e}", source.root.display())))?;
+    let root = &root_buf;
     let config = Flux3Config::from_dir(root)?;
     config.validate_supported()?;
     let dense = NativeDitStorage::from_package(root)?;
@@ -159,21 +174,23 @@ pub fn convert_native(
     let mut config_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(CONFIG_FILE))?).map_err(invalid)?;
     config_json["quantization"] = storage.marker()?;
-    let dit_artifacts =
-        BTreeMap::from([(DIT_WEIGHTS_FILE.to_owned(), hash_file(&dit_source)?.sha256)]);
+    let dit_artifacts = BTreeMap::from([(
+        DIT_WEIGHTS_FILE.to_owned(),
+        hash_source_file(&dit_source)?.sha256,
+    )]);
     let ae_files = BTreeMap::from([(
         config.vae.path.clone(),
-        hash_file(&root.join(&config.vae.path))?,
+        hash_source_file(&root.join(&config.vae.path))?,
     )]);
     let te_files = hash_tree(root, &config.text_encoder.path)?;
     let mut source_artifacts = dit_artifacts.clone();
     source_artifacts.insert(
         CONFIG_FILE.into(),
-        hash_file(&root.join(CONFIG_FILE))?.sha256,
+        hash_source_file(&root.join(CONFIG_FILE))?.sha256,
     );
 
     let mut receipt = None;
-    publish_conversion(output, |stage| {
+    let status = publish_conversion(output, |stage| {
         let mut writer = SafetensorsStreamWriter::create(
             &stage.join(DIT_WEIGHTS_FILE),
             planned.clone(),
@@ -279,6 +296,12 @@ pub fn convert_native(
         receipt = Some(built.clone());
         Ok(built)
     })?;
+    if let super::conversion::PublishStatus::ParentSyncFailed(error) = &status {
+        eprintln!(
+            "flux3 conversion published {} but its parent directory sync failed ({error}); the \n             output is complete and verified, its rename may not survive a power loss",
+            output.display()
+        );
+    }
     receipt.ok_or_else(|| invalid("publication returned no receipt"))
 }
 

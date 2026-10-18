@@ -296,3 +296,61 @@ fn warm_resident_to_exclusive_drops_old_owner_before_new_load() {
         ]
     );
 }
+
+/// A panic inside the caption phase poisons the ownership lock; the slot recovers, and the owner
+/// the panicking phase left behind is fenced and dropped before the next request reuses anything.
+///
+/// *Mutations that red this:* surfacing the poison as a permanent error, or recovering without
+/// marking the surviving owner `pending_release`.
+#[test]
+fn a_panicking_phase_poisons_nothing_and_its_owner_is_released_first() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slot = PhaseResourceSlot::default();
+    let (owner, weak) = resource(&events);
+    let cancel = CancelFlag::new();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = slot.with_request(
+            true,
+            false,
+            &cancel,
+            || Ok(owner),
+            |_| -> Result<()> { panic!("caption phase panicked") },
+            |_| Ok(()),
+            || {},
+        );
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        slot.is_loaded().unwrap(),
+        "the panicking phase left its owner"
+    );
+    assert!(
+        slot.cleanup_pending().unwrap(),
+        "recovery marks it for release"
+    );
+    events.lock().unwrap().clear();
+    let (next, _) = resource(&events);
+    let value = slot
+        .with_request(
+            true,
+            false,
+            &cancel,
+            || {
+                events.lock().unwrap().push("load");
+                Ok(next)
+            },
+            |_| Ok(7),
+            |_| {
+                events.lock().unwrap().push("fence");
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap();
+    assert_eq!(value, 7);
+    assert!(
+        weak.upgrade().is_none(),
+        "the surviving owner was really dropped"
+    );
+    assert_eq!(*events.lock().unwrap(), vec!["fence", "drop-owner", "load"]);
+}
