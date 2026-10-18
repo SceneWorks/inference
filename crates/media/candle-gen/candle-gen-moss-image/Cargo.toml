@@ -1,0 +1,28 @@
+[package]
+name = "candle-gen-moss-image"
+version = "0.0.0"
+edition = "2021"
+description = "Native MOSS-Image Base/SFT and published optional DMD execution."
+license = "Apache-2.0"
+autotests = false
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+candle-gen-flux2 = { path = "../candle-gen-flux2" }
+candle-llm = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-llm/cuda"]
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-llm/metal"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"

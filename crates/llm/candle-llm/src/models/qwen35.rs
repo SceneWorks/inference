@@ -2608,6 +2608,17 @@ impl Qwen35Model {
     /// cache and the static path stay one arithmetic); both keep the cache's host-side state
     /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
+        self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+    }
+
+    fn hidden_checked(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        check(input_ids)?;
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let s = h.dim(1)?;
         if s <= MAX_DEVICE_STEP_TOKENS
@@ -2627,6 +2638,7 @@ impl Qwen35Model {
                 .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
             let mut h = h;
             for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+                check(&h)?;
                 h = layer.forward_with(
                     &h,
                     &cos,
@@ -2636,13 +2648,14 @@ impl Qwen35Model {
                     Some(positions),
                     None,
                 )?;
+                check(&h)?;
             }
             return Ok(h);
         }
         let (cos, sin) = self
             .rope
             .cos_sin(s as i32, offset, self.dtype, &self.device)?;
-        self.hidden_from_embeds(&h, &cos, &sin, cache)
+        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check)
     }
 
     /// The step start a short cached step attends from with the length-aware decode attention
@@ -2671,10 +2684,23 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        self.hidden_from_embeds_checked(embeds, cos, sin, cache, &mut |_| Ok(()))
+    }
+
+    fn hidden_from_embeds_checked(
+        &self,
+        embeds: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35Cache,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        check(embeds)?;
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            check(&h)?;
             h = layer.forward_with(
                 &h,
                 cos,
@@ -2684,6 +2710,7 @@ impl Qwen35Model {
                 None,
                 decode_start.as_ref(),
             )?;
+            check(&h)?;
         }
         Ok(h)
     }
@@ -2739,7 +2766,30 @@ impl Qwen35Model {
         cache: &mut Qwen35Cache,
         offset: i32,
     ) -> Result<Tensor> {
-        self.normalize(&self.hidden(input_ids, cache, offset)?)
+        self.forward_hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+    }
+
+    /// Final-normalized headless states with cooperative checks before/after every decoder block
+    /// and final norm. Any error resets KV/recurrent state, allowing clean prompt reentry.
+    /// The callback uses engine errors and may return [`Error::Canceled`].
+    pub fn forward_hidden_checked(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        let result = (|| {
+            let h = self.hidden_checked(input_ids, cache, offset, check)?;
+            check(&h)?;
+            let hidden = self.normalize(&h)?;
+            check(&hidden)?;
+            Ok(hidden)
+        })();
+        if result.is_err() {
+            cache.reset();
+        }
+        result
     }
 
     /// Target verification output for Qwen3.8 MTP: logits and final-normalized target hidden states
@@ -3922,6 +3972,45 @@ pub(crate) mod tests {
                 .forward(&ids(&[1]), &mut encoder.new_cache(), 0)
                 .is_err());
         }
+    }
+
+    #[test]
+    fn headless_checked_callback_cancels_between_layers_and_resets_cache() {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let weights = synthetic_weights_with_prefix(&cfg, "language_model");
+        let model =
+            Qwen35Model::from_weights_headless(&weights, "language_model", cfg.clone()).unwrap();
+        let mut cache = model.new_cache();
+        let expected = model
+            .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        cache.reset();
+        let mut calls = 0;
+        let checked = model
+            .forward_hidden_checked(&ids(&[1, 7, 3]), &mut cache, 0, &mut |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 2 * cfg.num_layers + 4);
+        assert!(max_abs_diff(&checked, &expected) < 1e-6);
+        cache.reset();
+        let mut calls = 0;
+        let result = model.forward_hidden_checked(&ids(&[1, 7, 3]), &mut cache, 0, &mut |_| {
+            calls += 1;
+            if calls == 4 {
+                Err(Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(calls, 4);
+        assert_eq!(cache.offset(), 0);
+        let recovered = model
+            .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        assert!(max_abs_diff(&recovered, &expected) < 1e-6);
     }
 
     #[test]
