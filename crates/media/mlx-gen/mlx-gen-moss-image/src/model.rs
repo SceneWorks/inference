@@ -16,7 +16,7 @@ use mlx_gen::{
     ModelDescriptor, OffloadPolicy, Precision, Progress, Result,
 };
 use mlx_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 use std::{collections::BTreeMap, sync::Mutex};
 
 fn incremental_peak(peak: u64, owned: u64, committed: u64) -> u64 {
@@ -434,11 +434,7 @@ impl MossImage {
             mlx_rs::transforms::eval([&latents])?;
             let output = match inputs.output {
                 MossImageOutputKind::Latents => {
-                    let values = latents
-                        .as_dtype(Dtype::Float32)?
-                        .try_as_slice::<f32>()
-                        .map_err(|e| Error::Msg(e.to_string()))?
-                        .to_vec();
+                    let values = crate::pipeline::logical_f32_readback(&latents)?;
                     if values.iter().any(|v| !v.is_finite()) {
                         return Err(Error::Msg("nonfinite MOSS latent output".into()));
                     }
