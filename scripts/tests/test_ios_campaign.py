@@ -354,7 +354,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(set(optimized), {"key", "anchor_kind", "selection", "outcome", "evidence_class"})
         captures = optimized["outcome"]["completed"]["captures"]
         self.assertEqual([c["run_id"] for c in captures], ["a", "b", "c"])
-        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds"})
+        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "quanta", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds"})
         self.assertEqual((captures[2]["footprint_bytes"], captures[2]["baseline_footprint_bytes"]), (170, 40))
         self.assertEqual(captures[0]["phase_peaks"], {"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
         self.assertEqual(captures[0]["steps"], 1)
@@ -381,6 +381,22 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("never changes admission", printed.getvalue())
         self.assertIn('"schema": 3', printed.getvalue())
         self.assertEqual(table.read_bytes(), before, "evidence output is printed, never written")
+
+    def test_the_per_formula_device_calibration_table(self):
+        mib = 1 << 20
+        def row(run, quanta):
+            return dict(self.capture_row(self.keys[1], "diagnostic_success"), run_id=run, kernel_lifetime_phys_footprint_peak_bytes=4000 * mib, baseline_phys_footprint_bytes=100 * mib, quanta=quanta)
+        q = lambda p, o, e: {"priced_scratch_bytes": p * mib, "observed_bytes": o * mib, "exact": e}
+        rows = [row("a", {"tile": q(400, 200, True), "block": q(100, 95, True)}),
+                row("b", {"tile": q(400, 260, True), "block": q(100, 300, False)}),
+                row("c", {"tile": q(400, 999, False), "bad": {"priced_scratch_bytes": True, "observed_bytes": 1, "exact": True}})]
+        table = campaign.calibration_table(rows)
+        self.assertEqual(set(table), {"tile", "block"}, "malformed observations are dropped")
+        self.assertEqual((table["tile"]["priced_scratch_bytes"], table["tile"]["observed_bytes"]), (400 * mib, 260 * mib))
+        self.assertEqual((table["tile"]["exact_captures"], table["tile"]["masked_captures"]), (2, 1))
+        self.assertTrue(table["tile"]["over_priced_beyond_margin"], "400 priced vs 260 observed > 32 MiB")
+        self.assertFalse(table["block"]["over_priced_beyond_margin"], "100 vs 95 is within the margin")
+        self.assertEqual(table["tile"]["priced_over_observed"], round(400 / 260, 4))
 
     def test_steps_and_geometry_validation_reports(self):
         opt = self.keys[1].replace("/text/", "/text/")

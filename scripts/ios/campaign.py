@@ -39,6 +39,8 @@ STEPS_MAX = 100
 PURPOSES = ("resident", "optimized", "validation_steps", "validation_geometry")
 CAPTURE_PURPOSES = ("resident", "optimized", "validation_steps")
 OPTIMIZED_REPEATS = 3
+# Mirrors evidence::ANCHOR_MARGIN_FLOOR_BYTES: the low-end margin's floor.
+ANCHOR_MARGIN_FLOOR_BYTES = 32 << 20
 STATUSES = {"successful", "admitted_refused", "diagnostic_success", "diagnostic_failure", "capture_refused", "skipped"}
 REFUSAL_KINDS = ("capacity", "no_evidence", "mode", "strategy", "artifact")
 EVIDENCE_TABLE = "crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json"
@@ -497,8 +499,13 @@ def capture_of(r):
         bytes_, exact = value.get("peak_bytes"), value.get("exact")
         if isinstance(bytes_, int) and not isinstance(bytes_, bool) and baseline <= bytes_ <= peak and isinstance(exact, bool):
             phases[name] = {"peak_bytes": bytes_, "exact": exact}
+    quanta = {}
+    for label, q in (r.get("quanta") or {}).items():
+        if isinstance(q, dict) and label and _count(q.get("priced_scratch_bytes")) and _count(q.get("observed_bytes")) \
+                and isinstance(q.get("exact"), bool) and q["observed_bytes"] <= peak:
+            quanta[label] = {"priced_scratch_bytes": q["priced_scratch_bytes"], "observed_bytes": q["observed_bytes"], "exact": q["exact"]}
     return {"run_id": str(r.get("run_id") or ""), "build_sha": str(r.get("build_sha") or ""), "steps": steps,
-            "baseline_footprint_bytes": baseline, "footprint_bytes": peak, "phase_peaks": phases,
+            "baseline_footprint_bytes": baseline, "footprint_bytes": peak, "phase_peaks": phases, "quanta": quanta,
             "mlx_peak_bytes": int(r["mlx_peak_bytes"]), "min_headroom_mib": float(r["min_headroom_mib"]),
             "elapsed_seconds": float(r["elapsed_seconds"])}
 
@@ -531,6 +538,32 @@ def anchor_rows(rows):
         else:
             problems.append(f"{purpose} {group[0]['case']}: no completed capture" + (" (DEFECT: the fully optimized anchor must fit)" if purpose == "optimized" else ""))
     return anchors, problems
+
+
+def calibration_table(rows):
+    """The per-formula DEVICE calibration across every completed capture: per quantum label its
+    worst EXACT observed/priced invocation (priced scratch vs device-observed growth), how many
+    captures observed it, and whether the formula over-prices the device beyond the low-end margin
+    (there, admitted work's guard runs at the anchor-derived quantum peak instead of its formula)."""
+    table = {}
+    for r in rows:
+        c = capture_of(r)
+        if not c:
+            continue
+        for label, q in c["quanta"].items():
+            entry = table.setdefault(label, {"priced_scratch_bytes": None, "observed_bytes": None, "exact_captures": 0, "masked_captures": 0})
+            if not q["exact"]:
+                entry["masked_captures"] += 1
+                continue
+            entry["exact_captures"] += 1
+            p, o = q["priced_scratch_bytes"], q["observed_bytes"]
+            if p and (entry["priced_scratch_bytes"] is None or o * entry["priced_scratch_bytes"] > entry["observed_bytes"] * p):
+                entry["priced_scratch_bytes"], entry["observed_bytes"] = p, o
+    for entry in table.values():
+        p, o = entry["priced_scratch_bytes"], entry["observed_bytes"]
+        entry["priced_over_observed"] = round(p / o, 4) if p and o else None
+        entry["over_priced_beyond_margin"] = bool(p is not None and p - o > ANCHOR_MARGIN_FLOOR_BYTES)
+    return dict(sorted(table.items()))
 
 
 def steps_validation(rows):
@@ -592,6 +625,7 @@ def main(argv=None):
         print(f"# Candidate anchor rows for {EVIDENCE_TABLE} (schema 3). Review, then commit by hand; capture never changes admission.")
         print(json.dumps({"schema": 3, "anchors": anchors}, indent=2))
         print("# Short-step validation (full / short growth): " + json.dumps(steps_validation(rows)))
+        print("# Per-formula DEVICE calibration (priced scratch vs observed growth): " + json.dumps(calibration_table(rows)))
         for problem in problems:
             print("# PROBLEM: " + problem)
         return 0 if not problems else 2

@@ -486,6 +486,9 @@ fn key_unchecked(
     })
 }
 
+/// Per quantum label, the device's calibration of that formula (from the anchor captures).
+pub type Calibration = std::collections::BTreeMap<String, mlx_gen::ios_quantum::QuantumCalibration>;
+
 /// What an admission's demand rests on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionBasis {
@@ -507,6 +510,8 @@ pub struct Admission {
     /// The anchor's measured repeat spread (floored): the explicit low-end margin.
     pub(crate) margin_bytes: u64,
     pub(crate) basis: AdmissionBasis,
+    /// The anchor's per-quantum DEVICE calibration the admitted work's guards run under.
+    pub(crate) calibration: Calibration,
     pub(crate) spec: LoadSpec,
     pub(crate) context: MemoryRunContext,
     pub(crate) binding: [u8; 32],
@@ -539,6 +544,11 @@ impl Admission {
     }
     pub fn basis(&self) -> AdmissionBasis {
         self.basis
+    }
+    /// The anchor's per-quantum DEVICE calibration (label → priced scratch vs device-observed
+    /// growth) the admitted work's guards use inside the measured envelope.
+    pub fn quantum_calibration(&self) -> &Calibration {
+        &self.calibration
     }
     pub fn context(&self) -> &MemoryRunContext {
         &self.context
@@ -616,12 +626,15 @@ fn anchored_demand(
     contract: &MemoryProviderContract,
     key: &EvidenceKey,
     rows: &[AnchorRow],
-) -> AdmissionResult<(u64, u64, AdmissionBasis)> {
+) -> AdmissionResult<(u64, u64, AdmissionBasis, Calibration)> {
     if let Some(row) = evidence::lookup(rows, key) {
         return match (&row.outcome, row.demand_bytes(), row.margin_bytes()) {
-            (_, Some(demand), Some(margin)) => {
-                Ok((demand, margin, AdmissionBasis::Measured(row.anchor_kind)))
-            }
+            (_, Some(demand), Some(margin)) => Ok((
+                demand,
+                margin,
+                AdmissionBasis::Measured(row.anchor_kind),
+                row.quantum_calibration(),
+            )),
             (evidence::AnchorOutcome::Refused { refused_quantum, .. }, ..) => {
                 Err(AdmissionError::refused(
                     RefusalKind::Capacity,
@@ -722,6 +735,7 @@ fn anchored_demand(
         AdmissionBasis::Derived {
             from: base.anchor_kind,
         },
+        base.quantum_calibration(),
     ))
 }
 
@@ -809,8 +823,8 @@ fn admit_one(
                 "actual execution does not implement the selected ladder",
             ));
         }
-        let (demand_bytes, margin_bytes, basis) = match rows {
-            None => (0, 0, AdmissionBasis::CapturePermit),
+        let (demand_bytes, margin_bytes, basis, calibration) = match rows {
+            None => (0, 0, AdmissionBasis::CapturePermit, Calibration::new()),
             Some(rows) => anchored_demand(candidate, &contract, &key, rows)?,
         };
         let mut context = candidate.context.clone();
@@ -841,6 +855,7 @@ fn admit_one(
             demand_bytes,
             margin_bytes,
             basis,
+            calibration,
             spec,
             context,
             binding: work_binding(&candidate.work),
@@ -943,8 +958,13 @@ impl Admission {
     /// The measured envelope an admitted (non-capture) load and its renders run under, opened
     /// before the load so it spans the weights too.
     fn envelope(&self) -> Option<mlx_gen::ios_quantum::AdmittedEnvelope> {
-        (!self.is_capture())
-            .then(|| mlx_gen::ios_quantum::open_admitted_envelope(self.required_bytes()))
+        (!self.is_capture()).then(|| {
+            mlx_gen::ios_quantum::open_admitted_envelope(
+                self.required_bytes(),
+                self.calibration.clone(),
+                self.margin_bytes,
+            )
+        })
     }
 
     fn check_kind(&self, expected: &str) -> Result<()> {

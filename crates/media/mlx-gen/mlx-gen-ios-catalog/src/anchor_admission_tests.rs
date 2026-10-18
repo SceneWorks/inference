@@ -89,7 +89,19 @@ fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow 
         outcome: AnchorOutcome::Completed {
             captures: vec![
                 capture("a", base, base + 2480 * MIB, &phases(2480)),
-                capture("b", base, base + 2500 * MIB, &phases(2500)),
+                {
+                    // The device saw the tiled decode formula at half its price.
+                    let mut c = capture("b", base, base + 2500 * MIB, &phases(2500));
+                    c.quanta.insert(
+                        "SDXL VAE tiled stage".into(),
+                        evidence::QuantumObservation {
+                            priced_scratch_bytes: 400 * MIB,
+                            observed_bytes: 200 * MIB,
+                            exact: true,
+                        },
+                    );
+                    c
+                },
                 capture("c", base, base + 2490 * MIB, &phases(2490)),
             ],
         },
@@ -147,6 +159,14 @@ fn the_optimized_anchor_admits_its_own_key_at_the_measurement_plus_the_stated_ma
         assert_eq!(
             admitted.basis(),
             AdmissionBasis::Measured(AnchorKind::Optimized)
+        );
+        // The admitted work's guards carry the anchor's per-quantum device calibration.
+        assert_eq!(
+            admitted.quantum_calibration()["SDXL VAE tiled stage"],
+            mlx_gen::ios_quantum::QuantumCalibration {
+                priced_bytes: 400 * MIB,
+                observed_bytes: 200 * MIB,
+            }
         );
         // One MiB less of live headroom than measurement + margin: a typed capacity refusal.
         assert_eq!(

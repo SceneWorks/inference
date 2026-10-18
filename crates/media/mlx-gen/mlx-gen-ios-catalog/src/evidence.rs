@@ -192,6 +192,18 @@ pub struct PhasePeak {
     pub exact: bool,
 }
 
+/// One quantum formula as the device saw it in a capture: the guard's priced scratch at the
+/// invocation with the largest observed/priced ratio, the kernel-footprint growth across it (the
+/// lifetime peak at its end minus the footprint at its check), and whether that growth is exact
+/// (the lifetime peak rose inside the quantum) or masked by an earlier peak (an upper bound).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantumObservation {
+    pub priced_scratch_bytes: u64,
+    pub observed_bytes: u64,
+    pub exact: bool,
+}
+
 /// One capture run of an anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +219,10 @@ pub struct Capture {
     /// Per-phase peaks split through the quantum marks (`IosPhase::as_key` → peak). A phase the
     /// capture could not attribute is absent and is priced at the whole-run peak (erring large).
     pub phase_peaks: BTreeMap<String, PhasePeak>,
+    /// Per quantum label, the device's observation of that formula (the per-formula DEVICE
+    /// calibration: priced scratch vs observed peak).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quanta: BTreeMap<String, QuantumObservation>,
     /// MLX `get_peak_memory`, bytes (informational).
     pub mlx_peak_bytes: u64,
     /// Minimum sampled `os_proc_available_memory`, MiB (informational).
@@ -294,6 +310,38 @@ impl AnchorRow {
     /// [`ANCHOR_MARGIN_FLOOR_BYTES`]. `None` for a refused anchor.
     pub fn margin_bytes(&self) -> Option<u64> {
         margin_bytes(self.captures())
+    }
+
+    /// The anchor's per-quantum DEVICE calibration: per label, over every repeat's EXACT
+    /// observation, the one with the largest observed/priced ratio (the formula's worst
+    /// under-pricing on the device). A label never observed exactly has no entry and keeps its
+    /// formula.
+    pub fn quantum_calibration(
+        &self,
+    ) -> BTreeMap<String, mlx_gen::ios_quantum::QuantumCalibration> {
+        let mut out: BTreeMap<String, mlx_gen::ios_quantum::QuantumCalibration> = BTreeMap::new();
+        for capture in self.captures() {
+            for (label, q) in &capture.quanta {
+                if !q.exact || q.priced_scratch_bytes == 0 {
+                    continue;
+                }
+                // Keep the larger observed/priced ratio (cross-multiplied, exact).
+                let worse = out.get(label).is_none_or(|existing| {
+                    u128::from(q.observed_bytes) * u128::from(existing.priced_bytes)
+                        > u128::from(existing.observed_bytes) * u128::from(q.priced_scratch_bytes)
+                });
+                if worse {
+                    out.insert(
+                        label.clone(),
+                        mlx_gen::ios_quantum::QuantumCalibration {
+                            priced_bytes: q.priced_scratch_bytes,
+                            observed_bytes: q.observed_bytes,
+                        },
+                    );
+                }
+            }
+        }
+        out
     }
 }
 
@@ -395,6 +443,13 @@ fn validate(rows: &[AnchorRow]) -> Result<(), String> {
                             "row {k:?}: capture baseline footprint must be present and below its peak"
                         ));
                     }
+                    for (label, q) in &c.quanta {
+                        if label.is_empty() || q.observed_bytes > c.footprint_bytes {
+                            return Err(format!(
+                                "row {k:?}: quantum {label} observed above the lifetime peak"
+                            ));
+                        }
+                    }
                     for (phase, peak) in &c.phase_peaks {
                         if IosPhase::from_key(phase).is_none()
                             || peak.peak_bytes < c.baseline_footprint_bytes
@@ -487,6 +542,7 @@ pub(crate) mod fixture {
                     )
                 })
                 .collect(),
+            quanta: BTreeMap::new(),
             mlx_peak_bytes: 1,
             min_headroom_mib: 1.0,
             elapsed_seconds: 1.0,
@@ -686,6 +742,52 @@ mod tests {
         ];
         assert_eq!(margin_bytes(&wide), Some(80 << 20));
         assert_eq!(margin_bytes(&[]), None);
+    }
+
+    #[test]
+    fn the_quantum_calibration_keeps_each_formulas_worst_exact_device_ratio() {
+        let mut row = completed(key(), AnchorKind::Optimized, optimized(), 1000);
+        let q = |priced, observed, exact| QuantumObservation {
+            priced_scratch_bytes: priced,
+            observed_bytes: observed,
+            exact,
+        };
+        if let AnchorOutcome::Completed { captures } = &mut row.outcome {
+            captures[0]
+                .quanta
+                .insert("decode tile".into(), q(400, 200, true));
+            captures[1]
+                .quanta
+                .insert("decode tile".into(), q(400, 260, true));
+            // Masked (an upper bound) never calibrates, even when it reads higher.
+            captures[2]
+                .quanta
+                .insert("decode tile".into(), q(400, 390, false));
+            captures[0]
+                .quanta
+                .insert("denoise block".into(), q(100, 90, false));
+            captures[1]
+                .quanta
+                .insert("text layer".into(), q(0, 10, true));
+        }
+        let calibration = row.quantum_calibration();
+        assert_eq!(
+            calibration.keys().collect::<Vec<_>>(),
+            ["decode tile"],
+            "masked and zero-priced observations do not calibrate"
+        );
+        assert_eq!(calibration["decode tile"].observed_bytes, 260);
+        assert_eq!(calibration["decode tile"].priced_bytes, 400);
+        // Round-trips, and an observation above the lifetime peak fails the table closed.
+        assert_eq!(
+            parse(&table(std::slice::from_ref(&row))).unwrap(),
+            vec![row.clone()]
+        );
+        if let AnchorOutcome::Completed { captures } = &mut row.outcome {
+            let peak = captures[0].footprint_bytes;
+            captures[0].quanta.insert("x".into(), q(1, peak + 1, true));
+        }
+        assert!(parse(&table(&[row])).is_err());
     }
 
     #[test]

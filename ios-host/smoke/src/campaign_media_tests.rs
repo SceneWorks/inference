@@ -136,6 +136,9 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
         phase: Some(phase),
         opens,
         lifetime_peak,
+        label: String::new(),
+        scratch: 0,
+        current: 0,
     };
     let marks = [
         m(Load, true, 100),          // load floor checked (pre-load glue → load)
@@ -149,6 +152,9 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
             phase: None,
             opens: true,
             lifetime_peak: 2000,
+            label: String::new(),
+            scratch: 0,
+            current: 0,
         },
     ];
     let split = support::phase_peaks(50, &marks, 2100);
@@ -159,4 +165,54 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
     // The tail after an unattributed mark is dropped, never credited to another phase.
     assert!(!split.contains_key(&Encode));
     assert!(split.values().all(|(peak, _)| *peak <= 2100));
+}
+
+/// The per-formula DEVICE calibration of a capture: each opened quantum's growth over its check's
+/// footprint, exact only when the lifetime peak rose inside it; per label the worst
+/// observed/priced invocation (exact before masked).
+#[test]
+fn a_capture_observes_each_quantum_formula_against_its_priced_scratch() {
+    let q = |label: &str, opens, scratch, current, lifetime_peak| support::Mark {
+        phase: None,
+        opens,
+        lifetime_peak,
+        label: label.into(),
+        scratch,
+        current,
+    };
+    let marks = [
+        q("tile", true, 400, 1000, 1500), // peak rose to 1700 inside: 700 observed, exact
+        q("tile", false, 0, 1100, 1700),
+        q("tile", true, 400, 1100, 1700), // rose to 1750: 650, exact, ratio 650/400 < 700/400
+        q("tile", false, 0, 1100, 1750),
+        q("block", true, 100, 1600, 1750), // never rose: masked, 150 upper bound
+        q("block", false, 0, 1600, 1750),
+        q("last", true, 50, 1700, 1750), // the run's end peak 1800 is after it: exact 100
+    ];
+    let o = support::quantum_observations(&marks, 1800);
+    assert_eq!(
+        o["tile"],
+        support::Observation {
+            priced: 400,
+            observed: 700,
+            exact: true
+        }
+    );
+    assert_eq!(
+        o["block"],
+        support::Observation {
+            priced: 100,
+            observed: 150,
+            exact: false
+        }
+    );
+    assert_eq!(
+        o["last"],
+        support::Observation {
+            priced: 50,
+            observed: 100,
+            exact: true
+        }
+    );
+    assert_eq!(o.len(), 3, "synchronizations are not quanta");
 }

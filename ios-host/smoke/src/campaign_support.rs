@@ -210,11 +210,61 @@ pub(super) fn persist_images(
 /// `ios_quantum_phase`; `None` for a label it does not attribute), whether it OPENS a quantum (a
 /// pre-construction check) or closes one (a synchronization), and the kernel lifetime
 /// `phys_footprint` peak at that instant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Mark {
     pub phase: Option<mlx_gen::ios_pricing::IosPhase>,
     pub opens: bool,
     pub lifetime_peak: u64,
+    /// The quantum's label, its priced scratch (0 for a synchronization) and the CURRENT
+    /// `phys_footprint` at the mark.
+    pub label: String,
+    pub scratch: u64,
+    pub current: u64,
+}
+
+/// One quantum formula as the device saw it: the priced scratch and the observed growth of the
+/// invocation with the largest observed/priced ratio, and whether that growth is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Observation {
+    pub priced: u64,
+    pub observed: u64,
+    pub exact: bool,
+}
+
+/// The per-quantum DEVICE observations of a capture: for every quantum a check opened, the
+/// kernel-footprint growth across it — the lifetime peak at the next mark minus the footprint at
+/// the check. EXACT when the lifetime peak rose inside the quantum (so that reading is the
+/// quantum's own peak); otherwise an earlier peak masked it and the reading is an upper bound. Per
+/// label the invocation with the largest observed/priced ratio is kept (an exact one before any
+/// masked one): the formula's worst under-pricing on the device.
+pub(super) fn quantum_observations(
+    marks: &[Mark],
+    end_peak: u64,
+) -> std::collections::BTreeMap<String, Observation> {
+    let mut out: std::collections::BTreeMap<String, Observation> = Default::default();
+    for (i, mark) in marks.iter().enumerate() {
+        if !mark.opens || mark.scratch == 0 {
+            continue;
+        }
+        let after = marks.get(i + 1).map_or(end_peak, |next| next.lifetime_peak);
+        let exact = after > mark.lifetime_peak;
+        let observed = if exact { after } else { mark.lifetime_peak }.saturating_sub(mark.current);
+        let candidate = Observation {
+            priced: mark.scratch,
+            observed,
+            exact,
+        };
+        let better = out.get(&mark.label).is_none_or(|existing| {
+            (candidate.exact && !existing.exact)
+                || (candidate.exact == existing.exact
+                    && u128::from(candidate.observed) * u128::from(existing.priced)
+                        > u128::from(existing.observed) * u128::from(candidate.priced))
+        });
+        if better {
+            out.insert(mark.label.clone(), candidate);
+        }
+    }
+    out
 }
 
 /// Split a run's kernel lifetime peak by phase through its quantum marks.
@@ -244,7 +294,7 @@ pub(super) fn phase_peaks(
     };
     let mut previous = start_peak;
     for (i, mark) in marks.iter().enumerate() {
-        let phase = match i.checked_sub(1).map(|j| marks[j]) {
+        let phase = match i.checked_sub(1).map(|j| &marks[j]) {
             Some(earlier) if earlier.opens => earlier.phase,
             _ => mark.phase,
         };

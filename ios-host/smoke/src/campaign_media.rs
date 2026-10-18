@@ -928,20 +928,23 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         let sink = Arc::clone(&marks);
         let provider = case.provider.clone();
         runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
-            let (label, opens) = match mark {
-                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, .. } => {
-                    (label, true)
+            let (label, opens, scratch) = match mark {
+                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, scratch } => {
+                    (label, true, scratch)
                 }
                 runtime_ios::media::ios_quantum::QuantumMark::Synchronized { label } => {
-                    (label, false)
+                    (label, false, 0)
                 }
             };
-            if let Some((_, support::PeakReading::Read(lifetime_peak))) = phys_footprint() {
+            if let Some((current, support::PeakReading::Read(lifetime_peak))) = phys_footprint() {
                 if let Ok(mut marks) = sink.lock() {
                     marks.push(support::Mark {
                         phase: runtime_ios::media::pricing::quantum_phase(&provider, label),
                         opens,
                         lifetime_peak,
+                        label: label.to_string(),
+                        scratch,
+                        current,
                     });
                 }
             }
@@ -971,6 +974,16 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                 .collect::<serde_json::Map<_, _>>(),
             _ => serde_json::Map::new(),
         };
+        // The per-formula DEVICE calibration: each quantum's priced scratch vs its observed growth.
+        let quanta = match (e.lifetime_peak, marks.lock()) {
+            (Some(end), Ok(marks)) => support::quantum_observations(&marks, end)
+                .into_iter()
+                .map(|(label, o)| {
+                    (label, json!({"priced_scratch_bytes": o.priced, "observed_bytes": o.observed, "exact": o.exact}))
+                })
+                .collect::<serde_json::Map<_, _>>(),
+            _ => serde_json::Map::new(),
+        };
         let (status, reason) = if status.production_success()
             && (e.footprint.is_none() || e.min_headroom_mib.is_none() || e.lifetime_peak.is_none())
         {
@@ -982,7 +995,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
-            "baseline_phys_footprint_bytes":baseline_footprint, "phase_peaks":phase_peaks, "steps":case.steps,
+            "baseline_phys_footprint_bytes":baseline_footprint, "phase_peaks":phase_peaks, "quanta":quanta, "steps":case.steps,
             "anchor_selection":adapter.candidate.as_ref().map(|c| runtime_ios::media::evidence::AnchorSelection::from_parts(c.context.selection.strategy, &c.context.selection.parameters)),
             "admitted":adapter.admitted,
             "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,

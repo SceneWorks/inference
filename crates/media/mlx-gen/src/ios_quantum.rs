@@ -277,10 +277,23 @@ fn mark(m: QuantumMark<'_>) {
 
 /// The measured envelope an ADMITTED request runs under: the admission's demand (the anchor-derived
 /// growth over the starting footprint) plus its stated margin, and the live headroom when it began.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Envelope {
     start_available: u64,
     budget: u64,
+    /// The device's per-quantum calibration (label → its anchor capture's priced scratch and the
+    /// device-observed peak over the quantum's starting footprint) and the margin it is charged at.
+    calibration: std::collections::BTreeMap<String, QuantumCalibration>,
+    margin: u64,
+}
+
+/// One quantum formula's DEVICE calibration, from an anchor capture: the guard's priced scratch at
+/// that invocation and the kernel-footprint growth the device observed across it (the lifetime
+/// peak at the quantum's end minus the footprint at its check — exact: the peak rose inside it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuantumCalibration {
+    pub priced_bytes: u64,
+    pub observed_bytes: u64,
 }
 
 static ENVELOPE: std::sync::Mutex<Option<Envelope>> = std::sync::Mutex::new(None);
@@ -312,13 +325,20 @@ impl Drop for AdmittedEnvelope {
     }
 }
 
-/// Open an [`AdmittedEnvelope`] of `budget_bytes` at the current live headroom.
-pub fn open_admitted_envelope(budget_bytes: u64) -> AdmittedEnvelope {
+/// Open an [`AdmittedEnvelope`] of `budget_bytes` at the current live headroom, carrying the
+/// anchor's per-quantum DEVICE calibration and its margin (see `requirement`).
+pub fn open_admitted_envelope(
+    budget_bytes: u64,
+    calibration: std::collections::BTreeMap<String, QuantumCalibration>,
+    margin_bytes: u64,
+) -> AdmittedEnvelope {
     let opened = match (ENVELOPE.lock(), available_bytes()) {
         (Ok(mut slot), Some(start_available)) if slot.is_none() => {
             *slot = Some(Envelope {
                 start_available,
                 budget: budget_bytes,
+                calibration,
+                margin: margin_bytes,
             });
             true
         }
@@ -327,35 +347,61 @@ pub fn open_admitted_envelope(budget_bytes: u64) -> AdmittedEnvelope {
     AdmittedEnvelope { opened }
 }
 
-/// Run `body` inside an [`AdmittedEnvelope`] of `budget_bytes`.
+/// Run `body` inside an [`AdmittedEnvelope`] of `budget_bytes` with no per-quantum calibration.
 pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) -> T {
-    let _envelope = open_admitted_envelope(budget_bytes);
+    let _envelope = open_admitted_envelope(budget_bytes, Default::default(), 0);
     body()
 }
 
-/// The `(scratch, reserve)` a guard checks: its formula price, or — inside an admitted envelope
-/// the process is still within — the envelope's remaining bytes when those are smaller.
-fn requirement(available: Option<u64>, scratch: u64) -> (u64, u64) {
+/// The `(scratch, reserve)` the guard of `label` checks.
+///
+/// Outside an admitted envelope, or once the process has grown past it (the measurement no longer
+/// describes this run): the counted formula, `scratch + PROCESS_RESERVE_BYTES`. Inside it, the
+/// smallest of the formula and the two MEASURED requirements:
+/// * the envelope's remaining bytes (the anchor's whole-run growth still to come), and
+/// * the anchor-derived peak of THIS quantum: `scratch × observed / priced` from the device's
+///   calibration of the same formula (an exact observation in the anchor capture), plus the
+///   anchor's margin.
+///
+/// So a guard whose formula over-prices what the device measured for that quantum never refuses a
+/// configuration the anchor shows fits, while every guard keeps its formula as the safety net past
+/// the measured envelope.
+fn requirement(label: &str, available: Option<u64>, scratch: u64) -> (u64, u64) {
     let formula = (scratch, PROCESS_RESERVE_BYTES);
+    let formula_total = scratch.saturating_add(PROCESS_RESERVE_BYTES);
     let (Some(available), Ok(slot)) = (available, ENVELOPE.lock()) else {
         return formula;
     };
-    let Some(envelope) = *slot else {
+    let Some(envelope) = slot.as_ref() else {
         return formula;
     };
     let consumed = envelope.start_available.saturating_sub(available);
-    match envelope.budget.checked_sub(consumed) {
-        Some(remaining) if remaining < scratch.saturating_add(PROCESS_RESERVE_BYTES) => {
-            (remaining, 0)
-        }
-        _ => formula,
+    let Some(remaining) = envelope.budget.checked_sub(consumed) else {
+        return formula;
+    };
+    let calibrated = envelope
+        .calibration
+        .get(label)
+        .filter(|c| c.priced_bytes > 0)
+        .map(|c| {
+            let scaled = (u128::from(scratch) * u128::from(c.observed_bytes))
+                .div_ceil(u128::from(c.priced_bytes));
+            u64::try_from(scaled)
+                .unwrap_or(u64::MAX)
+                .saturating_add(envelope.margin)
+        });
+    let measured = calibrated.map_or(remaining, |c| c.min(remaining));
+    if measured < formula_total {
+        (measured, 0)
+    } else {
+        formula
     }
 }
 
 pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
         let available = available_for(label, scratch);
-        let (required, reserve) = requirement(available, scratch);
+        let (required, reserve) = requirement(label, available, scratch);
         check_headroom(available, required, reserve).map_err(|e| {
             record_refusal(label, required, reserve, available);
             Error::Unsupported(format!("{label}: {e}; scratch {required} bytes + engineering reserve {reserve} bytes (not a process bound)"))
@@ -398,7 +444,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
     }
     let checked = std::cell::Cell::new(false);
     let available = available_for(label, scratch);
-    let (required, reserve) = requirement(available, scratch);
+    let (required, reserve) = requirement(label, available, scratch);
     let result = budget::guarded(
         available,
         required,
@@ -856,4 +902,65 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
             "checked:cheap"
         ]
     );
+}
+
+/// The per-quantum DEVICE calibration: inside an admitted envelope a guard whose formula
+/// over-prices what the device measured for that quantum needs only the anchor-derived quantum
+/// peak (`scratch × observed / priced` + margin); another label keeps its formula, and so does
+/// every guard once the process has grown past the envelope.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak() {
+    const CHILD: &str = "MLX_IOS_QUANTUM_CALIBRATION_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ios_quantum::a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
+    const MIB: u64 = 1 << 20;
+    let calibration = std::collections::BTreeMap::from([(
+        "decode tile".to_string(),
+        QuantumCalibration {
+            priced_bytes: 400 * MIB,
+            observed_bytes: 200 * MIB,
+        },
+    )]);
+    with_cpu_diagnostic_headroom(1024 * MIB, || {
+        // A large remaining envelope (5000 MiB) does not relax anything by itself …
+        let _envelope = open_admitted_envelope(5000 * MIB, calibration.clone(), 32 * MIB);
+        // … but the calibrated quantum needs 600 × 200/400 + 32 = 332 MiB, not 600 + 512.
+        before("decode tile", 600 * MIB)?;
+        assert_eq!(
+            requirement("decode tile", Some(1024 * MIB), 600 * MIB),
+            (332 * MIB, 0)
+        );
+        // At 2100 MiB of formula scratch the calibrated peak (1050 + 32) exceeds 1024: refused.
+        assert!(before("decode tile", 2100 * MIB).is_err());
+        assert_eq!(take_refusal().unwrap().scratch_bytes, 1082 * MIB);
+        // An uncalibrated label keeps its formula.
+        assert!(before("denoise block", 600 * MIB).is_err());
+        assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
+        Ok(())
+    })
+    .unwrap();
+    // Past the envelope the calibration no longer applies.
+    with_cpu_diagnostic_headroom(1024 * MIB, || {
+        let _envelope = open_admitted_envelope(100 * MIB, calibration.clone(), 32 * MIB);
+        with_cpu_diagnostic_headroom(800 * MIB, || {
+            assert!(before("decode tile", 600 * MIB).is_err());
+            Ok(())
+        })
+    })
+    .unwrap();
+    assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
 }
