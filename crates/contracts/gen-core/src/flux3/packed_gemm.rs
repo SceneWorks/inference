@@ -25,9 +25,12 @@ fn invalid(detail: impl std::fmt::Display) -> Error {
 /// * its dynamic activation quantization: GGML Q8_1 blocks (36 B per 32, the CUDA path for both
 ///   formats and the CPU path for Q4_1) bound the CPU Q8_0 path's 34 B; the publisher FP8R/NVFP4
 ///   paths quantize to one byte (FP8) or half a byte plus scales (NVFP4) per element;
-/// * the f32 kernel output (`4n`) and its single rounding to the compute dtype (`n · width`).
+/// * the f32 kernel output (`4n`) and its single rounding to the compute dtype (`n · width`);
+///   the publisher NVFP4 GEMM writes BF16 directly (`2n`), but first copies its rows into a
+///   zero-padded compute-dtype buffer (`k · width`).
 ///
 /// MLX affine is W4/8A16: it reads the compute-dtype input directly with no activation copy.
+/// Per-launch fixed costs that do not scale with the chunk are [`launch_overhead_bytes`].
 pub fn transient_bytes_per_row(
     storage: NativeDitStorage,
     k: usize,
@@ -50,21 +53,45 @@ pub fn transient_bytes_per_row(
             if k % 16 != 0 {
                 return Err(invalid("NVFP4 width must be whole 16-element blocks"));
             }
-            4 * k + k / 2 + k / 16
+            k * compute_width + 4 * k + k / 2 + k / 16
         }
         NativeDitStorage::MlxAffine { .. } => 0,
         NativeDitStorage::Publisher(DitFormat::Dense) => {
             return Err(invalid("a dense projection is not a packed GEMM"))
         }
     };
-    let output = if matches!(storage, NativeDitStorage::MlxAffine { .. }) {
-        n * compute_width
-    } else {
-        4 * n + n * compute_width
+    let output = match storage {
+        NativeDitStorage::MlxAffine { .. } => n * compute_width,
+        NativeDitStorage::Publisher(DitFormat::Nvfp4) => 2 * n,
+        _ => 4 * n + n * compute_width,
     };
     activation
         .checked_add(output)
         .ok_or_else(|| invalid("transient byte overflow"))
+}
+
+/// NVFP4 W4A4 pads every launch to the FP4 GEMM row alignment.
+pub const NVFP4_M_ALIGN: u64 = 16;
+
+/// Bytes one launch allocates regardless of its row count: the NVFP4 path pads up to
+/// `NVFP4_M_ALIGN - 1` extra rows (each costing a full row's transient) and its block scales up
+/// to a 128-row x 4-block atom (`127 · ceil4(k/16)` bytes). Other formats have none. A planner
+/// caller subtracts this from the budget so the WHOLE launch stays within it.
+pub fn launch_overhead_bytes(
+    storage: NativeDitStorage,
+    k: usize,
+    n: usize,
+    compute_width: u64,
+) -> Result<u64> {
+    if storage != NativeDitStorage::Publisher(DitFormat::Nvfp4) {
+        return Ok(0);
+    }
+    let per_row = transient_bytes_per_row(storage, k, n, compute_width)?;
+    let blocks = (k as u64 / 16).div_ceil(4) * 4;
+    (NVFP4_M_ALIGN - 1)
+        .checked_mul(per_row)
+        .and_then(|v| v.checked_add(127 * blocks))
+        .ok_or_else(|| invalid("launch overhead overflow"))
 }
 
 /// Contiguous `(start, len)` launches covering `rows`, each within `budget` transient bytes and
@@ -128,6 +155,33 @@ mod tests {
         assert!(
             transient_bytes_per_row(NativeDitStorage::Publisher(DitFormat::Dense), 32, 8, 2)
                 .is_err()
+        );
+    }
+
+    /// NVFP4 prices its padded compute-dtype copy, writes BF16 directly, and carries a fixed
+    /// per-launch padding overhead; FP8R prices its E4M3 bytes and row scale.
+    #[test]
+    fn publisher_transients_include_padding_and_direct_bf16_output() {
+        let (k, n) = (3072, 9216);
+        let nvfp4 = NativeDitStorage::Publisher(DitFormat::Nvfp4);
+        let per_row = transient_bytes_per_row(nvfp4, k, n, 2).unwrap();
+        assert_eq!(
+            per_row,
+            2 * 3072 + 4 * 3072 + 3072 / 2 + 3072 / 16 + 2 * 9216
+        );
+        assert_eq!(
+            launch_overhead_bytes(nvfp4, k, n, 2).unwrap(),
+            15 * per_row + 127 * 192
+        );
+        let fp8 = NativeDitStorage::Publisher(DitFormat::Fp8Rowwise);
+        assert_eq!(
+            transient_bytes_per_row(fp8, k, n, 2).unwrap(),
+            4 * 3072 + 3072 + 4 + 4 * 9216 + 2 * 9216
+        );
+        assert_eq!(launch_overhead_bytes(fp8, k, n, 2).unwrap(), 0);
+        assert_eq!(
+            launch_overhead_bytes(NativeDitStorage::GgmlQ4_1, k, n, 2).unwrap(),
+            0
         );
     }
 

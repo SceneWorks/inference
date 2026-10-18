@@ -46,6 +46,7 @@ pub mod packed_gemm;
 pub mod phase_resource;
 pub mod pup;
 pub mod quantization;
+pub mod reference_workspace;
 pub mod references;
 pub mod safetensors_stream;
 pub mod training;

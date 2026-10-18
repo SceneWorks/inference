@@ -648,6 +648,50 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
         .collect()
 }
 
+/// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
+/// formula ([`gen_core::flux3::reference_workspace`]) at this backend's compute width.
+fn reference_workspace_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    refuse_unloadable_spec(spec)?;
+    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+        spec,
+        provider_id,
+        u64::from(compute_width(spec.precision)),
+    )?;
+    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+}
+
+/// `flux3_klein`'s pre-fit reference pricer.
+pub fn reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(MODEL_ID, spec, facts)
+}
+
+/// `flux3_klein_base`'s pre-fit reference pricer (references occupy both CFG rows).
+pub fn base_reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(gen_core::flux3::BASE_MODEL_ID, spec, facts)
+}
+
+pub const REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: MODEL_ID,
+        reference_workspace_bytes,
+    };
+
+pub const BASE_REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        reference_workspace_bytes: base_reference_workspace_bytes,
+    };
+
 /// The pre-load contract and admission check of `flux3_klein`.
 pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
@@ -788,6 +832,50 @@ mod tests {
     /// *Mutations that red this:* declaring `StagedResidency` `Missing`; promoting a bounded
     /// rung to `Implemented` (no lifecycle hook backs it); dropping the eager filter in
     /// `memory_contract_surface_specs`.
+    /// Hosted-only twin of the Candle test: the registered pre-fit reference pricer is zero
+    /// without references and priced and monotone with them, on both routes.
+    #[test]
+    fn registered_reference_pricer_is_additive_and_monotone_on_both_routes() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let registry = crate::provider_registry().unwrap();
+        let facts = |canvases: &[(u32, u32)]| gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens: canvases
+                .iter()
+                .map(|&(w, h)| u64::from(w / 16) * u64::from(h / 16))
+                .sum(),
+            prepared_canvases: canvases.to_vec(),
+        };
+        for (id, dir) in [
+            (MODEL_ID, "tiny-snapshot"),
+            (gen_core::flux3::BASE_MODEL_ID, "tiny-base-snapshot"),
+        ] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(fixtures.join(dir)));
+            // The tiny base package ships only config + DiT; both routes take the distilled
+            // package's encoder and autoencoder as components, as the generator tests do.
+            spec.components.insert(
+                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
+            );
+            assert_eq!(
+                registry.reference_workspace_bytes(id, &spec, None).unwrap(),
+                Some(0)
+            );
+            let one = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64)])))
+                .unwrap()
+                .unwrap();
+            let two = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64), (64, 64)])))
+                .unwrap()
+                .unwrap();
+            assert!(one > 0 && two > one, "{id}: {one} {two}");
+        }
+    }
+
     #[test]
     fn the_route_declares_exactly_the_rungs_its_engine_runs() {
         let surfaces = memory_contract_surface_specs();

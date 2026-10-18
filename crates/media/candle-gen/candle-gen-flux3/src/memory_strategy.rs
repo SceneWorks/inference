@@ -204,13 +204,15 @@ pub fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
 
 /// Resident DiT bytes for an explicit native storage, as `Flux3Dit::load_with_storage` holds it:
 ///
-/// * each packed target at its EXACT stored GGML bytes (the block scales live inside the blocks,
-///   so the header byte count is codes + scales, with no dequantized copy anywhere);
+/// * each packed target at its EXACT stored bytes (GGML block scales live inside the blocks;
+///   publisher FP8 codes and packed E2M1 nibbles stage as stored), no dequantized copy anywhere;
+/// * a publisher `<stem>.weight_scale` at its STAGED width whatever its stored rank: FP8R row
+///   scales stage as f32 (4 B/element), NVFP4 block scales as their E4M3 bytes;
 /// * every other matrix at the compute width and every vector at f32, exactly as the dense path;
-/// * plus the bounded per-launch packed-GEMM transient (f32 activation copy, Q8 activation
-///   blocks, f32 output and its rounding), which the row-chunk planner caps at
-///   [`gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`] per projection call. Charged as
-///   that cap: an upper bound, not a measurement.
+/// * plus [`gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`], charged ONCE as resident.
+///   The row-chunk planner caps every packed launch (f32 activation copy, Q8/FP8/FP4 activation
+///   codes, output and padding) at it, and it also bounds candle's grows-only CUDA quantized-matmul
+///   workspace, which persists after the largest launch. An upper bound, not a measurement.
 pub fn native_dit_bytes(
     weights: &Path,
     precision: Precision,
@@ -227,6 +229,22 @@ pub fn native_dit_bytes(
     let weights = checked_sum(headers.iter().map(|header| {
         if targets.contains(&header.name) {
             Ok(header.data_bytes)
+        } else if header.name.ends_with(".weight_scale") {
+            let elements = header
+                .shape
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+                .ok_or_else(|| {
+                    CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow"))
+                })?;
+            let staged = if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) {
+                4
+            } else {
+                1
+            };
+            elements
+                .checked_mul(staged)
+                .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow")))
         } else {
             tensor_bytes(
                 header,
@@ -736,6 +754,56 @@ pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
         .collect()
 }
 
+/// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
+/// formula ([`gen_core::flux3::reference_workspace`]). On the Candle CPU backend every DiT GEMM
+/// runs over f32 temporaries whatever the compute dtype, so the per-token term is priced at f32.
+fn reference_workspace_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    refuse_unloadable_spec(spec)?;
+    let width = if production_device_is_cpu() {
+        4
+    } else {
+        u64::from(compute_width(spec.precision))
+    };
+    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+        spec,
+        provider_id,
+        width,
+    )?;
+    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+}
+
+/// `flux3_klein`'s pre-fit reference pricer.
+pub fn reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(MODEL_ID, spec, facts)
+}
+
+/// `flux3_klein_base`'s pre-fit reference pricer (references occupy both CFG rows).
+pub fn base_reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(gen_core::flux3::BASE_MODEL_ID, spec, facts)
+}
+
+pub const REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: MODEL_ID,
+        reference_workspace_bytes,
+    };
+
+pub const BASE_REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        reference_workspace_bytes: base_reference_workspace_bytes,
+    };
+
 /// The pre-load contract and admission check of `flux3_klein`.
 pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
     provider_id: MODEL_ID,
@@ -948,6 +1016,132 @@ mod tests {
             "{:?}",
             staged.conformance_errors()
         );
+    }
+
+    /// The pre-fit reference pricer through the real catalog: zero without references, priced
+    /// and monotone with them, and the base CFG route charges its reference tokens in both rows.
+    ///
+    /// *Mutations that red this:* not registering the pricer, pricing `None` as non-zero, or the
+    /// base route pricing one CFG row.
+    /// Publisher packages price codes as stored, `weight_scale` at its STAGED width (FP8R f32 row
+    /// scales 4 B, NVFP4 E4M3 block scales 1 B), every other matrix at the compute width and
+    /// vectors at f32, plus the one resident packed-launch cap.
+    ///
+    /// *Mutations that red this:* pricing FP8R scales at the compute width, or NVFP4 block scales
+    /// as a float matrix.
+    #[test]
+    fn publisher_scales_price_at_their_staged_width() {
+        use gen_core::flux3::safetensors_stream::{PlannedTensor, SafetensorsStreamWriter};
+        use gen_core::weightsmeta::Dtype;
+        let cfg = Flux3Config::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
+        )
+        .unwrap()
+        .dit;
+        let dir = tempfile::tempdir().unwrap();
+        for format in [DitFormat::Fp8Rowwise, DitFormat::Nvfp4] {
+            let storage = NativeDitStorage::Publisher(format);
+            let expected = storage.expected_tensors(&cfg).unwrap();
+            let path = dir.path().join(format!("{format:?}.safetensors"));
+            let planned: Vec<PlannedTensor> = expected
+                .iter()
+                .map(|(name, spec)| PlannedTensor {
+                    name: name.clone(),
+                    dtype: format!("{:?}", spec.dtype),
+                    shape: spec.shape.clone(),
+                })
+                .collect();
+            let mut writer =
+                SafetensorsStreamWriter::create(&path, planned, &Default::default()).unwrap();
+            for (name, spec) in &expected {
+                writer
+                    .write(name, &vec![0u8; spec.bytes().unwrap() as usize])
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            let targets = storage.packed_targets(&cfg).unwrap();
+            let want: u64 = expected
+                .iter()
+                .map(|(name, spec)| {
+                    let elements: u64 = spec.shape.iter().map(|&d| d as u64).product();
+                    if targets.contains(name) {
+                        spec.bytes().unwrap()
+                    } else if name.ends_with(".weight_scale") {
+                        elements
+                            * if format == DitFormat::Fp8Rowwise {
+                                4
+                            } else {
+                                1
+                            }
+                    } else if spec.dtype == Dtype::BF16 && spec.shape.len() >= 2 {
+                        elements * 2
+                    } else if spec.dtype == Dtype::BF16 || spec.dtype == Dtype::F32 {
+                        elements * 4
+                    } else {
+                        spec.bytes().unwrap()
+                    }
+                })
+                .sum::<u64>()
+                + gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET;
+            assert_eq!(
+                native_dit_bytes(&path, Precision::Bf16, storage, &cfg).unwrap(),
+                want,
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_reference_pricer_is_additive_and_monotone_on_both_routes() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
+        let registry = crate::provider_registry().unwrap();
+        let facts = |canvases: &[(u32, u32)]| gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens: canvases
+                .iter()
+                .map(|&(w, h)| u64::from(w / 16) * u64::from(h / 16))
+                .sum(),
+            prepared_canvases: canvases.to_vec(),
+        };
+        let mut per_route = Vec::new();
+        for (id, dir) in [
+            (MODEL_ID, "tiny-snapshot"),
+            (gen_core::flux3::BASE_MODEL_ID, "tiny-base-snapshot"),
+        ] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(fixtures.join(dir)));
+            // The tiny base package ships only config + DiT; both routes take the distilled
+            // package's encoder and autoencoder as components, as the generator tests do.
+            spec.components.insert(
+                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
+            );
+            assert_eq!(
+                registry.reference_workspace_bytes(id, &spec, None).unwrap(),
+                Some(0)
+            );
+            let one = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64)])))
+                .unwrap()
+                .unwrap();
+            let two = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64), (64, 64)])))
+                .unwrap()
+                .unwrap();
+            let big = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(128, 128)])))
+                .unwrap()
+                .unwrap();
+            assert!(one > 0 && two > one && big > one, "{id}: {one} {two} {big}");
+            per_route.push(two - one);
+        }
+        // Same tiny DiT widths: the base route's per-reference DiT term is at least the
+        // distilled one's (two CFG rows vs one).
+        assert!(per_route[1] > per_route[0], "{per_route:?}");
     }
 
     #[test]

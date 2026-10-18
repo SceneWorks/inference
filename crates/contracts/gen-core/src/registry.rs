@@ -1305,6 +1305,17 @@ pub struct ActivationMemoryRegistration {
     pub anchor: crate::ActivationMemoryAnchor,
 }
 
+/// Provider-owned PRE-FIT pricing of a request's reference work (sc-26241): the additional bytes
+/// the resolved [`crate::MemoryReferenceResourceFacts`] need on the loaded package `spec`. Opt-in
+/// and separate from [`MemoryRegistration`], like [`ActivationMemoryRegistration`]; omission is
+/// the explicit unpriced state, and a request without references prices zero.
+#[derive(Clone, Copy)]
+pub struct ReferenceWorkspaceRegistration {
+    pub provider_id: &'static str,
+    pub reference_workspace_bytes:
+        fn(&LoadSpec, &crate::MemoryReferenceResourceFacts) -> Result<u64>,
+}
+
 /// A transform provider's registration (parallel to [`ModelRegistration`]).
 #[derive(Clone, Copy)]
 pub struct TransformRegistration {
@@ -1393,6 +1404,7 @@ pub struct ProviderRegistryBuilder {
     resident_only_memory_contract: Vec<ResidentOnlyMemoryContractRegistration>,
     memory_behavior: Vec<MemoryBehaviorRegistration>,
     activation_memory: Vec<ActivationMemoryRegistration>,
+    reference_workspace: Vec<ReferenceWorkspaceRegistration>,
     composed_memory_strategy_ids: Vec<&'static str>,
     transforms: Vec<TransformRegistration>,
     audio_transforms: Vec<AudioTransformRegistration>,
@@ -1878,6 +1890,11 @@ impl ProviderRegistryBuilder {
         ActivationMemoryRegistration
     );
     builder_registration_method!(
+        register_reference_workspace,
+        reference_workspace,
+        ReferenceWorkspaceRegistration
+    );
+    builder_registration_method!(
         register_memory_strategy,
         memory_strategy,
         MemoryRegistration
@@ -2030,6 +2047,27 @@ impl ProviderRegistryBuilder {
         }
         let imported_models =
             validate_checkpoint_adapters(&self.checkpoint_adapters, &self.generators)?;
+        {
+            let mut ids = std::collections::BTreeSet::new();
+            for registration in &self.reference_workspace {
+                if !ids.insert(registration.provider_id) {
+                    return Err(Error::Msg(format!(
+                        "duplicate reference-workspace provider id '{}'",
+                        registration.provider_id
+                    )));
+                }
+                if !self
+                    .generators
+                    .iter()
+                    .any(|generator| (generator.descriptor)().id == registration.provider_id)
+                {
+                    return Err(Error::Msg(format!(
+                        "reference-workspace registration '{}' has no matching generator",
+                        registration.provider_id
+                    )));
+                }
+            }
+        }
         {
             let mut ids = std::collections::BTreeSet::new();
             for registration in &self.activation_memory {
@@ -2195,6 +2233,7 @@ impl ProviderRegistryBuilder {
             resident_only_memory_contract: self.resident_only_memory_contract.into_boxed_slice(),
             memory_behavior: self.memory_behavior.into_boxed_slice(),
             activation_memory: self.activation_memory.into_boxed_slice(),
+            reference_workspace: self.reference_workspace.into_boxed_slice(),
             composed_memory_strategy_ids: self.composed_memory_strategy_ids.into_boxed_slice(),
             transforms: self.transforms.into_boxed_slice(),
             audio_transforms: self.audio_transforms.into_boxed_slice(),
@@ -2223,6 +2262,7 @@ pub struct ProviderRegistry {
     resident_only_memory_contract: Box<[ResidentOnlyMemoryContractRegistration]>,
     memory_behavior: Box<[MemoryBehaviorRegistration]>,
     activation_memory: Box<[ActivationMemoryRegistration]>,
+    reference_workspace: Box<[ReferenceWorkspaceRegistration]>,
     composed_memory_strategy_ids: Box<[&'static str]>,
     transforms: Box<[TransformRegistration]>,
     audio_transforms: Box<[AudioTransformRegistration]>,
@@ -2584,6 +2624,35 @@ impl ProviderRegistry {
             .iter()
             .find(|registration| registration.provider_id == id)
             .map(|registration| registration.anchor.bytes_1024))
+    }
+
+    /// Provider-owned PRE-FIT bytes of a request's reference work for generator `id` on `spec`.
+    /// `facts == None` (no references) is `Ok(Some(0))` for a registered provider, so decisions
+    /// without references are unchanged; an unregistered provider is `Ok(None)` (unpriced); an
+    /// unknown id is an error.
+    pub fn reference_workspace_bytes(
+        &self,
+        id: &str,
+        spec: &LoadSpec,
+        facts: Option<&crate::MemoryReferenceResourceFacts>,
+    ) -> Result<Option<u64>> {
+        if !self
+            .generators()
+            .any(|registration| (registration.descriptor)().id == id)
+        {
+            return Err(Error::Msg(format!("no generator registered for id '{id}'")));
+        }
+        let Some(registration) = self
+            .reference_workspace
+            .iter()
+            .find(|registration| registration.provider_id == id)
+        else {
+            return Ok(None);
+        };
+        match facts {
+            None => Ok(Some(0)),
+            Some(facts) => (registration.reference_workspace_bytes)(spec, facts).map(Some),
+        }
     }
 
     /// Every adopted memory-strategy registration in this explicit catalog.
@@ -7012,6 +7081,68 @@ mod tests {
                 .unwrap(),
             Some(8)
         );
+    }
+
+    /// *Mutations that red this:* pricing `None` facts through the provider, treating an
+    /// unregistered provider as zero, or accepting duplicate/orphan registrations.
+    #[test]
+    fn reference_workspace_registration_is_additive_and_fails_closed() {
+        fn price(_: &LoadSpec, facts: &crate::MemoryReferenceResourceFacts) -> Result<u64> {
+            Ok(facts.conditioning_tokens * 10)
+        }
+        const REGISTRATION: ReferenceWorkspaceRegistration = ReferenceWorkspaceRegistration {
+            provider_id: "dummy_test_model",
+            reference_workspace_bytes: price,
+        };
+        let spec = LoadSpec::new(crate::WeightsSource::Dir("/unused".into()));
+        let facts = crate::MemoryReferenceResourceFacts {
+            conditioning_tokens: 3,
+            prepared_canvases: vec![(48, 16)],
+        };
+        let registry = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            registry
+                .reference_workspace_bytes("dummy_test_model", &spec, None)
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            registry
+                .reference_workspace_bytes("dummy_test_model", &spec, Some(&facts))
+                .unwrap(),
+            Some(30)
+        );
+        assert!(registry
+            .reference_workspace_bytes("no_such_model", &spec, None)
+            .is_err());
+        let unpriced = ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .build()
+            .unwrap();
+        assert_eq!(
+            unpriced
+                .reference_workspace_bytes("dummy_test_model", &spec, Some(&facts))
+                .unwrap(),
+            None
+        );
+        assert!(ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .register_reference_workspace(REGISTRATION)
+            .build()
+            .is_err());
+        assert!(ProviderRegistryBuilder::new()
+            .register_generator(DUMMY_GENERATOR_REGISTRATION)
+            .register_reference_workspace(ReferenceWorkspaceRegistration {
+                provider_id: "no_such_model",
+                reference_workspace_bytes: price,
+            })
+            .build()
+            .is_err());
     }
 
     #[test]

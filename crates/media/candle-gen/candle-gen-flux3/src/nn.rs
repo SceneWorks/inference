@@ -661,12 +661,15 @@ fn publisher_forward(publisher: &PublisherBase, flat: &Tensor) -> Result<Tensor>
     let (rows, input) = flat.dims2()?;
     let per_row = packed_gemm::transient_bytes_per_row(publisher.storage, input, publisher.out, 2)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
+    // The fixed per-launch padding (NVFP4) comes out of the budget first, so the WHOLE launch fits.
+    let overhead = packed_gemm::launch_overhead_bytes(publisher.storage, input, publisher.out, 2)
+        .map_err(|e| Error::Unsupported(e.to_string()))?;
     let plan = packed_gemm::plan_row_chunks(
         rows,
         input,
         publisher.out,
         per_row,
-        packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET,
+        packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET.saturating_sub(overhead),
     )
     .map_err(|e| Error::Unsupported(e.to_string()))?;
     let flat = to(flat, DType::BF16)?;
@@ -690,6 +693,19 @@ fn publisher_forward(publisher: &PublisherBase, flat: &Tensor) -> Result<Tensor>
     }
 }
 
+/// ONE planned launch's rows, widened to f32 AFTER narrowing: the f32 copy is a per-chunk
+/// transient of exactly `len · k` elements (what `transient_bytes_per_row` prices), never a
+/// whole-input copy held across every launch.
+fn widened_chunk(flat: &Tensor, start: usize, len: usize) -> Result<Tensor> {
+    let rows = flat.dim(0)?;
+    let chunk = if start == 0 && len == rows {
+        flat.contiguous()?
+    } else {
+        flat.narrow(0, start, len)?.contiguous()?
+    };
+    to(&chunk, DType::F32)
+}
+
 /// The strict packed GEMM: the compute-dtype rows widened exactly to f32 (the quantized kernels'
 /// input dtype), run in planned row chunks, and rounded ONCE to the compute dtype.
 fn packed_forward(
@@ -708,14 +724,9 @@ fn packed_forward(
             .map_err(|e| Error::Unsupported(e.to_string()))?;
     let plan = packed_gemm::plan_row_chunks(rows, input, out, per_row, budget)
         .map_err(|e| Error::Unsupported(e.to_string()))?;
-    let wide = to(flat, DType::F32)?;
     let mut parts = Vec::with_capacity(plan.len());
     for (start, len) in plan {
-        let chunk = if len == rows {
-            wide.contiguous()?
-        } else {
-            wide.narrow(0, start, len)?.contiguous()?
-        };
+        let chunk = widened_chunk(flat, start, len)?;
         parts.push(to(&matmul.forward(&chunk)?, compute)?);
     }
     match parts.len() {
@@ -1028,6 +1039,32 @@ mod tests {
                 assert!(err < 0.02, "{storage:?}/{compute:?}: {err}");
             }
             drop(q_gpu);
+        }
+    }
+
+    /// The f32 widening is per planned launch: each chunk's f32 storage holds exactly its own
+    /// `len · k` elements, so the priced per-row transient is the real one.
+    ///
+    /// *Mutation that reds this:* widening the whole `[rows, k]` input before narrowing (each
+    /// chunk would then be a view over full-size f32 storage).
+    #[test]
+    fn packed_chunks_widen_only_their_own_rows() {
+        let k = 64;
+        let x = seeded(10, k, 2.1).to_dtype(DType::BF16).unwrap();
+        for (start, len) in [(0, 3), (3, 3), (9, 1), (0, 10)] {
+            let chunk = widened_chunk(&x, start, len).unwrap();
+            assert_eq!(chunk.dims(), &[len, k]);
+            assert_eq!(chunk.dtype(), DType::F32);
+            let (storage, _) = chunk.storage_and_layout();
+            let elements = match &*storage {
+                candle_gen::candle_core::Storage::Cpu(cpu) => cpu.as_slice::<f32>().unwrap().len(),
+                _ => unreachable!("CPU test"),
+            };
+            assert_eq!(
+                elements,
+                len * k,
+                "chunk {start}+{len}: f32 copy is per chunk"
+            );
         }
     }
 

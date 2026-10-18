@@ -78,7 +78,9 @@ pub fn register_providers(
     register_memory_contract_surfaces(
         registry
             .register_generator(model::REGISTRATION)
-            .register_generator(model::BASE_REGISTRATION),
+            .register_generator(model::BASE_REGISTRATION)
+            .register_reference_workspace(memory_strategy::REFERENCE_WORKSPACE_REGISTRATION)
+            .register_reference_workspace(memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION),
     )
 }
 
