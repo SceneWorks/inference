@@ -103,6 +103,28 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
         correct.flux3_reference_output,
         Some(ReferenceOutputSize::default())
     );
+    // A caller can accidentally drop BOTH the images and their output intent after admission.
+    // Matching numeric dimensions must not let that request silently become a T2I render.
+    let mut dropped = correct.clone();
+    dropped.conditioning.clear();
+    dropped.flux3_reference_output = None;
+    let mut scope = guard_memory_scope(
+        Box::new(Scope {
+            admitted,
+            seen: seen.clone(),
+        }),
+        admitted,
+    );
+    let error = scope.configure_request(&mut dropped).unwrap_err();
+    assert!(matches!(&error, gen_core::Error::Unsupported(_)));
+    assert!(error
+        .to_string()
+        .contains("resolve owned references before memory admission"));
+    assert_eq!(
+        seen.get(),
+        1,
+        "dropped references must be refused before generic scope/render"
+    );
     let admitted = MemoryGeometry {
         width: 1024,
         height: 1024,
@@ -120,6 +142,48 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
     scope.configure_request(&mut legacy).unwrap();
     assert_eq!((legacy.width, legacy.height), (1024, 1024));
     assert_eq!(legacy.flux3_reference_output, None);
+}
+
+#[test]
+fn multi_reference_auto_canvas_uses_the_positive_token_grid_not_the_single_padding_floor() {
+    use gen_core::flux3::references::{
+        normalize_request, request_plan, validate_request_with_resolved_output,
+    };
+    use gen_core::{Capabilities, Conditioning, ConditioningKind, GenerationRequest, SizeFloor};
+    let mut request = GenerationRequest {
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![image(48, 64, 7), image(64, 64, 13)],
+        }],
+        flux3_reference_output: Some(ReferenceOutputSize::default()),
+        ..Default::default()
+    };
+    let plan = request_plan(&request).unwrap().unwrap();
+    assert_eq!(plan.output.canvas, (48, 64));
+    assert_eq!(plan.output.crop, None);
+    assert_eq!(plan.canvases, [(48, 64), (64, 64)]);
+    normalize_request(&mut request).unwrap();
+    assert_eq!((request.width, request.height), (48, 64));
+    let caps = Capabilities {
+        min_size: 64,
+        max_size: 4096,
+        max_count: 1,
+        size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+        conditioning: vec![ConditioningKind::MultiReference],
+        ..Default::default()
+    };
+    assert!(caps.validate_request("flux3_klein", &request).is_err());
+    validate_request_with_resolved_output(&caps, "flux3_klein", &request).unwrap();
+    let mut plain = request.clone();
+    plain.conditioning.clear();
+    plain.flux3_reference_output = None;
+    assert!(validate_request_with_resolved_output(&caps, "flux3_klein", &plain).is_err());
+    assert_eq!(
+        gen_core::flux3::references::plan(&[(16, 64), (64, 64)], ReferenceOutputSize::default())
+            .unwrap()
+            .output
+            .canvas,
+        (16, 64)
+    );
 }
 
 #[test]

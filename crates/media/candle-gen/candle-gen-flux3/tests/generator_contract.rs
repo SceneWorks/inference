@@ -150,6 +150,35 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
             (64, 80),
             "ten EXIF references use upstream multi-reference crop"
         );
+        let mut narrow = edit.clone();
+        narrow.conditioning = vec![
+            Conditioning::Reference {
+                image: Image {
+                    width: 48,
+                    height: 64,
+                    pixels: vec![19; 48 * 64 * 3],
+                },
+                strength: None,
+            },
+            refs[0].clone(),
+        ];
+        narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
+        // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
+        // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
+        let plan = candle_gen::gen_core::flux3::references::normalize_request(&mut narrow)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.output.canvas, (48, 64));
+        g.validate(&narrow).unwrap();
+        let narrow_image = render(&narrow);
+        assert_eq!((narrow_image.width, narrow_image.height), (48, 64));
+        let mut narrow_t2i = narrow;
+        narrow_t2i.conditioning.clear();
+        narrow_t2i.flux3_reference_output = None;
+        assert!(
+            g.validate(&narrow_t2i).is_err(),
+            "legacy no-reference minimum is unchanged"
+        );
         let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
         for file in [

@@ -160,14 +160,21 @@ pub fn plan(dimensions: &[(u32, u32)], size: ReferenceOutputSize) -> Result<Refe
         size.width.unwrap_or(first.0),
         size.height.unwrap_or(first.1),
     );
-    if canvas.0 < MIN_SIDE
-        || canvas.1 < MIN_SIDE
+    // Frozen generate.py requires positive 16px-grid output sides. MIN_SIDE applies only to
+    // prepare_reference's padded SINGLE image, not a multi-reference crop or output canvas.
+    // Retain this provider's existing advertised MAX_SIDE envelope (model::MAX_SIZE), rather
+    // than silently expanding its allocation contract; UPSTREAM.md records that upper deviation.
+    if canvas.0 < DOWNSAMPLING_RATIO
+        || canvas.1 < DOWNSAMPLING_RATIO
         || canvas.0 > MAX_SIDE
         || canvas.1 > MAX_SIDE
-        || !canvas.0.is_multiple_of(16)
-        || !canvas.1.is_multiple_of(16)
+        || !canvas.0.is_multiple_of(DOWNSAMPLING_RATIO)
+        || !canvas.1.is_multiple_of(DOWNSAMPLING_RATIO)
     {
-        return Err(invalid(format!("output canvas {}x{} must have 64–4096px sides on the 16px grid; specify output dimensions for a smaller multi-reference canvas",canvas.0,canvas.1)));
+        return Err(invalid(format!(
+            "output canvas {}x{} must have positive 16px-grid sides within this provider's 4096px side limit",
+            canvas.0, canvas.1
+        )));
     }
     let crop = if !multi
         && size.width.is_none()
@@ -324,19 +331,52 @@ fn ordered_inputs(req: &crate::GenerationRequest) -> Result<Vec<Input<'_>>> {
     let mut inputs = Vec::with_capacity(count);
     for item in &req.conditioning {
         match item {
-            Conditioning::Reference {image,strength:None}=>{buffer_valid(image,inputs.len())?;inputs.push(Input::Rgb(image));},
-            Conditioning::ReferenceRgba {image,strength:None}=>{
-                let expected=(image.width as usize).checked_mul(image.height as usize).and_then(|n|n.checked_mul(4));
-                if image.width==0 || image.height==0 || expected!=Some(image.pixels.len()) {
-                    return Err(invalid(format!("reference {} has invalid RGBA dimensions/buffer ({}x{}, {} bytes)",inputs.len()+1,image.width,image.height,image.pixels.len())));
+            Conditioning::Reference {
+                image,
+                strength: None,
+            } => {
+                buffer_valid(image, inputs.len())?;
+                inputs.push(Input::Rgb(image));
+            }
+            Conditioning::ReferenceRgba {
+                image,
+                strength: None,
+            } => {
+                let expected = (image.width as usize)
+                    .checked_mul(image.height as usize)
+                    .and_then(|n| n.checked_mul(4));
+                if image.width == 0 || image.height == 0 || expected != Some(image.pixels.len()) {
+                    return Err(invalid(format!(
+                        "reference {} has invalid RGBA dimensions/buffer ({}x{}, {} bytes)",
+                        inputs.len() + 1,
+                        image.width,
+                        image.height,
+                        image.pixels.len()
+                    )));
                 }
                 inputs.push(Input::Rgba(image));
-            },
-            Conditioning::MultiReference {images} if !images.is_empty()=>{
-                for image in images {buffer_valid(image,inputs.len())?;inputs.push(Input::Rgb(image));}
-            },
-            Conditioning::Reference {strength:Some(_),..}|Conditioning::ReferenceRgba {strength:Some(_),..}=>return Err(invalid("per-reference strength is unsupported; remove it to use reference conditioning")),
-            _=>return Err(invalid("only ordered Reference/ReferenceRgba/MultiReference conditioning is supported; remove unsupported conditioning")),
+            }
+            Conditioning::MultiReference { images } if !images.is_empty() => {
+                for image in images {
+                    buffer_valid(image, inputs.len())?;
+                    inputs.push(Input::Rgb(image));
+                }
+            }
+            Conditioning::Reference {
+                strength: Some(_), ..
+            }
+            | Conditioning::ReferenceRgba {
+                strength: Some(_), ..
+            } => {
+                return Err(invalid(
+                    "per-reference strength is unsupported; remove it to use reference conditioning",
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    "only ordered Reference/ReferenceRgba/MultiReference conditioning is supported; remove unsupported conditioning",
+                ));
+            }
         }
     }
     if inputs.is_empty() && req.flux3_reference_output.is_some() {
@@ -378,6 +418,22 @@ pub fn request_plan(req: &crate::GenerationRequest) -> Result<Option<ReferencePl
         request_output(req),
     )
     .map(Some)
+}
+
+/// Validate the shared control surface against resolved reference geometry. The descriptor's
+/// historical minimum is the T2I default envelope, not a kernel floor for reference-derived
+/// canvases: frozen multi-reference crops may be 16/32/48 pixels on one side. `request_plan`
+/// enforces their positive grid and the existing provider maximum before skipping raw/default sizes.
+pub fn validate_request_with_resolved_output(
+    caps: &crate::Capabilities,
+    model_id: &str,
+    req: &crate::GenerationRequest,
+) -> Result<()> {
+    if request_plan(req)?.is_some() {
+        caps.validate_request_skip_size(model_id, req)
+    } else {
+        caps.validate_request(model_id, req)
+    }
 }
 
 /// Existing PUP consumes ORIGINAL ordered RGB/RGBA, never AE RGB-converted/resized canvases.
@@ -466,12 +522,19 @@ struct ReferenceScope<'a> {
 
 impl crate::MemoryRequestScope for ReferenceScope<'_> {
     fn configure_request(&mut self, req: &mut crate::GenerationRequest) -> Result<()> {
-        if let Some(plan) = request_plan(req)? {
-            if plan.output.canvas != (self.admitted.width, self.admitted.height)
-                || plan.geometry.len() != self.admitted.reference_count as usize
-            {
-                return Err(invalid(format!("resolved reference canvas {}x{} and {} references do not match admitted {}x{} and {}; resolve owned references before memory admission",plan.output.canvas.0,plan.output.canvas.1,plan.geometry.len(),self.admitted.width,self.admitted.height,self.admitted.reference_count)));
-            }
+        let plan = request_plan(req)?;
+        let actual_count = plan.as_ref().map_or(0, |plan| plan.geometry.len());
+        let canvas = plan
+            .as_ref()
+            .map_or((req.width, req.height), |plan| plan.output.canvas);
+        if actual_count != self.admitted.reference_count as usize
+            || (plan.is_some() && canvas != (self.admitted.width, self.admitted.height))
+        {
+            return Err(invalid(format!(
+                "resolved reference canvas {}x{} and {} references do not match admitted {}x{} and {}; resolve owned references before memory admission",
+                canvas.0, canvas.1, actual_count,
+                self.admitted.width, self.admitted.height, self.admitted.reference_count
+            )));
         }
         normalize_request(req)?;
         self.inner.configure_request(req)

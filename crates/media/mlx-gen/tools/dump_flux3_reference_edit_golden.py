@@ -49,6 +49,19 @@ for i in range(10):
     for prepare in (lambda im:pipeline.prepare_reference(im)[0],pipeline.prepare_multi_reference):
         assert np.array_equal(np.asarray(prepare(rgba_image)),np.asarray(prepare(originals[-1])))
 
+class RecordingAutoencoder:
+    """Observe the exact frozen AE output before Pipeline.encode_references stores BF16."""
+    def __init__(self, encoder):
+        self.encoder = encoder
+        self.tokens = []
+
+    def encode(self, image):
+        tokens, ids = self.encoder.encode(image)
+        assert tokens.dtype == torch.float32
+        self.tokens.append(tokens.detach().clone())
+        return tokens, ids
+
+
 def pack(cond,base_mode):
     samples=[[neg,cond,(x.clone(),ids)],[pos,cond,(x.clone(),ids)]] if base_mode else [[pos,cond,(x.clone(),ids)]]
     packed=pipeline.pack(samples)
@@ -59,7 +72,9 @@ def pack(cond,base_mode):
 with torch.inference_mode():
     for name,images in [('one',originals[:1]),('two',originals[:2]),('ten',originals),('reversed',list(reversed(originals)))]:
         prepared=[pipeline.prepare_multi_reference(im) for im in images] if len(images)>1 else [pipeline.prepare_reference(images[0])[0]]
-        cond=pipeline.Pipeline.encode_references(SimpleNamespace(autoencoder=ae,device='cpu'),prepared)
+        recording = RecordingAutoencoder(ae)
+        cond=pipeline.Pipeline.encode_references(SimpleNamespace(autoencoder=recording,device='cpu'),prepared)
+        out[name+'/reference_tokens_f32']=torch.cat(recording.tokens)
         out[name+'/reference_tokens']=cond[0].float()
         out[name+'/reference_ids']=cond[1].float()
         tokens=sampling.denoise_flow_map(flow,pack(cond,False),schedule)
