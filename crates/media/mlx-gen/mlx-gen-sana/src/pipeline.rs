@@ -238,7 +238,7 @@ pub fn decode_to_image(
     decode_to_image_with_tiling(decoder, cfg, latents, cancel, None)
 }
 
-fn decode_to_image_with_tiling(
+pub(crate) fn decode_to_image_with_tiling(
     decoder: &DcAeDecoder,
     cfg: &DcAeConfig,
     latents: &Array,
@@ -346,6 +346,12 @@ pub fn resolved_decode_plan(
 /// (at the request's edge, else [`DECODE_TILE_EDGE`]). Nothing else does — in particular a Mac
 /// request with no memory selection (Resident or Sequential) keeps the whole-image encode.
 pub fn resolved_encode_tile(memory: Option<GenerationMemory>) -> Option<i32> {
+    resolved_encode_tile_on(memory, mlx_gen::ios_quantum::enabled())
+}
+
+/// [`resolved_encode_tile`] with the iOS quantum scope's state given explicitly (`ios`): what a
+/// request resolves to on a device, priced off it by [`crate::ios_pricing`].
+pub fn resolved_encode_tile_on(memory: Option<GenerationMemory>, ios: bool) -> Option<i32> {
     let requested = memory
         .filter(|memory| memory.tile_vae_decode)
         .map(|memory| {
@@ -353,7 +359,7 @@ pub fn resolved_encode_tile(memory: Option<GenerationMemory>) -> Option<i32> {
                 .decode_tile_edge
                 .map_or(DECODE_TILE_EDGE, |edge| edge as i32)
         });
-    requested.or_else(|| mlx_gen::ios_quantum::enabled().then_some(DECODE_TILE_EDGE))
+    requested.or_else(|| ios.then_some(DECODE_TILE_EDGE))
 }
 
 pub fn resolve_decode_tiling(
@@ -469,7 +475,7 @@ fn decode_tiled(
             let decoded = decoder.decode_tail_cancellable(&tile, cancel)?;
             let shape = decoded.shape();
             mlx_gen::ios_quantum::before(
-                "DC-AE tile fold",
+                crate::quantum::labels::TILE_FOLD,
                 crate::quantum::tile_fold_bytes(
                     shape[1] as u64,
                     shape[2] as u64,
@@ -482,7 +488,7 @@ fn decode_tiled(
         },
         |accumulators| {
             if mlx_gen::ios_quantum::enabled() {
-                mlx_gen::ios_quantum::finish("DC-AE tile fold", accumulators)
+                mlx_gen::ios_quantum::finish(crate::quantum::labels::TILE_FOLD, accumulators)
             } else {
                 for accumulator in accumulators {
                     accumulator.eval()?;
@@ -497,12 +503,12 @@ fn decode_tiled(
         },
         |_| {
             mlx_gen::ios_quantum::before(
-                "DC-AE final normalize",
+                crate::quantum::labels::TILE_FINALIZE,
                 crate::quantum::tile_finalize_bytes(out_h, out_w),
             )
         },
     )?;
-    mlx_gen::ios_quantum::finish("DC-AE final normalize", &[&out])?;
+    mlx_gen::ios_quantum::finish(crate::quantum::labels::TILE_FINALIZE, &[&out])?;
     let shape = out.shape();
     Ok(out.reshape(&[1, shape[2], shape[3], shape[4]])?)
 }
@@ -710,7 +716,7 @@ pub(crate) fn denoise_sprint_from_with_memory(
         // responsive rather than deferred to decode. The prior step's SCM update (or the seeded
         // prior on the first step) materializes here, inside its own guarded quantum.
         materialize_latents(
-            "SANA SCM step",
+            crate::quantum::labels::SCM_STEP,
             &[&latents],
             crate::quantum::scm_step_bytes(latents.size() as u64),
         )?;
@@ -776,7 +782,7 @@ pub(crate) fn denoise_sprint_from_with_memory(
     // still lazy here and materializes with the division.
     let out = divide(&denoised, arr1(sd))?;
     materialize_latents(
-        "SANA SCM final",
+        crate::quantum::labels::SCM_FINAL,
         &[&out],
         crate::quantum::scm_step_bytes(out.size() as u64).saturating_add(
             mlx_gen::ios_quantum::elementwise_bytes(out.size() as u64, 1),
@@ -1058,7 +1064,7 @@ pub fn prepare_reference_latent(
     // The scaling multiply is the only pending work over the encoder output: one latent-sized
     // f32 output plus its f32 scale operand.
     materialize_latents(
-        "SANA reference latent",
+        crate::quantum::labels::REFERENCE_LATENT,
         &[&latent],
         mlx_gen::ios_quantum::elementwise_bytes(latent.size() as u64 + 1, 1),
     )?;
@@ -1247,7 +1253,7 @@ impl SanaHeavy {
             crate::transformer::SanaForwardPlan::RESIDENT,
         )?;
         materialize_latents(
-            "SANA latent",
+            crate::quantum::labels::LATENT,
             &[&latents],
             crate::quantum::scm_step_bytes(latents.size() as u64),
         )?;

@@ -34,6 +34,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{BlockType, DcAeConfig};
+use crate::quantum::labels;
 
 const F32: Dtype = Dtype::Float32;
 
@@ -546,7 +547,7 @@ impl DcAeDecoder {
         let (b, lh, lw, lc) = nhwc(&latent);
         let mut h = quantum(
             cancel,
-            "DC-AE head input",
+            labels::DECODER_INPUT,
             crate::quantum::dcae_decoder_input_bytes(
                 b,
                 lh,
@@ -583,7 +584,7 @@ impl DcAeDecoder {
         let (b, hh, hw, c) = nhwc(&h);
         quantum(
             cancel,
-            "DC-AE output",
+            labels::DECODER_OUTPUT,
             crate::quantum::dcae_decoder_output_bytes(
                 b,
                 hh,
@@ -614,14 +615,20 @@ impl Stage {
     fn run_decoder(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let mut h = x.clone();
         if let Some(up) = &self.upsample {
-            h = quantum(cancel, "DC-AE upsample", up.quantum_bytes(&h), || {
-                up.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::DECODER_UPSAMPLE,
+                up.quantum_bytes(&h),
+                || up.forward(&h),
+            )?;
         }
         for block in &self.blocks {
-            h = quantum(cancel, "DC-AE block", block.quantum_bytes(&h), || {
-                block.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::DECODER_BLOCK,
+                block.quantum_bytes(&h),
+                || block.forward(&h),
+            )?;
         }
         Ok(h)
     }
@@ -819,7 +826,7 @@ impl DcAeEncoder {
         let (b, xh, xw, xc) = nhwc(x);
         let mut h = quantum(
             cancel,
-            "DC-AE encoder input",
+            labels::ENCODER_INPUT,
             crate::quantum::dcae_encoder_input_bytes(
                 b,
                 xh,
@@ -845,7 +852,7 @@ impl DcAeEncoder {
         // out_shortcut: conv_out(h) + mean_group(h → latent_channels).
         quantum(
             cancel,
-            "DC-AE encoder output",
+            labels::ENCODER_OUTPUT,
             crate::quantum::dcae_encoder_output_bytes(
                 b,
                 hh,
@@ -930,7 +937,7 @@ impl DcAeEncoder {
         let (b, _, _, c) = nhwc(&rows[0][0]);
         let stitched = quantum(
             cancel,
-            "DC-AE encode tile stitch",
+            labels::ENCODER_STITCH,
             crate::quantum::dcae_encode_stitch_bytes(
                 b,
                 (height / cell) as u64,
@@ -958,14 +965,20 @@ impl EncStage {
     fn run_encoder(&self, x: &Array, cancel: &CancelFlag) -> Result<Array> {
         let mut h = x.clone();
         for block in &self.blocks {
-            h = quantum(cancel, "DC-AE block", block.quantum_bytes(&h), || {
-                block.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::ENCODER_BLOCK,
+                block.quantum_bytes(&h),
+                || block.forward(&h),
+            )?;
         }
         if let Some(down) = &self.downsample {
-            h = quantum(cancel, "DC-AE downsample", down.quantum_bytes(&h), || {
-                down.forward(&h)
-            })?;
+            h = quantum(
+                cancel,
+                labels::ENCODER_DOWNSAMPLE,
+                down.quantum_bytes(&h),
+                || down.forward(&h),
+            )?;
         }
         Ok(h)
     }
@@ -1107,6 +1120,11 @@ pub(crate) mod quantum_proofs {
     }
 
     pub(crate) fn weights(cfg: &DcAeConfig) -> Weights {
+        Weights::from_map(weight_map(cfg))
+    }
+
+    /// [`weights`]' tensors by name (to write a fixture snapshot).
+    pub(crate) fn weight_map(cfg: &DcAeConfig) -> HashMap<String, Array> {
         let mut w = W(HashMap::new(), 4000);
         let n = cfg.num_stages();
         let ch = &cfg.block_out_channels;
@@ -1149,7 +1167,7 @@ pub(crate) mod quantum_proofs {
         w.affine("decoder.norm_out", ch[0]);
         w.conv("decoder.conv_out", cfg.in_channels, ch[0], 3, true);
         w.conv("encoder.conv_out", cfg.latent_channels, ch[n - 1], 3, true);
-        Weights::from_map(w.0)
+        w.0
     }
 
     fn rand(shape: &[i32], seed: u64) -> Array {
