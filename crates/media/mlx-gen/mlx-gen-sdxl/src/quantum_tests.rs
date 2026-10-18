@@ -114,11 +114,18 @@ fn assert_well_ordered(events: &[Ev]) {
     let mut open: Option<&str> = None;
     for (i, e) in events.iter().enumerate() {
         match e {
-            Ev::Checked(label, _) if label == VAE_TILE => assert_eq!(
-                open,
-                Some(VAE_TILED_STAGE),
-                "tile check #{i} outside a tiled stage: {events:?}"
-            ),
+            Ev::Checked(label, _) if label == VAE_TILE || label == VAE_ENCODE_TILE => {
+                let stage = if label == VAE_TILE {
+                    VAE_TILED_STAGE
+                } else {
+                    VAE_ENCODE_TILED_STAGE
+                };
+                assert_eq!(
+                    open,
+                    Some(stage),
+                    "tile check #{i} outside a tiled stage: {events:?}"
+                )
+            }
             Ev::Checked(label, _) => {
                 assert!(
                     open.is_none(),
@@ -128,9 +135,8 @@ fn assert_well_ordered(events: &[Ev]) {
             }
             // `mlx_gen::vae_tiling` synchronizes and drains each tiled core itself, inside the
             // open tiled stage, after that tile's own check.
-            Ev::Synced(label) if label == TILED_CORE => assert_eq!(
-                open,
-                Some(VAE_TILED_STAGE),
+            Ev::Synced(label) if label == TILED_CORE => assert!(
+                matches!(open, Some(VAE_TILED_STAGE | VAE_ENCODE_TILED_STAGE)),
                 "tiled core synchronized outside a tiled stage: {events:?}"
             ),
             Ev::Synced(label) => {
@@ -454,11 +460,73 @@ fn streamed_transformer_blocks_are_checked_before_materialization() {
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
     assert_well_ordered(&events);
     assert_unet_counts(&events, &streamed, &cfg);
-    // The streamed block's floor is its resident twin's: same loaded shapes, same request.
+    // The streamed block's activations are its resident twin's (same loaded shapes, same
+    // request); its quantum also reads the block from the snapshot (epic 16774): every stored
+    // tensor of the block plus the GEGLU value/gate halves beside the projection they are sliced
+    // from — read off the file, in forward order (down, mid, up).
     let (_, resident_events) = observe(PLENTY, || resident.forward(&x, 500.0, &ctx, &pooled, &ids));
+    let mut stacks: Vec<String> = Vec::new();
+    let n = cfg.block_out_channels.len();
+    for i in 0..n {
+        if cfg.down_block_types[i].contains("CrossAttn") {
+            for j in 0..cfg.layers_per_block[i] {
+                stacks.push(format!("down_blocks.{i}.attentions.{j}"));
+            }
+        }
+    }
+    stacks.push("mid_block.attentions.0".into());
+    for k in 0..n {
+        let ci = n - 1 - k;
+        if cfg.up_block_types[ci].contains("CrossAttn") {
+            for j in 0..=cfg.layers_per_block[ci] {
+                stacks.push(format!("up_blocks.{k}.attentions.{j}"));
+            }
+        }
+    }
+    let mut read = Vec::new();
+    for stack in &stacks {
+        let depth = weights
+            .keys()
+            .filter_map(|k| k.strip_prefix(&format!("{stack}.transformer_blocks.")))
+            .filter_map(|rest| rest.split('.').next()?.parse::<usize>().ok())
+            .max()
+            .map_or(0, |d| d + 1);
+        for b in 0..depth {
+            let block = format!("{stack}.transformer_blocks.{b}.");
+            read.push(
+                weights
+                    .keys()
+                    .filter(|k| k.starts_with(&block))
+                    .map(|k| {
+                        let a = weights.get(k).unwrap();
+                        let stored = mlx_gen::ios_quantum::allocated_bytes(bytes(a));
+                        if k.contains(".ff.net.0.proj.") {
+                            // The value/gate halves beside the projection, and (once, off the
+                            // weight) the two `[hidden]` i32 row selections slicing them.
+                            let selections = if k.ends_with(".weight") {
+                                let half = a.shape()[0] as u64 / 2;
+                                2 * mlx_gen::ios_quantum::allocated_bytes(4 * half)
+                            } else {
+                                0
+                            };
+                            2 * stored + selections
+                        } else {
+                            stored
+                        }
+                    })
+                    .sum::<u64>(),
+            );
+        }
+    }
+    let resident_blocks = checked(&resident_events, TRANSFORMER_BLOCK);
+    assert_eq!(resident_blocks.len(), read.len());
     assert_eq!(
         checked(&events, TRANSFORMER_BLOCK),
-        checked(&resident_events, TRANSFORMER_BLOCK)
+        resident_blocks
+            .iter()
+            .zip(&read)
+            .map(|(activations, weights)| activations + weights)
+            .collect::<Vec<_>>()
     );
     assert!(assert_refusals(&events, |headroom| observe(
         headroom, forward
@@ -917,9 +985,9 @@ fn vae_encode_is_bounded_and_identical() {
     assert_well_ordered(&events);
     for (label, want) in [
         (VAE_ENCODE_IN, 1),
-        (VAE_RESNET, 2 + 2),
+        (VAE_ENCODE_RESNET, 2 + 2),
         (VAE_DOWNSAMPLE, 1),
-        (VAE_ATTENTION, 1),
+        (VAE_ENCODE_ATTENTION, 1),
         (VAE_ENCODE_OUT, 1),
     ] {
         assert_eq!(checked(&events, label).len(), want, "{label} checks");
@@ -942,29 +1010,29 @@ fn save(weights: &Weights, path: &std::path::Path) {
     Array::save_safetensors(named, None, path).unwrap();
 }
 
-/// The cast-aware load floor for dense `files` loaded at `target` (`width` bytes): every tensor's
-/// resident bytes after the cast (its cast copy when its stored dtype differs, its stored bytes
-/// otherwise) plus the largest tensor's transient (stored + cast copy, or one stored read).
+/// The cast-aware load floor for dense `files` loaded at `target` (`width` bytes) small enough to
+/// materialize in one batch: every tensor's stored bytes as read, plus the cast copy of every
+/// tensor whose stored dtype differs — the read sources and the copies are live together until the
+/// batch completes.
 fn cast_load_floor(
     files: &[&std::path::Path],
     target: mlx_gen::gen_core::weightsmeta::Dtype,
     width: u64,
 ) -> u64 {
-    let (mut total, mut largest) = (0u64, 0u64);
-    for h in files
+    files
         .iter()
         .flat_map(|f| mlx_gen::gen_core::safetensors_path_tensor_headers(f).unwrap())
-    {
-        if h.dtype == target {
-            total += h.data_bytes;
-            largest = largest.max(h.data_bytes);
-        } else {
-            let cast = h.shape.iter().product::<usize>() as u64 * width;
-            total += cast;
-            largest = largest.max(cast + h.data_bytes);
-        }
-    }
-    total + largest
+        .map(|h| {
+            let cast = if h.dtype == target {
+                0
+            } else {
+                mlx_gen::ios_quantum::allocated_bytes(
+                    h.shape.iter().product::<usize>() as u64 * width,
+                )
+            };
+            mlx_gen::ios_quantum::allocated_bytes(h.data_bytes) + cast
+        })
+        .sum()
 }
 
 /// Every component loader checks its header floor before constructing anything; with no headroom
@@ -1028,8 +1096,17 @@ fn component_loads_check_their_header_floor_before_construction() {
         // fixtures loaded at f16 (the fp16-fix VAE, the U-Net, the ControlNet) price their f16
         // copies; the f32 loads (the stock VAE, CLIP here) cast nothing and price the stored bytes.
         let floor = match *label {
-            "SDXL fp16-fix VAE load" | "SDXL UNet load" | "SDXL ControlNet load" => {
+            "SDXL fp16-fix VAE load" | "SDXL ControlNet load" => {
                 cast_load_floor(&[file], Stored::F16, 2)
+            }
+            // The U-Net's constructor also builds every block's GEGLU row selections and the
+            // timestep / `text_time` sinusoid tables (the SDXL-base config's) before materializing.
+            "SDXL UNet load" => {
+                let tables = crate::unet::SinusoidalPositionalEncoding::timestep_table_bytes(320)
+                    + crate::unet::SinusoidalPositionalEncoding::timestep_table_bytes(256);
+                cast_load_floor(&[file], Stored::F16, 2)
+                    + crate::loader::geglu_index_bytes(&[file.to_path_buf()], |_| true).unwrap()
+                    + tables
             }
             _ => cast_load_floor(&[file], Stored::F32, 4),
         };
@@ -1280,12 +1357,16 @@ fn bounded_encode_is_selected_on_ios_guarded_and_routed_by_the_rung() {
     assert_eq!(bits(&host), bits(&guarded.unwrap()));
     assert_well_ordered(&events);
     assert!(
-        !checked(&events, VAE_TILE).is_empty(),
+        !checked(&events, VAE_ENCODE_TILE).is_empty(),
         "iOS encode_mean must tile"
     );
     // conv_in, block 0's resnet, its downsample, block 1's resnet: one tiled stage each.
-    assert_eq!(checked(&events, VAE_TILED_STAGE).len(), 4);
-    assert_eq!(synced(&events, VAE_TILED_STAGE), 4);
+    assert_eq!(checked(&events, VAE_ENCODE_TILED_STAGE).len(), 4);
+    assert_eq!(synced(&events, VAE_ENCODE_TILED_STAGE), 4);
+    assert!(
+        checked(&events, VAE_TILE).is_empty() && checked(&events, VAE_RESNET).is_empty(),
+        "an encode checks only encode-phase labels"
+    );
     assert_eq!(
         checked(&events, VAE_ENCODE_IN).len(),
         0,
@@ -1620,7 +1701,7 @@ mod proofs {
     /// [`RUNS`] times, UNTHROTTLED (no memory limit is ever set; the fixture only enables the iOS
     /// guards and barriers), and prove `formula` tracks the worst measured peak. Prints the ratio for
     /// the record.
-    fn prove(label: &str, formula: u64, run: impl Fn() -> Result<Vec<Array>>) -> f64 {
+    pub(super) fn prove(label: &str, formula: u64, run: impl Fn() -> Result<Vec<Array>>) -> f64 {
         let warm = run().unwrap();
         mlx_rs::transforms::eval(warm.iter()).unwrap();
         drop(warm);
@@ -2608,7 +2689,14 @@ mod proofs {
         prove(
             &format!("{VAE_TILED_STAGE} + {VAE_TILE} (resnet)"),
             tiled_stage_bytes(&[1, 32, 32, 64], 64, 64, 4, true) + tile,
-            || Ok(vec![resnet.forward_tiled_vae(&x, 16, None)?]),
+            || {
+                Ok(vec![resnet.forward_tiled_vae(
+                    &x,
+                    16,
+                    None,
+                    crate::quantum::VAE_DECODE_LABELS,
+                )?])
+            },
         );
         // The bounded encode's stride-2 downsample, at a stage-dominated shape (8-pixel output
         // cores, 17x17 exact-halo crops, over a 128x128x32 input: the row strips + assembly carry
@@ -2696,683 +2784,11 @@ mod proofs {
 // resident + scratch + the 512 MiB reserve fits the 6142 MiB entitled launch headroom.
 // ---------------------------------------------------------------------------------------------
 
-mod reachable {
-    use super::*;
-    use mlx_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, Dtype as Stored};
+#[path = "quantum_tests_reachable.rs"]
+mod reachable;
 
-    const MIB: u64 = 1 << 20;
-    const ENTITLED: u64 = 6142 * MIB;
-    const HALF: u64 = 2;
-
-    /// The caller-provisioned snapshot for `repo`, from `SDXL_PREDICTION_SNAPSHOTS` (a directory
-    /// holding one sub-directory per repo name). Inference never derives a cache path.
-    fn snapshot(repo: &str) -> Option<std::path::PathBuf> {
-        let root = std::path::PathBuf::from(std::env::var_os("SDXL_PREDICTION_SNAPSHOTS")?);
-        Some(root.join(repo)).filter(|p| p.is_dir())
-    }
-
-    /// Resident bytes of `file` after the iOS load: every float tensor not at `target` is cast to
-    /// it (`width` bytes) — on a packed file only the dense leaves (never codes or `.scales` /
-    /// `.biases`) — else its stored bytes.
-    fn resident(file: &std::path::Path, target: Stored, width: u64) -> u64 {
-        let headers = safetensors_path_tensor_headers(file).unwrap();
-        let packed = headers.iter().any(|h| h.name.ends_with(".scales"));
-        headers
-            .iter()
-            .map(|h| {
-                let floating = matches!(
-                    h.dtype,
-                    Stored::F16 | Stored::BF16 | Stored::F32 | Stored::F64
-                );
-                let companion = h.name.ends_with(".scales") || h.name.ends_with(".biases");
-                let casts = h.dtype != target && (!packed || (floating && !companion));
-                if casts {
-                    h.shape.iter().product::<usize>() as u64 * width
-                } else {
-                    h.data_bytes
-                }
-            })
-            .sum()
-    }
-
-    /// A dense f16 ControlNet's resident bytes after `quantize(bits)` (its attention/FFN/embedding
-    /// linears pack at `bits` + one bf16 scale and bias per 64-group; convs and norms stay f16).
-    fn quantized_controlnet(file: &std::path::Path, bits: Option<u64>) -> u64 {
-        safetensors_path_tensor_headers(file)
-            .unwrap()
-            .iter()
-            .map(|h| {
-                let elements = h.shape.iter().product::<usize>() as u64;
-                let linear = h.shape.len() == 2
-                    && h.name.ends_with(".weight")
-                    && !h.name.contains("conv")
-                    && !h.name.contains("norm");
-                match bits {
-                    Some(b) if linear => elements * b / 8 + elements / 64 * 2 * 2,
-                    _ => elements * HALF,
-                }
-            })
-            .sum()
-    }
-
-    /// The largest tensor of `file` as stored (a load's read transient; `before_cast_for_load`'s
-    /// scratch beyond the resident bytes for an uncast file).
-    fn largest(file: &std::path::Path) -> u64 {
-        safetensors_path_tensor_headers(file)
-            .unwrap()
-            .iter()
-            .map(|h| h.data_bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn w(o: i32, k: i32, c: i32) -> Array {
-        Array::zeros::<f32>(&[o, k, k, c])
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap()
-    }
-
-    /// The activation width a component file's projections run its f16 inputs at: f32 when its
-    /// packed projections carry scales of another dtype (MLX promotes the quantized matmul to
-    /// `result_type(x, scales)`), else f16.
-    fn activation_width(file: &std::path::Path) -> u64 {
-        let promotes = safetensors_path_tensor_headers(file)
-            .unwrap()
-            .iter()
-            .any(|h| h.name.ends_with(".scales") && h.dtype != Stored::F16);
-        if promotes {
-            4
-        } else {
-            HALF
-        }
-    }
-
-    fn worst(quanta: &[(String, u64)]) -> (String, u64) {
-        quanta.iter().max_by_key(|q| q.1).cloned().unwrap()
-    }
-
-    /// Every counted quantum of one SDXL U-Net forward at latent edge `l` (sequential CFG: one
-    /// latent row, the pair's text memory), `ip` IP tokens, its activations at `act` bytes from the
-    /// first resnet's time-embedding sum on (the stem and that resnet's first half run the f16
-    /// latent).
-    fn unet_quanta(l: i32, ip: i32, act: u64) -> Vec<(String, u64)> {
-        let m = Backend::Metal;
-        let mut q = Vec::new();
-        let x = Array::zeros::<f32>(&[1, l, l, 4])
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        let ctx = Array::zeros::<f32>(&[2, 77, 2048])
-            .unwrap()
-            .as_dtype(Dtype::Float16)
-            .unwrap();
-        q.push((
-            UNET_STEM.into(),
-            crate::unet::stem_bytes(&x, &ctx, &w(320, 3, 4), None, 0, m),
-        ));
-        let (l1, l2) = (l / 2, l / 4);
-        // (grid, pre-concat channels, conv1 in, out)
-        let resnets = [
-            (l, 320, 320, 320),
-            (l1, 320, 320, 640),
-            (l1, 640, 640, 640),
-            (l2, 640, 640, 1280),
-            (l2, 1280, 1280, 1280),
-            (l2, 1280, 2560, 1280),
-            (l2, 1280, 1920, 1280),
-            (l1, 1280, 1920, 640),
-            (l1, 640, 1280, 640),
-            (l1, 640, 960, 640),
-            (l, 640, 960, 320),
-            (l, 320, 640, 320),
-        ];
-        for (i, (h, cx, cin, cout)) in resnets.into_iter().enumerate() {
-            let act_in = if i == 0 { HALF } else { act };
-            q.push((
-                format!("{UNET_RESNET} {cin}->{cout} @{h}"),
-                resnet_bytes(
-                    &[1, h, h, cx],
-                    act_in,
-                    act,
-                    &w(cout, 3, cin),
-                    &w(cout, 3, cout),
-                    m,
-                ),
-            ));
-        }
-        for (h, c) in [(l, 320), (l1, 640)] {
-            let call = ConvCall::new(&[1, h, h, c], act, &w(c, 3, c), 2, 1);
-            q.push((
-                format!("{UNET_DOWNSAMPLE} @{h}"),
-                single_conv_bytes(&call, 0, 0, m),
-            ));
-        }
-        for (h, c) in [(l2, 1280), (l1, 640)] {
-            let call = ConvCall::new(&[1, 2 * h, 2 * h, c], act, &w(c, 3, c), 1, 1);
-            q.push((
-                format!("{UNET_UPSAMPLE} @{h}"),
-                single_conv_bytes(&call, 1, 0, m),
-            ));
-        }
-        for (h, dim, heads) in [(l1, 640u64, 10), (l2, 1280, 20)] {
-            let tokens = h * h;
-            q.push((
-                format!("{TRANSFORMER_BLOCK} {dim} @{h}"),
-                transformer_block_bytes(
-                    1,
-                    2,
-                    tokens,
-                    dim,
-                    heads,
-                    64,
-                    77 + ip,
-                    4 * dim,
-                    tokens,
-                    ip > 0,
-                    act,
-                    m,
-                ),
-            ));
-            let plane = |c: u64| (tokens as u64) * c * act;
-            q.push((
-                format!("{TRANSFORMER_PROJ_IN} @{h}"),
-                plane(dim) * (GROUP_NORM_BUFFERS + 1) + page_slack(GROUP_NORM_BUFFERS + 1),
-            ));
-        }
-        let call = ConvCall::new(&[1, l, l, 320], act, &w(4, 3, 320), 1, 1);
-        q.push((UNET_CONV_OUT.into(), norm_conv_bytes(&call, m)));
-        q
-    }
-
-    /// The ControlNet branch's own quanta at latent edge `l`: its conditioning embedding at full
-    /// resolution (once per request) and the zero-convs; its encoder copy is the U-Net's down/mid.
-    fn controlnet_quanta(l: i32) -> Vec<(String, u64)> {
-        let m = Backend::Metal;
-        let mut q = Vec::new();
-        let e = 8 * l;
-        let convs = [
-            (e, 3, 16, 1),
-            (e, 16, 16, 1),
-            (e, 16, 32, 2),
-            (e / 2, 32, 32, 1),
-            (e / 2, 32, 96, 2),
-            (e / 4, 96, 96, 1),
-            (e / 4, 96, 256, 2),
-            (e / 8, 256, 320, 1),
-        ];
-        for (h, c, o, s) in convs {
-            let call = ConvCall::new(&[1, h, h, c], HALF, &w(o, 3, c), s, 1);
-            q.push((
-                format!("{CONTROL_COND_CONV} {c}->{o} @{h}"),
-                single_conv_bytes(&call, 0, 1, m),
-            ));
-        }
-        let call = ConvCall::new(&[1, l, l, 320], HALF, &w(320, 1, 320), 1, 0);
-        q.push((CONTROL_ZERO_CONV.into(), single_conv_bytes(&call, 0, 0, m)));
-        q
-    }
-
-    /// The fp16-fix VAE decode at latent edge `l`: the dense head (conv_in, mid resnets, the
-    /// chunked mid attention) and either the dense tail or the layer-wise tiled tail at output
-    /// tile edge `tile` (each stage priced with its widest tile), and the pixel conversion.
-    fn decode_quanta(l: i32, tile: Option<i32>) -> Vec<(String, u64)> {
-        let m = Backend::Metal;
-        let mut q = Vec::new();
-        let call = ConvCall::new(&[1, l, l, 4], HALF, &w(512, 3, 4), 1, 1);
-        q.push((VAE_DECODE_IN.into(), single_conv_bytes(&call, 2, 0, m)));
-        q.push((
-            format!("{VAE_RESNET} mid @{l}"),
-            resnet_bytes(
-                &[1, l, l, 512],
-                HALF,
-                HALF,
-                &w(512, 3, 512),
-                &w(512, 3, 512),
-                m,
-            ),
-        ));
-        let n = l * l;
-        let rows = mlx_gen::attention::AttentionBudget::from_score_elements(
-            VAE_ATTENTION_SCORE_ELEMENTS,
-            true,
-        )
-        .query_block(1, 1, n, n);
-        q.push((
-            format!("{VAE_ATTENTION} ({rows}-row chunks)"),
-            vae_attention_bytes(1, n, 512, rows, HALF, m),
-        ));
-        // (input grid, cin, cout, upsample after)
-        let blocks = [
-            (l, 512, 512, true),
-            (2 * l, 512, 512, true),
-            (4 * l, 512, 256, true),
-            (8 * l, 256, 128, false),
-        ];
-        let bias = |c: i32| {
-            Array::zeros::<f32>(&[c])
-                .unwrap()
-                .as_dtype(Dtype::Float16)
-                .unwrap()
-        };
-        for (i, (h, cin, cout, up)) in blocks.into_iter().enumerate() {
-            let scale = 8 / (1 << i);
-            for j in 0..3 {
-                let ci = if j == 0 { cin } else { cout };
-                let label = format!("{VAE_RESNET} {ci}->{cout} @{h}");
-                q.push((
-                    label,
-                    match tile {
-                        None => resnet_bytes(
-                            &[1, h, h, ci],
-                            HALF,
-                            HALF,
-                            &w(cout, 3, ci),
-                            &w(cout, 3, cout),
-                            m,
-                        ),
-                        Some(t) => {
-                            let e = ((t + scale - 1) / scale).max(3);
-                            tiled_stage_bytes(&[1, h, h, cout], ci, cout, HALF, true)
-                                + tile_bytes(
-                                    &[1, e.min(h) + 2, e.min(h) + 2, ci],
-                                    HALF,
-                                    &w(cout, 3, ci),
-                                    false,
-                                    m,
-                                )
-                        }
-                    },
-                ));
-            }
-            if up {
-                let label = format!("{VAE_UPSAMPLE} @{}", 2 * h);
-                q.push((
-                    label,
-                    match tile {
-                        None => single_conv_bytes(
-                            &ConvCall::new(&[1, 2 * h, 2 * h, cout], HALF, &w(cout, 3, cout), 1, 1),
-                            1,
-                            0,
-                            m,
-                        ),
-                        Some(t) => {
-                            let e = ((t + scale / 2 - 1) / (scale / 2)).max(3);
-                            tiled_stage_f32_accum(
-                                &[1, 2 * h, 2 * h, cout],
-                                &w(cout, 3, cout),
-                                &bias(cout),
-                                HALF,
-                            ) + tile_bytes(
-                                &[1, e.min(2 * h) + 2, e.min(2 * h) + 2, cout],
-                                HALF,
-                                &w(cout, 3, cout),
-                                true,
-                                m,
-                            )
-                        }
-                    },
-                ));
-            }
-        }
-        let e8 = 8 * l;
-        q.push((
-            VAE_DECODE_OUT.into(),
-            match tile {
-                None => norm_conv_bytes(
-                    &ConvCall::new(&[1, e8, e8, 128], HALF, &w(3, 3, 128), 1, 1),
-                    m,
-                ),
-                Some(t) => {
-                    tiled_stage_bytes(&[1, e8, e8, 3], 128, 3, HALF, false)
-                        + tile_bytes(
-                            &[1, t.min(e8) + 2, t.min(e8) + 2, 128],
-                            HALF,
-                            &w(3, 3, 128),
-                            false,
-                            m,
-                        )
-                }
-            },
-        ));
-        let decoded = Array::zeros::<f32>(&[1, e8, e8, 3]).unwrap();
-        q.push((DECODED_TO_IMAGE.into(), decoded_to_image_bytes(&decoded)));
-        q
-    }
-
-    /// The fp16-fix VAE encode (img2img) at image edge `8l`: dense, every stage at its extent.
-    fn encode_quanta(l: i32) -> Vec<(String, u64)> {
-        let m = Backend::Metal;
-        let e = 8 * l;
-        let mut q = vec![(
-            VAE_ENCODE_IN.to_string(),
-            single_conv_bytes(
-                &ConvCall::new(&[1, e, e, 3], HALF, &w(128, 3, 3), 1, 1),
-                1,
-                0,
-                m,
-            ),
-        )];
-        for (h, cin, cout) in [
-            (e, 128, 128),
-            (e / 2, 128, 256),
-            (e / 4, 256, 512),
-            (e / 8, 512, 512),
-        ] {
-            q.push((
-                format!("{VAE_RESNET} {cin}->{cout} @{h}"),
-                resnet_bytes(
-                    &[1, h, h, cin],
-                    HALF,
-                    HALF,
-                    &w(cout, 3, cin),
-                    &w(cout, 3, cout),
-                    m,
-                ),
-            ));
-            if h > e / 8 {
-                q.push((
-                    format!("{VAE_DOWNSAMPLE} @{h}"),
-                    single_conv_bytes(
-                        &ConvCall::new(&[1, h + 1, h + 1, cout], HALF, &w(cout, 3, cout), 2, 0),
-                        1,
-                        0,
-                        m,
-                    ),
-                ));
-            }
-        }
-        let n = l * l;
-        let rows = mlx_gen::attention::AttentionBudget::from_score_elements(
-            VAE_ATTENTION_SCORE_ELEMENTS,
-            true,
-        )
-        .query_block(1, 1, n, n);
-        q.push((
-            VAE_ATTENTION.into(),
-            vae_attention_bytes(1, n, 512, rows, HALF, m),
-        ));
-        let call = ConvCall::new(&[1, l, l, 512], HALF, &w(8, 3, 512), 1, 1);
-        q.push((
-            VAE_ENCODE_OUT.into(),
-            norm_conv_bytes(&call, m) + 4 * call.out_bytes() * 2,
-        ));
-        q
-    }
-
-    /// The bounded (tiled) fp16-fix VAE encode at image edge `8l` with `tile` input pixels: each
-    /// full-resolution layer a tiled stage priced with its widest tile, the latent-resolution mid
-    /// block dense with the chunked attention, the output head.
-    fn encode_tiled_quanta(l: i32, tile: i32) -> Vec<(String, u64)> {
-        let m = Backend::Metal;
-        let e = 8 * l;
-        let crop = |edge: i32, h: i32| edge.min(h) + 2;
-        let mut q = vec![(
-            format!("{VAE_TILED_STAGE} conv_in @{e}"),
-            tiled_stage_bytes(&[1, e, e, 128], 3, 128, HALF, false)
-                + tile_bytes(
-                    &[1, crop(tile, e), crop(tile, e), 3],
-                    HALF,
-                    &w(128, 3, 3),
-                    false,
-                    m,
-                ),
-        )];
-        let mut scale = 1;
-        for (h, cin, cout) in [
-            (e, 128, 128),
-            (e / 2, 128, 256),
-            (e / 4, 256, 512),
-            (e / 8, 512, 512),
-        ] {
-            let edge = ((tile + scale - 1) / scale).max(3);
-            for ci in [cin, cout] {
-                q.push((
-                    format!("{VAE_TILED_STAGE} resnet {ci}->{cout} @{h}"),
-                    tiled_stage_bytes(&[1, h, h, cout], ci, cout, HALF, true)
-                        + tile_bytes(
-                            &[1, crop(edge, h), crop(edge, h), ci],
-                            HALF,
-                            &w(cout, 3, ci),
-                            false,
-                            m,
-                        ),
-                ));
-            }
-            if h > e / 8 {
-                scale *= 2;
-                let core = ((tile + scale - 1) / scale).max(1).min(h / 2);
-                q.push((
-                    format!("{VAE_TILED_STAGE} downsample @{h}"),
-                    downsample_stage_bytes(&[1, h / 2, h / 2, cout], HALF)
-                        + downsample_tile_bytes(
-                            &[1, 2 * core + 1, 2 * core + 1, cout],
-                            HALF,
-                            &w(cout, 3, cout),
-                            m,
-                        ),
-                ));
-            }
-        }
-        q.push((
-            format!("{VAE_RESNET} mid @{l}"),
-            resnet_bytes(
-                &[1, l, l, 512],
-                HALF,
-                HALF,
-                &w(512, 3, 512),
-                &w(512, 3, 512),
-                m,
-            ),
-        ));
-        let n = l * l;
-        let rows = mlx_gen::attention::AttentionBudget::from_score_elements(
-            VAE_ATTENTION_SCORE_ELEMENTS,
-            true,
-        )
-        .query_block(1, 1, n, n);
-        q.push((
-            VAE_ATTENTION.into(),
-            vae_attention_bytes(1, n, 512, rows, HALF, m),
-        ));
-        let call = ConvCall::new(&[1, l, l, 512], HALF, &w(8, 3, 512), 1, 1);
-        q.push((
-            VAE_ENCODE_OUT.into(),
-            norm_conv_bytes(&call, m) + 4 * call.out_bytes() * 2,
-        ));
-        q
-    }
-
-    fn row(
-        mode: &str,
-        tier: &str,
-        edge: i32,
-        phase: &str,
-        resident: u64,
-        (label, scratch): (String, u64),
-    ) {
-        let total = resident + scratch + PROCESS_RESERVE_BYTES;
-        println!(
-            "| {mode} | {tier} | {edge} | {phase} | {:.0} | {:.0} ({label}) | {:.0} + 512 = {:.0} | {} |",
-            resident as f64 / MIB as f64,
-            scratch as f64 / MIB as f64,
-            (resident + scratch) as f64 / MIB as f64,
-            total as f64 / MIB as f64,
-            if total <= ENTITLED { "fits" } else { "REFUSED" }
-        );
-    }
-
-    #[test]
-    #[ignore = "prediction table from on-disk safetensors headers; run with --ignored --nocapture"]
-    fn reachable_sizes_prediction() {
-        if !cpu_child("reachable::reachable_sizes_prediction") {
-            return;
-        }
-        let Some(base) = snapshot("models--SceneWorks--sdxl-base-mlx") else {
-            println!("sdxl-base-mlx snapshot not on disk");
-            return;
-        };
-        let fix = snapshot("models--madebyollin--sdxl-vae-fp16-fix")
-            .map(|d| d.join("diffusion_pytorch_model.safetensors"));
-        let cn = snapshot("models--xinsir--controlnet-tile-sdxl-1.0")
-            .map(|d| d.join("diffusion_pytorch_model.safetensors"));
-        let vae = fix.as_deref().map_or(0, |f| resident(f, Stored::F16, HALF));
-        println!(
-            "fp16-fix VAE resident at f16: {:.0} MiB",
-            vae as f64 / MIB as f64
-        );
-        println!("| mode | tier | edge | phase | resident MiB | largest quantum MiB | resident+scratch + reserve MiB | vs 6142 MiB |");
-        println!("|---|---|---|---|---|---|---|---|");
-        for (tier, bits) in [("bf16", None), ("q8", Some(8u64)), ("q4", Some(4))] {
-            let dir = base.join(tier);
-            let file = |sub: &str, stem: &str| {
-                let fp16 = dir.join(sub).join(format!("{stem}.fp16.safetensors"));
-                if fp16.exists() {
-                    fp16
-                } else {
-                    dir.join(sub).join(format!("{stem}.safetensors"))
-                }
-            };
-            let te = resident(&file("text_encoder", "model"), Stored::F16, HALF)
-                + resident(&file("text_encoder_2", "model"), Stored::F16, HALF);
-            let unet = resident(&file("unet", "diffusion_pytorch_model"), Stored::F16, HALF);
-            let control = cn.as_deref().map_or(0, |f| quantized_controlnet(f, bits));
-            // IP-Adapter plus (not on disk; config-derived): ViT-H/14 (632M params) + the Resampler
-            // (83M) at f16, and the 70 cross-attention K/V pairs (341M params) at the tier.
-            let ip_pairs = 341_000_000u64 * bits.map_or(16, |b| b) / 8
-                + bits.map_or(0, |_| 341_000_000 / 64 * 4);
-            let ip_resident = (632_000_000 + 83_000_000) * HALF + ip_pairs;
-            println!(
-                "<!-- {tier}: text encoders {:.0} MiB, U-Net {:.0} MiB, ControlNet-tile {:.0} MiB, IP (config) {:.0} MiB -->",
-                te as f64 / MIB as f64, unet as f64 / MIB as f64, control as f64 / MIB as f64, ip_resident as f64 / MIB as f64
-            );
-            let te_act = activation_width(&file("text_encoder", "model"))
-                .max(activation_width(&file("text_encoder_2", "model")));
-            let text = [
-                (
-                    CLIP_LAYER.to_string() + " L",
-                    clip_layer_bytes(2, 77, 768, 3072, 12, 64, true, te_act, Backend::Metal),
-                ),
-                (
-                    CLIP_LAYER.to_string() + " bigG",
-                    clip_layer_bytes(2, 77, 1280, 5120, 20, 64, true, te_act, Backend::Metal),
-                ),
-            ];
-            let unet_file = file("unet", "diffusion_pytorch_model");
-            let act = activation_width(&unet_file);
-            println!(
-                "<!-- {tier}: U-Net activations {act} B, text-encoder activations {te_act} B -->"
-            );
-            // Staged loads: the text encoders load into an empty process; the U-Net (its floor =
-            // its resident bytes + its largest tensor) loads after they are shed, the VAE beside it.
-            let te_floor = te + largest(&file("text_encoder_2", "model"));
-            row(
-                "all",
-                tier,
-                0,
-                "text load",
-                0,
-                ("SDXL text_encoder_2 load floor".into(), te_floor),
-            );
-            let unet_floor = unet + largest(&unet_file);
-            row(
-                "all",
-                tier,
-                0,
-                "U-Net load",
-                0,
-                ("SDXL UNet load floor".into(), unet_floor),
-            );
-            if let Some(f) = cn.as_deref() {
-                // The ControlNet loads dense f16 (its tier quantization runs after the load).
-                let floor = resident(f, Stored::F16, HALF) + largest(f);
-                row(
-                    "controlnet",
-                    tier,
-                    0,
-                    "ControlNet load",
-                    unet + vae,
-                    ("SDXL ControlNet load floor".into(), floor),
-                );
-            }
-            for edge in [512, 768, 1024] {
-                let l = edge / 8;
-                row("txt2img", tier, edge, "text", te, worst(&text));
-                row(
-                    "txt2img",
-                    tier,
-                    edge,
-                    "denoise",
-                    unet + vae,
-                    worst(&unet_quanta(l, 0, act)),
-                );
-                row(
-                    "txt2img",
-                    tier,
-                    edge,
-                    "decode (dense)",
-                    vae,
-                    worst(&decode_quanta(l, None)),
-                );
-                row(
-                    "txt2img",
-                    tier,
-                    edge,
-                    "decode (tiled 256)",
-                    vae,
-                    worst(&decode_quanta(l, Some(256))),
-                );
-                // img2img and inpaint share the init encode, which runs in the heavy phase (the
-                // U-Net is already resident); the init latent is then denoised in the txt2img
-                // denoise phase (inpaint adds its blend to the sampler-step quantum).
-                row(
-                    "img2img/inpaint",
-                    tier,
-                    edge,
-                    "encode (dense, host path)",
-                    unet + vae,
-                    worst(&encode_quanta(l)),
-                );
-                row(
-                    "img2img/inpaint",
-                    tier,
-                    edge,
-                    "encode (bounded, iOS 256)",
-                    unet + vae,
-                    worst(&encode_tiled_quanta(l, crate::vae::IOS_ENCODE_TILE_PX)),
-                );
-                let mut cq = unet_quanta(l, 0, act);
-                cq.extend(controlnet_quanta(l));
-                row(
-                    "controlnet",
-                    tier,
-                    edge,
-                    "denoise",
-                    unet + vae + control,
-                    worst(&cq),
-                );
-                let vision =
-                    clip_layer_bytes(1, 257, 1280, 5120, 16, 80, false, HALF, Backend::Metal);
-                row(
-                    "ip-adapter",
-                    tier,
-                    edge,
-                    "image encode",
-                    unet + vae + ip_resident,
-                    (VISION_LAYER.into(), vision),
-                );
-                row(
-                    "ip-adapter",
-                    tier,
-                    edge,
-                    "denoise",
-                    unet + vae + ip_resident,
-                    worst(&unet_quanta(l, 16, act)),
-                );
-            }
-        }
-    }
-}
+#[path = "quantum_tests_pricing.rs"]
+mod pricing;
 
 // ---------------------------------------------------------------------------------------------
 // Adapter (LoRA / LoKr / LoHa) reads and installs (sc-26270 round 4, item 2).

@@ -22,6 +22,7 @@ pub(crate) mod block_stream;
 pub mod config;
 pub mod convert;
 pub mod inpaint;
+pub mod ios_pricing;
 pub mod ip_adapter;
 pub mod ldm;
 pub mod loader;

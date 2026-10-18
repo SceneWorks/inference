@@ -155,8 +155,18 @@ impl ClipEncoderLayer {
             self.head_dim,
             true,
             act,
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         ))
+    }
+
+    /// The dtype this layer leaves the residual stream at for `x`-typed input: `x` promoted by the
+    /// projections it runs through (the activation width [`Self::quantum_scratch`] prices).
+    fn output_dtype(&self, x: Dtype) -> Dtype {
+        [&self.q, &self.out, &self.linear1, &self.linear2]
+            .iter()
+            .fold(x, |d, linear| {
+                Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+            })
     }
 
     /// `x`: `[B, N, D]`; `mask`: additive causal `[1, 1, N, N]`.
@@ -246,6 +256,14 @@ impl ClipTextEncoder {
         })
     }
 
+    /// The pooled output's width: the projection's rows (TE2), else the hidden width.
+    pub(crate) fn pooled_width(&self) -> i32 {
+        match &self.text_projection {
+            Some(p) => crate::quantum::linear_out(p) as i32,
+            None => self.token_embedding.shape()[1],
+        }
+    }
+
     /// Quantize every Linear (the per-layer projections + the text projection) to Q4/Q8. The token /
     /// position embeddings stay dense (gather lookups, not matmuls).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -288,6 +306,49 @@ impl ClipTextEncoder {
         let (n, dtype) = (s[1], x.dtype());
         let x = x.clone();
         (scratch, move || layer.forward(&x, &causal_mask(n, dtype)?))
+    }
+
+    /// Header-only pricing of [`Self::forward`] over `b` rows of `n` tokens: every quantum it
+    /// checks, in order, with the guards' own formulas. Returns the dtypes of the penultimate
+    /// hidden state (the SDXL conditioning) and of the pooled output.
+    pub(crate) fn price_forward(
+        &self,
+        b: i32,
+        n: i32,
+        out: &mut crate::quantum::Quanta,
+    ) -> (Dtype, Dtype) {
+        let dim = self.token_embedding.shape()[1];
+        let act = crate::quantum::element_bytes(&self.token_embedding);
+        let hidden = mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, dim as u64]);
+        out.push((crate::quantum::CLIP_EMBEDDINGS, 3 * hidden));
+        let mut x = Dtype::from_promoting_types(
+            self.token_embedding.dtype(),
+            self.position_embedding.dtype(),
+        );
+        let mut hidden_states = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            out.push((crate::quantum::CLIP_LAYER, layer.quantum_scratch(b, n, x)));
+            x = layer.output_dtype(x);
+            hidden_states.push(x);
+        }
+        let wide = crate::quantum::dtype_bytes(x).max(act);
+        let final_hidden =
+            mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, n as u64, dim as u64]);
+        let pooled_rows = mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, 2 * dim as u64]);
+        out.push((
+            crate::quantum::CLIP_POOLED,
+            final_hidden.saturating_add(pooled_rows),
+        ));
+        let normed = crate::quantum::promote_all(x, &[&self.final_ln_w, &self.final_ln_b]);
+        let pooled = match &self.text_projection {
+            Some(p) => crate::quantum::linear_output_dtype(p, normed),
+            None => normed,
+        };
+        let penultimate = hidden_states
+            .len()
+            .checked_sub(2)
+            .map_or(x, |i| hidden_states[i]);
+        (penultimate, pooled)
     }
 
     /// Run the encoder over `input_ids` `[B, N]` (int32). Returns the last hidden state, the

@@ -27,19 +27,60 @@ use mlx_gen::ios_quantum::{
 // diffusers VAE on iOS (sc-26433): it lives in `mlx_gen::ios_quantum` and is re-exported here so
 // this crate's call sites and proofs keep their paths.
 pub(crate) use mlx_gen::ios_quantum::{
-    bytes, conv_channels, decoded_to_image_bytes, dtype_bytes, element_bytes, elements,
-    group_norm_buffers, norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes,
-    single_conv_bytes, tile_bytes, tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes,
-    Backend, ConvCall, VAE_ATTENTION_SCORE_ELEMENTS,
+    bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes, downsample_tile_bytes,
+    dtype_bytes, element_bytes, elements, group_norm_buffers, norm_conv_bytes,
+    norm_promotion_units, page_slack, resnet_bytes, single_conv_bytes, tile_bytes,
+    tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall,
+    VAE_ATTENTION_SCORE_ELEMENTS,
 };
 #[cfg(test)]
-pub(crate) use mlx_gen::ios_quantum::{
-    downsample_stage_bytes, downsample_tile_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES,
-};
+pub(crate) use mlx_gen::ios_quantum::{GROUP_NORM_BUFFERS, PAGE_BYTES};
 use mlx_rs::{Array, Dtype};
 
 fn u(v: i32) -> u64 {
     v.max(0) as u64
+}
+
+thread_local! {
+    static PRICING_BACKEND: std::cell::Cell<Option<Backend>> = const { std::cell::Cell::new(None) };
+}
+
+/// The backend every counted SDXL quantum is priced for: the running device's
+/// ([`Backend::current`]), except inside [`with_backend`], where header-only pricing
+/// ([`crate::ios_pricing`]) prices the device's Metal kernels from any host.
+pub(crate) fn backend() -> Backend {
+    PRICING_BACKEND
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(Backend::current)
+}
+
+/// Run `body` with every [`backend`] call answering `backend` (restored on return or unwind).
+pub(crate) fn with_backend<T>(backend: Backend, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Backend>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRICING_BACKEND.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(PRICING_BACKEND.with(|b| b.replace(Some(backend))));
+    body()
+}
+
+/// The counted quanta one header-only pricing walk checks, in execution order: `(label, scratch)`.
+pub(crate) type Quanta = Vec<(&'static str, u64)>;
+
+/// `a` promoted with every array's dtype, as MLX promotes an elementwise chain over them.
+pub(crate) fn promote_all(a: Dtype, arrays: &[&Array]) -> Dtype {
+    arrays
+        .iter()
+        .fold(a, |d, x| Dtype::from_promoting_types(d, x.dtype()))
+}
+
+/// A shape-and-dtype stand-in for an activation in header-only pricing: a lazy MLX array that is
+/// never evaluated, so it carries the `shape()` / `dtype()` every scratch formula reads and no
+/// payload.
+pub(crate) fn shaped(shape: &[i32], dtype: Dtype) -> mlx_gen::Result<Array> {
+    Ok(mlx_rs::ops::zeros_dtype(shape, dtype)?)
 }
 
 /// U-Net stem: Kolors context projection, timestep/`text_time` embedding and `conv_in`.
@@ -108,6 +149,55 @@ pub(crate) const SAMPLER_STEP: &str = "SDXL sampler step";
 pub(crate) const VAE_TILE: &str = "SDXL VAE tile";
 /// The assembled output of one tiled VAE layer (resnet / upsample / output convolution).
 pub(crate) const VAE_TILED_STAGE: &str = "SDXL VAE tiled stage";
+/// One VAE ENCODER (temb-free) resnet — the encode twin of [`VAE_RESNET`], labelled apart so a
+/// device capture attributes it to the encode phase ([`crate::ios_pricing::ios_quantum_phase`]).
+pub(crate) const VAE_ENCODE_RESNET: &str = "SDXL VAE encode resnet";
+/// The VAE ENCODER mid-block attention (the encode twin of [`VAE_ATTENTION`]).
+pub(crate) const VAE_ENCODE_ATTENTION: &str = "SDXL VAE encode attention";
+/// One halo-expanded tile of a bounded-encode convolution (the encode twin of [`VAE_TILE`]).
+pub(crate) const VAE_ENCODE_TILE: &str = "SDXL VAE encode tile";
+/// One assembled bounded-encode layer (the encode twin of [`VAE_TILED_STAGE`]).
+pub(crate) const VAE_ENCODE_TILED_STAGE: &str = "SDXL VAE encode tiled stage";
+
+/// The labels one VAE pass (encode or decode) checks its shared quanta under. The encoder and the
+/// decoder run the same resnet / attention / tiled-convolution code, so the pass names its labels:
+/// a label must say which phase it runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VaeLabels {
+    pub resnet: &'static str,
+    pub attention: &'static str,
+    pub tiled_stage: &'static str,
+    pub tile: &'static str,
+}
+
+/// The decode pass's labels.
+pub(crate) const VAE_DECODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_RESNET,
+    attention: VAE_ATTENTION,
+    tiled_stage: VAE_TILED_STAGE,
+    tile: VAE_TILE,
+};
+
+/// The encode pass's labels.
+pub(crate) const VAE_ENCODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_ENCODE_RESNET,
+    attention: VAE_ENCODE_ATTENTION,
+    tiled_stage: VAE_ENCODE_TILED_STAGE,
+    tile: VAE_ENCODE_TILE,
+};
+
+/// Component load floors (`ios_quantum::before` over a header-only floor before construction).
+pub(crate) const TEXT_ENCODER_1_LOAD: &str = "SDXL text_encoder load";
+pub(crate) const TEXT_ENCODER_2_LOAD: &str = "SDXL text_encoder_2 load";
+pub(crate) const UNET_LOAD: &str = "SDXL UNet load";
+pub(crate) const VAE_LOAD: &str = "SDXL VAE load";
+pub(crate) const VAE_FP16_FIX_LOAD: &str = "SDXL fp16-fix VAE load";
+pub(crate) const CONTROLNET_LOAD: &str = "SDXL ControlNet load";
+pub(crate) const IP_IMAGE_ENCODER_LOAD: &str = "SDXL IP image encoder load";
+pub(crate) const IP_ADAPTER_LOAD: &str = "SDXL IP adapter load";
+/// The fused single-file (LDM) checkpoint's phase loads.
+pub(crate) const LDM_TEXT_LOAD: &str = "SDXL LDM text load";
+pub(crate) const LDM_HEAVY_LOAD: &str = "SDXL LDM UNet+VAE load";
 
 /// One adapter (LoRA / LoKr / LoHa) file's read, checked against its header floor before the read.
 pub(crate) const ADAPTER_LOAD: &str = "SDXL adapter load";
@@ -310,15 +400,20 @@ pub(crate) fn transformer_block_bytes(
 /// conv graph is constructed, priced at the tile's extent and `weight`'s channel counts. Called from
 /// the per-tile preprocess hook of `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc*`, which evaluates
 /// each output core before the next tile is built.
-pub(crate) fn before_tile(tile: &Array, weight: &Array, f32_accum: bool) -> mlx_gen::Result<()> {
+pub(crate) fn before_tile(
+    label: &str,
+    tile: &Array,
+    weight: &Array,
+    f32_accum: bool,
+) -> mlx_gen::Result<()> {
     mlx_gen::ios_quantum::before(
-        VAE_TILE,
+        label,
         tile_bytes(
             tile.shape(),
             element_bytes(tile),
             weight,
             f32_accum,
-            Backend::current(),
+            backend(),
         ),
     )
 }
@@ -362,38 +457,64 @@ pub(crate) fn adapter_install_bytes(
         .saturating_add(page_slack(widths.len() as u64 + 2))
 }
 
-/// iOS pre-load floor for a component that [`crate::loader::cast_for_load`]-style casts after
-/// reading: every tensor's RESIDENT bytes after the load (its `dtype`-wide copy when the loader casts
-/// it, its stored bytes otherwise), plus the largest stored-or-cast tensor (a cast holds its source
-/// and its copy together; a read holds one tensor). `casts(name, stored)` mirrors the loader's rule.
-/// Header-only; a no-op off device.
-pub(crate) fn before_cast_load(
-    label: &str,
+/// iOS pre-load floor of a component that [`crate::loader::cast_for_load`]-style casts after
+/// reading, as `(resident bytes after the load, floor)`. Header-only.
+///
+/// Every KEPT tensor (`keep(name)`: a rung-4 streamed U-Net leaves its `transformer_blocks`
+/// bodies to the block stream) ends resident at its stored bytes, or — when `casts(name, stored)`
+/// (the loader's rule) — at its `target_bytes`-wide copy, each one page-rounded allocation
+/// ([`mlx_gen::ios_quantum::allocated_bytes`]). The loader materializes the kept
+/// tensors through `Weights::materialize_*`, which evaluates them in sorted-key batches of
+/// [`mlx_gen::weights::Weights::MATERIALIZE_BATCH_BYTES`] resident bytes, each batch's safetensors
+/// reads first: within a batch every read source and every cast copy are live together (the
+/// device holds a command buffer's operands until it completes), on top of the batches already
+/// resident. The floor is the worst batch, and at least the whole resident set.
+pub(crate) fn cast_load_parts(
     files: &[std::path::PathBuf],
     target_bytes: u64,
     casts: impl Fn(&str, mlx_gen::gen_core::weightsmeta::Dtype) -> bool,
-) -> mlx_gen::Result<()> {
-    if !mlx_gen::ios_quantum::enabled() {
-        return Ok(());
-    }
-    let (mut total, mut largest) = (0u64, 0u64);
+    keep: impl Fn(&str) -> bool,
+) -> mlx_gen::Result<(u64, u64)> {
+    let mut tensors: Vec<(String, u64, u64)> = Vec::new();
     for file in files {
         for header in mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
             .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?
         {
-            let resident = if casts(&header.name, header.dtype) {
-                let cast = header
-                    .shape
-                    .iter()
-                    .fold(target_bytes, |a, &d| a.saturating_mul(d as u64));
-                largest = largest.max(cast.saturating_add(header.data_bytes));
-                cast
+            if !keep(&header.name) {
+                continue;
+            }
+            let stored = mlx_gen::ios_quantum::allocated_bytes(header.data_bytes);
+            let (resident, live) = if casts(&header.name, header.dtype) {
+                let cast = mlx_gen::ios_quantum::allocated_bytes(
+                    header
+                        .shape
+                        .iter()
+                        .fold(target_bytes, |a, &d| a.saturating_mul(d as u64)),
+                );
+                // The loader holds every source until the batch completes
+                // (`loader::hold_cast_sources`), so the copy is never donated the source's buffer:
+                // it ends resident at its own width, the source and the copy live together.
+                (cast, cast.saturating_add(stored))
             } else {
-                largest = largest.max(header.data_bytes);
-                header.data_bytes
+                (stored, stored)
             };
-            total = total.saturating_add(resident);
+            tensors.push((header.name, resident, live));
         }
     }
-    mlx_gen::ios_quantum::before(label, total.saturating_add(largest))
+    tensors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let batch = mlx_gen::weights::Weights::MATERIALIZE_BATCH_BYTES as u64;
+    let (mut done, mut floor) = (0u64, 0u64);
+    let (mut batch_resident, mut batch_live) = (0u64, 0u64);
+    for (_, resident, live) in tensors {
+        batch_resident = batch_resident.saturating_add(resident);
+        batch_live = batch_live.saturating_add(live);
+        if batch_resident >= batch {
+            floor = floor.max(done.saturating_add(batch_live));
+            done = done.saturating_add(batch_resident);
+            (batch_resident, batch_live) = (0, 0);
+        }
+    }
+    floor = floor.max(done.saturating_add(batch_live));
+    done = done.saturating_add(batch_resident);
+    Ok((done, floor.max(done)))
 }

@@ -40,9 +40,31 @@ pub(crate) fn quantize_linear(linear: &mut AdaptableLinear, bits: i32) -> Result
     if linear.quantized_params().is_some() {
         return Ok(());
     }
+    if LAZY_QUANTIZE.with(std::cell::Cell::get) {
+        return linear.quantize(bits, None);
+    }
     linear.materialize_weights()?;
     linear.quantize(bits, None)?;
     linear.materialize_weights()
+}
+
+thread_local! {
+    static LAZY_QUANTIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `body` with [`quantize_linear`] building the packed projection LAZILY (never reading the
+/// dense source or evaluating the pack): header-only pricing (`crate::ios_pricing`) quantizes a
+/// lazily constructed component to learn the dtypes its packed projections promote to, without a
+/// tensor payload. Restored on return or unwind.
+pub(crate) fn with_lazy_quantize<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAZY_QUANTIZE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(LAZY_QUANTIZE.with(|flag| flag.replace(true)));
+    body()
 }
 
 /// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).

@@ -222,8 +222,35 @@ impl ResnetBlock2D {
             act_out,
             self.conv1.weight(),
             self.conv2.weight(),
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         )
+    }
+
+    /// The dtype [`Self::forward_core`] returns for an `input`-typed input (the up path's
+    /// concatenation already applied) and a `temb`-typed time embedding: MLX promotes through
+    /// every weight, bias and norm affine the forward touches and the projected embedding
+    /// ([`crate::quantum::linear_output_dtype`]). Header-only pricing threads it.
+    pub(crate) fn output_dtype(&self, input: Dtype, temb: Option<Dtype>) -> Dtype {
+        let mut arrays: Vec<&Array> = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
+        arrays.extend(self.conv1.bias());
+        arrays.extend([&self.norm2_w, &self.norm2_b, self.conv2.weight()]);
+        arrays.extend(self.conv2.bias());
+        let mut y = crate::quantum::promote_all(input, &arrays);
+        if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
+            y = Dtype::from_promoting_types(y, crate::quantum::linear_output_dtype(proj, t));
+        }
+        let residual = match &self.shortcut {
+            Some(sc) => {
+                Dtype::from_promoting_types(input, crate::quantum::linear_output_dtype(sc, input))
+            }
+            None => input,
+        };
+        Dtype::from_promoting_types(residual, y)
+    }
+
+    /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).
+    pub(crate) fn conv_weights(&self) -> (&Array, &Array) {
+        (self.conv1.weight(), self.conv2.weight())
     }
 
     /// [`forward_planned`](Self::forward_planned) as one guarded iOS quantum (sc-26270). `skip`
@@ -250,11 +277,12 @@ impl ResnetBlock2D {
     ///
     /// The U-Net continues to use [`Self::forward`]. VAE resnets carry no time embedding, allowing
     /// their GroupNorms to use full-image statistics while only the two 3×3 convolutions tile.
-    pub fn forward_tiled_vae(
+    pub(crate) fn forward_tiled_vae(
         &self,
         x: &Array,
         tile_edge: i32,
         cancel: Option<&CancelFlag>,
+        labels: crate::quantum::VaeLabels,
     ) -> Result<Array> {
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
@@ -269,7 +297,7 @@ impl ResnetBlock2D {
         let s = x.shape();
         let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
         mlx_gen::ios_quantum::before(
-            crate::quantum::VAE_TILED_STAGE,
+            labels.tiled_stage,
             crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
         )?;
         let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
@@ -281,7 +309,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| {
                 // sc-26270: each tile is checked before its norm/conv graph is constructed.
-                crate::quantum::before_tile(tile, self.conv1.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, self.conv1.weight(), false)?;
                 silu_glue(&norm1.apply(tile)?)
             },
         )?;
@@ -297,7 +325,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(tile, self.conv2.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, self.conv2.weight(), false)?;
                 silu_glue(&norm2.apply(tile)?)
             },
         )?;
@@ -308,8 +336,61 @@ impl ResnetBlock2D {
         };
         let out = add(&residual, &y)?;
         out.eval()?;
-        mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+        mlx_gen::ios_quantum::finish(labels.tiled_stage, &[&out])?;
         Ok(out)
+    }
+
+    /// Header-only pricing of [`Self::forward_tiled_vae`] over the shape-only `x`: the stage and
+    /// each convolution's widest tile, with the guards' own formulas. Returns the shape-only output.
+    pub(crate) fn price_tiled_vae(
+        &self,
+        x: &Array,
+        tile_edge: i32,
+        labels: crate::quantum::VaeLabels,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        let s = x.shape();
+        let (cin, cout) = crate::quantum::conv_channels(self.conv1.weight());
+        out.push((
+            labels.tiled_stage,
+            crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
+        ));
+        let tile = |input: &[i32], channels: i32, width: u64, weight: &Array| {
+            let (th, tw) = crate::vae::max_conv_tile(input[1], input[2], tile_edge);
+            crate::quantum::tile_bytes(
+                &[input[0], th, tw, channels],
+                width,
+                weight,
+                false,
+                crate::quantum::backend(),
+            )
+        };
+        out.push((
+            labels.tile,
+            tile(
+                s,
+                s[3],
+                crate::quantum::element_bytes(x),
+                self.conv1.weight(),
+            ),
+        ));
+        let mut conv1 = vec![&self.norm1_w, &self.norm1_b, self.conv1.weight()];
+        conv1.extend(self.conv1.bias());
+        let y = crate::quantum::promote_all(x.dtype(), &conv1);
+        let mid = [s[0], s[1], s[2], self.conv2.weight().shape()[3]];
+        out.push((
+            labels.tile,
+            tile(
+                &mid,
+                mid[3],
+                crate::quantum::dtype_bytes(y),
+                self.conv2.weight(),
+            ),
+        ));
+        crate::quantum::shaped(
+            &[s[0], s[1], s[2], cout],
+            self.output_dtype(x.dtype(), None),
+        )
     }
 
     /// The one LoRA-targetable **Linear** on a U-Net resnet — `time_emb_proj`. The convs
