@@ -1,7 +1,7 @@
 //! Native MOSS-Image Base/SFT, including both explicit published DMD precision policies.
 //! Caller-provisioned exact assets only. No acquisition or Python production execution.
 mod loader;
-mod memory_strategy;
+pub mod memory_strategy;
 mod pipeline;
 mod text_encoder;
 mod transformer;
@@ -75,7 +75,14 @@ impl MossImageGenerator {
     ) -> gen_core::Result<u64> {
         let r = MossImageResolved::resolve(self.variant(), request)?;
         let images = inputs.validate(request, &r)?;
-        memory_strategy::estimate(&self.sources, &r, request, images, self.staged(request))
+        memory_strategy::estimate(
+            self.selected_sources(r.acceleration, &request.cancel)?
+                .as_ref(),
+            &r,
+            request,
+            images,
+            self.staged(request),
+        )
     }
     /// Incremental structural demand above the caller's committed budget snapshot. Only this
     /// generator's actual retained tensor weights receive credit; unrelated memory never does.
@@ -129,6 +136,21 @@ impl MossImageGenerator {
         }
         Ok(text.saturating_add(renderer).saturating_add(vae))
     }
+    fn selected_sources(
+        &self,
+        mode: MossImageAcceleration,
+        cancel: &CancelFlag,
+    ) -> gen_core::Result<std::borrow::Cow<'_, Sources>> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        if self.sources.selection == Some(mode) {
+            Ok(std::borrow::Cow::Borrowed(&self.sources))
+        } else {
+            Sources::selected_with_cancel(self.variant(), &self.sources.spec, mode, cancel)
+                .map(std::borrow::Cow::Owned)
+        }
+    }
     fn variant(&self) -> MossImageVariant {
         MossImageVariant::from_provider_id(self.descriptor.id).expect("static descriptor")
     }
@@ -174,9 +196,10 @@ impl MossImageGenerator {
         checked_host_elements(req, images)?;
         memory_strategy::check_request(req)?;
         transformer::check_cancel(&req.cancel)?;
-        let assets = self.sources.assets(r.acceleration)?;
+        let sources = self.selected_sources(r.acceleration, &req.cancel)?;
+        let assets = sources.assets(r.acceleration)?;
         let staged = self.staged(req);
-        let peak = memory_strategy::estimate(&self.sources, &r, req, images, staged)?;
+        let peak = memory_strategy::estimate(&sources, &r, req, images, staged)?;
         if let Some(context) = admission {
             let demand = peak.saturating_sub(
                 self.cached_resident_bytes(state)?
@@ -282,7 +305,7 @@ impl MossImageGenerator {
             }
             transformer::check_cancel(&req.cancel)?;
             state.select_renderer(r.acceleration, || {
-                pipeline::Renderer::load(&self.sources, r.acceleration, &self.device)
+                pipeline::Renderer::load(&sources, r.acceleration, &self.device)
             })?;
         }
         let sampled = pipeline::sample(
@@ -395,6 +418,12 @@ impl Generator for MossImageGenerator {
     fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
         candle_gen::lock_recover(&self.state).report.clone()
     }
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| self.cached_resident_bytes(&state).ok())
+    }
     fn adapter_apply_reports(&self) -> Vec<AdapterApplyReport> {
         self.moss_image_execution_report()
             .map_or_else(Vec::new, |r| r.data().adapter_reports.clone())
@@ -428,7 +457,8 @@ impl Generator for MossImageGenerator {
                 })?,
         )?;
         memory_strategy::check_request(req)?;
-        self.sources.assets(r.acceleration)?;
+        self.selected_sources(r.acceleration, &req.cancel)?
+            .assets(r.acceleration)?;
         Ok(())
     }
     fn generate(

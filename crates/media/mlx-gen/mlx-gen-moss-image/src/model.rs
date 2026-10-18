@@ -162,7 +162,6 @@ impl MossImage {
                 vae_weights.unused_keys()
             )));
         }
-        let renderer = sources.transformer(MossImageAcceleration::Off, &cancel)?;
         sources.ensure_unchanged()?;
         Ok(Self {
             variant,
@@ -173,10 +172,13 @@ impl MossImage {
             vae,
             memory,
             state: Mutex::new(State {
-                renderer: Some((MossImageAcceleration::Off, renderer)),
+                renderer: None,
                 report: None,
             }),
         })
+    }
+    fn selected_sources(&self, mode: MossImageAcceleration) -> Result<Sources> {
+        Sources::selected(self.variant, &self.spec, mode)
     }
     fn validate_inputs(
         &self,
@@ -197,7 +199,8 @@ impl MossImage {
         {
             return Err(Error::Unsupported("MOSS currently implements resident execution; staging, tiling, chunking, windows and alternate execution policies are unavailable".into()));
         }
-        self.sources.mode_assets(resolved.acceleration)?;
+        self.selected_sources(resolved.acceleration)?
+            .mode_assets(resolved.acceleration)?;
         let branches = if matches!(resolved.acceleration, MossImageAcceleration::Off) {
             1 + u32::from(resolved.guidance != 1.0)
                 + u32::from(
@@ -236,7 +239,10 @@ impl MossImage {
         } else {
             1
         };
-        let assets = memory_strategy::selected_facts(&self.sources, r.acceleration)?;
+        let assets = memory_strategy::selected_facts(
+            &self.selected_sources(r.acceleration)?,
+            r.acceleration,
+        )?;
         memory_strategy::request_workspace_bytes(
             request.width,
             request.height,
@@ -263,17 +269,22 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        let shared = self
-            .encoder
+        Ok(incremental_peak(
+            peak,
+            self.cached_owned_weight_bytes(&state),
+            budget.committed_bytes,
+        ))
+    }
+    fn cached_owned_weight_bytes(&self, state: &State) -> u64 {
+        self.encoder
             .resident_bytes()
-            .saturating_add(self.memory.asset_facts.decoder_bytes);
-        let owned = shared.saturating_add(
-            state
-                .renderer
-                .as_ref()
-                .map_or(0, |(_, renderer)| renderer.resident_bytes()),
-        );
-        Ok(incremental_peak(peak, owned, budget.committed_bytes))
+            .saturating_add(self.memory.asset_facts.decoder_bytes)
+            .saturating_add(
+                state
+                    .renderer
+                    .as_ref()
+                    .map_or(0, |(_, renderer)| renderer.resident_bytes()),
+            )
     }
     fn execute(
         &self,
@@ -288,8 +299,10 @@ impl MossImage {
         state.begin();
         let result = (|| {
             check(&request.cancel)?;
-            let (resolved, count) = self.validate_inputs(request, inputs)?;
             self.sources.ensure_unchanged()?;
+            let (resolved, count) = self.validate_inputs(request, inputs)?;
+            let sources = self.selected_sources(resolved.acceleration)?;
+            sources.ensure_unchanged()?;
             let peak = self.estimated_request_peak(request, inputs)?;
             if let Some(cap) = mlx_gen::memory::recommended_working_set_bytes() {
                 if peak > cap {
@@ -354,8 +367,7 @@ impl MossImage {
             check(&request.cancel)?;
             state.select(resolved.acceleration, || {
                 mlx_gen::residency::drain_allocator_cache();
-                self.sources
-                    .transformer(resolved.acceleration, &request.cancel)
+                sources.transformer(resolved.acceleration, &request.cancel)
             })?;
             let shape = [
                 count as i32,
@@ -392,7 +404,7 @@ impl MossImage {
             }
             let noise = Array::from_slice(&noise_values, &shape);
             drop(noise_values);
-            let assets = self.sources.mode_assets(resolved.acceleration)?;
+            let assets = sources.mode_assets(resolved.acceleration)?;
             let dataspace = if resolved.acceleration != MossImageAcceleration::Off {
                 let weights = read_weights(
                     assets
@@ -529,7 +541,7 @@ impl MossImage {
                     });
                 }
             }
-            self.sources.ensure_unchanged()?;
+            sources.ensure_unchanged()?;
             check(&request.cancel)?;
             let report = MossImageExecutionReport::new(MossImageExecutionData {
                 execution_device: MossImageExecutionDevice::Mlx,
@@ -600,6 +612,12 @@ impl Generator for MossImage {
     }
     fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
         self.state.lock().ok().and_then(|s| s.report.clone())
+    }
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
         self.moss_image_execution_report()

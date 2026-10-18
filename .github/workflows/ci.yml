@@ -925,6 +925,9 @@ jobs:
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Verify native MOSS transport guards without GPU execution
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest
       - name: Install pinned uv for Windows supervisor smoke
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:

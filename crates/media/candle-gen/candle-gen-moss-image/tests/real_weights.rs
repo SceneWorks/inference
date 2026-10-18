@@ -66,8 +66,18 @@ fn prepared(variant: MossImageVariant, base: &Path, shared: &Path, dmd: &Path) -
     .unwrap();
     spec
 }
+fn record(output: &Path, value: serde_json::Value) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output.join("backend-cases.jsonl"))
+        .unwrap();
+    writeln!(file, "{value}").unwrap();
+}
 fn save(output: &Path, name: &str, images: &[Image], report: &MossImageExecutionReport) {
-    for (i, image) in images.iter().enumerate() {
+    let skip_png = std::env::var("MOSS_NATIVE_SKIP_PNG").as_deref() == Ok("1");
+    for (i, image) in images.iter().enumerate().filter(|_| !skip_png) {
         image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
             .unwrap()
             .save(output.join(format!("{name}-{i}.png")))
@@ -78,6 +88,10 @@ fn save(output: &Path, name: &str, images: &[Image], report: &MossImageExecution
         serde_json::to_vec_pretty(report).unwrap(),
     )
     .unwrap();
+    record(
+        output,
+        serde_json::json!({"case":name,"status":"completed","receipt":format!("{name}.receipt.json"),"pngs_skipped":skip_png,"images":images.len()}),
+    );
 }
 fn images(output: GenerationOutput) -> Vec<Image> {
     match output {
@@ -249,8 +263,14 @@ fn native_complete_surface_campaign() {
                 serde_json::to_vec_pretty(&report).unwrap(),
             )
             .unwrap();
+            record(
+                &output,
+                serde_json::json!({"case":"Sft-advanced","status":"completed","receipt":"Sft-advanced.receipt.json","images":0,"pngs_skipped":true}),
+            );
         }
-        let canceled = request.clone();
+        let mut canceled = request.clone();
+        // Each variant must retain its own cancellation attempt; cloned flags share state.
+        canceled.cancel = CancelFlag::default();
         let result = generator.generate(&canceled, &mut |p| {
             if matches!(p, Progress::Step { current: 1, .. }) {
                 canceled.cancel.cancel()
@@ -258,6 +278,10 @@ fn native_complete_surface_campaign() {
         });
         assert!(matches!(result, Err(gen_core::Error::Canceled)));
         assert!(generator.moss_image_execution_report().is_none());
+        record(
+            &output,
+            serde_json::json!({"case":format!("{variant:?}-cancel"),"status":"canceled","typed_cancelled":true,"receipt_cleared":true}),
+        );
         let mut recovered = request.clone();
         recovered.cancel = CancelFlag::default();
         let recovered = images(generator.generate(&recovered, &mut |_| {}).unwrap());

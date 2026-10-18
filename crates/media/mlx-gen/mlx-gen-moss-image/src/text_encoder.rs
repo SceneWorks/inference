@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 pub(crate) struct Encoder {
     model: Qwen35Model,
     tokenizer: TextTokenizer,
+    owned_weight_bytes: u64,
 }
 impl Encoder {
     pub(crate) fn load(s: &Sources, cancel: &CancelFlag) -> Result<Self> {
@@ -44,15 +45,20 @@ impl Encoder {
                 pad_to_max_length: false,
             },
         )?;
-        Ok(Self { model, tokenizer })
+        let mut owned_weight_bytes = 0u64;
+        for array in model.param_groups().into_iter().flatten() {
+            crate::transformer::check(cancel)?;
+            mlx_rs::transforms::eval([&array])?;
+            owned_weight_bytes = owned_weight_bytes.saturating_add(array.nbytes() as u64);
+        }
+        Ok(Self {
+            model,
+            tokenizer,
+            owned_weight_bytes,
+        })
     }
     pub(crate) fn resident_bytes(&self) -> u64 {
-        self.model
-            .param_groups()
-            .into_iter()
-            .flatten()
-            .map(|a| a.nbytes() as u64)
-            .sum()
+        self.owned_weight_bytes
     }
     pub(crate) fn encode(
         &self,

@@ -11,7 +11,11 @@ The implemented memory surface is resident, eager, official BF16 plus explicit
 published mixed/full-FP32 DMD policies. Arbitrary generic adapters, quantization,
 staging, decoder tiling, block windows and alternate execution policies are refused.
 Footprints and request workspace are structural estimates; no native calibration is
-claimed. The registry's generic memory contract describes ordinary OFF residency.
+claimed. The generic constructor prepares/materializes shared Qwen/VAE components only,
+with no DiT renderer until the validated request chooses its exact source closure.
+Its memory contract describes those common components; a full-FP32 prepared
+spec never needs unused ordinary DiT pins. The selected published config is
+authenticated before renderer construction.
 Before loading, callers selecting acceleration use
 `memory_strategy::selected_asset_facts(variant, &spec, resolved.acceleration)` plus
 `request_workspace_bytes(width, height, expanded_count, max_sequence_length, branches)`;

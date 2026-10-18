@@ -13,3 +13,6 @@
 
 #[path = "native_smoke.rs"]
 mod native_smoke;
+
+#[path = "small_vae.rs"]
+mod small_vae;

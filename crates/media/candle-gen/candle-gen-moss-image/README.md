@@ -68,3 +68,39 @@ checks ordinary→mixed/full→ordinary identity, advanced latent conditioning/b
 transport, typed cancellation with no stale receipt, and warm reentry. Environment
 variables are a guard against accidental invocation, not an ownership lease or
 independent physical-device proof; the external terminal allocator supplies those.
+
+
+## Static consumer admission (sc-26325)
+
+Before the generic boxed provider loader, call public
+`memory_strategy::selected_preload_estimate(variant, &spec, &request,
+MossImageAdvancedInputs::default())`. Its `peak_bytes` reuses the runtime formula;
+`asset_facts` is selected resident accounting, `workspace_bytes` is scratch plus
+512MiB fixed overhead, and `owned_shard_transient_bytes` is the largest selected
+owned source shard. **The shard is added once in `peak_bytes`; workspace excludes
+it.** This differs from MLX's older workspace helper, which already includes its
+fixed source staging envelope. `selected_asset_facts` and `request_workspace_bytes`
+are also public, but consumers should use the combined call to authenticate once.
+No device or tensor is created by static admission. Cold header authentication
+streams one open file in at most 64KiB chunks and retains only the bounded header;
+header facts and optional FP32 validation proofs are cached by approved immutable
+identity, with retained-pin checks on every reuse. Request-bearing preparation
+checks cancellation during cold IO and scans. Actual tensor loading still
+independently authenticates its exact owned shard buffer, and `peak_bytes` retains
+that conservative staging allowance. OFF does not authenticate optional DMD availability; mixed does not
+read full-FP32 shards; full replaces the ordinary BF16 DiT closure for static facts and runtime weights.
+The ordinary SFT core remains a catalog installation prerequisite. Both normal
+constructors prepare only shared sources and defer DiT selection to the validated
+request; no ordinary DiT config/index/shard pin is required for the selected full
+FP32 closure. Its published config is authenticated before constructing that
+renderer. Constructor facts describe the common components; selected static and
+runtime estimates describe the complete requested policy. Warm admission uses
+`Generator::moss_image_owned_weight_bytes()` inside the serialized transaction,
+bounded by the current committed snapshot. It reports actual materialized retained
+weights without tensor evaluation or new allocations.
+
+The dedicated inference `moss-native-terminal-windows.yml` workflow is exclusively
+for the stationary final inference-main pin in the frozen product epic feature. Its strict JSON control
+and physical-GPU0 lease are described in
+`docs/moss-native-terminal-windows.md`. The CPU-only `native_inventory` example
+verifies the shared 41-file frozen manifest; it does not initialize CUDA.

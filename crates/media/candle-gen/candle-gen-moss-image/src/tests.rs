@@ -41,16 +41,45 @@ fn weights(v: &Value, dtype: DType) -> Weights {
             .collect(),
     )
 }
+fn checked_delta(a: &[f32], shape: &[usize], b: &[f32], expected_shape: &[usize]) -> f32 {
+    assert_eq!(shape, expected_shape, "oracle shape");
+    assert_eq!(a.len(), b.len(), "oracle count");
+    assert_eq!(
+        shape.iter().product::<usize>(),
+        a.len(),
+        "oracle shape/count"
+    );
+    assert!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "nonfinite oracle value"
+    );
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max)
+}
 fn compare(actual: &Tensor, expected: &Value, tolerance: f32, label: &str) {
     let a = loader::tensor_f32(actual).unwrap();
     let b: Vec<f32> = serde_json::from_value(expected["values"].clone()).unwrap();
-    assert_eq!(a.len(), b.len(), "{label}");
-    let max = a
-        .iter()
-        .zip(&b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
+    let shape: Vec<usize> = serde_json::from_value(expected["shape"].clone()).unwrap();
+    let max = checked_delta(&a, actual.dims(), &b, &shape);
     assert!(max <= tolerance, "{label}: max abs {max} > {tolerance}");
+}
+#[test]
+fn numerical_oracle_rejects_nan_truncation_and_shape_mismatch_sc26325() {
+    assert_eq!(checked_delta(&[1., 2.], &[2], &[1., 2.], &[2]), 0.);
+    for (a, shape, b, expected_shape) in [
+        (vec![f32::NAN], vec![1], vec![0.], vec![1]),
+        (vec![0.], vec![1], vec![f32::NAN], vec![1]),
+        (vec![f32::INFINITY], vec![1], vec![0.], vec![1]),
+        (vec![1.], vec![1], vec![1., 2.], vec![2]),
+        (vec![1., 2.], vec![2], vec![1.], vec![2]),
+        (vec![1., 2.], vec![1, 2], vec![1., 2.], vec![2, 1]),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| checked_delta(&a, &shape, &b, &expected_shape)).is_err()
+        );
+    }
 }
 #[test]
 fn descriptors_keep_acceleration_explicit() {
@@ -269,8 +298,8 @@ fn mask_and_cancellation_refuse_before_blocks() {
     ));
 }
 
-fn synthetic_sources() -> Sources {
-    Sources{ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
+pub(crate) fn synthetic_sources() -> Sources {
+    Sources{selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
         text_config:candle_llm::models::qwen35::Qwen35Config::from_json(&serde_json::json!({"hidden_size":4096,"num_hidden_layers":2,"intermediate_size":24,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":32,"linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":8,"linear_value_head_dim":8})).unwrap(),
         tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
         spec:LoadSpec::new(WeightsSource::Dir("synthetic-unloaded-only".into()))}
@@ -653,6 +682,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
 fn warm_admission_credits_only_actual_provider_weights() {
     let d = fixture("fixture.json");
     let generator = synthetic_generator();
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(0));
     let mode = MossImageAcceleration::Off;
     let model = Transformer::load(&weights(&d["weights"], DType::F32), geometry(&d), None).unwrap();
     let actual = model.resident_bytes();
@@ -667,6 +697,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
     let peak = generator
         .estimated_peak_bytes(&request, MossImageAdvancedInputs::default())
         .unwrap();
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(actual));
     let budget = MemoryBudget {
         total_bytes: u64::MAX / 2,
         committed_bytes: actual + 123456,
@@ -801,7 +832,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
                     }
                 }
             }
-            let expected = serde_json::json!({"values":x});
+            let expected = serde_json::json!({"values":x,"shape":[4,4,2,3]});
             compare(
                 &actual.latents,
                 &expected,
@@ -873,4 +904,33 @@ fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
     let mut recovered = req.clone();
     recovered.cancel = CancelFlag::default();
     assert!(run(&recovered, &mut |_| {}).is_ok());
+}
+
+#[test]
+fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("transformer/pipeline_moss_image.py");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source=include_bytes!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_author/frozen_author_pipeline.py");
+    std::fs::write(&path, source).unwrap();
+    let unused = tmp.path().join("unused-full-fp32");
+    std::fs::write(&unused, b"available unused").unwrap();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().into()));
+    spec.prepare_with_file_pins([
+        PinnedWeightsFile::pin(&path).unwrap(),
+        PinnedWeightsFile::pin(&unused).unwrap(),
+    ])
+    .unwrap();
+    std::fs::write(&unused, b"changed unused availability").unwrap();
+    assert!(spec.validate_prepared_file_pins().is_err());
+    let selected = loader::Asset::new(
+        &spec,
+        path,
+        MossImageAssetRole::Transformer,
+        SFT_REPO,
+        SFT_REVISION,
+        "transformer/pipeline_moss_image.py",
+    )
+    .unwrap();
+    assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }
