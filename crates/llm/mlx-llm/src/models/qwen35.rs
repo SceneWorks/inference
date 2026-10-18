@@ -1033,7 +1033,7 @@ pub struct Qwen35Model {
     embed_tokens: TokenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Array,
-    lm_head: Projection,
+    lm_head: Option<Projection>,
     rope: Rope,
     mtp: Option<MtpPredictor>,
     /// Why a configured native MTP head was not built (E2): the snapshot stores none of it, or it
@@ -1119,7 +1119,9 @@ impl Qwen35Model {
         let mut top = Vec::new();
         self.embed_tokens.push_arrays(&mut top);
         top.push(self.norm.clone());
-        self.lm_head.push_arrays(&mut top);
+        if let Some(head) = &self.lm_head {
+            head.push_arrays(&mut top);
+        }
         let mut groups = vec![top];
         groups.extend(self.layers.iter().map(DecoderLayer::arrays));
         if let Some(mtp) = &self.mtp {
@@ -1219,6 +1221,29 @@ impl Qwen35Model {
         self.hidden_from_embeds(&h, &cos, &sin, cache)
     }
 
+    /// Final RMS-normalized decoder states `[B, S, hidden]`, without a vocabulary projection.
+    /// Use an individual unpadded prompt with a fresh cache for text-encoder inference.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<Array> {
+        rms_norm(
+            &self.hidden(input_ids, cache, offset)?,
+            &self.norm,
+            self.eps,
+        )
+    }
+
+    fn language_head(&self) -> Result<&Projection> {
+        self.lm_head.as_ref().ok_or_else(|| {
+            Error::Config(
+                "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+            )
+        })
+    }
+
     /// Final-normalized target hidden states and logits for every supplied position. Qwen3.8 MTP
     /// consumes the same final-normalized states the upstream runtime exposes to its predictor.
     pub(crate) fn hidden_and_logits(
@@ -1229,7 +1254,7 @@ impl Qwen35Model {
     ) -> Result<(Array, Array)> {
         let h = self.hidden(input_ids, cache, offset)?;
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
 
@@ -1244,7 +1269,7 @@ impl Qwen35Model {
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
-        let logits = self.lm_head.forward(&last)?;
+        let logits = self.language_head()?.forward(&last)?;
         Ok((
             normalized,
             logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
@@ -1281,7 +1306,7 @@ impl Qwen35Model {
             |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
         )?;
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         Ok((normalized, logits))
     }
 
@@ -1312,7 +1337,7 @@ impl Qwen35Model {
         let normalized = rms_norm(&h, &self.norm, self.eps)?;
         let s = normalized.shape()[1];
         let last = normalized.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
-        let logits = self.lm_head.forward(&last)?;
+        let logits = self.language_head()?.forward(&last)?;
         Ok((
             normalized,
             logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?,
@@ -1349,7 +1374,7 @@ impl Qwen35Model {
         positions: [&[i32]; 3],
     ) -> Result<(Array, Array)> {
         let normalized = self.mtp_hidden_from_embeds(embeds, hidden_states, cache, positions)?;
-        let logits = self.lm_head.forward(&normalized)?;
+        let logits = self.language_head()?.forward(&normalized)?;
         let last = logits.take_axis(Array::from_slice(&[normalized.shape()[1] - 1], &[1]), 1)?;
         Ok((
             normalized,
@@ -1440,7 +1465,7 @@ impl Qwen35Model {
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
     fn project(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.eps)?;
-        self.lm_head.forward(&normed)
+        self.language_head()?.forward(&normed)
     }
 
     /// Project the **last** position of `h` `[B, S, hidden]` → logits `[B, vocab]`.
@@ -1640,6 +1665,18 @@ impl Qwen35Model {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
+    /// Build only the text decoder and final norm, without reading or allocating an LM head.
+    /// `prefix` is the exact decoder root, including any frozen `language_model` wrapper.
+    /// Parse wrapped configurations with [`Qwen35Config::from_json`].
+    pub fn from_weights_headless(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
+        Self::materialized(w, Self::build_headless_lazy(w, prefix, cfg)?)
+    }
+
+    // Keep headless graph construction private: production loads cross the same coherence boundary.
+    fn build_headless_lazy(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, None, None, false)
+    }
+
     /// Build from a loaded checkpoint, optionally quantizing the large projections on load.
     ///
     /// `prefix` is the **decoder root** path: keys are read as `{prefix}.embed_tokens.weight`,
@@ -1672,7 +1709,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, quant, None)
+        Self::from_weights_layout(w, prefix, cfg, quant, None, true)
     }
 
     /// [`Qwen35Model::from_prism_weights`] without evaluating anything (see
@@ -1682,7 +1719,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         pack: &PrismMlxPack,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack))
+        Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack), true)
     }
 
     /// The caller-owned-map load boundary: every source this constructor read is verified
@@ -1700,6 +1737,7 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
         prism: Option<&PrismMlxPack>,
+        with_lm_head: bool,
     ) -> Result<Self> {
         let eps = cfg.rms_norm_eps;
         let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(compute())?) };
@@ -1731,7 +1769,13 @@ impl Qwen35Model {
         let proj_dense = |key: String| -> Result<Projection> {
             Projection::load(w.require(&key)?.as_dtype(compute())?, None)
         };
-        let dp = |s: &str| format!("{prefix}.{s}");
+        let dp = |s: &str| {
+            if prefix.is_empty() {
+                s.to_string()
+            } else {
+                format!("{prefix}.{s}")
+            }
+        };
 
         let embed_key = dp("embed_tokens.weight");
         let embed_weight = if prism.is_none() {
@@ -1745,18 +1789,22 @@ impl Qwen35Model {
             TokenEmbedding::Dense(embed_weight.clone().expect("dense embedding"))
         };
         let norm = norm_w(dp("norm.weight"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            if prism.is_some() {
-                return Err(Error::Config(
-                    "Prism requires an explicit packed lm_head; tied embeddings are unsupported"
-                        .into(),
-                ));
-            }
-            Projection::load(embed_weight.expect("dense embedding"), None)?
-        } else if let Some(pack) = prism {
-            Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
+        let lm_head = if !with_lm_head {
+            None
         } else {
-            Projection::load(req("lm_head.weight".to_string())?, None)?
+            Some(if cfg.tie_word_embeddings {
+                if prism.is_some() {
+                    return Err(Error::Config(
+                        "Prism requires an explicit packed lm_head; tied embeddings are unsupported"
+                            .into(),
+                    ));
+                }
+                Projection::load(embed_weight.expect("dense embedding"), None)?
+            } else if let Some(pack) = prism {
+                Projection::Prism(pack.linear(w, "language_model.lm_head.weight", compute())?)
+            } else {
+                Projection::load(req("lm_head.weight".to_string())?, None)?
+            })
         };
 
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
@@ -1822,28 +1870,33 @@ impl Qwen35Model {
         // fails the load in `build_mtp_predictor` (a missing tensor is integrity, not absence).
         let mut cfg = cfg;
         let mut mtp_fallback = None;
-        let mtp = match core_llm::native_mtp_plan(
-            cfg.mtp_num_hidden_layers,
-            cfg.mtp_use_dedicated_embeddings,
-            w.keys().any(|key| key.starts_with("mtp.")),
-        )
-        .map_err(|e| Error::Config(e.to_string()))?
-        {
-            core_llm::NativeMtp::Absent => None,
-            // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
-            // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`,
-            // sc-24438).
-            core_llm::NativeMtp::Build => Some(build_mtp_predictor(
-                &cfg,
-                "mtp.",
-                &|key| proj_q(key),
-                &|key| norm_w(key),
-                &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
-            )?),
-            core_llm::NativeMtp::Fallback(why) => {
-                mtp_fallback = Some(why);
-                cfg.mtp_num_hidden_layers = 0;
-                None
+        let mtp = if !with_lm_head {
+            cfg.mtp_num_hidden_layers = 0;
+            None
+        } else {
+            match core_llm::native_mtp_plan(
+                cfg.mtp_num_hidden_layers,
+                cfg.mtp_use_dedicated_embeddings,
+                w.keys().any(|key| key.starts_with("mtp.")),
+            )
+            .map_err(|e| Error::Config(e.to_string()))?
+            {
+                core_llm::NativeMtp::Absent => None,
+                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+                // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`,
+                // sc-24438).
+                core_llm::NativeMtp::Build => Some(build_mtp_predictor(
+                    &cfg,
+                    "mtp.",
+                    &|key| proj_q(key),
+                    &|key| norm_w(key),
+                    &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
+                )?),
+                core_llm::NativeMtp::Fallback(why) => {
+                    mtp_fallback = Some(why);
+                    cfg.mtp_num_hidden_layers = 0;
+                    None
+                }
             }
         };
 
@@ -2495,6 +2548,47 @@ pub(crate) mod tests {
         assert!((dense.item::<f32>() - source[0]).abs() < 1e-6);
     }
 
+    #[test]
+    fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache_on_cpu() {
+        on_cpu(|| {
+            let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+            let prefix = "language_model";
+            let mut tensors = synthetic_tensors_with_prefix(&cfg, prefix);
+            let lm = Qwen35Model::build_lazy(
+                &Weights::from_map(tensors.clone()),
+                prefix,
+                cfg.clone(),
+                None,
+            )
+            .unwrap();
+            tensors.remove("lm_head.weight");
+            let weights = Weights::from_map(tensors);
+            assert!(Qwen35Model::build_lazy(&weights, prefix, cfg.clone(), None).is_err());
+            // The public constructor explicitly verifies GPU views; test the shared loader and
+            // decoder on their CPU stream without invoking that Metal-only boundary.
+            let encoder = Qwen35Model::build_headless_lazy(&weights, prefix, cfg.clone()).unwrap();
+            assert!(encoder.lm_head.is_none());
+            let mut lm_cache = lm.new_cache();
+            let mut cache = encoder.new_cache();
+            let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+            let (expected, logits) = lm.hidden_and_logits(&ids, &mut lm_cache, 0).unwrap();
+            let hidden = encoder.forward_hidden(&ids, &mut cache, 0).unwrap();
+            assert_eq!(hidden.shape(), &[1, 3, cfg.hidden_size]);
+            assert_eq!(logits.shape(), &[1, 3, cfg.vocab_size]);
+            assert_eq!(host(&hidden), host(&expected));
+            assert_eq!(cache.offset(), 3);
+            let next_ids = Array::from_slice(&[42i32], &[1, 1]);
+            let next = encoder.forward_hidden(&next_ids, &mut cache, 3).unwrap();
+            let (expected, _) = lm.hidden_and_logits(&next_ids, &mut lm_cache, 3).unwrap();
+            assert_eq!(host(&next), host(&expected));
+            assert_eq!(cache.offset(), 4);
+            cache.reset().unwrap();
+            let repeated = encoder.forward_hidden(&ids, &mut cache, 0).unwrap();
+            assert_eq!(host(&repeated), host(&hidden));
+            assert!(encoder.forward(&ids, &mut encoder.new_cache(), 0).is_err());
+        });
+    }
+
     pub(crate) fn cfg_json() -> serde_json::Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
@@ -2914,7 +3008,11 @@ pub(crate) mod tests {
                 [&seed_positions, &seed_positions, &seed_positions],
             )
             .unwrap();
-        let all_mtp_logits = model.lm_head.forward(&full_mtp_hidden).unwrap();
+        let all_mtp_logits = model
+            .language_head()
+            .unwrap()
+            .forward(&full_mtp_hidden)
+            .unwrap();
         let expected_mtp_last = all_mtp_logits
             .take_axis(Array::from_slice(&[1i32], &[1]), 1)
             .unwrap();

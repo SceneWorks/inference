@@ -3664,6 +3664,7 @@ dependencies = [
  "image",
  "libc",
  "safetensors 0.4.5",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

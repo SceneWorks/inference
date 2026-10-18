@@ -44,6 +44,7 @@ mod macros;
 pub mod media;
 pub mod memory_phases;
 pub mod memory_strategy;
+pub mod moss_image;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
