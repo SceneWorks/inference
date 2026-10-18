@@ -1284,25 +1284,74 @@ mod tests {
             noise: Tensor,
         }
 
+        /// `N(0, std²)` of shape `dims` from the seeded `rng`.
+        fn randn_seeded(rng: &mut StdRng, std: f32, dims: &[usize]) -> Tensor {
+            let n = dims.iter().product();
+            let v: Vec<f32> = candle_gen::seeded_normal_vec(rng, n)
+                .into_iter()
+                .map(|x| x * std)
+                .collect();
+            Tensor::from_vec(v, dims, &Device::Cpu).unwrap()
+        }
+
+        /// Redraw every random-init var of `vm` from `rng`, in name order (the map is a `HashMap`),
+        /// at candle-nn's own init scale: Kaiming-normal weights `√(2/fan_in)` and `±1/√fan_in`
+        /// biases (std `1/√(3·fan_in)`). Constant-init vars (norm γ/β) are left as they are.
+        fn reseed_varmap(vm: &VarMap, rng: &mut StdRng) {
+            let data = vm.data().lock().unwrap();
+            let fan_in = |dims: &[usize]| dims[1..].iter().product::<usize>() as f32;
+            let mut names: Vec<&String> = data.keys().collect();
+            names.sort();
+            for name in names {
+                let v = &data[name];
+                let vals = v
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                if vals.iter().all(|x| *x == vals[0]) {
+                    continue;
+                }
+                let std = if v.dims().len() >= 2 {
+                    (2.0 / fan_in(v.dims())).sqrt()
+                } else {
+                    let w = name
+                        .strip_suffix("bias")
+                        .and_then(|stem| data.get(&format!("{stem}weight")))
+                        .unwrap_or_else(|| panic!("random-init 1-D var {name} has no weight"));
+                    (3.0 * fan_in(w.dims())).sqrt().recip()
+                };
+                v.set(&randn_seeded(rng, std, v.dims())).unwrap();
+            }
+        }
+
+        /// Seeded: candle's CPU backend ignores `Device::set_seed`, so `Tensor::randn` and the
+        /// `VarMap` init draw from the process-global RNG; a rare draw pushes the tiny random
+        /// decoder's output outside `[0, 1]` at every pixel, its final clamp zeroes every adapter
+        /// gradient, and the depth test fails intermittently (the SDXL / Lens fixtures' flake).
+        /// Every tensor here comes from one `StdRng`.
         fn fixture() -> Fixture {
             let dev = Device::Cpu;
+            let mut rng = StdRng::seed_from_u64(0x5a1e_2123);
             let vm = VarMap::new();
             let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
             let (mut dit, cfg) = tiny_dit(vb);
+            reseed_varmap(&vm, &mut rng);
             let suffixes: Vec<String> =
                 Z_IMAGE_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
             let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
             for v in &set.vars {
-                v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                v.set(&randn_seeded(&mut rng, 0.02, v.as_tensor().dims()))
                     .unwrap();
             }
-            let shape = (1, cfg.in_channels, 4, 4);
+            let shape = [1, cfg.in_channels, 4, 4];
             Fixture {
                 dit,
                 vars: set.vars,
-                x0: Tensor::randn(0f32, 1f32, shape, &dev).unwrap(),
-                cap: Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap(),
-                noise: Tensor::randn(0f32, 1f32, shape, &dev).unwrap(),
+                x0: randn_seeded(&mut rng, 1.0, &shape),
+                cap: randn_seeded(&mut rng, 1.0, &[3, cfg.cap_feat_dim]),
+                noise: randn_seeded(&mut rng, 1.0, &shape),
             }
         }
 
