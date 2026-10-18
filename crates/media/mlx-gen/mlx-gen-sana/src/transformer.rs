@@ -1688,6 +1688,8 @@ pub(crate) mod quantum_proofs {
         // (label, mlp_ratio, caption tokens, budget): which phase dominates.
         let mut proofs = Vec::new();
         let mut superseded = Vec::new();
+        // (qk_norm, activation-dominated, caption dtype, formula, measured) of every entry proof.
+        let mut entries = Vec::new();
         // (label, heads, head_dim, mlp_ratio, side, caption tokens, budget). The last case is
         // WEIGHT-dominated: F16 weights at dim 512 against f32 activations over 2x2 = 4 tokens, so
         // the block's promoted weight copies (~13 MB) dwarf every activation (~8 KB each) and the
@@ -1812,6 +1814,13 @@ pub(crate) mod quantum_proofs {
                     );
                     let label =
                         format!("SANA entry{scale} qk_norm={qk_norm} caption={caption_dtype:?}");
+                    entries.push((
+                        qk_norm,
+                        scale.is_empty(),
+                        caption_dtype,
+                        crate::quantum::entry_bytes(entry),
+                        measured,
+                    ));
                     ratio(
                         &mut proofs,
                         &label,
@@ -1863,6 +1872,24 @@ pub(crate) mod quantum_proofs {
                     );
                 }
             }
+        }
+        // The bf16 caption's f32 widening copy is released before gelu's chain (the caption term's
+        // peak): at the chain-dominated shape a bf16 and an f32 caption peak alike, so their
+        // formulas must not differ by more than the measurement does (a page of slack). Pricing
+        // the copy on top of the chain over-counts it (CI: 1.524x).
+        for &(qk, dominated, dtype, formula, measured) in &entries {
+            if !dominated || dtype != Dtype::Bfloat16 {
+                continue;
+            }
+            let &(_, _, _, f32_formula, f32_measured) = entries
+                .iter()
+                .find(|e| e.0 == qk && e.1 && e.2 == Dtype::Float32)
+                .unwrap();
+            assert!(
+                formula.abs_diff(f32_formula) <= measured.abs_diff(f32_measured) + 16384,
+                "qk_norm={qk}: the bf16 caption is priced {formula} vs f32 {f32_formula}, but they \
+                 measure {measured} vs {f32_measured}"
+            );
         }
         for (label, formula, measured) in proofs {
             let cap = if label.starts_with("SANA block weight copies") {
