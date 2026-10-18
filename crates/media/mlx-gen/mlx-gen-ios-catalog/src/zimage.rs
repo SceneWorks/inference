@@ -396,6 +396,50 @@ pub(crate) mod tests {
         )
         .unwrap();
         crate::ios_admission::validate_actual(&registry, &candidate).unwrap();
+        // A caller selection outside the provider's declared space, or for another strategy, is a
+        // typed strategy refusal before any price; a declared one is executed as given.
+        let contract = registry
+            .memory_strategy_contract(Z_IMAGE_TURBO_ID, &candidate.spec)
+            .unwrap()
+            .unwrap();
+        let space = contract
+            .selection_space(
+                MemoryStrategy::BoundedTransformerResidency,
+                candidate.context.selection.tier,
+                false,
+            )
+            .unwrap();
+        let chosen = space[space.len() - 1];
+        let with = |selection, strategy| {
+            let mut spec = z_image_turbo_load_spec(WeightsSource::Dir(q4.path().to_owned()), None);
+            spec.quantize = Some(Quant::Q4);
+            build_candidate(
+                &registry,
+                Z_IMAGE_TURBO_ID,
+                spec,
+                Some(selection),
+                strategy,
+                work("text", 512),
+            )
+        };
+        let built = with(chosen, MemoryStrategy::BoundedTransformerResidency).unwrap();
+        assert_eq!(built.context.selection, chosen);
+        let mut outside = chosen;
+        outside.parameters.decode_tile_edge = Some(500);
+        assert_eq!(
+            with(outside, MemoryStrategy::BoundedTransformerResidency)
+                .map(|_| ())
+                .unwrap_err()
+                .refusal_kind(),
+            Some(RefusalKind::Strategy)
+        );
+        assert_eq!(
+            with(chosen, MemoryStrategy::BoundedAttention)
+                .map(|_| ())
+                .unwrap_err()
+                .refusal_kind(),
+            Some(RefusalKind::Strategy)
+        );
         let IosWork::Generate(req) = &mut candidate.work else {
             unreachable!()
         };
