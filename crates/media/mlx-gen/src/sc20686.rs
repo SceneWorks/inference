@@ -726,7 +726,7 @@ pub fn observe_progress(progress: &Progress) {
         Progress::Loading(LoadPhase::Renderer) => enter_phase(state, "load"),
         // The optional prompt-upsampling stage (sc-26238) precedes the encode and rewrites the
         // prompt; it is part of the conditioning window, not a phase of its own here.
-        Progress::Upsampling { .. } => {}
+        Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
     });
 }
 
