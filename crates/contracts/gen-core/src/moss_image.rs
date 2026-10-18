@@ -96,7 +96,7 @@ pub struct MossSkipLayerGuidance {
 pub struct MossImageOptions {
     pub acceleration: MossImageAcceleration,
     pub max_sequence_length: u32,
-    /// None uses author default [22] for ordinary inference. Some(empty) disables skipping.
+    /// None uses author default `[22]` for ordinary inference. Some(empty) disables skipping.
     pub uncond_skip_layers: Option<Vec<u32>>,
     pub slg: Option<MossSkipLayerGuidance>,
     /// None uses the frozen training grid shift 1.0.
@@ -688,7 +688,7 @@ pub fn validate_dmd_package(
         .collect(),
     )
 }
-/// Fixed-noise DMD input x=z+Q*x0. NCHW, Q indexed [output,input], all arithmetic FP32.
+/// Fixed-noise DMD input x=z+Q*x0. NCHW, Q indexed `[output,input]`, all arithmetic FP32.
 pub fn moss_dmd_input(
     noise: &[f32],
     clean: &[f32],
