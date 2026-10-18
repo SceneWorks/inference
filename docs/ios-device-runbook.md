@@ -188,11 +188,16 @@ phase is `exact` when the lifetime peak rose inside it, else an upper bound (mas
 phase). An unattributed phase is priced at the whole-run peak.
 
 **Campaign size.** `campaign.py list` (the runner's own catalog, never a hand list) currently
-plans <!-- CASES --> — versus 18,450 cells before; the 20,000-case budget is gone by
+plans **246 cases / 490 cold launches** (122 resident anchors × 1, 122 optimized
+anchors × 3, the two validation cases × 1) — SDXL family 150 cases / 300 launches,
+Z-Image control 36 / 72, Z-Image 12 / 24, SANA base 12 / 24 (+2 validation), SANA
+Sprint 12 / 24, Iris 12 / 24, Iris depth 2 / 4, Iris restore 2 / 4, Anima Turbo 6 / 12;
+four dense-only route/tiers are listed `unserved` — versus 18,450 cells before; the 20,000-case budget is gone by
 construction (`--max-cases` is an optional cap). Estimated phone time (stated assumptions, low
 confidence): a resident anchor ~0.75 min (most refuse at an early load quantum on 8 GB), an
 optimized capture ~2.5 min (cold launch + load from flash + 2 steps + tiled decode at 1024²),
-the two validation cases ~5 min each: <!-- PHONE TIME -->.
+the two validation cases ~5 min each: about **17 h** of phone time (122 × 0.75 +
+366 × 2.5 + 2 × 5 min, plus one ~10 min install), plausibly 10–25 h.
 
 **Validation cases (part of the campaign, not optional).** For the first optimized family in
 catalog order: `validation_steps` — the optimized anchor at the provider's full step count,
@@ -202,7 +207,42 @@ captured beside the anchor (`evidence` prints full/short growth, whole run and p
 demand (`admitted.demand_bytes`, basis `Derived`) and the measured growth, and `validate` prints
 the error.
 
-<!-- FITS TABLE -->
+#### The fully optimized configuration fits every served cell (host-derived prediction)
+
+Michael: "for the phone, we want to make sure the fully optimized will fit". Per provider route ×
+tier × mode × size the fully optimized configuration (the optimized anchor's selection) is priced
+by the providers' counted iOS pricing over the real snapshot headers — every phase's resident
+bytes plus its largest counted quantum, plus the 512 MiB formula reserve — against the 6142 MiB
+entitled launch headroom. **Predictions, not device evidence**; regenerate with each crate's
+`reachable_sizes` / `reachable_sizes_prediction` ignored test, and the catalog's own request shape
+with `IOS_PRICING_SNAPSHOTS=<dir of route/tier snapshot dirs> cargo test -p mlx-gen-ios-catalog
+--lib host_integration -- --ignored --nocapture` (54 cells: SANA, Z-Image, SDXL routes).
+
+| Provider / mode | Tier | Before (worst of 512/768/1024, MiB) | After (512 / 768 / 1024) | What made it fit |
+|---|---|---:|---|---|
+| SANA base / Sprint, text + reference | q4 / q8 / bf16 | 3808 / 3946 / 5566 | ≤ 3808 / ≤ 3927 / 5566 | already fit (rung 3; SANA withholds rung 4) |
+| Anima Turbo, text | all | 2903 | 2052 / 2070 / 2903 | already fit (rung 4 is implemented on the iOS load; the "planned" label was wrong) |
+| Z-Image Turbo, text + reference | q4 / q8 / bf16 | fit at the cheapest selection | ≤ 4659 / ≤ 4660 / ≤ 4885 | already fit |
+| Z-Image control (+ reference), each kind | q4 | fit | 2758 / 3435 / 4659 | — |
+| Z-Image control (+ reference), each kind | **q8** | **6383 / 7061 / 8009 ✗** | 3392 / 4070 / 5018 | the deferred (rung-4) control load packs only its 2 resident refiner blocks; each streamed window packs its own block (was: all 15 packed and kept resident) |
+| Z-Image control (+ reference), each kind | bf16 | — | 4208 / 4886 / 5834 | same |
+| Iris 3B text / prompt batch 2 | **bf16** | **load 11979–12014 ✗** | 1696–1997 / 1890–2757 / 2450–3873 | (a) Qwen3-VL text-tower layer streaming (rung 4, scope `te`/`both`); (b) rung-4 backbone block streaming on a deferred load |
+| Iris 3B prompt batch 2, 1024 | **q8 / q4** | **7576 / 6152 ✗** | 3868 / 3751 | (b) rung-4 backbone streaming ((c) the per-row pixel stage alone leaves the trunk block binding) |
+| Iris restore / depth | **bf16** | **11944 / 11946 ✗** | 2018 / 1400–1955 | (b) streamed blocks + deferred skeletons |
+| SDXL family, text | all | fit | ≤ 2210 (bf16) / ≤ 2341 / ≤ 2317 | rung 4 priced as the iOS load actually runs it (the U-Net resident only as its non-block remainder) |
+| SDXL family, reference / mask | **bf16** | **6270 / 6718 ✗ (768 / 1024)** | 2076 / 2076 / 2428 | (b) rung 4 priced correctly on the iOS load |
+| SDXL family, control | **bf16** | **8127–8469 ✗** | 4085 / 4360 / 4770 | (b) |
+| SDXL family, ip_adapter | **bf16** | **7590–8097 ✗** | 3425 | (b) + (d) a staged IP request releases the CLIP-ViT-H encoder and Resampler once its tokens exist |
+| SDXL / RealVisXL, ip_adapter 1024 | **q8** | **6261 ✗** | 3375 | (b) + (d) |
+| Illustrious v1/v2 (cached q8 revision: no packed marker, rung 2 deepest), control / ip_adapter | q8 | 5987 / 6261 ✗ | 5972 / 5599 | load floors follow `Weights::materialize` batching with cast sources held (fixes a 44% cast-load under-count); (d) |
+
+No cell is physically impossible. The largest indivisible tensor anywhere is Iris's bf16 Qwen3-VL
+token-embedding table, 151936 × 2560 × 2 B = 742 MiB: with the 70 MiB that stays resident and the
+512 MiB reserve, 1324 MiB. The tightest fully optimized cell is Illustrious q8 ControlNet on the
+cached (marker-less) q8 revision, 5972 MiB (170 MiB margin); on a packed-marker q8 revision it
+streams at rung 4 like RealVisXL (3748 MiB). Every rung-0 RESIDENT configuration above 512² (and
+most at 512²) is predicted over the headroom: those anchors are expected to be typed pre-allocation
+refusals, which is their evidence.
 
 Z-Image Turbo host-derived reachable sizes (sc-26433), kept as the pre-anchor
 record of the quality-first selection walk the campaign NO LONGER performs (it
