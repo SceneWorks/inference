@@ -597,7 +597,17 @@ fn price_anchor(
         execution: &execution,
         token_window: row.key.token_window,
     })
-    .map_err(|e| AdmissionError::Failed(e.into()))
+    .map_err(pricing_error)
+}
+
+/// A provider's pricing that declines a configuration (`Unsupported`: an adapter stack, a PiD
+/// decode, a layout it does not price) makes it not derivable — a typed `no_evidence`; anything else
+/// (an unreadable header) is a failure.
+fn pricing_error(error: mlx_gen::Error) -> AdmissionError {
+    match Error::from(error) {
+        Error::Unsupported(reason) => no_evidence(format!("not derivable: {reason}")),
+        other => AdmissionError::Failed(other),
+    }
 }
 
 /// Step 3: the request's demand and margin from the anchor table (see the module docs).
@@ -636,6 +646,15 @@ fn anchored_demand(
             "no completed optimized anchor for {family:?} in {EVIDENCE_TABLE_PATH}: another mode,              tier, route, artifact layout or device is not derivable"
         )));
     };
+    // Execution levers OUTSIDE the ladder (e.g. CFG batching) are part of the regime the counted
+    // pricing describes only as the iOS ladder sets them: anything else is not derivable.
+    if candidate.execution
+        != execution_for(&candidate.provider, contract, &candidate.context.selection)
+    {
+        return Err(no_evidence(format!(
+            "{key:?}: execution levers outside the iOS ladder are not derivable from an anchor"
+        )));
+    }
     let Some((pricer, _)) = crate::pricing::provider_pricing(&candidate.provider) else {
         return Err(no_evidence(format!(
             "{}: no counted iOS pricing, so only its anchors' own keys are admitted",
@@ -651,7 +670,7 @@ fn anchored_demand(
         execution: &candidate.execution,
         token_window: key.token_window,
     })
-    .map_err(|e| AdmissionError::Failed(e.into()))?;
+    .map_err(pricing_error)?;
     let resident = resident.filter(|r| completed(r));
     // Derive UPWARD from the optimized anchor; a measured resident anchor prices only its own
     // regime at other geometries (never derived downward toward the optimized end).

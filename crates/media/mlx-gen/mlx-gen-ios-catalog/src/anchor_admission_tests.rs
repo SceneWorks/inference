@@ -37,7 +37,7 @@ fn phase_of(_: &str) -> Option<IosPhase> {
 }
 
 fn priced<T>(body: impl FnOnce() -> T) -> T {
-    crate::pricing::with_test_pricing((synthetic, phase_of), body)
+    crate::pricing::with_test_pricing(Some((synthetic, phase_of)), body)
 }
 
 fn at(
@@ -238,8 +238,6 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
         );
     });
     // No pricing: the anchor's own key still admits (a measurement needs no scaling) …
-    admit_one_of(&registry, &opt, 8192, &rows).unwrap();
-    // … but nothing else of the family does.
     let big = at(
         &registry,
         root.path(),
@@ -247,10 +245,27 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
-    assert_eq!(
-        kind(admit_one_of(&registry, &big, 8192, &rows)),
-        Some(RefusalKind::NoEvidence)
-    );
+    crate::pricing::with_test_pricing(None, || {
+        admit_one_of(&registry, &opt, 8192, &rows).unwrap();
+        // … but nothing else of the family does.
+        assert_eq!(
+            kind(admit_one_of(&registry, &big, 8192, &rows)),
+            Some(RefusalKind::NoEvidence)
+        );
+    });
+    // An execution lever outside the ladder (batched CFG; iOS runs SDXL CFG sequentially) is not
+    // derivable either.
+    let mut batched = big.clone();
+    batched.execution.cfg_batching = Some(mlx_gen::gen_core::CfgBatching::Batched);
+    if let IosWork::Generate(r) = &mut batched.work {
+        r.memory = Some(batched.execution);
+    }
+    priced(|| {
+        assert_eq!(
+            kind(admit_one_of(&registry, &batched, 8192, &rows)),
+            Some(RefusalKind::NoEvidence)
+        );
+    });
     // A family with only a resident anchor has nothing to derive from.
     let mut resident_only = optimized_anchor(&registry, &opt);
     resident_only.anchor_kind = AnchorKind::Resident;
