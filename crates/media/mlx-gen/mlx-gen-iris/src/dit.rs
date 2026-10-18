@@ -7,6 +7,7 @@
 //! the released `model.safetensors` loads unchanged. Precision: see [`crate::nn`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use gen_core::iris::{self, ModelConfig};
@@ -14,9 +15,11 @@ use mlx_gen::gen_core;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::nn::{gelu, sigmoid, silu};
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
 use crate::retention::{Attention, Kind, NormInput, Retention};
+use crate::stream::{BlockRead, CastPolicy};
 
 use crate::nn::{
     attention_at_site, barrier, cat, chunk_last, key_padding_mask, modulate, AdaptedLinears,
@@ -206,7 +209,7 @@ struct DualText {
 }
 
 /// `MMDiTBlock`: separate image/text weights, text-first joint attention.
-struct DualBlock {
+pub(crate) struct DualBlock {
     norm_x1: RmsNorm,
     norm_x2: RmsNorm,
     norm_y1: RmsNorm,
@@ -227,7 +230,7 @@ struct DualBlock {
 }
 
 /// `SingleStreamBlock`: one weight set over `cat([text, image])`.
-struct SingleBlock {
+pub(crate) struct SingleBlock {
     norm1: RmsNorm,
     norm2: RmsNorm,
     qkv: Qkv,
@@ -242,7 +245,7 @@ struct SingleBlock {
     text_out: bool,
 }
 
-enum Block {
+pub(crate) enum Block {
     Dual(Box<DualBlock>),
     Single(Box<SingleBlock>),
 }
@@ -282,6 +285,100 @@ impl Block {
     }
 }
 
+impl Block {
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out: Vec<&Array> = Vec::new();
+        match self {
+            Block::Dual(b) => {
+                for n in [
+                    &b.norm_x1,
+                    &b.norm_x2,
+                    &b.norm_y1,
+                    &b.q_norm_x,
+                    &b.k_norm_x,
+                    &b.q_norm_y,
+                    &b.k_norm_y,
+                    &b.attn_post_norm_x,
+                    &b.mlp_post_norm_x,
+                ] {
+                    out.extend(n.arrays());
+                }
+                out.extend(b.qkv_x.arrays());
+                out.extend(b.qkv_y.arrays());
+                out.extend(b.proj_x.arrays());
+                out.extend(b.gate_x.arrays());
+                out.extend(b.mlp_x.arrays());
+                if let Some(t) = &b.text {
+                    out.extend(t.norm2.arrays());
+                    out.extend(t.proj.arrays());
+                    out.extend(t.gate.arrays());
+                    out.extend(t.attn_post_norm.arrays());
+                    out.extend(t.mlp.arrays());
+                    out.extend(t.mlp_post_norm.arrays());
+                }
+                out.push(&b.mod_img.bias);
+                out.push(&b.mod_txt.bias);
+            }
+            Block::Single(b) => {
+                for n in [
+                    &b.norm1,
+                    &b.norm2,
+                    &b.q_norm,
+                    &b.k_norm,
+                    &b.attn_post_norm,
+                    &b.mlp_post_norm,
+                ] {
+                    out.extend(n.arrays());
+                }
+                out.extend(b.qkv.arrays());
+                out.extend(b.attn_gate.arrays());
+                out.extend(b.attn_proj.arrays());
+                out.extend(b.mlp.arrays());
+                out.push(&b.modulation.bias);
+            }
+        }
+        out
+    }
+}
+
+impl PitBlock {
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out: Vec<&Array> = Vec::new();
+        out.extend(self.norm1.arrays());
+        out.extend(self.norm2.arrays());
+        out.extend(self.adaln.arrays());
+        out.extend(self.compress.arrays());
+        out.extend(self.expand.arrays());
+        out.extend(self.attn.arrays());
+        out.extend(self.fc1.arrays());
+        out.extend(self.fc2.arrays());
+        out
+    }
+}
+
+impl LayerBlock {
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out: Vec<&Array> = Vec::new();
+        out.extend(self.norm1.arrays());
+        out.extend(self.attn.arrays());
+        out.extend(self.norm2.arrays());
+        out.extend(self.mlp0.arrays());
+        out.extend(self.mlp2.arrays());
+        out
+    }
+}
+
+impl AdapterBlock {
+    fn arrays(&self) -> Vec<&Array> {
+        let mut out: Vec<&Array> = Vec::new();
+        out.extend(self.norm1.arrays());
+        out.extend(self.attn.arrays());
+        out.extend(self.norm2.arrays());
+        out.extend(self.mlp.arrays());
+        out
+    }
+}
+
 /// Labels of the iOS execution quanta of one backbone forward, in forward order.
 pub(crate) mod quanta {
     pub const EMBED: &str = "Iris patch/timestep embed";
@@ -293,6 +390,313 @@ pub(crate) mod quanta {
     pub const PIXEL_EMBED: &str = "Iris pixel embed";
     pub const PIXEL_BLOCK: &str = "Iris pixel block";
     pub const OUTPUT: &str = "Iris output projection";
+    /// A streamed backbone's window read (rung 4): the window's blocks read, cast and built.
+    pub const BLOCK_READ: &str = "Iris backbone block read";
+    /// The per-row PiT stage's output rows concatenated back into the batch (rung 3).
+    pub const OUTPUT_ROWS: &str = "Iris output rows";
+    /// Every label above, for the phase attribution's coverage test.
+    pub const ALL: [&str; 11] = [
+        EMBED,
+        TEXT_LAYER_BLOCK,
+        TEXT_POOL,
+        TEXT_REFINER_BLOCK,
+        TEXT_OUTPUT,
+        TRUNK_BLOCK,
+        PIXEL_EMBED,
+        PIXEL_BLOCK,
+        OUTPUT,
+        BLOCK_READ,
+        OUTPUT_ROWS,
+    ];
+}
+
+/// The four block stacks of the backbone, in forward order: the text adapter's layerwise blocks
+/// and refiner blocks, the trunk, the PiT pixel head. Rung 4 streams each of them by window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum Stack {
+    Layer,
+    Refiner,
+    Trunk,
+    Pixel,
+}
+
+impl Stack {
+    pub(crate) const ALL: [Stack; 4] = [Stack::Layer, Stack::Refiner, Stack::Trunk, Stack::Pixel];
+
+    /// The checkpoint key stem of the stack's blocks (`{stem}.{i}.*`).
+    pub(crate) const fn stem(self) -> &'static str {
+        match self {
+            Stack::Layer => "y_embedder.layer_blocks",
+            Stack::Refiner => "y_embedder.refiner.blocks",
+            Stack::Trunk => "blocks",
+            Stack::Pixel => "pixel_blocks",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Stack::Layer => 0,
+            Stack::Refiner => 1,
+            Stack::Trunk => 2,
+            Stack::Pixel => 3,
+        }
+    }
+
+    /// The stack and block index a backbone key (export prefix stripped) belongs to, if any.
+    pub(crate) fn of(name: &str) -> Option<(Stack, usize)> {
+        Stack::ALL.into_iter().find_map(|stack| {
+            let rest = name.strip_prefix(stack.stem())?.strip_prefix('.')?;
+            let (index, tail) = rest.split_once('.')?;
+            (!tail.is_empty())
+                .then(|| index.parse().ok())
+                .flatten()
+                .map(|i| (stack, i))
+        })
+    }
+
+    /// Blocks of this stack under `cfg` (the text adapter has two layerwise and two refiner blocks).
+    pub(crate) fn depth(self, cfg: &ModelConfig) -> usize {
+        match self {
+            Stack::Layer | Stack::Refiner => TEXT_ADAPTER_BLOCKS,
+            Stack::Trunk => cfg.depth,
+            Stack::Pixel => cfg.pixel.depth,
+        }
+    }
+}
+
+/// A test-build hook run as each streamed window opens.
+#[cfg(test)]
+pub(crate) type WindowHook = Box<dyn FnMut(Stack, usize)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called as each streamed window opens, before its read (test builds only): the residency
+    /// tests read MLX's active memory there.
+    pub(crate) static WINDOW_HOOK: std::cell::RefCell<Option<WindowHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `lap_blocks2`: two layerwise blocks, two refiner blocks.
+const TEXT_ADAPTER_BLOCKS: usize = 2;
+
+/// Per stack, per block: the checkpoint's `(file key, built key)` pairs and the block's read price,
+/// from the safetensors headers alone (`file_prefix` is the export's key prefix, `pixel.` for
+/// depth). Shared by the streamed loader and the iOS pricing, so both read one inventory.
+pub(crate) struct StackInventory {
+    pub keys: [Vec<Vec<(String, String)>>; 4],
+    pub reads: [Vec<BlockRead>; 4],
+}
+
+impl StackInventory {
+    pub(crate) fn from_headers(
+        headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+        file_prefix: &str,
+        cfg: &ModelConfig,
+        policy: CastPolicy,
+    ) -> Result<Self> {
+        let mut grouped: [Vec<Vec<&mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>>; 4] =
+            Stack::ALL.map(|stack| vec![Vec::new(); stack.depth(cfg)]);
+        let mut keys: [Vec<Vec<(String, String)>>; 4] =
+            Stack::ALL.map(|stack| vec![Vec::new(); stack.depth(cfg)]);
+        for header in headers {
+            let Some(name) = header.name.strip_prefix(file_prefix) else {
+                continue;
+            };
+            let Some((stack, i)) = Stack::of(name) else {
+                continue;
+            };
+            let slot = grouped[stack.index()].get_mut(i).ok_or_else(|| {
+                Error::Msg(format!(
+                    "iris: the checkpoint carries {} block {i}, but the config has {}",
+                    stack.stem(),
+                    stack.depth(cfg)
+                ))
+            })?;
+            slot.push(header);
+            keys[stack.index()][i].push((header.name.clone(), name.to_owned()));
+        }
+        for stack in Stack::ALL {
+            if let Some(i) = keys[stack.index()].iter().position(Vec::is_empty) {
+                return Err(Error::Msg(format!(
+                    "iris: the checkpoint has no {} block {i}",
+                    stack.stem()
+                )));
+            }
+        }
+        for stack_keys in &mut keys {
+            for block in stack_keys {
+                block.sort();
+            }
+        }
+        let reads = Stack::ALL.map(|stack| {
+            grouped[stack.index()]
+                .iter()
+                .map(|block| crate::stream::block_read(block, policy))
+                .collect()
+        });
+        Ok(Self { keys, reads })
+    }
+
+    pub(crate) fn reads(&self, stack: Stack) -> &[BlockRead] {
+        &self.reads[stack.index()]
+    }
+}
+
+/// Rung 4 of a backbone: the checkpoint its block stacks are read from per window, and what one
+/// window of each stack reads and holds.
+pub(crate) struct BlockStream {
+    path: PathBuf,
+    compute: Dtype,
+    inventory: StackInventory,
+    /// The window a forward that names none runs (the encoder-free routes' published window; the
+    /// generation route's whole stack — a deferred load that did not select rung 4 still never
+    /// keeps a stack resident across forwards).
+    default_window: Option<usize>,
+}
+
+impl BlockStream {
+    /// The stream over `path`'s block stacks (export key prefix `file_prefix`), at `compute`.
+    pub(crate) fn open(
+        path: &Path,
+        file_prefix: &str,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        default_window: Option<usize>,
+    ) -> Result<Self> {
+        let headers = crate::stream::headers(path)?;
+        let inventory = StackInventory::from_headers(
+            &headers,
+            file_prefix,
+            cfg,
+            CastPolicy::Backbone { compute },
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            compute,
+            inventory,
+            default_window,
+        })
+    }
+
+    pub(crate) fn len(&self, stack: Stack) -> usize {
+        self.inventory.keys[stack.index()].len()
+    }
+
+    /// The read price of block `i` of `stack`.
+    #[cfg(test)]
+    pub(crate) fn read(&self, stack: Stack, i: usize) -> BlockRead {
+        self.inventory.reads(stack)[i]
+    }
+
+    /// The checkpoint the stacks are read from.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read block `i` of `stack` out of `view` and build it with the resident constructors.
+    pub(crate) fn build(
+        &self,
+        view: &mut Weights,
+        cfg: &ModelConfig,
+        stack: Stack,
+        i: usize,
+    ) -> Result<Built> {
+        let map = crate::stream::materialize(
+            view,
+            &self.inventory.keys[stack.index()][i],
+            CastPolicy::Backbone {
+                compute: self.compute,
+            },
+        )?;
+        let l = Loader {
+            weights: &map,
+            compute: self.compute,
+            adapted: None,
+            quant: None,
+        };
+        let eps = cfg.norm_eps as f32;
+        let gqa = cfg.num_kv_heads.is_some_and(|kv| kv != cfg.num_heads);
+        let built = match stack {
+            Stack::Trunk => Built::Trunk(Box::new(IrisDiT::load_block(&l, cfg, i, eps, gqa)?)),
+            Stack::Pixel => Built::Pixel(Box::new(IrisDiT::load_pit(&l, cfg, i, eps)?)),
+            Stack::Layer => Built::Layer(Box::new(IrisDiT::load_layer_block(&l, cfg, i, eps)?)),
+            Stack::Refiner => {
+                Built::Refiner(Box::new(IrisDiT::load_refiner_block(&l, cfg, i, eps)?))
+            }
+        };
+        let unused = map.unused_keys();
+        if let Some(first) = unused.first() {
+            return Err(Error::Msg(format!(
+                "iris stream: {} block {i} carries `{first}`, which the block does not consume",
+                stack.stem()
+            )));
+        }
+        crate::stream::eval_all(&built.arrays())?;
+        Ok(built)
+    }
+}
+
+/// One block a streamed window built (boxed: a window holds a handful at most).
+pub(crate) enum Built {
+    Trunk(Box<Block>),
+    Pixel(Box<PitBlock>),
+    Layer(Box<LayerBlock>),
+    Refiner(Box<AdapterBlock>),
+}
+
+impl Built {
+    pub(crate) fn arrays(&self) -> Vec<&Array> {
+        match self {
+            Built::Trunk(b) => b.arrays(),
+            Built::Pixel(b) => b.arrays(),
+            Built::Layer(b) => b.arrays(),
+            Built::Refiner(b) => b.arrays(),
+        }
+    }
+
+    fn as_ref(&self) -> BlockRef<'_> {
+        match self {
+            Built::Trunk(b) => BlockRef::Trunk(b),
+            Built::Pixel(b) => BlockRef::Pixel(b),
+            Built::Layer(b) => BlockRef::Layer(b),
+            Built::Refiner(b) => BlockRef::Refiner(b),
+        }
+    }
+}
+
+/// A block of one of the four stacks, resident or just built by a window.
+#[derive(Clone, Copy)]
+enum BlockRef<'a> {
+    Trunk(&'a Block),
+    Pixel(&'a PitBlock),
+    Layer(&'a LayerBlock),
+    Refiner(&'a AdapterBlock),
+}
+
+/// How one backbone forward executes: the attention plan (rung 3's query-row bound and the
+/// request's cancel flag), the streamed window (rung 4), and whether the PiT stage runs one batch
+/// row at a time (rung 3's pixel-row bound). [`Execution::resident`] is the historical forward.
+#[derive(Clone, Copy)]
+pub struct Execution<'a> {
+    pub plan: mlx_gen::AttentionPlan<'a>,
+    /// Blocks per streamed window; `None` runs the stream's default. A resident backbone ignores it.
+    pub window: Option<usize>,
+    /// Run the PiT blocks and the output projection one batch row at a time. The PiT attention
+    /// mixes patches within a row only, so the rows are independent: equal to the batched stage up
+    /// to matmul blocking, with the stage's activation bounded by one row instead of the batch.
+    pub pixel_rows: bool,
+}
+
+impl<'a> Execution<'a> {
+    /// `plan`, no window, batched pixel stage — the forward every caller ran before rung 4.
+    pub const fn resident(plan: mlx_gen::AttentionPlan<'a>) -> Self {
+        Self {
+            plan,
+            window: None,
+            pixel_rows: false,
+        }
+    }
 }
 
 /// The geometry of one trunk block quantum (see [`IrisDiT::trunk_block_scratch`]): the request's
@@ -388,7 +792,7 @@ pub(crate) struct TextBlockGeometry {
 }
 
 /// `PiTBlock` with `modulation="post"`.
-struct PitBlock {
+pub(crate) struct PitBlock {
     norm1: RmsNorm,
     norm2: RmsNorm,
     adaln: Linear,
@@ -400,7 +804,7 @@ struct PitBlock {
 }
 
 /// `LayerwiseAttentionBlock` over one token's encoder-layer states.
-struct LayerBlock {
+pub(crate) struct LayerBlock {
     norm1: RmsNorm,
     attn: SelfAttention,
     norm2: RmsNorm,
@@ -409,7 +813,7 @@ struct LayerBlock {
 }
 
 /// `TextAdapterBlock` (masked keys).
-struct AdapterBlock {
+pub(crate) struct AdapterBlock {
     norm1: RmsNorm,
     attn: SelfAttention,
     norm2: RmsNorm,
@@ -444,6 +848,8 @@ pub struct IrisDiT {
     final_norm: RmsNorm,
     final_linear: Linear,
     pos_cache: Mutex<HashMap<(usize, usize), Array>>,
+    /// Rung 4: the block stacks are read per window from this checkpoint (`None`: resident).
+    stream: Option<BlockStream>,
 }
 
 /// What the embed quantum produces: the patch tokens, the timestep embedding and both modulation
@@ -479,7 +885,20 @@ impl IrisDiT {
         compute: Dtype,
         input_channels: usize,
     ) -> Result<Self> {
-        Self::build(w, cfg, compute, input_channels, None, None)
+        Self::build(w, cfg, compute, input_channels, None, None, None)
+    }
+
+    /// The skeleton of a streamed backbone (rung 4): `w` holds every tensor but the four block
+    /// stacks, which `stream` reads per window (`BlockStream`). The skeleton is built by the
+    /// same constructors as the resident backbone; the stacks by the same per-block ones.
+    pub(crate) fn from_weights_streamed(
+        w: &Weights,
+        cfg: &ModelConfig,
+        compute: Dtype,
+        input_channels: usize,
+        stream: BlockStream,
+    ) -> Result<Self> {
+        Self::build(w, cfg, compute, input_channels, None, None, Some(stream))
     }
 
     /// [`from_weights`](Self::from_weights) with the projections of an adapter install
@@ -505,7 +924,7 @@ impl IrisDiT {
         adapted: Option<&AdaptedLinears>,
         quant: Option<BackboneQuant>,
     ) -> Result<Self> {
-        let dit = Self::build(w, cfg, compute, cfg.in_channels, adapted, quant)?;
+        let dit = Self::build(w, cfg, compute, cfg.in_channels, adapted, quant, None)?;
         if let Some(adapted) = adapted {
             let orphans = adapted.unconsumed();
             if !orphans.is_empty() {
@@ -524,6 +943,7 @@ impl IrisDiT {
         input_channels: usize,
         adapted: Option<&AdaptedLinears>,
         quant: Option<BackboneQuant>,
+        stream: Option<BlockStream>,
     ) -> Result<Self> {
         let l = Loader {
             weights: w,
@@ -539,30 +959,21 @@ impl IrisDiT {
         } else {
             None
         };
-        let mut blocks = Vec::with_capacity(cfg.depth);
-        for i in 0..cfg.depth {
+        // A streamed backbone builds no stack here: each block is built per window by
+        // `BlockStream::build`, through these same constructors.
+        let resident = stream.is_none();
+        let depth = |stack: Stack| if resident { stack.depth(cfg) } else { 0 };
+        let mut blocks = Vec::with_capacity(depth(Stack::Trunk));
+        for i in 0..depth(Stack::Trunk) {
             blocks.push(Self::load_block(&l, cfg, i, eps, gqa)?);
         }
-        let mut layer_blocks = Vec::with_capacity(2);
-        for i in 0..2 {
-            let p = |name: &str| format!("y_embedder.layer_blocks.{i}.{name}");
-            layer_blocks.push(LayerBlock {
-                norm1: l.norm(&p("norm1"), eps)?,
-                attn: SelfAttention::load(&l, &p("attn"), cfg.text_lap_num_heads, false, eps)?,
-                norm2: l.norm(&p("norm2"), eps)?,
-                mlp0: l.linear(&p("mlp.0"), true)?,
-                mlp2: l.linear(&p("mlp.2"), true)?,
-            });
+        let mut layer_blocks = Vec::with_capacity(depth(Stack::Layer));
+        for i in 0..depth(Stack::Layer) {
+            layer_blocks.push(Self::load_layer_block(&l, cfg, i, eps)?);
         }
-        let mut adapter_blocks = Vec::with_capacity(2);
-        for i in 0..2 {
-            let p = |name: &str| format!("y_embedder.refiner.blocks.{i}.{name}");
-            adapter_blocks.push(AdapterBlock {
-                norm1: l.norm(&p("norm1"), eps)?,
-                attn: SelfAttention::load(&l, &p("attn"), cfg.num_heads, cfg.qk_norm, eps)?,
-                norm2: l.norm(&p("norm2"), eps)?,
-                mlp: SwiGlu::load(&l, &p("mlp"))?,
-            });
+        let mut adapter_blocks = Vec::with_capacity(depth(Stack::Refiner));
+        for i in 0..depth(Stack::Refiner) {
+            adapter_blocks.push(Self::load_refiner_block(&l, cfg, i, eps)?);
         }
         let y_embedder = TextAdapter {
             layer_blocks,
@@ -572,8 +983,8 @@ impl IrisDiT {
             norm: l.norm("y_embedder.refiner.norm", eps)?,
         };
 
-        let mut pixel_blocks = Vec::with_capacity(cfg.pixel.depth);
-        for i in 0..cfg.pixel.depth {
+        let mut pixel_blocks = Vec::with_capacity(depth(Stack::Pixel));
+        for i in 0..depth(Stack::Pixel) {
             pixel_blocks.push(Self::load_pit(&l, cfg, i, eps)?);
         }
 
@@ -594,6 +1005,7 @@ impl IrisDiT {
             final_norm: l.norm("final_layer.norm", eps)?,
             final_linear: l.linear("final_layer.linear", true)?,
             pos_cache: Mutex::new(HashMap::new()),
+            stream,
         };
         let mut unused = w.unused_keys();
         unused.sort_unstable();
@@ -617,6 +1029,34 @@ impl IrisDiT {
             &[cfg.pixel.hidden_size as i32, input_channels as i32],
         )?;
         Ok(dit)
+    }
+
+    /// Load text-adapter layerwise block `i` (`y_embedder.layer_blocks.{i}.*`) from `l`.
+    fn load_layer_block(l: &Loader, cfg: &ModelConfig, i: usize, eps: f32) -> Result<LayerBlock> {
+        let p = |name: &str| format!("y_embedder.layer_blocks.{i}.{name}");
+        Ok(LayerBlock {
+            norm1: l.norm(&p("norm1"), eps)?,
+            attn: SelfAttention::load(l, &p("attn"), cfg.text_lap_num_heads, false, eps)?,
+            norm2: l.norm(&p("norm2"), eps)?,
+            mlp0: l.linear(&p("mlp.0"), true)?,
+            mlp2: l.linear(&p("mlp.2"), true)?,
+        })
+    }
+
+    /// Load text-refiner block `i` (`y_embedder.refiner.blocks.{i}.*`) from `l`.
+    fn load_refiner_block(
+        l: &Loader,
+        cfg: &ModelConfig,
+        i: usize,
+        eps: f32,
+    ) -> Result<AdapterBlock> {
+        let p = |name: &str| format!("y_embedder.refiner.blocks.{i}.{name}");
+        Ok(AdapterBlock {
+            norm1: l.norm(&p("norm1"), eps)?,
+            attn: SelfAttention::load(l, &p("attn"), cfg.num_heads, cfg.qk_norm, eps)?,
+            norm2: l.norm(&p("norm2"), eps)?,
+            mlp: SwiGlu::load(l, &p("mlp"))?,
+        })
     }
 
     /// Load trunk block `i` (`blocks.{i}.*`) from `l` — the backbone build and a checkpointed
@@ -723,7 +1163,8 @@ impl IrisDiT {
         self.arrays().iter().map(|a| a.nbytes() as u64).sum()
     }
 
-    /// Every parameter array, for an eager evaluation at load (never inside a forward).
+    /// Every parameter array, for an eager evaluation at load (never inside a forward). A streamed
+    /// backbone (rung 4) holds only its skeleton; its block stacks are read per window.
     pub fn arrays(&self) -> Vec<&Array> {
         let mut out: Vec<&Array> = Vec::new();
         out.extend(self.s_embedder.arrays());
@@ -731,89 +1172,38 @@ impl IrisDiT {
         out.extend(self.t_mlp2.arrays());
         let y = &self.y_embedder;
         for b in &y.layer_blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.mlp0.arrays());
-            out.extend(b.mlp2.arrays());
+            out.extend(b.arrays());
         }
         out.extend(y.layer_pool.arrays());
         out.extend(y.proj.arrays());
         for b in &y.blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.mlp.arrays());
+            out.extend(b.arrays());
         }
         out.extend(y.norm.arrays());
         out.push(&self.y_pos_embedding);
         out.extend(self.core_img.arrays());
         out.extend(self.core_txt.iter().flat_map(Linear::arrays));
         for block in &self.blocks {
-            match block {
-                Block::Dual(b) => {
-                    for n in [
-                        &b.norm_x1,
-                        &b.norm_x2,
-                        &b.norm_y1,
-                        &b.q_norm_x,
-                        &b.k_norm_x,
-                        &b.q_norm_y,
-                        &b.k_norm_y,
-                        &b.attn_post_norm_x,
-                        &b.mlp_post_norm_x,
-                    ] {
-                        out.extend(n.arrays());
-                    }
-                    out.extend(b.qkv_x.arrays());
-                    out.extend(b.qkv_y.arrays());
-                    out.extend(b.proj_x.arrays());
-                    out.extend(b.gate_x.arrays());
-                    out.extend(b.mlp_x.arrays());
-                    if let Some(t) = &b.text {
-                        out.extend(t.norm2.arrays());
-                        out.extend(t.proj.arrays());
-                        out.extend(t.gate.arrays());
-                        out.extend(t.attn_post_norm.arrays());
-                        out.extend(t.mlp.arrays());
-                        out.extend(t.mlp_post_norm.arrays());
-                    }
-                    out.push(&b.mod_img.bias);
-                    out.push(&b.mod_txt.bias);
-                }
-                Block::Single(b) => {
-                    for n in [
-                        &b.norm1,
-                        &b.norm2,
-                        &b.q_norm,
-                        &b.k_norm,
-                        &b.attn_post_norm,
-                        &b.mlp_post_norm,
-                    ] {
-                        out.extend(n.arrays());
-                    }
-                    out.extend(b.qkv.arrays());
-                    out.extend(b.attn_gate.arrays());
-                    out.extend(b.attn_proj.arrays());
-                    out.extend(b.mlp.arrays());
-                    out.push(&b.modulation.bias);
-                }
-            }
+            out.extend(block.arrays());
         }
         out.extend(self.pixel_proj.arrays());
         for b in &self.pixel_blocks {
-            out.extend(b.norm1.arrays());
-            out.extend(b.norm2.arrays());
-            out.extend(b.adaln.arrays());
-            out.extend(b.compress.arrays());
-            out.extend(b.expand.arrays());
-            out.extend(b.attn.arrays());
-            out.extend(b.fc1.arrays());
-            out.extend(b.fc2.arrays());
+            out.extend(b.arrays());
         }
         out.extend(self.final_norm.arrays());
         out.extend(self.final_linear.arrays());
         out
+    }
+
+    /// Whether the block stacks are streamed by window (rung 4) rather than resident.
+    pub fn is_streamed(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// The streamed backbone's window source (test builds: the read proofs build blocks from it).
+    #[cfg(test)]
+    pub(crate) fn block_stream(&self) -> Option<&BlockStream> {
+        self.stream.as_ref()
     }
 
     // ---- iOS execution quanta (pass-through everywhere but a physical iOS device) ----------
@@ -826,7 +1216,12 @@ impl IrisDiT {
     // prices a weight copy. Every count is proven against MLX's measured peak at small shapes in
     // `crate::quantum_proofs`.
 
-    fn query_rows(plan: mlx_gen::AttentionPlan<'_>, batch: i32, heads: i32, tokens: i32) -> u64 {
+    pub(crate) fn query_rows(
+        plan: mlx_gen::AttentionPlan<'_>,
+        batch: i32,
+        heads: i32,
+        tokens: i32,
+    ) -> u64 {
         plan.budget.query_block(batch, heads, tokens, tokens).max(0) as u64
     }
 
@@ -835,6 +1230,7 @@ impl IrisDiT {
     }
 
     /// Trunk block `i` over `n_patches` image and `n_txt` text tokens.
+    #[cfg(test)]
     pub(crate) fn trunk_block_scratch(
         &self,
         i: usize,
@@ -843,11 +1239,25 @@ impl IrisDiT {
         n_txt: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        let (dim, ff) = self.blocks[i].widths();
+        self.trunk_block_scratch_of(&self.blocks[i], i, batch, n_patches, n_txt, plan)
+    }
+
+    /// [`Self::trunk_block_scratch`] of a block built outside the resident stack (a streamed
+    /// window's), at its index `i`.
+    fn trunk_block_scratch_of(
+        &self,
+        block: &Block,
+        i: usize,
+        batch: i32,
+        n_patches: i32,
+        n_txt: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
+        let (dim, ff) = block.widths();
         let tokens = (n_patches + n_txt).max(0);
         let heads = self.cfg.num_heads as i32;
         let kv_heads = self.cfg.num_kv_heads.unwrap_or(self.cfg.num_heads) as u64;
-        let (split_qkv, text, down_pad) = self.blocks[i].layout();
+        let (split_qkv, text, down_pad) = block.layout();
         let g = TrunkGeometry {
             compute_bytes: self.compute_bytes(),
             batch: batch.max(0) as u64,
@@ -864,7 +1274,7 @@ impl IrisDiT {
             down_pad,
             img_stream_bytes: if i == 0 { self.compute_bytes() } else { 4 },
         };
-        match self.blocks[i] {
+        match block {
             Block::Dual(_) => Self::dual_block_bytes(&g, crate::retention::unfused()),
             Block::Single(_) => Self::single_block_bytes(&g, crate::retention::unfused()),
         }
@@ -1079,6 +1489,7 @@ impl IrisDiT {
     }
 
     /// PiT block `i` over `n_patches` patches of `p²` pixels.
+    #[cfg(test)]
     pub(crate) fn pixel_block_scratch(
         &self,
         i: usize,
@@ -1086,7 +1497,16 @@ impl IrisDiT {
         n_patches: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        let blk = &self.pixel_blocks[i];
+        self.pixel_block_scratch_of(&self.pixel_blocks[i], batch, n_patches, plan)
+    }
+
+    fn pixel_block_scratch_of(
+        &self,
+        blk: &PitBlock,
+        batch: i32,
+        n_patches: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
         let heads = blk.attn.heads;
         Self::pixel_block_bytes(
             PixelBlockGeometry {
@@ -1208,6 +1628,7 @@ impl IrisDiT {
 
     /// Text-adapter layer block `i`: attention over the `layers` encoder states of each of the
     /// `rows = B · T` tokens.
+    #[cfg(test)]
     pub(crate) fn text_layer_block_scratch(
         &self,
         i: usize,
@@ -1215,7 +1636,16 @@ impl IrisDiT {
         layers: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        let blk = &self.y_embedder.layer_blocks[i];
+        self.text_layer_block_scratch_of(&self.y_embedder.layer_blocks[i], rows, layers, plan)
+    }
+
+    fn text_layer_block_scratch_of(
+        &self,
+        blk: &LayerBlock,
+        rows: i32,
+        layers: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
         Self::text_block_bytes(
             TextBlockGeometry {
                 compute_bytes: self.compute_bytes(),
@@ -1235,6 +1665,7 @@ impl IrisDiT {
     }
 
     /// Text-refiner block `i` over `t` masked-key text tokens.
+    #[cfg(test)]
     pub(crate) fn text_refiner_block_scratch(
         &self,
         i: usize,
@@ -1242,7 +1673,16 @@ impl IrisDiT {
         t: i32,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> u64 {
-        let blk = &self.y_embedder.blocks[i];
+        self.text_refiner_block_scratch_of(&self.y_embedder.blocks[i], batch, t, plan)
+    }
+
+    fn text_refiner_block_scratch_of(
+        &self,
+        blk: &AdapterBlock,
+        batch: i32,
+        t: i32,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> u64 {
         Self::text_block_bytes(
             TextBlockGeometry {
                 compute_bytes: self.compute_bytes(),
@@ -1565,14 +2005,14 @@ impl IrisDiT {
 
     /// `LayerwiseTextEmbedder.forward(y, mask)` (`y` `[B, T, L, Dt]`) → `[B, T, D]` f32.
     pub fn text_adapter(&self, text: &TextBatch) -> Result<Array> {
-        self.text_adapter_budgeted(text, mlx_gen::AttentionPlan::UNBOUNDED)
+        self.text_adapter_exec(
+            text,
+            &Execution::resident(mlx_gen::AttentionPlan::UNBOUNDED),
+        )
     }
 
-    fn text_adapter_budgeted(
-        &self,
-        text: &TextBatch,
-        plan: mlx_gen::AttentionPlan<'_>,
-    ) -> Result<Array> {
+    fn text_adapter_exec(&self, text: &TextBatch, exec: &Execution<'_>) -> Result<Array> {
+        let plan = exec.plan;
         let sh = text.states.shape();
         let (b, t, layers, dt) = (sh[0], sh[1], sh[2], sh[3]);
         if text.mask.len() != b as usize || text.mask.iter().any(|m| m.len() != t as usize) {
@@ -1581,48 +2021,158 @@ impl IrisDiT {
             )));
         }
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-        let mut y = text
+        let y = text
             .states
             .as_dtype(Dtype::Float32)?
             .reshape(&[b * t, layers, dt])?;
-        for i in 0..self.y_embedder.layer_blocks.len() {
-            let scratch = self.text_layer_block_scratch(i, b * t, layers, plan);
-            y = mlx_gen::ios_quantum::run(quanta::TEXT_LAYER_BLOCK, scratch, || {
-                self.text_layer_body(i, &y, plan)
-            })?;
-        }
+        let y = self.run_stack(
+            Stack::Layer,
+            exec,
+            y,
+            |y, _, block| {
+                let BlockRef::Layer(blk) = block else {
+                    unreachable!("the layerwise stack holds layerwise blocks")
+                };
+                let scratch = self.text_layer_block_scratch_of(blk, b * t, layers, plan);
+                mlx_gen::ios_quantum::run(quanta::TEXT_LAYER_BLOCK, scratch, || {
+                    Self::text_layer_body_with(blk, self.compute, &y, plan)
+                })
+            },
+            |y| Ok(eval([y])?),
+        )?;
         // layer_pool: Linear(L → 1) over the layer axis, then the refiner's input projection.
-        let mut y = mlx_gen::ios_quantum::run(
+        let y = mlx_gen::ios_quantum::run(
             quanta::TEXT_POOL,
             self.text_pool_scratch(b, t, layers, dt),
             || self.text_pool_body(&y, b, t, dt),
         )?;
         // refiner (TransformerTextEmbedder): keys masked, every query keeps its own position.
         let key_mask = key_padding_mask(text.mask, t as usize);
-        for i in 0..self.y_embedder.blocks.len() {
-            let scratch = self.text_refiner_block_scratch(i, b, t, plan);
-            y = mlx_gen::ios_quantum::run(quanta::TEXT_REFINER_BLOCK, scratch, || {
-                self.text_refiner_body(i, &y, &key_mask, plan)
-            })?;
-        }
+        let y = self.run_stack(
+            Stack::Refiner,
+            exec,
+            y,
+            |y, _, block| {
+                let BlockRef::Refiner(blk) = block else {
+                    unreachable!("the refiner stack holds refiner blocks")
+                };
+                let scratch = self.text_refiner_block_scratch_of(blk, b, t, plan);
+                mlx_gen::ios_quantum::run(quanta::TEXT_REFINER_BLOCK, scratch, || {
+                    Self::text_refiner_body_with(blk, self.compute, &y, &key_mask, plan)
+                })
+            },
+            |y| Ok(eval([y])?),
+        )?;
         mlx_gen::ios_quantum::run(quanta::TEXT_OUTPUT, self.text_output_scratch(b, t), || {
             self.text_output_body(&y)
         })
     }
 
+    /// Run `step` over every block of `stack`: the resident stack in order, or — on a streamed
+    /// backbone (rung 4) — window by window through the shared [`mlx_gen::block_residency`] driver:
+    /// each window's blocks are read inside one priced [`quanta::BLOCK_READ`] quantum, run, the
+    /// carry `materialize`d, and the window released before the next is read.
+    fn run_stack<S>(
+        &self,
+        stack: Stack,
+        exec: &Execution<'_>,
+        init: S,
+        mut step: impl FnMut(S, usize, BlockRef<'_>) -> Result<S>,
+        materialize: impl Fn(&S) -> Result<()>,
+    ) -> Result<S> {
+        let Some(stream) = &self.stream else {
+            let mut state = init;
+            for i in 0..self.resident_len(stack) {
+                state = step(state, i, self.resident_block(stack, i))?;
+            }
+            return Ok(state);
+        };
+        let n = stream.len(stack);
+        if n == 0 {
+            return Ok(init);
+        }
+        let window = exec
+            .window
+            .or(stream.default_window)
+            .unwrap_or(n)
+            .clamp(1, n);
+        let windows = mlx_gen::block_residency::BlockPlan::new(n, window)
+            .map_err(|e| Error::Msg(format!("iris stream: {e}")))?;
+        let uncancellable = mlx_gen::CancelFlag::default();
+        let cancel = exec.plan.cancel.unwrap_or(&uncancellable);
+        mlx_gen::block_residency::run_windowed(
+            &windows,
+            cancel,
+            init,
+            || Weights::from_file(&stream.path),
+            |mut state, view, range| {
+                #[cfg(test)]
+                WINDOW_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(stack, range.start);
+                    }
+                });
+                let reads = &stream.inventory.reads(stack)[range.clone()];
+                mlx_gen::ios_quantum::before(
+                    quanta::BLOCK_READ,
+                    crate::stream::window_read_bytes(reads),
+                )?;
+                let mut built = Vec::with_capacity(range.len());
+                for i in range.clone() {
+                    built.push(stream.build(view, &self.cfg, stack, i)?);
+                }
+                let arrays: Vec<&Array> = built.iter().flat_map(Built::arrays).collect();
+                mlx_gen::ios_quantum::finish(quanta::BLOCK_READ, &arrays)?;
+                drop(arrays);
+                for (i, block) in range.zip(&built) {
+                    state = step(state, i, block.as_ref())?;
+                }
+                Ok(state)
+            },
+            materialize,
+        )
+    }
+
+    fn resident_len(&self, stack: Stack) -> usize {
+        match stack {
+            Stack::Layer => self.y_embedder.layer_blocks.len(),
+            Stack::Refiner => self.y_embedder.blocks.len(),
+            Stack::Trunk => self.blocks.len(),
+            Stack::Pixel => self.pixel_blocks.len(),
+        }
+    }
+
+    fn resident_block(&self, stack: Stack, i: usize) -> BlockRef<'_> {
+        match stack {
+            Stack::Layer => BlockRef::Layer(&self.y_embedder.layer_blocks[i]),
+            Stack::Refiner => BlockRef::Refiner(&self.y_embedder.blocks[i]),
+            Stack::Trunk => BlockRef::Trunk(&self.blocks[i]),
+            Stack::Pixel => BlockRef::Pixel(&self.pixel_blocks[i]),
+        }
+    }
+
     /// Body of text-adapter layer block `i` over `y` `[B·T, layers, Dt]` (one quantum).
+    #[cfg(test)]
     pub(crate) fn text_layer_body(
         &self,
         i: usize,
         y: &Array,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let block = &self.y_embedder.layer_blocks[i];
+        Self::text_layer_body_with(&self.y_embedder.layer_blocks[i], self.compute, y, plan)
+    }
+
+    fn text_layer_body_with(
+        block: &LayerBlock,
+        compute: Dtype,
+        y: &Array,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> Result<Array> {
         let h = block.attn.forward(
             &block.norm1.forward(y)?,
             None,
             None,
-            self.compute,
+            compute,
             plan,
             "adapter",
         )?;
@@ -1645,6 +2195,7 @@ impl IrisDiT {
     }
 
     /// Body of text-refiner block `i` over `y` `[B, T, D]` under the additive key mask (one quantum).
+    #[cfg(test)]
     pub(crate) fn text_refiner_body(
         &self,
         i: usize,
@@ -1652,12 +2203,21 @@ impl IrisDiT {
         key_mask: &Array,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<Array> {
-        let block = &self.y_embedder.blocks[i];
+        Self::text_refiner_body_with(&self.y_embedder.blocks[i], self.compute, y, key_mask, plan)
+    }
+
+    fn text_refiner_body_with(
+        block: &AdapterBlock,
+        compute: Dtype,
+        y: &Array,
+        key_mask: &Array,
+        plan: mlx_gen::AttentionPlan<'_>,
+    ) -> Result<Array> {
         let h = block.attn.forward(
             &block.norm1.forward(y)?,
             None,
             Some(key_mask),
-            self.compute,
+            compute,
             plan,
             "refiner",
         )?;
@@ -1689,7 +2249,12 @@ impl IrisDiT {
 
     /// Predict the flow velocity `[B, C, H, W]` (f32) for noisy pixels `x` at model time `t` `[B]`.
     pub fn forward(&self, x: &Array, t: &Array, text: &TextBatch) -> Result<Array> {
-        self.forward_hooked(x, t, text, &mut NoHooks)
+        self.forward_exec(
+            x,
+            t,
+            text,
+            Execution::resident(mlx_gen::AttentionPlan::UNBOUNDED),
+        )
     }
 
     /// [`Self::forward`] with `hooks` around every trunk and pixel block — the training forward's
@@ -1702,7 +2267,13 @@ impl IrisDiT {
         text: &TextBatch,
         hooks: &mut dyn ForwardHooks,
     ) -> Result<Array> {
-        self.forward_budgeted_hooked(x, t, text, hooks, mlx_gen::AttentionPlan::UNBOUNDED)
+        self.forward_impl(
+            x,
+            t,
+            text,
+            Some(hooks),
+            Execution::resident(mlx_gen::AttentionPlan::UNBOUNDED),
+        )
     }
 
     /// Convenience wrapper for callers without cancellation (legacy/training stays unbounded).
@@ -1724,7 +2295,19 @@ impl IrisDiT {
         text: &TextBatch,
         plan: mlx_gen::AttentionPlan<'_>,
     ) -> Result<Array> {
-        self.forward_budgeted_hooked(x, t, text, &mut NoHooks, plan)
+        self.forward_exec(x, t, text, Execution::resident(plan))
+    }
+
+    /// The inference forward under an explicit [`Execution`]: the attention plan, the streamed
+    /// window (rung 4) and the per-row pixel stage (rung 3).
+    pub fn forward_exec(
+        &self,
+        x: &Array,
+        t: &Array,
+        text: &TextBatch,
+        exec: Execution<'_>,
+    ) -> Result<Array> {
+        self.forward_impl(x, t, text, None, exec)
     }
 
     /// Body of the patch/timestep embedding and both modulation cores over `x` `[B, C, H, W]`
@@ -1876,15 +2459,16 @@ impl IrisDiT {
             .as_dtype(Dtype::Float32)?)
     }
 
-    fn forward_budgeted_hooked(
+    fn forward_impl(
         &self,
         x: &Array,
         t: &Array,
         text: &TextBatch,
-        hooks: &mut dyn ForwardHooks,
-        plan: mlx_gen::AttentionPlan<'_>,
+        mut hooks: Option<&mut dyn ForwardHooks>,
+        exec: Execution<'_>,
     ) -> Result<Array> {
         let cfg = &self.cfg;
+        let plan = exec.plan;
         let sh = x.shape();
         let (b, c, h, w) = (sh[0], sh[1], sh[2], sh[3]);
         let p = cfg.patch_size as i32;
@@ -1898,6 +2482,13 @@ impl IrisDiT {
             return Err(Error::Msg(format!(
                 "iris: input {h}x{w} is not divisible by patch_size {p}"
             )));
+        }
+        if hooks.is_some() && self.stream.is_some() {
+            return Err(Error::Unsupported(
+                "iris: forward hooks run the resident block stacks; a streamed backbone (rung 4) \
+                 builds each block per window"
+                    .into(),
+            ));
         }
         let (hp, wp) = (h / p, w / p);
         let n_patches = hp * wp;
@@ -1917,7 +2508,7 @@ impl IrisDiT {
                 .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(x.size() as u64)),
         )?;
         let Embedded {
-            mut s,
+            s,
             t_emb,
             core_img,
             core_txt,
@@ -1926,36 +2517,128 @@ impl IrisDiT {
         embedded.extend(core_txt.as_ref());
         mlx_gen::ios_quantum::finish(quanta::EMBED, &embedded)?;
 
-        let mut y = self.text_adapter_budgeted(text, plan)?;
+        let y = self.text_adapter_exec(text, &exec)?;
         let n_txt = y.shape()[1];
-        y = self.text_positions(&y)?;
+        let y = self.text_positions(&y)?;
 
         let ctx = self.trunk_ctx(hp, wp, n_txt, plan);
         // The text positional add and both RoPE tables are lazy and materialize inside the FIRST
         // trunk block's quantum, whose scratch carries them.
         let entry_extra = self.trunk_entry_allowance(b, n_patches, n_txt);
-        for i in 0..self.blocks.len() {
-            let scratch = self
-                .trunk_block_scratch(i, b, n_patches, n_txt, plan)
-                .saturating_add(if i == 0 { entry_extra } else { 0 });
-            mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
-            (s, y) = hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?;
-            mlx_gen::ios_quantum::finish(quanta::TRUNK_BLOCK, &[&s, &y])?;
-        }
+        let (s, _y) = self.run_stack(
+            Stack::Trunk,
+            &exec,
+            (s, y),
+            |(s, y), i, block| {
+                let BlockRef::Trunk(blk) = block else {
+                    unreachable!("the trunk holds trunk blocks")
+                };
+                let scratch = self
+                    .trunk_block_scratch_of(blk, i, b, n_patches, n_txt, plan)
+                    .saturating_add(if i == 0 { entry_extra } else { 0 });
+                mlx_gen::ios_quantum::before(quanta::TRUNK_BLOCK, scratch)?;
+                let (s, y) = match hooks.as_deref_mut() {
+                    Some(hooks) => {
+                        hooks.trunk_block(self, i, &ctx, &s, &y, &core_img, core_txt.as_ref())?
+                    }
+                    None => {
+                        Self::trunk_block_with(blk, &ctx, &s, &y, &core_img, core_txt.as_ref())?
+                    }
+                };
+                mlx_gen::ios_quantum::finish(quanta::TRUNK_BLOCK, &[&s, &y])?;
+                Ok((s, y))
+            },
+            |(s, y)| Ok(eval([s, y])?),
+        )?;
 
         mlx_gen::ios_quantum::before(quanta::PIXEL_EMBED, self.pixel_embed_scratch(b, h, w))?;
-        let (s_cond, mut pixels) = self.pixel_embed_body(x, &t_emb, &s)?;
-        let pctx = self.pixel_ctx(b, hp, wp, plan);
+        let (s_cond, pixels) = self.pixel_embed_body(x, &t_emb, &s)?;
         mlx_gen::ios_quantum::finish(quanta::PIXEL_EMBED, &[&s_cond, &pixels])?;
-        for i in 0..self.pixel_blocks.len() {
-            let scratch = self.pixel_block_scratch(i, b, n_patches, plan);
-            pixels = mlx_gen::ios_quantum::run(quanta::PIXEL_BLOCK, scratch, || {
-                hooks.pixel_block(self, i, &pctx, &pixels, &s_cond)
-            })?;
+        drop(s);
+        // Rung 3's pixel-row bound: the PiT stage one batch row at a time (each row evaluated
+        // before the next is built, on every device), so its activation is one row's.
+        let by_row = exec.pixel_rows && b > 1;
+        let (row_batch, rows) = if by_row { (1, b) } else { (b, 1) };
+        let pctx = self.pixel_ctx(row_batch, hp, wp, plan);
+        let conds = if by_row {
+            s_cond.split(b, 0)?
+        } else {
+            vec![s_cond]
+        };
+        let parts = if by_row {
+            pixels.split(b, 0)?
+        } else {
+            vec![pixels]
+        };
+        let parts = self.run_stack(
+            Stack::Pixel,
+            &exec,
+            parts,
+            |mut parts, i, block| {
+                let BlockRef::Pixel(blk) = block else {
+                    unreachable!("the PiT stack holds PiT blocks")
+                };
+                let scratch = self.pixel_block_scratch_of(blk, row_batch, n_patches, plan);
+                for (part, cond) in parts.iter_mut().zip(&conds) {
+                    let next = mlx_gen::ios_quantum::run(quanta::PIXEL_BLOCK, scratch, || {
+                        match hooks.as_deref_mut() {
+                            Some(hooks) => hooks.pixel_block(self, i, &pctx, part, cond),
+                            None => Self::pit(
+                                pctx.compute,
+                                blk,
+                                part,
+                                cond,
+                                &pctx.rope_pix,
+                                pctx.batch,
+                                pctx.n_patches,
+                                pctx.plan,
+                            ),
+                        }
+                    })?;
+                    if by_row {
+                        eval([&next])?;
+                    }
+                    *part = next;
+                }
+                Ok(parts)
+            },
+            |parts| Ok(eval(parts.iter())?),
+        )?;
+        if !by_row {
+            return mlx_gen::ios_quantum::run(
+                quanta::OUTPUT,
+                self.output_scratch(b, n_patches),
+                || self.output_body(&parts[0], b, h, w),
+            );
         }
-        mlx_gen::ios_quantum::run(quanta::OUTPUT, self.output_scratch(b, n_patches), || {
-            self.output_body(&pixels, b, h, w)
-        })
+        let mut outs = Vec::with_capacity(rows as usize);
+        for part in &parts {
+            let out = mlx_gen::ios_quantum::run(
+                quanta::OUTPUT,
+                self.output_scratch(1, n_patches),
+                || self.output_body(part, 1, h, w),
+            )?;
+            eval([&out])?;
+            outs.push(out);
+        }
+        drop(parts);
+        mlx_gen::ios_quantum::run(
+            quanta::OUTPUT_ROWS,
+            Self::output_rows_bytes(b, cfg.in_channels as i32, h, w),
+            || {
+                let refs: Vec<&Array> = outs.iter().collect();
+                Ok(mlx_rs::ops::concatenate_axis(&refs, 0)?)
+            },
+        )
+    }
+
+    /// The per-row PiT stage's concatenation of its `b` output rows: the `[B, C, H, W]` f32 batch.
+    pub(crate) fn output_rows_bytes(b: i32, channels: i32, h: i32, w: i32) -> u64 {
+        let d = |v: i32| v.max(0) as u64;
+        crate::retention::allocated(mlx_gen::ios_quantum::tensor_bytes(
+            4,
+            &[d(b), d(channels), d(h), d(w)],
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

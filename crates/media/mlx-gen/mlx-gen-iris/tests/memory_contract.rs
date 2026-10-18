@@ -214,12 +214,13 @@ fn a_staged_selection_stages_a_warm_generator_and_renders_the_same_image_body() 
 
 /// The encoder-free tasks publish their loaded contract too: the resident baseline, priced from
 /// the export on disk, identical to what the registration builds for the same spec, with the
-/// registered safety check bound to the precision the model computes in. A deferred load shape —
-/// which no Iris loader has — is refused at load on all three routes.
+/// registered safety check bound to the precision the model computes in. A deferred load shape
+/// (rung 4, epic 16774) loads on all three routes and publishes the registration's deferred
+/// contract, bounded transformer residency implemented.
 ///
 /// *Mutations that red this:* a loader pricing at a precision other than its spec's (the restorer
 /// pricing bf16 for an FP32 load); a loaded safety check that ignores the model's precision; a
-/// loader that accepts a deferred spec.
+/// deferred loader publishing the eager contract.
 #[test]
 fn the_encoder_free_tasks_publish_their_registered_contract_when_loaded() {
     cpu_process(
@@ -355,31 +356,38 @@ fn the_encoder_free_tasks_publish_their_registered_contract_when_loaded_body() {
         }
     }
 
-    // No loader has a deferred-materialization load shape: each refuses one by name.
+    // Every loader takes a deferred-materialization load shape (rung 4) and publishes the
+    // registration's deferred contract, with bounded transformer residency implemented.
     let deferred = gen_core::LoadShape::DeferredMaterialization;
-    let refusal = |error: String| assert!(error.contains("load_shape"), "{error}");
+    let rung4 = |contract: &gen_core::MemoryProviderContract| {
+        gen_core_testkit::memory_strategy_conformance(contract);
+        assert_eq!(contract.load_shape, deferred);
+        assert_eq!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            gen_core::MemoryStrategySupport::Implemented
+        );
+    };
     let spec = LoadSpec::new(WeightsSource::Dir(depth_dir)).with_load_shape(deferred);
-    match mlx_gen_iris::depth::load_depth(&spec) {
-        Err(mlx_gen::Error::Unsupported(message)) => refusal(message),
-        other => panic!("depth: expected a typed refusal, got {:?}", other.err()),
-    }
+    let depth = mlx_gen_iris::depth::load_depth(&spec).unwrap();
+    assert_eq!(
+        *depth.memory_strategy_contract(),
+        (DEPTH_MEMORY_REGISTRATION.contract)(&spec).unwrap()
+    );
+    rung4(depth.memory_strategy_contract());
     let spec = LoadSpec::new(WeightsSource::Dir(restore_dir)).with_load_shape(deferred);
-    match mlx_gen_iris::IrisRestorer::load(&spec) {
-        Err(mlx_gen::Error::Unsupported(message)) => refusal(message),
-        other => panic!(
-            "restoration: expected a typed refusal, got {:?}",
-            other.err()
-        ),
-    }
+    let restorer = mlx_gen_iris::IrisRestorer::load(&spec).unwrap();
+    assert_eq!(
+        *restorer.memory_strategy_contract(),
+        (RESTORE_MEMORY_REGISTRATION.contract)(&spec).unwrap()
+    );
+    rung4(restorer.memory_strategy_contract());
     let spec = generation_spec(OffloadPolicy::Resident).with_load_shape(deferred);
-    match mlx_gen_iris::provider_registry()
+    let generator = mlx_gen_iris::provider_registry()
         .unwrap()
         .load("iris_3b", &spec)
-    {
-        Err(gen_core::Error::Unsupported(message)) => refusal(message),
-        other => panic!(
-            "generation: expected a typed refusal, got {:?}",
-            other.err()
-        ),
-    }
+        .unwrap();
+    rung4(generator.memory_strategy_contract().unwrap());
 }
