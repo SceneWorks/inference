@@ -1,4 +1,4 @@
-//! Bounded SANA/Gemma execution quanta on a physical iOS device.
+//! Bounded execution quanta on a physical iOS device (every model in the iOS catalog).
 //!
 //! Before constructing each graph, compare architecture-derived tensor scratch plus an explicit
 //! engineering reserve with CURRENT OS headroom. Materialize and synchronize each result, then
@@ -10,6 +10,8 @@ use crate::{Error, Result};
 use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
+#[path = "ios_quantum_kernels.rs"]
+mod kernels;
 #[cfg(not(target_os = "ios"))]
 pub use budget::measured_peak_bytes;
 pub use budget::{
@@ -17,6 +19,13 @@ pub use budget::{
     check_headroom, conv_stage_bytes, elementwise_bytes, rope_table_bytes, sampler_step_bytes,
     scores_bytes, tensor_bytes, AttentionBlockGeometry, ConvStageGeometry, Scores,
     PROCESS_RESERVE_BYTES,
+};
+pub use kernels::{
+    bytes, conv_channels, conv_sum, decoded_to_image_bytes, downsample_stage_bytes,
+    downsample_tile_bytes, dtype_bytes, element_bytes, elements, group_norm_buffers,
+    norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes, sdpa_scores,
+    single_conv_bytes, tile_bytes, tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes,
+    Backend, ConvCall, GROUP_NORM_BUFFERS, PAGE_BYTES, VAE_ATTENTION_SCORE_ELEMENTS,
 };
 
 /// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross
@@ -66,6 +75,49 @@ type QuantumObserver = Box<dyn FnMut(&QuantumEvent)>;
 thread_local! {
     static CPU_FIXTURE_HEADROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static CPU_FIXTURE_OBSERVER: std::cell::RefCell<Option<QuantumObserver>> = const { std::cell::RefCell::new(None) };
+    static CPU_FIXTURE_SHORT_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Inside a CPU diagnostic fixture, make the FIRST check of `label` see live headroom one byte short
+/// of its own price plus the reserve (every other check sees the fixture's headroom), so a test can
+/// refuse any one quantum of a path — not only the first one whose price exceeds every earlier one.
+/// Unavailable on iOS.
+#[cfg(not(target_os = "ios"))]
+pub fn with_cpu_diagnostic_short_at<T>(label: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CPU_FIXTURE_SHORT_AT.with(|s| *s.borrow_mut() = previous);
+        }
+    }
+    let previous = CPU_FIXTURE_SHORT_AT.with(|s| s.borrow_mut().replace(label.to_string()));
+    let _restore = Restore(previous);
+    body()
+}
+
+/// The live headroom the check of `label` at `scratch` sees.
+fn available_for(_label: &str, _scratch: u64) -> Option<u64> {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let short = CPU_FIXTURE_SHORT_AT.with(|s| {
+            let mut slot = s.borrow_mut();
+            if slot.as_deref() == Some(_label) {
+                *slot = None;
+                true
+            } else {
+                false
+            }
+        });
+        if short {
+            return Some(
+                _scratch
+                    .saturating_add(PROCESS_RESERVE_BYTES)
+                    .saturating_sub(1),
+            );
+        }
+    }
+    available_bytes()
 }
 
 /// Observe checks/synchronizations of a CPU diagnostic fixture. Unavailable on iOS.
@@ -192,7 +244,7 @@ impl Drop for Scope {
 
 pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
-        let available = available_bytes();
+        let available = available_for(label, scratch);
         check_headroom(available, scratch, PROCESS_RESERVE_BYTES).map_err(|e| {
             record_refusal(label, scratch, available);
             Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)"))
@@ -232,7 +284,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
         return build();
     }
     let checked = std::cell::Cell::new(false);
-    let available = available_bytes();
+    let available = available_for(label, scratch);
     let result = budget::guarded(
         available,
         scratch,

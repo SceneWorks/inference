@@ -27,13 +27,11 @@ required-features = ["media"]
 # E5's image-generation checks. Off by default so the LLM smoke stays the small, fast binary that
 # E3/E4 ship, and so a media compile break can never block the text lane's device runs.
 media = ["runtime-ios/media", "runtime-ios/device-capture", "dep:image", "dep:mlx-gen", "dep:mlx-gen-sana"]
-# E5 go/no-go for a SECOND image model. Deliberately a direct path dep rather than a catalog entry:
-# `mlx-gen-ios-catalog` is a deliberately narrow composition root (SANA, Anima Turbo, the SDXL
-# family and Iris 3B) and widening it is an architectural decision, not a way to run an
-# experiment. This crate is excluded from the workspace, so a dep here reaches neither
-# `EXPECTED_MEMBER_COUNT` nor the catalog's ordered surface test.
-# If z-image earns a place on iOS, THAT is when the catalog changes.
-zimage = ["dep:mlx-gen-z-image", "dep:mlx-gen", "dep:image"]
+# The Z-Image Turbo lane (`run_smoke.sh --zimage`): Z-Image Turbo is in the iOS catalog (sc-26433),
+# so this lane is a bounded device CAPTURE of one Z-Image campaign case through
+# `runtime_ios::media::capture_permit` — the same admitted/capture path every other model runs, no
+# separate unadmitted loader.
+zimage = ["media"]
 
 [dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "fe22998bf73e5e785d7659beb2f24d624b785bda" }
@@ -52,13 +50,9 @@ serde_json = "1"
 # LOOKED at. A pixel-range assertion proves the decode produced content; only the image proves it
 # produced the right content, and "SANA runs on iPhone" is a claim worth being able to see.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
-# Z-Image-Turbo, for the go/no-go above. Carries the full memory ladder (rungs 0-4) already, which
-# is why it is the cheapest second model to try.
-mlx-gen-z-image = { path = "../../crates/media/mlx-gen/mlx-gen-z-image", default-features = false, optional = true }
 # For `pipeline::resolved_decode_plan` — reading back which of env/request/residency actually chose
 # the decode geometry. The GENERATOR still comes from the catalog registry, so this changes nothing
-# about what ships; it reaches a diagnostic the catalog does not re-export. Same shape as the
-# z-image dep below.
+# about what ships; it reaches a diagnostic the catalog does not re-export.
 mlx-gen-sana = { path = "../../crates/media/mlx-gen/mlx-gen-sana", optional = true }
 # For `memory_probe::FootprintProbe` — the shared MLX `active + cache` sampler, the footprint term
 # `get_peak_memory` omits. Same path crate the provider already links, so this adds no code to the
@@ -67,3 +61,5 @@ mlx-gen = { path = "../../crates/media/mlx-gen", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The production Qwen3-4B encoder contract fixture a Z-Image Turbo campaign case validates.
+sceneworks-gen-core-testkit = { path = "../../crates/contracts/gen-core-testkit" }

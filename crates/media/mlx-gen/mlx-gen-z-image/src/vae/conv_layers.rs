@@ -25,6 +25,11 @@ impl ConvLayer {
         })
     }
 
+    /// The `[out, 3, 3, in]` NHWC weight (for the iOS convolution accounting).
+    pub(crate) fn weight(&self) -> &Array {
+        &self.w
+    }
+
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
         let h = conv2d(&x, &self.w, Some(&self.b), 1, 1)?;
@@ -44,10 +49,16 @@ impl ConvLayer {
             return Err(Error::Canceled);
         }
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        // iOS: the tiled output convolution is one stage; each tile is checked on its own.
+        crate::quantum::before_tiled_stage(x.shape(), x.item_size() as u64, &self.w, false)?;
         let global = GlobalGroupNorm::new(&x, &norm.weight, &norm.bias, GN_GROUPS, GN_EPS)?;
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
+            crate::quantum::before_tile(tile, &self.w)?;
             silu(&global.apply(tile)?)
         })?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&h])?;
+        }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
 }

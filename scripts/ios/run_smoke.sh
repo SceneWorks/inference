@@ -44,10 +44,11 @@ while [ $# -gt 0 ]; do
     # Documents/<any-subdir>/ (scripts/ios/push_model.sh <dir> sana); without one the check
     # reports "skipped" rather than failing.
     --media)  CARGO_FEATURES="--features media"; shift ;;
-    # E5 go/no-go for Z-Image-Turbo. Additive over --media; needs a q4 tier pushed to
-    # Documents/<name containing "zimage">/ (scripts/ios/push_model.sh <tier> zimage-q4).
+    # One bounded CAPTURE of a Z-Image Turbo campaign case (IOS_SMOKE_ZIMAGE_CASE, default
+    # z_image_turbo/z_image_turbo/q4/1024/text/4) through the capture permit (sc-26433); needs the
+    # campaign slot (scripts/ios/push_model.sh <tier-dir> --campaign-route z_image_turbo --tier q4).
     --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
-    # The measurement lane: LLM and Z-Image loads have no footprint estimate, so iOS admission
+    # The measurement lane: LLM loads have no footprint estimate, so iOS admission
     # refuses them by default (the report says "refused before load"). This runs them UNADMITTED to
     # produce that estimate, and the report's "iOS admission lane" line says so.
     --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;

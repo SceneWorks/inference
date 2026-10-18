@@ -82,6 +82,38 @@ impl ZImageContextBlock {
         Ok(())
     }
 
+    /// The block's counted iOS quantum price over `x` (see
+    /// [`crate::transformer_block::dit_block_scratch`]; no adaLN modulation).
+    pub(crate) fn quantum_scratch(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        let a = &self.attention;
+        let f = &self.feed_forward;
+        crate::transformer_block::dit_block_scratch(a, f, None, x, freqs_cis, plan, backend)
+    }
+
+    /// [`Self::forward_budgeted`] as one iOS execution quantum (checked before construction,
+    /// materialized before return; a pass-through off device).
+    pub(crate) fn forward_quantum(
+        &self,
+        x: &Array,
+        freqs_cis: &Array,
+        plan: AttentionPlan<'_>,
+    ) -> Result<Array> {
+        let scratch = if mlx_gen::ios_quantum::enabled() {
+            self.quantum_scratch(x, freqs_cis, plan, mlx_gen::ios_quantum::Backend::current())
+        } else {
+            0
+        };
+        mlx_gen::ios_quantum::run(crate::quantum::DIT_CONTEXT_BLOCK, scratch, || {
+            self.forward_budgeted(x, freqs_cis, plan)
+        })
+    }
+
     /// The unbounded context-block forward — byte-identical to the pre-SC-15615 path.
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
         self.forward_budgeted(x, freqs_cis, AttentionPlan::UNBOUNDED)
@@ -102,6 +134,8 @@ impl ZImageContextBlock {
             plan,
         )?;
         let x = add(x, &rms_norm(&attn_out, &self.attention_norm2, self.eps)?)?;
+        // iOS: the attention half is materialized before the MLP half is built (a no-op off device).
+        crate::quantum::barrier(&[&x])?;
         let ffn_out = self
             .feed_forward
             .forward(&rms_norm(&x, &self.ffn_norm1, self.eps)?)?;

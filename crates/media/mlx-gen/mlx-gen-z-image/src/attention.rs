@@ -108,6 +108,11 @@ impl ZImageAttention {
         })
     }
 
+    /// `(heads, head_dim)`, as the iOS quantum accounting reads them.
+    pub(crate) fn head_geometry(&self) -> (i32, i32) {
+        (self.n_heads, self.head_dim)
+    }
+
     /// Toggle SDPA-segment gradient checkpointing (sc-4886). Training-only knob — see `ckpt_sdpa`.
     pub fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;

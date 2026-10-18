@@ -22,7 +22,6 @@ use mlx_gen::{
     FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
     ModelDescriptor, Precision, Progress, Quant, Residency, Result, StagedHeavy, WeightsSource,
 };
-use mlx_rs::Dtype;
 use std::path::Path;
 
 use crate::control_transformer::ZImageControlTransformer;
@@ -407,7 +406,7 @@ impl ZImageTurboControl {
                     Ok(cap)
                 } else {
                     // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's cap.
-                    Ok(cap.as_dtype(Dtype::Bfloat16)?)
+                    pipeline::caption_cast_quantum(&cap)
                 }
             },
             // Materialize the post-cast `cap` while the encoder is still alive (Sequential only) — MLX

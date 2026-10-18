@@ -22,6 +22,32 @@ impl DownSampler {
         })
     }
 
+    /// The downsample as one iOS quantum: the bottom/right padded copy and the stride-2
+    /// convolution's output and kernel transient ([`mlx_gen::ios_quantum::single_conv_bytes`]).
+    pub(crate) fn forward_quantum(&self, x_nchw: &Array) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_DOWNSAMPLE,
+            |backend| {
+                let [b, h, w, c] = crate::quantum::nhwc(x_nchw);
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &[b, h + 1, w + 1, c],
+                    x_nchw.item_size() as u64,
+                    &self.w,
+                    2,
+                    0,
+                );
+                mlx_gen::ios_quantum::single_conv_bytes(&call, 1, 0, backend)
+            },
+            || self.forward(x_nchw),
+        )
+    }
+
+    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting proofs).
+    #[cfg(test)]
+    pub(crate) fn weight(&self) -> &Array {
+        &self.w
+    }
+
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
                                                        // Pad H (axis 1) and W (axis 2) by one at the end (bottom/right). Equivalent to the

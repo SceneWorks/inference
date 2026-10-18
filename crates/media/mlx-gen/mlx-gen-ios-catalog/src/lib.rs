@@ -43,6 +43,10 @@
 //!
 //! **Iris 3B** (`iris_3b` generation incl. prompt batches, the `iris_3b_restore` transform and the
 //! `iris_3b_depth` task), inference only.
+//!
+//! **Z-Image Turbo** (`z_image_turbo` text / image-to-image / LoRA+LoKr, and its Fun-Controlnet-Union
+//! route `z_image_turbo_control`), inference only, at its packed Q4/Q8 and dense bf16 tiers;
+//! [`zimage`] states the load defaults and the stored-tier artifact policy.
 
 mod admission;
 pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
@@ -78,6 +82,7 @@ use mlx_gen_sana::pipeline::{resolved_decode_plan, DecodeTilingPlan, DECODE_OVER
 pub mod anima;
 pub mod iris_depth;
 pub mod sdxl;
+pub mod zimage;
 pub use anima::{
     anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
     anima_turbo_planning_decision, ios_memory_budget, ANIMA_TURBO_ID,
@@ -90,8 +95,10 @@ pub use anima::{
 pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistryBuilder {
     // Turbo alone, through the provider's own per-variant seam: its generator and complete memory
     // registration, never a trainer — whatever features another crate unifies onto `mlx-gen-anima`.
-    mlx_gen_iris::register_inference_providers(mlx_gen_sdxl::register_generator(
-        mlx_gen_anima::register_turbo_generator(mlx_gen_sana::register_providers(registry)),
+    mlx_gen_z_image::register_turbo_generators(mlx_gen_iris::register_inference_providers(
+        mlx_gen_sdxl::register_generator(mlx_gen_anima::register_turbo_generator(
+            mlx_gen_sana::register_providers(registry),
+        )),
     ))
 }
 
@@ -311,7 +318,9 @@ mod tests {
                 "sana_sprint_1600m",
                 "anima_turbo",
                 "sdxl",
-                "iris_3b"
+                "iris_3b",
+                "z_image_turbo",
+                "z_image_turbo_control"
             ],
             "the iOS media surface changed -- if deliberate, update this test and confirm the new \
              provider is admission-gated; registration is not a device fitting claim"
@@ -324,7 +333,13 @@ mod tests {
             .memory_strategy_registrations()
             .map(|r| r.provider_id)
             .collect();
-        for id in ["iris_3b", "iris_3b_depth", "iris_3b_restore"] {
+        for id in [
+            "iris_3b",
+            "iris_3b_depth",
+            "iris_3b_restore",
+            "z_image_turbo",
+            "z_image_turbo_control",
+        ] {
             assert!(memory.contains(&id), "missing Iris mode {id}: {memory:?}");
         }
         assert_eq!(registry.captioners().len(), 0, "iOS ships no captioners");

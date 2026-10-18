@@ -549,9 +549,9 @@ dependencies = [
  "libc",
  "mlx-gen",
  "mlx-gen-sana",
- "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "runtime-ios",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",
 ]
@@ -750,6 +750,7 @@ dependencies = [
  "mlx-gen-iris",
  "mlx-gen-sana",
  "mlx-gen-sdxl",
+ "mlx-gen-z-image",
  "serde",
  "serde_json",
  "sha2",
@@ -1338,6 +1339,14 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "windows-sys",
+]
+
+[[package]]
+name = "sceneworks-gen-core-testkit"
+version = "0.1.0"
+dependencies = [
+ "sceneworks-gen-core",
+ "serde_json",
 ]
 
 [[package]]

@@ -36,13 +36,14 @@ impl DownEncoderBlock {
         })
     }
 
+    /// iOS: each resnet and the downsample is one bounded quantum (pass-throughs off device).
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = x.clone();
         for resnet in &self.resnets {
-            h = resnet.forward(&h)?;
+            h = resnet.forward_quantum(&h)?;
         }
         if let Some(ds) = &self.downsampler {
-            h = ds.forward(&h)?;
+            h = ds.forward_quantum(&h)?;
         }
         Ok(h)
     }

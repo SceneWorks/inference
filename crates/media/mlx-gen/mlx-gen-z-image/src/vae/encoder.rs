@@ -69,14 +69,82 @@ impl Encoder {
     }
 
     /// `image` NCHW (3 channels) → `2·C` latent-dist channels NCHW (spatial ÷8).
+    ///
+    /// iOS: `conv_in`, every resnet / downsample / mid-block stage and the output head are bounded
+    /// quanta (pass-throughs off device).
     pub fn forward(&self, image: &Array) -> Result<Array> {
-        let mut h = self.conv_in.forward(image)?;
+        self.forward_then(image, 0, Ok)
+    }
+
+    /// [`Self::forward`] with `then` applied to the encoder output inside the output head's quantum
+    /// (priced with `then_bytes` on top) — `Vae::encode`'s latent-mean selection and affine.
+    pub(crate) fn forward_then(
+        &self,
+        image: &Array,
+        then_bytes: u64,
+        then: impl FnOnce(Array) -> Result<Array>,
+    ) -> Result<Array> {
+        let mut h = self.conv_in_quantum(image)?;
         for down in &self.down_blocks {
             h = down.forward(&h)?;
         }
         h = self.mid_block.forward(&h)?;
-        h = self.conv_norm_out.forward(&h)?;
-        h = silu(&h)?;
-        self.conv_out.forward(&h)
+        self.head(&h, then_bytes, then)
+    }
+
+    /// The `conv_in` (`first`) or `conv_out` NHWC weight (for the iOS accounting proofs).
+    #[cfg(test)]
+    pub(crate) fn conv_weight(&self, first: bool) -> &Array {
+        if first {
+            self.conv_in.weight()
+        } else {
+            self.conv_out.weight()
+        }
+    }
+
+    /// `conv_in` as one bounded iOS quantum over the (materialized) input image.
+    pub(crate) fn conv_in_quantum(&self, image: &Array) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_ENCODE_IN,
+            |backend| {
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &crate::quantum::nhwc(image),
+                    image.item_size() as u64,
+                    self.conv_in.weight(),
+                    1,
+                    1,
+                );
+                mlx_gen::ios_quantum::single_conv_bytes(&call, 0, 0, backend)
+            },
+            || self.conv_in.forward(image),
+        )
+    }
+
+    /// The output GroupNorm + SiLU + `conv_out` (`then` appended inside the same quantum), as one
+    /// iOS quantum priced by [`mlx_gen::ios_quantum::norm_conv_bytes`] plus `then_bytes`.
+    pub(crate) fn head(
+        &self,
+        h: &Array,
+        then_bytes: u64,
+        then: impl FnOnce(Array) -> Result<Array>,
+    ) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_ENCODE_OUT,
+            |backend| {
+                let call = mlx_gen::ios_quantum::ConvCall::new(
+                    &crate::quantum::nhwc(h),
+                    h.item_size() as u64,
+                    self.conv_out.weight(),
+                    1,
+                    1,
+                );
+                mlx_gen::ios_quantum::norm_conv_bytes(&call, backend).saturating_add(then_bytes)
+            },
+            || {
+                let h = self.conv_norm_out.forward(h)?;
+                let h = silu(&h)?;
+                then(self.conv_out.forward(&h)?)
+            },
+        )
     }
 }

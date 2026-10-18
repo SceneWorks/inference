@@ -157,6 +157,11 @@ pub fn build_candidate(
     strategy: mlx_gen::gen_core::MemoryStrategy,
     mut work: IosWork,
 ) -> AdmissionResult<IosCandidate> {
+    // Z-Image Turbo's artifact policy (stored tier, inventory, the control route's checkpoint) is
+    // checked from small configs before its contract reads any tensor header.
+    if crate::zimage::is_z_image(provider) {
+        artifact(crate::zimage::check_artifact(provider, &spec))?;
+    }
     let contract = registry
         .memory_strategy_contract(provider, &spec)?
         .ok_or_else(|| {

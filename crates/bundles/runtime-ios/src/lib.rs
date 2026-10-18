@@ -71,11 +71,11 @@ pub mod media {
         anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
         ios_memory_budget, ios_quantum, sana_decode_plan, sana_decode_tile_edge,
         sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
-        Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator, BoundTransform,
-        FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind, SanaDeviceFootprint,
-        SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB,
-        IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
-        SANA_DEVICE_FOOTPRINTS,
+        zimage, Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
+        BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
+        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
+        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID,
+        IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
     };
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
@@ -229,6 +229,18 @@ pub mod media {
         candidates: &[IosCandidate],
     ) -> AdmissionResult<(usize, BoundGenerator)> {
         generator(&[ANIMA_TURBO_ID], candidates)
+    }
+
+    /// Z-Image Turbo: `z_image_turbo` (text, image-to-image, LoRA/LoKr) and its Fun-Controlnet-Union
+    /// route `z_image_turbo_control` (pose / canny / depth, optional img2img init), at the stored
+    /// Q4 / Q8 / bf16 tier ([`zimage::z_image_turbo_load_spec`], [`zimage::check_artifact`]).
+    pub fn load_z_image_turbo(
+        candidates: &[IosCandidate],
+    ) -> AdmissionResult<(usize, BoundGenerator)> {
+        generator(
+            &[zimage::Z_IMAGE_TURBO_ID, zimage::Z_IMAGE_TURBO_CONTROL_ID],
+            candidates,
+        )
     }
 
     /// Iris 3B generation, including prompt batches.
@@ -819,6 +831,30 @@ mod tests {
                     "x",
                 );
             }
+            let zimage = root.join("zimage");
+            for component in ["transformer", "vae"] {
+                tensor(&zimage.join(component).join("model.safetensors"), "x");
+                std::fs::write(
+                    zimage.join(component).join("config.json"),
+                    r#"{"quantization":{"bits":4,"group_size":64}}"#,
+                )
+                .unwrap();
+            }
+            gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                &zimage.join("text_encoder"),
+                mlx_gen_ios_catalog::zimage::ENCODER_CONTRACT,
+                Some(4),
+            )
+            .unwrap();
+            tensor(&root.join("zimage-control.safetensors"), "x");
+            let zimage_spec = |control: bool| {
+                let mut spec = crate::media::zimage::z_image_turbo_load_spec(
+                    WeightsSource::Dir(zimage.clone()),
+                    control.then(|| WeightsSource::File(root.join("zimage-control.safetensors"))),
+                );
+                spec.quantize = Some(crate::gen_core::Quant::Q4);
+                spec
+            };
             let iris = root.join("iris");
             copy_tree(&iris_fixtures().join("tiny-snapshot/iris"), &iris);
             let mut iris_spec = crate::gen_core::LoadSpec::new(WeightsSource::Dir(iris));
@@ -860,6 +896,27 @@ mod tests {
                     MemoryStrategy::BoundedDecode,
                 ),
                 gen("iris_3b", iris_spec, MemoryStrategy::Resident),
+                gen(
+                    "z_image_turbo",
+                    zimage_spec(false),
+                    MemoryStrategy::BoundedTransformerResidency,
+                ),
+                build_candidate(
+                    &registry,
+                    "z_image_turbo_control",
+                    zimage_spec(true),
+                    None,
+                    MemoryStrategy::BoundedTransformerResidency,
+                    IosWork::Generate(GenerationRequest {
+                        conditioning: vec![crate::gen_core::Conditioning::Control {
+                            image: image(512),
+                            kind: crate::gen_core::ControlKind::Pose,
+                            scale: Some(1.0),
+                        }],
+                        ..request(512)
+                    }),
+                )
+                .unwrap(),
                 build_candidate(
                     &registry,
                     crate::media::IRIS_RESTORE_ID,
@@ -899,11 +956,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let candidates = fixtures::candidates(root.path());
         type Facade = fn(&[media::IosCandidate]) -> Result<usize, AdmissionError>;
-        let facades: [(&str, Facade); 6] = [
+        let facades: [(&str, Facade); 8] = [
             ("sana_1600m", |c| media::load_sana(c).map(|r| r.0)),
             ("sdxl", |c| media::load_sdxl(c).map(|r| r.0)),
             ("anima_turbo", |c| media::load_anima_turbo(c).map(|r| r.0)),
             ("iris_3b", |c| media::load_iris(c).map(|r| r.0)),
+            ("z_image_turbo", |c| {
+                media::load_z_image_turbo(c).map(|r| r.0)
+            }),
+            ("z_image_turbo_control", |c| {
+                media::load_z_image_turbo(c).map(|r| r.0)
+            }),
             ("iris_3b_restore", |c| {
                 media::load_iris_restore(c).map(|r| r.0)
             }),
@@ -915,8 +978,8 @@ mod tests {
             Ok(_) => panic!("admitted without evidence"),
         };
         super::PLATFORM_LIMITS_BOUND.store(false, super::Ordering::Release);
-        for ((id, facade), candidate) in facades.iter().zip(&candidates) {
-            assert_eq!(candidate.provider, *id);
+        for (id, facade) in facades.iter() {
+            let candidate = candidates.iter().find(|c| c.provider == *id).unwrap();
             assert_eq!(
                 kind(facade(std::slice::from_ref(candidate))),
                 None,
@@ -924,13 +987,18 @@ mod tests {
             );
         }
         super::PLATFORM_LIMITS_BOUND.store(true, super::Ordering::Release);
-        for ((id, facade), candidate) in facades.iter().zip(&candidates) {
+        let by_id = |id: &str| candidates.iter().find(|c| c.provider == id).unwrap();
+        for (id, facade) in facades.iter() {
+            let candidate = by_id(id);
             assert_eq!(
                 kind(facade(std::slice::from_ref(candidate))),
                 Some(RefusalKind::NoEvidence),
                 "{id}"
             );
-            let other = candidates.iter().find(|c| c.provider != *id).unwrap();
+            let other = candidates
+                .iter()
+                .find(|c| !c.provider.starts_with(&id[..4]))
+                .unwrap();
             assert_eq!(
                 kind(facade(std::slice::from_ref(other))),
                 Some(RefusalKind::Mode),
@@ -1042,7 +1110,8 @@ mod tests {
         assert_eq!(snapshot.platform, "ios");
         assert_eq!(snapshot.backend, "mlx");
 
-        // The media surface is SANA + Anima Turbo + SDXL + Iris under `media`, empty without it. An
+        // The media surface is SANA + Anima Turbo + SDXL + Iris + Z-Image Turbo under `media`, empty
+        // without it. An
         // incidental `mlx-gen-catalog` dependency — every provider including video — fails here
         // rather than quietly compiling into an iPhone app.
         #[cfg(feature = "media")]
@@ -1053,7 +1122,9 @@ mod tests {
                 "sana_sprint_1600m",
                 "anima_turbo",
                 "sdxl",
-                "iris_3b"
+                "iris_3b",
+                "z_image_turbo",
+                "z_image_turbo_control"
             ],
             "the iOS image surface changed; registration is not a device fitting claim"
         );

@@ -27,9 +27,16 @@ impl UNetMidBlock {
         self.attention.quantize(bits)
     }
 
+    /// The block's two resnets and its attention (the reachable-sizes prediction prices them).
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&ResnetBlock2D, &VaeAttention, &ResnetBlock2D) {
+        (&self.resnet0, &self.attention, &self.resnet1)
+    }
+
+    /// iOS: each resnet and the attention is one bounded quantum (pass-throughs off device).
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let h = self.resnet0.forward(x)?;
-        let h = self.attention.forward(&h)?;
-        self.resnet1.forward(&h)
+        let h = self.resnet0.forward_quantum(x)?;
+        let h = self.attention.forward_quantum(&h)?;
+        self.resnet1.forward_quantum(&h)
     }
 }

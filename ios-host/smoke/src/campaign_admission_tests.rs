@@ -456,3 +456,115 @@ fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
         assert_eq!(p.evidence_key.as_ref().unwrap().mode, mode);
     }
 }
+/// Z-Image Turbo's cells: both routes, every mode, refused for evidence (never capacity) on an
+/// injected device before any load; the control route loads the `z_image_turbo` slot with that
+/// slot's provisioned `control` role (and is a provisioning failure without it); a slot whose stored
+/// tier is not the case's is a typed artifact refusal.
+#[test]
+fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let slot = temp.path().join("z_image_turbo/q4");
+    for component in ["transformer", "vae"] {
+        tensor(&slot.join(component).join("model.safetensors"), "x");
+        std::fs::write(
+            slot.join(component).join("config.json"),
+            r#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+    }
+    gen_core_testkit::write_encoder_contract_fixture_with_quant(
+        &slot.join("text_encoder"),
+        runtime_ios::media::zimage::ENCODER_CONTRACT,
+        Some(4),
+    )
+    .unwrap();
+    let run = |key: &str| {
+        let case = Case::parse(key).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let result = campaign::run(&mut p, &case, false);
+        (result, p.refusal_kind)
+    };
+    // No control checkpoint provisioned yet: the control route is a provisioning failure.
+    let ((status, reason), kind) =
+        run("z_image_turbo_control/z_image_turbo_control/q4/512/control/4");
+    assert_eq!(status, Status::DiagnosticFailure, "{reason}");
+    assert!(reason.contains("`control`"), "{reason}");
+    assert_eq!(kind, None);
+    tensor(&slot.join("control.safetensors"), "x");
+    std::fs::write(
+        slot.join("components.json"),
+        r#"{"control":"control.safetensors"}"#,
+    )
+    .unwrap();
+    for key in [
+        "z_image_turbo/z_image_turbo/q4/512/text/4",
+        "z_image_turbo/z_image_turbo/q4/768/reference/4",
+        "z_image_turbo/z_image_turbo/q4/1024/text/0",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/control/4",
+        "z_image_turbo_control/z_image_turbo_control/q4/512/reference/4",
+    ] {
+        let ((status, reason), kind) = run(key);
+        assert_eq!(status, Status::AdmittedRefused, "{key}: {reason}");
+        assert_eq!(kind, Some("no_evidence"), "{key}: {reason}");
+    }
+    // The q4 slot provisioned as the q8 tier: the stored tier is not the case's.
+    copy_tree(&slot, &temp.path().join("z_image_turbo/q8"));
+    let ((status, reason), kind) = run("z_image_turbo/z_image_turbo/q8/512/text/4");
+    assert_eq!(status, Status::AdmittedRefused, "{reason}");
+    assert_eq!(kind, Some("artifact"), "{reason}");
+    // The control route carries its required control image (its first declared kind) in every
+    // mode, ahead of a reference mode's init image; the base route never carries one.
+    let carried = |key: &str| {
+        let c = Case::parse(key).unwrap();
+        let Ok(runtime_ios::media::IosWork::Generate(r)) =
+            work(&c, &CancelFlag::new(), catalog.media())
+        else {
+            panic!("{key}: not a generate request");
+        };
+        r.conditioning
+            .iter()
+            .map(|x| match x {
+                Conditioning::Control { kind, .. } => format!("control:{kind:?}"),
+                Conditioning::Reference { .. } => "reference".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        carried("z_image_turbo_control/z_image_turbo_control/q4/512/control/4"),
+        ["control:Pose"]
+    );
+    assert_eq!(
+        carried("z_image_turbo_control/z_image_turbo_control/q4/512/reference/4"),
+        ["control:Pose", "reference"]
+    );
+    assert_eq!(
+        carried("z_image_turbo/z_image_turbo/q4/512/reference/4"),
+        ["reference"]
+    );
+    assert!(carried("z_image_turbo/z_image_turbo/q4/512/text/4").is_empty());
+    // Enumeration: both routes at every tier and edge; the control route has no plain text mode.
+    let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
+    let keys: Vec<&str> = listing["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    for tier in ["q4", "q8", "bf16"] {
+        for edge in [512, 768, 1024] {
+            for key in [
+                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/text/4"),
+                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/reference/4"),
+                format!("z_image_turbo_control/z_image_turbo_control/{tier}/{edge}/control/4"),
+                format!("z_image_turbo_control/z_image_turbo_control/{tier}/{edge}/reference/4"),
+            ] {
+                assert!(keys.contains(&key.as_str()), "{key}");
+            }
+        }
+    }
+    assert!(!keys
+        .iter()
+        .any(|k| k.starts_with("z_image_turbo_control/") && k.contains("/text/")));
+}

@@ -375,11 +375,18 @@ impl ZImageTransformer {
         dims: (i32, i32, i32, i32),
         cap_feats: &Array,
     ) -> Result<Prepared> {
+        let quanta = mlx_gen::ios_quantum::enabled();
+        if quanta {
+            mlx_gen::ios_quantum::before(
+                crate::quantum::DIT_PREPARE,
+                self.prepare_bytes(dims, cap_feats),
+            )?;
+        }
         let meta = self.patchify_meta(dims, cap_feats)?;
         let x_freqs = self.rope.forward(&meta.x_pos_ids)?;
         let cap_freqs = self.rope.forward(&meta.cap_pos_ids)?;
         let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
-        Ok(Prepared {
+        let prep = Prepared {
             cap_tokens: meta.cap_tokens,
             x_size: meta.x_size,
             x_keep: meta.x_keep,
@@ -388,7 +395,52 @@ impl ZImageTransformer {
             x_freqs,
             cap_freqs,
             unified_freqs,
-        })
+        };
+        if quanta {
+            mlx_gen::ios_quantum::finish(
+                crate::quantum::DIT_PREPARE,
+                &[
+                    &prep.cap_tokens,
+                    &prep.x_keep,
+                    &prep.cap_keep,
+                    &prep.x_freqs,
+                    &prep.cap_freqs,
+                    &prep.unified_freqs,
+                ],
+            )?;
+        }
+        Ok(prep)
+    }
+
+    /// [`Self::prepare`]'s counted price for latent `dims` and caption `cap_feats`, new buffers
+    /// (each page-rounded as allocated): the caption's zero padding and padded copy (`[C, cap_dim]`,
+    /// f32); the position ids and keep masks; for the image rows and for the caption rows, each axis's
+    /// RoPE gather index and table gather (`[rows, axis_dim/2, 2]` f32) and their concatenation
+    /// (`[rows, head_dim]`); the unified concatenation.
+    pub(crate) fn prepare_bytes(&self, dims: (i32, i32, i32, i32), cap_feats: &Array) -> u64 {
+        use crate::quantum::{ab, u};
+        let (_c, f, h, w) = dims;
+        let n0 =
+            (f / self.cfg.f_patch_size) * (h / self.cfg.patch_size) * (w / self.cfg.patch_size);
+        let n = u(n0 + (-(n0 as i64)).rem_euclid(32) as i32);
+        let c0 = cap_feats.shape()[0];
+        let c = u(c0 + (-(c0 as i64)).rem_euclid(32) as i32);
+        let cap_dim = u(cap_feats.shape()[1]);
+        let head_dim: u64 = self.cfg.axes_dims.iter().map(|&d| u(d)).sum();
+        // Per axis: the gather's index array and the gathered `[rows, axis_dim/2, 2]` table.
+        let rope = |rows: u64| {
+            self.cfg
+                .axes_dims
+                .iter()
+                .map(|&d| ab(4, &[rows]) + ab(4, &[rows, u(d)]))
+                .sum::<u64>()
+                + ab(4, &[rows, head_dim])
+        };
+        ab(4, &[c - u(c0), cap_dim])
+            .saturating_add(ab(4, &[c, cap_dim]))
+            .saturating_add(ab(4, &[n, 3]) + ab(4, &[c, 3]) + ab(4, &[n, 1]) + ab(4, &[c, 1]))
+            .saturating_add(rope(n) + rope(c))
+            .saturating_add(ab(4, &[n + c, head_dim]))
     }
 
     /// Run the DiT for one denoise step against a cached [`Prepared`]. `x` is the current latent
@@ -437,41 +489,38 @@ impl ZImageTransformer {
         plan: AttentionPlan<'_>,
         window: Option<crate::block_stream::BlockWindow<'_>>,
     ) -> Result<Array> {
-        let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
-        let t_emb = self.t_embedder.forward(&t)?;
-
-        // Image stream: patchify (the only value-dependent step) -> embed -> pad -> noise refiner.
-        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
-        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
-        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
-        let mut x_emb = x_emb.expand_dims(0)?;
+        // iOS: every stage below is one bounded quantum (checked against live headroom before its
+        // graph is built, materialized before the next); off device each guard is a pass-through,
+        // so the op sequence is exactly the historical forward.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let (t_emb, x_emb) = self.embed_quantum(prep, x, timestep)?;
+        let mut x_emb = x_emb;
         for layer in &self.noise_refiner {
-            x_emb = layer.forward_budgeted(&x_emb, &prep.x_freqs, &t_emb, plan)?;
+            x_emb = layer.forward_quantum(&x_emb, &prep.x_freqs, &t_emb, plan, 0, Ok)?;
         }
 
         // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
-        let cap_normed = rms_norm(&prep.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
-        let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
-        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
-        let mut cap_emb = cap_emb.expand_dims(0)?;
+        let mut cap_emb = self.caption_quantum(prep)?;
         for layer in &self.context_refiner {
-            cap_emb = layer.forward_budgeted(&cap_emb, &prep.cap_freqs, plan)?;
+            cap_emb = layer.forward_quantum(&cap_emb, &prep.cap_freqs, plan)?;
         }
 
         // Unify and run the main stack. In bf16 training the f32 caption stream joins cast to the
         // training dtype here (see `train_unify_dtype`); inference: None, no-op.
-        let cap_emb = match self.train_unify_dtype {
-            Some(dt) => cap_emb.as_dtype(dt)?,
-            None => cap_emb,
-        };
         let x_len = x_emb.shape()[1];
-        let unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+        let unified = self.unify_quantum(&x_emb, &cap_emb)?;
         let unified = match window {
             None => {
                 let mut unified = unified;
                 for layer in &self.layers {
-                    unified =
-                        layer.forward_budgeted(&unified, &prep.unified_freqs, &t_emb, plan)?;
+                    unified = layer.forward_quantum(
+                        &unified,
+                        &prep.unified_freqs,
+                        &t_emb,
+                        plan,
+                        0,
+                        Ok,
+                    )?;
                 }
                 unified
             }
@@ -479,13 +528,218 @@ impl ZImageTransformer {
         };
 
         // Final layer + unpatchify (only the real image tokens survive).
-        let unified = self.final_layer.forward(&unified, &t_emb)?;
-        let embed_dim = unified.shape()[2];
-        let head = unified
-            .reshape(&[unified.shape()[1], embed_dim])? // drop batch dim (size 1)
-            .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
-        let out = self.unpatchify(&head, prep.x_size)?;
-        Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+        self.output_quantum(&unified, &t_emb, x_len, prep.x_size)
+    }
+
+    /// The timestep embedding and the image stream's patchify / `x_embedder` / pad tokens, as one
+    /// iOS quantum (priced by [`Self::embed_bytes`]). Returns `(t_emb, x_emb [1, N, D])`.
+    pub(crate) fn embed_quantum(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+    ) -> Result<(Array, Array)> {
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::before(
+                crate::quantum::DIT_EMBED,
+                self.embed_bytes(x, prep.img_pad, mlx_gen::ios_quantum::Backend::current()),
+            )?;
+        }
+        let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
+        let t_emb = self.t_embedder.forward(&t)?;
+
+        // Image stream: patchify (the only value-dependent step) -> embed -> pad.
+        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
+        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
+        let x_emb = x_emb.expand_dims(0)?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::DIT_EMBED, &[&t_emb, &x_emb])?;
+        }
+        Ok((t_emb, x_emb))
+    }
+
+    /// [`Self::embed_quantum`]'s counted price over latent `x` (`[C, F, H, W]`), new buffers (each
+    /// page-rounded as allocated):
+    /// * the timestep MLP's small vectors (sinusoid args, cos, sin, concat, `linear1`, SiLU,
+    ///   `linear2`: 7 rows of the widest of them, f32);
+    /// * the patch tokens' transposed copy (`[N, p²C]` at the latent's width) and, when the token
+    ///   count pads, the f32 zero rows and the padded concatenation;
+    /// * `x_embedder`'s output (`[N, D]` at its promoted width) and the pad merge's two products
+    ///   (at the pad token's promoted width; the sum donates);
+    /// * the dense `x_embedder` weight's stream-width copy and any adapter residuals on it.
+    pub(crate) fn embed_bytes(
+        &self,
+        x: &Array,
+        img_pad: i32,
+        _backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        use crate::quantum::{ab, u};
+        let sh = x.shape();
+        let (pf, ph, pw) = (
+            self.cfg.f_patch_size,
+            self.cfg.patch_size,
+            self.cfg.patch_size,
+        );
+        let n0 = u((sh[1] / pf) * (sh[2] / ph) * (sh[3] / pw));
+        let n = n0 + u(img_pad);
+        let patch = u(pf * ph * pw * sh[0]);
+        let dim = u(self.cfg.dim);
+        let widest = self
+            .t_embedder
+            .widths()
+            .into_iter()
+            .chain([u(self.cfg.frequency_embedding_size)])
+            .max()
+            .unwrap_or(0);
+        let xw = x.item_size() as u64;
+        let tokens = ab(xw, &[n0, patch])
+            + if img_pad > 0 {
+                ab(4, &[u(img_pad), patch]) + ab(4, &[n, patch])
+            } else {
+                0
+            };
+        let token_dtype = if img_pad > 0 {
+            mlx_rs::Dtype::Float32
+        } else {
+            x.dtype()
+        };
+        let emb = crate::quantum::linear_out_dtype(&self.x_embedder, token_dtype);
+        let lin = [&self.x_embedder];
+        (7 * ab(4, &[1, widest]))
+            .saturating_add(tokens)
+            .saturating_add(ab(mlx_gen::ios_quantum::dtype_bytes(emb), &[n, dim]))
+            .saturating_add(2 * ab(crate::quantum::pad_width(emb, &self.x_pad_token), &[n, dim]))
+            .saturating_add(crate::quantum::promoted_weight_bytes(
+                &lin,
+                mlx_gen::ios_quantum::dtype_bytes(token_dtype),
+            ))
+            .saturating_add(crate::quantum::adapter_bytes(
+                &lin,
+                n,
+                mlx_gen::ios_quantum::dtype_bytes(token_dtype),
+            ))
+    }
+
+    /// The caption stream's RMSNorm / `cap_embedder` / pad tokens, as one iOS quantum (priced by
+    /// [`Self::caption_bytes`]). Returns `cap_emb [1, C, D]`.
+    pub(crate) fn caption_quantum(&self, prep: &Prepared) -> Result<Array> {
+        self.caption_quantum_parts(&prep.cap_tokens, &prep.cap_keep)
+    }
+
+    /// [`Self::caption_quantum`] over the padded caption tokens and their keep mask.
+    pub(crate) fn caption_quantum_parts(
+        &self,
+        cap_tokens: &Array,
+        cap_keep: &Array,
+    ) -> Result<Array> {
+        let scratch = if mlx_gen::ios_quantum::enabled() {
+            self.caption_bytes(cap_tokens, mlx_gen::ios_quantum::Backend::current())
+        } else {
+            0
+        };
+        mlx_gen::ios_quantum::run(crate::quantum::DIT_CAPTION, scratch, || {
+            let cap_normed = rms_norm(cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
+            let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
+            cap_emb = apply_pad(&cap_emb, cap_keep, &self.cap_pad_token)?;
+            Ok(cap_emb.expand_dims(0)?)
+        })
+    }
+
+    /// [`Self::caption_quantum`]'s counted price over `cap_tokens` (`[C, cap_dim]`, f32): the
+    /// RMSNorm ([`crate::quantum::rms_units`]); `cap_linear`'s output and the pad merge's two
+    /// products (`[C, D]` at their promoted widths); the dense projection's copy and any adapter
+    /// residuals.
+    pub(crate) fn caption_bytes(
+        &self,
+        cap_tokens: &Array,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        use crate::quantum::{ab, u};
+        let sh = cap_tokens.shape();
+        let (c, cap_dim, dim) = (u(sh[0]), u(sh[1]), u(self.cfg.dim));
+        let cw = cap_tokens.item_size() as u64;
+        let emb = crate::quantum::linear_out_dtype(&self.cap_linear, cap_tokens.dtype());
+        let lin = [&self.cap_linear];
+        crate::quantum::rms_units(backend)
+            .saturating_mul(ab(cw, &[c, cap_dim]))
+            .saturating_add(ab(mlx_gen::ios_quantum::dtype_bytes(emb), &[c, dim]))
+            .saturating_add(
+                2 * ab(
+                    crate::quantum::pad_width(emb, &self.cap_pad_token),
+                    &[c, dim],
+                ),
+            )
+            .saturating_add(crate::quantum::promoted_weight_bytes(&lin, cw))
+            .saturating_add(crate::quantum::adapter_bytes(&lin, c, cw))
+    }
+
+    /// The image + caption concatenation into the unified stream (+ the training-only caption cast),
+    /// as one iOS quantum ([`unify_bytes`]).
+    pub(crate) fn unify_quantum(&self, x_emb: &Array, cap_emb: &Array) -> Result<Array> {
+        mlx_gen::ios_quantum::run(
+            crate::quantum::DIT_UNIFY,
+            unify_bytes(x_emb, cap_emb),
+            || {
+                let cap_emb = match self.train_unify_dtype {
+                    Some(dt) => cap_emb.as_dtype(dt)?,
+                    None => cap_emb.clone(),
+                };
+                Ok(concatenate_axis(&[x_emb, &cap_emb], 1)?)
+            },
+        )
+    }
+
+    /// The final layer, unpatchify and velocity negation, as one iOS quantum (priced by
+    /// [`Self::output_bytes`]).
+    pub(crate) fn output_quantum(
+        &self,
+        unified: &Array,
+        t_emb: &Array,
+        x_len: i32,
+        x_size: (i32, i32, i32),
+    ) -> Result<Array> {
+        let scratch = if mlx_gen::ios_quantum::enabled() {
+            self.output_bytes(unified, mlx_gen::ios_quantum::Backend::current())
+        } else {
+            0
+        };
+        mlx_gen::ios_quantum::run(crate::quantum::DIT_OUTPUT, scratch, || {
+            let unified = self.final_layer.forward(unified, t_emb)?;
+            let embed_dim = unified.shape()[2];
+            let head = unified
+                .reshape(&[unified.shape()[1], embed_dim])? // drop batch dim (size 1)
+                .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
+            let out = self.unpatchify(&head, x_size)?;
+            Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+        })
+    }
+
+    /// [`Self::output_quantum`]'s counted price over `unified` (`[1, L, D]`): the final LayerNorm
+    /// ([`crate::quantum::rms_units`]: one fused kernel, its composed buffers on the CPU) and the
+    /// scale product (`[1, L, D]` at the stream width); the projection, the image-row gather, the
+    /// unpatchify gather's transposed copy and the negation (`[L, p²C]`, f32); the adaLN modulation's
+    /// small vectors; the dense projections' largest copy and adapter residuals.
+    pub(crate) fn output_bytes(
+        &self,
+        unified: &Array,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        use crate::quantum::{ab, u};
+        let sh = unified.shape();
+        let (l, d) = (u(sh[1]), u(sh[2]));
+        let eb = (unified.item_size() as u64).max(4);
+        let patch = u(self.cfg.f_patch_size
+            * self.cfg.patch_size
+            * self.cfg.patch_size
+            * self.cfg.in_channels);
+        let lins = self.final_layer.projections();
+        (crate::quantum::rms_units(backend) + 1)
+            .saturating_mul(ab(eb, &[1, l, d]))
+            .saturating_add(4 * ab(4, &[l, patch]))
+            .saturating_add(4 * ab(4, &[1, d]))
+            .saturating_add(crate::quantum::promoted_weight_bytes(&lins, eb))
+            .saturating_add(crate::quantum::adapter_bytes(&lins, l, eb))
     }
 
     /// Rung 4's unified stack: walk the 30 blocks in windows, materializing each window's weights from
@@ -511,6 +765,7 @@ impl ZImageTransformer {
             t_emb,
             plan,
             window,
+            &|_: usize, _: &Array| 0,
             &mut |state: &Array, _i: usize| Ok(state.clone()),
         )
     }
@@ -530,6 +785,7 @@ impl ZImageTransformer {
         t_emb: &Array,
         plan: AttentionPlan<'_>,
         window: crate::block_stream::BlockWindow<'_>,
+        after_bytes: &dyn Fn(usize, &Array) -> u64,
         after_block: &mut dyn FnMut(&Array, usize) -> Result<Array>,
     ) -> Result<Array> {
         let stream = self.block_stream.as_ref().ok_or_else(|| {
@@ -559,9 +815,14 @@ impl ZImageTransformer {
             |state, view, range| {
                 let mut cur = state;
                 for i in range {
-                    let block = stream.materialize(view, i)?;
-                    cur = block.forward_budgeted(&cur, unified_freqs, t_emb, plan)?;
-                    cur = after_block(&cur, i)?;
+                    // Materializing builds lazy weight handles only: the block's stored bytes (and
+                    // any replayed packing) are read INSIDE its quantum, which is priced with them.
+                    let (block, read_bytes) = stream.materialize_counted(view, i)?;
+                    let extra = read_bytes.saturating_add(after_bytes(i, &cur));
+                    cur =
+                        block.forward_quantum(&cur, unified_freqs, t_emb, plan, extra, |out| {
+                            after_block(&out, i)
+                        })?;
                 }
                 Ok(cur)
             },
@@ -915,6 +1176,16 @@ pub(crate) fn image_pos_keep(
         .map(|i| if i < img_ori { 1.0 } else { 0.0 })
         .collect();
     (pos, keep, img_pad)
+}
+
+/// The unify quantum's counted price: the `[1, N + C, D]` concatenation at the wider stream's width,
+/// plus the cast copy of the narrower stream when the two widths differ.
+pub(crate) fn unify_bytes(x_emb: &Array, cap_emb: &Array) -> u64 {
+    let width = x_emb.item_size().max(cap_emb.item_size()) as u64;
+    let rows = (x_emb.shape()[1] + cap_emb.shape()[1]).max(0) as u64;
+    let dim = x_emb.shape()[2].max(0) as u64;
+    let units = 1 + u64::from(x_emb.dtype() != cap_emb.dtype());
+    units * crate::quantum::ab(width, &[1, rows, dim])
 }
 
 /// `[0, 1, …, n-1]` as an int32 index array for `take_axis`.

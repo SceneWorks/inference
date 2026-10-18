@@ -17,11 +17,15 @@ has been recorded. Registration is not admission or demonstrated fit.
 | Iris 3B | q8/q4 engine fixes merged #1275 (`2f3265c71`); iOS registration #1277 merged | No demonstrated phone fit; depth access is explicitly diagnostic |
 | SDXL, Illustrious-XL v1/v2, RealVisXL, RealVisXL Lightning | Low-memory engine fixes merged #1274 (`a54ad6c3a`); iOS registration #1278 merged | No demonstrated phone fit |
 | Supra2-IMG | sc-26269 requires epic 24212 on inference main; not started | No implementation/fit claim here |
+| Z-Image Turbo (`z_image_turbo` text / img2img / LoRA+LoKr; `z_image_turbo_control` pose/canny/depth) | Registered without training at its stored q4/q8/bf16 tiers (sc-26433); every quantum bounded; host-derived reachable sizes below | No demonstrated phone fit. Michael's 8 GB **Mac** q4 run is Mac evidence, not device evidence |
 
 The legacy S3 image check drives SANA. The sc-26270 campaign protocol below now
 selects every catalog provider/route/tier/geometry/mode/strategy explicitly. There
-are still no `--iris`, `--sdxl`, `--anima` or `--supra2` shortcut flags. Legacy
-Z-Image diagnostics are not part of this epic's supported model set.
+are still no `--iris`, `--sdxl`, `--anima` or `--supra2` shortcut flags. Z-Image Turbo
+is a catalog model (sc-26433); `run_smoke.sh --zimage` is now only a shortcut for ONE
+bounded capture of a Z-Image campaign case (`IOS_SMOKE_ZIMAGE_CASE`, default
+`z_image_turbo/z_image_turbo/q4/1024/text/4`) through the same capture permit — there is
+no unadmitted Z-Image loader.
 
 ## Campaign protocol and command matrix (sc-26270)
 
@@ -52,11 +56,11 @@ python3 scripts/ios/campaign.py list --catalog /tmp/ios-campaign-catalog.json \
 
 | Axis | Values / source |
 |---|---|
-| Provider | Catalog generators SANA base/sprint, Anima Turbo, SDXL, Iris; registered restoration and composed depth tasks |
+| Provider | Catalog generators SANA base/sprint, Anima Turbo, SDXL, Iris, Z-Image Turbo and its control route; registered restoration and composed depth tasks |
 | SDXL route | `sdxl`, `illustrious_xl_v1`, `illustrious_xl_v2`, `realvisxl`, `realvisxl_lightning` (provider constant) |
 | Tier | `q4`, `q8`, `bf16`; unsupported task/tier combinations stay explicit refusals |
 | Geometry | 512², 768², 1024²; future registered Supra2: 256² |
-| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade |
+| Mode | Descriptor conditioning kinds plus text, advertised prompt batch, SDXL `ip_adapter`, registered restoration/depth; no edit-to-text downgrade. A route whose control input is required (`z_image_turbo_control`) has no text mode: its `control` and `reference` cells both carry the control image (pose) |
 | Strategy | `--rung 0..4`, translated through the provider's shared contract, not a copied cumulative ladder |
 
 Provision complete caller-owned snapshots into a distinct slot for every
@@ -86,7 +90,40 @@ scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route illustrious_xl_v2 --
 # without its component is a provisioning failure, never admission or refusal evidence.
 scripts/ios/push_model.sh "$SDXL_SNAPSHOT" --campaign-route sdxl --tier q4 \
   --control "$CONTROLNET_TILE_SDXL" --ip-adapter "$IP_ADAPTER_SDXL" --device "$DEVICE"
+# Z-Image Turbo: the published `SceneWorks/z-image-turbo-mlx` tiers are already stored packed
+# (q4/, q8/) or dense (bf16/) — push each tier dir as-is; a tier slot holding another stored tier is
+# a typed `artifact` refusal. Both routes load the `z_image_turbo` slot; the control route
+# (`z_image_turbo_control`) also needs the dense Fun-Controlnet-Union checkpoint as the slot's
+# `control` role (packed on the phone at load, one bounded quantum per block):
+scripts/ios/push_model.sh "$ZIMAGE_MLX/q4" --campaign-route z_image_turbo --tier q4 \
+  --control "$ZIMAGE_TURBO_FUN_CONTROLNET_UNION" --device "$DEVICE"
 ```
+
+Z-Image Turbo host-derived reachable sizes (sc-26433) — **predictions, not device
+evidence**: per tier and edge, the resident bytes of each phase plus its largest
+counted quantum (`Backend::Metal`) plus the 512 MiB reserve, against the 6142 MiB
+entitled launch headroom, under the campaign's rung-4 representative selection
+(staged residency, the DiT streamed one block at a time, chunked attention, decode
+tiled at the first published edge 768, a 512-token prompt, the text encoder
+resident). `ZIMAGE_TIER_ROOT=<snapshot> cargo test -p mlx-gen-z-image --lib
+reachable_sizes -- --ignored --nocapture` regenerates it from the snapshot's
+headers alone.
+
+| tier | edge | conditioning | denoise | decode (tile 768) | binding quantum | fits | largest fitting decode tile |
+|---|---:|---:|---:|---:|---|---|---|
+| q4 | 512 | 2886 | 1475 | 4915 | decode VAE resnet | yes | 768: 4915 MiB |
+| q4 | 768 | 2886 | 1738 | 10154 | decode VAE resnet (untiled at 768) | NO | 640: 5444 MiB |
+| q4 | 1024 | 2886 | 2106 | 8107 | decode VAE tiled upsample stage | NO | 512: 5707 MiB |
+| q8 | 512 | 4804 | 1909 | 4916 | decode VAE resnet | yes | 768: 4916 MiB |
+| q8 | 768 | 4804 | 2172 | 10155 | decode VAE resnet (untiled at 768) | NO | 640: 5445 MiB |
+| q8 | 1024 | 4804 | 2540 | 8108 | decode VAE tiled upsample stage | NO | 512: 5708 MiB |
+| bf16 | 512 | 8785 | 2873 | 4917 | conditioning (7.5 GiB encoder resident) | NO | 768 + text-encoder window: 4917 MiB |
+| bf16 | 768 | 8785 | 3136 | 10157 | decode VAE resnet | NO | 640 + text-encoder window: 5447 MiB |
+| bf16 | 1024 | 8785 | 3504 | 8110 | conditioning | NO | 512 + text-encoder window: 5710 MiB |
+
+(MiB.) The representative cells that do not fit are expected to stop at their
+first over-headroom quantum as `capture_refused` — that refusal, not a jetsam kill,
+is the evidence.
 
 The following are **future session recipes, not instructions to run now**. Phone
 availability alone does not authorize a full-model diagnostic. Use a fresh evidence

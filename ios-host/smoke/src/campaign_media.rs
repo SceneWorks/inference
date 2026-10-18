@@ -35,7 +35,14 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     let mut out = Vec::new();
     for registration in registry.generators() {
         let d = (registration.descriptor)();
-        let mut modes = vec!["text".into()];
+        // A route whose control input is REQUIRED (a declared control-kind policy, e.g. Z-Image
+        // Turbo's Fun-Controlnet-Union route) has no plain text mode: every one of its modes carries
+        // the control image ([`work`]).
+        let mut modes = if d.control_kinds.is_some() {
+            Vec::new()
+        } else {
+            vec!["text".to_string()]
+        };
         modes.extend(
             d.capabilities
                 .conditioning
@@ -139,9 +146,37 @@ fn prompt(provider: &str) -> String {
     }
 }
 
+/// The control kind a case's control carrier uses: the first kind the route declares it accepts
+/// (Z-Image's Fun-Controlnet-Union: pose), else SDXL's tile ControlNet.
+fn control_kind(registry: &ProviderRegistry, provider: &str) -> ControlKind {
+    let declared = registry
+        .generators()
+        .map(|r| (r.descriptor)())
+        .find(|d| d.id == provider)
+        .and_then(|d| d.control_kinds);
+    match declared {
+        Some(AcceptedControlKinds::Only(kinds)) if !kinds.is_empty() => kinds[0].clone(),
+        Some(_) => ControlKind::Pose,
+        None => ControlKind::Other("tile".into()),
+    }
+}
+
+/// Whether `provider`'s control input is required (its every mode carries the control image).
+fn control_required(registry: &ProviderRegistry, provider: &str) -> bool {
+    registry
+        .generators()
+        .map(|r| (r.descriptor)())
+        .any(|d| d.id == provider && d.control_kinds.is_some())
+}
+
 /// The actual work of a case's mode. Every registered mode has a carrier; a mode the provider
-/// does not serve is refused by admission with a typed `mode` kind, never dropped here.
-fn work(c: &Case, cancel: &CancelFlag) -> Result<runtime_ios::media::IosWork, AdmissionError> {
+/// does not serve is refused by admission with a typed `mode` kind, never dropped here. A route
+/// whose control input is required carries it in every mode (`reference` adds an img2img init).
+fn work(
+    c: &Case,
+    cancel: &CancelFlag,
+    registry: &ProviderRegistry,
+) -> Result<runtime_ios::media::IosWork, AdmissionError> {
     use runtime_ios::media::IosWork;
     let image = || synthetic_image(c.edge);
     let mut request = GenerationRequest {
@@ -180,7 +215,7 @@ fn work(c: &Case, cancel: &CancelFlag) -> Result<runtime_ios::media::IosWork, Ad
         "control" => {
             request.conditioning = vec![Conditioning::Control {
                 image: image(),
-                kind: ControlKind::Other("tile".into()),
+                kind: control_kind(registry, &c.provider),
                 scale: Some(1.0),
             }]
         }
@@ -205,11 +240,49 @@ fn work(c: &Case, cancel: &CancelFlag) -> Result<runtime_ios::media::IosWork, Ad
             )))
         }
     }
+    if control_required(registry, &c.provider)
+        && !request
+            .conditioning
+            .iter()
+            .any(|x| matches!(x, Conditioning::Control { .. }))
+    {
+        request.conditioning.insert(
+            0,
+            Conditioning::Control {
+                image: image(),
+                kind: control_kind(registry, &c.provider),
+                scale: Some(1.0),
+            },
+        );
+    }
     Ok(IosWork::Generate(request))
 }
 
+/// The provisioned slot a case loads from: its route's, except Z-Image Turbo's control route, which
+/// loads the `z_image_turbo` snapshot (the same base model) with that slot's `control` role.
+fn slot_route(c: &Case) -> &str {
+    if c.provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID {
+        runtime_ios::media::zimage::Z_IMAGE_TURBO_ID
+    } else {
+        &c.route
+    }
+}
+
+/// Whether `value`'s campaign slot (`Documents/campaign/<slot route>/<tier>/`) is provisioned on
+/// this device. A malformed case is "not provisioned".
+#[cfg(feature = "zimage")]
+pub fn slot_provisioned(value: &str) -> bool {
+    let (Ok(c), Some(docs)) = (Case::parse(value), super::dirs_documents()) else {
+        return false;
+    };
+    docs.join("campaign")
+        .join(slot_route(&c))
+        .join(&c.tier)
+        .is_dir()
+}
+
 fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
-    let path = root.join(&c.route).join(&c.tier);
+    let path = root.join(slot_route(c)).join(&c.tier);
     if !path.is_dir() {
         return Err(format!(
             "missing provisioned snapshot {}; not admission/refusal evidence",
@@ -222,6 +295,9 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             runtime_ios::media::sdxl::sdxl_load_spec(&c.route, source).map_err(|e| e.to_string())?
         }
         "anima_turbo" => runtime_ios::media::anima_turbo_load_spec(source),
+        id if runtime_ios::media::zimage::is_z_image(id) => {
+            runtime_ios::media::zimage::z_image_turbo_load_spec(source, None)
+        }
         id if id.starts_with("iris_") => {
             LoadSpec::new(source).with_load_shape(LoadShape::EagerMaterialization)
         }
@@ -274,8 +350,11 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             // attached only for their own mode: a loaded IP-Adapter takes the reference image
             // (so an image-to-image case would silently become IP-Adapter), and either adds
             // weights the other routes do not run.
+            // Z-Image Turbo's control route takes its ControlNet in every mode (it is the route).
+            let control_route = c.mode == "control"
+                || c.provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID;
             match key.as_str() {
-                "control" if c.mode == "control" => spec.control = Some(source),
+                "control" if control_route => spec.control = Some(source),
                 "ip_adapter" if c.mode == "ip_adapter" => spec.ip_adapter = Some(source),
                 "control" | "ip_adapter" => {}
                 _ => {
@@ -309,11 +388,26 @@ impl DeviceProvider<'_> {
         let spec = snapshot(&self.root, c)?;
         // A control / IP-Adapter case without its provisioned component would silently run as
         // another route: a provisioning failure, never admission or refusal evidence.
-        if c.provider == "sdxl" && c.mode == "control" && spec.control.is_none() {
-            return Err("SDXL control case needs a provisioned `control` component (components.json); not admission/refusal evidence".into());
+        if ((c.provider == "sdxl" && c.mode == "control")
+            || c.provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID)
+            && spec.control.is_none()
+        {
+            return Err(format!("{} {} case needs a provisioned `control` component (components.json); not admission/refusal evidence", c.provider, c.mode).into());
         }
         if c.mode == "ip_adapter" && spec.ip_adapter.is_none() {
             return Err("IP-Adapter case needs a provisioned `ip_adapter` component (components.json); not admission/refusal evidence".into());
+        }
+        // Z-Image Turbo's stored-tier artifact policy runs before its contract reads any header (the
+        // provider's own tier guard would otherwise surface it as an untyped backend failure).
+        if runtime_ios::media::zimage::is_z_image(&c.provider) {
+            match runtime_ios::media::zimage::check_artifact(&c.provider, &spec) {
+                Ok(()) => {}
+                Err(Error::Unsupported(reason)) => {
+                    self.refusal_kind = Some("artifact");
+                    return Err(AdmissionError::Refused(reason));
+                }
+                Err(e) => return Err(e.to_string().into()),
+            }
         }
         let contract = self
             .registry
@@ -337,7 +431,7 @@ impl DeviceProvider<'_> {
                 self.refusal_kind = Some("strategy");
                 AdmissionError::Refused(e.to_string())
             })?;
-        let work = work(c, &self.cancel)?;
+        let work = work(c, &self.cancel, self.registry)?;
         let candidate = runtime_ios::media::build_candidate(
             self.registry,
             &c.provider,
@@ -409,6 +503,9 @@ impl DeviceProvider<'_> {
                                 "sdxl" => runtime_ios::media::load_sdxl(one),
                                 "anima_turbo" => runtime_ios::media::load_anima_turbo(one),
                                 "iris_3b" => runtime_ios::media::load_iris(one),
+                                id if runtime_ios::media::zimage::is_z_image(id) => {
+                                    runtime_ios::media::load_z_image_turbo(one)
+                                }
                                 _ => runtime_ios::media::load_sana(one),
                             };
                             Box::new(loaded.map_err(refused)?.1)

@@ -36,8 +36,14 @@ pub mod model_control;
 pub mod pipeline;
 pub mod preview;
 pub mod quant;
+// iOS execution-quantum labels and counted prices (epic 16774, sc-26433).
+pub(crate) mod quantum;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_proofs;
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_tests;
+#[cfg(test)]
+mod reachable_sizes;
 pub mod rope_embedder;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
@@ -243,12 +249,33 @@ pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 pub fn register_providers(
     registry: mlx_gen::gen_core::ProviderRegistryBuilder,
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry
+    let registry = register_turbo_control_generator(register_base_control_generator(
+        register_base_generator(register_turbo_generator(registry)),
+    ));
+    // The LoRA trainer and its perceptual/depth/dataset deps are the `training` feature, so an
+    // inference-only graph (the iOS bundle) compiles no trainer (sc-26265).
+    #[cfg(feature = "training")]
+    let registry = registry.register_trainer(training::REGISTRATION);
+    registry
+}
+
+/// The two Z-Image Turbo generators — `z_image_turbo` (text, image-to-image, LoRA/LoKr) and its
+/// Fun-Controlnet-Union control route `z_image_turbo_control` — with their complete memory
+/// registrations, and no trainer: the inference-only surface the iOS catalog ships (sc-26433).
+pub fn register_turbo_generators(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    register_turbo_control_generator(register_turbo_generator(registry))
+}
+
+/// Add `z_image_turbo` with its activation anchor and its complete memory-strategy registration
+/// (contract, weights-free fixture, behavior seam). No trainer.
+pub fn register_turbo_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
         .register_generator(model::REGISTRATION)
         .register_activation_memory(model::ACTIVATION_MEMORY_REGISTRATION)
-        .register_generator(model_base::REGISTRATION)
-        .register_generator(model_base_control::REGISTRATION)
-        .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -258,6 +285,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add the base `z_image` generator with its complete memory-strategy registration.
+pub fn register_base_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_base::REGISTRATION)
         .register_memory_strategy(model_base::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -267,6 +302,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_base::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add the base `z_image_control` generator with its complete memory-strategy registration.
+pub fn register_base_control_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_base_control::REGISTRATION)
         .register_memory_strategy(model_base_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -279,6 +322,14 @@ pub fn register_providers(
             },
         })
         .register_memory_behavior(model_base_control::MEMORY_BEHAVIOR_REGISTRATION)
+}
+
+/// Add `z_image_turbo_control` with its complete memory-strategy registration.
+pub fn register_turbo_control_generator(
+    registry: mlx_gen::gen_core::ProviderRegistryBuilder,
+) -> mlx_gen::gen_core::ProviderRegistryBuilder {
+    registry
+        .register_generator(model_control::REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
@@ -290,13 +341,7 @@ pub fn register_providers(
                 )
             },
         })
-        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION);
-    // The LoRA trainer and its perceptual/depth/dataset deps are the `training` feature, so an
-    // inference-only graph (the iOS bundle reaches this crate through `mlx-gen-anima`'s reuse of
-    // the Qwen3 `EncoderLayer`) compiles no trainer (sc-26265).
-    #[cfg(feature = "training")]
-    let registry = registry.register_trainer(training::REGISTRATION);
-    registry
+        .register_memory_behavior(model_control::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
 /// Build the complete explicit Z-Image MLX provider catalog.

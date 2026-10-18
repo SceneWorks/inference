@@ -1472,10 +1472,7 @@ fn metal_conv_transients() {
         ConvCall::new(&[1, 128, 128, 4], 2, &w(320, 3, 4), 1, 1),
     ] {
         assert!(!call.winograd());
-        assert_eq!(
-            call.transient(Backend::Metal),
-            call.weight_elements_for_test() * 2
-        );
+        assert_eq!(call.transient(Backend::Metal), call.weight_elements() * 2);
     }
     // The fp16-fix VAE's f32-accumulating upsample tile prices its f32 promoted crop; the f32 path
     // has none.
@@ -2166,7 +2163,7 @@ mod proofs {
         let narrow = ConvCall::new(x16.shape(), 2, &wo, 1, 1);
         assert_eq!(
             call.transient(Backend::Metal) - narrow.transient(Backend::Metal),
-            call.weight_elements_for_test() * 2
+            call.weight_elements() * 2
         );
     }
 

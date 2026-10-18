@@ -47,6 +47,40 @@ impl ResnetBlock2D {
         })
     }
 
+    /// `(conv1, conv2)` NHWC weights (the reachable-sizes prediction prices tiled stages with them).
+    #[cfg(test)]
+    pub(crate) fn conv_weights(&self) -> (&Array, &Array) {
+        (&self.conv1_w, &self.conv2_w)
+    }
+
+    /// The resnet as one iOS quantum, priced by [`Self::quantum_scratch`]; a pass-through off
+    /// device.
+    pub(crate) fn forward_quantum(&self, x_nchw: &Array) -> Result<Array> {
+        crate::quantum::conv_quantum(
+            crate::quantum::VAE_RESNET,
+            |backend| self.quantum_scratch(x_nchw, backend),
+            || self.forward(x_nchw),
+        )
+    }
+
+    /// The resnet's counted price over `x_nchw` ([`mlx_gen::ios_quantum::resnet_bytes`]: GroupNorm,
+    /// SiLU, both convolutions and their kernel transients, the 1x1 shortcut's output, at the input
+    /// width) plus the shortcut convolution's own kernel transient.
+    pub(crate) fn quantum_scratch(
+        &self,
+        x_nchw: &Array,
+        backend: mlx_gen::ios_quantum::Backend,
+    ) -> u64 {
+        let act = x_nchw.item_size() as u64;
+        let x = crate::quantum::nhwc(x_nchw);
+        // The 1x1 shortcut convolution's own kernel transient (its output is counted).
+        let shortcut = self.shortcut.as_ref().map_or(0, |(w, _)| {
+            mlx_gen::ios_quantum::ConvCall::new(&x, act, w, 1, 0).transient(backend)
+        });
+        mlx_gen::ios_quantum::resnet_bytes(&x, act, act, &self.conv1_w, &self.conv2_w, backend)
+            .saturating_add(shortcut)
+    }
+
     pub fn forward(&self, x_nchw: &Array) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?; // NHWC
 
@@ -77,6 +111,9 @@ impl ResnetBlock2D {
             return Err(Error::Canceled);
         }
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        // iOS: the tiled layer is one stage quantum (full-resolution input, both conv outputs,
+        // shortcut and sum), inside which every conv tile is checked on its own.
+        crate::quantum::before_tiled_stage(x.shape(), x.item_size() as u64, &self.conv1_w, true)?;
 
         let norm1 = GlobalGroupNorm::new(&x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let h = tiled_conv2d_3x3_nhwc(
@@ -85,7 +122,10 @@ impl ResnetBlock2D {
             Some(&self.conv1_b),
             tile_edge,
             cancel,
-            |tile| silu(&norm1.apply(tile)?),
+            |tile| {
+                crate::quantum::before_tile(tile, &self.conv1_w)?;
+                silu(&norm1.apply(tile)?)
+            },
         )?;
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
@@ -97,7 +137,10 @@ impl ResnetBlock2D {
             Some(&self.conv2_b),
             tile_edge,
             cancel,
-            |tile| silu(&norm2.apply(tile)?),
+            |tile| {
+                crate::quantum::before_tile(tile, &self.conv2_w)?;
+                silu(&norm2.apply(tile)?)
+            },
         )?;
 
         let residual = match &self.shortcut {
@@ -106,6 +149,9 @@ impl ResnetBlock2D {
         };
         let out = add(&residual, &h)?;
         out.eval()?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&out])?;
+        }
         Ok(out.transpose_axes(&[0, 3, 1, 2])?)
     }
 }

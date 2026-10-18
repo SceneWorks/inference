@@ -2579,6 +2579,7 @@ dependencies = [
  "mlx-gen-iris",
  "mlx-gen-sana",
  "mlx-gen-sdxl",
+ "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde",
@@ -3604,6 +3605,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
  "tempfile",
 ]
 

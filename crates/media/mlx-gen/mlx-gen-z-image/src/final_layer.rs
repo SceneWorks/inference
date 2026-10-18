@@ -45,6 +45,12 @@ impl FinalLayer {
         Ok(())
     }
 
+    /// Both projections (the patch-space `linear`, the adaLN modulation), for the iOS output
+    /// quantum's weight-copy and adapter accounting.
+    pub(crate) fn projections(&self) -> [&AdaptableLinear; 2] {
+        [&self.linear, &self.ada]
+    }
+
     /// `x`: `(B, S, H)`, `c` (timestep emb): `(B, min(H,256))` → `(B, S, out_channels)`.
     pub fn forward(&self, x: &Array, c: &Array) -> Result<Array> {
         let ada_out = self.ada.forward(&silu(c)?)?;

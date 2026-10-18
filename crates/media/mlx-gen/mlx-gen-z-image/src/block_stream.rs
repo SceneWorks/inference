@@ -203,24 +203,45 @@ impl ZImageBlockStream {
 
     /// Materialize base block `index` out of `view`, quantized and adapted exactly like its resident
     /// twin, then drain the view of precisely the tensors that block read.
+    #[cfg(test)]
     pub(crate) fn materialize(
         &self,
         view: &mut Weights,
         index: usize,
     ) -> Result<ZImageTransformerBlock> {
+        Ok(self.materialize_counted(view, index)?.0)
+    }
+
+    /// [`Self::materialize`], also returning what the block's iOS quantum adds for having been
+    /// materialized here: the stored bytes of exactly the tensors it read (dtype x shape off the
+    /// lazy handles, never read here — the read happens inside the quantum) plus, when the stack
+    /// replays a load-time quantization over dense weights, the packed copies it builds.
+    pub(crate) fn materialize_counted(
+        &self,
+        view: &mut Weights,
+        index: usize,
+    ) -> Result<(ZImageTransformerBlock, u64)> {
         let prefix = self.check(index, false)?;
         let mut block = ZImageTransformerBlock::from_weights(view, &prefix, self.cfg)?;
+        let mut extra = stored_bytes(view);
         // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
         // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
         // real release rather than a no-op that still produces correct images.
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
+            extra = extra.saturating_add(
+                block
+                    .projections()
+                    .iter()
+                    .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+                    .sum::<u64>(),
+            );
             block.quantize(bits)?;
         }
         if let Some(adapters) = self.adapters.get(index) {
             adapters.install(&mut block)?;
         }
-        Ok(block)
+        Ok((block, extra))
     }
 
     /// Materialize ControlNet block `index` — the base submodules plus the `after_proj` hint
@@ -234,7 +255,7 @@ impl ZImageBlockStream {
         &self,
         view: &mut Weights,
         index: usize,
-    ) -> Result<crate::control_transformer_block::ZImageControlBlock> {
+    ) -> Result<(crate::control_transformer_block::ZImageControlBlock, u64)> {
         let prefix = self.check(index, true)?;
         let mut block = crate::control_transformer_block::ZImageControlBlock::from_weights(
             view,
@@ -242,12 +263,26 @@ impl ZImageBlockStream {
             self.cfg,
             index == 0,
         )?;
+        // As for a base block: the stored bytes the quantum reads, plus the packed copies of a
+        // load-time quantization replayed over the (dense-only published) ControlNet weights.
+        let mut extra = stored_bytes(view);
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
+            extra = extra.saturating_add(block.quantize_bytes(bits));
             block.quantize(bits)?;
         }
-        Ok(block)
+        Ok((block, extra))
     }
+}
+
+/// Stored bytes of the tensors a constructor read from `view` (header dtype x shape of the lazy
+/// handles; nothing is read here).
+fn stored_bytes(view: &Weights) -> u64 {
+    view.accessed_entries()
+        .iter()
+        .fold(0u64, |total, (_, array)| {
+            total.saturating_add(array.nbytes() as u64)
+        })
 }
 
 /// The plan + cancellation a windowed forward runs under. A thin pair so the forward signatures do not
