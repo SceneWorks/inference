@@ -1010,8 +1010,8 @@ fn phase_loads_check_the_header_floor_before_construction() {
 // Every quantum type's counted formula, proven against MLX's measured peak
 // (`mlx_gen::ios_quantum::measured_peak_bytes`) on the REAL module at the shipped bf16 storage and
 // compute width, with every input and resident weight materialized first, so the measurement is the
-// quantum body's own allocation. Each proof asserts formula >= measured and formula <= MAX_RATIO x
-// measured (`mlx_gen::ios_quantum::assert_tracks_measured`).
+// quantum body's own allocation. Each proof asserts formula >= measured (hard) and reports a ratio
+// above MAX_RATIO (`mlx_gen::ios_quantum::assert_tracks_measured`: report-only).
 
 /// The largest ratio any counted Anima formula may hold over its measured peak.
 const MAX_RATIO: f64 = 1.5;

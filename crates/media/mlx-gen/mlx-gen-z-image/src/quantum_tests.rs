@@ -580,6 +580,29 @@ fn assert_checked_before_synchronized(events: &[QuantumEvent]) {
     }
 }
 
+/// Two DIFFERENT graphs of the same math (a tiled vs a whole-image encode, a chunked vs an
+/// unchunked attention) agree to float reassociation, not bit for bit — the CI runner's kernels
+/// round some values 1-70 ULP differently from this Mac's. Held to the tiled-encode parity
+/// standard, `1e-5 · max(1, peak)` (SANA's `dc_ae` tiled-encode proof); a halo, stitch or chunking
+/// error moves an output by O(1e-1). Returns the max delta. Exact bit compares are kept only for
+/// the same graph run guarded and unguarded.
+fn assert_cross_graph_parity(label: &str, got: &Array, want: &Array) -> f32 {
+    assert_eq!(got.shape(), want.shape(), "{label}: shape");
+    let (got, want) = (bits(got), bits(want));
+    let peak = want
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
+    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &v)| {
+        m.max((f32::from_bits(g) - f32::from_bits(v)).abs())
+    });
+    eprintln!("{label}: max delta {delta:.3e} (peak {peak:.3e})");
+    assert!(
+        delta <= 1e-5 * peak.max(1.0),
+        "{label}: moved {delta:.3e} from its reference (peak {peak:.3e})"
+    );
+    delta
+}
+
 fn bits(a: &Array) -> Vec<u32> {
     let f = a.as_dtype(Dtype::Float32).unwrap();
     f.eval().unwrap();
@@ -692,18 +715,10 @@ fn chunked_vae_attention_matches_the_unchunked_attention() {
     );
     let whole = attention.forward(&x).unwrap();
     let chunked = attention.forward_planned(&x, plan).unwrap();
-    assert_eq!(chunked.shape(), whole.shape());
-    let (got, want) = (bits(&chunked), bits(&whole));
-    let peak = want
-        .iter()
-        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
-    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &v)| {
-        m.max((f32::from_bits(g) - f32::from_bits(v)).abs())
-    });
-    eprintln!("chunked VAE attention: {chunks} chunks, max delta {delta:.3e} (peak {peak:.3e})");
-    assert!(
-        delta <= 1e-5 * peak.max(1.0),
-        "chunked attention moved {delta:.3e} from the unchunked attention (peak {peak:.3e})"
+    assert_cross_graph_parity(
+        &format!("chunked VAE attention ({chunks} chunks)"),
+        &chunked,
+        &whole,
     );
 }
 
@@ -798,20 +813,9 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     let image = rand(&[1, 3, 40, 40], 77, Dtype::Float32);
     let whole = vae.encode(&image).unwrap();
     let tiled = vae.encode_tiled(&image, 16, None).unwrap();
-    assert_eq!(tiled.shape(), whole.shape());
-    let (got, want) = (bits(&tiled), bits(&whole));
-    let peak = want
-        .iter()
-        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
-    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &v)| {
-        m.max((f32::from_bits(g) - f32::from_bits(v)).abs())
-    });
-    eprintln!("bounded encode: max delta {delta:.3e} (peak {peak:.3e})");
-    assert!(
-        delta <= 1e-5 * peak.max(1.0),
-        "the bounded encode moved {delta:.3e} from the whole-image encode (peak {peak:.3e})"
-    );
-    // Guarded: the same graph, bit for bit; every layer one stage (conv_in, the two resnets, the
+    assert_cross_graph_parity("bounded encode", &tiled, &whole);
+    let got = bits(&tiled);
+    // Guarded: the same graph (its 400-token mid attention fits one chunk), bit for bit; every layer one stage (conv_in, the two resnets, the
     // downsample) and every stage's tiles checked inside it, before their graphs.
     let (guarded, events) = observed(AMPLE, || vae.encode_tiled(&image, 16, None));
     assert_eq!(bits(&guarded.unwrap()), got);
@@ -870,12 +874,13 @@ fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
     assert!(checks(&events)
         .iter()
         .any(|(l, _)| l == crate::quantum::VAE_ENCODE_TILED_STAGE));
-    assert_eq!(
-        bits(&routed.unwrap()),
-        bits(
-            &vae.encode_tiled(&big, crate::vae::decoder::IOS_ENCODE_TILE_PX, None)
-                .unwrap()
-        )
+    // A different graph from the unguarded bounded encode: on device the 17,424-token mid
+    // attention runs query-chunked.
+    assert_cross_graph_parity(
+        "routed bounded encode",
+        &routed.unwrap(),
+        &vae.encode_tiled(&big, crate::vae::decoder::IOS_ENCODE_TILE_PX, None)
+            .unwrap(),
     );
     let (_, events) = observed(AMPLE, || vae.encode(&image));
     assert!(!checks(&events)

@@ -99,6 +99,18 @@ scripts/ios/push_model.sh "$ZIMAGE_MLX/q4" --campaign-route z_image_turbo --tier
   --control "$ZIMAGE_TURBO_FUN_CONTROLNET_UNION" --device "$DEVICE"
 ```
 
+**Quantum pricing: safety on the host, accuracy on the device.** Every counted
+quantum price is proven on the host CPU against MLX's stalled peak
+(`mlx_gen::ios_quantum::measured_peak_bytes`). Formula ≥ measured is a HARD
+failure: it is the safety bound, and host load only lowers that measurement.
+Formula ≤ 1.5× measured is REPORT-ONLY: an over-ratio prints
+`PRICING-RATIO-HIGH <label> <ratio>` and the test passes. The CPU's in-flight
+window (about 11 single-op tasks) cannot observe the phone's wider retention (up
+to ten in-flight command buffers of up to 20 ops / 40 MB each), and it swings with
+host load. Low-end accuracy is therefore calibrated here, on the device: the
+fully optimized anchor captures and the validation case of this campaign
+calibrate the formulas. There are no per-proof allowances.
+
 Campaign case keys are `provider/route/tier/edge/mode/rung/selection/steps`. The
 selection token is the cell's memory selection from the provider's OWN declared
 space (`MemoryProviderContract::selection_space`, read from its weights-free
