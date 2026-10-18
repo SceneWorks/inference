@@ -8,8 +8,8 @@
 //! | 0 | [`MemoryStrategy::Resident`] | implemented | implemented | implemented |
 //! | 1 | [`MemoryStrategy::StagedResidency`] | **implemented** — the Qwen3-VL tower is loaded, encodes, and is dropped before the backbone loads | not applicable — no text encoder | not applicable — no text encoder |
 //! | 2 | [`MemoryStrategy::BoundedDecode`] | not applicable — pixel space, no decoder | not applicable | not applicable |
-//! | 3 | [`MemoryStrategy::BoundedAttention`] | implemented (query rows) | missing | missing |
-//! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | missing | missing | missing |
+//! | 3 | [`MemoryStrategy::BoundedAttention`] | implemented (query rows, per-row PiT stage) | missing | missing |
+//! | 4 | [`MemoryStrategy::BoundedTransformerResidency`] | **implemented on a deferred load** — the backbone's four block stacks and the Qwen3-VL tower's layers by window ([`crate::stream`]) | implemented on a deferred load (backbone) | implemented on a deferred load (backbone) |
 //!
 //! # What each declaration is true of
 //!
@@ -32,8 +32,17 @@
 //!   is why the contract publishes [`MemoryStrategy::Resident`] only and a pixel-count formula: a
 //!   tiling "rung" would be one the engine could not decline.
 //! * **Rung 3** is request-selected on generation, including the GQA trunk, text adapter and pixel
-//!   stage. It is tolerance-equivalent, not bit-exact. Rung 4 remains missing: no window loader is
-//!   claimed without evidence that it lowers peak. Encoder-free routes keep resident attention.
+//!   stage, and runs the PiT stage one batch row at a time (its rows never attend to each other).
+//!   It is tolerance-equivalent, not bit-exact. Encoder-free routes keep resident attention.
+//! * **Rung 4** exists only on a `LoadShape::DeferredMaterialization` load (the shared prerequisite):
+//!   such a load holds each component's skeleton and reads its block stacks per window
+//!   ([`crate::stream`], `BlockStream`, [`crate::text_encoder::IrisTextEncoder::load_streamed`]).
+//!   Generation selects the window and the component scope (`Dit`, `TextEncoder`, `Both`) per
+//!   request; a component outside the selected scope runs its whole stack as one window, so a
+//!   deferred load never keeps a stack resident. The encoder-free routes have no request channel
+//!   for a selection: their deferred load always streams at the published window. A streamed load
+//!   reads the artifact's own tier — the dense release at the dense tier, a packed export at its
+//!   tier — and carries no adapter stack (refused by name).
 //!
 //! # Nothing here is a measurement
 //!
@@ -89,17 +98,23 @@ pub const ATTENTION_CHUNK_SIZE: u32 = 67_108_864;
 pub const ATTENTION_NOT_ENABLED: &str =
     "encoder-free Iris routes have no request-selected attention carrier";
 
-/// Why rung 4 is declared `Missing` on every Iris route (applicable, not enabled).
-///
-/// Every loader here materializes the whole backbone and evaluates each parameter before it
-/// returns ([`crate::model::load_backbone_with_adapters`]); there is no deferred-materialization
-/// load shape, no per-block inference loader and no window hook in the inference forward. The
-/// block-level constructors on `IrisDiT` (`load_trunk_block`, `load_pixel_block`) serve the
-/// trainer's activation-checkpointing recompute from tensors already in memory, not a streamed
-/// read. Building the streamed loader is a new load path, not a declaration.
-pub const TRANSFORMER_WINDOW_NOT_ENABLED: &str =
-    "the Iris loaders materialize and evaluate the whole backbone at load; there is no \
-     deferred-materialization load shape or block-window inference loader";
+/// Why rung 4 is `Missing` on an eager load: its stacks are materialized and held, so a window
+/// would add a second copy of a block rather than bound residency. Load with
+/// `LoadShape::DeferredMaterialization`.
+pub const TRANSFORMER_WINDOW_NEEDS_DEFERRED_LOAD: &str =
+    "an eager Iris load materializes and holds its block stacks; bounded transformer residency \
+     needs a deferred-materialization load";
+
+/// The rung-4 component scopes of generation (both transformers stream; each scope is real).
+pub const GENERATION_WINDOW_COMPONENTS: &[gen_core::TransformerComponent] = &[
+    gen_core::TransformerComponent::Dit,
+    gen_core::TransformerComponent::TextEncoder,
+    gen_core::TransformerComponent::Both,
+];
+
+/// The rung-4 component scope of the encoder-free routes: the backbone, their one transformer.
+pub const ENCODER_FREE_WINDOW_COMPONENTS: &[gen_core::TransformerComponent] =
+    &[gen_core::TransformerComponent::Dit];
 
 /// The Iris task a registered provider id names.
 fn task_of(provider_id: &str) -> CoreResult<IrisTask> {
@@ -190,16 +205,15 @@ const fn export_tier(precision: Precision, quant: Option<gen_core::Quant>) -> Me
     }
 }
 
-/// Refuse a deferred-materialization load shape. No Iris loader has one: each materializes and
-/// evaluates the whole backbone before it returns (see [`TRANSFORMER_WINDOW_NOT_ENABLED`]), so a
-/// deferred spec would be accepted and silently loaded eagerly. The three loaders and the
-/// contract factories share this one refusal.
-pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResult<()> {
-    if spec.load_shape != LoadShape::EagerMaterialization {
+/// Refuse an adapter stack on a deferred-materialization (streamed) load: the adapters are
+/// installed on the projections of the materialized backbone, which a streamed load never holds —
+/// each window rebuilds its blocks from the checkpoint. The loaders and the contract factories
+/// share this one refusal.
+pub(crate) fn refuse_streamed_adapters(id: &str, spec: &LoadSpec) -> CoreResult<()> {
+    if spec.load_shape == LoadShape::DeferredMaterialization && !spec.adapters.is_empty() {
         return Err(CoreError::Unsupported(format!(
-            "{id}: LoadSpec::load_shape {:?} is not supported; the Iris-3B loaders have no \
-             deferred/block-window load path, use EagerMaterialization",
-            spec.load_shape
+            "{id}: LoadSpec::adapters cannot ride a deferred-materialization (streamed) load; each \
+             window rebuilds its blocks from the checkpoint, so load the adapters eagerly"
         )));
     }
     Ok(())
@@ -236,7 +250,7 @@ pub(crate) fn refuse_unloadable_quant(id: &str, spec: &LoadSpec) -> CoreResult<(
 /// `LoadSpec::adapters`; only generation installs adapters, and prices them as overlays).
 fn refuse_unloadable_spec(task: IrisTask, spec: &LoadSpec) -> CoreResult<()> {
     let id = provider_id(task);
-    refuse_deferred_load_shape(id, spec)?;
+    refuse_streamed_adapters(id, spec)?;
     // Every task names the q8 / q4 tiers: generation quantizes a dense release at load or reads a
     // packed artifact; the encoder-free tasks read a packed export only (`crate::packed`). Which
     // one the resources on disk are decides the calibration identity (see
@@ -294,28 +308,31 @@ fn base_contract(
     precision: Precision,
     quant: Option<gen_core::Quant>,
     config: Option<&IrisConfig>,
+    load_shape: LoadShape,
 ) -> MemoryProviderContract {
+    // Rung 4's one prerequisite: the deferred load that holds only the skeletons.
+    let streamable = load_shape == LoadShape::DeferredMaterialization;
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id(task),
         MemoryBackendRealization::MlxMetal {
             // Unified memory: a released phase returns to the wired-residency budget.
             bounded_wired_residency: true,
-            // Not declared: every loader casts each tensor to the compute dtype and evaluates it
-            // before returning, so the resident arrays are materialized copies, never the mapped
-            // file.
-            lazy_or_mmap_materialization: false,
+            // An eager load casts each tensor to the compute dtype and evaluates it before
+            // returning, so its arrays are materialized copies; a deferred load reads its block
+            // stacks from the mapped checkpoint per window.
+            lazy_or_mmap_materialization: streamable,
             // The conditioning is evaluated inside the encode and every solver step ends in an
             // `eval`, so a phase drop frees what it names.
             explicit_evaluation_and_synchronization: true,
             cache_eviction: true,
         },
     );
-    // The only shape any Iris loader has; a deferred spec is refused before a contract is built.
-    contract.load_shape = LoadShape::EagerMaterialization;
+    // Load shape is a typed axis of the calibration identity, never part of the fingerprint.
+    contract.load_shape = load_shape;
     contract.architecture_facts = architecture_facts(config, precision);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         calibration_fingerprint_for(task, precision, quant),
-        LoadShape::EagerMaterialization,
+        load_shape,
     ));
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
     // loaded policy: warm for a `Resident` load, staged for a `Sequential` one.
@@ -336,29 +353,36 @@ fn base_contract(
             synchronized_phase_release: true,
             decode_tiling: false,
             attention_chunking: true,
-            transformer_window_materialization: false,
+            transformer_window_materialization: streamable,
         };
+        // The text window is a fixed `text_len`, so the token count is not a request variable:
+        // the transient moves with the pixel count and with the rows one solve batches (the
+        // prompt batch, doubled under CFG) — and, streamed, with the window.
+        let mut variables = vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+            MemoryFormulaVariable::BatchCount,
+        ];
+        if streamable {
+            variables.push(MemoryFormulaVariable::TransformerWindowSize);
+        }
         contract.formula = MemoryFormulaKind::PhaseEnvelope {
             phases: contract.lifecycle.phases.clone(),
-            // The text window is a fixed `text_len`, so the token count is not a request variable:
-            // the transient moves with the pixel count and with the rows one solve batches (the
-            // prompt batch, doubled under CFG).
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::BatchCount,
-            ],
+            variables,
         };
     } else {
         // One forward (depth) or one forward per tile (restoration), no phases to separate. Depth
         // scales with the model-input pixel count; restoration's accelerator transient is bounded
         // by one tile while its host fusion canvas scales with the output pixel count.
-        contract.formula = MemoryFormulaKind::Affine {
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-            ],
-        };
+        let mut variables = vec![
+            MemoryFormulaVariable::AssetBytes,
+            MemoryFormulaVariable::PixelCount,
+        ];
+        if streamable {
+            contract.lifecycle.transformer_window_materialization = true;
+            variables.push(MemoryFormulaVariable::TransformerWindowSize);
+        }
+        contract.formula = MemoryFormulaKind::Affine { variables };
     }
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
@@ -386,12 +410,23 @@ fn base_contract(
                 },
             },
             MemoryStrategy::BoundedAttention if staged => MemoryStrategySupport::Implemented,
-            MemoryStrategy::BoundedAttention | MemoryStrategy::BoundedTransformerResidency => {
-                MemoryStrategySupport::Missing
+            MemoryStrategy::BoundedAttention => MemoryStrategySupport::Missing,
+            MemoryStrategy::BoundedTransformerResidency if streamable => {
+                MemoryStrategySupport::Implemented
             }
+            MemoryStrategy::BoundedTransformerResidency => MemoryStrategySupport::Missing,
         };
         if capability.strategy == MemoryStrategy::BoundedAttention && staged {
             capability.parameters.attention_chunk_sizes = vec![ATTENTION_CHUNK_SIZE];
+        }
+        if capability.strategy == MemoryStrategy::BoundedTransformerResidency && streamable {
+            capability.parameters.transformer_window_sizes =
+                crate::stream::TRANSFORMER_WINDOW_SIZES.to_vec();
+            capability.parameters.transformer_window_components = if staged {
+                GENERATION_WINDOW_COMPONENTS.to_vec()
+            } else {
+                ENCODER_FREE_WINDOW_COMPONENTS.to_vec()
+            };
         }
     }
     contract
@@ -406,7 +441,13 @@ pub fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     let task = task_of(provider_id)?;
     refuse_unloadable_spec(task, spec)?;
-    Ok(base_contract(task, spec.precision, spec.quantize, None))
+    Ok(base_contract(
+        task,
+        spec.precision,
+        spec.quantize,
+        None,
+        spec.load_shape,
+    ))
 }
 
 /// The executable contract for a real load: the declaration plus the resident bytes of what the
@@ -425,7 +466,13 @@ pub fn memory_strategy_contract(
         }
         IrisTask::Depth => {
             let export = TaskExport::from_spec(spec, IrisTask::Depth, DEPTH_MODEL_ID)?;
-            export_contract(IrisTask::Depth, spec.precision, spec.quantize, &export)
+            export_contract(
+                IrisTask::Depth,
+                spec.precision,
+                spec.quantize,
+                &export,
+                spec.load_shape,
+            )
         }
         IrisTask::Restoration => {
             let resources = RestorationResources::from_spec(spec, RESTORE_MODEL_ID)?;
@@ -434,6 +481,7 @@ pub fn memory_strategy_contract(
                 spec.precision,
                 spec.quantize,
                 &resources.export,
+                spec.load_shape,
             )
         }
     }
@@ -457,7 +505,31 @@ pub(crate) fn generation_contract(
     )?;
     let text_tier = crate::packed::text_encoder_tier(&resources.text_encoder_dir)?;
     let requested = spec.quantize.or(backbone_tier).or(text_tier);
-    let mut contract = base_contract(IrisTask::Generation, precision, requested, Some(config));
+    if spec.load_shape == LoadShape::DeferredMaterialization {
+        // A streamed load reads each artifact at its own tier ([`crate::stream`]).
+        let id = MODEL_ID;
+        crate::stream::refuse_stream_requantization(
+            id,
+            "the backbone",
+            backbone_tier,
+            spec.quantize,
+        )
+        .map_err(CoreError::from)?;
+        crate::stream::refuse_stream_requantization(
+            id,
+            "the text encoder",
+            text_tier,
+            spec.quantize,
+        )
+        .map_err(CoreError::from)?;
+    }
+    let mut contract = base_contract(
+        IrisTask::Generation,
+        precision,
+        requested,
+        Some(config),
+        spec.load_shape,
+    );
     let quant = crate::nn::BackboneQuant::for_load(spec.quantize)?;
     let transformer = backbone_bytes(
         &resources
@@ -512,16 +584,22 @@ pub(crate) fn generation_contract(
 }
 
 /// The depth or restoration contract for an already-resolved task export, at the precision its
-/// loader computes in. The load shape is not a parameter: the loaders refuse a deferred spec
-/// ([`refuse_deferred_load_shape`]), so a loaded model is always eagerly materialized.
+/// loader computes in and the load shape it was (or will be) loaded with.
 pub(crate) fn export_contract(
     task: IrisTask,
     precision: Precision,
     requested: Option<gen_core::Quant>,
     export: &TaskExport,
+    load_shape: LoadShape,
 ) -> CoreResult<MemoryProviderContract> {
     let tier = crate::packed::artifact_tier(&export.weights_path())?;
-    let mut contract = base_contract(task, precision, requested.or(tier), Some(&export.config));
+    let mut contract = base_contract(
+        task,
+        precision,
+        requested.or(tier),
+        Some(&export.config),
+        load_shape,
+    );
     if !production_calibration_identity(&[tier], requested.or(tier)) {
         contract.calibration = None;
     }
@@ -571,9 +649,21 @@ pub(crate) fn backbone_bytes(
     precision: Precision,
     quant: Option<crate::nn::BackboneQuant>,
 ) -> CoreResult<u64> {
+    backbone_bytes_where(weights, precision, quant, |_| true)
+}
+
+/// [`backbone_bytes`] over only the tensors `keep(name)` names — a streamed load's skeleton
+/// (rung 4), whose block stacks are read per window instead of held.
+pub(crate) fn backbone_bytes_where(
+    weights: &Path,
+    precision: Precision,
+    quant: Option<crate::nn::BackboneQuant>,
+    keep: impl Fn(&str) -> bool,
+) -> CoreResult<u64> {
     let width = u64::from(compute_width(precision));
     let mut total = 0_u64;
-    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
+    let mut headers = gen_core::weightsmeta::safetensors_path_tensor_headers(weights)?;
+    headers.retain(|h| keep(&h.name));
     // A packed artifact (`crate::packed`) is resident exactly as stored: its codes, scales,
     // biases and logical-width markers.
     let packed: std::collections::HashSet<&str> = headers
@@ -1033,56 +1123,63 @@ pub(crate) fn registered_begin_request(
     if let MemorySafetyDecision::Reject { reason } = safety_check(spec, contract, context) {
         return Err(CoreError::Unsupported(reason));
     }
-    if !task_of(&contract.provider_id)?.uses_text_encoder() {
+    let task = task_of(&contract.provider_id)?;
+    let windowed = context.selection.strategy == MemoryStrategy::BoundedTransformerResidency;
+    // The encoder-free routes take no `GenerationRequest`: their only request-scoped lever is the
+    // rung-4 window their deferred load runs, whose window bookkeeping the shared scope owns.
+    if !task.uses_text_encoder() && !windowed {
         return Ok(None);
     }
+    let id = provider_id(task);
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
-        MODEL_ID,
+        id,
         context.geometry,
         contract.generation_memory(&context.selection),
         context.use_pid,
+        // The trunk depth when the contract knows the checkpoint; weights-free, the window
+        // bookkeeping is bounded by the loaded stacks themselves.
         contract
             .architecture_facts
             .transformer_blocks
-            .unwrap_or_default() as usize,
-        |_use_pid, _edge, _overlap| {
+            .map_or(u32::MAX as usize, |blocks| blocks as usize),
+        move |_use_pid, _edge, _overlap| {
             Err(CoreError::Unsupported(format!(
-                "{MODEL_ID}: pixel space has no decoder to tile"
+                "{id}: pixel space has no decoder to tile"
             )))
         },
     )?;
     config.attention_chunk_size = config.memory.and_then(|m| m.attention_chunk_size);
+    config.load_shape = contract.load_shape;
+    config.transformer_window = windowed
+        .then_some(())
+        .and(context.selection.parameters.transformer_window_size);
+    let core = mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
+        config,
+        mlx_gen::request_scope::MlxScopeCleanup::Device,
+    );
+    if !task.uses_text_encoder() {
+        return Ok(Some(Box::new(core)));
+    }
     Ok(Some(Box::new(GenerationRequestScope {
-        core: mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
-            config,
-            mlx_gen::request_scope::MlxScopeCleanup::Device,
-        ),
+        core,
         admitted_images: context.geometry.batch,
     })))
 }
 
-/// The registry-load surface the two encoder-free routes witness: the one dense tier, eagerly
-/// materialized, under both offload policies (advisory there: those tasks are always resident).
-/// Neither loader accepts a quantized tier or has a deferred-materialization load shape, so
-/// neither is witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the two encoder-free routes witness: the one dense tier (their
+/// packed tiers are separate exports), eagerly materialized and deferred (rung 4), under both
+/// offload policies (advisory there: those tasks have one heavy component).
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
         .into_iter()
-        .filter(|surface| {
-            surface.selector.tier == MemoryContractSurfaceTier::Bf16
-                && surface.selector.load_shape == LoadShape::EagerMaterialization
-        })
+        .filter(|surface| surface.selector.tier == MemoryContractSurfaceTier::Bf16)
         .collect()
 }
 
 /// The registry-load surface of generation (sc-26266): the dense tier and the two affine tiers
-/// the loader packs, eagerly materialized (there is no deferred loader), under both offload
-/// policies.
+/// the loader packs, eagerly materialized and deferred (rung 4), under both offload policies.
 pub fn generation_memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
-        .into_iter()
-        .filter(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization)
-        .collect()
 }
 
 /// Generation: the pre-load contract and admission check of `iris_3b`.
@@ -1245,37 +1342,41 @@ mod tests {
     ///
     /// *Mutations that red this:* declaring `StagedResidency` implemented on an encoder-free task
     /// (the shared conformance refuses a staged rung with no lifecycle phases); declaring it
-    /// `Missing` on generation; withdrawing the bounded-attention hook or promoting the
-    /// unimplemented transformer-window rung.
+    /// `Missing` on generation; withdrawing the bounded-attention hook; declaring rung 4 on an
+    /// eager surface, or withdrawing it from a deferred one.
     #[test]
     fn each_route_declares_exactly_the_rungs_its_engine_runs() {
         let dense = memory_contract_surface_specs();
-        // *Mutation that reds this:* dropping the eager filter in
-        // `memory_contract_surface_specs` (a deferred selector no loader can take reappears, and
-        // its contract construction is refused).
-        assert_eq!(
-            dense.len(),
-            2,
-            "one dense tier, eager, x 2 offload policies"
-        );
-        let selectors: Vec<_> = dense.iter().map(|s| s.selector.id()).collect();
-        assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
-        // sc-26266: generation witnesses the two affine tiers its loader packs as well.
-        // *Mutation that reds this:* dropping the eager filter, or filtering generation to bf16.
-        let generation = generation_memory_contract_surface_specs();
-        let mut selectors: Vec<_> = generation.iter().map(|s| s.selector.id()).collect();
+        // *Mutation that reds this:* re-adding an eager-only filter (the deferred surfaces the
+        // streamed loaders take disappear), or dropping the bf16 filter of the encoder-free routes.
+        let mut selectors: Vec<_> = dense.iter().map(|s| s.selector.id()).collect();
         selectors.sort();
         assert_eq!(
             selectors,
             [
+                "bf16:resident:deferred",
                 "bf16:resident:eager",
+                "bf16:sequential:deferred",
                 "bf16:sequential:eager",
-                "q4:resident:eager",
-                "q4:sequential:eager",
-                "q8:resident:eager",
-                "q8:sequential:eager",
             ]
         );
+        // sc-26266: generation witnesses the two affine tiers its loader packs as well, under both
+        // load shapes.
+        let generation = generation_memory_contract_surface_specs();
+        let mut selectors: Vec<_> = generation.iter().map(|s| s.selector.id()).collect();
+        selectors.sort();
+        assert_eq!(selectors.len(), 12, "{selectors:?}");
+        for tier in ["bf16", "q4", "q8"] {
+            for policy in ["resident", "sequential"] {
+                for shape in ["deferred", "eager"] {
+                    let id = format!("{tier}:{policy}:{shape}");
+                    assert!(
+                        selectors.iter().any(|s| *s == id),
+                        "{id} missing from {selectors:?}"
+                    );
+                }
+            }
+        }
         for task in TASKS {
             let surfaces = if task == IrisTask::Generation {
                 &generation
@@ -1309,6 +1410,7 @@ mod tests {
                 } else {
                     "not-applicable"
                 };
+                let streamed = surface.spec.load_shape == LoadShape::DeferredMaterialization;
                 let declared: Vec<String> = MemoryStrategy::ALL
                     .into_iter()
                     .map(|strategy| support(&contract, strategy))
@@ -1324,7 +1426,7 @@ mod tests {
                         } else {
                             "missing"
                         },
-                        "missing"
+                        if streamed { "implemented" } else { "missing" },
                     ],
                     "{} [{}]",
                     provider_id(task),
@@ -1336,7 +1438,10 @@ mod tests {
                     contract.lifecycle.attention_chunking,
                     task == IrisTask::Generation
                 );
-                assert!(!contract.lifecycle.transformer_window_materialization);
+                assert_eq!(
+                    contract.lifecycle.transformer_window_materialization,
+                    streamed
+                );
                 assert_eq!(
                     contract.lifecycle.synchronized_phase_release,
                     task == IrisTask::Generation
@@ -1534,38 +1639,101 @@ mod tests {
         assert!(weights_free_memory_strategy_contract("iris_3b_unknown", &sentinel()).is_err());
     }
 
-    /// No Iris loader has a deferred-materialization load shape, so a deferred spec has no
-    /// contract on any route — weights-free or against real resources.
+    /// A deferred-materialization load publishes rung 4 on every route — weights-free and against
+    /// real resources — at the one published window, with generation's three component scopes and
+    /// the encoder-free routes' backbone scope; its calibration identity keeps the tier's
+    /// fingerprint and carries the deferred shape on its typed axis. An eager load keeps rung 4
+    /// `Missing`. A streamed load refuses an adapter stack, and (generation) a dense artifact asked
+    /// for at a packed tier.
     ///
-    /// *Mutation that reds this:* removing `refuse_deferred_load_shape` from
-    /// `refuse_unloadable_spec`.
+    /// *Mutations that red this:* keying rung 4 on anything but the load shape; dropping the
+    /// window domain or a component scope; folding the load shape into the fingerprint; removing
+    /// `refuse_streamed_adapters` or the streamed requantization refusal.
     #[test]
-    fn a_deferred_load_shape_has_no_contract() {
+    fn a_deferred_load_shape_publishes_bounded_transformer_residency() {
+        use gen_core::TransformerComponent;
         for task in TASKS {
             let id = provider_id(task);
-            for result in [
+            for contract in [
                 weights_free_memory_strategy_contract(
                     id,
                     &sentinel().with_load_shape(LoadShape::DeferredMaterialization),
-                ),
+                )
+                .unwrap(),
                 memory_strategy_contract(
                     id,
                     &tiny_spec(task).with_load_shape(LoadShape::DeferredMaterialization),
-                ),
+                )
+                .unwrap(),
             ] {
-                match result {
-                    Err(CoreError::Unsupported(message)) => {
-                        assert!(message.contains("load_shape"), "{id}: {message}")
-                    }
-                    other => panic!("{id}: expected a typed refusal, got {other:?}"),
-                }
+                gen_core_testkit::memory_strategy_conformance(&contract);
+                assert_eq!(contract.load_shape, LoadShape::DeferredMaterialization);
+                let calibration = contract.calibration.as_ref().unwrap();
+                assert_eq!(calibration.load_shape, LoadShape::DeferredMaterialization);
+                assert_eq!(calibration.fingerprint, calibration_fingerprint(task));
+                let rung4 = contract
+                    .capability(MemoryStrategy::BoundedTransformerResidency)
+                    .unwrap();
+                assert_eq!(rung4.support, MemoryStrategySupport::Implemented);
+                assert_eq!(rung4.parameters.transformer_window_sizes, [1]);
+                let components = if task == IrisTask::Generation {
+                    vec![
+                        TransformerComponent::Dit,
+                        TransformerComponent::TextEncoder,
+                        TransformerComponent::Both,
+                    ]
+                } else {
+                    vec![TransformerComponent::Dit]
+                };
+                assert_eq!(rung4.parameters.transformer_window_components, components);
+                assert!(contract.lifecycle.transformer_window_materialization);
+                // The cheapest declared selection streams both components at window 1.
+                let space = contract
+                    .selection_space(
+                        MemoryStrategy::BoundedTransformerResidency,
+                        loaded_tier(&sentinel()),
+                        false,
+                    )
+                    .unwrap();
+                let last = space.last().unwrap();
+                assert_eq!(last.parameters.transformer_window_size, Some(1));
+                assert_eq!(
+                    last.parameters.transformer_window_component,
+                    components.last().copied()
+                );
             }
             let eager = weights_free(task);
             assert_eq!(eager.load_shape, LoadShape::EagerMaterialization);
             assert_eq!(
-                eager.calibration.unwrap().load_shape,
+                eager.calibration.as_ref().unwrap().load_shape,
                 LoadShape::EagerMaterialization
             );
+            assert_eq!(
+                support(&eager, MemoryStrategy::BoundedTransformerResidency),
+                "missing"
+            );
+        }
+        let mut adapted =
+            tiny_spec(IrisTask::Generation).with_load_shape(LoadShape::DeferredMaterialization);
+        adapted.adapters = vec![AdapterSpec::new(
+            fixtures().join("iris_lora.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        )];
+        match memory_strategy_contract(MODEL_ID, &adapted) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("adapters"), "{message}")
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+        let requantized = tiny_spec(IrisTask::Generation)
+            .with_load_shape(LoadShape::DeferredMaterialization)
+            .with_quant(Quant::Q4);
+        match memory_strategy_contract(MODEL_ID, &requantized) {
+            Err(CoreError::Unsupported(message)) => {
+                assert!(message.contains("re-quantize"), "{message}")
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
         }
     }
 
@@ -1972,11 +2140,16 @@ mod tests {
         );
 
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // Generation: three tiers x two policies (sc-26266); depth and restoration: bf16 x two.
-        assert_eq!(surfaces.len(), 3 * 2 + 2 + 2);
-        assert!(surfaces
-            .iter()
-            .all(|surface| surface.selector.load_shape == LoadShape::EagerMaterialization));
+        // Generation: three tiers x two policies x two load shapes (sc-26266, rung 4); depth and
+        // restoration: bf16 x two policies x two load shapes.
+        assert_eq!(surfaces.len(), 3 * 2 * 2 + 2 * 2 + 2 * 2);
+        assert_eq!(
+            surfaces
+                .iter()
+                .filter(|surface| surface.selector.load_shape == LoadShape::DeferredMaterialization)
+                .count(),
+            surfaces.len() / 2
+        );
         // Depth is a provider-specific API and restoration a transform: both are composed routes.
         for surface in &surfaces {
             assert_eq!(
@@ -1989,7 +2162,7 @@ mod tests {
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
         let coverage =
             gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
-        assert_eq!(coverage.surfaces_checked, 10);
+        assert_eq!(coverage.surfaces_checked, 20);
         for load_shape in [
             LoadShape::EagerMaterialization,
             LoadShape::DeferredMaterialization,

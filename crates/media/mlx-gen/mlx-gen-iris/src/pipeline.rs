@@ -27,16 +27,31 @@ pub struct Conditioning {
 /// negative prompt run through the same template — `""` is the training-dropout null — and is only
 /// encoded when CFG is on.
 pub fn encode(te: &IrisTextEncoder, params: &GenerationParams) -> Result<Conditioning> {
+    encode_in(te, params, None, &CancelFlag::default())
+}
+
+/// [`encode`] with a streamed tower's layer window (rung 4) and the request's cancel flag.
+pub fn encode_in(
+    te: &IrisTextEncoder,
+    params: &GenerationParams,
+    layer_window: Option<usize>,
+    cancel: &CancelFlag,
+) -> Result<Conditioning> {
     let mut warnings = Vec::new();
     let mut cond = Vec::with_capacity(params.prompts.len());
     for prompt in &params.prompts {
-        let (c, warning) = te.encode_with_policy(prompt, params.caption_overflow)?;
+        let (c, warning) =
+            te.encode_with_policy_in(prompt, params.caption_overflow, layer_window, cancel)?;
         warnings.extend(warning);
         cond.push(c);
     }
     let uncond = if params.uses_cfg() {
-        let (u, warning) =
-            te.encode_with_policy(&params.negative_prompt, params.caption_overflow)?;
+        let (u, warning) = te.encode_with_policy_in(
+            &params.negative_prompt,
+            params.caption_overflow,
+            layer_window,
+            cancel,
+        )?;
         warnings.extend(warning);
         Some(u)
     } else {
@@ -104,9 +119,41 @@ pub fn denoise_budgeted(
     noise: &Array,
     params: &GenerationParams,
     cancel: &CancelFlag,
+    on_step: impl FnMut(usize),
+    preview: &PreviewSink,
+    budget: mlx_gen::AttentionBudget,
+) -> Result<Array> {
+    denoise_in(
+        dit,
+        flow,
+        conditioning,
+        noise,
+        params,
+        cancel,
+        on_step,
+        preview,
+        budget,
+        None,
+        false,
+    )
+}
+
+/// [`denoise_budgeted`] with rung 4's backbone window (`None`: a streamed backbone's whole-stack
+/// window; a resident backbone ignores it) and rung 3's per-row pixel stage
+/// ([`crate::dit::Execution`]).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_in(
+    dit: &IrisDiT,
+    flow: &FlowConfig,
+    conditioning: &Conditioning,
+    noise: &Array,
+    params: &GenerationParams,
+    cancel: &CancelFlag,
     mut on_step: impl FnMut(usize),
     preview: &PreviewSink,
     budget: mlx_gen::AttentionBudget,
+    window: Option<usize>,
+    pixel_rows: bool,
 ) -> Result<Array> {
     let plan = params.plan()?;
     let rows = conditioning.cond.len();
@@ -161,20 +208,28 @@ pub fn denoise_budgeted(
                 Some(batch) if params.cfg_at(step) => {
                     let xb = concatenate_axis(&[x, x], 0)?;
                     let tb = Array::from_slice(&vec![t; 2 * rows], &[2 * rows as i32]);
-                    let out = dit.forward_plan(
+                    let out = dit.forward_exec(
                         &xb,
                         &tb,
                         batch,
-                        mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                        crate::dit::Execution {
+                            plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                            window,
+                            pixel_rows,
+                        },
                     )?;
                     let halves = out.split(2, 0)?;
                     cfg_combine(&halves[0], &halves[1], params.cfg_scale)
                 }
-                _ => dit.forward_plan(
+                _ => dit.forward_exec(
                     x,
                     &Array::from_slice(&vec![t; rows], &[rows as i32]),
                     &cond_text,
-                    mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                    crate::dit::Execution {
+                        plan: mlx_gen::AttentionPlan::budgeted(budget).with_cancel(cancel),
+                        window,
+                        pixel_rows,
+                    },
                 ),
             }
         },

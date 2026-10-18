@@ -20,7 +20,7 @@ use mlx_rs::Dtype;
 
 use crate::dit::IrisDiT;
 use crate::nn::BackboneQuant;
-use crate::pipeline::{encode, noise_batch, to_images, Conditioning};
+use crate::pipeline::{encode_in, noise_batch, to_images, Conditioning};
 use crate::text_encoder::IrisTextEncoder;
 
 /// Registry id (the SceneWorks worker's `payload.model`).
@@ -124,6 +124,8 @@ pub struct Iris3b {
     /// The loaded memory contract ([`crate::memory_strategy::generation_contract`] over the
     /// resources on disk), published through [`Generator::memory_strategy_contract`].
     memory_strategy: gen_core::MemoryProviderContract,
+    /// A deferred-materialization load (rung 4): both components stream their stacks by window.
+    streamed: bool,
 }
 
 /// Whether one request runs staged: the request's admitted `GenerationMemory::stage_residency`
@@ -204,17 +206,7 @@ pub fn load_backbone_quantized(
         let Some(array) = weights.remove(&key) else {
             continue;
         };
-        // Read the file bytes on MLX's CPU stream first: a GPU cast over an unread `Load` makes the
-        // Metal command buffer wait on the disk, which on a cold page cache trips the GPU watchdog
-        // (sc-24245).
-        mlx_rs::transforms::eval_pending_loads([&array])?;
-        let array =
-            if array.ndim() >= 2 && key != "y_pos_embedding" && !is_packed_part(&key, &array) {
-                array.as_dtype(compute)?
-            } else {
-                array
-            };
-        eval([&array])?;
+        let array = read_backbone_tensor(&key, array, compute)?;
         weights.insert(key, array);
     }
     let installed = crate::adapters::install(&mut weights, compute, adapters, task, base_model)?;
@@ -234,6 +226,82 @@ pub fn load_backbone_quantized(
     Ok((dit, reports))
 }
 
+/// Read one backbone tensor the loaders' way: its file bytes on MLX's CPU stream first (a GPU cast
+/// over an unread `Load` makes the Metal command buffer wait on the disk, which on a cold page cache
+/// trips the GPU watchdog — sc-24245), then every matrix but the text position table and a packed
+/// projection's stored parts cast to the compute dtype, evaluated before the next tensor is read.
+pub(crate) fn read_backbone_tensor(
+    key: &str,
+    array: mlx_rs::Array,
+    compute: Dtype,
+) -> Result<mlx_rs::Array> {
+    mlx_rs::transforms::eval_pending_loads([&array])?;
+    let array = if array.ndim() >= 2 && key != "y_pos_embedding" && !is_packed_part(key, &array) {
+        array.as_dtype(compute)?
+    } else {
+        array
+    };
+    eval([&array])?;
+    Ok(array)
+}
+
+/// The streamed backbone of a deferred-materialization load (rung 4): the skeleton (every tensor
+/// but the four block stacks) read and evaluated now, the stacks read per window at forward time
+/// (`BlockStream`). `default_window` is the window a forward that names none runs
+/// (`None`: the whole stack). A packed artifact streams at its own tier; the dense release at the
+/// dense tier only (`refuse_stream_requantization`).
+pub fn load_backbone_streamed(
+    dir: &Path,
+    config: &IrisConfig,
+    compute: Dtype,
+    quant: Option<Quant>,
+    default_window: Option<usize>,
+) -> Result<IrisDiT> {
+    let path = dir.join(gen_core::iris::BACKBONE_WEIGHTS_FILE);
+    let artifact = crate::packed::artifact_tier(&path)?;
+    crate::packed::check_requested("the backbone", artifact, quant)?;
+    crate::stream::refuse_stream_requantization(MODEL_ID, "the backbone", artifact, quant)?;
+    if artifact.is_some() && compute != Dtype::Bfloat16 {
+        return Err(Error::Unsupported(format!(
+            "iris: {} is a packed {artifact:?} artifact, which runs under the bf16 compute policy",
+            path.display()
+        )));
+    }
+    let skeleton = |name: &str| crate::dit::Stack::of(name).is_none();
+    mlx_gen::ios_quantum::before_load_where(
+        BACKBONE_LOAD_QUANTUM,
+        std::slice::from_ref(&path),
+        skeleton,
+    )?;
+    let mut weights = Weights::from_file(&path)
+        .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
+    let mut keys: Vec<String> = weights.keys().map(str::to_owned).collect();
+    keys.sort();
+    for key in keys {
+        let Some(array) = weights.remove(&key) else {
+            continue;
+        };
+        // A stack tensor's lazy handle is dropped unread: its window reads it.
+        if skeleton(&key) {
+            let array = read_backbone_tensor(&key, array, compute)?;
+            weights.insert(key, array);
+        }
+    }
+    let stream = crate::dit::BlockStream::open(&path, "", &config.model, compute, default_window)?;
+    let dit = IrisDiT::from_weights_streamed(
+        &weights,
+        &config.model,
+        compute,
+        config.model.in_channels,
+        stream,
+    )?;
+    for group in dit.arrays().chunks(64) {
+        eval(group.iter().copied())?;
+    }
+    drop(weights);
+    Ok(dit)
+}
+
 /// Whether `key` is part of a packed projection ([`crate::packed`]): its u32 codes or its stored
 /// scales / biases, which every loader keeps exactly as stored.
 pub(crate) fn is_packed_part(key: &str, array: &mlx_rs::Array) -> bool {
@@ -241,7 +309,7 @@ pub(crate) fn is_packed_part(key: &str, array: &mlx_rs::Array) -> bool {
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
+    crate::memory_strategy::refuse_streamed_adapters(MODEL_ID, spec)?;
     crate::memory_strategy::refuse_unloadable_quant(MODEL_ID, spec)?;
     let refusals: [(&str, bool); 6] = [
         ("text_encoder", spec.text_encoder.is_some()),
@@ -284,10 +352,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let quant = spec.quantize;
     let adapter_reports = Arc::new(Mutex::new(Vec::new()));
     let reports_sink = Arc::clone(&adapter_reports);
+    // Rung 4: a deferred-materialization load streams both components' stacks by window; which
+    // window each runs is a per-request decision ([`request_rungs`]).
+    let streamed = spec.load_shape == gen_core::LoadShape::DeferredMaterialization;
     let residency = Residency::from_policy(
         spec.offload_policy,
-        move || IrisTextEncoder::load_quantized(&te_dir, &te_cfg, quant),
+        move || {
+            if streamed {
+                IrisTextEncoder::load_streamed(&te_dir, &te_cfg, quant)
+            } else {
+                IrisTextEncoder::load_quantized(&te_dir, &te_cfg, quant)
+            }
+        },
         move |_use_pid| {
+            if streamed {
+                let dit = load_backbone_streamed(&bb_dir, &bb_cfg, compute, quant, None)?;
+                return Ok(Heavy { dit });
+            }
             let (dit, reports) = load_backbone_quantized(
                 &bb_dir,
                 &bb_cfg,
@@ -313,6 +394,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapter_reports,
         spec: spec.clone(),
         memory_strategy,
+        streamed,
     }))
 }
 
@@ -323,6 +405,7 @@ impl Iris3b {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
+        let rungs = request_rungs(req, self.streamed)?;
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let params = GenerationParams::resolve(req, default_seed(), &self.config)?;
         let rows = params.prompts.len() as u32;
@@ -336,7 +419,9 @@ impl Iris3b {
             &req.cancel,
             false,
             on_progress,
-            |te: &IrisTextEncoder| -> Result<Conditioning> { encode(te, &params) },
+            |te: &IrisTextEncoder| -> Result<Conditioning> {
+                encode_in(te, &params, rungs.text_window, &req.cancel)
+            },
             |_| Ok(()),
             |heavy: &Heavy, conditioning: Conditioning, on_progress| {
                 let channels = heavy.dit.config().in_channels;
@@ -349,7 +434,7 @@ impl Iris3b {
                         .collect();
                     let z = noise_batch(&seeds, channels, params.width, params.height)?;
                     let done = c * params.steps as u32;
-                    let x = crate::pipeline::denoise_budgeted(
+                    let x = crate::pipeline::denoise_in(
                         &heavy.dit,
                         &flow,
                         &conditioning,
@@ -363,7 +448,9 @@ impl Iris3b {
                             })
                         },
                         &req.preview,
-                        attention_budget(req)?,
+                        rungs.budget,
+                        rungs.dit_window,
+                        rungs.pixel_rows,
                     )?;
                     images.push(x);
                 }
@@ -402,25 +489,84 @@ impl Iris3b {
             .validate_request(MODEL_ID, req)?;
         validate_generation_request(MODEL_ID, req, &self.config)?;
         refuse_unhonored_memory(req)?;
+        request_rungs(req, self.streamed)?;
         Ok(())
     }
 }
 
+/// What one generation request runs with: rung 3's attention budget and its pixel-row bound
+/// (the PiT stage one batch row at a time), and rung 4's windows — `None` for a component the
+/// request does not stream, which on a deferred load runs its whole stack in one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestRungs {
+    pub budget: mlx_gen::AttentionBudget,
+    pub pixel_rows: bool,
+    pub text_window: Option<usize>,
+    pub dit_window: Option<usize>,
+}
+
+/// Resolve a request's admitted `GenerationMemory` against the load: rung 4 only on a
+/// deferred-materialization load (`streamed`), at a published window and component scope.
+pub(crate) fn request_rungs(req: &GenerationRequest, streamed: bool) -> Result<RequestRungs> {
+    let budget = attention_budget(req)?;
+    let Some(memory) = req.memory else {
+        return Ok(RequestRungs {
+            budget,
+            pixel_rows: false,
+            text_window: None,
+            dit_window: None,
+        });
+    };
+    let pixel_rows = memory.chunk_attention;
+    if !memory.stream_transformer_blocks {
+        if memory.transformer_window_size.is_some() || memory.transformer_window_component.is_some()
+        {
+            return Err(Error::Unsupported(format!(
+                "{MODEL_ID}: transformer_window_size / transformer_window_component require \
+                 stream_transformer_blocks"
+            )));
+        }
+        return Ok(RequestRungs {
+            budget,
+            pixel_rows,
+            text_window: None,
+            dit_window: None,
+        });
+    }
+    if !streamed {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: GenerationMemory::stream_transformer_blocks needs a \
+             deferred-materialization load (LoadShape::DeferredMaterialization); this generator \
+             holds its stacks resident, so a window would add memory rather than bound it"
+        )));
+    }
+    let window = memory
+        .transformer_window_size
+        .unwrap_or(crate::stream::TRANSFORMER_WINDOW_SIZE);
+    if !crate::stream::TRANSFORMER_WINDOW_SIZES.contains(&window) {
+        return Err(Error::Unsupported(format!(
+            "{MODEL_ID}: transformer_window_size {window} is outside the published domain {:?}",
+            crate::stream::TRANSFORMER_WINDOW_SIZES
+        )));
+    }
+    let component = memory.transformer_window_component.unwrap_or_default();
+    Ok(RequestRungs {
+        budget,
+        pixel_rows,
+        text_window: component.includes_text_encoder().then_some(window as usize),
+        dit_window: component.includes_dit().then_some(window as usize),
+    })
+}
+
 /// Refuse the memory-ladder controls this route has no mechanism for, so none is accepted and
-/// ignored: there is no decoder to tile (pixel space) and no block-streaming loader.
-/// Staged residency and bounded attention are request-scoped controls.
+/// ignored: there is no decoder to tile (pixel space). Staged residency, bounded attention and
+/// (on a deferred load) the transformer window are request-scoped controls ([`request_rungs`]).
 fn refuse_unhonored_memory(req: &GenerationRequest) -> Result<()> {
     let Some(memory) = req.memory else {
         return Ok(());
     };
     attention_budget(req)?;
-    let refusals = [
-        ("tile_vae_decode", memory.tile_vae_decode),
-        (
-            "stream_transformer_blocks",
-            memory.stream_transformer_blocks,
-        ),
-    ];
+    let refusals = [("tile_vae_decode", memory.tile_vae_decode)];
     for (control, set) in refusals {
         if set {
             return Err(Error::Unsupported(format!(
@@ -644,13 +790,6 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            (
-                "stream_transformer_blocks",
-                GenerationMemory {
-                    stream_transformer_blocks: true,
-                    ..Default::default()
-                },
-            ),
         ] {
             match refuse_unhonored_memory(&with(memory)) {
                 Err(Error::Unsupported(message)) => {
@@ -661,17 +800,81 @@ mod tests {
         }
     }
 
-    /// No Iris loader has a deferred-materialization load shape; the load refuses one by name
-    /// before reading any resource.
+    /// Rung 4 resolves per request on a deferred load only: the published window, each component
+    /// scope streaming exactly its component(s), the other one at its whole-stack window; on an
+    /// eager load, out of the domain, or as a window without the stream flag, a typed refusal.
+    /// Rung 3 carries the per-row PiT stage.
     ///
-    /// *Mutation that reds this:* dropping `refuse_deferred_load_shape` from
+    /// *Mutations that red this:* accepting rung 4 on an eager load; swapping the scopes; dropping
+    /// the domain check or the stray-window refusal; decoupling the pixel rows from rung 3.
+    #[test]
+    fn request_rungs_resolve_the_window_and_scope_on_a_deferred_load() {
+        use mlx_gen::gen_core::{GenerationMemory, TransformerComponent};
+        let with = |memory: GenerationMemory| GenerationRequest {
+            memory: Some(memory),
+            ..Default::default()
+        };
+        let stream = |component: Option<TransformerComponent>, size: Option<u32>| {
+            with(GenerationMemory {
+                chunk_attention: true,
+                stream_transformer_blocks: true,
+                transformer_window_size: size,
+                transformer_window_component: component,
+                ..Default::default()
+            })
+        };
+        let plain = request_rungs(&GenerationRequest::default(), true).unwrap();
+        assert_eq!(
+            (plain.text_window, plain.dit_window, plain.pixel_rows),
+            (None, None, false)
+        );
+        for (component, text, dit) in [
+            (None, None, Some(1)),
+            (Some(TransformerComponent::Dit), None, Some(1)),
+            (Some(TransformerComponent::TextEncoder), Some(1), None),
+            (Some(TransformerComponent::Both), Some(1), Some(1)),
+        ] {
+            let rungs = request_rungs(&stream(component, Some(1)), true).unwrap();
+            assert_eq!(
+                (rungs.text_window, rungs.dit_window),
+                (text, dit),
+                "{component:?}"
+            );
+            assert!(rungs.pixel_rows);
+        }
+        let refused = |req: GenerationRequest, streamed: bool, needle: &str| match request_rungs(
+            &req, streamed,
+        ) {
+            Err(Error::Unsupported(message)) => assert!(message.contains(needle), "{message}"),
+            other => panic!("expected a typed refusal naming {needle}, got {other:?}"),
+        };
+        refused(stream(None, Some(1)), false, "deferred-materialization");
+        refused(stream(None, Some(2)), true, "transformer_window_size 2");
+        refused(
+            with(GenerationMemory {
+                transformer_window_size: Some(1),
+                ..Default::default()
+            }),
+            true,
+            "require stream_transformer_blocks",
+        );
+    }
+
+    /// A deferred (streamed) load refuses an adapter stack by name before reading any resource.
+    ///
+    /// *Mutation that reds this:* dropping `refuse_streamed_adapters` from
     /// `refuse_unsupported_spec`.
     #[test]
-    fn a_deferred_load_shape_is_a_typed_refusal() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()))
+    fn a_streamed_load_refuses_adapters() {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/iris-not-on-disk".into()))
             .with_load_shape(mlx_gen::gen_core::LoadShape::DeferredMaterialization);
+        spec.adapters = vec![mlx_gen::AdapterSpec::new(
+            "/iris-not-on-disk/lora.safetensors".into(),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        )];
         match load(&spec) {
-            Err(Error::Unsupported(m)) => assert!(m.contains("load_shape"), "{m}"),
+            Err(Error::Unsupported(m)) => assert!(m.contains("adapters"), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),
         }
     }

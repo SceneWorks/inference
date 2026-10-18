@@ -23,7 +23,7 @@ use mlx_rs::ops::{addmm, concatenate_axis, zeros};
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-use crate::dit::{ForwardHooks, IrisDiT, NoHooks, TextBatch};
+use crate::dit::{ForwardHooks, IrisDiT, TextBatch};
 use crate::model::compute_dtype;
 
 /// Model id of the depth task.
@@ -40,6 +40,8 @@ pub(crate) mod quanta {
     pub const LOAD: &str = "Iris depth load";
     pub const INPUT: &str = "Iris depth input";
     pub const REDUCER: &str = "Iris depth reducer";
+    /// Every label above, for the phase attribution's coverage test.
+    pub const ALL: [&str; 3] = [LOAD, INPUT, REDUCER];
 }
 
 /// A loaded Iris-3B depth model.
@@ -62,7 +64,6 @@ pub struct IrisDepth {
 }
 
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    crate::memory_strategy::refuse_deferred_load_shape(DEPTH_MODEL_ID, spec)?;
     crate::memory_strategy::refuse_unloadable_quant(DEPTH_MODEL_ID, spec)?;
     let refusals: [(&str, bool); 6] = [
         ("adapters", !spec.adapters.is_empty()),
@@ -94,11 +95,32 @@ pub fn load_depth(spec: &LoadSpec) -> Result<IrisDepth> {
         &export.weights_path(),
         spec.quantize,
     )?;
+    if spec.load_shape == gen_core::LoadShape::DeferredMaterialization {
+        return load_depth_export_streamed(export, compute_dtype(spec));
+    }
     load_depth_export(export, compute_dtype(spec))
 }
 
 /// [`load_depth`] from an already-resolved export at an explicit compute dtype.
 pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth> {
+    load_depth_export_as(export, compute, false)
+}
+
+/// [`load_depth_export`] as a deferred-materialization load (rung 4): the backbone's block stacks
+/// are read per window of [`crate::stream::TRANSFORMER_WINDOW_SIZE`] blocks at forward time
+/// (`BlockStream`); everything else is read now. The depth task has no request
+/// channel for a selection, so the load shape is its rung-4 engagement.
+pub fn load_depth_export_streamed(export: TaskExport, compute: Dtype) -> Result<IrisDepth> {
+    load_depth_export_as(export, compute, true)
+}
+
+/// Whether a depth export key (prefix included) belongs to one of the backbone's block stacks.
+fn is_stack_key(key: &str) -> bool {
+    key.strip_prefix(BACKBONE_PREFIX)
+        .is_some_and(|name| crate::dit::Stack::of(name).is_some())
+}
+
+fn load_depth_export_as(export: TaskExport, compute: Dtype, streamed: bool) -> Result<IrisDepth> {
     let model = &export.config.model;
     let path = export.weights_path();
     // A packed export (`crate::packed`) is read packed, under the bf16 compute its scales are
@@ -111,7 +133,11 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
             path.display()
         )));
     }
-    mlx_gen::ios_quantum::before_load(quanta::LOAD, &[path.clone(), export.empty_prompt_path()])?;
+    mlx_gen::ios_quantum::before_load_where(
+        quanta::LOAD,
+        &[path.clone(), export.empty_prompt_path()],
+        |name| !streamed || !is_stack_key(name),
+    )?;
     let mut source = Weights::from_file(&path)
         .map_err(|e| Error::Msg(format!("iris: loading {}: {e}", path.display())))?;
     let mut keys: Vec<String> = source.keys().map(str::to_owned).collect();
@@ -124,24 +150,18 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
         let Some(array) = source.remove(&key) else {
             continue;
         };
-        // Read the file bytes on MLX's CPU stream first: a GPU cast over an unread `Load` makes the
-        // Metal command buffer wait on the disk, which on a cold page cache trips the GPU watchdog
-        // (sc-24245).
-        mlx_rs::transforms::eval_pending_loads([&array])?;
+        // A streamed stack tensor's lazy handle is dropped unread: its window reads it.
+        if streamed && is_stack_key(&key) {
+            continue;
+        }
         if let Some(name) = key.strip_prefix(BACKBONE_PREFIX) {
-            let array = if array.ndim() >= 2
-                && name != "y_pos_embedding"
-                && !crate::model::is_packed_part(name, &array)
-            {
-                array.as_dtype(compute)?
-            } else {
-                array
-            };
-            eval([&array])?;
+            let array = crate::model::read_backbone_tensor(name, array, compute)?;
             backbone.insert(name, array);
         } else if key == REDUCER_WEIGHT {
+            mlx_rs::transforms::eval_pending_loads([&array])?;
             reducer_weight = Some(array);
         } else if key == REDUCER_BIAS {
+            mlx_rs::transforms::eval_pending_loads([&array])?;
             reducer_bias = Some(array);
         } else {
             return Err(Error::Msg(format!(
@@ -165,12 +185,19 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
         .as_dtype(compute)?;
     let reducer_bias = reducer_bias.as_dtype(compute)?;
 
-    let dit = IrisDiT::from_weights_widened(
-        &backbone,
-        model,
-        compute,
-        model.in_channels + DEPTH_EXTRA_INPUT_CHANNELS,
-    )?;
+    let input_channels = model.in_channels + DEPTH_EXTRA_INPUT_CHANNELS;
+    let dit = if streamed {
+        let stream = crate::dit::BlockStream::open(
+            &path,
+            BACKBONE_PREFIX,
+            model,
+            compute,
+            Some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize),
+        )?;
+        IrisDiT::from_weights_streamed(&backbone, model, compute, input_channels, stream)?
+    } else {
+        IrisDiT::from_weights_widened(&backbone, model, compute, input_channels)?
+    };
     drop(backbone);
 
     let prompt: EmptyPrompt = export.empty_prompt()?;
@@ -186,8 +213,18 @@ pub fn load_depth_export(export: TaskExport, compute: Dtype) -> Result<IrisDepth
         Dtype::Float32 => mlx_gen::Precision::Fp32,
         _ => mlx_gen::Precision::Bf16,
     };
-    let memory_strategy =
-        crate::memory_strategy::export_contract(IrisTask::Depth, precision, artifact, &export)?;
+    let load_shape = if streamed {
+        gen_core::LoadShape::DeferredMaterialization
+    } else {
+        gen_core::LoadShape::EagerMaterialization
+    };
+    let memory_strategy = crate::memory_strategy::export_contract(
+        IrisTask::Depth,
+        precision,
+        artifact,
+        &export,
+        load_shape,
+    )?;
     Ok(IrisDepth {
         memory_strategy,
         precision,
@@ -218,16 +255,24 @@ pub struct DepthParts<'a> {
 /// `IrisDepth.forward` over `parts`: RGB ‖ zero channel, one backbone forward at model time
 /// `num_train_timesteps` on the empty prompt, the 1×1 reducer. `[B, 3, H, W]` → `[B, 1, H, W]` f32.
 pub fn depth_forward(parts: &DepthParts, rgb: &Array) -> Result<Array> {
-    depth_forward_hooked(parts, rgb, &mut NoHooks)
+    depth_forward_with(parts, rgb, None)
 }
 
 /// [`depth_forward`] with `hooks` around every trunk and pixel block of the backbone forward — the
-/// depth trainer's seam for activation-checkpointing regions (sc-25690). With [`NoHooks`] it is
+/// depth trainer's seam for activation-checkpointing regions (sc-25690). With [`crate::dit::NoHooks`] it is
 /// exactly the estimator's forward.
 pub fn depth_forward_hooked(
     parts: &DepthParts,
     rgb: &Array,
     hooks: &mut dyn ForwardHooks,
+) -> Result<Array> {
+    depth_forward_with(parts, rgb, Some(hooks))
+}
+
+fn depth_forward_with(
+    parts: &DepthParts,
+    rgb: &Array,
+    hooks: Option<&mut dyn ForwardHooks>,
 ) -> Result<Array> {
     let sh = rgb.shape();
     let (b, h, w) = (sh[0], sh[2], sh[3]);
@@ -235,15 +280,14 @@ pub fn depth_forward_hooked(
     let (x, t, states) = depth_input_body(parts, rgb)?;
     mlx_gen::ios_quantum::finish(quanta::INPUT, &[&x, &states])?;
     let mask = vec![parts.mask.to_vec(); b as usize];
-    let out = parts.dit.forward_hooked(
-        &x,
-        &t,
-        &TextBatch {
-            states: &states,
-            mask: &mask,
-        },
-        hooks,
-    )?;
+    let text = TextBatch {
+        states: &states,
+        mask: &mask,
+    };
+    let out = match hooks {
+        Some(hooks) => parts.dit.forward_hooked(&x, &t, &text, hooks)?,
+        None => parts.dit.forward(&x, &t, &text)?,
+    };
     mlx_gen::ios_quantum::run(
         quanta::REDUCER,
         depth_reducer_scratch(&out, parts.dit.compute_dtype()),

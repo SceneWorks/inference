@@ -58,6 +58,18 @@ pub(crate) fn step_scratch(state_elements: u64, update: &DpmUpdate) -> u64 {
     states * crate::retention::allocated(4 * state_elements) + 4 * scalars
 }
 
+/// [`step_scratch`] of the costlier update (second order) — the price of every step of a request
+/// whose sampler is not priced (`crate::ios_pricing`).
+pub(crate) fn worst_step_scratch(state_elements: u64) -> u64 {
+    let second = DpmUpdate::Second {
+        cx: 0.0,
+        c0: 0.0,
+        c1: 0.0,
+        r0: 1.0,
+    };
+    step_scratch(state_elements, &second)
+}
+
 /// One FlowDPM-Solver++ update of `x` from the network output `out` (both f32): returns the new
 /// state and this step's predicted clean image `x0` (the body of one [`STEP_QUANTUM`]).
 pub(crate) fn step_update(

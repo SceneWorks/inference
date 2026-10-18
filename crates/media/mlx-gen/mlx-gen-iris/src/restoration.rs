@@ -69,6 +69,8 @@ pub(crate) mod quanta {
     pub const HOST_PLANES: &str = "Iris restoration host planes";
     /// The post-tile phase's new host planes, checked when the last tile returns.
     pub const POST_TILE: &str = "Iris restoration post-tile planes";
+    /// Every label above, for the phase attribution's coverage test.
+    pub const ALL: [&str; 4] = [LOAD, TILE, HOST_PLANES, POST_TILE];
 }
 
 /// A loaded Iris-3B restorer.
@@ -92,7 +94,6 @@ pub struct IrisRestorer {
 
 /// Refuse every load knob the restoration route does not implement, by name.
 fn refuse_unsupported_spec(spec: &LoadSpec) -> Result<()> {
-    crate::memory_strategy::refuse_deferred_load_shape(MODEL_ID, spec)?;
     crate::memory_strategy::refuse_unloadable_quant(MODEL_ID, spec)?;
     let refusals: [(&str, bool); 7] = [
         ("adapters", !spec.adapters.is_empty()),
@@ -124,19 +125,34 @@ impl IrisRestorer {
         let weights = resources.export.weights_path();
         crate::packed::refuse_dense_requested_as_packed(MODEL_ID, &weights, spec.quantize)?;
         let tier = crate::packed::artifact_tier(&weights)?;
-        mlx_gen::ios_quantum::before_load(
+        // Rung 4: a deferred-materialization load streams the backbone's block stacks by window
+        // of [`crate::stream::TRANSFORMER_WINDOW_SIZE`]; the transform has no request channel for
+        // a selection, so the load shape is its rung-4 engagement.
+        let streamed = spec.load_shape == gen_core::LoadShape::DeferredMaterialization;
+        mlx_gen::ios_quantum::before_load_where(
             quanta::LOAD,
             &[
                 resources.export.weights_path(),
                 resources.export.empty_prompt_path(),
             ],
+            |name| !streamed || crate::dit::Stack::of(name).is_none(),
         )?;
         let prompt = resources.empty_prompt()?;
-        let dit = load_backbone(
-            &resources.export.dir,
-            &resources.export.config,
-            compute_dtype(spec),
-        )?;
+        let dit = if streamed {
+            crate::model::load_backbone_streamed(
+                &resources.export.dir,
+                &resources.export.config,
+                compute_dtype(spec),
+                None,
+                Some(crate::stream::TRANSFORMER_WINDOW_SIZE as usize),
+            )?
+        } else {
+            load_backbone(
+                &resources.export.dir,
+                &resources.export.config,
+                compute_dtype(spec),
+            )?
+        };
         let shape: Vec<i32> = prompt.shape.iter().map(|&d| d as i32).collect();
         let states = Array::from_slice(&prompt.embeddings, &shape);
         eval([&states])?;
@@ -145,6 +161,7 @@ impl IrisRestorer {
             spec.precision,
             tier,
             &resources.export,
+            spec.load_shape,
         )?;
         Ok(Self {
             memory_strategy,

@@ -65,7 +65,7 @@ fn bits(quant: Quant) -> i32 {
 }
 
 /// Convert `src` (CPU, ample budget) into a fresh dir under `root`.
-fn convert(kind: ConvertKind, src: &Path, root: &Path, quant: Quant) -> PathBuf {
+pub(crate) fn convert(kind: ConvertKind, src: &Path, root: &Path, quant: Quant) -> PathBuf {
     let dst = root.join(format!("{kind:?}-{quant:?}").replace(['{', '}', ' ', ':'], ""));
     prequantize_cpu(kind, src, &dst, bits(quant), u64::MAX).unwrap();
     dst
@@ -214,7 +214,7 @@ fn a_packed_backbone_loads_bit_identical_to_the_release_quantized_at_load() {
 
 /// The miniature tower with an aligned MLP (`intermediate_size: 64`; the released miniature's 48
 /// has no affine tier), seeded MLP weights, everything else the fixture's.
-fn aligned_tiny_text_encoder(root: &Path) -> PathBuf {
+pub(crate) fn aligned_tiny_text_encoder(root: &Path) -> PathBuf {
     let source = fixtures().join("tiny-snapshot/text_encoder");
     let dir = root.join("text_encoder");
     std::fs::create_dir_all(&dir).unwrap();

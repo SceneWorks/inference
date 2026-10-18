@@ -479,6 +479,7 @@ fn text_encoder_body() {
         for state in &states {
             eval([state]).unwrap();
         }
+        let states: Vec<Option<Array>> = states.into_iter().map(Some).collect();
         let start = window.prefix_len as i32;
         let real = window.window_tokens() as i32;
         let (peak, _) = measure(|| Ok(vec![te.conditioning_body(&states, start, real)?]));
@@ -587,5 +588,140 @@ fn every_small_step_quantum_price_tracks_its_measured_peak() {
     in_cpu_child(
         "quantum_proofs::every_small_step_quantum_price_tracks_its_measured_peak",
         small_steps_body,
+    );
+}
+
+/// The streamed (rung-4) quanta: a backbone window's read (every block of every stack, dense at
+/// both compute widths and packed at both tiers), the tower's layer read (f32-stored, packed), its
+/// cache-free decoder layer and its embedding + RoPE quantum, and the per-row output concatenation.
+fn streamed_body() {
+    use crate::dit::Stack;
+    use crate::packed::ConvertKind;
+    use mlx_gen::weights::Weights;
+    use mlx_gen::Quant;
+    let config = IrisConfig::from_dir(&backbone_dir()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut backbones = vec![
+        (backbone_dir(), Dtype::Float32, None),
+        (backbone_dir(), Dtype::Bfloat16, None),
+    ];
+    for quant in [Quant::Q4, Quant::Q8] {
+        let packed = crate::packed_tests::convert(
+            ConvertKind::Export { depth: false },
+            &backbone_dir(),
+            root.path(),
+            quant,
+        );
+        backbones.push((packed, Dtype::Bfloat16, Some(quant)));
+    }
+    for (dir, dtype, quant) in backbones {
+        let dit =
+            crate::model::load_backbone_streamed(&dir, &config, dtype, quant, Some(1)).unwrap();
+        let stream = dit.block_stream().unwrap();
+        for stack in Stack::ALL {
+            for i in 0..stream.len(stack) {
+                let (peak, _) = measure(|| {
+                    let mut view = Weights::from_file(stream.path())?;
+                    let built = stream.build(&mut view, &config.model, stack, i)?;
+                    Ok(built.arrays().into_iter().cloned().collect())
+                });
+                prove(
+                    &format!("backbone block read {stack:?} {i} {dtype:?} {quant:?}"),
+                    crate::stream::window_read_bytes(&[stream.read(stack, i)]),
+                    peak,
+                );
+            }
+        }
+    }
+
+    use crate::text_encoder::IrisTextEncoder;
+    let aligned = crate::packed_tests::aligned_tiny_text_encoder(root.path());
+    let mut towers = vec![(fixtures().join("tiny-snapshot/text_encoder"), None)];
+    for quant in [Quant::Q4, Quant::Q8] {
+        let packed =
+            crate::packed_tests::convert(ConvertKind::TextEncoder, &aligned, root.path(), quant);
+        towers.push((packed, Some(quant)));
+    }
+    for (dir, quant) in towers {
+        let te = IrisTextEncoder::load_streamed(&dir, &config.text_encoder, quant).unwrap();
+        let tower = te.streamed().unwrap();
+        let cfg = tower.config();
+        for i in [0, 1, cfg.num_layers - 1] {
+            let (peak, _) = measure(|| tower.read_layer(i));
+            prove(
+                &format!("text layer read {i} {quant:?}"),
+                crate::stream::window_read_bytes(&[tower.read_price(i)]),
+                peak,
+            );
+        }
+        for n in [48, 96] {
+            let ids: Vec<i32> = (0..n).map(|i| (i * 7 + 3) % cfg.vocab_size).collect();
+            let (peak, out) = measure(|| {
+                let ids = Array::from_slice(&ids, &[1, n]);
+                let h = mlx_llm::primitives::nn::embed(tower.embed_table(), &ids)
+                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+                let (cos, sin) = tower
+                    .rope()
+                    .cos_sin(n, 0, Dtype::Bfloat16)
+                    .map_err(|e| mlx_gen::Error::Msg(e.to_string()))?;
+                Ok(vec![h, cos, sin])
+            });
+            prove(
+                &format!("text streamed embedding n{n} {quant:?}"),
+                crate::text_encoder::streamed_embedding_bytes(cfg, n as u64),
+                peak,
+            );
+            let (h, cos, sin) = (out[0].clone(), out[1].clone(), out[2].clone());
+            for i in [0, 1] {
+                let layer = tower.build_layer(i).unwrap();
+                // One cache-free decoder layer — the bound of `DECODER_PROOF_MAX` (see there).
+                let mut worst = 0;
+                for stalled in [false, true] {
+                    for _ in 0..2 * RUNS {
+                        let peak = with_cpu_diagnostic_headroom(PLENTY, || {
+                            let _scope = mlx_gen::ios_quantum::Scope::new();
+                            let ahead = stalled.then(stall);
+                            let peak = measured_peak_bytes(|| {
+                                Ok(vec![layer.forward(cfg, &h, &cos, &sin)?])
+                            });
+                            drop(ahead);
+                            peak
+                        })
+                        .unwrap();
+                        worst = worst.max(peak);
+                    }
+                }
+                prove_within(
+                    &format!("text streamed layer {i} n{n} {quant:?}"),
+                    crate::text_encoder::streamed_layer_bytes(cfg, n as u64),
+                    worst,
+                    DECODER_PROOF_MAX,
+                );
+            }
+        }
+    }
+
+    // The per-row PiT stage's output rows concatenated into the batch.
+    for (b, h, w) in [(2, 16, 24), (4, 32, 32)] {
+        let rows: Vec<Array> = (0..b)
+            .map(|r| rand(&[1, 3, h, w], 20 + r as u64, Dtype::Float32))
+            .collect();
+        let (peak, _) = measure(|| {
+            let refs: Vec<&Array> = rows.iter().collect();
+            Ok(vec![mlx_rs::ops::concatenate_axis(&refs, 0)?])
+        });
+        prove(
+            &format!("output rows b{b} {h}x{w}"),
+            crate::dit::IrisDiT::output_rows_bytes(b, 3, h, w),
+            peak,
+        );
+    }
+}
+
+#[test]
+fn every_streamed_quantum_price_tracks_its_measured_peak() {
+    in_cpu_child(
+        "quantum_proofs::every_streamed_quantum_price_tracks_its_measured_peak",
+        streamed_body,
     );
 }
