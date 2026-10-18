@@ -337,7 +337,15 @@ pub fn validate_actual(
                     format!("{provider} does not serve prompt batches"),
                 ));
             }
-            if req.memory.unwrap_or_default() != candidate.execution || req.use_pid {
+            // A PiD decode is not an iOS route (no provider's iOS contract offers it): a typed mode
+            // refusal, never an untyped mismatch.
+            if req.use_pid {
+                return Err(AdmissionError::refused(
+                    RefusalKind::Mode,
+                    format!("{provider}: a PiD decode (`use_pid`) is not served on iOS"),
+                ));
+            }
+            if req.memory.unwrap_or_default() != candidate.execution {
                 return Err(mismatch("request execution"));
             }
             caps.validate_request(provider, req)?;

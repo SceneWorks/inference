@@ -1051,7 +1051,7 @@ fn pipeline_and_vae_head_formulas_track_the_measured_peak() {
     for dtype in [Dtype::Float32, Dtype::Bfloat16] {
         let decoded = rnd(&[1, 3, 1, 256, 256], 2, 0.5).as_dtype(dtype).unwrap();
         decoded.eval().unwrap();
-        let formula = crate::quantum::decoded_to_image_bytes(
+        let formula = crate::quantum::zimage_pixel_conversion_bytes(
             decoded.size() as u64,
             decoded.item_size() as u64,
         );

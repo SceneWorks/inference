@@ -256,7 +256,7 @@ fn predict(root: &Path, edge: u32, tile: u32) -> Vec<Phase> {
     let pixels = 3 * u64::from(edge) * u64::from(edge);
     quanta.push((
         "decoded to image",
-        crate::quantum::decoded_to_image_bytes(pixels, 4),
+        crate::quantum::zimage_pixel_conversion_bytes(pixels, 4),
     ));
     let decode = Phase {
         name: "decode",

@@ -96,11 +96,13 @@ pub(crate) fn latents_bytes(elements: u64, img2img: bool) -> u64 {
         }
 }
 
-/// The pixel-conversion quantum's price over a decode of `elements` at `element_bytes`: the f32
-/// cast of a narrower decode, and the denormalize/clip/round chain's f32 images (measured four
+/// Z-Image's OWN pixel-conversion quantum (its pipeline's denormalize/clip/round chain, not
+/// `mlx_gen::image::decoded_to_image`, whose price is the shared
+/// [`mlx_gen::ios_quantum::decoded_to_image_bytes`]) over a decode of `elements` at
+/// `element_bytes`: the f32 cast of a narrower decode, and the denormalize/clip/round chain's f32 images (measured four
 /// live: the scale, the clip pair and the row-contiguous readback copy of the transposed result)
 /// and its scalars.
-pub(crate) fn decoded_to_image_bytes(elements: u64, element_bytes: u64) -> u64 {
+pub(crate) fn zimage_pixel_conversion_bytes(elements: u64, element_bytes: u64) -> u64 {
     // + the chain's four f32 scalars (0.5, 0, 1, 255).
     (4 + u64::from(element_bytes < 4)) * ab(4, &[elements]) + ab(4, &[4])
 }

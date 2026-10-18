@@ -576,26 +576,6 @@ fn assert_checked_before_synchronized(events: &[QuantumEvent]) {
     }
 }
 
-/// The guarded paths are DIFFERENT graphs from the host's (the iOS VAE attention runs chunked; the
-/// sub-quantum barriers split the lazy graph), so they agree to float reassociation, not bit for
-/// bit: one host's kernels may give identical bits where another CPU's round differently. Held to
-/// the epic's cross-graph parity standard, 1e-5 of `max(1, peak)` (SANA's tiled-encode standard);
-/// a missed guard path, a mis-chunked attention or a dropped term moves an output by O(1e-1).
-fn assert_cross_graph_parity(label: &str, got: &Array, want: &Array) {
-    assert_eq!(got.shape(), want.shape(), "{label}: shape");
-    let (got, want) = (bits(got), bits(want));
-    let peak = want
-        .iter()
-        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
-    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &w)| {
-        m.max((f32::from_bits(g) - f32::from_bits(w)).abs())
-    });
-    assert!(
-        delta <= 1e-5 * peak.max(1.0),
-        "{label}: guarded output moved {delta:.3e} from the host (peak {peak:.3e})"
-    );
-}
-
 fn bits(a: &Array) -> Vec<u32> {
     let f = a.as_dtype(Dtype::Float32).unwrap();
     f.eval().unwrap();
@@ -603,11 +583,13 @@ fn bits(a: &Array) -> Vec<u32> {
 }
 
 /// Every host path run under bounded quanta: every quantum is checked before it synchronizes, the
-/// expected labels all appear, and every output matches the unguarded host run within the
-/// cross-graph parity standard ([`assert_cross_graph_parity`]).
+/// expected labels all appear, and every output is BYTE-IDENTICAL to the unguarded host run. The
+/// guards and barriers only split the lazy graph at quantum boundaries; the fixture's VAE attention
+/// fits one chunk, so no path here changes its arithmetic (the chunked iOS attention is held to its
+/// tolerance separately, [`chunked_vae_attention_matches_the_unchunked_attention`]).
 #[test]
-fn guarded_paths_check_every_quantum_and_match_the_host() {
-    if !in_cpu_child("guarded_paths_check_every_quantum_and_match_the_host") {
+fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
+    if !in_cpu_child("guarded_paths_check_every_quantum_and_stay_byte_identical") {
         return;
     }
     let host = host_paths();
@@ -615,7 +597,11 @@ fn guarded_paths_check_every_quantum_and_match_the_host() {
     let guarded = guarded.unwrap();
     assert_checked_before_synchronized(&events);
     for ((name, a), (_, b)) in host.iter().zip(&guarded) {
-        assert_cross_graph_parity(name, b, a);
+        assert_eq!(
+            bits(a),
+            bits(b),
+            "{name}: guarded output differs from the host"
+        );
     }
     let labels: std::collections::BTreeSet<String> =
         checks(&events).into_iter().map(|(l, _)| l).collect();
@@ -655,6 +641,64 @@ fn guarded_paths_check_every_quantum_and_match_the_host() {
     let count = |label: &str| checks(&events).iter().filter(|(l, _)| l == label).count();
     // The tiny DiT runs 1 noise refiner + 2 main blocks per forward, and 1 context block.
     assert!(count(crate::quantum::DIT_BLOCK) >= 3 * count(crate::quantum::DIT_CONTEXT_BLOCK));
+}
+
+/// The iOS VAE attention's query-chunked plan against the unchunked attention: a different graph
+/// (each chunk's scores and softmax run at their own shape), so it is held to the cross-graph parity
+/// standard — 1e-5 of `max(1, peak)`, SANA's tiled-encode standard — rather than bit for bit. A
+/// chunk that drops or repeats rows, or misses keys, moves the output by O(1e-1).
+#[test]
+fn chunked_vae_attention_matches_the_unchunked_attention() {
+    if !in_cpu_child("chunked_vae_attention_matches_the_unchunked_attention") {
+        return;
+    }
+    let (c, side) = (64, 8);
+    let n = side * side;
+    let mut w = Weights::from_map(Default::default());
+    w.insert(
+        "a.group_norm.weight".to_string(),
+        rand(&[c], 1, Dtype::Float32),
+    );
+    w.insert(
+        "a.group_norm.bias".to_string(),
+        rand(&[c], 2, Dtype::Float32),
+    );
+    for (i, name) in ["to_q", "to_k", "to_v", "to_out.0"].iter().enumerate() {
+        let weight = mlx_rs::ops::multiply(
+            rand(&[c, c], 10 + i as u64, Dtype::Float32),
+            Array::from_f32(0.125),
+        )
+        .unwrap();
+        w.insert(format!("a.{name}.weight"), weight);
+        w.insert(
+            format!("a.{name}.bias"),
+            rand(&[c], 20 + i as u64, Dtype::Float32),
+        );
+    }
+    let attention = crate::vae::VaeAttention::from_weights(&w, "a").unwrap();
+    let x = rand(&[1, c, side, side], 30, Dtype::Float32);
+    let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(n as u64 * 4, true));
+    let rows = plan.budget.query_block(1, 1, n, n);
+    let chunks = (n + rows - 1) / rows.max(1);
+    assert!(
+        rows > 0 && chunks > 1,
+        "the plan must chunk: {rows} of {n} rows"
+    );
+    let whole = attention.forward(&x).unwrap();
+    let chunked = attention.forward_planned(&x, plan).unwrap();
+    assert_eq!(chunked.shape(), whole.shape());
+    let (got, want) = (bits(&chunked), bits(&whole));
+    let peak = want
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
+    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &v)| {
+        m.max((f32::from_bits(g) - f32::from_bits(v)).abs())
+    });
+    eprintln!("chunked VAE attention: {chunks} chunks, max delta {delta:.3e} (peak {peak:.3e})");
+    assert!(
+        delta <= 1e-5 * peak.max(1.0),
+        "chunked attention moved {delta:.3e} from the unchunked attention (peak {peak:.3e})"
+    );
 }
 
 /// For every quantum label the host paths check, a run whose FIRST check of that label sees live
@@ -866,7 +910,7 @@ fn pipeline_quanta_refuse_before_construction() {
     let fixed = Fixed(decoded.clone());
     assert_refused_at(
         crate::quantum::DECODED_TO_IMAGE,
-        crate::quantum::decoded_to_image_bytes(decoded.size() as u64, 4),
+        crate::quantum::zimage_pixel_conversion_bytes(decoded.size() as u64, 4),
         || {
             crate::pipeline::decode_batch(
                 &fixed,

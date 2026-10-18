@@ -1048,11 +1048,11 @@ pub(crate) fn decode_batch(
             None => decoder.decode(&unpacked)?,
         };
         // iOS: the f32 cast and the pixel conversion are one quantum
-        // ([`crate::quantum::decoded_to_image_bytes`]).
+        // ([`crate::quantum::zimage_pixel_conversion_bytes`]).
         if mlx_gen::ios_quantum::enabled() {
             mlx_gen::ios_quantum::before(
                 crate::quantum::DECODED_TO_IMAGE,
-                crate::quantum::decoded_to_image_bytes(
+                crate::quantum::zimage_pixel_conversion_bytes(
                     decoded.size() as u64,
                     decoded.item_size() as u64,
                 ),

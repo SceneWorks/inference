@@ -48,7 +48,8 @@ pub fn z_image_turbo_load_spec(source: WeightsSource, control: Option<WeightsSou
 /// The artifact policy for a Z-Image Turbo candidate: a snapshot directory with no component
 /// overrides whose transformer, text encoder and VAE are each STORED at the requested tier (packed
 /// Q4/Q8 at that width, or dense for bf16), and — for the control route — a provisioned ControlNet
-/// checkpoint. Any other inventory is `Unsupported` (a typed artifact refusal at admission).
+/// checkpoint, and no PiD overlay. Any other inventory is `Unsupported` (a typed artifact refusal at
+/// admission).
 pub fn check_artifact(provider: &str, spec: &LoadSpec) -> Result<()> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(Error::Unsupported(format!(
@@ -58,6 +59,13 @@ pub fn check_artifact(provider: &str, spec: &LoadSpec) -> Result<()> {
     if !spec.components.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Unsupported(format!(
             "{provider}: iOS loads the snapshot's own components (no overrides)"
+        )));
+    }
+    // A PiD overlay (the PiD student plus its Gemma encoder) is built at load by the provider,
+    // outside every iOS quantum and footprint: never an iOS load.
+    if spec.pid.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{provider}: a PiD decode overlay is not an iOS load (never captured or bounded)"
         )));
     }
     match (provider == Z_IMAGE_TURBO_CONTROL_ID, &spec.control) {
@@ -355,6 +363,49 @@ pub(crate) mod tests {
         assert_eq!(
             attempt(mixed.path(), Z_IMAGE_TURBO_ID, Some(Quant::Q4), None),
             artifact
+        );
+        // A PiD overlay: the provider would build the PiD student and its Gemma encoder at load,
+        // outside every quantum — refused before any load.
+        let mut spec = z_image_turbo_load_spec(WeightsSource::Dir(q4.path().to_owned()), None);
+        spec.quantize = Some(Quant::Q4);
+        spec.pid = Some(mlx_gen::gen_core::PidWeights {
+            checkpoint: WeightsSource::File(q4.path().join("pid.safetensors")),
+            gemma: WeightsSource::Dir(q4.path().join("gemma")),
+        });
+        let refused = build_candidate(
+            &registry,
+            Z_IMAGE_TURBO_ID,
+            spec,
+            None,
+            MemoryStrategy::BoundedTransformerResidency,
+            work("text", 512),
+        )
+        .map(|_| ())
+        .expect_err("a PiD overlay must be refused");
+        assert_eq!(refused.refusal_kind(), artifact);
+        // A PiD decode request on an admitted candidate: a typed MODE refusal, not a mismatch.
+        let mut spec = z_image_turbo_load_spec(WeightsSource::Dir(q4.path().to_owned()), None);
+        spec.quantize = Some(Quant::Q4);
+        let mut candidate = build_candidate(
+            &registry,
+            Z_IMAGE_TURBO_ID,
+            spec,
+            None,
+            MemoryStrategy::BoundedTransformerResidency,
+            work("text", 512),
+        )
+        .unwrap();
+        crate::ios_admission::validate_actual(&registry, &candidate).unwrap();
+        let IosWork::Generate(req) = &mut candidate.work else {
+            unreachable!()
+        };
+        req.use_pid = true;
+        let refused = crate::ios_admission::validate_actual(&registry, &candidate)
+            .expect_err("use_pid must be refused");
+        assert_eq!(
+            refused.refusal_kind(),
+            Some(RefusalKind::Mode),
+            "{refused:?}"
         );
     }
 
