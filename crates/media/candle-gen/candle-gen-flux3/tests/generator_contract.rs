@@ -602,7 +602,9 @@ fn base_and_quantized_packages_are_typed_refusals() {
             "CFG checkpoint",
             config
                 .replace("\"flow_map\": true", "\"flow_map\": false")
-                .replace("\"guidance\": null", "\"guidance\": 3.5"),
+                .replace("\"guidance\": null", "\"guidance\": 3.5")
+                // A well-formed base package (frozen 50/3.5) so the ROUTE mismatch is what refuses.
+                .replace("\"steps\": 4", "\"steps\": 50"),
         ),
         (
             "quantized variant",

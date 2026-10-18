@@ -960,6 +960,7 @@ mod tests {
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
         // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
+        // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
         assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
         assert_eq!(mapped.len(), 67);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
@@ -1028,11 +1029,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            27,
+            28,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900, flux3_klein in sc-26234)"
+             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1236,15 +1237,32 @@ mod tests {
             .find(|provider| provider["provider_id"] == "flux3_klein")
             .expect("the new FLUX 3 provider is serialized, not just counted");
         let components = flux3["components"].as_array().unwrap();
-        assert_eq!(components.len(), 2);
-        for component in ["flux3_image_klein", "qwen3_vl_4b_instruct"] {
-            assert!(
-                components
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(component)),
-                "FLUX 3 manifest omitted {component}"
-            );
-        }
+        assert_eq!(components.len(), 3);
+        let component_ids: BTreeSet<_> = components
+            .iter()
+            .map(|entry| entry.as_str().expect("component ids are strings"))
+            .collect();
+        assert_eq!(
+            component_ids,
+            BTreeSet::from([
+                "flux3_image_klein",
+                "qwen3_vl_4b_instruct",
+                "flux3_image_klein_pup",
+            ])
+        );
+        let pup = resolve_component(component_licenses(), "flux3_image_klein_pup")
+            .expect("the optional PUP identity resolves to its own license row");
+        assert_eq!(
+            pup.source_url,
+            "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup"
+        );
+        assert_eq!(pup.declared, "apache-2.0");
+        assert_eq!(pup.family, "apache-2-0");
+        assert!(!pup.gated);
+        assert_eq!(
+            gen_core::flux3::pup::UPSAMPLER_REVISION,
+            "8b069751eb5dcab23829d9c5eccb470eb8b8a4ed"
+        );
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

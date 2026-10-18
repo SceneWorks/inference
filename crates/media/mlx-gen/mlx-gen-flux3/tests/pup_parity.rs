@@ -5,9 +5,11 @@
 //! refusal without the component), and the package-level refusals.
 //!
 //! The greedy ids are compared where the oracle's top-1/top-2 logit margin is wide enough that
-//! an f32 MLX-vs-torch rounding difference cannot flip the argmax; a mismatch on a narrow step
+//! a dtype-matched MLX-vs-torch rounding difference cannot flip the argmax; a mismatch on a narrow step
 //! ends the comparison (the trajectories legitimately diverge from there), and at least
-//! `MIN_MATCHED` steps must have matched.
+//! `MIN_MATCHED` steps must have matched. An earlier ambiguous text step is accepted only after
+//! its complete 12-step teacher-forced certificate passes at least `MIN_MATCHED` wide exact checks.
+//! Candidate validation retains the same margin; a tie is never pinned to a CPU-specific id.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +41,7 @@ fn tiny_snapshot() -> std::path::PathBuf {
 }
 
 fn golden() -> Weights {
-    fixture("flux3_pup_golden.safetensors")
+    fixture("flux3_pup_mlx_bf16_golden.safetensors")
 }
 
 fn load_upsampler() -> Flux3PromptUpsampler {
@@ -141,12 +143,14 @@ fn run_engine(
 /// decoder gate is candle-llm/tests/flux3_pup_decoder.rs; never delete protocol ids from its oracle.
 fn assert_greedy_parity(
     up: &Flux3PromptUpsampler,
+    g: &Weights,
     case: &str,
     got: &[i32],
     raw: &[i32],
     margins: &[f32],
-    output: &core_llm::TextLlmOutput,
+    output_and_certificate: (&core_llm::TextLlmOutput, Option<usize>),
 ) {
+    let (output, teacher_forced_wide) = output_and_certificate;
     assert_eq!(raw.len(), margins.len());
     let tokenizer = up.package().tokenizer();
     let special = tokenizer.constraint_decode_table().special;
@@ -174,15 +178,39 @@ fn assert_greedy_parity(
         let actual = *got.get(index).unwrap_or_else(|| {
             panic!("{case}: public stream omitted visible token {index} (raw step {raw_index})")
         });
+        if margin == 0.0 {
+            let scores = g.get(&format!("step_scores_{case}")).unwrap();
+            let vocab = scores.shape()[1] as usize;
+            let rows = host_f32(scores);
+            gen_core_testkit::assert_exact_greedy_tie(
+                &rows[raw_index * vocab..(raw_index + 1) * vocab],
+                actual as usize,
+            );
+            assert!(
+                matched >= MIN_MATCHED
+                    || teacher_forced_wide.is_some_and(|wide| wide >= MIN_MATCHED),
+                "{case}: exact tie requires sufficient prefix or complete teacher-forced coverage"
+            );
+            eprintln!("{case}: validated exact tie at raw step {raw_index}; teacher-forced gate owns suffix");
+            return;
+        }
         if actual == expected {
             matched += 1;
             continue;
         }
         assert!(margin < MARGIN,
             "{case}: visible step {index}, raw step {raw_index} differs ({actual} vs {expected}) on wide margin {margin:.4}");
+        let scores = g.get(&format!("step_scores_{case}")).unwrap();
+        let vocab = scores.shape()[1] as usize;
+        let rows = host_f32(scores);
+        let row = &rows[raw_index * vocab..(raw_index + 1) * vocab];
         assert!(
-            matched >= MIN_MATCHED,
-            "{case}: only {matched} greedy steps matched before a narrow-margin divergence"
+            row[expected as usize] - row[actual as usize] <= MARGIN,
+            "{case}: public candidate outside the existing narrow margin"
+        );
+        assert!(
+            matched >= MIN_MATCHED || teacher_forced_wide.is_some_and(|wide| wide >= MIN_MATCHED),
+            "{case}: only {matched} prefix matches and no sufficient teacher-forced certificate"
         );
         eprintln!(
             "{case}: narrow-margin divergence at raw step {raw_index} after {matched} matches"
@@ -212,6 +240,32 @@ fn the_golden_was_dumped_from_the_pinned_upsampler() {
     let g = golden();
     assert_eq!(meta(&g, "pup_revision"), pup::UPSAMPLER_REVISION);
     assert_eq!(meta(&g, "presence_penalty_scope"), "generated_only");
+    for (key, expected) in [
+        ("oracle_precision", "mlx_mixed_bf16_f32"),
+        ("language_compute_dtype", "bfloat16"),
+        ("vision_compute_dtype", "float32"),
+        ("recurrence_dtype", "float32"),
+        ("conv_cache_dtype", "bfloat16"),
+        ("kv_cache_dtype", "bfloat16"),
+        ("rope_frequency_dtype", "float32"),
+        ("ordinary_norm_multiplier", "bf16_load_folded"),
+        (
+            "cast_guard_negative_controls",
+            "whole_model_float32,whole_model_bfloat16,whole_language_module_bfloat16,unfolded_norm",
+        ),
+    ] {
+        assert_eq!(meta(&g, key), expected, "{key}");
+    }
+    for key in [
+        "reference_torch_version",
+        "reference_transformers_version",
+        "reference_python_version",
+    ] {
+        assert!(
+            !meta(&g, key).is_empty(),
+            "recorded reference version: {key}"
+        );
+    }
     for mode in UpsampleMode::ALL {
         assert_eq!(
             meta(&g, &format!("presence_penalty_{}", mode.system_key()))
@@ -227,11 +281,81 @@ fn the_golden_was_dumped_from_the_pinned_upsampler() {
     // The miniature snapshot is the package layout: every required file, the Qwen3.5 config.
     pup::UpsamplePackage::check(&tiny_snapshot()).unwrap();
     use sha2::Digest;
+    for (path, key) in [
+        (
+            fixtures().join("flux3_pup_golden.safetensors"),
+            "f32_oracle_sha256",
+        ),
+        (
+            tiny_snapshot().join("model.safetensors"),
+            "checkpoint_sha256",
+        ),
+    ] {
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(std::fs::read(path).unwrap())),
+            meta(&g, key)
+        );
+    }
     let tok = std::fs::read(tiny_snapshot().join("tokenizer.json")).unwrap();
     assert_eq!(
         format!("{:x}", sha2::Sha256::digest(&tok)),
         meta(&g, "tokenizer_sha256")
     );
+}
+
+/// Verify the complete raw trajectory before certifying an ambiguous public-stream prefix.
+fn teacher_forced_text_certificate(g: &Weights, case: &str) -> usize {
+    use mlx_llm::models::{Qwen35Config, Qwen35Model};
+    use mlx_llm::primitives::Weights as LlmWeights;
+    use mlx_rs::Array;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tiny_snapshot().join("config.json")).unwrap())
+            .unwrap();
+    let weights = LlmWeights::from_dir(tiny_snapshot()).unwrap();
+    let model = Qwen35Model::from_weights(
+        &weights,
+        "model.language_model",
+        Qwen35Config::from_json(&config).unwrap(),
+    )
+    .unwrap();
+    let prompt = host_i32(g.get(&format!("ids_{case}")).unwrap());
+    let expected = host_i32(g.get(&format!("generated_{case}")).unwrap());
+    assert_eq!(
+        expected.len(),
+        12,
+        "{case}: complete teacher-forced trajectory"
+    );
+    let reference = g.get(&format!("step_scores_{case}")).unwrap();
+    let vocab = reference.shape()[1] as usize;
+    let reference = host_f32(reference);
+    assert_eq!(reference.len(), expected.len() * vocab);
+    let mut cache = model.new_cache();
+    let mut input = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+    let mut offset = 0;
+    let mut generated = std::collections::BTreeSet::new();
+    let mut wide = 0;
+    for (step, &id) in expected.iter().enumerate() {
+        let mut actual = host_f32(&model.decode_logits(&input, &mut cache, offset).unwrap());
+        assert_eq!(actual.len(), vocab);
+        // The independent host projection applies presence once to GENERATED ids only.
+        for &token in &generated {
+            actual[token as usize] -= pup::PRESENCE_PENALTY_T2I;
+        }
+        if gen_core_testkit::assert_teacher_forced_logit_step(
+            &format!("{case}: teacher-forced raw step {step}"),
+            id as usize,
+            &reference[step * vocab..(step + 1) * vocab],
+            &actual,
+            MARGIN,
+        ) {
+            wide += 1;
+        }
+        generated.insert(id);
+        offset += input.shape()[1];
+        input = Array::from_slice(&[id], &[1, 1]);
+    }
+    assert!(wide >= MIN_MATCHED, "{case}: only {wide} wide exact checks");
+    wide
 }
 
 #[test]
@@ -246,11 +370,25 @@ fn text_modes_match_the_oracle_greedy_run() {
             "{case}: chat text"
         );
         let want_ids = host_i32(g.get(&format!("ids_{case}")).unwrap());
+        let rendered = up.package().render(&plan).unwrap();
+        let actual_ids: Vec<i32> = up
+            .package()
+            .tokenizer()
+            .encode(&rendered, false)
+            .unwrap()
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        assert_eq!(
+            actual_ids, want_ids,
+            "{case}: complete package-tokenized prompt"
+        );
         assert_eq!(
             up.package().prompt_tokens(&plan).unwrap(),
             want_ids.len(),
             "{case}: prompt length"
         );
+        let certificate = teacher_forced_text_certificate(&g, case);
         let (got, output) = run_engine(&up, &plan);
         assert_eq!(
             output.usage.prompt_tokens as usize,
@@ -259,7 +397,15 @@ fn text_modes_match_the_oracle_greedy_run() {
         );
         let want = host_i32(g.get(&format!("generated_{case}")).unwrap());
         let margins = host_f32(g.get(&format!("margins_{case}")).unwrap());
-        assert_greedy_parity(&up, case, &got, &want, &margins, &output);
+        assert_greedy_parity(
+            &up,
+            &g,
+            case,
+            &got,
+            &want,
+            &margins,
+            (&output, Some(certificate)),
+        );
     }
 }
 
@@ -290,7 +436,7 @@ fn editing_modes_match_the_oracle_greedy_run_with_the_same_reference_pixels() {
         );
         let want = host_i32(g.get(&format!("generated_{case}")).unwrap());
         let margins = host_f32(g.get(&format!("margins_{case}")).unwrap());
-        assert_greedy_parity(&up, case, &got, &want, &margins, &output);
+        assert_greedy_parity(&up, &g, case, &got, &want, &margins, (&output, None));
     }
 }
 
