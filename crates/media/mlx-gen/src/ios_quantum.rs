@@ -42,12 +42,12 @@ pub struct QuantumRefusal {
 
 static LAST_REFUSAL: std::sync::Mutex<Option<QuantumRefusal>> = std::sync::Mutex::new(None);
 
-fn record_refusal(label: &str, scratch: u64, available: Option<u64>) {
+fn record_refusal(label: &str, scratch: u64, reserve: u64, available: Option<u64>) {
     if let Ok(mut slot) = LAST_REFUSAL.lock() {
         *slot = Some(QuantumRefusal {
             label: label.to_string(),
             scratch_bytes: scratch,
-            reserve_bytes: PROCESS_RESERVE_BYTES,
+            reserve_bytes: reserve,
             available_bytes: available,
         });
     }
@@ -242,14 +242,111 @@ impl Drop for Scope {
     }
 }
 
+// ---- Production quantum marks and the admitted measured envelope (epic 16774 anchor law) ----
+
+/// A quantum boundary as production code sees it. A device capture registers a listener to read
+/// its kernel footprint at every boundary and attribute the lifetime peak to the phase each label
+/// runs in (`ios_pricing::IosPhase`, via the provider's `ios_quantum_phase`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantumMark<'a> {
+    /// A pre-construction headroom check passed: the quantum `label` is about to run.
+    Checked { label: &'a str, scratch: u64 },
+    /// The quantum `label` completed and its stream was synchronized.
+    Synchronized { label: &'a str },
+}
+
+type Listener = Box<dyn Fn(QuantumMark<'_>) + Send + Sync>;
+static LISTENER: std::sync::RwLock<Option<Listener>> = std::sync::RwLock::new(None);
+
+/// Install (or with `None`, remove) the process-wide quantum listener. Returns whether one was
+/// installed before. Only a device capture installs one; it never changes a decision.
+pub fn set_quantum_listener(listener: Option<Listener>) -> bool {
+    match LISTENER.write() {
+        Ok(mut slot) => std::mem::replace(&mut *slot, listener).is_some(),
+        Err(_) => false,
+    }
+}
+
+fn mark(m: QuantumMark<'_>) {
+    if let Ok(slot) = LISTENER.read() {
+        if let Some(listener) = slot.as_ref() {
+            listener(m);
+        }
+    }
+}
+
+/// The measured envelope an ADMITTED request runs under: the admission's demand (the anchor-derived
+/// growth over the starting footprint) plus its stated margin, and the live headroom when it began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Envelope {
+    start_available: u64,
+    budget: u64,
+}
+
+static ENVELOPE: std::sync::Mutex<Option<Envelope>> = std::sync::Mutex::new(None);
+
+/// Run `body` under an admitted, MEASURED envelope of `budget_bytes` (the anchor-derived demand
+/// plus its margin). While the process's growth since the envelope opened stays within it, a
+/// quantum's guard requires only the envelope's REMAINING bytes of live headroom when that is less
+/// than its formula price (scratch + [`PROCESS_RESERVE_BYTES`]): the measured device anchor, not the
+/// counted formula's conservative scratch, bounds an admitted request. Once growth exceeds the
+/// envelope (the measurement no longer describes this run) every guard is back on its formula — the
+/// runtime safety net. Without a live headroom reading the envelope changes nothing. Nested calls
+/// keep the outer envelope.
+pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if self.0 {
+                if let Ok(mut slot) = ENVELOPE.lock() {
+                    *slot = None;
+                }
+            }
+        }
+    }
+    let opened = match (ENVELOPE.lock(), available_bytes()) {
+        (Ok(mut slot), Some(start_available)) if slot.is_none() => {
+            *slot = Some(Envelope {
+                start_available,
+                budget: budget_bytes,
+            });
+            true
+        }
+        _ => false,
+    };
+    let _restore = Restore(opened);
+    body()
+}
+
+/// The `(scratch, reserve)` a guard checks: its formula price, or — inside an admitted envelope
+/// the process is still within — the envelope's remaining bytes when those are smaller.
+fn requirement(available: Option<u64>, scratch: u64) -> (u64, u64) {
+    let formula = (scratch, PROCESS_RESERVE_BYTES);
+    let (Some(available), Ok(slot)) = (available, ENVELOPE.lock()) else {
+        return formula;
+    };
+    let Some(envelope) = *slot else {
+        return formula;
+    };
+    let consumed = envelope.start_available.saturating_sub(available);
+    match envelope.budget.checked_sub(consumed) {
+        Some(remaining) if remaining < scratch.saturating_add(PROCESS_RESERVE_BYTES) => {
+            (remaining, 0)
+        }
+        _ => formula,
+    }
+}
+
 pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
         let available = available_for(label, scratch);
-        check_headroom(available, scratch, PROCESS_RESERVE_BYTES).map_err(|e| {
-            record_refusal(label, scratch, available);
-            Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)"))
+        let (required, reserve) = requirement(available, scratch);
+        check_headroom(available, required, reserve).map_err(|e| {
+            record_refusal(label, required, reserve, available);
+            Error::Unsupported(format!("{label}: {e}; scratch {required} bytes + engineering reserve {reserve} bytes (not a process bound)"))
         })?;
         notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
+        mark(QuantumMark::Checked { label, scratch });
     }
     Ok(())
 }
@@ -267,6 +364,7 @@ fn synchronize(label: &str) -> Result<()> {
     }
     let index = stream.get_index().unwrap_or(-1);
     notify(|| QuantumEventArg::Synchronized(label.to_string(), index));
+    mark(QuantumMark::Synchronized { label });
     Ok(())
 }
 
@@ -285,13 +383,15 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
     }
     let checked = std::cell::Cell::new(false);
     let available = available_for(label, scratch);
+    let (required, reserve) = requirement(available, scratch);
     let result = budget::guarded(
         available,
-        scratch,
-        PROCESS_RESERVE_BYTES,
+        required,
+        reserve,
         || {
             checked.set(true);
             notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
+            mark(QuantumMark::Checked { label, scratch });
             build()
         },
         |value| {
@@ -308,7 +408,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
                 && (reason.starts_with("iOS quantum refused")
                     || reason == "iOS quantum accounting overflow") =>
         {
-            record_refusal(label, scratch, available);
+            record_refusal(label, required, reserve, available);
             Error::Unsupported(format!("{label}: {reason}"))
         }
         other => other,
@@ -660,4 +760,79 @@ fn cpu_quantum_synchronizes_the_installed_non_default_stream() {
         })
         .collect();
     assert_eq!(synchronized, [installed_index, installed_index]);
+}
+
+/// The admitted measured envelope (epic 16774 anchor law): inside it a guard needs only the
+/// envelope's remaining bytes when its formula price is larger; a process grown past it is back on
+/// the formula; and the production listener sees every check and synchronization in order.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
+    const CHILD: &str = "MLX_IOS_QUANTUM_ENVELOPE_CPU_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ios_quantum::an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+    assert!(quantum_metal_guard::forbid_metal());
+    const MIB: u64 = 1 << 20;
+    let headroom = 1024 * MIB;
+    // Formula: 600 MiB scratch + 512 MiB reserve > 1024 MiB live headroom.
+    let scratch = 600 * MIB;
+    let marks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = std::sync::Arc::clone(&marks);
+    assert!(!set_quantum_listener(Some(Box::new(move |m| {
+        sink.lock().unwrap().push(match m {
+            QuantumMark::Checked { label, .. } => format!("checked:{label}"),
+            QuantumMark::Synchronized { label } => format!("synchronized:{label}"),
+        })
+    }))));
+    with_cpu_diagnostic_headroom(headroom, || {
+        assert!(before("formula", scratch).is_err(), "the formula alone refuses");
+        assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
+        // A measured envelope of 900 MiB, admitted against 1024 MiB: the guard now needs the
+        // envelope's remaining 900 MiB, which the live headroom covers.
+        with_admitted_envelope(900 * MIB, || before("enveloped", scratch))?;
+        let ran = with_admitted_envelope(900 * MIB, || {
+            run("enveloped run", scratch, || {
+                Ok(mlx_rs::Array::from_slice(&[1.0f32, 2.0], &[2]))
+            })
+        })?;
+        assert_eq!(ran.as_slice::<f32>(), &[1.0, 2.0]);
+        // An envelope larger than live headroom (an unsound admission) still refuses.
+        assert!(with_admitted_envelope(1100 * MIB, || before("unsound", scratch)).is_err());
+        let refusal = take_refusal().unwrap();
+        assert_eq!((refusal.scratch_bytes, refusal.reserve_bytes), (1100 * MIB, 0));
+        // Growth beyond the envelope: the guard is back on its formula (the safety net).
+        with_admitted_envelope(300 * MIB, || {
+            with_cpu_diagnostic_headroom(headroom - 400 * MIB, || {
+                assert!(before("past the envelope", 200 * MIB).is_err());
+                Ok(())
+            })
+        })?;
+        assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
+        // A cheap quantum whose formula is below the envelope's remaining keeps the formula.
+        with_admitted_envelope(900 * MIB, || before("cheap", MIB))?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(set_quantum_listener(None));
+    assert_eq!(
+        *marks.lock().unwrap(),
+        [
+            "checked:enveloped",
+            "checked:enveloped run",
+            "synchronized:enveloped run",
+            "checked:cheap"
+        ]
+    );
 }
