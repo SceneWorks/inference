@@ -1055,7 +1055,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertEqual(runner_job_env(mutated), [("native", "ANY_NAME")])
 
         native = yaml.safe_load(
-            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text()
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
         )
         self.assertEqual(runner_job_env(native), [])
         job = native["jobs"]["native"]
