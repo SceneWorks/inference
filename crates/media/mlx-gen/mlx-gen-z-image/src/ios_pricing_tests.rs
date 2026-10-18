@@ -28,10 +28,10 @@ use crate::transformer::ZImageTransformerConfig;
 
 const CHILD: &str = "ZIMAGE_IOS_PRICING_CPU_CHILD";
 /// Far above every tiny quantum's scratch + the reserve: every guard passes.
-const AMPLE: u64 = 1 << 34;
+pub(crate) const AMPLE: u64 = 1 << 34;
 /// The fixture image edge: above the iOS bounded-encode tile (256), so the encode tiles, and above
 /// the decode tile (256), so the decode tiles.
-const EDGE: u32 = 288;
+pub(crate) const EDGE: u32 = 288;
 /// An edge within both tiles: the whole-image encode and the untiled decode.
 const SMALL_EDGE: u32 = 128;
 /// The fixture's padded token window and valid caption tokens (a padded caption: 20 → 32).
@@ -116,7 +116,7 @@ const DIM: i32 = 64;
 const FF: i32 = 128;
 
 /// The tiny DiT (production structure; widths quantizable at group 64).
-fn dit_cfg() -> ZImageTransformerConfig {
+pub(crate) fn dit_cfg() -> ZImageTransformerConfig {
     ZImageTransformerConfig {
         patch_size: 2,
         f_patch_size: 1,
@@ -194,15 +194,15 @@ fn mid(t: &mut Tensors, p: &str, c: i32) {
 
 /// The tiny snapshot: `text_encoder/` (the bounded Qwen3 contract, 3 layers), `transformer/`,
 /// `vae/` (the production AutoencoderKL structure at channels 32/32/64/64) and a ControlNet file.
-struct Snapshot {
+pub(crate) struct Snapshot {
     _dir: tempfile::TempDir,
-    root: PathBuf,
-    control: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) control: PathBuf,
     te_cfg: ZTextEncoderConfig,
     te_contract: mlx_gen::gen_core::EncoderContract,
 }
 
-fn snapshot() -> Snapshot {
+pub(crate) fn snapshot() -> Snapshot {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("snapshot");
     // Text encoder: the bounded contract's exact tensor surface, random bf16 payload.
@@ -350,7 +350,7 @@ fn snapshot() -> Snapshot {
 }
 
 impl Snapshot {
-    fn facts(&self, control: bool, quant_bits: Option<i32>) -> Facts {
+    pub(crate) fn facts(&self, control: bool, quant_bits: Option<i32>) -> Facts {
         Facts {
             te_cfg: self.te_cfg,
             dit_cfg: dit_cfg(),
@@ -384,7 +384,7 @@ fn execution() -> GenerationMemory {
     }
 }
 
-fn image(edge: u32, seed: u32) -> mlx_gen::Image {
+pub(crate) fn image(edge: u32, seed: u32) -> mlx_gen::Image {
     mlx_gen::Image {
         width: edge,
         height: edge,
@@ -398,12 +398,6 @@ fn image(edge: u32, seed: u32) -> mlx_gen::Image {
 /// (`model::ZImageTurbo::generate_impl` / `model_control::ZImageTurboControl::generate_impl`
 /// over `Residency::run_staged_request_scoped`), returning every checked `(label, scratch)`.
 fn run(snap: &Snapshot, route: &Route) -> Vec<(String, u64)> {
-    let id = crate::model::MODEL_ID;
-    let cfg = dit_cfg();
-    let mode = route.mode;
-    let edge = route.width;
-    let req = route.request();
-    let cancel = CancelFlag::default();
     let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let sink = events.clone();
     with_cpu_diagnostic_headroom(AMPLE, || {
@@ -413,147 +407,182 @@ fn run(snap: &Snapshot, route: &Route) -> Vec<(String, u64)> {
                     sink.borrow_mut().push((label.clone(), *scratch));
                 }
             },
-            || {
-                // Phase A: the streamable text encoder, the prompt encode, its drop.
-                let source = snap
-                    .te_contract
-                    .validate_source(&WeightsSource::Dir(snap.root.join("text_encoder")))
-                    .unwrap();
-                let te = crate::loader::load_validated_text_encoder_streamable_with(
-                    &source,
-                    &snap.te_cfg,
-                )?;
-                let ids: Vec<i32> = (0..WINDOW).map(|i| 3 + i * 7).collect();
-                let mask: Vec<i32> = (0..WINDOW).map(|i| i32::from(i < VALID)).collect();
-                let window = crate::pipeline::EncoderWindow::resolve(&req, true, id)?;
-                let cap = crate::pipeline::encode_tokens(
-                    &te,
-                    &Array::from_slice(&ids, &[1, WINDOW]),
-                    &Array::from_slice(&mask, &[1, WINDOW]),
-                    VALID,
-                    window,
-                )?;
-                let cap = if mode.img2img() {
-                    cap
-                } else {
-                    crate::pipeline::caption_cast_quantum(&cap)?
-                };
-                cap.eval()?;
-                drop(te);
-
-                // Phase B: the heavy components, the encodes, the denoise batch.
-                let block_window = crate::pipeline::resolve_block_window(&req, true, id)?;
-                let budget = crate::pipeline::attention_budget(&req);
-                let steps = 3;
-                let start = if mode.img2img() { 1 } else { 0 };
-                let scheduler = FlowMatchEuler::for_static_shift(steps, 3.0);
-                let (latents, vae) = if mode.control() {
-                    let dit = crate::loader::load_control_transformer_with_stream_cfg(
-                        &snap.root,
-                        &WeightsSource::File(snap.control.clone()),
-                        cfg.clone(),
-                        true,
-                        true,
-                    )?;
-                    let vae = crate::loader::load_vae(&snap.root)?;
-                    let cc =
-                        crate::pipeline::encode_control_context(&vae, &image(edge, 1), edge, edge)?;
-                    let clean = if mode.img2img() {
-                        Some(crate::pipeline::encode_init_latents(
-                            &vae,
-                            &image(edge, 2),
-                            edge,
-                            edge,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let latents = crate::pipeline::denoise_batch(
-                        &scheduler,
-                        clean.as_ref(),
-                        start,
-                        7,
-                        &req,
-                        &mut |_| {},
-                        |latents, seed, op| {
-                            crate::pipeline::denoise_control_with_progress(
-                                &dit,
-                                &scheduler,
-                                None,
-                                seed,
-                                latents,
-                                &cap,
-                                &cc,
-                                0.8,
-                                start,
-                                budget,
-                                block_window,
-                                &cancel,
-                                op,
-                            )
-                        },
-                    )?;
-                    (latents, vae)
-                } else {
-                    let dit = crate::loader::load_transformer_with_stream_cfg(
-                        &snap.root,
-                        cfg.clone(),
-                        true,
-                        true,
-                    )?;
-                    let vae = crate::loader::load_vae(&snap.root)?;
-                    let clean = if mode.img2img() {
-                        Some(crate::pipeline::encode_init_latents(
-                            &vae,
-                            &image(edge, 2),
-                            edge,
-                            edge,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let latents = crate::pipeline::denoise_batch(
-                        &scheduler,
-                        clean.as_ref(),
-                        start,
-                        7,
-                        &req,
-                        &mut |_| {},
-                        |latents, seed, op| {
-                            crate::pipeline::denoise_with_progress(
-                                &dit,
-                                &scheduler,
-                                None,
-                                seed,
-                                latents,
-                                &cap,
-                                start,
-                                budget,
-                                block_window,
-                                &cancel,
-                                op,
-                            )
-                        },
-                    )?;
-                    (latents, vae)
-                };
-
-                // Phase C: the (tiled) decode.
-                let tiling = crate::pipeline::decode_tiling(&req, true);
-                crate::pipeline::decode_batch(
-                    &vae,
-                    tiling.as_ref(),
-                    latents,
-                    &cancel,
-                    &mut |_| {},
-                )?;
-                Ok(())
-            },
+            || run_request(snap, &snap.root, route, None, &image(route.width, 1)),
         )
     })
     .unwrap();
     let events = events.borrow().clone();
     events
+}
+
+/// One request's production phases on the snapshot at `root` (the dense snapshot, or a packed copy
+/// whose DiT is stored at `quant_bits`), fresh loads included, in the generators' order: under
+/// `stage_residency` (`Residency::run_staged_request_scoped`) the text encoder loads, encodes and
+/// drops before the heavy components load, and the decode runs after the DiT is shed; without it
+/// every component loads up front and stays resident to the end. A quantized load replays the
+/// generators' load-time `quantize` (`model::load_heavy` / `model_control::load_control_heavy`: a
+/// no-op on the packed base, packing the dense ControlNet). `control_image` is the control route's
+/// hint image (the reference init is `image(edge, 2)`).
+pub(crate) fn run_request(
+    snap: &Snapshot,
+    root: &Path,
+    route: &Route,
+    quant_bits: Option<i32>,
+    control_image: &mlx_gen::Image,
+) -> mlx_gen::Result<()> {
+    let id = crate::model::MODEL_ID;
+    let cfg = dit_cfg();
+    let mode = route.mode;
+    let edge = route.width;
+    let req = route.request();
+    let staged = route.execution.stage_residency;
+    let cancel = CancelFlag::default();
+
+    let source = snap
+        .te_contract
+        .validate_source(&WeightsSource::Dir(snap.root.join("text_encoder")))
+        .unwrap();
+    let te = crate::loader::load_validated_text_encoder_streamable_with(&source, &snap.te_cfg)?;
+    enum Heavy {
+        Base(Box<crate::ZImageTransformer>),
+        Control(Box<crate::ZImageControlTransformer>),
+    }
+    let load_heavy = || -> mlx_gen::Result<(Heavy, crate::vae::Vae)> {
+        let dit = if mode.control() {
+            let mut dit = crate::loader::load_control_transformer_with_stream_cfg(
+                root,
+                &WeightsSource::File(snap.control.clone()),
+                cfg.clone(),
+                true,
+                true,
+            )?;
+            if let Some(bits) = quant_bits {
+                dit.quantize(bits)?;
+            }
+            Heavy::Control(Box::new(dit))
+        } else {
+            let mut dit =
+                crate::loader::load_transformer_with_stream_cfg(root, cfg.clone(), true, true)?;
+            if let Some(bits) = quant_bits {
+                dit.quantize(bits)?;
+            }
+            Heavy::Base(Box::new(dit))
+        };
+        let mut vae = crate::loader::load_vae(root)?;
+        if let Some(bits) = quant_bits {
+            vae.quantize(bits)?;
+        }
+        Ok((dit, vae))
+    };
+    // Unstaged: the heavy components load beside the encoder, before conditioning.
+    let mut heavy = if staged { None } else { Some(load_heavy()?) };
+
+    // Phase A: the streamable text encoder's prompt encode (then, staged, its drop).
+    let ids: Vec<i32> = (0..WINDOW).map(|i| 3 + i * 7).collect();
+    let mask: Vec<i32> = (0..WINDOW).map(|i| i32::from(i < VALID)).collect();
+    let window = crate::pipeline::EncoderWindow::resolve(&req, true, id)?;
+    let cap = crate::pipeline::encode_tokens(
+        &te,
+        &Array::from_slice(&ids, &[1, WINDOW]),
+        &Array::from_slice(&mask, &[1, WINDOW]),
+        VALID,
+        window,
+    )?;
+    let cap = if mode.img2img() {
+        cap
+    } else {
+        crate::pipeline::caption_cast_quantum(&cap)?
+    };
+    cap.eval()?;
+    let te = if staged {
+        drop(te);
+        None
+    } else {
+        Some(te)
+    };
+
+    // Phase B: the heavy components, the encodes, the denoise batch.
+    if heavy.is_none() {
+        heavy = Some(load_heavy()?);
+    }
+    let (dit, vae) = heavy.take().unwrap();
+    let block_window = crate::pipeline::resolve_block_window(&req, true, id)?;
+    let budget = crate::pipeline::attention_budget(&req);
+    let steps = 3;
+    let start = if mode.img2img() { 1 } else { 0 };
+    let scheduler = FlowMatchEuler::for_static_shift(steps, 3.0);
+    let cc = match &dit {
+        Heavy::Control(_) => Some(crate::pipeline::encode_control_context(
+            &vae,
+            control_image,
+            edge,
+            edge,
+        )?),
+        Heavy::Base(_) => None,
+    };
+    let clean = if mode.img2img() {
+        Some(crate::pipeline::encode_init_latents(
+            &vae,
+            &image(edge, 2),
+            edge,
+            edge,
+        )?)
+    } else {
+        None
+    };
+    let latents = crate::pipeline::denoise_batch(
+        &scheduler,
+        clean.as_ref(),
+        start,
+        7,
+        &req,
+        &mut |_| {},
+        |latents, seed, op| match &dit {
+            Heavy::Control(dit) => crate::pipeline::denoise_control_with_progress(
+                dit,
+                &scheduler,
+                None,
+                seed,
+                latents,
+                &cap,
+                cc.as_ref().unwrap(),
+                0.8,
+                start,
+                budget,
+                block_window,
+                &cancel,
+                op,
+            ),
+            Heavy::Base(dit) => crate::pipeline::denoise_with_progress(
+                dit,
+                &scheduler,
+                None,
+                seed,
+                latents,
+                &cap,
+                start,
+                budget,
+                block_window,
+                &cancel,
+                op,
+            ),
+        },
+    )?;
+    // The denoise phase's locals (the control context, the img2img init latents) end with it.
+    drop((cc, clean));
+    // Staged: the DiT (and ControlNet) shed before the decode.
+    let dit = if staged {
+        drop(dit);
+        None
+    } else {
+        Some(dit)
+    };
+
+    // Phase C: the (tiled) decode.
+    let tiling = crate::pipeline::decode_tiling(&req, staged);
+    crate::pipeline::decode_batch(&vae, tiling.as_ref(), latents, &cancel, &mut |_| {})?;
+    drop((te, dit, vae));
+    Ok(())
 }
 
 fn largest_by_label<'a>(quanta: impl Iterator<Item = (&'a str, u64)>) -> BTreeMap<String, u64> {
@@ -746,7 +775,7 @@ fn tile_extent_is_the_largest_tile_the_tiler_cuts() {
 
 /// The tiny DiT stored PACKED at `bits` (a published Q4/Q8 turnkey's form: every Linear as its
 /// `weight` codes + `scales` + `biases`, norms / pad tokens / biases dense) under `root`.
-fn packed_transformer(snap: &Snapshot, root: &Path, bits: i32) {
+pub(crate) fn packed_transformer(snap: &Snapshot, root: &Path, bits: i32) {
     let dense =
         mlx_gen::weights::Weights::from_file(snap.root.join("transformer/model.safetensors"))
             .unwrap();

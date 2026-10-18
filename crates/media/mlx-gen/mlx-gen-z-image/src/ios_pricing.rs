@@ -93,6 +93,20 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     })
 }
 
+/// The `MemoryMode` keys of the requests this crate serves that are NOT derivable from the
+/// `z_image_turbo` TEXT anchor by the anchor law (`mlx_gen::ios_anchor_law::derive`): each is its own
+/// anchor family. `image_to_image` (the reference mode) and `control` (the control route, with or
+/// without a reference init, every kind) both add the bounded, layer-tiled VAE ENCODE, whose tile
+/// quanta measure above their counted price on the CPU fixture (by about one full-resolution
+/// activation per tiled resnet). The law prices an extra phase at its counted formula plus the
+/// anchor's largest unpriced overhead, and the text anchor has no tiled encode to measure that
+/// overhead in: from a rung-0 anchor (whole decode) the encode is under-derived by ~5%, and at the
+/// fully optimized selection it is covered only by the anchor's tiled decode happening to measure a
+/// comparable overhead (a few KB either way; short on the packed tiers). Every other phase of both
+/// modes derives. Failing test:
+/// `ios_additivity_tests::only_the_encode_is_not_derivable_from_the_text_anchor`.
+pub const IOS_NON_ADDITIVE_MODES: &[&str] = &["image_to_image", "control"];
+
 /// Price one iOS request header-only on the device backend (Metal).
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
     let facts = Facts::from_spec(req.provider, req.spec)?;
@@ -703,11 +717,14 @@ impl Model {
             + f32b(&[n, rope_dim])
             + f32b(&[c, rope_dim])
             + f32b(&[l, rope_dim]);
+        // img2img: the clean init latents, and the bf16 noise `denoise_batch` blended them with —
+        // its binding outlives the denoise of that image.
+        let noise = q::ab(2, &[lc as u64, 1, lh as u64, lw as u64]);
         let mut denoise_res = render_res
             + prep
             + latent
             + latent * u64::from(route.count - 1)
-            + if mode.img2img() { latent } else { 0 };
+            + if mode.img2img() { latent + noise } else { 0 };
         if mode.control() {
             // The control context and its cached embedding.
             denoise_res += context + row(n);
@@ -911,8 +928,12 @@ impl Model {
                 } else {
                     scale
                 };
-                for r in resnets {
-                    let live = q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                // The caller holds the block's input across the whole block
+                // (`DownEncoderBlock::forward_tiled(&h)`): live beside every layer after the first.
+                let block_in = q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                for (k, r) in resnets.iter().enumerate() {
+                    let held = if k > 0 { block_in } else { 0 };
+                    let live = held + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                     let (c1, c2) = r.conv_weights();
                     let x = [1, ch, cw, c];
                     stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, b);
@@ -928,7 +949,8 @@ impl Model {
                 }
                 if let Some(ds) = downsampler {
                     let core = ((tile_px + next - 1) / next).max(1);
-                    let live = q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                    let held = if resnets.is_empty() { 0 } else { block_in };
+                    let live = held + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                     let (oh, ow) = ((ch - 2) / 2 + 1, (cw - 2) / 2 + 1);
                     let cout = ds.weight().shape()[0];
                     let stage = mlx_gen::ios_quantum::downsample_stage_bytes(&[1, oh, ow, cout], 4);
@@ -952,20 +974,25 @@ impl Model {
             ));
             for down in downs {
                 let (resnets, downsampler) = down.parts();
-                for r in resnets {
+                // The caller holds the block's input across the whole block
+                // (`DownEncoderBlock::forward(&h)`): live beside every layer after the first.
+                let block_in = q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                for (k, r) in resnets.iter().enumerate() {
+                    let held = if k > 0 { block_in } else { 0 };
                     let x = carrier(&[1, c, ch, cw], Dtype::Float32)?;
                     out.push((
                         labels.resnet,
-                        mlx_gen::ios_quantum::bytes(&x),
+                        held + mlx_gen::ios_quantum::bytes(&x),
                         r.quantum_scratch(&x, b),
                     ));
                     c = mlx_gen::ios_quantum::conv_channels(r.conv_weights().1).1;
                 }
                 if let Some(ds) = downsampler {
+                    let held = if resnets.is_empty() { 0 } else { block_in };
                     let call = ConvCall::new(&[1, ch + 1, cw + 1, c], 4, ds.weight(), 2, 0);
                     out.push((
                         q::VAE_DOWNSAMPLE,
-                        q::ab(4, &[1, c as u64, ch as u64, cw as u64]),
+                        held + q::ab(4, &[1, c as u64, ch as u64, cw as u64]),
                         mlx_gen::ios_quantum::single_conv_bytes(&call, 1, 0, b),
                     ));
                     (ch, cw) = ((ch - 2) / 2 + 1, (cw - 2) / 2 + 1);
@@ -1021,7 +1048,7 @@ impl Model {
                     .iter()
                     .filter(|u| u.upsamples())
                     .fold(1_i32, |s, _| s.saturating_mul(2));
-                for up in ups {
+                for (i, up) in ups.iter().enumerate() {
                     let edge = edge_at(remaining);
                     let next = if up.upsamples() {
                         (remaining / 2).max(1)
@@ -1029,8 +1056,13 @@ impl Model {
                         remaining
                     };
                     let (resnets, upsampler) = up.parts();
-                    for r in resnets {
-                        let live = head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                    // The caller holds the block's input across the whole block
+                    // (`UpDecoderBlock::forward_tiled(&h)`): live beside every layer after the
+                    // first (the first block's input is the head, already live).
+                    let block_in = held_block_input(i, c, ch, cw);
+                    for (k, r) in resnets.iter().enumerate() {
+                        let held = if k > 0 { block_in } else { 0 };
+                        let live = held + head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                         let (c1, c2) = r.conv_weights();
                         let x = [1, ch, cw, c];
                         stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, b);
@@ -1045,7 +1077,8 @@ impl Model {
                         c = mlx_gen::ios_quantum::conv_channels(c2).1;
                     }
                     if let Some(u) = upsampler {
-                        let live = head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
+                        let held = if resnets.is_empty() { 0 } else { block_in };
+                        let live = held + head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                         let x = [1, 2 * ch, 2 * cw, c];
                         stage_and_tiles(
                             &mut out,
@@ -1075,22 +1108,27 @@ impl Model {
                 );
             }
             None => {
-                for up in ups {
+                for (i, up) in ups.iter().enumerate() {
                     let (resnets, upsampler) = up.parts();
-                    for r in resnets {
+                    // The caller holds the block's input across the whole block
+                    // (`UpDecoderBlock::forward(&h)`), as in the tiled tail.
+                    let block_in = held_block_input(i, c, ch, cw);
+                    for (k, r) in resnets.iter().enumerate() {
+                        let held = if k > 0 { block_in } else { 0 };
                         let x = carrier(&[1, c, ch, cw], Dtype::Float32)?;
                         out.push((
                             labels.resnet,
-                            head + mlx_gen::ios_quantum::bytes(&x),
+                            held + head + mlx_gen::ios_quantum::bytes(&x),
                             r.quantum_scratch(&x, b),
                         ));
                         c = mlx_gen::ios_quantum::conv_channels(r.conv_weights().1).1;
                     }
                     if let Some(u) = upsampler {
+                        let held = if resnets.is_empty() { 0 } else { block_in };
                         let call = ConvCall::new(&[1, 2 * ch, 2 * cw, c], 4, u.weight(), 1, 1);
                         out.push((
                             q::VAE_UPSAMPLE,
-                            head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]),
+                            held + head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]),
                             mlx_gen::ios_quantum::single_conv_bytes(&call, 1, 0, b),
                         ));
                         (ch, cw) = (2 * ch, 2 * cw);
@@ -1126,6 +1164,16 @@ fn packed_resident(block: &ZImageControlBlock, stored: u64, bits: Option<i32>) -
                 .saturating_add(q::packed_bytes(lin, bits)),
             None => total,
         })
+}
+
+/// The f32 input of up block `i` (`[1, c, h, w]`) the decoder holds across that block's layers —
+/// zero for the first block, whose input is the head (already priced live through the tail).
+fn held_block_input(i: usize, c: i32, h: i32, w: i32) -> u64 {
+    if i == 0 {
+        0
+    } else {
+        q::ab(4, &[1, c as u64, h as u64, w as u64])
+    }
 }
 
 /// The mid block's quanta (resnet, attention, resnet) over a `[1, c, h, w]` f32 activation.

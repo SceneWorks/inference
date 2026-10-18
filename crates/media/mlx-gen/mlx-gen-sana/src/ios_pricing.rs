@@ -55,6 +55,14 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
     }
 }
 
+/// The `MemoryMode` keys of the requests this crate serves that are NOT derivable from the
+/// `sana_1600m` TEXT anchor by the anchor law (`mlx_gen::ios_anchor_law::derive`) — each such mode
+/// would be its own anchor family. Empty: `sana_1600m` reference and `sana_sprint_1600m` text and
+/// reference are component-additive over the base architecture's text anchor, proven on the CPU
+/// fixtures at the fully optimized selection and rung 0, dense and packed
+/// (`ios_pricing::additivity::every_mode_is_derivable_from_the_text_anchor`).
+pub const IOS_NON_ADDITIVE_MODES: &[&str] = &[];
+
 /// One tensor of a safetensors header inventory.
 #[derive(Clone, Debug)]
 struct Tensor {
@@ -622,7 +630,19 @@ pub fn priced_quanta(
             })?,
             labels::REFERENCE_ENCODER_LOAD,
         );
-        phase(IosPhase::Load, cond_bytes, load);
+        // The preprocessed f32 reference image (`encode_init_latents_with_tiling`'s input) is
+        // allocated after this load and before the encode's first guard, i.e. inside the load's
+        // interval of the Load phase: it is resident by the phase's end. (Unstaged, the image is
+        // allocated after the last Gemma quantum synchronizes, so it belongs to Encode alone.)
+        let image = tensor_bytes(
+            4,
+            &[
+                dcae.in_channels as u64,
+                u64::from(plan.height),
+                u64::from(plan.width),
+            ],
+        );
+        phase(IosPhase::Load, cond_bytes + image, load);
     }
     let mut load = Quanta::default();
     load.take(
@@ -735,9 +755,25 @@ pub fn priced_quanta(
         quantum::scm_step_bytes(count * latent_elems),
         labels::LATENT_BATCH,
     );
+    // The sampler state carried beside the latents through every trunk forward: the drawn noise
+    // outlives the loop whenever it is not itself the starting latents (`denoise_cfg` /
+    // `denoise_sprint` keep `noise` alive after blending the img2img start, and Sprint's prior is the
+    // separate `noise · σ_data`), and Sprint's SCM loop feeds the trunk a separate scaled model input
+    // (`lat_in`, live beside the latents for the whole forward).
+    let noise = if plan.img2img || plan.sprint {
+        latent_bytes
+    } else {
+        0
+    };
+    let model_input = if plan.sprint { latent_bytes } else { 0 };
     phase(
         IosPhase::Denoise,
-        resident(dit_bytes + dec_bytes) + cond_bytes + reference + (count - 1) * latent_bytes,
+        resident(dit_bytes + dec_bytes)
+            + cond_bytes
+            + reference
+            + noise
+            + model_input
+            + (count - 1) * latent_bytes,
         den,
     );
 
@@ -808,5 +844,7 @@ pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
     price(&facts, &plan)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod additivity;
 #[cfg(test)]
 mod tests;

@@ -39,6 +39,8 @@ pub mod preview;
 pub mod quant;
 // iOS execution-quantum labels and counted prices (epic 16774, sc-26433).
 #[cfg(all(test, target_os = "macos"))]
+mod ios_additivity_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod ios_pricing_tests;
 pub(crate) mod quantum;
 #[cfg(all(test, target_os = "macos"))]
