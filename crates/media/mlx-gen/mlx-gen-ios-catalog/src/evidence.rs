@@ -565,7 +565,10 @@ mod tests {
     #[test]
     fn anchor_rows_round_trip_and_malformed_rows_fail_the_whole_table_closed() {
         let good = completed(key(), AnchorKind::Optimized, optimized(), 3 << 30);
-        assert_eq!(parse(&table(&[good.clone()])).unwrap(), vec![good.clone()]);
+        assert_eq!(
+            parse(&table(std::slice::from_ref(&good))).unwrap(),
+            vec![good.clone()]
+        );
         // A resident refusal is evidence; an optimized refusal is a defect.
         let refused = |kind, rung| AnchorRow {
             key: EvidenceKey {
