@@ -28,8 +28,15 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: "4"
       RUSTC_WRAPPER: ""
       CARGO_NET_OFFLINE: "true"
-      MOSS_TRANSPORT_ARTIFACT_ROOT: ${{ runner.temp }}/moss-native-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      - name: Initialize evidence outside both checkouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP ("moss-native-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          New-Item -ItemType Directory -Path $root|Out-Null
+          "MOSS_TRANSPORT_ARTIFACT_ROOT=$root"|Out-File -FilePath $env:GITHUB_ENV -Encoding UTF8 -Append
+          @{status='initialized';workflow_revision=$env:GITHUB_SHA}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $root 'transport-initialization.json') -Encoding UTF8
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ fromJSON(inputs.control_json).inference_revision }}

@@ -164,3 +164,30 @@ Remediation source status: **F-277/F-278/F-279 addressed in the sole paired fix
 batch and locally self-verified within the explicit CPU boundary**. This preserves
 the original independent CHANGES_REQUIRED verdict as historical review evidence;
 it is not a second review or a claim of final native acceptance.
+
+## Minimal workflow CI validation repair after whole-branch R2
+
+GitHub rejected workflow run `39140431560` before any job at published source
+`3843e6e3052f20085542572930e2dec4591b09d0`: line31 used `runner.temp` in
+job-level env, where the runner context is unavailable. GitHub's annotation was
+`Line31 Col37: Unrecognized named-value: 'runner'`. The existing 65 policy
+tests had passed but did not validate this new workflow's expression context.
+This is a minimum self-verified CI repair, not another source review.
+
+The first PowerShell step now derives the unique outside-checkout evidence root
+from runtime RUNNER_TEMP and run/attempt environment values, creates it, exports
+it through GITHUB_ENV and writes initialization evidence before either checkout.
+Subsequent steps and always-upload share that exported root; checkout or source
+guard failure therefore retains initialization evidence. Exact trusted-main/pin,
+ancestry, device ownership and campaign protocols are unchanged.
+
+Actionlint 1.7.12 with the explicit native self-hosted label config reproduces the
+original invalid runner-context rejection and accepts the repaired workflow. The
+new structural policy regression rejects direct, bracket and wrapped runner
+expressions in job env while accepting runner expressions in step env, and checks
+pre-checkout evidence initialization plus always-upload wiring. All **66 policy
+tests passed** with Python3.14; whitespace checks passed. Initial local tooling
+attempts using system Python3.9 (no tomllib) and Python3.12 (no PyYAML) are retained
+as environment diagnostics. PowerShell is not installed locally; its Windows
+SelfTest, CUDA compile and native terminal remain pending platform gates. No
+model/Rust production source, GPU/Metal execution or Windows dispatch changed.

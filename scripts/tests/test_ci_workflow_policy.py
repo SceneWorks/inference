@@ -1026,6 +1026,56 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_native_terminal_initializes_evidence_without_job_runner_context(self):
+        # Job env is evaluated before a runner exists. Step env may use runner context;
+        # parse the context boundary so a different path/name or wrapped expression fails too.
+        def runner_job_env(workflow):
+            return [
+                (job_name, name)
+                for job_name, job in workflow.get("jobs", {}).items()
+                for name, value in job.get("env", {}).items()
+                if any(
+                    re.search(r"\brunner\s*(?:\.|\[)", expression)
+                    for expression in re.findall(r"\$\{\{(.*?)\}\}", str(value), re.S)
+                )
+            ]
+
+        valid = {"jobs": {"native": {
+            "env": {"ID": "${{ github.run_id }}"},
+            "steps": [{"env": {"PATH": "${{ runner.temp }}"}}],
+        }}}
+        self.assertEqual(runner_job_env(valid), [])
+        for invalid in (
+            "${{ runner.temp }}/evidence",
+            "${{ runner['temp'] }}",
+            "${{ format('{0}', runner.os) }}",
+        ):
+            mutated = copy.deepcopy(valid)
+            mutated["jobs"]["native"]["env"]["ANY_NAME"] = invalid
+            self.assertEqual(runner_job_env(mutated), [("native", "ANY_NAME")])
+
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text()
+        )
+        self.assertEqual(runner_job_env(native), [])
+        job = native["jobs"]["native"]
+        steps = job["steps"]
+        first = steps[0]
+        self.assertEqual(first["shell"], "powershell")
+        self.assertNotIn("uses", first)
+        self.assertIn("$env:RUNNER_TEMP", first["run"])
+        self.assertIn("$env:GITHUB_ENV", first["run"])
+        self.assertIn("transport-initialization.json", first["run"])
+        self.assertNotIn("$env:GITHUB_WORKSPACE", first["run"])
+        upload = next(
+            step for step in steps
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn(
+            "${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.json", upload["with"]["path"]
+        )
+
     def require_posix_shell(self) -> str:
         shell = posix_shell()
         if shell is None:
