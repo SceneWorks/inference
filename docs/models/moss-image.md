@@ -118,3 +118,56 @@ Every cache/load identity includes the selected variant, acceleration/precision 
 all exact content pins. OFF→ON→OFF requires separate immutable loaded state or a full reload;
 no ordinary request may inherit DMD LoRA/time replacements from cached accelerated state.
 Reject absent components and incompatible parent/mode/control combinations before execution.
+
+## Canonical JSON and execution receipts
+
+`MossImageOptions`, `MossImageResolved` and validated `MossImageExecutionReport` implement
+serde serialization/deserialization. Use these types directly at product transport boundaries;
+do not implement another boolean/string parser in each route. Acceleration is exactly one of
+`"off"`, `"unmerged_bf16"`, `"full_fp32"`; unknown fields/variants, invalid controls and nonfinite
+numbers are refused. Missing options fields use the ordinary defaults. Null or omitted
+`uncond_skip_layers` uses the author default; an explicit empty list disables ordinary skipping.
+Examples:
+
+```json
+{"acceleration":"off","max_sequence_length":4096,"uncond_skip_layers":null,"slg":null,"training_shift":null}
+```
+
+```json
+{"acceleration":"unmerged_bf16","max_sequence_length":4096,"uncond_skip_layers":null,"slg":null,"training_shift":null}
+```
+
+The advanced native trait carries the same `&mut dyn FnMut(Progress)` callback as
+`Generator::generate`, alongside the request's cancellation flag. Embeddings/masks/noise/latent
+output belong to that native advanced interface; this contract does not introduce a REST tensor
+upload route or authorize a product to advertise one.
+
+`Generator::moss_image_execution_report()` defaults to None for compatibility. MOSS providers
+clear their receipt under the lifecycle lock **before validation or work on every attempt** and
+publish only after every output succeeds and the final cancellation check passes. Load or mode
+replacement creates fresh state. Failure/cancel leaves None. The worker must serialize generation
+and receipt retrieval as one operation; this getter is last-completed state, not a concurrent job
+lookup. No receipt may be reconstructed from settings after an execution failure.
+
+Construct `MossImageExecutionData` from actual consumed inputs, then
+`MossImageExecutionReport::new(data)`. `report.data()` returns immutable facts; deserialization
+passes the same validator. It checks effective resolved controls, exact consumed config/shard/
+tokenizer/auxiliary file set and identities, sigma schedule or DMD prefix/matrix digest, expanded
+batch/output geometry, actual noise/seed and conditioning digests/valid lengths, published dtype
+islands and complete adapter installation. Digests are lowercase64-character SHA256 hex strings.
+Use `MossImageAssetReceipt::from_pin` with retained verified `PinnedWeightsFile` tokens;
+consistency validation is not independent proof that an arbitrary claimed digest is genuine.
+No raw prompt text is copied into these receipts. The execution-device kind is explicit
+`cpu`/`mlx`/`cuda`/`metal`: the reused Candle text tower computes FP32 on CPU and BF16 on GPU.
+These facts describe actual execution, not a new checkpoint or quantization variant.
+
+Full-FP32 DMD is the author's **already distilled** FP32 `transformer/` plus dataspace. It does
+not load a second LoRA or apply the delta again. The unmerged policy uses the official SFT BF16
+transformer plus the separate FP32 adapters/replacements. An FP32 cast of the official SFT
+backbone with another unmerged addition is not silently substituted for the published full
+checkpoint's arithmetic.
+
+The sc-26322 review fix pins CPU FP32 linspace's step and two endpoint anchors before nearest
+grid snapping. In the seven-step shift1 case the lower neighbor at the sixth inference point is
+training index166 (sigma0.16700001060962677), not167. Nondefault fixtures generated with
+CPU torch2.9.1 cover inference/training shifts and exact endpoints without model execution.

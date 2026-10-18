@@ -35,6 +35,14 @@ pub trait Generator {
         None
     }
 
+    /// Actual last successful MOSS execution. Providers clear this under their lifecycle lock
+    /// before every attempt and publish only after all outputs and a final cancellation check.
+    /// Callers must serialize generation and receipt retrieval together; concurrent attempts may
+    /// clear/replace the last-completed receipt. None never implies successful MOSS execution.
+    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
