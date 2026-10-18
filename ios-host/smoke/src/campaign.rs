@@ -199,7 +199,8 @@ pub struct Planned {
 /// component-additive, else the mode itself).
 pub struct Grouping<'a> {
     pub architecture: &'a dyn Fn(&str, &str, &str) -> String,
-    pub variant: &'a dyn Fn(&str, &str) -> String,
+    /// `(provider, campaign mode, tier)` → variant.
+    pub variant: &'a dyn Fn(&str, &str, &str) -> String,
 }
 
 /// One anchor family: its group key, the member `provider/route/mode` cells it prices (all derived
@@ -216,7 +217,7 @@ pub struct Family {
 
 /// The weights-free grouping: no checkpoint collapse (each `(provider, route)` is its own
 /// architecture group), variants from `variant`.
-pub fn per_route<'a>(variant: &'a dyn Fn(&str, &str) -> String) -> Grouping<'a> {
+pub fn per_route<'a>(variant: &'a dyn Fn(&str, &str, &str) -> String) -> Grouping<'a> {
     Grouping {
         architecture: &|provider: &str, route: &str, _tier: &str| format!("{provider}/{route}"),
         variant,
@@ -231,7 +232,7 @@ pub fn families(surfaces: &[Surface], grouping: &Grouping<'_>) -> Vec<Family> {
             for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
                 let architecture = (grouping.architecture)(&s.provider, route, tier);
                 for mode in &s.modes {
-                    let variant = (grouping.variant)(&s.provider, mode);
+                    let variant = (grouping.variant)(&s.provider, mode, tier);
                     let member = format!("{}/{route}/{mode}", s.provider);
                     match out.iter_mut().find(|f| {
                         f.architecture == architecture && f.tier == tier && f.variant == variant
@@ -347,7 +348,7 @@ pub fn plan(surfaces: &[Surface], grouping: &Grouping<'_>) -> (Vec<Family>, Vec<
 /// [`plan`] under the weights-free [`per_route`] grouping with every mode additive (the campaign
 /// shape the unit tests hold).
 pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
-    let variant = |_: &str, _: &str| "base".to_string();
+    let variant = |_: &str, _: &str, _: &str| "base".to_string();
     plan(surfaces, &per_route(&variant)).1
 }
 
@@ -534,7 +535,7 @@ mod tests {
                 provider.to_string()
             }
         };
-        let variant = |_: &str, mode: &str| {
+        let variant = |_: &str, mode: &str, _: &str| {
             if mode == "batch" {
                 mode.to_string()
             } else {
@@ -668,7 +669,7 @@ mod tests {
             "anchors and the three validation cases only"
         );
         // The weights-free grouping never collapses routes.
-        let variant = |_: &str, _: &str| "base".to_string();
+        let variant = |_: &str, _: &str, _: &str| "base".to_string();
         assert_eq!(families_count(&[a], &per_route(&variant)), 3 * 3);
         assert!(enumerate(&[supra])
             .iter()

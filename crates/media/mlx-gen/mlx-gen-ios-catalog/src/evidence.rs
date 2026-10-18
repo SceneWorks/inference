@@ -91,7 +91,7 @@ impl EvidenceKey {
             machine: self.machine.clone(),
             architecture_sha256: self.architecture_sha256.clone(),
             tier: self.tier.clone(),
-            variant: crate::pricing::anchor_variant(&self.provider, &self.mode),
+            variant: crate::pricing::anchor_variant(&self.provider, &self.mode, &self.tier),
         }
     }
 }
