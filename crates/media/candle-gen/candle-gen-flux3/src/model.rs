@@ -506,6 +506,9 @@ impl Flux3Klein {
             encoder_materialization_boundary(||Ok(self.device.synchronize()?)),
             |heavy:&Heavy,(text,negative,params):(TextConditioning,Option<TextConditioning>,GenerationParams),progress| {
                 let reference_tokens=prepared.map(|p|crate::references::encode(&heavy.ae,p,&self.device,&req.cancel)).transpose()?;
+                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                    self.device.synchronize().map_err(Error::from).map_err(gen_core::Error::from)
+                }, progress)?;
                 let total=params.steps*req.count;
                 let mut tokens=Vec::with_capacity(req.count as usize);
                 for index in 0..req.count {
@@ -628,6 +631,9 @@ impl Flux3Klein {
                     .as_ref()
                     .map(|p| crate::references::encode(&heavy.ae, p, &self.device, &req.cancel))
                     .transpose()?;
+                gen_core::flux3::phase_resource::conditioning_complete(&req.cancel, || {
+                    self.device.synchronize().map_err(Error::from).map_err(gen_core::Error::from)
+                }, on_progress)?;
                 let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.

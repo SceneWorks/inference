@@ -2280,6 +2280,11 @@ impl std::fmt::Debug for PromptEnhancementSink {
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    /// Optional exact phase boundary: all text and reference conditioning has been materialized
+    /// and its device work successfully synchronized, before the first denoiser forward. Emitted
+    /// once per request by adopting providers, on resident and staged paths. This is not a step,
+    /// loading event or terminal result; consumers that do not price phases may ignore it.
+    ConditioningComplete,
     /// Denoising step `current` of `total` (1-based).
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).

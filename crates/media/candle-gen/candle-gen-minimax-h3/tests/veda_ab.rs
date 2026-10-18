@@ -537,7 +537,8 @@ fn veda_ab_render() {
         .generate(&req, &mut |p| match p {
             Progress::Step { .. } => step_ticks.push(gen_started.elapsed()),
             Progress::Decoding => decode_tick = Some(gen_started.elapsed()),
-            Progress::Loading(_) | Progress::Upsampling { .. } => {}
+            Progress::Loading(_) | Progress::ConditioningComplete | Progress::Upsampling { .. } => {
+            }
         })
         .unwrap_or_else(|e| panic!("generate {MODEL_ID} ({tier}, veda {veda_on}): {e}"));
     let gen_total = gen_started.elapsed();

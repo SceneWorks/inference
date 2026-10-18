@@ -165,6 +165,29 @@ impl<T> PhaseResourceSlot<T> {
     }
 }
 
+/// Publish the exact conditioning/denoising boundary only after the provider's materialization
+/// AND device fence succeed. Cancellation before or during that work suppresses the event; a
+/// consumer canceling in the callback prevents the first denoiser forward. Positive `Step`
+/// events stay 1-based; this boundary emits neither a step nor a terminal event.
+pub fn conditioning_complete(
+    cancel: &CancelFlag,
+    materialize_and_synchronize: impl FnOnce() -> Result<()>,
+    progress: &mut dyn FnMut(crate::Progress),
+) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    materialize_and_synchronize()?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    progress(crate::Progress::ConditioningComplete);
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "phase_resource_tests.rs"]
 mod tests;

@@ -75,7 +75,8 @@ fn run(g: &dyn mlx_gen::Generator, req: &GenerationRequest) -> (GenerationOutput
             Progress::Decoding => decoding = true,
             // Sequential-only component-load signal (sc-11126); boogu runs Resident here, so it never
             // fires — a no-op arm keeps the match exhaustive over the additive `Progress` variant.
-            Progress::Loading(_) | Progress::Upsampling { .. } => {}
+            Progress::Loading(_) | Progress::ConditioningComplete | Progress::Upsampling { .. } => {
+            }
         })
         .expect("generate");
     (out, max_step, decoding)

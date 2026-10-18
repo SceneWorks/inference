@@ -354,3 +354,88 @@ fn a_panicking_phase_poisons_nothing_and_its_owner_is_released_first() {
     );
     assert_eq!(*events.lock().unwrap(), vec!["fence", "drop-owner", "load"]);
 }
+
+#[test]
+fn conditioning_boundary_follows_materialization_and_precedes_denoise_and_one_decode() {
+    let cancel = CancelFlag::new();
+    let order = std::cell::RefCell::new(Vec::new());
+    let events = std::cell::RefCell::new(Vec::new());
+    let mut progress = |event| {
+        order.borrow_mut().push("boundary");
+        events.borrow_mut().push(event);
+    };
+    conditioning_complete(
+        &cancel,
+        || {
+            order.borrow_mut().push("materialize");
+            order.borrow_mut().push("synchronize");
+            Ok(())
+        },
+        &mut progress,
+    )
+    .unwrap();
+    order.borrow_mut().push("first-forward");
+    events.borrow_mut().push(crate::Progress::Step {
+        current: 1,
+        total: 1,
+    });
+    events.borrow_mut().push(crate::Progress::Decoding);
+    assert_eq!(
+        *order.borrow(),
+        ["materialize", "synchronize", "boundary", "first-forward"]
+    );
+    assert_eq!(
+        *events.borrow(),
+        [
+            crate::Progress::ConditioningComplete,
+            crate::Progress::Step {
+                current: 1,
+                total: 1
+            },
+            crate::Progress::Decoding
+        ]
+    );
+}
+
+#[test]
+fn canceled_or_failed_conditioning_never_reports_a_false_boundary() {
+    for during in [false, true] {
+        let cancel = CancelFlag::new();
+        if !during {
+            cancel.cancel();
+        }
+        let mut events = Vec::new();
+        let result = conditioning_complete(
+            &cancel,
+            || {
+                cancel.cancel();
+                Ok(())
+            },
+            &mut |event| events.push(event),
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert!(events.is_empty());
+    }
+    let cancel = CancelFlag::new();
+    let mut events = Vec::new();
+    let error = conditioning_complete(
+        &cancel,
+        || Err(Error::Unsupported("fence failed".into())),
+        &mut |event| events.push(event),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("fence failed"));
+    assert!(events.is_empty());
+}
+
+#[test]
+fn cancellation_in_conditioning_callback_stops_before_denoise_without_terminal_progress() {
+    let cancel = CancelFlag::new();
+    let mut events = Vec::new();
+    let result = conditioning_complete(&cancel, || Ok(()), &mut |event| {
+        events.push(event);
+        cancel.cancel();
+    });
+    assert!(matches!(result, Err(Error::Canceled)));
+    assert_eq!(events, [crate::Progress::ConditioningComplete]);
+}
