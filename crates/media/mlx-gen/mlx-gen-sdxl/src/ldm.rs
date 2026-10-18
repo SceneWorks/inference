@@ -109,6 +109,64 @@ pub fn split_ldm_checkpoint(path: &Path) -> Result<LdmComponents> {
     })
 }
 
+/// iOS pre-load floor (sc-26270) for constructing `components` out of the fused checkpoint at
+/// `path`: every tensor that remaps into one of them at its RESIDENT width after the load's cast
+/// (the VAE upcast to f32 by `load_vae_from_weights`; the U-Net and CLIP encoders cast to the
+/// compute dtype by `loader::cast_for_load` — a fused checkpoint is never packed), plus the largest
+/// such tensor's transient (its stored source and cast copy together, or one read). Restricted to
+/// the components this phase actually builds (a fused file also carries the others). Header-only;
+/// a no-op (no file read) off device.
+pub(crate) fn before_component_load(
+    label: &str,
+    path: &Path,
+    components: &[SdxlComponent],
+) -> Result<()> {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    if !mlx_gen::ios_quantum::enabled() {
+        return Ok(());
+    }
+    let compute = match crate::model::DTYPE {
+        mlx_rs::Dtype::Float32 => (Stored::F32, 4u64),
+        mlx_rs::Dtype::Bfloat16 => (Stored::BF16, 2),
+        _ => (Stored::F16, 2),
+    };
+    let mut total = 0u64;
+    let mut largest = 0u64;
+    for header in mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+        .map_err(|e| Error::Msg(e.to_string()))?
+    {
+        let component = match remap_sdxl_ldm_key(&header.name) {
+            Some(
+                TensorRemap::Rename(component, _)
+                | TensorRemap::Transpose(component, _)
+                | TensorRemap::Squeeze(component, _)
+                | TensorRemap::SplitQkv(component, _),
+            ) => component,
+            None => continue,
+        };
+        if !components.contains(&component) {
+            continue;
+        }
+        let (target, width) = if component == SdxlComponent::Vae {
+            (Stored::F32, 4)
+        } else {
+            compute
+        };
+        if header.dtype == target {
+            total = total.saturating_add(header.data_bytes);
+            largest = largest.max(header.data_bytes);
+        } else {
+            let cast = header
+                .shape
+                .iter()
+                .fold(width, |a, &d| a.saturating_mul(d as u64));
+            total = total.saturating_add(cast);
+            largest = largest.max(cast.saturating_add(header.data_bytes));
+        }
+    }
+    mlx_gen::ios_quantum::before(label, total.saturating_add(largest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

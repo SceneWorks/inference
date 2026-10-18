@@ -1100,6 +1100,7 @@ impl CausalLm {
             Stack::Resident(layers) => {
                 let checkpoint_prefill = input_embeds.shape()[1] > SDPA_EVAL_GROUP_QLEN;
                 for (i, layer) in layers.iter().enumerate() {
+                    crate::layer_gate::before_layer(i)?;
                     h = layer.forward(&h, ropes, mask, cache, i, &mut shared)?;
                     if checkpoint_prefill {
                         // The sequential stack already evaluates its carry per layer. Do the
@@ -1121,6 +1122,7 @@ impl CausalLm {
                 // a resident pass with extra steps.
                 let mut view = stream.open()?;
                 for i in 0..self.cfg.num_layers {
+                    crate::layer_gate::before_layer(i)?;
                     h = stream.run_layer(
                         &mut view,
                         &self.cfg,

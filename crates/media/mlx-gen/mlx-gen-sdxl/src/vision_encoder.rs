@@ -143,11 +143,43 @@ impl VisionEncoderLayer {
         })
     }
 
+    /// iOS quantum scratch (sc-26270) of this layer over `x` `[B, N, D]`, from the loaded widths
+    /// (hidden from `layer_norm1`, MLP width from `fc1`; [`crate::quantum::clip_layer_bytes`]).
+    fn quantum_scratch(&self, x: &Array) -> u64 {
+        let s = x.shape();
+        crate::quantum::clip_layer_bytes(
+            s[0],
+            s[1],
+            self.ln1_w.shape()[0] as u64,
+            crate::quantum::linear_out(&self.fc1),
+            self.num_heads,
+            self.head_dim,
+            false,
+            crate::quantum::element_bytes(x),
+            crate::quantum::Backend::current(),
+        )
+    }
+
+    /// The layer as one guarded iOS quantum (sc-26270); a pass-through off device.
+    fn forward_quantum(&self, x: &Array) -> Result<Array> {
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VISION_LAYER,
+            self.quantum_scratch(x),
+            || self.forward(x),
+        )
+    }
+
     /// `x`: `[B, N, D]`. No mask (bidirectional).
     fn forward(&self, x: &Array) -> Result<Array> {
         let y = layer_norm(x, Some(&self.ln1_w), Some(&self.ln1_b), LN_EPS)?;
         let y = self.attention(&y)?;
         let x = add(x, &y)?;
+        // sc-26270: on iOS the attention half is materialized before the MLP is built, bounding the
+        // layer quantum to its wider half (`quantum::clip_layer_bytes`); values are unchanged and
+        // off device the graph is the historical one.
+        if mlx_gen::ios_quantum::enabled() {
+            x.eval()?;
+        }
 
         let y = layer_norm(&x, Some(&self.ln2_w), Some(&self.ln2_b), LN_EPS)?;
         let y = self.fc1.forward(&y)?;
@@ -257,14 +289,68 @@ impl ClipVisionEncoder {
     /// L{n-1}_out]` (length `num_layers + 1`). IP-Adapter "plus" reads `[-2]` (= the penultimate
     /// layer's output).
     pub fn hidden_states(&self, pixel_values: &Array) -> Result<Vec<Array>> {
-        let mut x = self.embed(pixel_values)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut x = self.embed_quantum(pixel_values)?;
         let mut states = Vec::with_capacity(self.layers.len() + 1);
         states.push(x.clone());
         for layer in &self.layers {
-            x = layer.forward(&x)?;
+            x = layer.forward_quantum(&x)?;
             states.push(x.clone());
         }
         Ok(states)
+    }
+
+    /// [`Self::embed`] as one guarded iOS quantum (sc-26270), priced by [`Self::embed_scratch`].
+    fn embed_quantum(&self, pixel_values: &Array) -> Result<Array> {
+        mlx_gen::ios_quantum::run(
+            crate::quantum::VISION_EMBEDDINGS,
+            self.embed_scratch(pixel_values),
+            || self.embed(pixel_values),
+        )
+    }
+
+    /// iOS scratch (sc-26270) of [`Self::embed`], counted as new buffers under
+    /// `quantum::conv_sum`'s retention model: the patch convolution's output and kernel transient,
+    /// then the class/patch concatenation and the LayerNorm (`[B, tokens, hidden]`;
+    /// `quantum::layer_norm_buffers`; the position sum donates the concatenation; measured).
+    fn embed_scratch(&self, pixel_values: &Array) -> u64 {
+        let s = pixel_values.shape();
+        let tokens = (s[1] / self.patch) * (s[2] / self.patch) + 1;
+        let act = crate::quantum::element_bytes(pixel_values);
+        let call = crate::quantum::ConvCall::new(s, act, &self.patch_embedding, self.patch, 0);
+        let backend = crate::quantum::Backend::current();
+        let units = 1 + crate::quantum::layer_norm_buffers(backend);
+        crate::quantum::single_conv_bytes(&call, 0, 0, backend)
+            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
+                act,
+                &[units, s[0] as u64, tokens as u64, self.hidden as u64],
+            ))
+            .saturating_add(crate::quantum::page_slack(units))
+    }
+
+    /// The embedding quantum's price and body (sc-26270 proof tests).
+    #[cfg(test)]
+    pub(crate) fn embed_quantum_for_test(
+        &self,
+        pixel_values: &Array,
+    ) -> (u64, impl Fn() -> Result<Array> + '_) {
+        let pixels = pixel_values.clone();
+        (self.embed_scratch(pixel_values), move || {
+            self.embed(&pixels)
+        })
+    }
+
+    /// One layer's guarded quantum body and price (sc-26270 proof tests).
+    #[cfg(test)]
+    pub(crate) fn layer_quantum_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+    ) -> (u64, impl Fn() -> Result<Array> + '_) {
+        let layer = &self.layers[index];
+        let scratch = layer.quantum_scratch(x);
+        let x = x.clone();
+        (scratch, move || layer.forward(&x))
     }
 
     /// The penultimate hidden state `[B, num_positions, hidden]` — the IP-Adapter "plus" image
@@ -274,10 +360,11 @@ impl ClipVisionEncoder {
     /// so forwarding the whole tower and discarding the last layer + every intermediate state was
     /// wasted work (one ViT-H layer + the retained states; F-076).
     pub fn penultimate(&self, pixel_values: &Array) -> Result<Array> {
-        let mut x = self.embed(pixel_values)?;
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let mut x = self.embed_quantum(pixel_values)?;
         let keep = self.layers.len().saturating_sub(1);
         for layer in &self.layers[..keep] {
-            x = layer.forward(&x)?;
+            x = layer.forward_quantum(&x)?;
         }
         Ok(x)
     }

@@ -47,6 +47,7 @@ use crate::pipeline::{
 };
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
+use mlx_gen::StagedHeavy;
 
 /// Registry id for SANA-1.6B 1024px (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "sana_1600m";
@@ -300,9 +301,13 @@ fn load_heavy(
     needs_encoder: bool,
     streamable: bool,
 ) -> Result<SanaHeavy> {
-    mlx_gen::ios_quantum::before_load(
+    // Only the components this bundle constructs are priced: a text-to-image bundle (and the
+    // Sequential img2img bundle, whose reference was encoded in its own phase) never builds the
+    // DC-AE encoder, so its `encoder.*` tensors are never materialized.
+    mlx_gen::ios_quantum::before_load_where(
         "SANA heavy load",
         &[root.join("transformer"), root.join("vae")],
+        |name| needs_encoder || !name.starts_with("encoder."),
     )?;
     let transformer_dir = root.join("transformer");
     let trunk_w = Weights::from_dir(&transformer_dir)?;
@@ -583,80 +588,228 @@ impl Sana {
         });
         let tiling =
             crate::pipeline::resolve_decode_tiling(req.memory, self.residency.is_sequential());
+        // img2img's bounded DC-AE encode: iOS, or a request whose bounded-VAE rung asks for it.
+        let encode_tile = crate::pipeline::resolved_encode_tile(req.memory);
+
+        // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
+        // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the Gemma encoder is
+        // LOADED, encodes, materializes, then is DROPPED + the cache cleared before anything else
+        // loads. Under `Resident` it borrows the warm encoder (byte-identical to the pre-seam
+        // `encode_with_mask`).
+        let encode = |text_encoder: &SanaTextEncoder| {
+            encode_conditioning(
+                text_encoder,
+                self.sprint,
+                &req.prompt,
+                req.negative_prompt.as_deref(),
+                guidance,
+            )
+        };
+        // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
+        // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
+        // encoder referenced through the graph and the drop would free nothing.
+        let materialize_encoded = |cond: Option<&SanaConditioning>| -> Result<()> {
+            let Some(cond) = cond else { return Ok(()) };
+            let mut arrays = vec![&cond.cond, &cond.cond_mask];
+            if let Some((u, um)) = &cond.uncond {
+                arrays.push(u);
+                arrays.push(um);
+            }
+            mlx_rs::transforms::eval(arrays)?;
+            Ok(())
+        };
+        // Phase B produces and materializes every latent while the DiT is alive. `encoded_reference`
+        // is `Some` when the reference was already encoded in its own phase (the Sequential img2img
+        // schedule below), else the heavy bundle prepares it once at request scope.
+        let denoise = |heavy: &SanaHeavy,
+                       cond: SanaConditioning,
+                       encoded_reference: Option<Option<mlx_rs::Array>>,
+                       on_progress: &mut dyn FnMut(Progress)|
+         -> Result<Vec<mlx_rs::Array>> {
+            // Rungs 3 and 4, resolved against the trunk that will actually run them.
+            let plan = crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
+            let prepare_req =
+                base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+            let latents = render_batch_with_prepared_reference(
+                base_seed,
+                req.count,
+                || match encoded_reference {
+                    Some(prepared) => Ok(prepared),
+                    None => {
+                        heavy.prepare_reference_with_tiling(&prepare_req, &req.cancel, encode_tile)
+                    }
+                },
+                |seed, prepared_reference| {
+                    let sana_req =
+                        base_sana_request(req, seed, init_image, strength, guidance_scale);
+                    heavy.denoise_one_with_prepared_reference(
+                        &cond,
+                        &sana_req,
+                        guidance,
+                        prepared_reference,
+                        &req.cancel,
+                        on_progress,
+                        &req.preview,
+                        plan,
+                    )
+                },
+            )?;
+            materialize_latent_batch(&latents)?;
+            Ok(latents)
+        };
+        let decode = |view: crate::pipeline::SanaDecodeView<'_>,
+                      latents: Vec<mlx_rs::Array>,
+                      on_progress: &mut dyn FnMut(Progress)|
+         -> Result<GenerationOutput> {
+            on_progress(Progress::Decoding);
+            let mut images = Vec::with_capacity(latents.len());
+            for latent in &latents {
+                images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
+            }
+            Ok(GenerationOutput::Images(images))
+        };
+
+        if self.residency.is_sequential() && init_image.is_some() {
+            // Sequential img2img: the reference DC-AE encode runs in its OWN phase with only the
+            // VAE encoder resident — after the Gemma encoder is dropped and before the trunk loads —
+            // so the encoder's deep attention stages never share memory with the DiT.
+            let id = self.descriptor.id;
+            let spec = &self.loaded_spec;
+            let streamable = crate::memory_strategy::is_streamable(spec);
+            let prepare_req =
+                base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+            return self.residency.run_exclusive_staged(&req.cancel, || {
+                run_staged_img2img(
+                    &req.cancel,
+                    on_progress,
+                    || load_text_encoder_component(load_components(spec, id)?),
+                    encode,
+                    |cond| materialize_encoded(Some(cond)),
+                    || load_reference_encoder(load_components(spec, id)?),
+                    |encoder| {
+                        crate::pipeline::prepare_reference_latent(
+                            Some(encoder),
+                            &DcAeConfig::sana_f32c32(),
+                            self.sprint,
+                            &prepare_req,
+                            &req.cancel,
+                            encode_tile,
+                        )
+                    },
+                    || load_heavy(load_components(spec, id)?, self.sprint, false, streamable),
+                    |heavy, cond, reference, on_progress| {
+                        denoise(heavy, cond, Some(reference), on_progress)
+                    },
+                    |heavy: SanaHeavy| heavy.shed_dit(),
+                    |light, latents, on_progress| {
+                        decode(SanaHeavy::light_view(light), latents, on_progress)
+                    },
+                )
+            });
+        }
 
         self.residency.run_staged(
             &req.cancel,
             // The generic flag is free on SANA and selects the optional DC-AE encoder for img2img.
             init_image.is_some(),
             on_progress,
-            // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
-            // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the shared seam LOADS
-            // the Gemma encoder, encodes, materializes, then DROPS it + `clear_cache()` before the
-            // trunk/DC-AE load. Under `Resident` it borrows the warm encoder (byte-identical to the
-            // pre-seam `encode_with_mask`).
-            |text_encoder: &SanaTextEncoder| {
-                encode_conditioning(
-                    text_encoder,
-                    self.sprint,
-                    &req.prompt,
-                    req.negative_prompt.as_deref(),
-                    guidance,
-                )
-            },
-            // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
-            // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
-            // encoder referenced through the graph and the drop would free nothing.
-            |cond: Option<&SanaConditioning>| {
-                let Some(cond) = cond else { return Ok(()) };
-                let mut arrays = vec![&cond.cond, &cond.cond_mask];
-                if let Some((u, um)) = &cond.uncond {
-                    arrays.push(u);
-                    arrays.push(um);
-                }
-                mlx_rs::transforms::eval(arrays)?;
-                Ok(())
-            },
-            // Phase B produces and materializes every latent while the DiT is alive. Sequential then
-            // sheds the DiT and optional encoder before phase-C decode; Resident borrows a warm view.
+            encode,
+            materialize_encoded,
             |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
-                // Rungs 3 and 4, resolved against the trunk that will actually run them.
-                let plan =
-                    crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
-                let prepare_req =
-                    base_sana_request(req, base_seed, init_image, strength, guidance_scale);
-                let latents = render_batch_with_prepared_reference(
-                    base_seed,
-                    req.count,
-                    || heavy.prepare_reference(&prepare_req, &req.cancel),
-                    |seed, prepared_reference| {
-                        let sana_req =
-                            base_sana_request(req, seed, init_image, strength, guidance_scale);
-                        heavy.denoise_one_with_prepared_reference(
-                            &cond,
-                            &sana_req,
-                            guidance,
-                            prepared_reference,
-                            &req.cancel,
-                            on_progress,
-                            &req.preview,
-                            plan,
-                        )
-                    },
-                )?;
-                mlx_rs::transforms::eval(latents.iter())?;
-                Ok(latents)
+                denoise(heavy, cond, None, on_progress)
             },
-            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
-            |view: crate::pipeline::SanaDecodeView<'_>, latents, on_progress| {
-                on_progress(Progress::Decoding);
-                let mut images = Vec::with_capacity(latents.len());
-                for latent in &latents {
-                    images.push(view.decode_one(latent, &req.cancel, tiling.as_ref())?);
-                }
-                Ok(GenerationOutput::Images(images))
-            },
+            |latents: &Vec<mlx_rs::Array>| materialize_latent_batch(latents),
+            decode,
         )
     }
+}
+
+/// The Sequential img2img phase schedule (one component family resident per phase, the cache
+/// cleared after each drop):
+///
+/// 1. **text** — load the Gemma encoder, encode + materialize the conditioning, drop it;
+/// 2. **reference encode** — load ONLY the DC-AE encoder, encode + materialize the reference
+///    latent (its own guarded quanta), drop it;
+/// 3. **denoise** — load the trunk + decoder, denoise from the prepared reference, materialize the
+///    latents, shed the trunk;
+/// 4. **decode** — decode with only the decoder resident.
+///
+/// Cancellation is observed at every phase boundary. Generic over the components so the order is
+/// weight-free testable; the encode is deterministic, so the reorder changes no value
+/// (`pipeline::quantum_tests::sequential_reference_reorder_is_byte_identical`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_staged_img2img<T, C, E, H, L, M, O>(
+    cancel: &mlx_gen::CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    load_text: impl FnOnce() -> Result<T>,
+    encode: impl FnOnce(&T) -> Result<C>,
+    materialize_encoded: impl FnOnce(&C) -> Result<()>,
+    load_encoder: impl FnOnce() -> Result<E>,
+    encode_reference: impl FnOnce(&E) -> Result<Option<mlx_rs::Array>>,
+    load_heavy: impl FnOnce() -> Result<H>,
+    denoise: impl FnOnce(&H, C, Option<mlx_rs::Array>, &mut dyn FnMut(Progress)) -> Result<M>,
+    shed: impl FnOnce(H) -> L,
+    decode: impl FnOnce(&L, M, &mut dyn FnMut(Progress)) -> Result<O>,
+) -> Result<O> {
+    let boundary = || -> Result<()> {
+        mlx_gen::residency::drain_allocator_cache();
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        Ok(())
+    };
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
+    let encoded = {
+        let text = load_text()?;
+        let encoded = encode(&text)?;
+        materialize_encoded(&encoded)?;
+        encoded
+    };
+    boundary()?;
+    on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
+    let reference = {
+        let encoder = load_encoder()?;
+        encode_reference(&encoder)?
+    };
+    boundary()?;
+    let (light, latents) = {
+        let heavy = load_heavy()?;
+        let latents = denoise(&heavy, encoded, reference, on_progress)?;
+        (shed(heavy), latents)
+    };
+    boundary()?;
+    decode(&light, latents, on_progress)
+}
+
+/// Load ONLY the DC-AE encoder (`encoder.*` of `vae/`) for the Sequential img2img reference phase,
+/// pre-checked against its own header inventory (the decoder's tensors are not constructed).
+fn load_reference_encoder(root: &Path) -> Result<DcAeEncoder> {
+    let vae = root.join("vae");
+    mlx_gen::ios_quantum::before_load_where(
+        "SANA reference encoder load",
+        std::slice::from_ref(&vae),
+        |name| name.starts_with("encoder."),
+    )?;
+    let vae_w = Weights::from_dir(vae)?;
+    let encoder = DcAeEncoder::from_weights(&vae_w, DcAeConfig::sana_f32c32())?;
+    // Materialize at load (sc-24245), exactly as the heavy bundle does for its VAE.
+    vae_w.materialize_accessed()?;
+    Ok(encoder)
+}
+
+/// Materialize a batch's denoised latents inside one guarded quantum (their pending graphs are at
+/// most one sampler update each; already-materialized latents cost nothing).
+fn materialize_latent_batch(latents: &[mlx_rs::Array]) -> Result<()> {
+    let elements: u64 = latents.iter().map(|l| l.size() as u64).sum();
+    let refs: Vec<&mlx_rs::Array> = latents.iter().collect();
+    crate::pipeline::materialize_latents(
+        "SANA latent batch",
+        &refs,
+        crate::quantum::scm_step_bytes(elements),
+    )
 }
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
@@ -748,7 +901,7 @@ mod tests {
 
     fn check_registered_reference_path(source: &str) -> Result<()> {
         let generate = braced_item(source, "    fn generate_impl(");
-        let prepare = "|| heavy.prepare_reference(&prepare_req, &req.cancel)";
+        let prepare = "heavy.prepare_reference_with_tiling(&prepare_req, &req.cancel, encode_tile)";
         let prepared_tail = "heavy.denoise_one_with_prepared_reference(";
         if generate
             .matches("render_batch_with_prepared_reference(")
@@ -793,14 +946,204 @@ mod tests {
         );
 
         let dropped = shipped.replacen(
-            "|| heavy.prepare_reference(&prepare_req, &req.cancel)",
-            "|| Ok(None)",
+            "heavy.prepare_reference_with_tiling(&prepare_req, &req.cancel, encode_tile)",
+            "Ok(None)",
             1,
         );
         assert!(
             check_registered_reference_path(&dropped).is_err(),
             "dropping request-scope preparation must fail"
         );
+    }
+
+    /// The Sequential img2img schedule holds ONE component family per phase, in the order text →
+    /// reference encode → trunk denoise → decode: each component is dropped (and the cache drained)
+    /// before the next loads, the trunk is shed before decode, and a cancel at any phase boundary
+    /// stops before the next load. The registered generator routes Sequential img2img through it.
+    #[test]
+    fn sequential_img2img_encodes_the_reference_alone_between_text_and_trunk() {
+        struct Part(&'static str, std::rc::Rc<RefCell<Vec<String>>>);
+        impl Drop for Part {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(format!("drop {}", self.0));
+            }
+        }
+        let run = |cancel_after: Option<&'static str>| {
+            let log = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+            let cancel = mlx_gen::CancelFlag::new();
+            let event = |e: &str| {
+                log.borrow_mut().push(e.to_string());
+                if cancel_after == Some(e) {
+                    cancel.cancel();
+                }
+            };
+            let result = run_staged_img2img(
+                &cancel,
+                &mut |p| log.borrow_mut().push(format!("{p:?}")),
+                || {
+                    event("load text");
+                    Ok(Part("text", log.clone()))
+                },
+                |_text| {
+                    event("encode");
+                    Ok(7u8)
+                },
+                |_cond| {
+                    event("materialize");
+                    Ok(())
+                },
+                || {
+                    event("load encoder");
+                    Ok(Part("encoder", log.clone()))
+                },
+                |_encoder| {
+                    event("encode reference");
+                    Ok(None)
+                },
+                || {
+                    event("load heavy");
+                    Ok(Part("heavy", log.clone()))
+                },
+                |_heavy, cond, _reference, _p| {
+                    event("denoise");
+                    Ok(cond)
+                },
+                |heavy| {
+                    event("shed");
+                    drop(heavy);
+                    Part("light", log.clone())
+                },
+                |_light, mid, _p| {
+                    event("decode");
+                    Ok(mid)
+                },
+            );
+            let log = log.borrow().clone();
+            (result, log)
+        };
+        let (result, log) = run(None);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(
+            log,
+            [
+                "Loading(TextEncoder)",
+                "load text",
+                "encode",
+                "materialize",
+                "drop text",
+                "Loading(Renderer)",
+                "load encoder",
+                "encode reference",
+                "drop encoder",
+                "load heavy",
+                "denoise",
+                "shed",
+                "drop heavy",
+                "decode",
+                "drop light",
+            ]
+        );
+        for (cancel_after, next) in [
+            ("materialize", "load encoder"),
+            ("encode reference", "load heavy"),
+            ("denoise", "decode"),
+        ] {
+            let (result, log) = run(Some(cancel_after));
+            assert!(matches!(result, Err(Error::Canceled)), "{cancel_after}");
+            assert!(!log.iter().any(|e| e == next), "{cancel_after}: {log:?}");
+        }
+        // The registered generator takes this schedule for Sequential img2img.
+        let generate = braced_item(include_str!("model.rs"), "    fn generate_impl(");
+        assert!(generate.contains("if self.residency.is_sequential() && init_image.is_some() {"));
+        assert!(generate.contains("run_staged_img2img("));
+        assert!(generate
+            .contains("|| load_heavy(load_components(spec, id)?, self.sprint, false, streamable)"));
+    }
+
+    /// Each Sequential img2img load is priced over exactly the tensors it constructs: the reference
+    /// phase over `vae/encoder.*` only, the encoder-free heavy bundle over the transformer and
+    /// `vae/` WITHOUT `encoder.*`, and the historical encoder-carrying bundle over both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_loads_price_only_the_tensors_they_construct() {
+        const CHILD: &str = "SANA_STAGED_LOAD_PRICE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model::tests::staged_loads_price_only_the_tensors_they_construct",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        let root = std::env::temp_dir().join(format!("sana-staged-price-{}", std::process::id()));
+        let write = |dir: &str, tensors: &[(&str, usize)]| {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut offset = 0;
+            let entries: Vec<String> = tensors
+                .iter()
+                .map(|(name, bytes)| {
+                    let e = format!(
+                        r#""{name}":{{"dtype":"F32","shape":[{}],"data_offsets":[{offset},{}]}}"#,
+                        bytes / 4,
+                        offset + bytes
+                    );
+                    offset += bytes;
+                    e
+                })
+                .collect();
+            let header = format!("{{{}}}", entries.join(","));
+            let mut file = (header.len() as u64).to_le_bytes().to_vec();
+            file.extend(header.as_bytes());
+            file.resize(file.len() + offset, 0);
+            std::fs::write(dir.join("diffusion_pytorch_model.safetensors"), file).unwrap();
+        };
+        write("transformer", &[("t", 64)]);
+        write("vae", &[("encoder.x", 32), ("decoder.y", 16)]);
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        mlx_gen::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+            mlx_gen::ios_quantum::with_cpu_diagnostic_observer(
+                move |e| sink.borrow_mut().push(e.clone()),
+                || {
+                    // The synthetic files carry no real model: each load fails AFTER its check.
+                    assert!(load_reference_encoder(&root).is_err());
+                    assert!(load_heavy(&root, false, false, false).is_err());
+                    assert!(load_heavy(&root, false, true, false).is_err());
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+        let checks: Vec<(String, u64)> = seen
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                mlx_gen::ios_quantum::QuantumEvent::Checked { label, scratch } => {
+                    Some((label.clone(), *scratch))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                // encoder.x (32): the proven load floor is the stored bytes
+                ("SANA reference encoder load".to_string(), 32),
+                // t (64) + decoder.y (16)
+                ("SANA heavy load".to_string(), 80),
+                // t + encoder.x + decoder.y
+                ("SANA heavy load".to_string(), 112),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn req(w: u32, h: u32) -> GenerationRequest {

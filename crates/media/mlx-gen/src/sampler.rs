@@ -173,6 +173,27 @@ fn ge<T>(r: std::result::Result<T, mlx_rs::error::Exception>) -> gen_core::Resul
     r.map_err(|e| crate::Error::from(e).into())
 }
 
+/// iOS quantum label of a curated-solver step boundary.
+pub const SAMPLER_STEP_QUANTUM: &str = "sampler step";
+
+/// A solver step boundary: the previous step's lazy guidance combine + solver update materialize
+/// here. On a physical iOS device it is a guarded quantum priced by
+/// [`crate::ios_quantum::sampler_step_bytes`] over the latents being evaluated (checked before
+/// the graph is materialized, then synchronized and drained); everywhere else exactly `eval`.
+fn step_eval(arrays: &[&Array]) -> crate::Result<()> {
+    if crate::ios_quantum::enabled() {
+        let elements = arrays.iter().map(|a| a.size() as u64).sum();
+        crate::ios_quantum::before(
+            SAMPLER_STEP_QUANTUM,
+            crate::ios_quantum::sampler_step_bytes(elements),
+        )?;
+        crate::ios_quantum::finish(SAMPLER_STEP_QUANTUM, arrays)
+    } else {
+        mlx_rs::transforms::eval(arrays.iter().copied())?;
+        Ok(())
+    }
+}
+
 /// The per-eval cancel + progress preamble shared by every curated-solver driver
 /// ([`run_curated_sampler`], [`run_cfgpp_sampler`], [`run_av_curated_sampler`]) — F-068 dedup. Each
 /// driver's `denoise` closure calls this at the top of every model eval, then performs its own
@@ -424,7 +445,7 @@ pub fn run_curated_sampler_with_latent_hook(
         // this the whole denoise is one un-cancellable graph that only runs at VAE decode). Output-
         // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
         // back here is always the fresh node to integrate from, so evaluating it is safe.
-        ge(mlx_rs::transforms::eval([x]))?;
+        step_eval(&[x]).map_err(gen_core::Error::from)?;
         if step_observer.is_step_start(sigmas, sigma) {
             on_latent(x, sigma);
         }
@@ -437,7 +458,7 @@ pub fn run_curated_sampler_with_latent_hook(
         .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(crate::Error::from)?;
     // Force the final step's advancement (never seen by the callback, which evals only inputs).
-    mlx_rs::transforms::eval([&out])?;
+    step_eval(&[&out])?;
     Ok(out)
 }
 
@@ -504,7 +525,7 @@ pub fn run_cfgpp_sampler_with_latent_hook(
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
-        ge(mlx_rs::transforms::eval([x]))?;
+        step_eval(&[x]).map_err(gen_core::Error::from)?;
         on_latent(x, sigma);
         gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
             predict_pair(xin, t).map_err(Into::into)
@@ -514,7 +535,7 @@ pub fn run_cfgpp_sampler_with_latent_hook(
     let out = sampler
         .sample(&ops, &mut denoise_fn, latents, sigmas)
         .map_err(crate::Error::from)?;
-    mlx_rs::transforms::eval([&out])?;
+    step_eval(&[&out])?;
     Ok(out)
 }
 
@@ -672,7 +693,7 @@ pub fn run_av_curated_sampler(
 
     let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
         step_gate(cancel, on_progress, sigmas, total, sigma)?;
-        ge(mlx_rs::transforms::eval([&x.video, &x.audio]))?;
+        step_eval(&[&x.video, &x.audio]).map_err(gen_core::Error::from)?;
         gc_denoise(&ops, &ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })
@@ -681,7 +702,7 @@ pub fn run_av_curated_sampler(
     let out = sampler
         .sample(&ops, &ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(crate::Error::from)?;
-    mlx_rs::transforms::eval([&out.video, &out.audio])?;
+    step_eval(&[&out.video, &out.audio])?;
     Ok(out)
 }
 
@@ -1339,6 +1360,90 @@ mod tests {
             let want = x0 - e * sigmas[0]; // x_init − ε·σ_0
             assert!((g - want).abs() < 2e-3, "eps euler: got {g} want {want}");
         }
+    }
+
+    /// iOS: every solver step boundary (and the final advancement) is a checked quantum before it
+    /// materializes, priced by the shared latent-sized allowance; a refusal stops the denoise before
+    /// the next model eval. Off device it is exactly the unguarded eval (byte-identical output).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn curated_solver_steps_are_guarded_quanta() {
+        const CHILD: &str = "MLX_GEN_SAMPLER_STEP_QUANTUM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sampler::tests::curated_solver_steps_are_guarded_quanta",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        use crate::ios_quantum::{
+            with_cpu_diagnostic_headroom, with_cpu_diagnostic_observer, QuantumEvent,
+        };
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.0];
+        let x_init = arr(&[0.3, -1.1, 2.0, 0.5]);
+        let eps = [0.7_f32, -0.2, 0.4, 0.1];
+        let calls = std::cell::Cell::new(0);
+        let run = || {
+            let cancel = CancelFlag::new();
+            run_curated_sampler(
+                Some("euler"),
+                &ms,
+                &sigmas,
+                x_init.clone(),
+                0,
+                &cancel,
+                &mut |_| {},
+                |_xin, _t| {
+                    calls.set(calls.get() + 1);
+                    Ok(arr(&eps))
+                },
+            )
+        };
+        let host = run().unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let guarded = with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(move |e| sink.borrow_mut().push(e.clone()), run)
+        })
+        .unwrap();
+        assert_eq!(guarded.as_slice::<f32>(), host.as_slice::<f32>());
+        let checks: Vec<u64> = seen
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                QuantumEvent::Checked { label, scratch } if label == SAMPLER_STEP_QUANTUM => {
+                    Some(*scratch)
+                }
+                _ => None,
+            })
+            .collect();
+        // One boundary per model eval (4 steps) plus the final advancement, each 16 latent buffers.
+        assert_eq!(checks, vec![16 * 4 * 4; 5]);
+        // The allowance is never below what one Euler step actually allocates.
+        let x = arr(&[0.3, -1.1, 2.0, 0.5]);
+        let measured = crate::ios_quantum::measured_peak_bytes(|| {
+            let d = mlx_rs::ops::multiply(arr(&eps), Array::from_f32(-4.0))?;
+            Ok(vec![mlx_rs::ops::add(&x, &d)?])
+        })
+        .unwrap();
+        assert!(16 * 4 * 4 >= measured, "{measured}");
+        // A refusal stops before the next model eval.
+        calls.set(0);
+        let _ = crate::ios_quantum::take_refusal();
+        assert!(with_cpu_diagnostic_headroom(0, run).is_err());
+        assert_eq!(
+            crate::ios_quantum::take_refusal().unwrap().label,
+            SAMPLER_STEP_QUANTUM
+        );
+        assert_eq!(calls.get(), 0, "no model eval past the refused boundary");
     }
 
     #[test]

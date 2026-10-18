@@ -1,8 +1,17 @@
-//! Admission-bound SDXL execution. The wrapped provider is never returned to callers.
-use crate::sdxl::actual_request_key;
+//! Admission-bound iOS execution for every registered model (generators, the Iris restoration
+//! transform and the Iris depth task). The wrapped provider is never returned to callers: every
+//! entry point rechecks the exact admitted work (geometry, tile, mode, conditioning, prompt,
+//! execution — everything but seed and cancellation), live capacity and the sealed source pins
+//! BEFORE reaching the provider, and preserves the caller's real cancellation handle.
+use crate::ios_admission::{work_binding, IosWork};
+use mlx_gen::gen_core::iris::depth::{DepthOutput, DepthRequest, IrisDepthEstimator};
 use mlx_gen::gen_core::*;
 
-pub struct BoundSdxlGenerator {
+fn generation_binding(req: &GenerationRequest) -> [u8; 32] {
+    work_binding(&IosWork::Generate(req.clone()))
+}
+
+pub struct BoundGenerator {
     inner: Box<dyn Generator>,
     spec: LoadSpec,
     context: MemoryRunContext,
@@ -11,7 +20,7 @@ pub struct BoundSdxlGenerator {
     capacity: Box<dyn Fn(u64) -> Result<()>>,
 }
 
-impl BoundSdxlGenerator {
+impl BoundGenerator {
     pub(crate) fn new(
         inner: Box<dyn Generator>,
         spec: LoadSpec,
@@ -36,15 +45,19 @@ impl BoundSdxlGenerator {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        if actual_request_key(req) != self.request {
-            return Err(Error::Unsupported("SDXL request differs from the admitted actual request (geometry/mode/conditioning/prompt/execution)".into()));
+        if generation_binding(req) != self.request {
+            return Err(Error::Unsupported(
+                "iOS request differs from the admitted request \
+                 (geometry/tile/mode/conditioning/prompt/execution)"
+                    .into(),
+            ));
         }
         Ok(())
     }
     fn check_context(&self, context: &MemoryRunContext) -> Result<()> {
         if context != &self.context {
             return Err(Error::Unsupported(
-                "SDXL lifecycle context differs from admission".into(),
+                "iOS lifecycle context differs from admission".into(),
             ));
         }
         self.spec.validate_prepared_file_pins()
@@ -61,7 +74,7 @@ impl BoundSdxlGenerator {
     }
 }
 
-impl Generator for BoundSdxlGenerator {
+impl Generator for BoundGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         self.inner.descriptor()
     }
@@ -154,7 +167,7 @@ impl Generator for BoundSdxlGenerator {
 
 struct BoundScope<'a> {
     inner: Box<dyn MemoryRequestScope + 'a>,
-    owner: &'a BoundSdxlGenerator,
+    owner: &'a BoundGenerator,
 }
 impl MemoryRequestScope for BoundScope<'_> {
     fn configure_request(&mut self, req: &mut GenerationRequest) -> Result<()> {
@@ -241,5 +254,115 @@ impl MemoryRequestScope for BoundScope<'_> {
         let result = self.inner.finish(outcome);
         self.owner.spec.validate_prepared_file_pins()?;
         result
+    }
+}
+
+/// Admission-bound restoration transform.
+pub struct BoundTransform {
+    inner: Box<dyn Transform>,
+    spec: LoadSpec,
+    binding: [u8; 32],
+    footprint: u64,
+    capacity: Box<dyn Fn(u64) -> Result<()>>,
+}
+
+impl BoundTransform {
+    pub(crate) fn new(
+        inner: Box<dyn Transform>,
+        spec: LoadSpec,
+        binding: [u8; 32],
+        footprint: u64,
+        capacity: Box<dyn Fn(u64) -> Result<()>>,
+    ) -> Self {
+        Self {
+            inner,
+            spec,
+            binding,
+            footprint,
+            capacity,
+        }
+    }
+    fn run<T>(
+        &self,
+        req: &TransformRequest,
+        call: impl FnOnce(&dyn Transform) -> Result<T>,
+    ) -> Result<T> {
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if work_binding(&IosWork::Restore(req.clone())) != self.binding {
+            return Err(Error::Unsupported(
+                "iOS restoration request differs from the admitted request".into(),
+            ));
+        }
+        (self.capacity)(self.footprint)?;
+        self.spec
+            .read_prepared_files_unchanged(|| call(self.inner.as_ref()))
+    }
+}
+
+impl Transform for BoundTransform {
+    fn descriptor(&self) -> &TransformDescriptor {
+        self.inner.descriptor()
+    }
+    fn validate(&self, req: &TransformRequest) -> Result<()> {
+        self.run(req, |inner| inner.validate(req))
+    }
+    fn apply(
+        &self,
+        req: &TransformRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        self.run(req, |inner| inner.apply(req, on_progress))
+    }
+}
+
+/// Admission-bound Iris depth task.
+pub struct BoundDepth {
+    inner: Box<dyn IrisDepthEstimator>,
+    spec: LoadSpec,
+    binding: [u8; 32],
+    footprint: u64,
+    capacity: Box<dyn Fn(u64) -> Result<()>>,
+}
+
+impl BoundDepth {
+    pub(crate) fn new(
+        inner: Box<dyn IrisDepthEstimator>,
+        spec: LoadSpec,
+        binding: [u8; 32],
+        footprint: u64,
+        capacity: Box<dyn Fn(u64) -> Result<()>>,
+    ) -> Self {
+        Self {
+            inner,
+            spec,
+            binding,
+            footprint,
+            capacity,
+        }
+    }
+}
+
+impl IrisDepthEstimator for BoundDepth {
+    fn backend(&self) -> &'static str {
+        self.inner.backend()
+    }
+    fn estimate(
+        &self,
+        req: &DepthRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<DepthOutput> {
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        if work_binding(&IosWork::Depth(req.clone())) != self.binding {
+            return Err(Error::Unsupported(
+                "iOS depth request differs from the admitted request".into(),
+            ));
+        }
+        (self.capacity)(self.footprint)?;
+        self.spec
+            .read_prepared_files_unchanged(|| self.inner.estimate(req, on_progress))
     }
 }

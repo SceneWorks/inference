@@ -10,10 +10,44 @@ use crate::{Error, Result};
 use mlx_rs::Array;
 #[path = "ios_quantum_budget.rs"]
 mod budget;
+#[cfg(not(target_os = "ios"))]
+pub use budget::measured_peak_bytes;
 pub use budget::{
-    check_headroom, dcae_stage_bytes, gemma_layer_bytes, sana_block_bytes,
-    sana_promoted_conv_bytes, SanaBlockGeometry, PROCESS_RESERVE_BYTES,
+    allocated_bytes, allocated_tensor_bytes, assert_tracks_measured, attention_block_bytes,
+    check_headroom, conv_stage_bytes, elementwise_bytes, rope_table_bytes, sampler_step_bytes,
+    scores_bytes, tensor_bytes, AttentionBlockGeometry, ConvStageGeometry, Scores,
+    PROCESS_RESERVE_BYTES,
 };
+
+/// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross
+/// provider/contract seams that may stringify them, so the refusal is ALSO recorded here, where a
+/// device capture reads it without parsing any message. Capacity evidence, never a cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumRefusal {
+    pub label: String,
+    pub scratch_bytes: u64,
+    pub reserve_bytes: u64,
+    /// Live `os_proc_available_memory` at the check; `None` when the OS reported none.
+    pub available_bytes: Option<u64>,
+}
+
+static LAST_REFUSAL: std::sync::Mutex<Option<QuantumRefusal>> = std::sync::Mutex::new(None);
+
+fn record_refusal(label: &str, scratch: u64, available: Option<u64>) {
+    if let Ok(mut slot) = LAST_REFUSAL.lock() {
+        *slot = Some(QuantumRefusal {
+            label: label.to_string(),
+            scratch_bytes: scratch,
+            reserve_bytes: PROCESS_RESERVE_BYTES,
+            available_bytes: available,
+        });
+    }
+}
+
+/// Take (and clear) the most recent pre-construction quantum refusal in this process.
+pub fn take_refusal() -> Option<QuantumRefusal> {
+    LAST_REFUSAL.lock().ok().and_then(|mut slot| slot.take())
+}
 
 /// One observed quantum boundary in a CPU diagnostic fixture.
 #[cfg(not(target_os = "ios"))]
@@ -158,8 +192,11 @@ impl Drop for Scope {
 
 pub fn before(label: &str, scratch: u64) -> Result<()> {
     if enabled() {
-        check_headroom(available_bytes(), scratch, PROCESS_RESERVE_BYTES)
-            .map_err(|e| Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)")))?;
+        let available = available_bytes();
+        check_headroom(available, scratch, PROCESS_RESERVE_BYTES).map_err(|e| {
+            record_refusal(label, scratch, available);
+            Error::Unsupported(format!("{label}: {e}; scratch {scratch} bytes + engineering reserve {PROCESS_RESERVE_BYTES} bytes (not a process bound)"))
+        })?;
         notify(|| QuantumEventArg::Checked(label.to_string(), scratch));
     }
     Ok(())
@@ -195,8 +232,9 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
         return build();
     }
     let checked = std::cell::Cell::new(false);
+    let available = available_bytes();
     let result = budget::guarded(
-        available_bytes(),
+        available,
         scratch,
         PROCESS_RESERVE_BYTES,
         || {
@@ -218,6 +256,7 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
                 && (reason.starts_with("iOS quantum refused")
                     || reason == "iOS quantum accounting overflow") =>
         {
+            record_refusal(label, scratch, available);
             Error::Unsupported(format!("{label}: {reason}"))
         }
         other => other,
@@ -229,25 +268,77 @@ pub fn run(label: &str, scratch: u64, build: impl FnOnce() -> Result<Array>) -> 
 /// scratch. Called BEFORE model construction. Counts the entire VAE file even for txt2img.
 /// Not a process upper bound: conversion or a backend operation can need more than this floor.
 pub fn before_load(label: &str, components: &[std::path::PathBuf]) -> Result<()> {
+    before_load_where(label, components, |_| true)
+}
+
+/// [`before_load`] over only the tensors `resident(name)` keeps: for a load that constructs just
+/// part of a file up front (e.g. a rung-4 streamed DiT, whose block bodies are read per window by
+/// that window's own priced quantum). Header-only; a no-op off device.
+pub fn before_load_where(
+    label: &str,
+    components: &[std::path::PathBuf],
+    resident: impl Fn(&str) -> bool,
+) -> Result<()> {
     if !enabled() {
         return Ok(());
     }
+    before(label, load_floor_bytes(components, resident)?)
+}
+
+/// Header-only load floor: the stored bytes of every kept tensor. Proven against MLX's measured
+/// peak while a file is read (`cpu_quantum_materializes_before_return_refuses_before_build_and_
+/// restores_cache`): the bytes land once, with no extra per-tensor read copy.
+pub fn load_floor_bytes(
+    components: &[std::path::PathBuf],
+    resident: impl Fn(&str) -> bool,
+) -> Result<u64> {
     let mut total = 0u64;
-    let mut largest = 0u64;
     for component in components {
         for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
             .map_err(|e| Error::Msg(e.to_string()))?
         {
-            total = total
-                .checked_add(header.data_bytes)
-                .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
-            largest = largest.max(header.data_bytes);
+            if resident(&header.name) {
+                total = total
+                    .checked_add(header.data_bytes)
+                    .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
+            }
         }
     }
-    let scratch = total
-        .checked_add(largest)
-        .ok_or_else(|| Error::Unsupported("iOS load accounting overflow".into()))?;
-    before(label, scratch)
+    Ok(total)
+}
+
+/// [`before_load`] for a component whose loader CASTS every tensor to a `bytes_per_element`-wide
+/// dtype after reading it (e.g. an upcast to f32): the stored bytes AND the cast copies are live
+/// together (proven against the measured peak of a read + cast). Header-only; a no-op off device.
+pub fn before_load_cast(
+    label: &str,
+    components: &[std::path::PathBuf],
+    bytes_per_element: u64,
+) -> Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let overflow = || Error::Unsupported("iOS load accounting overflow".into());
+    let mut total = 0u64;
+    for component in components {
+        for header in crate::gen_core::weightsmeta::safetensors_path_tensor_headers(component)
+            .map_err(|e| Error::Msg(e.to_string()))?
+        {
+            let elements = header
+                .shape
+                .iter()
+                .try_fold(1u64, |a, &d| a.checked_mul(d as u64))
+                .ok_or_else(overflow)?;
+            let cast = elements
+                .checked_mul(bytes_per_element)
+                .ok_or_else(overflow)?;
+            total = total
+                .checked_add(header.data_bytes)
+                .and_then(|t| t.checked_add(cast))
+                .ok_or_else(overflow)?;
+        }
+    }
+    before(label, total)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -297,14 +388,17 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
         let weight = Array::ones::<f32>(&[40, 1, 1, 8])?.as_dtype(mlx_rs::Dtype::Float16)?;
         let promoted = run(
             "tiny F16 convolution",
-            sana_block_bytes(SanaBlockGeometry {
+            // Promoted F32 weights (40*8 elements) plus the f32 output, counted for this op.
+            conv_stage_bytes(ConvStageGeometry {
                 batch: 1,
-                tokens: 16,
-                dim: 8,
-                caption_tokens: 5,
-                ff_channels: 40,
-                cross_heads: 2,
-                conv_weight_elements: 40 * 8,
+                height: 4,
+                width: 4,
+                in_channels: 8,
+                out_channels: 40,
+                element_bytes: 4,
+                in_live: 1,
+                out_live: 1,
+                weight_bytes: 40 * 8 * 4,
             }),
             || {
                 Ok(mlx_rs::ops::conv2d(
@@ -332,6 +426,136 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
     });
     assert!(refused.is_err());
     assert!(!constructed.get());
+    // The refusal is typed for a capture, independent of how the error string is propagated.
+    let record = take_refusal().expect("a pre-construction refusal is recorded");
+    assert_eq!(record.label, "refused");
+    assert_eq!(record.scratch_bytes, 4096);
+    assert_eq!(record.available_bytes, Some(0));
+    assert_eq!(take_refusal(), None, "taking clears the record");
+    let before_refused = with_cpu_diagnostic_headroom(1, || before("before refused", 8));
+    assert!(before_refused.is_err());
+    assert_eq!(
+        take_refusal().map(|r| (r.label, r.available_bytes)),
+        Some(("before refused".to_string(), Some(1)))
+    );
+    // The measurement every counted formula is proven against: two 256x256 f32 inputs built
+    // inside the quantum plus their sum = three live 256 KiB tensors at the peak.
+    let measured = measured_peak_bytes(|| {
+        let a = Array::ones::<f32>(&[256, 256])?;
+        let b = Array::ones::<f32>(&[256, 256])?;
+        Ok(vec![mlx_rs::ops::add(&a, &b)?])
+    })
+    .unwrap();
+    let three = 3 * tensor_bytes(4, &[256, 256]);
+    assert_tracks_measured("ones + ones", three, measured, 1.5);
+    // The measurement is STALLED, so it realizes the retention worst case whatever this host's
+    // worker speed: a chain of eight 16 KiB matmuls (no donation), each read only by the next, is
+    // encoded in full — every output allocated, every operand held by its queued task — before any
+    // runs, so all eight products are live at once. The ops are tiny, so unstalled this host's
+    // worker keeps up with the encoder and holds only four (measured) — the same 2x run-to-run
+    // swing the CI runner showed on the Anima output quantum.
+    let weight = Array::ones::<f32>(&[64, 64]).unwrap();
+    let start = Array::ones::<f32>(&[64, 64]).unwrap();
+    mlx_rs::transforms::eval([&weight, &start]).unwrap();
+    let chain = measured_peak_bytes(|| {
+        let mut x = start.clone();
+        for _ in 0..8 {
+            x = x.matmul(&weight)?;
+        }
+        Ok(vec![x])
+    })
+    .unwrap();
+    assert_eq!(
+        chain,
+        8 * tensor_bytes(4, &[64, 64]),
+        "a stalled measurement holds the whole encoded chain"
+    );
+    // The load floor is proven against MLX's peak while a safetensors file is read: the stored
+    // bytes land once, with no extra per-tensor copy (no "largest tensor" scratch on top).
+    {
+        let dir = std::env::temp_dir().join(format!("ios-quantum-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.safetensors");
+        let a = Array::ones::<f32>(&[256, 1024]).unwrap();
+        let b = Array::ones::<f32>(&[512, 1024]).unwrap();
+        let c = Array::ones::<f32>(&[1024, 1024]).unwrap();
+        Array::save_safetensors(vec![("a", &a), ("b", &b), ("c", &c)], None, &file).unwrap();
+        let measured = measured_peak_bytes(|| {
+            let w = crate::weights::Weights::from_file(&file)?;
+            Ok(["a", "b", "c"]
+                .iter()
+                .map(|k| w.require(k).unwrap().clone())
+                .collect())
+        })
+        .unwrap();
+        // Read + upcast: stored f16 bytes and the f32 copies are live together.
+        let half = dir.join("h.safetensors");
+        let h = [&a, &b, &c].map(|x| x.as_dtype(mlx_rs::Dtype::Float16).unwrap());
+        Array::save_safetensors(vec![("a", &h[0]), ("b", &h[1]), ("c", &h[2])], None, &half)
+            .unwrap();
+        let cast_measured = measured_peak_bytes(|| {
+            let w = crate::weights::Weights::from_file(&half)?;
+            Ok(["a", "b", "c"]
+                .iter()
+                .map(|k| {
+                    w.require(k)
+                        .unwrap()
+                        .as_dtype(mlx_rs::Dtype::Float32)
+                        .unwrap()
+                })
+                .collect())
+        })
+        .unwrap();
+        let stored_half = (256 + 512 + 1024) * 1024 * 2;
+        assert_tracks_measured(
+            "safetensors load + f32 cast",
+            stored_half + 2 * stored_half,
+            cast_measured,
+            1.5,
+        );
+        assert_tracks_measured(
+            "safetensors load",
+            load_floor_bytes(std::slice::from_ref(&file), |_| true).unwrap(),
+            measured,
+            1.5,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    // A casting load prices stored bytes + the widened copies + the largest widened tensor.
+    let dir = std::env::temp_dir().join(format!("ios-quantum-cast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("vae.safetensors");
+    let header = r#"{"w":{"dtype":"F16","shape":[4,8],"data_offsets":[0,64]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header.as_bytes());
+    bytes.resize(bytes.len() + 64, 0);
+    std::fs::write(&file, bytes).unwrap();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    with_cpu_diagnostic_headroom(1 << 30, || {
+        with_cpu_diagnostic_observer(
+            move |e| sink.borrow_mut().push(e.clone()),
+            || {
+                before_load("stored", std::slice::from_ref(&file))?;
+                before_load_cast("cast", std::slice::from_ref(&file), 4)
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        [
+            QuantumEvent::Checked {
+                label: "stored".into(),
+                scratch: 64
+            },
+            QuantumEvent::Checked {
+                label: "cast".into(),
+                scratch: 64 + 128
+            },
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[cfg(all(test, target_os = "macos"))]

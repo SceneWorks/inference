@@ -150,6 +150,53 @@ impl Loader<'_> {
         self.weights.require(key)
     }
 
+    fn has(&self, key: &str) -> bool {
+        self.weights.keys().any(|k| k == key)
+    }
+
+    /// The pre-quantized projection `prefix` of a packed artifact ([`crate::packed`]): the stored
+    /// codes / scales / biases and the bias at bf16 — exactly what [`pack_projection`] builds from
+    /// the dense weight at load — and the zero columns its input is padded by. `None` when the
+    /// projection is stored dense.
+    fn packed(&self, prefix: &str, bias: bool) -> Result<Option<(AdaptableLinear, i32)>> {
+        let scales_key = format!("{prefix}.scales");
+        if !self.has(&scales_key) {
+            crate::packed::check_loaded_projection(self.weights, prefix, None)?;
+            return Ok(None);
+        }
+        let codes = self.require(&format!("{prefix}.weight"))?.clone();
+        let scales = self.require(&scales_key)?.clone();
+        let biases = self.require(&format!("{prefix}.biases"))?.clone();
+        let bias = if bias {
+            Some(
+                self.require(&format!("{prefix}.bias"))?
+                    .as_dtype(Dtype::Bfloat16)?,
+            )
+        } else {
+            None
+        };
+        let group = QUANT_GROUP_SIZE as i32;
+        let bits = mlx_gen::quant::packed_bits(&codes, &scales, group)?;
+        crate::packed::check_loaded_projection(self.weights, prefix, Some(bits))?;
+        let padded_in = scales.shape()[1] * group;
+        let in_key = format!("{prefix}{}", crate::packed::IN_FEATURES_SUFFIX);
+        let in_features = if self.has(&in_key) {
+            self.require(&in_key)?.item::<i32>()
+        } else {
+            padded_in
+        };
+        if in_features <= 0 || in_features > padded_in {
+            return Err(Error::Msg(format!(
+                "iris: the packed projection {prefix} records {in_features} input features over \
+                 a {padded_in}-wide pack"
+            )));
+        }
+        Ok(Some((
+            AdaptableLinear::from_quantized_parts(codes, scales, biases, bias, group, bits),
+            padded_in - in_features,
+        )))
+    }
+
     /// A tensor kept in f32 (norm gains, adaLN biases, the text position table).
     pub fn f32(&self, key: &str) -> Result<Array> {
         Ok(self.require(key)?.as_dtype(Dtype::Float32)?)
@@ -172,6 +219,16 @@ impl Loader<'_> {
                 // Every adapter factor is read and evaluated here, at the load boundary, so no
                 // forward ever waits on a lazy adapter read.
                 inner.materialize_adapters()?;
+                // A packed artifact's base is stored packed: the install acted on a zero-stride
+                // placeholder of its logical shape, and the adapters ride on the stored pack.
+                if let Some((mut packed, in_pad)) = self.packed(prefix, bias)? {
+                    packed.set_adapters(inner.adapters().to_vec());
+                    return Ok(Linear {
+                        inner: packed,
+                        compute: self.compute,
+                        in_pad,
+                    });
+                }
                 // The adapters stay forward-time residuals over the packed base, reading the
                 // checkpoint-width input; an unaligned base is rebuilt over its zero-padded input
                 // with the same adapter stack ([`Linear::forward`] feeds each its own width).
@@ -201,6 +258,13 @@ impl Loader<'_> {
                     in_pad,
                 });
             }
+        }
+        if let Some((inner, in_pad)) = self.packed(prefix, bias)? {
+            return Ok(Linear {
+                inner,
+                compute: self.compute,
+                in_pad,
+            });
         }
         let weight = self
             .require(&format!("{prefix}.weight"))?
@@ -327,6 +391,16 @@ impl Linear {
     pub fn is_quantized(&self) -> bool {
         self.inner.is_quantized()
     }
+
+    /// Output width of the loaded projection.
+    pub fn out_features(&self) -> u64 {
+        self.logical_shape()[0] as u64
+    }
+
+    /// Zero columns appended to the input before an unaligned packed base (`0` otherwise).
+    pub fn input_pad(&self) -> u64 {
+        self.in_pad.max(0) as u64
+    }
 }
 
 /// `iris3b.nn.norms.RMSNorm`: f32 normalisation, f32 gain.
@@ -346,6 +420,11 @@ impl RmsNorm {
 
     pub fn arrays(&self) -> Vec<&Array> {
         vec![&self.weight]
+    }
+
+    /// Width of the loaded gain (the normalized axis).
+    pub fn width(&self) -> u64 {
+        self.weight.size() as u64
     }
 }
 
@@ -456,6 +535,50 @@ pub fn attention_budgeted(
     let mask = mask.map(|m| m.as_dtype(compute)).transpose()?;
     let out = mlx_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, mask.as_ref(), plan)?;
     Ok(out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?)
+}
+
+/// Whether the current default device runs MLX's fused kernels (`rms_norm`, SDPA) — any device but
+/// the CPU, whose backend runs their unfused fallbacks. On the GPU, MLX 0.32 runs every Iris
+/// attention as a fused kernel that streams its scores (`sdpa_full` above 8 query rows at head
+/// widths 64/80/128, `sdpa_vector` at most 8 at 64/96/128/256; Iris's are 128 — trunk, refiner,
+/// PiT, the Qwen3-VL tower — and 80, the layerwise adapter), so no score tensor exists there.
+pub fn fused_kernels() -> bool {
+    mlx_rs::Device::try_default().is_ok_and(|d| d != mlx_rs::Device::cpu())
+}
+
+/// Bytes per element of a compute dtype (f32 4, bf16/f16 2).
+pub fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Float32 => 4,
+        _ => 2,
+    }
+}
+
+/// A sub-layer barrier of one iOS block quantum (sc-26270): on a physical iOS device (and in the
+/// CPU fixture that runs its guards) `arrays` are materialized before the block builds its next
+/// sub-layer. MLX allocates an op's output when it encodes it and keeps the op's inputs alive until
+/// its command buffer completes — with up to ten command buffers encoded ahead — so one lazy block
+/// graph can hold every intermediate of the block at once; these barriers bound a block quantum's
+/// peak to its widest sub-layer, which is what the counted prices in [`crate::dit`] sum. An eval
+/// never changes a value, and off device the graph is exactly the historical one.
+pub(crate) fn barrier(arrays: &[&Array]) -> Result<()> {
+    if mlx_gen::ios_quantum::enabled() {
+        mlx_rs::transforms::eval(arrays.iter().copied())?;
+        #[cfg(test)]
+        BARRIER_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run after every sub-layer barrier's evaluation — the quantum proofs' seam to measure each
+    /// sub-layer from its own start (`crate::quantum_proofs`). Test builds only.
+    pub(crate) static BARRIER_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
 /// One named production attention site. Debug observations report the *executed* shared kernel

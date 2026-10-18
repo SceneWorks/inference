@@ -743,6 +743,19 @@ jobs:
       # rebuilding them from zero — that clean alone cost a third libmlx cmake build.
       - name: Test LLM-only macOS bundle
         run: cargo test --locked --no-default-features --lib -p runtime-macos -p runtime-ios
+      # The non-default `device-capture` surface (`media::capture_permit`), which only the device
+      # harness enables: its own tests (incl. the CPU capture-path depth run) and lints.
+      - name: Test runtime-ios device-capture surface
+        run: |
+          cargo clippy --locked -p runtime-ios --features device-capture --all-targets -- -D warnings
+          cargo test --locked --lib -p runtime-ios --features device-capture
+          cargo test --locked --lib -p mlx-gen-ios-catalog --features device-capture
+      # The compile_fail doctests that keep `capture_permit` out of a product build (and the
+      # inverse doctests that prove the feature exposes it): `--lib` above never runs doctests.
+      - name: Doctest runtime-ios capture gating
+        run: |
+          cargo test --locked --doc -p runtime-ios
+          cargo test --locked --doc -p runtime-ios --features device-capture
       # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
       - name: Disk after LLM-only bundle
         if: always()
@@ -795,6 +808,38 @@ jobs:
         run: >-
           cargo test --locked -p candle-gen -p candle-gen-qwen-image-2-1 --features metal
           --test integration -- metal_strided_reduce:: metal_reference_latents::
+      # Epic 16774 E3: the iOS device harness `ios-host/smoke` on the host. It is NOT a workspace
+      # member (own `[workspace]` and Cargo.lock, hence `--manifest-path`), so nothing above compiles
+      # it. Two settings make it reuse this job's `target/` instead of building a second one:
+      # `CARGO_TARGET_DIR` points it at the workspace target, and the root manifest's
+      # `[profile.dev.package."*"] opt-level = 3` (which the harness manifest lacks) is supplied by
+      # `--config`, so its registry/git units, pmetal-mlx-sys included, hash identically.
+      # Only weights-free, CPU-only tests run here. MLX has no environment switch to a CPU default
+      # device, so the one test that drives the GPU, `smoke_passes_on_the_host` (the whole device
+      # smoke: GEMMs, softmax, metallib load), is skipped by name; it is the device harness's own
+      # host baseline and runs from `scripts/ios/run_smoke.sh`, never on this shared runner.
+      - name: Clippy iOS device harness (host)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          cargo --config 'profile.dev.package."*".opt-level=3'
+          clippy --locked --manifest-path ios-host/smoke/Cargo.toml
+          --features media --all-targets -- -D warnings
+      - name: Test iOS device harness (host, weights-free)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          cargo --config 'profile.dev.package."*".opt-level=3'
+          test --locked --manifest-path ios-host/smoke/Cargo.toml
+          --features media --lib -- --skip smoke_passes_on_the_host
+      # sc-19556: see "Disk after rustdoc". Diagnostics only; never fails the job.
+      - name: Disk after iOS device harness
+        if: always()
+        run: |
+          set +e
+          df -h /
+          du -sh target 2>/dev/null
+          exit 0
 
   # sc-16779 (epic 16774): the iOS cross-build. `runtime-ios`'s HOST build and tests ride
   # `macos-metal`; this lane proves the bundle compiles for the device and simulator triples AND that
@@ -858,6 +903,47 @@ jobs:
         run: cargo build --locked --target ${{ matrix.target }} -p runtime-ios
       - name: Assert the metallib targets ${{ matrix.target }}
         run: scripts/ci/assert_metallib_triple.sh target/${{ matrix.target }} ${{ matrix.metallib_triple }}
+      # The LLM-only product profile: `media` off compiles no image graph at all, which is a
+      # different crate graph and different cfg branches from the default build above.
+      - name: Build LLM-only runtime-ios for ${{ matrix.target }}
+        run: cargo build --locked --target ${{ matrix.target }} -p runtime-ios --no-default-features
+      # Epic 16774 E3: Clippy for the iOS triple, both product profiles. The host Clippy on
+      # `macos-metal` cannot see `#[cfg(target_os = "ios")]` code, so an iOS-only dead-code warning
+      # surfaced only on a device build. `--all-targets` is check-only here (nothing links or runs),
+      # and the test targets' dev-dependencies (tempfile, mlx-gen-ios-catalog) compile for iOS.
+      - name: Clippy runtime-ios for ${{ matrix.target }}
+        run: |
+          cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --all-targets -- -D warnings
+          cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked --target ${{ matrix.target }} -p runtime-ios --features device-capture --all-targets -- -D warnings
+      # The device harness `ios-host/smoke` (own `[workspace]` and Cargo.lock) is what
+      # `scripts/ios/run_smoke.sh` links into the app: the default (LLM smoke) and `media` profiles.
+      # It shares this job's `target/` (`CARGO_TARGET_DIR`), and `--config` supplies the root
+      # manifest's `[profile.dev.package."*"] opt-level = 3`, so its registry/git units hash like
+      # the workspace's and the iOS libmlx built above is reused rather than rebuilt by cmake.
+      - name: Build iOS device harness (media) for ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          cargo --config 'profile.dev.package."*".opt-level=3'
+          build --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml
+          --features media
+      # The harness's third feature, the Z-Image go/no-go (`run_smoke.sh --zimage`), so every
+      # harness feature compiles for the device in CI.
+      - name: Build iOS device harness (zimage) for ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          cargo --config 'profile.dev.package."*".opt-level=3'
+          build --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml
+          --features zimage
+      - name: Clippy iOS device harness for ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --all-targets -- -D warnings
+          cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features media --all-targets -- -D warnings
+          cargo --config 'profile.dev.package."*".opt-level=3' clippy --locked --target ${{ matrix.target }} --manifest-path ios-host/smoke/Cargo.toml --features zimage --all-targets -- -D warnings
 
   macos-nax:
     name: runtime-macos NAX (macOS 26.2, manual)

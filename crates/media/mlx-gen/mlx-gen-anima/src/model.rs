@@ -243,6 +243,9 @@ impl Anima {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
+        // iOS: one cache-limit scope for the whole request (loads, encode, denoise, decode); inert
+        // on every other target.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let variant = self.variant;
@@ -311,13 +314,7 @@ impl Anima {
                 let Some((cond, uncond)) = encoded else {
                     return Ok(());
                 };
-                let mut arrays = vec![&cond.source, &cond.t5_ids];
-                if let Some(u) = uncond {
-                    arrays.push(&u.source);
-                    arrays.push(&u.t5_ids);
-                }
-                mlx_rs::transforms::eval(arrays)?;
-                Ok(())
+                materialize_conditioning_inputs(cond, uncond.as_ref())
             },
             // ── Phase B: conditioner forward (once per cond/uncond — seed-independent) then the count
             // loop of denoise. Identical body for every residency and rung, so a staged or windowed job
@@ -360,7 +357,7 @@ impl Anima {
             // Force every latent before the DiT + conditioner are shed: an unevaluated latent still
             // references the DiT graph, so dropping it would free nothing (the SC-15750 MLX trap, one
             // level up from the block window).
-            |latents: &Vec<mlx_rs::Array>| Ok(mlx_rs::transforms::eval(latents.iter())?),
+            |latents: &Vec<mlx_rs::Array>| materialize_latents(latents),
             // ── Phase C: decode from whichever VAE survived — the warm bundle's or the shed one's.
             |view: AnimaDecodeView<'_>, latents, on_progress: &mut dyn FnMut(Progress)| {
                 calibration_fault(req, mlx_gen::gen_core::MemoryPhase::Decode)?;
@@ -381,6 +378,53 @@ impl Anima {
             },
         )
     }
+}
+
+/// iOS quantum labels for the two phase-boundary materializations outside any model quantum.
+pub(crate) const CONDITIONING_INPUTS_QUANTUM: &str = "Anima conditioning inputs materialize";
+pub(crate) const LATENTS_QUANTUM: &str = "Anima latents materialize";
+
+/// Force the phase-A conditioner inputs while the Qwen3 TE is alive (staged only — MLX is lazy, so
+/// an unevaluated `source` keeps the TE referenced and dropping it would free nothing). The Qwen3
+/// tower's last quantum materialized its states; what is still lazy here is each prompt's
+/// mask-multiply, priced at [`AnimaTextConditioner::mask_multiply_bytes`] and checked before the
+/// graph runs on iOS. The T5 ids are host data.
+///
+/// [`AnimaTextConditioner::mask_multiply_bytes`]: crate::conditioner::AnimaTextConditioner::mask_multiply_bytes
+pub(crate) fn materialize_conditioning_inputs(
+    cond: &AnimaCondInputs,
+    uncond: Option<&AnimaCondInputs>,
+) -> Result<()> {
+    let inputs: Vec<&AnimaCondInputs> = std::iter::once(cond).chain(uncond).collect();
+    let scratch = inputs.iter().fold(0u64, |total, input| {
+        total.saturating_add(
+            crate::conditioner::AnimaTextConditioner::mask_multiply_bytes(&input.source),
+        )
+    });
+    let arrays: Vec<&mlx_rs::Array> = inputs
+        .iter()
+        .flat_map(|input| [&input.source, &input.t5_ids])
+        .collect();
+    mlx_gen::ios_quantum::before(CONDITIONING_INPUTS_QUANTUM, scratch)?;
+    mlx_rs::transforms::eval(arrays.iter().copied())?;
+    mlx_gen::ios_quantum::finish(CONDITIONING_INPUTS_QUANTUM, &arrays)
+}
+
+/// Force every latent before the DiT + conditioner are shed (an unevaluated latent still references
+/// the DiT graph, so dropping it would free nothing — the SC-15750 MLX trap, one level up from the
+/// block window). The DiT's quanta materialized every velocity; what is still lazy here is each
+/// latent's LAST CFG combine + sampler update, priced at
+/// [`mlx_gen::ios_quantum::sampler_step_bytes`] per latent and checked before the graph runs on iOS.
+pub(crate) fn materialize_latents(latents: &[mlx_rs::Array]) -> Result<()> {
+    let scratch = latents.iter().fold(0u64, |total, latent| {
+        total.saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
+            latent.size() as u64
+        ))
+    });
+    mlx_gen::ios_quantum::before(LATENTS_QUANTUM, scratch)?;
+    mlx_rs::transforms::eval(latents.iter())?;
+    let arrays: Vec<&mlx_rs::Array> = latents.iter().collect();
+    mlx_gen::ios_quantum::finish(LATENTS_QUANTUM, &arrays)
 }
 
 /// Request-local, calibration-only fault injection at a physical phase boundary (SC-15449's

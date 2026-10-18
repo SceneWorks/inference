@@ -120,12 +120,57 @@ impl ClipEncoderLayer {
         }
     }
 
+    /// iOS quantum scratch (sc-26270) of this layer over `b` rows of `n` tokens of `x`-typed
+    /// input, from the loaded widths: hidden from `layer_norm1`, MLP width from `fc1`,
+    /// heads/head_dim from the config ([`crate::quantum::clip_layer_bytes`]), at the activation
+    /// width the layer's projections promote `x` to (a packed snapshot's BF16 scales make an f16
+    /// layer's every projection output and its residual f32 —
+    /// [`crate::quantum::linear_output_dtype`]). The causal mask is an additive array mask, which
+    /// MLX's fused Metal SDPA accepts at head dim 64.
+    fn quantum_scratch(&self, b: i32, n: i32, x: Dtype) -> u64 {
+        let act = crate::quantum::dtype_bytes(
+            [&self.q, &self.out, &self.linear1, &self.linear2]
+                .iter()
+                .fold(x, |d, linear| {
+                    Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+                }),
+        );
+        // A promoting layer entered at a narrower width: each of q/k/v casts the narrow LayerNorm
+        // output up (`quantized_matmul`'s `astype(x, result_type)`) — three hidden-sized copies.
+        let casts = if act > crate::quantum::dtype_bytes(x) {
+            mlx_gen::ios_quantum::tensor_bytes(
+                act,
+                &[3, b as u64, n as u64, self.ln1_w.shape()[0] as u64],
+            )
+            .saturating_add(crate::quantum::page_slack(3))
+        } else {
+            0
+        };
+        casts.saturating_add(crate::quantum::clip_layer_bytes(
+            b,
+            n,
+            self.ln1_w.shape()[0] as u64,
+            crate::quantum::linear_out(&self.linear1),
+            self.num_heads,
+            self.head_dim,
+            true,
+            act,
+            crate::quantum::Backend::current(),
+        ))
+    }
+
     /// `x`: `[B, N, D]`; `mask`: additive causal `[1, 1, N, N]`.
     fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
         // Self-attention (pre-norm, residual).
         let y = layer_norm(x, Some(&self.ln1_w), Some(&self.ln1_b), LN_EPS)?;
         let y = self.attention(&y, mask)?;
         let x = add(x, &y)?;
+        // sc-26270: on iOS the attention half is materialized before the MLP is built, bounding the
+        // layer quantum to its wider half (`quantum::clip_layer_bytes`); values are unchanged and
+        // off device the graph is the historical one.
+        if mlx_gen::ios_quantum::enabled() {
+            x.eval()?;
+        }
 
         // MLP (pre-norm, residual).
         let y = layer_norm(&x, Some(&self.ln2_w), Some(&self.ln2_b), LN_EPS)?;
@@ -229,6 +274,22 @@ impl ClipTextEncoder {
         Ok(())
     }
 
+    /// One layer's guarded quantum body and price (sc-26270 proof tests): `layer.forward(x, mask)`
+    /// and its counted scratch over `x`.
+    #[cfg(test)]
+    pub(crate) fn layer_quantum_for_test(
+        &self,
+        index: usize,
+        x: &Array,
+    ) -> (u64, impl Fn() -> Result<Array> + '_) {
+        let s = x.shape();
+        let layer = &self.layers[index];
+        let scratch = layer.quantum_scratch(s[0], s[1], x.dtype());
+        let (n, dtype) = (s[1], x.dtype());
+        let x = x.clone();
+        (scratch, move || layer.forward(&x, &causal_mask(n, dtype)?))
+    }
+
     /// Run the encoder over `input_ids` `[B, N]` (int32). Returns the last hidden state, the
     /// per-layer hidden states, and the pooled EOS token (projected for TE2).
     pub fn forward(&self, input_ids: &Array) -> Result<ClipOutput> {
@@ -249,23 +310,45 @@ impl ClipTextEncoder {
                 "sdxl clip: sequence length {n} exceeds position-embedding capacity {max_pos}"
             )));
         }
+        // sc-26270: embeddings, each layer, and the final norm + pooled token are guarded iOS
+        // quanta (pass-throughs off device), each counted from its own ops.
+        let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
+        let act = crate::quantum::element_bytes(&self.token_embedding);
+        let hidden = mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, dim as u64]);
 
         // Token + position embeddings. `position_embedding.weight[:N]` broadcast over the batch.
-        let ids_flat = input_ids.reshape(&[b * n])?;
-        let tok = self
-            .token_embedding
-            .take_axis(&ids_flat, 0)?
-            .reshape(&[b, n, dim])?;
-        let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-        let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
-        let mut x = add(&tok, &pos.reshape(&[1, n, dim])?)?;
+        // Counted: the gathered tokens, the gathered positions and the sum.
+        let mut x = mlx_gen::ios_quantum::run(crate::quantum::CLIP_EMBEDDINGS, 3 * hidden, || {
+            let ids_flat = input_ids.reshape(&[b * n])?;
+            let tok = self
+                .token_embedding
+                .take_axis(&ids_flat, 0)?
+                .reshape(&[b, n, dim])?;
+            let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+            let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
+            Ok(add(&tok, &pos.reshape(&[1, n, dim])?)?)
+        })?;
 
         let mask = causal_mask(n, x.dtype())?;
         let mut hidden_states = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            x = layer.forward(&x, &mask)?;
+            x = mlx_gen::ios_quantum::run(
+                crate::quantum::CLIP_LAYER,
+                layer.quantum_scratch(b, n, x.dtype()),
+                || layer.forward(&x, &mask),
+            )?;
             hidden_states.push(x.clone());
         }
+        // Counted: the final LayerNorm output (the pooled gather and its projection are rows), at
+        // the width the layers left the hidden state (f32 after a packed layer's promotion).
+        let wide = crate::quantum::element_bytes(&x).max(act);
+        let final_hidden =
+            mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, n as u64, dim as u64]);
+        let pooled_rows = mlx_gen::ios_quantum::tensor_bytes(wide, &[b as u64, 2 * dim as u64]);
+        mlx_gen::ios_quantum::before(
+            crate::quantum::CLIP_POOLED,
+            final_hidden.saturating_add(pooled_rows),
+        )?;
         let last_hidden_state =
             layer_norm(&x, Some(&self.final_ln_w), Some(&self.final_ln_b), LN_EPS)?;
 
@@ -285,6 +368,7 @@ impl ClipTextEncoder {
             Some(p) => p.forward(&pooled)?,
             None => pooled,
         };
+        mlx_gen::ios_quantum::finish(crate::quantum::CLIP_POOLED, &[&last_hidden_state, &pooled])?;
 
         Ok(ClipOutput {
             last_hidden_state,

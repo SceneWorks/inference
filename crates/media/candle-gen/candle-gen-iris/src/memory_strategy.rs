@@ -86,6 +86,42 @@ pub const DEPTH_MEMORY_CALIBRATION_FINGERPRINT: &str = "iris-3b-depth-candle-der
 pub const RESTORE_MEMORY_CALIBRATION_FINGERPRINT: &str =
     "iris-3b-restore-candle-derived-2026-10-12-v1";
 
+/// The retained calibration fingerprint of `task`'s DENSE bf16 contract (the strings consumers
+/// already key on). Every other tier has its own identity: [`calibration_fingerprint_for`].
+pub const fn calibration_fingerprint(task: IrisTask) -> &'static str {
+    match task {
+        IrisTask::Generation => MEMORY_CALIBRATION_FINGERPRINT,
+        IrisTask::Depth => DEPTH_MEMORY_CALIBRATION_FINGERPRINT,
+        IrisTask::Restoration => RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
+    }
+}
+
+/// The calibration identity of `task` at the tier the load computes and packs in, keyed on
+/// **(task, tier)** — the MLX twin's rule (sc-22731). One string per task across tiers would let a
+/// q8 record satisfy a q4 request (and vice versa), though the packed widths and so the footprints
+/// differ. The dense bf16 cell keeps its retained string byte-for-byte; the fp32 dense reference
+/// and the q8 / q4 packed tiers each get their own.
+pub fn calibration_fingerprint_for(
+    task: IrisTask,
+    precision: gen_core::Precision,
+    quant: Option<gen_core::Quant>,
+) -> String {
+    let tier = match (quant, precision) {
+        (None, gen_core::Precision::Bf16) => return calibration_fingerprint(task).to_owned(),
+        (None, gen_core::Precision::Fp32) => "fp32",
+        (Some(gen_core::Quant::Q8), _) => "q8",
+        (Some(gen_core::Quant::Q4), _) => "q4",
+        // Refused before any contract is built (`refuse_unloadable_quant`); never published.
+        (Some(_), _) => "unsupported",
+    };
+    let route = match task {
+        IrisTask::Generation => "iris-3b",
+        IrisTask::Depth => "iris-3b-depth",
+        IrisTask::Restoration => "iris-3b-restore",
+    };
+    format!("{route}-{tier}-candle-derived-2026-10-12-v1")
+}
+
 /// The published attention score budget (elements of one `[rows, heads, queries, keys]` scores
 /// tensor): the shared rung-3 operating point
 /// ([`candle_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET`], 64 Mi), like the sibling families.
@@ -405,7 +441,7 @@ fn refuse_deferred_materialization(model_id: &str, spec: &LoadSpec) -> gen_core:
     Ok(())
 }
 
-fn base_contract(model_id: &str, fingerprint: &str, spec: &LoadSpec) -> MemoryProviderContract {
+fn base_contract(model_id: &str, task: IrisTask, spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         model_id,
         MemoryBackendRealization::CandleCuda {
@@ -419,6 +455,7 @@ fn base_contract(model_id: &str, fingerprint: &str, spec: &LoadSpec) -> MemoryPr
     );
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
+    let fingerprint = calibration_fingerprint_for(task, spec.precision, spec.quantize);
     contract.calibration = Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
     contract
@@ -436,7 +473,7 @@ pub fn weights_free_memory_strategy_contract(
 ) -> gen_core::Result<MemoryProviderContract> {
     crate::model::refuse_unsupported_spec(spec)?;
     refuse_deferred_materialization(MODEL_ID, spec)?;
-    let mut contract = base_contract(MODEL_ID, MEMORY_CALIBRATION_FINGERPRINT, spec);
+    let mut contract = base_contract(MODEL_ID, IrisTask::Generation, spec);
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -563,11 +600,11 @@ fn price_adapter_stack(
 /// only.
 fn weights_free_downstream_contract(
     model_id: &str,
-    fingerprint: &str,
+    task: IrisTask,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     refuse_deferred_materialization(model_id, spec)?;
-    let mut contract = base_contract(model_id, fingerprint, spec);
+    let mut contract = base_contract(model_id, task, spec);
     // No lifecycle phases and no hooks: one forward, nothing to stage, tile or chunk on request.
     contract.lifecycle = MemoryLifecycleCapabilities::default();
     contract.formula = MemoryFormulaKind::Affine {
@@ -623,7 +660,7 @@ fn price_downstream_export(
 /// The depth contract with no asset facts — the registry conformance surface.
 pub fn weights_free_depth_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     crate::depth::refuse_unsupported_spec(spec)?;
-    weights_free_downstream_contract(DEPTH_MODEL_ID, DEPTH_MEMORY_CALIBRATION_FINGERPRINT, spec)
+    weights_free_downstream_contract(DEPTH_MODEL_ID, IrisTask::Depth, spec)
 }
 
 /// The executable depth contract for a real load: the widened backbone and its 1×1 reducer at the
@@ -640,11 +677,7 @@ pub fn weights_free_restoration_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     crate::restoration::refuse_unsupported_spec(spec)?;
-    weights_free_downstream_contract(
-        RESTORATION_MODEL_ID,
-        RESTORE_MEMORY_CALIBRATION_FINGERPRINT,
-        spec,
-    )
+    weights_free_downstream_contract(RESTORATION_MODEL_ID, IrisTask::Restoration, spec)
 }
 
 /// The executable restoration contract for a real load: the fine-tuned backbone at the compute
@@ -1248,6 +1281,121 @@ mod tests {
         }
         assert_eq!(DEPTH_MEMORY_MODE, IrisTask::Depth.name());
         assert_eq!(RESTORE_MEMORY_MODE, IrisTask::Restoration.name());
+    }
+
+    /// The calibration identity is keyed on (task, tier), mirroring the MLX twin: dense bf16 keeps
+    /// its retained string, and the fp32 dense reference and the q8 / q4 tiers each get their own.
+    /// A record whose evidence identity is one quantized tier's never passes the safety check of
+    /// the other tier's load (q8 never satisfies q4 and vice versa), while its own tier passes.
+    ///
+    /// *Mutation that reds this:* returning one shared string for q8 and q4 from
+    /// `calibration_fingerprint_for`.
+    #[test]
+    fn a_record_of_one_tier_never_satisfies_another_tiers_request() {
+        let expected = [
+            (
+                IrisTask::Generation,
+                [
+                    "iris-3b-candle-derived-2026-10-12-v1",
+                    "iris-3b-fp32-candle-derived-2026-10-12-v1",
+                    "iris-3b-q8-candle-derived-2026-10-12-v1",
+                    "iris-3b-q4-candle-derived-2026-10-12-v1",
+                ],
+            ),
+            (
+                IrisTask::Depth,
+                [
+                    "iris-3b-depth-candle-derived-2026-10-12-v1",
+                    "iris-3b-depth-fp32-candle-derived-2026-10-12-v1",
+                    "iris-3b-depth-q8-candle-derived-2026-10-12-v1",
+                    "iris-3b-depth-q4-candle-derived-2026-10-12-v1",
+                ],
+            ),
+            (
+                IrisTask::Restoration,
+                [
+                    "iris-3b-restore-candle-derived-2026-10-12-v1",
+                    "iris-3b-restore-fp32-candle-derived-2026-10-12-v1",
+                    "iris-3b-restore-q8-candle-derived-2026-10-12-v1",
+                    "iris-3b-restore-q4-candle-derived-2026-10-12-v1",
+                ],
+            ),
+        ];
+        let tiers = [
+            (Precision::Bf16, None),
+            (Precision::Fp32, None),
+            (Precision::Bf16, Some(Quant::Q8)),
+            (Precision::Bf16, Some(Quant::Q4)),
+        ];
+        let mut seen = BTreeSet::new();
+        for (task, strings) in expected {
+            assert_eq!(
+                calibration_fingerprint_for(task, Precision::Bf16, None),
+                calibration_fingerprint(task),
+                "{task:?}: the dense bf16 cell keeps its retained string"
+            );
+            for ((precision, quant), want) in tiers.into_iter().zip(strings) {
+                let fingerprint = calibration_fingerprint_for(task, precision, quant);
+                assert_eq!(fingerprint, want, "{task:?} {precision:?} {quant:?}");
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+                assert!(
+                    seen.insert(fingerprint),
+                    "{task:?}: tiers share an identity"
+                );
+            }
+        }
+
+        // Every published contract carries its own tier's identity (the dense tiers on all three
+        // routes; q8 / q4 on generation, the only route whose loader packs them).
+        let published: [(IrisTask, ContractFactory); 3] = [
+            (IrisTask::Generation, weights_free_memory_strategy_contract),
+            (IrisTask::Depth, weights_free_depth_contract),
+            (IrisTask::Restoration, weights_free_restoration_contract),
+        ];
+        for (task, factory) in published {
+            for precision in [Precision::Bf16, Precision::Fp32] {
+                let mut spec = unresolved();
+                spec.precision = precision;
+                assert_eq!(
+                    factory(&spec).unwrap().calibration.unwrap().fingerprint,
+                    calibration_fingerprint_for(task, precision, None)
+                );
+            }
+        }
+        let spec = |quant: Quant| unresolved().with_quant(quant);
+        let contract = |quant: Quant| weights_free_memory_strategy_contract(&spec(quant)).unwrap();
+        for quant in [Quant::Q8, Quant::Q4] {
+            assert_eq!(
+                contract(quant).calibration.unwrap().fingerprint,
+                calibration_fingerprint_for(IrisTask::Generation, Precision::Bf16, Some(quant))
+            );
+        }
+
+        // A record carrying the request's tier but another tier's evidence identity is refused by
+        // the registered safety check; the request's own record passes.
+        for (record_tier, request_tier) in [(Quant::Q8, Quant::Q4), (Quant::Q4, Quant::Q8)] {
+            let request = contract(request_tier);
+            let own = fixture_context(
+                &spec(request_tier),
+                &request,
+                MemoryStrategy::StagedResidency,
+            );
+            assert_eq!(
+                generation_safety_check(&spec(request_tier), &request, &own),
+                MemorySafetyDecision::Accept,
+                "{request_tier:?}"
+            );
+            let mut foreign = own.clone();
+            foreign.calibration_fingerprint =
+                contract(record_tier).calibration.unwrap().fingerprint;
+            assert!(
+                matches!(
+                    generation_safety_check(&spec(request_tier), &request, &foreign),
+                    MemorySafetyDecision::Reject { .. }
+                ),
+                "a {record_tier:?} record satisfied a {request_tier:?} request"
+            );
+        }
     }
 
     /// The axes come from each task's own `config.yaml`, and a weights-free surface publishes none.

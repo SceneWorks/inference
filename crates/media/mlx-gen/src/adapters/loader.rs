@@ -1593,6 +1593,9 @@ fn apply_loha_thirdparty_bfl(
 /// tree (`bfl_targets()` / `kohya_table()`), which only the autoprefix path does. Callers that may
 /// receive BFL or kohya files must use the autoprefix variant; here such a file would resolve no
 /// targets and be reported as fully unmatched rather than applied.
+/// iOS pre-load quantum label of an adapter (LoRA/LoKr/LoHa/diff-patch) file read.
+pub const ADAPTER_LOAD_QUANTUM: &str = "adapter load";
+
 pub fn apply_adapter_specs(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -1600,6 +1603,8 @@ pub fn apply_adapter_specs(
 ) -> Result<ApplyReport> {
     let mut combined = ApplyReport::default();
     for spec in specs {
+        // iOS: header-only floor of the adapter file before it is eagerly read (no-op elsewhere).
+        crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;
         let w = Weights::from_file(&spec.path)?;
         let report = match spec.kind {
             AdapterKind::Lokr => {
@@ -1807,6 +1812,8 @@ fn apply_adapter_specs_autoprefix_reported(
         // Load + classify the file once per spec (F-004); `classify_adapter_format` is the single
         // source of routing truth (F-069) — the arms below only fetch the table the applier needs
         // and apply.
+        // iOS: header-only floor of the adapter file before it is eagerly read (no-op elsewhere).
+        crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;
         let w = Weights::from_file(&spec.path)?;
         let report = match classify_adapter_format(&w, spec.kind, host, &mut tables) {
             AdapterFormat::ThirdpartyLokrBfl => {
@@ -1991,6 +1998,8 @@ fn fold_diff_patch_adapters_reported(
     let mut reports = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut report = DiffPatchReport::default();
+        // iOS: header-only floor of the adapter file before it is eagerly read (no-op elsewhere).
+        crate::ios_quantum::before_load(ADAPTER_LOAD_QUANTUM, std::slice::from_ref(&spec.path))?;
         let w = Weights::from_file(&spec.path)?;
         // Group each module's `.diff`/`.diff_b` by its resolved (prefix-stripped) dotted stem.
         let mut groups: BTreeMap<String, DiffParts> = BTreeMap::new();
@@ -2386,6 +2395,61 @@ mod tests {
         fn adaptable_paths(&self) -> Vec<String> {
             self.paths.clone()
         }
+    }
+
+    /// iOS: every adapter file read is checked against live headroom (its header-only floor)
+    /// BEFORE it is read, on each apply path; with no headroom nothing is read or applied.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adapter_reads_check_their_header_floor_before_reading() {
+        const CHILD: &str = "MLX_GEN_ADAPTER_LOAD_FLOOR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "adapters::loader::tests::adapter_reads_check_their_header_floor_before_reading",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = scratch_file(&tmp, "lora.safetensors");
+        let down = Array::ones::<f32>(&[2, 4]).unwrap();
+        let up = Array::ones::<f32>(&[4, 2]).unwrap();
+        Array::save_safetensors(
+            vec![("lin.lora_A.weight", &down), ("lin.lora_B.weight", &up)],
+            None,
+            &path,
+        )
+        .unwrap();
+        let spec = AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lora);
+        let base = Array::ones::<f32>(&[4, 4]).unwrap();
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(base.clone(), None),
+        };
+        let _ = crate::ios_quantum::take_refusal();
+        let refused = crate::ios_quantum::with_cpu_diagnostic_headroom(0, || {
+            apply_adapter_specs(&mut host, std::slice::from_ref(&spec), None)
+        });
+        assert!(refused.is_err());
+        let record = crate::ios_quantum::take_refusal().expect("typed refusal");
+        assert_eq!(record.label, ADAPTER_LOAD_QUANTUM);
+        // Header floor: both tensors' stored bytes — a load peaks at exactly what it stores
+        // (`ios_quantum_budget::load_floor_bytes`, proven by measurement), no extra read scratch.
+        assert_eq!(record.scratch_bytes, 32 + 32);
+        assert!(
+            host.lin.adapters().is_empty(),
+            "nothing applied past the refusal"
+        );
+        // With headroom it applies exactly as off-device.
+        crate::ios_quantum::with_cpu_diagnostic_headroom(1 << 30, || {
+            apply_adapter_specs(&mut host, std::slice::from_ref(&spec), None)
+        })
+        .unwrap();
     }
 
     /// Minimal host with a single adaptable linear at path `["lin"]`.

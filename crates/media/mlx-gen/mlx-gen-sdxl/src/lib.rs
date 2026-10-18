@@ -37,7 +37,17 @@ pub mod pipeline;
 pub mod plan;
 pub mod preview;
 pub mod quant;
+// iOS bounded execution quanta (sc-26270): labels and loaded-tensor scratch geometry.
+pub(crate) mod quantum;
+#[cfg(all(test, target_os = "macos"))]
+mod quantum_tests;
+// sc-26270 (E2): the Mac default txt2img/img2img path pinned to a pre-epic golden.
+#[cfg(all(test, target_os = "macos"))]
+mod default_path_golden;
 pub mod sampler;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../mlx-gen-iris/tests/common/metal_guard.rs"]
+pub(crate) mod test_metal_guard;
 #[doc(hidden)]
 pub mod test_support;
 pub mod text_encoder;
@@ -88,8 +98,9 @@ pub use loader::{
 };
 pub use long_prompt::ChunkedTokens;
 pub use model::{
-    descriptor, load, load_concrete, load_from_ldm_file, snapshot_component_footprint,
-    DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID, PID_BACKBONE, SIZE_MULTIPLE,
+    conditioning_window_count, descriptor, load, load_concrete, load_from_ldm_file,
+    snapshot_component_footprint, DecodeQualitySample, Sdxl, LDM_TOKENIZER_COMPONENT, MODEL_ID,
+    PID_BACKBONE, SIZE_MULTIPLE,
 };
 pub use pipeline::{
     decode_image, decode_image_tiled, decoded_to_image, denoise, denoise_cfgpp,
@@ -98,8 +109,9 @@ pub use pipeline::{
     denoise_ip_control, denoise_ip_control_with_preview, denoise_ip_multi_control,
     denoise_ip_multi_control_with_preview, denoise_ip_with_preview, denoise_multi_control,
     denoise_multi_control_with_preview, denoise_with_preview, encode_conditioning,
-    encode_conditioning_windows, encode_init_latents, preprocess_control_image,
-    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
+    encode_conditioning_windows, encode_init_latents, encode_init_latents_tiled,
+    preprocess_control_image, preprocess_init_image, seeded_prior, text_time_ids, ControlContext,
+    Denoiser,
 };
 pub use plan::{SdxlBlockWindow, SdxlForwardPlan};
 pub use sampler::EulerSampler;

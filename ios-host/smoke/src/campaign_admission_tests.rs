@@ -9,12 +9,22 @@ fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
         refusal_kind: None,
         cancel: CancelFlag::new(),
         deadline: Instant::now() + Duration::from_secs(30),
-        spec: None,
-        context: None,
-        request: None,
+        candidate: None,
+        evidence_key: None,
+        permit: None,
+        refused_quantum: None,
         refusal_only: false,
-        sdxl: None,
     }
+}
+fn tokenizer(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut vocab = String::from("{");
+    for (i, c) in ('a'..='z').enumerate() {
+        vocab += &format!("\"{c}\":{},\"{c}</w>\":{},", 2 * i, 2 * i + 1);
+    }
+    vocab += "\"<|startoftext|>\":49406,\"<|endoftext|>\":49407}";
+    std::fs::write(dir.join("vocab.json"), vocab).unwrap();
+    std::fs::write(dir.join("merges.txt"), "#version: 0.2\n").unwrap();
 }
 fn tensor(path: &Path, key: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -51,20 +61,37 @@ fn campaign_injected_device_sana_profiles_errors_rungs_and_modes() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("sana_1600m/bf16");
     sana(&root);
+    // SANA image-to-image is admitted-reachable: refused for EVIDENCE, not for its mode.
     for (mode, rung, kind) in [
         ("text", 2, "no_evidence"),
-        ("reference", 2, "mode"),
+        ("reference", 2, "no_evidence"),
+        ("control", 2, "mode"),
         ("text", 4, "strategy"),
     ] {
         let case = Case::parse(&format!("sana_1600m/sana_1600m/bf16/512/{mode}/{rung}")).unwrap();
         let mut p = adapter(catalog.media(), temp.path().into());
         let result = campaign::run(&mut p, &case, false);
         assert_eq!(result.0, Status::AdmittedRefused, "{result:?}");
-        assert_eq!(p.refusal_kind, Some(kind));
-        assert!(p.artifact["layout_sha256"]
-            .as_str()
-            .is_some_and(|s| s.len() == 64));
+        assert_eq!(p.refusal_kind, Some(kind), "{mode}/{rung}: {result:?}");
+        if kind == "no_evidence" {
+            assert!(p.artifact["layout_sha256"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64));
+            assert!(p.evidence_key.is_some(), "the memory key is recorded");
+        }
     }
+    // A dense snapshot requested as q4 is a typed ARTIFACT refusal (the provider publishes no
+    // calibration for a load-time requantization), never an untyped failure or a wrong price.
+    copy_tree(&root, &temp.path().join("sana_1600m/q4"));
+    let case = Case::parse("sana_1600m/sana_1600m/q4/512/text/2").unwrap();
+    let mut p = adapter(catalog.media(), temp.path().into());
+    let result = campaign::run(&mut p, &case, false);
+    assert_eq!(result.0, Status::AdmittedRefused, "{result:?}");
+    assert_eq!(p.refusal_kind, Some("artifact"), "{result:?}");
+    assert!(
+        p.evidence_key.is_none(),
+        "no key/price is computed for the wrong tier"
+    );
     std::fs::write(
         root.join("text_encoder/gemma-2-2b-it.safetensors"),
         b"malformed",
@@ -86,6 +113,8 @@ fn campaign_injected_device_sdxl_anima_iris_no_evidence_is_not_capacity() {
     for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
         tensor(&sdxl.join(component).join("model.safetensors"), "x");
     }
+    tokenizer(&sdxl.join("tokenizer"));
+    tokenizer(&sdxl.join("tokenizer_2"));
     let anima = temp.path().join("anima_turbo/bf16");
     for component in ["diffusion_models", "text_encoders", "vae"] {
         tensor(
@@ -122,14 +151,24 @@ fn campaign_injected_device_sdxl_anima_iris_no_evidence_is_not_capacity() {
             "{provider}: {result:?}"
         );
     }
+    // Iris prompt batches are admitted-reachable too; a mode Iris does not serve is a typed
+    // refusal, never a silent text-to-image substitute.
+    for (mode, kind) in [("prompt_batch", "no_evidence"), ("reference", "mode")] {
+        let case = Case::parse(&format!("iris_3b/iris_3b/bf16/512/{mode}/0")).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let result = campaign::run(&mut p, &case, false);
+        assert_eq!(result.0, Status::AdmittedRefused, "{mode}: {result:?}");
+        assert_eq!(p.refusal_kind, Some(kind), "{mode}: {result:?}");
+    }
     let case = Case::parse("iris_3b/iris_3b/bf16/512/prompt_batch/0").unwrap();
     let mut p = adapter(catalog.media(), temp.path().into());
     p.prepare(&case).unwrap();
-    assert_eq!(p.request.as_ref().unwrap().prompt_batch.len(), 2);
-    assert_ne!(
-        p.request.as_ref().unwrap().prompt_batch[0],
-        p.request.as_ref().unwrap().prompt_batch[1]
-    );
+    let runtime_ios::media::IosWork::Generate(request) = &p.candidate.as_ref().unwrap().work else {
+        panic!("prompt batch is a generation")
+    };
+    assert_eq!(request.prompt_batch.len(), 2);
+    assert_ne!(request.prompt_batch[0], request.prompt_batch[1]);
+    assert_eq!(p.candidate.as_ref().unwrap().context.geometry.batch, 2);
 }
 #[test]
 fn campaign_oversized_component_manifest_fails_without_full_allocation() {
@@ -143,26 +182,95 @@ fn campaign_oversized_component_manifest_fails_without_full_allocation() {
 }
 #[test]
 fn campaign_kernel_ledger_uses_exact_peak_not_sampled_current() {
-    let (current, peak) = support::read_footprint(|words, count| {
-        assert_eq!(*count, 44);
+    use support::{PeakReading, TASK_VM_INFO_COUNT, TASK_VM_INFO_REV3_COUNT};
+    // The SDK layout: phys_footprint at words 36-37, ledger_phys_footprint_peak at 42-43, REV2 = 42
+    // words, REV3 = 84, the full REV7 struct = 93.
+    assert_eq!((TASK_VM_INFO_REV3_COUNT, TASK_VM_INFO_COUNT), (84, 93));
+    let fill = |words: &mut [u32]| {
         words[36] = 123;
         words[37] = 1;
         words[40] = 999;
         words[42] = 456;
         words[43] = 2;
+    };
+    // REV3+ reply (the kernel returns its own count): the exact lifetime peak.
+    for returned in [TASK_VM_INFO_REV3_COUNT, TASK_VM_INFO_COUNT] {
+        let (current, peak) = support::read_footprint(|words, count| {
+            assert_eq!(*count, TASK_VM_INFO_COUNT, "request the full struct");
+            assert_eq!(words.len(), TASK_VM_INFO_COUNT as usize);
+            fill(words);
+            *count = returned;
+            0
+        })
+        .unwrap();
+        assert_eq!(current, (1u64 << 32) + 123);
+        assert_eq!(peak, PeakReading::Read((2u64 << 32) + 456));
+    }
+    // A REV2-sized reply (42 words) carries no peak: an explicit typed reading, not a silent None.
+    let (current, peak) = support::read_footprint(|words, count| {
+        fill(words);
+        *count = 42;
         0
     })
     .unwrap();
     assert_eq!(current, (1u64 << 32) + 123);
-    assert_eq!(peak, Some((2u64 << 32) + 456));
-    let (_, peak) = support::read_footprint(|words, count| {
-        words[36] = 321;
-        *count = 38;
+    assert_eq!(peak, PeakReading::Unavailable { returned_words: 42 });
+    assert!(support::read_footprint(|_, count| {
+        *count = 30;
         0
     })
-    .unwrap();
-    assert_eq!(peak, None);
+    .is_none());
     assert!(support::read_footprint(|_, _| -1).is_none());
+}
+/// The mirrored layout must equal the installed SDK's `struct task_vm_info` (macOS hosts with
+/// Xcode; skipped elsewhere): same field order and widths under `#pragma pack(4)`.
+#[cfg(target_os = "macos")]
+#[test]
+fn task_vm_info_layout_matches_the_sdk_header() {
+    let sdk = std::process::Command::new("xcrun")
+        .args(["--sdk", "iphoneos", "--show-sdk-path"])
+        .output();
+    let Some(sdk) = sdk
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        eprintln!("no iPhoneOS SDK; layout cross-check skipped");
+        return;
+    };
+    let header = std::fs::read_to_string(format!("{sdk}/usr/include/mach/task_info.h")).unwrap();
+    assert!(header.contains("#pragma pack(push, 4)"));
+    let body = header
+        .split("struct task_vm_info {")
+        .nth(1)
+        .unwrap()
+        .split("};")
+        .next()
+        .unwrap();
+    let mut words = 0usize;
+    let mut offsets = std::collections::HashMap::new();
+    for line in body.lines() {
+        let line = line.split("/*").next().unwrap().trim();
+        let Some(decl) = line.strip_suffix(';') else {
+            continue;
+        };
+        let mut parts = decl.split_whitespace();
+        let ty = parts.next().unwrap();
+        let name = parts.last().unwrap().to_string();
+        offsets.insert(name, words);
+        words += match ty {
+            "integer_t" => 1,
+            "mach_vm_size_t" | "mach_vm_address_t" | "int64_t" | "uint64_t" => 2,
+            other => panic!("unmapped task_vm_info field type {other}"),
+        };
+    }
+    assert_eq!(words as u32, support::TASK_VM_INFO_COUNT);
+    assert_eq!(offsets["phys_footprint"], 36);
+    assert_eq!(offsets["ledger_phys_footprint_peak"], 42);
+    assert_eq!(
+        offsets["limit_bytes_remaining"] as u32,
+        support::TASK_VM_INFO_REV3_COUNT
+    );
 }
 #[test]
 fn campaign_sdxl_malformed_shard_is_failure_before_missing_evidence() {
@@ -188,9 +296,16 @@ fn campaign_case_renders_are_unique_and_registered_in_manifest() {
         height: 256,
         pixels: (0..256 * 256 * 3).map(|i| (i % 251) as u8).collect(),
     };
-    support::persist_images(root.path(), &case, &[image.clone(), image.clone()]).unwrap();
+    support::persist_images(
+        root.path(),
+        &case,
+        &[image.clone(), image.clone()],
+        Some(256),
+    )
+    .unwrap();
     case.tier = "q8".into();
-    support::persist_images(root.path(), &case, &[image]).unwrap();
+    support::persist_images(root.path(), &case, std::slice::from_ref(&image), None).unwrap();
+    assert!(support::persist_images(root.path(), &case, &[image], Some(512)).is_err());
     let manifest = std::fs::read_to_string(root.path().join(crate::RENDERS_MANIFEST)).unwrap();
     let names: Vec<_> = manifest.lines().collect();
     assert_eq!(names.len(), 3);
@@ -212,4 +327,132 @@ fn campaign_deadline_cooperatively_cancels_without_signals() {
     let mut deadline = Deadline::start(cancel.clone(), Duration::ZERO);
     deadline.thread.take().unwrap().join().unwrap();
     assert!(cancel.is_cancelled());
+}
+
+/// Finding 6: refusal kinds come TYPED from runtime-ios. An SDXL capacity refusal whose message
+/// reads "...candidate 0: unsupported: <reason>" is recorded as capacity, not a diagnostic failure,
+/// and no message text decides the kind.
+#[test]
+fn campaign_typed_refusals_classify_sdxl_capacity_without_parsing_messages() {
+    use runtime_ios::media::{AdmissionError as Typed, Refusal, RefusalKind};
+    for (kind, label) in [
+        (RefusalKind::Capacity, "capacity"),
+        (RefusalKind::NoEvidence, "no_evidence"),
+        (RefusalKind::Mode, "mode"),
+        (RefusalKind::Strategy, "strategy"),
+        (RefusalKind::Artifact, "artifact"),
+    ] {
+        let mut recorded = None;
+        // Deliberately misleading text: only the typed kind may decide the classification.
+        let error = Typed::Refused(Refusal {
+            kind,
+            reason: "iOS admission on iPhone17,2: no candidate admitted; candidate 0: \
+                     unsupported: no applicable artifact/device/request capture"
+                .into(),
+        });
+        assert!(matches!(
+            support::classify(&mut recorded, error),
+            AdmissionError::Refused(_)
+        ));
+        assert_eq!(recorded, Some(label));
+    }
+    let mut recorded = None;
+    let failed = Typed::Failed(runtime_ios::gen_core::Error::Unsupported(
+        "iOS admission: estimated footprint 9999 MiB exceeds the cap".into(),
+    ));
+    assert!(matches!(
+        support::classify(&mut recorded, failed),
+        AdmissionError::Failure(_)
+    ));
+    assert_eq!(
+        recorded, None,
+        "a failure is never a refusal, whatever its text"
+    );
+}
+
+/// Finding 1: the diagnostic flag selects the bounded CAPTURE permit, which never consults the
+/// evidence table. Off-device it is a typed failure (no bounded quanta), never a pass and never an
+/// admission.
+#[cfg(not(target_os = "ios"))]
+#[test]
+fn campaign_capture_requires_bounded_quanta_and_skips_evidence() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    sana(&temp.path().join("sana_1600m/bf16"));
+    let case = Case::parse("sana_1600m/sana_1600m/bf16/512/text/2").unwrap();
+    let mut p = adapter(catalog.media(), temp.path().into());
+    let (status, reason) = campaign::run(&mut p, &case, true);
+    assert_eq!(status, Status::DiagnosticFailure, "{reason}");
+    assert!(reason.contains("bounded per-quantum"), "{reason}");
+    assert_eq!(p.refusal_kind, None);
+    assert!(p.permit.is_none());
+}
+
+/// SDXL ControlNet and IP-Adapter are provisioned through components.json roles onto the load
+/// spec's typed `control` / `ip_adapter` sources; `ip_adapter` is an enumerated SDXL mode, and a
+/// case missing its component is a provisioning failure, never evidence.
+#[test]
+fn campaign_sdxl_control_and_ip_adapter_are_provisioned_roles() {
+    let catalog = runtime_ios::catalog().unwrap();
+    let sdxl = surfaces(catalog.media())
+        .into_iter()
+        .find(|s| s.provider == "sdxl")
+        .unwrap();
+    assert!(sdxl.modes.contains(&"ip_adapter".to_string()));
+    assert!(sdxl.modes.contains(&"control".to_string()));
+    let temp = tempfile::tempdir().unwrap();
+    let slot = temp.path().join("sdxl/q4");
+    for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+        tensor(&slot.join(component).join("model.safetensors"), "x");
+    }
+    tokenizer(&slot.join("tokenizer"));
+    tokenizer(&slot.join("tokenizer_2"));
+    for mode in ["control", "ip_adapter"] {
+        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let (status, reason) = campaign::run(&mut p, &case, false);
+        assert_eq!(status, Status::DiagnosticFailure, "{mode}: {reason}");
+        assert!(reason.contains("provisioned"), "{reason}");
+        assert_eq!(p.refusal_kind, None);
+    }
+    tensor(&slot.join("control/model.safetensors"), "x");
+    tensor(&slot.join("ip_adapter.safetensors"), "x");
+    std::fs::write(
+        slot.join("components.json"),
+        r#"{"control":"control","ip_adapter":"ip_adapter.safetensors"}"#,
+    )
+    .unwrap();
+    let spec = |mode: &str| {
+        snapshot(
+            temp.path(),
+            &Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        spec("control").control,
+        Some(WeightsSource::Dir(_))
+    ));
+    assert!(spec("control").ip_adapter.is_none());
+    assert!(matches!(
+        spec("ip_adapter").ip_adapter,
+        Some(WeightsSource::File(_))
+    ));
+    assert!(spec("ip_adapter").control.is_none());
+    // An image-to-image case never loads the IP-Adapter (it would take the reference image).
+    let img2img = spec("reference");
+    assert!(img2img.ip_adapter.is_none() && img2img.control.is_none());
+    assert!(
+        img2img.components.is_empty(),
+        "roles are not named components"
+    );
+    // Provisioned: both reach admission and are refused for EVIDENCE under their own routes.
+    for mode in ["control", "ip_adapter"] {
+        let case = Case::parse(&format!("sdxl/sdxl/q4/512/{mode}/2")).unwrap();
+        let mut p = adapter(catalog.media(), temp.path().into());
+        let (status, reason) = campaign::run(&mut p, &case, false);
+        assert_eq!(status, Status::AdmittedRefused, "{mode}: {reason}");
+        assert_eq!(p.refusal_kind, Some("no_evidence"), "{mode}: {reason}");
+        assert_eq!(p.evidence_key.as_ref().unwrap().mode, mode);
+    }
 }

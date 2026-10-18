@@ -4,7 +4,6 @@
 //! `concat(x, residual.pop())` (the U-Net skip connections); the resnets' loaded conv weights
 //! already carry the post-concat channel counts, so no channel math is needed here.
 
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
@@ -177,25 +176,53 @@ impl UNetBlock2D {
     ) -> Result<(Array, Vec<Array>)> {
         let mut x = x.clone();
         let mut output_states = Vec::with_capacity(self.resnets.len() + 1);
+        // sc-26270: each resnet (with its skip concat), each attention block and each sampler is one
+        // guarded iOS quantum; every guard is a pass-through off device.
         for i in 0..self.resnets.len() {
-            if let Some(res) = residuals.as_deref_mut() {
-                let skip = res.pop().ok_or_else(|| {
+            let skip = match residuals.as_deref_mut() {
+                Some(res) => Some(res.pop().ok_or_else(|| {
                     mlx_gen::Error::Msg("sdxl unet: residual stack underflow".into())
-                })?;
-                x = concatenate_axis(&[&x, &skip], -1)?;
-            }
-            x = self.resnets[i].forward_planned(&x, Some(temb), plan)?;
+                })?),
+                None => None,
+            };
+            x = self.resnets[i].forward_quantum(&x, skip, Some(temb), plan)?;
             if let Some(attns) = &self.attentions {
                 x = attns[i].forward_ip(&x, encoder_x, ip, plan)?;
             }
             output_states.push(x.clone());
         }
         if let Some(c) = &self.downsample {
-            x = conv2d(&x, c.weight(), c.bias(), 2, 1)?;
+            // The stride-2 convolution's output (+ its bias add) and kernel transient.
+            let call = crate::quantum::ConvCall::new(
+                x.shape(),
+                crate::quantum::element_bytes(&x),
+                c.weight(),
+                2,
+                1,
+            );
+            let scratch =
+                crate::quantum::single_conv_bytes(&call, 0, 0, crate::quantum::Backend::current());
+            x = mlx_gen::ios_quantum::run(crate::quantum::UNET_DOWNSAMPLE, scratch, || {
+                conv2d(&x, c.weight(), c.bias(), 2, 1)
+            })?;
             output_states.push(x.clone());
         }
         if let Some(c) = &self.upsample {
-            x = conv2d(&upsample_nearest(&x, 2)?, c.weight(), c.bias(), 1, 1)?;
+            let s = x.shape();
+            // The nearest-2x copy (input width at the doubled extent), the convolution's output
+            // (+ its bias add) and kernel transient.
+            let call = crate::quantum::ConvCall::new(
+                &[s[0], 2 * s[1], 2 * s[2], s[3]],
+                crate::quantum::element_bytes(&x),
+                c.weight(),
+                1,
+                1,
+            );
+            let scratch =
+                crate::quantum::single_conv_bytes(&call, 1, 0, crate::quantum::Backend::current());
+            x = mlx_gen::ios_quantum::run(crate::quantum::UNET_UPSAMPLE, scratch, || {
+                conv2d(&upsample_nearest(&x, 2)?, c.weight(), c.bias(), 1, 1)
+            })?;
             output_states.push(x.clone());
         }
         Ok((x, output_states))

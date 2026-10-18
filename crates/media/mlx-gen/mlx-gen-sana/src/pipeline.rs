@@ -340,6 +340,22 @@ pub fn resolved_decode_plan(
     })
 }
 
+/// The img2img DC-AE **encode** tile core edge (image pixels), or `None` for the historical
+/// whole-image encode. A request that selects the bounded-VAE rung (`tile_vae_decode`) tiles its
+/// encode at the same image-pixel edge it decodes at; an iOS device quantum scope always tiles
+/// (at the request's edge, else [`DECODE_TILE_EDGE`]). Nothing else does — in particular a Mac
+/// request with no memory selection (Resident or Sequential) keeps the whole-image encode.
+pub fn resolved_encode_tile(memory: Option<GenerationMemory>) -> Option<i32> {
+    let requested = memory
+        .filter(|memory| memory.tile_vae_decode)
+        .map(|memory| {
+            memory
+                .decode_tile_edge
+                .map_or(DECODE_TILE_EDGE, |edge| edge as i32)
+        });
+    requested.or_else(|| mlx_gen::ios_quantum::enabled().then_some(DECODE_TILE_EDGE))
+}
+
 pub fn resolve_decode_tiling(
     memory: Option<GenerationMemory>,
     is_sequential: bool,
@@ -438,13 +454,10 @@ fn decode_tiled(
     let plan = tiling.plan(vae, 1, height, width);
     let lifted = head.reshape(&[1, 1, height, width, channels])?;
     let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
-    // One full RGB f32 output. A tile fold holds the accumulator, the padded placement and their sum
-    // (3 outputs); finalization holds output, normalizer, maximum, quotient and contiguous copy (5).
-    let output_bytes = (height as u64)
-        .saturating_mul(width as u64)
-        .saturating_mul(decoder.tail_scale() as u64)
-        .saturating_mul(decoder.tail_scale() as u64)
-        .saturating_mul(3 * 4);
+    let (out_h, out_w) = (
+        (height as u64).saturating_mul(decoder.tail_scale() as u64),
+        (width as u64).saturating_mul(decoder.tail_scale() as u64),
+    );
     let out = mlx_gen::vae_tiling::tiled_decode_with_finalizer(
         &lifted,
         &plan,
@@ -454,8 +467,17 @@ fn decode_tiled(
             let shape = tile.shape();
             let tile = tile.reshape(&[1, shape[2], shape[3], shape[4]])?;
             let decoded = decoder.decode_tail_cancellable(&tile, cancel)?;
-            mlx_gen::ios_quantum::before("DC-AE tile fold", output_bytes.saturating_mul(3))?;
             let shape = decoded.shape();
+            mlx_gen::ios_quantum::before(
+                "DC-AE tile fold",
+                crate::quantum::tile_fold_bytes(
+                    shape[1] as u64,
+                    shape[2] as u64,
+                    out_h,
+                    out_w,
+                    shape[3] as u64,
+                ),
+            )?;
             Ok(decoded.reshape(&[1, 1, shape[1], shape[2], shape[3]])?)
         },
         |accumulators| {
@@ -473,7 +495,12 @@ fn decode_tiled(
                 mlx_gen::residency::drain_allocator_cache();
             }
         },
-        |_| mlx_gen::ios_quantum::before("DC-AE final normalize", output_bytes.saturating_mul(5)),
+        |_| {
+            mlx_gen::ios_quantum::before(
+                "DC-AE final normalize",
+                crate::quantum::tile_finalize_bytes(out_h, out_w),
+            )
+        },
     )?;
     mlx_gen::ios_quantum::finish("DC-AE final normalize", &[&out])?;
     let shape = out.shape();
@@ -655,8 +682,6 @@ pub(crate) fn denoise_sprint_from_with_memory(
     preview: &PreviewSink,
     plan: crate::transformer::SanaForwardPlan,
 ) -> Result<Array> {
-    use mlx_rs::transforms::eval;
-
     let sd = scheduler.sigma_data;
     let mut latents = latents;
 
@@ -682,8 +707,13 @@ pub(crate) fn denoise_sprint_from_with_memory(
             return Err(Error::Canceled);
         }
         // Per-eval compute boundary (MLX is lazy): force the prior step's graph so cancel/progress are
-        // responsive rather than deferred to decode.
-        eval([&latents])?;
+        // responsive rather than deferred to decode. The prior step's SCM update (or the seeded
+        // prior on the first step) materializes here, inside its own guarded quantum.
+        materialize_latents(
+            "SANA SCM step",
+            &[&latents],
+            crate::quantum::scm_step_bytes(latents.size() as u64),
+        )?;
         on_progress(Progress::Step {
             current: (i - start) as u32 + 1,
             total,
@@ -715,50 +745,120 @@ pub(crate) fn denoise_sprint_from_with_memory(
             cancel,
         )?;
 
-        // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
-        // `lat_in`, NOT the un-scaled latent):
-        //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / sqrt(scm_t²+(1-scm_t)²)
-        //   noise_pred = noise_pred * sigma_data
-        let a = 1.0 - 2.0 * scm_t;
-        let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
-        let model_output = multiply(
-            &divide(
-                &add(&multiply(&lat_in, arr1(a))?, &multiply(&raw, arr1(b))?)?,
-                arr1(in_scale),
-            )?,
-            arr1(sd),
-        )?;
-
-        // SCMScheduler.step (trigflow x0-pred + renoise). `s` = current angle, `t_next` = next angle.
-        // pred_x0 = cos(s)·latents − sin(s)·model_output.
-        let pred_x0 = subtract(
-            &multiply(&latents, arr1(s.cos()))?,
-            &multiply(&model_output, arr1(s.sin()))?,
-        )?;
-        denoised = pred_x0.clone();
         // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
         // `if len(self.timesteps) > 1`). On the last step `t_next == 0` ⇒ `cos(0)=1`, `sin(0)=0`, so the
         // renoise reduces to exactly `pred_x0` — gate the noise DRAW on a non-terminal step (`i+1 < n`)
         // so the final step doesn't burn a wasted `random::normal` + key derivation (F-092; bit-exact,
         // the drawn noise was multiplied by `sin(0)=0` anyway).
-        latents = if scheduler.is_single_step() || i + 1 >= n {
-            pred_x0
+        let renoise_key = if scheduler.is_single_step() || i + 1 >= n {
+            None
         } else {
+            Some(step_key(i)?)
+        };
+        let (pred_x0, next) = scm_step(
+            &latents,
+            &lat_in,
+            &raw,
+            ScmStepAngles {
+                scm_t,
+                in_scale,
+                sigma_data: sd,
+                s,
+                t_next,
+            },
+            renoise_key.as_ref(),
+        )?;
+        denoised = pred_x0;
+        latents = next;
+    }
+
+    // diffusers: latents = denoised / sigma_data (the decode input). The last step's update is
+    // still lazy here and materializes with the division.
+    let out = divide(&denoised, arr1(sd))?;
+    materialize_latents(
+        "SANA SCM final",
+        &[&out],
+        crate::quantum::scm_step_bytes(out.size() as u64).saturating_add(
+            mlx_gen::ios_quantum::elementwise_bytes(out.size() as u64, 1),
+        ),
+    )?;
+    Ok(out)
+}
+
+/// The SCM angles of one step (see [`scm_step`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScmStepAngles {
+    pub(crate) scm_t: f32,
+    pub(crate) in_scale: f32,
+    pub(crate) sigma_data: f32,
+    pub(crate) s: f32,
+    pub(crate) t_next: f32,
+}
+
+/// One SCM (TrigFlow) update after the trunk forward: the diffusers trigflow recombination of
+/// `raw` (with the SCALED model input `lat_in`), `SCMScheduler.step`'s x0 prediction, and — when a
+/// renoise key is given — the renoise to the next angle. Returns `(pred_x0, next_latents)`; with no
+/// key the next latents ARE `pred_x0` (the final / single-step transition).
+pub(crate) fn scm_step(
+    latents: &Array,
+    lat_in: &Array,
+    raw: &Array,
+    angles: ScmStepAngles,
+    renoise_key: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let ScmStepAngles {
+        scm_t,
+        in_scale,
+        sigma_data: sd,
+        s,
+        t_next,
+    } = angles;
+    // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
+    // `lat_in`, NOT the un-scaled latent):
+    //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / sqrt(scm_t²+(1-scm_t)²)
+    //   noise_pred = noise_pred * sigma_data
+    let a = 1.0 - 2.0 * scm_t;
+    let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
+    let model_output = multiply(
+        &divide(
+            &add(&multiply(lat_in, arr1(a))?, &multiply(raw, arr1(b))?)?,
+            arr1(in_scale),
+        )?,
+        arr1(sd),
+    )?;
+
+    // SCMScheduler.step (trigflow x0-pred + renoise). `s` = current angle, `t_next` = next angle.
+    // pred_x0 = cos(s)·latents − sin(s)·model_output.
+    let pred_x0 = subtract(
+        &multiply(latents, arr1(s.cos()))?,
+        &multiply(&model_output, arr1(s.sin()))?,
+    )?;
+    let next = match renoise_key {
+        None => pred_x0.clone(),
+        Some(key) => {
             let noise = multiply(
-                &random::normal::<f32>(latents.shape(), None, None, Some(&step_key(i)?))?,
+                &random::normal::<f32>(latents.shape(), None, None, Some(key))?,
                 arr1(sd),
             )?;
             add(
                 &multiply(&pred_x0, arr1(t_next.cos()))?,
                 &multiply(&noise, arr1(t_next.sin()))?,
             )?
-        };
-    }
+        }
+    };
+    Ok((pred_x0, next))
+}
 
-    // diffusers: latents = denoised / sigma_data (the decode input).
-    let out = divide(&denoised, arr1(sd))?;
-    eval([&out])?;
-    Ok(out)
+/// Materialize latent-sized sampler work (an SCM update, a final scaling) inside a guarded quantum
+/// priced at `scratch` — on iOS a check before the graph is built and a synchronize after; off
+/// device exactly the plain `eval` it replaces.
+pub(crate) fn materialize_latents(label: &str, latents: &[&Array], scratch: u64) -> Result<()> {
+    mlx_gen::ios_quantum::before(label, scratch)?;
+    if mlx_gen::ios_quantum::enabled() {
+        mlx_gen::ios_quantum::finish(label, latents)
+    } else {
+        Ok(mlx_rs::transforms::eval(latents.iter().copied())?)
+    }
 }
 
 /// SANA prompt conditioning materialized by [`encode_conditioning`] — the Gemma-2 CHI last-hidden
@@ -891,9 +991,78 @@ pub fn encode_init_latents(
     height: u32,
     cancel: &CancelFlag,
 ) -> Result<Array> {
+    encode_init_latents_with_tiling(encoder, cfg, image, width, height, cancel, None)
+}
+
+/// [`encode_init_latents`] with an optional bounded encode ([`DcAeEncoder::encode_tiled`] at
+/// `tile` image pixels); `None` is the whole-image encode.
+pub fn encode_init_latents_with_tiling(
+    encoder: &DcAeEncoder,
+    cfg: &DcAeConfig,
+    image: &Image,
+    width: u32,
+    height: u32,
+    cancel: &CancelFlag,
+    tile: Option<i32>,
+) -> Result<Array> {
     let image_nchw = preprocess_init_image(image, width, height)?;
-    let raw = encoder.encode(&image_nchw, cancel)?; // [1, 32, H/32, W/32], raw (pre-scale)
+    // [1, 32, H/32, W/32], raw (pre-scale)
+    let raw = match tile {
+        Some(core) => encoder.encode_tiled(&image_nchw, core, cancel)?,
+        None => encoder.encode(&image_nchw, cancel)?,
+    };
     Ok(multiply(&raw, arr1(cfg.scaling_factor))?)
+}
+
+/// The seed-independent img2img reference latent for `req` — `None` for txt2img or a zero-strength
+/// start — from a DC-AE `encoder` that need NOT belong to a loaded heavy bundle: the Sequential
+/// img2img schedule encodes with only the VAE encoder resident, before the trunk loads
+/// ([`crate::model`]). `sprint` selects the variant's default step count. The result is
+/// materialized inside its own guarded quantum (so the encoder can be dropped right after).
+pub fn prepare_reference_latent(
+    encoder: Option<&DcAeEncoder>,
+    dc_ae_cfg: &DcAeConfig,
+    sprint: bool,
+    req: &SanaGenerateRequest<'_>,
+    cancel: &CancelFlag,
+    encode_tile: Option<i32>,
+) -> Result<Option<Array>> {
+    let steps = req.steps.unwrap_or(if sprint {
+        SPRINT_DEFAULT_STEPS
+    } else {
+        DEFAULT_STEPS
+    });
+    let start_step = match req.init_image {
+        Some(_) => init_time_step(steps, req.strength),
+        None => 0,
+    };
+    if start_step == 0 {
+        return Ok(None);
+    }
+
+    let image = req
+        .init_image
+        .ok_or_else(|| Error::Msg("SANA positive img2img start requires an init image".into()))?;
+    let encoder = encoder.ok_or_else(|| {
+        Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+    })?;
+    let latent = encode_init_latents_with_tiling(
+        encoder,
+        dc_ae_cfg,
+        image,
+        req.width,
+        req.height,
+        cancel,
+        encode_tile,
+    )?;
+    // The scaling multiply is the only pending work over the encoder output: one latent-sized
+    // f32 output plus its f32 scale operand.
+    materialize_latents(
+        "SANA reference latent",
+        &[&latent],
+        mlx_gen::ios_quantum::elementwise_bytes(latent.size() as u64 + 1, 1),
+    )?;
+    Ok(Some(latent))
 }
 
 impl SanaHeavy {
@@ -992,33 +1161,25 @@ impl SanaHeavy {
         req: &SanaGenerateRequest<'_>,
         cancel: &CancelFlag,
     ) -> Result<Option<Array>> {
-        let steps = req.steps.unwrap_or(if self.sprint {
-            SPRINT_DEFAULT_STEPS
-        } else {
-            DEFAULT_STEPS
-        });
-        let start_step = match req.init_image {
-            Some(_) => init_time_step(steps, req.strength),
-            None => 0,
-        };
-        if start_step == 0 {
-            return Ok(None);
-        }
+        self.prepare_reference_with_tiling(req, cancel, resolved_encode_tile(None))
+    }
 
-        let image = req.init_image.ok_or_else(|| {
-            Error::Msg("SANA positive img2img start requires an init image".into())
-        })?;
-        let encoder = self.encoder.as_ref().ok_or_else(|| {
-            Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
-        })?;
-        Ok(Some(encode_init_latents(
-            encoder,
+    /// [`Self::prepare_reference`] with an optional bounded DC-AE encode (see
+    /// [`resolved_encode_tile`]).
+    pub(crate) fn prepare_reference_with_tiling(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+        encode_tile: Option<i32>,
+    ) -> Result<Option<Array>> {
+        prepare_reference_latent(
+            self.encoder.as_ref(),
             &self.dc_ae_cfg,
-            image,
-            req.width,
-            req.height,
+            self.sprint,
+            req,
             cancel,
-        )?))
+            encode_tile,
+        )
     }
 
     /// Render ONE image from pre-encoded [`SanaConditioning`] + a per-image request. `guidance` is the
@@ -1085,7 +1246,11 @@ impl SanaHeavy {
             preview,
             crate::transformer::SanaForwardPlan::RESIDENT,
         )?;
-        mlx_rs::transforms::eval([&latents])?;
+        materialize_latents(
+            "SANA latent",
+            &[&latents],
+            crate::quantum::scm_step_bytes(latents.size() as u64),
+        )?;
         on_progress(Progress::Decoding);
         self.decode_view().decode_one(&latents, cancel, tiling)
     }
@@ -1913,5 +2078,860 @@ mod quantum_tests {
             .filter(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE tile fold"))
             .count();
         assert!(folds > 1, "fixture must genuinely tile: {events:?}");
+    }
+
+    /// The tiled decode's fold and finalization quanta, proven against MLX's measured peak for the
+    /// SAME shared fold `decode_tiled` drives: each fold's allocations (measured from the decoded
+    /// tile's materialization to the fold's) against [`crate::quantum::tile_fold_bytes`] at that
+    /// tile, and the final normalization against [`crate::quantum::tile_finalize_bytes`].
+    #[test]
+    fn tile_fold_and_finalize_track_their_measured_peaks() {
+        const CHILD: &str = "SANA_TILE_FOLD_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::tile_fold_and_finalize_track_their_measured_peaks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        use mlx_gen::ios_quantum::assert_tracks_measured;
+        use mlx_rs::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+        let decoder = tiny_all_res_decoder();
+        let latent = rand(&[1, 4, 96, 96], 78);
+        let head = decoder.decode_head(&latent).unwrap();
+        head.eval().unwrap();
+        let shape = head.shape();
+        let (height, width, channels) = (shape[1], shape[2], shape[3]);
+        let vae = VaeTiling {
+            spatial_scale: decoder.tail_scale(),
+            temporal_scale: 1,
+            causal_temporal: false,
+            full_res_channels: 3,
+        };
+        let plan = TilingConfig::spatial_only(64, 16).plan(vae, 1, height, width);
+        assert!(plan.h.len() > 1 && plan.w.len() > 1);
+        let lifted = head.reshape(&[1, 1, height, width, channels]).unwrap();
+        let (out_h, out_w) = (
+            (height * decoder.tail_scale()) as u64,
+            (width * decoder.tail_scale()) as u64,
+        );
+        let cancel = CancelFlag::new();
+        let start = std::cell::Cell::new(0u64);
+        let tile = std::cell::Cell::new((0u64, 0u64));
+        let folds = std::cell::RefCell::new(Vec::new());
+        let out = mlx_gen::vae_tiling::tiled_decode_with_finalizer(
+            &lifted,
+            &plan,
+            [1, 2, 3],
+            Some(&cancel),
+            |t| {
+                let s = t.shape();
+                let decoded = decoder.decode_tail(&t.reshape(&[1, s[2], s[3], s[4]])?)?;
+                decoded.eval()?;
+                let d = decoded.shape();
+                tile.set((d[1] as u64, d[2] as u64));
+                start.set(get_active_memory() as u64);
+                reset_peak_memory();
+                Ok(decoded.reshape(&[1, 1, d[1], d[2], d[3]])?)
+            },
+            |accumulators| {
+                for accumulator in accumulators {
+                    accumulator.eval()?;
+                }
+                let (th, tw) = tile.get();
+                folds.borrow_mut().push((
+                    crate::quantum::tile_fold_bytes(th, tw, out_h, out_w, 3),
+                    (get_peak_memory() as u64).saturating_sub(start.get()),
+                ));
+                Ok(())
+            },
+            || {},
+            |folded| {
+                folded.eval()?;
+                start.set(get_active_memory() as u64);
+                reset_peak_memory();
+                Ok(())
+            },
+        )
+        .unwrap();
+        out.eval().unwrap();
+        let finalize = (get_peak_memory() as u64).saturating_sub(start.get());
+        let folds = folds.into_inner();
+        assert!(folds.len() > 1);
+        // The formula prices the worst (row-closing) fold; prove it against the LARGEST measured
+        // fold of the largest tile, and as an upper bound of every fold.
+        let (formula, measured) = folds.iter().copied().max_by_key(|(_, m)| *m).unwrap();
+        println!(
+            "[DC-AE tile fold] formula {formula} measured {measured} ratio {:.3}",
+            formula as f64 / measured as f64
+        );
+        assert_tracks_measured(
+            "DC-AE tile fold",
+            formula,
+            measured,
+            crate::quantum::MAX_RATIO,
+        );
+        for (formula, measured) in &folds {
+            assert!(formula >= measured, "a fold exceeded its price: {folds:?}");
+        }
+        let formula = crate::quantum::tile_finalize_bytes(out_h, out_w);
+        println!(
+            "[DC-AE final normalize] formula {formula} measured {finalize} ratio {:.3}",
+            formula as f64 / finalize as f64
+        );
+        assert_tracks_measured(
+            "DC-AE final normalize",
+            formula,
+            finalize,
+            crate::quantum::MAX_RATIO,
+        );
+    }
+
+    /// One SCM step (the Sprint sampler update the per-step latent quantum materializes) against
+    /// [`crate::quantum::scm_step_bytes`], with and without the renoise draw.
+    #[test]
+    fn scm_step_tracks_its_measured_peak() {
+        const CHILD: &str = "SANA_SCM_STEP_PROOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::scm_step_tracks_its_measured_peak",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        use mlx_gen::ios_quantum::{assert_tracks_measured, measured_peak_bytes};
+        let shape = [1, 32, 64, 64];
+        let latents = rand(&shape, 1);
+        let raw = rand(&shape, 2);
+        let lat_in = multiply(&latents, arr1(0.7)).unwrap();
+        let key = random::key(9).unwrap();
+        mlx_rs::transforms::eval([&latents, &raw, &lat_in, &key]).unwrap();
+        let angles = ScmStepAngles {
+            scm_t: 0.3,
+            in_scale: 0.8,
+            sigma_data: 0.5,
+            s: 1.2,
+            t_next: 0.6,
+        };
+        for renoise in [Some(&key), None] {
+            let measured = measured_peak_bytes(|| {
+                let (pred, next) = scm_step(&latents, &lat_in, &raw, angles, renoise)?;
+                Ok(vec![pred, next])
+            })
+            .unwrap();
+            let formula = crate::quantum::scm_step_bytes(latents.size() as u64);
+            println!(
+                "[SCM step renoise={}] formula {formula} measured {measured} ratio {:.3}",
+                renoise.is_some(),
+                formula as f64 / measured as f64
+            );
+            if renoise.is_some() {
+                assert_tracks_measured("SCM step", formula, measured, crate::quantum::MAX_RATIO);
+            } else {
+                // The terminal step is a subset of the priced update.
+                assert!(formula >= measured);
+            }
+        }
+    }
+
+    /// The bounded encode is selected exactly by a request's bounded-VAE rung or an iOS quantum
+    /// scope; a Mac request with no memory selection keeps the whole-image encode.
+    #[test]
+    fn encode_tiling_is_request_or_device_selected_and_never_a_mac_default() {
+        let bounded = GenerationMemory {
+            tile_vae_decode: true,
+            decode_tile_edge: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(resolved_encode_tile(None), None);
+        assert_eq!(
+            resolved_encode_tile(Some(GenerationMemory::default())),
+            None
+        );
+        assert_eq!(resolved_encode_tile(Some(bounded)), Some(256));
+        let default_edge = GenerationMemory {
+            decode_tile_edge: None,
+            ..bounded
+        };
+        assert_eq!(
+            resolved_encode_tile(Some(default_edge)),
+            Some(DECODE_TILE_EDGE)
+        );
+    }
+
+    /// On an iOS quantum scope (the CPU diagnostic fixture stands in for the device) img2img's
+    /// reference encode resolves the bounded encode at the iOS tile edge and runs it — its tiles'
+    /// prefix quanta and the stitch quantum are checked — and the result is the whole-image encode
+    /// within the tiled-encode parity standard (1e-5 of peak; see the body). Off device the same
+    /// call resolves no tiling.
+    #[test]
+    fn ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode() {
+        const CHILD: &str = "SANA_IOS_TILED_ENCODE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pipeline::quantum_tests::ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(
+                status.success(),
+                "CPU child failed ({status}); its panic is printed above"
+            );
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        // Tiled vs whole-image encode are DIFFERENT graphs (each tile's convolutions run at their
+        // own shapes), so they agree to float reassociation, not bit for bit: this Mac's kernels
+        // happen to give identical bits, the CI runner's differ by up to 5.5e-7 on a 1.57 peak.
+        // Held to the tiled-encode parity standard of
+        // `dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch`
+        // (1e-5 of max(1, peak)); a halo or stitch error moves the latent by O(1e-1).
+        let assert_parity = |label: &str, got: &Array, want: &Array| {
+            assert_eq!(got.shape(), want.shape(), "{label}: shape");
+            let want = want.as_slice::<f32>();
+            let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let delta = got
+                .as_slice::<f32>()
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+            println!("[{label}] max|delta| {delta:.3e} (peak {peak:.3e})");
+            assert!(
+                delta <= 1e-5 * peak.max(1.0),
+                "{label}: tiled encode diverged from the whole-image encode by {delta:.3e}"
+            );
+        };
+        let cfg = crate::dc_ae::quantum_proofs::config();
+        let encoder =
+            DcAeEncoder::from_weights(&crate::dc_ae::quantum_proofs::weights(&cfg), cfg.clone())
+                .unwrap();
+        let (w, h) = (256u32, 224u32);
+        let image = Image {
+            width: w,
+            height: h,
+            pixels: (0..w * h * 3).map(|i| (i * 37 % 251) as u8).collect(),
+        };
+        let cancel = CancelFlag::new();
+        assert_eq!(
+            resolved_encode_tile(None),
+            None,
+            "the Mac default never tiles"
+        );
+        let whole = encode_init_latents(&encoder, &cfg, &image, w, h, &cancel).unwrap();
+        whole.eval().unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let tiled = with_cpu_diagnostic_headroom(1 << 30, || {
+            let tile = resolved_encode_tile(None);
+            assert_eq!(tile, Some(DECODE_TILE_EDGE));
+            with_cpu_diagnostic_observer(
+                move |e| sink.borrow_mut().push(e.clone()),
+                || encode_init_latents_with_tiling(&encoder, &cfg, &image, w, h, &cancel, tile),
+            )
+        })
+        .unwrap();
+        tiled.eval().unwrap();
+        assert_parity("iOS tiled encode", &tiled, &whole);
+        let events = events.borrow();
+        let stitched = events
+            .iter()
+            .filter(|e| matches!(e, QuantumEvent::Synchronized { label, .. } if label == "DC-AE encode tile stitch"))
+            .count();
+        let inputs = events
+            .iter()
+            .filter(|e| matches!(e, QuantumEvent::Checked { label, .. } if label == "DC-AE encoder input"))
+            .count();
+        assert_eq!(stitched, 1, "{events:?}");
+        assert!(inputs > 1, "the encode must genuinely tile: {events:?}");
+        drop(events);
+
+        // The reference latent's scaling materializes in its own guarded quantum (counted: one
+        // latent-sized f32 output and the scale operand over the materialized encoder output —
+        // proven below).
+        let req = SanaGenerateRequest {
+            height: h,
+            width: w,
+            steps: Some(4),
+            init_image: Some(&image),
+            strength: Some(0.6),
+            ..SanaGenerateRequest::new("reference")
+        };
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let prepared = with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(
+                move |e| sink.borrow_mut().push(e.clone()),
+                || {
+                    prepare_reference_latent(
+                        Some(&encoder),
+                        &cfg,
+                        false,
+                        &req,
+                        &cancel,
+                        resolved_encode_tile(None),
+                    )
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_parity("iOS reference latent", &prepared, &whole);
+        let latent_elements = prepared.size() as u64;
+        assert!(seen.borrow().contains(&QuantumEvent::Checked {
+            label: "SANA reference latent".into(),
+            scratch: mlx_gen::ios_quantum::elementwise_bytes(latent_elements + 1, 1),
+        }));
+        let raw = rand(&[1, 4, 256, 256], 3);
+        raw.eval().unwrap();
+        let measured = mlx_gen::ios_quantum::measured_peak_bytes(|| {
+            Ok(vec![multiply(&raw, arr1(cfg.scaling_factor))?])
+        })
+        .unwrap();
+        let formula = mlx_gen::ios_quantum::elementwise_bytes(raw.size() as u64 + 1, 1);
+        println!(
+            "[SANA reference latent] formula {formula} measured {measured} ratio {:.3}",
+            formula as f64 / measured as f64
+        );
+        mlx_gen::ios_quantum::assert_tracks_measured(
+            "SANA reference latent",
+            formula,
+            measured,
+            crate::quantum::MAX_RATIO,
+        );
+    }
+
+    /// The base-rev goldens: outputs of `91ffb4a81`'s default paths (`SanaHeavy::render_one`'s image
+    /// and the latents it decodes, the whole-image `encode_init_latents`) on the tiny CPU fixture in
+    /// `golden_fixture_items.rs`, generated by an integration test that `include!`s that same file
+    /// at the base rev, CPU device (the latents read through a scratch-only `pub` wrapper over the
+    /// base's own `denoise_one_with_preview`, the call `render_one` decodes).
+    const BASE_GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_base_91ffb4a81_golden.safetensors"
+    );
+
+    fn base_golden(key: &str) -> Array {
+        let golden = Weights::from_file(BASE_GOLDEN)
+            .unwrap()
+            .require(key)
+            .unwrap()
+            .clone();
+        golden.eval().unwrap();
+        golden
+    }
+
+    /// Image-golden tolerance: at most ONE 8-bit level on any pixel, and on average at most 0.01
+    /// levels (at most 1% of the samples off by one). The fixture runs the same pinned MLX CPU
+    /// kernels at both revs, so on one machine the default paths reproduce the golden exactly;
+    /// across machines the f32 GEMM/reduction order of the host BLAS may differ in the last ulps,
+    /// which can move a value sitting on a quantization boundary by one level. A real change to a
+    /// default path moves many pixels by many levels.
+    fn assert_image_matches_golden(label: &str, got: &Image, key: &str) {
+        let want = base_golden(key);
+        assert_eq!(
+            want.dtype(),
+            mlx_rs::Dtype::Uint8,
+            "{label}: golden storage"
+        );
+        let want = want.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let got = crate::golden_fixture::pixels_array(got)
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        assert_eq!(got.shape(), want.shape(), "{label}: geometry");
+        let want = want.as_slice::<f32>();
+        let (mut max, mut total) = (0f32, 0f64);
+        for (g, w) in got.as_slice::<f32>().iter().zip(want) {
+            let d = (g - w).abs();
+            max = max.max(d);
+            total += d as f64;
+        }
+        let mean = total / want.len() as f64;
+        println!("[{label}] max |delta| {max} levels, mean {mean:.5}");
+        assert!(
+            max <= 1.0 && mean <= 0.01,
+            "{label}: diverged from the base-rev golden {key} (max {max}, mean {mean})"
+        );
+    }
+
+    /// Encode-golden tolerance: max |delta| <= 1e-5 x max(1, max |golden|) — the tiled-encode parity
+    /// standard of `dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch`
+    /// (each tile carries the attention-free prefix's full receptive halo, so the bounded encode
+    /// differs from the whole-image encode only by float reassociation).
+    const ENCODE_GOLDEN_TOLERANCE: f32 = 1e-5;
+    /// Denoised-latent tolerance: max |delta| <= 1e-4 x max(1, max |golden|). One machine
+    /// reproduces the base rev bit for bit (same pinned MLX CPU kernels, same graph); across
+    /// machines the host BLAS's f32 accumulation order may differ in the last ulps, and the 20
+    /// Euler steps (2 SCM steps for Sprint) can carry that a few ulps further. The decoded image
+    /// alone is a weak check on this fixture (its random DC-AE squashes trunk changes to ~1 level),
+    /// so the latents carry the discrimination.
+    const DENOISE_GOLDEN_TOLERANCE: f32 = 1e-4;
+
+    fn assert_latent_matches_golden(label: &str, got: &Array, key: &str, tolerance: f32) {
+        let want = base_golden(key);
+        assert_eq!(got.shape(), want.shape(), "{label}: shape");
+        // Row-major values: the encoder's NHWC→NCHW output is a strided view, and `as_slice`
+        // reads the raw buffer (the golden was saved row-contiguous).
+        let got = got.reshape(&[-1]).unwrap();
+        got.eval().unwrap();
+        let scale = want
+            .as_slice::<f32>()
+            .iter()
+            .fold(0f32, |m, v| m.max(v.abs()));
+        let delta = got
+            .as_slice::<f32>()
+            .iter()
+            .zip(want.as_slice::<f32>())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("[{label}] max |delta| {delta:.3e} (scale {scale:.3e})");
+        assert!(
+            delta <= tolerance * scale.max(1.0),
+            "{label}: diverged from the base-rev golden {key}: {delta}"
+        );
+    }
+
+    /// E2: the Mac DEFAULT paths reproduce the base rev (`91ffb4a81`) — txt2img and img2img, base
+    /// and Sprint, Resident (the bundle owns the encoder and prepares the reference) and Sequential
+    /// (the reference encoded by a standalone encoder before an encoder-free bundle denoises, the
+    /// DiT shed before decode, the Sequential decode tiling) — each composed exactly as
+    /// `model::Sana::generate` composes it with no memory selection. Goldens and tolerances:
+    /// [`BASE_GOLDEN`], [`DENOISE_GOLDEN_TOLERANCE`] (the denoised latents),
+    /// [`assert_image_matches_golden`] (the decoded image).
+    #[test]
+    fn default_paths_match_the_base_rev_goldens() {
+        const CHILD: &str = "SANA_BASE_GOLDEN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::default_paths_match_the_base_rev_goldens",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        use crate::golden_fixture as fx;
+        let dcfg = fx::dcae_config();
+        let vae = Weights::from_map(fx::dcae_weights(&dcfg));
+        let image = fx::image(fx::WIDTH, fx::HEIGHT);
+        let cancel = CancelFlag::new();
+        // No memory selection: the Mac default.
+        let encode_tile = resolved_encode_tile(None);
+        assert_eq!(encode_tile, None);
+        for sprint in [false, true] {
+            let cfg = fx::trunk_config(sprint);
+            let trunk_w = Weights::from_map(fx::trunk_weights(&cfg));
+            let trunk = || SanaTransformer::from_weights(&trunk_w, cfg.clone()).unwrap();
+            let decoder = || DcAeDecoder::from_weights(&vae, dcfg.clone()).unwrap();
+            let encoder = || DcAeEncoder::from_weights(&vae, dcfg.clone()).unwrap();
+            let cond = fx::conditioning(&cfg, sprint);
+            let variant = if sprint { "sprint" } else { "base" };
+            let scale = fx::SPRINT_GUIDANCE_EMBEDS_SCALE;
+            let resident = if sprint {
+                SanaHeavy::new_sprint(trunk(), encoder(), decoder(), dcfg.clone(), scale)
+            } else {
+                SanaHeavy::new(trunk(), encoder(), decoder(), dcfg.clone())
+            };
+            // The Sequential heavy bundle never builds the encoder.
+            let staged_bundle = || {
+                if sprint {
+                    SanaHeavy::new_sprint_text_to_image(trunk(), decoder(), dcfg.clone(), scale)
+                } else {
+                    SanaHeavy::new_text_to_image(trunk(), decoder(), dcfg.clone())
+                }
+            };
+            let plan = resolved_rung_plan(None, resident.transformer_blocks()).unwrap();
+            assert_eq!(plan, crate::transformer::SanaForwardPlan::RESIDENT);
+            for (name, init) in [("txt2img", None), ("img2img", Some(&image))] {
+                let key = format!("{variant}_{name}");
+                let req = SanaGenerateRequest {
+                    height: fx::HEIGHT,
+                    width: fx::WIDTH,
+                    steps: None,
+                    seed: Some(fx::SEED),
+                    init_image: init,
+                    strength: init.map(|_| fx::STRENGTH),
+                    ..SanaGenerateRequest::new("golden")
+                };
+                let denoise = |heavy: &SanaHeavy, reference: Option<&Array>| {
+                    heavy
+                        .denoise_one_with_prepared_reference(
+                            &cond,
+                            &req,
+                            fx::GUIDANCE,
+                            reference,
+                            &cancel,
+                            &mut |_| {},
+                            &PreviewSink::default(),
+                            plan,
+                        )
+                        .unwrap()
+                };
+                // Resident: the bundle prepares its own reference; decode untiled.
+                let reference = resident
+                    .prepare_reference_with_tiling(&req, &cancel, encode_tile)
+                    .unwrap();
+                assert_eq!(reference.is_some(), init.is_some(), "{key}");
+                let latents = denoise(&resident, reference.as_ref());
+                latents.eval().unwrap();
+                assert_latent_matches_golden(
+                    &format!("{key} Resident latents"),
+                    &latents,
+                    &format!("{key}_latents"),
+                    DENOISE_GOLDEN_TOLERANCE,
+                );
+                let image_out = resident
+                    .decode_view()
+                    .decode_one(
+                        &latents,
+                        &cancel,
+                        resolve_decode_tiling(None, false).as_ref(),
+                    )
+                    .unwrap();
+                assert_image_matches_golden(&format!("{key} Resident"), &image_out, &key);
+
+                // Sequential: txt2img through the encoder-free bundle; img2img's reference
+                // encoded first by a standalone encoder; the DiT shed before the decode.
+                let staged = staged_bundle();
+                let reference = match init {
+                    Some(_) => prepare_reference_latent(
+                        Some(&encoder()),
+                        &dcfg,
+                        sprint,
+                        &req,
+                        &cancel,
+                        encode_tile,
+                    )
+                    .unwrap(),
+                    None => staged
+                        .prepare_reference_with_tiling(&req, &cancel, encode_tile)
+                        .unwrap(),
+                };
+                assert_eq!(reference.is_some(), init.is_some(), "{key}");
+                let latents = denoise(&staged, reference.as_ref());
+                latents.eval().unwrap();
+                assert_latent_matches_golden(
+                    &format!("{key} Sequential latents"),
+                    &latents,
+                    &format!("{key}_latents"),
+                    DENOISE_GOLDEN_TOLERANCE,
+                );
+                let light = staged.shed_dit();
+                let image_out = SanaHeavy::light_view(&light)
+                    .decode_one(
+                        &latents,
+                        &cancel,
+                        resolve_decode_tiling(None, true).as_ref(),
+                    )
+                    .unwrap();
+                assert_image_matches_golden(&format!("{key} Sequential"), &image_out, &key);
+            }
+        }
+        // Control: the comparison discriminates — a different seed misses the golden.
+        let cfg = fx::trunk_config(false);
+        let trunk_w = Weights::from_map(fx::trunk_weights(&cfg));
+        let heavy = SanaHeavy::new_text_to_image(
+            SanaTransformer::from_weights(&trunk_w, cfg.clone()).unwrap(),
+            DcAeDecoder::from_weights(&vae, dcfg.clone()).unwrap(),
+            dcfg.clone(),
+        );
+        let other = heavy
+            .render_one(
+                &fx::conditioning(&cfg, false),
+                &SanaGenerateRequest {
+                    height: fx::HEIGHT,
+                    width: fx::WIDTH,
+                    seed: Some(fx::SEED + 1),
+                    ..SanaGenerateRequest::new("golden")
+                },
+                fx::GUIDANCE,
+                &cancel,
+                &mut |_| {},
+            )
+            .unwrap();
+        let golden = base_golden("base_txt2img");
+        let off = other
+            .pixels
+            .iter()
+            .zip(golden.as_slice::<u8>())
+            .filter(|(g, w)| g.abs_diff(**w) > 1)
+            .count();
+        assert!(
+            off * 10 > other.pixels.len(),
+            "the golden must discriminate: only {off} pixels moved under a different seed"
+        );
+    }
+
+    /// The opt-in Mac bounded-VAE rung (`tile_vae_decode`, no iOS scope) tiles the img2img
+    /// reference encode at [`DECODE_TILE_EDGE`]; the result stays within the tiled-encode tolerance
+    /// ([`assert_latent_matches_golden`]) of the base rev's (`91ffb4a81`) whole-image
+    /// `encode_init_latents`, as does the unchanged untiled default. The 448x384 fixture image
+    /// genuinely tiles at that edge (more than one tile's input quantum is checked).
+    #[test]
+    fn mac_bounded_rung_encode_matches_the_base_rev_whole_image_encode() {
+        const CHILD: &str = "SANA_BOUNDED_ENCODE_GOLDEN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::mac_bounded_rung_encode_matches_the_base_rev_whole_image_encode",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        use crate::golden_fixture as fx;
+        let dcfg = fx::dcae_config();
+        let encoder =
+            DcAeEncoder::from_weights(&Weights::from_map(fx::dcae_weights(&dcfg)), dcfg.clone())
+                .unwrap();
+        let image = fx::image(fx::ENCODE_WIDTH, fx::ENCODE_HEIGHT);
+        let cancel = CancelFlag::new();
+        let req = SanaGenerateRequest {
+            height: fx::ENCODE_HEIGHT,
+            width: fx::ENCODE_WIDTH,
+            steps: Some(4),
+            init_image: Some(&image),
+            strength: Some(0.6),
+            ..SanaGenerateRequest::new("golden")
+        };
+        let bounded = Some(GenerationMemory {
+            tile_vae_decode: true,
+            ..Default::default()
+        });
+        let tile = resolved_encode_tile(bounded);
+        assert_eq!(tile, Some(DECODE_TILE_EDGE));
+        let tiled = prepare_reference_latent(Some(&encoder), &dcfg, false, &req, &cancel, tile)
+            .unwrap()
+            .unwrap();
+        tiled.eval().unwrap();
+        assert_latent_matches_golden(
+            "Mac bounded-rung encode",
+            &tiled,
+            "encode_whole",
+            ENCODE_GOLDEN_TOLERANCE,
+        );
+        let untiled = prepare_reference_latent(
+            Some(&encoder),
+            &dcfg,
+            false,
+            &req,
+            &cancel,
+            resolved_encode_tile(None),
+        )
+        .unwrap()
+        .unwrap();
+        untiled.eval().unwrap();
+        assert_latent_matches_golden(
+            "Mac default untiled encode",
+            &untiled,
+            "encode_whole",
+            ENCODE_GOLDEN_TOLERANCE,
+        );
+
+        // The same tile at this image genuinely splits: under the CPU diagnostic scope the bounded
+        // encode checks more than one tile's input quantum.
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = events.clone();
+        with_cpu_diagnostic_headroom(1 << 30, || {
+            with_cpu_diagnostic_observer(
+                move |e| sink.borrow_mut().push(e.clone()),
+                || {
+                    encode_init_latents_with_tiling(
+                        &encoder,
+                        &dcfg,
+                        &image,
+                        fx::ENCODE_WIDTH,
+                        fx::ENCODE_HEIGHT,
+                        &cancel,
+                        tile,
+                    )
+                },
+            )
+        })
+        .unwrap();
+        let inputs = events
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, QuantumEvent::Checked { label, .. } if label == "DC-AE encoder input"))
+            .count();
+        assert!(
+            inputs > 1,
+            "the bounded encode must genuinely tile ({inputs} tiles)"
+        );
+    }
+
+    /// The Sequential img2img reorder changes no value: the reference encoded by a standalone
+    /// encoder BEFORE the trunk exists (then denoised by a text-to-image bundle) yields the same
+    /// image bytes as the historical bundle that owns the encoder and prepares the reference itself
+    /// — base and Sprint, on the CPU at a tiny 6-stage DC-AE (x32) and a one-block trunk.
+    #[test]
+    fn sequential_reference_reorder_is_byte_identical() {
+        const CHILD: &str = "SANA_SEQUENTIAL_REORDER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::quantum_tests::sequential_reference_reorder_is_byte_identical",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        assert!(crate::test_metal_guard::forbid_metal());
+        use crate::config::BlockType::{EfficientVit as E, Res as R};
+        let dcfg = DcAeConfig {
+            in_channels: 3,
+            latent_channels: LATENT_CHANNELS,
+            attention_head_dim: 8,
+            block_out_channels: vec![8, 8, 8, 16, 32, 32],
+            layers_per_block: vec![1; 6],
+            encoder_layers_per_block: vec![1; 6],
+            block_types: vec![R, R, R, E, E, E],
+            qkv_multiscales: vec![5],
+            upsample_interpolate: true,
+            norm_eps: 1e-5,
+            attn_eps: 1e-15,
+            scaling_factor: 0.41407,
+        };
+        let vae = crate::dc_ae::quantum_proofs::weights(&dcfg);
+        let (w, h) = (128u32, 96u32);
+        let image = Image {
+            width: w,
+            height: h,
+            pixels: (0..w * h * 3).map(|i| (i * 53 % 241) as u8).collect(),
+        };
+        let cancel = CancelFlag::new();
+        for sprint in [false, true] {
+            let cfg = crate::transformer::quantum_proofs::cfg(4, 16, 2.5, sprint);
+            let cfg = crate::config::SanaTransformerConfig {
+                num_layers: 1,
+                ..cfg
+            };
+            let mut b = crate::transformer::quantum_proofs::Builder {
+                map: std::collections::HashMap::new(),
+                seed: 7000,
+                dtype: mlx_rs::Dtype::Float16,
+            };
+            b.trunk(&cfg);
+            b.block("transformer_blocks.0", &cfg);
+            let trunk_w = b.weights();
+            let trunk = || SanaTransformer::from_weights(&trunk_w, cfg.clone()).unwrap();
+            let decoder = || DcAeDecoder::from_weights(&vae, dcfg.clone()).unwrap();
+            let encoder = || DcAeEncoder::from_weights(&vae, dcfg.clone()).unwrap();
+            let cond = SanaConditioning {
+                cond: rand(&[1, 300, cfg.caption_channels], 11),
+                cond_mask: Array::ones::<f32>(&[1, 300]).unwrap(),
+                uncond: (!sprint).then(|| {
+                    (
+                        rand(&[1, 300, cfg.caption_channels], 12),
+                        Array::ones::<f32>(&[1, 300]).unwrap(),
+                    )
+                }),
+            };
+            let req = SanaGenerateRequest {
+                height: h,
+                width: w,
+                // Variant default steps (20 base / 2 Sprint): the variant flag then decides the
+                // img2img start step on both routes.
+                steps: None,
+                seed: Some(5),
+                init_image: Some(&image),
+                strength: Some(0.6),
+                ..SanaGenerateRequest::new("reorder")
+            };
+            let guidance = 4.5;
+            let (historical, staged) = if sprint {
+                (
+                    SanaHeavy::new_sprint(trunk(), encoder(), decoder(), dcfg.clone(), 0.1),
+                    SanaHeavy::new_sprint_text_to_image(trunk(), decoder(), dcfg.clone(), 0.1),
+                )
+            } else {
+                (
+                    SanaHeavy::new(trunk(), encoder(), decoder(), dcfg.clone()),
+                    SanaHeavy::new_text_to_image(trunk(), decoder(), dcfg.clone()),
+                )
+            };
+            // Historical: the bundle owns the encoder and prepares the reference itself.
+            let before = historical
+                .render_one(&cond, &req, guidance, &cancel, &mut |_| {})
+                .unwrap();
+            // Reordered: a standalone encoder prepares it first, the encoder-free bundle renders.
+            let reference = {
+                let encoder = encoder();
+                prepare_reference_latent(Some(&encoder), &dcfg, sprint, &req, &cancel, None)
+                    .unwrap()
+            };
+            assert!(
+                reference.is_some(),
+                "the fixture must run a genuine img2img start"
+            );
+            let latents = staged
+                .denoise_one_with_prepared_reference(
+                    &cond,
+                    &req,
+                    guidance,
+                    reference.as_ref(),
+                    &cancel,
+                    &mut |_| {},
+                    &PreviewSink::default(),
+                    crate::transformer::SanaForwardPlan::RESIDENT,
+                )
+                .unwrap();
+            let after = staged
+                .decode_view()
+                .decode_one(&latents, &cancel, None)
+                .unwrap();
+            assert_eq!((after.width, after.height), (before.width, before.height));
+            assert_eq!(
+                after.pixels, before.pixels,
+                "sprint={sprint}: reorder changed the image"
+            );
+            // Control: a different reference genuinely changes the output, so equality is not
+            // vacuous.
+            let other = Image {
+                pixels: image.pixels.iter().map(|p| 255 - p).collect(),
+                ..image.clone()
+            };
+            let other_req = SanaGenerateRequest {
+                init_image: Some(&other),
+                ..req.clone()
+            };
+            let changed = historical
+                .render_one(&cond, &other_req, guidance, &cancel, &mut |_| {})
+                .unwrap();
+            assert_ne!(
+                changed.pixels, before.pixels,
+                "sprint={sprint}: reference is inert"
+            );
+        }
     }
 }

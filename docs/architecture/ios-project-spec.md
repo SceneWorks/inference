@@ -43,41 +43,35 @@ lanes remain in place; this epic does not replace them with iOS CI.
 
 ## Public loading contract
 
-On the merged feature base `a54ad6c3a`:
+Every registered image model and mode loads through ONE admission seam
+(`mlx_gen_ios_catalog::ios_admission`), exposed as one admitted facade per surface:
 
-- `runtime_ios::media::load_sana(sana_id, spec, image_edge, tile_edge)` is the
-  admitted SANA facade. `admit_sana_snapshot` checks actual component layout,
-  provider and hardware applicability before any model load. It presently
-  refuses because no applicable target capture exists.
-- `runtime_ios::load_admitted(estimate_mib, closure)` rejects absent estimates,
-  estimates over the provisional budget, or over current OS headroom before
-  invoking its closure. Supplying a number does not itself establish evidence.
-- `runtime_ios::catalog()` and raw catalog registries are composition/inspection
-  surfaces, not admission authority. Raw LLM loading is likewise unadmitted.
-- `load_sana_unadmitted_for_diagnostics` is explicit diagnostic access only.
-  The harness labels evidence capture **UNADMITTED**, including if it renders.
-
-Iris registration [#1277](https://github.com/SceneWorks/inference/pull/1277) and
-SDXL registration [#1278](https://github.com/SceneWorks/inference/pull/1278) were
-open at this documentation snapshot. Their reviewed heads (`9829ca95` and
-`abf72cf1` respectively) preserve the safe media facade; neither exposes
-`runtime_ios::media::provider_registry` as an admitted shortcut.
-
-In the reviewed SDXL head, `runtime_ios::media::load_sdxl(candidates)` selects
-from ordered `sdxl::SdxlCandidate` values and returns the selected index and a
-`BoundSdxlGenerator`. It requires platform limits bound first, checks applicable
-artifact/device evidence and the provider's shared safety check before tensor
-loading, then rechecks capacity and request/source binding at generation. No
-current iPhone capture authorizes a product load. This is a pending interface,
-not a call available on the merged base above.
-
-In the reviewed Iris head, `runtime_ios::iris_depth` is separate from the safe
-image facade. Its `load_depth_unadmitted_for_diagnostics` loader exposes the
-callable depth task without claiming admission or phone fit. Iris image catalog
-registration likewise does not authorize a raw registry load as production
-admission. No Iris or SDXL phone fit is established by these changes. Preserve
-all conditioning/mode routes even when admission refuses them, and reconcile
-these source-bound interface notes if the final merged heads differ.
+- `runtime_ios::media::load_sana`, `load_sdxl`, `load_anima_turbo` and `load_iris` take ordered
+  `IosCandidate`s (built with `media::build_candidate` from the provider's own contract) and return
+  the admitted index plus a `BoundGenerator`. `load_iris_restore` returns a `BoundTransform`,
+  `load_iris_depth` a `BoundDepth`. Each requires `bound_mlx_to_platform_limits()` first, then
+  keys the request (hardware, provider, route, tier, path-free layout digest, mode, geometry,
+  reference count, execution levers, token window — never prompt, seed or install path), looks
+  the key up in the single reviewed table
+  `crates/media/mlx-gen/mlx-gen-ios-catalog/evidence/ios_device_evidence.json`, runs the provider's
+  registered `standard_memory_strategy_safety_check` with the captured footprint against the
+  provisional cap and live headroom, and only then loads. The bound wrapper rechecks the exact
+  request (geometry, tile, mode, conditioning, prompt, execution), live capacity and source pins
+  before every provider call and preserves cancellation.
+- Refusals are typed (`media::RefusalKind`: capacity, no_evidence, mode, strategy, artifact). The
+  table is empty, so every product load currently refuses `no_evidence`. Modes a provider does
+  not serve are refused `mode`, never dropped.
+- `runtime_ios::load_admitted(estimate_mib, closure)` rejects absent estimates, estimates over the
+  provisional budget, or over current OS headroom before invoking its closure.
+- `runtime_ios::catalog()` and raw catalog registries are composition/inspection surfaces, not
+  admission authority. Raw LLM loading is likewise unadmitted.
+- `runtime_ios::media::capture_permit(candidate)` is the explicitly labelled DEVICE CAPTURE path:
+  it needs no evidence row (that would be circular) and is granted only where every quantum of
+  the model checks live OS headroom before constructing its graph (`mlx_gen::ios_quantum`, a
+  physical device). A quantum that does not fit refuses before allocating; that typed refusal
+  (`ios_quantum::take_refusal`) is the "next size refused before jetsam" evidence. Capture output
+  never changes admission: `scripts/ios/campaign.py evidence` prints candidate rows for review.
+  There are no unadmitted image or depth loaders.
 
 ## Evidence and measurement contract
 

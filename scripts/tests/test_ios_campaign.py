@@ -228,6 +228,84 @@ class CampaignTests(unittest.TestCase):
         row["evidence_revision"] = "no-device-capture"
         self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
 
+    def capture_row(self, key, status):
+        row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
+                   evidence_key={"machine": "iPhone17,2", "provider": "fake"}, run_id="fixture-run",
+                   baseline_phys_footprint_bytes=40)
+        if status == "capture_refused":
+            row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
+        return row
+
+    def test_capture_walks_each_ladder_upward_and_stops_at_the_first_refusal(self):
+        outcome = {512: "diagnostic_success", 768: "capture_refused", 1024: "diagnostic_success"}
+        calls = []
+        def fake(session, key, **kw):
+            calls.append(key)
+            return self.capture_row(key, outcome[int(key.split("/")[3])])
+        output = self.root / "capture.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
+            cls.return_value.blocked = False
+            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--device", "fake", "--output", str(output))
+        self.assertEqual(code, 0)
+        ladders = {}
+        for key in calls:
+            fields = key.split("/")
+            ladders.setdefault(fields[5], []).append(int(fields[3]))
+        self.assertEqual(set(ladders), {"0", "1", "2", "3", "4"})
+        for edges in ladders.values():
+            self.assertEqual(edges, [512, 768], "never past the refused size, never a retry")
+        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all(r["diagnostic"] is True and r["production_success"] is False for r in rows))
+        table = campaign.render(rows)
+        self.assertIn('"largest_completed_edge": 512', table)
+        self.assertIn('"refused_before_jetsam_edge": 768', table)
+        self.assertIn("refused before construction: SANA block", table)
+        self.assertIn("diagnostics excluded): {}", table)
+
+    def test_capture_rejects_edge_selectors_and_failure_stops_the_ladder(self):
+        for options in (("--edge", "512"), ("--case", self.keys[0]), ("--next-edge", "1024")):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                self.main("capture", "--provider", "fake", "--device", "fake", "--output", str(self.root / "x.jsonl"), *options)
+        calls = []
+        def fake(session, key, **kw):
+            calls.append(key)
+            return campaign.failure(key, "load failed")
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
+            cls.return_value.blocked = False
+            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "0", "--device", "fake", "--output", str(self.root / "fail.jsonl"))
+        self.assertEqual(code, 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_capture_refusal_rows_need_the_typed_quantum_record(self):
+        key = self.keys[0]
+        good = self.capture_row(key, "capture_refused")
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(good), key)["status"], "capture_refused")
+        for broken in (dict(good, refused_quantum=None), dict(good, refusal_kind="no_evidence"), dict(good, diagnostic=False), dict(good, evidence_class="admitted")):
+            self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(broken), key)["status"], "diagnostic_failure")
+        artifact = dict(self.success(key), status="admitted_refused", production_success=False, refusal_kind="artifact")
+        self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(artifact), key)["status"], "admitted_refused")
+
+    def test_evidence_rows_come_only_from_completed_captures_with_telemetry(self):
+        key = self.keys[0]
+        rows = [self.capture_row(key, "diagnostic_success"), self.capture_row(key, "capture_refused"),
+                dict(self.capture_row(key, "diagnostic_success"), kernel_lifetime_phys_footprint_peak_bytes=None),
+                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=None),
+                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=150),
+                dict(self.success(key), evidence_key={"machine": "x"})]
+        out = campaign.evidence_rows(rows)
+        self.assertEqual(len(out), 1, "no row without a capture baseline below the peak")
+        self.assertEqual(set(out[0]), {"key", "footprint_bytes", "baseline_footprint_bytes", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds", "evidence_class", "run_id", "build_sha"})
+        self.assertEqual((out[0]["footprint_bytes"], out[0]["baseline_footprint_bytes"]), (150, 40))
+        self.assertEqual(out[0]["evidence_class"], "device_capture")
+        source = self.root / "capture.jsonl"
+        source.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        table = Path(campaign.ROOT / campaign.EVIDENCE_TABLE)
+        before = table.read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(campaign.main(["evidence", "--input", str(source)]), 0)
+        self.assertIn("never changes admission", printed.getvalue())
+        self.assertEqual(table.read_bytes(), before, "evidence output is printed, never written")
+
     def primitive_row(self):
         reading = {"available_bytes": 6000 << 20, "footprint_bytes": 40 << 20, "kernel_lifetime_peak_bytes": 60 << 20,
                    "mlx_active_bytes": 0, "mlx_cache_bytes": 0, "mlx_peak_bytes": 0}

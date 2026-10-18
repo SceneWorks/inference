@@ -123,7 +123,80 @@ impl Gen {
 /// Random weights for every key [`UNet2DConditionModel::from_weights`] reads under
 /// [`tiny_unet_config`] (diffusers key layout, torch OIHW convs). Deterministic in `seed`.
 pub fn tiny_unet_weights(seed: u64) -> Result<Weights> {
-    let cfg = tiny_unet_config();
+    tiny_unet_weights_for(&tiny_unet_config(), seed)
+}
+
+/// Three blocks (`[32, 32, 64]`), two resnets per block and cross-attention on the inner two — the
+/// smallest SDXL-shaped U-Net whose down path yields the nine skip residuals a ControlNet's nine
+/// zero-convs pair with (sc-26270).
+pub fn tiny_control_unet_config() -> UNetConfig {
+    UNetConfig {
+        block_out_channels: vec![32, 32, 64],
+        layers_per_block: vec![2, 2, 2],
+        transformer_layers_per_block: vec![1, 1, 1],
+        num_attention_heads: vec![1, 1, 2],
+        cross_attention_dim: vec![TINY_CONTEXT_DIM; 3],
+        down_block_types: vec![
+            "DownBlock2D".into(),
+            "CrossAttnDownBlock2D".into(),
+            "CrossAttnDownBlock2D".into(),
+        ],
+        up_block_types: vec![
+            "UpBlock2D".into(),
+            "CrossAttnUpBlock2D".into(),
+            "CrossAttnUpBlock2D".into(),
+        ],
+        ..tiny_unet_config()
+    }
+}
+
+/// Random weights for a diffusers SDXL `ControlNetModel` over `cfg` (which must yield nine down
+/// residuals, e.g. [`tiny_control_unet_config`]): the U-Net encoder copy, a small conditioning
+/// embedding (`3 → 8 → … → block_out_channels[0]`, three stride-2 convs) and the nine + one 1x1
+/// zero-convs. Deterministic in `seed`.
+pub fn tiny_controlnet_weights(cfg: &UNetConfig, seed: u64) -> Result<Weights> {
+    let unet = tiny_unet_weights_for(cfg, seed)?;
+    let mut g = Gen {
+        w: Weights::empty(),
+        seed: seed.wrapping_add(17),
+        n: 0,
+    };
+    for key in unet.keys().map(str::to_owned).collect::<Vec<_>>() {
+        if !(key.starts_with("up_blocks.")
+            || key.starts_with("conv_norm_out")
+            || key.starts_with("conv_out"))
+        {
+            let value = unet.get(&key).expect("listed key").clone();
+            g.w.insert(key, value);
+        }
+    }
+    let boc = &cfg.block_out_channels;
+    g.conv("controlnet_cond_embedding.conv_in", 8, 3, 3)?;
+    for i in 0..6 {
+        g.conv(&format!("controlnet_cond_embedding.blocks.{i}"), 8, 8, 3)?;
+    }
+    g.conv("controlnet_cond_embedding.conv_out", boc[0], 8, 3)?;
+    // The skip-residual channel sequence: stem, then each down block's resnets and downsample.
+    let mut channels = vec![boc[0]];
+    for (i, c) in boc.iter().enumerate() {
+        for _ in 0..cfg.layers_per_block[i] {
+            channels.push(*c);
+        }
+        if i + 1 < boc.len() {
+            channels.push(*c);
+        }
+    }
+    for (i, c) in channels.iter().enumerate() {
+        g.conv(&format!("controlnet_down_blocks.{i}"), *c, *c, 1)?;
+    }
+    let mid = *boc.last().expect("non-empty config");
+    g.conv("controlnet_mid_block", mid, mid, 1)?;
+    Ok(g.w)
+}
+
+/// [`tiny_unet_weights`] for an arbitrary SDXL-shaped `cfg`.
+pub fn tiny_unet_weights_for(cfg: &UNetConfig, seed: u64) -> Result<Weights> {
+    let cfg = cfg.clone();
     let boc = cfg.block_out_channels.clone();
     let n = boc.len();
     let temb = cfg.time_embed_dim();
