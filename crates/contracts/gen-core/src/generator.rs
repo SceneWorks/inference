@@ -43,6 +43,14 @@ pub trait Generator {
         None
     }
 
+    /// MOSS-owned materialized weight buffers retained by this provider, excluding workspace,
+    /// allocator slack, source payloads and other providers. This metadata-only getter never
+    /// evaluates tensors. Call within the serialized cache transaction; warm admission may credit
+    /// at most this value bounded by the current committed snapshot. None grants no extra credit.
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
@@ -6447,6 +6455,7 @@ mod tests {
                 ..Default::default()
             },
         });
+        assert_eq!(generator.moss_image_owned_weight_bytes(), None);
         let mut progress = Vec::new();
         let report = generator
             .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))

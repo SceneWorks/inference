@@ -31,7 +31,11 @@ impl Asset {
     ) -> gen_core::Result<Self> {
         let path = std::path::absolute(path)?;
         let pin = if spec.prepared_file_pins().is_prepared() {
-            spec.validate_prepared_file_pins()?;
+            if !spec.prepared_file_pins().is_finalized() {
+                return Err(gen_core::Error::Unsupported(
+                    "MOSS unfinalized prepared source".into(),
+                ));
+            }
             spec.prepared_file_pins()
                 .get(&path)
                 .cloned()
@@ -142,6 +146,32 @@ fn optional_file(
 }
 impl Sources {
     pub fn new(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Self> {
+        Self::selected(variant, spec, MossImageAcceleration::Off).map_err(|e| gen_core::Error::Unsupported(format!("MOSS ordinary parent snapshot preparation failed; install the complete Base/SFT core before optional DMD: {e}")))
+    }
+    pub fn selected(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        mode: MossImageAcceleration,
+    ) -> gen_core::Result<Self> {
+        let full_fp32 = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
+        let unmerged = mode == MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16);
+        let required: &[&str] = match mode {
+            MossImageAcceleration::Off => &[],
+            MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16) => &[
+                DMD_LORA_COMPONENT,
+                DMD_TIME_COMPONENT,
+                DMD_DATASPACE_COMPONENT,
+            ],
+            MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32) => {
+                &[DMD_TRANSFORMER_COMPONENT, DMD_DATASPACE_COMPONENT]
+            }
+        };
+        if required.iter().any(|k| !spec.components.contains_key(*k)) {
+            return Err(gen_core::Error::Unsupported("MOSS selected DMD closure missing; provision frozen DMD assets for explicit request".into()));
+        }
+        if variant == MossImageVariant::Base && mode != MossImageAcceleration::Off {
+            return Err(gen_core::Error::Unsupported("MOSS DMD requires SFT".into()));
+        }
         if spec.precision != gen_core::Precision::Bf16
             || spec.quantize.is_some()
             || !spec.adapters.is_empty()
@@ -196,6 +226,9 @@ impl Sources {
                 continue;
             }
             let tr = relative.starts_with("transformer/");
+            if full_fp32 && tr {
+                continue;
+            }
             let role = if tr {
                 MossImageAssetRole::Transformer
             } else if relative.starts_with("text_encoder/") {
@@ -220,13 +253,34 @@ impl Sources {
                 relative,
             )?);
         }
-        let config = MossImageConfig::from_json(
-            &ordinary
-                .iter()
-                .find(|a| a.relative == "transformer/config.json")
-                .expect("static path")
+        let config = if full_fp32 {
+            let source = spec.components.get(DMD_TRANSFORMER_COMPONENT).ok_or_else(||gen_core::Error::Unsupported("MOSS full_fp32 needs prepared published moss-dmd-transformer/dataspace; provision frozen full FP32 DMD assets".into()))?;
+            let dir = root(source)?;
+            let path = if dir.file_name().is_some_and(|n| n == "transformer") {
+                dir.join("config.json")
+            } else {
+                dir.join("transformer/config.json")
+            };
+            MossImageConfig::from_json(
+                &Asset::new(
+                    spec,
+                    path,
+                    MossImageAssetRole::Transformer,
+                    DMD_REPO,
+                    DMD_REVISION,
+                    "transformer/config.json",
+                )?
                 .json()?,
-        )?;
+            )?
+        } else {
+            MossImageConfig::from_json(
+                &ordinary
+                    .iter()
+                    .find(|a| a.relative == "transformer/config.json")
+                    .expect("static path")
+                    .json()?,
+            )?
+        };
         let text_config = Qwen35Config::from_json(
             &ordinary
                 .iter()
@@ -273,27 +327,41 @@ impl Sources {
                 MossImageAssetRole::TextEncoder,
             ),
         ] {
-            validate_shards(&dir, index, &ordinary, role)?;
+            if !(full_fp32 && role == MossImageAssetRole::Transformer) {
+                validate_shards(&dir, index, &ordinary, role)?;
+            }
         }
         let mut headers = validate_source_dtypes(&ordinary)?;
-        let lora = optional_file(
-            spec,
-            DMD_LORA_COMPONENT,
-            "lora.safetensors",
-            MossImageAssetRole::DmdLora,
-        )?;
-        let time = optional_file(
-            spec,
-            DMD_TIME_COMPONENT,
-            "time_embedding.safetensors",
-            MossImageAssetRole::DmdTime,
-        )?;
-        let data = optional_file(
-            spec,
-            DMD_DATASPACE_COMPONENT,
-            "dataspace.safetensors",
-            MossImageAssetRole::DmdDataspace,
-        )?;
+        let lora = if unmerged {
+            optional_file(
+                spec,
+                DMD_LORA_COMPONENT,
+                "lora.safetensors",
+                MossImageAssetRole::DmdLora,
+            )?
+        } else {
+            None
+        };
+        let time = if unmerged {
+            optional_file(
+                spec,
+                DMD_TIME_COMPONENT,
+                "time_embedding.safetensors",
+                MossImageAssetRole::DmdTime,
+            )?
+        } else {
+            None
+        };
+        let data = if mode != MossImageAcceleration::Off {
+            optional_file(
+                spec,
+                DMD_DATASPACE_COMPONENT,
+                "dataspace.safetensors",
+                MossImageAssetRole::DmdDataspace,
+            )?
+        } else {
+            None
+        };
         if let Some(data) = &data {
             validate_dataspace(data)?;
         }
@@ -311,7 +379,11 @@ impl Sources {
                 ))
             }
         };
-        let full = if let Some(source) = spec.components.get(DMD_TRANSFORMER_COMPONENT) {
+        let full = if let Some(source) = spec
+            .components
+            .get(DMD_TRANSFORMER_COMPONENT)
+            .filter(|_| full_fp32)
+        {
             let p = root(source)?;
             let p = if p.file_name().is_some_and(|n| n == "transformer") {
                 p.to_path_buf()

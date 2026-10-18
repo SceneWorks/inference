@@ -184,3 +184,102 @@ fn native_generation_or_cancel_with_actual_receipt() {
     )
     .unwrap();
 }
+
+/// sc-26325: latent-only native transport acceptance, separate from image quality or adoption.
+#[test]
+#[ignore = "requires coordinator-admitted Metal ownership and exact local assets; no PNG comparison"]
+fn native_advanced_supplied_order_receipt() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        std::env::var("MOSS_NATIVE_TEST_ADMITTED").as_deref(),
+        Ok("1")
+    );
+    let variant = match std::env::var("MOSS_NATIVE_TEST_VARIANT").as_deref() {
+        Ok("base") => MossImageVariant::Base,
+        Ok("sft") => MossImageVariant::Sft,
+        _ => panic!("set MOSS_NATIVE_TEST_VARIANT=base or sft"),
+    };
+    let mut spec = LoadSpec::new(WeightsSource::Dir(path("MOSS_NATIVE_TEST_SNAPSHOT")));
+    if variant == MossImageVariant::Base {
+        spec.components.insert(
+            MOSS_SHARED_SNAPSHOT_COMPONENT.into(),
+            WeightsSource::Dir(path("MOSS_NATIVE_TEST_SHARED_SNAPSHOT")),
+        );
+    }
+    let model = MossImage::load(variant, &spec).unwrap();
+    let request = GenerationRequest {
+        prompt: String::new(),
+        width: 256,
+        height: 256,
+        count: 2,
+        steps: Some(1),
+        guidance: Some(1.0),
+        ..Default::default()
+    };
+    let embeddings: Vec<f32> = (0..2 * 3 * 4096)
+        .map(|i| 1.001 + (i as f32 * 0.019).sin() * 0.1)
+        .collect();
+    let mask = [1, 0, 1, 0, 1, 1];
+    let stride = 128 * 16 * 16;
+    let noise: Vec<f32> = (0..4 * stride).map(|i| (i as f32 * 0.017).sin()).collect();
+    let output = model
+        .generate_moss_advanced(
+            &request,
+            MossImageAdvancedInputs {
+                positive: Some(MossImageEmbeddings {
+                    values: &embeddings,
+                    batch: 2,
+                    sequence: 3,
+                    mask: Some(&mask),
+                }),
+                noise: Some(&noise),
+                output: MossImageOutputKind::Latents,
+                ..Default::default()
+            },
+            &mut |event| eprintln!("advanced native progress: {event:?}"),
+        )
+        .unwrap();
+    let MossImageAdvancedOutput::Latents { values, shape } = output else {
+        panic!("expected supplied native latents")
+    };
+    assert_eq!(shape, [4, 128, 16, 16]);
+    assert_eq!(values.len(), 4 * stride);
+    assert!(values.iter().all(|v| v.is_finite()));
+    assert!(values.iter().any(|v| v.abs() > 0.0001));
+    let report = model.moss_image_execution_report().unwrap();
+    assert_eq!(
+        report.data().resolved.acceleration,
+        MossImageAcceleration::Off
+    );
+    assert_eq!(report.data().output_kind, MossImageOutputKind::Latents);
+    assert_eq!(report.data().samples.len(), 4);
+    for i in 0..4 {
+        let mut hash = Sha256::new();
+        for value in &noise[i * stride..(i + 1) * stride] {
+            hash.update(value.to_le_bytes());
+        }
+        assert_eq!(
+            report.data().samples[i].noise_sha256,
+            format!("{:x}", hash.finalize())
+        );
+        assert!(report.data().samples[i].seed.is_none());
+        let b = i / 2;
+        let mut hash = Sha256::new();
+        for value in &embeddings[b * 3 * 4096..(b + 1) * 3 * 4096] {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update(&mask[b * 3..(b + 1) * 3]);
+        assert_eq!(
+            report.data().conditioning[i].positive.sha256,
+            format!("{:x}", hash.finalize())
+        );
+        assert_eq!(report.data().conditioning[i].positive.valid_tokens, 2);
+    }
+    let out = path("MOSS_NATIVE_TEST_OUTPUT_DIR");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        out.join("advanced-supplied.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+}

@@ -263,17 +263,22 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        let shared = self
-            .encoder
+        Ok(incremental_peak(
+            peak,
+            self.cached_owned_weight_bytes(&state),
+            budget.committed_bytes,
+        ))
+    }
+    fn cached_owned_weight_bytes(&self, state: &State) -> u64 {
+        self.encoder
             .resident_bytes()
-            .saturating_add(self.memory.asset_facts.decoder_bytes);
-        let owned = shared.saturating_add(
-            state
-                .renderer
-                .as_ref()
-                .map_or(0, |(_, renderer)| renderer.resident_bytes()),
-        );
-        Ok(incremental_peak(peak, owned, budget.committed_bytes))
+            .saturating_add(self.memory.asset_facts.decoder_bytes)
+            .saturating_add(
+                state
+                    .renderer
+                    .as_ref()
+                    .map_or(0, |(_, renderer)| renderer.resident_bytes()),
+            )
     }
     fn execute(
         &self,
@@ -604,6 +609,12 @@ impl Generator for MossImage {
     }
     fn moss_image_execution_report(&self) -> Option<MossImageExecutionReport> {
         self.state.lock().ok().and_then(|s| s.report.clone())
+    }
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .map(|state| self.cached_owned_weight_bytes(&state))
     }
     fn adapter_apply_reports(&self) -> Vec<gen_core::AdapterApplyReport> {
         self.moss_image_execution_report()

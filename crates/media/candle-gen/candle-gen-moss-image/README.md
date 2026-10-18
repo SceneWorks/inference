@@ -68,3 +68,34 @@ checks ordinary→mixed/full→ordinary identity, advanced latent conditioning/b
 transport, typed cancellation with no stale receipt, and warm reentry. Environment
 variables are a guard against accidental invocation, not an ownership lease or
 independent physical-device proof; the external terminal allocator supplies those.
+
+
+## Static consumer admission (sc-26325)
+
+Before the generic boxed provider loader, call public
+`memory_strategy::selected_preload_estimate(variant, &spec, &request,
+MossImageAdvancedInputs::default())`. Its `peak_bytes` reuses the runtime formula;
+`asset_facts` is selected resident accounting, `workspace_bytes` is scratch plus
+512MiB fixed overhead, and `owned_shard_transient_bytes` is the largest selected
+owned source shard. **The shard is added once in `peak_bytes`; workspace excludes
+it.** This differs from MLX's older workspace helper, which already includes its
+fixed source staging envelope. `selected_asset_facts` and `request_workspace_bytes`
+are also public, but consumers should use the combined call to authenticate once.
+No device or tensor is created by static admission. Authentication itself reads
+one owned shard on the host; callers must provide that staging headroom before
+calling it. OFF does not authenticate optional DMD availability; mixed does not
+read full-FP32 shards; full replaces the ordinary BF16 DiT closure for static facts and runtime weights.
+The ordinary SFT core remains an installation prerequisite: generic construction
+has no request mode and authenticates its metadata without allocating its tensors.
+The largest full-FP32 shard bound covers that earlier ordinary metadata buffer as
+well, rather than adding another concurrent buffer. Selected ON
+sources are prepared lazily from the retained caller spec. Normal generator
+construction prepares OFF metadata only and retains optional availability, not
+enabled acceleration. Warm product credits may use measured own backend committed
+allocation delta bounded by the current committed snapshot; undercredit is safe.
+
+The dedicated inference `moss-native-terminal-windows.yml` workflow is exclusively
+for the stationary final inference-main/product-main pin. Its strict JSON control
+and physical-GPU0 lease are described in
+`docs/moss-native-terminal-windows.md`. The CPU-only `native_inventory` example
+verifies the shared 41-file frozen manifest; it does not initialize CUDA.

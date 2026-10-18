@@ -269,7 +269,7 @@ fn mask_and_cancellation_refuse_before_blocks() {
     ));
 }
 
-fn synthetic_sources() -> Sources {
+pub(crate) fn synthetic_sources() -> Sources {
     Sources{ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
         text_config:candle_llm::models::qwen35::Qwen35Config::from_json(&serde_json::json!({"hidden_size":4096,"num_hidden_layers":2,"intermediate_size":24,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":32,"linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":8,"linear_value_head_dim":8})).unwrap(),
         tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
@@ -653,6 +653,7 @@ fn renderer_off_on_off_never_reuses_modified_backbone() {
 fn warm_admission_credits_only_actual_provider_weights() {
     let d = fixture("fixture.json");
     let generator = synthetic_generator();
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(0));
     let mode = MossImageAcceleration::Off;
     let model = Transformer::load(&weights(&d["weights"], DType::F32), geometry(&d), None).unwrap();
     let actual = model.resident_bytes();
@@ -667,6 +668,7 @@ fn warm_admission_credits_only_actual_provider_weights() {
     let peak = generator
         .estimated_peak_bytes(&request, MossImageAdvancedInputs::default())
         .unwrap();
+    assert_eq!(generator.moss_image_owned_weight_bytes(), Some(actual));
     let budget = MemoryBudget {
         total_bytes: u64::MAX / 2,
         committed_bytes: actual + 123456,
@@ -873,4 +875,33 @@ fn sampler_seed_receipts_progress_cancel_and_warm_reentry_are_actual() {
     let mut recovered = req.clone();
     recovered.cancel = CancelFlag::default();
     assert!(run(&recovered, &mut |_| {}).is_ok());
+}
+
+#[test]
+fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("transformer/pipeline_moss_image.py");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let source=include_bytes!("../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_author/frozen_author_pipeline.py");
+    std::fs::write(&path, source).unwrap();
+    let unused = tmp.path().join("unused-full-fp32");
+    std::fs::write(&unused, b"available unused").unwrap();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().into()));
+    spec.prepare_with_file_pins([
+        PinnedWeightsFile::pin(&path).unwrap(),
+        PinnedWeightsFile::pin(&unused).unwrap(),
+    ])
+    .unwrap();
+    std::fs::write(&unused, b"changed unused availability").unwrap();
+    assert!(spec.validate_prepared_file_pins().is_err());
+    let selected = loader::Asset::new(
+        &spec,
+        path,
+        MossImageAssetRole::Transformer,
+        SFT_REPO,
+        SFT_REVISION,
+        "transformer/pipeline_moss_image.py",
+    )
+    .unwrap();
+    assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }

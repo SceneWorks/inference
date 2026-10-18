@@ -1,0 +1,71 @@
+name: MOSS native terminal (Windows)
+on:
+  workflow_dispatch:
+    inputs:
+      sceneworks_revision:
+        description: Exact final SceneWorks main revision containing the permanent inference pin
+        required: true
+        type: string
+      control_json:
+        description: Strict native-only control with exact snapshots, fresh physical GPU0 UUID lease and bounded deadline
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights, cuda-windows-2]
+    timeout-minutes: 240
+    env:
+      MOSS_NATIVE_CONTROL: ${{ inputs.control_json }}
+      MOSS_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      CARGO_BUILD_JOBS: "4"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+      RUSTC_WRAPPER: ""
+      CARGO_NET_OFFLINE: "true"
+      MOSS_TRANSPORT_ARTIFACT_ROOT: ${{ runner.temp }}/moss-native-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: ${{ inputs.sceneworks_revision }}
+          path: .terminal-sceneworks
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - name: Verify native-only transport on CPU
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1 -SelfTest
+      - name: Run the exact pinned native campaign under a fresh physical GPU0 lease
+        shell: powershell
+        run: ./scripts/ci/moss-native-terminal.ps1
+      - name: Preserve native evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-native-cuda-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.json
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.jsonl
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.log
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.csv
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/product-worker/*.json
+            ${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/product-worker/*.png
+          if-no-files-found: error

@@ -46,7 +46,7 @@ fn shaped(w: &Weights, key: &str, shape: &[i32]) -> Result<Array> {
     }
     Ok(a.clone())
 }
-fn check(cancel: &CancelFlag) -> Result<()> {
+pub(crate) fn check(cancel: &CancelFlag) -> Result<()> {
     if cancel.is_cancelled() {
         Err(Error::Canceled)
     } else {
@@ -340,6 +340,7 @@ impl Block {
     }
 }
 pub(crate) struct Transformer {
+    owned_weight_bytes: u64,
     g: Geometry,
     video: Projection,
     text: Projection,
@@ -359,6 +360,7 @@ impl Transformer {
             .map(|i| Block::load(w, i, &g))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            owned_weight_bytes: 0,
             video: Projection::load(w, "video_embedder", g.channels, g.dim, true)?,
             text: Projection::load(w, "text_embedder.proj", g.text, g.dim, true)?,
             text_blocks: (0..2)
@@ -414,18 +416,19 @@ impl Transformer {
     }
     /// Evaluate retained weight casts before publishing residency credit. Scalar alpha and the
     /// regenerated RoPE bands are not retained weight buffers and receive no credit.
-    pub(crate) fn materialize_owned(&self, cancel: &CancelFlag) -> Result<()> {
+    pub(crate) fn materialize_owned(&mut self, cancel: &CancelFlag) -> Result<()> {
+        let mut owned_weight_bytes = 0u64;
         for array in self.owned_arrays() {
             check(cancel)?;
             eval([array])?;
+            owned_weight_bytes = owned_weight_bytes.saturating_add(array.nbytes() as u64);
         }
-        check(cancel)
+        check(cancel)?;
+        self.owned_weight_bytes = owned_weight_bytes;
+        Ok(())
     }
     pub(crate) fn resident_bytes(&self) -> u64 {
-        self.owned_arrays()
-            .into_iter()
-            .map(|a| a.nbytes() as u64)
-            .sum()
+        self.owned_weight_bytes
     }
     pub(crate) fn install_dmd(
         &mut self,

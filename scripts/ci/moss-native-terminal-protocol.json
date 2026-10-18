@@ -1,0 +1,124 @@
+{
+  "protocol": "sc-26325-native-terminal-v1",
+  "backend": [
+    {
+      "case": "Base-ordinary",
+      "variant": "base",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Base-warm-after-cancel",
+      "variant": "base",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-ordinary",
+      "variant": "sft",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-UnmergedBf16",
+      "variant": "sft",
+      "acceleration": "unmerged_bf16",
+      "steps": 8,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-off-after-UnmergedBf16",
+      "variant": "sft",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-FullFp32",
+      "variant": "sft",
+      "acceleration": "full_fp32",
+      "steps": 8,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-off-after-FullFp32",
+      "variant": "sft",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-advanced",
+      "variant": "sft",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "latents",
+      "samples": 4,
+      "status": "completed"
+    },
+    {
+      "case": "Sft-warm-after-cancel",
+      "variant": "sft",
+      "acceleration": "off",
+      "steps": 2,
+      "output_kind": "images",
+      "samples": 1,
+      "status": "completed"
+    },
+    {
+      "case": "Base-cancel",
+      "status": "canceled"
+    },
+    {
+      "case": "Sft-cancel",
+      "status": "canceled"
+    }
+  ],
+  "product": [
+    {
+      "case": "base_off",
+      "variant": "base",
+      "acceleration": "off",
+      "status": "completed"
+    },
+    {
+      "case": "sft_unmerged_bf16",
+      "variant": "sft",
+      "acceleration": "unmerged_bf16",
+      "status": "completed"
+    },
+    {
+      "case": "sft_full_fp32",
+      "variant": "sft",
+      "acceleration": "full_fp32",
+      "status": "completed"
+    },
+    {
+      "case": "sft_off",
+      "variant": "sft",
+      "acceleration": "off",
+      "status": "completed"
+    },
+    {
+      "case": "sft_off_warm_cancel",
+      "status": "canceled"
+    }
+  ]
+}
