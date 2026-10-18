@@ -40,8 +40,7 @@ impl UpSampler {
         )
     }
 
-    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting proofs).
-    #[cfg(test)]
+    /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting).
     pub(crate) fn weight(&self) -> &Array {
         &self.conv_w
     }
@@ -64,6 +63,7 @@ impl UpSampler {
         // tile is checked on its own.
         let s = x.shape();
         crate::quantum::before_tiled_stage(
+            crate::quantum::VAE_DECODE_TILED_STAGE,
             &[s[0], 2 * s[1], 2 * s[2], s[3]],
             x.item_size() as u64,
             &self.conv_w,
@@ -77,12 +77,12 @@ impl UpSampler {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(tile, &self.conv_w)?;
+                crate::quantum::before_tile(crate::quantum::VAE_DECODE_TILE, tile, &self.conv_w)?;
                 Ok(tile.clone())
             },
         )?;
         if mlx_gen::ios_quantum::enabled() {
-            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&h])?;
+            mlx_gen::ios_quantum::finish(crate::quantum::VAE_DECODE_TILED_STAGE, &[&h])?;
         }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }

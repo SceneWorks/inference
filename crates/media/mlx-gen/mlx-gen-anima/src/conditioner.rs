@@ -386,7 +386,12 @@ impl AnimaTextConditioner {
     /// Allowance for the lazy Qwen3 mask-multiply feeding `source_hidden`: the states, the cast
     /// mask broadcast and the product (three source-sized f32 buffers).
     pub(crate) fn mask_multiply_bytes(source_hidden: &Array) -> u64 {
-        mlx_gen::ios_quantum::elementwise_bytes(source_hidden.size() as u64, 3)
+        Self::mask_multiply_bytes_for(source_hidden.size() as u64)
+    }
+
+    /// [`Self::mask_multiply_bytes`] over `source_elements` Qwen3 state elements.
+    pub(crate) fn mask_multiply_bytes_for(source_elements: u64) -> u64 {
+        mlx_gen::ios_quantum::elementwise_bytes(source_elements, 3)
     }
 
     pub fn forward_weighted(
@@ -560,8 +565,8 @@ impl AnimaTextConditioner {
         }
     }
 
-    /// The blocks (the CPU proofs run one block's quantum body directly).
-    #[cfg(test)]
+    /// The blocks (the CPU proofs run one block's quantum body directly; the iOS pricing prices
+    /// each block's quantum).
     pub(crate) fn blocks(&self) -> &[Block] {
         &self.blocks
     }

@@ -26,6 +26,7 @@ pub mod control_transformer_block;
 pub mod convert;
 pub mod feed_forward;
 pub mod final_layer;
+pub mod ios_pricing;
 // Shared memory-strategy contract adoption (SC-15449) + the SC-15615 rung-3 finding.
 pub mod loader;
 pub mod memory_strategy;
@@ -37,6 +38,8 @@ pub mod pipeline;
 pub mod preview;
 pub mod quant;
 // iOS execution-quantum labels and counted prices (epic 16774, sc-26433).
+#[cfg(all(test, target_os = "macos"))]
+mod ios_pricing_tests;
 pub(crate) mod quantum;
 #[cfg(all(test, target_os = "macos"))]
 mod quantum_proofs;

@@ -284,8 +284,11 @@ pub(crate) fn build_residency(
 
 /// Load the Gemma-2 CHI text encoder (`text_encoder/`) — the phase-A component dropped first under
 /// `Sequential`. Bundles the gemma weights + `tokenizer.json` (the un-gated mirror, epic 7840).
-fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
-    mlx_gen::ios_quantum::before_load("SANA text load", &[root.join("text_encoder")])?;
+pub(crate) fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
+    mlx_gen::ios_quantum::before_load(
+        crate::quantum::labels::TEXT_LOAD,
+        &[root.join("text_encoder")],
+    )?;
     SanaTextEncoder::from_snapshot(root.join("text_encoder"))
 }
 
@@ -295,7 +298,7 @@ fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
 /// path builds the same bundle up front. Components are independent of the text encoder (separate weight
 /// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
 /// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
-fn load_heavy(
+pub(crate) fn load_heavy(
     root: &Path,
     sprint: bool,
     needs_encoder: bool,
@@ -305,7 +308,7 @@ fn load_heavy(
     // Sequential img2img bundle, whose reference was encoded in its own phase) never builds the
     // DC-AE encoder, so its `encoder.*` tensors are never materialized.
     mlx_gen::ios_quantum::before_load_where(
-        "SANA heavy load",
+        crate::quantum::labels::HEAVY_LOAD,
         &[root.join("transformer"), root.join("vae")],
         |name| needs_encoder || !name.starts_with("encoder."),
     )?;
@@ -786,10 +789,10 @@ pub(crate) fn run_staged_img2img<T, C, E, H, L, M, O>(
 
 /// Load ONLY the DC-AE encoder (`encoder.*` of `vae/`) for the Sequential img2img reference phase,
 /// pre-checked against its own header inventory (the decoder's tensors are not constructed).
-fn load_reference_encoder(root: &Path) -> Result<DcAeEncoder> {
+pub(crate) fn load_reference_encoder(root: &Path) -> Result<DcAeEncoder> {
     let vae = root.join("vae");
     mlx_gen::ios_quantum::before_load_where(
-        "SANA reference encoder load",
+        crate::quantum::labels::REFERENCE_ENCODER_LOAD,
         std::slice::from_ref(&vae),
         |name| name.starts_with("encoder."),
     )?;
@@ -802,11 +805,11 @@ fn load_reference_encoder(root: &Path) -> Result<DcAeEncoder> {
 
 /// Materialize a batch's denoised latents inside one guarded quantum (their pending graphs are at
 /// most one sampler update each; already-materialized latents cost nothing).
-fn materialize_latent_batch(latents: &[mlx_rs::Array]) -> Result<()> {
+pub(crate) fn materialize_latent_batch(latents: &[mlx_rs::Array]) -> Result<()> {
     let elements: u64 = latents.iter().map(|l| l.size() as u64).sum();
     let refs: Vec<&mlx_rs::Array> = latents.iter().collect();
     crate::pipeline::materialize_latents(
-        "SANA latent batch",
+        crate::quantum::labels::LATENT_BATCH,
         &refs,
         crate::quantum::scm_step_bytes(elements),
     )

@@ -57,7 +57,11 @@ impl Encoder {
         Ok(Self {
             conv_in: ConvLayer::from_weights(w, &p("conv_in"))?,
             down_blocks,
-            mid_block: UNetMidBlock::from_weights(w, &p("mid_block"))?,
+            mid_block: UNetMidBlock::from_weights_labeled(
+                w,
+                &p("mid_block"),
+                &crate::quantum::ENCODE_LABELS,
+            )?,
             conv_norm_out: ConvNormOut::from_weights(w, &p("conv_norm_out"))?,
             conv_out: ConvLayer::from_weights(w, &p("conv_out"))?,
         })
@@ -132,8 +136,7 @@ impl Encoder {
         }
     }
 
-    /// `(conv_in, down blocks, mid block, conv_out)` (the reachable-sizes prediction prices them).
-    #[cfg(test)]
+    /// `(conv_in, down blocks, mid block, conv_out)` (the iOS pricing prices them).
     pub(crate) fn parts(&self) -> (&ConvLayer, &[DownEncoderBlock], &UNetMidBlock, &ConvLayer) {
         (
             &self.conv_in,

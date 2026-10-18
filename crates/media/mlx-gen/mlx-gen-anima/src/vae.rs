@@ -80,24 +80,34 @@ pub fn convert_vae_key(key: &str) -> String {
     }
 }
 
+/// The dtype the VAE runs (and is cast to at load) in: f32, the qwen-image golden convention — the
+/// denoised latents are f32 and this avoids a mixed-dtype Conv3d, at a negligible memory cost for
+/// the small VAE.
+pub(crate) const VAE_DTYPE: mlx_rs::Dtype = mlx_rs::Dtype::Float32;
+
 /// Load the Qwen-Image VAE from Anima's single-file `qwen_image_vae.safetensors`.
 pub fn load_vae(path: impl AsRef<Path>) -> Result<QwenVae> {
-    let src = Weights::from_file(path.as_ref())?;
+    let (vae, diff) = vae_from_source(&Weights::from_file(path.as_ref())?)?;
+    // Materialize at load (sc-24245; see `crate::loader::load_heavy_phase_with_stream`).
+    diff.materialize_accessed()?;
+    Ok(vae)
+}
+
+/// Build the VAE from the file's original-naming tensors (lazy: nothing is evaluated), returning it
+/// with the converted weights it was built from. Shared by [`load_vae`] and the iOS pricing, which
+/// builds it over shape-only placeholders to price its decode quanta.
+pub(crate) fn vae_from_source(src: &Weights) -> Result<(QwenVae, Weights)> {
     // 1. original naming → diffusers `AutoencoderKLQwenImage` naming (rename-only).
     let mut diff = Weights::empty();
     let keys: Vec<String> = src.keys().map(String::from).collect();
     for k in &keys {
         diff.insert(convert_vae_key(k), src.require(k)?.clone());
     }
-    // Run the VAE in f32 (the qwen-image golden convention): the denoised latents are f32 and this
-    // avoids a mixed-dtype Conv3d, at a negligible memory cost for the small VAE.
-    diff.cast_all(mlx_rs::Dtype::Float32)?;
+    diff.cast_all(VAE_DTYPE)?;
     // 2. diffusers → internal (rename + conv transposes + gamma→1-D), then assemble.
     mlx_gen_qwen_image::loader::remap_vae_keys(&mut diff)?;
     let vae = QwenVae::from_weights(&diff)?;
-    // Materialize at load (sc-24245; see `crate::loader::load_heavy_phase_with_stream`).
-    diff.materialize_accessed()?;
-    Ok(vae)
+    Ok((vae, diff))
 }
 
 #[cfg(test)]

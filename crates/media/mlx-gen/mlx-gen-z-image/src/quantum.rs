@@ -62,10 +62,14 @@ pub(crate) const CONTROL_CONTEXT: &str = "Z-Image control context";
 pub(crate) const VAE_DECODE_IN: &str = "Z-Image VAE decode conv_in";
 /// VAE encoder `conv_in`.
 pub(crate) const VAE_ENCODE_IN: &str = "Z-Image VAE encode conv_in";
-/// One VAE resnet.
-pub(crate) const VAE_RESNET: &str = "Z-Image VAE resnet";
-/// The VAE mid-block single-head attention.
-pub(crate) const VAE_ATTENTION: &str = "Z-Image VAE attention";
+/// One VAE decoder resnet (mid block or up path).
+pub(crate) const VAE_DECODE_RESNET: &str = "Z-Image VAE decode resnet";
+/// One VAE encoder resnet (down path or mid block).
+pub(crate) const VAE_ENCODE_RESNET: &str = "Z-Image VAE encode resnet";
+/// The VAE decoder mid-block single-head attention.
+pub(crate) const VAE_DECODE_ATTENTION: &str = "Z-Image VAE decode attention";
+/// The VAE encoder mid-block single-head attention.
+pub(crate) const VAE_ENCODE_ATTENTION: &str = "Z-Image VAE encode attention";
 /// A VAE nearest-2x upsample plus its convolution.
 pub(crate) const VAE_UPSAMPLE: &str = "Z-Image VAE upsample";
 /// A VAE bottom/right-pad stride-2 downsample convolution.
@@ -74,10 +78,43 @@ pub(crate) const VAE_DOWNSAMPLE: &str = "Z-Image VAE downsample";
 pub(crate) const VAE_DECODE_OUT: &str = "Z-Image VAE decode conv_out";
 /// VAE encoder output GroupNorm + SiLU + `conv_out` + the latent mean's affine.
 pub(crate) const VAE_ENCODE_OUT: &str = "Z-Image VAE encode conv_out";
-/// One halo-expanded tile of a layer-wise tiled VAE convolution, checked before its graph exists.
-pub(crate) const VAE_TILE: &str = "Z-Image VAE tile";
-/// The assembled output of one tiled VAE layer (resnet / upsample / output convolution).
-pub(crate) const VAE_TILED_STAGE: &str = "Z-Image VAE tiled stage";
+/// One halo-expanded tile of a layer-wise tiled VAE decode convolution, checked before its graph
+/// exists.
+pub(crate) const VAE_DECODE_TILE: &str = "Z-Image VAE decode tile";
+/// One halo-expanded tile of the bounded encode's tiled convolutions (and its downsample crops).
+pub(crate) const VAE_ENCODE_TILE: &str = "Z-Image VAE encode tile";
+/// The assembled output of one tiled VAE decode layer (resnet / upsample / output convolution).
+pub(crate) const VAE_DECODE_TILED_STAGE: &str = "Z-Image VAE decode tiled stage";
+/// The assembled output of one tiled layer of the bounded encode (`conv_in` / resnet / downsample).
+pub(crate) const VAE_ENCODE_TILED_STAGE: &str = "Z-Image VAE encode tiled stage";
+
+/// The quantum labels of the VAE modules shared by the encoder and the decoder (resnets, the
+/// mid-block attention, the layer-wise tiled stages and their tiles). A module built for one side
+/// carries that side's labels, so every label names exactly one phase (`crate::ios_pricing::
+/// ios_quantum_phase`: encode vs decode).
+#[derive(Debug)]
+pub(crate) struct VaeLabels {
+    pub(crate) resnet: &'static str,
+    pub(crate) attention: &'static str,
+    pub(crate) tile: &'static str,
+    pub(crate) stage: &'static str,
+}
+
+/// The decoder's labels (also every VAE module's default).
+pub(crate) const DECODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_DECODE_RESNET,
+    attention: VAE_DECODE_ATTENTION,
+    tile: VAE_DECODE_TILE,
+    stage: VAE_DECODE_TILED_STAGE,
+};
+
+/// The encoder's labels.
+pub(crate) const ENCODE_LABELS: VaeLabels = VaeLabels {
+    resnet: VAE_ENCODE_RESNET,
+    attention: VAE_ENCODE_ATTENTION,
+    tile: VAE_ENCODE_TILE,
+    stage: VAE_ENCODE_TILED_STAGE,
+};
 /// The decoded image's f32 cast and pixel conversion.
 pub(crate) const DECODED_TO_IMAGE: &str = "Z-Image decoded to image";
 /// The caption features: the valid-token gather of the encoder output and its compute-dtype cast.
@@ -244,18 +281,6 @@ pub(crate) fn quantize_bytes(lin: &AdaptableLinear, bits: i32) -> u64 {
     let Some((weight, bias)) = lin.dense_weight() else {
         return 0;
     };
-    let shape = lin.base_shape();
-    let (out, inp) = (
-        shape.first().map_or(0, |&d| d.max(0) as u64),
-        shape.get(1).map_or(0, |&d| d.max(0) as u64),
-    );
-    let groups = inp.div_ceil(crate::quant::GROUP_SIZE as u64);
-    let packed = mlx_gen::ios_quantum::allocated_bytes(
-        out.saturating_mul(inp)
-            .saturating_mul(bits.max(0) as u64)
-            .div_ceil(8),
-    )
-    .saturating_add(2 * ab(2, &[out, groups]));
     let cast = |a: &Array| {
         if a.item_size() > 2 {
             mlx_gen::ios_quantum::bytes(a) / a.item_size() as u64 * 2
@@ -263,9 +288,30 @@ pub(crate) fn quantize_bytes(lin: &AdaptableLinear, bits: i32) -> u64 {
             0
         }
     };
-    packed
+    packed_bytes(lin, bits)
         .saturating_add(cast(weight))
         .saturating_add(bias.map_or(0, cast))
+}
+
+/// The packed Q4/Q8 weight, scales and biases (group 64, each page-rounded as allocated) that
+/// `AdaptableLinear::quantize` leaves resident in place of a dense `[out, in]` projection's weight
+/// (its dense bias stays). `0` for an already packed projection.
+pub(crate) fn packed_bytes(lin: &AdaptableLinear, bits: i32) -> u64 {
+    if lin.dense_weight().is_none() {
+        return 0;
+    }
+    let shape = lin.base_shape();
+    let (out, inp) = (
+        shape.first().map_or(0, |&d| d.max(0) as u64),
+        shape.get(1).map_or(0, |&d| d.max(0) as u64),
+    );
+    let groups = inp.div_ceil(crate::quant::GROUP_SIZE as u64);
+    mlx_gen::ios_quantum::allocated_bytes(
+        out.saturating_mul(inp)
+            .saturating_mul(bits.max(0) as u64)
+            .div_ceil(8),
+    )
+    .saturating_add(2 * ab(2, &[out, groups]))
 }
 
 /// One DiT attention block's shape, as its quantum is priced.
@@ -387,12 +433,12 @@ pub(crate) fn nhwc(x_nchw: &Array) -> [i32; 4] {
 /// ([`mlx_gen::ios_quantum::tile_bytes`]). Called from the per-tile preprocess hook of
 /// `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc`, which evaluates each output core before the next
 /// tile is built.
-pub(crate) fn before_tile(tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
+pub(crate) fn before_tile(label: &str, tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
     mlx_gen::ios_quantum::before(
-        VAE_TILE,
+        label,
         mlx_gen::ios_quantum::tile_bytes(
             tile.shape(),
             tile.item_size() as u64,
@@ -406,6 +452,7 @@ pub(crate) fn before_tile(tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
 /// One layer-wise tiled VAE stage's check over `x_nhwc` producing `cout` channels
 /// ([`mlx_gen::ios_quantum::tiled_stage_bytes`]); a no-op off device.
 pub(crate) fn before_tiled_stage(
+    label: &str,
     x_nhwc: &[i32],
     act: u64,
     weight: &Array,
@@ -416,7 +463,7 @@ pub(crate) fn before_tiled_stage(
     }
     let (cin, cout) = mlx_gen::ios_quantum::conv_channels(weight);
     mlx_gen::ios_quantum::before(
-        VAE_TILED_STAGE,
+        label,
         mlx_gen::ios_quantum::tiled_stage_bytes(x_nhwc, cin, cout, act, resnet),
     )
 }
@@ -444,6 +491,14 @@ pub(crate) fn source_files(
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(Vec::new());
     }
+    component_files(source)
+}
+
+/// The `.safetensors` files a component source loads (a directory's non-hidden shards, sorted, or
+/// the one file) — what [`source_files`] lists on device, and what the iOS pricing reads headers of.
+pub(crate) fn component_files(
+    source: &mlx_gen::WeightsSource,
+) -> mlx_gen::Result<Vec<std::path::PathBuf>> {
     Ok(match source {
         mlx_gen::WeightsSource::File(path) => vec![path.clone()],
         mlx_gen::WeightsSource::Dir(dir) => {

@@ -716,8 +716,8 @@ impl CosmosDiT {
         &self.cfg
     }
 
-    /// The resident blocks (the CPU proofs run one block's quantum body directly).
-    #[cfg(test)]
+    /// The resident blocks (the CPU proofs run one block's quantum body directly; the iOS pricing
+    /// prices each block's quantum).
     pub(crate) fn blocks(&self) -> &[Block] {
         &self.blocks
     }
@@ -1084,10 +1084,16 @@ impl CosmosDiT {
     /// sampler-step allowance for the previous step's lazy CFG combine + sampler update over the
     /// incoming latent, which materializes here.
     pub(crate) fn embed_quantum_scratch(&self, latents: &Array, dtype: Dtype) -> u64 {
-        self.embed_body_bytes(latents.shape(), dtype_bytes(dtype))
-            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(
-                latents.size() as u64
-            ))
+        self.embed_quantum_scratch_for(latents.shape(), dtype)
+    }
+
+    /// [`Self::embed_quantum_scratch`] over a `latent_shape` latent.
+    pub(crate) fn embed_quantum_scratch_for(&self, latent_shape: &[i32], dtype: Dtype) -> u64 {
+        let elements = latent_shape
+            .iter()
+            .fold(1u64, |a, &d| a.saturating_mul(d.max(0) as u64));
+        self.embed_body_bytes(latent_shape, dtype_bytes(dtype))
+            .saturating_add(mlx_gen::ios_quantum::sampler_step_bytes(elements))
     }
 
     /// The DiT output quantum ([`Self::output`]) over `[B, tokens, hidden]` at `element_bytes`:

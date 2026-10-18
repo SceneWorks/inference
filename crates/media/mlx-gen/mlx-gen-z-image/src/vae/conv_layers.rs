@@ -45,13 +45,20 @@ impl ConvLayer {
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
-        crate::quantum::before_tiled_stage(x.shape(), x.item_size() as u64, &self.w, false)?;
+        let labels = &crate::quantum::ENCODE_LABELS;
+        crate::quantum::before_tiled_stage(
+            labels.stage,
+            x.shape(),
+            x.item_size() as u64,
+            &self.w,
+            false,
+        )?;
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
-            crate::quantum::before_tile(tile, &self.w)?;
+            crate::quantum::before_tile(labels.tile, tile, &self.w)?;
             Ok(tile.clone())
         })?;
         if mlx_gen::ios_quantum::enabled() {
-            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&h])?;
+            mlx_gen::ios_quantum::finish(labels.stage, &[&h])?;
         }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }
@@ -70,14 +77,21 @@ impl ConvLayer {
         }
         let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
         // iOS: the tiled output convolution is one stage; each tile is checked on its own.
-        crate::quantum::before_tiled_stage(x.shape(), x.item_size() as u64, &self.w, false)?;
+        let labels = &crate::quantum::DECODE_LABELS;
+        crate::quantum::before_tiled_stage(
+            labels.stage,
+            x.shape(),
+            x.item_size() as u64,
+            &self.w,
+            false,
+        )?;
         let global = GlobalGroupNorm::new(&x, &norm.weight, &norm.bias, GN_GROUPS, GN_EPS)?;
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
-            crate::quantum::before_tile(tile, &self.w)?;
+            crate::quantum::before_tile(labels.tile, tile, &self.w)?;
             silu(&global.apply(tile)?)
         })?;
         if mlx_gen::ios_quantum::enabled() {
-            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&h])?;
+            mlx_gen::ios_quantum::finish(labels.stage, &[&h])?;
         }
         Ok(h.transpose_axes(&[0, 3, 1, 2])?)
     }

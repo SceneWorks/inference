@@ -55,6 +55,7 @@ pub(crate) mod golden_fixture {
 }
 pub mod convert;
 pub mod dc_ae;
+pub mod ios_pricing;
 pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;

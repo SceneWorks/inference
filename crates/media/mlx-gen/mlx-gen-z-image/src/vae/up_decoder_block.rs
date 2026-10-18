@@ -62,8 +62,7 @@ impl UpDecoderBlock {
         Ok(h)
     }
 
-    /// The block's resnets and upsampler (the reachable-sizes prediction walks them).
-    #[cfg(test)]
+    /// The block's resnets and upsampler (the iOS pricing walks them).
     pub(crate) fn parts(&self) -> (&[ResnetBlock2D], Option<&UpSampler>) {
         (&self.resnets, self.upsampler.as_ref())
     }

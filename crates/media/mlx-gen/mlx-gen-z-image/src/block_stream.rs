@@ -222,20 +222,8 @@ impl ZImageBlockStream {
         index: usize,
     ) -> Result<(ZImageTransformerBlock, u64)> {
         let prefix = self.check(index, false)?;
-        let mut block = ZImageTransformerBlock::from_weights(view, &prefix, self.cfg)?;
-        let mut extra = stored_bytes(view);
-        // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
-        // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
-        // real release rather than a no-op that still produces correct images.
-        view.remove_accessed();
+        let (mut block, extra) = base_block_counted(view, &prefix, self.cfg, self.quant_bits)?;
         if let Some(bits) = self.quant_bits {
-            extra = extra.saturating_add(
-                block
-                    .projections()
-                    .iter()
-                    .map(|lin| crate::quantum::quantize_bytes(lin, bits))
-                    .sum::<u64>(),
-            );
             block.quantize(bits)?;
         }
         if let Some(adapters) = self.adapters.get(index) {
@@ -257,22 +245,66 @@ impl ZImageBlockStream {
         index: usize,
     ) -> Result<(crate::control_transformer_block::ZImageControlBlock, u64)> {
         let prefix = self.check(index, true)?;
-        let mut block = crate::control_transformer_block::ZImageControlBlock::from_weights(
-            view,
-            &prefix,
-            self.cfg,
-            index == 0,
-        )?;
-        // As for a base block: the stored bytes the quantum reads, plus the packed copies of a
-        // load-time quantization replayed over the (dense-only published) ControlNet weights.
-        let mut extra = stored_bytes(view);
-        view.remove_accessed();
+        let (mut block, extra) =
+            control_block_counted(view, &prefix, self.cfg, index == 0, self.quant_bits)?;
         if let Some(bits) = self.quant_bits {
-            extra = extra.saturating_add(block.quantize_bytes(bits));
             block.quantize(bits)?;
         }
         Ok((block, extra))
     }
+}
+
+/// Build base block `prefix` from `view` (lazy handles: nothing is read) and drain the view of
+/// exactly the tensors it read, returning what the block's iOS quantum adds for having been
+/// materialized there: their stored bytes plus, replaying `quant_bits`, the packed copies the
+/// quantization builds. Does not quantize. Shared with the header-only iOS pricing
+/// (`crate::ios_pricing`).
+pub(crate) fn base_block_counted(
+    view: &mut Weights,
+    prefix: &str,
+    cfg: ZImageBlockConfig,
+    quant_bits: Option<i32>,
+) -> Result<(ZImageTransformerBlock, u64)> {
+    let block = ZImageTransformerBlock::from_weights(view, prefix, cfg)?;
+    let mut extra = stored_bytes(view);
+    // LOAD-BEARING (SC-15750): the view keeps its own refcounted handle to every tensor the
+    // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
+    // real release rather than a no-op that still produces correct images.
+    view.remove_accessed();
+    if let Some(bits) = quant_bits {
+        extra = extra.saturating_add(
+            block
+                .projections()
+                .iter()
+                .map(|lin| crate::quantum::quantize_bytes(lin, bits))
+                .sum::<u64>(),
+        );
+    }
+    Ok((block, extra))
+}
+
+/// [`base_block_counted`] for a ControlNet block (block 0 carries `before_proj`): the stored bytes
+/// the quantum reads, plus the packed copies of a load-time quantization replayed over the
+/// (dense-only published) ControlNet weights. Does not quantize.
+pub(crate) fn control_block_counted(
+    view: &mut Weights,
+    prefix: &str,
+    cfg: ZImageBlockConfig,
+    has_before_proj: bool,
+    quant_bits: Option<i32>,
+) -> Result<(crate::control_transformer_block::ZImageControlBlock, u64)> {
+    let block = crate::control_transformer_block::ZImageControlBlock::from_weights(
+        view,
+        prefix,
+        cfg,
+        has_before_proj,
+    )?;
+    let mut extra = stored_bytes(view);
+    view.remove_accessed();
+    if let Some(bits) = quant_bits {
+        extra = extra.saturating_add(block.quantize_bytes(bits));
+    }
+    Ok((block, extra))
 }
 
 /// Stored bytes of the tensors a constructor read from `view` (header dtype x shape of the lazy

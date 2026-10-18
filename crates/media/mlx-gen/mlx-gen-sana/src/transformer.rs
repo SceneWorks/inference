@@ -709,7 +709,7 @@ impl SanaBlock {
             budget,
             hidden.dtype(),
         ));
-        mlx_gen::ios_quantum::run("SANA block", scratch, || {
+        mlx_gen::ios_quantum::run(crate::quantum::labels::BLOCK, scratch, || {
             // 1. Modulation: scale_shift_table[None] + temb.reshape(B,6,-1)  → chunk(6) along axis 1.
             let ss = self.scale_shift_table.reshape(&[1, 6, dim])?;
             let modg = add(&ss, &temb.reshape(&[b, 6, dim])?)?; // [B,6,dim]
@@ -1063,7 +1063,7 @@ impl SanaTransformer {
         let _quantum_scope = mlx_gen::ios_quantum::Scope::new();
         // The previous step's CFG combine + sampler update is lazy and materializes here.
         mlx_gen::ios_quantum::before(
-            "SANA patch/caption/timestep",
+            crate::quantum::labels::ENTRY,
             crate::quantum::entry_bytes(self.entry_quantum(
                 latent_nchw.shape(),
                 caption.shape(),
@@ -1077,7 +1077,7 @@ impl SanaTransformer {
         let (mut hidden, caption, temb, emb) =
             self.entry(latent_nchw, caption, timestep, guidance)?;
         mlx_gen::ios_quantum::finish(
-            "SANA patch/caption/timestep",
+            crate::quantum::labels::ENTRY,
             &[&hidden, &caption, &temb, &emb],
         )?;
 
@@ -1120,11 +1120,11 @@ impl SanaTransformer {
             return Err(Error::Canceled);
         }
         mlx_gen::ios_quantum::before(
-            "SANA output projection",
+            crate::quantum::labels::OUTPUT,
             crate::quantum::output_bytes(self.output_quantum(b, ph * pw, hidden.dtype())),
         )?;
         let out = self.output(&hidden, &emb, b, ph, pw)?;
-        mlx_gen::ios_quantum::finish("SANA output projection", &[&out])?;
+        mlx_gen::ios_quantum::finish(crate::quantum::labels::OUTPUT, &[&out])?;
         Ok(out)
     }
 
