@@ -63,6 +63,21 @@ pub fn provider_pricing(provider: &str) -> Option<Pricing> {
     }
 }
 
+/// The anchor VARIANT of a `(provider, mode)`: `base` when the provider has proven the mode
+/// component-additive on its CPU fixtures (`ios_anchor_law::measure_phases` + `derive`: the measured
+/// mode peak never exceeds the one derived from the text-mode run), so it is derived from the text
+/// anchor of its architecture; otherwise the mode key itself — a separate anchor family.
+pub fn anchor_variant(provider: &str, mode: &str) -> String {
+    let non_additive: &[&str] = match provider {
+        _ => &[],
+    };
+    if non_additive.contains(&mode) {
+        mode.to_string()
+    } else {
+        "base".to_string()
+    }
+}
+
 /// The phase a quantum label of `provider` runs in.
 pub fn quantum_phase(provider: &str, label: &str) -> Option<IosPhase> {
     provider_pricing(provider).and_then(|(_, phase)| phase(label))

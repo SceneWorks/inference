@@ -131,7 +131,11 @@ fn admit_one_of(
 fn kind(r: AdmissionResult<Admission>) -> Option<RefusalKind> {
     match r {
         Err(e) => e.refusal_kind(),
-        Ok(a) => panic!("admitted: {a:?}"),
+        Ok(a) => panic!(
+            "admitted: demand {} basis {:?}",
+            a.demand_bytes(),
+            a.basis()
+        ),
     }
 }
 
@@ -230,8 +234,9 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
     });
 }
 
-/// A different variant (here the img2img mode) is another anchor family and is never derived; a
-/// provider without counted pricing admits only its anchors' own keys.
+/// A component-additive mode (img2img) of the same ARCHITECTURE is derived from the text anchor; a
+/// header-different architecture is another family and never derived; a provider without counted
+/// pricing admits only its anchors' own keys.
 #[test]
 fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let registry = crate::provider_registry().unwrap();
@@ -252,11 +257,66 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
         "image_to_image",
     );
     priced(|| {
+        let admitted = admit_one_of(&registry, &img2img, 8192, &rows).unwrap();
         assert_eq!(
-            kind(admit_one_of(&registry, &img2img, 8192, &rows)),
+            admitted.basis(),
+            AdmissionBasis::Derived {
+                from: AnchorKind::Optimized
+            }
+        );
+    });
+    // Another architecture (a U-Net with different headers) is another family: never derived.
+    let other_root = fixture();
+    crate::sdxl::tests::write_tensor(
+        &other_root
+            .path()
+            .join("unet/diffusion_pytorch_model.safetensors"),
+        "F16",
+        16,
+    );
+    let other = at(
+        &registry,
+        other_root.path(),
+        1024,
+        MemoryStrategy::BoundedDecode,
+        "text_to_image",
+    );
+    assert_ne!(
+        evidence_key(&registry, &other, DEVICE)
+            .unwrap()
+            .architecture_sha256,
+        rows[0].key.architecture_sha256
+    );
+    priced(|| {
+        assert_eq!(
+            kind(admit_one_of(&registry, &other, 8192, &rows)),
             Some(RefusalKind::NoEvidence)
         );
     });
+    // Another route of the SAME architecture (a fine-tune: identical headers) shares the family.
+    let realvis = {
+        let mut c = candidate(
+            &registry,
+            root.path(),
+            "realvisxl",
+            1024,
+            Some(Quant::Q4),
+            "text_to_image",
+        );
+        if c.context.selection.strategy != MemoryStrategy::BoundedDecode {
+            c = at(
+                &registry,
+                root.path(),
+                1024,
+                MemoryStrategy::BoundedDecode,
+                "text_to_image",
+            );
+        }
+        c
+    };
+    let key = evidence_key(&registry, &realvis, DEVICE).unwrap();
+    assert_eq!(key.architecture_sha256, rows[0].key.architecture_sha256);
+    assert_eq!(key.family(), rows[0].key.family());
     // No pricing: the anchor's own key still admits (a measurement needs no scaling) …
     let big = at(
         &registry,

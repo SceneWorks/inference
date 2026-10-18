@@ -476,6 +476,9 @@ fn key_unchecked(
         route,
         tier: tier_label(&candidate.spec),
         layout_sha256: crate::layout::hex(&layout),
+        architecture_sha256: crate::layout::hex(&artifact(crate::layout::architecture_digest(
+            &candidate.spec,
+        ))?),
         mode: c.mode.as_key().into(),
         width: c.geometry.width,
         height: c.geometry.height,
@@ -570,12 +573,23 @@ fn completed(row: &AnchorRow) -> bool {
     row.demand_bytes().is_some()
 }
 
-/// The counted price of `candidate`'s family at an ANCHOR's configuration: the anchor's own
-/// selection, its execution levers and its reference geometry, on the candidate's artifact.
+/// The `MemoryMode` a key string names.
+fn mode_from_key(key: &str) -> MemoryMode {
+    match key {
+        "text_to_image" => MemoryMode::TextToImage,
+        "image_to_image" => MemoryMode::ImageToImage,
+        "edit" => MemoryMode::Edit,
+        other => MemoryMode::Other(other.to_string()),
+    }
+}
+
+/// The counted price of an ANCHOR's own configuration, on the request's artifact: the anchor's
+/// provider and mode, its selection and execution levers, its reference geometry, and the
+/// request's spec WITHOUT the mode-added components (ControlNet, IP-Adapter) — the anchor of a
+/// family measures its base architecture only.
 fn price_anchor(
-    pricer: mlx_gen::ios_pricing::IosPricer,
+    registry: &ProviderRegistry,
     candidate: &IosCandidate,
-    contract: &MemoryProviderContract,
     row: &AnchorRow,
 ) -> AdmissionResult<IosPricing> {
     let (Some(strategy), Some(parameters)) = (row.selection.strategy(), row.selection.parameters())
@@ -585,12 +599,23 @@ fn price_anchor(
             row.key
         )));
     };
+    let provider = row.key.provider.as_str();
+    let Some((pricer, _)) = crate::pricing::provider_pricing(provider) else {
+        return Err(no_evidence(format!("{provider}: no counted iOS pricing")));
+    };
+    let mut spec = candidate.spec.clone();
+    spec.control = None;
+    spec.extra_controls.clear();
+    spec.ip_adapter = None;
+    let contract = registry
+        .memory_strategy_contract(provider, &spec)?
+        .ok_or_else(|| no_evidence(format!("{provider}: no memory contract")))?;
     let selection = MemorySelection {
         strategy,
         parameters,
         tier: candidate.context.selection.tier,
     };
-    let execution = execution_for(&candidate.provider, contract, &selection);
+    let execution = execution_for(provider, &contract, &selection);
     let geometry = MemoryGeometry {
         width: row.key.width,
         height: row.key.height,
@@ -599,9 +624,9 @@ fn price_anchor(
         reference_count: row.key.reference_count,
     };
     pricer(&IosPricingRequest {
-        provider: &candidate.provider,
-        spec: &candidate.spec,
-        mode: &candidate.context.mode,
+        provider,
+        spec: &spec,
+        mode: &mode_from_key(&row.key.mode),
         geometry,
         selection: &selection,
         execution: &execution,
@@ -622,6 +647,7 @@ fn pricing_error(error: mlx_gen::Error) -> AdmissionError {
 
 /// Step 3: the request's demand and margin from the anchor table (see the module docs).
 fn anchored_demand(
+    registry: &ProviderRegistry,
     candidate: &IosCandidate,
     contract: &MemoryProviderContract,
     key: &EvidenceKey,
@@ -656,7 +682,8 @@ fn anchored_demand(
     let (resident, optimized) = evidence::family_anchors(rows, &family);
     let Some(optimized) = optimized.filter(|r| completed(r)) else {
         return Err(no_evidence(format!(
-            "no completed optimized anchor for {family:?} in {EVIDENCE_TABLE_PATH}: another mode,              tier, route, artifact layout or device is not derivable"
+            "no completed optimized anchor for {family:?} in {EVIDENCE_TABLE_PATH}: another \
+             architecture, tier, non-additive mode or device is not derivable"
         )));
     };
     // Execution levers OUTSIDE the ladder (e.g. CFG batching) are part of the regime the counted
@@ -692,7 +719,7 @@ fn anchored_demand(
         _ => optimized,
     };
     let measured = anchor::measured_anchor(base).ok_or_else(|| no_evidence("no capture".into()))?;
-    let at_base = price_anchor(pricer, candidate, contract, base)?;
+    let at_base = price_anchor(registry, candidate, base)?;
     let derived = anchor::derive(
         &measured,
         &at_base,
@@ -710,14 +737,16 @@ fn anchored_demand(
     if let Some(resident) = resident {
         let check = anchor::consistency(
             &anchor::measured_anchor(optimized).ok_or_else(|| no_evidence("no capture".into()))?,
-            &price_anchor(pricer, candidate, contract, optimized)?,
+            &price_anchor(registry, candidate, optimized)?,
             &anchor::measured_anchor(resident).ok_or_else(|| no_evidence("no capture".into()))?,
-            &price_anchor(pricer, candidate, contract, resident)?,
+            &price_anchor(registry, candidate, resident)?,
         )
         .map_err(|e| no_evidence(format!("{family:?}: anchors not mutually derivable: {e}")))?;
         if check.fails_closed() {
             return Err(no_evidence(format!(
-                "{family:?}: the optimized anchor under-predicts the measured resident anchor                  ({} B predicted vs {} B measured, {:+.1}% beyond the {:.1}% tolerance);                  derivations of this family fail closed",
+                "{family:?}: the optimized anchor under-predicts the measured resident anchor \
+                 ({} B predicted vs {} B measured, {:+.1}% beyond the {:.1}% tolerance); \
+                 derivations of this family fail closed",
                 check.predicted,
                 check.measured,
                 check.relative_error * 100.0,
@@ -824,7 +853,7 @@ fn admit_one(
         }
         let (demand_bytes, margin_bytes, basis, calibration) = match rows {
             None => (0, 0, AdmissionBasis::CapturePermit, Calibration::new()),
-            Some(rows) => anchored_demand(candidate, &contract, &key, rows)?,
+            Some(rows) => anchored_demand(registry, candidate, &contract, &key, rows)?,
         };
         let mut context = candidate.context.clone();
         if rows.is_some() {

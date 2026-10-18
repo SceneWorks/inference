@@ -65,7 +65,12 @@ pub struct EvidenceKey {
     pub tier: String,
     /// Path-free tensor/config layout digest of every configured source (hex SHA-256).
     pub layout_sha256: String,
-    /// `MemoryMode::as_key` of the request route (the anchor family's variant axis).
+    /// Path-free ARCHITECTURE digest of the base components (tensor names, shapes, dtypes and
+    /// packing from headers; [`crate::layout::architecture_digest`]): the anchor FAMILY axis. Two
+    /// checkpoints of one architecture share it; the per-checkpoint `layout_sha256` above stays the
+    /// exact-key artifact check.
+    pub architecture_sha256: String,
+    /// `MemoryMode::as_key` of the request route.
     pub mode: String,
     pub width: u32,
     pub height: u32,
@@ -83,25 +88,24 @@ impl EvidenceKey {
     pub fn family(&self) -> AnchorFamily {
         AnchorFamily {
             machine: self.machine.clone(),
-            provider: self.provider.clone(),
-            route: self.route.clone(),
+            architecture_sha256: self.architecture_sha256.clone(),
             tier: self.tier.clone(),
-            layout_sha256: self.layout_sha256.clone(),
-            mode: self.mode.clone(),
+            variant: crate::pricing::anchor_variant(&self.provider, &self.mode),
         }
     }
 }
 
-/// What must be equal between a request and an anchor for the anchor law to apply. A different
-/// mode (variant), tier, artifact layout (decoder / components), route or device is NOT derivable.
+/// What must be equal between a request and an anchor for the anchor law to apply: the device, the
+/// base ARCHITECTURE (so checkpoints of one architecture — the SDXL family's routes, SANA base and
+/// Sprint — share anchors, and a header-different checkpoint or decoder is its own family), the
+/// tier, and the anchor VARIANT: `base` for every mode the provider proves component-additive (its
+/// components and extra phases are priced on top of the text-mode anchor), else the mode itself.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnchorFamily {
     pub machine: String,
-    pub provider: String,
-    pub route: String,
+    pub architecture_sha256: String,
     pub tier: String,
-    pub layout_sha256: String,
-    pub mode: String,
+    pub variant: String,
 }
 
 /// Which extreme of the ladder an anchor measures.
@@ -363,13 +367,14 @@ struct Table {
 }
 
 fn validate_key(k: &EvidenceKey) -> Result<(), String> {
-    if k.layout_sha256.len() != 64
-        || !k
-            .layout_sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(format!("row {k:?}: layout_sha256 must be 64 lowercase hex"));
+    for digest in [&k.layout_sha256, &k.architecture_sha256] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(format!("row {k:?}: digests must be 64 lowercase hex"));
+        }
     }
     if !["bf16", "q8", "q4"].contains(&k.tier.as_str())
         || k.machine.is_empty()
@@ -586,6 +591,7 @@ mod tests {
             route: "sana_1600m".into(),
             tier: "q4".into(),
             layout_sha256: "ab".repeat(32),
+            architecture_sha256: "cd".repeat(32),
             mode: "text_to_image".into(),
             width: 512,
             height: 512,
