@@ -590,13 +590,78 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
             &mut dyn FnMut(Progress),
         ) -> RuntimeResult<R, Out>,
     ) -> RuntimeResult<R, Out> {
+        // Keep an unused legacy FnOnce alive through the complete compatibility
+        // call, including errors where the new API invokes its None cleanup arm.
+        let mut legacy_mid = Some(materialize_mid);
+        self.run_staged_request_scoped_with_prepare(
+            stage_residency,
+            streamable,
+            cancel,
+            use_pid,
+            on_progress,
+            None::<fn() -> RuntimeResult<R, ()>>,
+            |_| Ok(()),
+            |text, ()| encode(text),
+            materialize_encoded,
+            denoise,
+            |mid| match mid {
+                Some(mid) => {
+                    legacy_mid
+                        .take()
+                        .expect("FnOnce materializer called at most once")(mid)
+                }
+                None => Ok(()),
+            },
+            decode,
+        )
+    }
+
+    /// Three-phase execution with exclusive preparation. A staged warm cache is
+    /// fenced (when supplied) and ACTUALLY evicted under the same mutex BEFORE
+    /// PUP/preparation. The new mid materializer also receives None on errors so
+    /// a backend can fence queued work without masking the primary error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_staged_request_scoped_with_prepare<Prepared, Encoded, Mid, Out, WarmFence>(
+        &self,
+        stage_residency: bool,
+        streamable: bool,
+        cancel: &CancelFlag,
+        use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
+        synchronize_warm: Option<WarmFence>,
+        prepare: impl FnOnce(&mut dyn FnMut(Progress)) -> RuntimeResult<R, Prepared>,
+        encode: impl FnOnce(&Text, Prepared) -> RuntimeResult<R, Encoded>,
+        materialize_encoded: impl FnOnce(Option<&Encoded>) -> RuntimeResult<R, ()>,
+        denoise: impl FnOnce(&Heavy, Encoded, &mut dyn FnMut(Progress)) -> RuntimeResult<R, Mid>,
+        materialize_mid: impl FnOnce(Option<&Mid>) -> RuntimeResult<R, ()>,
+        decode: impl FnOnce(
+            Heavy::DecodeView<'_>,
+            Mid,
+            &mut dyn FnMut(Progress),
+        ) -> RuntimeResult<R, Out>,
+    ) -> RuntimeResult<R, Out>
+    where
+        WarmFence: FnOnce() -> RuntimeResult<R, ()>,
+    {
         check_cancel::<R>(cancel)?;
         if stage_residency || streamable {
             self.ensure_rebuildable("stage or rematerialize components")?;
         }
         let mut warm = self.warm()?;
+        if stage_residency {
+            if let Some(advisory) = &self.on_staged {
+                advisory();
+            }
+            if warm.is_some() {
+                if let Some(fence) = synchronize_warm {
+                    fence()?;
+                }
+            }
+            Self::evict_warm_locked(&mut warm);
+        }
+        let prepared = prepare(on_progress)?;
+        check_cancel::<R>(cancel)?;
         if !stage_residency {
-            // Same boundary placement as the two-phase warm arm above (sc-22738).
             let loading = Self::warm_needs_load(&warm, streamable);
             if loading {
                 on_progress(Progress::Loading(LoadPhase::TextEncoder));
@@ -606,28 +671,29 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
                 .map_err(Into::<R::Error>::into)?;
-            let encoded = match encode(&pair.text) {
+            let encoded = match encode(&pair.text, prepared) {
                 Ok(encoded) => encoded,
-                Err(error) => {
+                Err(primary) => {
                     let _ = materialize_encoded(None);
-                    return Err(error);
+                    return Err(primary);
                 }
             };
             check_cancel::<R>(cancel)?;
             if loading {
                 on_progress(Progress::Loading(LoadPhase::Renderer));
             }
-            let mid = denoise(&pair.heavy, encoded, on_progress)?;
+            let mid = match denoise(&pair.heavy, encoded, on_progress) {
+                Ok(mid) => mid,
+                Err(primary) => {
+                    let _ = materialize_mid(None);
+                    return Err(primary);
+                }
+            };
+            check_cancel::<R>(cancel)?;
             let result = decode(pair.heavy.decode_view(), mid, on_progress);
             drop(warm);
             return result;
         }
-
-        if let Some(advisory) = &self.on_staged {
-            advisory();
-        }
-        Self::evict_warm_locked(&mut warm);
-
         on_progress(Progress::Loading(LoadPhase::TextEncoder));
         let text = match (self.loaders.load_text)(streamable, Some(cancel)) {
             Ok(text) => text,
@@ -636,18 +702,17 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 return Err(error);
             }
         };
-        let encoded = match encode(&text) {
+        let encoded = match encode(&text, prepared) {
             Ok(encoded) => materialize_encoded(Some(&encoded)).map(|()| encoded),
-            Err(error) => {
+            Err(primary) => {
                 let _ = materialize_encoded(None);
-                Err(error)
+                Err(primary)
             }
         };
         drop(text);
         R::after_component_drop();
         let encoded = encoded?;
         check_cancel::<R>(cancel)?;
-
         on_progress(Progress::Loading(LoadPhase::Renderer));
         let heavy = match (self.loaders.load_heavy)(use_pid, streamable, Some(cancel)) {
             Ok(heavy) => heavy,
@@ -656,17 +721,22 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 return Err(error);
             }
         };
-        let light_and_mid = check_cancel::<R>(cancel).and_then(|()| {
-            denoise(&heavy, encoded, on_progress).and_then(|mid| {
-                materialize_mid(&mid)?;
-                Ok(mid)
-            })
-        });
-        let light_and_mid = match light_and_mid {
+        let denoised =
+            check_cancel::<R>(cancel).and_then(|()| denoise(&heavy, encoded, on_progress));
+        let mid = match denoised {
+            Ok(mid) => materialize_mid(Some(&mid))
+                .and_then(|()| check_cancel::<R>(cancel))
+                .map(|()| mid),
+            Err(primary) => {
+                let _ = materialize_mid(None);
+                Err(primary)
+            }
+        };
+        let light_and_mid = match mid {
             Ok(mid) => Ok((heavy.shed_dit(), mid)),
-            Err(error) => {
+            Err(primary) => {
                 drop(heavy);
-                Err(error)
+                Err(primary)
             }
         };
         R::after_component_drop();
@@ -800,6 +870,231 @@ mod tests {
             .unwrap();
         log.lock().unwrap().clear();
         owner
+    }
+
+    struct ThreeWitness {
+        dit: Witness,
+        ae: Witness,
+    }
+    impl StagedHeavy for ThreeWitness {
+        type Light = Witness;
+        type DecodeView<'a> = &'a Witness;
+        fn shed_dit(self) -> Self::Light {
+            drop(self.dit);
+            self.ae
+        }
+        fn decode_view(&self) -> Self::DecodeView<'_> {
+            &self.ae
+        }
+        fn light_view(light: &Self::Light) -> Self::DecodeView<'_> {
+            light
+        }
+    }
+    fn prepared_three_owner(
+        log: &Arc<Mutex<Vec<&'static str>>>,
+    ) -> Residency<Witness, ThreeWitness, Runtime> {
+        let text_log = log.clone();
+        let heavy_log = log.clone();
+        let owner = Residency::<Witness, ThreeWitness, Runtime>::request_scoped(
+            move |_| {
+                text_log.lock().unwrap().push("load-text");
+                Ok(Witness {
+                    name: "drop-text",
+                    log: text_log.clone(),
+                })
+            },
+            move |_, _| {
+                heavy_log.lock().unwrap().push("load-heavy");
+                Ok(ThreeWitness {
+                    dit: Witness {
+                        name: "drop-dit",
+                        log: heavy_log.clone(),
+                    },
+                    ae: Witness {
+                        name: "drop-ae",
+                        log: heavy_log.clone(),
+                    },
+                })
+            },
+        );
+        owner
+            .run_request_scoped(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                |_| Ok(()),
+                |_| Ok(()),
+                |_, (), _| Ok(()),
+            )
+            .unwrap();
+        log.lock().unwrap().clear();
+        owner
+    }
+
+    #[test]
+    fn prepared_three_phase_fences_warm_under_lock_then_drops_dit_before_decode() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_three_owner(&log);
+        let settings = (2032u32, 64u32, 7u32, 3.5f64, 2u32, vec![11u8, 7, 11]);
+        let output = owner
+            .run_staged_request_scoped_with_prepare(
+                true,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                Some(|| {
+                    assert!(matches!(
+                        owner.warm.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    log.lock().unwrap().push("warm-fence");
+                    Ok(())
+                }),
+                |_| {
+                    assert_eq!(
+                        *log.lock().unwrap(),
+                        vec!["warm-fence", "drop-text", "drop-dit", "drop-ae"]
+                    );
+                    log.lock().unwrap().push("pup");
+                    Ok(settings.clone())
+                },
+                |_, prepared| {
+                    assert_eq!(prepared, settings);
+                    log.lock().unwrap().push("encode");
+                    Ok(prepared)
+                },
+                |value| {
+                    assert!(value.is_some());
+                    log.lock().unwrap().push("text-fence");
+                    Ok(())
+                },
+                |_, encoded, _| {
+                    assert_eq!(encoded, settings);
+                    log.lock().unwrap().push("denoise");
+                    Ok(encoded)
+                },
+                |mid| {
+                    assert_eq!(mid, Some(&settings));
+                    log.lock().unwrap().push("mid-fence");
+                    Ok(())
+                },
+                |_, mid, _| {
+                    assert_eq!(log.lock().unwrap().last(), Some(&"drop-dit"));
+                    log.lock().unwrap().push("decode");
+                    Ok(mid)
+                },
+            )
+            .unwrap();
+        assert_eq!(output, settings);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "warm-fence",
+                "drop-text",
+                "drop-dit",
+                "drop-ae",
+                "pup",
+                "load-text",
+                "encode",
+                "text-fence",
+                "drop-text",
+                "load-heavy",
+                "denoise",
+                "mid-fence",
+                "drop-dit",
+                "decode",
+                "drop-ae"
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_three_phase_failed_warm_fence_retains_cache_and_never_prepares() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_three_owner(&log);
+        let result: crate::Result<()> = owner.run_staged_request_scoped_with_prepare(
+            true,
+            false,
+            &CancelFlag::new(),
+            false,
+            &mut |_| {},
+            Some(|| {
+                log.lock().unwrap().push("failed-warm-fence");
+                Err(Error::Msg("warm fence failed".into()))
+            }),
+            |_| -> crate::Result<()> { panic!("PUP must not start") },
+            |_, ()| Ok(()),
+            |_| Ok(()),
+            |_, (), _| Ok(()),
+            |_| Ok(()),
+            |_, (), _| Ok(()),
+        );
+        assert!(matches!(result,Err(Error::Msg(message))if message=="warm fence failed"));
+        assert!(owner.warm.lock().unwrap().is_some());
+        assert_eq!(*log.lock().unwrap(), vec!["failed-warm-fence"]);
+    }
+
+    #[test]
+    fn prepared_three_phase_resident_does_not_fence_or_evict_warm_weights() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_three_owner(&log);
+        let output = owner
+            .run_staged_request_scoped_with_prepare(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |_| {},
+                Some(|| -> crate::Result<()> {
+                    panic!("resident warm owner must not be fenced for eviction")
+                }),
+                |_| {
+                    log.lock().unwrap().push("pup");
+                    Ok(37)
+                },
+                |_, n| Ok(n),
+                |_| panic!("resident text remains owned"),
+                |_, n, _| Ok(n),
+                |_| panic!("resident DiT remains owned"),
+                |_, n, _| Ok(n),
+            )
+            .unwrap();
+        assert_eq!(output, 37);
+        assert!(owner.warm.lock().unwrap().is_some());
+        assert_eq!(*log.lock().unwrap(), vec!["pup"]);
+    }
+
+    #[test]
+    fn prepared_three_phase_denoise_error_attempts_cleanup_without_masking_primary() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let owner = prepared_three_owner(&log);
+        let result: crate::Result<()> = owner.run_staged_request_scoped_with_prepare(
+            true,
+            false,
+            &CancelFlag::new(),
+            false,
+            &mut |_| {},
+            Some(|| Ok(())),
+            |_| Ok(()),
+            |_, ()| Ok(()),
+            |_| Ok(()),
+            |_, (), _| {
+                log.lock().unwrap().push("denoise-error");
+                Err(Error::Msg("primary denoise error".into()))
+            },
+            |mid: Option<&()>| {
+                assert!(mid.is_none());
+                log.lock().unwrap().push("mid-error-fence");
+                Err(Error::Msg("cleanup failure".into()))
+            },
+            |_, (), _| -> crate::Result<()> { panic!("decode after error") },
+        );
+        assert!(matches!(result,Err(Error::Msg(message))if message=="primary denoise error"));
+        let events = log.lock().unwrap();
+        assert!(events.ends_with(&["denoise-error", "mid-error-fence", "drop-dit", "drop-ae"]));
     }
 
     #[test]

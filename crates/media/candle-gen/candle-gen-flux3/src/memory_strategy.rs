@@ -39,16 +39,18 @@
 use std::path::Path;
 
 use candle_gen::candle_core::DType;
+use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
+use candle_gen::gen_core::flux3::quantization::DitFormat;
 use candle_gen::gen_core::flux3::{Flux3Config, GenerationResources, TextEncoderConfig};
 use candle_gen::gen_core::weightsmeta::{safetensors_path_tensor_headers, SafetensorsTensorHeader};
 use candle_gen::gen_core::{
     self, Error as CoreError, LoadShape, LoadSpec, MemoryArchitectureFacts, MemoryAssetFacts,
     MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
-    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
-    Precision, ResidentRequestMemory, Result as CoreResult,
+    MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant,
+    ResidentRequestMemory, Result as CoreResult,
 };
 
 use crate::model::MODEL_ID;
@@ -77,8 +79,9 @@ pub const TRANSFORMER_WINDOW_NOT_ENABLED: &str =
     "the FLUX 3 loader materializes the whole DiT at load; there is no deferred-materialization \
      load shape or block-window inference loader";
 
-/// The numeric tier a spec loads: the precision it names and no quantization (the loader refuses
-/// `LoadSpec::quantize`). No component is resident above the selected width.
+/// The numeric tier a spec loads: its precision and its DiT storage tier (`None` dense, or the
+/// GGML Q4_1 / Q8_0 package `LoadSpec::quantize` selects). No component is resident above the
+/// selected width; the encoder and autoencoder keep their own representations.
 fn loaded_tier(spec: &LoadSpec) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: spec.precision,
@@ -103,13 +106,43 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 /// Refuse the spec axes that would make a contract describe a load that cannot happen.
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
-    if spec.quantize.is_some() {
-        return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: the distilled route ships one dense tier; LoadSpec::quantize is refused \
-             at load (sc-26241), so there is no quantized memory contract"
-        )));
-    }
-    Ok(())
+    selected_storage(spec.quantize).map(|_| ())
+}
+
+/// The Candle native DiT storage a `LoadSpec::quantize` selects: dense, or the GGML Q4_1 / Q8_0
+/// packages converted from the ORIGINAL dense checkpoint. Publisher FP8R/NVFP4 have no Candle
+/// FLUX3 kernel on this build yet: a typed refusal, never a dequantized or dense substitute.
+pub fn selected_storage(quant: Option<Quant>) -> CoreResult<NativeDitStorage> {
+    Ok(match quant {
+        None => NativeDitStorage::Publisher(DitFormat::Dense),
+        Some(Quant::Q4) => NativeDitStorage::GgmlQ4_1,
+        Some(Quant::Q8) => NativeDitStorage::GgmlQ8_0,
+        // The frozen publisher artifacts, loaded as shipped onto their CUDA kernels. CUDA-only
+        // formats are normal: other builds refuse them below rather than dequantizing.
+        #[cfg(feature = "cuda")]
+        Some(Quant::Fp8Rowwise) => NativeDitStorage::Publisher(DitFormat::Fp8Rowwise),
+        #[cfg(feature = "cuda")]
+        Some(Quant::Nvfp4) => NativeDitStorage::Publisher(DitFormat::Nvfp4),
+        // Every format has a storage on the CUDA build; this refusal is the other builds'.
+        #[cfg_attr(feature = "cuda", allow(unreachable_patterns))]
+        Some(other) => {
+            return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID}: LoadSpec::quantize {} has no Candle FLUX3 kernel on this build; the \
+                 native Candle tiers are q4 (GGML Q4_1) and q8 (GGML Q8_0) converted from the \
+                 original dense package",
+                other.key()
+            )))
+        }
+    })
+}
+
+/// The calibration identity of one numeric tier. A packed tier is a different stored footprint
+/// and a different GEMM, so it never inherits the dense tier's identity.
+pub fn tier_fingerprint(base: &str, quant: Option<Quant>) -> CoreResult<String> {
+    Ok(match selected_storage(quant)? {
+        NativeDitStorage::Publisher(DitFormat::Dense) => base.to_owned(),
+        storage => format!("{base}-{}", storage.key()?.replace('_', "-")),
+    })
 }
 
 // ================================================================================================
@@ -167,6 +200,75 @@ pub fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
             },
         )
     }))
+}
+
+/// Resident DiT bytes for an explicit native storage, as `Flux3Dit::load_with_storage` holds it:
+///
+/// * each packed target at its EXACT stored bytes (GGML block scales live inside the blocks;
+///   publisher FP8 codes and packed E2M1 nibbles stage as stored), no dequantized copy anywhere;
+/// * a publisher `<stem>.weight_scale` at its STAGED width whatever its stored rank: FP8R row
+///   scales stage as f32 (4 B/element), NVFP4 block scales as their E4M3 bytes;
+/// * every other matrix at the compute width and every vector at f32, exactly as the dense path;
+/// * plus [`gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET`], charged ONCE as resident.
+///   The row-chunk planner caps every packed launch (f32 activation copy, Q8/FP8/FP4 activation
+///   codes, output and padding) at it, and it also bounds candle's grows-only CUDA quantized-matmul
+///   workspace, which persists after the largest launch. An upper bound, not a measurement.
+pub fn native_dit_bytes(
+    weights: &Path,
+    precision: Precision,
+    storage: NativeDitStorage,
+    cfg: &gen_core::flux3::DitConfig,
+) -> CoreResult<u64> {
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        return dit_bytes(weights, precision);
+    }
+    let headers = safetensors_path_tensor_headers(weights)?;
+    storage.validate_headers(cfg, &headers)?;
+    let targets = storage.packed_targets(cfg)?;
+    let compute_width = compute_width(precision) as u64;
+    let weights = checked_sum(headers.iter().map(|header| {
+        if targets.contains(&header.name) {
+            Ok(header.data_bytes)
+        } else if header.name.ends_with(".weight_scale") {
+            let elements = header
+                .shape
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+                .ok_or_else(|| {
+                    CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow"))
+                })?;
+            let staged = if storage == NativeDitStorage::Publisher(DitFormat::Fp8Rowwise) {
+                4
+            } else {
+                1
+            };
+            elements
+                .checked_mul(staged)
+                .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: scale size overflow")))
+        } else {
+            tensor_bytes(
+                header,
+                if header.shape.len() >= 2 {
+                    compute_width
+                } else {
+                    4
+                },
+            )
+        }
+    }))?;
+    weights
+        .checked_add(gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET)
+        .ok_or_else(|| CoreError::Unsupported(format!("{MODEL_ID}: DiT byte overflow")))
+}
+
+fn apply_tier_fingerprint(
+    contract: &mut MemoryProviderContract,
+    quant: Option<Quant>,
+) -> CoreResult<()> {
+    if let Some(calibration) = &mut contract.calibration {
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, quant)?;
+    }
+    Ok(())
 }
 
 /// Resident bytes of the autoencoder as [`crate::model::load_autoencoder`] holds it: f32.
@@ -266,11 +368,6 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
     // loaded policy: warm for a `Resident` load, staged for a `Sequential` one.
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
-    // After the conditioning release the DiT + autoencoder are the one heavy bundle, through the
-    // decode.
-    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
-        gen_core::StagedWeightSchedule::TwoStage,
-    ));
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -282,6 +379,9 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
         attention_chunking: false,
         transformer_window_materialization: false,
     };
+    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
+        gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
         // The attention transient moves with the pixel count (image tokens) and with the text
@@ -334,6 +434,7 @@ pub fn weights_free_memory_strategy_contract(
         // (always two rows, any guidance), carried by its separate calibration identity. It is
         // not a request variable: `count` still renders sequentially, so no BatchCount axis.
     }
+    apply_tier_fingerprint(&mut contract, spec.quantize)?;
     Ok(contract)
 }
 
@@ -393,7 +494,19 @@ pub(crate) fn generation_contract(
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let transformer = dit_bytes(&resources.dit_weights(), precision)?;
+    let storage = selected_storage(spec.quantize)?;
+    let package_storage = NativeDitStorage::from_package(&resources.package_dir)?;
+    if package_storage != storage {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: selected {} but the package quantization marker is {}; install the \
+             exact requested native tier (no tier or model fallback)",
+            storage.key()?,
+            package_storage.key()?
+        )));
+    }
+    storage.validate_selection(spec.quantize, precision)?;
+    apply_tier_fingerprint(&mut contract, spec.quantize)?;
+    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
     let conditioning = text_encoder_bytes(
         &resources.text_encoder_dir,
         production_tower_dtype(&config.text_encoder)?.size_in_bytes() as u64,
@@ -411,7 +524,11 @@ pub(crate) fn generation_contract(
         overlay_bytes: 0,
     };
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
-        account_upsampler(&mut contract, crate::pup::load_memory_bytes(&dir)?)?;
+        account_upsampler(
+            &mut contract,
+            crate::pup::load_memory_bytes(&dir)?,
+            upsampler_residency(spec.offload_policy),
+        )?;
     }
     let mut adapter_bytes = 0u64;
     for adapter in &spec.adapters {
@@ -458,9 +575,35 @@ pub(crate) fn generation_contract(
     Ok(contract)
 }
 
-/// Keep the optional VLM separate from the image encoder. This is its conservative native
-/// source/load bound held throughout the render, NOT measured KV/activation peak memory.
-fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+/// A `Sequential` load always runs the PUP slot exclusively: the bounded VLM is fenced and its
+/// actual owner dropped before the text encoder loads, so it is priced as consumed during
+/// conditioning with nothing retained. A `Resident` load may keep it warm across requests and
+/// stays conservatively whole-render (a request-admitted staging only lowers the real peak).
+pub(crate) fn upsampler_residency(
+    policy: gen_core::OffloadPolicy,
+) -> gen_core::MemoryComponentResidency {
+    match policy {
+        gen_core::OffloadPolicy::Resident => gen_core::MemoryComponentResidency::WholeRender,
+        gen_core::OffloadPolicy::Sequential => {
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                evidence: "candle_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
+                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                    .into(),
+            }
+        }
+    }
+}
+
+/// Keep the optional VLM separate from the image encoder. `bytes` is its native header-only
+/// load bound (prefix cache and CUDA graphs disabled), NOT measured KV/activation peak memory;
+/// the LLM admits its request-time KV separately.
+fn account_upsampler(
+    contract: &mut MemoryProviderContract,
+    bytes: u64,
+    residency: gen_core::MemoryComponentResidency,
+) -> CoreResult<()> {
     if bytes == 0 {
         return Err(CoreError::Unsupported(format!(
             "{MODEL_ID}: prompt_upsampler has no accountable weights; install the complete package"
@@ -480,7 +623,7 @@ fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreR
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
+            residency,
         }],
     };
     Ok(())
@@ -582,26 +725,84 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
-    Ok(Some(gen_core::flux3::references::guard_memory_scope(
-        Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
-            config,
-        )),
-        context.geometry,
-    )))
+    Ok(Some(
+        gen_core::flux3::references::guard_memory_scope_with_resources(
+            Box::new(candle_gen::request_scope::CandleRequestScopeCore::new(
+                config,
+            )),
+            context.geometry,
+            context.reference_resources.clone(),
+        ),
+    ))
 }
 
-/// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,
-/// under both offload policies. No loader accepts a quantized tier or has a deferred load shape,
-/// so neither is witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the route witnesses: the dense tier and the two native GGML tiers
+/// (q4 = Q4_1, q8 = Q8_0), eagerly materialized, under both offload policies. NVFP4 and the
+/// deferred load shape have no Candle FLUX3 loader, so neither is witnessed.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
-    gen_core::candle_memory_contract_surface_specs()
+    // The CUDA build additionally witnesses the publisher FP8R/NVFP4 tiers it loads as shipped.
+    #[cfg(feature = "cuda")]
+    let surfaces = gen_core::candle_publisher_memory_contract_surface_specs();
+    #[cfg(not(feature = "cuda"))]
+    let surfaces = gen_core::candle_memory_contract_surface_specs();
+    surfaces
         .into_iter()
         .filter(|surface| {
-            surface.selector.tier == MemoryContractSurfaceTier::Bf16
+            selected_storage(surface.spec.quantize).is_ok()
                 && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
 }
+
+/// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
+/// formula ([`gen_core::flux3::reference_workspace`]). On the Candle CPU backend every DiT GEMM
+/// runs over f32 temporaries whatever the compute dtype, so the per-token term is priced at f32.
+fn reference_workspace_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    refuse_unloadable_spec(spec)?;
+    let width = if production_device_is_cpu() {
+        4
+    } else {
+        u64::from(compute_width(spec.precision))
+    };
+    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+        spec,
+        provider_id,
+        width,
+    )?;
+    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+}
+
+/// `flux3_klein`'s pre-fit reference pricer.
+pub fn reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(MODEL_ID, spec, facts)
+}
+
+/// `flux3_klein_base`'s pre-fit reference pricer (references occupy both CFG rows).
+pub fn base_reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(gen_core::flux3::BASE_MODEL_ID, spec, facts)
+}
+
+pub const REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: MODEL_ID,
+        reference_workspace_bytes,
+    };
+
+pub const BASE_REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        reference_workspace_bytes: base_reference_workspace_bytes,
+    };
 
 /// The pre-load contract and admission check of `flux3_klein`.
 pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -749,7 +950,12 @@ mod tests {
         let mut contract = base_contract(Precision::Bf16, None);
         contract.asset_facts.base_bytes = 113;
         contract.asset_facts.conditioning_bytes = 17;
-        account_upsampler(&mut contract, 37).unwrap();
+        account_upsampler(
+            &mut contract,
+            37,
+            upsampler_residency(gen_core::OffloadPolicy::Resident),
+        )
+        .unwrap();
         assert_eq!(contract.asset_facts.base_bytes, 113);
         assert_eq!(contract.asset_facts.conditioning_bytes, 17);
         assert_eq!(contract.asset_facts.overlay_bytes, 37);
@@ -773,25 +979,205 @@ mod tests {
             resident_components[0].residency,
             gen_core::MemoryComponentResidency::WholeRender
         );
-        assert!(account_upsampler(&mut contract, 0).is_err());
+        assert_eq!(contract.auxiliary_resident_bytes(), 37);
+        assert!(account_upsampler(
+            &mut contract,
+            0,
+            upsampler_residency(gen_core::OffloadPolicy::Resident)
+        )
+        .is_err());
+
+        // Sequential: the exclusive slot drops PUP before conditioning work, so the bound is the
+        // conditioning-phase head only and NO later phase is charged for it.
+        let mut staged = base_contract(Precision::Bf16, None);
+        staged.asset_facts.base_bytes = 113;
+        staged.asset_facts.conditioning_bytes = 17;
+        staged.asset_facts.transformer_bytes = 96;
+        account_upsampler(
+            &mut staged,
+            37,
+            upsampler_residency(gen_core::OffloadPolicy::Sequential),
+        )
+        .unwrap();
+        let component = &staged.resident_components()[0];
+        assert_eq!(component.resident_bytes, 37);
+        assert_eq!(component.steady_state_bytes(), 0);
+        assert_eq!(component.evicted_bytes(), 37);
+        assert!(matches!(
+            component.residency,
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                ..
+            }
+        ));
+        assert!(
+            staged.conformance_errors().is_empty(),
+            "{:?}",
+            staged.conformance_errors()
+        );
+    }
+
+    /// The pre-fit reference pricer through the real catalog: zero without references, priced
+    /// and monotone with them, and the base CFG route charges its reference tokens in both rows.
+    ///
+    /// *Mutations that red this:* not registering the pricer, pricing `None` as non-zero, or the
+    /// base route pricing one CFG row.
+    /// Publisher packages price codes as stored, `weight_scale` at its STAGED width (FP8R f32 row
+    /// scales 4 B, NVFP4 E4M3 block scales 1 B), every other matrix at the compute width and
+    /// vectors at f32, plus the one resident packed-launch cap.
+    ///
+    /// *Mutations that red this:* pricing FP8R scales at the compute width, or NVFP4 block scales
+    /// as a float matrix.
+    #[test]
+    fn publisher_scales_price_at_their_staged_width() {
+        use gen_core::flux3::safetensors_stream::{PlannedTensor, SafetensorsStreamWriter};
+        use gen_core::weightsmeta::Dtype;
+        let cfg = Flux3Config::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
+        )
+        .unwrap()
+        .dit;
+        let dir = tempfile::tempdir().unwrap();
+        for format in [DitFormat::Fp8Rowwise, DitFormat::Nvfp4] {
+            let storage = NativeDitStorage::Publisher(format);
+            let expected = storage.expected_tensors(&cfg).unwrap();
+            let path = dir.path().join(format!("{format:?}.safetensors"));
+            let planned: Vec<PlannedTensor> = expected
+                .iter()
+                .map(|(name, spec)| PlannedTensor {
+                    name: name.clone(),
+                    dtype: format!("{:?}", spec.dtype),
+                    shape: spec.shape.clone(),
+                })
+                .collect();
+            let mut writer =
+                SafetensorsStreamWriter::create(&path, planned, &Default::default()).unwrap();
+            for (name, spec) in &expected {
+                writer
+                    .write(name, &vec![0u8; spec.bytes().unwrap() as usize])
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            let targets = storage.packed_targets(&cfg).unwrap();
+            let want: u64 = expected
+                .iter()
+                .map(|(name, spec)| {
+                    let elements: u64 = spec.shape.iter().map(|&d| d as u64).product();
+                    if targets.contains(name) {
+                        spec.bytes().unwrap()
+                    } else if name.ends_with(".weight_scale") {
+                        elements
+                            * if format == DitFormat::Fp8Rowwise {
+                                4
+                            } else {
+                                1
+                            }
+                    } else if spec.dtype == Dtype::BF16 && spec.shape.len() >= 2 {
+                        elements * 2
+                    } else if spec.dtype == Dtype::BF16 || spec.dtype == Dtype::F32 {
+                        elements * 4
+                    } else {
+                        spec.bytes().unwrap()
+                    }
+                })
+                .sum::<u64>()
+                + gen_core::flux3::packed_gemm::PACKED_GEMM_TRANSIENT_BUDGET;
+            assert_eq!(
+                native_dit_bytes(&path, Precision::Bf16, storage, &cfg).unwrap(),
+                want,
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_reference_pricer_is_additive_and_monotone_on_both_routes() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures");
+        let registry = crate::provider_registry().unwrap();
+        let facts = |canvases: &[(u32, u32)]| gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens: canvases
+                .iter()
+                .map(|&(w, h)| u64::from(w / 16) * u64::from(h / 16))
+                .sum(),
+            prepared_canvases: canvases.to_vec(),
+        };
+        let mut per_route = Vec::new();
+        for (id, dir) in [
+            (MODEL_ID, "tiny-snapshot"),
+            (gen_core::flux3::BASE_MODEL_ID, "tiny-base-snapshot"),
+        ] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(fixtures.join(dir)));
+            // The tiny base package ships only config + DiT; both routes take the distilled
+            // package's encoder and autoencoder as components, as the generator tests do.
+            spec.components.insert(
+                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
+            );
+            assert_eq!(
+                registry.reference_workspace_bytes(id, &spec, None).unwrap(),
+                Some(0)
+            );
+            let one = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64)])))
+                .unwrap()
+                .unwrap();
+            let two = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64), (64, 64)])))
+                .unwrap()
+                .unwrap();
+            let big = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(128, 128)])))
+                .unwrap()
+                .unwrap();
+            assert!(one > 0 && two > one && big > one, "{id}: {one} {two} {big}");
+            per_route.push(two - one);
+        }
+        // Same tiny DiT widths: the base route's per-reference DiT term is at least the
+        // distilled one's (two CFG rows vs one).
+        assert!(per_route[1] > per_route[0], "{per_route:?}");
     }
 
     #[test]
     fn the_route_declares_exactly_the_rungs_its_engine_runs() {
         let surfaces = memory_contract_surface_specs();
-        assert_eq!(
-            surfaces.len(),
-            2,
-            "one dense tier, eager, x 2 offload policies"
-        );
-        let selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
-        assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
+        // Dense + GGML q4/q8 everywhere; the CUDA build adds the publisher fp8r/nvfp4 tiers.
+        let mut tiers = vec!["bf16", "q4", "q8"];
+        if cfg!(feature = "cuda") {
+            tiers.extend(["fp8r", "nvfp4"]);
+        }
+        let mut want: Vec<String> = tiers
+            .iter()
+            .flat_map(|t| {
+                [
+                    format!("{t}:resident:eager"),
+                    format!("{t}:sequential:eager"),
+                ]
+            })
+            .collect();
+        want.sort();
+        let mut selectors: Vec<String> = surfaces
+            .iter()
+            .map(|s| s.selector.id().to_string())
+            .collect();
+        selectors.sort();
+        assert_eq!(selectors, want, "eager tiers x 2 offload policies");
         for surface in &surfaces {
             let contract = weights_free_memory_strategy_contract(MODEL_ID, &surface.spec).unwrap();
             gen_core_testkit::memory_strategy_conformance(&contract);
             assert_eq!(contract.provider_id, MODEL_ID);
             let calibration = contract.calibration.as_ref().unwrap();
-            assert_eq!(calibration.fingerprint, MEMORY_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                calibration.fingerprint,
+                tier_fingerprint(MEMORY_CALIBRATION_FINGERPRINT, surface.spec.quantize).unwrap()
+            );
+            gen_core::validate_calibration_fingerprint(&calibration.fingerprint).unwrap();
             assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
             let declared: Vec<&str> = MemoryStrategy::ALL
                 .into_iter()
@@ -839,7 +1225,8 @@ mod tests {
             moe_expert: None,
         });
         for spec in [
-            sentinel().with_quant(Quant::Q4),
+            sentinel().with_quant(Quant::Nvfp4),
+            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
             adapters,
         ] {

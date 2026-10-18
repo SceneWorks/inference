@@ -3632,6 +3632,18 @@ impl MemoryMode {
     }
 }
 
+/// Reference-only geometry resolved from actual owned image carriers before
+/// admission/cache sizing, not user-authored numeric hints. `conditioning_tokens`
+/// excludes TEXT tokens and is not multiplied by CFG/job/decode batch. A backend
+/// prices encoder work by evaluating ALL ordered `(width, height)` canvases at
+/// its actual precision/tile strategy and taking the largest allocation demand.
+/// There is deliberately no caller-supplied peak or preselected maximum canvas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryReferenceResourceFacts {
+    pub conditioning_tokens: u64,
+    pub prepared_canvases: Vec<(u32, u32)>,
+}
+
 /// Context for provider safety and lifecycle hooks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRunContext {
@@ -3650,6 +3662,9 @@ pub struct MemoryRunContext {
     pub use_pid: bool,
     pub has_phases: bool,
     pub geometry: MemoryGeometry,
+    /// Actual ordered reference geometry, when the provider requires full token/
+    /// encoder-workspace proof. `None` preserves legacy/no-reference callers.
+    pub reference_resources: Option<MemoryReferenceResourceFacts>,
     /// Exact overlay identity used for evidence keying. Structured request data belongs in typed
     /// context or geometry fields; key/value encodings such as `references=2` are rejected.
     pub overlay: Option<String>,
@@ -3699,6 +3714,7 @@ pub fn standard_memory_behavior_context(
         ))
     })?;
     Ok(MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, tier, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Calibrated,
         calibration_abi: calibration.abi,
@@ -4293,11 +4309,7 @@ const fn precision_key(precision: Precision) -> &'static str {
 }
 
 const fn quant_key(quant: Quant) -> &'static str {
-    match quant {
-        Quant::Q4 => "q4",
-        Quant::Q8 => "q8",
-        Quant::Nvfp4 => "nvfp4",
-    }
+    quant.key()
 }
 
 impl MemoryEvidence {
@@ -4736,6 +4748,7 @@ mod tests {
     fn admitted_context(contract: &MemoryProviderContract) -> MemoryRunContext {
         let calibration = contract.calibration.as_ref().expect("calibration");
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
                 parameters: MemoryStrategyParameters::default(),

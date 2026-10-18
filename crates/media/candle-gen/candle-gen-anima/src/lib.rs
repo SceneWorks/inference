@@ -859,7 +859,7 @@ mod tests {
         let packed_columns = match quant {
             Quant::Q4 => 8,
             Quant::Q8 => 16,
-            Quant::Nvfp4 => unreachable!("Anima does not advertise NVFP4"),
+            Quant::Nvfp4 | Quant::Fp8Rowwise => unreachable!("Anima does not advertise NVFP4"),
         };
         // `[out, in·bits/32]` codes + `[out, in/64]` scales derive the physical bit width.
         m.insert(

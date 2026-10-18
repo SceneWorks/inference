@@ -2875,7 +2875,10 @@ impl ComponentPrecisionFloor {
     pub const fn applies_to(self, selected: Quant) -> bool {
         matches!(
             (self.selected_tier, selected),
-            (Quant::Q4, Quant::Q4) | (Quant::Q8, Quant::Q8) | (Quant::Nvfp4, Quant::Nvfp4)
+            (Quant::Q4, Quant::Q4)
+                | (Quant::Q8, Quant::Q8)
+                | (Quant::Nvfp4, Quant::Nvfp4)
+                | (Quant::Fp8Rowwise, Quant::Fp8Rowwise)
         )
     }
 }
@@ -3369,8 +3372,13 @@ pub struct Capabilities {
     /// conversation+seed; the `gen-core-testkit` `check_multi_turn` check enforces it. A model may
     /// advertise either path independently.
     pub supports_conversation_session: bool,
-    /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
-    /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
+    /// Exact native quantization formats this engine can load (empty slice = none),
+    /// whether from a pre-converted/publisher artifact or an explicitly supported
+    /// on-the-fly conversion. This is NOT a list of interchangeable bit widths:
+    /// FP8R does not inherit Q8 support. A loader must reject incompatible artifacts
+    /// and must not claim on-the-fly conversion where only a packaged tier exists.
+    /// Read by the worker's capability advertisement instead of a hardcoded per-row flag.
+    /// `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
     /// Component-local numeric floors applied above the selected model tier. Empty means that a q4
     /// load is uniformly q4 across every packable component. This is a binding provider contract:

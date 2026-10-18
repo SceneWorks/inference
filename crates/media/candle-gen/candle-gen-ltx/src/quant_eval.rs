@@ -119,6 +119,9 @@ impl Ltx25QuantMode {
             Some(Quant::Q4) => Ok(Self::Q4),
             Some(Quant::Q8) => Ok(Self::PackedQ8),
             Some(Quant::Nvfp4) => Ok(Self::Nvfp4),
+            Some(Quant::Fp8Rowwise) => Err(gen_core::Error::Unsupported(
+                "LTX-2.5 has no FP8 rowwise quant mode".into(),
+            )),
         }
     }
 

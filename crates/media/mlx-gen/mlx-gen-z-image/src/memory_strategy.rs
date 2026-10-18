@@ -1808,6 +1808,7 @@ mod tests {
 
     fn context_for(strategy: MemoryStrategy, use_pid: bool) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: selection_for(strategy, use_pid),
             calibration_abi: MEMORY_CALIBRATION_ABI,

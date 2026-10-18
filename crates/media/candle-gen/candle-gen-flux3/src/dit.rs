@@ -30,7 +30,8 @@ use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
     cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
-    packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader, Rope,
+    packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader,
+    PackedSource, PublisherSource, Rope,
 };
 
 /// `MLPEmbedder`: `out_layer(silu(in_layer(x)))`, bias-free.
@@ -354,15 +355,82 @@ impl Flux3Dit {
     /// at a time, each cast to `compute` as it is consumed, so the load peak is the compute-dtype
     /// model plus a single stored tensor) onto `device`.
     pub fn load(path: &Path, cfg: &DitConfig, compute: DType, device: &Device) -> Result<Self> {
+        Self::load_with_storage(
+            path,
+            cfg,
+            compute,
+            device,
+            candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+                candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
+            ),
+        )
+    }
+
+    /// [`Self::load`] for an explicit native storage. The exact physical inventory is validated
+    /// from the headers BEFORE any tensor is read; GGML targets load as `QTensor`s and every
+    /// other tensor through the dense compute-dtype path. Publisher FP8R/NVFP4 and MLX affine
+    /// storage are typed refusals here (no Candle kernel / not a Candle format).
+    pub fn load_with_storage(
+        path: &Path,
+        cfg: &DitConfig,
+        compute: DType,
+        device: &Device,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    ) -> Result<Self> {
+        use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
         if !path.is_file() {
             return Err(Error::Msg(format!(
                 "flux3: the DiT weights file {} does not exist",
                 path.display()
             )));
         }
+        let dense = NativeDitStorage::Publisher(
+            candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
+        );
+        if storage != dense {
+            // The dense path keeps its historical per-key checks; a packed package must match its
+            // exact physical inventory before one code byte is read.
+            let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+                .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
+            storage
+                .validate_headers(cfg, &headers)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+        }
+        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        let targets = || {
+            storage
+                .packed_targets(cfg)
+                .map_err(|e| Error::Unsupported(e.to_string()))
+        };
+        let (packed, publisher) = match storage {
+            NativeDitStorage::Publisher(DitFormat::Dense) => (None, None),
+            NativeDitStorage::GgmlQ4_1 | NativeDitStorage::GgmlQ8_0 => {
+                (Some(PackedSource::new(path, storage, targets()?)?), None)
+            }
+            // Shipped publisher artifacts load AS SHIPPED onto their frozen-recipe CUDA kernels;
+            // `PublisherSource::new` is the typed refusal on any other backend or device floor.
+            NativeDitStorage::Publisher(DitFormat::Fp8Rowwise | DitFormat::Nvfp4) => (
+                None,
+                Some(PublisherSource::new(path, storage, targets()?, device)?),
+            ),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "flux3: {} DiT storage has no Candle loader; install the native GGML tier \
+                     for Candle or the dense package",
+                    other.key().map_err(|e| Error::Unsupported(e.to_string()))?
+                )))
+            }
+        };
         let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], compute, device)
             .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", path.display())))?;
-        Self::from_var_builder(&vb, cfg, compute, device)
+        Self::from_var_builder_packed(
+            &vb,
+            cfg,
+            compute,
+            device,
+            packed.as_ref(),
+            publisher.as_ref(),
+        )
     }
 
     /// Build from an already-mapped checkpoint at `compute` dtype.
@@ -372,10 +440,23 @@ impl Flux3Dit {
         compute: DType,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_var_builder_packed(vb, cfg, compute, device, None, None)
+    }
+
+    fn from_var_builder_packed(
+        vb: &VarBuilder<'static>,
+        cfg: &DitConfig,
+        compute: DType,
+        device: &Device,
+        packed: Option<&PackedSource>,
+        publisher: Option<&PublisherSource>,
+    ) -> Result<Self> {
         let l = Loader {
             vb,
             compute,
             device,
+            packed,
+            publisher,
         };
         let hidden = cfg.hidden;
         let emb_in_image = l.linear("emb_in.image")?;

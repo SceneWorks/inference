@@ -61,6 +61,7 @@ fn main() -> Result<()> {
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
+        Some(Quant::Fp8Rowwise) => "fp8r",
         _ => "dense",
     };
     let steps: Option<u32> = arg(&args, "--steps").and_then(|s| s.parse().ok());

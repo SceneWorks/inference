@@ -2913,6 +2913,7 @@ mod tests {
             reference_count: 0,
         };
         let context = |geometry: MemoryGeometry, use_pid: bool| MemoryRunContext {
+            reference_resources: None,
             // The optimized StagedResidency probe must clear the shared authority gate to reach
             // the geometry clauses under test; Calibrated matches the fixture's real calibration
             // handshake above.

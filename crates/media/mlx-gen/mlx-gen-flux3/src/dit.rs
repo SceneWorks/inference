@@ -370,9 +370,21 @@ impl Flux3Dit {
 
     /// Build from the package's `model.safetensors` (upstream key names) at `compute` dtype.
     pub fn from_weights(w: &Weights, cfg: &DitConfig, compute: Dtype) -> Result<Self> {
+        Self::from_weights_affine(w, cfg, compute, None)
+    }
+
+    /// [`Self::from_weights`] over a converted MLX affine package: the `affine` targets load as
+    /// packed `quantized_matmul` projections, every other tensor through the dense path.
+    pub fn from_weights_affine(
+        w: &Weights,
+        cfg: &DitConfig,
+        compute: Dtype,
+        affine: Option<&crate::nn::AffineTargets>,
+    ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
+            affine,
         };
         let hidden = cfg.hidden as i32;
         let emb_in_image = l.linear("emb_in.image")?;

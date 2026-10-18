@@ -638,6 +638,7 @@ fn estimated_behavior_context(
     route: gen_core::MemoryBehaviorRoute,
 ) -> gen_core::Result<MemoryRunContext> {
     Ok(MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
         calibration_abi: 0,

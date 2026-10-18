@@ -55,7 +55,8 @@ use crate::runtime::Quant;
 pub fn fidelity_rank(tier: Option<Quant>) -> u8 {
     match tier {
         None => 3,
-        Some(Quant::Q8) => 2,
+        // Same storage-width rank, not permission to substitute one format for the other.
+        Some(Quant::Q8) | Some(Quant::Fp8Rowwise) => 2,
         Some(Quant::Q4) | Some(Quant::Nvfp4) => 1,
     }
 }
@@ -87,6 +88,8 @@ pub fn control_branch_tier(base: Option<Quant>) -> Option<Quant> {
     match base {
         None => None,
         Some(Quant::Q8) => Some(Quant::Q8),
+        // No affine alias. Providers without this exact branch format reject it at load.
+        Some(Quant::Fp8Rowwise) => Some(Quant::Fp8Rowwise),
         Some(Quant::Q4) | Some(Quant::Nvfp4) => Some(Quant::Q8),
     }
 }

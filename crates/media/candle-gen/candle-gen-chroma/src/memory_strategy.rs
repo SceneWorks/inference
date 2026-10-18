@@ -1037,6 +1037,11 @@ pub(crate) fn weights_free_contract(
                 "Chroma has no NVFP4 turnkey".into(),
             ))
         }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
+            ))
+        }
     };
     let mut normalized = spec.clone();
     normalized.quantize = None;
@@ -1084,6 +1089,11 @@ pub(crate) fn weights_free_surface_contract(
         gen_core::MemoryContractSurfaceTier::Nvfp4 => {
             return Err(gen_core::Error::Unsupported(
                 "Chroma has no NVFP4 turnkey".into(),
+            ))
+        }
+        gen_core::MemoryContractSurfaceTier::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
             ))
         }
     };
@@ -1777,6 +1787,11 @@ fn weights_free_behavior_spec(provider_id: &str, spec: &LoadSpec) -> gen_core::R
                 "Chroma has no NVFP4 turnkey".into(),
             ))
         }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "Chroma has no FP8 rowwise turnkey".into(),
+            ))
+        }
     };
     let mut exact = spec.clone();
     exact.weights = WeightsSource::Dir(
@@ -1798,6 +1813,7 @@ fn estimated_behavior_context(
     route: MemoryBehaviorRoute,
 ) -> gen_core::Result<MemoryRunContext> {
     Ok(MemoryRunContext {
+        reference_resources: None,
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
         // sc-22731: the handshake half is the contract's OWN identity, whatever it is — the empty
@@ -2305,6 +2321,7 @@ mod tests {
 
     fn context(contract: &MemoryProviderContract, count: u32) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
                 parameters: MemoryStrategyParameters::default(),

@@ -171,6 +171,7 @@ fn admit(
     let evidence_revision = wan_i2v_memory::request_evidence_revision(prepared, request).unwrap();
     let geometry = wan_i2v_memory::geometry_from_request(request);
     MemoryRunContext {
+        reference_resources: None,
         selection,
         optimization_authority: if strategy.is_optimized() {
             MemoryOptimizationAuthority::Estimated

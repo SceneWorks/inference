@@ -37,9 +37,18 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
 pub mod adapters;
+pub mod affine;
+pub mod artifacts;
+pub mod conversion;
 pub mod image_input;
+pub mod native_convert;
+pub mod packed_gemm;
+pub mod phase_resource;
 pub mod pup;
+pub mod quantization;
+pub mod reference_workspace;
 pub mod references;
+pub mod safetensors_stream;
 pub mod training;
 
 // ---------------------------------------------------------------------------------------------
@@ -315,6 +324,9 @@ impl Flux3Config {
         };
         let quantization = match field(&root, "quantization", "")? {
             serde_json::Value::Null => None,
+            v if v.is_object() => artifacts::NativeDitStorage::from_marker(v)?
+                .config_marker_name()
+                .map(str::to_owned),
             v => Some(string_of(v, "quantization")?),
         };
         let vec_in_dim = match field(dit, "vec_in_dim", "dit.")? {
@@ -402,6 +414,17 @@ impl Flux3Config {
     /// mis-render. The supported set is the released bf16 architecture's switches; every width
     /// and depth is read from the file.
     pub fn validate_supported(&self) -> Result<()> {
+        self.validate_graph(false)
+    }
+
+    /// Validate graph/sampler semantics AFTER a caller has preflighted the exact
+    /// native artifact/backend/tier with `artifacts::NativeDitStorage`. Legacy
+    /// dense-only callers keep `validate_supported` and cannot misread packed codes.
+    pub fn validate_native_storage_graph(&self) -> Result<()> {
+        self.validate_graph(true)
+    }
+
+    fn validate_graph(&self, allow_native_storage: bool) -> Result<()> {
         let d = &self.dit;
         let checks: [(&str, bool, String); 14] = [
             (
@@ -410,10 +433,15 @@ impl Flux3Config {
                 self.format_version.to_string(),
             ),
             (
-                // sc-26241 adds the quantized variants; their `model.safetensors` carries packed
-                // codes the bf16 loader cannot read.
+                // Packed codes are accepted ONLY through the explicit-storage
+                // graph entry point; the historical dense entry point still refuses them.
                 "quantization",
-                self.quantization.is_none(),
+                self.quantization.is_none()
+                    || (allow_native_storage
+                        && matches!(
+                            self.quantization.as_deref(),
+                            Some("fp8r" | "nvfp4" | "mlx-affine" | "ggml-q4_1" | "ggml-q8_0")
+                        )),
                 format!("{:?}", self.quantization),
             ),
             (

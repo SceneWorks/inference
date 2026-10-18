@@ -877,6 +877,9 @@ fn validate_transformer_tensor_headers(
         Some(Quant::Nvfp4) => Err(CoreError::Unsupported(
             "flux2 Klein MLX does not support an NVFP4 artifact tier".to_owned(),
         )),
+        Some(Quant::Fp8Rowwise) => Err(CoreError::Unsupported(
+            "flux2 Klein MLX does not support an FP8 rowwise artifact tier".to_owned(),
+        )),
     }
 }
 
@@ -1536,7 +1539,7 @@ mod tests {
                     ("block.biases".to_owned(), "BF16", vec![8, 1]),
                 ]
             }
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         }
     }
 
@@ -1605,7 +1608,7 @@ mod tests {
             None => "bf16",
             Some(Quant::Q4) => "q4",
             Some(Quant::Q8) => "q8",
-            Some(Quant::Nvfp4) => unreachable!(),
+            Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
         };
         let repository = tmp.path().join(cache);
         let root = repository.join("snapshots").join(revision).join(tier_dir);
@@ -1845,7 +1848,7 @@ mod tests {
                 None => "bf16",
                 Some(Quant::Q4) => "q4",
                 Some(Quant::Q8) => "q8",
-                Some(Quant::Nvfp4) => unreachable!(),
+                Some(Quant::Nvfp4 | Quant::Fp8Rowwise) => unreachable!(),
             })
     }
 
@@ -1890,7 +1893,7 @@ mod tests {
             (TurnkeyFamily::Kv, None) => &KV_BF16,
             (TurnkeyFamily::Kv, Some(Quant::Q4)) => &KV_Q4,
             (TurnkeyFamily::Kv, Some(Quant::Q8)) => &KV_Q8,
-            (_, Some(Quant::Nvfp4)) => unreachable!(),
+            (_, Some(Quant::Nvfp4 | Quant::Fp8Rowwise)) => unreachable!(),
         };
         fixture.get_or_init(|| {
             let tmp = turnkey_fixture(family, tier);

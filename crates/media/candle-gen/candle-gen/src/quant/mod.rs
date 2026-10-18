@@ -125,6 +125,17 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use gen_core::Quant;
 
+// Reject the NEW format before a legacy quantizer can no-op over an already
+// packed base or allocate a dense CPU staging matrix. All old quant semantics stay unchanged.
+pub(crate) fn reject_rowwise_as_legacy_quant(quant: Quant) -> Result<()> {
+    if quant == Quant::Fp8Rowwise {
+        return Err(candle_core::Error::wrap(crate::CandleError::Unsupported(
+            "fp8r is source rowwise W8A8, not an affine/GGML tier; use the explicit fp8r provider kernel".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// The GGUF block type a load-time [`Quant`] level maps to when quantizing a *dense* weight in place
 /// — `Q4_0` / `Q8_0` (block size 32). Shared with the per-crate seams (Lens sc-5117, FLUX.2 sc-5917):
 /// the single source of truth for the family's `Quant → GgmlDType` mapping. The **packed** path uses
@@ -139,6 +150,9 @@ pub fn ggml_dtype(quant: Quant) -> Result<GgmlDType> {
     match quant {
         Quant::Q4 => Ok(GgmlDType::Q4_0),
         Quant::Q8 => Ok(GgmlDType::Q8_0),
+        Quant::Fp8Rowwise => candle_core::bail!(
+            "Quant::Fp8Rowwise is source rowwise W8A8, not affine Q8 or a GGUF block type; use a provider with the explicit fp8r packed kernel"
+        ),
         Quant::Nvfp4 => candle_core::bail!(
             "Quant::Nvfp4 has no GGUF block type; NVFP4 is served by Nvfp4Linear from a packed \
              Nvfp4Tensor (sc-11041), not the in-place GGUF fold"
@@ -786,6 +800,7 @@ impl QLinear {
         fwd: QuantForward,
         skip_indivisible: bool,
     ) -> Result<()> {
+        reject_rowwise_as_legacy_quant(quant)?;
         let Self::Dense(dense) = self else {
             return Ok(());
         };

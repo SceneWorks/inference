@@ -43,6 +43,48 @@ pub struct ReferencePlan {
     pub conditioning_tokens: u64,
 }
 
+impl ReferencePlan {
+    /// Reference-only admission facts. Keep every actual `(width,height)` canvas
+    /// in attachment order: equal areas need not have equal backend workspaces.
+    /// The backend evaluates its actual AE precision/tile estimator over ALL of
+    /// these shapes; this pure geometry layer makes no peak-memory claim.
+    pub fn memory_resources(&self) -> Result<crate::MemoryReferenceResourceFacts> {
+        if self.canvases.is_empty()
+            || self.canvases.len() > MAX_REFERENCES
+            || self.canvases.len() != self.geometry.len()
+        {
+            return Err(invalid("incomplete reference resource plan"));
+        }
+        let tokens = self
+            .canvases
+            .iter()
+            .try_fold(0_u64, |total, &(width, height)| {
+                if width == 0
+                    || height == 0
+                    || !width.is_multiple_of(16)
+                    || !height.is_multiple_of(16)
+                {
+                    return Err(invalid(
+                        "reference resource canvas is not on the source 16px grid",
+                    ));
+                }
+                let tokens = u64::from(width / 16) * u64::from(height / 16);
+                total
+                    .checked_add(tokens)
+                    .ok_or_else(|| invalid("reference token sum overflow"))
+            })?;
+        if tokens != self.conditioning_tokens {
+            return Err(invalid(
+                "reference token count disagrees with actual canvases",
+            ));
+        }
+        Ok(crate::MemoryReferenceResourceFacts {
+            conditioning_tokens: tokens,
+            prepared_canvases: self.canvases.clone(),
+        })
+    }
+}
+
 pub struct PreparedReferences {
     pub images: Vec<Image>,
     pub geometry: Vec<ReferenceGeometry>,
@@ -512,12 +554,37 @@ pub fn guard_memory_scope<'a>(
     inner: Box<dyn crate::MemoryRequestScope + 'a>,
     admitted: crate::MemoryGeometry,
 ) -> Box<dyn crate::MemoryRequestScope + 'a> {
-    Box::new(ReferenceScope { inner, admitted })
+    Box::new(ReferenceScope {
+        inner,
+        admitted,
+        resources: None,
+        require_resources: false,
+    })
+}
+
+/// Full external-admission proof. Unlike the legacy dimension/count-only guard,
+/// this requires actual reference facts when references were admitted, and checks
+/// them against the request's owned carriers BEFORE delegating to any phase hook.
+/// Standalone generation without an external scope still derives its source plan
+/// internally and is not forced to supply admission-only metadata.
+pub fn guard_memory_scope_with_resources<'a>(
+    inner: Box<dyn crate::MemoryRequestScope + 'a>,
+    admitted: crate::MemoryGeometry,
+    resources: Option<crate::MemoryReferenceResourceFacts>,
+) -> Box<dyn crate::MemoryRequestScope + 'a> {
+    Box::new(ReferenceScope {
+        inner,
+        admitted,
+        resources,
+        require_resources: true,
+    })
 }
 
 struct ReferenceScope<'a> {
     inner: Box<dyn crate::MemoryRequestScope + 'a>,
     admitted: crate::MemoryGeometry,
+    resources: Option<crate::MemoryReferenceResourceFacts>,
+    require_resources: bool,
 }
 
 impl crate::MemoryRequestScope for ReferenceScope<'_> {
@@ -536,7 +603,18 @@ impl crate::MemoryRequestScope for ReferenceScope<'_> {
                 self.admitted.width, self.admitted.height, self.admitted.reference_count
             )));
         }
-        normalize_request(req)?;
+        if self.require_resources {
+            let actual = plan
+                .as_ref()
+                .map(ReferencePlan::memory_resources)
+                .transpose()?;
+            if actual != self.resources || (self.admitted.reference_count > 0 && actual.is_none()) {
+                return Err(invalid("actual ordered reference canvases/tokens do not match admitted resource facts; resolve owned references before admission and cache sizing"));
+            }
+        }
+        if let Some(plan) = plan {
+            (req.width, req.height) = plan.output.canvas;
+        }
         self.inner.configure_request(req)
     }
     fn enter_phase(&mut self, phase: crate::MemoryPhase) -> Result<()> {

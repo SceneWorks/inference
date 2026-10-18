@@ -32,6 +32,8 @@
 use std::path::Path;
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+use mlx_gen::gen_core::flux3::artifacts::NativeDitStorage;
+use mlx_gen::gen_core::flux3::quantization::DitFormat;
 use mlx_gen::gen_core::flux3::{Flux3Config, GenerationResources};
 use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
 use mlx_gen::gen_core::{
@@ -40,8 +42,8 @@ use mlx_gen::gen_core::{
     MemoryCalibrationIdentity, MemoryContractSurfaceSpec, MemoryContractSurfaceTier,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
     MemoryNumericTier, MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, ResidentRequestMemory,
-    Result as CoreResult,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategySupport, Precision, Quant,
+    ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::LoadSpec;
 
@@ -96,13 +98,24 @@ pub(crate) fn refuse_deferred_load_shape(id: &str, spec: &LoadSpec) -> CoreResul
 /// Refuse the spec axes that would make a contract describe a load that cannot happen.
 fn refuse_unloadable_spec(spec: &LoadSpec) -> CoreResult<()> {
     refuse_deferred_load_shape(MODEL_ID, spec)?;
-    if spec.quantize.is_some() {
-        return Err(CoreError::Unsupported(format!(
-            "{MODEL_ID}: the distilled route ships one dense tier in S1; LoadSpec::quantize is \
-             refused at load (sc-26241), so there is no quantized memory contract"
-        )));
+    match spec.quantize {
+        None | Some(Quant::Q4 | Quant::Q8) => Ok(()),
+        Some(other) => Err(CoreError::Unsupported(format!(
+            "{MODEL_ID}: {} has no MLX FLUX3 kernel; the native MLX tiers are affine q4/q8 \
+             converted from the original dense package",
+            other.key()
+        ))),
     }
-    Ok(())
+}
+
+/// The calibration identity of one tier: a packed MLX affine tier never inherits the dense
+/// identity. Weights-free surfaces know only the bit width; a loaded package adds its group.
+pub fn tier_fingerprint(base: &str, quant: Option<Quant>, group: Option<u32>) -> String {
+    match (quant, group) {
+        (None, _) => base.to_owned(),
+        (Some(q), None) => format!("{base}-mlx-affine-{}", q.key()),
+        (Some(q), Some(g)) => format!("{base}-mlx-affine-{}-g{g}", q.key()),
+    }
 }
 
 /// Bytes per element of the DiT's compute dtype.
@@ -162,11 +175,6 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
     // A `Resident` selection leaves the request memory block absent, which keeps exactly the
     // loaded policy: warm for a `Resident` load, staged for a `Sequential` one.
     contract.resident_request_memory = ResidentRequestMemory::PreserveLoadDefaults;
-    // After the conditioning release the DiT + autoencoder are the one heavy bundle, through the
-    // decode.
-    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
-        gen_core::StagedWeightSchedule::TwoStage,
-    ));
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -178,6 +186,9 @@ fn base_contract(precision: Precision, config: Option<&Flux3Config>) -> MemoryPr
         attention_chunking: false,
         transformer_window_materialization: false,
     };
+    contract.phase_facts = Some(gen_core::MemoryPhaseFacts::staged(
+        gen_core::StagedWeightSchedule::ThreeStage,
+    ));
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
         // The attention transient moves with the pixel count (image tokens) and with the text
@@ -229,6 +240,9 @@ pub fn weights_free_memory_strategy_contract(
         // CFG's [unconditional, conditional] pack is a FIXED x2 coefficient of the base route
         // (always two rows, any guidance), carried by its separate calibration identity. It is
         // not a request variable: `count` still renders sequentially, so no BatchCount axis.
+    }
+    if let Some(calibration) = &mut contract.calibration {
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, None);
     }
     Ok(contract)
 }
@@ -289,7 +303,16 @@ pub(crate) fn generation_contract(
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
     }
 
-    let transformer = dit_bytes(&resources.dit_weights(), precision)?;
+    let storage = NativeDitStorage::from_package(&resources.package_dir)?;
+    storage.validate_selection(spec.quantize, precision)?;
+    if let Some(calibration) = &mut contract.calibration {
+        let group = match storage {
+            NativeDitStorage::MlxAffine { group_size, .. } => Some(group_size),
+            _ => None,
+        };
+        calibration.fingerprint = tier_fingerprint(&calibration.fingerprint, spec.quantize, group);
+    }
+    let transformer = native_dit_bytes(&resources.dit_weights(), precision, storage, &config.dit)?;
     let conditioning = text_encoder_bytes(&resources.text_encoder_dir)?;
     let decoder = autoencoder_bytes(&resources.autoencoder_file)?;
     let base_bytes = conditioning
@@ -306,13 +329,14 @@ pub(crate) fn generation_contract(
     if let Some(dir) = gen_core::flux3::pup::UpsamplePackage::component_dir(spec)? {
         gen_core::flux3::pup::UpsamplePackage::check(&dir)?;
         let llm_spec = gen_core::core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
-        let bytes = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
+        let load_bound = mlx_llm::load_memory_required_bytes(&llm_spec).map_err(|e| {
             CoreError::Unsupported(format!(
                 "{MODEL_ID}: cannot account for prompt_upsampler at {}: {e}",
                 dir.display()
             ))
         })?;
-        account_upsampler(&mut contract, bytes)?;
+        let (bytes, residency) = upsampler_charge(load_bound, spec.offload_policy)?;
+        account_upsampler(&mut contract, bytes, residency)?;
     }
     let mut adapter_bytes = 0u64;
     for adapter in &spec.adapters {
@@ -359,11 +383,42 @@ pub(crate) fn generation_contract(
     Ok(contract)
 }
 
-/// Charge the optional VLM exactly once, separate from the base encoder. The shared LLM
-/// header-only load bound includes derivatives and staging and conservatively reserves those
-/// bytes throughout the render, since this loader keeps the VLM alive. It does NOT estimate
-/// upsampling activations or its KV cache: those require the terminal resource campaign.
-fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreResult<()> {
+/// What the PUP slot actually holds per load policy. `Sequential` always takes the exclusive
+/// path: `load_bounded` (prefix cache 0), fenced and dropped before the text encoder loads, so
+/// the bare load bound is consumed in conditioning with nothing retained. `Resident` keeps the
+/// default `load` warm, whose cross-request prefix cache reserves its default budget on top of
+/// the weights; the header-only load bound does not include that budget, so it is added here.
+pub(crate) fn upsampler_charge(
+    load_bound: u64,
+    policy: gen_core::OffloadPolicy,
+) -> CoreResult<(u64, gen_core::MemoryComponentResidency)> {
+    Ok(match policy {
+        gen_core::OffloadPolicy::Resident => (
+            load_bound
+                .checked_add(gen_core::core_llm::defaults::MLX.prefix_cache_bytes)
+                .ok_or_else(|| CoreError::Unsupported("flux3: prompt_upsampler byte overflow".into()))?,
+            gen_core::MemoryComponentResidency::WholeRender,
+        ),
+        gen_core::OffloadPolicy::Sequential => (
+            load_bound,
+            gen_core::MemoryComponentResidency::PrecomputedThenEvicted {
+                precomputed_in: gen_core::MemoryPhase::Conditioning,
+                retained_bytes: 0,
+                evidence: "mlx_gen_flux3::model::tests::actual_generator_lazy_pup_bypass_and_exclusive_ownership_are_honest; \
+                           gen_core::flux3::phase_resource::tests::exclusive_work_fences_and_really_drops_before_the_next_phase"
+                    .into(),
+            },
+        ),
+    })
+}
+
+/// Charge the optional VLM exactly once, separate from the base encoder. It does NOT estimate
+/// upsampling activations or its KV cache: the LLM admits those at request time.
+fn account_upsampler(
+    contract: &mut MemoryProviderContract,
+    bytes: u64,
+    residency: gen_core::MemoryComponentResidency,
+) -> CoreResult<()> {
     if bytes == 0 {
         return Err(CoreError::Unsupported(
             "flux3: prompt_upsampler has no accountable weights; provision a complete package"
@@ -384,7 +439,7 @@ fn account_upsampler(contract: &mut MemoryProviderContract, bytes: u64) -> CoreR
             kind: gen_core::MemoryComponentKind::PromptUpsampler,
             resident_bytes: bytes,
             bounded_by: None,
-            residency: gen_core::MemoryComponentResidency::WholeRender,
+            residency,
         }],
     };
     Ok(())
@@ -399,6 +454,35 @@ fn dit_bytes(weights: &Path, precision: Precision) -> CoreResult<u64> {
     };
     projected_safetensors_bytes(weights, |header| {
         if header.shape.len() >= 2 {
+            cast
+        } else {
+            ResidentProjection::Stored
+        }
+    })
+}
+
+/// Resident DiT bytes for the declared storage, as `load_dit_with_storage` holds it: packed
+/// `u32` codes at their exact stored bytes, their scales/biases and every other matrix at the
+/// compute width, vectors as stored. MLX affine is W4/8A16: `quantized_matmul` reads the compute
+/// input directly and writes the same output a dense GEMM does, so it adds no packed transient.
+fn native_dit_bytes(
+    weights: &Path,
+    precision: Precision,
+    storage: NativeDitStorage,
+    cfg: &gen_core::flux3::DitConfig,
+) -> CoreResult<u64> {
+    if storage == NativeDitStorage::Publisher(DitFormat::Dense) {
+        return dit_bytes(weights, precision);
+    }
+    let targets = storage.packed_targets(cfg)?;
+    let cast = match precision {
+        Precision::Bf16 => ResidentProjection::Bfloat16,
+        Precision::Fp32 => ResidentProjection::Float32,
+    };
+    projected_safetensors_bytes(weights, |header| {
+        if targets.contains(&header.name) {
+            ResidentProjection::Stored
+        } else if header.shape.len() >= 2 {
             cast
         } else {
             ResidentProjection::Stored
@@ -535,27 +619,78 @@ pub(crate) fn registered_begin_request(
             )))
         },
     )?;
-    Ok(Some(gen_core::flux3::references::guard_memory_scope(
-        Box::new(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
-            config,
-            mlx_gen::request_scope::MlxScopeCleanup::Device,
-        )),
-        context.geometry,
-    )))
+    Ok(Some(
+        gen_core::flux3::references::guard_memory_scope_with_resources(
+            Box::new(mlx_gen::request_scope::MlxRequestScopeCore::with_cleanup(
+                config,
+                mlx_gen::request_scope::MlxScopeCleanup::Device,
+            )),
+            context.geometry,
+            context.reference_resources.clone(),
+        ),
+    ))
 }
 
-/// The registry-load surface the route witnesses: the one dense tier, eagerly materialized,
-/// under both offload policies. No loader accepts a quantized tier or has a deferred load shape,
-/// so neither is witnessed — a selector no load can take would be a witness-only surface.
+/// The registry-load surface the route witnesses: the dense tier and the MLX affine q4/q8
+/// tiers, eagerly materialized, under both offload policies. NVFP4 and the deferred load
+/// shape have no MLX FLUX3 loader, so neither is witnessed.
 pub fn memory_contract_surface_specs() -> Vec<MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
         .into_iter()
         .filter(|surface| {
-            surface.selector.tier == MemoryContractSurfaceTier::Bf16
-                && surface.selector.load_shape == LoadShape::EagerMaterialization
+            matches!(
+                surface.selector.tier,
+                MemoryContractSurfaceTier::Bf16
+                    | MemoryContractSurfaceTier::Q4
+                    | MemoryContractSurfaceTier::Q8
+            ) && surface.selector.load_shape == LoadShape::EagerMaterialization
         })
         .collect()
 }
+
+/// PRE-FIT reference workspace of one request on the package `spec` names, through the shared
+/// formula ([`gen_core::flux3::reference_workspace`]) at this backend's compute width.
+fn reference_workspace_for(
+    provider_id: &str,
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    refuse_unloadable_spec(spec)?;
+    let inputs = gen_core::flux3::reference_workspace::ReferenceWorkspaceInputs::from_spec(
+        spec,
+        provider_id,
+        u64::from(compute_width(spec.precision)),
+    )?;
+    gen_core::flux3::reference_workspace::reference_workspace_bytes(&inputs, Some(facts))
+}
+
+/// `flux3_klein`'s pre-fit reference pricer.
+pub fn reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(MODEL_ID, spec, facts)
+}
+
+/// `flux3_klein_base`'s pre-fit reference pricer (references occupy both CFG rows).
+pub fn base_reference_workspace_bytes(
+    spec: &LoadSpec,
+    facts: &gen_core::MemoryReferenceResourceFacts,
+) -> CoreResult<u64> {
+    reference_workspace_for(gen_core::flux3::BASE_MODEL_ID, spec, facts)
+}
+
+pub const REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: MODEL_ID,
+        reference_workspace_bytes,
+    };
+
+pub const BASE_REFERENCE_WORKSPACE_REGISTRATION: gen_core::ReferenceWorkspaceRegistration =
+    gen_core::ReferenceWorkspaceRegistration {
+        provider_id: gen_core::flux3::BASE_MODEL_ID,
+        reference_workspace_bytes: base_reference_workspace_bytes,
+    };
 
 /// The pre-load contract and admission check of `flux3_klein`.
 pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
@@ -697,22 +832,81 @@ mod tests {
     /// *Mutations that red this:* declaring `StagedResidency` `Missing`; promoting a bounded
     /// rung to `Implemented` (no lifecycle hook backs it); dropping the eager filter in
     /// `memory_contract_surface_specs`.
+    /// Hosted-only twin of the Candle test: the registered pre-fit reference pricer is zero
+    /// without references and priced and monotone with them, on both routes.
+    #[test]
+    fn registered_reference_pricer_is_additive_and_monotone_on_both_routes() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let registry = crate::provider_registry().unwrap();
+        let facts = |canvases: &[(u32, u32)]| gen_core::MemoryReferenceResourceFacts {
+            conditioning_tokens: canvases
+                .iter()
+                .map(|&(w, h)| u64::from(w / 16) * u64::from(h / 16))
+                .sum(),
+            prepared_canvases: canvases.to_vec(),
+        };
+        for (id, dir) in [
+            (MODEL_ID, "tiny-snapshot"),
+            (gen_core::flux3::BASE_MODEL_ID, "tiny-base-snapshot"),
+        ] {
+            let mut spec = LoadSpec::new(gen_core::WeightsSource::Dir(fixtures.join(dir)));
+            // The tiny base package ships only config + DiT; both routes take the distilled
+            // package's encoder and autoencoder as components, as the generator tests do.
+            spec.components.insert(
+                gen_core::flux3::TEXT_ENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::Dir(fixtures.join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                gen_core::flux3::AUTOENCODER_COMPONENT.into(),
+                gen_core::WeightsSource::File(fixtures.join("tiny-snapshot/ae.safetensors")),
+            );
+            assert_eq!(
+                registry.reference_workspace_bytes(id, &spec, None).unwrap(),
+                Some(0)
+            );
+            let one = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64)])))
+                .unwrap()
+                .unwrap();
+            let two = registry
+                .reference_workspace_bytes(id, &spec, Some(&facts(&[(64, 64), (64, 64)])))
+                .unwrap()
+                .unwrap();
+            assert!(one > 0 && two > one, "{id}: {one} {two}");
+        }
+    }
+
     #[test]
     fn the_route_declares_exactly_the_rungs_its_engine_runs() {
         let surfaces = memory_contract_surface_specs();
         assert_eq!(
             surfaces.len(),
-            2,
-            "one dense tier, eager, x 2 offload policies"
+            6,
+            "dense + MLX affine q4/q8 tiers, eager, x 2 offload policies"
         );
-        let selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
-        assert_eq!(selectors, ["bf16:resident:eager", "bf16:sequential:eager"]);
+        let mut selectors: Vec<_> = surfaces.iter().map(|s| s.selector.id()).collect();
+        selectors.sort();
+        assert_eq!(
+            selectors,
+            [
+                "bf16:resident:eager",
+                "bf16:sequential:eager",
+                "q4:resident:eager",
+                "q4:sequential:eager",
+                "q8:resident:eager",
+                "q8:sequential:eager"
+            ]
+        );
         for surface in &surfaces {
             let contract = weights_free_memory_strategy_contract(MODEL_ID, &surface.spec).unwrap();
             gen_core_testkit::memory_strategy_conformance(&contract);
             assert_eq!(contract.provider_id, MODEL_ID);
             let calibration = contract.calibration.as_ref().unwrap();
-            assert_eq!(calibration.fingerprint, MEMORY_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                calibration.fingerprint,
+                tier_fingerprint(MEMORY_CALIBRATION_FINGERPRINT, surface.spec.quantize, None)
+            );
+            gen_core::validate_calibration_fingerprint(&calibration.fingerprint).unwrap();
             assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
             let declared: Vec<&str> = MemoryStrategy::ALL
                 .into_iter()
@@ -755,7 +949,12 @@ mod tests {
         };
         let original = contract.asset_facts;
         let before = contract.total_resident_bytes();
-        account_upsampler(&mut contract, 37).unwrap();
+        account_upsampler(
+            &mut contract,
+            37,
+            gen_core::MemoryComponentResidency::WholeRender,
+        )
+        .unwrap();
         assert_eq!(contract.asset_facts.base_bytes, original.base_bytes);
         assert_eq!(
             contract.asset_facts.conditioning_bytes,
@@ -782,8 +981,39 @@ mod tests {
             contract.conformance_errors()
         );
         let mut absent = base_contract(Precision::Bf16, None);
-        assert!(account_upsampler(&mut absent, 0).is_err());
+        assert!(account_upsampler(
+            &mut absent,
+            0,
+            gen_core::MemoryComponentResidency::WholeRender
+        )
+        .is_err());
         assert_eq!(absent.asset_facts.overlay_bytes, 0);
+    }
+
+    #[test]
+    fn upsampler_charge_matches_the_loader_each_policy_actually_runs() {
+        let prefix = gen_core::core_llm::defaults::MLX.prefix_cache_bytes;
+        assert!(prefix > 0);
+        let (resident, whole) = upsampler_charge(37, gen_core::OffloadPolicy::Resident).unwrap();
+        assert_eq!(
+            resident,
+            37 + prefix,
+            "a warm default load reserves its prefix-cache budget"
+        );
+        assert_eq!(whole, gen_core::MemoryComponentResidency::WholeRender);
+        let (bounded, evicted) = upsampler_charge(37, gen_core::OffloadPolicy::Sequential).unwrap();
+        assert_eq!(bounded, 37, "load_bounded disables the prefix cache");
+        let mut staged = base_contract(Precision::Bf16, None);
+        account_upsampler(&mut staged, bounded, evicted).unwrap();
+        let component = &staged.resident_components()[0];
+        assert_eq!(component.steady_state_bytes(), 0);
+        assert_eq!(component.evicted_bytes(), 37);
+        assert!(
+            staged.conformance_errors().is_empty(),
+            "{:?}",
+            staged.conformance_errors()
+        );
+        assert!(upsampler_charge(u64::MAX, gen_core::OffloadPolicy::Resident).is_err());
     }
 
     #[test]
@@ -795,7 +1025,8 @@ mod tests {
     #[test]
     fn a_spec_no_loader_opens_has_no_contract() {
         for spec in [
-            sentinel().with_quant(Quant::Q4),
+            sentinel().with_quant(Quant::Nvfp4),
+            sentinel().with_quant(Quant::Fp8Rowwise),
             sentinel().with_load_shape(LoadShape::DeferredMaterialization),
         ] {
             match weights_free_memory_strategy_contract(MODEL_ID, &spec) {
