@@ -51,7 +51,7 @@ pub fn sdxl_generation_memory() -> GenerationMemory {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::evidence::{EvidenceRow, DEVICE_CAPTURE_CLASS};
+    use crate::evidence::{AnchorKind, AnchorRow, AnchorSelection, ANCHOR_MARGIN_FLOOR_BYTES};
     use crate::ios_admission::{
         admit_with_rows, build_candidate, capacity_budget, evidence_key, IosCandidate, IosWork,
     };
@@ -179,23 +179,27 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A synthetic completed anchor at `candidate`'s own key whose admission charge (measured
+    /// demand + the floored margin) is exactly `bytes`.
     pub(crate) fn capture(
         registry: &ProviderRegistry,
         candidate: &IosCandidate,
         bytes: u64,
-    ) -> EvidenceRow {
-        EvidenceRow {
-            key: evidence_key(registry, candidate, DEVICE).unwrap(),
-            footprint_bytes: bytes,
-            // Synthetic rows: a zero capture baseline makes the demand the whole figure.
-            baseline_footprint_bytes: 0,
-            mlx_peak_bytes: bytes,
-            min_headroom_mib: 1.0,
-            elapsed_seconds: 1.0,
-            evidence_class: DEVICE_CAPTURE_CLASS.into(),
-            run_id: "synthetic".into(),
-            build_sha: "synthetic".into(),
-        }
+    ) -> AnchorRow {
+        let kind = if candidate.context.selection.strategy == MemoryStrategy::Resident {
+            AnchorKind::Resident
+        } else {
+            AnchorKind::Optimized
+        };
+        crate::evidence::fixture::completed(
+            evidence_key(registry, candidate, DEVICE).unwrap(),
+            kind,
+            AnchorSelection::from_parts(
+                candidate.context.selection.strategy,
+                &candidate.context.selection.parameters,
+            ),
+            bytes.saturating_sub(ANCHOR_MARGIN_FLOOR_BYTES),
+        )
     }
 
     pub(crate) fn budget() -> MemoryBudget {
@@ -389,7 +393,7 @@ pub(crate) mod tests {
             capture(&registry, &candidates[2], cap),
         ];
         let admitted = admit_with_rows(&registry, &candidates, DEVICE, budget(), &rows).unwrap();
-        assert_eq!((admitted.index(), admitted.footprint_mib()), (2, 1024));
+        assert_eq!((admitted.index(), admitted.required_mib()), (2, 1024));
         // The next size up is refused as CAPACITY, typed, never as a string to parse.
         assert_eq!(
             refusal(admit_with_rows(

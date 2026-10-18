@@ -49,20 +49,22 @@
 //! [`zimage`] states the load defaults and the stored-tier artifact policy.
 
 mod admission;
+pub mod anchor;
 pub use admission::{sana_snapshot_profile, SanaSnapshotProfile};
 mod bound;
 pub mod evidence;
 pub mod ios_admission;
 mod layout;
+pub mod pricing;
 mod refusal;
 pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
 /// The labelled bounded device-capture permit; compiled only for the device harness.
 #[cfg(feature = "device-capture")]
 pub use ios_admission::capture_permit;
 pub use ios_admission::{
-    admit, build_candidate, capacity_budget, evidence_key, execution_key, tier_label, token_window,
-    validate_actual, work_binding, work_mode, Admission, IosCandidate, IosWork, IRIS_DEPTH_ID,
-    IRIS_RESTORE_ID,
+    admit, build_candidate, capacity_budget, evidence_key, execution_for, execution_key,
+    tier_label, token_window, validate_actual, work_binding, work_mode, Admission,
+    AdmissionBasis, IosCandidate, IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
 pub use layout::{artifact_layout_digest, hex};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads

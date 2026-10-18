@@ -69,7 +69,8 @@ pub mod media {
     pub use mlx_gen_ios_catalog::control_required;
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
-        anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
+        anchor, anima_turbo_planning_decision, build_candidate, capacity_budget, evidence,
+        evidence_key, pricing, AdmissionBasis,
         ios_memory_budget, ios_quantum, sana_decode_plan, sana_decode_tile_edge,
         sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
         zimage, Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
@@ -93,15 +94,18 @@ pub mod media {
 
     /// The capacity check at admission, before load and before every bound call (E4).
     ///
-    /// `demand_bytes` is the admitted work's own growth: the capture's peak minus the capture
-    /// process's starting footprint (the evidence row's baseline). Nothing this process already
-    /// holds is credited as reusable. On a recheck only the growth realized SINCE ADMISSION is
-    /// credited, `remaining = demand - (F_now - F_admission)`, so a loaded generator's second render
-    /// is not charged its weights twice while an unrelated resident never makes room. The
-    /// [`ios_quantum::PROCESS_RESERVE_BYTES`] reserve is part of the boundary: `remaining + reserve`
-    /// must fit live headroom; the projected absolute footprint must fit the single cap.
+    /// `required_bytes` is the admitted work's own growth plus its margin
+    /// ([`Admission::required_bytes`]): the anchor-measured (or anchor-law derived) growth over the
+    /// capture's starting footprint, plus the anchor's measured repeat spread. Nothing this process
+    /// already holds is credited as reusable. On a recheck only the growth realized SINCE ADMISSION
+    /// is credited, `remaining = required - (F_now - F_admission)`, so a loaded generator's second
+    /// render is not charged its weights twice while an unrelated resident never makes room.
+    /// `remaining` must fit live headroom; the projected absolute footprint must fit the single cap.
+    /// The anchor's measured margin replaces the 512 MiB formula reserve here: a kernel
+    /// `phys_footprint` anchor already contains the driver and allocator overhead that reserve
+    /// guessed at, and stacking it on a measurement would make the low end inaccurate.
     pub(crate) fn incremental_capacity(
-        demand_bytes: u64,
+        required_bytes: u64,
         now: super::ProcessMemory,
         at_admission: super::ProcessMemory,
     ) -> Result<()> {
@@ -113,7 +117,7 @@ pub mod media {
                 _ => 0,
             },
         };
-        let remaining = demand_bytes.saturating_sub(realized);
+        let remaining = required_bytes.saturating_sub(realized);
         let held = now
             .footprint
             .or_else(|| at_admission.footprint.map(|f| f.saturating_add(realized)))
@@ -127,16 +131,14 @@ pub mod media {
             // Off-iOS / no live reading: nothing to refuse on beyond the cap.
             return Ok(());
         };
-        let required = remaining.saturating_add(ios_quantum::PROCESS_RESERVE_BYTES);
-        if required > available {
+        if remaining > available {
             record_capacity_refusal();
             return Err(Error::Unsupported(format!(
-                "iOS admission: {} MiB still to come (demand {} MiB, {} MiB realized since \
-                 admission) + {} MiB reserve exceeds the {} MiB of per-process headroom left",
+                "iOS admission: {} MiB still to come (demand + margin {} MiB, {} MiB realized \
+                 since admission) exceeds the {} MiB of per-process headroom left",
                 remaining >> 20,
-                demand_bytes >> 20,
+                required_bytes >> 20,
                 realized >> 20,
-                ios_quantum::PROCESS_RESERVE_BYTES >> 20,
                 available >> 20
             )));
         }
@@ -191,10 +193,11 @@ pub mod media {
             now.footprint.unwrap_or(0),
             now.available,
         );
-        budget.reserved_headroom_bytes = ios_quantum::PROCESS_RESERVE_BYTES;
+        // No blanket reserve: the predicted peak is the anchor's demand plus its MEASURED margin.
+        budget.reserved_headroom_bytes = 0;
         let admission = admit(&registry, candidates, &super::device_machine(), budget)?;
         // The cap/headroom check the generic guard runs, BEFORE any weight payload.
-        incremental_capacity(admission.demand_bytes(), now, now)
+        incremental_capacity(admission.required_bytes(), now, now)
             .map_err(|e| AdmissionError::refused(RefusalKind::Capacity, e.to_string()))?;
         Ok((registry, admission, now))
     }
@@ -1013,51 +1016,54 @@ mod tests {
     /// The per-call recheck charges only the demand still to come: weights loaded since admission
     /// are in the process footprint and already absent from live headroom, so they are not counted
     /// twice. First and second renders on a loaded generator fit; a genuinely short headroom and an
-    /// over-cap footprint still refuse.
+    /// over-cap footprint still refuse. The charge is `demand + measured margin`, with no 512 MiB
+    /// formula reserve stacked on the measurement.
     #[cfg(feature = "media")]
     #[test]
     fn the_loaded_generator_recheck_charges_only_incremental_demand() {
         use super::media::incremental_capacity;
         use super::ProcessMemory;
         const MIB: u64 = 1 << 20;
-        // The evidence row: capture peak 3600 MiB from a 200 MiB harness baseline.
-        let demand = 3400 * MIB;
+        // The anchor: 3368 MiB of growth over its capture baseline + its 32 MiB margin.
+        let required = 3400 * MIB;
         let read = |footprint: u64, available: u64| ProcessMemory {
             footprint: Some(footprint * MIB),
             available: Some(available * MIB),
         };
-        // Admission needs the demand plus the reserve: 3400 + 512 = 3912 MiB > 3600 refuses.
-        let short = read(200, 3600);
-        assert!(incremental_capacity(demand, short, short).is_err());
+        // Admission needs exactly demand + margin of live headroom: 3400 fits, 3399 does not.
+        let exact = read(200, 3400);
+        incremental_capacity(required, exact, exact).unwrap();
+        let short = read(200, 3399);
+        assert!(incremental_capacity(required, short, short).is_err());
         let fresh = read(200, 5900);
-        incremental_capacity(demand, fresh, fresh).unwrap();
-        // An unrelated resident (SANA ~2 GB still loaded): 1800 MiB available. The old absolute
-        // arithmetic (3600 - 2200 = 1400 <= 1800) would admit; the growth is 3400: refused.
+        incremental_capacity(required, fresh, fresh).unwrap();
+        // An unrelated resident (SANA ~2 GB still loaded): 1800 MiB available. The growth is 3400:
+        // refused (a product's residents are never credited).
         let busy = read(2200, 1800);
         let _ = super::media::take_capacity_refusal();
-        assert!(incremental_capacity(demand, busy, busy).is_err());
+        assert!(incremental_capacity(required, busy, busy).is_err());
         assert!(
             super::media::take_capacity_refusal(),
             "typed capacity record"
         );
-        // First render after loading 2000 MiB of weights: 1400 still to come + 512 <= 3900.
-        incremental_capacity(demand, read(2200, 3900), fresh).unwrap();
-        // Second render on the same generator: the whole demand already realized (headroom did
-        // not recover): only the reserve must fit.
-        incremental_capacity(demand, read(3600, 2500), fresh).unwrap();
-        // The reserve is part of the boundary: exactly remaining + reserve fits, one MiB less not.
-        incremental_capacity(demand, read(2200, 1400 + 512), fresh).unwrap();
-        assert!(incremental_capacity(demand, read(2200, 1400 + 511), fresh).is_err());
+        // First render after loading 2000 MiB of weights: 1400 still to come <= 3900.
+        incremental_capacity(required, read(2200, 3900), fresh).unwrap();
+        // Second render on the same generator: the whole demand already realized.
+        incremental_capacity(required, read(3600, 2500), fresh).unwrap();
+        // The boundary is the remaining growth itself: exactly 1400 fits, one MiB less not.
+        incremental_capacity(required, read(2200, 1400), fresh).unwrap();
+        assert!(incremental_capacity(required, read(2200, 1399), fresh).is_err());
         // Kernel footprint unavailable: realized growth derived from the headroom consumed.
         let blind = ProcessMemory {
             footprint: None,
             available: Some(3900 * MIB),
         };
-        incremental_capacity(demand, blind, fresh).unwrap();
+        incremental_capacity(required, blind, fresh).unwrap();
         // Over the single cap: 3000 held + 1400 to come > 4096.
-        assert!(incremental_capacity(demand, read(3000, 9000), read(1600, 9000)).is_err());
+        assert!(incremental_capacity(required, read(3000, 9000), read(1600, 9000)).is_err());
         // Off-device (no live reading): only the cap applies.
-        incremental_capacity(demand, ProcessMemory::default(), ProcessMemory::default()).unwrap();
+        incremental_capacity(required, ProcessMemory::default(), ProcessMemory::default())
+            .unwrap();
     }
 
     /// The capture permit is not an admission and is unavailable off-device: without bounded

@@ -105,7 +105,7 @@ fn tier_name(bits: Option<i32>) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::evidence::{EvidenceRow, DEVICE_CAPTURE_CLASS};
+    use crate::evidence::{AnchorKind, AnchorSelection};
     use crate::ios_admission::{admit, admit_with_rows, build_candidate, evidence_key, IosWork};
     use crate::sdxl::tests::{budget, write_tensor, DEVICE};
     use crate::RefusalKind;
@@ -492,17 +492,21 @@ pub(crate) mod tests {
             work("text", 768),
         )
         .unwrap();
-        let row = EvidenceRow {
-            key: evidence_key(&registry, &candidate, DEVICE).unwrap(),
-            footprint_bytes: 3 << 30,
-            baseline_footprint_bytes: 1 << 28,
-            mlx_peak_bytes: 2 << 30,
-            min_headroom_mib: 900.0,
-            elapsed_seconds: 60.0,
-            evidence_class: DEVICE_CAPTURE_CLASS.into(),
-            run_id: "synthetic".into(),
-            build_sha: "synthetic".into(),
-        };
+        let mut row = crate::evidence::fixture::completed(
+            evidence_key(&registry, &candidate, DEVICE).unwrap(),
+            AnchorKind::Optimized,
+            AnchorSelection::from_parts(
+                candidate.context.selection.strategy,
+                &candidate.context.selection.parameters,
+            ),
+            0,
+        );
+        if let crate::evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
+            for c in captures.iter_mut() {
+                c.footprint_bytes = 3 << 30;
+                c.baseline_footprint_bytes = 1 << 28;
+            }
+        }
         let admitted = admit_with_rows(
             &registry,
             std::slice::from_ref(&candidate),

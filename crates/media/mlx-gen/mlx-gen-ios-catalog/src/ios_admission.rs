@@ -7,12 +7,16 @@
 //!    refuses a mode the provider does not serve ([`RefusalKind::Mode`]);
 //! 2. computes the evidence key: hardware, provider, route, tier, path-free layout digest, mode,
 //!    geometry, reference count, execution levers, token window — never prompt, seed or path;
-//! 3. looks the key up in the single reviewed table ([`crate::evidence`]); no row refuses
-//!    ([`RefusalKind::NoEvidence`]);
+//! 3. prices the request from the single reviewed ANCHOR table ([`crate::evidence`]) by the anchor
+//!    law ([`crate::anchor`]): at an anchor's own key, its measured demand; otherwise the demand
+//!    DERIVED from the family's anchors (the optimized anchor, or a same-regime resident one), after
+//!    the two anchors' self-check. No anchor family, an underivable request, or a self-check
+//!    failure refuses ([`RefusalKind::NoEvidence`]); a measured resident refusal at its own key is
+//!    [`RefusalKind::Capacity`];
 //! 4. checks the execution implements the selected ladder ([`RefusalKind::Strategy`]);
 //! 5. runs the provider's REGISTERED safety check (`standard_memory_strategy_safety_check` plus the
-//!    provider's route gate, E5) with the captured absolute footprint as the predicted peak; a
-//!    rejection over the budget is [`RefusalKind::Capacity`], any other is `Strategy`;
+//!    provider's route gate, E5) with the demand plus the anchor's measured margin as the predicted
+//!    peak; a rejection over the budget is [`RefusalKind::Capacity`], any other is `Strategy`;
 //! 6. seals the source inventory and an exact work binding for the bound wrappers' lifetime check.
 //!
 //! `capture_permit` (feature `device-capture`) is the explicitly labelled, NON-circular evidence path: it performs 1, 2 and 4
@@ -25,13 +29,15 @@ use mlx_gen::gen_core::iris::depth::DepthRequest;
 use mlx_gen::gen_core::{
     standard_memory_behavior_context, CfgBatching, Conditioning, ConditioningKind, Error,
     GenerationMemory, GenerationRequest, LoadSpec, MemoryBehaviorRoute, MemoryBudget,
-    MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryRunContext, MemorySafetyDecision,
-    MemorySelection, MemoryStrategySupport, Precision, ProviderRegistry, Quant, Result,
-    SourceInventory, TransformRequest,
+    MemoryGeometry, MemoryMode, MemoryNumericTier, MemoryProviderContract, MemoryRunContext,
+    MemorySafetyDecision, MemorySelection, MemoryStrategySupport, Precision, ProviderRegistry,
+    Quant, Result, SourceInventory, TransformRequest,
 };
+use mlx_gen::ios_pricing::{IosPricing, IosPricingRequest};
 use sha2::{Digest, Sha256};
 
-use crate::evidence::{self, EvidenceKey, EvidenceRow, EVIDENCE_TABLE_PATH};
+use crate::anchor::{self, MeasuredAnchor};
+use crate::evidence::{self, AnchorKind, AnchorRow, EvidenceKey, EVIDENCE_TABLE_PATH};
 use crate::refusal::{artifact, AdmissionError, AdmissionResult, RefusalKind};
 
 /// The Iris restoration transform's memory provider id.
@@ -222,12 +228,7 @@ pub fn build_candidate(
     }
     context.geometry = geometry;
     context.load_shape = spec.load_shape;
-    let mut execution = contract
-        .generation_memory(&context.selection)
-        .unwrap_or_default();
-    if provider == crate::sdxl::SDXL_ID {
-        execution.cfg_batching = Some(CfgBatching::Sequential);
-    }
+    let execution = execution_for(provider, &contract, &context.selection);
     if let IosWork::Generate(req) = &mut work {
         req.memory = Some(execution);
     }
@@ -238,6 +239,20 @@ pub fn build_candidate(
         execution,
         work,
     })
+}
+
+/// The execution levers a selection runs with on iOS: the provider's ladder execution, plus SDXL's
+/// sequential CFG.
+pub fn execution_for(
+    provider: &str,
+    contract: &MemoryProviderContract,
+    selection: &MemorySelection,
+) -> GenerationMemory {
+    let mut execution = contract.generation_memory(selection).unwrap_or_default();
+    if provider == crate::sdxl::SDXL_ID {
+        execution.cfg_batching = Some(CfgBatching::Sequential);
+    }
+    execution
 }
 
 /// Canonical memory-relevant execution identity: strategy, every ladder parameter, every request
@@ -471,20 +486,31 @@ fn key_unchecked(
     })
 }
 
+/// What an admission's demand rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionBasis {
+    /// The request IS this anchor: its measured demand, no derivation.
+    Measured(AnchorKind),
+    /// Derived by the anchor law from this anchor of the family.
+    Derived { from: AnchorKind },
+    /// A labelled device-capture permit: no evidence, bounded per quantum.
+    CapturePermit,
+}
+
 /// A sealed admission: the source inventory, the admitted context and the exact work binding.
 #[derive(Debug)]
 pub struct Admission {
     pub(crate) index: usize,
     pub(crate) provider: String,
-    pub(crate) footprint_bytes: u64,
-    /// The render's own demand: the capture's peak minus the capture process's starting footprint.
+    /// The render's own growth over the process's starting footprint (anchor-measured or derived).
     pub(crate) demand_bytes: u64,
+    /// The anchor's measured repeat spread (floored): the explicit low-end margin.
+    pub(crate) margin_bytes: u64,
+    pub(crate) basis: AdmissionBasis,
     pub(crate) spec: LoadSpec,
     pub(crate) context: MemoryRunContext,
     pub(crate) binding: [u8; 32],
     pub(crate) key: EvidenceKey,
-    /// `true` only for a `capture_permit`: execution bounded per quantum, no evidence row.
-    pub(crate) capture: bool,
 }
 
 impl Admission {
@@ -494,18 +520,25 @@ impl Admission {
     pub fn provider(&self) -> &str {
         &self.provider
     }
-    /// The captured footprint this admission was granted on (0 for a capture permit).
-    pub fn footprint_bytes(&self) -> u64 {
-        self.footprint_bytes
-    }
-    /// What the admitted work itself adds to a process: the capture's peak minus its starting
-    /// footprint (0 for a capture permit). This, never the absolute peak, is charged against live
-    /// headroom, and only its not-yet-realized part on a recheck.
+    /// What the admitted work itself adds to a process (0 for a capture permit): the anchor's
+    /// measured growth at its own key, else the anchor-law derivation. Never an absolute peak.
     pub fn demand_bytes(&self) -> u64 {
         self.demand_bytes
     }
-    pub fn footprint_mib(&self) -> u32 {
-        u32::try_from(self.footprint_bytes.div_ceil(1 << 20)).unwrap_or(u32::MAX)
+    /// The low-end margin charged on top of the demand: the anchor's measured repeat spread.
+    pub fn margin_bytes(&self) -> u64 {
+        self.margin_bytes
+    }
+    /// `demand + margin`: what live headroom must cover, and the measured envelope the admitted
+    /// work's quantum guards run under ([`mlx_gen::ios_quantum::with_admitted_envelope`]).
+    pub fn required_bytes(&self) -> u64 {
+        self.demand_bytes.saturating_add(self.margin_bytes)
+    }
+    pub fn required_mib(&self) -> u32 {
+        u32::try_from(self.required_bytes().div_ceil(1 << 20)).unwrap_or(u32::MAX)
+    }
+    pub fn basis(&self) -> AdmissionBasis {
+        self.basis
     }
     pub fn context(&self) -> &MemoryRunContext {
         &self.context
@@ -515,8 +548,162 @@ impl Admission {
     }
     /// Whether this is an evidence-collection capture permit rather than a product admission.
     pub fn is_capture(&self) -> bool {
-        self.capture
+        self.basis == AdmissionBasis::CapturePermit
     }
+}
+
+fn no_evidence(reason: String) -> AdmissionError {
+    AdmissionError::refused(RefusalKind::NoEvidence, reason)
+}
+
+fn completed(row: &AnchorRow) -> bool {
+    row.demand_bytes().is_some()
+}
+
+/// The counted price of `candidate`'s family at an ANCHOR's configuration: the anchor's own
+/// selection, its execution levers and its reference geometry, on the candidate's artifact.
+fn price_anchor(
+    pricer: mlx_gen::ios_pricing::IosPricer,
+    candidate: &IosCandidate,
+    contract: &MemoryProviderContract,
+    row: &AnchorRow,
+) -> AdmissionResult<IosPricing> {
+    let (Some(strategy), Some(parameters)) = (row.selection.strategy(), row.selection.parameters())
+    else {
+        return Err(no_evidence(format!(
+            "anchor {:?} carries an unreadable selection",
+            row.key
+        )));
+    };
+    let selection = MemorySelection {
+        strategy,
+        parameters,
+        tier: candidate.context.selection.tier,
+    };
+    let execution = execution_for(&candidate.provider, contract, &selection);
+    let geometry = MemoryGeometry {
+        width: row.key.width,
+        height: row.key.height,
+        batch: row.key.batch,
+        frames: 1,
+        reference_count: row.key.reference_count,
+    };
+    pricer(&IosPricingRequest {
+        provider: &candidate.provider,
+        spec: &candidate.spec,
+        mode: &candidate.context.mode,
+        geometry,
+        selection: &selection,
+        execution: &execution,
+        token_window: row.key.token_window,
+    })
+    .map_err(|e| AdmissionError::Failed(e.into()))
+}
+
+/// Step 3: the request's demand and margin from the anchor table (see the module docs).
+fn anchored_demand(
+    candidate: &IosCandidate,
+    contract: &MemoryProviderContract,
+    key: &EvidenceKey,
+    rows: &[AnchorRow],
+) -> AdmissionResult<(u64, u64, AdmissionBasis)> {
+    if let Some(row) = evidence::lookup(rows, key) {
+        return match (&row.outcome, row.demand_bytes(), row.margin_bytes()) {
+            (_, Some(demand), Some(margin)) => {
+                Ok((demand, margin, AdmissionBasis::Measured(row.anchor_kind)))
+            }
+            (evidence::AnchorOutcome::Refused { refused_quantum, .. }, ..) => {
+                Err(AdmissionError::refused(
+                    RefusalKind::Capacity,
+                    format!(
+                        "measured on {}: this {:?} anchor refused before allocation at quantum                          {} ({} B + {} B reserve, {:?} B live)",
+                        key.machine,
+                        row.anchor_kind,
+                        refused_quantum.label,
+                        refused_quantum.scratch_bytes,
+                        refused_quantum.reserve_bytes,
+                        refused_quantum.available_bytes
+                    ),
+                ))
+            }
+            _ => Err(no_evidence(format!("anchor {key:?} has no capture"))),
+        };
+    }
+    let family = key.family();
+    let (resident, optimized) = evidence::family_anchors(rows, &family);
+    let Some(optimized) = optimized.filter(|r| completed(r)) else {
+        return Err(no_evidence(format!(
+            "no completed optimized anchor for {family:?} in {EVIDENCE_TABLE_PATH}: another mode,              tier, route, artifact layout or device is not derivable"
+        )));
+    };
+    let Some((pricer, _)) = crate::pricing::provider_pricing(&candidate.provider) else {
+        return Err(no_evidence(format!(
+            "{}: no counted iOS pricing, so only its anchors' own keys are admitted",
+            candidate.provider
+        )));
+    };
+    let request = pricer(&IosPricingRequest {
+        provider: &candidate.provider,
+        spec: &candidate.spec,
+        mode: &candidate.context.mode,
+        geometry: candidate.context.geometry,
+        selection: &candidate.context.selection,
+        execution: &candidate.execution,
+        token_window: key.token_window,
+    })
+    .map_err(|e| AdmissionError::Failed(e.into()))?;
+    let resident = resident.filter(|r| completed(r));
+    // Derive UPWARD from the optimized anchor; a measured resident anchor prices only its own
+    // regime at other geometries (never derived downward toward the optimized end).
+    let base = match resident {
+        Some(r) if r.key.execution == key.execution => r,
+        _ => optimized,
+    };
+    let measured = MeasuredAnchor::from_row(base).ok_or_else(|| no_evidence("no capture".into()))?;
+    let at_base = price_anchor(pricer, candidate, contract, base)?;
+    let derived = anchor::derive(
+        &measured,
+        &at_base,
+        &request,
+        anchor::area(key.width, key.height, key.batch),
+    )
+    .map_err(|e| {
+        no_evidence(format!(
+            "{key:?} is not derivable from its {:?} anchor: {e}",
+            base.anchor_kind
+        ))
+    })?;
+    // The two anchors check each other: a law that under-predicts a measured anchor beyond the
+    // measured recapture spread fails the whole family's derivations closed.
+    if let Some(resident) = resident {
+        let check = anchor::consistency(
+            &MeasuredAnchor::from_row(optimized)
+                .ok_or_else(|| no_evidence("no capture".into()))?,
+            &price_anchor(pricer, candidate, contract, optimized)?,
+            &MeasuredAnchor::from_row(resident).ok_or_else(|| no_evidence("no capture".into()))?,
+            &price_anchor(pricer, candidate, contract, resident)?,
+        )
+        .map_err(|e| no_evidence(format!("{family:?}: anchors not mutually derivable: {e}")))?;
+        if check.fails_closed() {
+            return Err(no_evidence(format!(
+                "{family:?}: the optimized anchor under-predicts the measured resident anchor                  ({} B predicted vs {} B measured, {:+.1}% beyond the {:.1}% tolerance);                  derivations of this family fail closed",
+                check.predicted,
+                check.measured,
+                check.relative_error * 100.0,
+                anchor::CONSISTENCY_TOLERANCE * 100.0
+            )));
+        }
+    }
+    let margin = base
+        .margin_bytes()
+        .ok_or_else(|| no_evidence("no capture".into()))?;
+    Ok((
+        derived.demand,
+        margin,
+        AdmissionBasis::Derived {
+            from: base.anchor_kind,
+        },
+    ))
 }
 
 /// Steps 3–6 for one candidate, under its own source inventory.
@@ -526,19 +713,19 @@ fn admit_one(
     candidate: &IosCandidate,
     machine: &str,
     budget: MemoryBudget,
-    rows: Option<&[EvidenceRow]>,
+    rows: Option<&[AnchorRow]>,
 ) -> AdmissionResult<Admission> {
     validate_actual(registry, candidate)?;
     let route = route_of(candidate)?;
     if let Some(rows) = rows {
-        // Cheap pre-check: refuse before opening any source when no row can match.
+        // Cheap pre-check: refuse before opening any source when no anchor can match.
         if !rows.iter().any(|r| {
             r.key.machine == machine && r.key.provider == candidate.provider && r.key.route == route
         }) {
             return Err(AdmissionError::refused(
                 RefusalKind::NoEvidence,
                 format!(
-                    "{}: no reviewed device capture for route {route} on {machine} in \
+                    "{}: no reviewed device anchor for route {route} on {machine} in \
                      {EVIDENCE_TABLE_PATH} (source unopened)",
                     candidate.provider
                 ),
@@ -548,22 +735,6 @@ fn admit_one(
     let guard = SourceInventory::capture(&candidate.spec)?;
     guard.read_unchanged(|| -> AdmissionResult<Admission> {
         let key = key_unchecked(candidate, machine, route.clone())?;
-        let (footprint_bytes, demand_bytes) = match rows {
-            None => (0, 0),
-            Some(rows) => {
-                let row = evidence::lookup(rows, &key).ok_or_else(|| {
-                    AdmissionError::refused(
-                        RefusalKind::NoEvidence,
-                        format!("no reviewed device capture in {EVIDENCE_TABLE_PATH} for {key:?}"),
-                    )
-                })?;
-                (
-                    row.footprint_bytes,
-                    row.footprint_bytes
-                        .saturating_sub(row.baseline_footprint_bytes),
-                )
-            }
-        };
         let contract = registry
             .memory_strategy_contract(&candidate.provider, &candidate.spec)?
             .ok_or_else(|| {
@@ -591,9 +762,7 @@ fn admit_one(
                 ),
             ));
         }
-        let expected = contract
-            .generation_memory(&candidate.context.selection)
-            .unwrap_or_default();
+        let expected = execution_for(&candidate.provider, &contract, &candidate.context.selection);
         let actual = candidate.execution;
         if (
             actual.stage_residency,
@@ -621,13 +790,17 @@ fn admit_one(
                 "actual execution does not implement the selected ladder",
             ));
         }
+        let (demand_bytes, margin_bytes, basis) = match rows {
+            None => (0, 0, AdmissionBasis::CapturePermit),
+            Some(rows) => anchored_demand(candidate, &contract, &key, rows)?,
+        };
         let mut context = candidate.context.clone();
         if rows.is_some() {
             context.budget = budget;
-            // The render's own growth; what the process already holds is the budget's committed
-            // bytes and is never credited as reusable.
-            context.predicted_peak_bytes = demand_bytes;
-            context.evidence_revision = format!("ios-device-capture:{}", key.layout_sha256);
+            // The render's own growth plus the anchor's measured margin; what the process already
+            // holds is the budget's committed bytes and is never credited as reusable.
+            context.predicted_peak_bytes = demand_bytes.saturating_add(margin_bytes);
+            context.evidence_revision = format!("ios-device-anchor:{}", key.layout_sha256);
             if let MemorySafetyDecision::Reject { reason } =
                 (registration.safety_check)(&candidate.spec, &contract, &context)
             {
@@ -646,13 +819,13 @@ fn admit_one(
         Ok(Admission {
             index,
             provider: candidate.provider.clone(),
-            footprint_bytes,
             demand_bytes,
+            margin_bytes,
+            basis,
             spec,
             context,
             binding: work_binding(&candidate.work),
             key,
-            capture: rows.is_none(),
         })
     })
 }
@@ -666,7 +839,7 @@ pub fn admit_with_rows(
     candidates: &[IosCandidate],
     machine: &str,
     budget: MemoryBudget,
-    rows: &[EvidenceRow],
+    rows: &[AnchorRow],
 ) -> AdmissionResult<Admission> {
     let mut first_refusal: Option<RefusalKind> = None;
     let mut first_failure: Option<Error> = None;
@@ -748,6 +921,13 @@ pub fn capture_permit(
 }
 
 impl Admission {
+    /// The measured envelope an admitted (non-capture) load and its renders run under, opened
+    /// before the load so it spans the weights too.
+    fn envelope(&self) -> Option<mlx_gen::ios_quantum::AdmittedEnvelope> {
+        (!self.is_capture())
+            .then(|| mlx_gen::ios_quantum::open_admitted_envelope(self.required_bytes()))
+    }
+
     fn check_kind(&self, expected: &str) -> Result<()> {
         let ok = match expected {
             "generate" => {
@@ -781,7 +961,9 @@ impl Admission {
         load: impl FnOnce(&LoadSpec) -> Result<Box<dyn mlx_gen::gen_core::Generator>>,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
     ) -> Result<crate::bound::BoundGenerator> {
-        capacity(self.demand_bytes)?;
+        capacity(self.required_bytes())?;
+        let envelope = self.envelope();
+        let required = self.required_bytes();
         let inner = self
             .spec
             .read_prepared_files_unchanged(|| load(&self.spec))?;
@@ -790,8 +972,9 @@ impl Admission {
             self.spec,
             self.context,
             self.binding,
-            self.demand_bytes,
+            required,
             capacity,
+            envelope,
         ))
     }
 
@@ -802,7 +985,9 @@ impl Admission {
         capacity: impl Fn(u64) -> Result<()> + 'static,
     ) -> Result<crate::bound::BoundTransform> {
         self.check_kind("restoration")?;
-        capacity(self.demand_bytes)?;
+        capacity(self.required_bytes())?;
+        let envelope = self.envelope();
+        let required = self.required_bytes();
         let provider = self.provider.clone();
         let inner = self
             .spec
@@ -811,8 +996,9 @@ impl Admission {
             inner,
             self.spec,
             self.binding,
-            self.demand_bytes,
+            required,
             Box::new(capacity),
+            envelope,
         ))
     }
 
@@ -822,7 +1008,9 @@ impl Admission {
         capacity: impl Fn(u64) -> Result<()> + 'static,
     ) -> Result<crate::bound::BoundDepth> {
         self.check_kind("depth")?;
-        capacity(self.demand_bytes)?;
+        capacity(self.required_bytes())?;
+        let envelope = self.envelope();
+        let required = self.required_bytes();
         let inner = self.spec.read_prepared_files_unchanged(|| {
             mlx_gen_iris::depth::load_depth(&self.spec).map_err(Error::from)
         })?;
@@ -830,8 +1018,9 @@ impl Admission {
             Box::new(inner),
             self.spec,
             self.binding,
-            self.demand_bytes,
+            required,
             Box::new(capacity),
+            envelope,
         ))
     }
 }
@@ -839,3 +1028,7 @@ impl Admission {
 #[cfg(test)]
 #[path = "ios_admission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "anchor_admission_tests.rs"]
+mod anchor_tests;

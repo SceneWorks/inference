@@ -16,8 +16,12 @@ pub struct BoundGenerator {
     spec: LoadSpec,
     context: MemoryRunContext,
     request: [u8; 32],
+    /// The admission's `demand + margin` (0 for a capture permit).
     footprint: u64,
     capacity: Box<dyn Fn(u64) -> Result<()>>,
+    /// The admission's measured envelope, open from before the load for this object's lifetime
+    /// (`None` for a capture permit, which runs on the formula guards alone).
+    _envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
 }
 
 impl BoundGenerator {
@@ -28,8 +32,10 @@ impl BoundGenerator {
         request: [u8; 32],
         footprint: u64,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
+        envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
     ) -> Self {
         Self {
+            _envelope: envelope,
             inner,
             spec,
             context,
@@ -262,8 +268,12 @@ pub struct BoundTransform {
     inner: Box<dyn Transform>,
     spec: LoadSpec,
     binding: [u8; 32],
+    /// The admission's `demand + margin` (0 for a capture permit).
     footprint: u64,
     capacity: Box<dyn Fn(u64) -> Result<()>>,
+    /// The admission's measured envelope, open from before the load for this object's lifetime
+    /// (`None` for a capture permit, which runs on the formula guards alone).
+    _envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
 }
 
 impl BoundTransform {
@@ -273,8 +283,10 @@ impl BoundTransform {
         binding: [u8; 32],
         footprint: u64,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
+        envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
     ) -> Self {
         Self {
+            _envelope: envelope,
             inner,
             spec,
             binding,
@@ -322,8 +334,12 @@ pub struct BoundDepth {
     inner: Box<dyn IrisDepthEstimator>,
     spec: LoadSpec,
     binding: [u8; 32],
+    /// The admission's `demand + margin` (0 for a capture permit).
     footprint: u64,
     capacity: Box<dyn Fn(u64) -> Result<()>>,
+    /// The admission's measured envelope, open from before the load for this object's lifetime
+    /// (`None` for a capture permit, which runs on the formula guards alone).
+    _envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
 }
 
 impl BoundDepth {
@@ -333,8 +349,10 @@ impl BoundDepth {
         binding: [u8; 32],
         footprint: u64,
         capacity: Box<dyn Fn(u64) -> Result<()>>,
+        envelope: Option<mlx_gen::ios_quantum::AdmittedEnvelope>,
     ) -> Self {
         Self {
+            _envelope: envelope,
             inner,
             spec,
             binding,

@@ -51,19 +51,23 @@ fn generation(edge: u32, conditioning: Vec<Conditioning>) -> IosWork {
     })
 }
 
-fn row(registry: &ProviderRegistry, c: &IosCandidate, bytes: u64) -> EvidenceRow {
-    EvidenceRow {
-        key: evidence_key(registry, c, DEVICE).unwrap(),
-        footprint_bytes: bytes,
-        // Synthetic rows: a zero capture baseline makes the demand the whole figure.
-        baseline_footprint_bytes: 0,
-        mlx_peak_bytes: bytes,
-        min_headroom_mib: 1.0,
-        elapsed_seconds: 1.0,
-        evidence_class: evidence::DEVICE_CAPTURE_CLASS.into(),
-        run_id: "synthetic".into(),
-        build_sha: "synthetic".into(),
-    }
+/// A synthetic completed anchor AT the candidate's own key whose measured demand is `bytes` (a
+/// rung-0 candidate is a resident anchor, any other an optimized one); its margin is the floor.
+fn row(registry: &ProviderRegistry, c: &IosCandidate, bytes: u64) -> AnchorRow {
+    let kind = if c.context.selection.strategy == MemoryStrategy::Resident {
+        AnchorKind::Resident
+    } else {
+        AnchorKind::Optimized
+    };
+    evidence::fixture::completed(
+        evidence_key(registry, c, DEVICE).unwrap(),
+        kind,
+        evidence::AnchorSelection::from_parts(
+            c.context.selection.strategy,
+            &c.context.selection.parameters,
+        ),
+        bytes,
+    )
 }
 
 fn iris_fixtures() -> std::path::PathBuf {
@@ -387,10 +391,11 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
         .unwrap();
     let bound = crate::bound::BoundTransform::new(
         Box::new(ProbeTransform(descriptor, calls.clone())),
-        admitted.spec,
+        admitted.spec.clone(),
         admitted.binding,
-        admitted.footprint_bytes,
+        admitted.required_bytes(),
         Box::new(|_| Ok(())),
+        None,
     );
     let IosWork::Restore(req) = &restore.work else {
         unreachable!()
@@ -422,10 +427,11 @@ fn restore_and_depth_are_keyed_admitted_and_request_bound() {
     let calls = Rc::new(Cell::new(0));
     let bound = crate::bound::BoundDepth::new(
         Box::new(ProbeDepth(calls.clone())),
-        admitted.spec,
+        admitted.spec.clone(),
         admitted.binding,
-        admitted.footprint_bytes,
+        admitted.required_bytes(),
         Box::new(|_| Ok(())),
+        None,
     );
     let IosWork::Depth(req) = &depth.work else {
         unreachable!()
@@ -488,7 +494,8 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     .unwrap()
     .unwrap();
     assert!(permit.is_capture());
-    assert_eq!(permit.footprint_bytes(), 0);
+    assert_eq!(permit.required_bytes(), 0);
+    assert_eq!(permit.basis(), AdmissionBasis::CapturePermit);
     assert_eq!(
         permit.evidence_key(),
         &evidence_key(&registry, &candidate, DEVICE).unwrap()
@@ -505,10 +512,10 @@ fn capture_permit_needs_bounded_quanta_not_evidence() {
     assert_eq!(refused, Some(RefusalKind::Strategy));
 }
 
-/// E4: the evidence peak is the CAPTURE process's absolute peak, including its own baseline. Only
-/// the render's growth (peak - capture baseline) is charged, and what this process already holds
-/// is committed, never credited: an unrelated resident (e.g. another generator) makes a load that
-/// would fit an empty process a typed capacity refusal.
+/// E4: the anchor's peak is the CAPTURE process's absolute peak, including its own baseline. Only
+/// the render's growth (peak - capture baseline) plus the anchor's measured margin is charged, and
+/// what this process already holds is committed, never credited: an unrelated resident (e.g.
+/// another generator) makes a load that would fit an empty process a typed capacity refusal.
 #[test]
 fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
     let registry = crate::provider_registry().unwrap();
@@ -522,15 +529,17 @@ fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
         "text_to_image",
     );
     const MIB: u64 = 1 << 20;
-    let mut row = row(&registry, &candidate, 3600 * MIB);
-    row.baseline_footprint_bytes = 200 * MIB; // the harness's own baseline at capture start
+    let mut row = row(&registry, &candidate, 0);
+    // The harness's own baseline at capture start (200 MiB) and its lifetime peak (3600 MiB).
+    if let evidence::AnchorOutcome::Completed { captures } = &mut row.outcome {
+        for c in captures.iter_mut() {
+            c.baseline_footprint_bytes = 200 * MIB;
+            c.footprint_bytes = 3600 * MIB;
+        }
+    }
     let rows = [row];
-    let budget = |held: u64, available: u64| {
-        let mut b = capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
-        b.reserved_headroom_bytes = 512 * MIB;
-        b
-    };
-    // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + reserve fits.
+    let budget = |held: u64, available: u64| capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
+    // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + 32 MiB margin fits.
     let admitted = admit_with_rows(
         &registry,
         std::slice::from_ref(&candidate),
@@ -540,9 +549,13 @@ fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
     )
     .unwrap();
     assert_eq!(admitted.demand_bytes(), 3400 * MIB);
-    // SANA (~2 GB) still resident: 2400 MiB available (1888 after the reserve). The absolute-peak
-    // arithmetic would credit the resident 2200 MiB (3600 - 2200 = 1400 <= 1888) and admit; the
-    // growth is 3400 MiB: refused.
+    assert_eq!(admitted.margin_bytes(), evidence::ANCHOR_MARGIN_FLOOR_BYTES);
+    assert_eq!(
+        admitted.basis(),
+        AdmissionBasis::Measured(AnchorKind::Optimized)
+    );
+    // SANA (~2 GB) still resident: 2400 MiB available. The absolute-peak arithmetic would credit
+    // the resident 2200 MiB (3600 - 2200 = 1400 <= 2400) and admit; the growth is 3400: refused.
     assert_eq!(
         kind(admit_with_rows(
             &registry,
@@ -553,13 +566,13 @@ fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
         )),
         Some(RefusalKind::Capacity)
     );
-    // The reserve is part of the boundary: growth + reserve must fit, not growth alone.
+    // The margin is part of the boundary: growth + margin must fit, not growth alone.
     assert_eq!(
         kind(admit_with_rows(
             &registry,
             std::slice::from_ref(&candidate),
             DEVICE,
-            budget(200, 3400 + 511),
+            budget(200, 3400 + 32 - 1),
             &rows
         )),
         Some(RefusalKind::Capacity)
@@ -568,7 +581,7 @@ fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
         &registry,
         std::slice::from_ref(&candidate),
         DEVICE,
-        budget(200, 3400 + 512),
+        budget(200, 3400 + 32),
         &rows,
     )
     .unwrap();

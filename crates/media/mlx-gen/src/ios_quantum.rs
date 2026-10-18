@@ -285,25 +285,35 @@ struct Envelope {
 
 static ENVELOPE: std::sync::Mutex<Option<Envelope>> = std::sync::Mutex::new(None);
 
-/// Run `body` under an admitted, MEASURED envelope of `budget_bytes` (the anchor-derived demand
-/// plus its margin). While the process's growth since the envelope opened stays within it, a
-/// quantum's guard requires only the envelope's REMAINING bytes of live headroom when that is less
-/// than its formula price (scratch + [`PROCESS_RESERVE_BYTES`]): the measured device anchor, not the
-/// counted formula's conservative scratch, bounds an admitted request. Once growth exceeds the
-/// envelope (the measurement no longer describes this run) every guard is back on its formula — the
-/// runtime safety net. Without a live headroom reading the envelope changes nothing. Nested calls
-/// keep the outer envelope.
-pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if self.0 {
-                if let Ok(mut slot) = ENVELOPE.lock() {
-                    *slot = None;
-                }
+/// An admitted, MEASURED envelope of process growth, open while this guard lives.
+///
+/// The envelope is the admission's demand (the anchor-measured or anchor-derived growth over the
+/// footprint at admission) plus its stated margin, anchored at the live headroom when it opened —
+/// i.e. it spans the admitted work's loads and every render the loaded model then serves. While the
+/// process's growth since the envelope opened stays within it, a quantum's guard requires only the
+/// envelope's REMAINING bytes of live headroom when that is less than its formula price (scratch +
+/// [`PROCESS_RESERVE_BYTES`]): the measured device anchor, not the counted formula's conservative
+/// scratch, bounds an admitted request. Once growth exceeds the envelope (the measurement no longer
+/// describes this run) every guard is back on its formula — the runtime safety net. Without a live
+/// headroom reading the envelope changes nothing. While one envelope is open another open is a
+/// no-op (the outer envelope keeps bounding; past it, the formula does).
+#[derive(Debug)]
+pub struct AdmittedEnvelope {
+    opened: bool,
+}
+
+impl Drop for AdmittedEnvelope {
+    fn drop(&mut self) {
+        if self.opened {
+            if let Ok(mut slot) = ENVELOPE.lock() {
+                *slot = None;
             }
         }
     }
+}
+
+/// Open an [`AdmittedEnvelope`] of `budget_bytes` at the current live headroom.
+pub fn open_admitted_envelope(budget_bytes: u64) -> AdmittedEnvelope {
     let opened = match (ENVELOPE.lock(), available_bytes()) {
         (Ok(mut slot), Some(start_available)) if slot.is_none() => {
             *slot = Some(Envelope {
@@ -314,7 +324,12 @@ pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) ->
         }
         _ => false,
     };
-    let _restore = Restore(opened);
+    AdmittedEnvelope { opened }
+}
+
+/// Run `body` inside an [`AdmittedEnvelope`] of `budget_bytes`.
+pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) -> T {
+    let _envelope = open_admitted_envelope(budget_bytes);
     body()
 }
 
