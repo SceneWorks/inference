@@ -81,9 +81,13 @@ owned source shard. **The shard is added once in `peak_bytes`; workspace exclude
 it.** This differs from MLX's older workspace helper, which already includes its
 fixed source staging envelope. `selected_asset_facts` and `request_workspace_bytes`
 are also public, but consumers should use the combined call to authenticate once.
-No device or tensor is created by static admission. Authentication itself reads
-one owned shard on the host; callers must provide that staging headroom before
-calling it. OFF does not authenticate optional DMD availability; mixed does not
+No device or tensor is created by static admission. Cold header authentication
+streams one open file in at most 64KiB chunks and retains only the bounded header;
+header facts and optional FP32 validation proofs are cached by approved immutable
+identity, with retained-pin checks on every reuse. Request-bearing preparation
+checks cancellation during cold IO and scans. Actual tensor loading still
+independently authenticates its exact owned shard buffer, and `peak_bytes` retains
+that conservative staging allowance. OFF does not authenticate optional DMD availability; mixed does not
 read full-FP32 shards; full replaces the ordinary BF16 DiT closure for static facts and runtime weights.
 The ordinary SFT core remains a catalog installation prerequisite. Both normal
 constructors prepare only shared sources and defer DiT selection to the validated

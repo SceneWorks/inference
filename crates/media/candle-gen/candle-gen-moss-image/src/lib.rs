@@ -76,7 +76,8 @@ impl MossImageGenerator {
         let r = MossImageResolved::resolve(self.variant(), request)?;
         let images = inputs.validate(request, &r)?;
         memory_strategy::estimate(
-            self.selected_sources(r.acceleration)?.as_ref(),
+            self.selected_sources(r.acceleration, &request.cancel)?
+                .as_ref(),
             &r,
             request,
             images,
@@ -138,11 +139,16 @@ impl MossImageGenerator {
     fn selected_sources(
         &self,
         mode: MossImageAcceleration,
+        cancel: &CancelFlag,
     ) -> gen_core::Result<std::borrow::Cow<'_, Sources>> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
         if self.sources.selection == Some(mode) {
             Ok(std::borrow::Cow::Borrowed(&self.sources))
         } else {
-            Sources::selected(self.variant(), &self.sources.spec, mode).map(std::borrow::Cow::Owned)
+            Sources::selected_with_cancel(self.variant(), &self.sources.spec, mode, cancel)
+                .map(std::borrow::Cow::Owned)
         }
     }
     fn variant(&self) -> MossImageVariant {
@@ -190,7 +196,7 @@ impl MossImageGenerator {
         checked_host_elements(req, images)?;
         memory_strategy::check_request(req)?;
         transformer::check_cancel(&req.cancel)?;
-        let sources = self.selected_sources(r.acceleration)?;
+        let sources = self.selected_sources(r.acceleration, &req.cancel)?;
         let assets = sources.assets(r.acceleration)?;
         let staged = self.staged(req);
         let peak = memory_strategy::estimate(&sources, &r, req, images, staged)?;
@@ -451,7 +457,7 @@ impl Generator for MossImageGenerator {
                 })?,
         )?;
         memory_strategy::check_request(req)?;
-        self.selected_sources(r.acceleration)?
+        self.selected_sources(r.acceleration, &req.cancel)?
             .assets(r.acceleration)?;
         Ok(())
     }

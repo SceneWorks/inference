@@ -41,16 +41,45 @@ fn weights(v: &Value, dtype: DType) -> Weights {
             .collect(),
     )
 }
+fn checked_delta(a: &[f32], shape: &[usize], b: &[f32], expected_shape: &[usize]) -> f32 {
+    assert_eq!(shape, expected_shape, "oracle shape");
+    assert_eq!(a.len(), b.len(), "oracle count");
+    assert_eq!(
+        shape.iter().product::<usize>(),
+        a.len(),
+        "oracle shape/count"
+    );
+    assert!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "nonfinite oracle value"
+    );
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max)
+}
 fn compare(actual: &Tensor, expected: &Value, tolerance: f32, label: &str) {
     let a = loader::tensor_f32(actual).unwrap();
     let b: Vec<f32> = serde_json::from_value(expected["values"].clone()).unwrap();
-    assert_eq!(a.len(), b.len(), "{label}");
-    let max = a
-        .iter()
-        .zip(&b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
+    let shape: Vec<usize> = serde_json::from_value(expected["shape"].clone()).unwrap();
+    let max = checked_delta(&a, actual.dims(), &b, &shape);
     assert!(max <= tolerance, "{label}: max abs {max} > {tolerance}");
+}
+#[test]
+fn numerical_oracle_rejects_nan_truncation_and_shape_mismatch_sc26325() {
+    assert_eq!(checked_delta(&[1., 2.], &[2], &[1., 2.], &[2]), 0.);
+    for (a, shape, b, expected_shape) in [
+        (vec![f32::NAN], vec![1], vec![0.], vec![1]),
+        (vec![0.], vec![1], vec![f32::NAN], vec![1]),
+        (vec![f32::INFINITY], vec![1], vec![0.], vec![1]),
+        (vec![1.], vec![1], vec![1., 2.], vec![2]),
+        (vec![1., 2.], vec![2], vec![1.], vec![2]),
+        (vec![1., 2.], vec![1, 2], vec![1., 2.], vec![2, 1]),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| checked_delta(&a, &shape, &b, &expected_shape)).is_err()
+        );
+    }
 }
 #[test]
 fn descriptors_keep_acceleration_explicit() {
@@ -803,7 +832,7 @@ fn ordinary_sampler_executes_cfg_zero_one_slg_interval_skips_and_expanded_batch(
                     }
                 }
             }
-            let expected = serde_json::json!({"values":x});
+            let expected = serde_json::json!({"values":x,"shape":[4,4,2,3]});
             compare(
                 &actual.latents,
                 &expected,

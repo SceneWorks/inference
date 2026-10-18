@@ -193,7 +193,7 @@ pub fn selected_preload_estimate(
     let images = inputs.validate(request, &r)?;
     crate::checked_host_elements(request, images)?;
     check_request(request)?;
-    let s = Sources::selected(variant, spec, r.acceleration)?;
+    let s = Sources::selected_with_cancel(variant, spec, r.acceleration, &request.cancel)?;
     let asset_facts = selected_facts(&s, r.acceleration)?;
     let branches = branches(&r);
     let workspace_bytes = request_workspace_bytes(

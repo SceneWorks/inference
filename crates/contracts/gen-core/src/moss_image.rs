@@ -1033,7 +1033,8 @@ pub struct MossImageAssetReceipt {
     pub sha256: String,
 }
 impl MossImageAssetReceipt {
-    /// Construct from the actual retained file pin; labels alone never produce a content receipt.
+    /// Construct from an approved logical asset and retained pin, independent of physical basename.
+    /// Frozen repository/revision/path, size and digest must all authenticate; labels alone fail.
     pub fn from_pin(
         role: MossImageAssetRole,
         repository: &str,
@@ -1041,11 +1042,9 @@ impl MossImageAssetReceipt {
         relative_path: &str,
         pin: &crate::PinnedWeightsFile,
     ) -> Result<Self> {
-        pin.verify_unchanged()?;
-        require(
-            pin.loader_path().ends_with(relative_path),
-            "asset receipt path does not match its retained pin",
-        )?;
+        // sc-26325 / F-282: explicit file components may use content-addressed filenames.
+        // Bind the logical approved identity to actual bytes, never to a lexical suffix.
+        verify_moss_image_asset(pin, repository, revision, relative_path)?;
         Ok(Self {
             role,
             repository: repository.into(),
@@ -2212,42 +2211,59 @@ mod execution_receipt_tests {
         assert!(MossImageExecutionReport::new(bad).is_err());
     }
     #[test]
-    fn asset_receipt_uses_real_pin_and_rejects_rebinding() {
-        use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"actual fixture content").unwrap();
-        let pin = crate::PinnedWeightsFile::pin(file.path()).unwrap();
-        let name = file
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let r = MossImageAssetReceipt::from_pin(
+    fn asset_receipt_uses_approved_logical_identity_for_renamed_file_sc26325() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("content-addressed-cache.safetensors");
+        std::fs::write(
+            &file,
+            include_bytes!("../tests/fixtures/moss_image/transformer_config.json"),
+        )
+        .unwrap();
+        let pin = crate::PinnedWeightsFile::pin(&file).unwrap();
+        let receipt = MossImageAssetReceipt::from_pin(
             MossImageAssetRole::Transformer,
             SFT_REPO,
             SFT_REVISION,
-            &name,
+            "transformer/config.json",
             &pin,
         )
         .unwrap();
-        assert_eq!(r.sha256, hex_digest(pin.content_sha256()));
+        assert_eq!(receipt.relative_path, "transformer/config.json");
+        assert_eq!(receipt.sha256, hex_digest(pin.content_sha256()));
+        assert!(!pin.loader_path().ends_with("transformer/config.json"));
+        for (repo, rev, path) in [
+            (SFT_REPO, "main", "transformer/config.json"),
+            (SFT_REPO, DMD_REVISION, "transformer/config.json"),
+            (DMD_REPO, DMD_REVISION, "dataspace.safetensors"),
+        ] {
+            assert!(MossImageAssetReceipt::from_pin(
+                MossImageAssetRole::Transformer,
+                repo,
+                rev,
+                path,
+                &pin
+            )
+            .is_err());
+        }
+        let mut foreign =
+            include_bytes!("../tests/fixtures/moss_image/transformer_config.json").to_vec();
+        foreign[0] = b'X'; // Same size forces digest validation rather than a size-only rejection.
+        std::fs::write(&file, &foreign).unwrap();
         assert!(MossImageAssetReceipt::from_pin(
             MossImageAssetRole::Transformer,
             SFT_REPO,
             SFT_REVISION,
-            "other-file",
+            "transformer/config.json",
             &pin
         )
         .is_err());
-        file.write_all(b"changed").unwrap();
+        let bad = crate::PinnedWeightsFile::pin(&file).unwrap();
         assert!(MossImageAssetReceipt::from_pin(
             MossImageAssetRole::Transformer,
             SFT_REPO,
             SFT_REVISION,
-            &name,
-            &pin
+            "transformer/config.json",
+            &bad
         )
         .is_err());
     }

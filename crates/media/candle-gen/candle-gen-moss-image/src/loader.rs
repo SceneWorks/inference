@@ -2,7 +2,7 @@
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
-    self, moss_image::*, weightsmeta, LoadSpec, PinnedWeightsFile, WeightsSource,
+    self, moss_image::*, weightsmeta, CancelFlag, LoadSpec, PinnedWeightsFile, WeightsSource,
 };
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
@@ -10,7 +10,9 @@ use candle_gen_flux2::vae::{Flux2Vae, Flux2VaeDecoderConfig};
 use candle_llm::models::qwen35::{Qwen35Config, Qwen35Model};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone)]
 pub(crate) struct Asset {
@@ -193,20 +195,30 @@ fn snapshot_files(selection: Option<MossImageAcceleration>) -> impl Iterator<Ite
 }
 impl Sources {
     pub fn new(variant: MossImageVariant, spec: &LoadSpec) -> gen_core::Result<Self> {
-        Self::prepare(variant, spec, None)
+        Self::prepare(variant, spec, None, None)
     }
     pub fn selected(
         variant: MossImageVariant,
         spec: &LoadSpec,
         mode: MossImageAcceleration,
     ) -> gen_core::Result<Self> {
-        Self::prepare(variant, spec, Some(mode))
+        Self::prepare(variant, spec, Some(mode), None)
+    }
+    pub fn selected_with_cancel(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        mode: MossImageAcceleration,
+        cancel: &CancelFlag,
+    ) -> gen_core::Result<Self> {
+        Self::prepare(variant, spec, Some(mode), Some(cancel))
     }
     fn prepare(
         variant: MossImageVariant,
         spec: &LoadSpec,
         selection: Option<MossImageAcceleration>,
+        cancel: Option<&CancelFlag>,
     ) -> gen_core::Result<Self> {
+        preparation_check(cancel)?;
         let shared_only = selection.is_none();
         let mode = selection.unwrap_or(MossImageAcceleration::Off);
         let full_fp32 = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
@@ -278,6 +290,7 @@ impl Sources {
         };
         let mut ordinary = Vec::new();
         for relative in snapshot_files(selection) {
+            preparation_check(cancel)?;
             let tr = relative.starts_with("transformer/");
             let role = if tr {
                 MossImageAssetRole::Transformer
@@ -354,7 +367,7 @@ impl Sources {
                 validate_shards(&dir, index, &ordinary, role)?;
             }
         }
-        let mut headers = validate_source_dtypes(&ordinary)?;
+        let mut headers = validate_source_dtypes(&ordinary, cancel)?;
         let lora = if unmerged {
             optional_file(
                 spec,
@@ -386,14 +399,14 @@ impl Sources {
             None
         };
         if let Some(data) = &data {
-            validate_dataspace(data)?;
+            validate_dataspace(data, cancel)?;
         }
         let mixed = match (lora, time, data.clone()) {
             (None, None, _) => None,
             (Some(l), Some(t), Some(d)) => {
-                validate_fp32(&l, &dmd_lora_shapes())?;
-                validate_fp32(&t, &dmd_replacement_shapes())?;
-                validate_dataspace(&d)?;
+                validate_fp32(&l, &dmd_lora_shapes(), cancel)?;
+                validate_fp32(&t, &dmd_replacement_shapes(), cancel)?;
+                validate_dataspace(&d, cancel)?;
                 Some(vec![l, t, d])
             }
             _ => {
@@ -441,13 +454,13 @@ impl Sources {
             assets.push(data.ok_or_else(|| {
                 gen_core::Error::Unsupported("MOSS full FP32 DMD requires dataspace".into())
             })?);
-            headers.extend(validate_source_dtypes(&assets)?);
+            headers.extend(validate_source_dtypes(&assets, cancel)?);
             Some(assets)
         } else {
             None
         };
         if let Some(assets) = &mixed {
-            headers.extend(validate_source_dtypes(assets)?);
+            headers.extend(validate_source_dtypes(assets, cancel)?);
         }
         let tokenizer = ordinary
             .iter()
@@ -552,36 +565,145 @@ fn validate_shards(
     }
     Ok(())
 }
+type HeaderKey = (&'static str, &'static str, &'static str, u64, [u8; 32]);
+type HeaderFacts = Vec<weightsmeta::SafetensorsTensorHeader>;
+type HeaderCache = Mutex<BTreeMap<HeaderKey, HeaderFacts>>;
+type Fp32Proofs = BTreeMap<HeaderKey, BTreeMap<String, Vec<usize>>>;
+fn preparation_check(cancel: Option<&CancelFlag>) -> gen_core::Result<()> {
+    if cancel.is_some_and(|c| c.is_cancelled()) {
+        Err(gen_core::Error::Canceled)
+    } else {
+        Ok(())
+    }
+}
+fn cached_headers(
+    cache: &HeaderCache,
+    key: HeaderKey,
+    pin: &PinnedWeightsFile,
+    cancel: Option<&CancelFlag>,
+    read: impl FnOnce() -> gen_core::Result<HeaderFacts>,
+) -> gen_core::Result<HeaderFacts> {
+    preparation_check(cancel)?;
+    pin.verify_unchanged()?;
+    let cached = cache
+        .lock()
+        .map_err(|_| gen_core::Error::Msg("MOSS header cache poisoned".into()))?
+        .get(&key)
+        .cloned();
+    if let Some(headers) = cached {
+        pin.verify_unchanged()?;
+        preparation_check(cancel)?;
+        return Ok(headers);
+    }
+    let headers = read()?;
+    pin.verify_unchanged()?;
+    preparation_check(cancel)?;
+    cache
+        .lock()
+        .map_err(|_| gen_core::Error::Msg("MOSS header cache poisoned".into()))?
+        .insert(key, headers.clone());
+    Ok(headers)
+}
+struct HashReader<'a, R> {
+    inner: R,
+    hash: Sha256,
+    bytes: u64,
+    cancel: Option<&'a CancelFlag>,
+}
+impl<R: Read> Read for HashReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_some_and(|c| c.is_cancelled()) {
+            return Err(std::io::Error::other("MOSS preparation canceled"));
+        }
+        let limit = buffer.len().min(64 * 1024);
+        let n = self.inner.read(&mut buffer[..limit])?;
+        self.hash.update(&buffer[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+fn stream_headers(
+    reader: impl Read,
+    bytes: u64,
+    digest: &[u8; 32],
+    cancel: Option<&CancelFlag>,
+) -> gen_core::Result<HeaderFacts> {
+    let mut reader = HashReader {
+        inner: reader,
+        hash: Sha256::new(),
+        bytes: 0,
+        cancel,
+    };
+    let result = (|| {
+        let layout = weightsmeta::safetensors_reader_tensor_locations(
+            &mut reader,
+            bytes,
+            "MOSS authenticated stream",
+        )?;
+        let mut chunk = [0u8; 64 * 1024];
+        while reader.read(&mut chunk)? != 0 {
+            if reader.bytes > bytes {
+                return Err(gen_core::Error::Unsupported(
+                    "MOSS stream size mismatch".into(),
+                ));
+            }
+        }
+        if reader.bytes != bytes || reader.hash.finalize()[..] != digest[..] {
+            return Err(gen_core::Error::Unsupported(
+                "MOSS streamed source SHA/size mismatch".into(),
+            ));
+        }
+        Ok(layout.tensors.into_iter().map(|t| t.header).collect())
+    })();
+    preparation_check(cancel)?;
+    result
+}
+fn asset_headers(a: &Asset, cancel: Option<&CancelFlag>) -> gen_core::Result<HeaderFacts> {
+    static CACHE: OnceLock<HeaderCache> = OnceLock::new();
+    verify_moss_image_asset(&a.pin, a.repo, a.revision, &a.relative)?;
+    let identity = moss_image_asset(a.repo, a.revision, &a.relative)
+        .ok_or_else(|| gen_core::Error::Unsupported("unknown MOSS source identity".into()))?;
+    let key = (
+        identity.repository,
+        identity.revision,
+        identity.relative_path,
+        identity.bytes,
+        *a.pin.content_sha256(),
+    );
+    cached_headers(
+        CACHE.get_or_init(Mutex::default),
+        key,
+        &a.pin,
+        cancel,
+        || {
+            a.pin.read_unchanged(|path| {
+                let file = std::fs::File::open(path)?;
+                if file.metadata()?.len() != identity.bytes {
+                    return Err(gen_core::Error::Unsupported(
+                        "MOSS opened source size mismatch".into(),
+                    ));
+                }
+                stream_headers(file, identity.bytes, a.pin.content_sha256(), cancel)
+            })
+        },
+    )
+}
 fn validate_source_dtypes(
     assets: &[Asset],
-) -> gen_core::Result<BTreeMap<[u8; 32], Vec<weightsmeta::SafetensorsTensorHeader>>> {
+    cancel: Option<&CancelFlag>,
+) -> gen_core::Result<BTreeMap<[u8; 32], HeaderFacts>> {
     let mut result = BTreeMap::new();
     for a in assets
         .iter()
         .filter(|a| a.relative.ends_with(".safetensors"))
     {
+        preparation_check(cancel)?;
         let expected = if a.repo == DMD_REPO || a.role == MossImageAssetRole::Vae {
             weightsmeta::Dtype::F32
         } else {
             weightsmeta::Dtype::BF16
         };
-        let bytes = a.authenticated_bytes()?;
-        let file = candle_gen::candle_core::safetensors::SliceSafetensors::new(&bytes)
-            .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
-        let headers: Vec<_> = file
-            .tensors()
-            .into_iter()
-            .map(|(name, t)| {
-                Ok(weightsmeta::SafetensorsTensorHeader {
-                    name,
-                    dtype: weightsmeta::Dtype::parse(&format!("{:?}", t.dtype())).ok_or_else(
-                        || gen_core::Error::Unsupported("MOSS unknown source tensor dtype".into()),
-                    )?,
-                    shape: t.shape().to_vec(),
-                    data_bytes: t.data().len() as u64,
-                })
-            })
-            .collect::<gen_core::Result<_>>()?;
+        let headers = asset_headers(a, cancel)?;
         if headers.iter().any(|h| {
             h.dtype != expected
                 && !h.name.ends_with("num_batches_tracked")
@@ -596,13 +718,82 @@ fn validate_source_dtypes(
     }
     Ok(result)
 }
-fn validate_fp32(a: &Asset, expected: &BTreeMap<String, Vec<usize>>) -> gen_core::Result<()> {
-    validate_fp32_bytes(&a.authenticated_bytes()?, expected)
+fn validate_fp32(
+    a: &Asset,
+    expected: &BTreeMap<String, Vec<usize>>,
+    cancel: Option<&CancelFlag>,
+) -> gen_core::Result<()> {
+    static VALIDATED: OnceLock<Mutex<Fp32Proofs>> = OnceLock::new();
+    preparation_check(cancel)?;
+    verify_moss_image_asset(&a.pin, a.repo, a.revision, &a.relative)?;
+    let identity = moss_image_asset(a.repo, a.revision, &a.relative)
+        .ok_or_else(|| gen_core::Error::Unsupported("unknown MOSS asset".into()))?;
+    let key = (
+        identity.repository,
+        identity.revision,
+        identity.relative_path,
+        identity.bytes,
+        *a.pin.content_sha256(),
+    );
+    let cache = VALIDATED.get_or_init(Mutex::default);
+    if cache
+        .lock()
+        .map_err(|_| gen_core::Error::Msg("MOSS validation cache poisoned".into()))?
+        .get(&key)
+        == Some(expected)
+    {
+        a.pin.verify_unchanged()?;
+        preparation_check(cancel)?;
+        return Ok(());
+    }
+    let result = a.pin.read_unchanged(|path| {
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() != identity.bytes {
+            return Err(gen_core::Error::Unsupported(
+                "MOSS opened source size mismatch".into(),
+            ));
+        }
+        let capacity = usize::try_from(identity.bytes)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| gen_core::Error::Unsupported("MOSS source too large".into()))?;
+        let mut reader = HashReader {
+            inner: file.take(identity.bytes + 1),
+            hash: Sha256::new(),
+            bytes: 0,
+            cancel,
+        };
+        let mut bytes = Vec::with_capacity(capacity);
+        reader.read_to_end(&mut bytes)?;
+        if reader.bytes != identity.bytes
+            || reader.hash.finalize()[..] != a.pin.content_sha256()[..]
+        {
+            return Err(gen_core::Error::Unsupported(
+                "MOSS actual validation bytes differ from approved identity".into(),
+            ));
+        }
+        validate_fp32_bytes_cancellable(&bytes, expected, cancel)
+    });
+    preparation_check(cancel)?;
+    result?;
+    cache
+        .lock()
+        .map_err(|_| gen_core::Error::Msg("MOSS validation cache poisoned".into()))?
+        .insert(key, expected.clone());
+    Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_fp32_bytes(
     bytes: &[u8],
     expected: &BTreeMap<String, Vec<usize>>,
+) -> gen_core::Result<()> {
+    validate_fp32_bytes_cancellable(bytes, expected, None)
+}
+fn validate_fp32_bytes_cancellable(
+    bytes: &[u8],
+    expected: &BTreeMap<String, Vec<usize>>,
+    cancel: Option<&CancelFlag>,
 ) -> gen_core::Result<()> {
     let file = candle_gen::candle_core::safetensors::SliceSafetensors::new(bytes)
         .map_err(|e| gen_core::Error::Msg(e.to_string()))?;
@@ -620,7 +811,10 @@ pub(crate) fn validate_fp32_bytes(
                 "MOSS DMD dtype/shape/coverage mismatch {name}"
             )));
         }
-        for bytes in tensor.data().chunks_exact(4) {
+        for (index, bytes) in tensor.data().chunks_exact(4).enumerate() {
+            if index.is_multiple_of(16384) {
+                preparation_check(cancel)?;
+            }
             let value = f32::from_le_bytes(bytes.try_into().expect("four bytes"));
             if !value.is_finite() || (name.ends_with(".alpha") && value != 128.0) {
                 return Err(gen_core::Error::Unsupported(format!(
@@ -632,7 +826,7 @@ pub(crate) fn validate_fp32_bytes(
     Ok(())
 }
 
-fn validate_dataspace(a: &Asset) -> gen_core::Result<()> {
+fn validate_dataspace(a: &Asset, cancel: Option<&CancelFlag>) -> gen_core::Result<()> {
     validate_fp32(
         a,
         &[
@@ -641,6 +835,7 @@ fn validate_dataspace(a: &Asset) -> gen_core::Result<()> {
         ]
         .into_iter()
         .collect(),
+        cancel,
     )
 }
 pub(crate) fn load_weights(
@@ -679,6 +874,182 @@ pub(crate) fn load_weights(
 }
 pub(crate) fn tensor_f32(t: &Tensor) -> Result<Vec<f32>> {
     Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
+}
+
+#[cfg(test)]
+mod header_cpu_tests {
+    use super::*;
+    use std::{cell::Cell, io::Cursor};
+    struct Counted<'a> {
+        bytes: Cursor<Vec<u8>>,
+        read: &'a Cell<usize>,
+        largest: &'a Cell<usize>,
+        cancel: Option<&'a CancelFlag>,
+    }
+    impl Read for Counted<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.largest.set(self.largest.get().max(out.len()));
+            let n = self.bytes.read(out)?;
+            self.read.set(self.read.get() + n);
+            if self.read.get() > 64 * 1024 {
+                if let Some(cancel) = self.cancel {
+                    cancel.cancel();
+                }
+            }
+            Ok(n)
+        }
+    }
+    fn fixture() -> Vec<u8> {
+        let mut h = serde_json::to_vec(
+            &serde_json::json!({"t":{"dtype":"BF16","shape":[65536],"data_offsets":[0,131072]}}),
+        )
+        .unwrap();
+        while !h.len().is_multiple_of(8) {
+            h.push(b' ');
+        }
+        let mut out = (h.len() as u64).to_le_bytes().to_vec();
+        out.extend(h);
+        out.resize(out.len() + 131072, 0);
+        out
+    }
+    #[test]
+    fn authenticated_header_cache_counts_cold_reads_and_zero_warm_payload_io_sc26325() {
+        let data = fixture();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
+        let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
+        let digest = *pin.content_sha256();
+        let key = (
+            "tiny-approved-test",
+            "rev",
+            "tensor.safetensors",
+            data.len() as u64,
+            digest,
+        );
+        let cache = HeaderCache::default();
+        let read = Cell::new(0);
+        let largest = Cell::new(0);
+        let auth = Cell::new(0);
+        let headers = cached_headers(&cache, key, &pin, None, || {
+            auth.set(auth.get() + 1);
+            pin.read_unchanged(|_| {
+                stream_headers(
+                    Counted {
+                        bytes: Cursor::new(data.clone()),
+                        read: &read,
+                        largest: &largest,
+                        cancel: None,
+                    },
+                    data.len() as u64,
+                    &digest,
+                    None,
+                )
+            })
+        })
+        .unwrap();
+        assert_eq!(read.get(), data.len());
+        assert_eq!(auth.get(), 1);
+        assert!(largest.get() <= 64 * 1024);
+        assert_eq!(headers[0].shape, vec![65536]);
+        assert_eq!(headers[0].data_bytes, 131072);
+        let before = read.get();
+        let warm = cached_headers(&cache, key, &pin, None, || {
+            panic!("warm header facts reopened payload")
+        })
+        .unwrap();
+        assert_eq!(warm, headers);
+        assert_eq!(read.get(), before);
+        assert_eq!(auth.get(), 1);
+        std::fs::write(tmp.path(), b"changed retained target").unwrap();
+        assert!(cached_headers(&cache, key, &pin, None, || panic!("mutated pin read")).is_err());
+    }
+    #[test]
+    fn corrupt_and_canceled_streams_never_cache_and_same_identity_can_retry_sc26325() {
+        let data = fixture();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
+        let pin = PinnedWeightsFile::pin(tmp.path()).unwrap();
+        let digest = *pin.content_sha256();
+        let key = (
+            "tiny-approved-test",
+            "rev",
+            "tensor.safetensors",
+            data.len() as u64,
+            digest,
+        );
+        for canceled in [false, true] {
+            let cache = HeaderCache::default();
+            let token = CancelFlag::default();
+            let read = Cell::new(0);
+            let largest = Cell::new(0);
+            let mut bad = data.clone();
+            if !canceled {
+                *bad.last_mut().unwrap() = 1;
+            }
+            let result = cached_headers(&cache, key, &pin, Some(&token), || {
+                pin.read_unchanged(|_| {
+                    stream_headers(
+                        Counted {
+                            bytes: Cursor::new(bad),
+                            read: &read,
+                            largest: &largest,
+                            cancel: canceled.then_some(&token),
+                        },
+                        data.len() as u64,
+                        &digest,
+                        Some(&token),
+                    )
+                })
+            });
+            assert!(result.is_err());
+            if canceled {
+                assert!(matches!(result, Err(gen_core::Error::Canceled)));
+                assert!(read.get() < data.len());
+            }
+            assert!(cache.lock().unwrap().is_empty());
+            let fresh = CancelFlag::default();
+            let facts = cached_headers(&cache, key, &pin, Some(&fresh), || {
+                pin.read_unchanged(|_| {
+                    stream_headers(
+                        Cursor::new(data.clone()),
+                        data.len() as u64,
+                        &digest,
+                        Some(&fresh),
+                    )
+                })
+            })
+            .unwrap();
+            assert_eq!(facts[0].data_bytes, 131072);
+            assert_eq!(cache.lock().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn truncated_and_oversized_prefixes_refuse_before_large_allocation_sc26325() {
+        for bytes in [
+            vec![0, 1, 2],
+            u64::MAX.to_le_bytes().to_vec(),
+            100_000_001u64.to_le_bytes().to_vec(),
+            32u64.to_le_bytes().to_vec(),
+        ] {
+            let read = Cell::new(0);
+            let largest = Cell::new(0);
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            assert!(stream_headers(
+                Counted {
+                    bytes: Cursor::new(bytes.clone()),
+                    read: &read,
+                    largest: &largest,
+                    cancel: None
+                },
+                bytes.len() as u64,
+                &digest,
+                None
+            )
+            .is_err());
+            assert!(read.get() <= 8);
+            assert!(largest.get() <= 8);
+        }
+    }
 }
 
 #[cfg(test)]

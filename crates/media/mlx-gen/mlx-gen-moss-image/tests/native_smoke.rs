@@ -189,7 +189,6 @@ fn native_generation_or_cancel_with_actual_receipt() {
 #[test]
 #[ignore = "requires coordinator-admitted Metal ownership and exact local assets; no PNG comparison"]
 fn native_advanced_supplied_order_receipt() {
-    use sha2::{Digest, Sha256};
     assert_eq!(
         std::env::var("MOSS_NATIVE_TEST_ADMITTED").as_deref(),
         Ok("1")
@@ -252,29 +251,15 @@ fn native_advanced_supplied_order_receipt() {
         MossImageAcceleration::Off
     );
     assert_eq!(report.data().output_kind, MossImageOutputKind::Latents);
-    assert_eq!(report.data().samples.len(), 4);
-    for i in 0..4 {
-        let mut hash = Sha256::new();
-        for value in &noise[i * stride..(i + 1) * stride] {
-            hash.update(value.to_le_bytes());
-        }
-        assert_eq!(
-            report.data().samples[i].noise_sha256,
-            format!("{:x}", hash.finalize())
-        );
-        assert!(report.data().samples[i].seed.is_none());
-        let b = i / 2;
-        let mut hash = Sha256::new();
-        for value in &embeddings[b * 3 * 4096..(b + 1) * 3 * 4096] {
-            hash.update(value.to_le_bytes());
-        }
-        hash.update(&mask[b * 3..(b + 1) * 3]);
-        assert_eq!(
-            report.data().conditioning[i].positive.sha256,
-            format!("{:x}", hash.finalize())
-        );
-        assert_eq!(report.data().conditioning[i].positive.valid_tokens, 2);
-    }
+    assert_supplied_order(
+        &report.data().conditioning,
+        &report.data().samples,
+        report.data().images_per_prompt,
+        &embeddings,
+        &mask,
+        &noise,
+        stride,
+    );
     let out = path("MOSS_NATIVE_TEST_OUTPUT_DIR");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(
@@ -282,4 +267,100 @@ fn native_advanced_supplied_order_receipt() {
         serde_json::to_vec_pretty(&report).unwrap(),
     )
     .unwrap();
+}
+
+fn assert_supplied_order(
+    conditioning: &[MossImageConditioningReceipt],
+    samples: &[MossImageSampleReceipt],
+    images_per_prompt: u32,
+    embeddings: &[f32],
+    mask: &[u8],
+    noise: &[f32],
+    stride: usize,
+) {
+    use sha2::{Digest, Sha256};
+    assert_eq!(samples.len(), 4);
+    assert_eq!(conditioning.len(), 2);
+    assert_eq!(images_per_prompt, 2);
+    assert_eq!(noise.len(), 4 * stride);
+    for i in 0..4 {
+        let mut hash = Sha256::new();
+        for value in &noise[i * stride..(i + 1) * stride] {
+            hash.update(value.to_le_bytes());
+        }
+        assert_eq!(samples[i].noise_sha256, format!("{:x}", hash.finalize()));
+        assert!(samples[i].seed.is_none());
+        let b = i / 2;
+        let mut hash = Sha256::new();
+        for value in &embeddings[b * 3 * 4096..(b + 1) * 3 * 4096] {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update(&mask[b * 3..(b + 1) * 3]);
+        assert_eq!(
+            conditioning[b].positive.sha256,
+            format!("{:x}", hash.finalize())
+        );
+        assert_eq!(conditioning[b].positive.valid_tokens, 2);
+    }
+}
+#[test]
+fn supplied_receipt_prompt_major_order_is_distinct_from_sample_order_sc26325() {
+    use sha2::{Digest, Sha256};
+    let embeddings: Vec<f32> = (0..2 * 3 * 4096).map(|i| i as f32 * 0.01).collect();
+    let mask = [1, 0, 1, 0, 1, 1];
+    let noise = [1., 2., 3., 4., 5., 6., 7., 8.];
+    let conditioning: Vec<_> = (0..2)
+        .map(|b| {
+            let mut h = Sha256::new();
+            for v in &embeddings[b * 3 * 4096..(b + 1) * 3 * 4096] {
+                h.update(v.to_le_bytes());
+            }
+            h.update(&mask[b * 3..(b + 1) * 3]);
+            MossImageConditioningReceipt {
+                positive: MossImageConditioningInputReceipt {
+                    source: MossImageConditioningSource::Embeddings,
+                    sha256: format!("{:x}", h.finalize()),
+                    sequence_length: 3,
+                    valid_tokens: 2,
+                },
+                negative: None,
+            }
+        })
+        .collect();
+    let samples: Vec<_> = noise
+        .chunks_exact(2)
+        .map(|chunk| {
+            let mut h = Sha256::new();
+            for v in chunk {
+                h.update(f32::to_le_bytes(*v));
+            }
+            MossImageSampleReceipt {
+                seed: None,
+                noise_sha256: format!("{:x}", h.finalize()),
+            }
+        })
+        .collect();
+    assert_supplied_order(&conditioning, &samples, 2, &embeddings, &mask, &noise, 2);
+    let mut wrong = conditioning.clone();
+    wrong.swap(0, 1);
+    assert!(std::panic::catch_unwind(|| assert_supplied_order(
+        &wrong,
+        &samples,
+        2,
+        &embeddings,
+        &mask,
+        &noise,
+        2
+    ))
+    .is_err());
+    assert!(std::panic::catch_unwind(|| assert_supplied_order(
+        &conditioning[..1],
+        &samples,
+        2,
+        &embeddings,
+        &mask,
+        &noise,
+        2
+    ))
+    .is_err());
 }
