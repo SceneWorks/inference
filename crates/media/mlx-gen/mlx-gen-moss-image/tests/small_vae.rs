@@ -138,6 +138,8 @@ fn actual_moss_small_decoder_matches_frozen_author_pixels_on_metal() {
             .transpose_axes(&[0, 3, 1, 2])
             .unwrap();
         assert_eq!(actual.shape(), [1, 3, 16, 16]);
+        // The NCHW transpose is a strided view of NHWC pixels; host slices expose storage order.
+        let actual = mlx_gen::array::contiguous(&actual).unwrap();
         mlx_rs::transforms::eval([&actual]).unwrap();
         let actual = actual.try_as_slice::<f32>().unwrap();
         let expected = values(&f["pixels_nchw"]["values"]);

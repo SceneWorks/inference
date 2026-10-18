@@ -692,7 +692,8 @@ mod author_fixture_tests {
             .collect()
     }
     fn delta(actual: &Array, expected: &serde_json::Value) -> f32 {
-        let actual = actual.as_dtype(Dtype::Float32).unwrap();
+        // Host slices expose physical storage; a B=1 concatenation can retain a transposed view.
+        let actual = mlx_gen::array::contiguous(&actual.as_dtype(Dtype::Float32).unwrap()).unwrap();
         eval([&actual]).unwrap();
         let expected_values: Vec<f32> = serde_json::from_value(expected["values"].clone()).unwrap();
         let expected_shape: Vec<i32> = serde_json::from_value(expected["shape"].clone()).unwrap();
@@ -858,10 +859,14 @@ mod author_fixture_tests {
                 .as_dtype(Dtype::Float32)
                 .unwrap();
             let expected = &f["runs"]["correct_widened"]["steps"][i];
-            assert!(delta(&velocity, &expected["velocity"]) < 1e-3);
+            let velocity_error = delta(&velocity, &expected["velocity"]);
+            assert!(velocity_error < 1e-3,
+                "DMD step={i} velocity max_abs={velocity_error}; input max_abs={}; actual={:?}; expected={:?}",
+                delta(&input, &expected["input"]), crate::pipeline::logical_f32_readback(&velocity).unwrap(), expected["velocity"]["values"]);
             clean = subtract(&noise, velocity).unwrap();
             eval([&clean]).unwrap();
-            assert!(delta(&clean, &expected["x0"]) < 1e-3);
+            let clean_error = delta(&clean, &expected["x0"]);
+            assert!(clean_error < 1e-3, "DMD step={i} x0 max_abs={clean_error}");
         }
     }
 }

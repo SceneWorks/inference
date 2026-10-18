@@ -7,6 +7,17 @@ use mlx_gen::gen_core::moss_image::{
 use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
+
+/// Read logical C-order values, rather than the physical storage of an MLX strided view.
+pub(crate) fn logical_f32_readback(array: &Array) -> Result<Vec<f32>> {
+    let contiguous = mlx_gen::array::contiguous(&array.as_dtype(Dtype::Float32)?)?;
+    mlx_rs::transforms::eval([&contiguous])?;
+    Ok(contiguous
+        .try_as_slice::<f32>()
+        .map_err(|error| Error::Msg(error.to_string()))?
+        .to_vec())
+}
+
 pub(crate) fn check(cancel: &CancelFlag) -> Result<()> {
     if cancel.is_cancelled() {
         Err(Error::Canceled)
@@ -166,5 +177,84 @@ mod cpu_tests {
         let c = CancelFlag::new();
         c.cancel();
         assert!(matches!(check(&c), Err(Error::Canceled)));
+    }
+}
+
+#[cfg(test)]
+mod host_readback_cpu_tests {
+    use super::*;
+    #[test]
+    fn noncontiguous_b1_and_b2_latents_read_in_logical_nchw_order() {
+        const CHILD: &str = "MOSS_TEST_LOGICAL_READBACK_CPU_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            // Process-default devices are global. Isolate CPU selection so this regression can
+            // run beside the ordinary Metal fixtures even under a parallel libtest harness.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pipeline::host_readback_cpu_tests::noncontiguous_b1_and_b2_latents_read_in_logical_nchw_order", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "CPU readback child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // This isolated child runs exactly this test. Both defaults are CPU, including C++
+        // operations that omit their explicit stream; no parent or sibling device is changed.
+        mlx_rs::Device::set_default(&mlx_rs::Device::new(mlx_rs::DeviceType::Cpu, 0));
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            for batch in [1usize, 2] {
+                let source: Vec<f32> = (0..batch * 2 * 3 * 4)
+                    .map(|i| (i as f32 - 24.0) / 32.0)
+                    .collect();
+                let view = Array::from_slice(&source, &[batch as i32, 2, 3, 4])
+                    .as_dtype(Dtype::Bfloat16)
+                    .unwrap()
+                    .transpose_axes(&[0, 3, 1, 2])
+                    .unwrap();
+                let mut expected = Vec::new();
+                for b in 0..batch {
+                    for c in 0..4 {
+                        for y in 0..2 {
+                            for x in 0..3 {
+                                expected.push(source[((b * 2 + y) * 3 + x) * 4 + c]);
+                            }
+                        }
+                    }
+                }
+                let physical = view.as_dtype(Dtype::Float32).unwrap();
+                mlx_rs::transforms::eval([&physical]).unwrap();
+                assert_ne!(
+                    physical.try_as_slice::<f32>().unwrap(),
+                    expected.as_slice(),
+                    "fixture must discriminate physical NHWC storage from logical NCHW"
+                );
+                assert_eq!(logical_f32_readback(&view).unwrap(), expected);
+                let samples = (0..batch)
+                    .map(|b| mlx_gen::attention::slice_axis(&view, 0, b as i32, 1).unwrap())
+                    .collect::<Vec<_>>();
+                let concatenated =
+                    mlx_rs::ops::concatenate_axis(&samples.iter().collect::<Vec<_>>(), 0).unwrap();
+                assert_eq!(concatenated.shape(), [batch as i32, 4, 2, 3]);
+                assert_eq!(logical_f32_readback(&concatenated).unwrap(), expected);
+                if batch == 1 {
+                    // MOSS's decoded NHWC image is handed to the shared converter as NCHW.
+                    // Its explicit flatten must retain logical RGB order even for this strided crop.
+                    let rgb = mlx_gen::attention::slice_axis(&view, 1, 0, 3).unwrap();
+                    let image = mlx_gen::image::decoded_to_image(&rgb).unwrap();
+                    let expected_rgb: Vec<u8> = source
+                        .chunks_exact(4)
+                        .flat_map(|pixel| pixel[..3].iter())
+                        .map(|v| {
+                            (((v * 0.5 + 0.5).clamp(0.0, 1.0)) * 255.0).round_ties_even() as u8
+                        })
+                        .collect();
+                    assert_eq!((image.width, image.height), (3, 2));
+                    assert_eq!(image.pixels, expected_rgb);
+                }
+            }
+        });
     }
 }
