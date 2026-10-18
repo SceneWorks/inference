@@ -866,6 +866,9 @@ mod tests {
                 "sd3" => Some(&SD3_LATENT_SPACE),
                 "sdxl" | "kolors" => Some(&SDXL_LATENT_SPACE),
                 "flux2" | "ideogram" | "lens" => Some(&FLUX2_PACKED_LATENT_SPACE),
+                // MOSS's small FLUX.2 VAE consumes the same normalized 128-channel packed grid
+                // before channel-major 2×2 unpacking into the raw 32-channel VAE latents.
+                "moss_image" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
                 "mage_flow" => Some(&MAGE_LATENT_SPACE),
                 "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
