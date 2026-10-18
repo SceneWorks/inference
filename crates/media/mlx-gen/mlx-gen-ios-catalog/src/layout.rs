@@ -303,6 +303,58 @@ pub fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The architecture digest is the headers' names, shapes, dtypes (and so packing) only: two
+    /// installs of fine-tunes of one architecture — other directory, other file names, other
+    /// config values, other weight bytes, another route — share it; another dtype, shape or tensor
+    /// does not; a mode-added ControlNet / IP-Adapter source is not part of it.
+    #[test]
+    fn the_architecture_digest_is_headers_only() {
+        fn write(path: &Path, dtype: &str, shape: &[usize], fill: u8) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let width = if dtype == "F32" { 4 } else { 2 };
+            let bytes = shape.iter().product::<usize>() * width;
+            let header = format!(
+                r#"{{"w":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[0,{bytes}]}}}}"#
+            );
+            let mut data = (header.len() as u64).to_le_bytes().to_vec();
+            data.extend(header.as_bytes());
+            data.resize(data.len() + bytes, fill);
+            std::fs::write(path, data).unwrap();
+        }
+        let make = |name: &str, dtype: &str, fill: u8, config: &str| {
+            let root = tempfile::tempdir().unwrap();
+            write(&root.path().join("unet").join(name), dtype, &[4, 8], fill);
+            std::fs::write(root.path().join("unet/config.json"), config).unwrap();
+            root
+        };
+        let digest = |root: &Path, route: &str| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_owned()));
+            spec.resolved_route = Some(route.into());
+            architecture_digest(&spec).unwrap()
+        };
+        let base = make("model.safetensors", "F16", 1, r#"{"sample_size": 128}"#);
+        let tune = make("model.fp16.safetensors", "F16", 7, r#"{"sample_size": 64}"#);
+        assert_eq!(
+            digest(base.path(), "sdxl"),
+            digest(tune.path(), "realvisxl")
+        );
+        let wider = make("model.safetensors", "F32", 1, "{}");
+        assert_ne!(digest(base.path(), "sdxl"), digest(wider.path(), "sdxl"));
+        // The artifact layout (exact-key check) does tell the two checkpoints apart.
+        let layout = |root: &Path| {
+            artifact_layout_digest(&LoadSpec::new(WeightsSource::Dir(root.to_owned()))).unwrap()
+        };
+        assert_ne!(layout(base.path()), layout(tune.path()));
+        // A mode-added component does not change the base architecture.
+        let control = make("controlnet.safetensors", "F16", 1, "{}");
+        let mut with_control = LoadSpec::new(WeightsSource::Dir(base.path().to_owned()));
+        with_control.control = Some(WeightsSource::Dir(control.path().to_owned()));
+        assert_eq!(
+            architecture_digest(&with_control).unwrap(),
+            digest(base.path(), "sdxl")
+        );
+    }
+
     pub(crate) fn write_tensor(path: &Path, dtype: &str, count: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = count * if dtype == "F32" { 4 } else { 2 };

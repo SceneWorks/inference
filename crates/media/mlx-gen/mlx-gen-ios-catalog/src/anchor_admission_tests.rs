@@ -29,6 +29,10 @@ fn synthetic(req: &IosPricingRequest<'_>) -> mlx_gen::Result<IosPricing> {
         Some(_) => p.take(Decode, 200 * MIB, 400 * MIB, "SDXL VAE tiled stage"),
         None => p.take(Decode, 200 * MIB, mp(1600 * MIB), "SDXL VAE resnet"),
     }
+    // img2img adds an ENCODE phase the text anchor never ran.
+    if *req.mode == mlx_gen::gen_core::MemoryMode::ImageToImage {
+        p.take(Encode, 1500 * MIB, 1500 * MIB, "SDXL VAE encode resnet");
+    }
     Ok(p)
 }
 
@@ -264,6 +268,10 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
                 from: AnchorKind::Optimized
             }
         );
+        // The anchor is priced as MEASURED (text mode, no encode): the img2img request's extra
+        // encode phase is its formula (1500 resident + 1500 scratch) + the anchor's largest
+        // unpriced overhead (denoise, 700) = 3700 MiB, above every anchored phase.
+        assert_eq!(admitted.demand_bytes(), 3700 * MIB);
     });
     // Another architecture (a U-Net with different headers) is another family: never derived.
     let other_root = fixture();
