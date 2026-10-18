@@ -13,7 +13,7 @@
 //! so the branch is a generic primitive, not tile-specific.
 
 use mlx_rs::ops::{add, multiply};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
@@ -75,20 +75,27 @@ impl Conv2dLayer {
             &self.call(x),
             0,
             u64::from(silu),
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         );
         mlx_gen::ios_quantum::run(crate::quantum::CONTROL_COND_CONV, scratch, build)
+    }
+
+    /// The NHWC shape and dtype this layer's convolution returns over `x` (header-only pricing).
+    fn price_output(&self, x: &Array) -> Result<Array> {
+        let s = x.shape();
+        let w = self.weight.shape();
+        let out = |n: i32, k: i32| (n + 2 * self.pad - k) / self.stride.max(1) + 1;
+        crate::quantum::shaped(
+            &[s[0], out(s[1], w[1]), out(s[2], w[2]), w[0]],
+            crate::quantum::promote_all(x.dtype(), &[&self.weight, &self.bias]),
+        )
     }
 
     /// One 1x1 zero-conv head scaled by `s`, as a guarded iOS quantum (sc-26270): the output (its
     /// bias add and the scale donate) and the kernel transient.
     fn zero_quantum(&self, x: &Array, s: &Array) -> Result<Array> {
-        let scratch = crate::quantum::single_conv_bytes(
-            &self.call(x),
-            0,
-            0,
-            crate::quantum::Backend::current(),
-        );
+        let scratch =
+            crate::quantum::single_conv_bytes(&self.call(x), 0, 0, crate::quantum::backend());
         mlx_gen::ios_quantum::run(crate::quantum::CONTROL_ZERO_CONV, scratch, || {
             Ok(multiply(&self.forward(x)?, s)?)
         })
@@ -121,6 +128,28 @@ impl CondEmbedding {
             blocks,
             conv_out,
         })
+    }
+
+    /// Header-only pricing of [`Self::forward`] over the shape-only `control`: each convolution's
+    /// guarded quantum, in order. Returns the shape-only embedding.
+    fn price_forward(&self, control: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
+        let mut e = control.clone();
+        for (layer, silu) in std::iter::once((&self.conv_in, true))
+            .chain(self.blocks.iter().map(|b| (b, true)))
+            .chain(std::iter::once((&self.conv_out, false)))
+        {
+            out.push((
+                crate::quantum::CONTROL_COND_CONV,
+                crate::quantum::single_conv_bytes(
+                    &layer.call(&e),
+                    0,
+                    u64::from(silu),
+                    crate::quantum::backend(),
+                ),
+            ));
+            e = layer.price_output(&e)?;
+        }
+        Ok(e)
     }
 
     /// `control`: NHWC `[B, H, W, 3]` in `[0,1]` → `[B, H/8, W/8, 320]`.
@@ -275,6 +304,105 @@ impl ControlNet {
         self.cond_embedding.forward(control)
     }
 
+    /// Header-only pricing of [`Self::embed_cond`] over the shape-only control image.
+    pub(crate) fn price_embed_cond(
+        &self,
+        control: &Array,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        self.cond_embedding.price_forward(control, out)
+    }
+
+    /// Header-only pricing of one [`Self::forward_planned`]: every quantum it checks, in order,
+    /// with the guards' own formulas, over the shape-only latent row `x`, the shape-only
+    /// conditioning embedding row, the text memory and pooled embedding at the pair's batch.
+    /// Returns the shape-only scaled residuals `(down, mid)` the U-Net injects.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn price_forward(
+        &self,
+        x: &Array,
+        cond_embed: &Array,
+        encoder_x: &Array,
+        text_emb: &Array,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<(Vec<Array>, Array)> {
+        let plan =
+            crate::plan::SdxlForwardPlan::with_attention(plan.attention).with_cfg_row(plan.cfg_row);
+        let batch = x.shape()[0];
+        let dtype = x.dtype();
+        out.push((
+            crate::quantum::CONTROL_STEM,
+            self.stem_scratch(x, encoder_x),
+        ));
+        let projected = match &self.encoder_hid_proj {
+            Some(proj) => {
+                let e = encoder_x.shape();
+                Some(crate::quantum::shaped(
+                    &[e[0], e[1], crate::quantum::linear_out(proj) as i32],
+                    crate::quantum::linear_output_dtype(proj, encoder_x.dtype()),
+                )?)
+            }
+            None => None,
+        };
+        let encoder_x = projected.as_ref().unwrap_or(encoder_x);
+        let temb = crate::quantum::shaped(
+            &[
+                plan.conditioning_batch(batch),
+                self.time_embedding.out_features(),
+            ],
+            super::embeddings::text_time_temb_dtype(
+                &self.time_embedding,
+                &self.add_embedding,
+                text_emb.dtype(),
+                dtype,
+            ),
+        )?;
+        let stem = self.conv_in.price_output(x)?;
+        let mut x = crate::quantum::shaped(
+            stem.shape(),
+            Dtype::from_promoting_types(stem.dtype(), cond_embed.dtype()),
+        )?;
+        let mut residuals: Vec<Array> = vec![x.clone()];
+        for block in &self.down_blocks {
+            let (o, res) = block.price_forward(&x, encoder_x, &temb, None, None, plan, out)?;
+            x = o;
+            residuals.extend(res);
+        }
+        for (resnet, attention) in [
+            (&self.mid_resnet0, Some(&self.mid_transformer)),
+            (&self.mid_resnet1, None),
+        ] {
+            out.push((
+                crate::quantum::UNET_RESNET,
+                resnet.quantum_scratch(&x, Some(&temb)),
+            ));
+            let s = x.shape();
+            x = crate::quantum::shaped(
+                &[s[0], s[1], s[2], resnet.conv_weights().1.shape()[0]],
+                resnet.output_dtype(x.dtype(), Some(temb.dtype())),
+            )?;
+            if let Some(attention) = attention {
+                x = attention.price_forward(&x, encoder_x, None, plan, out)?;
+            }
+        }
+        check_residual_zero_pairing(residuals.len(), self.down_zero.len())?;
+        let scaled = |z: &Conv2dLayer, r: &Array, out: &mut crate::quantum::Quanta| {
+            out.push((
+                crate::quantum::CONTROL_ZERO_CONV,
+                crate::quantum::single_conv_bytes(&z.call(r), 0, 0, crate::quantum::backend()),
+            ));
+            let o = z.price_output(r)?;
+            crate::quantum::shaped(o.shape(), Dtype::from_promoting_types(o.dtype(), dtype))
+        };
+        let mut down = Vec::with_capacity(residuals.len());
+        for (r, z) in residuals.iter().zip(&self.down_zero) {
+            down.push(scaled(z, r, out)?);
+        }
+        let mid = scaled(&self.mid_zero, &x, out)?;
+        Ok((down, mid))
+    }
+
     /// Compute the control residuals for one denoise step.
     /// - `x`: NHWC latents `[B, H, W, 4]` (the same CFG-batched input the UNet sees).
     /// - `cond_embed`: the precomputed conditioning embedding ([`embed_cond`](Self::embed_cond)) for
@@ -407,7 +535,7 @@ impl ControlNet {
             &self.conv_in.weight,
             self.encoder_hid_proj.as_ref(),
             0,
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         )
     }
 

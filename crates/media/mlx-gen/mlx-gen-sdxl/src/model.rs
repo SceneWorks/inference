@@ -320,7 +320,11 @@ pub(crate) struct SdxlHeavyOwned {
     /// Optional IP-Adapter image-token source (sc-3059), loaded from `LoadSpec::ip_adapter`. When
     /// present, the model is in "IP mode": a `Reference` conditioning is the image prompt (txt2img +
     /// IP), not an img2img init. The decoupled-attn K/V projections are installed into `unet`.
-    ip_adapter: Option<IpImageEncoder>,
+    ///
+    /// Behind a lock so a STAGED request can shed it once the image prompt is encoded (epic 16774
+    /// lever: [`Self::ip_tokens`]): the ViT-H tower and the Resampler are not read again by the
+    /// denoise — only the installed K/V pairs are — so the denoise runs without their bytes.
+    ip_adapter: std::sync::Mutex<Option<IpImageEncoder>>,
     vae: Autoencoder,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): loaded when the spec
     /// carries [`LoadSpec::pid`]. `Some` ⇒ a `req.use_pid` generation decodes the final SDXL latent
@@ -335,7 +339,6 @@ pub(crate) struct SdxlHeavyOwned {
 struct SdxlHeavy<'a> {
     unet: &'a UNet2DConditionModel,
     controls: &'a [ControlNet],
-    ip_adapter: Option<&'a IpImageEncoder>,
     vae: &'a Autoencoder,
     pid: Option<&'a PidEngine>,
 }
@@ -345,10 +348,79 @@ impl SdxlHeavyOwned {
         SdxlHeavy {
             unet: &self.unet,
             controls: &self.controls,
-            ip_adapter: self.ip_adapter.as_ref(),
             vae: &self.vae,
             pid: self.pid.as_ref(),
         }
+    }
+
+    /// A heavy bundle of `unet`, `vae` and an optional IP image encoder (epic 16774 tests).
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        unet: UNet2DConditionModel,
+        vae: Autoencoder,
+        ip: Option<IpImageEncoder>,
+    ) -> Self {
+        Self {
+            unet,
+            controls: Vec::new(),
+            ip_adapter: std::sync::Mutex::new(ip),
+            vae,
+            pid: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ip_adapter_for_test(&self) -> bool {
+        self.has_ip_adapter().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ip_tokens_for_test(
+        &self,
+        image: &Image,
+        cfg_on: bool,
+        shed: bool,
+    ) -> Result<mlx_rs::Array> {
+        self.ip_tokens(image, cfg_on, shed)
+    }
+
+    /// Whether the IP-Adapter image encoder is loaded (and not yet shed).
+    fn has_ip_adapter(&self) -> Result<bool> {
+        Ok(self.ip_lock()?.is_some())
+    }
+
+    fn ip_lock(&self) -> Result<std::sync::MutexGuard<'_, Option<IpImageEncoder>>> {
+        self.ip_adapter
+            .lock()
+            .map_err(|_| Error::Msg("sdxl: the IP-Adapter encoder lock is poisoned".into()))
+    }
+
+    /// The request's IP image-prompt tokens — CFG-batched with a zeros uncond row when `cfg_on` —
+    /// and, when `shed` ([`sheds_ip_image_encoder`]: a staged request), the release of the image
+    /// encoder and Resampler the moment the tokens are materialized: nothing after reads them, so
+    /// the denoise runs without their bytes (epic 16774 lever; the K/V pairs stay installed in the
+    /// U-Net). The tokens are the same values either way.
+    fn ip_tokens(&self, image: &Image, cfg_on: bool, shed: bool) -> Result<mlx_rs::Array> {
+        let mut slot = self.ip_lock()?;
+        let enc = slot.as_ref().ok_or_else(|| {
+            Error::Msg("sdxl: the IP-Adapter image encoder was already released".into())
+        })?;
+        let tokens = enc.tokens(image)?;
+        let tokens = if cfg_on {
+            let zeros = enc.zeros_like_tokens(tokens.dtype())?;
+            concatenate_axis(&[&tokens, &zeros], 0)?
+        } else {
+            tokens
+        };
+        if shed {
+            // Materialize before the release: a lazy token graph still references the encoder's
+            // weights, and dropping it first would free nothing.
+            tokens.eval()?;
+            *slot = None;
+            drop(slot);
+            mlx_gen::residency::drain_allocator_cache();
+        }
+        Ok(tokens)
     }
 }
 
@@ -389,6 +461,13 @@ impl StagedHeavy for SdxlHeavyOwned {
     fn light_view(light: &SdxlLight) -> SdxlDecodeView<'_> {
         SdxlDecodeView { vae: &light.vae }
     }
+}
+
+/// Whether a request sheds the IP-Adapter image encoder once its image prompt is encoded (epic 16774
+/// lever): exactly a staged request, whose heavy bundle is its own (a warm bundle serves the next
+/// request and keeps it).
+pub(crate) fn sheds_ip_image_encoder(stage_residency: bool) -> bool {
+    stage_residency
 }
 
 /// What the denoise phase hands the decode phase: every image's final latent (evaluated), plus the
@@ -624,7 +703,7 @@ pub(crate) fn build_ldm_residency(
             warm_spec.read_prepared_files_unchanged(|| {
                 warm_file.read_unchanged(|file| {
                     crate::ldm::before_component_load(
-                        "SDXL LDM text load",
+                        crate::quantum::LDM_TEXT_LOAD,
                         file,
                         &[SdxlLdmComponent::ClipL, SdxlLdmComponent::ClipBigG],
                     )?;
@@ -636,7 +715,7 @@ pub(crate) fn build_ldm_residency(
                     } = crate::ldm::split_ldm_checkpoint(file)?;
                     let text = build_ldm_text(clip_l, clip_bigg, warm_spec.quantize)?;
                     crate::ldm::before_component_load(
-                        "SDXL LDM UNet+VAE load",
+                        crate::quantum::LDM_HEAVY_LOAD,
                         file,
                         ldm_heavy_components(&warm_spec),
                     )?;
@@ -648,7 +727,7 @@ pub(crate) fn build_ldm_residency(
         move || {
             text_file.read_unchanged(|file| {
                 crate::ldm::before_component_load(
-                    "SDXL LDM text load",
+                    crate::quantum::LDM_TEXT_LOAD,
                     file,
                     &[SdxlLdmComponent::ClipL, SdxlLdmComponent::ClipBigG],
                 )?;
@@ -662,7 +741,7 @@ pub(crate) fn build_ldm_residency(
             heavy_spec.read_prepared_files_unchanged(|| {
                 heavy_file.read_unchanged(|file| {
                     crate::ldm::before_component_load(
-                        "SDXL LDM UNet+VAE load",
+                        crate::quantum::LDM_HEAVY_LOAD,
                         file,
                         ldm_heavy_components(&heavy_spec),
                     )?;
@@ -776,7 +855,7 @@ fn build_ldm_heavy(
     Ok(SdxlHeavyOwned {
         unet,
         controls,
-        ip_adapter,
+        ip_adapter: std::sync::Mutex::new(ip_adapter),
         vae,
         pid,
     })
@@ -983,7 +1062,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
     Ok(SdxlHeavyOwned {
         unet,
         controls,
-        ip_adapter,
+        ip_adapter: std::sync::Mutex::new(ip_adapter),
         vae,
         pid,
     })
@@ -1288,22 +1367,19 @@ impl Sdxl {
         // mask/control/accel), the Reference is the image prompt (txt2img + IP), NOT an img2img init.
         // The IP scale rides the Reference `strength` field (default 0.6). Tokens are seed-independent
         // → built once, CFG-batched with a zeros uncond row so the negative pass gets no IP signal.
-        let ip_mode = heavy.ip_adapter.is_some()
+        let ip_mode = heavy_owned.has_ip_adapter()?
             && reference.is_some()
             && mask_img.is_none()
             && control_reqs.is_empty()
             && !is_accel;
         let ip_scale = reference.and_then(|(_, s)| s).unwrap_or(IP_DEFAULT_SCALE);
         let ip_tokens = if ip_mode {
-            let enc = heavy.ip_adapter.expect("ip_adapter present in ip_mode");
             let (image, _) = reference.expect("reference present in ip_mode");
-            let tokens = enc.tokens(image)?;
-            Some(if cfg_on {
-                let zeros = enc.zeros_like_tokens(tokens.dtype())?;
-                concatenate_axis(&[&tokens, &zeros], 0)?
-            } else {
-                tokens
-            })
+            Some(heavy_owned.ip_tokens(
+                image,
+                cfg_on,
+                sheds_ip_image_encoder(stage_residency),
+            )?)
         } else {
             None
         };
@@ -2296,7 +2372,7 @@ mod tests {
             Ok(SdxlHeavyOwned {
                 unet,
                 controls: Vec::new(),
-                ip_adapter: None,
+                ip_adapter: std::sync::Mutex::new(None),
                 vae,
                 pid: None,
             })

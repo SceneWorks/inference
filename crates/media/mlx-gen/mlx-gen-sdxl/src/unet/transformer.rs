@@ -446,7 +446,7 @@ impl TransformerBlock {
             rows,
             ip && self.has_ip(),
             act,
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         ))
     }
 
@@ -724,8 +724,8 @@ impl Transformer2D {
             Some(window) => self.run_windowed_blocks(y, encoder_x, ip, plan, window)?,
             None => {
                 let mut y = y;
-                for block in &self.blocks {
-                    let scratch = self.block_scratch(block, &y, encoder_x, ip, plan);
+                for (index, block) in self.blocks.iter().enumerate() {
+                    let scratch = self.block_scratch(index, &y, encoder_x, ip, plan)?;
                     y = mlx_gen::ios_quantum::run(
                         crate::quantum::TRANSFORMER_BLOCK,
                         scratch,
@@ -772,7 +772,7 @@ impl Transformer2D {
             )
         };
         let c = sh[3] as u64;
-        let groups = crate::quantum::group_norm_buffers(crate::quantum::Backend::current(), act);
+        let groups = crate::quantum::group_norm_buffers(crate::quantum::backend(), act);
         // proj_in's output, and the hidden state proj_out reads, at their promoted dtypes.
         let entered = crate::quantum::linear_output_dtype(&self.proj_in, x.dtype());
         let hidden = self
@@ -800,19 +800,37 @@ impl Transformer2D {
         (proj_in, proj_out)
     }
 
-    /// iOS quantum scratch for `block` over the hidden tokens `y` `[B, N, C]` (sc-26270).
+    /// iOS quantum scratch for block `index` over the hidden tokens `y` `[B, N, C]` (sc-26270); 0
+    /// off device.
     fn block_scratch(
         &self,
-        block: &TransformerBlock,
+        index: usize,
         y: &Array,
         encoder_x: &Array,
         ip: Option<(&Array, f32)>,
         plan: SdxlForwardPlan<'_>,
-    ) -> u64 {
+    ) -> Result<u64> {
         if !mlx_gen::ios_quantum::enabled() {
-            return 0;
+            return Ok(0);
         }
-        block.quantum_scratch(
+        self.block_price(index, y, encoder_x, ip, plan)
+    }
+
+    /// The counted price of block `index`'s quantum over the hidden tokens `y` `[B, N, C]`: its
+    /// activations ([`TransformerBlock::quantum_scratch`]) and — on a sub-stack armed for rung 4,
+    /// where the block is read from the snapshot INSIDE its quantum — the block's streamed weight
+    /// bytes ([`crate::block_stream::SdxlBlockStream::streamed_bytes`]). A resident block's weights
+    /// are already resident. Shared by the guard and header-only pricing.
+    pub(crate) fn block_price(
+        &self,
+        index: usize,
+        y: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+    ) -> Result<u64> {
+        let block = &self.blocks[index];
+        let activations = block.quantum_scratch(
             y.shape()[0],
             plan.conditioning_batch(y.shape()[0])
                 .max(encoder_x.shape()[0]),
@@ -821,7 +839,80 @@ impl Transformer2D {
             ip.is_some(),
             y.dtype(),
             plan.attention,
-        )
+        );
+        let weights = match &self.block_stream {
+            Some(stream) => stream.streamed_bytes(index)?,
+            None => 0,
+        };
+        Ok(activations.saturating_add(weights))
+    }
+
+    /// Block `index`'s streamed bytes (epic 16774 proof tests).
+    #[cfg(test)]
+    pub(crate) fn stream_bytes_for_test(&self, index: usize) -> Result<u64> {
+        self.block_stream
+            .as_ref()
+            .ok_or_else(|| Error::Msg("no block stream".into()))?
+            .streamed_bytes(index)
+    }
+
+    /// Block `index`'s streamed quantum body as `run_windowed_blocks` runs it: read the block from
+    /// a fresh view of the snapshot, then its forward (epic 16774 proof tests).
+    #[cfg(test)]
+    pub(crate) fn streamed_block_for_test(
+        &self,
+        index: usize,
+        y: &Array,
+        encoder_x: &Array,
+        plan: SdxlForwardPlan<'_>,
+    ) -> Result<Array> {
+        let stream = self
+            .block_stream
+            .as_ref()
+            .ok_or_else(|| Error::Msg("no block stream".into()))?;
+        let mut view = stream.open()?;
+        let block = stream.materialize(&mut view, index)?;
+        block.forward_ip(y, encoder_x, None, plan)
+    }
+
+    /// The dtype [`Self::forward_ip`] returns for an `x`-typed input: `proj_out`'s output (after
+    /// every block's promotion) summed with the residual.
+    pub(crate) fn output_dtype(&self, x: Dtype) -> Dtype {
+        let entered = crate::quantum::linear_output_dtype(&self.proj_in, x);
+        let hidden = self
+            .blocks
+            .iter()
+            .fold(entered, |d, block| block.activation_dtype(d));
+        let projected = crate::quantum::linear_output_dtype(&self.proj_out, hidden);
+        Dtype::from_promoting_types(projected, x)
+    }
+
+    /// Header-only pricing of [`Self::forward_ip`] over the shape-only `x` (NHWC): every quantum it
+    /// checks, in order, with the guard's own formulas. Returns the shape-only output.
+    pub(crate) fn price_forward(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+        plan: SdxlForwardPlan<'_>,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        let (proj_in, proj_out) = self.projection_scratch(x);
+        out.push((crate::quantum::TRANSFORMER_PROJ_IN, proj_in));
+        let s = x.shape();
+        let inner = crate::quantum::linear_out(&self.proj_in) as i32;
+        let mut hidden = crate::quantum::linear_output_dtype(&self.proj_in, x.dtype());
+        let inner_plan = plan.with_window(None);
+        for (index, block) in self.blocks.iter().enumerate() {
+            let y = crate::quantum::shaped(&[s[0], s[1] * s[2], inner], hidden)?;
+            out.push((
+                crate::quantum::TRANSFORMER_BLOCK,
+                self.block_price(index, &y, encoder_x, ip, inner_plan)?,
+            ));
+            hidden = block.activation_dtype(hidden);
+        }
+        out.push((crate::quantum::TRANSFORMER_PROJ_OUT, proj_out));
+        crate::quantum::shaped(s, self.output_dtype(x.dtype()))
     }
 
     /// Rung 4's block loop for this sub-stack: walk its blocks in windows, materializing each
@@ -873,7 +964,7 @@ impl Transformer2D {
                     // sc-26270: the check precedes the block's materialization from the snapshot
                     // and its graph. Geometry comes from the resident twin's (lazy, unread)
                     // tensors, which carry the same shapes the streamed block is rebuilt with.
-                    let scratch = self.block_scratch(&self.blocks[index], &y, encoder_x, ip, inner);
+                    let scratch = self.block_scratch(index, &y, encoder_x, ip, inner)?;
                     y = mlx_gen::ios_quantum::run(
                         crate::quantum::TRANSFORMER_BLOCK,
                         scratch,

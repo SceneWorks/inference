@@ -18,7 +18,7 @@
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{conv2d, gelu_exact, gelu_quick};
@@ -156,8 +156,17 @@ impl VisionEncoderLayer {
             self.head_dim,
             false,
             crate::quantum::element_bytes(x),
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         )
+    }
+
+    /// The dtype this layer returns for an `x`-typed input (header-only pricing).
+    fn output_dtype(&self, x: Dtype) -> Dtype {
+        [&self.q, &self.out, &self.fc1, &self.fc2]
+            .iter()
+            .fold(x, |d, linear| {
+                Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+            })
     }
 
     /// The layer as one guarded iOS quantum (sc-26270); a pass-through off device.
@@ -318,7 +327,7 @@ impl ClipVisionEncoder {
         let tokens = (s[1] / self.patch) * (s[2] / self.patch) + 1;
         let act = crate::quantum::element_bytes(pixel_values);
         let call = crate::quantum::ConvCall::new(s, act, &self.patch_embedding, self.patch, 0);
-        let backend = crate::quantum::Backend::current();
+        let backend = crate::quantum::backend();
         let units = 1 + crate::quantum::layer_norm_buffers(backend);
         crate::quantum::single_conv_bytes(&call, 0, 0, backend)
             .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
@@ -351,6 +360,38 @@ impl ClipVisionEncoder {
         let scratch = layer.quantum_scratch(x);
         let x = x.clone();
         (scratch, move || layer.forward(&x))
+    }
+
+    /// Header-only pricing of [`Self::penultimate`] over the shape-only `pixel_values`: every
+    /// quantum it checks, in order, with the guards' own formulas. Returns the shape-only output.
+    pub(crate) fn price_penultimate(
+        &self,
+        pixel_values: &Array,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        out.push((
+            crate::quantum::VISION_EMBEDDINGS,
+            self.embed_scratch(pixel_values),
+        ));
+        let s = pixel_values.shape();
+        let tokens = (s[1] / self.patch) * (s[2] / self.patch) + 1;
+        let embedded = crate::quantum::promote_all(
+            pixel_values.dtype(),
+            &[
+                &self.patch_embedding,
+                &self.class_embedding,
+                &self.position_embedding,
+                &self.pre_ln_w,
+                &self.pre_ln_b,
+            ],
+        );
+        let mut x = crate::quantum::shaped(&[s[0], tokens, self.hidden], embedded)?;
+        let keep = self.layers.len().saturating_sub(1);
+        for layer in &self.layers[..keep] {
+            out.push((crate::quantum::VISION_LAYER, layer.quantum_scratch(&x)));
+            x = crate::quantum::shaped(x.shape(), layer.output_dtype(x.dtype()))?;
+        }
+        Ok(x)
     }
 
     /// The penultimate hidden state `[B, num_positions, hidden]` — the IP-Adapter "plus" image

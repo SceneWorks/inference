@@ -111,6 +111,16 @@ impl IpImageEncoder {
         self.resampler.forward(&penultimate)
     }
 
+    /// Header-only pricing of [`Self::tokens`]: every quantum the image encode checks (the vision
+    /// tower, then the Resampler), in order, with the guards' own formulas. Returns the shape-only
+    /// `[1, num_queries, output_dim]` tokens.
+    pub(crate) fn price_tokens(&self, out: &mut crate::quantum::Quanta) -> Result<Array> {
+        let size = self.image_size as i32;
+        let pixels = crate::quantum::shaped(&[1, size, size, 3], self.resampler.dtype())?;
+        let penultimate = self.encoder.price_penultimate(&pixels, out)?;
+        self.resampler.price_forward(&penultimate, out)
+    }
+
     /// A zeros token tensor matching [`tokens`](Self::tokens)'s shape/dtype — the CFG uncond row.
     pub fn zeros_like_tokens(&self, dtype: Dtype) -> Result<Array> {
         let n = self.resampler.num_queries;
@@ -422,6 +432,36 @@ impl Resampler {
         })
     }
 
+    /// Header-only pricing of [`Self::forward`] over the shape-only `image_features`: every
+    /// quantum it checks, in order, with the guards' own formulas. Returns the shape-only tokens.
+    pub(crate) fn price_forward(
+        &self,
+        image_features: &Array,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Array> {
+        let b = image_features.shape()[0];
+        let nx = image_features.shape()[1];
+        let act = crate::quantum::element_bytes(&self.latents);
+        let rows = |n: i32, width: u64| {
+            mlx_gen::ios_quantum::tensor_bytes(act, &[b as u64, n as u64, width])
+        };
+        out.push((
+            crate::quantum::RESAMPLER_PROJ_IN,
+            2 * rows(nx, crate::quantum::linear_out(&self.proj_in)),
+        ));
+        for (attn, ff) in &self.layers {
+            out.push((
+                crate::quantum::RESAMPLER_LAYER,
+                self.layer_scratch(attn, ff, b, nx),
+            ));
+        }
+        out.push((
+            crate::quantum::RESAMPLER_PROJ_OUT,
+            3 * rows(self.num_queries, crate::quantum::linear_out(&self.proj_out)),
+        ));
+        crate::quantum::shaped(&[b, self.num_queries, self.output_dim()], self.dtype())
+    }
+
     /// One perceiver layer: attention over `[x, latents]` + residual, then the FFN + residual.
     fn layer_body(
         attn: &PerceiverAttention,
@@ -471,7 +511,7 @@ impl Resampler {
         let width = (self.dim as u64).max(crate::quantum::linear_out(&attn.to_q));
         let ffw = crate::quantum::linear_out(&ff.fc1);
         let scores = crate::quantum::scores(
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
             attn.dim_head,
             self.num_queries,
             act,
@@ -480,7 +520,7 @@ impl Resampler {
             scores,
             mlx_gen::ios_quantum::Scores::Materialized { .. }
         ));
-        let ln = crate::quantum::layer_norm_buffers(crate::quantum::Backend::current());
+        let ln = crate::quantum::layer_norm_buffers(crate::quantum::backend());
         // The key side's LayerNorm counts its output only: the concatenation consumes it before
         // `to_kv`'s output exists, so a CPU fallback's centred/squared temporaries are already
         // released (measured); on Metal the fused LayerNorm writes only its output anyway.

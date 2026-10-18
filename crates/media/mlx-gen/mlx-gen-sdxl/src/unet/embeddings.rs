@@ -97,6 +97,13 @@ impl SinusoidalPositionalEncoding {
         mlx_rs::transforms::eval([&self.sigmas])?;
         Ok(())
     }
+
+    /// The host bytes [`Self::timestep`]`(dims)` holds from construction (its lazy `sigmas` graph
+    /// keeps the f32 `arange` table and its four f32 scalars): header-free pricing of the U-Net
+    /// load (`loader::unet_load_parts`).
+    pub(crate) fn timestep_table_bytes(dims: i32) -> u64 {
+        4 * (dims / 2).max(0) as u64 + 4 * 4
+    }
 }
 
 /// The 2-layer time-embedding MLP (`linear_1 → SiLU → linear_2`). Used both for the timestep
@@ -142,6 +149,32 @@ impl TimestepEmbedding {
         let x = silu_glue(&x)?;
         self.linear2.forward(&x)
     }
+
+    /// The dtype [`Self::forward`] returns for an `x`-typed input (header-only pricing).
+    pub(crate) fn output_dtype(&self, x: Dtype) -> Dtype {
+        [&self.linear1, &self.linear2].iter().fold(x, |d, linear| {
+            Dtype::from_promoting_types(d, crate::quantum::linear_output_dtype(linear, d))
+        })
+    }
+
+    /// The output width (`linear_2` rows).
+    pub(crate) fn out_features(&self) -> i32 {
+        crate::quantum::linear_out(&self.linear2) as i32
+    }
+}
+
+/// The dtype [`text_time_temb`] returns for a `text_emb_dtype` pooled embedding at the model
+/// `dtype` (header-only pricing).
+pub(crate) fn text_time_temb_dtype(
+    time_embedding: &TimestepEmbedding,
+    add_embedding: &TimestepEmbedding,
+    text_emb_dtype: Dtype,
+    dtype: Dtype,
+) -> Dtype {
+    Dtype::from_promoting_types(
+        time_embedding.output_dtype(dtype),
+        add_embedding.output_dtype(Dtype::from_promoting_types(text_emb_dtype, dtype)),
+    )
 }
 
 /// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by

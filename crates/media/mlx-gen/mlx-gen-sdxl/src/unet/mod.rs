@@ -26,7 +26,8 @@ use mlx_gen::Result;
 
 use crate::config::UNetConfig;
 use block::{BlockSpec, UNetBlock2D};
-use embeddings::{text_time_temb, SinusoidalPositionalEncoding, TimestepEmbedding};
+pub(crate) use embeddings::SinusoidalPositionalEncoding;
+use embeddings::{text_time_temb, TimestepEmbedding};
 pub use transformer::Transformer2D;
 
 // Shared with the VAE (the vendored VAE reuses the UNet `ResnetBlock2D` without a time embedding).
@@ -675,16 +676,7 @@ impl UNet2DConditionModel {
         }
 
         // Conv head.
-        let head_scratch = crate::quantum::norm_conv_bytes(
-            &crate::quantum::ConvCall::new(
-                x.shape(),
-                crate::quantum::element_bytes(&x),
-                self.conv_out.weight(),
-                1,
-                1,
-            ),
-            crate::quantum::Backend::current(),
-        );
+        let head_scratch = self.conv_out_scratch(&x);
         mlx_gen::ios_quantum::run(crate::quantum::UNET_CONV_OUT, head_scratch, || {
             let x = group_norm(
                 &x,
@@ -696,6 +688,131 @@ impl UNet2DConditionModel {
             let x = silu_glue(&x)?;
             conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
         })
+    }
+
+    /// iOS scratch (sc-26270) of the output GroupNorm + SiLU + `conv_out` over `x`.
+    fn conv_out_scratch(&self, x: &Array) -> u64 {
+        crate::quantum::norm_conv_bytes(
+            &crate::quantum::ConvCall::new(
+                x.shape(),
+                crate::quantum::element_bytes(x),
+                self.conv_out.weight(),
+                1,
+                1,
+            ),
+            crate::quantum::backend(),
+        )
+    }
+
+    /// Header-only pricing of one [`Self::forward_planned`] (sc-26270 quanta, epic 16774 pricing):
+    /// every quantum the forward checks, in order, with the guards' own formulas, over shape-only
+    /// inputs — the latent `x` `[B, h, w, 4]` at the forward's batch and dtype, the text memory
+    /// `encoder_x` and pooled `text_emb` at the conditioning batch, the shape-only ControlNet
+    /// residuals when a branch is injected, and the IP tokens when the IP branch runs. Pushes into
+    /// `out`; builds no graph that is ever evaluated. Returns the predicted noise's dtype.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn price_forward(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        text_emb: &Array,
+        control: Option<&(Vec<Array>, Array)>,
+        ip: Option<(&Array, f32)>,
+        plan: crate::plan::SdxlForwardPlan<'_>,
+        out: &mut crate::quantum::Quanta,
+    ) -> Result<Dtype> {
+        let batch = x.shape()[0];
+        let dtype = x.dtype();
+        out.push((crate::quantum::UNET_STEM, self.stem_scratch(x, encoder_x)));
+        let projected = match &self.encoder_hid_proj {
+            Some(proj) => {
+                let e = encoder_x.shape();
+                Some(crate::quantum::shaped(
+                    &[e[0], e[1], crate::quantum::linear_out(proj) as i32],
+                    crate::quantum::linear_output_dtype(proj, encoder_x.dtype()),
+                )?)
+            }
+            None => None,
+        };
+        let encoder_x = projected.as_ref().unwrap_or(encoder_x);
+        let temb = crate::quantum::shaped(
+            &[
+                plan.conditioning_batch(batch),
+                self.time_embedding.out_features(),
+            ],
+            embeddings::text_time_temb_dtype(
+                &self.time_embedding,
+                &self.add_embedding,
+                text_emb.dtype(),
+                dtype,
+            ),
+        )?;
+        let s = x.shape();
+        let mut conv_in = vec![self.conv_in.weight()];
+        conv_in.extend(self.conv_in.bias());
+        let mut x = crate::quantum::shaped(
+            &[s[0], s[1], s[2], self.conv_in.weight().shape()[0]],
+            crate::quantum::promote_all(dtype, &conv_in),
+        )?;
+        let mut residuals: Vec<Array> = vec![x.clone()];
+        for block in &self.down_blocks {
+            let (o, res) = block.price_forward(&x, encoder_x, &temb, None, ip, plan, out)?;
+            x = o;
+            residuals.extend(res);
+        }
+        if let Some((down, _)) = control {
+            let live: Vec<&Array> = residuals.iter().collect();
+            out.push((
+                crate::quantum::CONTROL_DOWN_INJECTION,
+                crate::quantum::elementwise_bytes(&live, 1),
+            ));
+            for (residual, c) in residuals.iter_mut().zip(down) {
+                *residual = crate::quantum::shaped(
+                    residual.shape(),
+                    Dtype::from_promoting_types(residual.dtype(), c.dtype()),
+                )?;
+            }
+        }
+        for (resnet, attention) in [
+            (&self.mid_resnet0, Some(&self.mid_transformer)),
+            (&self.mid_resnet1, None),
+        ] {
+            out.push((
+                crate::quantum::UNET_RESNET,
+                resnet.quantum_scratch(&x, Some(&temb)),
+            ));
+            let s = x.shape();
+            x = crate::quantum::shaped(
+                &[s[0], s[1], s[2], resnet.conv_weights().1.shape()[0]],
+                resnet.output_dtype(x.dtype(), Some(temb.dtype())),
+            )?;
+            if let Some(attention) = attention {
+                x = attention.price_forward(&x, encoder_x, ip, plan, out)?;
+            }
+        }
+        if let Some((_, mid)) = control {
+            out.push((
+                crate::quantum::CONTROL_MID_INJECTION,
+                crate::quantum::elementwise_bytes(&[&x], 1),
+            ));
+            x = crate::quantum::shaped(
+                x.shape(),
+                Dtype::from_promoting_types(x.dtype(), mid.dtype()),
+            )?;
+        }
+        for block in &self.up_blocks {
+            let (o, _) =
+                block.price_forward(&x, encoder_x, &temb, Some(&mut residuals), ip, plan, out)?;
+            x = o;
+        }
+        out.push((crate::quantum::UNET_CONV_OUT, self.conv_out_scratch(&x)));
+        let mut head = vec![
+            &self.conv_norm_out_w,
+            &self.conv_norm_out_b,
+            self.conv_out.weight(),
+        ];
+        head.extend(self.conv_out.bias());
+        Ok(crate::quantum::promote_all(x.dtype(), &head))
     }
 
     /// The stem quantum's body: the Kolors context projection (when loaded), the timestep +
@@ -762,7 +879,7 @@ impl UNet2DConditionModel {
             self.conv_in.weight(),
             self.encoder_hid_proj.as_ref(),
             0,
-            crate::quantum::Backend::current(),
+            crate::quantum::backend(),
         )
     }
 
