@@ -1229,11 +1229,32 @@ impl Qwen35Model {
         cache: &mut Qwen35Cache,
         offset: i32,
     ) -> Result<Array> {
-        rms_norm(
-            &self.hidden(input_ids, cache, offset)?,
-            &self.norm,
-            self.eps,
-        )
+        self.forward_hidden_with_block_hook(input_ids, cache, offset, &mut |_, _| Ok(()))
+    }
+
+    /// Final-normalized hidden states with a cooperative block execution boundary.
+    /// Boundary zero supplies embeddings before the first block; subsequent boundaries supply
+    /// each block output, then the final-normalized output. The hook may evaluate each lazy
+    /// output before checking cancellation. The ordinary hidden-only entry point uses a no-op
+    /// hook and preserves its existing lazy execution. Discard the per-prompt cache after error.
+    pub fn forward_hidden_with_block_hook(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        hook: &mut dyn FnMut(usize, &Array) -> Result<()>,
+    ) -> Result<Array> {
+        let h = self.embed_tokens.forward(input_ids)?.as_dtype(compute())?;
+        let (cos, sin) = self.rope.cos_sin(h.shape()[1], offset, compute())?;
+        let h = walk_hidden_blocks(
+            h,
+            self.layers.iter().zip(cache.layers.iter_mut()),
+            |h, (layer, slot)| layer.forward(&h, &cos, &sin, slot),
+            &mut *hook,
+        )?;
+        let normalized = rms_norm(&h, &self.norm, self.eps)?;
+        hook(self.layers.len() + 1, &normalized)?;
+        Ok(normalized)
     }
 
     fn language_head(&self) -> Result<&Projection> {
@@ -2426,6 +2447,22 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
     let merge = spatial_merge_size.max(1);
     let [t, h, w] = grid_thw;
     (t.max(0) * (h.max(0) / merge) * (w.max(0) / merge)) as usize
+}
+
+// Tensor-independent traversal lets CPU contract tests exercise cancellation short-circuiting
+// without initializing a backend device. Production supplies real layer/cache pairs and Arrays.
+fn walk_hidden_blocks<T, L>(
+    mut hidden: T,
+    layers: impl IntoIterator<Item = L>,
+    mut forward: impl FnMut(T, L) -> Result<T>,
+    mut hook: impl FnMut(usize, &T) -> Result<()>,
+) -> Result<T> {
+    hook(0, &hidden)?;
+    for (index, layer) in layers.into_iter().enumerate() {
+        hidden = forward(hidden, layer)?;
+        hook(index + 1, &hidden)?;
+    }
+    Ok(hidden)
 }
 
 #[cfg(test)]
@@ -5310,5 +5347,62 @@ pub(crate) mod tests {
             }
             assert_eq!(attention_layers, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod hidden_block_hook_cpu_tests {
+    use super::*;
+    #[test]
+    fn noop_preserves_values_and_hooks_observe_completed_boundaries() {
+        let mut boundaries = Vec::new();
+        let output = walk_hidden_blocks(
+            1u32,
+            [2, 3, 4],
+            |v, n| Ok(v + n),
+            |index, v| {
+                boundaries.push((index, *v));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, 10);
+        assert_eq!(boundaries, [(0, 1), (1, 3), (2, 6), (3, 10)]);
+        assert_eq!(
+            walk_hidden_blocks(1u32, [2, 3, 4], |v, n| Ok(v + n), |_, _| Ok(())).unwrap(),
+            output
+        );
+    }
+    #[test]
+    fn typed_cancel_prevents_later_blocks_and_initial_cancel_runs_none() {
+        let mut forwards = 0;
+        let result = walk_hidden_blocks(
+            0,
+            [1, 2, 3],
+            |v, n| {
+                forwards += 1;
+                Ok(v + n)
+            },
+            |index, _| {
+                if index == 1 {
+                    Err(Error::Canceled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(forwards, 1);
+        let result = walk_hidden_blocks(
+            0,
+            [1, 2, 3],
+            |v, n| {
+                forwards += 1;
+                Ok(v + n)
+            },
+            |_, _| Err(Error::Canceled),
+        );
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(forwards, 1);
     }
 }

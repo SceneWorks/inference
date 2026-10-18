@@ -2460,6 +2460,7 @@ dependencies = [
  "mlx-gen-mage",
  "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
+ "mlx-gen-moss-image",
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
@@ -2730,6 +2731,21 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux2",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 

@@ -364,6 +364,15 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Exact MOSS bundles, including SFT's optional published distillation package.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft", "moss_image_sft_8_steps_dmd"],
+    },
     // --- pulid -------------------------------------------------------------------------------
     // MLX-only: the Candle twin is a plain struct the worker drives and registers nothing. The row
     // reaches through the unregistered `mlx-gen-face` crate to the artifacts that crate loads, which
@@ -936,8 +945,8 @@ mod tests {
         // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
-        assert_eq!(registered.len(), 75, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 65);
+        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 67);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1004,11 +1013,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            26,
+            28,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900)"
+             sc-25900; MOSS Base/SFT in sc-26323)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1196,7 +1205,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 65);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 67);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]
