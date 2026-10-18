@@ -1018,7 +1018,9 @@ mod tests {
     #[test]
     fn unsupported_spec_fields_are_typed_refusals() {
         let mut spec = LoadSpec::new(WeightsSource::Dir("/flux3-not-on-disk".into()));
-        spec.quantize = Some(mlx_gen::Quant::Q4);
+        // q4/q8 are real MLX affine tiers now (sc-26241); a format with no MLX kernel is the
+        // typed `quantize` refusal, before any package is read.
+        spec.quantize = Some(mlx_gen::Quant::Nvfp4);
         match load(&spec) {
             Err(Error::Unsupported(m)) => assert!(m.contains("quantize"), "{m}"),
             other => panic!("expected a typed refusal, got {:?}", other.err()),

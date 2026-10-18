@@ -551,7 +551,10 @@ fn the_advertised_quants_are_exactly_the_accepted_ones() {
         spec.quantize = Some(q);
         let err = load_synthetic(&spec).err().unwrap().to_string();
         let accepted = err.contains("tier was requested but");
-        let refused = err.contains("is not an advertised YuE2 tier");
+        // fp8r is refused one layer earlier, by the registry's exact-format opt-in (it never
+        // aliases Q8), so it never reaches the YuE2 tier check.
+        let refused = err.contains("is not an advertised YuE2 tier")
+            || err.contains("does not advertise the exact fp8r packed format");
         assert!(accepted != refused, "{q:?}: {err}");
         assert_eq!(accepted, advertised.contains(&q), "{q:?}: {err}");
     }
