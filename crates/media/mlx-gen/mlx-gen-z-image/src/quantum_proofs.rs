@@ -98,8 +98,9 @@ const STALL_EDGE: i32 = 2048;
 ///
 /// MLX's scheduler encodes ahead of execution: an op's output is allocated when it is encoded, its
 /// inputs stay referenced until its queued task (CPU) or command buffer (Metal) completes, so a
-/// phase's intermediates can all be live at once — the retention every counted price follows. A
-/// natural run reaches it only as far as the worker happens to lag. A STALLED run queues a long
+/// phase's intermediates can all be live at once — the retention every counted price follows. The
+/// plain run is [`measured_peak_bytes`], which stalls the stream ahead of the body only. A STALLED
+/// run here also queues a long
 /// kernel ([`stall`]) on the same stream ahead of the body and after every sub-quantum barrier
 /// ([`crate::quantum::BARRIER_HOOK`]), so each phase is encoded — its buffers allocated, none
 /// released — before its first op runs: the retention worst case, realized on the CPU. Each phase's

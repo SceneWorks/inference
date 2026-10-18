@@ -576,6 +576,26 @@ fn assert_checked_before_synchronized(events: &[QuantumEvent]) {
     }
 }
 
+/// The guarded paths are DIFFERENT graphs from the host's (the iOS VAE attention runs chunked; the
+/// sub-quantum barriers split the lazy graph), so they agree to float reassociation, not bit for
+/// bit: one host's kernels may give identical bits where another CPU's round differently. Held to
+/// the epic's cross-graph parity standard, 1e-5 of `max(1, peak)` (SANA's tiled-encode standard);
+/// a missed guard path, a mis-chunked attention or a dropped term moves an output by O(1e-1).
+fn assert_cross_graph_parity(label: &str, got: &Array, want: &Array) {
+    assert_eq!(got.shape(), want.shape(), "{label}: shape");
+    let (got, want) = (bits(got), bits(want));
+    let peak = want
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
+    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &w)| {
+        m.max((f32::from_bits(g) - f32::from_bits(w)).abs())
+    });
+    assert!(
+        delta <= 1e-5 * peak.max(1.0),
+        "{label}: guarded output moved {delta:.3e} from the host (peak {peak:.3e})"
+    );
+}
+
 fn bits(a: &Array) -> Vec<u32> {
     let f = a.as_dtype(Dtype::Float32).unwrap();
     f.eval().unwrap();
@@ -583,10 +603,11 @@ fn bits(a: &Array) -> Vec<u32> {
 }
 
 /// Every host path run under bounded quanta: every quantum is checked before it synchronizes, the
-/// expected labels all appear, and every output is BYTE-IDENTICAL to the unguarded host run.
+/// expected labels all appear, and every output matches the unguarded host run within the
+/// cross-graph parity standard ([`assert_cross_graph_parity`]).
 #[test]
-fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
-    if !in_cpu_child("guarded_paths_check_every_quantum_and_stay_byte_identical") {
+fn guarded_paths_check_every_quantum_and_match_the_host() {
+    if !in_cpu_child("guarded_paths_check_every_quantum_and_match_the_host") {
         return;
     }
     let host = host_paths();
@@ -594,11 +615,7 @@ fn guarded_paths_check_every_quantum_and_stay_byte_identical() {
     let guarded = guarded.unwrap();
     assert_checked_before_synchronized(&events);
     for ((name, a), (_, b)) in host.iter().zip(&guarded) {
-        assert_eq!(
-            bits(a),
-            bits(b),
-            "{name}: guarded output differs from the host"
-        );
+        assert_cross_graph_parity(name, b, a);
     }
     let labels: std::collections::BTreeSet<String> =
         checks(&events).into_iter().map(|(l, _)| l).collect();
@@ -901,6 +918,8 @@ fn streamed_quanta_are_priced_with_the_bytes_they_read() {
     let (windowed, w_events) = observed(AMPLE, || {
         model.forward_windowed(x, 0.6, cap, AttentionPlan::UNBOUNDED, 1, &cancel)
     });
+    // The same graph over the same weight values (only where the blocks' arrays come from
+    // differs), so this one holds bit for bit on any host.
     assert_eq!(bits(&resident.unwrap()), bits(&windowed.unwrap()));
     let blocks = |events: &[QuantumEvent]| -> Vec<u64> {
         checks(events)
