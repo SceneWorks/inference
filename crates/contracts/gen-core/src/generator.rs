@@ -505,6 +505,13 @@ pub struct GenerationRequest {
 
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
+    /// FLUX 3 reference-output intent before API defaults are inserted (sc-26236).
+    /// `None` preserves legacy explicit `width`/`height`; `Some` preserves whether neither,
+    /// one, or both dimensions were supplied. Auto size is the first prepared reference canvas;
+    /// a padded single-reference output is cropped only when neither dimension was supplied.
+    /// Consumers must resolve this intent and reference token count BEFORE memory admission.
+    /// This is not img2img strength and is unsupported on other model families.
+    pub flux3_reference_output: Option<crate::flux3::references::ReferenceOutputSize>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
     /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
@@ -1332,6 +1339,7 @@ impl Default for GenerationRequest {
             prompt_batch: Vec::new(),
             caption_overflow: None,
             conditioning: Vec::new(),
+            flux3_reference_output: None,
             strength: None,
             control_scale: None,
             text_style_gain: None,
@@ -1614,6 +1622,8 @@ impl GenerationRequest {
             // bounds join the float floor below.
             prompt_batch: _,
             caption_overflow: _,
+            // Optional integer output dimensions, not floating controls.
+            flux3_reference_output: _,
             cfg_interval,
             conditioning,
             frames: _,
@@ -3643,6 +3653,16 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
+        if req.flux3_reference_output.is_some()
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_reference_output is supported only by FLUX 3 reference editing; remove it"
+            )));
+        }
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
         // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.

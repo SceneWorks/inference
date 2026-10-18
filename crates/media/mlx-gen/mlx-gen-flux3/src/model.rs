@@ -19,8 +19,9 @@ use mlx_rs::Dtype;
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
-use crate::pipeline::{decode_tokens, denoise_one_conditioned};
+use crate::pipeline::{decode_tokens, denoise_one_with_references};
 use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
+use gen_core::flux3::references::{self, PreparedReferences};
 
 /// Registry id (the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = gen_core::flux3::DISTILLED_MODEL_ID;
@@ -77,6 +78,11 @@ pub fn descriptor() -> ModelDescriptor {
             // `prompt_upsampler` component) before encoding; without it the request is a typed
             // refusal, never a silent pass-through.
             supports_prompt_enhancement: true,
+            conditioning: vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::ReferenceRgba,
+                gen_core::ConditioningKind::MultiReference,
+            ],
             ..Default::default()
         },
     }
@@ -327,6 +333,19 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
+        // Validate all originals/geometry before PUP, text encoding, or heavy GPU work.
+        let originals = references::request_images(req)?;
+        let prepared: Option<PreparedReferences> = if originals.is_empty() {
+            None
+        } else {
+            Some(references::prepare_borrowed(
+                &originals
+                    .iter()
+                    .map(|image| image.as_ref())
+                    .collect::<Vec<_>>(),
+                references::request_output(req),
+            )?)
+        };
         // Preparation belongs to the exclusive request lifecycle. In particular a staged
         // request must evict a reused resident pair before the optional VLM runs.
         let images = self.residency.run_request_scoped_with_prepare(
@@ -339,7 +358,7 @@ impl Flux3Klein {
                 let caption = crate::pup::effective_prompt(
                     self.upsampler.as_ref(),
                     req,
-                    &crate::pup::text_input(req),
+                    &references::upsampler_input(req)?,
                     on_progress,
                 )?
                 .caption;
@@ -370,6 +389,10 @@ impl Flux3Klein {
                 GenerationParams,
             ),
              on_progress| {
+                let reference_tokens = prepared
+                    .as_ref()
+                    .map(|p| crate::references::encode(&heavy.ae, p, &req.cancel))
+                    .transpose()?;
                 let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
@@ -377,10 +400,11 @@ impl Flux3Klein {
                 for c in 0..req.count {
                     let done = c * params.steps;
                     let seed = params.seed.wrapping_add(u64::from(c));
-                    tokens.push(denoise_one_conditioned(
+                    tokens.push(denoise_one_with_references(
                         &heavy.dit,
                         &text,
                         negative.as_ref(),
+                        reference_tokens.as_ref(),
                         &params,
                         seed,
                         &req.cancel,
@@ -397,8 +421,13 @@ impl Flux3Klein {
                     return Err(Error::Canceled);
                 }
                 let (h, w) = params.latent_shape()?;
-                let images =
-                    decode_batch(&tokens, &req.cancel, |t| decode_tokens(&heavy.ae, t, h, w))?;
+                let images = decode_batch(&tokens, &req.cancel, |t| {
+                    let image = decode_tokens(&heavy.ae, t, h, w)?;
+                    match prepared.as_ref() {
+                        Some(p) => Ok(references::crop_output(image, &p.output)?),
+                        None => Ok(image),
+                    }
+                })?;
                 mlx_rs::memory::clear_cache();
                 Ok(images)
             },
@@ -415,9 +444,11 @@ impl Flux3Klein {
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
+        references::validate_request_with_resolved_output(
+            &self.descriptor.capabilities,
+            self.descriptor.id,
+            req,
+        )?;
         validate_generation_request(self.descriptor.id, req, &self.config)?;
         refuse_unhonored_memory(req)?;
         Ok(())

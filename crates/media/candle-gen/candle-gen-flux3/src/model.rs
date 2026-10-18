@@ -19,8 +19,9 @@ use candle_gen::{CandleError as Error, Result};
 
 use crate::autoencoder::Flux3AutoEncoder;
 use crate::dit::Flux3Dit;
-use crate::pipeline::{decode_tokens, denoise_one_conditioned};
+use crate::pipeline::{decode_tokens, denoise_one_with_references};
 use crate::text_encoder::{Flux3TextEncoder, TextConditioning};
+use gen_core::flux3::references::{self, PreparedReferences};
 
 /// Registry id (the SceneWorks worker's `payload.model`) — the same id as the MLX twin, bound to
 /// the `candle` backend by the descriptor.
@@ -73,6 +74,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_sequential_offload: true,
             // The optional native VLM resolves the effective caption before encoding.
             supports_prompt_enhancement: true,
+            conditioning: vec![
+                gen_core::ConditioningKind::Reference,
+                gen_core::ConditioningKind::ReferenceRgba,
+                gen_core::ConditioningKind::MultiReference,
+            ],
             size_floor: SizeFloor::RangeCheckedOnGrid {
                 multiple: SIZE_MULTIPLE,
             },
@@ -329,6 +335,19 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationReport> {
         self.validate_impl(req)?;
+        // Validate all originals/geometry before PUP, text encoding, or heavy GPU work.
+        let originals = references::request_images(req)?;
+        let prepared: Option<PreparedReferences> = if originals.is_empty() {
+            None
+        } else {
+            Some(references::prepare_borrowed(
+                &originals
+                    .iter()
+                    .map(|image| image.as_ref())
+                    .collect::<Vec<_>>(),
+                references::request_output(req),
+            )?)
+        };
         let images = prepared_image_request(
             &self.residency,
             stage_residency_for(&self.spec, req),
@@ -365,6 +384,10 @@ impl Flux3Klein {
                 GenerationParams,
             ),
              on_progress| {
+                let reference_tokens = prepared
+                    .as_ref()
+                    .map(|p| crate::references::encode(&heavy.ae, p, &self.device, &req.cancel))
+                    .transpose()?;
                 let total = params.steps * req.count;
                 // Every image's Euler loop first, then ONE `Decoding` and the decodes: the
                 // progress contract reports the decode phase once per request.
@@ -372,10 +395,11 @@ impl Flux3Klein {
                 for c in 0..req.count {
                     let done = c * params.steps;
                     let seed = candle_gen::image_seed(params.seed, c);
-                    tokens.push(denoise_one_conditioned(
+                    tokens.push(denoise_one_with_references(
                         &heavy.dit,
                         &text,
                         negative.as_ref(),
+                        reference_tokens.as_ref(),
                         &params,
                         seed,
                         &req.cancel,
@@ -392,7 +416,13 @@ impl Flux3Klein {
                     return Err(Error::Canceled);
                 }
                 let (h, w) = params.latent_shape()?;
-                decode_batch(&tokens, &req.cancel, |t| decode_tokens(&heavy.ae, t, h, w))
+                decode_batch(&tokens, &req.cancel, |t| {
+                    let image = decode_tokens(&heavy.ae, t, h, w)?;
+                    match prepared.as_ref() {
+                        Some(p) => Ok(references::crop_output(image, &p.output)?),
+                        None => Ok(image),
+                    }
+                })
             },
         )?;
         checked_completion(
@@ -407,9 +437,11 @@ impl Flux3Klein {
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
+        references::validate_request_with_resolved_output(
+            &self.descriptor.capabilities,
+            self.descriptor.id,
+            req,
+        )?;
         validate_generation_request(self.descriptor.id, req, &self.config)?;
         refuse_unhonored_memory(req)?;
         Ok(())

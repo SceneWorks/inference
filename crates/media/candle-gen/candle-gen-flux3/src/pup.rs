@@ -115,7 +115,7 @@ pub fn effective_prompt(
 ) -> Result<UpsampleOutcome> {
     let outcome = pup::upsample(
         upsampler.map(|u| u as &dyn PromptUpsampler),
-        &text_input(req),
+        &gen_core::flux3::references::upsampler_input(req)?,
         &UpsampleOptions {
             temperature: req.enhance_temperature,
             max_tokens: req.enhance_max_tokens,

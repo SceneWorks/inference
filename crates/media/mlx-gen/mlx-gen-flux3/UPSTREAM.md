@@ -23,7 +23,7 @@ commercial-output exception for Qualifying Users under US$5M revenue, content-fi
 attribution obligations); the text encoder is Apache-2.0 (Qwen). See `NOTICE` and the catalog's
 licence rows (`gen_core::license`).
 
-S6 registers the base checkpoint separately as `flux3_klein_base`; reference images and boxes remain sc-26236/7. The prompt upsampler is sc-26238 (the
+S6 registers the base checkpoint separately as `flux3_klein_base`; S3 adds ordered reference conditioning, while structured boxes remain sc-26237. The prompt upsampler is sc-26238 (the
 `pup` module here and `gen_core::flux3::pup`): an **optional** co-requisite, loaded only when the
 `prompt_upsampler` component names its package and accounted separately from the image model and
 its text encoder.
@@ -81,7 +81,10 @@ typed refusal until sc-26241.
 | Default seed `int(sha256(caption).hexdigest(), 16) % 2**32` when the request carries none | `generate.py` | `gen_core::flux3::prompt_seed` | S1 |
 | CFG sampling (base checkpoint): [unconditional, conditional], default 50/3.5, no target-time; explicit negative caption independently encoded | `sampling.denoise` | `pipeline::denoise_cfg`, shared request resolver | S6 |
 | Additive LoRA with explicit finite scale and base/revision/rank/alpha/target admission | frozen diffusers converter at `7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941` | `gen_core::flux3::adapters`, `adapters.rs`, existing native residual hosts | S6 |
-| Reference images (`image_cond`), boxes, quantized variants | `pipeline.encode_references`, `fp8.py`/`nvfp4.py` | — | sc-26236/7, sc-26241 |
+| Ordered 1–10 RGB/RGBA references: single ≤4 Mi-pixel padded canvas (Lanczos, centred reflect/symmetric), multi each ≤1 Mi-pixel with centred 16px crop; first-reference auto size and single auto output crop only when neither dimension was explicit | `pipeline.prepare_reference`, `prepare_multi_reference`, `default_size`, `generate.py` | `gen_core::flux3::references`, typed `GenerationRequest::flux3_reference_output`; scope verifies admission against resolved geometry before normalizing numeric defaults | S3 |
+| Reference AE tokens cast bf16, ordered negative l-axis IDs, spatial axes ×0.5; identical image_cond in negative/positive base rows even CFG0/1 | `pipeline.encode_references`, `pack`, both samplers | `references.rs`, `pipeline::*_with_references`; generation Qwen text encoding remains text-only, not VLM/deepstack | S3 |
+| Original EXIF-oriented RGBA forks before AE RGB-drop-alpha versus existing PUP white-composite policy; invalid count/pixels/strength rejected before generation | `pipeline.prepare_reference`, `pup.policy_reference` | family-only authorized-file decoder, existing `ReferenceRgba`/ordered `Reference` carriers, existing `UpsamplerInput` modes | S3 |
+| Boxes, quantized variants | `bbox.py`, `fp8.py`/`nvfp4.py` | — | sc-26237, sc-26241 |
 | **Prompt upsampler (sc-26238)** — four modes by system prompt (`t2i`, `i2i`, `t2i_bbox`, `i2i_bbox`): `bbox.plan` (passed boxes → canvas rows; a table already in the prompt locks by itself), the `ORIGINAL PROMPT:` / `LOCKED BOUNDING-BOX ANNOTATIONS` input, the two `I2I_SCAFFOLD`s, the chat template with `enable_thinking=False`, greedy `top_p 0.95 / top_k 20 / max_tokens 3584`, presence penalty 1.5 (t2i) / 0.0 (i2i), `max_model_len 8192`, `bbox.reconcile` (IoU ≥ 0.9 rename, locked rows verbatim adopting the desc, valid cited rows appended), `generate.py`'s `--no-pup` caption and finished-answer skip | `pup.py`, `bbox.py` | `gen_core::flux3::pup` (tensor-neutral, byte-for-byte text), `pup.rs` (the engine) | S5 |
 | Upsampler reference policy: EXIF transpose, alpha over white, `reference_size` budget (1 MP / 724² / 512² by reference count, multiples of 32, aspect ≤ 200:1 else the prompt as typed), Pillow `LANCZOS`, JPEG q92 | `pup.policy_reference` | `gen_core::flux3::pup::policy_reference` (bit-exact Pillow RGB/alpha/LANCZOS and libjpeg's q92 integer 4:2:0 round trip, pixel-equality fixtures) | S5 |
 | Qwen3.5 VLM serving (hybrid linear/full attention, Qwen3-VL ViT, `<\|image_pad\|>` expansion by the processor's `smart_resize`) | vLLM | shared `mlx_llm` provider (`mlx-llama`, `qwen3_5`) | S5 |
@@ -94,6 +97,19 @@ f32 (the noise is `.float()`) with `dt · velocity` multiplied at f32 opmath and
 rounded to bf16 before the add (the Python-float `dt` itself is never rounded); the timestep `1000·t` is formed in bf16.
 The port mirrors this at `Precision::Bf16` (the default) and runs everything in f32 at
 `Precision::Fp32` (the oracle's CPU path, which has no autocast). The autoencoder is f32 on both.
+
+## Reference output envelope (S3)
+
+Frozen `generate.py:65..77` requires positive 16-pixel-grid output sides; `pipeline.MIN_SIDE`
+(64) is the **single-reference padding** floor, not the multi-reference or decoder kernel floor.
+Reference-derived 16/32/48-pixel sides are therefore accepted, including after the memory scope
+normalizes the numeric request canvas. Plain no-reference requests retain their existing 64-pixel
+minimum.
+
+Both native providers retain their existing advertised **4096-pixel output-side ceiling**
+(`model::MAX_SIZE`). This is an explicit native allocation-envelope deviation, not an upstream
+renderer or kernel limit: larger explicit canvases or very wide multi-reference canvases are
+refused before generation rather than expanding that public envelope without validation.
 
 ## Fixtures
 

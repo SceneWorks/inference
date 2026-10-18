@@ -35,7 +35,9 @@ Every row of the MLX twin's coverage table marked S1 is ported here one-to-one, 
 | Default seed `sha256(caption)` when the request carries none | `gen_core::flux3::prompt_seed` |
 | Base CFG50/3.5, explicit negative conditioning, additive identity-checked LoRA | `pipeline::denoise_cfg`, `adapters.rs`, native `AdaptLinear` residuals (S6) |
 | Optional prompt upsampler | separate `pup.rs` model and shared four-mode contract (S5) |
-| References, boxes, quantized variants | typed `Unsupported` refusals (sc-26236/7, sc-26241) |
+| Ordered 1–10 RGB/RGBA references; single Lanczos fit/reflect-or-symmetric padding, multi-reference fit/centre crop; optional output-size intent and single auto output crop | `gen_core::flux3::references`, `references.rs`, immutable `image_cond` in both flow-map and both base CFG samples (S3); generation Qwen encoding stays text-only |
+| Source EXIF/RGB conversion versus PUP alpha-over-white fork | caller-authorized asset decode preserves oriented RGBA; AE drops alpha, existing PUP sees original RGBA; no raw-path generation-request carrier |
+| Boxes, quantized variants | typed `Unsupported` refusals (sc-26237, sc-26241) |
 
 ## Deliberate differences from the MLX twin
 
@@ -58,6 +60,19 @@ Every row of the MLX twin's coverage table marked S1 is ported here one-to-one, 
   them to the same fixtures.
 * The memory contract's calibration fingerprint is Candle's own
   (`flux3-klein-candle-derived-…`): the two backends never share calibration evidence.
+
+## Reference output envelope (S3)
+
+Frozen `generate.py:65..77` requires positive 16-pixel-grid output sides; `pipeline.MIN_SIDE`
+(64) is the **single-reference padding** floor, not the multi-reference or decoder kernel floor.
+Reference-derived 16/32/48-pixel sides are therefore accepted, including after the memory scope
+normalizes the numeric request canvas. Plain no-reference requests retain their existing 64-pixel
+minimum.
+
+Both native providers retain their existing advertised **4096-pixel output-side ceiling**
+(`model::MAX_SIZE`). This is an explicit native allocation-envelope deviation, not an upstream
+renderer or kernel limit: larger explicit canvases or very wide multi-reference canvases are
+refused before generation rather than expanding that public envelope without validation.
 
 ## Fixtures
 
