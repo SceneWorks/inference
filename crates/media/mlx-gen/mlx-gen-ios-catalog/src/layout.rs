@@ -211,6 +211,89 @@ pub fn artifact_layout_digest(spec: &LoadSpec) -> Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
+/// Path-free ARCHITECTURE digest of the spec's BASE components (the weights directory, a separate
+/// text encoder and named components), from safetensors HEADERS alone: per component directory and
+/// tensor name, its dtype and shape (so packing — `.scales`/`.biases` tensors and packed shapes —
+/// is read from the headers, never from a config marker), plus the load settings that shape memory
+/// (precision, requested tier, offload policy, load shape). No tensor value, no config content, no
+/// file name, no path, no route. Two checkpoints of one architecture (fine-tunes sharing every
+/// tensor name, shape and dtype) share it; a distilled U-Net or another VAE that differs in any
+/// header does not.
+///
+/// Mode-added components — a ControlNet, an IP-Adapter, adapter overlays — are deliberately NOT
+/// part of it: they are component-additive and priced by the counted formulas on top of the
+/// family's anchor (see `crate::anchor`), so a request that carries one still belongs to the base
+/// architecture's family.
+pub fn architecture_digest(spec: &LoadSpec) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(b"ios-architecture-v1");
+    digest.update(
+        format!(
+            "{:?}|{:?}|{:?}|{:?}",
+            spec.precision, spec.quantize, spec.offload_policy, spec.load_shape
+        )
+        .as_bytes(),
+    );
+    let mut roles: Vec<(String, &WeightsSource)> = vec![("weights".into(), &spec.weights)];
+    if let Some(s) = &spec.text_encoder {
+        roles.push(("text_encoder".into(), s));
+    }
+    for (name, s) in &spec.components {
+        roles.push((format!("component.{name}"), s));
+    }
+    let mut tensors = 0usize;
+    for (role, src) in roles {
+        digest.update((role.len() as u64).to_le_bytes());
+        digest.update(role.as_bytes());
+        let (root, mut files) = match src {
+            WeightsSource::File(path) => (
+                path.parent().map(Path::to_owned).unwrap_or_default(),
+                vec![path.clone()],
+            ),
+            WeightsSource::Dir(path) => {
+                let mut files = Vec::new();
+                collect(path, path, &mut files)?;
+                (path.clone(), files)
+            }
+        };
+        files.sort();
+        let single = matches!(src, WeightsSource::File(_));
+        let mut entries: BTreeMap<(String, String), String> = BTreeMap::new();
+        for file in files {
+            if file.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+                continue;
+            }
+            let component = if single {
+                String::new()
+            } else {
+                relative(&root, &file)
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_owned())
+                    .unwrap_or_default()
+            };
+            for header in safetensors_path_tensor_headers(&file)? {
+                entries.insert(
+                    (component.clone(), header.name),
+                    format!("{}:{:?}", header.dtype.as_str(), header.shape),
+                );
+            }
+        }
+        tensors += entries.len();
+        for ((component, name), entry) in entries {
+            for part in [component.as_bytes(), name.as_bytes(), entry.as_bytes()] {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+        }
+    }
+    if tensors == 0 {
+        return Err(Error::Unsupported(
+            "iOS evidence: no tensor headers in the base sources".into(),
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
 /// Lowercase hex of a digest.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
