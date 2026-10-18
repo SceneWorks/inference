@@ -586,6 +586,7 @@ dependencies = [
  "candle-gen-mage",
  "candle-gen-minimax-h3",
  "candle-gen-mochi",
+ "candle-gen-moss-image",
  "candle-gen-pid",
  "candle-gen-pulid",
  "candle-gen-qwen-image",
@@ -882,6 +883,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-flux2",
+ "candle-llm",
+ "image",
+ "rand",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2445,6 +2460,7 @@ dependencies = [
  "mlx-gen-mage",
  "mlx-gen-minimax-h3",
  "mlx-gen-mochi",
+ "mlx-gen-moss-image",
  "mlx-gen-pid",
  "mlx-gen-pulid",
  "mlx-gen-qwen-image",
@@ -2715,6 +2731,21 @@ dependencies = [
  "mlx-gen-flux",
  "pmetal-mlx-rs",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-moss-image"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux2",
+ "mlx-llm",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -3664,6 +3695,7 @@ dependencies = [
  "image",
  "libc",
  "safetensors 0.4.5",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
