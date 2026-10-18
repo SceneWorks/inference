@@ -659,7 +659,8 @@ fn anchored_demand(
         Some(r) if r.key.execution == key.execution => r,
         _ => optimized,
     };
-    let measured = MeasuredAnchor::from_row(base).ok_or_else(|| no_evidence("no capture".into()))?;
+    let measured =
+        MeasuredAnchor::from_row(base).ok_or_else(|| no_evidence("no capture".into()))?;
     let at_base = price_anchor(pricer, candidate, contract, base)?;
     let derived = anchor::derive(
         &measured,
@@ -677,8 +678,7 @@ fn anchored_demand(
     // measured recapture spread fails the whole family's derivations closed.
     if let Some(resident) = resident {
         let check = anchor::consistency(
-            &MeasuredAnchor::from_row(optimized)
-                .ok_or_else(|| no_evidence("no capture".into()))?,
+            &MeasuredAnchor::from_row(optimized).ok_or_else(|| no_evidence("no capture".into()))?,
             &price_anchor(pricer, candidate, contract, optimized)?,
             &MeasuredAnchor::from_row(resident).ok_or_else(|| no_evidence("no capture".into()))?,
             &price_anchor(pricer, candidate, contract, resident)?,

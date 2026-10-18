@@ -14,24 +14,35 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const BASE_SELECTION: &str = "base";
 
 /// Denoise steps of an anchor capture: the memory peak of a denoise step does not grow with the
-/// step count (each step's activations are released before the next), so one step is the
-/// footprint of N. [`Purpose::ValidationSteps`] checks that claim on one model.
-pub const ANCHOR_STEPS: u32 = 1;
+/// step count (each step's activations are released before the next), so a short run is the
+/// footprint of a long one. Two steps rather than one so the capture also crosses a step-to-step
+/// release (and no sampler sees a degenerate one-sigma schedule). [`Purpose::ValidationSteps`]
+/// checks the claim on one model against the provider's full default schedule.
+pub const ANCHOR_STEPS: u32 = 2;
 
 /// Repeats of each optimized anchor: their spread is the admission margin at the low end.
 pub const OPTIMIZED_REPEATS: u32 = 3;
 
-/// The second geometry of the low-end validation case (the anchors sit at [`reference_edge`]).
-pub const VALIDATION_EDGE: u32 = 1024;
+/// The second geometry of the low-end validation case (the anchors sit at [`reference_edge`]): the
+/// farthest ladder size from the anchor, derived downward.
+pub const VALIDATION_EDGE: u32 = 512;
 
-/// The anchors' reference geometry: the smallest square edge every iOS image provider renders
-/// natively and the one most likely to complete for BOTH anchors on an 8 GB phone (every phase's
-/// activations are smallest there; resident weights do not depend on it). Supra2 renders 256².
+/// The anchors' reference geometry: the LARGEST ladder edge (1024²; Supra2 renders 256² only).
+///
+/// * The fully optimized configuration must fit at every ladder size, so it completes here by
+///   requirement — and this is the tightest cell, where an accurate low end matters most: it is
+///   measured, not derived.
+/// * Derivation from it is safe and tight. Measured on the desktop MLX lane (SceneWorks
+///   `docs/sc-16195`, 7 tiers x 5 geometries), the activation transient is linear in area above
+///   1024² (≤ 2.0% error from a 1024² anchor) and floored below it (a smaller request is never
+///   credited, so it errs large). From a 512² anchor the same data shows a 1024²-knee law would
+///   UNDER-predict 1024² by 49–70%, and the safe linear law over-predict it by 19–105%.
+/// * The resident anchor may be refused before allocation here; that typed refusal is its evidence.
 pub fn reference_edge(provider: &str) -> u32 {
     if provider.contains("supra") {
         256
     } else {
-        512
+        1024
     }
 }
 

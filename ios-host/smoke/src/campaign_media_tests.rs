@@ -62,7 +62,10 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
         assert_eq!(entry["case"], planned.case.key());
         assert_eq!(entry["purpose"], planned.purpose.label());
         assert_eq!(entry["repeats"], planned.repeats);
-        assert_eq!(Case::parse(entry["case"].as_str().unwrap()).unwrap(), planned.case);
+        assert_eq!(
+            Case::parse(entry["case"].as_str().unwrap()).unwrap(),
+            planned.case
+        );
     }
     for purpose in ["validation_steps", "validation_geometry"] {
         assert_eq!(
@@ -74,11 +77,11 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     assert!(listed.iter().any(|e| e["case"]
         .as_str()
         .unwrap()
-        .starts_with("iris_3b_depth/iris_3b_depth/q8/512/depth/")));
+        .starts_with("iris_3b_depth/iris_3b_depth/q8/1024/depth/")));
     assert!(listed.iter().any(|e| e["case"]
         .as_str()
         .unwrap()
-        .starts_with("sdxl/illustrious_xl_v2/q4/512/mask/")));
+        .starts_with("sdxl/illustrious_xl_v2/q4/1024/mask/")));
 }
 #[cfg(not(target_os = "ios"))]
 #[test]
@@ -124,13 +127,13 @@ fn a_capture_splits_its_lifetime_peak_by_phase_through_the_quantum_marks() {
         lifetime_peak,
     };
     let marks = [
-        m(Load, true, 100),            // load floor checked (pre-load glue → load)
-        m(Conditioning, true, 900),    // the TE weights landed inside the load quantum → load 900
-        m(Conditioning, false, 950),   // text layer ran → conditioning 950
-        m(Denoise, true, 950),         // glue
-        m(Denoise, false, 2000),       // denoise block → denoise 2000
-        m(Decode, true, 2000),         // glue
-        m(Decode, false, 2000),        // decode never rose above denoise: masked
+        m(Load, true, 100),          // load floor checked (pre-load glue → load)
+        m(Conditioning, true, 900),  // the TE weights landed inside the load quantum → load 900
+        m(Conditioning, false, 950), // text layer ran → conditioning 950
+        m(Denoise, true, 950),       // glue
+        m(Denoise, false, 2000),     // denoise block → denoise 2000
+        m(Decode, true, 2000),       // glue
+        m(Decode, false, 2000),      // decode never rose above denoise: masked
         support::Mark {
             phase: None,
             opens: true,

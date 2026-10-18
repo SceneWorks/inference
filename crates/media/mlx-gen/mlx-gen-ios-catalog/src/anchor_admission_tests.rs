@@ -65,8 +65,11 @@ fn at(
     c
 }
 
-/// The optimized anchor: three repeats over a 300 MiB baseline measuring 2480/2500/2490 MiB of
-/// growth, with phase peaks conditioning 700, denoise = the run's growth, decode 900 MiB.
+/// The optimized anchor (at the iOS reference geometry, 1024²): three repeats over a 300 MiB
+/// baseline measuring 2480/2500/2490 MiB of growth, with phase peaks conditioning 700, denoise =
+/// the run's growth, decode 900 MiB. Against the synthetic pricing at 1024² (U-Net 1500 + 300
+/// scratch, tiled decode 200 + 400, text 600 + 10) its unpriced overheads are denoise 700,
+/// decode 300 and conditioning 90 MiB.
 fn optimized_anchor(registry: &ProviderRegistry, c: &IosCandidate) -> AnchorRow {
     let base = 300 * MIB;
     let phases = |denoise: u64| {
@@ -122,7 +125,7 @@ fn kind(r: AdmissionResult<Admission>) -> Option<RefusalKind> {
 
 /// LOW END: at the optimized anchor's own key, admission IS the measurement — the largest repeat
 /// (2500 MiB) plus the stated margin (the 32 MiB floor; the repeats spread 20 MiB) — with no
-/// counted-formula inflation (the synthetic formula would price this key above 2600 MiB).
+/// counted-formula inflation and no 512 MiB formula reserve.
 #[test]
 fn the_optimized_anchor_admits_its_own_key_at_the_measurement_plus_the_stated_margin() {
     let registry = crate::provider_registry().unwrap();
@@ -130,7 +133,7 @@ fn the_optimized_anchor_admits_its_own_key_at_the_measurement_plus_the_stated_ma
     let opt = at(
         &registry,
         root.path(),
-        512,
+        1024,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
@@ -162,37 +165,37 @@ fn other_geometries_and_rungs_are_derived_and_refused_on_capacity_when_they_exce
     let opt = at(
         &registry,
         root.path(),
-        512,
+        1024,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
     let rows = [optimized_anchor(&registry, &opt)];
     priced(|| {
-        // 1024², same selection. Denoise: residue 2500 - 1500 = 1000 against 75 MiB priced at
-        // 512² (κ = 1) → 925 MiB overhead, flat to 1024² → 1500 + 925 + 300 = 2725. Decode: residue
-        // 700 against 400 priced → 300 overhead, tile flat → 200 + 300 + 400 = 900. Conditioning
-        // 600 + 90 + 10 = 700. Demand 2725.
-        let big = at(
+        // 512², same selection (derived DOWN, the overhead floored): denoise 1500 + 700 + 300 x
+        // (75/300 of the calibrated formula) = 2275; decode 200 + 300 + 400 = 900; conditioning
+        // 600 + 90 + 10 = 700. Demand 2275.
+        let small = at(
             &registry,
             root.path(),
-            1024,
+            512,
             MemoryStrategy::BoundedDecode,
             "text_to_image",
         );
-        let admitted = admit_one_of(&registry, &big, 4096, &rows).unwrap();
-        assert_eq!(admitted.demand_bytes(), 2725 * MIB);
+        let admitted = admit_one_of(&registry, &small, 4096, &rows).unwrap();
+        assert_eq!(admitted.demand_bytes(), 2275 * MIB);
         assert_eq!(
             admitted.basis(),
             AdmissionBasis::Derived {
                 from: AnchorKind::Optimized
             }
         );
-        // Resident (rung 0) at 512²: the U-Net 2000 resident + 925 + 75 = 3000; the untiled decode
-        // is another quantum (κ = 1): 200 + 300 + 400 = 900. Demand 3000: upward from the anchor.
+        // Resident (rung 0) at 1024²: the U-Net 2000 resident + 700 + 300 = 3000; the untiled
+        // decode is another quantum (κ = 1): 200 + 300 + 1600 = 2100. Demand 3000: upward from the
+        // optimized anchor.
         let resident = at(
             &registry,
             root.path(),
-            512,
+            1024,
             MemoryStrategy::Resident,
             "text_to_image",
         );
@@ -216,7 +219,7 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let opt = at(
         &registry,
         root.path(),
-        512,
+        1024,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
@@ -240,7 +243,7 @@ fn another_family_or_a_provider_without_pricing_is_no_evidence() {
     let big = at(
         &registry,
         root.path(),
-        1024,
+        512,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
@@ -269,21 +272,21 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
     let opt = at(
         &registry,
         root.path(),
-        512,
+        1024,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
     let res = at(
         &registry,
         root.path(),
-        512,
+        1024,
         MemoryStrategy::Resident,
         "text_to_image",
     );
     let big = at(
         &registry,
         root.path(),
-        1024,
+        512,
         MemoryStrategy::BoundedDecode,
         "text_to_image",
     );
@@ -300,21 +303,18 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
     };
     priced(|| {
         // The law predicts the resident anchor at 3000 MiB. Measured 3100: within 12.6%.
-        let rows = [
-            optimized_anchor(&registry, &opt),
-            resident_row(3100),
-        ];
+        let rows = [optimized_anchor(&registry, &opt), resident_row(3100)];
         assert_eq!(
             admit_one_of(&registry, &big, 8192, &rows)
                 .unwrap()
                 .demand_bytes(),
-            2725 * MIB
+            2275 * MIB
         );
         // A resident request at another geometry is derived from the same-regime resident anchor.
         let res_big = at(
             &registry,
             root.path(),
-            1024,
+            512,
             MemoryStrategy::Resident,
             "text_to_image",
         );
@@ -327,10 +327,7 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
             }
         );
         // Measured 3600: the law under-predicts by 16.7% → every derivation fails closed.
-        let rows = [
-            optimized_anchor(&registry, &opt),
-            resident_row(3600),
-        ];
+        let rows = [optimized_anchor(&registry, &opt), resident_row(3600)];
         assert_eq!(
             kind(admit_one_of(&registry, &big, 8192, &rows)),
             Some(RefusalKind::NoEvidence)
@@ -371,7 +368,7 @@ fn the_two_anchor_self_check_fails_derivations_closed_and_a_refused_resident_is_
             admit_one_of(&registry, &big, 8192, &rows)
                 .unwrap()
                 .demand_bytes(),
-            2725 * MIB
+            2275 * MIB
         );
     });
 }

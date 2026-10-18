@@ -14,7 +14,7 @@
 //!   s_p        = min(residue_p, S_p(anchor))              the part the counted formula accounts for
 //!   overhead_p = residue_p − s_p                          the part no formula prices (driver, allocator)
 //!   D_p        = C_p(request regime)                      the request's own resident components
-//!              + overhead_p × λ(area)                     unpriced overhead, area-scaled (below)
+//!              + overhead_p × λ                           unpriced overhead, area-scaled (below)
 //!              + S_p(request) × κ_p                       the request's counted activation, calibrated
 //!   κ_p        = s_p / S_p(anchor)  if the request's binding quantum IS the anchor's, else 1
 //!   demand     = max_p D_p                                phases run in sequence
@@ -27,9 +27,15 @@
 //!   what the device measured, the request on THE SAME quantum is priced at the measured ratio, so
 //!   admission near the anchor is the measurement, not the formula's conservative scratch. A
 //!   different binding quantum gets its formula unscaled (erring large).
-//! * `λ(area) = max(A_request, 1024²) / max(A_anchor, 1024²)`: the unpriced overhead is linear in
-//!   area above 1024² and FLOORED below (measured on the desktop MLX lane: the activation transient
-//!   is proportional to megapixels above 1024², max 1.97% deviation, with a floor below — sc-16195).
+//! * `λ = max(A_request, A_anchor) / A_anchor`: the unpriced overhead is linear in area ABOVE the
+//!   anchor and FLOORED below it (never credited for a smaller request). Measured on the desktop
+//!   MLX lane (SceneWorks `docs/sc-16195`: the activation transient of 7 tiers at 5 geometries) the
+//!   transient is proportional to megapixels above 1024² (≤ 2.0% from a 1024² anchor) and has a
+//!   floor below it. The iOS anchors sit at 1024², where this is exactly "linear above 1024², floor
+//!   below". It is written relative to the anchor rather than to a fixed 1024² knee because the
+//!   knee form, applied from an anchor below 1024², holds the overhead flat up to 1024² — which
+//!   the same sweep shows UNDER-predicts 512² → 1024² by 49–70%; anchor-relative linear growth
+//!   over-predicts it instead ([`tests::the_area_law_against_the_measured_desktop_sweep`]).
 //! * DOMAIN: a phase whose measured growth is below the components its regime holds resident has
 //!   left the law's domain (the counters did not see the weights) and is NOT derivable — never
 //!   clamped to zero. A request phase the anchor never ran is not derivable either.
@@ -41,9 +47,6 @@
 use crate::evidence::AnchorRow;
 use mlx_gen::ios_pricing::{IosPhase, IosPricing};
 use std::collections::BTreeMap;
-
-/// The area knee of the unpriced-overhead scaler: linear above, floor below.
-pub const AREA_KNEE: u64 = 1024 * 1024;
 
 /// Tolerance of the two-anchor self-check: the measured same-cell RECAPTURE spread of the desktop
 /// MLX active peak (SceneWorks `MLX_ACTIVE_RECAPTURE_SPREAD`, 0.1260…), i.e. how far two captures of
@@ -137,13 +140,9 @@ fn mul_div_ceil(value: u64, num: u64, den: u64) -> u64 {
     u64::try_from(product.div_ceil(u128::from(den))).unwrap_or(u64::MAX)
 }
 
-/// The unpriced-overhead area scaler `λ` applied to `bytes`.
+/// The unpriced-overhead area scaler `λ = max(A_request, A_anchor) / A_anchor` applied to `bytes`.
 pub fn scale_overhead(bytes: u64, request_area: u64, anchor_area: u64) -> u64 {
-    mul_div_ceil(
-        bytes,
-        request_area.max(AREA_KNEE),
-        anchor_area.max(AREA_KNEE),
-    )
+    mul_div_ceil(bytes, request_area.max(anchor_area), anchor_area.max(1))
 }
 
 /// Derive `request`'s demand from `anchor`, measured in the configuration `at_anchor` prices.
@@ -340,30 +339,18 @@ mod tests {
     }
 
     #[test]
-    fn the_unpriced_overhead_is_floored_below_1024_and_linear_in_area_above() {
-        // Below the knee: flat.
-        assert_eq!(
-            scale_overhead(100 * MIB, area(768, 768, 1), area(512, 512, 1)),
-            100 * MIB
-        );
-        assert_eq!(
-            scale_overhead(100 * MIB, area(1024, 1024, 1), area(512, 512, 1)),
-            100 * MIB
-        );
-        // Above: proportional to megapixels over the knee (or over the anchor when it is above).
-        assert_eq!(
-            scale_overhead(100 * MIB, area(2048, 2048, 1), area(512, 512, 1)),
-            400 * MIB
-        );
-        assert_eq!(
-            scale_overhead(100 * MIB, area(1536, 1536, 1), area(512, 512, 1)),
-            225 * MIB
-        );
-        assert_eq!(
-            scale_overhead(100 * MIB, area(1024, 1024, 1), area(2048, 2048, 1)),
-            25 * MIB
-        );
-        // Through the law: the denoise overhead (110 MiB) is carried flat to 1024², x4 at 2048².
+    fn the_unpriced_overhead_is_floored_below_the_anchor_and_linear_in_area_above_it() {
+        // A 1024² anchor (the iOS reference geometry): flat below, proportional above.
+        let k = area(1024, 1024, 1);
+        assert_eq!(scale_overhead(100 * MIB, area(512, 512, 1), k), 100 * MIB);
+        assert_eq!(scale_overhead(100 * MIB, area(768, 768, 1), k), 100 * MIB);
+        assert_eq!(scale_overhead(100 * MIB, k, k), 100 * MIB);
+        assert_eq!(scale_overhead(100 * MIB, area(2048, 2048, 1), k), 400 * MIB);
+        assert_eq!(scale_overhead(100 * MIB, area(1536, 1536, 1), k), 225 * MIB);
+        // Batch multiplies the area.
+        assert_eq!(scale_overhead(100 * MIB, area(1024, 1024, 2), k), 200 * MIB);
+        // Through the law from a 512² anchor: the denoise overhead (110 MiB) grows with the area
+        // above the anchor — never held flat below a fixed knee.
         let (a, p) = optimized_512();
         let d = |edge: u32| {
             derive(&a, &p, &p, area(edge, edge, 1))
@@ -374,8 +361,65 @@ mod tests {
                 .unwrap()
                 .bytes
         };
-        assert_eq!(d(1024), d(512));
-        assert_eq!(d(2048) - d(512), 3 * 110 * MIB);
+        assert_eq!(d(256), d(512));
+        assert_eq!(d(1024) - d(512), 3 * 110 * MIB);
+    }
+
+    /// VALIDATION against measured data: SceneWorks `docs/sc-16195/resolution-sweep.json`, the
+    /// desktop MLX activation transient (bytes) of 7 tiers at 5 geometries. Taken as if NOTHING were
+    /// priced (the whole transient as unpriced overhead — the law's worst case), the area law from
+    /// a 1024² anchor is within 2.0% above it and errs large below it; it NEVER under-predicts from
+    /// either anchor geometry. The 1024²-knee form from a 512² anchor would under-predict by up to
+    /// 70.3% — which is why λ is anchor-relative.
+    #[test]
+    fn the_area_law_against_the_measured_desktop_sweep() {
+        const GEOMETRIES: [(u32, u32); 5] = [
+            (512, 512),
+            (1024, 1024),
+            (1024, 1536),
+            (1152, 2048),
+            (2048, 2048),
+        ];
+        #[rustfmt::skip]
+        const SWEEP: [(&str, [u64; 5]); 6] = [
+            ("illustrious_xl_v1 q8", [4598180324, 15074781464, 22569658648, 33837312280, 59121494296]),
+            ("krea_2_turbo bf16/q8", [4208132200, 8232829032, 12330385512, 18484609128, 32863912040]),
+            ("lens q4", [4731765416, 15080292984, 22577119864, 33847739000, 59138802296]),
+            ("qwen_image q8", [4204138088, 8226047592, 12323079784, 18476516968, 32853984616]),
+            ("sdxl bf16", [4598011364, 15074497816, 22569293080, 33836864792, 59120817432]),
+            ("z_image_turbo q4", [4477811836, 15078788688, 22574042704, 33842302544, 59127860816]),
+        ];
+        let areas = GEOMETRIES.map(|(w, h)| area(w, h, 1));
+        let error =
+            |predicted: u64, measured: u64| (predicted as f64 - measured as f64) / measured as f64;
+        let (mut worst_above_1024, mut worst_from_512, mut knee_from_512) = (0f64, 0f64, 0f64);
+        for (name, transient) in SWEEP {
+            for anchor in [0usize, 1] {
+                for (i, &measured) in transient.iter().enumerate() {
+                    let predicted = scale_overhead(transient[anchor], areas[i], areas[anchor]);
+                    let e = error(predicted, measured);
+                    assert!(
+                        e >= -1e-9,
+                        "{name}: anchor {anchor} under-predicts geometry {i} by {e}"
+                    );
+                    if anchor == 1 && i > 1 {
+                        worst_above_1024 = worst_above_1024.max(e);
+                    }
+                    if anchor == 0 && i > 0 {
+                        worst_from_512 = worst_from_512.max(e);
+                        let knee = mul_div_ceil(
+                            transient[0],
+                            areas[i].max(areas[1]),
+                            areas[0].max(areas[1]),
+                        );
+                        knee_from_512 = knee_from_512.min(error(knee, measured));
+                    }
+                }
+            }
+        }
+        assert!(worst_above_1024 < 0.021, "{worst_above_1024}");
+        assert!(worst_from_512 < 1.05, "{worst_from_512}");
+        assert!(knee_from_512 < -0.70, "{knee_from_512}");
     }
 
     #[test]

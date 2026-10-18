@@ -63,8 +63,8 @@ pub use bound::{BoundDepth, BoundGenerator, BoundTransform};
 pub use ios_admission::capture_permit;
 pub use ios_admission::{
     admit, build_candidate, capacity_budget, evidence_key, execution_for, execution_key,
-    tier_label, token_window, validate_actual, work_binding, work_mode, Admission,
-    AdmissionBasis, IosCandidate, IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
+    tier_label, token_window, validate_actual, work_binding, work_mode, Admission, AdmissionBasis,
+    IosCandidate, IosWork, IRIS_DEPTH_ID, IRIS_RESTORE_ID,
 };
 pub use layout::{artifact_layout_digest, hex};
 /// The bounded-quantum mechanism (live headroom before every graph): a capture reads

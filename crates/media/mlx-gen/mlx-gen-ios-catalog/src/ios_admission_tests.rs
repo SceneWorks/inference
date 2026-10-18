@@ -538,7 +538,8 @@ fn an_unrelated_resident_is_never_credited_as_reusable_headroom() {
         }
     }
     let rows = [row];
-    let budget = |held: u64, available: u64| capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
+    let budget =
+        |held: u64, available: u64| capacity_budget(6142 * MIB, held * MIB, Some(available * MIB));
     // A fresh process (200 MiB held, 5900 MiB available): 3400 MiB growth + 32 MiB margin fits.
     let admitted = admit_with_rows(
         &registry,

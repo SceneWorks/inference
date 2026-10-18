@@ -866,7 +866,9 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         // law derives. The selection is validated against the provider's declared space in
         // `prepare` (a token outside it is a typed strategy refusal).
         if !surfaces(catalog.media()).iter().any(|s| {
-            s.provider == case.provider && s.routes.contains(&case.route) && s.modes.contains(&case.mode)
+            s.provider == case.provider
+                && s.routes.contains(&case.route)
+                && s.modes.contains(&case.mode)
         }) {
             return Err("case not in the actual supported catalog".into());
         }
@@ -912,7 +914,9 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         let provider = case.provider.clone();
         runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
             let (label, opens) = match mark {
-                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, .. } => (label, true),
+                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, .. } => {
+                    (label, true)
+                }
                 runtime_ios::media::ios_quantum::QuantumMark::Synchronized { label } => {
                     (label, false)
                 }
@@ -944,7 +948,10 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             (Some(start), Some(end), Ok(marks)) => support::phase_peaks(start, &marks, end)
                 .into_iter()
                 .map(|(phase, (peak, exact))| {
-                    (phase.as_key().to_string(), json!({"peak_bytes": peak, "exact": exact}))
+                    (
+                        phase.as_key().to_string(),
+                        json!({"peak_bytes": peak, "exact": exact}),
+                    )
                 })
                 .collect::<serde_json::Map<_, _>>(),
             _ => serde_json::Map::new(),

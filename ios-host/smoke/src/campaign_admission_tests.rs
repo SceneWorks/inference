@@ -583,13 +583,13 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
         .collect();
     for tier in ["q4", "q8", "bf16"] {
         let mut prefixes = vec![
-            format!("z_image_turbo/z_image_turbo/{tier}/512/text/"),
-            format!("z_image_turbo/z_image_turbo/{tier}/512/reference/"),
+            format!("z_image_turbo/z_image_turbo/{tier}/1024/text/"),
+            format!("z_image_turbo/z_image_turbo/{tier}/1024/reference/"),
         ];
         for kind in ["pose", "canny", "depth"] {
             for mode in ["control", "reference"] {
                 prefixes.push(format!(
-                    "z_image_turbo_control/z_image_turbo_control/{tier}/512/{mode}_{kind}/"
+                    "z_image_turbo_control/z_image_turbo_control/{tier}/1024/{mode}_{kind}/"
                 ));
             }
         }

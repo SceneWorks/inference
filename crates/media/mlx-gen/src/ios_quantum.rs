@@ -812,7 +812,10 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
         })
     }))));
     with_cpu_diagnostic_headroom(headroom, || {
-        assert!(before("formula", scratch).is_err(), "the formula alone refuses");
+        assert!(
+            before("formula", scratch).is_err(),
+            "the formula alone refuses"
+        );
         assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
         // A measured envelope of 900 MiB, admitted against 1024 MiB: the guard now needs the
         // envelope's remaining 900 MiB, which the live headroom covers.
@@ -826,7 +829,10 @@ fn an_admitted_envelope_replaces_formula_scratch_until_growth_exceeds_it() {
         // An envelope larger than live headroom (an unsound admission) still refuses.
         assert!(with_admitted_envelope(1100 * MIB, || before("unsound", scratch)).is_err());
         let refusal = take_refusal().unwrap();
-        assert_eq!((refusal.scratch_bytes, refusal.reserve_bytes), (1100 * MIB, 0));
+        assert_eq!(
+            (refusal.scratch_bytes, refusal.reserve_bytes),
+            (1100 * MIB, 0)
+        );
         // Growth beyond the envelope: the guard is back on its formula (the safety net).
         with_admitted_envelope(300 * MIB, || {
             with_cpu_diagnostic_headroom(headroom - 400 * MIB, || {
