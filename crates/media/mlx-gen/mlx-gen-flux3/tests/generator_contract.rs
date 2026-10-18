@@ -59,11 +59,15 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
         use mlx_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
         let refs: Vec<Conditioning> = (0..10)
             .map(|n| {
-                let (w, h) = if n % 2 == 0 { (83, 67) } else { (67, 99) };
+                let (w, h) = if n.is_multiple_of(2) {
+                    (83, 67)
+                } else {
+                    (67, 99)
+                };
                 let rgb = (0..w * h)
                     .flat_map(|p| [n * 19, (p % 251) as u8, (p / w % 251) as u8])
                     .collect::<Vec<_>>();
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     Conditioning::ReferenceRgba {
                         image: RgbaImage {
                             width: w,
