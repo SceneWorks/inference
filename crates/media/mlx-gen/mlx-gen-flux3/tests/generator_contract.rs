@@ -57,13 +57,17 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
     crate::common::on_cpu(|| {
         use mlx_gen::gen_core::flux3::references::ReferenceOutputSize;
         use mlx_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
-        let refs: Vec<Conditioning> = (0..10)
+        let refs: Vec<Conditioning> = (0..10u8)
             .map(|n| {
-                let (w, h) = if n % 2 == 0 { (83, 67) } else { (67, 99) };
+                let (w, h) = if n.is_multiple_of(2) {
+                    (83, 67)
+                } else {
+                    (67, 99)
+                };
                 let rgb = (0..w * h)
                     .flat_map(|p| [n * 19, (p % 251) as u8, (p / w % 251) as u8])
                     .collect::<Vec<_>>();
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     Conditioning::ReferenceRgba {
                         image: RgbaImage {
                             width: w,
@@ -154,6 +158,35 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 (oriented_ten.width, oriented_ten.height),
                 (64, 80),
                 "ten EXIF references use upstream multi-reference crop"
+            );
+            let mut narrow = edit.clone();
+            narrow.conditioning = vec![
+                Conditioning::Reference {
+                    image: Image {
+                        width: 48,
+                        height: 64,
+                        pixels: vec![19; 48 * 64 * 3],
+                    },
+                    strength: None,
+                },
+                refs[0].clone(),
+            ];
+            narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
+            // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
+            // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
+            let plan = mlx_gen::gen_core::flux3::references::normalize_request(&mut narrow)
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.output.canvas, (48, 64));
+            g.validate(&narrow).unwrap();
+            let narrow_image = render(&narrow);
+            assert_eq!((narrow_image.width, narrow_image.height), (48, 64));
+            let mut narrow_t2i = narrow;
+            narrow_t2i.conditioning.clear();
+            narrow_t2i.flux3_reference_output = None;
+            assert!(
+                g.validate(&narrow_t2i).is_err(),
+                "legacy no-reference minimum is unchanged"
             );
             let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");

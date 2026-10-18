@@ -12,6 +12,7 @@ categories = ["science"]
 autotests = false
 
 [dependencies]
+serde_json = { workspace = true }
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
@@ -22,7 +23,6 @@ mlx-rs = { workspace = true }
 mlx-llm = { workspace = true }
 # Backend-neutral safetensors encoding for atomic native training snapshots/adapters.
 safetensors = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]

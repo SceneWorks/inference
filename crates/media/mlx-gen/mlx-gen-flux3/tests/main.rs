@@ -16,6 +16,9 @@ mod common;
 #[path = "ae_parity.rs"]
 mod ae_parity;
 
+#[path = "ae_training_precision.rs"]
+mod ae_training_precision;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 
@@ -33,6 +36,9 @@ mod real_weights;
 
 #[path = "text_parity.rs"]
 mod text_parity;
+
+#[path = "text_training.rs"]
+mod text_training;
 
 #[path = "training_checkpoint.rs"]
 mod training_checkpoint;

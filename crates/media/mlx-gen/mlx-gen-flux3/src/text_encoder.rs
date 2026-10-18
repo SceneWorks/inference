@@ -38,7 +38,8 @@ use mlx_rs::{Array, Dtype};
 
 /// One prompt's conditioning, as `TextEncoder.encode` returns it.
 pub struct TextConditioning {
-    /// `[L, layers · hidden]` bf16: the selected hidden states concatenated per token.
+    /// `[L, layers · hidden]`: selected states per token; BF16 for generation,
+    /// explicitly selected precision for the frozen training teacher.
     pub tokens: Array,
     /// `[L]` ids `(0, 0, 0, position)`.
     pub ids: Vec<[f32; 4]>,
@@ -54,6 +55,7 @@ pub struct Flux3TextEncoder {
     layers: Vec<usize>,
     pad_multiple: usize,
     max_length: usize,
+    output_dtype: Dtype,
     hidden: usize,
 }
 
@@ -86,6 +88,41 @@ impl Flux3TextEncoder {
     /// the language tower's tensors are read. `text_in_channels` is the DiT's `txt_in` width,
     /// checked against `layers × hidden` so a mismatched encoder fails at load, by number.
     pub fn load(dir: &Path, cfg: &TextEncoderConfig, text_in_channels: usize) -> Result<Self> {
+        Self::load_internal(dir, cfg, text_in_channels, None)
+    }
+
+    /// Frozen training teacher with selected compute/output precision, HF Module.to
+    /// frequency-buffer rounding, and source training window cap (default512).
+    pub fn load_for_training(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        text_in_channels: usize,
+        compute: Dtype,
+        max_sequence_length: usize,
+    ) -> Result<Self> {
+        if !matches!(compute, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+            || max_sequence_length == 0
+            || max_sequence_length > i32::MAX as usize
+        {
+            return Err(Error::Unsupported(
+                "flux3 training teacher requires F32/F16/BF16 and a positive bounded text window"
+                    .into(),
+            ));
+        }
+        Self::load_internal(
+            dir,
+            cfg,
+            text_in_channels,
+            Some((compute, max_sequence_length)),
+        )
+    }
+
+    fn load_internal(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        text_in_channels: usize,
+        training: Option<(Dtype, usize)>,
+    ) -> Result<Self> {
         let model_cfg = ModelConfig::from_dir(dir).map_err(from_llm)?;
         if !model_cfg.architecture.is_qwen3_vl() {
             return Err(Error::Unsupported(format!(
@@ -113,13 +150,23 @@ impl Flux3TextEncoder {
                 model_cfg.num_layers
             )));
         }
-        if cfg.dtype != "bfloat16" {
+        if training.is_none() && cfg.dtype != "bfloat16" {
             return Err(Error::Unsupported(format!(
                 "flux3: text_encoder.dtype {} is not the bf16 the shared tower computes in",
                 cfg.dtype
             )));
         }
 
+        let (output_dtype, max_length) = match training {
+            Some((dtype, max_length)) => {
+                if cfg.pad_multiple == 0 || max_length > model_cfg.max_position_embeddings as usize
+                {
+                    return Err(Error::Unsupported("flux3 training: text window exceeds teacher positional capacity or has invalid padding".into()));
+                }
+                (dtype, max_length)
+            }
+            None => (Dtype::Bfloat16, cfg.window_max_length()),
+        };
         let files = weight_shards(dir)?;
         let mut tensors = HashMap::new();
         for file in &files {
@@ -140,7 +187,13 @@ impl Flux3TextEncoder {
         let weights = mlx_llm::primitives::weights::Weights::from_map(tensors);
         // `from_weights` evaluates every parameter group it built (the load boundary), so no
         // forward ever reads a weight from disk.
-        let lm = CausalLm::from_weights(&weights, "", model_cfg).map_err(from_llm)?;
+        let lm = match training {
+            Some((dtype, _)) => CausalLm::from_weights_dtype(&weights, "", model_cfg, dtype)
+                .map_err(from_llm)?
+                .with_training_frequency_storage()
+                .map_err(from_llm)?,
+            None => CausalLm::from_weights(&weights, "", model_cfg).map_err(from_llm)?,
+        };
         drop(weights);
 
         let tokenizer = TextTokenizer::from_file(
@@ -165,13 +218,30 @@ impl Flux3TextEncoder {
             pad_id,
             layers: cfg.layers.clone(),
             pad_multiple: cfg.pad_multiple,
-            max_length: cfg.window_max_length(),
+            max_length,
+            output_dtype,
             hidden,
         })
     }
 
     pub fn pad_id(&self) -> i32 {
         self.pad_id
+    }
+
+    pub fn compute_dtype(&self) -> Dtype {
+        self.lm.compute_dtype()
+    }
+    pub fn output_dtype(&self) -> Dtype {
+        self.output_dtype
+    }
+    pub fn precision_profile_key(&self) -> String {
+        format!(
+            "{};output={:?};max={};layers={:?}",
+            self.lm.cache_fingerprint(),
+            self.output_dtype,
+            self.max_length,
+            self.layers
+        )
     }
 
     /// `layers × hidden`: the width of one conditioning row.
@@ -227,7 +297,7 @@ impl Flux3TextEncoder {
             .collect::<Result<_>>()?;
         let refs: Vec<&Array> = picked.iter().collect();
         // `stack(dim=1).permute(0, 2, 1, 3).reshape(L, -1)`: layer-major within each token row.
-        let tokens = concatenate_axis(&refs, 1)?.as_dtype(Dtype::Bfloat16)?;
+        let tokens = concatenate_axis(&refs, 1)?.as_dtype(self.output_dtype)?;
         eval([&tokens])?;
         Ok(TextConditioning {
             tokens,

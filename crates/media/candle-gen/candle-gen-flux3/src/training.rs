@@ -1,6 +1,8 @@
 //! Native trainable FLUX3 DiT seam. Frozen base weights stay in the inference graph;
 //! adapter `Var`s use the shared trainable residual mechanism, not pre-merged deltas.
 pub mod checkpoint;
+pub(crate) mod runner;
+pub mod trainer;
 
 use std::collections::BTreeMap;
 
@@ -22,6 +24,9 @@ pub struct TrainingGraph {
     pub dit: Flux3Dit,
     pub factors: Vec<LoraFactors>,
     pub scale: f64,
+    /// The configured global LoRA alpha, exported verbatim (never re-derived as `scale * rank`,
+    /// which rounds, e.g. 29/7*7 = 29.000000000000004).
+    pub alpha: f64,
 }
 
 impl TrainingGraph {
@@ -79,6 +84,7 @@ impl TrainingGraph {
             dit,
             factors,
             scale,
+            alpha,
         })
     }
 

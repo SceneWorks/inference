@@ -1962,6 +1962,7 @@ mod tests {
                 "anima_base",
                 "anima_aesthetic",
                 "anima_turbo",
+                "flux3_klein_base",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",

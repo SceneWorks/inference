@@ -734,3 +734,271 @@ impl Flux3AutoEncoder {
         out
     }
 }
+
+// Additive training opmath. Selected-dtype parameters/activations are real:
+// only one operation's rounded operands are promoted, with one low output write.
+fn training_pair_cast(p: &mut (Array, Array), dtype: Dtype) -> Result<()> {
+    p.0 = p.0.as_dtype(dtype)?;
+    p.1 = p.1.as_dtype(dtype)?;
+    Ok(())
+}
+
+fn training_conv(x: &Array, p: &(Array, Array), stride: i32, padding: i32) -> Result<Array> {
+    Ok(conv2d(
+        &x.as_dtype(Dtype::Float32)?,
+        &p.0.as_dtype(Dtype::Float32)?,
+        Some(&p.1.as_dtype(Dtype::Float32)?),
+        stride,
+        padding,
+    )?
+    .as_dtype(x.dtype())?)
+}
+
+fn training_linear(x: &Array, p: &(Array, Array)) -> Result<Array> {
+    Ok(linear(
+        &x.as_dtype(Dtype::Float32)?,
+        &p.0.as_dtype(Dtype::Float32)?,
+        &p.1.as_dtype(Dtype::Float32)?,
+    )?
+    .as_dtype(x.dtype())?)
+}
+
+fn training_silu(x: &Array) -> Result<Array> {
+    Ok(silu(&x.as_dtype(Dtype::Float32)?)?.as_dtype(x.dtype())?)
+}
+
+impl Norm {
+    fn training_cast(&mut self, dtype: Dtype) -> Result<()> {
+        self.weight = self.weight.as_dtype(dtype)?;
+        self.bias = self.bias.as_dtype(dtype)?;
+        Ok(())
+    }
+    fn training_forward(&self, x: &Array) -> Result<Array> {
+        Ok(group_norm(
+            &x.as_dtype(Dtype::Float32)?,
+            &self.weight.as_dtype(Dtype::Float32)?,
+            &self.bias.as_dtype(Dtype::Float32)?,
+            GN_GROUPS,
+            GN_EPS,
+        )?
+        .as_dtype(x.dtype())?)
+    }
+}
+
+impl ResnetBlock {
+    fn training_cast(&mut self, dtype: Dtype) -> Result<()> {
+        self.norm1.training_cast(dtype)?;
+        self.norm2.training_cast(dtype)?;
+        training_pair_cast(&mut self.conv1, dtype)?;
+        training_pair_cast(&mut self.conv2, dtype)?;
+        if let Some(p) = &mut self.nin_shortcut {
+            training_pair_cast(p, dtype)?;
+        }
+        Ok(())
+    }
+    fn training_forward(&self, x: &Array) -> Result<Array> {
+        let h = training_conv(
+            &training_silu(&self.norm1.training_forward(x)?)?,
+            &self.conv1,
+            1,
+            1,
+        )?;
+        let h = training_conv(
+            &training_silu(&self.norm2.training_forward(&h)?)?,
+            &self.conv2,
+            1,
+            1,
+        )?;
+        let residual = match &self.nin_shortcut {
+            Some(p) => training_linear(x, p)?,
+            None => x.clone(),
+        };
+        Ok(add(&residual, &h)?)
+    }
+}
+
+impl AttnBlock {
+    fn training_cast(&mut self, dtype: Dtype) -> Result<()> {
+        self.norm.training_cast(dtype)?;
+        for p in [&mut self.q, &mut self.k, &mut self.v, &mut self.proj_out] {
+            training_pair_cast(p, dtype)?;
+        }
+        Ok(())
+    }
+    fn training_forward(&self, x: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
+        let y = self.norm.training_forward(x)?;
+        let seq = |p: &(Array, Array)| -> Result<Array> {
+            Ok(training_linear(&y, p)?
+                .as_dtype(Dtype::Float32)?
+                .reshape(&[b, 1, h * w, c])?)
+        };
+        let (q, k, v) = (seq(&self.q)?, seq(&self.k)?, seq(&self.v)?);
+        let o = scaled_dot_product_attention(&q, &k, &v, 1.0 / (c as f32).sqrt(), None, None)?
+            .reshape(&[b, h, w, c])?
+            .as_dtype(x.dtype())?;
+        Ok(add(x, &training_linear(&o, &self.proj_out)?)?)
+    }
+}
+
+impl Encoder {
+    fn training_cast(&mut self, dtype: Dtype) -> Result<()> {
+        for p in [&mut self.conv_in, &mut self.conv_out, &mut self.quant_conv] {
+            training_pair_cast(p, dtype)?;
+        }
+        for level in &mut self.down {
+            for block in &mut level.blocks {
+                block.training_cast(dtype)?;
+            }
+            if let Some(p) = &mut level.downsample {
+                training_pair_cast(p, dtype)?;
+            }
+        }
+        self.mid.block_1.training_cast(dtype)?;
+        self.mid.attn_1.training_cast(dtype)?;
+        self.mid.block_2.training_cast(dtype)?;
+        self.norm_out.training_cast(dtype)
+    }
+    fn training_forward(&self, x: &Array) -> Result<Array> {
+        let mut h = training_conv(x, &self.conv_in, 1, 1)?;
+        for level in &self.down {
+            for block in &level.blocks {
+                h = block.training_forward(&h)?;
+            }
+            if let Some(p) = &level.downsample {
+                h = pad(&h, &[(0, 0), (0, 1), (0, 1), (0, 0)][..], None, None)?;
+                h = training_conv(&h, p, 2, 0)?;
+            }
+        }
+        h = self.mid.block_1.training_forward(&h)?;
+        h = self.mid.attn_1.training_forward(&h)?;
+        h = self.mid.block_2.training_forward(&h)?;
+        h = training_conv(
+            &training_silu(&self.norm_out.training_forward(&h)?)?,
+            &self.conv_out,
+            1,
+            1,
+        )?;
+        training_linear(&h, &self.quant_conv)
+    }
+}
+
+/// Frozen encoder-only training view. CPU-stream load/cast/evaluation ensures
+/// selected precision exists before subsequent GPU evaluation (MLX unified memory;
+/// no physical-upload claim). Retains selected weights, never a decoder or F32
+/// encoder shadow. Every operation uses F32 opmath and a selected-dtype write.
+pub struct FrozenTrainingEncoder {
+    encoder: Encoder,
+    bn_mean: Array,
+    bn_std: Array,
+    embed_dim: i32,
+    compute: Dtype,
+}
+
+impl FrozenTrainingEncoder {
+    pub fn from_weights(w: &Weights, compute: Dtype) -> Result<Self> {
+        if !matches!(compute, Dtype::Float32 | Dtype::Bfloat16 | Dtype::Float16) {
+            return Err(layout_error("training compute must be F32, BF16 or F16"));
+        }
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            // Original statistics captured and evaluated BEFORE half parameter casts.
+            let bn_mean = f32w(w, "bn.running_mean")?;
+            let bn_std = sqrt(&add(&f32w(w, "bn.running_var")?, scalar(BN_EPS))?)?;
+            bn_mean.eval()?;
+            bn_std.eval()?;
+            let (mut encoder, levels, _) = Encoder::from_weights(w)?;
+            let two_e = encoder.quant_conv.0.shape()[0];
+            if levels != 4
+                || two_e <= 0
+                || two_e % 2 != 0
+                || encoder.quant_conv.0.shape()[1] != two_e
+                || encoder.conv_out.0.shape()[0] != two_e
+            {
+                return Err(layout_error(
+                    "training encoder requires source 16x geometry and matching 2E moments",
+                ));
+            }
+            let embed_dim = two_e / 2;
+            let c = embed_dim * PATCH * PATCH;
+            if bn_mean.shape() != [c] || bn_std.shape() != [c] {
+                return Err(layout_error(
+                    "training original BN statistics must have 4E channels",
+                ));
+            }
+            encoder.training_cast(compute)?;
+            let mut arrays = Vec::new();
+            encoder.arrays(&mut arrays);
+            for array in arrays {
+                array.eval()?;
+            }
+            Ok(Self {
+                encoder,
+                bn_mean,
+                bn_std,
+                embed_dim,
+                compute,
+            })
+        })
+    }
+
+    pub fn compute_dtype(&self) -> Dtype {
+        self.compute
+    }
+    pub fn latent_channels(&self) -> i32 {
+        self.embed_dim * PATCH * PATCH
+    }
+
+    /// Selected encoder parameters followed by the two ORIGINAL F32 BN arrays.
+    /// Never includes decoder arrays or a retained F32 encoder shadow.
+    pub fn arrays(&self) -> Vec<&Array> {
+        let mut out = Vec::new();
+        self.encoder.arrays(&mut out);
+        out.push(&self.bn_mean);
+        out.push(&self.bn_std);
+        out
+    }
+
+    /// F32 NHWC input -> deterministic mean -> patchify -> original-F32 BN,
+    /// already-normalized F32 tokens in row-major grid order. No second packing.
+    pub fn encode(&self, image: &Array) -> Result<(Array, (i32, i32))> {
+        let sh = image.shape();
+        if image.dtype() != Dtype::Float32
+            || sh.len() != 4
+            || sh[0] != 1
+            || sh[3] != 3
+            || sh[1] <= 0
+            || sh[2] <= 0
+            || sh[1] % DOWNSAMPLING_RATIO != 0
+            || sh[2] % DOWNSAMPLING_RATIO != 0
+        {
+            return Err(layout_error(
+                "training input must be F32 [1,H,W,3], positive sides multiple16",
+            ));
+        }
+        let (h, w) = (sh[1] / DOWNSAMPLING_RATIO, sh[2] / DOWNSAMPLING_RATIO);
+        let image = mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || -> Result<Array> {
+            let selected = image.as_dtype(self.compute)?;
+            selected.eval()?;
+            Ok(selected)
+        })?;
+        let moments = self.encoder.training_forward(&image)?;
+        let e = self.embed_dim;
+        if moments.shape() != [1, h * PATCH, w * PATCH, 2 * e] {
+            return Err(layout_error(
+                "training encoder produced unexpected moments geometry",
+            ));
+        }
+        let idx = Array::from_slice(&(0..e).collect::<Vec<i32>>(), &[e]);
+        let mean = moments.take_axis(&idx, 3)?.as_dtype(Dtype::Float32)?;
+        let packed = mean
+            .reshape(&[1, h, PATCH, w, PATCH, e])?
+            .transpose_axes(&[0, 1, 3, 5, 2, 4])?
+            .reshape(&[1, h, w, self.latent_channels()])?;
+        let normalized = divide(&subtract(&packed, &self.bn_mean)?, &self.bn_std)?;
+        Ok((
+            normalized.reshape(&[h * w, self.latent_channels()])?,
+            (h, w),
+        ))
+    }
+}

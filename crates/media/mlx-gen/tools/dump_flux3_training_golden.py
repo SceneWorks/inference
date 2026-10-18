@@ -7,6 +7,8 @@ plain-LoRA targets follow diffusers7ecb1e1b. These are NOT actual BFL weights.
 """
 from pathlib import Path
 import hashlib
+import importlib.metadata
+import json
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _flux3_common import import_upstream, patch_dit_constants, FIXTURE_DIR, SNAPSHOT, FLUX3_COMMIT
@@ -26,6 +28,14 @@ for name, expected in training_hashes.items():
     actual = hashlib.sha256((training_source / name).read_bytes()).hexdigest()
     if actual != expected:
         raise SystemExit(f"frozen training source mismatch: {name}: {actual} != {expected}")
+def installed_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+reference_environment = {"python": sys.version, "platform": sys.platform}
+reference_environment.update({name: installed_version(name) for name in ["torch", "diffusers", "transformers", "datasets", "Pillow", "accelerate", "safetensors"]})
 torch.set_num_threads(2)
 patch_dit_constants(dit_module)
 model = dit_module.DiT(flow_map=False).eval()
@@ -88,5 +98,5 @@ for step, index in enumerate([137, 721]):
 for handle in handles:
     handle.remove()
 assert all(not parameter.requires_grad for parameter in model.parameters())
-save_file({k: v.detach().contiguous().float() for k, v in out.items()}, str(FIXTURE_DIR / "flux3_training_golden.safetensors"), metadata={"fixture": "synthetic tiny geometry, NOT actual BFL weights", "training_reference": TRAINING_REF, "training_img2img_source_sha256": training_hashes["train_dreambooth_lora_flux3_klein_img2img.py"], "conditioning_position": "T0/H0.5/W0.5/L-1, paired same-grid cached synthetic latents", "initialization": "controlled synthetic sinusoidal A, zero B; not a PEFT RNG-stream identity claim", "forward_reference": FLUX3_COMMIT, "optimizer": "torch AdamW CPU lr0.0003 beta0.9,0.999 eps1e-8 wd0.0001", "rank": str(rank), "alpha": str(alpha), "precision": "f32", "steps": "2"})
+save_file({k: v.detach().contiguous().float() for k, v in out.items()}, str(FIXTURE_DIR / "flux3_training_golden.safetensors"), metadata={"fixture": "synthetic tiny geometry, NOT actual BFL weights", "reference_environment": json.dumps(reference_environment, sort_keys=True), "oracle_scope": "DiT gradients and optimizer on controlled cached inputs; does not execute AE/TE preprocessing, installed diffusers or datasets trainers", "native_intake_policy": "dataset-decoded EXIF-oriented RGB; HF datasets4.4.1 source is audit evidence, not a pinned or executed dependency", "training_reference": TRAINING_REF, "training_img2img_source_sha256": training_hashes["train_dreambooth_lora_flux3_klein_img2img.py"], "conditioning_position": "T0/H0.5/W0.5/L-1, paired same-grid cached synthetic latents", "initialization": "controlled synthetic sinusoidal A, zero B; not a PEFT RNG-stream identity claim", "forward_reference": FLUX3_COMMIT, "optimizer": "torch AdamW CPU lr0.0003 beta0.9,0.999 eps1e-8 wd0.0001", "rank": str(rank), "alpha": str(alpha), "precision": "f32", "steps": "2"})
 print(f"Synthetic CPU oracle: {len(factors)} factors, two nonzero-gradient AdamW steps; no real weights")

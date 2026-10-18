@@ -678,9 +678,11 @@ impl Flux3Klein {
     }
 
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
+        references::validate_request_with_resolved_output(
+            &self.descriptor.capabilities,
+            self.descriptor.id,
+            req,
+        )?;
         validate_generation_request(self.descriptor.id, req, &self.config)?;
         refuse_unhonored_memory(req)?;
         Ok(())

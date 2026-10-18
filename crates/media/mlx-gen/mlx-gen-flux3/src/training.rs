@@ -3,6 +3,7 @@
 //! projection inside the traced closure. The frozen DiT/AE/text weights are never parameters.
 pub mod checkpoint;
 pub mod optim;
+pub mod trainer;
 
 use crate::{Flux3Dit, SampleTokens};
 use mlx_gen::gen_core::flux3::training::{lora_targets, LoraTarget};
@@ -17,6 +18,9 @@ pub struct TrainingGraph {
     pub targets: Vec<LoraTarget>,
     pub rank: usize,
     pub scale: f64,
+    /// The configured global LoRA alpha, exported verbatim (never re-derived as `scale * rank`,
+    /// which rounds, e.g. 29/7*7 = 29.000000000000004).
+    pub alpha: f64,
 }
 
 impl TrainingGraph {
@@ -33,6 +37,7 @@ impl TrainingGraph {
             targets,
             rank,
             scale: alpha / rank as f64,
+            alpha,
         })
     }
 
@@ -95,7 +100,7 @@ impl TrainingGraph {
                     "flux3 training: packed velocity target shape mismatch",
                 ));
             }
-            let difference = prediction.subtract(&target.as_dtype(Dtype::Float32)?)?;
+            let difference = prediction.subtract(target.as_dtype(Dtype::Float32)?)?;
             let loss = difference
                 .square()?
                 .mean(None)?

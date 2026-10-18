@@ -61,6 +61,19 @@ Every row of the MLX twin's coverage table marked S1 is ported here one-to-one, 
 * The memory contract's calibration fingerprint is Candle's own
   (`flux3-klein-candle-derived-…`): the two backends never share calibration evidence.
 
+## Reference output envelope (S3)
+
+Frozen `generate.py:65..77` requires positive 16-pixel-grid output sides; `pipeline.MIN_SIDE`
+(64) is the **single-reference padding** floor, not the multi-reference or decoder kernel floor.
+Reference-derived 16/32/48-pixel sides are therefore accepted, including after the memory scope
+normalizes the numeric request canvas. Plain no-reference requests retain their existing 64-pixel
+minimum.
+
+Both native providers retain their existing advertised **4096-pixel output-side ceiling**
+(`model::MAX_SIZE`). This is an explicit native allocation-envelope deviation, not an upstream
+renderer or kernel limit: larger explicit canvases or very wide multi-reference canvases are
+refused before generation rather than expanding that public envelope without validation.
+
 ## Fixtures
 
 The parity tests read the MLX twin's committed fixtures
