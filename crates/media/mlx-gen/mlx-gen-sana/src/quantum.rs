@@ -5,7 +5,8 @@
 //! that quantum's peak — and each is proven by a CPU test (`quantum_proofs` below) that builds the
 //! real module at a small shape, measures MLX's peak with
 //! [`mlx_gen::ios_quantum::measured_peak_bytes`] and asserts the formula is at least the
-//! measurement and at most [`MAX_RATIO`] times it. These are floors for one materialized quantum,
+//! measurement (hard), reporting a ratio above [`MAX_RATIO`] (report-only: low-end accuracy is
+//! calibrated on the device). These are floors for one materialized quantum,
 //! never a process bound and never production admission.
 //!
 //! **Convolution workspace.** MLX's CPU backend runs every ungrouped convolution as an explicit

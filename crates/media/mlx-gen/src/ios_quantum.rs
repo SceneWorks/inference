@@ -17,7 +17,7 @@ pub use budget::measured_peak_bytes;
 pub use budget::{
     allocated_bytes, allocated_tensor_bytes, assert_tracks_measured, attention_block_bytes,
     check_headroom, conv_stage_bytes, elementwise_bytes, rope_table_bytes, sampler_step_bytes,
-    scores_bytes, tensor_bytes, AttentionBlockGeometry, ConvStageGeometry, Scores,
+    scores_bytes, tensor_bytes, AttentionBlockGeometry, ConvStageGeometry, RatioReport, Scores,
     PROCESS_RESERVE_BYTES,
 };
 pub use kernels::{

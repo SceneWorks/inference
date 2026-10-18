@@ -1,11 +1,23 @@
 //! iOS quantum accounting primitives. Every figure is COUNTED from the ops of one quantum — how
 //! many tensors of each shape are live at that quantum's peak — by its call site, and each call
 //! site proves its counts with a CPU test that measures MLX's peak for a small shape
-//! ([`measured_peak_bytes`]) and asserts the formula is at least the measurement and within a
-//! stated factor of it ([`assert_tracks_measured`]). No blanket multipliers: a floor that
-//! over-prices refuses sizes the phone could run, and a campaign would then record the guard's
-//! arithmetic instead of the device. These remain floors for one materialized quantum, not a
-//! process or Metal-driver bound, and they never authorize production admission.
+//! ([`measured_peak_bytes`], the stalled measurement) through [`assert_tracks_measured`], which
+//! splits the proof in two:
+//!
+//! - **formula ≥ measured is a HARD failure** — the safety bound: a guard priced below what its
+//!   quantum allocates admits a jetsam kill. Load only ever LOWERS a stalled CPU measurement (the
+//!   CPU's in-flight window retains less of the graph when the worker keeps up), so this side
+//!   never flakes.
+//! - **formula ≤ 1.5× measured is REPORT-ONLY** — a ratio above it prints a greppable
+//!   `PRICING-RATIO-HIGH <label> <ratio>` line and the test passes. The CPU measurement cannot
+//!   observe the device's wider retention (up to ten in-flight command buffers of up to 20 ops /
+//!   40 MB each on a phone) and swings with host load, so it cannot bound the high side; the
+//!   LOW-END ACCURACY of every formula is calibrated against the device instead — the on-device
+//!   anchor captures and the validation case (docs/ios-device-runbook.md, "Campaign protocol").
+//!   There are no per-proof allowances: every ratio is printed and reported against the same 1.5.
+//!
+//! No blanket multipliers. These remain floors for one materialized quantum, not a process or
+//! Metal-driver bound, and they never authorize production admission.
 
 pub const PROCESS_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -207,18 +219,45 @@ fn stall_kernel() -> crate::Result<mlx_rs::Array> {
     Ok(product)
 }
 
-/// The proof every counted formula carries: never below the measured peak (it must not admit a
-/// quantum that allocates more), and at most `max_ratio` times it (it must not refuse sizes that
-/// fit). Panics with both figures otherwise.
-pub fn assert_tracks_measured(label: &str, formula: u64, measured: u64, max_ratio: f64) {
+/// The proof every counted formula carries (see the module doc for the split):
+///
+/// - **HARD**: the formula is never below the measured peak — it must not admit a quantum that
+///   allocates more. Panics with both figures otherwise.
+/// - **REPORT-ONLY**: above `max_ratio` times the measurement (1.5 everywhere) it writes
+///   `PRICING-RATIO-HIGH <label> <ratio>` straight to the process's stderr (not through the test
+///   harness's captured output, so a passing test still shows it) and returns
+///   [`RatioReport::High`]. Low-end accuracy is calibrated on the device, not by this CPU bound.
+pub fn assert_tracks_measured(
+    label: &str,
+    formula: u64,
+    measured: u64,
+    max_ratio: f64,
+) -> RatioReport {
     assert!(
         formula >= measured,
         "{label}: formula {formula} B is BELOW the measured peak {measured} B"
     );
-    assert!(
-        (formula as f64) <= max_ratio * measured as f64,
-        "{label}: formula {formula} B over-prices the measured peak {measured} B by more than {max_ratio}x"
-    );
+    let ratio = formula as f64 / measured.max(1) as f64;
+    if ratio > max_ratio {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "PRICING-RATIO-HIGH {label} {ratio:.3} (formula {formula} B, measured {measured} B, \
+             report threshold {max_ratio}x)"
+        );
+        RatioReport::High(ratio)
+    } else {
+        RatioReport::Within(ratio)
+    }
+}
+
+/// What [`assert_tracks_measured`] found on the report-only side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RatioReport {
+    /// formula / measured, at or under the report threshold.
+    Within(f64),
+    /// formula / measured, over the report threshold (a `PRICING-RATIO-HIGH` line was written).
+    High(f64),
 }
 
 /// Latent-sized elementwise work BETWEEN denoiser forwards (classifier-free-guidance combine and
@@ -403,16 +442,24 @@ mod tests {
         assert_eq!(allocated_bytes(u64::MAX), u64::MAX);
     }
 
+    /// The high side is report-only: ten times the measurement passes and reports.
     #[test]
-    #[should_panic(expected = "over-prices")]
-    fn a_formula_ten_times_the_measurement_fails_its_proof() {
-        assert_tracks_measured("x", 1000, 100, 1.5);
+    fn a_formula_ten_times_the_measurement_is_reported_not_failed() {
+        assert_eq!(
+            assert_tracks_measured("x", 1000, 100, 1.5),
+            RatioReport::High(10.0)
+        );
+        assert_eq!(
+            assert_tracks_measured("x", 150, 100, 1.5),
+            RatioReport::Within(1.5)
+        );
     }
 
+    /// The low side stays a HARD failure: one byte under the measurement panics.
     #[test]
     #[should_panic(expected = "BELOW")]
     fn a_formula_under_the_measurement_fails_its_proof() {
-        assert_tracks_measured("x", 99, 100, 1.5);
+        let _ = assert_tracks_measured("x", 99, 100, 1.5);
     }
 
     #[test]

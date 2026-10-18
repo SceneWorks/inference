@@ -4,8 +4,9 @@
 //! materializes the quantum's inputs and resident weights, then measures MLX's peak allocation while
 //! exactly that guarded quantum builds and evaluates — UNTHROTTLED (no memory limit is ever set; the
 //! CPU fixture only enables the iOS guards and barriers), the worst of [`RUNS`] runs after one warm-up
-//! ([`measure`]) — and asserts the counted formula is at least the measurement and at most
-//! [`MAX_RATIO`] times it ([`mlx_gen::ios_quantum::assert_tracks_measured`]). The proofs price on
+//! ([`measure`]) — and asserts the counted formula is at least the measurement (hard), reporting a
+//! ratio above [`MAX_RATIO`] ([`mlx_gen::ios_quantum::assert_tracks_measured`]: report-only; low-end
+//! accuracy is calibrated on the device). The proofs price on
 //! the backend they measure ([`Backend::Cpu`]: composed RMSNorm, unfused SDPA, explicit-GEMM
 //! convolution); the device prices the same counts with Metal's kernels. Activations run at the
 //! widths the device runs them: the text encoder and DiT stream f32 (the f32 RoPE tables and pad
