@@ -167,7 +167,7 @@ pub fn packed_bits_from_headers(component_dir: &Path) -> Result<Option<i32>> {
         }
         let input = (scales.shape[1] as u64) * HEADER_PACKED_GROUP_SIZE as u64;
         let packed_bits = (weight.shape[1] as u64) * 32;
-        if input == 0 || weight.shape[0] != scales.shape[0] || packed_bits % input != 0 {
+        if input == 0 || weight.shape[0] != scales.shape[0] || !packed_bits.is_multiple_of(input) {
             return Err(bad());
         }
         let b = i32::try_from(packed_bits / input).map_err(|_| bad())?;
