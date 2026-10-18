@@ -1068,8 +1068,9 @@ mod tests {
         // sc-25688 adds the `iris_3b_restore` trainer, which reuses the iris_3b_restore TRANSFORM
         // row (its training-only resources — VGG16, LPIPS, OpenCLIP ConvNeXt-XXL — carry their
         // licences on `gen_core::iris::restoration_train::TRAINING_RESOURCES` and never ship in an
-        // export).
-        assert_eq!(trainers.len(), 20);
+        // export). sc-26240 adds the `flux3_klein_base` trainer, which reuses the sc-26239
+        // generator row.
+        assert_eq!(trainers.len(), 21);
         let transforms: BTreeSet<String> = registry
             .transforms()
             .map(|r| (r.descriptor)().id.to_string())

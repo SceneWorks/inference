@@ -50,6 +50,30 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// Explicit HF TRAINING buffer policy: round the F32 inverse frequencies to
+    /// selected storage precision, then widen for F32 phase/trig. Rebuild BOTH
+    /// the host vector and derived device row; ordinary constructors are unchanged.
+    /// This converts frozen configuration constants, never autograd inputs.
+    pub fn with_training_frequency_storage(&self, dtype: Dtype) -> Result<Self> {
+        if !matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16) {
+            return Err(Error::Unsupported(
+                "training RoPE frequency storage requires F32/F16/BF16".into(),
+            ));
+        }
+        if dtype == Dtype::Float32 {
+            return Ok(self.clone());
+        }
+        let values = Array::from_slice(&self.inv_freq, &[self.inv_freq.len() as i32])
+            .as_dtype_device(dtype, mlx_rs::StreamOrDevice::cpu())?
+            .as_dtype_device(Dtype::Float32, mlx_rs::StreamOrDevice::cpu())?;
+        mlx_rs::transforms::eval([&values])?;
+        Ok(Self::new(
+            values.as_slice::<f32>().to_vec(),
+            self.dim,
+            self.interleaved,
+        ))
+    }
+
     /// The one constructor: lift the schedule to its device row.
     fn new(inv_freq: Vec<f32>, dim: i32, interleaved: bool) -> Self {
         let row: Vec<f32> = if interleaved {
@@ -448,6 +472,10 @@ pub fn apply_rope(x: &Array, cos: &Array, sin: &Array, interleaved: bool) -> Res
         None => Ok(rotated),
     }
 }
+
+#[cfg(test)]
+#[path = "rope/training_precision_tests.rs"]
+mod training_precision_tests;
 
 #[cfg(test)]
 mod tests {

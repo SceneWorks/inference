@@ -40,6 +40,7 @@ pub mod adapters;
 pub mod image_input;
 pub mod pup;
 pub mod references;
+pub mod training;
 
 // ---------------------------------------------------------------------------------------------
 // Identity

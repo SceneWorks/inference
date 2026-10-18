@@ -47,6 +47,7 @@ pub mod pipeline;
 pub mod pup;
 pub mod references;
 pub mod text_encoder;
+pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
 pub use candle_gen::gen_core::flux3::{
@@ -76,7 +77,8 @@ pub fn register_providers(
     register_memory_contract_surfaces(
         registry
             .register_generator(model::REGISTRATION)
-            .register_generator(model::BASE_REGISTRATION),
+            .register_generator(model::BASE_REGISTRATION)
+            .register_trainer(training::trainer::TRAINER_REGISTRATION),
     )
 }
 

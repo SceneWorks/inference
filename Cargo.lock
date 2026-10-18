@@ -2567,6 +2567,7 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "safetensors 0.4.5",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",

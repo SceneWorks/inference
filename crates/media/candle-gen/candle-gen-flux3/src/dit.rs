@@ -29,8 +29,8 @@ use candle_gen::gen_core::flux3::{
 use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
-    cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention, rmsnorm_rope, silu,
-    to, Linear, Loader, Rope,
+    cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
+    packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader, Rope,
 };
 
 /// `MLPEmbedder`: `out_layer(silu(in_layer(x)))`, bias-free.
@@ -138,6 +138,7 @@ impl Block {
 
     /// `x` `[N, hidden]` (compute dtype); `rope` the `[N, head_dim/2]` tables; `bounds` the
     /// per-sample token spans of this run.
+    #[allow(clippy::too_many_arguments)] // source block inputs plus explicit autograd policy
     fn forward(
         &self,
         x: &Tensor,
@@ -146,6 +147,7 @@ impl Block {
         m: Modulation<'_>,
         heads: usize,
         compute: DType,
+        training: bool,
     ) -> Result<Tensor> {
         let n = x.dim(0)?;
         let x_mod = layernorm_modulation(x, m.scale, m.shift)?;
@@ -155,14 +157,24 @@ impl Block {
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = rmsnorm_rope(
+        let normalize = if training {
+            rmsnorm_rope_training
+        } else {
+            rmsnorm_rope
+        };
+        let q = normalize(
             &split(self.q_proj.forward(&x_mod)?)?,
             &self.query_norm,
             rope,
         )?;
-        let k = rmsnorm_rope(&split(self.k_proj.forward(&x_mod)?)?, &self.key_norm, rope)?;
+        let k = normalize(&split(self.k_proj.forward(&x_mod)?)?, &self.key_norm, rope)?;
         let v = split(self.v_proj.forward(&x_mod)?)?;
-        let attn = packed_attention(&q, &k, &v, bounds, compute)?;
+        let attention = if training {
+            packed_attention_training
+        } else {
+            packed_attention
+        };
+        let attn = attention(&q, &k, &v, bounds, compute)?;
         let mut gate_up = chunk_last(&self.mlp_in.forward(&x_mod)?, 2)?;
         let up = gate_up.pop().expect("two chunks");
         let gate_in = gate_up.pop().expect("two chunks");
@@ -273,6 +285,28 @@ impl Flux3Dit {
         up: Tensor,
         scale: f64,
     ) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, false)
+    }
+
+    /// Add storage-sharing Var leaves, without inference's prepared-factor cache.
+    pub fn install_trainable_lora(
+        &mut self,
+        target: &str,
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+    ) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, true)
+    }
+
+    fn install_lora_impl(
+        &mut self,
+        target: &str,
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+        training: bool,
+    ) -> Result<()> {
         let (parent, leaf) = target
             .rsplit_once('.')
             .ok_or_else(|| Error::Unsupported(format!("flux3 LoRA: invalid target {target}")))?;
@@ -309,7 +343,11 @@ impl Flux3Dit {
                 )))
             }
         };
-        linear.push_lora(down, up, scale)
+        if training {
+            linear.push_trainable_lora(down, up, scale)
+        } else {
+            linear.push_lora(down, up, scale)
+        }
     }
 
     /// Load from the package's `model.safetensors` (upstream key names; an mmap read one tensor
@@ -472,6 +510,20 @@ impl Flux3Dit {
     /// Velocity prediction for the image tokens of every sample, `[Σ Ni, image_in_channels]` in
     /// the compute dtype, in sample order (the image tokens of sample 0, then sample 1, …).
     pub fn forward(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
+        self.forward_impl(samples, false)
+    }
+
+    /// Training-only autograd path. Inference retains the exact existing fused norm path.
+    pub fn forward_training(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
+        if self.is_flow_map() {
+            return Err(Error::Unsupported(
+                "flux3 training: requires the undistilled base DiT".into(),
+            ));
+        }
+        self.forward_impl(samples, true)
+    }
+
+    fn forward_impl(&self, samples: &[SampleTokens<'_>], training: bool) -> Result<Tensor> {
         if samples.is_empty() {
             return Err(Error::Msg("flux3: forward over no samples".into()));
         }
@@ -567,6 +619,7 @@ impl Flux3Dit {
                     },
                     heads,
                     compute,
+                    training,
                 )?;
             }
             streams[mode] = Some(x);
@@ -627,6 +680,7 @@ impl Flux3Dit {
                 },
                 heads,
                 compute,
+                training,
             )?;
         }
 
