@@ -1,7 +1,8 @@
 # Native MOSS Windows terminal acceptance (sc-26325)
 
-Run once after final inference-main and SceneWorks-main pin are stationary. The
-workflow is manual-only, refuses feature/story refs, and never invokes a Python
+Run once after the final inference-main pin is merged into the frozen SceneWorks
+epic feature head, before the product feature merges to main. The
+workflow is dispatched on inference main, refuses feature/story workflow refs, and never invokes a Python
 model, comparison/calibration corpus, model downloader, or adoption gate.
 
 `moss-native-terminal-windows.yml` selects the `cuda-windows-2` listener on
@@ -9,7 +10,8 @@ MICHAEL-TRX50. Labels and GitHub concurrency are not host ownership: the coordin
 must reconcile both repositories, all CI/listeners and external users before
 claiming physical GPU0. Existing GPU1 policies do not authorize GPU0 work.
 
-Dispatch on `main`, supplying the exact product-main SHA and strict data JSON:
+Dispatch on inference `main`, supplying the exact frozen product feature-head SHA
+and strict data JSON:
 
 ```sh
 gh workflow run moss-native-terminal-windows.yml -R SceneWorks/inference --ref main --json < native-dispatch.json
@@ -21,7 +23,7 @@ The control object's exact fields are:
 ```json
 {
   "campaign": "sc-26325-native-final-unique-id",
-  "inference_revision": "<exact final inference main SHA matching product Cargo/pin>",
+  "inference_revision": "<exact final inference main ancestor SHA matching product Cargo/pin>",
   "snapshot_base": "E:\\sceneworks-evaluation\\moss\\sc-26322-reference-v9\\hub\\models--OpenMOSS-Team--MOSS-Image-Base\\snapshots\\1ceede80badddd6a7812069619edaa5633587192",
   "snapshot_shared": "E:\\sceneworks-evaluation\\moss\\sc-26322-reference-v9\\hub\\models--OpenMOSS-Team--MOSS-Image-SFT\\snapshots\\fc5de0d56fc910cbca6f6625a70f5f582b26deb1",
   "snapshot_dmd": "E:\\sceneworks-evaluation\\moss\\sc-26322-reference-v9\\hub\\models--lodestones--MOSS-Image-SFT-8-steps-dmd\\snapshots\\5ff314b4c1470876b114b810146085db8a181a6e",
@@ -43,8 +45,9 @@ If a desktop process is explicitly admitted, each baseline row contains exactly
 Missing/inaccessible or reused PID is refused. No process is implicitly exempted.
 The host-local UUID lock is created exclusively under the existing
 `E:\sceneworks-evaluation\moss\device-locks` authority. Stale or conflicting locks
-are refused; they are not stolen. Only observed owned child identities are
-terminated on failure/timeout. A new campaign directory is required; failed or
+are refused; they are not stolen. Every child ancestry edge requires a matching immutable parent identity and
+creation-time ordering. Retained handles are rechecked before GPU allowlisting;
+cleanup terminates only those exact held process objects, never a reopened PID. A new campaign directory is required; failed or
 old evidence is never overwritten or automatically retried.
 
 Snapshots above are historical candidates. The CPU-only Rust `native_inventory`
@@ -52,26 +55,42 @@ example rehashes all 41 shared frozen entries before admission, including four
 published full-FP32 shards. It fails rather than acquiring missing files. The
 actual loader then revalidates retained pins and authenticates the exact owned
 bytes consumed. No model payload is trusted from a directory label or old receipt.
-The build is locked/offline and uses a fresh owned target; missing dependency
-cache/toolchain is a setup failure. The installed CUDA12.9/MSVC2022 toolchain is
+Build and inventory are locked/offline and use a fresh owned target; missing
+toolchains or dependency preparation failures stop before a device lease. The installed CUDA12.9/MSVC2022 toolchain is
 recorded; the inference architecture floor stays80 (native Blackwell rung comes
 from its existing kernel builder). Build/inventory are bounded before the lease.
 
-After the final pin is stationary, the coordinator must prime the exact product
-checkout's dependency cache as separate pre-lease setup. From that exact checkout,
-`cargo fetch --locked --target x86_64-pc-windows-msvc` may acquire source dependencies
-under the coordinator's explicit setup authority. It acquires no model assets.
-Then restore `CARGO_NET_OFFLINE=true` and verify:
+The trusted main workflow checks out exactly `control.inference_revision` and
+verifies it is reachable from `origin/main` before executing its controller or
+SelfTest. `GITHUB_SHA` is recorded separately as the workflow revision: unrelated
+newer inference main commits do not force a product pin change. The product
+checkout must equal both the supplied exact revision and the frozen
+`origin/feature/sc-26321-moss-image-evaluation` head; product main is deliberately
+not required at this pre-main terminal stage. Cargo.toml, lock and generated pin
+must all match the exact selected inference execution source.
+
+After those source/pin checks and before any build or lease, the controller runs
+bounded supervised CPU dependency setup in that exact product checkout:
+
+```powershell
+cargo fetch --locked --target x86_64-pc-windows-msvc
+```
+
+Only that command temporarily sets `CARGO_NET_OFFLINE=false`; `finally` restores
+it to true even on failure. This acquires ordinary Cargo source dependencies only,
+with no models, reference runner, comparison corpus or dependency path patches.
+The controller checks unchanged source, HEAD, pin and Cargo.lock afterwards, then
+records and validates the exact offline resolution:
 
 ```powershell
 cargo metadata --locked --offline --format-version 1 --filter-platform x86_64-pc-windows-msvc
 ```
 
-The resolved inference package sources must all equal
+Resolved inference package sources must all equal
 `git+https://github.com/SceneWorks/inference?rev=<final SHA>#<final SHA>`.
-The controller repeats this exact offline metadata check before the product
-build and lease. A missing cache is a setup failure; the terminal controller
-never fetches, patches dependency paths, changes the pin, or rewrites the lock.
+Preparation stdout/stderr, source/lock hashes and failure status are retained.
+A preparation failure stops before the lease; no separate remote endpoint,
+lockfile rewrite or second transport mode is required.
 
 Both backend and `sceneworks-worker` ignored test executables are compiled before
 the lease, selected from actual Cargo JSON, hashed, and run directly

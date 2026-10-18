@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       sceneworks_revision:
-        description: Exact final SceneWorks main revision containing the permanent inference pin
+        description: Exact frozen SceneWorks epic feature head containing the permanent inference-main pin
         required: true
         type: string
       control_json:
@@ -32,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: ${{ fromJSON(inputs.control_json).inference_revision }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -41,6 +42,26 @@ jobs:
           path: .terminal-sceneworks
           fetch-depth: 0
           persist-credentials: false
+      # This guard is trusted workflow source on main, before executing the pinned checkout's
+      # controller or self-tests. Unrelated newer main commits do not require another product pin.
+      - name: Verify frozen inference source is an exact main ancestor
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT|Out-Null
+          $guard=@{status='failed';workflow_revision=$env:GITHUB_SHA}
+          try {
+            if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'Trusted main workflow required' }
+            $control=$env:MOSS_NATIVE_CONTROL|ConvertFrom-Json
+            $revision=[string]$control.inference_revision
+            $guard.inference_revision=$revision
+            if ($revision -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact inference SHA required' }
+            $actual=git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0 -or $actual -cne $revision) { throw 'Inference checkout mismatch' }
+            git merge-base --is-ancestor $revision origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned inference is not a main ancestor' }
+            $guard.status='passed'
+          } catch { $guard.error=$_.Exception.Message;throw }
+          finally { $guard|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $env:MOSS_TRANSPORT_ARTIFACT_ROOT 'source-guard.json') -Encoding UTF8 }
       - name: Select Git Bash
         shell: cmd
         run: |

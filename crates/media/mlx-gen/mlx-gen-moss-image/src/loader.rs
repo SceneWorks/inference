@@ -135,6 +135,7 @@ impl Asset {
 }
 #[derive(Clone)]
 pub(crate) struct Sources {
+    pub selection: Option<MossImageAcceleration>,
     pub ordinary: Vec<Asset>,
     pub optional: Vec<Asset>,
     pub config: MossImageConfig,
@@ -160,9 +161,71 @@ fn role(relative: &str) -> MossImageAssetRole {
         MossImageAssetRole::Vae
     }
 }
+fn snapshot_files(selection: Option<MossImageAcceleration>) -> impl Iterator<Item = &'static str> {
+    SNAPSHOT_FILES.iter().copied().filter(move |relative| {
+        *relative != "LICENSE"
+            && (!relative.starts_with("transformer/")
+                || selection
+                    .is_some_and(|m| m != MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32)))
+    })
+}
+fn transformer_config(
+    selection: Option<MossImageAcceleration>,
+    ordinary: &[Asset],
+    optional: &[Asset],
+) -> Result<MossImageConfig> {
+    if selection.is_none() {
+        return Ok(MossImageConfig::default());
+    }
+    let assets = if selection == Some(MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32)) {
+        optional
+    } else {
+        ordinary
+    };
+    MossImageConfig::from_json(
+        &assets
+            .iter()
+            .find(|a| a.relative == "transformer/config.json")
+            .ok_or_else(|| Error::Msg("missing selected MOSS transformer config".into()))?
+            .json()?,
+    )
+    .map_err(Into::into)
+}
 impl Sources {
     pub(crate) fn prepare(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
-        spec.validate_prepared_file_pins()?;
+        Self::prepare_inner(variant, spec, None)
+    }
+    pub(crate) fn selected(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        mode: MossImageAcceleration,
+    ) -> Result<Self> {
+        Self::prepare_inner(variant, spec, Some(mode))
+    }
+    fn prepare_inner(
+        variant: MossImageVariant,
+        spec: &LoadSpec,
+        selection: Option<MossImageAcceleration>,
+    ) -> Result<Self> {
+        let mode = selection.unwrap_or(MossImageAcceleration::Off);
+        let full = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
+        if variant == MossImageVariant::Base && mode != MossImageAcceleration::Off {
+            return Err(Error::Unsupported("MOSS DMD requires SFT".into()));
+        }
+        if moss_dmd_components(mode)
+            .iter()
+            .any(|id| !spec.components.contains_key(*id))
+        {
+            return Err(Error::Unsupported(
+                "MOSS selected DMD closure missing; provision the exact selected frozen components"
+                    .into(),
+            ));
+        }
+        if spec.prepared_file_pins().is_prepared() && !spec.prepared_file_pins().is_finalized() {
+            return Err(Error::Unsupported(
+                "MOSS unfinalized prepared source".into(),
+            ));
+        }
         if spec.precision != mlx_gen::Precision::Bf16
             || spec.offload_policy != mlx_gen::OffloadPolicy::Resident
             || spec.load_shape != mlx_gen::gen_core::LoadShape::EagerMaterialization
@@ -212,7 +275,7 @@ impl Sources {
             }
         };
         let mut ordinary = Vec::new();
-        for relative in SNAPSHOT_FILES.iter().filter(|p| **p != "LICENSE") {
+        for relative in snapshot_files(selection) {
             let transformer = relative.starts_with("transformer/");
             let (base, repo, rev) = if transformer {
                 (root, variant.repository(), variant.revision())
@@ -265,7 +328,11 @@ impl Sources {
                 MossImageAssetRole::DmdDataspace,
             ),
         ] {
-            if let Some(source) = spec.components.get(id) {
+            if let Some(source) = spec
+                .components
+                .get(id)
+                .filter(|_| moss_dmd_components(mode).contains(&id))
+            {
                 let path = match source {
                     WeightsSource::File(p) => p.clone(),
                     WeightsSource::Dir(p) => p.join(file),
@@ -280,7 +347,11 @@ impl Sources {
                 )?);
             }
         }
-        if let Some(source) = spec.components.get(DMD_TRANSFORMER_COMPONENT) {
+        if let Some(source) = spec
+            .components
+            .get(DMD_TRANSFORMER_COMPONENT)
+            .filter(|_| full)
+        {
             let path = dir(source)?;
             let root = if path.file_name().is_some_and(|p| p == "transformer") {
                 path.parent()
@@ -303,20 +374,17 @@ impl Sources {
             }
         }
         let sources = Self {
-            config: MossImageConfig::from_json(
-                &ordinary
-                    .iter()
-                    .find(|a| a.relative == "transformer/config.json")
-                    .ok_or_else(|| Error::Msg("missing transformer config".into()))?
-                    .json()?,
-            )?,
+            selection,
+            config: transformer_config(selection, &ordinary, &optional)?,
             ordinary,
             optional,
         };
-        sources.verify_index(
-            false,
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-        )?;
+        if selection.is_some() && !full {
+            sources.verify_index(
+                false,
+                "transformer/diffusion_pytorch_model.safetensors.index.json",
+            )?;
+        }
         sources.verify_index(false, "text_encoder/model.safetensors.index.json")?;
         if sources
             .optional
@@ -404,6 +472,11 @@ impl Sources {
             .ok_or_else(|| Error::Msg(format!("missing MOSS {relative}")))
     }
     pub(crate) fn mode_assets(&self, mode: MossImageAcceleration) -> Result<Vec<&Asset>> {
+        if self.selection.is_some_and(|selected| selected != mode) {
+            return Err(Error::Unsupported(
+                "MOSS prepared source mode mismatch".into(),
+            ));
+        }
         let full = mode == MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32);
         let mut assets: Vec<_> = self
             .ordinary
@@ -605,6 +678,91 @@ pub(crate) fn fp32_map(w: &Weights) -> Result<BTreeMap<String, Vec<f32>>> {
 
 #[cfg(test)]
 mod cpu_tests {
+    #[test]
+    fn full_prepared_closure_and_default_constructor_skip_ordinary_dit_sc26325() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("full/transformer/config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            include_bytes!(
+                "../../../../contracts/gen-core/tests/fixtures/moss_image/transformer_config.json"
+            ),
+        )
+        .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().join("ordinary-unpinned")));
+        spec.components.insert(
+            DMD_TRANSFORMER_COMPONENT.into(),
+            WeightsSource::Dir(tmp.path().join("full")),
+        );
+        spec.components.insert(
+            DMD_DATASPACE_COMPONENT.into(),
+            WeightsSource::File(tmp.path().join("selected-data-not-yet-opened")),
+        );
+        let data = tmp.path().join("selected-data-not-yet-opened");
+        std::fs::write(
+            &data,
+            b"unselected at construction; selected consumption must authenticate",
+        )
+        .unwrap();
+        spec.prepare_with_file_pins([
+            PinnedWeightsFile::pin(&config).unwrap(),
+            PinnedWeightsFile::pin(data).unwrap(),
+        ])
+        .unwrap();
+        let selected = Asset::capture(
+            &spec,
+            config.clone(),
+            DMD_REPO,
+            DMD_REVISION,
+            "transformer/config.json",
+            MossImageAssetRole::Transformer,
+        )
+        .unwrap();
+        let bad = tmp.path().join("ordinary-config");
+        std::fs::write(&bad, b"unselected ordinary config must not be consumed").unwrap();
+        let ordinary = vec![Asset {
+            pin: PinnedWeightsFile::pin(bad).unwrap(),
+            role: MossImageAssetRole::Transformer,
+            repo: SFT_REPO,
+            revision: SFT_REVISION,
+            relative: "transformer/config.json".into(),
+        }];
+        let full = Some(MossImageAcceleration::Dmd(MossDmdPrecision::FullFp32));
+        assert_eq!(
+            transformer_config(full, &ordinary, std::slice::from_ref(&selected))
+                .unwrap()
+                .dim,
+            3072
+        );
+        for mode in [
+            MossImageAcceleration::Off,
+            MossImageAcceleration::Dmd(MossDmdPrecision::UnmergedBf16),
+        ] {
+            assert!(
+                transformer_config(Some(mode), &ordinary, std::slice::from_ref(&selected)).is_err()
+            );
+            assert_eq!(
+                snapshot_files(Some(mode))
+                    .filter(|p| p.starts_with("transformer/"))
+                    .count(),
+                5
+            );
+        }
+        assert_eq!(
+            snapshot_files(None).collect::<Vec<_>>(),
+            snapshot_files(full).collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot_files(None).count(), 12);
+        // Exact normal factory call: refusal occurs in shared-file preparation before any MLX
+        // allocation/device lookup. No real-weight constructor success is claimed by this fixture.
+        let error = crate::model::load_sft(&spec).err().unwrap().to_string();
+        assert!(error.contains("text_encoder/config.json"), "{error}");
+        assert!(!error.contains("ordinary-unpinned/transformer"), "{error}");
+        std::fs::write(config, b"corrupt selected published config").unwrap();
+        assert!(transformer_config(full, &ordinary, &[selected]).is_err());
+    }
+
     use super::*;
     #[test]
     fn prepared_child_pin_authenticates_consumed_bytes_and_refuses_mutation_or_missing_pin() {
@@ -671,6 +829,7 @@ mod cpu_tests {
             .to_string()
             .contains("unknown MOSS component"));
         let s = Sources {
+            selection: None,
             ordinary: vec![],
             optional: vec![],
             config: MossImageConfig::default(),

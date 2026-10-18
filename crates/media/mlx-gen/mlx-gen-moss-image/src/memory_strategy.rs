@@ -11,7 +11,7 @@ pub fn selected_asset_facts(
     spec: &LoadSpec,
     mode: moss_image::MossImageAcceleration,
 ) -> Result<MemoryAssetFacts> {
-    let sources = Sources::prepare(variant, spec).map_err(Error::from)?;
+    let sources = Sources::selected(variant, spec, mode).map_err(Error::from)?;
     selected_facts(&sources, mode)
 }
 
@@ -244,6 +244,7 @@ mod cpu_tests {
             revision: "test",
         };
         let mut sources = Sources {
+            selection: None,
             ordinary: vec![
                 asset(MossImageAssetRole::Transformer, "ordinary.safetensors"),
                 asset(MossImageAssetRole::TextEncoder, "text.safetensors"),

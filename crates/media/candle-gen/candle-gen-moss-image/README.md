@@ -85,17 +85,18 @@ No device or tensor is created by static admission. Authentication itself reads
 one owned shard on the host; callers must provide that staging headroom before
 calling it. OFF does not authenticate optional DMD availability; mixed does not
 read full-FP32 shards; full replaces the ordinary BF16 DiT closure for static facts and runtime weights.
-The ordinary SFT core remains an installation prerequisite: generic construction
-has no request mode and authenticates its metadata without allocating its tensors.
-The largest full-FP32 shard bound covers that earlier ordinary metadata buffer as
-well, rather than adding another concurrent buffer. Selected ON
-sources are prepared lazily from the retained caller spec. Normal generator
-construction prepares OFF metadata only and retains optional availability, not
-enabled acceleration. Warm product credits may use measured own backend committed
-allocation delta bounded by the current committed snapshot; undercredit is safe.
+The ordinary SFT core remains a catalog installation prerequisite. Both normal
+constructors prepare only shared sources and defer DiT selection to the validated
+request; no ordinary DiT config/index/shard pin is required for the selected full
+FP32 closure. Its published config is authenticated before constructing that
+renderer. Constructor facts describe the common components; selected static and
+runtime estimates describe the complete requested policy. Warm admission uses
+`Generator::moss_image_owned_weight_bytes()` inside the serialized transaction,
+bounded by the current committed snapshot. It reports actual materialized retained
+weights without tensor evaluation or new allocations.
 
 The dedicated inference `moss-native-terminal-windows.yml` workflow is exclusively
-for the stationary final inference-main/product-main pin. Its strict JSON control
+for the stationary final inference-main pin in the frozen product epic feature. Its strict JSON control
 and physical-GPU0 lease are described in
 `docs/moss-native-terminal-windows.md`. The CPU-only `native_inventory` example
 verifies the shared 41-file frozen manifest; it does not initialize CUDA.

@@ -162,7 +162,6 @@ impl MossImage {
                 vae_weights.unused_keys()
             )));
         }
-        let renderer = sources.transformer(MossImageAcceleration::Off, &cancel)?;
         sources.ensure_unchanged()?;
         Ok(Self {
             variant,
@@ -173,10 +172,13 @@ impl MossImage {
             vae,
             memory,
             state: Mutex::new(State {
-                renderer: Some((MossImageAcceleration::Off, renderer)),
+                renderer: None,
                 report: None,
             }),
         })
+    }
+    fn selected_sources(&self, mode: MossImageAcceleration) -> Result<Sources> {
+        Sources::selected(self.variant, &self.spec, mode)
     }
     fn validate_inputs(
         &self,
@@ -197,7 +199,8 @@ impl MossImage {
         {
             return Err(Error::Unsupported("MOSS currently implements resident execution; staging, tiling, chunking, windows and alternate execution policies are unavailable".into()));
         }
-        self.sources.mode_assets(resolved.acceleration)?;
+        self.selected_sources(resolved.acceleration)?
+            .mode_assets(resolved.acceleration)?;
         let branches = if matches!(resolved.acceleration, MossImageAcceleration::Off) {
             1 + u32::from(resolved.guidance != 1.0)
                 + u32::from(
@@ -236,7 +239,10 @@ impl MossImage {
         } else {
             1
         };
-        let assets = memory_strategy::selected_facts(&self.sources, r.acceleration)?;
+        let assets = memory_strategy::selected_facts(
+            &self.selected_sources(r.acceleration)?,
+            r.acceleration,
+        )?;
         memory_strategy::request_workspace_bytes(
             request.width,
             request.height,
@@ -293,8 +299,10 @@ impl MossImage {
         state.begin();
         let result = (|| {
             check(&request.cancel)?;
-            let (resolved, count) = self.validate_inputs(request, inputs)?;
             self.sources.ensure_unchanged()?;
+            let (resolved, count) = self.validate_inputs(request, inputs)?;
+            let sources = self.selected_sources(resolved.acceleration)?;
+            sources.ensure_unchanged()?;
             let peak = self.estimated_request_peak(request, inputs)?;
             if let Some(cap) = mlx_gen::memory::recommended_working_set_bytes() {
                 if peak > cap {
@@ -359,8 +367,7 @@ impl MossImage {
             check(&request.cancel)?;
             state.select(resolved.acceleration, || {
                 mlx_gen::residency::drain_allocator_cache();
-                self.sources
-                    .transformer(resolved.acceleration, &request.cancel)
+                sources.transformer(resolved.acceleration, &request.cancel)
             })?;
             let shape = [
                 count as i32,
@@ -397,7 +404,7 @@ impl MossImage {
             }
             let noise = Array::from_slice(&noise_values, &shape);
             drop(noise_values);
-            let assets = self.sources.mode_assets(resolved.acceleration)?;
+            let assets = sources.mode_assets(resolved.acceleration)?;
             let dataspace = if resolved.acceleration != MossImageAcceleration::Off {
                 let weights = read_weights(
                     assets
@@ -538,7 +545,7 @@ impl MossImage {
                     });
                 }
             }
-            self.sources.ensure_unchanged()?;
+            sources.ensure_unchanged()?;
             check(&request.cancel)?;
             let report = MossImageExecutionReport::new(MossImageExecutionData {
                 execution_device: MossImageExecutionDevice::Mlx,

@@ -139,7 +139,7 @@ impl MossImageGenerator {
         &self,
         mode: MossImageAcceleration,
     ) -> gen_core::Result<std::borrow::Cow<'_, Sources>> {
-        if mode == MossImageAcceleration::Off {
+        if self.sources.selection == Some(mode) {
             Ok(std::borrow::Cow::Borrowed(&self.sources))
         } else {
             Sources::selected(self.variant(), &self.sources.spec, mode).map(std::borrow::Cow::Owned)
