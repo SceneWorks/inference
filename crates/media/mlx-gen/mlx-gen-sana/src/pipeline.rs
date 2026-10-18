@@ -2278,7 +2278,8 @@ mod quantum_tests {
     /// On an iOS quantum scope (the CPU diagnostic fixture stands in for the device) img2img's
     /// reference encode resolves the bounded encode at the iOS tile edge and runs it — its tiles'
     /// prefix quanta and the stitch quantum are checked — and the result is the whole-image encode
-    /// bit for bit. Off device the same call resolves no tiling.
+    /// within the tiled-encode parity standard (1e-5 of peak; see the body). Off device the same
+    /// call resolves no tiling.
     #[test]
     fn ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode() {
         const CHILD: &str = "SANA_IOS_TILED_ENCODE_CHILD";
@@ -2286,11 +2287,35 @@ mod quantum_tests {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "pipeline::quantum_tests::ios_img2img_encode_is_tiled_and_matches_the_whole_image_encode", "--nocapture"])
                 .env(CHILD, "1").status().unwrap();
-            assert!(status.success());
+            assert!(
+                status.success(),
+                "CPU child failed ({status}); its panic is printed above"
+            );
             return;
         }
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         assert!(crate::test_metal_guard::forbid_metal());
+        // Tiled vs whole-image encode are DIFFERENT graphs (each tile's convolutions run at their
+        // own shapes), so they agree to float reassociation, not bit for bit: this Mac's kernels
+        // happen to give identical bits, the CI runner's differ by up to 5.5e-7 on a 1.57 peak.
+        // Held to the tiled-encode parity standard of
+        // `dc_ae::quantum_proofs::tiled_encode_matches_the_whole_image_encode_and_prices_its_stitch`
+        // (1e-5 of max(1, peak)); a halo or stitch error moves the latent by O(1e-1).
+        let assert_parity = |label: &str, got: &Array, want: &Array| {
+            assert_eq!(got.shape(), want.shape(), "{label}: shape");
+            let want = want.as_slice::<f32>();
+            let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let delta = got
+                .as_slice::<f32>()
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+            println!("[{label}] max|delta| {delta:.3e} (peak {peak:.3e})");
+            assert!(
+                delta <= 1e-5 * peak.max(1.0),
+                "{label}: tiled encode diverged from the whole-image encode by {delta:.3e}"
+            );
+        };
         let cfg = crate::dc_ae::quantum_proofs::config();
         let encoder =
             DcAeEncoder::from_weights(&crate::dc_ae::quantum_proofs::weights(&cfg), cfg.clone())
@@ -2321,8 +2346,7 @@ mod quantum_tests {
         })
         .unwrap();
         tiled.eval().unwrap();
-        assert_eq!(tiled.shape(), whole.shape());
-        assert_eq!(tiled.as_slice::<f32>(), whole.as_slice::<f32>());
+        assert_parity("iOS tiled encode", &tiled, &whole);
         let events = events.borrow();
         let stitched = events
             .iter()
@@ -2366,7 +2390,7 @@ mod quantum_tests {
         })
         .unwrap()
         .unwrap();
-        assert_eq!(prepared.as_slice::<f32>(), whole.as_slice::<f32>());
+        assert_parity("iOS reference latent", &prepared, &whole);
         let latent_elements = prepared.size() as u64;
         assert!(seen.borrow().contains(&QuantumEvent::Checked {
             label: "SANA reference latent".into(),
