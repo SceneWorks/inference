@@ -500,6 +500,28 @@ fn cpu_quantum_materializes_before_return_refuses_before_build_and_restores_cach
     .unwrap();
     let three = 3 * tensor_bytes(4, &[256, 256]);
     assert_tracks_measured("ones + ones", three, measured, 1.5);
+    // The measurement is STALLED, so it realizes the retention worst case whatever this host's
+    // worker speed: a chain of eight 16 KiB matmuls (no donation), each read only by the next, is
+    // encoded in full — every output allocated, every operand held by its queued task — before any
+    // runs, so all eight products are live at once. The ops are tiny, so unstalled this host's
+    // worker keeps up with the encoder and holds only four (measured) — the same 2x run-to-run
+    // swing the CI runner showed on the Anima output quantum.
+    let weight = Array::ones::<f32>(&[64, 64]).unwrap();
+    let start = Array::ones::<f32>(&[64, 64]).unwrap();
+    mlx_rs::transforms::eval([&weight, &start]).unwrap();
+    let chain = measured_peak_bytes(|| {
+        let mut x = start.clone();
+        for _ in 0..8 {
+            x = x.matmul(&weight)?;
+        }
+        Ok(vec![x])
+    })
+    .unwrap();
+    assert_eq!(
+        chain,
+        8 * tensor_bytes(4, &[64, 64]),
+        "a stalled measurement holds the whole encoded chain"
+    );
     // The load floor is proven against MLX's peak while a safetensors file is read: the stored
     // bytes land once, with no extra per-tensor copy (no "largest tensor" scratch on top).
     {

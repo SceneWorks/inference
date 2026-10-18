@@ -3,21 +3,27 @@
 //!
 //! The fixture is built entirely from host `sin` arithmetic (no RNG), so the weights, conditioning
 //! and init image are bit-identical on every machine; the only RNG is MLX's seeded threefry stream
-//! (the prior and the ancestral noise), exactly as the production generate draws it. This file was
-//! copied verbatim into a scratch worktree at `91ffb4a81` and run there with `SDXL_GOLDEN_WRITE`
-//! set to produce `tests/fixtures/sdxl_default_path_golden.safetensors`.
+//! (the prior and the ancestral noise), exactly as the production generate draws it. This file's
+//! fixture and [`run_default_paths`] were copied verbatim into a scratch worktree at `91ffb4a81` and
+//! run there with `SDXL_GOLDEN_WRITE` set to produce
+//! `tests/fixtures/sdxl_default_path_golden.safetensors` (the two tests below that name post-base
+//! APIs were left out of that copy).
 //!
-//! The chain is the default Mac generate's: fp16 U-Net + fp16 ancestral Euler (`DTYPE`), CFG 7 over
-//! a cond/uncond pair, the f32 VAE; img2img encodes the init image with the whole-image
+//! The chain is the default Mac generate's — the ancestral Euler schedule, CFG 7 over a cond/uncond
+//! pair, the U-Net and the f32 VAE; img2img encodes the init image with the whole-image
 //! [`crate::pipeline::encode_init_latents`] (the Mac default — no tiling), noises it to
-//! `max_time · 0.8` (`DEFAULT_STRENGTH`) and runs `int(steps · 0.8)` steps.
+//! `max_time · 0.8` (`DEFAULT_STRENGTH`) and runs `int(steps · 0.8)` steps — computed at
+//! [`CHAIN_DTYPE`] = **f32**, not the production fp16 (`model::DTYPE`, pinned exactly by
+//! [`the_default_compute_dtype_is_fp16`]).
 //!
-//! Tolerances (CPU float ops, held across machines): the golden and this run execute the same MLX
-//! CPU kernels, and on the producing machine they agree bit for bit (printed). Across Apple CPUs the
-//! BLAS (Accelerate) GEMM and the vectorized transcendentals may round differently in the last
-//! place, which the fp16 U-Net and the ancestral sampler amplify over the steps — so latents are
-//! held to `1e-2` of their peak magnitude and pixels to `±2` of 255, far below a behaviour change
-//! (a different noise draw, schedule or dtype moves latents by O(1) of peak).
+//! Why f32: the golden has to hold on another Apple CPU, whose BLAS GEMM and vectorized
+//! transcendentals round differently in the last f32 place. In an fp16 chain those differences flip
+//! fp16 roundings, and CFG 7 over this random fixture amplifies them: one fp16 ulp on 1% of the
+//! prior's elements moves the fp16 chain's latents by 1.7e-2 of peak even at ONE step — a
+//! cross-machine golden on it cannot separate machine noise from a behaviour change. In f32 a 1e-6
+//! relative perturbation of the prior moves the latents by 6e-5 of peak (measured), so latents are
+//! held to `1e-3` of peak and pixels to `±2` of 255 — still far below a behaviour change (a
+//! different noise draw, schedule, CFG or graph moves latents by O(1) of peak).
 //!
 //! Item 3 (the opt-in bounded-decode rung's tiled img2img encode,
 //! [`crate::pipeline::encode_init_latents_tiled`]) is pinned against the SAME golden's whole-image
@@ -40,6 +46,8 @@ const POOLED: i32 = 16;
 const WIDTH: u32 = 32;
 const HEIGHT: u32 = 24;
 const STEPS: usize = 3;
+/// The golden chain's compute dtype (see the module doc).
+const CHAIN_DTYPE: Dtype = Dtype::Float32;
 const CFG: f32 = 7.0;
 const STRENGTH: f32 = 0.8;
 const SEED: u64 = 4242;
@@ -170,7 +178,7 @@ fn unet() -> crate::unet::UNet2DConditionModel {
     g.norm("conv_norm_out", 32);
     g.conv("conv_out", 4, 32, 3);
     let mut w = g.w;
-    w.cast_all(Dtype::Float16).unwrap();
+    w.cast_all(CHAIN_DTYPE).unwrap();
     crate::unet::UNet2DConditionModel::from_weights(&w, &unet_config()).unwrap()
 }
 
@@ -234,7 +242,7 @@ fn vae() -> crate::vae::Autoencoder {
 
 /// `(conditioning, pooled, time ids)` for the CFG pair (cond row first), fp16 like the encoders'.
 fn conditioning() -> (Array, Array, Array) {
-    let half = |a: Array| a.as_dtype(Dtype::Float16).unwrap();
+    let half = |a: Array| a.as_dtype(CHAIN_DTYPE).unwrap();
     (
         half(values(&[2, 5, CTX], 3.0, 1.0)),
         half(values(&[2, POOLED], 5.0, 1.0)),
@@ -264,7 +272,7 @@ fn run_default_paths() -> Vec<(&'static str, Array)> {
     let vae = vae();
     // The production sampler at the production compute dtype (`model::DTYPE`, fp16).
     let euler =
-        EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, Dtype::Float16).unwrap();
+        EulerSampler::new_with_dtype(&DiffusionConfig::sdxl_base(), true, CHAIN_DTYPE).unwrap();
     let (cond, pooled, ids) = conditioning();
     let cancel = mlx_gen::CancelFlag::default();
     let max_time = euler.max_time();
@@ -398,11 +406,18 @@ fn default_txt2img_and_img2img_match_the_base_rev_golden() {
             let delta = relative_max_delta(reference, out);
             eprintln!("GOLDEN {name}: relative max Δ {delta:.3e}");
             assert!(
-                delta <= 1e-2,
+                delta <= 1e-3,
                 "{name} moved {delta:.3e} of peak from the base rev"
             );
         }
     }
+}
+
+/// The production compute dtype the f32 golden chain stands in for (see the module doc): the
+/// default Mac generate's U-Net, text encoders and sampler run fp16.
+#[test]
+fn the_default_compute_dtype_is_fp16() {
+    assert_eq!(crate::model::DTYPE, Dtype::Float16);
 }
 
 /// Item 3: the bounded-decode rung's tiled img2img encode tracks the base rev's whole-image encode

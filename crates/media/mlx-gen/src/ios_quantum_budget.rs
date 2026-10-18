@@ -154,18 +154,57 @@ pub fn conv_stage_bytes(g: ConvStageGeometry) -> u64 {
 /// MLX's peak allocation while `run` builds and evaluates one quantum, above what was live before
 /// it (inputs already materialized do not count; the outputs do). For host CPU proofs of a call
 /// site's counted formula; the device enforces only the formula.
+///
+/// Measured STALLED: a long kernel (`STALL_EDGE`) is queued on the default stream first, so the
+/// quantum's ops are encoded — their outputs allocated on the encoding thread, their operands held
+/// by the queued tasks (so never donated) — before the first of them runs. That is the retention
+/// worst case MLX's scheduler allows (it caps the work in flight, on the CPU at ten tasks, and the
+/// device holds a command buffer's operands until it completes), and it is what every counted
+/// price follows. Unstalled, the peak depends on how far THIS host's worker happens to lag the
+/// encoder: the CI runner measured the same Anima output quantum at 68 KB in one run and 135 KB in
+/// another (this Mac: 134 KB every time), so an unstalled measurement is a property of the
+/// machine's load, not of the quantum.
 #[cfg(not(target_os = "ios"))]
 pub fn measured_peak_bytes(
     run: impl FnOnce() -> crate::Result<Vec<mlx_rs::Array>>,
 ) -> crate::Result<u64> {
     mlx_rs::memory::clear_cache();
+    let stall = stall_kernel()?;
     let before = mlx_rs::memory::get_active_memory() as u64;
     mlx_rs::memory::reset_peak_memory();
     let outputs = run()?;
     mlx_rs::transforms::eval(outputs.iter())?;
     let peak = mlx_rs::memory::get_peak_memory() as u64;
     drop(outputs);
+    mlx_rs::transforms::eval([&stall])?;
+    drop(stall);
     Ok(peak.saturating_sub(before))
+}
+
+/// The stall kernel's edge: one `[E, E]` f32 product (~137 GFLOP at 4096; its one output is
+/// allocated before the measurement starts) keeps the stream's worker busy far longer than encoding
+/// any proof quantum's graph up to the scheduler's in-flight cap takes.
+#[cfg(not(target_os = "ios"))]
+const STALL_EDGE: i32 = 4096;
+
+/// Queue `STALL_EDGE`'s product on the default stream and hand it back unevaluated-but-queued.
+#[cfg(not(target_os = "ios"))]
+fn stall_kernel() -> crate::Result<mlx_rs::Array> {
+    thread_local! {
+        static OPERAND: std::cell::RefCell<Option<mlx_rs::Array>> = const { std::cell::RefCell::new(None) };
+    }
+    let operand = OPERAND.with(|cell| -> crate::Result<mlx_rs::Array> {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            let a = mlx_rs::ops::ones::<f32>(&[STALL_EDGE, STALL_EDGE])?;
+            mlx_rs::transforms::eval([&a])?;
+            *cell = Some(a);
+        }
+        Ok(cell.as_ref().expect("set above").clone())
+    })?;
+    let product = operand.matmul(&operand)?;
+    mlx_rs::transforms::async_eval([&product])?;
+    Ok(product)
 }
 
 /// The proof every counted formula carries: never below the measured peak (it must not admit a
