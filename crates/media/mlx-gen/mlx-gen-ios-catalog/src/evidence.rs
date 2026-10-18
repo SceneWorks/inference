@@ -43,7 +43,7 @@ pub const EVIDENCE_SCHEMA: u32 = 3;
 /// suffice because the floor already backstops a spread two repeats happen to under-sample.
 pub const MIN_OPTIMIZED_REPEATS: usize = 2;
 
-/// Floor of the low-end margin. Three repeats can agree to the byte, and a zero margin would be a
+/// Floor of the low-end margin. Two repeats can agree to the byte, and a zero margin would be a
 /// claim that the next render is bit-identical in footprint. This floor is an ENGINEERING choice,
 /// not a measurement: 32 MiB is about 0.5% of the 6142 MiB entitled launch headroom and two orders of
 /// magnitude below the 512 MiB formula reserve it replaces at an anchor. Replace it only with a
@@ -662,7 +662,7 @@ mod tests {
             2
         );
         assert!(parse(&table(&[refused(AnchorKind::Optimized, 4)])).is_err());
-        // Fewer than three optimized repeats: no margin basis.
+        // Fewer than two optimized repeats: no margin basis.
         let mut short = good.clone();
         if let AnchorOutcome::Completed { captures } = &mut short.outcome {
             captures.pop();

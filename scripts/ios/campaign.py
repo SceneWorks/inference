@@ -5,7 +5,7 @@ The campaign measures anchors only, per the recorded memory-anchor rule (two mea
 family, every other rung / selection / geometry DERIVED by the anchor law in
 crates/media/mlx-gen/mlx-gen-ios-catalog/src/anchor.rs). The listing (the runner's own catalog, never
 a hand list) names, per provider route x tier x mode, the fully RESIDENT anchor (rung 0) and the
-fully OPTIMIZED anchor (deepest implemented rung, cheapest selection, captured 3 times: its spread is
+fully OPTIMIZED anchor (deepest implemented rung, cheapest selection, captured 2 times: its spread is
 the low-end margin), both at the reference geometry with 2 denoise steps; plus one model's
 full-step case (validation_steps) and its second-geometry case (validation_geometry).
 
