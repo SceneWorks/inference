@@ -110,11 +110,14 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     out
 }
 
+/// The weights-free campaign listing (schema 2): every planned ANCHOR case with its purpose and
+/// repeat count ([`campaign::enumerate`]), derived from the actual runtime catalog.
 pub fn listing() -> Result<String, String> {
     let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
-    let cases = campaign::enumerate(&surfaces(catalog.media()));
-    Ok(json!({"schema": 1, "cases": cases.iter().map(Case::key).collect::<Vec<_>>(),
-        "dependencies": [{"provider":"supra2", "epic":24212, "available": cases.iter().any(|c| c.provider.contains("supra")), "reason":"requires native engine and iOS catalog registration; absence is not a passing cell"}]
+    let planned = campaign::enumerate(&surfaces(catalog.media()));
+    Ok(json!({"schema": 2,
+        "cases": planned.iter().map(|p| json!({"case": p.case.key(), "purpose": p.purpose.label(), "repeats": p.repeats})).collect::<Vec<_>>(),
+        "dependencies": [{"provider":"supra2", "epic":24212, "available": planned.iter().any(|p| p.case.provider.contains("supra")), "reason":"requires native engine and iOS catalog registration; absence is not a passing cell"}]
     }).to_string())
 }
 
@@ -175,6 +178,7 @@ fn selections(
             mode: String::new(),
             rung: 0,
             selection: campaign::BASE_SELECTION.into(),
+            steps: 0,
         };
         let Ok(spec) = load_spec(&probe, WeightsSource::Dir(PathBuf::new())) else {
             continue;
@@ -319,6 +323,8 @@ fn work(
         seed: Some(16774),
         count: 1,
         cancel: cancel.clone(),
+        // An anchor captures a short run ([`campaign::ANCHOR_STEPS`]); 0 keeps the provider's own.
+        steps: (c.steps > 0).then_some(c.steps),
         ..Default::default()
     };
     match mode.as_str() {
@@ -360,6 +366,7 @@ fn work(
                 image: image(),
                 seed: Some(16774),
                 cancel: cancel.clone(),
+                steps: (c.steps > 0).then_some(c.steps),
                 ..Default::default()
             }))
         }
@@ -520,6 +527,8 @@ struct DeviceProvider<'a> {
     /// The typed pre-construction quantum refusal, when a capture stopped at one.
     refused_quantum: Option<Value>,
     refusal_only: bool,
+    /// An admitted case's price: demand, margin and its basis (measured anchor or derived).
+    admitted: Option<Value>,
 }
 impl DeviceProvider<'_> {
     fn prepare(&mut self, c: &Case) -> Result<(), AdmissionError> {
@@ -803,6 +812,12 @@ impl Provider for DeviceProvider<'_> {
         if admitted.index() != 0 {
             return Err("admission silently changed the selected case".into());
         }
+        self.admitted = Some(json!({
+            "demand_bytes": admitted.demand_bytes(),
+            "margin_bytes": admitted.margin_bytes(),
+            "required_bytes": admitted.required_bytes(),
+            "basis": format!("{:?}", admitted.basis()),
+        }));
         Ok(())
     }
     fn execute(&mut self, c: &Case) -> Result<(), ExecuteError> {
@@ -847,17 +862,12 @@ pub fn report(value: &str, diagnostic: bool) -> String {
     let model_case = || -> Result<Value, String> {
         let case = Case::parse(value)?;
         let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
-        if !campaign::enumerate(&surfaces(catalog.media()))
-            .iter()
-            .any(|c| {
-                c.provider == case.provider
-                    && c.route == case.route
-                    && c.tier == case.tier
-                    && c.mode == case.mode
-                    && c.rung == case.rung
-                    && c.selection == case.selection
-            })
-        {
+        // The catalog's DOMAIN (provider, route, mode): an anchor or any configuration the anchor
+        // law derives. The selection is validated against the provider's declared space in
+        // `prepare` (a token outside it is a typed strategy refusal).
+        if !surfaces(catalog.media()).iter().any(|s| {
+            s.provider == case.provider && s.routes.contains(&case.route) && s.modes.contains(&case.mode)
+        }) {
             return Err("case not in the actual supported catalog".into());
         }
         if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {
@@ -879,6 +889,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             permit: None,
             refused_quantum: None,
             refusal_only: std::env::var("IOS_CAMPAIGN_REFUSAL_ONLY").as_deref() == Ok("1"),
+            admitted: None,
         };
         // Bind before any source inspection/load. This does not create footprint evidence.
         runtime_ios::bound_mlx_to_platform_limits()
@@ -890,6 +901,32 @@ pub fn report(value: &str, diagnostic: bool) -> String {
         // The capture's starting footprint, before any of this case's loads: an evidence row's
         // demand is its peak minus this baseline (admission never credits a product's residents).
         let baseline_footprint = phys_footprint().map(|(current, _)| current);
+        let start_peak = phys_footprint().and_then(|(_, peak)| match peak {
+            support::PeakReading::Read(peak) => Some(peak),
+            support::PeakReading::Unavailable { .. } => None,
+        });
+        // Every quantum boundary reads the kernel lifetime peak, attributed to the phase the
+        // provider says that quantum runs in: the anchor's per-phase split.
+        let marks = Arc::new(Mutex::new(Vec::<support::Mark>::new()));
+        let sink = Arc::clone(&marks);
+        let provider = case.provider.clone();
+        runtime_ios::media::ios_quantum::set_quantum_listener(Some(Box::new(move |mark| {
+            let (label, opens) = match mark {
+                runtime_ios::media::ios_quantum::QuantumMark::Checked { label, .. } => (label, true),
+                runtime_ios::media::ios_quantum::QuantumMark::Synchronized { label } => {
+                    (label, false)
+                }
+            };
+            if let Some((_, support::PeakReading::Read(lifetime_peak))) = phys_footprint() {
+                if let Ok(mut marks) = sink.lock() {
+                    marks.push(support::Mark {
+                        phase: runtime_ios::media::pricing::quantum_phase(&provider, label),
+                        opens,
+                        lifetime_peak,
+                    });
+                }
+            }
+        })));
         let sampler = Sampler::start();
         let deadline = Deadline::start(
             adapter.cancel.clone(),
@@ -901,7 +938,17 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             reason = "device cooperative deadline cancelled the case".into();
         }
         drop(deadline);
+        runtime_ios::media::ios_quantum::set_quantum_listener(None);
         let e = sampler.finish()?;
+        let phase_peaks = match (start_peak, e.lifetime_peak, marks.lock()) {
+            (Some(start), Some(end), Ok(marks)) => support::phase_peaks(start, &marks, end)
+                .into_iter()
+                .map(|(phase, (peak, exact))| {
+                    (phase.as_key().to_string(), json!({"peak_bytes": peak, "exact": exact}))
+                })
+                .collect::<serde_json::Map<_, _>>(),
+            _ => serde_json::Map::new(),
+        };
         let (status, reason) = if status.production_success()
             && (e.footprint.is_none() || e.min_headroom_mib.is_none() || e.lifetime_peak.is_none())
         {
@@ -913,7 +960,9 @@ pub fn report(value: &str, diagnostic: bool) -> String {
             "elapsed_seconds":started.elapsed().as_secs_f64(), "mlx_peak_bytes":mlx_rs::memory::get_peak_memory(),
             "device":runtime_ios::device_machine(), "cap_mib":runtime_ios::IOS_APP_MEMORY_CAP_MIB,
             "cap_validated":false, "diagnostic":diagnostic, "artifact_identity":adapter.artifact,
-            "baseline_phys_footprint_bytes":baseline_footprint,
+            "baseline_phys_footprint_bytes":baseline_footprint, "phase_peaks":phase_peaks, "steps":case.steps,
+            "anchor_selection":adapter.candidate.as_ref().map(|c| runtime_ios::media::evidence::AnchorSelection::from_parts(c.context.selection.strategy, &c.context.selection.parameters)),
+            "admitted":adapter.admitted,
             "evidence_class": if diagnostic { "capture" } else { "admitted" }, "evidence_key":adapter.evidence_key, "refused_quantum":adapter.refused_quantum,
             "selected_parameters":adapter.candidate.as_ref().map(|c| &c.context).map(|c| json!({"strategy":format!("{:?}",c.selection.strategy),"stage_residency":c.selection.parameters.stage_residency,"decode_tile_edge":c.selection.parameters.decode_tile_edge,"decode_overlap":c.selection.parameters.decode_overlap,"attention_chunk_size":c.selection.parameters.attention_chunk_size,"transformer_window_size":c.selection.parameters.transformer_window_size,"transformer_window_component":format!("{:?}",c.selection.parameters.transformer_window_component),"numeric_tier":format!("{:?}",c.selection.tier)})),
             "evidence_revision":adapter.candidate.as_ref().map(|c| &c.context.evidence_revision),

@@ -205,3 +205,54 @@ pub(super) fn persist_images(
     }
     Ok(())
 }
+
+/// One quantum boundary seen by a capture: the phase its label runs in (the provider's own
+/// `ios_quantum_phase`; `None` for a label it does not attribute), whether it OPENS a quantum (a
+/// pre-construction check) or closes one (a synchronization), and the kernel lifetime
+/// `phys_footprint` peak at that instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Mark {
+    pub phase: Option<mlx_gen::ios_pricing::IosPhase>,
+    pub opens: bool,
+    pub lifetime_peak: u64,
+}
+
+/// Split a run's kernel lifetime peak by phase through its quantum marks.
+///
+/// The lifetime peak is monotone, so the growth between two consecutive readings happened in the
+/// interval between them. That interval belongs to the quantum the earlier mark OPENED, else (glue
+/// after a synchronization) to the quantum the later mark belongs to; the stretch before the first
+/// mark to the first mark's phase and the stretch after the last to the last mark's. A phase's peak
+/// is the largest lifetime reading at the end of its intervals; it is `exact` when that reading was
+/// reached by growth inside the phase's own interval (otherwise an earlier phase masked it and the
+/// reading is an upper bound). Unattributed intervals are dropped (their phase stays absent and is
+/// priced at the whole-run peak downstream, erring large).
+pub(super) fn phase_peaks(
+    start_peak: u64,
+    marks: &[Mark],
+    end_peak: u64,
+) -> std::collections::BTreeMap<mlx_gen::ios_pricing::IosPhase, (u64, bool)> {
+    let mut out: std::collections::BTreeMap<_, (u64, bool)> = Default::default();
+    let mut record = |phase: Option<_>, before: u64, after: u64| {
+        let Some(phase) = phase else { return };
+        let slot = out.entry(phase).or_insert((0, false));
+        if after > slot.0 {
+            *slot = (after, after > before);
+        } else if after == slot.0 && after > before {
+            slot.1 = true;
+        }
+    };
+    let mut previous = start_peak;
+    for (i, mark) in marks.iter().enumerate() {
+        let phase = match i.checked_sub(1).map(|j| marks[j]) {
+            Some(earlier) if earlier.opens => earlier.phase,
+            _ => mark.phase,
+        };
+        record(phase, previous, mark.lifetime_peak);
+        previous = previous.max(mark.lifetime_peak);
+    }
+    if let Some(last) = marks.last() {
+        record(last.phase, previous, end_peak.max(previous));
+    }
+    out
+}

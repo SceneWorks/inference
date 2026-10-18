@@ -8,8 +8,13 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import argparse
 import unittest
 from unittest import mock
+
+
+def argparse_error():
+    return argparse.ArgumentTypeError
 
 MODULE = Path(__file__).resolve().parents[1] / "ios/campaign.py"
 spec = importlib.util.spec_from_file_location("ios_campaign", MODULE)
@@ -22,11 +27,18 @@ class CampaignTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # Rung 2 declares a quality-first selection space (two decode tiles); the others none.
-        self.selections = {2: ("t768", "t512")}
-        self.keys = [f"fake/fake/{tier}/{edge}/{mode}/{rung}/{sel}" for tier in campaign.TIERS for edge in (512, 768, 1024) for mode in ("text", "reference", "restore", "depth") for rung in range(5) for sel in self.selections.get(rung, ("base",))]
+        # The anchor listing: per tier x mode a resident (rung 0) and an optimized (rung 4, cheapest
+        # selection, 3 repeats) anchor at 512 with 1 step; plus the two validation cases.
+        self.entries = []
+        for tier in campaign.TIERS:
+            for mode in ("text", "reference"):
+                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/0/base/1", "purpose": "resident", "repeats": 1})
+                self.entries.append({"case": f"fake/fake/{tier}/512/{mode}/4/s_t256/1", "purpose": "optimized", "repeats": 3})
+        self.entries.append({"case": "fake/fake/q4/512/text/4/s_t256/0", "purpose": "validation_steps", "repeats": 1})
+        self.entries.append({"case": "fake/fake/q4/1024/text/4/s_t256/1", "purpose": "validation_geometry", "repeats": 1})
+        self.keys = [e["case"] for e in self.entries]
         self.catalog = self.root / "catalog.json"
-        self.catalog.write_text(json.dumps({"schema": 1, "cases": self.keys}), encoding="utf-8")
+        self.catalog.write_text(json.dumps({"schema": 2, "cases": self.entries}), encoding="utf-8")
         self.guard = mock.patch.object(campaign.subprocess, "Popen", side_effect=AssertionError("TEST MUST NOT START ANY REAL PROCESS"))
         self.guard.start()
         self.addCleanup(self.guard.stop)
@@ -69,16 +81,44 @@ class CampaignTests(unittest.TestCase):
         return session
 
     def test_public_cli_listing_is_pure_and_rung_zero_is_selected(self):
-        self.assertEqual(self.main("list", "--tier", "q8", "--edge", "768", "--mode", "restore", "--rung", "4"), 0)
+        self.assertEqual(self.main("list", "--tier", "q8", "--mode", "reference", "--rung", "4"), 0)
         args = campaign.parser().parse_args(["list", "--rung", "0"])
-        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1/base"))
-        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0/base"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/1/base/1"))
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/0/base/1"))
         args = campaign.parser().parse_args(["list", "--selection", "t512"])
-        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/2/t512"))
-        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/2/t768"))
+        self.assertTrue(campaign.selected(args, "fake/fake/q4/512/text/2/t512/1"))
+        self.assertFalse(campaign.selected(args, "fake/fake/q4/512/text/2/t768/1"))
+        args = campaign.parser().parse_args(["list", "--purpose", "optimized"])
+        self.assertEqual([e["purpose"] for e in self.entries if campaign.selected(args, e)], ["optimized"] * 6)
+        args = campaign.parser().parse_args(["list", "--steps", "0"])
+        self.assertEqual([e["case"] for e in self.entries if campaign.selected(args, e)], ["fake/fake/q4/512/text/4/s_t256/0"])
+
+    def test_the_listing_is_the_anchor_shape_and_malformed_listings_are_refused(self):
+        args = campaign.parser().parse_args(["list", "--catalog", str(self.catalog)])
+        self.assertEqual(campaign.catalog(args)["cases"], self.entries)
+        bad = {
+            "schema 1 grid": {"schema": 1, "cases": self.keys},
+            "bare key": {"schema": 2, "cases": [self.keys[0]]},
+            "unknown purpose": {"schema": 2, "cases": [dict(self.entries[0], purpose="ladder")]},
+            "too few optimized repeats": {"schema": 2, "cases": [dict(self.entries[1], repeats=2)]},
+            "zero repeats": {"schema": 2, "cases": [dict(self.entries[0], repeats=0)]},
+            "seven-field key": {"schema": 2, "cases": [dict(self.entries[0], case="fake/fake/q4/512/text/0/base")]},
+            "duplicate": {"schema": 2, "cases": [self.entries[0], self.entries[0]]},
+            "extra field": {"schema": 2, "cases": [dict(self.entries[0], edge=512)]},
+            "empty": {"schema": 2, "cases": []},
+        }
+        for name, listing in bad.items():
+            with self.subTest(name=name):
+                path = self.root / (name.replace(" ", "-") + ".json")
+                path.write_text(json.dumps(listing), encoding="utf-8")
+                with self.assertRaises((ValueError, argparse_error())):
+                    campaign.catalog(campaign.parser().parse_args(["list", "--catalog", str(path)]))
+        # No 20,000-case budget: the listing is finite by construction and --max-cases optional.
+        self.assertIsNone(campaign.parser().parse_args(["run"]).max_cases)
+        self.assertEqual(campaign.parser().parse_args(["run", "--max-cases", "50000"]).max_cases, 50000)
 
     def test_invalid_finite_budgets_and_cases(self):
-        for options in (("--case", "p/../q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0"), ("--case", "p/p/q4/512/text/0/t5.1"), ("--timeout-seconds", "0"), ("--max-cases", "20001"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5")):
+        for options in (("--case", "p/../q4/512/text/0/base/1"), ("--case", "p/p/q4/512/text/0/base"), ("--case", "p/p/q4/512/text/0/t5.1/1"), ("--case", "p/p/q4/512/text/0/base/101"), ("--timeout-seconds", "0"), ("--timeout-seconds", "20001"), ("--max-cases", "0"), ("--tier", "q5"), ("--edge", "999999"), ("--rung", "5"), ("--steps", "101"), ("--purpose", "ladder")):
             with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 campaign.parser().parse_args(["run", *options])
         with self.assertRaises(SystemExit):
@@ -221,10 +261,9 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("--install-only", run.call_args.args[0])
         self.assertNotIn("--campaign-case", run.call_args.args[0])
 
-    def test_table_has_all_metrics_and_no_diagnostic_largest_edge(self):
+    def test_table_has_all_metrics_and_typed_capacity_probes(self):
         row = dict(self.success(), status="diagnostic_success", production_success=False, diagnostic=True)
         table = campaign.render([row])
-        self.assertIn("diagnostics excluded): {}", table)
         self.assertIn("Active MiB | Cache MiB | Combined MiB", table)
         row.update(status="admitted_refused", refusal_only=True, refusal_kind="no_evidence")
         self.assertIn("Capacity-refused next-up probes: []", campaign.render([row]))
@@ -235,95 +274,54 @@ class CampaignTests(unittest.TestCase):
 
     def capture_row(self, key, status):
         row = dict(self.success(key), status=status, production_success=False, diagnostic=True, evidence_class="capture",
-                   evidence_key={"machine": "iPhone17,2", "provider": "fake"}, run_id="fixture-run",
-                   baseline_phys_footprint_bytes=40)
+                   evidence_key={"machine": "iPhone17,2", "provider": "fake", "execution": key.split("/")[5]}, run_id="fixture-run",
+                   baseline_phys_footprint_bytes=40, steps=int(key.split("/")[7]),
+                   anchor_selection={"rung": int(key.split("/")[5])},
+                   phase_peaks={"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
         if status == "capture_refused":
             row.update(refusal_kind="capacity", refused_quantum={"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
         return row
 
-    def test_capture_walks_each_ladder_upward_and_stops_at_the_first_refusal(self):
-        outcome = {512: "diagnostic_success", 768: "capture_refused", 1024: "diagnostic_success"}
+    def test_capture_runs_exactly_the_listed_anchor_cases_with_their_repeats(self):
         calls = []
         def fake(session, key, **kw):
             calls.append(key)
-            return self.capture_row(key, outcome[int(key.split("/")[3])])
+            # Resident anchors refuse before allocation (their evidence); optimized complete.
+            status = "capture_refused" if key.split("/")[5] == "0" else "diagnostic_success"
+            row = self.capture_row(key, status)
+            row["run_id"] = f"run-{len(calls)}"
+            return row
         output = self.root / "capture.jsonl"
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
             cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--device", "fake", "--output", str(output))
+            code = self.main("capture", "--all-cases", "--device", "fake", "--output", str(output))
         self.assertEqual(code, 0)
-        ladders = {}
-        for key in calls:
-            fields = key.split("/")
-            ladders.setdefault(fields[5], []).append((int(fields[3]), fields[6]))
-        self.assertEqual(set(ladders), {"0", "1", "2", "3", "4"})
-        for rung, steps in ladders.items():
-            if rung == "2":
-                # Every selection tried at the refused size, quality first; never past it.
-                self.assertEqual(steps, [(512, "t768"), (768, "t768"), (768, "t512")])
-            else:
-                self.assertEqual(steps, [(512, "base"), (768, "base")], "never past the refused size, never a retry")
-        self.assertEqual(len(calls), len(set(calls)), "no cell runs twice")
+        expected = [e["case"] for e in self.entries if e["purpose"] != "validation_geometry" for _ in range(e["repeats"])]
+        self.assertEqual(calls, expected, "each capture case its listed repeats, in listing order; no ladder, no admitted validation")
         rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
         self.assertTrue(all(r["diagnostic"] is True and r["production_success"] is False for r in rows))
+        self.assertEqual([r["repeat"] for r in rows if r["case"] == self.keys[1]], [0, 1, 2])
         table = campaign.render(rows)
-        self.assertIn('"largest_completed_edge": 512', table)
-        self.assertIn('"refused_before_jetsam_edge": 768', table)
         self.assertIn("refused before construction: SANA block", table)
-        self.assertIn("diagnostics excluded): {}", table)
+        self.assertIn('"completed_demand_mib": [0.0, 0.0, 0.0]', table)
 
-    def test_capture_steps_to_a_cheaper_selection_and_carries_it_up_the_ladder(self):
-        # The quality selection refuses from 768 up; the cheaper one completes 768 and 1024. At 1024
-        # the ladder starts from the selection that completed 768 (the quality one cannot fit a
-        # larger size), and the cheapest refusing everywhere would stop it.
-        def outcome(edge, sel):
-            if sel == "t768" and edge >= 768:
-                return "capture_refused"
-            return "diagnostic_success"
+    def test_an_optimized_anchor_that_does_not_complete_is_a_defect_and_is_not_repeated(self):
         calls = []
         def fake(session, key, **kw):
             calls.append(key)
-            fields = key.split("/")
-            return self.capture_row(key, outcome(int(fields[3]), fields[6]))
-        output = self.root / "ladder.jsonl"
+            return self.capture_row(key, "capture_refused")
+        output = self.root / "defect.jsonl"
         with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
             cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(output))
-        self.assertEqual(code, 0)
-        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("768", "t768"), ("768", "t512"), ("1024", "t512")])
-        rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-        table = campaign.render(rows)
-        self.assertIn('"completed_selection": "t512"', table)
-        self.assertIn('"largest_completed_edge": 1024', table)
-        self.assertNotIn("refused_before_jetsam_edge", table, "a size a cheaper selection completed is not a refused size")
-        # Every selection refusing at a size stops the ladder there.
-        calls.clear()
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), self.capture_row(key, "capture_refused"))[1]):
-            cls.return_value.blocked = False
-            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "stop.jsonl"))
-        self.assertEqual([tuple(k.split("/")[3::3]) for k in calls], [("512", "t768"), ("512", "t512")])
-        rows = [json.loads(line) for line in (self.root / "stop.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertIn('"refused_before_jetsam_edge": 512', campaign.render(rows))
-        # A failure (not a capture refusal) at a selection stops the ladder, no cheaper retry.
-        calls.clear()
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=lambda session, key, **kw: (calls.append(key), campaign.failure(key, "load failed"))[1]):
-            cls.return_value.blocked = False
-            self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "2", "--device", "fake", "--output", str(self.root / "fail2.jsonl"))
-        self.assertEqual(len(calls), 1)
-
-    def test_capture_rejects_edge_selectors_and_failure_stops_the_ladder(self):
-        for options in (("--edge", "512"), ("--case", self.keys[0]), ("--next-edge", "1024"), ("--selection", "t512")):
+            code = self.main("capture", "--purpose", "optimized", "--tier", "q4", "--mode", "text", "--device", "fake", "--output", str(output))
+        self.assertEqual(code, 2)
+        self.assertEqual(calls, ["fake/fake/q4/512/text/4/s_t256/1"], "a refused case is not repeated")
+        row = json.loads(output.read_text(encoding="utf-8"))
+        self.assertIn("must complete", row["anchor_defect"])
+        self.assertIn("DEFECT", campaign.render([row]))
+        for options in (("--case", self.keys[0]), ("--next-edge", "1024")):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 self.main("capture", "--provider", "fake", "--device", "fake", "--output", str(self.root / "x.jsonl"), *options)
-        calls = []
-        def fake(session, key, **kw):
-            calls.append(key)
-            return campaign.failure(key, "load failed")
-        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", side_effect=fake):
-            cls.return_value.blocked = False
-            code = self.main("capture", "--provider", "fake", "--tier", "q4", "--mode", "text", "--rung", "0", "--device", "fake", "--output", str(self.root / "fail.jsonl"))
-        self.assertEqual(code, 2)
-        self.assertEqual(len(calls), 1)
 
     def test_capture_refusal_rows_need_the_typed_quantum_record(self):
         key = self.keys[0]
@@ -334,18 +332,46 @@ class CampaignTests(unittest.TestCase):
         artifact = dict(self.success(key), status="admitted_refused", production_success=False, refusal_kind="artifact")
         self.assertEqual(campaign.parse_report("CAMPAIGN_JSON " + json.dumps(artifact), key)["status"], "admitted_refused")
 
-    def test_evidence_rows_come_only_from_completed_captures_with_telemetry(self):
-        key = self.keys[0]
-        rows = [self.capture_row(key, "diagnostic_success"), self.capture_row(key, "capture_refused"),
-                dict(self.capture_row(key, "diagnostic_success"), kernel_lifetime_phys_footprint_peak_bytes=None),
-                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=None),
-                dict(self.capture_row(key, "diagnostic_success"), baseline_phys_footprint_bytes=150),
-                dict(self.success(key), evidence_key={"machine": "x"})]
-        out = campaign.evidence_rows(rows)
-        self.assertEqual(len(out), 1, "no row without a capture baseline below the peak")
-        self.assertEqual(set(out[0]), {"key", "footprint_bytes", "baseline_footprint_bytes", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds", "evidence_class", "run_id", "build_sha"})
-        self.assertEqual((out[0]["footprint_bytes"], out[0]["baseline_footprint_bytes"]), (150, 40))
-        self.assertEqual(out[0]["evidence_class"], "device_capture")
+    def test_anchor_rows_come_only_from_completed_captures_and_resident_refusals(self):
+        opt, res = self.keys[1], self.keys[0]
+        def completed(run, **kw):
+            return dict(self.capture_row(opt, "diagnostic_success"), purpose="optimized", run_id=run, **kw)
+        rows = [completed("a"), completed("b"), completed("c", kernel_lifetime_phys_footprint_peak_bytes=170),
+                dict(self.capture_row(res, "capture_refused"), purpose="resident"),
+                # Not captures: no telemetry / no baseline below the peak / not a capture.
+                completed("d", kernel_lifetime_phys_footprint_peak_bytes=None),
+                completed("e", baseline_phys_footprint_bytes=150)]
+        anchors, problems = campaign.anchor_rows(rows)
+        self.assertEqual(problems, [])
+        # A non-capture row under another key is reported, never turned into an anchor.
+        junk, junk_problems = campaign.anchor_rows([dict(self.success(opt), purpose="optimized", evidence_key={"machine": "x"})])
+        self.assertEqual(junk, [])
+        self.assertEqual(len(junk_problems), 1)
+        kinds = {a["anchor_kind"]: a for a in anchors}
+        self.assertEqual(set(kinds), {"optimized", "resident"})
+        optimized = kinds["optimized"]
+        # The serde shape of `evidence::AnchorRow` (deny_unknown_fields on the Rust side).
+        self.assertEqual(set(optimized), {"key", "anchor_kind", "selection", "outcome", "evidence_class"})
+        captures = optimized["outcome"]["completed"]["captures"]
+        self.assertEqual([c["run_id"] for c in captures], ["a", "b", "c"])
+        self.assertEqual(set(captures[0]), {"run_id", "build_sha", "steps", "baseline_footprint_bytes", "footprint_bytes", "phase_peaks", "mlx_peak_bytes", "min_headroom_mib", "elapsed_seconds"})
+        self.assertEqual((captures[2]["footprint_bytes"], captures[2]["baseline_footprint_bytes"]), (170, 40))
+        self.assertEqual(captures[0]["phase_peaks"], {"denoise": {"peak_bytes": 120, "exact": True}, "decode": {"peak_bytes": 150, "exact": False}})
+        self.assertEqual(captures[0]["steps"], 1)
+        self.assertEqual(optimized["evidence_class"], "device_capture")
+        refused = kinds["resident"]["outcome"]["refused"]
+        self.assertEqual(refused["refused_quantum"], {"label": "SANA block", "scratch_bytes": 9, "reserve_bytes": 1, "available_bytes": 3})
+        # A phase peak outside [baseline, lifetime peak] is dropped, never kept.
+        odd = completed("z", phase_peaks={"decode": {"peak_bytes": 10, "exact": True}, "denoise": {"peak_bytes": 999, "exact": True}})
+        self.assertEqual(campaign.capture_of(odd)["phase_peaks"], {})
+        # Fewer than three completed optimized repeats: no margin basis, a problem, no row.
+        anchors, problems = campaign.anchor_rows(rows[:2])
+        self.assertEqual(anchors, [])
+        self.assertIn("3 needed", problems[0])
+        # An optimized anchor that only refused is a DEFECT problem, never refusal evidence.
+        anchors, problems = campaign.anchor_rows([dict(self.capture_row(opt, "capture_refused"), purpose="optimized")])
+        self.assertEqual(anchors, [])
+        self.assertIn("DEFECT", problems[0])
         source = self.root / "capture.jsonl"
         source.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
         table = Path(campaign.ROOT / campaign.EVIDENCE_TABLE)
@@ -353,7 +379,32 @@ class CampaignTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(campaign.main(["evidence", "--input", str(source)]), 0)
         self.assertIn("never changes admission", printed.getvalue())
+        self.assertIn('"schema": 3', printed.getvalue())
         self.assertEqual(table.read_bytes(), before, "evidence output is printed, never written")
+
+    def test_steps_and_geometry_validation_reports(self):
+        opt = self.keys[1].replace("/text/", "/text/")
+        short = [dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/1", "diagnostic_success"), purpose="optimized", run_id=r) for r in "abc"]
+        full = dict(self.capture_row("fake/fake/q4/512/text/4/s_t256/0", "diagnostic_success"), purpose="validation_steps",
+                    kernel_lifetime_phys_footprint_peak_bytes=160, phase_peaks={"denoise": {"peak_bytes": 130, "exact": True}})
+        report = campaign.steps_validation(short + [full])
+        self.assertEqual(len(report), 1)
+        self.assertEqual((report[0]["full_steps_demand_bytes"], report[0]["short_steps_demand_bytes"]), (120, 110))
+        self.assertEqual(report[0]["ratio"], round(120 / 110, 4))
+        self.assertEqual(report[0]["phase_ratios"], {"denoise": round(90 / 80, 4)})
+        self.assertEqual(campaign.steps_validation([full])[0]["problem"], "no completed optimized anchor of the same case")
+        admitted = dict(self.success("fake/fake/q4/1024/text/4/s_t256/1"), purpose="validation_geometry",
+                        baseline_phys_footprint_bytes=40, admitted={"demand_bytes": 100, "margin_bytes": 5, "basis": "Derived { from: Optimized }"})
+        geometry = campaign.geometry_validation([admitted])
+        self.assertEqual(geometry[0]["measured_demand_bytes"], 110)
+        self.assertEqual(geometry[0]["relative_error"], round(-10 / 110, 4))
+        self.assertEqual(geometry[0]["basis"], "Derived { from: Optimized }")
+        output = self.root / "validate.jsonl"
+        with mock.patch.object(campaign, "DeviceSession") as cls, mock.patch.object(campaign, "invoke", return_value=admitted) as run:
+            cls.return_value.blocked = False
+            self.assertEqual(self.main("validate", "--all-cases", "--device", "fake", "--output", str(output)), 0)
+            self.assertEqual([c.args[1] for c in run.call_args_list], ["fake/fake/q4/1024/text/4/s_t256/1"])
+            self.assertFalse(cls.call_args.args[0].diagnostic, "the geometry validation runs ADMITTED")
 
     def primitive_row(self):
         reading = {"available_bytes": 6000 << 20, "footprint_bytes": 40 << 20, "kernel_lifetime_peak_bytes": 60 << 20,

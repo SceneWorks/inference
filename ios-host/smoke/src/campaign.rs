@@ -1,9 +1,39 @@
 //! Weights-free campaign protocol. One selected case per fresh process; no implicit fallbacks.
+//!
+//! The campaign measures ANCHORS only (the recorded memory-anchor rule: two measured extremes per
+//! family, everything in between derived — `mlx_gen_ios_catalog::anchor`): per provider route x
+//! tier x mode, the fully RESIDENT rung-0 composition and the fully OPTIMIZED deepest-rung,
+//! cheapest-selection composition, both at the [`reference_edge`] with [`ANCHOR_STEPS`] denoise
+//! steps. Two validation cases ride along for ONE model: the optimized anchor at full steps (does a
+//! short-step capture see the full-step peak?) and at the [`VALIDATION_EDGE`] (an ADMITTED run the
+//! anchor law predicts before it is measured).
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The selection token of a strategy with no declared parameters (and of a rung the provider does
 /// not implement: admission refuses it, typed).
 pub const BASE_SELECTION: &str = "base";
+
+/// Denoise steps of an anchor capture: the memory peak of a denoise step does not grow with the
+/// step count (each step's activations are released before the next), so one step is the
+/// footprint of N. [`Purpose::ValidationSteps`] checks that claim on one model.
+pub const ANCHOR_STEPS: u32 = 1;
+
+/// Repeats of each optimized anchor: their spread is the admission margin at the low end.
+pub const OPTIMIZED_REPEATS: u32 = 3;
+
+/// The second geometry of the low-end validation case (the anchors sit at [`reference_edge`]).
+pub const VALIDATION_EDGE: u32 = 1024;
+
+/// The anchors' reference geometry: the smallest square edge every iOS image provider renders
+/// natively and the one most likely to complete for BOTH anchors on an 8 GB phone (every phase's
+/// activations are smallest there; resident weights do not depend on it). Supra2 renders 256².
+pub fn reference_edge(provider: &str) -> u32 {
+    if provider.contains("supra") {
+        256
+    } else {
+        512
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
@@ -11,8 +41,30 @@ pub struct Surface {
     pub routes: Vec<String>,
     pub modes: Vec<String>,
     /// Per `(tier, rung)`, the provider's own declared selection space as tokens, QUALITY FIRST
-    /// (`MemoryProviderContract::selection_space`). Absent: the single [`BASE_SELECTION`].
+    /// (`MemoryProviderContract::selection_space`; only rungs the contract IMPLEMENTS have one).
+    /// Absent: the single [`BASE_SELECTION`].
     pub selections: BTreeMap<(String, u8), Vec<String>>,
+}
+
+impl Surface {
+    /// The first (most resident) selection token of `(tier, rung)`.
+    pub fn first_selection(&self, tier: &str, rung: u8) -> String {
+        self.selections
+            .get(&(tier.to_string(), rung))
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_else(|| BASE_SELECTION.into())
+    }
+
+    /// The fully optimized `(rung, selection)` of a tier: the deepest rung the provider implements
+    /// above rung 0, at its LAST (cheapest) selection; `None` when it implements none.
+    pub fn optimized(&self, tier: &str) -> Option<(u8, String)> {
+        (1..=4u8).rev().find_map(|rung| {
+            self.selections
+                .get(&(tier.to_string(), rung))
+                .and_then(|v| v.last())
+                .map(|token| (rung, token.clone()))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,17 +78,26 @@ pub struct Case {
     /// The cell's memory selection (tile edge, overlap, attention chunk, window size and scope) as
     /// a token of the provider's declared space; executed exactly as selected.
     pub selection: String,
+    /// Denoise steps the case runs (`0`: the provider's own default — full steps).
+    pub steps: u32,
 }
 impl Case {
     pub fn key(&self) -> String {
         format!(
-            "{}/{}/{}/{}/{}/{}/{}",
-            self.provider, self.route, self.tier, self.edge, self.mode, self.rung, self.selection
+            "{}/{}/{}/{}/{}/{}/{}/{}",
+            self.provider,
+            self.route,
+            self.tier,
+            self.edge,
+            self.mode,
+            self.rung,
+            self.selection,
+            self.steps
         )
     }
     pub fn parse(value: &str) -> Result<Self, String> {
         let p: Vec<_> = value.split('/').collect();
-        if p.len() != 7
+        if p.len() != 8
             || p.iter().any(|p| {
                 p.is_empty()
                     || !p
@@ -44,15 +105,19 @@ impl Case {
                         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             })
         {
-            return Err("case must be provider/route/{bf16,q8,q4}/edge/mode/rung/selection".into());
+            return Err(
+                "case must be provider/route/{bf16,q8,q4}/edge/mode/rung/selection/steps".into(),
+            );
         }
         let edge = p[3].parse::<u32>().map_err(|_| "invalid edge")?;
         let rung = p[5].parse::<u8>().map_err(|_| "invalid rung")?;
+        let steps = p[7].parse::<u32>().map_err(|_| "invalid steps")?;
         if !["bf16", "q8", "q4"].contains(&p[2])
             || ![256, 512, 768, 1024, 1280].contains(&edge)
             || rung > 4
+            || steps > 100
         {
-            return Err("tier, geometry or rung outside finite campaign domain".into());
+            return Err("tier, geometry, rung or steps outside finite campaign domain".into());
         }
         Ok(Self {
             provider: p[0].into(),
@@ -62,54 +127,113 @@ impl Case {
             mode: p[4].into(),
             rung,
             selection: p[6].into(),
+            steps,
         })
     }
 }
 
-/// Include every registered mode, even if its adapter/evidence is not yet available, and every
-/// selection the provider declares for each rung, quality first. A new provider is visible
+/// Why a case is in the campaign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Purpose {
+    /// The family's fully resident (rung 0) anchor; its pre-allocation refusal is evidence.
+    Resident,
+    /// The family's fully optimized anchor; must complete, captured [`OPTIMIZED_REPEATS`] times.
+    Optimized,
+    /// One model's optimized anchor at full steps: is the short-step peak the full-step peak?
+    ValidationSteps,
+    /// One model's optimized configuration at [`VALIDATION_EDGE`], run ADMITTED once the anchors are
+    /// committed: the anchor law's prediction against the measurement.
+    ValidationGeometry,
+}
+
+impl Purpose {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Optimized => "optimized",
+            Self::ValidationSteps => "validation_steps",
+            Self::ValidationGeometry => "validation_geometry",
+        }
+    }
+}
+
+/// One planned campaign case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Planned {
+    pub case: Case,
+    pub purpose: Purpose,
+    pub repeats: u32,
+}
+
+/// The anchor campaign, derived from the runner's own catalog (never a hand list): per provider x
+/// route x tier x registered mode, the resident and the optimized anchor at the reference
+/// geometry and [`ANCHOR_STEPS`]; plus the two validation cases on the FIRST family (catalog order,
+/// lowest tier) that has an optimized anchor. A family whose provider implements no rung above 0
+/// has only its resident anchor (and so nothing derivable). A new provider/mode is visible
 /// automatically; admission, never enumeration, decides whether it can run.
-pub fn enumerate(surfaces: &[Surface]) -> Vec<Case> {
-    let mut cases = Vec::new();
+pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
+    let mut out = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut validation: Option<Case> = None;
     for s in surfaces {
+        let edge = reference_edge(&s.provider);
         for route in &s.routes {
             for tier in ["q4", "q8", "bf16"] {
-                let edges: &[u32] = if s.provider.contains("supra") {
-                    &[256]
-                } else {
-                    &[512, 768, 1024]
-                };
-                for &edge in edges {
-                    for mode in &s.modes {
-                        for rung in 0..=4 {
-                            let base = [BASE_SELECTION.to_string()];
-                            let selections = s
-                                .selections
-                                .get(&(tier.to_string(), rung))
-                                .filter(|v| !v.is_empty())
-                                .map_or(&base[..], |v| &v[..]);
-                            for selection in selections {
-                                let c = Case {
-                                    provider: s.provider.clone(),
-                                    route: route.clone(),
-                                    tier: tier.into(),
-                                    edge,
-                                    mode: mode.clone(),
-                                    rung,
-                                    selection: selection.clone(),
-                                };
-                                if seen.insert(c.key()) {
-                                    cases.push(c);
-                                }
-                            }
+                for mode in &s.modes {
+                    let case = |rung: u8, selection: String, steps: u32| Case {
+                        provider: s.provider.clone(),
+                        route: route.clone(),
+                        tier: tier.into(),
+                        edge,
+                        mode: mode.clone(),
+                        rung,
+                        selection,
+                        steps,
+                    };
+                    let mut push = |c: Case, purpose, repeats| {
+                        if seen.insert(c.key()) {
+                            out.push(Planned {
+                                case: c,
+                                purpose,
+                                repeats,
+                            });
                         }
+                    };
+                    push(
+                        case(0, s.first_selection(tier, 0), ANCHOR_STEPS),
+                        Purpose::Resident,
+                        1,
+                    );
+                    if let Some((rung, selection)) = s.optimized(tier) {
+                        let optimized = case(rung, selection, ANCHOR_STEPS);
+                        validation.get_or_insert_with(|| optimized.clone());
+                        push(optimized, Purpose::Optimized, OPTIMIZED_REPEATS);
                     }
                 }
             }
         }
     }
-    cases
+    if let Some(anchor) = validation {
+        out.push(Planned {
+            case: Case {
+                steps: 0,
+                ..anchor.clone()
+            },
+            purpose: Purpose::ValidationSteps,
+            repeats: 1,
+        });
+        if anchor.edge != VALIDATION_EDGE {
+            out.push(Planned {
+                case: Case {
+                    edge: VALIDATION_EDGE,
+                    ..anchor
+                },
+                purpose: Purpose::ValidationGeometry,
+                repeats: 1,
+            });
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,66 +354,143 @@ mod tests {
         }
     }
     #[test]
-    fn public_case_parse_roundtrip_and_finite_budget() {
-        let c = Case::parse("iris_3b/iris_3b/q8/768/reference/4/t512_dit").unwrap();
+    fn public_case_parse_roundtrip_and_finite_domain() {
+        let c = Case::parse("iris_3b/iris_3b/q8/768/reference/4/t512_dit/1").unwrap();
         assert_eq!(c.edge, 768);
         assert_eq!(c.rung, 4);
         assert_eq!(c.tier, "q8");
         assert_eq!(c.selection, "t512_dit");
+        assert_eq!(c.steps, 1);
         assert_eq!(Case::parse(&c.key()).unwrap(), c);
         for s in [
-            "p/p/q4/0/text/1/base",
-            "p/p/q4/999999999/text/1/base",
-            "p/p/q4/512/text/5/base",
-            "p/../q4/512/text/0/base",
-            "p/p/q5/512/text/0/base",
-            "p/p/q4/512/text/0",
-            "p/p/q4/512/text/0/base/extra",
-            "p/p/q4/512/text/0/t5.12",
+            "p/p/q4/0/text/1/base/1",
+            "p/p/q4/999999999/text/1/base/1",
+            "p/p/q4/512/text/5/base/1",
+            "p/../q4/512/text/0/base/1",
+            "p/p/q5/512/text/0/base/1",
+            "p/p/q4/512/text/0/base",
+            "p/p/q4/512/text/0/base/1/extra",
+            "p/p/q4/512/text/0/t5.12/1",
+            "p/p/q4/512/text/0/base/101",
+            "p/p/q4/512/text/0/base/x",
         ] {
             assert!(Case::parse(s).is_err(), "{s}");
         }
     }
+
+    /// The campaign is the ANCHOR SHAPE, derived from the catalog: per provider x route x tier x
+    /// mode exactly one resident anchor (rung 0, the first selection) and, where the provider
+    /// implements a rung above 0, exactly one optimized anchor (the deepest such rung, its LAST
+    /// selection, repeated), both at the reference edge with short steps; plus exactly one
+    /// full-steps and one second-geometry validation case on the first optimized family. Nothing
+    /// else — no edge ladder, no selection ladder, no rung in between.
     #[test]
-    fn catalog_drives_all_modes_tiers_geometries_and_rungs() {
-        let s = surface();
-        let cases = enumerate(&[s.clone(), s]);
-        let actual: BTreeSet<_> = cases.iter().map(Case::key).collect();
-        assert_eq!(actual.len(), cases.len());
+    fn the_campaign_enumerates_exactly_the_anchor_cases() {
+        let mut a = surface();
         for tier in ["q4", "q8", "bf16"] {
-            for edge in [512, 768, 1024] {
-                for mode in ["text", "reference", "mask"] {
-                    for rung in 0..=4 {
-                        assert!(actual.contains(&format!(
-                            "new_provider/new_provider/{tier}/{edge}/{mode}/{rung}/base"
-                        )));
+            a.selections
+                .insert((tier.into(), 2), vec!["t768".into(), "t512".into()]);
+            a.selections.insert(
+                (tier.into(), 4),
+                vec!["t768_w2".into(), "t512_w2".into(), "s_t256_w1".into()],
+            );
+        }
+        let mut supra = surface();
+        supra.provider = "supra2_img".into();
+        supra.routes = vec!["supra2_img".into()];
+        let planned = enumerate(&[a.clone(), a.clone(), supra.clone()]);
+        let keys: BTreeSet<_> = planned.iter().map(|p| p.case.key()).collect();
+        assert_eq!(keys.len(), planned.len(), "no duplicate case");
+        let anchors: Vec<_> = planned
+            .iter()
+            .filter(|p| matches!(p.purpose, Purpose::Resident | Purpose::Optimized))
+            .collect();
+        for s in [&a, &supra] {
+            for route in &s.routes {
+                for tier in ["q4", "q8", "bf16"] {
+                    for mode in &s.modes {
+                        let family: Vec<_> = anchors
+                            .iter()
+                            .filter(|p| {
+                                p.case.provider == s.provider
+                                    && &p.case.route == route
+                                    && p.case.tier == tier
+                                    && &p.case.mode == mode
+                            })
+                            .collect();
+                        let resident: Vec<_> = family
+                            .iter()
+                            .filter(|p| p.purpose == Purpose::Resident)
+                            .collect();
+                        assert_eq!(resident.len(), 1);
+                        assert_eq!(resident[0].case.rung, 0);
+                        assert_eq!(resident[0].case.selection, s.first_selection(tier, 0));
+                        assert_eq!(resident[0].repeats, 1);
+                        let optimized: Vec<_> = family
+                            .iter()
+                            .filter(|p| p.purpose == Purpose::Optimized)
+                            .collect();
+                        match s.optimized(tier) {
+                            Some((rung, selection)) => {
+                                assert_eq!(optimized.len(), 1);
+                                assert_eq!(optimized[0].case.rung, rung);
+                                assert_eq!(optimized[0].case.selection, selection);
+                                assert_eq!(optimized[0].repeats, OPTIMIZED_REPEATS);
+                            }
+                            None => assert!(optimized.is_empty()),
+                        }
+                        for p in &family {
+                            assert_eq!(p.case.edge, reference_edge(&s.provider));
+                            assert_eq!(p.case.steps, ANCHOR_STEPS);
+                        }
                     }
                 }
             }
         }
-        let supra = Surface {
-            provider: "supra2_img".into(),
-            ..surface()
-        };
-        assert!(enumerate(&[supra]).iter().all(|c| c.edge == 256));
-        // A declared selection space yields one cell per selection, in its declared order, for
-        // exactly its (tier, rung).
-        let mut s = surface();
-        s.selections.insert(
-            ("q4".into(), 2),
-            vec!["t768".into(), "t640".into(), "t512".into()],
-        );
-        let cases = enumerate(&[s]);
-        let at = |tier: &str, rung: u8| {
-            cases
+        // The optimized anchor is the deepest implemented rung at its cheapest selection.
+        assert_eq!(a.optimized("q4"), Some((4, "s_t256_w1".into())));
+        assert_eq!(supra.optimized("q4"), None);
+        assert!(anchors
+            .iter()
+            .all(|p| p.case.provider != "supra2_img" || p.case.edge == 256));
+        // Exactly one of each validation case, both on the FIRST optimized family.
+        let first = anchors
+            .iter()
+            .find(|p| p.purpose == Purpose::Optimized)
+            .unwrap();
+        let of = |purpose| {
+            planned
                 .iter()
-                .filter(|c| c.tier == tier && c.rung == rung && c.edge == 1024 && c.mode == "text")
-                .map(|c| c.selection.as_str())
+                .filter(|p| p.purpose == purpose)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(at("q4", 2), ["t768", "t640", "t512"]);
-        assert_eq!(at("q8", 2), ["base"]);
-        assert_eq!(at("q4", 3), ["base"]);
+        let steps = of(Purpose::ValidationSteps);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].case,
+            Case {
+                steps: 0,
+                ..first.case.clone()
+            }
+        );
+        let geometry = of(Purpose::ValidationGeometry);
+        assert_eq!(geometry.len(), 1);
+        assert_eq!(
+            geometry[0].case,
+            Case {
+                edge: VALIDATION_EDGE,
+                ..first.case.clone()
+            }
+        );
+        assert_eq!(
+            planned.len(),
+            anchors.len() + 2,
+            "anchors and the two validation cases only"
+        );
+        // A catalog with no optimized family has no validation case.
+        assert!(enumerate(&[supra])
+            .iter()
+            .all(|p| p.purpose == Purpose::Resident));
     }
     struct Fake {
         admitted: bool,
@@ -323,7 +524,7 @@ mod tests {
     }
     #[test]
     fn next_up_refuses_before_weight_load_and_no_false_diagnostic_pass() {
-        let c = enumerate(&[surface()]).remove(0);
+        let c = enumerate(&[surface()]).remove(0).case;
         let mut p = Fake {
             admitted: false,
             fail: false,
@@ -347,7 +548,7 @@ mod tests {
     }
     #[test]
     fn a_capture_quantum_refusal_is_typed_capture_evidence_never_a_pass() {
-        let c = enumerate(&[surface()]).remove(0);
+        let c = enumerate(&[surface()]).remove(0).case;
         let mut p = Fake {
             admitted: true,
             fail: false,

@@ -1,25 +1,19 @@
 use super::*;
 
-/// The first (quality-first) enumerated cell of a `provider/route/tier/edge/mode/rung` prefix: the
-/// selection the capture ladder tries first. A prefix outside the enumerated domain (a mode the
-/// provider does not serve, a 256 edge) takes the first selection its provider declares for that
-/// tier and rung, else the parameterless one.
+/// The cell of a `provider/route/tier/edge/mode/rung` prefix at its provider's FIRST
+/// (quality-first) selection for that tier and rung (else the parameterless one), running the
+/// anchors' short step count. Any configuration of the catalog's domain, anchor or derived.
 pub(super) fn cell(prefix: &str) -> Case {
-    static CASES: std::sync::OnceLock<Vec<Case>> = std::sync::OnceLock::new();
-    let cases = CASES
-        .get_or_init(|| campaign::enumerate(&surfaces(runtime_ios::catalog().unwrap().media())));
-    if let Some(c) = cases
-        .iter()
-        .find(|c| c.key().starts_with(&format!("{prefix}/")))
-    {
-        return c.clone();
-    }
-    let mut c = Case::parse(&format!("{prefix}/{}", campaign::BASE_SELECTION)).unwrap();
-    if let Some(same) = cases
-        .iter()
-        .find(|o| o.provider == c.provider && o.tier == c.tier && o.rung == c.rung)
-    {
-        c.selection = same.selection.clone();
+    static SURFACES: std::sync::OnceLock<Vec<Surface>> = std::sync::OnceLock::new();
+    let surfaces = SURFACES.get_or_init(|| surfaces(runtime_ios::catalog().unwrap().media()));
+    let mut c = Case::parse(&format!(
+        "{prefix}/{}/{}",
+        campaign::BASE_SELECTION,
+        campaign::ANCHOR_STEPS
+    ))
+    .unwrap();
+    if let Some(s) = surfaces.iter().find(|s| s.provider == c.provider) {
+        c.selection = s.first_selection(&c.tier, c.rung);
     }
     c
 }
@@ -37,6 +31,7 @@ fn adapter(registry: &ProviderRegistry, root: PathBuf) -> DeviceProvider<'_> {
         permit: None,
         refused_quantum: None,
         refusal_only: false,
+        admitted: None,
     }
 }
 fn tokenizer(dir: &Path) {
@@ -577,30 +572,34 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
         work(&odd, &CancelFlag::new(), catalog.media()),
         Err(AdmissionError::Refused(_))
     ));
-    // Enumeration: both routes at every tier and edge, one control cell per accepted kind; the
-    // control route has no plain text mode.
+    // Enumeration: both routes have both anchors at every tier, one family per accepted control
+    // kind; the control route has no plain text mode.
     let listing: Value = serde_json::from_str(&listing().unwrap()).unwrap();
     let keys: Vec<&str> = listing["cases"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|k| k.as_str().unwrap())
+        .map(|k| k["case"].as_str().unwrap())
         .collect();
     for tier in ["q4", "q8", "bf16"] {
-        for edge in [512, 768, 1024] {
-            let mut prefixes = vec![
-                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/text/4/"),
-                format!("z_image_turbo/z_image_turbo/{tier}/{edge}/reference/4/"),
-            ];
-            for kind in ["pose", "canny", "depth"] {
-                for mode in ["control", "reference"] {
-                    prefixes.push(format!(
-                        "z_image_turbo_control/z_image_turbo_control/{tier}/{edge}/{mode}_{kind}/4/"
-                    ));
-                }
+        let mut prefixes = vec![
+            format!("z_image_turbo/z_image_turbo/{tier}/512/text/"),
+            format!("z_image_turbo/z_image_turbo/{tier}/512/reference/"),
+        ];
+        for kind in ["pose", "canny", "depth"] {
+            for mode in ["control", "reference"] {
+                prefixes.push(format!(
+                    "z_image_turbo_control/z_image_turbo_control/{tier}/512/{mode}_{kind}/"
+                ));
             }
-            for prefix in prefixes {
-                assert!(keys.iter().any(|k| k.starts_with(&prefix)), "{prefix}");
+        }
+        for prefix in prefixes {
+            for rung in ["/0/", "/4/"] {
+                assert!(
+                    keys.iter()
+                        .any(|k| k.starts_with(&prefix) && k[prefix.len() - 1..].starts_with(rung)),
+                    "{prefix}{rung}"
+                );
             }
         }
     }
@@ -616,17 +615,18 @@ fn campaign_injected_device_z_image_turbo_routes_and_tiers() {
 #[test]
 fn campaign_cells_execute_their_own_declared_selection() {
     let catalog = runtime_ios::catalog().unwrap();
-    let cases = campaign::enumerate(&surfaces(catalog.media()));
-    let tokens = |prefix: &str| {
-        cases
+    let discovered = surfaces(catalog.media());
+    // The provider's declared space for `provider/tier/rung`, quality first.
+    let tokens = |provider: &str, tier: &str, rung: u8| {
+        discovered
             .iter()
-            .filter(|c| c.key().starts_with(&format!("{prefix}/")))
-            .map(|c| c.selection.clone())
-            .collect::<Vec<_>>()
+            .find(|s| s.provider == provider)
+            .and_then(|s| s.selections.get(&(tier.to_string(), rung)).cloned())
+            .unwrap_or_default()
     };
     // Z-Image rung 4: staging x window scope x tile, quality first (unstaged, DiT-only scope,
     // largest tile first; staged, both streamed, smallest tile last).
-    let z = tokens("z_image_turbo/z_image_turbo/bf16/1024/text/4");
+    let z = tokens("z_image_turbo", "bf16", 4);
     assert_eq!(z.len(), 2 * 3 * 7, "{z:?}");
     assert_eq!(z[0], "t768_o64_c67108864_w1_dit");
     assert_eq!(z[1], "t640_o64_c67108864_w1_dit");
@@ -636,7 +636,7 @@ fn campaign_cells_execute_their_own_declared_selection() {
     // SANA rung 2 enumerates every declared tile (then the same staged); SDXL rung 2 its native
     // route's tiles.
     assert_eq!(
-        tokens("sana_1600m/sana_1600m/q4/1024/text/2"),
+        tokens("sana_1600m", "q4", 2),
         [
             "t512_o48",
             "t384_o48",
@@ -648,7 +648,7 @@ fn campaign_cells_execute_their_own_declared_selection() {
             "s_t192_o48"
         ]
     );
-    let sdxl = tokens("sdxl/sdxl/q4/1024/text/2");
+    let sdxl = tokens("sdxl", "q4", 2);
     assert_eq!(sdxl[0], "t896_o64");
     assert!(sdxl.contains(&"t512_o64".to_string()));
 
@@ -692,7 +692,7 @@ fn campaign_cells_execute_their_own_declared_selection() {
     };
     for scope in ["te", "both"] {
         let (parameters, memory, key) = selected(&format!(
-            "z_image_turbo/z_image_turbo/bf16/512/text/4/t768_o64_c67108864_w1_{scope}"
+            "z_image_turbo/z_image_turbo/bf16/512/text/4/t768_o64_c67108864_w1_{scope}/1"
         ));
         let want = if scope == "te" {
             TransformerComponent::TextEncoder
@@ -704,13 +704,13 @@ fn campaign_cells_execute_their_own_declared_selection() {
         assert!(key.contains(&format!("{want:?}")), "{key}");
     }
     let (parameters, memory, key) =
-        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit");
+        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit/1");
     assert_eq!(parameters.decode_tile_edge, Some(512));
     assert_eq!(memory.decode_tile_edge, Some(512));
     assert!(memory.stage_residency, "the staged selection evicts phases");
     assert!(key.contains("stage_residency: Some(true)"), "{key}");
     let (_, _, first) =
-        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/t768_o64_c67108864_w1_dit");
+        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/t768_o64_c67108864_w1_dit/1");
     assert_ne!(key, first, "the evidence key separates the selections");
     assert!(key.contains("decode_tile_edge: Some(512)"), "{key}");
     // SDXL: a non-first native tile.
@@ -720,12 +720,12 @@ fn campaign_cells_execute_their_own_declared_selection() {
     }
     tokenizer(&slot.join("tokenizer"));
     tokenizer(&slot.join("tokenizer_2"));
-    let (parameters, memory, _) = selected("sdxl/sdxl/q4/1024/text/2/t512_o64");
+    let (parameters, memory, _) = selected("sdxl/sdxl/q4/1024/text/2/t512_o64/1");
     assert_eq!(parameters.decode_tile_edge, Some(512));
     assert_eq!(memory.decode_tile_edge, Some(512));
     // A token outside the declared space: typed strategy refusal, nothing built.
     let (result, p) =
-        prepared("z_image_turbo/z_image_turbo/q4/1024/text/4/t500_o64_c67108864_w1_dit");
+        prepared("z_image_turbo/z_image_turbo/q4/1024/text/4/t500_o64_c67108864_w1_dit/1");
     assert!(matches!(result, Err(AdmissionError::Refused(_))));
     assert_eq!(p.refusal_kind, Some("strategy"));
     assert!(p.candidate.is_none());
