@@ -1538,7 +1538,7 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 }
 
 /// The Z-Image Turbo lane (`--zimage`, sc-26433): one bounded device CAPTURE of a Z-Image campaign
-/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4` — through
+/// case — `IOS_SMOKE_ZIMAGE_CASE`, default `z_image_turbo/z_image_turbo/q4/1024/text/4/t512_o64_c67108864_w1_dit` — through
 /// the same capture path every catalog model runs (`campaign_media::report` → `capture_permit`, every
 /// quantum checked against live headroom before its graph is built). A quantum refusal is evidence
 /// (the size does not fit) and passes; only a failure fails. The snapshot is the campaign slot
@@ -1547,8 +1547,9 @@ fn check_image_generation(media_dir: Option<&Path>) -> Check {
 #[cfg(feature = "zimage")]
 fn check_zimage_generation() -> Check {
     const NAME: &str = "Z-Image Turbo bounded capture";
-    let case = std::env::var("IOS_SMOKE_ZIMAGE_CASE")
-        .unwrap_or_else(|_| "z_image_turbo/z_image_turbo/q4/1024/text/4".into());
+    let case = std::env::var("IOS_SMOKE_ZIMAGE_CASE").unwrap_or_else(|_| {
+        "z_image_turbo/z_image_turbo/q4/1024/text/4/t512_o64_c67108864_w1_dit".into()
+    });
     // Capture runs only on a real device, against a provisioned slot; anywhere else the lane skips,
     // as every snapshot-backed lane does.
     if !cfg!(all(target_os = "ios", not(target_abi = "sim"))) {

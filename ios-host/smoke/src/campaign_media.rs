@@ -35,20 +35,30 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     let mut out = Vec::new();
     for registration in registry.generators() {
         let d = (registration.descriptor)();
-        // A route whose control input is REQUIRED (a declared control-kind policy, e.g. Z-Image
-        // Turbo's Fun-Controlnet-Union route) has no plain text mode: every one of its modes carries
-        // the control image ([`work`]).
-        let mut modes = if d.control_kinds.is_some() {
-            Vec::new()
+        let conditioning = d
+            .capabilities
+            .conditioning
+            .iter()
+            .map(|m| format!("{m:?}").to_ascii_lowercase());
+        // A control-REQUIRED route (the catalog's explicit route fact, e.g. Z-Image Turbo's
+        // Fun-Controlnet-Union route) has no plain text mode: every one of its modes carries the
+        // control image ([`work`]), and each is exercised once per control kind the route accepts
+        // (`control_pose`, `reference_canny`, ...).
+        let mut modes = if runtime_ios::media::control_required(d.id) {
+            let kinds = accepted_kinds(registry, d.id);
+            conditioning
+                .flat_map(|m| {
+                    kinds
+                        .iter()
+                        .map(move |k| format!("{m}_{}", kind_token(k)))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         } else {
-            vec!["text".to_string()]
+            std::iter::once("text".to_string())
+                .chain(conditioning)
+                .collect::<Vec<_>>()
         };
-        modes.extend(
-            d.capabilities
-                .conditioning
-                .iter()
-                .map(|m| format!("{m:?}").to_ascii_lowercase()),
-        );
         if d.capabilities.supports_prompt_batch {
             modes.push("prompt_batch".into());
         }
@@ -57,7 +67,7 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
         if d.id == "sdxl" {
             modes.push("ip_adapter".into());
         }
-        let routes = if d.id == "sdxl" {
+        let routes: Vec<String> = if d.id == "sdxl" {
             runtime_ios::media::sdxl::SDXL_FAMILY_ROUTES
                 .iter()
                 .map(|s| (*s).into())
@@ -66,6 +76,7 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
             vec![d.id.into()]
         };
         out.push(Surface {
+            selections: selections(registry, d.id, &routes[0]),
             provider: d.id.into(),
             routes,
             modes,
@@ -77,6 +88,7 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
             provider: d.id.into(),
             routes: vec![d.id.into()],
             modes: vec!["restore".into()],
+            selections: selections(registry, d.id, d.id),
         });
     }
     // Composed provider-specific tasks are not generators. Discover them through their actual
@@ -84,6 +96,7 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
     for r in registry.memory_strategy_registrations() {
         if !out.iter().any(|s| s.provider == r.provider_id) {
             out.push(Surface {
+                selections: selections(registry, r.provider_id, r.provider_id),
                 provider: r.provider_id.into(),
                 routes: vec![r.provider_id.into()],
                 modes: vec![if r.provider_id == "iris_3b_depth" {
@@ -105,10 +118,106 @@ pub fn listing() -> Result<String, String> {
     }).to_string())
 }
 
+/// The campaign token of a selection's parameters: `t{tile}`, `o{overlap}`, `c{chunk}`,
+/// `w{window}` and the window scope (`dit` / `te` / `both`), in that order, `_`-joined, and `s`
+/// first when it adds phase eviction; [`campaign::BASE_SELECTION`] when it has none.
+pub fn selection_token(p: &MemoryStrategyParameters) -> String {
+    let mut parts = Vec::new();
+    if p.stage_residency == Some(true) {
+        parts.push("s".to_string());
+    }
+    if let Some(t) = p.decode_tile_edge {
+        parts.push(format!("t{t}"));
+    }
+    if let Some(o) = p.decode_overlap {
+        parts.push(format!("o{o}"));
+    }
+    if let Some(c) = p.attention_chunk_size {
+        parts.push(format!("c{c}"));
+    }
+    if let Some(w) = p.transformer_window_size {
+        parts.push(format!("w{w}"));
+    }
+    if let Some(scope) = p.transformer_window_component {
+        parts.push(
+            match scope {
+                TransformerComponent::Dit => "dit",
+                TransformerComponent::TextEncoder => "te",
+                TransformerComponent::Both => "both",
+            }
+            .into(),
+        );
+    }
+    if parts.is_empty() {
+        campaign::BASE_SELECTION.into()
+    } else {
+        parts.join("_")
+    }
+}
+
+/// The provider's declared selection space per `(tier, rung)` as quality-first tokens, from its
+/// weights-free contract surface at the load shape the campaign actually uses ([`load_spec`]).
+fn selections(
+    registry: &ProviderRegistry,
+    provider: &str,
+    route: &str,
+) -> std::collections::BTreeMap<(String, u8), Vec<String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(contracts) = registry.memory_contract_surfaces() else {
+        return out;
+    };
+    for tier_name in ["q4", "q8", "bf16"] {
+        let probe = Case {
+            provider: provider.into(),
+            route: route.into(),
+            tier: tier_name.into(),
+            edge: 512,
+            mode: String::new(),
+            rung: 0,
+            selection: campaign::BASE_SELECTION.into(),
+        };
+        let Ok(spec) = load_spec(&probe, WeightsSource::Dir(PathBuf::new())) else {
+            continue;
+        };
+        let Some(surface) = contracts.iter().find(|s| {
+            s.contract.provider_id == provider
+                && s.selector.offload_policy == spec.offload_policy
+                && s.selector.load_shape == spec.load_shape
+                && match s.selector.tier {
+                    MemoryContractSurfaceTier::Q4 => tier_name == "q4",
+                    MemoryContractSurfaceTier::Q8 => tier_name == "q8",
+                    MemoryContractSurfaceTier::Bf16 => tier_name == "bf16",
+                    _ => false,
+                }
+        }) else {
+            continue;
+        };
+        for (rung, strategy) in MemoryStrategy::ALL.into_iter().enumerate().take(5) {
+            if let Ok(space) = surface
+                .contract
+                .selection_space(strategy, tier_of(tier_name), false)
+            {
+                out.insert(
+                    (tier_name.to_string(), rung as u8),
+                    space
+                        .iter()
+                        .map(|s| selection_token(&s.parameters))
+                        .collect(),
+                );
+            }
+        }
+    }
+    out
+}
+
 fn tier(case: &Case) -> MemoryNumericTier {
+    tier_of(&case.tier)
+}
+
+fn tier_of(tier: &str) -> MemoryNumericTier {
     MemoryNumericTier {
         precision: Precision::Bf16,
-        quant: match case.tier.as_str() {
+        quant: match tier {
             "q4" => Some(Quant::Q4),
             "q8" => Some(Quant::Q8),
             _ => None,
@@ -146,38 +255,62 @@ fn prompt(provider: &str) -> String {
     }
 }
 
-/// The control kind a case's control carrier uses: the first kind the route declares it accepts
-/// (Z-Image's Fun-Controlnet-Union: pose), else SDXL's tile ControlNet.
-fn control_kind(registry: &ProviderRegistry, provider: &str) -> ControlKind {
-    let declared = registry
+/// The control kinds a route declares it accepts (empty: no declared policy).
+fn accepted_kinds(registry: &ProviderRegistry, provider: &str) -> Vec<ControlKind> {
+    match registry
         .generators()
         .map(|r| (r.descriptor)())
         .find(|d| d.id == provider)
-        .and_then(|d| d.control_kinds);
-    match declared {
-        Some(AcceptedControlKinds::Only(kinds)) if !kinds.is_empty() => kinds[0].clone(),
-        Some(_) => ControlKind::Pose,
-        None => ControlKind::Other("tile".into()),
+        .and_then(|d| d.control_kinds)
+    {
+        Some(AcceptedControlKinds::Only(kinds)) => kinds.to_vec(),
+        _ => Vec::new(),
     }
 }
 
-/// Whether `provider`'s control input is required (its every mode carries the control image).
-fn control_required(registry: &ProviderRegistry, provider: &str) -> bool {
-    registry
-        .generators()
-        .map(|r| (r.descriptor)())
-        .any(|d| d.id == provider && d.control_kinds.is_some())
+/// A control kind's mode-suffix token (`pose`, `canny`, `depth`, ...).
+fn kind_token(kind: &ControlKind) -> String {
+    match kind {
+        ControlKind::Other(name) => name.to_ascii_lowercase(),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
+}
+
+/// A case's mode and, on a control-required route, the control kind its `{mode}_{kind}` suffix
+/// names (a kind the route does not accept is a typed mode refusal).
+fn mode_and_kind(
+    c: &Case,
+    registry: &ProviderRegistry,
+) -> Result<(String, Option<ControlKind>), AdmissionError> {
+    if !runtime_ios::media::control_required(&c.provider) {
+        return Ok((c.mode.clone(), None));
+    }
+    accepted_kinds(registry, &c.provider)
+        .into_iter()
+        .find_map(|k| {
+            c.mode
+                .strip_suffix(&format!("_{}", kind_token(&k)))
+                .map(|m| (m.to_string(), Some(k)))
+        })
+        .ok_or_else(|| {
+            AdmissionError::Refused(format!(
+                "{}: mode {} names no control kind the route accepts",
+                c.provider, c.mode
+            ))
+        })
 }
 
 /// The actual work of a case's mode. Every registered mode has a carrier; a mode the provider
-/// does not serve is refused by admission with a typed `mode` kind, never dropped here. A route
-/// whose control input is required carries it in every mode (`reference` adds an img2img init).
+/// does not serve is refused by admission with a typed `mode` kind, never dropped here. A
+/// control-required route carries its control image, of the kind its mode names, in every mode
+/// (`reference_<kind>` adds an img2img init); SDXL's optional ControlNet is its tile model.
 fn work(
     c: &Case,
     cancel: &CancelFlag,
     registry: &ProviderRegistry,
 ) -> Result<runtime_ios::media::IosWork, AdmissionError> {
     use runtime_ios::media::IosWork;
+    let (mode, required_kind) = mode_and_kind(c, registry)?;
     let image = || synthetic_image(c.edge);
     let mut request = GenerationRequest {
         prompt: prompt(&c.provider),
@@ -188,7 +321,7 @@ fn work(
         cancel: cancel.clone(),
         ..Default::default()
     };
-    match c.mode.as_str() {
+    match mode.as_str() {
         "text" => {}
         "prompt_batch" => {
             request.prompt_batch = vec![
@@ -212,13 +345,16 @@ fn work(
                 Conditioning::Mask { image: image() },
             ]
         }
-        "control" => {
+        // SDXL's optional ControlNet: its provisioned tile model.
+        "control" if required_kind.is_none() => {
             request.conditioning = vec![Conditioning::Control {
                 image: image(),
-                kind: control_kind(registry, &c.provider),
+                kind: ControlKind::Other("tile".into()),
                 scale: Some(1.0),
             }]
         }
+        // A control-required route's control-only mode: the control image below.
+        "control" => {}
         "restore" => {
             return Ok(IosWork::Restore(TransformRequest {
                 image: image(),
@@ -240,17 +376,12 @@ fn work(
             )))
         }
     }
-    if control_required(registry, &c.provider)
-        && !request
-            .conditioning
-            .iter()
-            .any(|x| matches!(x, Conditioning::Control { .. }))
-    {
+    if let Some(kind) = required_kind {
         request.conditioning.insert(
             0,
             Conditioning::Control {
                 image: image(),
-                kind: control_kind(registry, &c.provider),
+                kind,
                 scale: Some(1.0),
             },
         );
@@ -281,15 +412,10 @@ pub fn slot_provisioned(value: &str) -> bool {
         .is_dir()
 }
 
-fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
-    let path = root.join(slot_route(c)).join(&c.tier);
-    if !path.is_dir() {
-        return Err(format!(
-            "missing provisioned snapshot {}; not admission/refusal evidence",
-            path.display()
-        ));
-    }
-    let source = WeightsSource::Dir(path.clone());
+/// A case's load spec over `source`, before any provisioned component: the provider's iOS load
+/// policy at the case's tier. The same spec selects the weights-free contract surface the campaign
+/// enumerates selections from ([`selections`]), so enumeration and execution agree.
+fn load_spec(c: &Case, source: WeightsSource) -> Result<LoadSpec, String> {
     let mut spec = match c.provider.as_str() {
         "sdxl" => {
             runtime_ios::media::sdxl::sdxl_load_spec(&c.route, source).map_err(|e| e.to_string())?
@@ -307,6 +433,18 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
     };
     spec.precision = tier(c).precision;
     spec.quantize = tier(c).quant;
+    Ok(spec)
+}
+
+fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
+    let path = root.join(slot_route(c)).join(&c.tier);
+    if !path.is_dir() {
+        return Err(format!(
+            "missing provisioned snapshot {}; not admission/refusal evidence",
+            path.display()
+        ));
+    }
+    let mut spec = load_spec(c, WeightsSource::Dir(path.clone()))?;
     // Relative caller-provisioned components only. No download, path guessing, or unbound
     // substitution. Preserve lexical source paths and let provider inventory checks bind them.
     let manifest = path.join("components.json");
@@ -351,8 +489,8 @@ fn snapshot(root: &Path, c: &Case) -> Result<LoadSpec, String> {
             // (so an image-to-image case would silently become IP-Adapter), and either adds
             // weights the other routes do not run.
             // Z-Image Turbo's control route takes its ControlNet in every mode (it is the route).
-            let control_route = c.mode == "control"
-                || c.provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID;
+            let control_route =
+                c.mode == "control" || runtime_ios::media::control_required(&c.provider);
             match key.as_str() {
                 "control" if control_route => spec.control = Some(source),
                 "ip_adapter" if c.mode == "ip_adapter" => spec.ip_adapter = Some(source),
@@ -389,7 +527,7 @@ impl DeviceProvider<'_> {
         // A control / IP-Adapter case without its provisioned component would silently run as
         // another route: a provisioning failure, never admission or refusal evidence.
         if ((c.provider == "sdxl" && c.mode == "control")
-            || c.provider == runtime_ios::media::zimage::Z_IMAGE_TURBO_CONTROL_ID)
+            || runtime_ios::media::control_required(&c.provider))
             && spec.control.is_none()
         {
             return Err(format!("{} {} case needs a provisioned `control` component (components.json); not admission/refusal evidence", c.provider, c.mode).into());
@@ -425,13 +563,37 @@ impl DeviceProvider<'_> {
                 c.rung
             )));
         }
-        let selection = contract
-            .representative_selection(strategy, tier(c), false)
+        // The cell's own selection, from the provider's declared space on THIS artifact's
+        // contract (build_candidate re-validates it): never a substitute.
+        let space = contract
+            .selection_space(strategy, tier(c), false)
             .map_err(|e| {
                 self.refusal_kind = Some("strategy");
                 AdmissionError::Refused(e.to_string())
             })?;
-        let work = work(c, &self.cancel, self.registry)?;
+        let Some(selection) = space
+            .iter()
+            .find(|s| selection_token(&s.parameters) == c.selection)
+            .copied()
+        else {
+            self.refusal_kind = Some("strategy");
+            return Err(AdmissionError::Refused(format!(
+                "selection {} is not in {}'s declared space for rung {}: {:?}",
+                c.selection,
+                c.provider,
+                c.rung,
+                space
+                    .iter()
+                    .map(|s| selection_token(&s.parameters))
+                    .collect::<Vec<_>>()
+            )));
+        };
+        let work = work(c, &self.cancel, self.registry).map_err(|e| {
+            if matches!(e, AdmissionError::Refused(_)) {
+                self.refusal_kind = Some("mode");
+            }
+            e
+        })?;
         let candidate = runtime_ios::media::build_candidate(
             self.registry,
             &c.provider,
@@ -693,6 +855,7 @@ pub fn report(value: &str, diagnostic: bool) -> String {
                     && c.tier == case.tier
                     && c.mode == case.mode
                     && c.rung == case.rung
+                    && c.selection == case.selection
             })
         {
             return Err("case not in the actual supported catalog".into());

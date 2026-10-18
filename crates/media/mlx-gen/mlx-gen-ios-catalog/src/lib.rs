@@ -88,6 +88,17 @@ pub use anima::{
     anima_turbo_planning_decision, ios_memory_budget, ANIMA_TURBO_ID,
 };
 
+/// The iOS routes whose control input is REQUIRED in every request: the route IS a ControlNet (its
+/// generator refuses a request without a `Control` conditioning, `ControlBranch::require_control_present`,
+/// and its load requires the control checkpoint). Every mode of such a route carries a control image,
+/// so it has no plain text mode, and it is exercised once per control kind it accepts.
+pub const CONTROL_REQUIRED_ROUTES: &[&str] = &[zimage::Z_IMAGE_TURBO_CONTROL_ID];
+
+/// Whether `provider` is a [`CONTROL_REQUIRED_ROUTES`] route.
+pub fn control_required(provider: &str) -> bool {
+    CONTROL_REQUIRED_ROUTES.contains(&provider)
+}
+
 /// Add the iOS image generators to an explicit media registry builder, in catalog order.
 ///
 /// Order is part of the surface: [`provider_registry`]'s ids are asserted in this order by the
@@ -296,6 +307,49 @@ mod tests {
         MemoryNumericTier, MemorySelection, MemoryStrategy, MemoryStrategyParameters, WeightsSource,
     };
     use mlx_gen_sana::pipeline::DecodeTilingSource;
+
+    /// Every control-required route is a registered generator that declares the control kinds it
+    /// accepts and serves `Control` conditioning; its load refuses a spec without the control
+    /// checkpoint (the route fact is the generator's own requirement, not a naming convention).
+    #[test]
+    fn control_required_routes_are_registered_control_generators() {
+        let registry = super::provider_registry().unwrap();
+        assert!(!super::CONTROL_REQUIRED_ROUTES.is_empty());
+        for id in super::CONTROL_REQUIRED_ROUTES {
+            let registration = registry
+                .generators()
+                .find(|r| (r.descriptor)().id == *id)
+                .unwrap_or_else(|| panic!("{id} is not registered"));
+            let d = (registration.descriptor)();
+            assert!(
+                matches!(&d.control_kinds, Some(mlx_gen::gen_core::AcceptedControlKinds::Only(k)) if !k.is_empty()),
+                "{id} must declare the control kinds it accepts: {:?}",
+                d.control_kinds
+            );
+            assert!(d
+                .capabilities
+                .conditioning
+                .contains(&mlx_gen::gen_core::ConditioningKind::Control));
+            let dir = tempfile::tempdir().unwrap();
+            crate::zimage::tests::snapshot(dir.path(), Some(4));
+            let mut spec = mlx_gen::gen_core::LoadSpec::new(WeightsSource::Dir(dir.path().into()));
+            spec.quantize = Some(mlx_gen::gen_core::Quant::Q4);
+            let error = (registration.load)(&spec)
+                .map(|_| ())
+                .expect_err("a control-required route must refuse a load without its checkpoint");
+            assert!(error.to_string().contains("control"), "{id}: {error}");
+        }
+        // The SANA / SDXL / Anima / Iris routes are not control-required.
+        for id in [
+            "sana_1600m",
+            "sdxl",
+            "anima_turbo",
+            "iris_3b",
+            "z_image_turbo",
+        ] {
+            assert!(!super::control_required(id), "{id}");
+        }
+    }
 
     /// The exact, ordered surface this catalog ships on iOS.
     ///

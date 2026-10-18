@@ -66,6 +66,7 @@ pub mod media {
     pub use mlx_gen_ios_catalog::admit;
     #[cfg(feature = "device-capture")]
     use mlx_gen_ios_catalog::capture_permit as catalog_capture_permit;
+    pub use mlx_gen_ios_catalog::control_required;
     pub use mlx_gen_ios_catalog::{
         anima, anima_turbo_ios_selection, anima_turbo_load_spec, anima_turbo_memory_selection,
         anima_turbo_planning_decision, build_candidate, capacity_budget, evidence, evidence_key,
@@ -73,9 +74,9 @@ pub mod media {
         sana_footprint_bound, sana_generation_memory, sana_load_spec, sana_snapshot_profile, sdxl,
         zimage, Admission, AdmissionError, AdmissionResult, BoundDepth, BoundGenerator,
         BoundTransform, FootprintBound, IosCandidate, IosWork, Refusal, RefusalKind,
-        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, IOS_IMAGE_EDGES,
-        IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY, IRIS_DEPTH_ID,
-        IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
+        SanaDeviceFootprint, SanaSnapshotProfile, ANIMA_TURBO_ID, CONTROL_REQUIRED_ROUTES,
+        IOS_IMAGE_EDGES, IOS_MEMORY_BUDGET_MIB, IOS_MLX_CACHE_LIMIT_CAP_MIB, IOS_OFFLOAD_POLICY,
+        IRIS_DEPTH_ID, IRIS_RESTORE_ID, SANA_DEVICE_FOOTPRINTS,
     };
 
     use crate::gen_core::{Error, ProviderRegistry, Result};
