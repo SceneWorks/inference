@@ -441,3 +441,66 @@ fn mismatched_identity_and_corrupted_state_are_refused_before_mutating_factors()
     let (_, state) = fresh_opt.snapshot().unwrap();
     assert_eq!(state["optim.step"], "0");
 }
+
+/// PR #1288 review: the exported global alpha is the CONFIGURED value, never re-derived as
+/// `scale * rank` (29/7*7 is 29.000000000000004 in f64, which a re-derivation would publish).
+#[test]
+fn export_records_the_configured_alpha_verbatim() {
+    let rank = 7usize;
+    let alpha = 29.0f64;
+    assert_ne!(
+        (alpha / rank as f64) * rank as f64,
+        alpha,
+        "the case must be one where re-deriving alpha from the scale rounds"
+    );
+    let mut config = tiny_config();
+    config.dit.flow_map = false;
+    let dit = Flux3Dit::load(
+        &fixtures().join("tiny-base-snapshot/model.safetensors"),
+        &config.dit,
+        DType::F32,
+        &Device::Cpu,
+    )
+    .unwrap();
+    let initial = lora_targets(&config.dit, &[])
+        .unwrap()
+        .into_iter()
+        .map(|projection| {
+            let down = candle_gen::candle_core::Tensor::full(
+                0.01f32,
+                (rank, projection.input),
+                &Device::Cpu,
+            )
+            .unwrap();
+            (projection.native, down)
+        })
+        .collect();
+    let graph = TrainingGraph::new(dit, rank, alpha, &[], initial).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let path = export_adapter(
+        &graph,
+        &identity(&graph),
+        root.path(),
+        "alpha.safetensors",
+        &CancelFlag::new(),
+    )
+    .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+    let metadata = header.metadata().as_ref().unwrap();
+    assert_eq!(metadata["lora_alpha"], "29");
+    assert_eq!(metadata["rank"], "7");
+    let peft: serde_json::Value = serde_json::from_str(&metadata["lora_adapter_metadata"]).unwrap();
+    assert_eq!(
+        peft["lora_alpha"].as_f64().unwrap().to_bits(),
+        alpha.to_bits()
+    );
+    assert_eq!(peft["r"], serde_json::json!(7));
+    let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
+    let resolved = candle_gen::gen_core::flux3::adapters::inspect(&spec, &config.dit).unwrap();
+    assert_eq!(resolved.len(), 54);
+    assert!(resolved
+        .iter()
+        .all(|module| module.rank == rank
+            && module.scale.to_bits() == (alpha / rank as f64).to_bits()));
+}

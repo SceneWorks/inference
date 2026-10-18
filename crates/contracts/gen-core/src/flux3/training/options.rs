@@ -25,10 +25,33 @@ impl TrainingPrecision {
         }
     }
 }
+/// The `TrainingConfig.model_options` key holding this family's source options (the
+/// convention the other strict family trainers use, e.g. `model_options["iris"]`). Every key
+/// inside it must be one this trainer implements; an unknown one is refused. Keys OUTSIDE it
+/// belong to the host's product bag (SceneWorks forwards its whole `advanced` object, whose
+/// common fields are already mapped onto the typed `TrainingConfig` the parse checks above).
+pub const OPTIONS_KEY: &str = "flux3";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Workflow {
     Captioned,
     PairedEdit,
+}
+/// The native prefix of the projections that process ONLY reference (image-condition) tokens.
+pub const REFERENCE_ONLY_PREFIX: &str = "content_mode_blocks.image_cond.";
+impl Workflow {
+    /// Whether the LoRA factor named `factor` (a native target or `{native}.lora_{A,B}.weight`)
+    /// is reached by this workflow's graph, i.e. receives a gradient. A captioned run has no
+    /// reference tokens, so the `image_cond` projections never enter its graph: PyTorch leaves
+    /// their `.grad` as `None` and AdamW skips them entirely (no moment, no step count, no
+    /// decoupled decay). Candle's autograd yields the same partition (its GradStore omits them,
+    /// pinned by a runner test); MLX's functional gradient returns zeros instead, so it must
+    /// apply this predicate rather than step and decay factors the source never touches.
+    pub fn trains(self, factor: &str) -> bool {
+        match self {
+            Self::PairedEdit => true,
+            Self::Captioned => !factor.starts_with(REFERENCE_ONLY_PREFIX),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct TrainingOptions {
@@ -112,7 +135,16 @@ impl TrainingOptions {
         } else {
             Workflow::Captioned
         };
-        let bag = &cfg.model_options;
+        let empty = serde_json::Map::new();
+        let bag = match cfg.model_options.get(OPTIONS_KEY) {
+            None => &empty,
+            Some(serde_json::Value::Object(bag)) => bag,
+            Some(_) => {
+                return Err(invalid(format!(
+                    "model_options.{OPTIONS_KEY} must be an object of source options"
+                )))
+            }
+        };
         const ALLOWED: &[&str] = &[
             "mode",
             "caption_dropout",

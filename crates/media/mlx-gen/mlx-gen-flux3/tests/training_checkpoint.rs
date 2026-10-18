@@ -34,7 +34,7 @@ fn graph() -> (TrainingGraph, LoraParams) {
     let mut config = tiny_config();
     config.dit.flow_map = false;
     let weights =
-        Weights::from_file(&fixtures().join("tiny-base-snapshot/model.safetensors")).unwrap();
+        Weights::from_file(fixtures().join("tiny-base-snapshot/model.safetensors")).unwrap();
     let dit = Flux3Dit::from_weights(&weights, &config.dit, Dtype::Float32).unwrap();
     let golden = fixture("flux3_training_golden.safetensors");
     let mut params = LoraParams::new();
@@ -182,7 +182,7 @@ fn saved_checkpoint_resumes_corrected_optimizer_and_adapter_reloads_with_effect(
         let golden=fixture("flux3_training_golden.safetensors"); let get=|key:&str| golden.require(key).unwrap();
         let text_ids=ids(get("text_ids")); let image_ids=ids(get("image_ids")); let reference_ids=ids(get("reference_ids"));
         let sample=[SampleTokens {text:get("text"),text_ids:&text_ids,image:get("noise"),image_ids:&image_ids,image_cond:Some((get("reference"),&reference_ids)),timestep:0.6,target_timestep:None}];
-        let load=|| {let w=Weights::from_file(&fixtures().join("tiny-base-snapshot/model.safetensors")).unwrap(); Flux3Dit::from_weights(&w,&config.dit,Dtype::Float32).unwrap()};
+        let load=|| {let w=Weights::from_file(fixtures().join("tiny-base-snapshot/model.safetensors")).unwrap(); Flux3Dit::from_weights(&w,&config.dit,Dtype::Float32).unwrap()};
         let mut dit=load(); let bare=dit.forward(&sample).unwrap();
         mlx_gen_flux3::adapters::install(&mut dit,std::slice::from_ref(&spec)).unwrap();
         let on=dit.forward(&sample).unwrap(); assert!(host_f32(&on.subtract(&bare).unwrap()).iter().any(|v| v.abs()>1e-7));
@@ -257,4 +257,70 @@ fn checkpoint_codec_preserves_logical_strided_factor_moment_and_pending_bytes() 
             assert_eq!(host_f32(&fresh_optimizer.moments[&key].first),host_f32(&optimizer.moments[&key].first));
         })
     });
+}
+
+/// PR #1288 review, MLX mirror: the exported global alpha is the CONFIGURED value, never
+/// re-derived as `scale * rank` (29/7*7 is 29.000000000000004 in f64).
+#[test]
+fn export_records_the_configured_alpha_verbatim() {
+    cpu_process(
+        "training_checkpoint::export_records_the_configured_alpha_verbatim",
+        || {
+            on_cpu(|| {
+                let rank = 7usize;
+                let alpha = 29.0f64;
+                assert_ne!((alpha / rank as f64) * rank as f64, alpha);
+                let mut config = tiny_config();
+                config.dit.flow_map = false;
+                let weights =
+                    Weights::from_file(fixtures().join("tiny-base-snapshot/model.safetensors"))
+                        .unwrap();
+                let dit = Flux3Dit::from_weights(&weights, &config.dit, Dtype::Float32).unwrap();
+                let graph = TrainingGraph::new(dit, rank, alpha, &[]).unwrap();
+                let mut params = LoraParams::new();
+                for target in &graph.targets {
+                    params.insert(
+                        format!("{}.lora_A.weight", target.native).into(),
+                        Array::full::<f32>(
+                            &[rank as i32, target.input as i32],
+                            Array::from_f32(0.01),
+                        )
+                        .unwrap(),
+                    );
+                    params.insert(
+                        format!("{}.lora_B.weight", target.native).into(),
+                        Array::zeros::<f32>(&[target.output as i32, rank as i32]).unwrap(),
+                    );
+                }
+                let root = tempfile::tempdir().unwrap();
+                let path = export_adapter(
+                    &graph,
+                    &params,
+                    &identity(&params),
+                    root.path(),
+                    "alpha.safetensors",
+                    &CancelFlag::new(),
+                )
+                .unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).unwrap();
+                let metadata = header.metadata().as_ref().unwrap();
+                assert_eq!(metadata["lora_alpha"], "29");
+                assert_eq!(metadata["rank"], "7");
+                let peft: serde_json::Value =
+                    serde_json::from_str(&metadata["lora_adapter_metadata"]).unwrap();
+                assert_eq!(
+                    peft["lora_alpha"].as_f64().unwrap().to_bits(),
+                    alpha.to_bits()
+                );
+                assert_eq!(peft["r"], serde_json::json!(7));
+                let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
+                let resolved =
+                    mlx_gen::gen_core::flux3::adapters::inspect(&spec, &config.dit).unwrap();
+                assert_eq!(resolved.len(), 54);
+                assert!(resolved.iter().all(|module| module.rank == rank
+                    && module.scale.to_bits() == (alpha / rank as f64).to_bits()));
+            })
+        },
+    );
 }

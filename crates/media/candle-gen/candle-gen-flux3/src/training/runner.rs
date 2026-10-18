@@ -514,6 +514,9 @@ mod tests {
         }
     }
     fn session() -> (CandleSession, gen_core::flux3::Flux3Config) {
+        session_for(Workflow::PairedEdit)
+    }
+    fn session_for(workflow: Workflow) -> (CandleSession, gen_core::flux3::Flux3Config) {
         let config = gen_core::flux3::Flux3Config::parse(
             &std::fs::read_to_string(fixtures().join("tiny-base-snapshot/config.json")).unwrap(),
         )
@@ -563,7 +566,7 @@ mod tests {
                 text: text.clone(),
                 text_ids: text_ids.clone(),
                 empty_text: Some((&text * 0.5).unwrap()),
-                reference: Some(golden["reference"].clone()),
+                reference: (workflow == Workflow::PairedEdit).then(|| golden["reference"].clone()),
                 grid: (h, w),
             })
             .collect();
@@ -606,7 +609,19 @@ mod tests {
             ]),
         };
         (
-            CandleSession::new(graph, optimizer, examples, options(), identity, 73, 2).unwrap(),
+            CandleSession::new(
+                graph,
+                optimizer,
+                examples,
+                TrainingOptions {
+                    workflow,
+                    ..options()
+                },
+                identity,
+                73,
+                2,
+            )
+            .unwrap(),
             config,
         )
     }
@@ -777,5 +792,147 @@ mod tests {
             gen_core::flux3::training::controller::ensure_new_output(&req).is_err(),
             "a completed run must not be silently overwritten"
         );
+    }
+    fn factor_bits(session: &CandleSession) -> BTreeMap<String, Vec<u32>> {
+        session
+            .graph
+            .factors
+            .iter()
+            .flat_map(|f| {
+                [
+                    (format!("{}.lora_A.weight", f.target.native), &f.down),
+                    (format!("{}.lora_B.weight", f.target.native), &f.up),
+                ]
+            })
+            .map(|(name, var)| {
+                let values = var
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                (name, values.into_iter().map(f32::to_bits).collect())
+            })
+            .collect()
+    }
+    /// PR #1288 review: the source (PyTorch) never steps or decays a parameter whose `.grad` is
+    /// `None`. Candle's autograd is the ground truth for which factors a workflow reaches; this
+    /// pins that the shared `Workflow::trains` predicate (which the MLX twin must apply, because
+    /// its functional gradient returns zeros) is EXACTLY that partition, and that an unreached
+    /// factor is left bit-identical by the update (no moment, no decoupled weight decay).
+    #[test]
+    fn each_workflow_steps_exactly_the_factors_its_native_graph_reaches() {
+        for workflow in [Workflow::Captioned, Workflow::PairedEdit] {
+            let (mut session, _) = session_for(workflow);
+            let flag = CancelFlag::new();
+            let before = factor_bits(&session);
+            session.micro_batch(&[0], 0, &flag).unwrap();
+            let reached: BTreeSet<String> = session.named_pending().into_keys().collect();
+            let declared: BTreeSet<String> = before
+                .keys()
+                .filter(|name| workflow.trains(name))
+                .cloned()
+                .collect();
+            assert_eq!(
+                reached, declared,
+                "{workflow:?}: Workflow::trains must equal the native autograd partition"
+            );
+            let unreached = before.len() - declared.len();
+            match workflow {
+                Workflow::Captioned => assert!(
+                    unreached > 0,
+                    "a captioned run must leave the reference-only factors unreached"
+                ),
+                Workflow::PairedEdit => assert_eq!(unreached, 0),
+            }
+            session.optimizer_update(1.0, 0.05, &flag).unwrap();
+            let after = factor_bits(&session);
+            for (name, bits) in &before {
+                if !workflow.trains(name) {
+                    assert_eq!(
+                        &after[name], bits,
+                        "{workflow:?}: unreached {name} must be neither stepped nor decayed"
+                    );
+                } else if name.ends_with(".lora_B.weight") {
+                    assert_ne!(
+                        &after[name], bits,
+                        "{workflow:?}: reached {name} must update"
+                    );
+                }
+            }
+        }
+    }
+    /// PR #1288 review: a TRAINED export (not a hand-made fixture) loads through the public
+    /// provider path SceneWorks uses, `LoadSpec.adapters` -> `load("flux3_klein_base")` ->
+    /// `generate`, applies on every trained projection, changes the image, and is inert at 0.
+    #[test]
+    fn trained_export_loads_through_the_public_base_provider_and_changes_generation() {
+        use gen_core::flux3::{AUTOENCODER_COMPONENT, TEXT_ENCODER_COMPONENT};
+        use gen_core::{
+            GenerationOutput, GenerationRequest, Generator, LoadSpec, Precision, WeightsSource,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, _) = session();
+        let req = request(dir.path(), false);
+        let output = run(&mut session, &req, &plan(&req), &mut |_| {}).unwrap();
+        let registry = crate::provider_registry().unwrap();
+        let spec_with = |adapters: Vec<AdapterSpec>| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(fixtures().join("tiny-base-snapshot")));
+            spec.precision = Precision::Fp32;
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(fixtures().join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                AUTOENCODER_COMPONENT.into(),
+                WeightsSource::File(fixtures().join("tiny-snapshot/ae.safetensors")),
+            );
+            spec.adapters = adapters;
+            spec
+        };
+        let generation = GenerationRequest {
+            prompt: "a red fox in the snow".into(),
+            width: 80,
+            height: 64,
+            steps: Some(3),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let render = |generator: &dyn Generator| -> Vec<u8> {
+            generator.validate(&generation).unwrap();
+            let GenerationOutput::Images(images) =
+                generator.generate(&generation, &mut |_| {}).unwrap()
+            else {
+                panic!("image output required")
+            };
+            assert_eq!((images[0].width, images[0].height), (80, 64));
+            images[0].pixels.clone()
+        };
+        let bare = render(
+            registry
+                .load("flux3_klein_base", &spec_with(vec![]))
+                .unwrap()
+                .as_ref(),
+        );
+        let trained = AdapterSpec::new(output.adapter_path.clone(), 1.0, AdapterKind::Lora);
+        let adapted = registry
+            .load("flux3_klein_base", &spec_with(vec![trained.clone()]))
+            .unwrap();
+        assert_eq!(adapted.descriptor().id, "flux3_klein_base");
+        let reports = adapted.adapter_apply_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].applied, 54, "every trained projection applies");
+        assert!(reports[0].skipped.is_empty());
+        assert_ne!(
+            render(adapted.as_ref()),
+            bare,
+            "the trained adapter must change the generated image"
+        );
+        let mut inert = trained;
+        inert.scale = 0.0;
+        let zero = registry
+            .load("flux3_klein_base", &spec_with(vec![inert]))
+            .unwrap();
+        assert_eq!(render(zero.as_ref()), bare, "scale 0 must be bit-inert");
     }
 }

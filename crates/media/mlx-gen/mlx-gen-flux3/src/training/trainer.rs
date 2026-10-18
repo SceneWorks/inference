@@ -135,17 +135,28 @@ pub(crate) struct MlxSession {
     pub accumulation: u32,
     pending: LoraParams,
 }
+/// The run policy a session is built with (kept apart from the graph/state arguments so the
+/// constructor stays within the workspace's clippy argument budget).
+pub(crate) struct SessionPolicy {
+    pub options: TrainingOptions,
+    pub identity: ResumeIdentity,
+    pub seed: u64,
+    pub accumulation: u32,
+}
 impl MlxSession {
     pub fn new(
         graph: TrainingGraph,
         params: LoraParams,
         optimizer: SourceAdamW,
         examples: Vec<CachedExample>,
-        options: TrainingOptions,
-        identity: ResumeIdentity,
-        seed: u64,
-        accumulation: u32,
+        policy: SessionPolicy,
     ) -> Result<Self> {
+        let SessionPolicy {
+            options,
+            identity,
+            seed,
+            accumulation,
+        } = policy;
         graph.validate_factors(&params)?;
         if examples.is_empty() || accumulation == 0 {
             return Err(invalid("empty prepared cache or invalid accumulation"));
@@ -317,6 +328,12 @@ impl SourceTrainingSession for MlxSession {
                 eval([&loss])?;
                 raw_loss += loss.item::<f32>() / scale / indices.len() as f32;
                 for (name, gradient) in grads {
+                    // The functional gradient returns ZEROS for factors this workflow's graph
+                    // never reaches (the reference-only projections of a captioned run); the
+                    // source leaves their `.grad` None and AdamW skips them, so never pend them.
+                    if !self.options.workflow.trains(&name) {
+                        continue;
+                    }
                     let next = match self.pending.remove(&name) {
                         Some(previous) => previous.add(&gradient)?,
                         None => gradient,
@@ -338,9 +355,22 @@ impl SourceTrainingSession for MlxSession {
     ) -> gen_core::Result<()> {
         let result = (|| -> Result<()> {
             check(flag)?;
-            if self.pending.len() != self.params.len() {
+            let workflow = self.options.workflow;
+            let reached = self
+                .params
+                .keys()
+                .filter(|name| workflow.trains(name))
+                .count();
+            if reached == 0 {
                 return Err(invalid(
-                    "pending gradients do not cover every declared trainable factor",
+                    "no declared adapter target affects this workflow; refusing simulated training",
+                ));
+            }
+            if self.pending.len() != reached
+                || self.pending.keys().any(|name| !workflow.trains(name))
+            {
+                return Err(invalid(
+                    "pending gradients are not exactly the factors this workflow reaches",
                 ));
             }
             let mut total = Array::from_f32(0.0);
@@ -703,10 +733,12 @@ fn execute(
         params,
         SourceAdamW::new(req.config.learning_rate, req.config.weight_decay)?,
         examples,
-        opts,
-        identity,
-        req.config.seed,
-        req.config.gradient_accumulation,
+        SessionPolicy {
+            options: opts,
+            identity,
+            seed: req.config.seed,
+            accumulation: req.config.gradient_accumulation,
+        },
     )?;
     let output = controller::run(&mut session, req, &plan, on_progress).map_err(Error::from)?;
     check(&req.cancel)?;
@@ -720,6 +752,7 @@ mod tests {
     use super::*;
     use gen_core::flux3::training::policy::SourceLrKind;
     use gen_core::train::{TrainingConfig, TrainingItem};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -751,6 +784,9 @@ mod tests {
         }
     }
     fn session() -> (MlxSession, Flux3Config) {
+        session_for(Workflow::PairedEdit)
+    }
+    fn session_for(workflow: Workflow) -> (MlxSession, Flux3Config) {
         let config = Flux3Config::parse(
             &std::fs::read_to_string(fixtures().join("tiny-base-snapshot/config.json")).unwrap(),
         )
@@ -762,7 +798,7 @@ mod tests {
         )
         .unwrap();
         let golden =
-            Weights::from_file(&fixtures().join("flux3_training_golden.safetensors")).unwrap();
+            Weights::from_file(fixtures().join("flux3_training_golden.safetensors")).unwrap();
         let g = |k: &str| golden.require(k).unwrap().clone();
         let graph = TrainingGraph::new(dit, 3, 1.5, &[]).unwrap();
         let mut params = LoraParams::new();
@@ -783,7 +819,7 @@ mod tests {
                 text: g("text"),
                 text_ids: ids(&g("text_ids")),
                 empty_text: Some(g("text").multiply(Array::from_f32(0.5)).unwrap()),
-                reference: Some(g("reference")),
+                reference: (workflow == Workflow::PairedEdit).then(|| g("reference")),
                 grid: (h, w),
             })
             .collect();
@@ -829,10 +865,15 @@ mod tests {
                 params,
                 SourceAdamW::new(0.0003, 0.0001).unwrap(),
                 examples,
-                options(),
-                identity,
-                73,
-                2,
+                SessionPolicy {
+                    options: TrainingOptions {
+                        workflow,
+                        ..options()
+                    },
+                    identity,
+                    seed: 73,
+                    accumulation: 2,
+                },
             )
             .unwrap(),
             config,
@@ -916,5 +957,142 @@ mod tests {
             54
         );
         assert!(controller::ensure_new_output(&request(a.path(), false)).is_err());
+    }
+    fn factor_bits(session: &MlxSession) -> BTreeMap<String, Vec<u32>> {
+        session
+            .params
+            .iter()
+            .map(|(name, array)| (name.to_string(), host_bits(array).unwrap()))
+            .collect()
+    }
+    /// PR #1288 review, the MLX mirror of the Candle runner case: `keyed_value_and_grad`
+    /// returns zeros for factors the workflow's graph never reaches, so the session must pend,
+    /// step and decay EXACTLY the `Workflow::trains` partition (which the Candle twin pins against
+    /// its native autograd), leaving every unreached factor bit-identical and without a moment.
+    #[test]
+    fn each_workflow_steps_exactly_the_factors_its_graph_reaches() {
+        for workflow in [Workflow::Captioned, Workflow::PairedEdit] {
+            let (mut session, _) = session_for(workflow);
+            let flag = CancelFlag::new();
+            let before = factor_bits(&session);
+            session.micro_batch(&[0], 0, &flag).unwrap();
+            let pending: BTreeSet<String> = session
+                .pending
+                .keys()
+                .map(|name| name.to_string())
+                .collect();
+            let declared: BTreeSet<String> = before
+                .keys()
+                .filter(|name| workflow.trains(name))
+                .cloned()
+                .collect();
+            assert_eq!(
+                pending, declared,
+                "{workflow:?}: pending must be the reached set"
+            );
+            let unreached = before.len() - declared.len();
+            match workflow {
+                Workflow::Captioned => assert!(
+                    unreached > 0,
+                    "a captioned run must leave the reference-only factors unreached"
+                ),
+                Workflow::PairedEdit => assert_eq!(unreached, 0),
+            }
+            session.optimizer_update(1.0, 0.05, &flag).unwrap();
+            let moments: BTreeSet<String> = session
+                .optimizer
+                .moments
+                .keys()
+                .map(|name| name.to_string())
+                .collect();
+            assert_eq!(
+                moments, declared,
+                "{workflow:?}: AdamW state only for reached factors"
+            );
+            let after = factor_bits(&session);
+            for (name, bits) in &before {
+                if !workflow.trains(name) {
+                    assert_eq!(
+                        &after[name], bits,
+                        "{workflow:?}: unreached {name} must be neither stepped nor decayed"
+                    );
+                } else if name.ends_with(".lora_B.weight") {
+                    assert_ne!(
+                        &after[name], bits,
+                        "{workflow:?}: reached {name} must update"
+                    );
+                }
+            }
+        }
+    }
+    /// PR #1288 review, MLX mirror: a TRAINED export loads through the public provider path,
+    /// `LoadSpec.adapters` -> `load("flux3_klein_base")` -> `generate`, applies on every trained
+    /// projection, changes the image, and is inert at scale 0.
+    #[test]
+    fn trained_export_loads_through_the_public_base_provider_and_changes_generation() {
+        use gen_core::{GenerationOutput, GenerationRequest, Generator};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, _) = session();
+        let req = request(dir.path(), false);
+        let output = controller::run(&mut session, &req, &plan(&req), &mut |_| {}).unwrap();
+        let registry = crate::provider_registry().unwrap();
+        let spec_with = |adapters: Vec<AdapterSpec>| {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(fixtures().join("tiny-base-snapshot")));
+            spec.precision = Precision::Fp32;
+            spec.components.insert(
+                TEXT_ENCODER_COMPONENT.into(),
+                WeightsSource::Dir(fixtures().join("tiny-snapshot/text_encoder")),
+            );
+            spec.components.insert(
+                AUTOENCODER_COMPONENT.into(),
+                WeightsSource::File(fixtures().join("tiny-snapshot/ae.safetensors")),
+            );
+            spec.adapters = adapters;
+            spec
+        };
+        let generation = GenerationRequest {
+            prompt: "a red fox in the snow".into(),
+            width: 80,
+            height: 64,
+            steps: Some(3),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let render = |generator: &dyn Generator| -> Vec<u8> {
+            generator.validate(&generation).unwrap();
+            let GenerationOutput::Images(images) =
+                generator.generate(&generation, &mut |_| {}).unwrap()
+            else {
+                panic!("image output required")
+            };
+            assert_eq!((images[0].width, images[0].height), (80, 64));
+            images[0].pixels.clone()
+        };
+        let bare = render(
+            registry
+                .load("flux3_klein_base", &spec_with(vec![]))
+                .unwrap()
+                .as_ref(),
+        );
+        let trained = AdapterSpec::new(output.adapter_path.clone(), 1.0, AdapterKind::Lora);
+        let adapted = registry
+            .load("flux3_klein_base", &spec_with(vec![trained.clone()]))
+            .unwrap();
+        assert_eq!(adapted.descriptor().id, "flux3_klein_base");
+        let reports = adapted.adapter_apply_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].applied, 54, "every trained projection applies");
+        assert!(reports[0].skipped.is_empty());
+        assert_ne!(
+            render(adapted.as_ref()),
+            bare,
+            "the trained adapter must change the generated image"
+        );
+        let mut inert = trained;
+        inert.scale = 0.0;
+        let zero = registry
+            .load("flux3_klein_base", &spec_with(vec![inert]))
+            .unwrap();
+        assert_eq!(render(zero.as_ref()), bare, "scale 0 must be bit-inert");
     }
 }

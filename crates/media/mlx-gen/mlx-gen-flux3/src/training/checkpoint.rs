@@ -463,7 +463,7 @@ pub fn export_adapter(
             "adapter export requires canonical pinned base compatibility identity",
         ));
     }
-    let alpha = graph.scale * graph.rank as f64;
+    let alpha = graph.alpha;
     if !alpha.is_finite() || alpha <= 0.0 {
         return Err(invalid("invalid global LoRA alpha"));
     }

@@ -461,7 +461,7 @@ pub fn export_adapter(
             "mixed per-target ranks cannot be exported as plain global LoRA",
         ));
     }
-    let alpha = graph.scale * rank as f64;
+    let alpha = graph.alpha;
     if !alpha.is_finite() || alpha <= 0.0 {
         return Err(invalid("invalid global LoRA alpha"));
     }

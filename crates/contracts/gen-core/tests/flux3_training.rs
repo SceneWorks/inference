@@ -198,3 +198,67 @@ fn strong_resume_identity_binds_base_artifacts_data_and_every_config_field() {
     malformed.artifacts.values_mut().next().unwrap().clear();
     assert!(malformed.validate().is_err());
 }
+
+fn options_request(model_options: serde_json::Value) -> gen_core::train::TrainingRequest {
+    gen_core::train::TrainingRequest {
+        items: vec![gen_core::train::TrainingItem::captioned(
+            "synthetic/0.png".into(),
+            "synthetic".into(),
+        )],
+        config: gen_core::train::TrainingConfig {
+            optimizer: "adamw".into(),
+            train_dtype: "f32".into(),
+            resolution: 512,
+            timestep_type: "uniform".into(),
+            model_options: model_options.as_object().unwrap().clone(),
+            ..Default::default()
+        },
+        output_dir: "synthetic-out".into(),
+        file_name: "adapter.safetensors".into(),
+        trigger_words: vec![],
+        cancel: gen_core::CancelFlag::new(),
+    }
+}
+
+/// The source options live in the `model_options["flux3"]` bag (strict), while the host's
+/// product keys beside it (SceneWorks forwards its whole `advanced` object) are not FLUX3 options.
+#[test]
+fn source_options_are_read_strictly_from_the_namespaced_bag() {
+    use options::{TrainingOptions, Workflow, OPTIONS_KEY};
+    assert_eq!(OPTIONS_KEY, "flux3");
+    let product = serde_json::json!({
+        "mixedPrecision": "f32", "cacheLatents": true, "qualityPreset": "balanced",
+        "flux3": {"weighting_scheme": "cosmap", "caption_dropout": 0.25, "max_grad_norm": 0.5}
+    });
+    let parsed = TrainingOptions::parse(&options_request(product)).unwrap();
+    assert_eq!(parsed.weighting, Weighting::Cosmap);
+    assert_eq!(parsed.caption_dropout, 0.25);
+    assert_eq!(parsed.max_grad_norm, 0.5);
+    assert_eq!(parsed.workflow, Workflow::Captioned);
+    // Absent bag: the source defaults (uniform density -> weighting `none`).
+    let defaults = TrainingOptions::parse(&options_request(serde_json::json!({}))).unwrap();
+    assert_eq!(defaults.weighting, Weighting::None);
+    assert_eq!(defaults.max_sequence_length, 512);
+    for refused in [
+        serde_json::json!({"flux3": {"use_dora": false, "typo_option": 1}}),
+        serde_json::json!({"flux3": {"use_dora": true}}),
+        serde_json::json!({"flux3": "cosmap"}),
+    ] {
+        assert!(
+            TrainingOptions::parse(&options_request(refused.clone())).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn captioned_runs_never_reach_the_reference_only_projections() {
+    use options::Workflow;
+    let reference = "content_mode_blocks.image_cond.0.qkv.lora_A.weight";
+    let image = "content_mode_blocks.image.0.qkv.lora_A.weight";
+    assert!(!Workflow::Captioned.trains(reference));
+    assert!(Workflow::Captioned.trains(image));
+    assert!(Workflow::Captioned.trains("single_blocks.0.linear1.lora_B.weight"));
+    assert!(Workflow::PairedEdit.trains(reference));
+    assert!(Workflow::PairedEdit.trains(image));
+}

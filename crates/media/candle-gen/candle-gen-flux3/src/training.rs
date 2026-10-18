@@ -24,6 +24,9 @@ pub struct TrainingGraph {
     pub dit: Flux3Dit,
     pub factors: Vec<LoraFactors>,
     pub scale: f64,
+    /// The configured global LoRA alpha, exported verbatim (never re-derived as `scale * rank`,
+    /// which rounds, e.g. 29/7*7 = 29.000000000000004).
+    pub alpha: f64,
 }
 
 impl TrainingGraph {
@@ -81,6 +84,7 @@ impl TrainingGraph {
             dit,
             factors,
             scale,
+            alpha,
         })
     }
 

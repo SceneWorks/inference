@@ -91,7 +91,7 @@ fn all_six_projection_families_match_two_adamw_steps() {
                 let mut config = tiny_config();
                 config.dit.flow_map = false;
                 let mut weights =
-                    Weights::from_file(&tiny_package().join("model.safetensors")).unwrap();
+                    Weights::from_file(tiny_package().join("model.safetensors")).unwrap();
                 let remove = weights
                     .keys()
                     .filter(|key| key.starts_with("ref_time_in."))
