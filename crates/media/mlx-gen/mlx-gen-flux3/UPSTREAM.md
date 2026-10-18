@@ -98,6 +98,19 @@ rounded to bf16 before the add (the Python-float `dt` itself is never rounded); 
 The port mirrors this at `Precision::Bf16` (the default) and runs everything in f32 at
 `Precision::Fp32` (the oracle's CPU path, which has no autocast). The autoencoder is f32 on both.
 
+## Reference output envelope (S3)
+
+Frozen `generate.py:65..77` requires positive 16-pixel-grid output sides; `pipeline.MIN_SIDE`
+(64) is the **single-reference padding** floor, not the multi-reference or decoder kernel floor.
+Reference-derived 16/32/48-pixel sides are therefore accepted, including after the memory scope
+normalizes the numeric request canvas. Plain no-reference requests retain their existing 64-pixel
+minimum.
+
+Both native providers retain their existing advertised **4096-pixel output-side ceiling**
+(`model::MAX_SIZE`). This is an explicit native allocation-envelope deviation, not an upstream
+renderer or kernel limit: larger explicit canvases or very wide multi-reference canvases are
+refused before generation rather than expanding that public envelope without validation.
+
 ## Fixtures
 
 `tests/fixtures/tiny-snapshot/` is a miniature package in the released layout
