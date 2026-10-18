@@ -526,6 +526,20 @@ impl Flux3Config {
                 self.dit.flow_map, self.sampler.guidance
             )));
         }
+        // The base checkpoint's defaults are the frozen source's `pipeline.MODELS["base"]`
+        // (50 steps, CFG 3.5), not whatever a package's descriptive config.json claims. A config
+        // that disagrees is not the pinned release, so refuse it rather than pick either value.
+        if !self.dit.flow_map
+            && (self.sampler.steps != BASE_DEFAULT_STEPS
+                || self.sampler.guidance != Some(f64::from(BASE_DEFAULT_GUIDANCE)))
+        {
+            return Err(Error::Unsupported(format!(
+                "flux3: base config.json sampler = {} steps / guidance {:?}, but the frozen base \
+                 defaults are {BASE_DEFAULT_STEPS} steps / guidance {BASE_DEFAULT_GUIDANCE}; this is \
+                 not the pinned base package",
+                self.sampler.steps, self.sampler.guidance
+            )));
+        }
         Ok(())
     }
 
@@ -952,12 +966,8 @@ impl GenerationParams {
         let guidance = if config.dit.flow_map {
             None
         } else {
-            let g = req.guidance.unwrap_or(
-                config
-                    .sampler
-                    .guidance
-                    .unwrap_or(BASE_DEFAULT_GUIDANCE as f64) as f32,
-            );
+            // Frozen `pipeline.MODELS["base"]`; validate_supported refuses a disagreeing config.
+            let g = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
             if !g.is_finite() || g < 0.0 {
                 return Err(Error::Unsupported(
                     "flux3: CFG guidance must be finite and non-negative".into(),
@@ -965,7 +975,12 @@ impl GenerationParams {
             }
             Some(g)
         };
-        let steps = req.steps.unwrap_or(config.sampler.steps);
+        let default_steps = if config.dit.flow_map {
+            config.sampler.steps
+        } else {
+            BASE_DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps);
         if steps == 0 {
             return Err(Error::Msg("flux3: steps must be >= 1".into()));
         }
@@ -1274,6 +1289,33 @@ mod tests {
     }
 
     #[test]
+    fn base_config_disagreeing_with_frozen_defaults_is_refused() {
+        let mut base = release();
+        base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
+        base.sampler.guidance = Some(3.5);
+        base.validate_supported().unwrap();
+        for (steps, guidance) in [(16, Some(3.5)), (50, Some(4.0)), (28, Some(2.5))] {
+            let mut wrong = base.clone();
+            wrong.sampler.steps = steps;
+            wrong.sampler.guidance = guidance;
+            assert!(
+                matches!(wrong.validate_supported(), Err(Error::Unsupported(_))),
+                "{steps}/{guidance:?}"
+            );
+        }
+        // Defaults come from the frozen constants even when the config field is ignored.
+        let mut drifted = base.clone();
+        drifted.sampler.steps = 7;
+        drifted.sampler.guidance = Some(9.0);
+        let p = GenerationParams::resolve(&request(), 0, &drifted).unwrap();
+        assert_eq!(
+            (p.steps, p.guidance),
+            (BASE_DEFAULT_STEPS, Some(BASE_DEFAULT_GUIDANCE))
+        );
+    }
+
+    #[test]
     fn base_uses_cfg_defaults_and_explicit_negative_conditioning() {
         let mut base = release();
         base.dit.flow_map = false;
@@ -1409,6 +1451,7 @@ mod tests {
         ));
         let mut base = release();
         base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
         base.sampler.guidance = Some(3.5);
         base.validate_supported().unwrap();
         assert_eq!(

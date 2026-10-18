@@ -128,11 +128,7 @@ impl PromptUpsampler for Flux3PromptUpsampler {
 /// The per-request knobs of the stage, read off a [`GenerationRequest`] (`enhance_prompt`,
 /// `enhance_temperature`, `enhance_max_tokens`, `seed`).
 pub fn options_for(req: &GenerationRequest) -> UpsampleOptions {
-    UpsampleOptions {
-        temperature: req.enhance_temperature,
-        max_tokens: req.enhance_max_tokens,
-        seed: req.seed,
-    }
+    UpsampleOptions::from_generation_request(req)
 }
 
 /// The stage input of the distilled text-to-image route (sc-26234's request surface carries no
