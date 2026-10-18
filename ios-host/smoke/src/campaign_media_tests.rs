@@ -77,7 +77,18 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     assert!(listed.iter().any(|e| e["case"]
         .as_str()
         .unwrap()
-        .starts_with("iris_3b_depth/iris_3b_depth/q8/1024/depth/")));
+        .starts_with("iris_3b_depth/iris_3b_depth/bf16/1024/depth/")));
+    // A tier a route does not serve (the dense-only Iris tasks at q8) is listed as unserved, never
+    // silently dropped and never a planned cell.
+    assert!(listing["unserved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["provider"] == "iris_3b_depth" && u["tier"] == "q8"));
+    assert!(!listed.iter().any(|e| e["case"]
+        .as_str()
+        .unwrap()
+        .starts_with("iris_3b_depth/iris_3b_depth/q8/")));
     assert!(listed.iter().any(|e| e["case"]
         .as_str()
         .unwrap()

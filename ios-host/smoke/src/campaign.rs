@@ -68,6 +68,13 @@ impl Surface {
 
     /// The fully optimized `(rung, selection)` of a tier: the deepest rung the provider implements
     /// above rung 0, at its LAST (cheapest) selection; `None` when it implements none.
+    /// Whether the provider serves `tier` at all: its contract declares a selection space for some
+    /// rung at that tier (a route with no declared rung at a tier — e.g. a dense-only task asked for
+    /// q4 — is not an anchor family; the listing reports it as unserved).
+    pub fn serves(&self, tier: &str) -> bool {
+        self.selections.keys().any(|(t, _)| t == tier)
+    }
+
     pub fn optimized(&self, tier: &str) -> Option<(u8, String)> {
         (1..=4u8).rev().find_map(|rung| {
             self.selections
@@ -177,7 +184,7 @@ pub struct Planned {
 }
 
 /// The anchor campaign, derived from the runner's own catalog (never a hand list): per provider x
-/// route x tier x registered mode, the resident and the optimized anchor at the reference
+/// route x SERVED tier ([`Surface::serves`]) x registered mode, the resident and the optimized anchor at the reference
 /// geometry and [`ANCHOR_STEPS`]; plus the two validation cases on the FIRST family (catalog order,
 /// lowest tier) that has an optimized anchor. A family whose provider implements no rung above 0
 /// has only its resident anchor (and so nothing derivable). A new provider/mode is visible
@@ -189,7 +196,7 @@ pub fn enumerate(surfaces: &[Surface]) -> Vec<Planned> {
     for s in surfaces {
         let edge = reference_edge(&s.provider);
         for route in &s.routes {
-            for tier in ["q4", "q8", "bf16"] {
+            for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
                 for mode in &s.modes {
                     let case = |rung: u8, selection: String, steps: u32| Case {
                         provider: s.provider.clone(),
@@ -361,7 +368,11 @@ mod tests {
             provider: "new_provider".into(),
             routes: vec!["new_provider".into()],
             modes: vec!["text".into(), "reference".into(), "mask".into()],
-            selections: BTreeMap::new(),
+            // Every tier served at rung 0 (its parameterless selection).
+            selections: ["q4", "q8", "bf16"]
+                .into_iter()
+                .map(|t| ((t.to_string(), 0), vec![BASE_SELECTION.to_string()]))
+                .collect(),
         }
     }
     #[test]
@@ -409,6 +420,8 @@ mod tests {
         let mut supra = surface();
         supra.provider = "supra2_img".into();
         supra.routes = vec!["supra2_img".into()];
+        // Supra2 serves q4 only, at rung 0 only (so it has no optimized anchor).
+        supra.selections.retain(|(tier, _), _| tier == "q4");
         let planned = enumerate(&[a.clone(), a.clone(), supra.clone()]);
         let keys: BTreeSet<_> = planned.iter().map(|p| p.case.key()).collect();
         assert_eq!(keys.len(), planned.len(), "no duplicate case");
@@ -416,9 +429,13 @@ mod tests {
             .iter()
             .filter(|p| matches!(p.purpose, Purpose::Resident | Purpose::Optimized))
             .collect();
+        // An unserved tier has no family at all.
+        assert!(!planned
+            .iter()
+            .any(|p| p.case.provider == "supra2_img" && p.case.tier != "q4"));
         for s in [&a, &supra] {
             for route in &s.routes {
-                for tier in ["q4", "q8", "bf16"] {
+                for tier in ["q4", "q8", "bf16"].into_iter().filter(|t| s.serves(t)) {
                     for mode in &s.modes {
                         let family: Vec<_> = anchors
                             .iter()

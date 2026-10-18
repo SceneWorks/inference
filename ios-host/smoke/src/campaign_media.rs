@@ -114,8 +114,21 @@ pub fn surfaces(registry: &ProviderRegistry) -> Vec<Surface> {
 /// repeat count ([`campaign::enumerate`]), derived from the actual runtime catalog.
 pub fn listing() -> Result<String, String> {
     let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
-    let planned = campaign::enumerate(&surfaces(catalog.media()));
-    Ok(json!({"schema": 2,
+    let surfaces = surfaces(catalog.media());
+    let planned = campaign::enumerate(&surfaces);
+    // Visible, never silently dropped: every provider/route/tier it does not serve.
+    let unserved: Vec<Value> = surfaces
+        .iter()
+        .flat_map(|s| {
+            s.routes.iter().flat_map(move |route| {
+                ["q4", "q8", "bf16"]
+                    .into_iter()
+                    .filter(|tier| !s.serves(tier))
+                    .map(move |tier| json!({"provider": s.provider, "route": route, "tier": tier}))
+            })
+        })
+        .collect();
+    Ok(json!({"schema": 2, "unserved": unserved,
         "cases": planned.iter().map(|p| json!({"case": p.case.key(), "purpose": p.purpose.label(), "repeats": p.repeats})).collect::<Vec<_>>(),
         "dependencies": [{"provider":"supra2", "epic":24212, "available": planned.iter().any(|p| p.case.provider.contains("supra")), "reason":"requires native engine and iOS catalog registration; absence is not a passing cell"}]
     }).to_string())
