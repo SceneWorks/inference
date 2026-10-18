@@ -57,7 +57,7 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
     crate::common::on_cpu(|| {
         use mlx_gen::gen_core::flux3::references::ReferenceOutputSize;
         use mlx_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
-        let refs: Vec<Conditioning> = (0..10)
+        let refs: Vec<Conditioning> = (0..10u8)
             .map(|n| {
                 let (w, h) = if n.is_multiple_of(2) {
                     (83, 67)
