@@ -444,6 +444,8 @@ impl HdrRequest {
 pub struct GenerationRequest {
     // --- Core ---
     pub prompt: String,
+    /// Frozen MOSS controls. None means ordinary inference with acceleration OFF.
+    pub moss_image: Option<crate::moss_image::MossImageOptions>,
     pub negative_prompt: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -1312,6 +1314,7 @@ impl Default for GenerationRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            moss_image: None,
             negative_prompt: None,
             width: 1024,
             height: 1024,
@@ -1600,6 +1603,8 @@ impl GenerationRequest {
             // Non-float fields: explicitly ignored, but named (no `..`) so a newly-added field breaks
             // the build here and the author must classify it.
             prompt: _,
+            // MOSS sub-block floats join the floor through its exhaustive helper below.
+            moss_image,
             negative_prompt: _,
             width: _,
             height: _,
@@ -1677,6 +1682,9 @@ impl GenerationRequest {
             pid_capture_sigma,
             text_style_gain,
         } = self;
+        if let Some(nonfinite) = moss_image.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
             ("true_cfg", *true_cfg),
@@ -3644,6 +3652,13 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.moss_image.is_some()
+            && crate::moss_image::MossImageVariant::from_provider_id(id).is_none()
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: MOSS controls require a MOSS-Image provider"
+            )));
+        }
         if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
             return Err(Error::Unsupported(format!(
                 "{id}: Veda attention requires MiniMax-H3"
