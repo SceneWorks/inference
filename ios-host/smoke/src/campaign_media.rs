@@ -431,8 +431,10 @@ fn load_spec(c: &Case, source: WeightsSource) -> Result<LoadSpec, String> {
         id if runtime_ios::media::zimage::is_z_image(id) => {
             runtime_ios::media::zimage::z_image_turbo_load_spec(source, None)
         }
+        // Deferred: Iris's rung 4 (streamed text-tower layers and backbone blocks) exists only on a
+        // deferred load, and the fully optimized anchor is rung 4.
         id if id.starts_with("iris_") => {
-            LoadSpec::new(source).with_load_shape(LoadShape::EagerMaterialization)
+            LoadSpec::new(source).with_load_shape(LoadShape::DeferredMaterialization)
         }
         _ => LoadSpec::new(source)
             .with_offload_policy(OffloadPolicy::Sequential)
