@@ -122,6 +122,8 @@ impl IosPricing {
 /// text window. Exactly the memory-relevant facts of the iOS evidence key.
 #[derive(Clone, Copy, Debug)]
 pub struct IosPricingRequest<'a> {
+    /// The registered memory-strategy provider id (e.g. `sana_sprint_1600m`, `iris_3b_restore`).
+    pub provider: &'a str,
     pub spec: &'a LoadSpec,
     pub mode: &'a MemoryMode,
     pub geometry: MemoryGeometry,
