@@ -271,7 +271,7 @@ pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
     build_vae(&mut w)
 }
 
-fn build_vae(w: &mut Weights) -> Result<Vae> {
+pub(crate) fn build_vae(w: &mut Weights) -> Result<Vae> {
     remap_vae_decoder(w)?;
     remap_vae_encoder(w)?;
     Vae::from_weights(w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(

@@ -42,6 +42,28 @@ impl DownSampler {
         )
     }
 
+    /// The downsample over output cores of at most `tile` pixels a side with exact halos (the
+    /// bounded encode, sc-26433): the shared [`mlx_gen::vae_tiling::downsample_tiled_nhwc`] — one
+    /// tiled iOS stage, every tile checked before its graph — under Z-Image's labels. NCHW I/O.
+    pub(crate) fn forward_tiled(
+        &self,
+        x_nchw: &Array,
+        tile: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        let h = mlx_gen::vae_tiling::downsample_tiled_nhwc(
+            &x,
+            &self.w,
+            &self.b,
+            tile,
+            cancel,
+            crate::quantum::VAE_TILED_STAGE,
+            crate::quantum::VAE_TILE,
+        )?;
+        Ok(h.transpose_axes(&[0, 3, 1, 2])?)
+    }
+
     /// The `[out, 3, 3, in]` NHWC conv weight (for the iOS convolution accounting proofs).
     #[cfg(test)]
     pub(crate) fn weight(&self) -> &Array {

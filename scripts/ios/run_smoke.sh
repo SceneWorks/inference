@@ -45,7 +45,8 @@ while [ $# -gt 0 ]; do
     # reports "skipped" rather than failing.
     --media)  CARGO_FEATURES="--features media"; shift ;;
     # One bounded CAPTURE of a Z-Image Turbo campaign case (IOS_SMOKE_ZIMAGE_CASE, default
-    # z_image_turbo/z_image_turbo/q4/1024/text/4) through the capture permit (sc-26433); needs the
+    # z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit) through the capture
+    # permit (sc-26433); off-device or without a provisioned slot it skips; needs the
     # campaign slot (scripts/ios/push_model.sh <tier-dir> --campaign-route z_image_turbo --tier q4).
     --zimage) CARGO_FEATURES="--features media,zimage"; shift ;;
     # The measurement lane: LLM loads have no footprint estimate, so iOS admission
@@ -53,7 +54,7 @@ while [ $# -gt 0 ]; do
     # produce that estimate, and the report's "iOS admission lane" line says so.
     --unadmitted) export IOS_SMOKE_UNADMITTED=1; shift ;;
     --campaign-case)
-      [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung" >&2; exit 2; }
+      [ $# -ge 2 ] || { echo "--campaign-case needs provider/route/tier/edge/mode/rung/selection" >&2; exit 2; }
       export IOS_CAMPAIGN_CASE="$2"; CARGO_FEATURES="--features media"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
     --campaign-timeout) export IOS_CAMPAIGN_TIMEOUT_SECONDS="$2"; shift 2 ;;

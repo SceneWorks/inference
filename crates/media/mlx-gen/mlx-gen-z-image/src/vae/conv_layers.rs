@@ -36,6 +36,26 @@ impl ConvLayer {
         Ok(h.transpose_axes(&[0, 3, 1, 2])?) // NCHW
     }
 
+    /// The 3×3 convolution layer-wise tiled with exact halos (the bounded encode's `conv_in`): one
+    /// tiled iOS stage, every tile checked before its graph. NCHW I/O.
+    pub(crate) fn forward_tiled(
+        &self,
+        x_nchw: &Array,
+        tile_edge: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let x = x_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        crate::quantum::before_tiled_stage(x.shape(), x.item_size() as u64, &self.w, false)?;
+        let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
+            crate::quantum::before_tile(tile, &self.w)?;
+            Ok(tile.clone())
+        })?;
+        if mlx_gen::ios_quantum::enabled() {
+            mlx_gen::ios_quantum::finish(crate::quantum::VAE_TILED_STAGE, &[&h])?;
+        }
+        Ok(h.transpose_axes(&[0, 3, 1, 2])?)
+    }
+
     /// Final VAE `GroupNorm → SiLU → conv_out`, preserving full-image normalization while bounding
     /// the 3×3 convolution (sc-19753).
     pub fn forward_tiled_after_norm(

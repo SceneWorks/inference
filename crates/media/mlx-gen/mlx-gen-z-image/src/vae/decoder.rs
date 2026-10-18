@@ -14,6 +14,10 @@ use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
+/// The input-pixel tile edge of the bounded encode on iOS (sc-26433, as SDXL's): every
+/// full-resolution encoder convolution works on at most this many pixels a side (plus its halo).
+pub const IOS_ENCODE_TILE_PX: i32 = 256;
+
 /// Per-up-block `(num_resnet_layers, add_upsample)`.
 #[derive(Debug, Clone)]
 pub struct VaeDecoderConfig {
@@ -304,9 +308,35 @@ impl Vae {
         } else {
             image.clone()
         };
+        // iOS: the bounded encode at `IOS_ENCODE_TILE_PX` (an image that fits one tile takes the
+        // whole-image encode); everywhere else the historical whole-image encode, byte for byte.
+        let (h, w) = (image4.shape()[2], image4.shape()[3]);
+        if mlx_gen::ios_quantum::enabled() && (h > IOS_ENCODE_TILE_PX || w > IOS_ENCODE_TILE_PX) {
+            return self.encode_tiled(&image4, IOS_ENCODE_TILE_PX, None);
+        }
         encoder.forward_then(&image4, Self::latent_mean_bytes(&image4), |h| {
             self.latent_mean(h)
         })
+    }
+
+    /// The bounded encode ([`Encoder::forward_tiled_then`]) of an NCHW image at `tile_px` input
+    /// pixels a side, mapped to latent space like [`Self::encode`].
+    pub(crate) fn encode_tiled(
+        &self,
+        image4: &Array,
+        tile_px: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+    ) -> Result<Array> {
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("z_image VAE encoder not loaded (img2img unavailable)".into())
+        })?;
+        encoder.forward_tiled_then(
+            image4,
+            tile_px,
+            cancel,
+            Self::latent_mean_bytes(image4),
+            |h| self.latent_mean(h),
+        )
     }
 
     /// The latent mean's price inside the encoder's output-head quantum: the selected half and the

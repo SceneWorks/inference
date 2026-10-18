@@ -624,16 +624,29 @@ fn campaign_cells_execute_their_own_declared_selection() {
             .map(|c| c.selection.clone())
             .collect::<Vec<_>>()
     };
-    // Z-Image rung 4: tile x window scope, quality first (largest tile, DiT-only scope first).
+    // Z-Image rung 4: staging x window scope x tile, quality first (unstaged, DiT-only scope,
+    // largest tile first; staged, both streamed, smallest tile last).
     let z = tokens("z_image_turbo/z_image_turbo/bf16/1024/text/4");
-    assert_eq!(z.len(), 7 * 3, "{z:?}");
+    assert_eq!(z.len(), 2 * 3 * 7, "{z:?}");
     assert_eq!(z[0], "t768_o64_c67108864_w1_dit");
-    assert_eq!(z[z.len() - 1], "t256_o64_c67108864_w1_both");
+    assert_eq!(z[1], "t640_o64_c67108864_w1_dit");
+    assert_eq!(z[z.len() - 1], "s_t256_o64_c67108864_w1_both");
     assert!(z.contains(&"t512_o64_c67108864_w1_te".to_string()));
-    // SANA rung 2 enumerates every declared tile; SDXL rung 2 its native route's tiles.
+    assert!(z.contains(&"s_t512_o64_c67108864_w1_dit".to_string()));
+    // SANA rung 2 enumerates every declared tile (then the same staged); SDXL rung 2 its native
+    // route's tiles.
     assert_eq!(
         tokens("sana_1600m/sana_1600m/q4/1024/text/2"),
-        ["t512_o48", "t384_o48", "t256_o48", "t192_o48"]
+        [
+            "t512_o48",
+            "t384_o48",
+            "t256_o48",
+            "t192_o48",
+            "s_t512_o48",
+            "s_t384_o48",
+            "s_t256_o48",
+            "s_t192_o48"
+        ]
     );
     let sdxl = tokens("sdxl/sdxl/q4/1024/text/2");
     assert_eq!(sdxl[0], "t896_o64");
@@ -691,9 +704,11 @@ fn campaign_cells_execute_their_own_declared_selection() {
         assert!(key.contains(&format!("{want:?}")), "{key}");
     }
     let (parameters, memory, key) =
-        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/t512_o64_c67108864_w1_dit");
+        selected("z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit");
     assert_eq!(parameters.decode_tile_edge, Some(512));
     assert_eq!(memory.decode_tile_edge, Some(512));
+    assert!(memory.stage_residency, "the staged selection evicts phases");
+    assert!(key.contains("stage_residency: Some(true)"), "{key}");
     let (_, _, first) =
         selected("z_image_turbo/z_image_turbo/q4/1024/text/4/t768_o64_c67108864_w1_dit");
     assert_ne!(key, first, "the evidence key separates the selections");

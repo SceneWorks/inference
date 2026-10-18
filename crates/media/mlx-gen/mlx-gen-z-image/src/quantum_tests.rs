@@ -777,6 +777,111 @@ fn assert_refused_at<T>(
     events
 }
 
+/// The bounded encode (sc-26433): the iOS img2img / control encode of an image larger than
+/// `IOS_ENCODE_TILE_PX` runs layer-tiled — `conv_in`, the resnets and the stride-2 downsample each
+/// one tiled stage whose tiles are each checked before their graph — and matches the whole-image
+/// encode within the cross-graph parity standard (1e-5 of `max(1, peak)`: the tiled convolutions
+/// are different graphs). Off device `Vae::encode` stays the whole-image encode; a smaller image
+/// takes it on device too. A tile short of headroom refuses before its graph.
+#[test]
+fn bounded_encode_matches_the_whole_image_encode_and_checks_every_tile() {
+    if !in_cpu_child("bounded_encode_matches_the_whole_image_encode_and_checks_every_tile") {
+        return;
+    }
+    let vae = vae();
+    let image = rand(&[1, 3, 40, 40], 77, Dtype::Float32);
+    let whole = vae.encode(&image).unwrap();
+    let tiled = vae.encode_tiled(&image, 16, None).unwrap();
+    assert_eq!(tiled.shape(), whole.shape());
+    let (got, want) = (bits(&tiled), bits(&whole));
+    let peak = want
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(f32::from_bits(v).abs()));
+    let delta = got.iter().zip(&want).fold(0.0f32, |m, (&g, &v)| {
+        m.max((f32::from_bits(g) - f32::from_bits(v)).abs())
+    });
+    eprintln!("bounded encode: max delta {delta:.3e} (peak {peak:.3e})");
+    assert!(
+        delta <= 1e-5 * peak.max(1.0),
+        "the bounded encode moved {delta:.3e} from the whole-image encode (peak {peak:.3e})"
+    );
+    // Guarded: the same graph, bit for bit; every layer one stage (conv_in, the two resnets, the
+    // downsample) and every stage's tiles checked inside it, before their graphs.
+    let (guarded, events) = observed(AMPLE, || vae.encode_tiled(&image, 16, None));
+    assert_eq!(bits(&guarded.unwrap()), got);
+    assert_checked_before_synchronized(&events);
+    let all = checks(&events);
+    let stages: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, (l, _))| l == crate::quantum::VAE_TILED_STAGE)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        stages.len(),
+        4,
+        "conv_in, resnet, downsample, resnet: {all:?}"
+    );
+    for (n, &at) in stages.iter().enumerate() {
+        let end = stages.get(n + 1).copied().unwrap_or(all.len());
+        assert!(
+            all[at + 1..end]
+                .iter()
+                .filter(|(l, _)| l == crate::quantum::VAE_TILE)
+                .count()
+                > 1,
+            "stage {n} checks each of its tiles: {all:?}"
+        );
+    }
+    let (conv_in, downs, _, _) = vae.encoder().unwrap().parts();
+    assert_eq!(
+        all[stages[0]].1,
+        mlx_gen::ios_quantum::tiled_stage_bytes(&[1, 40, 40, 3], 3, 32, 4, false),
+        "conv_in's stage price"
+    );
+    let ds = downs[0].parts().1.unwrap();
+    assert_eq!(
+        all[stages[2]].1,
+        mlx_gen::ios_quantum::downsample_stage_bytes(&[1, 20, 20, 32], 4),
+        "the downsample's stage price"
+    );
+    assert!(
+        all[stages[2] + 1].1
+            == mlx_gen::ios_quantum::downsample_tile_bytes(
+                &[1, 17, 17, 32],
+                4,
+                ds.weight(),
+                mlx_gen::ios_quantum::Backend::Cpu
+            ),
+        "the downsample's first tile price: {all:?}"
+    );
+    let _ = conv_in;
+    // Routing: on device an image larger than the iOS tile edge takes the bounded encode; off
+    // device, or for an image within one tile, the whole-image encode (no tiled stage).
+    let edge = crate::vae::decoder::IOS_ENCODE_TILE_PX + 8;
+    let big = rand(&[1, 3, edge, edge], 78, Dtype::Float32);
+    let (routed, events) = observed(AMPLE, || vae.encode(&big));
+    assert!(checks(&events)
+        .iter()
+        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+    assert_eq!(
+        bits(&routed.unwrap()),
+        bits(
+            &vae.encode_tiled(&big, crate::vae::decoder::IOS_ENCODE_TILE_PX, None)
+                .unwrap()
+        )
+    );
+    let (_, events) = observed(AMPLE, || vae.encode(&image));
+    assert!(!checks(&events)
+        .iter()
+        .any(|(l, _)| l == crate::quantum::VAE_TILED_STAGE));
+    // A tile short of headroom refuses before its graph: nothing after it is checked.
+    let events = assert_refused_at(crate::quantum::VAE_TILE, all[stages[0] + 1].1, || {
+        vae.encode_tiled(&image, 16, None)
+    });
+    assert_eq!(checks(&events), all[..=stages[0]].to_vec());
+}
+
 /// The pre-load floors: each is checked against the header bytes of exactly what its load reads
 /// (a rung-4 load: everything but the streamed block bodies) BEFORE any tensor is read — the fake
 /// components here are not even loadable, so a load that read first would fail differently.

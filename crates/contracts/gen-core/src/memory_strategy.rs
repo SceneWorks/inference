@@ -2083,15 +2083,18 @@ impl MemoryProviderContract {
 
     /// Every selection this provider declares it can execute at `strategy` — the full product of
     /// the parameter domains of every rung the strategy engages (the decode route's tile edges and
-    /// overlaps, the attention chunk sizes, the transformer window sizes and components), each one
+    /// overlaps, the attention chunk sizes, the transformer window sizes and components) and, where
+    /// the provider implements staged residency but the strategy does not already engage it, the
+    /// optional phase eviction (`stage_residency: Some(true)`); each one
     /// [`validate_selection`](Self::validate_selection)-checked; never empty (a strategy with no
     /// declared parameters is its single parameterless selection).
     ///
     /// Ordered QUALITY FIRST, cheapest last: within each lever the most resident / largest value
-    /// first (the largest decode tile and overlap, the largest attention chunk and transformer
-    /// window, the narrowest window scope `Dit` → `TextEncoder` → `Both`), the tile edge varying
-    /// fastest, then the overlap, chunk, window size and component. A capture that refuses at one
-    /// selection can therefore step to the next cheaper one at the same size.
+    /// first (unstaged before staged, the largest decode tile and overlap, the largest attention
+    /// chunk and transformer window, the narrowest window scope `Dit` → `TextEncoder` → `Both`),
+    /// the tile edge varying fastest, then the overlap, chunk, window size, component and staging.
+    /// A capture that refuses at one selection can therefore step to the next cheaper one at the
+    /// same size.
     pub fn selection_space(
         &self,
         strategy: MemoryStrategy,
@@ -2145,26 +2148,40 @@ impl MemoryProviderContract {
                 }
             }
         }
+        let mut stages = vec![representative.parameters.stage_residency];
+        if strategy != MemoryStrategy::Resident
+            && representative.parameters.stage_residency.is_none()
+            && !self.engages(strategy, MemoryStrategy::StagedResidency)
+            && matches!(
+                self.support(MemoryStrategy::StagedResidency),
+                Some(MemoryStrategySupport::Implemented)
+            )
+        {
+            stages.push(Some(true));
+        }
         let mut out = Vec::new();
-        for &component in &components {
-            for &window in &windows {
-                for &chunk in &chunks {
-                    for &overlap in &overlaps {
-                        for &tile in &tiles {
-                            let selection = MemorySelection {
-                                strategy,
-                                parameters: MemoryStrategyParameters {
-                                    decode_tile_edge: tile,
-                                    decode_overlap: overlap,
-                                    attention_chunk_size: chunk,
-                                    transformer_window_size: window,
-                                    transformer_window_component: component,
-                                    ..representative.parameters
-                                },
-                                tier,
-                            };
-                            if self.validate_selection(&selection).is_ok() {
-                                out.push(selection);
+        for &stage_residency in &stages {
+            for &component in &components {
+                for &window in &windows {
+                    for &chunk in &chunks {
+                        for &overlap in &overlaps {
+                            for &tile in &tiles {
+                                let selection = MemorySelection {
+                                    strategy,
+                                    parameters: MemoryStrategyParameters {
+                                        stage_residency,
+                                        decode_tile_edge: tile,
+                                        decode_overlap: overlap,
+                                        attention_chunk_size: chunk,
+                                        transformer_window_size: window,
+                                        transformer_window_component: component,
+                                        ..representative.parameters
+                                    },
+                                    tier,
+                                };
+                                if self.validate_selection(&selection).is_ok() {
+                                    out.push(selection);
+                                }
                             }
                         }
                     }
@@ -6835,7 +6852,21 @@ mod tests {
                 * domain(MemoryStrategy::BoundedTransformerResidency, |p| {
                     p.transformer_window_sizes.len() * p.transformer_window_components.len().max(1)
                 });
+            let staged = strategy != MemoryStrategy::Resident
+                && !contract.engages(strategy, MemoryStrategy::StagedResidency)
+                && matches!(
+                    contract.support(MemoryStrategy::StagedResidency),
+                    Some(MemoryStrategySupport::Implemented)
+                );
+            let expected = expected * if staged { 2 } else { 1 };
             assert_eq!(space.len(), expected, "{strategy:?}: {space:?}");
+            if staged {
+                assert_eq!(space[0].parameters.stage_residency, None, "unstaged first");
+                assert_eq!(
+                    space[space.len() - 1].parameters.stage_residency,
+                    Some(true)
+                );
+            }
             let first = space[0].parameters;
             let last = space[space.len() - 1].parameters;
             if let (Some(a), Some(b)) = (first.decode_tile_edge, last.decode_tile_edge) {

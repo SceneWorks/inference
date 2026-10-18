@@ -940,12 +940,16 @@ fn vae_formulas_track_the_measured_peak() {
     g.vae_attention("a", 32);
     g.conv("up.conv", 64, 64, 3);
     g.conv("down.conv", 64, 64, 3);
+    g.conv("in.conv", 32, 3, 3);
+    g.conv("down32.conv", 32, 32, 3);
     let w = g.weights();
     let r0 = crate::vae::ResnetBlock2D::from_weights(&w, "r0").unwrap();
     let r1 = crate::vae::ResnetBlock2D::from_weights(&w, "r1").unwrap();
     let attn = crate::vae::VaeAttention::from_weights(&w, "a").unwrap();
     let up = crate::vae::UpSampler::from_weights(&w, "up").unwrap();
     let down = crate::vae::DownSampler::from_weights(&w, "down").unwrap();
+    let conv_in = crate::vae::conv_layers::ConvLayer::from_weights(&w, "in").unwrap();
+    let down32 = crate::vae::DownSampler::from_weights(&w, "down32").unwrap();
     w.materialize().unwrap();
     let x = rnd(&[1, 64, 64, 64], 1, 1.0);
     prove("VAE resnet", r0.quantum_scratch(&x, backend), || {
@@ -1008,6 +1012,49 @@ fn vae_formulas_track_the_measured_peak() {
     prove_composite("VAE tiled resnet stage + tile", stage + tile, || {
         Ok(vec![r1.forward_tiled(&x, edge, None)?])
     });
+    // The bounded encode (sc-26433): the tiled `conv_in` over a full-resolution image, and the
+    // tiled stride-2 downsample — each stage plus the largest tile it checks (an exact-halo crop:
+    // `2·core + 1` input pixels a side for the downsample).
+    let image = rnd(&[1, 3, 128, 128], 3, 1.0);
+    let edge = 32;
+    prove_composite(
+        "VAE tiled encode conv_in stage + tile",
+        mlx_gen::ios_quantum::tiled_stage_bytes(&[1, 128, 128, 3], 3, 32, act, false)
+            + mlx_gen::ios_quantum::tile_bytes(
+                &[1, edge, edge, 3],
+                act,
+                conv_in.weight(),
+                false,
+                backend,
+            ),
+        || Ok(vec![conv_in.forward_tiled(&image, edge, None)?]),
+    );
+    // The downsample at a stage-dominated shape (8-pixel output cores over a 128x128x32 input: the
+    // row strips and the assembly carry the peak) and a tile-dominated one (one 32-pixel core: its
+    // 65x65 padded crop, output and kernel transient) — the shapes SDXL proves the shared prices at.
+    let wide = rnd(&[1, 32, 128, 128], 4, 1.0);
+    prove_composite(
+        "VAE tiled downsample stage + tile (many tiles)",
+        mlx_gen::ios_quantum::downsample_stage_bytes(&[1, 64, 64, 32], act)
+            + mlx_gen::ios_quantum::downsample_tile_bytes(
+                &[1, 17, 17, 32],
+                act,
+                down32.weight(),
+                backend,
+            ),
+        || Ok(vec![down32.forward_tiled(&wide, 8, None)?]),
+    );
+    prove_composite(
+        "VAE tiled downsample stage + tile (one tile)",
+        mlx_gen::ios_quantum::downsample_stage_bytes(&[1, 32, 32, 64], act)
+            + mlx_gen::ios_quantum::downsample_tile_bytes(
+                &[1, 65, 65, 64],
+                act,
+                down.weight(),
+                backend,
+            ),
+        || Ok(vec![down.forward_tiled(&x, 32, None)?]),
+    );
 }
 
 /// A decoder that returns a fixed (materialized) decode, so `decode_batch`'s own pixel-conversion

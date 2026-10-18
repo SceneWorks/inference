@@ -92,6 +92,36 @@ impl Encoder {
         self.head(&h, then_bytes, then)
     }
 
+    /// The **bounded encode** (sc-26433), the encoder twin of the tiled decode and SDXL's
+    /// `encode_tiled`: every full-resolution layer runs layer-wise tiled with exact halos at
+    /// `tile_px` input pixels a side (scaled to each layer's resolution) — `conv_in`, each down
+    /// block's resnets (whole-image GroupNorm statistics) and stride-2 downsample — then the
+    /// latent-resolution mid block (its attention query-chunked on iOS) and the output head, each one
+    /// bounded quantum. Equal to [`Self::forward_then`]'s whole-image encode up to float
+    /// reassociation of the tiled convolutions. `cancel` is checked between tiles.
+    pub(crate) fn forward_tiled_then(
+        &self,
+        image: &Array,
+        tile_px: i32,
+        cancel: Option<&mlx_gen::CancelFlag>,
+        then_bytes: u64,
+        then: impl FnOnce(Array) -> Result<Array>,
+    ) -> Result<Array> {
+        let mut h = self.conv_in.forward_tiled(image, tile_px.max(3), cancel)?;
+        let mut scale = 1;
+        for down in &self.down_blocks {
+            let edge = ((tile_px + scale - 1) / scale).max(3);
+            let next = if down.downsamples() { scale * 2 } else { scale };
+            h = down.forward_tiled(&h, edge, ((tile_px + next - 1) / next).max(1), cancel)?;
+            scale = next;
+        }
+        if cancel.is_some_and(mlx_gen::CancelFlag::is_cancelled) {
+            return Err(mlx_gen::Error::Canceled);
+        }
+        h = self.mid_block.forward(&h)?;
+        self.head(&h, then_bytes, then)
+    }
+
     /// The `conv_in` (`first`) or `conv_out` NHWC weight (for the iOS accounting proofs).
     #[cfg(test)]
     pub(crate) fn conv_weight(&self, first: bool) -> &Array {
@@ -100,6 +130,17 @@ impl Encoder {
         } else {
             self.conv_out.weight()
         }
+    }
+
+    /// `(conv_in, down blocks, mid block, conv_out)` (the reachable-sizes prediction prices them).
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&ConvLayer, &[DownEncoderBlock], &UNetMidBlock, &ConvLayer) {
+        (
+            &self.conv_in,
+            &self.down_blocks,
+            &self.mid_block,
+            &self.conv_out,
+        )
     }
 
     /// `conv_in` as one bounded iOS quantum over the (materialized) input image.

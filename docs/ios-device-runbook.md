@@ -24,7 +24,7 @@ selects every catalog provider/route/tier/geometry/mode/strategy explicitly. The
 are still no `--iris`, `--sdxl`, `--anima` or `--supra2` shortcut flags. Z-Image Turbo
 is a catalog model (sc-26433); `run_smoke.sh --zimage` is now only a shortcut for ONE
 bounded capture of a Z-Image campaign case (`IOS_SMOKE_ZIMAGE_CASE`, default
-`z_image_turbo/z_image_turbo/q4/1024/text/4`) through the same capture permit — there is
+`z_image_turbo/z_image_turbo/q4/1024/text/4/s_t512_o64_c67108864_w1_dit`) through the same capture permit — there is
 no unadmitted Z-Image loader.
 
 ## Campaign protocol and command matrix (sc-26270)
@@ -99,31 +99,87 @@ scripts/ios/push_model.sh "$ZIMAGE_MLX/q4" --campaign-route z_image_turbo --tier
   --control "$ZIMAGE_TURBO_FUN_CONTROLNET_UNION" --device "$DEVICE"
 ```
 
+Campaign case keys are `provider/route/tier/edge/mode/rung/selection`. The
+selection token is the cell's memory selection from the provider's OWN declared
+space (`MemoryProviderContract::selection_space`, read from its weights-free
+contract surface at the campaign's load shape): `s` (optional phase eviction),
+`t<edge>`/`o<overlap>` (decode tile), `c<elements>` (attention chunk), `w<n>`
+(transformer window) and the window scope `dit`/`te`/`both`, `_`-joined; `base`
+when the rung declares no parameter. Every selection is its own cell, executed
+exactly as selected (a token outside the artifact's declared space is a typed
+`strategy` refusal) and recorded in the evidence key's execution levers. The
+listing enumerates them quality first (unstaged before staged; the largest tile,
+chunk and window first; scope `dit` → `te` → `both`); 18,450 cells today.
+Control-required routes (`CONTROL_REQUIRED_ROUTES`: `z_image_turbo_control`) have
+one cell per accepted control kind (`control_pose`, `control_canny`,
+`control_depth`, `reference_pose`, ...) and no plain text mode.
+
 Z-Image Turbo host-derived reachable sizes (sc-26433) — **predictions, not device
-evidence**: per tier and edge, the resident bytes of each phase plus its largest
-counted quantum (`Backend::Metal`) plus the 512 MiB reserve, against the 6142 MiB
-entitled launch headroom, under the campaign's rung-4 representative selection
-(staged residency, the DiT streamed one block at a time, chunked attention, decode
-tiled at the first published edge 768, a 512-token prompt, the text encoder
-resident). `ZIMAGE_TIER_ROOT=<snapshot> cargo test -p mlx-gen-z-image --lib
+evidence**. Per mode, tier and edge: the peak of every phase (its resident bytes
+plus its largest counted quantum's live input and scratch, `Backend::Metal`, plus
+the 512 MiB reserve) against the 6142 MiB entitled launch headroom, under each
+rung-4 selection in the capture ladder's quality-first order. Unstaged cells keep
+every component loaded; staged (`s_`) cells drop the text encoder before denoise
+and the DiT before decode; scope `dit` streams the DiT's blocks (text encoder
+resident), `te` the encoder's layers (DiT resident), `both` both. The img2img and
+control encodes run the bounded encode on the device (every full-resolution layer
+tiled at 256 input pixels, `IOS_ENCODE_TILE_PX`); the untiled encode is what
+refused every 768/1024 reference/control cell before it. The control route adds
+its resident embedder and 2-block refiner, its 15 streamed main blocks (dense
+read + packing at the tier) and its 17 live hints; its checkpoint bytes are
+derived from the published architecture (not provisioned on the host).
+`ZIMAGE_TIER_ROOT=<snapshot> cargo test -p mlx-gen-z-image --lib
 reachable_sizes -- --ignored --nocapture` regenerates it from the snapshot's
-headers alone.
+headers alone. "First" is the ladder's first selection
+(`t768_o64_c67108864_w1_dit`); "fits" is the first selection the ladder reaches
+that fits.
 
-| tier | edge | conditioning | denoise | decode (tile 768) | binding quantum | fits | largest fitting decode tile |
-|---|---:|---:|---:|---:|---|---|---|
-| q4 | 512 | 2886 | 1475 | 4915 | decode VAE resnet | yes | 768: 4915 MiB |
-| q4 | 768 | 2886 | 1738 | 10154 | decode VAE resnet (untiled at 768) | NO | 640: 5444 MiB |
-| q4 | 1024 | 2886 | 2106 | 8107 | decode VAE tiled upsample stage | NO | 512: 5707 MiB |
-| q8 | 512 | 4804 | 1909 | 4916 | decode VAE resnet | yes | 768: 4916 MiB |
-| q8 | 768 | 4804 | 2172 | 10155 | decode VAE resnet (untiled at 768) | NO | 640: 5445 MiB |
-| q8 | 1024 | 4804 | 2540 | 8108 | decode VAE tiled upsample stage | NO | 512: 5708 MiB |
-| bf16 | 512 | 8785 | 2873 | 4917 | conditioning (7.5 GiB encoder resident) | NO | 768 + text-encoder window: 4917 MiB |
-| bf16 | 768 | 8785 | 3136 | 10157 | decode VAE resnet | NO | 640 + text-encoder window: 5447 MiB |
-| bf16 | 1024 | 8785 | 3504 | 8110 | conditioning | NO | 512 + text-encoder window: 5710 MiB |
+| mode | tier | edge | first selection peak | first fitting selection | its peak | binding quantum |
+|---|---|---:|---:|---|---:|---|
+| text | q4 | 512 | 7722 | t448_o64_c67108864_w1_dit | 5554 | decode tiled upsample |
+| text | q4 | 768 | 13282 | t320_o64_c67108864_w1_dit | 5872 | decode tiled upsample |
+| text | q4 | 1024 | 10915 | t448_o64_c67108864_w1_both | 6101 | decode tiled upsample |
+| text | q8 | 512 | 9988 | t448_o64_c67108864_w1_both | 4138 | decode tiled upsample |
+| text | q8 | 768 | 15548 | t512_o64_c67108864_w1_both | 5642 | decode tiled upsample |
+| text | q8 | 1024 | 13180 | t320_o64_c67108864_w1_both | 5971 | decode tiled resnet |
+| text | bf16 | 512 | 14236 | t448_o64_c67108864_w1_both | 5138 | decode tiled upsample |
+| text | bf16 | 768 | 19796 | t384_o64_c67108864_w1_both | 5777 | decode tiled upsample |
+| text | bf16 | 1024 | 17429 | s_t512_o64_c67108864_w1_both | 5966 | decode tiled upsample |
+| reference | q4 | 512 | 7724 | t448_o64_c67108864_w1_dit | 5556 | decode tiled upsample |
+| reference | q4 | 768 | 13284 | t320_o64_c67108864_w1_dit | 5874 | decode tiled upsample |
+| reference | q4 | 1024 | 10917 | t448_o64_c67108864_w1_both | 6103 | decode tiled upsample |
+| reference | q8 | 512 | 9990 | t448_o64_c67108864_w1_both | 4140 | decode tiled upsample |
+| reference | q8 | 768 | 15550 | t512_o64_c67108864_w1_both | 5644 | decode tiled upsample |
+| reference | q8 | 1024 | 13183 | t320_o64_c67108864_w1_both | 5974 | decode tiled resnet |
+| reference | bf16 | 512 | 14238 | t448_o64_c67108864_w1_both | 5140 | decode tiled upsample |
+| reference | bf16 | 768 | 19798 | t384_o64_c67108864_w1_both | 5779 | decode tiled upsample |
+| reference | bf16 | 1024 | 17431 | s_t512_o64_c67108864_w1_both | 5966 | decode tiled upsample |
+| control (each kind) | q4 | 512 | 7941 | t448_o64_c67108864_w1_dit | 5773 | decode tiled upsample |
+| control (each kind) | q4 | 768 | 13501 | t320_o64_c67108864_w1_dit | 6091 | decode tiled upsample |
+| control (each kind) | q4 | 1024 | 11134 | t384_o64_c67108864_w1_both | 5919 | decode tiled upsample |
+| control (each kind) | q8 | 512 | 10400 | t448_o64_c67108864_w1_both | 4550 | decode tiled upsample |
+| control (each kind) | q8 | 768 | 15960 | t512_o64_c67108864_w1_both | 6054 | decode tiled upsample |
+| control (each kind) | q8 | 1024 | 13593 | s_t512_o64_c67108864_w1_dit | 5964 | decode tiled upsample |
+| control (each kind) | bf16 | 512 | 15011 | t448_o64_c67108864_w1_both | 5913 | decode tiled upsample |
+| control (each kind) | bf16 | 768 | 20571 | t256_o64_c67108864_w1_both | 5969 | decode tiled resnet |
+| control (each kind) | bf16 | 1024 | 18204 | s_t512_o64_c67108864_w1_both | 5991 | denoise control block |
+| control_reference (each kind) | q4 | 512 | 7943 | t448_o64_c67108864_w1_dit | 5775 | decode tiled upsample |
+| control_reference (each kind) | q4 | 768 | 13503 | t320_o64_c67108864_w1_dit | 6093 | decode tiled upsample |
+| control_reference (each kind) | q4 | 1024 | 11136 | t384_o64_c67108864_w1_both | 5921 | decode tiled upsample |
+| control_reference (each kind) | q8 | 512 | 10403 | t448_o64_c67108864_w1_both | 4553 | decode tiled upsample |
+| control_reference (each kind) | q8 | 768 | 15963 | t512_o64_c67108864_w1_both | 6057 | decode tiled upsample |
+| control_reference (each kind) | q8 | 1024 | 13596 | s_t512_o64_c67108864_w1_dit | 5964 | decode tiled upsample |
+| control_reference (each kind) | bf16 | 512 | 15014 | t448_o64_c67108864_w1_both | 5916 | decode tiled upsample |
+| control_reference (each kind) | bf16 | 768 | 20574 | t256_o64_c67108864_w1_both | 5971 | decode tiled resnet |
+| control_reference (each kind) | bf16 | 1024 | 18207 | s_t512_o64_c67108864_w1_both | 5995 | denoise control block |
 
-(MiB.) The representative cells that do not fit are expected to stop at their
-first over-headroom quantum as `capture_refused` — that refusal, not a jetsam kill,
-is the evidence.
+(MiB.) A selection that does not fit is expected to stop at its first
+over-headroom quantum as `capture_refused` — that refusal, not a jetsam kill, is
+the evidence — and the ladder then tries the next cheaper selection at the same
+size. At q4 / 1024 / text the walk refuses the 7 `dit` and 7 `te` selections and
+`t768`–`t512` `both`, then completes at `t448_o64_c67108864_w1_both` (6101 MiB);
+the staged `s_t512_o64_c67108864_w1_dit` (Michael's Mac configuration, tile 512)
+predicts 5963 MiB.
 
 The following are **future session recipes, not instructions to run now**. Phone
 availability alone does not authorize a full-model diagnostic. Use a fresh evidence
@@ -152,7 +208,7 @@ never to the legacy reinstall/terminate-existing path.
 ```sh
 # One exact cold case (JSONL output must not already exist):
 python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sana_1600m/sana_1600m/q4/512/text/2 --device "$DEVICE" \
+  --case sana_1600m/sana_1600m/q4/512/text/2/t512_o48 --device "$DEVICE" \
   --output "$EVIDENCE/sana-512.jsonl"
 # One selected model/tier ladder, including all its registered modes and rungs:
 python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
@@ -163,14 +219,17 @@ python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
 # Explicit next-up REFUSAL-ONLY probe after an admitted completion. This NEVER
 # loads weights at the larger geometry, even if its metadata preflight admits it.
 python3 scripts/ios/campaign.py run --catalog /tmp/ios-campaign-catalog.json \
-  --case sdxl/sdxl/q4/1024/text/2 --next-edge 1280 --device "$DEVICE" \
+  --case sdxl/sdxl/q4/1024/text/2/t896_o64 --next-edge 1280 --device "$DEVICE" \
   --output "$EVIDENCE/sdxl-next-up.jsonl"
 # Bounded DEVICE CAPTURE (labelled diagnostic, never production): no evidence row is
 # needed, because every quantum of every registered model checks live OS headroom
 # BEFORE constructing its graph. Each model/route/tier/mode/rung ladder is walked
-# 512 -> 768 -> 1024 and stops at the first case that is not a completed capture;
-# a `capture_refused` row names the refused quantum (the next-size-refused-before-
-# jetsam evidence). No retries; the cap is never raised.
+# 512 -> 768 -> 1024; at each size its selections run quality first, stepping to the
+# next cheaper selection only after a capture refusal (a completed selection carries
+# up to the next size). The ladder stops at the first size where even the cheapest
+# selection refuses, or at any failure; a `capture_refused` row names the refused
+# quantum (the refused-before-jetsam evidence). No cell runs twice; the cap is never
+# raised.
 python3 scripts/ios/campaign.py capture --catalog /tmp/ios-campaign-catalog.json \
   --provider sana_1600m --route sana_1600m --tier q4 --mode text --rung 2 \
   --device "$DEVICE" --output "$EVIDENCE/sana-q4-text-r2-capture.jsonl"

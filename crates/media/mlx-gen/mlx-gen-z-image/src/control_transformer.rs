@@ -843,7 +843,7 @@ pub(crate) fn control_block_quantum(
 
 /// What [`add_hint`] adds to a block's quantum over the base stream `x`: the scaled hint and the
 /// sum (`[1, L, D]`, f32 — the f32 hint promotes; one fused buffer under compiled glue).
-fn add_hint_bytes(x: &Array) -> u64 {
+pub(crate) fn add_hint_bytes(x: &Array) -> u64 {
     let sh = x.shape();
     let hidden = crate::quantum::tb(
         4,
