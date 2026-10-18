@@ -29,6 +29,9 @@ use crate::vae::QwenVae;
 /// `sampler` overrides it; any curated flow solver (euler, dpmpp_2m, …) is valid.
 pub const DEFAULT_SAMPLER: &str = "er_sde";
 
+/// The dtype the production denoise runs the DiT in (the iOS pricing prices its quanta at it).
+pub(crate) const DIT_DTYPE: Dtype = Dtype::Bfloat16;
+
 /// The Anima sigma schedule: `linspace(1.0, 1/N, N)` (**NOT** the diffusers default) time-shifted by
 /// the static `shift=3.0` (`3σ / (1 + 2σ)`), with the trailing terminal `0.0` the flow sampler
 /// integrates to. Length `N + 1`, descending.
@@ -70,14 +73,19 @@ pub fn anima_schedule(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
 /// Seeded initial latent noise `[1, 16, 1, H/8, W/8]` (f32 standard normal), the 5-D Cosmos latent.
 fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
     let key = random::key(seed)?;
-    let shape = [
+    let shape = latent_shape(width, height);
+    Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
+}
+
+/// The `[1, 16, 1, H/8, W/8]` latent a `width`x`height` render denoises and decodes (f32).
+pub(crate) fn latent_shape(width: u32, height: u32) -> [i32; 5] {
+    [
         1,
         VAE_CHANNELS as i32,
         1,
         (height / VAE_COMPRESSION) as i32,
         (width / VAE_COMPRESSION) as i32,
-    ];
-    Ok(random::normal::<f32>(&shape[..], None, None, Some(&key))?)
+    ]
 }
 
 /// Per-generation options.
@@ -818,7 +826,7 @@ impl AnimaHeavy {
             sampler,
             scheduler,
             seed,
-            Dtype::Bfloat16,
+            DIT_DTYPE,
             preview,
             cancel,
             on_progress,

@@ -110,6 +110,8 @@ use mlx_gen::gen_core::{
     MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
     Result as CoreResult, TransformerComponent,
 };
+// Aliased so the module docs' `GenerationMemory` intra-doc links keep their explicit targets.
+use mlx_gen::gen_core::GenerationMemory as RequestMemory;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
 
@@ -756,12 +758,29 @@ fn begin_with_cleanup(
 /// Rung 3: the bounded-attention plan for this request. Cancellation is threaded so a per-chunk
 /// `eval` observes a cancel promptly rather than at the next step boundary.
 pub(crate) fn attention_plan(req: &GenerationRequest) -> mlx_gen::attention::AttentionPlan<'_> {
-    match req.memory {
-        Some(memory) if memory.chunk_attention => mlx_gen::attention::AttentionPlan::budgeted(
+    if chunks_attention(req.memory) {
+        attention_plan_for(req.memory).with_cancel(&req.cancel)
+    } else {
+        attention_plan_for(req.memory)
+    }
+}
+
+/// Whether a request's memory block chunks attention (rung 3).
+fn chunks_attention(memory: Option<RequestMemory>) -> bool {
+    memory.is_some_and(|memory| memory.chunk_attention)
+}
+
+/// [`attention_plan`]'s budget for a request's memory block, without the request's cancel flag —
+/// what the iOS pricing (`crate::ios_pricing`) prices a request's attention at.
+pub(crate) fn attention_plan_for(
+    memory: Option<RequestMemory>,
+) -> mlx_gen::attention::AttentionPlan<'static> {
+    if chunks_attention(memory) {
+        mlx_gen::attention::AttentionPlan::budgeted(
             mlx_gen::attention::AttentionBudget::CONSTRAINED,
         )
-        .with_cancel(&req.cancel),
-        _ => mlx_gen::attention::AttentionPlan::UNBOUNDED,
+    } else {
+        mlx_gen::attention::AttentionPlan::UNBOUNDED
     }
 }
 
@@ -769,7 +788,14 @@ pub(crate) fn attention_plan(req: &GenerationRequest) -> mlx_gen::attention::Att
 /// implement — or a cadence outside the measured [`TRANSFORMER_WINDOW_SIZES`] — is a typed rejection
 /// rather than a silently narrowed (or silently *widened*) execution.
 pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Result<Option<usize>> {
-    let Some(memory) = req.memory.filter(|memory| memory.stream_transformer_blocks) else {
+    transformer_window_size_for(req.memory)
+}
+
+/// [`transformer_window_size`] for a request's memory block.
+pub(crate) fn transformer_window_size_for(
+    memory: Option<RequestMemory>,
+) -> mlx_gen::Result<Option<usize>> {
+    let Some(memory) = memory.filter(|memory| memory.stream_transformer_blocks) else {
         return Ok(None);
     };
     let component = memory
@@ -792,7 +818,14 @@ pub(crate) fn transformer_window_size(req: &GenerationRequest) -> mlx_gen::Resul
 
 /// Rung 2: the decode tiling for this request, or `None` for the single-pass decode.
 pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<TilingConfig>> {
-    let Some(memory) = req.memory.filter(|memory| memory.tile_vae_decode) else {
+    decode_tiling_for(req.memory)
+}
+
+/// [`decode_tiling`] for a request's memory block.
+pub(crate) fn decode_tiling_for(
+    memory: Option<RequestMemory>,
+) -> mlx_gen::Result<Option<TilingConfig>> {
+    let Some(memory) = memory.filter(|memory| memory.tile_vae_decode) else {
         return Ok(None);
     };
     let edge = memory.decode_tile_edge.unwrap_or(DECODE_TILE_EDGE);
@@ -808,8 +841,12 @@ pub(crate) fn decode_tiling(req: &GenerationRequest) -> mlx_gen::Result<Option<T
 
 /// Rung 1: whether this request stages its component residency.
 pub(crate) fn stage_residency(req: &GenerationRequest, default_staged: bool) -> bool {
-    req.memory
-        .map_or(default_staged, |memory| memory.stage_residency)
+    stage_residency_for(req.memory, default_staged)
+}
+
+/// [`stage_residency`] for a request's memory block.
+pub(crate) fn stage_residency_for(memory: Option<RequestMemory>, default_staged: bool) -> bool {
+    memory.map_or(default_staged, |memory| memory.stage_residency)
 }
 
 /// The strategy parameters this provider accepts, for a caller that wants the whole domain in one

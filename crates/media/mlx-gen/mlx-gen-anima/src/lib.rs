@@ -30,6 +30,7 @@ mod block_stream;
 pub mod conditioner;
 pub mod config;
 pub mod convert;
+pub mod ios_pricing;
 pub mod loader;
 pub mod memory_strategy;
 pub mod model;

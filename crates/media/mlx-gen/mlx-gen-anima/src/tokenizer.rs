@@ -17,7 +17,7 @@ use crate::config::QWEN_PAD_TOKEN_ID;
 use crate::prompt_weight::parse_prompt_weights;
 
 /// Anima's `max_sequence_length` (reference default 512; also the DiT's fixed text length).
-const MAX_LEN: usize = 512;
+pub(crate) const MAX_LEN: usize = 512;
 
 /// The vendored Qwen3/Qwen2 BPE tokenizer (Qwen3 lineage; text BPE identical across Qwen2.5/3).
 const QWEN_TOKENIZER_JSON: &str = include_str!("../assets/qwen_tokenizer.json");
