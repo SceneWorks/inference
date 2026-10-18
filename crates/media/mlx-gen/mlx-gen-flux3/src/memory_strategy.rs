@@ -226,9 +226,9 @@ pub fn weights_free_memory_strategy_contract(
             "flux3-klein-base-mlx-cfg-source-v1",
             LoadShape::EagerMaterialization,
         ));
-        if let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &mut contract.formula {
-            variables.push(MemoryFormulaVariable::BatchCount);
-        }
+        // CFG's [unconditional, conditional] pack is a FIXED x2 coefficient of the base route
+        // (always two rows, any guidance), carried by its separate calibration identity. It is
+        // not a request variable: `count` still renders sequentially, so no BatchCount axis.
     }
     Ok(contract)
 }
@@ -281,9 +281,9 @@ pub(crate) fn generation_contract(
             "flux3-klein-base-mlx-cfg-source-v1",
             LoadShape::EagerMaterialization,
         ));
-        if let MemoryFormulaKind::PhaseEnvelope { variables, .. } = &mut contract.formula {
-            variables.push(MemoryFormulaVariable::BatchCount);
-        }
+        // CFG's [unconditional, conditional] pack is a FIXED x2 coefficient of the base route
+        // (always two rows, any guidance), carried by its separate calibration identity. It is
+        // not a request variable: `count` still renders sequentially, so no BatchCount axis.
     }
     for adapter in &spec.adapters {
         gen_core::flux3::adapters::inspect(adapter, &config.dit)?;
@@ -349,7 +349,6 @@ pub(crate) fn generation_contract(
                         MemoryFormulaVariable::AssetBytes,
                         MemoryFormulaVariable::PixelCount,
                         MemoryFormulaVariable::ConditioningTokenCount,
-                        MemoryFormulaVariable::BatchCount,
                         MemoryFormulaVariable::OverlayBytes,
                     ],
                     resident_components: vec![component],
@@ -635,6 +634,17 @@ mod tests {
         let adapted = generation_contract(&spec, &resources, &config).unwrap();
         assert!(adapted.asset_facts.overlay_bytes > 0);
         assert_eq!(adapted.asset_facts.base_bytes, plain.asset_facts.base_bytes);
+        for contract in [&plain, &adapted] {
+            let variables = match &contract.formula {
+                MemoryFormulaKind::PhaseEnvelope { variables, .. }
+                | MemoryFormulaKind::ComponentPhaseEnvelope { variables, .. } => variables.clone(),
+                other => panic!("unexpected formula {other:?}"),
+            };
+            assert!(
+                !variables.contains(&MemoryFormulaVariable::BatchCount),
+                "CFG x2 is fixed, not a batch axis"
+            );
+        }
         spec.components.insert(
             gen_core::flux3::pup::UPSAMPLER_COMPONENT.into(),
             WeightsSource::Dir(fixture.join("tiny-pup-snapshot")),

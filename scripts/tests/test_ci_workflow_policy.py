@@ -1578,18 +1578,24 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         shell = self.require_posix_shell()
         native_run = subprocess.run
         script = "for bits in 4 8; do\n  :\ndone\n"
-        def windows_stdin(command, **kwargs):
-            payload = kwargs["input"]
-            if isinstance(payload, str):
-                payload = payload.replace("\n", "\r\n").encode("utf-8")
-            return native_run(command, input=payload, text=False, capture_output=True, check=False)
-        with patch.object(subprocess, "run", side_effect=windows_stdin):
+
+        def binary_transport(command, **kwargs):
+            # Check the real helper's subprocess boundary, not whether this host's Bash
+            # rejects CRLF: some Git for Windows builds accept it even with igncr off.
+            self.assertIsInstance(kwargs["input"], bytes, "syntax input must be binary")
+            self.assertEqual(kwargs["input"], script.encode("utf-8"))
+            self.assertFalse(kwargs.get("text", False), "text mode translates LF on Windows")
+            self.assertNotIn(b"\r", kwargs["input"])
+            return native_run(command, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=binary_transport):
             actual = bash_syntax_check(shell, script)
             self.assertEqual(actual.returncode, 0, actual.stderr)
-            # The previous text-mode implementation must fail the same discriminator.
-            mutant = subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
-                                    capture_output=True, check=False)
-            self.assertNotEqual(mutant.returncode, 0, "text stdin mutation escaped Windows-equivalent gate")
+            # The old text-stdin implementation must fail the same transport assertion,
+            # independently of the selected shell's carriage-return parsing policy.
+            with self.assertRaisesRegex(AssertionError, "syntax input must be binary"):
+                subprocess.run([shell, "-n"], input=script, text=True, encoding="utf-8",
+                               capture_output=True, check=False)
 
     def test_bash_syntax_check_rejects_a_malformed_build_script(self) -> None:
         # The positive case alone cannot tell "the script parses" from "the checker never fails".

@@ -161,13 +161,13 @@ pub fn denoise_cfg_with_references(
         let difference = rows[1].subtract(&rows[0])?.as_dtype(compute)?;
         let scaled = difference
             .as_dtype(Dtype::Float32)?
-            .multiply(&Array::from_f32(guidance))?
+            .multiply(Array::from_f32(guidance))?
             .as_dtype(compute)?;
         let velocity = rows[0].add(&scaled)?.as_dtype(compute)?;
         let dt = schedule[step + 1] - schedule[step];
         let update = velocity
             .as_dtype(Dtype::Float32)?
-            .multiply(&Array::from_f32(dt))?
+            .multiply(Array::from_f32(dt))?
             .as_dtype(compute)?;
         x = x.add(&update)?.as_dtype(Dtype::Float32)?;
         eval([&x])?;
