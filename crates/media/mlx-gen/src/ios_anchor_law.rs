@@ -25,9 +25,11 @@
 //!   priced at the whole-run growth, an upper bound). `C_p` / `S_p` are the counted resident bytes
 //!   and largest counted quantum of the phase under each regime and geometry.
 //! * `κ_p ≤ 1` is the measured calibration of a counted formula: where the formula over-prices
-//!   what the device measured, the request on THE SAME quantum is priced at the measured ratio, so
-//!   admission near the anchor is the measurement, not the formula's conservative scratch. A
-//!   different binding quantum gets its formula unscaled (erring large).
+//!   what the device measured, the request on THE SAME quantum at or below the anchor's size is
+//!   priced at the measured ratio, so admission near the anchor is the measurement, not the
+//!   formula's conservative scratch. A different binding quantum, or the same quantum LARGER than
+//!   at the anchor (the measured/priced ratio rises with size — Iris's CPU proofs show 0.75 at the
+//!   anchor, 0.82 at batch 2, 0.95 at 16x area), gets its formula unscaled (an upper bound).
 //! * `λ = max(A_request, A_anchor) / A_anchor`: the unpriced overhead is linear in area ABOVE the
 //!   anchor and FLOORED below it (never credited for a smaller request). Measured on the desktop
 //!   MLX lane (SceneWorks `docs/sc-16195`: the activation transient of 7 tiers at 5 geometries) the
@@ -172,8 +174,14 @@ pub fn derive(
         let (bytes, calibrated) = match (at_anchor.phase(wanted.phase), measured.get(&wanted.phase))
         {
             (Some(measured_at), Some(&(priced, overhead))) => {
-                let calibrated =
-                    wanted.binding == measured_at.binding && measured_at.scratch_bytes > 0;
+                // The device's calibration of a formula holds at and BELOW the size it was measured
+                // at: the measured/priced ratio of a quantum rises with its size (fixed costs the
+                // formula over-prices weigh less in a bigger quantum), so a ratio learned on a
+                // smaller quantum would under-price a larger one. Above the anchor's quantum the
+                // formula — an upper bound — prices it unscaled.
+                let calibrated = wanted.binding == measured_at.binding
+                    && measured_at.scratch_bytes > 0
+                    && wanted.scratch_bytes <= measured_at.scratch_bytes;
                 let activation = if calibrated {
                     mul_div_ceil(wanted.scratch_bytes, priced, measured_at.scratch_bytes)
                 } else {
@@ -285,11 +293,16 @@ pub fn measure_phases<T>(
     let baseline = mlx_rs::memory::get_active_memory() as u64;
     mlx_rs::memory::reset_peak_memory();
     // (phase of the interval in progress, whether the last mark opened a quantum)
-    let state: Rc<RefCell<(Option<IosPhase>, bool, BTreeMap<IosPhase, u64>)>> =
-        Rc::new(RefCell::new((None, false, BTreeMap::new())));
+    type State = (Option<IosPhase>, bool, BTreeMap<IosPhase, u64>);
+    let state: Rc<RefCell<State>> = Rc::new(RefCell::new((None, false, BTreeMap::new())));
+    // `reset_peak_memory` zeroes the peak: an interval with no allocation reads 0, so the reading
+    // is never below what is active now.
+    let peak_now = || {
+        (mlx_rs::memory::get_peak_memory() as u64).max(mlx_rs::memory::get_active_memory() as u64)
+    };
     let sink = Rc::clone(&state);
     let record = move |label: &str, opens: bool| {
-        let peak = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(baseline);
+        let peak = peak_now().saturating_sub(baseline);
         mlx_rs::memory::reset_peak_memory();
         let mut s = sink.borrow_mut();
         let here = phase_of(label);
@@ -311,7 +324,7 @@ pub fn measure_phases<T>(
     };
     let value = crate::ios_quantum::with_cpu_diagnostic_observer(observer, body)?;
     // The tail after the last mark belongs to the last mark's phase.
-    let tail = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(baseline);
+    let tail = peak_now().saturating_sub(baseline);
     let mut s = state.borrow_mut();
     if let Some(phase) = s.0 {
         let slot = s.2.entry(phase).or_insert(0);
@@ -430,6 +443,34 @@ mod tests {
         let decode = resident.phases.iter().find(|p| p.phase == Decode).unwrap();
         assert!(!decode.calibrated);
         assert_eq!(decode.bytes, (4200 + 2600) * MIB);
+    }
+
+    /// The calibration applies at and below the anchor's quantum size only: the same binding
+    /// quantum priced LARGER than at the anchor gets its formula unscaled.
+    #[test]
+    fn the_calibration_never_scales_a_quantum_above_the_anchors_size() {
+        let (a, p) = optimized_512();
+        let decode = |scratch: u64| {
+            let r = pricing(&[
+                (Conditioning, 1200, 60, "te layer"),
+                (Denoise, 1900, 240, "dit block"),
+                (Decode, 600, scratch, "vae tile"),
+            ]);
+            derive(&a, &p, &r, a.area)
+                .unwrap()
+                .phases
+                .into_iter()
+                .find(|x| x.phase == Decode)
+                .unwrap()
+        };
+        // Below: 350 × 400/700 = 200 calibrated.
+        let below = decode(350);
+        assert!(below.calibrated);
+        assert_eq!(below.bytes, (600 + 200) * MIB);
+        // Above: 1400 at full price, never 800.
+        let above = decode(1400);
+        assert!(!above.calibrated);
+        assert_eq!(above.bytes, (600 + 1400) * MIB);
     }
 
     #[test]
