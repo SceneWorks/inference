@@ -8,7 +8,7 @@
 //! to the mirrors by the GPU functional test (one admitted tiny-kernel slot), so a kernel that
 //! drifts from the source recipe is caught twice, never assumed.
 //!
-//! The wrappers that launch these kernels live on [`crate::cublaslt::CublasLt`]
+//! The wrappers that launch these kernels live on `crate::cublaslt::CublasLt` (CUDA builds only)
 //! (`flux3_fp8_rowwise_linear`, `flux3_stage_nvfp4_weight`, `flux3_nvfp4_static_linear`).
 
 /// The FLUX3 activation kernels. FP8 E4M3 GEMMs need sm_89; the floor here is the source's own

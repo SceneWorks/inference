@@ -351,7 +351,7 @@ mod affine_tests {
                 &[n as i32, k as i32],
             );
             let want = x
-                .matmul(&reference.transpose_axes(&[1, 0]).unwrap())
+                .matmul(reference.transpose_axes(&[1, 0]).unwrap())
                 .unwrap();
             let diff = y
                 .subtract(&want)
@@ -367,13 +367,13 @@ mod affine_tests {
             let dense = Array::from_slice(&w, &[n as i32, k as i32])
                 .as_dtype(Dtype::Bfloat16)
                 .unwrap();
-            let (mq, ms, mb) = mlx_rs::ops::quantize(&dense, group as i32, bits as i32).unwrap();
-            let theirs = mlx_rs::ops::dequantize(&mq, &ms, &mb, group as i32, bits as i32)
+            let (mq, ms, mb) = mlx_rs::ops::quantize(dense, group as i32, bits as i32).unwrap();
+            let theirs = mlx_rs::ops::dequantize(mq, ms, &mb, group as i32, bits as i32)
                 .unwrap()
                 .as_dtype(Dtype::Float32)
                 .unwrap();
             let gap = theirs
-                .subtract(&reference)
+                .subtract(reference)
                 .unwrap()
                 .abs()
                 .unwrap()

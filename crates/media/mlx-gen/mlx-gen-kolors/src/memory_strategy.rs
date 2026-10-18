@@ -967,7 +967,7 @@ struct ResolvedSurfaceMaterialization {
 fn resolved_surface_materialization(
     tier: mlx_gen::gen_core::MemoryContractSurfaceTier,
 ) -> ResolvedSurfaceMaterialization {
-    use mlx_gen::gen_core::MemoryContractSurfaceTier::{Bf16, Nvfp4, Q4, Q8};
+    use mlx_gen::gen_core::MemoryContractSurfaceTier::{Bf16, Fp8Rowwise, Nvfp4, Q4, Q8};
     match tier {
         Bf16 => ResolvedSurfaceMaterialization {
             unet_blocks_lazy: true,
@@ -979,7 +979,8 @@ fn resolved_surface_materialization(
             text_encoder_blocks_lazy: true,
             adapters_replayable: true,
         },
-        Nvfp4 => ResolvedSurfaceMaterialization {
+        // No MLX loader packs either publisher format; neither is a lazy or replayable tier.
+        Nvfp4 | Fp8Rowwise => ResolvedSurfaceMaterialization {
             unet_blocks_lazy: false,
             text_encoder_blocks_lazy: false,
             adapters_replayable: false,
