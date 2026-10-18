@@ -125,8 +125,8 @@ pub fn mode_key(mode: &str) -> &str {
 }
 
 /// A campaign mode's anchor variant: the provider's proven additivity (`anchor_variant`).
-pub fn variant(provider: &str, mode: &str) -> String {
-    runtime_ios::media::pricing::anchor_variant(provider, mode_key(mode))
+pub fn variant(provider: &str, mode: &str, tier: &str) -> String {
+    runtime_ios::media::pricing::anchor_variant(provider, mode_key(mode), tier)
 }
 
 /// The architecture group of `(provider, route, tier)`: on the host, the base-component
@@ -164,7 +164,7 @@ pub fn listing() -> Result<String, String> {
 pub fn listing_with(snapshots: Option<PathBuf>) -> Result<String, String> {
     let catalog = runtime_ios::catalog().map_err(|e| e.to_string())?;
     let surfaces = surfaces(catalog.media());
-    let variant_of = |provider: &str, mode: &str| variant(provider, mode);
+    let variant_of = |provider: &str, mode: &str, tier: &str| variant(provider, mode, tier);
     let by_architecture = |provider: &str, route: &str, tier: &str| match &snapshots {
         Some(root) => architecture_group(root, provider, slot_route_of(provider, route), tier),
         None => format!("{provider}/{route}"),

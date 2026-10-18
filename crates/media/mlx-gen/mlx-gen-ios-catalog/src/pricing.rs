@@ -63,19 +63,25 @@ pub fn provider_pricing(provider: &str) -> Option<Pricing> {
     }
 }
 
-/// The anchor VARIANT of a `(provider, mode)`: `base` when the provider has proven the mode
-/// component-additive on its CPU fixtures (`ios_anchor_law::measure_phases` + `derive`: the measured
-/// mode peak never exceeds the one derived from the text-mode run), so it is derived from the text
-/// anchor of its architecture; otherwise the mode key itself — a separate anchor family.
-pub fn anchor_variant(provider: &str, mode: &str) -> String {
-    let non_additive: &[&str] = match provider {
-        _ => &[],
-    };
+/// The anchor VARIANT of a `(provider, mode, tier)`: `base` when the provider has proven the mode
+/// component-additive at that tier on its CPU fixtures (`ios_anchor_law::measure_phases` +
+/// `derive`: the measured mode peak never exceeds the one derived from the text-mode run), so it is
+/// derived from the text anchor of its architecture; otherwise the mode key itself — a separate
+/// anchor family, kept explicit by the provider's failing proof.
+pub fn anchor_variant(provider: &str, mode: &str, tier: &str) -> String {
+    let non_additive = non_additive_modes(provider, tier);
     if non_additive.contains(&mode) {
         mode.to_string()
     } else {
         "base".to_string()
     }
+}
+
+/// The `MemoryMode` keys `provider` has NOT proven component-additive at `tier` (each provider's
+/// proof-backed list).
+pub fn non_additive_modes(provider: &str, tier: &str) -> Vec<&'static str> {
+    let _ = (provider, tier);
+    Vec::new()
 }
 
 /// The phase a quantum label of `provider` runs in.

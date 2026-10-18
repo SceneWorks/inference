@@ -4,7 +4,7 @@ fn campaign_actual_catalog_covers_each_registered_mode_without_loading() {
     let catalog = runtime_ios::catalog().unwrap();
     let registry = catalog.media();
     let discovered = surfaces(registry);
-    let variant_of = |p: &str, m: &str| variant(p, m);
+    let variant_of = |p: &str, m: &str, t: &str| variant(p, m, t);
     let (families, cases) = campaign::plan(&discovered, &campaign::per_route(&variant_of));
     for registration in registry.generators() {
         let descriptor = (registration.descriptor)();
