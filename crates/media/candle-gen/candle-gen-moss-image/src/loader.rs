@@ -1006,7 +1006,7 @@ mod header_cpu_tests {
                 assert!(matches!(result, Err(gen_core::Error::Canceled)));
                 assert!(read.get() < data.len());
             }
-            assert!(cache.lock().unwrap().is_empty());
+            assert!(candle_gen::lock_recover(&cache).is_empty());
             let fresh = CancelFlag::default();
             let facts = cached_headers(&cache, key, &pin, Some(&fresh), || {
                 pin.read_unchanged(|_| {
@@ -1020,7 +1020,7 @@ mod header_cpu_tests {
             })
             .unwrap();
             assert_eq!(facts[0].data_bytes, 131072);
-            assert_eq!(cache.lock().unwrap().len(), 1);
+            assert_eq!(candle_gen::lock_recover(&cache).len(), 1);
         }
     }
     #[test]

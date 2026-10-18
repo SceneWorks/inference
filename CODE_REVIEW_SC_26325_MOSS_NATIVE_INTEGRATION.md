@@ -191,3 +191,21 @@ attempts using system Python3.9 (no tomllib) and Python3.12 (no PyYAML) are reta
 as environment diagnostics. PowerShell is not installed locally; its Windows
 SelfTest, CUDA compile and native terminal remain pending platform gates. No
 model/Rust production source, GPU/Metal execution or Windows dispatch changed.
+
+## Batched Linux source-guard CI repair
+
+Native CI run `39140441570`, Linux lint/docs job `117713695618`, passed strict
+Clippy and Rustdoc, then failed the unchanged `check-lock-poison.sh` guard on the
+two test-only cache `.lock().unwrap()` calls introduced by F-280's canceled/corrupt
+miss regression (loader.rs1009/1023 at the tested head). Those acquisitions now
+use the established `candle_gen::lock_recover(&cache)`. The assertions still prove
+failed authentication/cancellation leaves the cache empty, followed by exactly
+one successful same-identity retry entry; production cache policy is unchanged.
+
+The exact CI source guards passed locally: `check-lock-poison.sh`,
+`check-gen-core-skew.sh --self-test` (single accepted, duplicate/missing refused),
+and `check-gen-core-skew.sh candle-gen` (one gen-core identity). All three focused
+header-cache CPU tests passed, including counted cold/warm reads, corruption,
+typed cancellation/retry and bounded malformed headers. No guard was weakened,
+no broad package/Metal suite was rerun, and no model math or controller changed.
+This is batched with the workflow initialization fix for coordinator publication.
