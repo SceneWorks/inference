@@ -403,6 +403,108 @@ fn supplied_embeddings_compact_noncontiguous_masks_and_hash_exact_inputs() {
     assert_eq!(&actual[4096..], &values[8192..12288]);
 }
 #[test]
+fn supplied_fp32_conditioning_preserves_precision_until_selected_projection_sc26324() {
+    // sc-26324 (F-276): the same ingestion path runs on CUDA and CPU. Deliberately
+    // non-BF16 values plus a ragged mask expose narrowing before a full-FP32 consumer.
+    let mut values = vec![0f32; 3 * 4096];
+    for (i, value) in values.iter_mut().enumerate() {
+        *value = 1.001 + (i % 19) as f32 * 0.013;
+    }
+    let mask = [1, 0, 1];
+    let supplied = text_encoder::supplied(
+        MossImageEmbeddings {
+            values: &values,
+            batch: 1,
+            sequence: 3,
+            mask: Some(&mask),
+        },
+        &Device::Cpu,
+    )
+    .unwrap();
+    assert_eq!(supplied.rows[0].dtype(), DType::F32);
+    let compact = loader::tensor_f32(&supplied.rows[0]).unwrap();
+    assert_eq!(&compact[..4096], &values[..4096]);
+    assert_eq!(&compact[4096..], &values[8192..]);
+    assert_eq!(
+        supplied.receipts[0].sha256,
+        text_encoder::digest_f32(&values, Some(&mask))
+    );
+
+    let d = fixture("fixture.json");
+    let g = geometry(&d);
+    let context = supplied.rows[0]
+        .narrow(2, 0, g.text)
+        .unwrap()
+        .contiguous()
+        .unwrap();
+    let rounded = context
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+    assert_ne!(
+        loader::tensor_f32(&context).unwrap(),
+        loader::tensor_f32(&rounded).unwrap()
+    );
+    let full = Transformer::load(&weights(&d["weights"], DType::F32), g, None).unwrap();
+    let actual = full.project_context(&context).unwrap();
+    assert_eq!(actual.dtype(), DType::F32);
+    let actual = loader::tensor_f32(&actual).unwrap();
+    let input = loader::tensor_f32(&context).unwrap();
+    let projection: Vec<f32> =
+        serde_json::from_value(d["weights"]["text_embedder.proj.weight"]["values"].clone())
+            .unwrap();
+    let bias: Vec<f32> =
+        serde_json::from_value(d["weights"]["text_embedder.proj.bias"]["values"].clone()).unwrap();
+    for (row, input) in input.chunks_exact(g.text).enumerate() {
+        for output in 0..g.dim {
+            let expected = input
+                .iter()
+                .zip(&projection[output * g.text..(output + 1) * g.text])
+                .fold(0f32, |sum, (x, w)| sum + x * w)
+                + bias[output];
+            assert!((actual[row * g.dim + output] - expected).abs() < 1e-6);
+        }
+    }
+    let wrong = loader::tensor_f32(&full.project_context(&rounded).unwrap()).unwrap();
+    assert!(actual.iter().zip(&wrong).any(|(a, b)| (a - b).abs() > 1e-4));
+    let x = tensor(&d["inputs"]["hidden_states"], DType::F32)
+        .narrow(0, 0, 1)
+        .unwrap();
+    let output = full
+        .forward(&x, 500.0, &context, &[1, 1], &[], &CancelFlag::default())
+        .unwrap();
+    let wrong = full
+        .forward(&x, 500.0, &rounded, &[1, 1], &[], &CancelFlag::default())
+        .unwrap();
+    assert!(loader::tensor_f32(&output)
+        .unwrap()
+        .iter()
+        .zip(loader::tensor_f32(&wrong).unwrap())
+        .any(|(a, b)| (a - b).abs() > 1e-8));
+
+    // Ordinary and unmerged DMD keep BF16 text projection weights; the consumer
+    // still performs the author's BF16 conversion, even with FP32 time/head islands.
+    let ordinary = weights(&d["weights"], DType::BF16);
+    let dm = fixture("dmd_fixture.json");
+    let mixed = transformer::install_replacements(
+        &ordinary,
+        &weights(&dm["replacement_tensors"], DType::F32),
+    )
+    .unwrap();
+    for (name, w) in [("ordinary", ordinary), ("mixed", mixed)] {
+        let model = Transformer::load(&w, g, None).unwrap();
+        let output = model.project_context(&context).unwrap();
+        assert_eq!(output.dtype(), DType::BF16, "{name}");
+        assert_eq!(
+            loader::tensor_f32(&output).unwrap(),
+            loader::tensor_f32(&model.project_context(&rounded).unwrap()).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn load_refuses_noncanonical_precision_and_missing_prepared_children() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("config.json");

@@ -3,7 +3,7 @@ use crate::{
     loader::{tensor_f32, Sources},
     transformer::check_cancel,
 };
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::{
     moss_image::*,
     tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig},
@@ -105,13 +105,9 @@ pub(crate) fn supplied(e: MossImageEmbeddings<'_>, device: &Device) -> Result<Co
             .flat_map(|(_, v)| v.iter().copied())
             .collect();
         let len = selected.len() / 4096;
-        rows.push(
-            Tensor::from_vec(selected, (1, len, 4096), device)?.to_dtype(if device.is_cpu() {
-                DType::F32
-            } else {
-                DType::BF16
-            })?,
-        );
+        // sc-26324 (F-276): author prepare preserves supplied FP32 conditioning on every
+        // device. The selected transformer's projection owns any weight-dtype conversion.
+        rows.push(Tensor::from_vec(selected, (1, len, 4096), device)?);
         receipts.push(MossImageConditioningInputReceipt {
             source: MossImageConditioningSource::Embeddings,
             sha256: digest_f32(values, mask),

@@ -523,6 +523,10 @@ impl Transformer {
         }
         Ok(result)
     }
+    pub(crate) fn project_context(&self, context: &Tensor) -> Result<Tensor> {
+        self.text.forward(&context.to_dtype(self.text.dtype())?)
+    }
+
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -600,7 +604,7 @@ impl Transformer {
                 video.dtype(),
                 x.device(),
             )?;
-            let mut text = self.text.forward(&ctx.to_dtype(self.text.dtype())?)?;
+            let mut text = self.project_context(&ctx)?;
             for block in &self.text_blocks {
                 check_cancel(cancel)?;
                 text = block.forward(&text, &r.narrow(1, h * w, indices.len())?)?;
