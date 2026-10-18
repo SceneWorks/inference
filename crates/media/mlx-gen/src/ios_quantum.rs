@@ -360,8 +360,8 @@ pub fn with_admitted_envelope<T>(budget_bytes: u64, body: impl FnOnce() -> T) ->
 /// smallest of the formula and the two MEASURED requirements:
 /// * the envelope's remaining bytes (the anchor's whole-run growth still to come), and
 /// * the anchor-derived peak of THIS quantum: `scratch × observed / priced` from the device's
-///   calibration of the same formula (an exact observation in the anchor capture), plus the
-///   anchor's margin.
+///   calibration of the same formula (an exact observation in the anchor capture, at a priced size
+///   at least this invocation's), plus the anchor's margin.
 ///
 /// So a guard whose formula over-prices what the device measured for that quantum never refuses a
 /// configuration the anchor shows fits, while every guard keeps its formula as the safety net past
@@ -382,7 +382,9 @@ fn requirement(label: &str, available: Option<u64>, scratch: u64) -> (u64, u64) 
     let calibrated = envelope
         .calibration
         .get(label)
-        .filter(|c| c.priced_bytes > 0)
+        // A device calibration holds at and below the size it was observed at (the observed/priced
+        // ratio rises with a quantum's size): a larger invocation keeps its formula.
+        .filter(|c| c.priced_bytes > 0 && scratch <= c.priced_bytes)
         .map(|c| {
             let scaled = (u128::from(scratch) * u128::from(c.observed_bytes))
                 .div_ceil(u128::from(c.priced_bytes));
@@ -931,22 +933,24 @@ fn a_device_calibrated_quantum_is_guarded_at_its_anchor_derived_peak() {
     let calibration = std::collections::BTreeMap::from([(
         "decode tile".to_string(),
         QuantumCalibration {
-            priced_bytes: 400 * MIB,
-            observed_bytes: 200 * MIB,
+            priced_bytes: 1200 * MIB,
+            observed_bytes: 600 * MIB,
         },
     )]);
     with_cpu_diagnostic_headroom(1024 * MIB, || {
         // A large remaining envelope (5000 MiB) does not relax anything by itself …
         let _envelope = open_admitted_envelope(5000 * MIB, calibration.clone(), 32 * MIB);
-        // … but the calibrated quantum needs 600 × 200/400 + 32 = 332 MiB, not 600 + 512.
+        // … but the calibrated quantum needs 600 × 600/1200 + 32 = 332 MiB, not 600 + 512.
         before("decode tile", 600 * MIB)?;
         assert_eq!(
             requirement("decode tile", Some(1024 * MIB), 600 * MIB),
             (332 * MIB, 0)
         );
-        // At 2100 MiB of formula scratch the calibrated peak (1050 + 32) exceeds 1024: refused.
+        // At 1200 MiB (the calibrated size) the anchor-derived peak 600 + 32 still fits 1024 …
+        before("decode tile", 1200 * MIB)?;
+        // … but 2100 MiB is LARGER than the device ever observed: its formula (2100 + 512) applies.
         assert!(before("decode tile", 2100 * MIB).is_err());
-        assert_eq!(take_refusal().unwrap().scratch_bytes, 1082 * MIB);
+        assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
         // An uncalibrated label keeps its formula.
         assert!(before("denoise block", 600 * MIB).is_err());
         assert_eq!(take_refusal().unwrap().reserve_bytes, PROCESS_RESERVE_BYTES);
