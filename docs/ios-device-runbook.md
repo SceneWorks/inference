@@ -181,6 +181,17 @@ process stays within it, a quantum guard needs only the envelope's remaining byt
 less than its formula price; past the envelope every guard is back on its formula (the runtime
 safety net). Captures run on the formula guards alone.
 
+**Per-formula DEVICE calibration.** CPU proofs cannot reproduce the device's retention (an
+~11-op Metal command window with buffer donation), so every capture also records, per quantum
+label, the guard's priced scratch against the kernel-footprint growth the device observed across
+that quantum (lifetime peak at its end − footprint at its check; `exact` only when the peak rose
+inside it). `campaign.py evidence` prints that table across all anchors (priced vs observed,
+ratio, and whether the formula over-prices the device beyond the low-end margin), and the anchor
+row keeps it. Inside an admitted envelope a quantum whose formula has an exact device observation
+is guarded at its ANCHOR-DERIVED peak — `scratch × observed / priced` + the anchor's margin — when
+that is below its formula price, so a guard never refuses a configuration the device showed fits.
+Past the envelope every guard is back on its formula.
+
 **Per-phase capture.** Every quantum check and synchronization reads the kernel lifetime peak
 (`task_vm_info` REV3); growth inside an opened quantum belongs to that quantum's phase (the
 provider's `ios_quantum_phase(label)`), glue after a synchronization to the next quantum's. A
