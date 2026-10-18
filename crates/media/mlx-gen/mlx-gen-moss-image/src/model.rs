@@ -70,7 +70,7 @@ pub struct MossImage {
 fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
     ModelDescriptor {
         encoder_contract: None,
-        denoiser_output_latent_space: None,
+        denoiser_output_latent_space: Some(&gen_core::FLUX2_PACKED_LATENT_SPACE),
         control_kinds: None,
         required_components: if variant == MossImageVariant::Base {
             &[MOSS_SHARED_SNAPSHOT_COMPONENT]
