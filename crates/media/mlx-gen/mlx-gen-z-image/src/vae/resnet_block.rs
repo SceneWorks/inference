@@ -133,6 +133,10 @@ impl ResnetBlock2D {
             true,
         )?;
 
+        let source = mlx_gen::ios_quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: true,
+        };
         let norm1 = GlobalGroupNorm::new(&x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let h = tiled_conv2d_3x3_nhwc(
             &x,
@@ -141,7 +145,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(self.labels.tile, tile, &self.conv1_w)?;
+                crate::quantum::before_tile(self.labels.tile, tile, source, &self.conv1_w)?;
                 silu(&norm1.apply(tile)?)
             },
         )?;
@@ -156,7 +160,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(self.labels.tile, tile, &self.conv2_w)?;
+                crate::quantum::before_tile(self.labels.tile, tile, source, &self.conv2_w)?;
                 silu(&norm2.apply(tile)?)
             },
         )?;

@@ -53,8 +53,12 @@ impl ConvLayer {
             &self.w,
             false,
         )?;
+        let source = mlx_gen::ios_quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: false,
+        };
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
-            crate::quantum::before_tile(labels.tile, tile, &self.w)?;
+            crate::quantum::before_tile(labels.tile, tile, source, &self.w)?;
             Ok(tile.clone())
         })?;
         if mlx_gen::ios_quantum::enabled() {
@@ -86,8 +90,12 @@ impl ConvLayer {
             false,
         )?;
         let global = GlobalGroupNorm::new(&x, &norm.weight, &norm.bias, GN_GROUPS, GN_EPS)?;
+        let source = mlx_gen::ios_quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: true,
+        };
         let h = tiled_conv2d_3x3_nhwc(&x, &self.w, Some(&self.b), tile_edge, cancel, |tile| {
-            crate::quantum::before_tile(labels.tile, tile, &self.w)?;
+            crate::quantum::before_tile(labels.tile, tile, source, &self.w)?;
             silu(&global.apply(tile)?)
         })?;
         if mlx_gen::ios_quantum::enabled() {

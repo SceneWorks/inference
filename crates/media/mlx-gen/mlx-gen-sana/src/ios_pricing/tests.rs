@@ -419,20 +419,39 @@ fn observed_peak_quantum_per_phase_is_the_priced_one() {
                 }
             }
         }
-        let priced: BTreeMap<IosPhase, (u64, String)> = priced
-            .phases
-            .iter()
-            .map(|p| (p.phase, (p.scratch_bytes, p.binding.clone())))
-            .collect();
+        // The largest PRICED quantum of each phase (the folded price binds the phase's worst
+        // resident + scratch, which a quantum with less scratch but more resident can win: the
+        // staged reference-encoder load holds the preprocessed image).
+        let mut largest: BTreeMap<IosPhase, (u64, String)> = BTreeMap::new();
+        for q in &quanta {
+            let slot = largest.entry(q.phase).or_insert((0, String::new()));
+            if q.scratch_bytes > slot.0 {
+                *slot = (q.scratch_bytes, q.label.to_string());
+            }
+        }
         println!(
-            "sprint={sprint} img2img={img2img}\n  observed {observed:?}\n  priced   {priced:?}"
+            "sprint={sprint} img2img={img2img}\n  observed {observed:?}\n  priced   {largest:?}"
         );
         assert_eq!(
             observed.keys().collect::<Vec<_>>(),
-            priced.keys().collect::<Vec<_>>(),
+            priced.phases.iter().map(|p| &p.phase).collect::<Vec<_>>(),
             "the priced phases are the phases the request runs"
         );
-        assert_eq!(observed, priced, "sprint={sprint} img2img={img2img}");
+        assert_eq!(observed, largest, "sprint={sprint} img2img={img2img}");
+        // Each phase's binding quantum was checked at exactly its priced scratch.
+        for p in &priced.phases {
+            assert!(
+                seen.borrow().iter().any(|e| matches!(
+                    e,
+                    QuantumEvent::Checked { label, scratch }
+                        if *label == p.binding && *scratch == p.scratch_bytes
+                )),
+                "{:?}: binding {} at {} B was never checked at that scratch",
+                p.phase,
+                p.binding,
+                p.scratch_bytes
+            );
+        }
         // Stronger than the phase maxima: every label's largest checked scratch is the largest
         // priced for it, and no label is priced that the request does not run (or vice versa).
         let mut observed: BTreeMap<String, u64> = BTreeMap::new();

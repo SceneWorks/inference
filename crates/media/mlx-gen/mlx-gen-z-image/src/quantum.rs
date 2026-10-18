@@ -429,11 +429,17 @@ pub(crate) fn nhwc(x_nchw: &Array) -> [i32; 4] {
 }
 
 /// Check one halo-expanded tile of a layer-wise tiled VAE convolution BEFORE its norm/activation/
-/// conv graph is constructed, priced at the tile's extent and `weight`'s channel counts
+/// conv graph is constructed, priced at the tile's extent, its `source` (the activation's width,
+/// whether the crop is normalized) and `weight`'s channel counts
 /// ([`mlx_gen::ios_quantum::tile_bytes`]). Called from the per-tile preprocess hook of
 /// `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc`, which evaluates each output core before the next
 /// tile is built.
-pub(crate) fn before_tile(label: &str, tile: &Array, weight: &Array) -> mlx_gen::Result<()> {
+pub(crate) fn before_tile(
+    label: &str,
+    tile: &Array,
+    source: mlx_gen::ios_quantum::TileSource,
+    weight: &Array,
+) -> mlx_gen::Result<()> {
     if !mlx_gen::ios_quantum::enabled() {
         return Ok(());
     }
@@ -441,6 +447,7 @@ pub(crate) fn before_tile(label: &str, tile: &Array, weight: &Array) -> mlx_gen:
         label,
         mlx_gen::ios_quantum::tile_bytes(
             tile.shape(),
+            source,
             tile.item_size() as u64,
             weight,
             false,

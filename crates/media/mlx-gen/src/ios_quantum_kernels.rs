@@ -414,12 +414,41 @@ pub fn vae_attention_bytes(
         .saturating_add(page_slack(projections.max(attention_units + 4)))
 }
 
-/// One tile of `mlx_gen::vae_tiling`'s tiled 3x3 convolution over a `[B, h, w, C]` crop (a strided
-/// slice of the full activation): the GlobalGroupNorm apply's contiguous crop copy, centred and
-/// affine buffers, the SiLU output (input width), the `f32_accum` promoted crop (f32), the
-/// convolution output and its core copy (output width, f32 under `f32_accum`) + the transient.
+/// Where one tile's `[B, h, w, C]` crop comes from in `mlx_gen::vae_tiling`'s tiled 3x3
+/// convolution, and what runs on it before the convolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileSource {
+    /// Width of the full activation the crop is sliced from (`x.shape()[2]` of the tiled call).
+    pub full_width: i32,
+    /// The crop is normalized by `vae_tiling::GlobalGroupNorm::apply` and SiLU-activated before
+    /// the convolution (a resnet's conv1/conv2, a decoder's `conv_out`); `false` for a raw crop
+    /// (`conv_in`, an upsample convolution).
+    pub normalized: bool,
+}
+
+/// One tile of `mlx_gen::vae_tiling`'s tiled 3x3 convolution over a `[B, h, w, C]` crop, counted
+/// under MLX's retention (the tile's graph is one `eval`, so its intermediates are live together —
+/// see [`conv_sum`]):
+///
+/// * the crop's materialization: a ROW STRIP `[B, h, full_width, C]` (the halo crop is a strided
+///   slice of the full activation; MLX materializes it through the full-width rows) and the
+///   contiguous crop itself, at the input width;
+/// * `normalized`: the GlobalGroupNorm apply's grouped copy, centred and transposed-back buffers
+///   (three f32 crops), and below f32 also the f32 normalized product and the cast back to the
+///   storage width;
+/// * the `f32_accum` promoted crop (f32);
+/// * the convolution output, its bias sum and the core copy (output width, f32 under
+///   `f32_accum`), plus the core's cast back to the storage width under `f32_accum`;
+/// * the kernel transient ([`ConvCall::transient`]) and an allocator page per buffer.
+///
+/// Measured (`vae_tiling::tests::tile_formula_tracks_the_measured_tile`, stalled runs on the CPU
+/// backend): f32 and f16, normalized and raw, `f32_accum` on and off, crops from 23% to 100% of the
+/// row width. The previous `max(norm phase, conv phase)` form under-counted every tile by the row
+/// strip, the bias sum and (normalized) the norm buffers live beside the convolution — ~5 crops on a
+/// 258² f32 crop of a 288-wide activation.
 pub fn tile_bytes(
     tile: &[i32],
+    source: TileSource,
     act: u64,
     weight: &Array,
     f32_accum: bool,
@@ -427,15 +456,34 @@ pub fn tile_bytes(
 ) -> u64 {
     let conv_act = if f32_accum { 4 } else { act };
     let call = ConvCall::new(tile, conv_act, weight, 1, 1);
-    let crop = tensor_bytes(act, &[u(tile[0]), u(tile[1]), u(tile[2]), u(tile[3])]);
+    let (b, h, w, c) = (u(tile[0]), u(tile[1]), u(tile[2]), u(tile[3]));
+    let crop = tensor_bytes(act, &[b, h, w, c]);
+    let strip = tensor_bytes(act, &[b, h, u(source.full_width).max(w), c]);
+    let crop_f32 = tensor_bytes(4, &[b, h, w, c]);
+    let norm = if source.normalized {
+        let narrow = if act < 4 {
+            crop_f32.saturating_add(crop)
+        } else {
+            0
+        };
+        crop_f32.saturating_mul(3).saturating_add(narrow)
+    } else {
+        0
+    };
     let promoted = if f32_accum { call.in_bytes() } else { 0 };
-    // The norm phase holds 3 crop-width buffers; the convolution the SiLU output (+ promoted
-    // copy), its output, the core and the transient.
-    (3 * crop).max(
-        crop.saturating_add(promoted)
-            .saturating_add(2 * call.out_bytes())
-            .saturating_add(call.transient(backend)),
-    )
+    let cast_back = if f32_accum {
+        tensor_bytes(act, &[call.batch, call.out_h, call.out_w, call.cout])
+    } else {
+        0
+    };
+    strip
+        .saturating_add(crop)
+        .saturating_add(norm)
+        .saturating_add(promoted)
+        .saturating_add(call.out_bytes().saturating_mul(3))
+        .saturating_add(cast_back)
+        .saturating_add(call.transient(backend))
+        .saturating_add(page_slack(16))
 }
 
 /// One layer-wise tiled VAE stage producing `[B, H, W, cout]` from a `[B, H, W, cin]` input: the

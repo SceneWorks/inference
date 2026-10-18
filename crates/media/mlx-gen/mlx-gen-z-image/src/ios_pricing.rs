@@ -94,18 +94,12 @@ pub fn ios_quantum_phase(label: &str) -> Option<IosPhase> {
 }
 
 /// The `MemoryMode` keys of the requests this crate serves that are NOT derivable from the
-/// `z_image_turbo` TEXT anchor by the anchor law (`mlx_gen::ios_anchor_law::derive`): each is its own
-/// anchor family. `image_to_image` (the reference mode) and `control` (the control route, with or
-/// without a reference init, every kind) both add the bounded, layer-tiled VAE ENCODE, whose tile
-/// quanta measure above their counted price on the CPU fixture (by about one full-resolution
-/// activation per tiled resnet). The law prices an extra phase at its counted formula plus the
-/// anchor's largest unpriced overhead, and the text anchor has no tiled encode to measure that
-/// overhead in: from a rung-0 anchor (whole decode) the encode is under-derived by ~5%, and at the
-/// fully optimized selection it is covered only by the anchor's tiled decode happening to measure a
-/// comparable overhead (a few KB either way; short on the packed tiers). Every other phase of both
-/// modes derives. Failing test:
-/// `ios_additivity_tests::only_the_encode_is_not_derivable_from_the_text_anchor`.
-pub const IOS_NON_ADDITIVE_MODES: &[&str] = &["image_to_image", "control"];
+/// `z_image_turbo` TEXT anchor by the anchor law (`mlx_gen::ios_anchor_law::derive`) — each such
+/// mode would be its own anchor family. Empty: the reference (img2img) and the control route's
+/// control / control + reference modes (every kind) are component-additive, proven on the CPU
+/// fixtures at the fully optimized selection and rung 0, dense, q4 and q8
+/// (`ios_additivity_tests::every_mode_is_derivable_from_the_text_anchor`, `packed_tier_matrix`).
+pub const IOS_NON_ADDITIVE_MODES: &[&str] = &[];
 
 /// Price one iOS request header-only on the device backend (Metal).
 pub fn ios_pricing(req: &IosPricingRequest<'_>) -> Result<IosPricing> {
@@ -917,6 +911,7 @@ impl Model {
                 conv_in.weight(),
                 tile_px.max(3),
                 false,
+                false,
                 b,
             );
             let mut scale = 1;
@@ -936,14 +931,21 @@ impl Model {
                     let live = held + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                     let (c1, c2) = r.conv_weights();
                     let x = [1, ch, cw, c];
-                    stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, b);
+                    stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, true, b);
                     let cout = mlx_gen::ios_quantum::conv_channels(c1).1;
                     let stage = mlx_gen::ios_quantum::tiled_stage_bytes(&x, c, cout, 4, true);
                     let t = tile_extent(ch, cw, edge);
                     out.push((
                         labels.tile,
                         live + stage,
-                        mlx_gen::ios_quantum::tile_bytes(&[1, t.0, t.1, cout], 4, c2, false, b),
+                        mlx_gen::ios_quantum::tile_bytes(
+                            &[1, t.0, t.1, cout],
+                            normalized(cw),
+                            4,
+                            c2,
+                            false,
+                            b,
+                        ),
                     ));
                     c = mlx_gen::ios_quantum::conv_channels(c2).1;
                 }
@@ -1065,14 +1067,21 @@ impl Model {
                         let live = held + head + q::ab(4, &[1, c as u64, ch as u64, cw as u64]);
                         let (c1, c2) = r.conv_weights();
                         let x = [1, ch, cw, c];
-                        stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, b);
+                        stage_and_tiles(&mut out, labels, live, &x, c1, edge, true, true, b);
                         let cout = mlx_gen::ios_quantum::conv_channels(c1).1;
                         let stage = mlx_gen::ios_quantum::tiled_stage_bytes(&x, c, cout, 4, true);
                         let t = tile_extent(ch, cw, edge);
                         out.push((
                             labels.tile,
                             live + stage,
-                            mlx_gen::ios_quantum::tile_bytes(&[1, t.0, t.1, cout], 4, c2, false, b),
+                            mlx_gen::ios_quantum::tile_bytes(
+                                &[1, t.0, t.1, cout],
+                                normalized(cw),
+                                4,
+                                c2,
+                                false,
+                                b,
+                            ),
                         ));
                         c = mlx_gen::ios_quantum::conv_channels(c2).1;
                     }
@@ -1087,6 +1096,7 @@ impl Model {
                             &x,
                             u.weight(),
                             edge_at(next),
+                            false,
                             false,
                             b,
                         );
@@ -1104,6 +1114,7 @@ impl Model {
                     conv_out.weight(),
                     tile_px.max(3),
                     false,
+                    true,
                     b,
                 );
             }
@@ -1203,7 +1214,8 @@ fn mid_quanta(
     Ok(())
 }
 
-/// One layer-wise tiled stage over `x` (NHWC, f32) run by `weight`'s 3x3 convolution — its stage
+/// One layer-wise tiled stage over `x` (NHWC, f32) run by `weight`'s 3x3 convolution (on crops
+/// GroupNorm + SiLU preprocessed when `normalized`) — its stage
 /// check ([`q::before_tiled_stage`]) and its largest tile check ([`q::before_tile`]) at `edge`.
 #[allow(clippy::too_many_arguments)]
 fn stage_and_tiles(
@@ -1214,17 +1226,30 @@ fn stage_and_tiles(
     weight: &Array,
     edge: i32,
     resnet: bool,
+    normalized: bool,
     b: Backend,
 ) {
     let (cin, cout) = mlx_gen::ios_quantum::conv_channels(weight);
     let stage = mlx_gen::ios_quantum::tiled_stage_bytes(x, cin, cout, 4, resnet);
     out.push((labels.stage, live, stage));
     let t = tile_extent(x[1], x[2], edge);
+    let source = mlx_gen::ios_quantum::TileSource {
+        full_width: x[2],
+        normalized,
+    };
     out.push((
         labels.tile,
         live + stage,
-        mlx_gen::ios_quantum::tile_bytes(&[1, t.0, t.1, x[3]], 4, weight, false, b),
+        mlx_gen::ios_quantum::tile_bytes(&[1, t.0, t.1, x[3]], source, 4, weight, false, b),
     ));
+}
+
+/// The tile source of a GroupNorm + SiLU preprocessed crop of a `full_width`-wide activation.
+fn normalized(full_width: i32) -> mlx_gen::ios_quantum::TileSource {
+    mlx_gen::ios_quantum::TileSource {
+        full_width,
+        normalized: true,
+    }
 }
 
 /// The largest halo-expanded tile `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc` cuts from an

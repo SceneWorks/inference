@@ -30,7 +30,7 @@ pub(crate) use mlx_gen::ios_quantum::{
     bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes, downsample_tile_bytes,
     dtype_bytes, element_bytes, elements, group_norm_buffers, norm_conv_bytes,
     norm_promotion_units, page_slack, resnet_bytes, single_conv_bytes, tile_bytes,
-    tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall,
+    tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall, TileSource,
     VAE_ATTENTION_SCORE_ELEMENTS,
 };
 #[cfg(test)]
@@ -397,12 +397,14 @@ pub(crate) fn transformer_block_bytes(
 }
 
 /// Check one halo-expanded tile of a layer-wise tiled VAE convolution BEFORE its norm/activation/
-/// conv graph is constructed, priced at the tile's extent and `weight`'s channel counts. Called from
+/// conv graph is constructed, priced at the tile's extent, its `source` (the activation's width,
+/// whether the crop is normalized) and `weight`'s channel counts. Called from
 /// the per-tile preprocess hook of `mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc*`, which evaluates
 /// each output core before the next tile is built.
 pub(crate) fn before_tile(
     label: &str,
     tile: &Array,
+    source: TileSource,
     weight: &Array,
     f32_accum: bool,
 ) -> mlx_gen::Result<()> {
@@ -410,6 +412,7 @@ pub(crate) fn before_tile(
         label,
         tile_bytes(
             tile.shape(),
+            source,
             element_bytes(tile),
             weight,
             f32_accum,

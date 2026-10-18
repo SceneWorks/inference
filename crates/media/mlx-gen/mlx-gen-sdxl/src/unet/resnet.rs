@@ -300,6 +300,10 @@ impl ResnetBlock2D {
             labels.tiled_stage,
             crate::quantum::tiled_stage_bytes(s, cin, cout, crate::quantum::element_bytes(x), true),
         )?;
+        let source = crate::quantum::TileSource {
+            full_width: x.shape()[2],
+            normalized: true,
+        };
         let norm1 = GlobalGroupNorm::new(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
         let y = tiled_conv2d_3x3_nhwc(
             x,
@@ -309,7 +313,7 @@ impl ResnetBlock2D {
             cancel,
             |tile| {
                 // sc-26270: each tile is checked before its norm/conv graph is constructed.
-                crate::quantum::before_tile(labels.tile, tile, self.conv1.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, source, self.conv1.weight(), false)?;
                 silu_glue(&norm1.apply(tile)?)
             },
         )?;
@@ -325,7 +329,7 @@ impl ResnetBlock2D {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(labels.tile, tile, self.conv2.weight(), false)?;
+                crate::quantum::before_tile(labels.tile, tile, source, self.conv2.weight(), false)?;
                 silu_glue(&norm2.apply(tile)?)
             },
         )?;
@@ -359,6 +363,10 @@ impl ResnetBlock2D {
             let (th, tw) = crate::vae::max_conv_tile(input[1], input[2], tile_edge);
             crate::quantum::tile_bytes(
                 &[input[0], th, tw, channels],
+                crate::quantum::TileSource {
+                    full_width: input[2],
+                    normalized: true,
+                },
                 width,
                 weight,
                 false,

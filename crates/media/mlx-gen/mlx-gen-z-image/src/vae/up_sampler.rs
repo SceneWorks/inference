@@ -77,7 +77,15 @@ impl UpSampler {
             tile_edge,
             cancel,
             |tile| {
-                crate::quantum::before_tile(crate::quantum::VAE_DECODE_TILE, tile, &self.conv_w)?;
+                crate::quantum::before_tile(
+                    crate::quantum::VAE_DECODE_TILE,
+                    tile,
+                    mlx_gen::ios_quantum::TileSource {
+                        full_width: up.shape()[2],
+                        normalized: false,
+                    },
+                    &self.conv_w,
+                )?;
                 Ok(tile.clone())
             },
         )?;

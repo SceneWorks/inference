@@ -19,16 +19,11 @@
 //! ([`crate::ios_pricing`]) and must cover the mode's measurement, overall and in every phase both
 //! ran ([`bound`]). Every test re-executes itself in a CPU child with Metal made fatal.
 //!
-//! RESULT. Every phase but the extra ENCODE derives, for every mode, selection and tier. The encode
-//! does not: it is always the bounded, layer-tiled encode on iOS, whose CPU tile quanta measure
-//! above their counted price (`mlx_gen::ios_quantum_kernels::tile_bytes`: the first tile of each
-//! tiled convolution grows ~5 crop-sized buffers past its formula; with the first convolution's
-//! output live beside the second's, the resnet's `live + stage + tile` is exceeded by one
-//! full-resolution activation). A rung-0 text anchor runs no tiled stage (its decode is whole), so
-//! it measured no such overhead for the law to carry into the extra phase: the encode is
-//! under-derived by ~10 MB (5%). The optimized anchor's tiled decode measures a comparable overhead,
-//! which covers the encode on the dense tier by a few KB and falls a few KB short on q4 / q8. Hence
-//! [`crate::ios_pricing::IOS_NON_ADDITIVE_MODES`].
+//! RESULT. Every mode derives — every phase, every selection, dense, q4 and q8. The extra ENCODE is
+//! always the bounded, layer-tiled encode on iOS; it derives because its tile quanta are priced by
+//! the counted `mlx_gen::ios_quantum_kernels::tile_bytes` (row strip + crop + norm buffers live beside
+//! the convolution), so the encode needs no unpriced overhead from an anchor that may run no tiled
+//! stage at all (rung 0 decodes whole). [`crate::ios_pricing::IOS_NON_ADDITIVE_MODES`] is empty.
 //!
 //! The control KIND is not a pricing input (the Fun-Controlnet-Union is a union ControlNet; the
 //! kinds share one VAE-encoded control path), but each kind is measured with its own hint image.
@@ -267,11 +262,10 @@ fn bound(
     }
 }
 
-/// One derived case's verdict: the table row and the phases (or `demand`) that broke.
+/// One derived case's verdict: the table row and its failures.
 struct Verdict {
     line: String,
     failures: Vec<String>,
-    failed_phases: Vec<String>,
 }
 
 /// Derive `mode` (priced `request`, measured `measured`) from the measured text `anchor` (priced
@@ -289,7 +283,7 @@ fn verdict(
     let a = area(EDGE, EDGE, 1);
     let derived = derive(&anchor.worst.anchor(a), at_anchor, request, a)
         .unwrap_or_else(|e| panic!("{case} {selection} {tier}: not derivable: {e}"));
-    let (mut failures, mut failed_phases, mut phases) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut failures, mut phases) = (Vec::new(), Vec::new());
     // The whole run is bounded by its worst phase's bound (phases run in sequence).
     let demand_bound = derived
         .phases
@@ -310,7 +304,6 @@ fn verdict(
             if ok { "" } else { " FAIL" }
         ));
         if !ok {
-            failed_phases.push(d.phase.as_key().to_string());
             failures.push(format!(
                 "{case} {selection} {tier}: phase {} measured {m} B > {limit} B (derived {} B{tag})",
                 d.phase.as_key(),
@@ -319,7 +312,6 @@ fn verdict(
         }
     }
     if measured.worst.demand > demand_bound {
-        failed_phases.push("demand".into());
         failures.push(format!(
             "{case} {selection} {tier}: demand measured {} B > {demand_bound} B (derived {} B)",
             measured.worst.demand, derived.demand
@@ -335,7 +327,6 @@ fn verdict(
             phases.join(", ")
         ),
         failures,
-        failed_phases,
     }
 }
 
@@ -372,7 +363,7 @@ fn prove(
     selection: usize,
     tier_names: &[&str],
     cases: &[(String, Mode, mlx_gen::Image)],
-    tamper: impl Fn(Mode, &mut IosPricing),
+    tamper: impl Fn(Mode, &IosPricing, &mut IosPricing),
 ) -> Vec<(String, Verdict)> {
     let snap = snapshot();
     println!(
@@ -395,7 +386,7 @@ fn prove(
             };
             let mode_route = route(*mode, execution);
             let mut request = pricing(&snap, tier, &mode_route);
-            tamper(*mode, &mut request);
+            tamper(*mode, &at_anchor, &mut request);
             let v = verdict(
                 case,
                 name,
@@ -419,55 +410,25 @@ fn failures(verdicts: &[(String, Verdict)]) -> Vec<String> {
         .collect()
 }
 
-/// The verdicts' shape (see the module docs): every phase but the extra ENCODE derives (the whole
-/// run's `demand` may break only with it, the encode being the run's largest phase), and from a
-/// rung-0 anchor every case's encode is under-derived.
-fn assert_only_the_encode_breaks(selection: usize, verdicts: &[(String, Verdict)]) {
-    for (case, v) in verdicts {
-        let broken: Vec<&str> = v.failed_phases.iter().map(String::as_str).collect();
-        assert!(
-            matches!(broken[..], [] | ["encode"] | ["encode", "demand"]),
-            "{case}: a phase other than the encode is under-derived: {:#?}",
-            v.failures
-        );
-        if selection == RUNG_0 {
-            assert!(
-                broken.first() == Some(&"encode"),
-                "{case}: from a rung-0 text anchor the encode must stay under-derived — if it now \
-                 derives, re-examine `IOS_NON_ADDITIVE_MODES`"
-            );
-        }
-    }
-}
-
-/// THE PROOF, and the failure [`crate::ios_pricing::IOS_NON_ADDITIVE_MODES`] cites. Every Z-Image
-/// mode (reference; control and control + reference for each kind) is derived from the
-/// `z_image_turbo` text anchor at the fully optimized selection and at rung 0: every phase but the
-/// extra encode is covered by its derivation, and the encode is not — from a rung-0 anchor it is
-/// under-derived by about one full-resolution activation in every case, and at the optimized
-/// selection it is covered only by the anchor's tiled decode measuring a comparable overhead (dense
-/// by 2.6–7.7 KB; the packed tiers fall 8–21 KB short). Dense tier; the packed tiers are
+/// THE PROOF: every Z-Image mode (reference; control and control + reference for each kind) is
+/// covered by its derivation from the `z_image_turbo` text anchor, overall and in every phase, at
+/// the fully optimized selection and at rung 0. Dense tier; the packed tiers are
 /// [`packed_tier_matrix`].
 #[cfg(target_os = "macos")]
 #[test]
-fn only_the_encode_is_not_derivable_from_the_text_anchor() {
-    if !in_cpu_child("only_the_encode_is_not_derivable_from_the_text_anchor") {
+fn every_mode_is_derivable_from_the_text_anchor() {
+    if !in_cpu_child("every_mode_is_derivable_from_the_text_anchor") {
         return;
     }
-    assert_eq!(
-        crate::ios_pricing::IOS_NON_ADDITIVE_MODES,
-        &["image_to_image", "control"]
-    );
+    assert!(crate::ios_pricing::IOS_NON_ADDITIVE_MODES.is_empty());
     for selection in [OPTIMIZED, RUNG_0] {
-        assert_only_the_encode_breaks(
-            selection,
-            &prove(selection, &["dense"], &cases(), |_, _| {}),
-        );
+        let failures = failures(&prove(selection, &["dense"], &cases(), |_, _, _| {}));
+        assert!(failures.is_empty(), "not additive: {failures:#?}");
     }
 }
 
-/// [`only_the_encode_is_not_derivable_from_the_text_anchor`] on the packed tiers (the DiT stored at
-/// q4 and at q8). ~15 min on the CPU fixture.
+/// [`every_mode_is_derivable_from_the_text_anchor`] on the packed tiers (the DiT stored at q4 and at
+/// q8). ~15 min on the CPU fixture.
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "the q4/q8 additivity matrix (~15 min of CPU): run with --ignored"]
@@ -476,48 +437,48 @@ fn packed_tier_matrix() {
         return;
     }
     for selection in [OPTIMIZED, RUNG_0] {
-        assert_only_the_encode_breaks(
-            selection,
-            &prove(selection, &["q4", "q8"], &cases(), |_, _| {}),
-        );
+        let failures = failures(&prove(selection, &["q4", "q8"], &cases(), |_, _, _| {}));
+        assert!(failures.is_empty(), "not additive: {failures:#?}");
     }
 }
 
-/// The proof has teeth: a derivation that forgets the control route's ControlNet (the `C_req` re-add
-/// of the extra component: its resident bytes in the phases a staged request holds it — the encode
-/// and the denoise) goes red at the optimized selection. Dense tier.
+/// The proof has teeth: a derivation that forgets the control route's extra components in its
+/// denoise (the `C_req` re-add: the ControlNet, its control context and hint caches — the request
+/// priced at the text anchor's denoise residency) goes red at the optimized selection. Dense tier.
 #[cfg(target_os = "macos")]
 #[test]
-fn dropping_the_controlnet_residency_breaks_the_proof() {
-    if !in_cpu_child("dropping_the_controlnet_residency_breaks_the_proof") {
+fn dropping_the_control_components_breaks_the_proof() {
+    if !in_cpu_child("dropping_the_control_components_breaks_the_proof") {
         return;
     }
-    let snap = snapshot();
-    let controlnet = Model::new(snap.facts(true, None))
-        .unwrap()
-        .control_resident();
-    assert!(controlnet > 0);
     let pose: Vec<_> = cases()
         .into_iter()
         .filter(|(case, _, _)| case.ends_with("pose"))
         .collect();
-    let failures = failures(&prove(OPTIMIZED, &["dense"], &pose, |mode, pricing| {
-        if !mode.control() {
-            return;
-        }
-        for phase in &mut pricing.phases {
-            if matches!(phase.phase, IosPhase::Encode | IosPhase::Denoise) {
-                phase.resident_bytes -= controlnet;
+    let failures = failures(&prove(
+        OPTIMIZED,
+        &["dense"],
+        &pose,
+        |mode, at_anchor, pricing| {
+            if !mode.control() {
+                return;
             }
-        }
-    }));
+            let text = at_anchor.phase(IosPhase::Denoise).unwrap().resident_bytes;
+            for phase in &mut pricing.phases {
+                if phase.phase == IosPhase::Denoise {
+                    assert!(phase.resident_bytes > text);
+                    phase.resident_bytes = text;
+                }
+            }
+        },
+    ));
     println!("{failures:#?}");
     for case in ["control pose", "control+reference pose"] {
         assert!(
             failures
                 .iter()
-                .any(|f| f.contains(case) && f.contains("phase encode")),
-            "{case}: dropping the ControlNet's residency must break the derivation"
+                .any(|f| f.contains(case) && f.contains("phase denoise")),
+            "{case}: dropping the control components must break the derivation"
         );
     }
 }

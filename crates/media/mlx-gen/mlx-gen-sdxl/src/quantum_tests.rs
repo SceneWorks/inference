@@ -1560,17 +1560,39 @@ fn metal_conv_transients() {
     let wt = w(512, 3, 512);
     let tile = [1, 64, 64, 512];
     let crop = 64 * 64 * 512 * 2;
+    // A raw crop of a 128-wide activation: its 128-wide row strip and the crop.
+    let raw = TileSource {
+        full_width: 128,
+        normalized: false,
+    };
+    let strip = 64 * 128 * 512 * 2;
     let wide = ConvCall::new(&tile, 4, &wt, 1, 1);
     assert_eq!(
-        tile_bytes(&tile, 2, &wt, true, Backend::Metal),
-        // f16 crop (after its SiLU), the f32 promoted crop, the f32 output and core, the f32 call's
-        // transients.
-        crop + 64 * 64 * 512 * 4 + 2 * wide.out_bytes() + wide.transient(Backend::Metal)
+        tile_bytes(&tile, raw, 2, &wt, true, Backend::Metal),
+        // strip + f16 crop, the f32 promoted crop, the f32 output, bias sum and core, the core's f16
+        // cast, the f32 call's transients and the page slack.
+        strip
+            + crop
+            + 64 * 64 * 512 * 4
+            + 3 * wide.out_bytes()
+            + 64 * 64 * 512 * 2
+            + wide.transient(Backend::Metal)
+            + page_slack(16)
     );
     let narrow = ConvCall::new(&tile, 2, &wt, 1, 1);
     assert_eq!(
-        tile_bytes(&tile, 2, &wt, false, Backend::Metal),
-        crop + 2 * narrow.out_bytes() + narrow.transient(Backend::Metal)
+        tile_bytes(&tile, raw, 2, &wt, false, Backend::Metal),
+        strip + crop + 3 * narrow.out_bytes() + narrow.transient(Backend::Metal) + page_slack(16)
+    );
+    // Normalized at f16: + the grouped copy, centred and transposed-back f32 buffers, the f32
+    // normalized product and the f16 cast back.
+    let normalized = TileSource {
+        full_width: 128,
+        normalized: true,
+    };
+    assert_eq!(
+        tile_bytes(&tile, normalized, 2, &wt, false, Backend::Metal),
+        tile_bytes(&tile, raw, 2, &wt, false, Backend::Metal) + 4 * 64 * 64 * 512 * 4 + crop
     );
 }
 
@@ -2685,7 +2707,17 @@ mod proofs {
         let bu = rand(&[64], 2);
         // A tiled stage plus its widest tile (the 16-edge tiles of a 32x32 extent).
         let x = rand(&[1, 32, 32, 64], 3);
-        let tile = tile_bytes(&[1, 16, 16, 64], 4, &wu, false, cpu);
+        let tile = tile_bytes(
+            &[1, 16, 16, 64],
+            TileSource {
+                full_width: 32,
+                normalized: true,
+            },
+            4,
+            &wu,
+            false,
+            cpu,
+        );
         prove(
             &format!("{VAE_TILED_STAGE} + {VAE_TILE} (resnet)"),
             tiled_stage_bytes(&[1, 32, 32, 64], 64, 64, 4, true) + tile,
@@ -2730,7 +2762,17 @@ mod proofs {
         prove(
             &format!("{VAE_TILED_STAGE} + {VAE_TILE} (encode conv_in)"),
             tiled_stage_bytes(&[1, 64, 64, 32], 3, 32, 4, false)
-                + tile_bytes(&[1, 18, 18, 3], 4, &wi, false, cpu),
+                + tile_bytes(
+                    &[1, 18, 18, 3],
+                    TileSource {
+                        full_width: 64,
+                        normalized: false,
+                    },
+                    4,
+                    &wi,
+                    false,
+                    cpu,
+                ),
             || {
                 Ok(vec![mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(
                     &image,

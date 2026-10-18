@@ -279,6 +279,10 @@ fn decode_quanta(l: i32, tile: Option<i32>) -> Vec<(String, u64)> {
                         tiled_stage_bytes(&[1, h, h, cout], ci, cout, HALF, true)
                             + tile_bytes(
                                 &[1, e.min(h) + 2, e.min(h) + 2, ci],
+                                TileSource {
+                                    full_width: h,
+                                    normalized: true,
+                                },
                                 HALF,
                                 &w(cout, 3, ci),
                                 false,
@@ -308,6 +312,10 @@ fn decode_quanta(l: i32, tile: Option<i32>) -> Vec<(String, u64)> {
                             HALF,
                         ) + tile_bytes(
                             &[1, e.min(2 * h) + 2, e.min(2 * h) + 2, cout],
+                            TileSource {
+                                full_width: 2 * h,
+                                normalized: false,
+                            },
                             HALF,
                             &w(cout, 3, cout),
                             true,
@@ -330,6 +338,10 @@ fn decode_quanta(l: i32, tile: Option<i32>) -> Vec<(String, u64)> {
                 tiled_stage_bytes(&[1, e8, e8, 3], 128, 3, HALF, false)
                     + tile_bytes(
                         &[1, t.min(e8) + 2, t.min(e8) + 2, 128],
+                        TileSource {
+                            full_width: e8,
+                            normalized: true,
+                        },
                         HALF,
                         &w(3, 3, 128),
                         false,
@@ -355,6 +367,10 @@ fn encode_tiled_quanta(l: i32, tile: i32) -> Vec<(String, u64)> {
         tiled_stage_bytes(&[1, e, e, 128], 3, 128, HALF, false)
             + tile_bytes(
                 &[1, crop(tile, e), crop(tile, e), 3],
+                TileSource {
+                    full_width: e,
+                    normalized: false,
+                },
                 HALF,
                 &w(128, 3, 3),
                 false,
@@ -375,6 +391,10 @@ fn encode_tiled_quanta(l: i32, tile: i32) -> Vec<(String, u64)> {
                 tiled_stage_bytes(&[1, h, h, cout], ci, cout, HALF, true)
                     + tile_bytes(
                         &[1, crop(edge, h), crop(edge, h), ci],
+                        TileSource {
+                            full_width: h,
+                            normalized: true,
+                        },
                         HALF,
                         &w(cout, 3, ci),
                         false,

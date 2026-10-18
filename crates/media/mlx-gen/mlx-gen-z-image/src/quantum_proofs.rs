@@ -995,8 +995,13 @@ fn vae_formulas_track_the_measured_peak() {
     // are live while each tile runs).
     let edge = 24;
     let stage = mlx_gen::ios_quantum::tiled_stage_bytes(&[1, 64, 64, 64], 64, 32, act, true);
+    let resnet_tile = mlx_gen::ios_quantum::TileSource {
+        full_width: 64,
+        normalized: true,
+    };
     let tile = mlx_gen::ios_quantum::tile_bytes(
         &[1, edge, edge, 64],
+        resnet_tile,
         act,
         &w.require("r1.conv1.weight").unwrap().clone(),
         false,
@@ -1004,6 +1009,7 @@ fn vae_formulas_track_the_measured_peak() {
     )
     .max(mlx_gen::ios_quantum::tile_bytes(
         &[1, edge, edge, 32],
+        resnet_tile,
         act,
         &w.require("r1.conv2.weight").unwrap().clone(),
         false,
@@ -1022,6 +1028,10 @@ fn vae_formulas_track_the_measured_peak() {
         mlx_gen::ios_quantum::tiled_stage_bytes(&[1, 128, 128, 3], 3, 32, act, false)
             + mlx_gen::ios_quantum::tile_bytes(
                 &[1, edge, edge, 3],
+                mlx_gen::ios_quantum::TileSource {
+                    full_width: 128,
+                    normalized: false,
+                },
                 act,
                 conv_in.weight(),
                 false,

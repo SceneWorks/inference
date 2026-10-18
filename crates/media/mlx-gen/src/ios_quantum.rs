@@ -25,7 +25,7 @@ pub use kernels::{
     downsample_tile_bytes, dtype_bytes, element_bytes, elements, group_norm_buffers,
     norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes, sdpa_scores,
     single_conv_bytes, tile_bytes, tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes,
-    Backend, ConvCall, GROUP_NORM_BUFFERS, PAGE_BYTES, VAE_ATTENTION_SCORE_ELEMENTS,
+    Backend, ConvCall, TileSource, GROUP_NORM_BUFFERS, PAGE_BYTES, VAE_ATTENTION_SCORE_ELEMENTS,
 };
 
 /// A typed record of the quantum that refused BEFORE constructing its graph. Error values cross

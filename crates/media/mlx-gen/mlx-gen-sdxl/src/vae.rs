@@ -441,6 +441,7 @@ pub(crate) fn max_conv_tile(h: i32, w: i32, max_tile_edge: i32) -> (i32, i32) {
 }
 
 /// Header-only pricing of one per-tile check (`quantum::before_tile`) at the widest crop.
+#[allow(clippy::too_many_arguments)]
 fn price_tiles(
     label: &'static str,
     x: &Array,
@@ -448,6 +449,7 @@ fn price_tiles(
     weight: &Array,
     edge: i32,
     f32_accum: bool,
+    normalized: bool,
     out: &mut crate::quantum::Quanta,
 ) {
     let s = x.shape();
@@ -456,6 +458,10 @@ fn price_tiles(
         label,
         crate::quantum::tile_bytes(
             &[s[0], th, tw, channels],
+            crate::quantum::TileSource {
+                full_width: s[2],
+                normalized,
+            },
             crate::quantum::element_bytes(x),
             weight,
             f32_accum,
@@ -493,6 +499,7 @@ fn price_upsample_tiled(
         weight,
         tile,
         f32_accum,
+        false,
         out,
     );
     let dtype = if f32_accum {
@@ -589,6 +596,10 @@ pub(crate) fn upsample_tiled(
     )?;
     let up = upsample_nearest(x, 2)?;
     trace_decode_stage("upsample.nearest", &up)?;
+    let source = crate::quantum::TileSource {
+        full_width: up.shape()[2],
+        normalized: false,
+    };
     let out = if x.dtype() == Dtype::Float16 {
         // Half storage, wide accumulation: only this unnormalized convolution is sensitive to
         // partial-sum overflow. The helper promotes one crop and casts each core back before
@@ -600,13 +611,13 @@ pub(crate) fn upsample_tiled(
             tile,
             cancel,
             |tile| {
-                crate::quantum::before_tile(crate::quantum::VAE_TILE, tile, weight, true)?;
+                crate::quantum::before_tile(crate::quantum::VAE_TILE, tile, source, weight, true)?;
                 Ok(tile.clone())
             },
         )?
     } else {
         mlx_gen::vae_tiling::tiled_conv2d_3x3_nhwc(&up, weight, Some(bias), tile, cancel, |tile| {
-            crate::quantum::before_tile(crate::quantum::VAE_TILE, tile, weight, false)?;
+            crate::quantum::before_tile(crate::quantum::VAE_TILE, tile, source, weight, false)?;
             Ok(tile.clone())
         })?
     };
@@ -857,6 +868,7 @@ impl Decoder {
             &self.conv_out_w,
             output_tile_edge.max(3),
             false,
+            true,
             out,
         );
         self.price_conv_out_output(&x)
@@ -991,6 +1003,10 @@ impl Decoder {
                 crate::quantum::before_tile(
                     crate::quantum::VAE_TILE,
                     tile,
+                    crate::quantum::TileSource {
+                        full_width: x.shape()[2],
+                        normalized: true,
+                    },
                     &self.conv_out_w,
                     false,
                 )?;
@@ -1116,6 +1132,10 @@ impl Encoder {
                 crate::quantum::before_tile(
                     crate::quantum::VAE_ENCODE_TILE,
                     t,
+                    crate::quantum::TileSource {
+                        full_width: x.shape()[2],
+                        normalized: false,
+                    },
                     &self.conv_in_w,
                     false,
                 )?;
@@ -1205,6 +1225,7 @@ impl Encoder {
             cin,
             &self.conv_in_w,
             tile.max(3),
+            false,
             false,
             out,
         );
