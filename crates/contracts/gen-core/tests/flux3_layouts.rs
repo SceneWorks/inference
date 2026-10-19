@@ -24,26 +24,22 @@ fn request_layout_defaults_absent_and_is_scoped_to_flux3() {
     request.flux3_layout = Some(
         Layout::from_json(json!({"version":1,"boxes":[{"id":"a","bbox":[0,0,1,1]}]})).unwrap(),
     );
-    assert!(
-        caps.validate_request("other_family", &request)
-            .unwrap_err()
-            .to_string()
-            .contains("flux3_layout")
-    );
-    assert!(
-        caps.validate_request_skip_size("other_family", &request)
-            .unwrap_err()
-            .to_string()
-            .contains("flux3_layout")
-    );
-    assert!(
-        caps.validate_request(gen_core::flux3::DISTILLED_MODEL_ID, &request)
-            .is_ok()
-    );
-    assert!(
-        caps.validate_request(gen_core::flux3::BASE_MODEL_ID, &request)
-            .is_ok()
-    );
+    assert!(caps
+        .validate_request("other_family", &request)
+        .unwrap_err()
+        .to_string()
+        .contains("flux3_layout"));
+    assert!(caps
+        .validate_request_skip_size("other_family", &request)
+        .unwrap_err()
+        .to_string()
+        .contains("flux3_layout"));
+    assert!(caps
+        .validate_request(gen_core::flux3::DISTILLED_MODEL_ID, &request)
+        .is_ok());
+    assert!(caps
+        .validate_request(gen_core::flux3::BASE_MODEL_ID, &request)
+        .is_ok());
 }
 
 #[test]
@@ -228,7 +224,10 @@ fn reject_invalid_before_any_conditioning_and_preserve_finite_outside_coordinate
         assert!(result.is_err());
     }
     assert!(Layout::parse(r#"{"version":1,"boxes":[{"id":"a","bbox":[NaN,0,1,1]}]}"#).is_err());
-    assert!(Layout::from_json(json!({"version":1,"boxes":[{"id":"same","bbox":[0,0,1,1]},{"id":"same","bbox":[0,0,1,1]}]})).is_err());
+    assert!(Layout::from_json(
+        json!({"version":1,"boxes":[{"id":"same","bbox":[0,0,1,1]},{"id":"same","bbox":[0,0,1,1]}]})
+    )
+    .is_err());
     let outside =
         Layout::from_json(json!({"version":1,"boxes":[{"id":"a","bbox":[-0.1,-2,1.2,2]}]}))
             .unwrap();
@@ -250,4 +249,79 @@ fn source_half_even_grid_and_complete_caption_bound() {
     );
     assert!(compiled.caption(&"猫".repeat(16000)).is_err());
     assert!(compiled.caption("scene").unwrap().starts_with("scene ["));
+}
+
+#[test]
+fn live_request_locks_layout_before_prompt_seed_for_both_reference_modes() {
+    use gen_core::{Conditioning, GenerationRequest, Image};
+    for reference in [false, true] {
+        let mut req = GenerationRequest {
+            prompt: "  move cat\n".into(),
+            width: 112,
+            height: 80,
+            flux3_layout: Some(Layout::from_json(if reference {
+                json!({"version":1,"boxes":[{"id":"cat","desc":"cat","from":"ref_image_0","src_bbox":[0.1,0.2,0.6,0.7],"tgt_bbox":null}]})
+            } else {
+                json!({"version":1,"boxes":[{"id":"cat","desc":"cat","bbox":[0.1,0.2,0.6,0.7]}]})
+            }).unwrap()),
+            ..Default::default()
+        };
+        if reference {
+            req.conditioning.push(Conditioning::Reference {
+                image: Image {
+                    width: 80,
+                    height: 64,
+                    pixels: vec![17; 80 * 64 * 3],
+                },
+                strength: None,
+            });
+        }
+        let original = req.flux3_layout.clone().unwrap();
+        let input = references::upsampler_input(&req).unwrap();
+        assert_eq!(
+            input.mode,
+            if reference {
+                pup::UpsampleMode::EditingWithBoxes
+            } else {
+                pup::UpsampleMode::TextWithBoxes
+            }
+        );
+        let compiled = compile_request(&req).unwrap().unwrap();
+        let outcome = pup::upsample(None, &input, &Default::default(), &req.cancel, &mut |_| {
+            panic!("bypass must not infer")
+        })
+        .unwrap();
+        assert_eq!(outcome.caption, compiled.caption(&req.prompt).unwrap());
+        assert_ne!(
+            gen_core::flux3::prompt_seed(&outcome.caption),
+            gen_core::flux3::prompt_seed(&req.prompt)
+        );
+        assert_eq!(outcome.report.original_prompt, req.prompt);
+        assert_eq!(
+            outcome.report.locked_annotations.as_deref(),
+            Some(compiled.rows_json().as_str())
+        );
+        assert_eq!(req.flux3_layout.as_ref(), Some(&original));
+    }
+}
+
+#[test]
+fn malformed_layout_reference_binding_fails_before_admission_and_pup() {
+    use gen_core::{Conditioning, GenerationRequest, Image};
+    let mut req = GenerationRequest {
+        flux3_layout: Some(Layout::from_json(json!({"version":1,"boxes":[{"id":"cat","from":"ref_image_0","reference_id":"selected","src_bbox":[0,0,1,1],"tgt_bbox":null}]})).unwrap()),
+        conditioning: vec![Conditioning::Reference {image:Image {width:80,height:64,pixels:vec![19;80*64*3]},strength:None}],
+        ..Default::default()
+    };
+    assert!(matches!(
+        references::request_plan(&req),
+        Err(gen_core::Error::Unsupported(_))
+    ));
+    req.flux3_layout_bindings = vec![ReferenceBinding::oriented("selected", (79, 64))];
+    assert!(references::request_plan(&req).is_err());
+    assert!(references::upsampler_input(&req).is_err());
+    req.flux3_layout_bindings[0].original_size = (80, 64);
+    assert!(references::request_plan(&req).unwrap().is_some());
+    req.flux3_layout = None;
+    assert!(references::request_plan(&req).is_err());
 }

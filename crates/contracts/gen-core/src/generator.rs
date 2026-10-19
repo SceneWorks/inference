@@ -516,6 +516,9 @@ pub struct GenerationRequest {
     /// not masks or img2img strength. Resolve against authorized reference geometry before
     /// admission/PUP/seed/text encoding; retain the original document in saved settings.
     pub flux3_layout: Option<crate::flux3::layouts::Layout>,
+    /// Caller-resolved attachment identities and decoded geometry in conditioning order.
+    /// Required for stable-ID or original-pixel layout coordinates; never inferred from a label.
+    pub flux3_layout_bindings: Vec<crate::flux3::layouts::ReferenceBinding>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
     /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
@@ -1345,6 +1348,7 @@ impl Default for GenerationRequest {
             conditioning: Vec::new(),
             flux3_reference_output: None,
             flux3_layout: None,
+            flux3_layout_bindings: Vec::new(),
             strength: None,
             control_scale: None,
             text_style_gain: None,
@@ -1631,6 +1635,7 @@ impl GenerationRequest {
             flux3_reference_output: _,
             // Layout construction validates f64 coordinates, before conversion to native rows.
             flux3_layout: _,
+            flux3_layout_bindings: _,
             cfg_interval,
             conditioning,
             frames: _,
@@ -3668,8 +3673,11 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
-        if req.flux3_layout.is_some()
-            && !matches!(id, crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID)
+        if (req.flux3_layout.is_some() || !req.flux3_layout_bindings.is_empty())
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
         {
             return Err(Error::Unsupported(format!(
                 "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"

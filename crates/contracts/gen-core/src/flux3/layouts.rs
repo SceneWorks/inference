@@ -254,6 +254,57 @@ impl Layout {
     }
 }
 
+/// Compile against the actual ordered, decoded request before admission or native inference.
+/// Callers without stable identities can use upstream ordinal boxes in oriented/normalized space.
+/// Stable-ID boxes and original-pixel coordinates require explicit resolver-owned bindings.
+pub fn compile_request(req: &crate::GenerationRequest) -> Result<Option<CompiledLayout>> {
+    let Some(layout) = &req.flux3_layout else {
+        if !req.flux3_layout_bindings.is_empty() {
+            return Err(invalid("reference bindings require a layout document"));
+        }
+        return Ok(None);
+    };
+    let plan = references::image_request_plan(req)?;
+    let fallback;
+    let bindings = if req.flux3_layout_bindings.is_empty() {
+        for row in layout.to_json()["boxes"]
+            .as_array()
+            .expect("validated layout")
+        {
+            if row.get("reference_id").is_some() || row["src_space"] == "original" {
+                return Err(invalid(
+                    "stable reference identity/original pixels require resolved bindings",
+                ));
+            }
+        }
+        fallback = plan
+            .as_ref()
+            .map(|p| {
+                p.geometry
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| {
+                        ReferenceBinding::oriented(format!("ref_image_{i}"), g.source_size)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        &fallback
+    } else {
+        &req.flux3_layout_bindings
+    };
+    let output = plan
+        .as_ref()
+        .map(|p| p.output.clone())
+        .unwrap_or(references::OutputGeometry {
+            canvas: (req.width, req.height),
+            crop: None,
+        });
+    let compiled = layout.compile(bindings, plan.as_ref(), &output)?;
+    compiled.caption(&req.prompt)?;
+    Ok(Some(compiled))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Space {
     Normalized,

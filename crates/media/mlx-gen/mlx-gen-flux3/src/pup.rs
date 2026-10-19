@@ -219,6 +219,28 @@ mod tests {
     }
 
     #[test]
+    fn authored_removal_reaches_native_caption_without_upsampler_or_gpu() {
+        let req = GenerationRequest {
+            prompt: "remove cat".into(),
+            conditioning: vec![gen_core::Conditioning::Reference {
+                image: gen_core::Image { width: 64, height: 64, pixels: vec![23; 64*64*3] }, strength: None,
+            }],
+            flux3_layout: Some(gen_core::flux3::layouts::Layout::parse(r#"{"version":1,"boxes":[{"id":"cat","from":"ref_image_0","src_bbox":[0.1,0.2,0.6,0.7],"tgt_bbox":null}]}"#).unwrap()),
+            ..Default::default()
+        };
+        let input = gen_core::flux3::references::upsampler_input(&req).unwrap();
+        let outcome =
+            effective_prompt(None, &req, &input, &mut |_| panic!("bypass must not infer")).unwrap();
+        assert_eq!(outcome.caption, "remove cat [{\"id\": \"cat\", \"from\": \"ref_image_0\", \"src_bbox\": [100, 200, 600, 700], \"tgt_bbox\": null, \"desc\": \"\"}]");
+        assert_eq!(outcome.report.original_prompt, "remove cat");
+        assert!(outcome
+            .report
+            .locked_annotations
+            .unwrap()
+            .contains("\"tgt_bbox\": null"));
+    }
+
+    #[test]
     fn enhance_without_an_upsampler_is_a_typed_refusal() {
         let req = GenerationRequest {
             prompt: "p".into(),
