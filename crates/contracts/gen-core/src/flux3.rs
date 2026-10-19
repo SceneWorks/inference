@@ -37,6 +37,7 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
 pub mod adapters;
+pub mod layouts;
 pub mod pup;
 pub mod references;
 

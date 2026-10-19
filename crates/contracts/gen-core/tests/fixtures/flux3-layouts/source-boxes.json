@@ -1,0 +1,240 @@
+{
+  "revision": "45e57c9fb06f9751cdced29a65c5d2171003be05",
+  "source_sha256": "fbea10c1c53980df1665d3cb6cc6264b8f50633399bf6809c91650f1dcf4fc37",
+  "cases": [
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "stable_A",
+            "desc": "猫 \"[red]\"",
+            "bbox": [
+              0.0,
+              0.123456789012345,
+              1.0,
+              1.25
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "stable_A",
+          "bbox": [
+            0,
+            123,
+            1000,
+            1000
+          ],
+          "desc": "猫 \"[red]\""
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"stable_A\", \"bbox\": [0, 123, 1000, 1000], \"desc\": \"猫 \\\"[red]\\\"\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "remove_A",
+            "desc": "removed",
+            "from": "ref_image_1",
+            "src_bbox": [
+              0,
+              0.25,
+              0.75,
+              1
+            ],
+            "tgt_bbox": null
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "remove_A",
+          "from": "ref_image_1",
+          "src_bbox": [
+            0,
+            250,
+            750,
+            1000
+          ],
+          "tgt_bbox": null,
+          "desc": "removed"
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"remove_A\", \"from\": \"ref_image_1\", \"src_bbox\": [0, 250, 750, 1000], \"tgt_bbox\": null, \"desc\": \"removed\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "move_A",
+            "desc": "moved",
+            "from": "ref_image_0",
+            "src_bbox": [
+              0.1,
+              0.2,
+              0.3,
+              0.4
+            ],
+            "tgt_bbox": [
+              0.6,
+              0.7,
+              0.8,
+              0.9
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "move_A",
+          "from": "ref_image_0",
+          "src_bbox": [
+            100,
+            200,
+            300,
+            400
+          ],
+          "tgt_bbox": [
+            600,
+            700,
+            800,
+            900
+          ],
+          "desc": "moved"
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"move_A\", \"from\": \"ref_image_0\", \"src_bbox\": [100, 200, 300, 400], \"tgt_bbox\": [600, 700, 800, 900], \"desc\": \"moved\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "new_A",
+            "desc": "target only",
+            "from": "target",
+            "src_bbox": null,
+            "tgt_bbox": [
+              0,
+              0,
+              1,
+              1
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "new_A",
+          "from": "target",
+          "src_bbox": null,
+          "tgt_bbox": [
+            0,
+            0,
+            1000,
+            1000
+          ],
+          "desc": "target only"
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"new_A\", \"from\": \"target\", \"src_bbox\": null, \"tgt_bbox\": [0, 0, 1000, 1000], \"desc\": \"target only\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "ties",
+            "desc": "bankers round",
+            "bbox": [
+              0.0005,
+              0.0015,
+              0.0025,
+              0.0035
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "ties",
+          "bbox": [
+            0,
+            2,
+            2,
+            4
+          ],
+          "desc": "bankers round"
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"ties\", \"bbox\": [0, 2, 2, 4], \"desc\": \"bankers round\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "outside",
+            "desc": "source clamps grid only",
+            "bbox": [
+              -0.1,
+              -2,
+              1.2,
+              2
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "outside",
+          "bbox": [
+            0,
+            0,
+            1000,
+            1000
+          ],
+          "desc": "source clamps grid only"
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"outside\", \"bbox\": [0, 0, 1000, 1000], \"desc\": \"source clamps grid only\"}]"
+    },
+    {
+      "input": {
+        "version": 1,
+        "boxes": [
+          {
+            "id": "absent_target",
+            "from": "ref_image_0",
+            "src_bbox": [
+              0,
+              0,
+              1,
+              1
+            ]
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "absent_target",
+          "from": "ref_image_0",
+          "src_bbox": [
+            0,
+            0,
+            1000,
+            1000
+          ],
+          "tgt_bbox": null,
+          "desc": ""
+        }
+      ],
+      "expected_python_json": "[{\"id\": \"absent_target\", \"from\": \"ref_image_0\", \"src_bbox\": [0, 0, 1000, 1000], \"tgt_bbox\": null, \"desc\": \"\"}]"
+    }
+  ]
+}

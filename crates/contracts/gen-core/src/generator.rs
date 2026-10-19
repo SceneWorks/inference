@@ -512,6 +512,10 @@ pub struct GenerationRequest {
     /// Consumers must resolve this intent and reference token count BEFORE memory admission.
     /// This is not img2img strength and is unsupported on other model families.
     pub flux3_reference_output: Option<crate::flux3::references::ReferenceOutputSize>,
+    /// Lossless FLUX 3 placement/edit controls (sc-26237). Caption-only spatial guidance,
+    /// not masks or img2img strength. Resolve against authorized reference geometry before
+    /// admission/PUP/seed/text encoding; retain the original document in saved settings.
+    pub flux3_layout: Option<crate::flux3::layouts::Layout>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
     /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
@@ -1340,6 +1344,7 @@ impl Default for GenerationRequest {
             caption_overflow: None,
             conditioning: Vec::new(),
             flux3_reference_output: None,
+            flux3_layout: None,
             strength: None,
             control_scale: None,
             text_style_gain: None,
@@ -1624,6 +1629,8 @@ impl GenerationRequest {
             caption_overflow: _,
             // Optional integer output dimensions, not floating controls.
             flux3_reference_output: _,
+            // Layout construction validates f64 coordinates, before conversion to native rows.
+            flux3_layout: _,
             cfg_interval,
             conditioning,
             frames: _,
@@ -3643,6 +3650,13 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
+        if req.flux3_layout.is_some()
+            && !matches!(id, crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID)
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"
+            )));
+        }
         if req.flux3_reference_output.is_some()
             && !matches!(
                 id,
