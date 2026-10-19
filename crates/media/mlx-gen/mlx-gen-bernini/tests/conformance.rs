@@ -186,7 +186,7 @@ fn bernini_full_pipeline_emits_its_declared_phase_boundaries_in_order() {
         Progress::Loading(LoadPhase::Renderer) => marks.push("renderer".into()),
         Progress::Decoding => marks.push("decode".into()),
         Progress::Step { current, .. } => marks.push(format!("step:{current}")),
-        Progress::Upsampling { .. } => {}
+        Progress::ConditioningComplete | Progress::Upsampling { .. } => {}
     })
     .expect("generate");
 

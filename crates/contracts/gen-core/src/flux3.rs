@@ -37,9 +37,20 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::{Error, Result};
 
 pub mod adapters;
+pub mod affine;
+pub mod artifacts;
+pub mod conversion;
+pub mod image_input;
 pub mod layouts;
+pub mod native_convert;
+pub mod packed_gemm;
+pub mod phase_resource;
 pub mod pup;
+pub mod quantization;
+pub mod reference_workspace;
 pub mod references;
+pub mod safetensors_stream;
+pub mod training;
 
 // ---------------------------------------------------------------------------------------------
 // Identity
@@ -314,6 +325,9 @@ impl Flux3Config {
         };
         let quantization = match field(&root, "quantization", "")? {
             serde_json::Value::Null => None,
+            v if v.is_object() => artifacts::NativeDitStorage::from_marker(v)?
+                .config_marker_name()
+                .map(str::to_owned),
             v => Some(string_of(v, "quantization")?),
         };
         let vec_in_dim = match field(dit, "vec_in_dim", "dit.")? {
@@ -401,6 +415,17 @@ impl Flux3Config {
     /// mis-render. The supported set is the released bf16 architecture's switches; every width
     /// and depth is read from the file.
     pub fn validate_supported(&self) -> Result<()> {
+        self.validate_graph(false)
+    }
+
+    /// Validate graph/sampler semantics AFTER a caller has preflighted the exact
+    /// native artifact/backend/tier with `artifacts::NativeDitStorage`. Legacy
+    /// dense-only callers keep `validate_supported` and cannot misread packed codes.
+    pub fn validate_native_storage_graph(&self) -> Result<()> {
+        self.validate_graph(true)
+    }
+
+    fn validate_graph(&self, allow_native_storage: bool) -> Result<()> {
         let d = &self.dit;
         let checks: [(&str, bool, String); 14] = [
             (
@@ -409,10 +434,15 @@ impl Flux3Config {
                 self.format_version.to_string(),
             ),
             (
-                // sc-26241 adds the quantized variants; their `model.safetensors` carries packed
-                // codes the bf16 loader cannot read.
+                // Packed codes are accepted ONLY through the explicit-storage
+                // graph entry point; the historical dense entry point still refuses them.
                 "quantization",
-                self.quantization.is_none(),
+                self.quantization.is_none()
+                    || (allow_native_storage
+                        && matches!(
+                            self.quantization.as_deref(),
+                            Some("fp8r" | "nvfp4" | "mlx-affine" | "ggml-q4_1" | "ggml-q8_0")
+                        )),
                 format!("{:?}", self.quantization),
             ),
             (
@@ -496,6 +526,20 @@ impl Flux3Config {
                 "flux3: config.json `dit.flow_map` = {} but `sampler.guidance` = {:?}; a flow map \
                  samples without CFG and a CFG checkpoint needs a guidance",
                 self.dit.flow_map, self.sampler.guidance
+            )));
+        }
+        // The base checkpoint's defaults are the frozen source's `pipeline.MODELS["base"]`
+        // (50 steps, CFG 3.5), not whatever a package's descriptive config.json claims. A config
+        // that disagrees is not the pinned release, so refuse it rather than pick either value.
+        if !self.dit.flow_map
+            && (self.sampler.steps != BASE_DEFAULT_STEPS
+                || self.sampler.guidance != Some(f64::from(BASE_DEFAULT_GUIDANCE)))
+        {
+            return Err(Error::Unsupported(format!(
+                "flux3: base config.json sampler = {} steps / guidance {:?}, but the frozen base \
+                 defaults are {BASE_DEFAULT_STEPS} steps / guidance {BASE_DEFAULT_GUIDANCE}; this is \
+                 not the pinned base package",
+                self.sampler.steps, self.sampler.guidance
             )));
         }
         Ok(())
@@ -924,12 +968,8 @@ impl GenerationParams {
         let guidance = if config.dit.flow_map {
             None
         } else {
-            let g = req.guidance.unwrap_or(
-                config
-                    .sampler
-                    .guidance
-                    .unwrap_or(BASE_DEFAULT_GUIDANCE as f64) as f32,
-            );
+            // Frozen `pipeline.MODELS["base"]`; validate_supported refuses a disagreeing config.
+            let g = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
             if !g.is_finite() || g < 0.0 {
                 return Err(Error::Unsupported(
                     "flux3: CFG guidance must be finite and non-negative".into(),
@@ -937,7 +977,12 @@ impl GenerationParams {
             }
             Some(g)
         };
-        let steps = req.steps.unwrap_or(config.sampler.steps);
+        let default_steps = if config.dit.flow_map {
+            config.sampler.steps
+        } else {
+            BASE_DEFAULT_STEPS
+        };
+        let steps = req.steps.unwrap_or(default_steps);
         if steps == 0 {
             return Err(Error::Msg("flux3: steps must be >= 1".into()));
         }
@@ -1246,6 +1291,33 @@ mod tests {
     }
 
     #[test]
+    fn base_config_disagreeing_with_frozen_defaults_is_refused() {
+        let mut base = release();
+        base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
+        base.sampler.guidance = Some(3.5);
+        base.validate_supported().unwrap();
+        for (steps, guidance) in [(16, Some(3.5)), (50, Some(4.0)), (28, Some(2.5))] {
+            let mut wrong = base.clone();
+            wrong.sampler.steps = steps;
+            wrong.sampler.guidance = guidance;
+            assert!(
+                matches!(wrong.validate_supported(), Err(Error::Unsupported(_))),
+                "{steps}/{guidance:?}"
+            );
+        }
+        // Defaults come from the frozen constants even when the config field is ignored.
+        let mut drifted = base.clone();
+        drifted.sampler.steps = 7;
+        drifted.sampler.guidance = Some(9.0);
+        let p = GenerationParams::resolve(&request(), 0, &drifted).unwrap();
+        assert_eq!(
+            (p.steps, p.guidance),
+            (BASE_DEFAULT_STEPS, Some(BASE_DEFAULT_GUIDANCE))
+        );
+    }
+
+    #[test]
     fn base_uses_cfg_defaults_and_explicit_negative_conditioning() {
         let mut base = release();
         base.dit.flow_map = false;
@@ -1381,6 +1453,7 @@ mod tests {
         ));
         let mut base = release();
         base.dit.flow_map = false;
+        base.sampler.steps = BASE_DEFAULT_STEPS;
         base.sampler.guidance = Some(3.5);
         base.validate_supported().unwrap();
         assert_eq!(

@@ -974,6 +974,9 @@ pub struct LlamaProvider {
     gemma4: Option<Gemma4Runtime>,
     /// Campaign-only prefix cache; ordinary serving never consults this state.
     campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
+    /// At most two OWNED stream handles: load CPU and actual last execution.
+    /// Fencing these orders execution; it does not evict model/cache ownership.
+    execution_fence: core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream>,
     /// The chat template's `date_string` kwarg. `None` (every production load) keeps the
     /// template's own dating — `strftime_now`, the current date, on Llama 3.2. Only
     /// [`Self::load_for_campaign`] pins it ([`crate::campaign::CAMPAIGN_CHAT_TEMPLATE_DATE_STRING`])
@@ -1005,6 +1008,29 @@ pub struct LlamaProvider {
     /// defaults-table row ([`core_llm::defaults::MLX`]) unless
     /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
     speculative_default: core_llm::Speculative,
+}
+
+// A failing load unwinds partial arrays before this earlier-declared guard.
+// Fence both retained streams on that failure, without replacing its primary error.
+struct LoadFailureFence<F: FnOnce() -> CoreResult<()>> {
+    fence: Option<F>,
+}
+impl<F: FnOnce() -> CoreResult<()>> LoadFailureFence<F> {
+    fn new(fence: F) -> Self {
+        Self { fence: Some(fence) }
+    }
+    fn disarm(&mut self) {
+        self.fence = None;
+    }
+}
+impl<F: FnOnce() -> CoreResult<()>> Drop for LoadFailureFence<F> {
+    fn drop(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            if let Err(error) = fence() {
+                eprintln!("mlx-llama partial-load synchronization failed; original load error preserved, no reclamation claimed: {error}");
+            }
+        }
+    }
 }
 
 /// A draft model resident beside its target (sc-24436).
@@ -1124,6 +1150,20 @@ fn materialize_decoder(weights: &mut Weights, groups: &[Vec<Array>]) -> CoreResu
 }
 
 impl LlamaProvider {
+    fn new_execution_fence() -> core_llm::text_llm::OwnedExecutionFence<mlx_rs::Stream> {
+        core_llm::text_llm::OwnedExecutionFence::new(
+            mlx_rs::Stream::cpu(),
+            mlx_rs::Stream::task_local_or_default(),
+        )
+    }
+
+    fn note_execution_stream(&self) -> crate::Result<()> {
+        self.execution_fence.before_execution(
+            mlx_rs::Stream::task_local_or_default(),
+            crate::primitives::synchronize_stream,
+        )
+    }
+
     /// Frozen SC-20671 family identity for architectures that implement the campaign's contiguous
     /// cache controls. Other architectures fail closed instead of being mislabeled as Llama/Qwen.
     pub(crate) fn campaign_family(&self) -> CoreResult<&'static str> {
@@ -1738,6 +1778,12 @@ impl LlamaProvider {
             available,
         );
 
+        let load_streams = Self::new_execution_fence();
+        let mut failed_load_fence = LoadFailureFence::new(move || {
+            load_streams
+                .synchronize(crate::primitives::synchronize_stream)
+                .map_err(to_core)
+        });
         let mut provider = Self::load_admitted(spec, quant, materialize_campaign_weights)?
             .with_prefix_budget(prefix_budget);
         provider.load_report.requested = spec.quantize;
@@ -1755,6 +1801,7 @@ impl LlamaProvider {
             DraftPlan::Refused(report) => provider.load_report.record_draft(report),
             DraftPlan::Load(draft_spec) => provider.attach_draft(&draft_spec),
         }
+        failed_load_fence.disarm();
         Ok(provider)
     }
 
@@ -2006,6 +2053,7 @@ impl LlamaProvider {
             vision,
             gemma4,
             campaign_prefix_cache: RefCell::new(None),
+            execution_fence: LlamaProvider::new_execution_fence(),
             campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
@@ -2109,6 +2157,7 @@ impl LlamaProvider {
             vision,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            execution_fence: LlamaProvider::new_execution_fence(),
             campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: spec.source.clone(),
@@ -2197,6 +2246,7 @@ impl LlamaProvider {
             vision: None,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            execution_fence: LlamaProvider::new_execution_fence(),
             campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),
@@ -3004,6 +3054,12 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
+    fn synchronize_before_release(&self) -> CoreResult<()> {
+        self.execution_fence
+            .synchronize(crate::primitives::synchronize_stream)
+            .map_err(to_core)
+    }
+
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
@@ -3145,6 +3201,15 @@ impl LlamaProvider {
         // `TextLlm::generate`, the measured single-request path — compressed on the contiguous
         // cache where it qualifies, never on the paged cache (sc-20688 review).
         if admitted.len() < 2 {
+            return results;
+        }
+        if let Err(error) = self.note_execution_stream() {
+            let message = error.to_string();
+            results.extend(
+                admitted
+                    .into_iter()
+                    .map(|(index, _, _)| (index, Err(to_core(crate::Error::Msg(message.clone()))))),
+            );
             return results;
         }
 
@@ -3755,6 +3820,10 @@ impl LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
+        // Pure validation/admission geometry above has scheduled no native work.
+        // On a stream change, finish the previous execution BEFORE cache mutation
+        // or new preprocessing; unchanged-stream generation adds no barrier.
+        self.note_execution_stream().map_err(to_core)?;
         // The backend-neutral speculative resolution (core-llm, sc-24433) against what this
         // provider advertises, then the proposer this request's shape can run on the engine
         // (sc-24434). Anything less than the request asked for is named in the report's
@@ -6958,6 +7027,7 @@ pub(crate) mod tests {
             vision: None,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            execution_fence: LlamaProvider::new_execution_fence(),
             campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),
@@ -6992,6 +7062,7 @@ pub(crate) mod tests {
             vision: None,
             gemma4: None,
             campaign_prefix_cache: RefCell::new(None),
+            execution_fence: LlamaProvider::new_execution_fence(),
             campaign_template_date: None,
             kv_reader: OnceCell::new(),
             kv_model_name: String::new(),

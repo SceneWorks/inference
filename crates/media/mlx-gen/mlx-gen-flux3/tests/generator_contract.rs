@@ -57,13 +57,17 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
     crate::common::on_cpu(|| {
         use mlx_gen::gen_core::flux3::references::ReferenceOutputSize;
         use mlx_gen::gen_core::{Conditioning, Image, Precision, RgbaImage};
-        let refs: Vec<Conditioning> = (0..10)
+        let refs: Vec<Conditioning> = (0..10u8)
             .map(|n| {
-                let (w, h) = if n % 2 == 0 { (83, 67) } else { (67, 99) };
+                let (w, h) = if n.is_multiple_of(2) {
+                    (83, 67)
+                } else {
+                    (67, 99)
+                };
                 let rgb = (0..w * h)
                     .flat_map(|p| [n * 19, (p % 251) as u8, (p / w % 251) as u8])
                     .collect::<Vec<_>>();
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     Conditioning::ReferenceRgba {
                         image: RgbaImage {
                             width: w,
@@ -155,6 +159,65 @@ fn public_reference_edits_honor_auto_crop_explicit_sizes_and_fail_before_progres
                 (64, 80),
                 "ten EXIF references use upstream multi-reference crop"
             );
+            let mut narrow = edit.clone();
+            narrow.conditioning = vec![
+                Conditioning::Reference {
+                    image: Image {
+                        width: 48,
+                        height: 64,
+                        pixels: vec![19; 48 * 64 * 3],
+                    },
+                    strength: None,
+                },
+                refs[0].clone(),
+            ];
+            narrow.flux3_reference_output = Some(ReferenceOutputSize::default());
+            // The ordinary memory scope normalizes numeric geometry BEFORE model validation.
+            // Its 48px canvas must not be re-rejected by the descriptor T2I minimum.
+            let plan = mlx_gen::gen_core::flux3::references::normalize_request(&mut narrow)
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.output.canvas, (48, 64));
+            g.validate(&narrow).unwrap();
+            let narrow_image = render(&narrow);
+            assert_eq!((narrow_image.width, narrow_image.height), (48, 64));
+            let mut narrow_t2i = narrow;
+            narrow_t2i.conditioning.clear();
+            narrow_t2i.flux3_reference_output = None;
+            assert!(
+                g.validate(&narrow_t2i).is_err(),
+                "legacy no-reference minimum is unchanged"
+            );
+            let formats = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../contracts/gen-core/tests/fixtures/flux3-image-input");
+            for file in [
+                "mode-luma16.png",
+                "mode-rgb16.png",
+                "mode-palette-alpha.png",
+                "mode-rgb-trns.png",
+            ] {
+                edit.conditioning =
+                    vec![mlx_gen::gen_core::flux3::references::decode_reference_file(
+                        &formats.join(file),
+                    )
+                    .unwrap()];
+                let normalized = mlx_gen::gen_core::flux3::references::request_images(&edit)
+                    .unwrap()[0]
+                    .as_ref()
+                    .clone();
+                let encoded = render(&edit);
+                assert_eq!(
+                    (encoded.width, encoded.height),
+                    (4, 3),
+                    "{file}: source auto output crop"
+                );
+                let mut canonical = edit.clone();
+                canonical.conditioning = vec![Conditioning::Reference {
+                    image: normalized,
+                    strength: None,
+                }];
+                assert_eq!(encoded.pixels,render(&canonical).pixels,"{file}: encoded input equals source-normalized RGB through the public provider");
+            }
             edit.conditioning = vec![refs[0].clone()];
             for (intent, size) in [
                 (
@@ -271,6 +334,7 @@ fn progress_is_steps_then_one_decoding_and_output_is_rgb8_body() {
     assert_eq!(
         events,
         [
+            "ConditioningComplete",
             "Step { current: 1, total: 3 }",
             "Step { current: 2, total: 3 }",
             "Step { current: 3, total: 3 }",
@@ -516,4 +580,43 @@ fn base_cfg_adapter_loads_through_the_public_provider_for_both_residencies() {
     }
         });
     });
+}
+
+#[test]
+fn callback_cancel_at_conditioning_boundary_stops_before_denoise() {
+    cpu_process(
+        "generator_contract::callback_cancel_at_conditioning_boundary_stops_before_denoise",
+        callback_cancel_at_conditioning_boundary_stops_before_denoise_body,
+    );
+}
+
+fn callback_cancel_at_conditioning_boundary_stops_before_denoise_body() {
+    for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+        let generator = load(policy);
+        let req = request();
+        let mut events = Vec::new();
+        let result = generator.generate(&req, &mut |event| {
+            events.push(event);
+            if event == Progress::ConditioningComplete {
+                req.cancel.cancel();
+            }
+        });
+        assert!(
+            matches!(result, Err(CoreError::Canceled)),
+            "{policy:?}: {result:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|&&p| p == Progress::ConditioningComplete)
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|p| matches!(p, Progress::Step { .. } | Progress::Decoding)),
+            "cancellation at the boundary must stop before the first forward: {events:?}"
+        );
+    }
 }

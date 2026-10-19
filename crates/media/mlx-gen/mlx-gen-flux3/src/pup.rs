@@ -49,8 +49,21 @@ impl Flux3PromptUpsampler {
     /// Load the package at `dir`: the host-side view first (every required file present,
     /// `config.json` the Qwen3.5 VLM), then the engine with vision required.
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_with_policy(dir, false)
+    }
+
+    /// An exclusive caption phase cannot benefit from a cross-request KV cache.
+    /// Keep the historical resident load's defaults unchanged.
+    pub fn load_bounded(dir: &Path) -> Result<Self> {
+        Self::load_with_policy(dir, true)
+    }
+
+    fn load_with_policy(dir: &Path, bounded: bool) -> Result<Self> {
         let package = UpsamplePackage::open(dir)?;
-        let spec = core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
+        let mut spec = core_llm::LoadSpec::dense(dir.to_string_lossy().into_owned());
+        if bounded {
+            spec.prefix_cache_bytes = Some(0);
+        }
         let requirements = ModelRequirements {
             vision: true,
             video: false,
@@ -83,6 +96,17 @@ impl Flux3PromptUpsampler {
     pub fn engine(&self) -> &dyn TextLlm {
         self.llm.as_ref()
     }
+
+    /// Fence the VLM's retained load/execution streams before its actual owner drops.
+    pub fn synchronize_before_release(&self) -> gen_core::Result<()> {
+        self.llm
+            .synchronize_before_release()
+            .map_err(|error| match error {
+                core_llm::Error::Canceled => gen_core::Error::Canceled,
+                core_llm::Error::Unsupported(detail) => gen_core::Error::Unsupported(detail),
+                other => gen_core::Error::Backend(Box::new(other)),
+            })
+    }
 }
 
 impl PromptUpsampler for Flux3PromptUpsampler {
@@ -104,11 +128,7 @@ impl PromptUpsampler for Flux3PromptUpsampler {
 /// The per-request knobs of the stage, read off a [`GenerationRequest`] (`enhance_prompt`,
 /// `enhance_temperature`, `enhance_max_tokens`, `seed`).
 pub fn options_for(req: &GenerationRequest) -> UpsampleOptions {
-    UpsampleOptions {
-        temperature: req.enhance_temperature,
-        max_tokens: req.enhance_max_tokens,
-        seed: req.seed,
-    }
+    UpsampleOptions::from_generation_request(req)
 }
 
 /// The stage input of the distilled text-to-image route (sc-26234's request surface carries no

@@ -5958,6 +5958,7 @@ mod tests {
             trainers,
             [
                 "anima_base",
+                "flux3_klein_base",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",
@@ -5996,7 +5997,9 @@ mod tests {
         // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
         // trainer reuses the transform's id and row and adds no id; sc-25901 adds
         // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55; sc-26235 adds
-        // `flux3_klein`, a generator with its own complete row: 66 / 56).
+        // `flux3_klein`, a generator with its own complete row: 66 / 56; sc-26239 adds
+        // `flux3_klein_base`, a generator with its own complete row: 67 / 57; the sc-26240
+        // `flux3_klein_base` trainer reuses that generator's id and row and adds no id).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in

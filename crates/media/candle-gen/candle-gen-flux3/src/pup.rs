@@ -65,6 +65,18 @@ impl Flux3PromptUpsampler {
     pub fn engine(&self) -> &dyn TextLlm {
         self.llm.as_ref()
     }
+
+    /// Fence the actual VLM device/stream, not an image generator's proxy device.
+    /// The slot must still remove/drop THIS owner; synchronization is not eviction.
+    pub fn synchronize_before_release(&self) -> gen_core::Result<()> {
+        self.llm
+            .synchronize_before_release()
+            .map_err(|error| match error {
+                core_llm::Error::Canceled => gen_core::Error::Canceled,
+                core_llm::Error::Unsupported(detail) => gen_core::Error::Unsupported(detail),
+                other => gen_core::Error::Backend(Box::new(other)),
+            })
+    }
 }
 
 impl PromptUpsampler for Flux3PromptUpsampler {
@@ -131,6 +143,21 @@ pub fn effective_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_pup_load_cannot_retain_a_global_graph_or_prefix_parameter_cache() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-pup-snapshot");
+        let spec = llm_spec(&dir);
+        assert_eq!(spec.cuda_graphs, Some(false));
+        assert_eq!(spec.prefix_cache_bytes, Some(0));
+        // Header-only CUDA pricing does NOT open a GPU. This catches the default
+        // CUDA graph policy even when the test itself runs in a CPU build.
+        let estimate = candle_llm::LlamaProvider::load_memory_estimate(&spec, true).unwrap();
+        assert_eq!(estimate.graph_param_cache_bytes, 0);
+        assert_eq!(estimate.prefix_cache_bytes, 0);
+    }
+
     use gen_core::{PromptEnhancementOutcome, PromptEnhancementSink};
     use std::sync::{Arc, Mutex};
 
@@ -140,13 +167,15 @@ mod tests {
         let sink = reports.clone();
         let req = GenerationRequest {
             prompt: "  original caption\n".into(),
-            prompt_enhancement: PromptEnhancementSink::new(move |r| sink.lock().unwrap().push(r)),
+            prompt_enhancement: PromptEnhancementSink::new(move |r| {
+                candle_gen::lock_recover(&sink).push(r)
+            }),
             ..Default::default()
         };
         let outcome =
             effective_prompt(None, &req, &mut |_| panic!("bypass must not infer")).unwrap();
         assert_eq!(outcome.caption, req.prompt);
-        let recorded = reports.lock().unwrap();
+        let recorded = candle_gen::lock_recover(&reports);
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].effective_prompt, req.prompt);
         assert_eq!(recorded[0].outcome, PromptEnhancementOutcome::Absent);

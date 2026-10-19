@@ -39,6 +39,7 @@
 
 pub mod adapters;
 pub mod autoencoder;
+pub mod convert;
 pub mod dit;
 pub mod memory_strategy;
 pub mod model;
@@ -47,6 +48,7 @@ pub mod pipeline;
 pub mod pup;
 pub mod references;
 pub mod text_encoder;
+pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
 pub use candle_gen::gen_core::flux3::{
@@ -76,7 +78,10 @@ pub fn register_providers(
     register_memory_contract_surfaces(
         registry
             .register_generator(model::REGISTRATION)
-            .register_generator(model::BASE_REGISTRATION),
+            .register_generator(model::BASE_REGISTRATION)
+            .register_reference_workspace(memory_strategy::REFERENCE_WORKSPACE_REGISTRATION)
+            .register_reference_workspace(memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION)
+            .register_trainer(training::trainer::TRAINER_REGISTRATION),
     )
 }
 
@@ -135,3 +140,9 @@ mod tests {
         assert_eq!(registry.memory_contract_fixture_registrations().len(), 2);
     }
 }
+
+#[cfg(test)]
+mod kernel_oracle_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_tests;

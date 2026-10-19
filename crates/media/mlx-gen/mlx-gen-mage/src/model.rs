@@ -316,7 +316,7 @@ fn surface_selector_matches_spec(
         }
         MemoryContractSurfaceTier::Q4 => surface.spec.quantize == Some(Quant::Q4),
         MemoryContractSurfaceTier::Q8 => surface.spec.quantize == Some(Quant::Q8),
-        MemoryContractSurfaceTier::Nvfp4 => false,
+        MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => false,
     };
     if tier_matches
         && surface.selector.offload_policy == surface.spec.offload_policy
@@ -349,6 +349,7 @@ pub fn weights_free_memory_surface_contract(
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => Some(Quant::Q4),
         mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => Some(Quant::Q8),
         mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => Some(Quant::Nvfp4),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Fp8Rowwise => Some(Quant::Fp8Rowwise),
     };
     let calibration = weights_free_calibration_fingerprint(provider_id, tier)
         .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, surface.spec.load_shape));
@@ -2138,7 +2139,9 @@ mod tests {
                     MemoryContractSurfaceTier::Bf16 => None,
                     MemoryContractSurfaceTier::Q4 => Some(Quant::Q4),
                     MemoryContractSurfaceTier::Q8 => Some(Quant::Q8),
-                    MemoryContractSurfaceTier::Nvfp4 => continue,
+                    MemoryContractSurfaceTier::Nvfp4 | MemoryContractSurfaceTier::Fp8Rowwise => {
+                        continue
+                    }
                 };
                 let contract = weights_free_memory_surface_contract(provider, &surface).unwrap();
                 let identity = contract.calibration.as_ref().unwrap();
@@ -2703,6 +2706,7 @@ mod tests {
             * 1_000_000_000.0)
             .round() as u64;
         let valid = MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection: MemorySelection {
                 strategy: MemoryStrategy::Resident,
@@ -2907,6 +2911,7 @@ mod tests {
         };
         let contract = memory_strategy_contract("mage_flow", Some(Quant::Q4));
         let context = MemoryRunContext {
+            reference_resources: None,
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,

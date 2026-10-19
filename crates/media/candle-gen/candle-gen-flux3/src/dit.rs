@@ -29,8 +29,9 @@ use candle_gen::gen_core::flux3::{
 use candle_gen::{CandleError as Error, Result};
 
 use crate::nn::{
-    cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention, rmsnorm_rope, silu,
-    to, Linear, Loader, Rope,
+    cat, chunk_last, expect_shape, layernorm_modulation, mul, packed_attention,
+    packed_attention_training, rmsnorm_rope, rmsnorm_rope_training, silu, to, Linear, Loader,
+    PackedSource, PublisherSource, Rope,
 };
 
 /// `MLPEmbedder`: `out_layer(silu(in_layer(x)))`, bias-free.
@@ -138,6 +139,7 @@ impl Block {
 
     /// `x` `[N, hidden]` (compute dtype); `rope` the `[N, head_dim/2]` tables; `bounds` the
     /// per-sample token spans of this run.
+    #[allow(clippy::too_many_arguments)] // source block inputs plus explicit autograd policy
     fn forward(
         &self,
         x: &Tensor,
@@ -146,6 +148,7 @@ impl Block {
         m: Modulation<'_>,
         heads: usize,
         compute: DType,
+        training: bool,
     ) -> Result<Tensor> {
         let n = x.dim(0)?;
         let x_mod = layernorm_modulation(x, m.scale, m.shift)?;
@@ -155,14 +158,24 @@ impl Block {
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = rmsnorm_rope(
+        let normalize = if training {
+            rmsnorm_rope_training
+        } else {
+            rmsnorm_rope
+        };
+        let q = normalize(
             &split(self.q_proj.forward(&x_mod)?)?,
             &self.query_norm,
             rope,
         )?;
-        let k = rmsnorm_rope(&split(self.k_proj.forward(&x_mod)?)?, &self.key_norm, rope)?;
+        let k = normalize(&split(self.k_proj.forward(&x_mod)?)?, &self.key_norm, rope)?;
         let v = split(self.v_proj.forward(&x_mod)?)?;
-        let attn = packed_attention(&q, &k, &v, bounds, compute)?;
+        let attention = if training {
+            packed_attention_training
+        } else {
+            packed_attention
+        };
+        let attn = attention(&q, &k, &v, bounds, compute)?;
         let mut gate_up = chunk_last(&self.mlp_in.forward(&x_mod)?, 2)?;
         let up = gate_up.pop().expect("two chunks");
         let gate_in = gate_up.pop().expect("two chunks");
@@ -273,6 +286,28 @@ impl Flux3Dit {
         up: Tensor,
         scale: f64,
     ) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, false)
+    }
+
+    /// Add storage-sharing Var leaves, without inference's prepared-factor cache.
+    pub fn install_trainable_lora(
+        &mut self,
+        target: &str,
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+    ) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, true)
+    }
+
+    fn install_lora_impl(
+        &mut self,
+        target: &str,
+        down: Tensor,
+        up: Tensor,
+        scale: f64,
+        training: bool,
+    ) -> Result<()> {
         let (parent, leaf) = target
             .rsplit_once('.')
             .ok_or_else(|| Error::Unsupported(format!("flux3 LoRA: invalid target {target}")))?;
@@ -309,22 +344,93 @@ impl Flux3Dit {
                 )))
             }
         };
-        linear.push_lora(down, up, scale)
+        if training {
+            linear.push_trainable_lora(down, up, scale)
+        } else {
+            linear.push_lora(down, up, scale)
+        }
     }
 
     /// Load from the package's `model.safetensors` (upstream key names; an mmap read one tensor
     /// at a time, each cast to `compute` as it is consumed, so the load peak is the compute-dtype
     /// model plus a single stored tensor) onto `device`.
     pub fn load(path: &Path, cfg: &DitConfig, compute: DType, device: &Device) -> Result<Self> {
+        Self::load_with_storage(
+            path,
+            cfg,
+            compute,
+            device,
+            candle_gen::gen_core::flux3::artifacts::NativeDitStorage::Publisher(
+                candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
+            ),
+        )
+    }
+
+    /// [`Self::load`] for an explicit native storage. The exact physical inventory is validated
+    /// from the headers BEFORE any tensor is read; GGML targets load as `QTensor`s and every
+    /// other tensor through the dense compute-dtype path. Publisher FP8R/NVFP4 and MLX affine
+    /// storage are typed refusals here (no Candle kernel / not a Candle format).
+    pub fn load_with_storage(
+        path: &Path,
+        cfg: &DitConfig,
+        compute: DType,
+        device: &Device,
+        storage: candle_gen::gen_core::flux3::artifacts::NativeDitStorage,
+    ) -> Result<Self> {
+        use candle_gen::gen_core::flux3::artifacts::NativeDitStorage;
         if !path.is_file() {
             return Err(Error::Msg(format!(
                 "flux3: the DiT weights file {} does not exist",
                 path.display()
             )));
         }
+        let dense = NativeDitStorage::Publisher(
+            candle_gen::gen_core::flux3::quantization::DitFormat::Dense,
+        );
+        if storage != dense {
+            // The dense path keeps its historical per-key checks; a packed package must match its
+            // exact physical inventory before one code byte is read.
+            let headers = candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path)
+                .map_err(|e| Error::Msg(format!("flux3: {}: {e}", path.display())))?;
+            storage
+                .validate_headers(cfg, &headers)
+                .map_err(|e| Error::Unsupported(e.to_string()))?;
+        }
+        use candle_gen::gen_core::flux3::quantization::DitFormat;
+        let targets = || {
+            storage
+                .packed_targets(cfg)
+                .map_err(|e| Error::Unsupported(e.to_string()))
+        };
+        let (packed, publisher) = match storage {
+            NativeDitStorage::Publisher(DitFormat::Dense) => (None, None),
+            NativeDitStorage::GgmlQ4_1 | NativeDitStorage::GgmlQ8_0 => {
+                (Some(PackedSource::new(path, storage, targets()?)?), None)
+            }
+            // Shipped publisher artifacts load AS SHIPPED onto their frozen-recipe CUDA kernels;
+            // `PublisherSource::new` is the typed refusal on any other backend or device floor.
+            NativeDitStorage::Publisher(DitFormat::Fp8Rowwise | DitFormat::Nvfp4) => (
+                None,
+                Some(PublisherSource::new(path, storage, targets()?, device)?),
+            ),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "flux3: {} DiT storage has no Candle loader; install the native GGML tier \
+                     for Candle or the dense package",
+                    other.key().map_err(|e| Error::Unsupported(e.to_string()))?
+                )))
+            }
+        };
         let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], compute, device)
             .map_err(|e| Error::Msg(format!("flux3: loading {}: {e}", path.display())))?;
-        Self::from_var_builder(&vb, cfg, compute, device)
+        Self::from_var_builder_packed(
+            &vb,
+            cfg,
+            compute,
+            device,
+            packed.as_ref(),
+            publisher.as_ref(),
+        )
     }
 
     /// Build from an already-mapped checkpoint at `compute` dtype.
@@ -334,10 +440,23 @@ impl Flux3Dit {
         compute: DType,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_var_builder_packed(vb, cfg, compute, device, None, None)
+    }
+
+    fn from_var_builder_packed(
+        vb: &VarBuilder<'static>,
+        cfg: &DitConfig,
+        compute: DType,
+        device: &Device,
+        packed: Option<&PackedSource>,
+        publisher: Option<&PublisherSource>,
+    ) -> Result<Self> {
         let l = Loader {
             vb,
             compute,
             device,
+            packed,
+            publisher,
         };
         let hidden = cfg.hidden;
         let emb_in_image = l.linear("emb_in.image")?;
@@ -472,6 +591,20 @@ impl Flux3Dit {
     /// Velocity prediction for the image tokens of every sample, `[Σ Ni, image_in_channels]` in
     /// the compute dtype, in sample order (the image tokens of sample 0, then sample 1, …).
     pub fn forward(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
+        self.forward_impl(samples, false)
+    }
+
+    /// Training-only autograd path. Inference retains the exact existing fused norm path.
+    pub fn forward_training(&self, samples: &[SampleTokens<'_>]) -> Result<Tensor> {
+        if self.is_flow_map() {
+            return Err(Error::Unsupported(
+                "flux3 training: requires the undistilled base DiT".into(),
+            ));
+        }
+        self.forward_impl(samples, true)
+    }
+
+    fn forward_impl(&self, samples: &[SampleTokens<'_>], training: bool) -> Result<Tensor> {
         if samples.is_empty() {
             return Err(Error::Msg("flux3: forward over no samples".into()));
         }
@@ -567,6 +700,7 @@ impl Flux3Dit {
                     },
                     heads,
                     compute,
+                    training,
                 )?;
             }
             streams[mode] = Some(x);
@@ -627,6 +761,7 @@ impl Flux3Dit {
                 },
                 heads,
                 compute,
+                training,
             )?;
         }
 

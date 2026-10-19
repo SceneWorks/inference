@@ -303,6 +303,28 @@ fn push_mode<'a>(
 impl Flux3Dit {
     /// Install one preflight-validated projection; unknown paths remain typed refusals.
     pub fn install_lora(&mut self, target: &str, down: Array, up: Array, scale: f64) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, false)
+    }
+
+    /// Functional training reinjection: replace rather than append, within the grad closure.
+    pub fn replace_training_lora(
+        &mut self,
+        target: &str,
+        down: Array,
+        up: Array,
+        scale: f64,
+    ) -> Result<()> {
+        self.install_lora_impl(target, down, up, scale, true)
+    }
+
+    fn install_lora_impl(
+        &mut self,
+        target: &str,
+        down: Array,
+        up: Array,
+        scale: f64,
+        training: bool,
+    ) -> Result<()> {
         let (parent, leaf) = target
             .rsplit_once('.')
             .ok_or_else(|| Error::Unsupported(format!("flux3 LoRA: invalid target {target}")))?;
@@ -339,14 +361,30 @@ impl Flux3Dit {
                 )))
             }
         };
-        linear.push_lora(down, up, scale)
+        if training {
+            linear.replace_training_lora(down, up, scale)
+        } else {
+            linear.push_lora(down, up, scale)
+        }
     }
 
     /// Build from the package's `model.safetensors` (upstream key names) at `compute` dtype.
     pub fn from_weights(w: &Weights, cfg: &DitConfig, compute: Dtype) -> Result<Self> {
+        Self::from_weights_affine(w, cfg, compute, None)
+    }
+
+    /// [`Self::from_weights`] over a converted MLX affine package: the `affine` targets load as
+    /// packed `quantized_matmul` projections, every other tensor through the dense path.
+    pub fn from_weights_affine(
+        w: &Weights,
+        cfg: &DitConfig,
+        compute: Dtype,
+        affine: Option<&crate::nn::AffineTargets>,
+    ) -> Result<Self> {
         let l = Loader {
             weights: w,
             compute,
+            affine,
         };
         let hidden = cfg.hidden as i32;
         let emb_in_image = l.linear("emb_in.image")?;

@@ -307,8 +307,8 @@ fn real_distilled_text_to_image_renders() {
         .generate(&request, &mut |p| events.push(format!("{p:?}")))
         .unwrap();
     let render_seconds = t_render.elapsed().as_secs_f64();
-    let expected: Vec<String> = (1..=steps)
-        .map(|i| format!("Step {{ current: {i}, total: {steps} }}"))
+    let expected: Vec<String> = std::iter::once("ConditioningComplete".to_owned())
+        .chain((1..=steps).map(|i| format!("Step {{ current: {i}, total: {steps} }}")))
         .chain(std::iter::once("Decoding".to_owned()))
         .collect();
     assert_eq!(events, expected);

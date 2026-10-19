@@ -1054,8 +1054,10 @@ mod tests {
         // under the same contract as `qwen_image_2_1` — 62/59 -> 63/60.
         // sc-26234 adds `flux3_klein` (Resident and StagedResidency implemented; the three
         // bounded rungs `Missing` until sc-26241), with a contract fixture — 63/60 -> 64/61.
-        assert_eq!(registry.memory_strategy_registrations().len(), 64);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 61);
+        // sc-26239 adds `flux3_klein_base` under the same ladder, with its own contract fixture —
+        // 64/61 -> 65/62.
+        assert_eq!(registry.memory_strategy_registrations().len(), 65);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 62);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1090,10 +1092,10 @@ mod tests {
         // sc-25900's `qwen_image_2_1_turbo` publishes the same full surface as `qwen_image_2_1`,
         // so it joins the 12-apiece group — 52 -> 53.
         //
-        // sc-26234's `flux3_klein` takes the Iris-shaped narrowed surface: one dense tier (the
-        // loader refuses `LoadSpec::quantize` until sc-26241), eagerly materialized, under both
-        // offload policies — 2.
-        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 2);
+        // sc-26234's `flux3_klein` and sc-26239's `flux3_klein_base` each witness the dense tier
+        // plus sc-26241's MLX affine q4/q8 tiers, eagerly materialized (no deferred FLUX3 load
+        // shape), under both offload policies — 3 tiers x 2 policies = 6 apiece.
+        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 6 + 6);
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
         let composed: std::collections::BTreeSet<_> = surfaces
@@ -1238,6 +1240,7 @@ mod tests {
                     MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
                     MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
                     MemoryContractSurfaceTier::Nvfp4 => Some(mlx_gen::Quant::Nvfp4),
+                    MemoryContractSurfaceTier::Fp8Rowwise => Some(mlx_gen::Quant::Fp8Rowwise),
                 };
                 let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
                 assert_eq!(
@@ -1959,6 +1962,7 @@ mod tests {
                 "anima_base",
                 "anima_aesthetic",
                 "anima_turbo",
+                "flux3_klein_base",
                 "iris_3b",
                 "iris_3b_depth",
                 "iris_3b_restore",
@@ -2009,8 +2013,9 @@ mod tests {
         // 74 / 64.
         // sc-25900 adds `qwen_image_2_1_turbo` (a generator with its own complete row): 75 / 65.
         // sc-26234 adds `flux3_klein` (a generator with its own complete row): 76 / 66.
+        // sc-26239 adds `flux3_klein_base` (a generator with its own complete row): 77 / 67.
         assert_eq!(distinct.len(), 77);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 66);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 67);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

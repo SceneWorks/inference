@@ -107,8 +107,8 @@ use candle_gen::gen_core::ProviderComponents;
 /// Sorted so a reader can find an id and a future diff stays local; the emitted manifest sorts
 /// independently, so this ordering carries no meaning beyond readability.
 ///
-/// One row per **distinct** id: fifteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
-/// `qwen_image_2_1`, `iris_3b`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
+/// One row per **distinct** id: sixteen Candle trainer ids (`krea_2_raw`, `lens`, `sdxl`,
+/// `qwen_image_2_1`, `iris_3b`, `flux3_klein_base`, `z_image_turbo`, …) are also generator ids and load the same checkpoints, so
 /// they appear once — a duplicate `provider_id` is rejected by the conformance gate. `krea_2_control`
 /// and `ltx_2_3` are trainer-**only** ids with no Candle generator, which is why they appear here
 /// and in no generator list.
@@ -645,8 +645,8 @@ mod tests {
             registered.len(),
             67,
             "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
-             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239) + 19 trainers (15 of them also \
-             generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
+             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239) + 20 trainers (16 of them also \
+             generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
         );

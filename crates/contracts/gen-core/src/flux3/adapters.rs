@@ -92,15 +92,6 @@ pub fn native_target(stem: &str, cfg: &DitConfig) -> Result<(String, usize, usiz
 /// Header-only admission, run before device initialization (including sequential loads).
 /// Every tensor must belong to exactly one A/B pair. No partial installs or ignored keys.
 pub fn inspect(spec: &AdapterSpec, cfg: &DitConfig) -> Result<Vec<Projection>> {
-    if spec.kind != AdapterKind::Lora
-        || !spec.scale.is_finite()
-        || spec.pass_scales.is_some()
-        || spec.moe_expert.is_some()
-    {
-        return Err(unsupported(
-            "requires LoRA, finite explicit scale, no pass/expert override",
-        ));
-    }
     let mut file =
         File::open(&spec.path).map_err(|e| unsupported(format!("{}: {e}", spec.path.display())))?;
     let mut len = [0u8; 8];
@@ -129,10 +120,30 @@ fn plain_metadata(meta: &serde_json::Value) -> Result<(f64, Vec<usize>)> {
                 .ok_or_else(|| unsupported("lora_adapter_metadata must be a JSON string"))?;
             let value: serde_json::Value = serde_json::from_str(text)
                 .map_err(|e| unsupported(format!("invalid lora_adapter_metadata: {e}")))?;
-            if !value.is_object() {
-                return Err(unsupported("lora_adapter_metadata must contain an object"));
+            let object = value
+                .as_object()
+                .ok_or_else(|| unsupported("lora_adapter_metadata must contain an object"))?;
+            // Pinned diffusers 7ecb1e1 `_save_lora_weights` packs the transformer's PEFT config
+            // with `_pack_dict_with_prefix(metadata, "transformer")` (lora_base.py:327,1105) and
+            // its loader strips exactly that prefix (peft.py:212). Normalize ONLY that prefix;
+            // another component's keys (text_encoder.* etc.) cannot describe this DiT adapter.
+            let mut normalized = serde_json::Map::new();
+            for (key, field) in object {
+                let bare = key.strip_prefix("transformer.").unwrap_or(key);
+                if bare.contains('.') || bare.is_empty() {
+                    return Err(unsupported(format!(
+                        "lora_adapter_metadata key {key:?} is not a transformer PEFT field; only the diffusers `transformer.` prefix is supported"
+                    )));
+                }
+                if let Some(previous) = normalized.insert(bare.to_owned(), field.clone()) {
+                    if &previous != field {
+                        return Err(unsupported(format!(
+                            "lora_adapter_metadata declares {bare:?} twice with different values"
+                        )));
+                    }
+                }
             }
-            Ok(value)
+            Ok(serde_json::Value::Object(normalized))
         })
         .transpose()?;
     let mut alpha: Option<f64> = None;
@@ -248,11 +259,64 @@ fn plain_metadata(meta: &serde_json::Value) -> Result<(f64, Vec<usize>)> {
     ))
 }
 
-fn inspect_header(
+/// Every `__metadata__` key admission reads. A backend that receives tensors and metadata from
+/// one loader (MLX `Weights`) rebuilds the header from exactly these, so validation and the
+/// installed tensors come from the same read rather than a second open of the file.
+pub const ADMISSION_METADATA_KEYS: &[&str] = &[
+    "base_model",
+    "base_revision",
+    "lora_adapter_metadata",
+    "networkType",
+    "network_type",
+    "peft_type",
+    "ss_network_args",
+    "ss_network_module",
+    "use_rslora",
+    "use_dora",
+    "fan_in_fan_out",
+    "rank_pattern",
+    "alpha_pattern",
+    "lora_alpha",
+    "alpha",
+    "ss_network_alpha",
+    "rank",
+    "r",
+    "ss_network_dim",
+];
+
+/// Admission over an in-memory safetensors buffer: the SAME bytes the caller then hands to its
+/// tensor loader, so the validated header and the installed tensors cannot diverge (no TOCTOU).
+pub fn inspect_bytes(spec: &AdapterSpec, cfg: &DitConfig, bytes: &[u8]) -> Result<Vec<Projection>> {
+    let len = bytes
+        .get(..8)
+        .map(|raw| u64::from_le_bytes(raw.try_into().expect("8 bytes")))
+        .ok_or_else(|| unsupported("invalid safetensors header: file shorter than 8 bytes"))?;
+    if len == 0 || len > 16 * 1024 * 1024 {
+        return Err(unsupported("invalid/oversized safetensors header"));
+    }
+    let body = bytes
+        .get(8..8 + len as usize)
+        .ok_or_else(|| unsupported("truncated header"))?;
+    let header: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| unsupported(format!("invalid header JSON: {e}")))?;
+    inspect_header(spec, cfg, &header)
+}
+
+/// Admission over a header value the caller assembled from its own loaded tensors + metadata.
+pub fn inspect_header(
     spec: &AdapterSpec,
     cfg: &DitConfig,
     header: &serde_json::Value,
 ) -> Result<Vec<Projection>> {
+    if spec.kind != AdapterKind::Lora
+        || !spec.scale.is_finite()
+        || spec.pass_scales.is_some()
+        || spec.moe_expert.is_some()
+    {
+        return Err(unsupported(
+            "requires LoRA, finite explicit scale, no pass/expert override",
+        ));
+    }
     let (repo, revision) = if cfg.flow_map {
         (DISTILLED_WEIGHTS_REPO, DISTILLED_WEIGHTS_REVISION)
     } else {
@@ -411,6 +475,115 @@ mod tests {
             ));
         }
     }
+    /// Header exactly as pinned diffusers 7ecb1e1 `Flux3LoraLoaderMixin.save_lora_weights` writes it:
+    /// `{"format":"pt","lora_adapter_metadata": json.dumps(_pack_dict_with_prefix(peft_config.to_dict(),
+    /// "transformer"), indent=2, sort_keys=True)}` plus `transformer.`-packed tensors; SceneWorks'
+    /// identity stamps are the only additions.
+    fn diffusers_saved_header(
+        patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> serde_json::Value {
+        let mut peft = serde_json::json!({
+            "alpha_pattern": {}, "auto_mapping": null, "base_model_name_or_path": null, "bias": "none",
+            "corda_config": null, "eva_config": null, "exclude_modules": null, "fan_in_fan_out": false,
+            "inference_mode": false, "init_lora_weights": "gaussian", "layer_replication": null,
+            "layers_pattern": null, "layers_to_transform": null, "loftq_config": {}, "lora_alpha": 6,
+            "lora_bias": false, "lora_dropout": 0.0, "megatron_config": null, "megatron_core": "megatron.core",
+            "modules_to_save": null, "peft_type": "LORA", "r": 2, "rank_pattern": {}, "revision": null,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out.0", "linear_in", "linear_out"],
+            "task_type": null, "trainable_token_indices": null, "use_dora": false, "use_rslora": false
+        }).as_object().unwrap().clone();
+        patch(&mut peft);
+        let packed: serde_json::Map<String, serde_json::Value> = peft
+            .into_iter()
+            .map(|(k, v)| (format!("transformer.{k}"), v))
+            .collect();
+        let mut h = header();
+        let meta = h["__metadata__"].as_object_mut().unwrap();
+        meta.remove("lora_alpha");
+        meta.insert("format".into(), "pt".into());
+        meta.insert(
+            "lora_adapter_metadata".into(),
+            serde_json::to_string_pretty(&packed).unwrap().into(),
+        );
+        h
+    }
+
+    #[test]
+    fn diffusers_saved_transformer_prefixed_metadata_is_normalized_and_still_guarded() {
+        let spec = AdapterSpec::new("adapter.safetensors".into(), -0.25, AdapterKind::Lora);
+        let plan = inspect_header(&spec, &config(), &diffusers_saved_header(|_| {})).unwrap();
+        assert_eq!(
+            (plan[0].rank, plan[0].scale),
+            (2, -0.75),
+            "prefixed lora_alpha 6 / r 2 is honoured"
+        );
+        let refused = |h: serde_json::Value, why: &str| {
+            assert!(
+                matches!(
+                    inspect_header(&spec, &config(), &h),
+                    Err(Error::Unsupported(_))
+                ),
+                "{why}"
+            );
+        };
+        refused(
+            diffusers_saved_header(|p| {
+                p.insert("use_rslora".into(), true.into());
+            }),
+            "prefixed rsLoRA",
+        );
+        refused(
+            diffusers_saved_header(|p| {
+                p.insert("use_dora".into(), true.into());
+            }),
+            "prefixed DoRA",
+        );
+        refused(
+            diffusers_saved_header(|p| {
+                p.insert("alpha_pattern".into(), serde_json::json!({"to_q": 12}));
+            }),
+            "prefixed alpha_pattern",
+        );
+        refused(
+            diffusers_saved_header(|p| {
+                p.insert("rank_pattern".into(), serde_json::json!({"to_q": 8}));
+            }),
+            "prefixed rank_pattern",
+        );
+        refused(
+            diffusers_saved_header(|p| {
+                p.insert("r".into(), 4.into());
+            }),
+            "prefixed rank contradicts factors",
+        );
+        let mut contradiction = diffusers_saved_header(|_| {});
+        contradiction["__metadata__"]["lora_alpha"] = "12".into();
+        refused(contradiction, "top-level alpha contradicts prefixed alpha");
+        let mut foreign = diffusers_saved_header(|_| {});
+        let mut blob: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            foreign["__metadata__"]["lora_adapter_metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        // A benign value that is otherwise consistent: only the component prefix is wrong.
+        blob.insert("text_encoder.r".into(), 2.into());
+        foreign["__metadata__"]["lora_adapter_metadata"] =
+            serde_json::to_string(&blob).unwrap().into();
+        refused(foreign, "another component's prefix");
+        let mut mixed = diffusers_saved_header(|_| {});
+        let mut blob: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            mixed["__metadata__"]["lora_adapter_metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        blob.insert("use_dora".into(), true.into());
+        mixed["__metadata__"]["lora_adapter_metadata"] =
+            serde_json::to_string(&blob).unwrap().into();
+        refused(mixed, "bare and prefixed copies disagree");
+    }
+
     #[test]
     fn plain_native_and_peft_metadata_never_silently_switch_scaling_algorithms() {
         let spec = AdapterSpec::new("adapter.safetensors".into(), -0.25, AdapterKind::Lora);

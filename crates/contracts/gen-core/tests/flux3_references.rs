@@ -103,6 +103,28 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
         correct.flux3_reference_output,
         Some(ReferenceOutputSize::default())
     );
+    // A caller can accidentally drop BOTH the images and their output intent after admission.
+    // Matching numeric dimensions must not let that request silently become a T2I render.
+    let mut dropped = correct.clone();
+    dropped.conditioning.clear();
+    dropped.flux3_reference_output = None;
+    let mut scope = guard_memory_scope(
+        Box::new(Scope {
+            admitted,
+            seen: seen.clone(),
+        }),
+        admitted,
+    );
+    let error = scope.configure_request(&mut dropped).unwrap_err();
+    assert!(matches!(&error, gen_core::Error::Unsupported(_)));
+    assert!(error
+        .to_string()
+        .contains("resolve owned references before memory admission"));
+    assert_eq!(
+        seen.get(),
+        1,
+        "dropped references must be refused before generic scope/render"
+    );
     let admitted = MemoryGeometry {
         width: 1024,
         height: 1024,
@@ -120,6 +142,139 @@ fn admission_checks_resolved_auto_canvas_then_normalizes_for_generic_scope() {
     scope.configure_request(&mut legacy).unwrap();
     assert_eq!((legacy.width, legacy.height), (1024, 1024));
     assert_eq!(legacy.flux3_reference_output, None);
+}
+
+#[test]
+fn multi_reference_auto_canvas_uses_the_positive_token_grid_not_the_single_padding_floor() {
+    use gen_core::flux3::references::{
+        normalize_request, request_plan, validate_request_with_resolved_output,
+    };
+    use gen_core::{Capabilities, Conditioning, ConditioningKind, GenerationRequest, SizeFloor};
+    let mut request = GenerationRequest {
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![image(48, 64, 7), image(64, 64, 13)],
+        }],
+        flux3_reference_output: Some(ReferenceOutputSize::default()),
+        ..Default::default()
+    };
+    let plan = request_plan(&request).unwrap().unwrap();
+    assert_eq!(plan.output.canvas, (48, 64));
+    assert_eq!(plan.output.crop, None);
+    assert_eq!(plan.canvases, [(48, 64), (64, 64)]);
+    normalize_request(&mut request).unwrap();
+    assert_eq!((request.width, request.height), (48, 64));
+    let caps = Capabilities {
+        min_size: 64,
+        max_size: 4096,
+        max_count: 1,
+        size_floor: SizeFloor::RangeCheckedOnGrid { multiple: 16 },
+        conditioning: vec![ConditioningKind::MultiReference],
+        ..Default::default()
+    };
+    assert!(caps.validate_request("flux3_klein", &request).is_err());
+    validate_request_with_resolved_output(&caps, "flux3_klein", &request).unwrap();
+    let mut plain = request.clone();
+    plain.conditioning.clear();
+    plain.flux3_reference_output = None;
+    assert!(validate_request_with_resolved_output(&caps, "flux3_klein", &plain).is_err());
+    assert_eq!(
+        gen_core::flux3::references::plan(&[(16, 64), (64, 64)], ReferenceOutputSize::default())
+            .unwrap()
+            .output
+            .canvas,
+        (16, 64)
+    );
+}
+
+#[test]
+fn encoded_png_modes_match_frozen_ae_and_pup_forks() {
+    use gen_core::flux3::{
+        pup::{policy_reference, ReferenceImage},
+        references::{decode_reference_file, prepare_borrowed, request_images, upsampler_input},
+    };
+    use gen_core::{Conditioning, GenerationRequest};
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flux3-image-input");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("image-input.json")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["pup_source_sha256"],
+        "e3561ae3cbff1a080ad8854c0b89bd0687c1ea9d84c74f5203b44844cbd4684d"
+    );
+    for row in metadata["encoded_formats"].as_array().unwrap() {
+        let name = row["name"].as_str().unwrap();
+        let path = root.join(row["file"].as_str().unwrap());
+        let decoded = decode_reference_file(&path).unwrap();
+        match row["carrier"].as_str().unwrap() {
+            "rgba" => {
+                let Conditioning::ReferenceRgba { image, .. } = &decoded else {
+                    panic!("{name}: source alpha mode must remain RGBA until the fork")
+                };
+                assert_eq!(
+                    image.pixels,
+                    std::fs::read(root.join(format!("{name}.decoded.rgba"))).unwrap(),
+                    "{name}: preserve hidden RGB and alpha"
+                );
+            }
+            "rgb" => assert!(
+                matches!(&decoded, Conditioning::Reference { .. }),
+                "{name}: source original mode must not acquire white-composited alpha"
+            ),
+            _ => panic!("unknown source carrier"),
+        }
+        let req = GenerationRequest {
+            conditioning: vec![decoded],
+            flux3_reference_output: Some(ReferenceOutputSize::default()),
+            ..Default::default()
+        };
+        let ae = request_images(&req).unwrap();
+        assert_eq!(
+            ae[0].pixels,
+            std::fs::read(root.join(format!("{name}.ae.rgb"))).unwrap(),
+            "{name}: source AE RGB conversion"
+        );
+        let prepared = prepare_borrowed(
+            &ae.iter().map(|i| i.as_ref()).collect::<Vec<_>>(),
+            ReferenceOutputSize::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.images[0].pixels,
+            std::fs::read(root.join(format!("{name}.prepared.rgb"))).unwrap(),
+            "{name}: source AE RGB+padding"
+        );
+        let pup = upsampler_input(&req).unwrap();
+        let expected = std::fs::read(root.join(format!("{name}.pup.rgb"))).unwrap();
+        assert_eq!(
+            pup.references[0].to_rgb8().unwrap().2,
+            expected,
+            "{name}: source PUP RGB fork"
+        );
+        let path_input = ReferenceImage::Path(path);
+        assert_eq!(
+            path_input.to_rgb8().unwrap().2,
+            expected,
+            "{name}: existing PUP path input shares the exact original-mode policy"
+        );
+        for count in [1, 10] {
+            let expected = std::fs::read(root.join(format!("{name}.policy{count}.rgb"))).unwrap();
+            for input in [&pup.references[0], &path_input] {
+                let actual = policy_reference(input, count).unwrap();
+                assert_eq!(
+                    actual.pixels, expected,
+                    "{name}: full frozen PUP JPEG policy at {count} refs"
+                );
+                assert_eq!(
+                    actual.width as u64,
+                    row[format!("policy{count}_size")][0].as_u64().unwrap()
+                );
+                assert_eq!(
+                    actual.height as u64,
+                    row[format!("policy{count}_size")][1].as_u64().unwrap()
+                );
+            }
+        }
+    }
 }
 
 #[test]

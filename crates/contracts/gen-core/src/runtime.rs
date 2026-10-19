@@ -651,6 +651,11 @@ pub enum Quant {
     /// candle-gen catalog only under the `cuda` feature — the MLX/macOS runtime (no FP4 hardware) and
     /// the CPU candle bundle (no FP4 compute) do not offer it.
     Nvfp4,
+    /// FLUX3 source rowwise E4M3 W8A8: per-output weight scales, per-token
+    /// activation scales and one final BF16 rounding. NOT affine integer Q8.
+    /// Providers must explicitly implement/advertise this format; element width
+    /// is not permission to dispatch an existing eight-bit affine quantizer.
+    Fp8Rowwise,
 }
 
 /// YuE2's AR execution mode, separate from the loaded weight tier. Experimental FP8 replaces
@@ -685,11 +690,48 @@ impl Quant {
     /// **not** an MLX-quantizer tier — it carries FP8 block scales + an FP32 per-tensor scale
     /// (~4.5 *effective* bits/weight) and is served by candle-gen's NVFP4 packed path, not the MLX
     /// affine quantizer; do not route `Nvfp4` through an MLX `quantize(bits)` call on this width alone.
+    /// The same rule applies to `Fp8Rowwise` (8-bit E4M3, not Q8). Affine loaders
+    /// must use [`Self::affine_bits`] rather than dispatching on this metadata.
     pub fn bits(self) -> i32 {
         match self {
             Quant::Q4 => 4,
-            Quant::Q8 => 8,
+            Quant::Q8 | Quant::Fp8Rowwise => 8,
             Quant::Nvfp4 => 4,
+        }
+    }
+
+    /// Exact wire/cache tier identity. Equal element widths never alias formats.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Q4 => "q4",
+            Self::Q8 => "q8",
+            Self::Nvfp4 => "nvfp4",
+            Self::Fp8Rowwise => "fp8r",
+        }
+    }
+
+    pub fn from_key(key: &str) -> crate::Result<Self> {
+        match key {
+            "q4" => Ok(Self::Q4),
+            "q8" => Ok(Self::Q8),
+            "nvfp4" => Ok(Self::Nvfp4),
+            "fp8r" => Ok(Self::Fp8Rowwise),
+            _ => Err(crate::Error::Unsupported(format!(
+                "unknown quantization format {key:?}; expected q4, q8, nvfp4 or fp8r"
+            ))),
+        }
+    }
+
+    /// Width accepted by an AFFINE integer quantizer. Packed floating-point
+    /// formats must not reach that quantizer just because their width is 4/8.
+    pub fn affine_bits(self) -> crate::Result<i32> {
+        match self {
+            Self::Q4 => Ok(4),
+            Self::Q8 => Ok(8),
+            _ => Err(crate::Error::Unsupported(format!(
+                "{} is not an affine integer quantization format",
+                self.key()
+            ))),
         }
     }
 }
@@ -2238,6 +2280,11 @@ impl std::fmt::Debug for PromptEnhancementSink {
 /// A progress event streamed to the caller during a long `generate` / `apply`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
+    /// Optional exact phase boundary: all text and reference conditioning has been materialized
+    /// and its device work successfully synchronized, before the first denoiser forward. Emitted
+    /// once per request by adopting providers, on resident and staged paths. This is not a step,
+    /// loading event or terminal result; consumers that do not price phases may ignore it.
+    ConditioningComplete,
     /// Denoising step `current` of `total` (1-based).
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).

@@ -254,6 +254,8 @@ pub struct CausalLm {
     rope_full: Option<Rope>,
     cfg: ModelConfig,
     dtype: DType,
+    /// Explicit HF training buffer rounding; None preserves generation's F32 frequencies.
+    training_frequency_storage: Option<DType>,
     device: Device,
     /// Per-layer compute device — every entry equals `device` for a single-device model, and differs
     /// when the model is **pipeline-sharded** across GPUs (contiguous layer blocks per device). Drives
@@ -755,6 +757,7 @@ impl CausalLm {
             rope,
             rope_full,
             dtype,
+            training_frequency_storage: None,
             device,
             layer_devices,
             quantized: format.is_some(),
@@ -1144,6 +1147,47 @@ impl CausalLm {
     /// it to match its additive attention mask to the score dtype.
     pub fn compute_dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// Enable the pinned HF teacher's explicit Module.to(dtype) frequency-buffer
+    /// rounding. Call only on a fresh dense Qwen3-VL teacher BEFORE any forward/cache.
+    /// Ordinary constructors and generation keep their existing schedule unchanged.
+    pub fn with_training_frequency_storage(mut self) -> Result<Self> {
+        if !self.cfg.architecture.is_qwen3_vl() || self.quantized {
+            return Err(Error::Unsupported(
+                "training frequency profile requires a dense Qwen3-VL teacher".into(),
+            ));
+        }
+        if self.training_frequency_storage == Some(self.dtype) {
+            return Ok(self);
+        }
+        self.rope = self.rope.with_training_frequency_storage(self.dtype)?;
+        self.rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| r.with_training_frequency_storage(self.dtype))
+            .transpose()?;
+        // The staged-device-position path must use the SAME rounded frequencies.
+        self.device_rope = DeviceRope::new(&self.rope, &self.device)?;
+        self.device_rope_full = self
+            .rope_full
+            .as_ref()
+            .map(|r| DeviceRope::new(r, &self.device))
+            .transpose()?;
+        self.training_frequency_storage = Some(self.dtype);
+        Ok(self)
+    }
+
+    pub fn training_frequency_storage_dtype(&self) -> Option<DType> {
+        self.training_frequency_storage
+    }
+
+    /// Training hidden-state cache identities must bind both compute and frequency policy.
+    pub fn precision_profile_key(&self) -> String {
+        format!(
+            "compute={:?};hf_training_frequency={:?}",
+            self.dtype, self.training_frequency_storage
+        )
     }
 
     /// Build per-row RoPE tables for a `[rows, cols]` grid of absolute positions (row-major flat
@@ -3019,6 +3063,10 @@ fn join(prefix: &str, suffix: &str) -> String {
         format!("{prefix}.{suffix}")
     }
 }
+
+#[cfg(test)]
+#[path = "llama/training_precision_tests.rs"]
+mod training_precision_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

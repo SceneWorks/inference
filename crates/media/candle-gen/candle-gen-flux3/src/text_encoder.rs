@@ -47,7 +47,8 @@ use candle_llm::{CausalLm, ModelConfig};
 
 /// One prompt's conditioning, as `TextEncoder.encode` returns it.
 pub struct TextConditioning {
-    /// `[L, layers · hidden]` bf16: the selected hidden states concatenated per token.
+    /// `[L, layers · hidden]`: selected states per token; BF16 for generation,
+    /// explicitly selected compute/output dtype for the frozen training teacher.
     pub tokens: Tensor,
     /// `[L]` ids `(0, 0, 0, position)`.
     pub ids: Vec<[f32; 4]>,
@@ -63,6 +64,7 @@ pub struct Flux3TextEncoder {
     layers: Vec<usize>,
     pad_multiple: usize,
     max_length: usize,
+    output_dtype: DType,
     hidden: usize,
     device: Device,
 }
@@ -148,6 +150,47 @@ impl Flux3TextEncoder {
         text_in_channels: usize,
         device: &Device,
     ) -> Result<Self> {
+        Self::load_internal(dir, cfg, text_in_channels, device, None)
+    }
+
+    /// Frozen training teacher with explicit selected compute/output dtype and
+    /// source training token cap (default512), independent of inference's policy.
+    pub fn load_for_training(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        text_in_channels: usize,
+        device: &Device,
+        compute: DType,
+        max_sequence_length: usize,
+    ) -> Result<Self> {
+        if !matches!(compute, DType::F32 | DType::F16 | DType::BF16)
+            || max_sequence_length == 0
+            || max_sequence_length > i32::MAX as usize
+        {
+            return Err(Error::Unsupported(
+                "flux3 training teacher requires F32/F16/BF16 and a positive bounded text window"
+                    .into(),
+            ));
+        }
+        if device.is_cpu() && compute == DType::BF16 {
+            return Err(Error::Unsupported("flux3 training: the Candle CPU teacher has no BF16 GEMM; choose F32 or native CUDA, never a silent F32 teacher".into()));
+        }
+        Self::load_internal(
+            dir,
+            cfg,
+            text_in_channels,
+            device,
+            Some((compute, max_sequence_length)),
+        )
+    }
+
+    fn load_internal(
+        dir: &Path,
+        cfg: &TextEncoderConfig,
+        text_in_channels: usize,
+        device: &Device,
+        training: Option<(DType, usize)>,
+    ) -> Result<Self> {
         let model_cfg = ModelConfig::from_dir(dir).map_err(from_llm)?;
         if !model_cfg.architecture.is_qwen3_vl() {
             return Err(Error::Unsupported(format!(
@@ -175,10 +218,44 @@ impl Flux3TextEncoder {
                 model_cfg.num_layers
             )));
         }
-        let dtype = tower_dtype(cfg, device)?;
-
+        let (dtype, output_dtype, max_length) = match training {
+            Some((dtype, max_length)) => {
+                if cfg.pad_multiple == 0 || max_length > model_cfg.max_position_embeddings as usize
+                {
+                    return Err(Error::Unsupported("flux3 training: text window exceeds the teacher's positional capacity or has invalid padding".into()));
+                }
+                (dtype, dtype, max_length)
+            }
+            None => (
+                tower_dtype(cfg, device)?,
+                DType::BF16,
+                cfg.window_max_length(),
+            ),
+        };
+        let files = shard_files(dir)?;
+        if training.is_some() {
+            // Header-only dense-format refusal before the first device upload.
+            for file in &files {
+                for header in
+                    candle_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(file)
+                        .map_err(Error::from)?
+                {
+                    let key = header.name.as_str();
+                    if !(key.starts_with("model.language_model.") || key.starts_with("lm_head.")) {
+                        continue;
+                    }
+                    if key.ends_with(".scales")
+                        || key.ends_with(".biases")
+                        || ((key.ends_with(".weight") || key.ends_with(".bias"))
+                            && !header.is_float())
+                    {
+                        return Err(Error::Unsupported("flux3 training teacher requires dense floating weights; packed/quantized teachers are not source-supported".into()));
+                    }
+                }
+            }
+        }
         let mut tensors = HashMap::new();
-        for file in shard_files(dir)? {
+        for file in files {
             let part =
                 candle_gen::candle_core::safetensors::load(&file, &Device::Cpu).map_err(|e| {
                     Error::Msg(format!(
@@ -199,6 +276,11 @@ impl Flux3TextEncoder {
         let weights = LlmWeights::from_map(tensors, device.clone());
         let lm =
             CausalLm::from_weights_dtype(&weights, "", model_cfg, None, dtype).map_err(from_llm)?;
+        let lm = if training.is_some() {
+            lm.with_training_frequency_storage().map_err(from_llm)?
+        } else {
+            lm
+        };
         drop(weights);
 
         let tokenizer = TextTokenizer::from_file(
@@ -223,7 +305,8 @@ impl Flux3TextEncoder {
             pad_id,
             layers: cfg.layers.clone(),
             pad_multiple: cfg.pad_multiple,
-            max_length: cfg.window_max_length(),
+            max_length,
+            output_dtype,
             hidden,
             device: device.clone(),
         })
@@ -241,6 +324,20 @@ impl Flux3TextEncoder {
     /// The tower's compute dtype.
     pub fn dtype(&self) -> DType {
         self.lm.compute_dtype()
+    }
+
+    pub fn output_dtype(&self) -> DType {
+        self.output_dtype
+    }
+
+    pub fn precision_profile_key(&self) -> String {
+        format!(
+            "{};output={:?};max={};layers={:?}",
+            self.lm.precision_profile_key(),
+            self.output_dtype,
+            self.max_length,
+            self.layers
+        )
     }
 
     pub fn device(&self) -> &Device {
@@ -294,7 +391,7 @@ impl Flux3TextEncoder {
             })
             .collect::<Result<_>>()?;
         // `stack(dim=1).permute(0, 2, 1, 3).reshape(L, -1)`: layer-major within each token row.
-        let tokens = Tensor::cat(&picked, 1)?.to_dtype(DType::BF16)?;
+        let tokens = Tensor::cat(&picked, 1)?.to_dtype(self.output_dtype)?;
         Ok(TextConditioning {
             tokens,
             ids: text_ids(n),

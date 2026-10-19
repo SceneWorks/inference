@@ -33,6 +33,7 @@ pub mod pipeline;
 pub mod pup;
 pub mod references;
 pub mod text_encoder;
+pub mod training;
 
 pub use autoencoder::Flux3AutoEncoder;
 pub use dit::{Flux3Dit, SampleTokens};
@@ -63,6 +64,9 @@ pub fn register_providers(
     registry
         .register_generator(model::REGISTRATION)
         .register_generator(model::BASE_REGISTRATION)
+        .register_reference_workspace(memory_strategy::REFERENCE_WORKSPACE_REGISTRATION)
+        .register_reference_workspace(memory_strategy::BASE_REFERENCE_WORKSPACE_REGISTRATION)
+        .register_trainer(training::trainer::TRAINER_REGISTRATION)
         .register_memory_strategy(memory_strategy::BASE_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::BASE_MEMORY_CONTRACT_FIXTURE)
         .register_memory_behavior(memory_strategy::BASE_MEMORY_BEHAVIOR_REGISTRATION)

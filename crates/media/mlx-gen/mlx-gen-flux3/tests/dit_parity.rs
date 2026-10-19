@@ -19,6 +19,97 @@ use crate::common::{
     assert_close, cpu_process, fixture, host_f32, on_cpu, tiny_config, tiny_package,
 };
 
+// AE computes in f32 before the source explicitly stores conditioning in BF16. CPU summation
+// order can flip a rounding midpoint without violating the pre-cast gate. Keep the source f32
+// max bound, add a tighter mean guard, then grade the stored dtype in ULPs rather than raising
+// the absolute bound for one reference count. A sparse-rounding guard rejects systematic bias.
+fn assert_reference_f32(got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len());
+    assert!(!got.is_empty());
+    let peak = want
+        .iter()
+        .fold(1.0_f32, |peak, value| peak.max(value.abs()));
+    let mut max = 0.0_f32;
+    let mut sum = 0.0_f64;
+    for (&a, &b) in got.iter().zip(want) {
+        let delta = (a - b).abs();
+        assert!(delta.is_finite());
+        max = max.max(delta);
+        sum += f64::from(delta);
+    }
+    let mean = sum / got.len() as f64;
+    eprintln!("AE pre-cast f32: max={max:.9e} mean={mean:.9e} peak={peak:.9e}");
+    assert!(max <= 1e-4 * peak, "AE pre-cast f32 max drift: {max}");
+    assert!(
+        mean <= 1e-6 * f64::from(peak),
+        "AE pre-cast f32 mean drift: {mean}"
+    );
+}
+
+fn assert_reference_bf16(got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len());
+    assert!(!got.is_empty());
+    let ordered = |value: f32| -> u32 {
+        assert!(value.is_finite());
+        assert_eq!(
+            value.to_bits() & 0xffff,
+            0,
+            "reference token omitted its BF16 cast"
+        );
+        let bits = value.to_bits() >> 16;
+        if bits & 0x8000 != 0 {
+            0x8000 - (bits & 0x7fff)
+        } else {
+            0x8000 + bits
+        }
+    };
+    let peak = want
+        .iter()
+        .fold(1.0_f32, |peak, value| peak.max(value.abs()));
+    let mut changed = 0_usize;
+    let mut sum = 0.0_f64;
+    for (&a, &b) in got.iter().zip(want) {
+        let ulp = ordered(a).abs_diff(ordered(b));
+        assert!(ulp <= 1, "AE stored BF16 drift: {a} vs {b}, {ulp} ULPs");
+        changed += usize::from(ulp != 0);
+        sum += f64::from((a - b).abs());
+    }
+    let mean = sum / got.len() as f64;
+    eprintln!(
+        "AE stored BF16: changed={changed}/{} mean={mean:.9e} peak={peak:.9e}",
+        got.len()
+    );
+    assert!(
+        mean <= 1e-4 * f64::from(peak),
+        "AE stored BF16 mean drift: {mean}"
+    );
+    assert!(
+        changed * 100 <= got.len(),
+        "AE stored BF16 rounding differences exceed 1%: {changed}/{}",
+        got.len()
+    );
+}
+
+#[test]
+fn reference_precision_guards_reject_bias_two_ulps_and_missing_cast() {
+    let want = vec![0.125_f32; 100];
+    let next = f32::from_bits(want[0].to_bits() + (1 << 16));
+    let mut sparse = want.clone();
+    sparse[0] = next;
+    assert_reference_bf16(&sparse, &want);
+    let mut biased = sparse.clone();
+    biased[1] = next;
+    assert!(std::panic::catch_unwind(|| assert_reference_bf16(&biased, &want)).is_err());
+    let mut two_ulps = want.clone();
+    two_ulps[0] = f32::from_bits(want[0].to_bits() + (2 << 16));
+    assert!(std::panic::catch_unwind(|| assert_reference_bf16(&two_ulps, &want)).is_err());
+    let mut uncast = want.clone();
+    uncast[0] = f32::from_bits(want[0].to_bits() + 1);
+    assert!(std::panic::catch_unwind(|| assert_reference_bf16(&uncast, &want)).is_err());
+    let f32_bias = vec![0.12505_f32; 100];
+    assert!(std::panic::catch_unwind(|| assert_reference_f32(&f32_bias, &want)).is_err());
+}
+
 fn ids_of(a: &Array) -> Vec<[f32; 4]> {
     host_f32(a)
         .chunks(4)
@@ -75,8 +166,8 @@ fn ordered_reference_edits_match_frozen_source_body() {
         .unwrap();
         let text = fixture("flux3_text_golden.safetensors");
         let conditioning = |name: &str| {
-            let tokens = text.require(&format!("{name}/tokens")).clone();
-            let ids = ids_of(text.require(&format!("{name}/ids")));
+            let tokens = text.require(&format!("{name}/tokens")).unwrap().clone();
+            let ids = ids_of(text.require(&format!("{name}/ids")).unwrap());
             let window = assemble_window(&vec![1; ids.len()], 0, 1, 4096).unwrap();
             TextConditioning {
                 tokens,
@@ -88,7 +179,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
         let negative = conditioning("empty");
         let originals: Vec<Image> = (0..10)
             .map(|i| {
-                let t = golden.require(&format!("input/{i}"));
+                let t = golden.require(&format!("input/{i}")).unwrap();
                 let dims = t.shape();
                 Image {
                     width: dims[1] as u32,
@@ -97,8 +188,8 @@ fn ordered_reference_edits_match_frozen_source_body() {
                 }
             })
             .collect();
-        let ids = ids_of(golden.require("image_ids"));
-        let schedule = host_f32(golden.require("schedule"));
+        let ids = ids_of(golden.require("image_ids").unwrap());
+        let schedule = host_f32(golden.require("schedule").unwrap());
         for (name, order) in [
             ("one", vec![0]),
             ("two", vec![0, 1]),
@@ -116,13 +207,13 @@ fn ordered_reference_edits_match_frozen_source_body() {
                 conditioning: order
                     .iter()
                     .map(|&i| {
-                        if i % 2 == 0 {
+                        if i.is_multiple_of(2) {
                             mlx_gen::gen_core::Conditioning::ReferenceRgba {
                                 image: mlx_gen::gen_core::RgbaImage {
                                     width: originals[i].width,
                                     height: originals[i].height,
                                     pixels: crate::common::host_f32(
-                                        golden.require(&format!("rgba/{i}")),
+                                        golden.require(&format!("rgba/{i}")).unwrap(),
                                     )
                                     .into_iter()
                                     .map(|v| v as u8)
@@ -152,33 +243,65 @@ fn ordered_reference_edits_match_frozen_source_body() {
             );
             let pup = mlx_gen::gen_core::flux3::references::upsampler_input(&mixed).unwrap();
             for (position, &i) in order.iter().enumerate() {
-                if i % 2 == 0 {
+                if i.is_multiple_of(2) {
                     let (_, _, rgb) = pup.references[position].to_rgb8().unwrap();
-                    let expected = crate::common::host_f32(golden.require(&format!("pup_rgb/{i}")))
-                        .into_iter()
-                        .map(|v| v as u8)
-                        .collect::<Vec<_>>();
+                    let expected =
+                        crate::common::host_f32(golden.require(&format!("pup_rgb/{i}")).unwrap())
+                            .into_iter()
+                            .map(|v| v as u8)
+                            .collect::<Vec<_>>();
                     assert_eq!(rgb, expected, "Pillow source alpha-over-white fork");
                 }
             }
             let prepared = mixed_prepared;
+            let pre_cast = prepared
+                .images
+                .iter()
+                .map(|image| {
+                    let values = image
+                        .pixels
+                        .iter()
+                        .map(|&v| v as f32 / 127.5 - 1.0)
+                        .collect::<Vec<_>>();
+                    let input = Array::from_slice(
+                        &values,
+                        &[1, image.height as i32, image.width as i32, 3],
+                    );
+                    let tokens = ae.encode(&input).unwrap().0;
+                    mlx_rs::transforms::eval([&tokens]).unwrap();
+                    tokens
+                })
+                .collect::<Vec<_>>();
+            let pre_cast_refs = pre_cast.iter().collect::<Vec<_>>();
+            let pre_cast = mlx_rs::ops::concatenate_axis(&pre_cast_refs, 0).unwrap();
+            assert_reference_f32(
+                &host_f32(&pre_cast),
+                &host_f32(
+                    golden
+                        .require(&format!("{name}/reference_tokens_f32"))
+                        .unwrap(),
+                ),
+            );
             let references =
                 mlx_gen_flux3::references::encode(&ae, &prepared, &CancelFlag::new()).unwrap();
             assert_eq!(references.tokens.dtype(), Dtype::Bfloat16);
             assert_eq!(
                 references.ids,
-                ids_of(golden.require(&format!("{name}/reference_ids")))
+                ids_of(golden.require(&format!("{name}/reference_ids")).unwrap())
             );
-            assert_close(
-                "AE reference tokens",
-                &references.tokens,
-                golden.require(&format!("{name}/reference_tokens")),
-                1e-4,
+            assert_eq!(
+                host_f32(&pre_cast.as_dtype(Dtype::Bfloat16).unwrap()),
+                host_f32(&references.tokens),
+                "production reference encode must retain exactly the AE's BF16 cast",
+            );
+            assert_reference_bf16(
+                &host_f32(&references.tokens),
+                &host_f32(golden.require(&format!("{name}/reference_tokens")).unwrap()),
             );
             let out = denoise_flow_map_with_references(
                 &flow,
                 &positive,
-                golden.require("noise"),
+                golden.require("noise").unwrap(),
                 &ids,
                 &schedule,
                 Some(&references),
@@ -189,11 +312,11 @@ fn ordered_reference_edits_match_frozen_source_body() {
             assert_close(
                 name,
                 &out,
-                golden.require(&format!("{name}/flow_tokens")),
+                golden.require(&format!("{name}/flow_tokens")).unwrap(),
                 1e-4,
             );
             let decoded = decode_tokens(&ae, &out, 2, 3).unwrap();
-            let expected = host_f32(golden.require(&format!("{name}/rgb8")))
+            let expected = host_f32(golden.require(&format!("{name}/rgb8")).unwrap())
                 .into_iter()
                 .map(|v| v as u8)
                 .collect::<Vec<_>>();
@@ -212,7 +335,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                         &base,
                         &positive,
                         &negative,
-                        golden.require("noise"),
+                        golden.require("noise").unwrap(),
                         &ids,
                         &schedule,
                         g,
@@ -224,7 +347,7 @@ fn ordered_reference_edits_match_frozen_source_body() {
                     assert_close(
                         "base ordered reference CFG",
                         &result,
-                        golden.require(&format!("{name}/cfg_{g:.1}")),
+                        golden.require(&format!("{name}/cfg_{g:.1}")).unwrap(),
                         1e-4,
                     );
                 }
@@ -482,7 +605,7 @@ fn base_cfg_and_explicit_adapter_identity_match_frozen_source() {
                 let mut config = tiny_config();
                 config.dit.flow_map = false;
                 let mut weights =
-                    Weights::from_file(&tiny_package().join("model.safetensors")).unwrap();
+                    Weights::from_file(tiny_package().join("model.safetensors")).unwrap();
                 let remove: Vec<_> = weights
                     .keys()
                     .filter(|key| key.starts_with("ref_time_in."))
