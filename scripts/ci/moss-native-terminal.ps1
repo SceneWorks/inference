@@ -70,6 +70,41 @@ function Native([string]$exe, [string[]]$arguments) {
     Require ($LASTEXITCODE -eq 0) "Native command failed: $exe"
     $value
 }
+function Import-MsvcEnvironment([string]$batch) {
+    Plain-Path $batch
+    # Windows PowerShell 5.1 rewrites nested quotes passed through & cmd.exe.
+    # Pass cmd's complete /s /c command line directly, preserving both quote layers.
+    $start=[Diagnostics.ProcessStartInfo]::new()
+    $start.FileName=$env:ComSpec
+    $start.Arguments='/d /s /c ""'+$batch+'" >nul && set"'
+    $start.UseShellExecute=$false
+    $start.CreateNoWindow=$true
+    $start.RedirectStandardOutput=$true
+    $start.RedirectStandardError=$true
+    $process=[Diagnostics.Process]::new(); $process.StartInfo=$start; $started=$false
+    try {
+        $started=$process.Start()
+        Require $started 'MSVC environment process did not start'
+        $null=$process.Handle # Retain the exact process object for timeout cleanup.
+        $stdout=$process.StandardOutput.ReadToEndAsync()
+        $stderr=$process.StandardError.ReadToEndAsync()
+        Require ($process.WaitForExit(60000)) 'MSVC environment import timed out'
+        Require ([Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),5000)) 'MSVC environment output drain timed out'
+        $lines=$stdout.GetAwaiter().GetResult()
+        $null=$stderr.GetAwaiter().GetResult()
+        Require ($process.ExitCode -eq 0) "MSVC environment import failed: exit=$($process.ExitCode)"
+        foreach ($line in ($lines -split "`r?`n")) {
+            if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1],$Matches[2],'Process') }
+        }
+    } finally {
+        try {
+            if ($started -and -not $process.HasExited) {
+                $process.Kill()
+                Require ($process.WaitForExit(5000)) 'MSVC environment process cleanup timed out'
+            }
+        } finally { $process.Dispose() }
+    }
+}
 function Snapshot-Identity($row) {
     Require ($null -ne $row.CreationDate) 'Unresolved process creation identity'
     [pscustomobject]@{pid=[int]$row.ProcessId;name=$row.Name;created_utc=Creation-Key $row.CreationDate}
@@ -275,6 +310,26 @@ if ($SelfTest) {
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('moss-transport-test-' + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $temp | Out-Null
     try {
+        $msvc=Join-Path $temp 'MSVC fixture with spaces (x86)'
+        New-Item -ItemType Directory -Path $msvc|Out-Null
+        $batch=Join-Path $msvc 'vcvars64.bat'
+        [IO.File]::WriteAllText($batch,"@echo off`r`nset `"MOSS_MSVC_FIXTURE=spaces & equals=preserved`"`r`nexit /b 0`r`n")
+        $previous=[Environment]::GetEnvironmentVariable('MOSS_MSVC_FIXTURE','Process')
+        try {
+            # Reproduce the actual failed transport on Windows PowerShell 5.1 before
+            # proving the replacement imports a space-containing path successfully.
+            if ($PSVersionTable.PSVersion.Major -eq 5) {
+                $rejected=$false
+                try { Native $env:ComSpec @('/d','/c',('""'+$batch+'" >nul && set"'))|Out-Null } catch { $rejected=$true }
+                Require $rejected 'Legacy MSVC quote regression did not discriminate'
+            }
+            Import-MsvcEnvironment $batch
+            Require ($env:MOSS_MSVC_FIXTURE -ceq 'spaces & equals=preserved') 'MSVC path/environment quoting failed'
+            [IO.File]::WriteAllText($batch,"@echo off`r`nset `"MOSS_MSVC_FIXTURE=must-not-import`"`r`nexit /b 7`r`n")
+            $rejected=$false
+            try { Import-MsvcEnvironment $batch } catch { $rejected=$_.Exception.Message -ceq 'MSVC environment import failed: exit=7' }
+            Require ($rejected -and $env:MOSS_MSVC_FIXTURE -ceq 'spaces & equals=preserved') 'Failed MSVC batch imported partial environment'
+        } finally { [Environment]::SetEnvironmentVariable('MOSS_MSVC_FIXTURE',$previous,'Process') }
         Test-Ownership-Fixture
         Cargo-Dependency-Setup {Require ($env:CARGO_NET_OFFLINE -ceq 'false') 'Dependency preparation was not scoped online'}
         Require ($env:CARGO_NET_OFFLINE -ceq 'true') 'Offline mode not restored after dependency setup'
@@ -359,7 +414,7 @@ try { $child.WaitForExit();exit $child.ExitCode } finally {$child.Dispose()}
 $script:evidence = $env:MOSS_TRANSPORT_ARTIFACT_ROOT
 Require (-not [string]::IsNullOrEmpty($script:evidence)) 'Missing artifact root'
 New-Item -ItemType Directory -Force -Path $script:evidence | Out-Null
-$status = @{status='failed'; run=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; host=$env:COMPUTERNAME; workflow_revision=$env:GITHUB_SHA; inference=$null; sceneworks=$env:MOSS_SCENEWORKS_REVISION; started_utc=[DateTime]::UtcNow.ToString('o')}
+$status = @{status='failed'; run=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; host=$env:COMPUTERNAME; workflow_revision=$env:GITHUB_SHA; controller_path=$PSCommandPath; controller_sha256=(Hash $PSCommandPath); inference=$null; sceneworks=$env:MOSS_SCENEWORKS_REVISION; started_utc=[DateTime]::UtcNow.ToString('o')}
 $leaseHandle=$null; $leasePath=$null; $leaseHash=$null; $persistent=$null; $persistentCreated=$false
 try {
     Require ($env:GITHUB_REF -ceq 'refs/heads/main') 'Terminal requires final inference main, not a feature/story ref'
@@ -410,8 +465,7 @@ try {
     # Import only the installed, fixed MSVC environment. No input is inserted into cmd source.
     $vcvars='C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
     Require (Test-Path -LiteralPath $vcvars) 'Missing installed VS2022 BuildTools'
-    $lines = Native $env:ComSpec @('/d','/c',('""'+$vcvars+'" >nul && set"'))
-    foreach ($line in $lines) { if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1],$Matches[2],'Process') } }
+    Import-MsvcEnvironment $vcvars
     $env:NVCC_CCBIN=Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64'
     $status.rustc=(Native rustc @('-Vv')) -join "`n"; $status.cargo=(Native cargo @('-V')) -join "`n"; $status.nvcc=(Native nvcc @('--version')) -join "`n"
     # CPU source-dependency preparation is supervised and precedes all builds and the GPU lease.

@@ -1086,6 +1086,48 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
         return shell
 
+    def test_native_terminal_uses_trusted_workflow_controller_with_pinned_engine(self):
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
+        )
+        steps = native["jobs"]["native"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        guard = next(i for i, run in enumerate(runs) if "Pinned inference is not a main ancestor" in run)
+        controller = next(i for i, run in enumerate(runs) if "controller-source.json" in run)
+        selftest = runs.index("& $env:MOSS_NATIVE_CONTROLLER -SelfTest")
+        execution = runs.index("& $env:MOSS_NATIVE_CONTROLLER")
+        self.assertLess(guard, controller)
+        self.assertLess(controller, selftest)
+        self.assertLess(selftest, execution)
+        materialize = runs[controller]
+        for invariant in (
+            "$env:GITHUB_REF -cne 'refs/heads/main'",
+            "git merge-base --is-ancestor $env:GITHUB_SHA origin/main",
+            "$object=$env:GITHUB_SHA+':scripts/ci/moss-native-terminal.ps1'",
+            "$start.Arguments='cat-file blob '+$blob",
+            "[IO.FileMode]::CreateNew",
+            "$process.StandardOutput.BaseStream.CopyToAsync($file)",
+            "git hash-object --no-filters $path",
+            "$actual -cne $blob",
+            "controller_sha256=$sha256",
+            "MOSS_NATIVE_CONTROLLER=$path",
+        ):
+            self.assertIn(invariant, materialize)
+        self.assertNotIn("inputs.", materialize)
+        self.assertNotIn("control_json", materialize)
+        self.assertIn("$env:MOSS_TRANSPORT_ARTIFACT_ROOT", materialize)
+        checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertEqual(checkouts[0]["with"]["ref"], "${{ fromJSON(inputs.control_json).inference_revision }}")
+        controller_source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assertIn("$source = (Get-Location).Path", controller_source)
+        self.assertIn("Join-Path $source 'scripts/ci/moss-native-terminal-protocol.json'", controller_source)
+        windows_selftest = [
+            step for step in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]["steps"]
+            if "moss-native-terminal.ps1 -SelfTest" in step.get("run", "")
+        ]
+        self.assertEqual(len(windows_selftest), 1)
+        self.assertEqual(windows_selftest[0]["shell"], "powershell")
+
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
     # so a renamed or dropped module would otherwise leave a green step that tests nothing.
