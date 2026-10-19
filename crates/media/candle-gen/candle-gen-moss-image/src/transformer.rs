@@ -232,24 +232,48 @@ fn rotate(x: &Tensor, rope: &Tensor) -> Result<Tensor> {
     Ok(x.broadcast_mul(&cos.to_dtype(dtype)?)?
         .add(&paired.broadcast_mul(&sin.to_dtype(dtype)?)?)?)
 }
-fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Result<Tensor> {
+fn attention_qk_operands(
+    q: &Tensor,
+    k: &Tensor,
+    value_dtype: DType,
+    r: &Tensor,
+    heads: usize,
+) -> Result<(Tensor, Tensor)> {
     let (b, s, d) = q.dims3()?;
     let width = d / heads;
     let q = rotate(&q.reshape((b, s, heads, width))?, r)?
         .transpose(1, 2)?
-        .to_dtype(v.dtype())?;
+        .to_dtype(value_dtype)?;
     let k = rotate(&k.reshape((b, s, heads, width))?, r)?
         .transpose(1, 2)?
-        .to_dtype(v.dtype())?;
-    let v = v.reshape((b, s, heads, width))?.transpose(1, 2)?;
-    // Explicit FP32 scores mirror SDPA accumulation; cast probabilities before value matmul.
-    let scores = (q
+        .to_dtype(value_dtype)?;
+    // CUDA batched GEMM needs packed heads. BF16 -> FP32 already packs these views,
+    // but DMD's FP32 -> FP32 is a no-op and retains the interleaved head strides.
+    // Pack K before its final matrix transpose, which cuBLAS supports directly.
+    Ok((
+        q.to_dtype(DType::F32)?.contiguous()?,
+        k.to_dtype(DType::F32)?.contiguous()?.transpose(2, 3)?,
+    ))
+}
+fn attention_value_operand(v: &Tensor, heads: usize) -> Result<Tensor> {
+    let (b, s, d) = v.dims3()?;
+    // The value GEMM has the same FP32 no-op-cast layout hazard as Q/K.
+    Ok(v.reshape((b, s, heads, d / heads))?
+        .transpose(1, 2)?
         .to_dtype(DType::F32)?
-        .matmul(&k.to_dtype(DType::F32)?.transpose(2, 3)?)?
-        / (width as f64).sqrt())?;
+        .contiguous()?)
+}
+fn attention(q: &Tensor, k: &Tensor, v: &Tensor, r: &Tensor, heads: usize) -> Result<Tensor> {
+    let (b, s, d) = q.dims3()?;
+    let output_dtype = v.dtype();
+    // Explicit FP32 score and value accumulation, then round to the activation dtype.
+    let scores = {
+        let (q, kt) = attention_qk_operands(q, k, output_dtype, r, heads)?;
+        (q.matmul(&kt)? / ((d / heads) as f64).sqrt())?
+    };
     let p = candle_nn::ops::softmax_last_dim(&scores)?;
-    Ok(p.matmul(&v.to_dtype(DType::F32)?)?
-        .to_dtype(v.dtype())?
+    Ok(p.matmul(&attention_value_operand(v, heads)?)?
+        .to_dtype(output_dtype)?
         .transpose(1, 2)?
         .reshape((b, s, d))?)
 }
@@ -680,4 +704,110 @@ pub(crate) fn test_projection(
 #[cfg(test)]
 pub(crate) fn test_norm(x: &Tensor, weight: Tensor) -> Result<Tensor> {
     Norm(weight).forward(x)
+}
+
+#[cfg(test)]
+mod attention_layout_tests {
+    use super::*;
+
+    const SEQUENCE: usize = 5;
+    const HEADS: usize = 3;
+    const WIDTH: usize = 8;
+
+    fn inputs(
+        device: &Device,
+        batch: usize,
+        qk_dtype: DType,
+        value_dtype: DType,
+        rope_dtype: DType,
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
+        let input = |offset: usize, dtype| {
+            let values: Vec<f32> = (0..batch * SEQUENCE * HEADS * WIDTH)
+                .map(|i| (((i * 7 + offset) % 29) as f32 - 14.) / 32.)
+                .collect();
+            Tensor::from_vec(values, (batch, SEQUENCE, HEADS * WIDTH), device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+        };
+        (
+            input(0, qk_dtype),
+            input(3, qk_dtype),
+            input(11, value_dtype),
+            rope(1, 2, 3, WIDTH, rope_dtype, device).unwrap(),
+        )
+    }
+
+    fn policies() -> [(DType, DType, DType); 4] {
+        [
+            (DType::BF16, DType::BF16, DType::BF16),
+            (DType::F32, DType::BF16, DType::BF16),
+            (DType::F32, DType::F32, DType::BF16),
+            (DType::F32, DType::F32, DType::F32),
+        ]
+    }
+
+    #[test]
+    fn production_attention_operands_pack_each_head_for_both_matmuls() {
+        for batch in [1, 2] {
+            for (qk_dtype, value_dtype, rope_dtype) in policies() {
+                let (q, k, v, r) = inputs(&Device::Cpu, batch, qk_dtype, value_dtype, rope_dtype);
+                let (q, kt) = attention_qk_operands(&q, &k, v.dtype(), &r, HEADS).unwrap();
+                let v = attention_value_operand(&v, HEADS).unwrap();
+                // These are the actual operands consumed by attention, not a CPU numerical
+                // proxy: CPU matmul accepts the interleaved strides that CUDA rejects.
+                let packed = [HEADS * SEQUENCE * WIDTH, SEQUENCE * WIDTH, WIDTH, 1];
+                assert_eq!(q.stride(), packed, "Q must pack its head matrices");
+                assert_eq!(v.stride(), packed, "V must pack its head matrices");
+                assert_eq!(
+                    kt.stride(),
+                    [HEADS * SEQUENCE * WIDTH, SEQUENCE * WIDTH, 1, WIDTH],
+                    "K must pack its head matrices before its cuBLAS-supported transpose"
+                );
+                assert_eq!(q.dims(), [batch, HEADS, SEQUENCE, WIDTH]);
+                assert_eq!(kt.dims(), [batch, HEADS, WIDTH, SEQUENCE]);
+                assert_eq!(v.dims(), q.dims());
+                for operand in [&q, &kt, &v] {
+                    assert_eq!(operand.dtype(), DType::F32);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an explicitly admitted CUDA device; no model weights"]
+    fn production_attention_cuda_accepts_ordinary_and_dmd_layouts() {
+        let device = Device::new_cuda(0).expect("admitted logical CUDA device 0");
+        for batch in [1, 2] {
+            for (qk_dtype, value_dtype, rope_dtype) in policies() {
+                let (q, k, v, r) = inputs(&device, batch, qk_dtype, value_dtype, rope_dtype);
+                let actual = attention(&q, &k, &v, &r, HEADS).unwrap();
+                let (q, k, v, r) = inputs(&Device::Cpu, batch, qk_dtype, value_dtype, rope_dtype);
+                let expected = attention(&q, &k, &v, &r, HEADS).unwrap();
+                assert_eq!(actual.dims(), [batch, SEQUENCE, HEADS * WIDTH]);
+                assert_eq!(actual.dtype(), value_dtype);
+                let flatten = |x: Tensor| {
+                    x.to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let actual = flatten(actual);
+                let expected = flatten(expected);
+                assert_eq!(actual.len(), expected.len());
+                let tolerance = if value_dtype == DType::BF16 {
+                    0.005
+                } else {
+                    0.0001
+                };
+                for (actual, expected) in actual.into_iter().zip(expected) {
+                    assert!(actual.is_finite() && expected.is_finite());
+                    assert!((actual - expected).abs() <= tolerance);
+                }
+            }
+        }
+    }
 }
