@@ -141,7 +141,9 @@ fn geometry(width: u32, height: u32, multi: bool) -> Result<(ReferenceGeometry, 
         };
         let (w, h) = (fit.0 / 16 * 16, fit.1 / 16 * 16);
         if w == 0 || h == 0 {
-            return Err(invalid(format!("multi-reference {width}x{height} becomes empty after the upstream 16px crop; use a less extreme aspect ratio and sides >=16")));
+            return Err(invalid(format!(
+                "multi-reference {width}x{height} becomes empty after the upstream 16px crop; use a less extreme aspect ratio and sides >=16"
+            )));
         }
         let (left, top) = ((fit.0 - w) / 2, (fit.1 - h) / 2);
         Ok((
@@ -451,6 +453,11 @@ pub fn request_images(req: &crate::GenerationRequest) -> Result<Vec<std::borrow:
 /// Validate original RGB/RGBA buffers and derive context cost without converting pixels/GPU work.
 /// The consumer must use this before admission, not after accepting a default-size estimate.
 pub fn request_plan(req: &crate::GenerationRequest) -> Result<Option<ReferencePlan>> {
+    super::layouts::compile_request(req)?;
+    image_request_plan(req)
+}
+
+pub(super) fn image_request_plan(req: &crate::GenerationRequest) -> Result<Option<ReferencePlan>> {
     let inputs = ordered_inputs(req)?;
     if inputs.is_empty() {
         return Ok(None);
@@ -471,6 +478,7 @@ pub fn validate_request_with_resolved_output(
     model_id: &str,
     req: &crate::GenerationRequest,
 ) -> Result<()> {
+    super::layouts::compile_request(req)?;
     if request_plan(req)?.is_some() {
         caps.validate_request_skip_size(model_id, req)
     } else {
@@ -483,7 +491,12 @@ pub fn validate_request_with_resolved_output(
 pub fn upsampler_input(req: &crate::GenerationRequest) -> Result<super::pup::UpsamplerInput> {
     use super::pup::{ReferenceImage, UpsampleMode, UpsamplerInput};
     let inputs = ordered_inputs(req)?;
-    let mode = UpsampleMode::infer(inputs.len(), super::pup::detect(&req.prompt).is_some());
+    let layout = super::layouts::compile_request(req)?;
+    let mode = UpsampleMode::infer(
+        inputs.len(),
+        layout.as_ref().is_some_and(|l| !l.boxes.is_empty())
+            || super::pup::detect(&req.prompt).is_some(),
+    );
     Ok(UpsamplerInput {
         prompt: req.prompt.clone(),
         references: inputs
@@ -501,7 +514,7 @@ pub fn upsampler_input(req: &crate::GenerationRequest) -> Result<super::pup::Ups
                 },
             })
             .collect(),
-        boxes: None,
+        boxes: layout.map(|l| l.boxes),
         mode,
         bypass: !req.enhance_prompt,
     })
@@ -519,9 +532,16 @@ pub fn request_output(req: &crate::GenerationRequest) -> ReferenceOutputSize {
 /// reference conditioning, never denoise-strength initialization. Context demand is caller-priced.
 pub fn validate_memory_route(mode: &crate::MemoryMode, count: u32) -> Result<()> {
     match mode {
-        crate::MemoryMode::TextToImage if count==0 => Ok(()),
-        crate::MemoryMode::ImageToImage | crate::MemoryMode::Edit if (1..=MAX_REFERENCES as u32).contains(&count) => Ok(()),
-        _ => Err(invalid(format!("mode {} requires zero references for text_to_image or 1–10 for image_to_image/edit; got {count}",mode.as_key()))),
+        crate::MemoryMode::TextToImage if count == 0 => Ok(()),
+        crate::MemoryMode::ImageToImage | crate::MemoryMode::Edit
+            if (1..=MAX_REFERENCES as u32).contains(&count) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(format!(
+            "mode {} requires zero references for text_to_image or 1–10 for image_to_image/edit; got {count}",
+            mode.as_key()
+        ))),
     }
 }
 
@@ -599,8 +619,12 @@ impl crate::MemoryRequestScope for ReferenceScope<'_> {
         {
             return Err(invalid(format!(
                 "resolved reference canvas {}x{} and {} references do not match admitted {}x{} and {}; resolve owned references before memory admission",
-                canvas.0, canvas.1, actual_count,
-                self.admitted.width, self.admitted.height, self.admitted.reference_count
+                canvas.0,
+                canvas.1,
+                actual_count,
+                self.admitted.width,
+                self.admitted.height,
+                self.admitted.reference_count
             )));
         }
         if self.require_resources {
@@ -609,7 +633,9 @@ impl crate::MemoryRequestScope for ReferenceScope<'_> {
                 .map(ReferencePlan::memory_resources)
                 .transpose()?;
             if actual != self.resources || (self.admitted.reference_count > 0 && actual.is_none()) {
-                return Err(invalid("actual ordered reference canvases/tokens do not match admitted resource facts; resolve owned references before admission and cache sizing"));
+                return Err(invalid(
+                    "actual ordered reference canvases/tokens do not match admitted resource facts; resolve owned references before admission and cache sizing",
+                ));
             }
         }
         if let Some(plan) = plan {
