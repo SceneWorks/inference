@@ -63,6 +63,18 @@ extensionless-command root and child/grandchild chain, the installed Cargo launc
 with a temporary CPU subcommand, exact timestamp/name/PID mutations, capture
 races, timeout/failure cleanup, and foreign survivor exclusion.
 
+A GPU process may exit between the CIM query and the retained-handle check.
+Only an authenticated held process with unchanged PID and exact handle creation
+time may account for its stale NVML row for at most 30 seconds after its recorded
+exit. A successful empty CIM result is distinct from an inaccessible/failed query;
+a present CIM row must still match the immutable name/PID/creation identity.
+Handles remain retained during the bounded post-command drain. Both owned NVML
+rows and the sampled memory/utilization must converge to the admitted desktop
+baseline before the next phase. An unconfirmed drain retains the UUID lock for
+coordinator reconciliation. CPU fixtures cover the exit interleavings, stale rows,
+PID reuse, failed queries, and drain timeout; Windows CI also exercises real exited
+handles before disposal.
+
 Snapshots above are historical candidates. The CPU-only Rust `native_inventory`
 example rehashes all 41 shared frozen entries before admission, including four
 published full-FP32 shards. It fails rather than acquiring missing files. The
