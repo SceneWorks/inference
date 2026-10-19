@@ -1128,6 +1128,58 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(len(windows_selftest), 1)
         self.assertEqual(windows_selftest[0]["shell"], "powershell")
 
+    def assert_moss_exit_drain_guards(self, source: str) -> None:
+        # Source policy complements Windows behavioral fixtures; it never executes PowerShell.
+        owned = source.split("function Owned-Gpu-Identity(", 1)[1].split("function Capture-Owned(", 1)[0]
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction Stop',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$entry.process.ExitTime.ToUniversalTime()',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+        ):
+            self.assertIn(guard, owned)
+        self.assertNotIn('catch', owned)
+        device = source.split("function Check-Device(", 1)[1].split("function Evidence-Files(", 1)[0]
+        self.assertIn('Pid-Subset $pids @($allowed+$baseline+@($owned.Keys))', device)
+        self.assertIn('Owned-Gpu-Identity ([int]$_) $owned', device)
+        self.assertIn('$g[0].owned_pids.Count -eq 0 -and', device)
+        self.assertIn('$script:deviceIdleConfirmed=$false', device)
+        self.assertIn('$script:deviceIdleConfirmed=$true; return $g', device)
+        run = source.split('function Owned-Run(', 1)[1].split('function Check-Device(', 1)[0]
+        self.assertIn('& $drain $owned', run)
+        self.assertLess(run.index('Stop-Owned $owned'), run.index('& $drain $owned'))
+        self.assertLess(run.index('& $drain $owned'), run.index('$p.Dispose()'))
+        self.assertIn('Test-Device-Exit-Fixture $temp', source)
+        self.assertEqual(source.count('} {param($owned) Wait-DeviceIdle $owned | Out-Null}'), 2)
+        self.assertIn('if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)', source)
+
+    def test_moss_exit_drain_guards_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / 'scripts/ci/moss-native-terminal.ps1').read_text(encoding='utf-8')
+        self.assert_moss_exit_drain_guards(source)
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+            '$g[0].owned_pids.Count -eq 0 -and',
+            '& $drain $owned',
+            'Test-Device-Exit-Fixture $temp',
+            '} {param($owned) Wait-DeviceIdle $owned | Out-Null}',
+            'if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)',
+        ):
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_exit_drain_guards(source.replace(guard, ''))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
+
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
     # so a renamed or dropped module would otherwise leave a green step that tests nothing.
