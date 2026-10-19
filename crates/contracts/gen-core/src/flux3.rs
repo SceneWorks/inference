@@ -915,6 +915,23 @@ pub fn prompt_seed(prompt: &str) -> u64 {
 }
 
 impl GenerationParams {
+    /// Resolve a completed PUP/bypass caption exactly once. The original request retains its
+    /// lossless layout and bindings for validation/provenance; only this internal clone consumes
+    /// them, because its prompt already contains the locked annotation table.
+    pub fn resolve_caption(
+        req: &GenerationRequest,
+        caption: String,
+        config: &Flux3Config,
+    ) -> Result<Self> {
+        layouts::compile_request(req)?;
+        pup::validate_caption_size(&caption, "effective caption")?;
+        let mut effective = req.clone();
+        effective.prompt = caption;
+        effective.flux3_layout = None;
+        effective.flux3_layout_bindings.clear();
+        Self::resolve(&effective, prompt_seed(&effective.prompt), config)
+    }
+
     /// Resolve a request against the loaded package. Base CFG consumes guidance (default3.5)
     /// and independently encoded negative conditioning; distilled is a flow map:
     /// any guidance is refused (upstream `generate`: "samples without CFG; drop the guidance"; the
@@ -1071,6 +1088,34 @@ mod tests {
 
     fn release() -> Flux3Config {
         Flux3Config::parse(RELEASE_CONFIG).unwrap()
+    }
+
+    #[test]
+    fn completed_layout_caption_is_consumed_once_without_rechecking_a_double_table() {
+        let original = layouts::Layout::from_json(serde_json::json!({"version":1,"boxes":[{"id":"a","bbox":[0.1,0.2,0.7,0.8],"desc":"x".repeat(9000)}]})).unwrap();
+        let req = GenerationRequest {
+            prompt: "scene".into(),
+            flux3_layout: Some(original.clone()),
+            ..Default::default()
+        };
+        validate_generation_request(DISTILLED_MODEL_ID, &req, &release()).unwrap();
+        let input = references::upsampler_input(&req).unwrap();
+        let bypass = pup::upsample(None, &input, &Default::default(), &req.cancel, &mut |_| {
+            panic!("bypass")
+        })
+        .unwrap();
+        assert!(bypass.caption.chars().count() < pup::MAX_EFFECTIVE_CAPTION_CHARS);
+        // A completed enhanced caption can be longer than the bypass, but still below the cap.
+        for caption in [
+            bypass.caption.clone(),
+            format!("{} {}", "enhanced ".repeat(300), bypass.caption),
+        ] {
+            let params =
+                GenerationParams::resolve_caption(&req, caption.clone(), &release()).unwrap();
+            assert_eq!(params.prompt, caption);
+            assert_eq!(params.seed, prompt_seed(&caption));
+            assert_eq!(req.flux3_layout.as_ref(), Some(&original));
+        }
     }
 
     /// The release package agrees with the frozen source's module constants on every width the

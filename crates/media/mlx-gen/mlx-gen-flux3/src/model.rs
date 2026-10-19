@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use gen_core::flux3::{
-    prompt_seed, validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
-    FAMILY, SAMPLERS,
+    validate_generation_request, Flux3Config, GenerationParams, GenerationResources, FAMILY,
+    SAMPLERS,
 };
 use gen_core::GenerationReport;
 use mlx_gen::weights::Weights;
@@ -560,11 +560,9 @@ impl Flux3Klein {
             crate::pup::Flux3PromptUpsampler::synchronize_before_release,
             ||{mlx_gen::residency::drain_allocator_cache();},
         )?;
-        let mut effective = req.clone();
-        effective.prompt = outcome.caption;
-        Ok(GenerationParams::resolve(
-            &effective,
-            prompt_seed(&effective.prompt),
+        Ok(GenerationParams::resolve_caption(
+            req,
+            outcome.caption,
             &self.config,
         )?)
     }

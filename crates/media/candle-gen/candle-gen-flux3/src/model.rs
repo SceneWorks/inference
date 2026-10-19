@@ -10,7 +10,7 @@ use candle_gen::gen_core::flux3::artifacts::{ArtifactBackend, NativeDitStorage};
 use candle_gen::gen_core::flux3::conversion::ComponentRole;
 use candle_gen::gen_core::flux3::quantization::DitFormat;
 use candle_gen::gen_core::flux3::{
-    prompt_seed, validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
+    validate_generation_request, Flux3Config, GenerationParams, GenerationResources,
     DISTILLED_MODEL_ID, FAMILY, SAMPLERS, TEXT_ENCODER_COMPONENT,
 };
 use candle_gen::gen_core::{
@@ -553,11 +553,9 @@ impl Flux3Klein {
             crate::pup::Flux3PromptUpsampler::synchronize_before_release,
             || {}, // Candle storage owns deallocation; unlike MLX there is no allocator-drain hook.
         )?;
-        let mut effective = req.clone();
-        effective.prompt = outcome.caption;
-        Ok(GenerationParams::resolve(
-            &effective,
-            prompt_seed(&effective.prompt),
+        Ok(GenerationParams::resolve_caption(
+            req,
+            outcome.caption,
             &self.config,
         )?)
     }

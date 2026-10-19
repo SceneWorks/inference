@@ -203,6 +203,39 @@ mod tests {
     }
 
     #[test]
+    fn near_limit_native_layout_caption_reaches_final_parameters_once() {
+        let config = gen_core::flux3::Flux3Config::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mlx-gen/mlx-gen-flux3/tests/fixtures/tiny-snapshot"),
+        )
+        .unwrap();
+        let layout=gen_core::flux3::layouts::Layout::from_json(serde_json::json!({"version":1,"boxes":[{"id":"large","bbox":[0.1,0.2,0.7,0.8],"desc":"x".repeat(9000)}]})).unwrap();
+        let req = GenerationRequest {
+            prompt: "scene".into(),
+            flux3_layout: Some(layout.clone()),
+            ..Default::default()
+        };
+        gen_core::flux3::validate_generation_request(
+            gen_core::flux3::DISTILLED_MODEL_ID,
+            &req,
+            &config,
+        )
+        .unwrap();
+        let bypass = effective_prompt(None, &req, &mut |_| panic!("bypass")).unwrap();
+        for caption in [
+            bypass.caption.clone(),
+            format!("{} {}", "enhanced ".repeat(300), bypass.caption),
+        ] {
+            let params =
+                gen_core::flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
+                    .unwrap();
+            assert_eq!(params.prompt, caption);
+            assert_eq!(params.seed, gen_core::flux3::prompt_seed(&caption));
+            assert_eq!(req.flux3_layout.as_ref(), Some(&layout));
+        }
+    }
+
+    #[test]
     fn enabled_without_component_is_an_actionable_typed_error() {
         let req = GenerationRequest {
             enhance_prompt: true,

@@ -241,6 +241,39 @@ mod tests {
     }
 
     #[test]
+    fn near_limit_native_layout_caption_reaches_final_parameters_once() {
+        let config = gen_core::flux3::Flux3Config::from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-snapshot"),
+        )
+        .unwrap();
+        let layout=gen_core::flux3::layouts::Layout::from_json(serde_json::json!({"version":1,"boxes":[{"id":"large","bbox":[0.1,0.2,0.7,0.8],"desc":"x".repeat(9000)}]})).unwrap();
+        let req = GenerationRequest {
+            prompt: "scene".into(),
+            flux3_layout: Some(layout.clone()),
+            ..Default::default()
+        };
+        gen_core::flux3::validate_generation_request(
+            gen_core::flux3::DISTILLED_MODEL_ID,
+            &req,
+            &config,
+        )
+        .unwrap();
+        let input = gen_core::flux3::references::upsampler_input(&req).unwrap();
+        let bypass = effective_prompt(None, &req, &input, &mut |_| panic!("bypass")).unwrap();
+        for caption in [
+            bypass.caption.clone(),
+            format!("{} {}", "enhanced ".repeat(300), bypass.caption),
+        ] {
+            let params =
+                gen_core::flux3::GenerationParams::resolve_caption(&req, caption.clone(), &config)
+                    .unwrap();
+            assert_eq!(params.prompt, caption);
+            assert_eq!(params.seed, gen_core::flux3::prompt_seed(&caption));
+            assert_eq!(req.flux3_layout.as_ref(), Some(&layout));
+        }
+    }
+
+    #[test]
     fn enhance_without_an_upsampler_is_a_typed_refusal() {
         let req = GenerationRequest {
             prompt: "p".into(),
