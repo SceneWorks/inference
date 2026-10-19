@@ -28,8 +28,15 @@ struct AttemptState<R, P> {
     report: Option<P>,
 }
 impl<R, P> AttemptState<R, P> {
-    fn begin(&mut self) {
+    fn begin(&mut self, pins: &[gen_core::PinnedWeightsFile]) -> Result<()> {
         self.report = None;
+        for pin in pins {
+            if let Err(error) = pin.verify_unchanged() {
+                self.renderer = None;
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
     fn failed(&mut self) {
         self.report = None;
@@ -129,19 +136,15 @@ impl MossImage {
         }
         let sources = Sources::prepare(variant, spec)?;
         let facts = memory_strategy::facts(&sources)?;
-        let memory = memory_strategy::contract_with_facts(variant, facts);
         let custom_adapter_bytes =
             crate::adapters::estimated_bytes(&spec.adapters, &sources.config)?;
+        let (memory, load_peak) =
+            memory_strategy::loaded_admission(variant, facts, custom_adapter_bytes, 5_362_224_248)?;
         let custom_pins = spec
             .adapters
             .iter()
             .map(|adapter| spec.file_pin_for(&adapter.path))
             .collect::<gen_core::Result<Vec<_>>>()?;
-        let load_peak = facts
-            .base_bytes
-            .saturating_add(facts.overlay_bytes)
-            .saturating_add(5_362_224_248)
-            .saturating_add(custom_adapter_bytes);
         if mlx_gen::memory::recommended_working_set_bytes().is_some_and(|cap| load_peak > cap) {
             return Err(Error::Unsupported(format!("MOSS resident load requires approximately {load_peak} bytes including source staging, beyond the admitted MLX working set")));
         }
@@ -310,7 +313,7 @@ impl MossImage {
             .state
             .lock()
             .map_err(|_| Error::Msg("MOSS lifecycle lock poisoned".into()))?;
-        state.begin();
+        state.begin(&self.custom_pins)?;
         let result = (|| {
             check(&request.cancel)?;
             self.sources.ensure_unchanged()?;
@@ -705,7 +708,7 @@ mod cpu_tests {
             (0, 0)
         );
         state.report = Some("completed");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(state.report.is_none());
         assert_eq!(
             *state
@@ -727,7 +730,7 @@ mod cpu_tests {
         );
         assert_eq!(loads, 3);
         state.report = Some("prior completion");
-        state.begin();
+        state.begin(&[]).unwrap();
         assert!(matches!(
             state.select(on, || Err(Error::Canceled)),
             Err(Error::Canceled)
@@ -768,5 +771,44 @@ mod cpu_tests {
                 .acceleration,
             MossImageAcceleration::Off
         );
+    }
+}
+
+#[cfg(test)]
+mod review_lifecycle_tests {
+    use super::*;
+    #[test]
+    fn cached_renderer_request_boundary_rejects_replaced_or_removed_adapter() {
+        for remove in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("adapter.safetensors");
+            std::fs::write(&path, b"original adapter source").unwrap();
+            let pins = [gen_core::PinnedWeightsFile::pin(&path).unwrap()];
+            let mut state: AttemptState<u8, ()> = AttemptState {
+                renderer: Some((MossImageAcceleration::Off, 7)),
+                report: Some(()),
+            };
+            state.begin(&pins).unwrap();
+            assert_eq!(
+                *state
+                    .select(MossImageAcceleration::Off, || panic!(
+                        "warm mode must reuse its renderer"
+                    ))
+                    .unwrap(),
+                7
+            );
+            state.report = Some(());
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"replaced adapter source").unwrap();
+            }
+            assert!(
+                state.begin(&pins).is_err(),
+                "cached renderer accepted changed adapter, remove={remove}"
+            );
+            assert!(state.report.is_none());
+            assert!(state.renderer.is_none());
+        }
     }
 }

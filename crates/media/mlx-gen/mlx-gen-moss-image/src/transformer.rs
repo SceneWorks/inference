@@ -1,4 +1,5 @@
 //! Frozen MOSS graph. No FLUX DiT/scheduler or ordinary cast-down adapter abstraction is used.
+use crate::adapters::Lokr;
 use crate::precision::{attention_fp32, linear_fp32};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::attention::slice_axis;
@@ -92,6 +93,7 @@ pub(crate) struct Projection {
     adapter: Option<(Array, Array, f32)>,
     // Adapter routing only; its shared base handle is never used or mutated by this graph.
     custom: AdaptableLinear,
+    lokr: Vec<Lokr>,
 }
 impl Projection {
     fn load(w: &Weights, p: &str, input: i32, output: i32, bias: bool) -> Result<Self> {
@@ -103,6 +105,7 @@ impl Projection {
                 None
             },
             adapter: None,
+            lokr: Vec::new(),
             custom: AdaptableLinear::dense(
                 shaped(w, &format!("{p}.weight"), &[output, input])?,
                 None,
@@ -156,6 +159,11 @@ impl Projection {
             };
             base = add(base.as_dtype(Dtype::Float32)?, residual)?;
         }
+        for adapter in &self.lokr {
+            if let Some(residual) = adapter.residual(x)? {
+                base = add(base.as_dtype(Dtype::Float32)?, residual)?;
+            }
+        }
         Ok(base)
     }
     fn cast(&mut self, dtype: Dtype) -> Result<()> {
@@ -166,6 +174,17 @@ impl Projection {
         self.custom = AdaptableLinear::dense(self.weight.clone(), None);
         Ok(())
     }
+    fn sync_routing_base(&mut self) {
+        // Routing and execution share one frozen allocation, including DMD replacements.
+        let adapters = self.custom.adapters().to_vec();
+        self.custom = AdaptableLinear::dense(self.weight.clone(), None);
+        self.custom.set_adapters(adapters);
+    }
+    fn replace_weight_bias(&mut self, weight: Array, bias: Option<Array>) {
+        self.weight = weight;
+        self.bias = bias;
+        self.sync_routing_base();
+    }
     fn widen(&mut self) -> Result<()> {
         self.weight = self.weight.as_dtype(Dtype::Float32)?;
         self.bias = self
@@ -173,6 +192,7 @@ impl Projection {
             .as_ref()
             .map(|b| b.as_dtype(Dtype::Float32))
             .transpose()?;
+        self.sync_routing_base();
         Ok(())
     }
     fn install(&mut self, w: &Weights, p: &str, rank: i32) -> Result<()> {
@@ -397,13 +417,15 @@ impl Block {
             for adapter in projection.custom.adapters() {
                 match adapter {
                     Adapter::Lora { a, b, .. } => inputs.extend([a.clone(), b.clone()]),
-                    Adapter::Lokr { delta, .. } => inputs.push(delta.clone()),
-                    Adapter::LokrStructured { .. } => {
+                    _ => {
                         return Err(Error::Unsupported(
-                            "MOSS checkpoint expects dense adapter factors".into(),
+                            "MOSS checkpoints require raw LoKr factors, never dense deltas".into(),
                         ))
                     }
                 }
+            }
+            for lokr in &projection.lokr {
+                inputs.extend(lokr.arrays().into_iter().cloned());
             }
         }
         let mut segment = mlx_rs::transforms::checkpoint(|arrays: &[Array]| {
@@ -412,37 +434,32 @@ impl Block {
             for projection in &mut block.projections {
                 let mut adapters = Vec::new();
                 for adapter in projection.custom.adapters() {
-                    let rebound = match adapter {
+                    match adapter {
                         Adapter::Lora { scale, .. } => {
-                            let adapter = Adapter::Lora {
+                            adapters.push(Adapter::Lora {
                                 a: arrays[cursor].clone(),
                                 b: arrays[cursor + 1].clone(),
                                 scale: *scale,
-                            };
+                            });
                             cursor += 2;
-                            adapter
                         }
-                        Adapter::Lokr { scale, .. } => {
-                            let adapter = Adapter::Lokr {
-                                delta: arrays[cursor].clone(),
-                                scale: *scale,
-                            };
-                            cursor += 1;
-                            adapter
-                        }
-                        Adapter::LokrStructured { .. } => {
+                        _ => {
                             return Err(mlx_rs::error::Exception::custom(
-                                "MOSS structured adapter cannot enter dense checkpoint",
+                                "dense LoKr entered MOSS checkpoint",
                             ))
                         }
-                    };
-                    adapters.push(rebound);
+                    }
                 }
                 projection.custom.set_training_adapters(adapters);
+                projection.lokr = projection
+                    .lokr
+                    .iter()
+                    .map(|lokr| lokr.rebound(arrays, &mut cursor))
+                    .collect();
             }
             if cursor != arrays.len() {
                 return Err(mlx_rs::error::Exception::custom(
-                    "MOSS checkpoint factor arity mismatch",
+                    "MOSS raw factor checkpoint arity mismatch",
                 ));
             }
             Ok(vec![block
@@ -548,6 +565,105 @@ impl Transformer {
             blocks,
             g,
         })
+    }
+    fn projection_mut(&mut self, path: &[&str]) -> Option<&mut Projection> {
+        match path {
+            ["layers", index, "proj", name] => {
+                let index = index.parse::<usize>().ok()?;
+                let projection = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
+                    .iter()
+                    .position(|n| n == name)?;
+                self.blocks.get_mut(index)?.projections.get_mut(projection)
+            }
+            _ => None,
+        }
+    }
+    pub(crate) fn push_lokr(&mut self, path: &str, lokr: Lokr) -> Result<()> {
+        let parts: Vec<_> = path.split('.').collect();
+        self.projection_mut(&parts)
+            .ok_or_else(|| Error::Unsupported(format!("unknown MOSS LoKr projection {path}")))?
+            .lokr
+            .push(lokr);
+        Ok(())
+    }
+    pub(crate) fn install_training_adapter(
+        &mut self,
+        adapter: &mlx_gen::train::lora::TrainAdapter,
+        params: &mlx_gen::train::lora::LoraParams,
+        alpha: f32,
+        rank: f32,
+    ) -> Result<()> {
+        if !rank.is_finite() || rank <= 0. || !alpha.is_finite() {
+            return Err(Error::Unsupported(
+                "MOSS training adapter scaling is invalid".into(),
+            ));
+        }
+        match adapter {
+            mlx_gen::train::lora::TrainAdapter::Lora { .. } => {
+                for path in adapter.paths() {
+                    let parts: Vec<_> = path.split('.').collect();
+                    self.projection_mut(&parts)
+                        .ok_or_else(|| Error::Msg("MOSS training path disappeared".into()))?
+                        .lokr
+                        .clear();
+                }
+                adapter.install(self, params, alpha, rank, Dtype::Float32)?;
+            }
+            mlx_gen::train::lora::TrainAdapter::Lokr { .. } => {
+                for path in adapter.paths() {
+                    let parts: Vec<_> = path.split('.').collect();
+                    let projection = self
+                        .projection_mut(&parts)
+                        .ok_or_else(|| Error::Msg("MOSS training path disappeared".into()))?;
+                    let mut group = std::collections::BTreeMap::new();
+                    for suffix in mlx_gen::gen_core::weightsmeta::LOKR_SUFFIXES {
+                        if let Some(array) = params.get(format!("{path}{suffix}").as_str()) {
+                            group.insert(suffix.trim_start_matches('.').to_owned(), array.clone());
+                        }
+                    }
+                    let lokr = Lokr::from_group(&group, projection.weight.shape(), alpha / rank)?;
+                    projection.custom.set_training_adapters(Vec::new());
+                    projection.lokr = vec![lokr];
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn materialize_custom(&mut self) -> Result<()> {
+        let mut bytes = 0u64;
+        for block in &self.blocks {
+            for projection in &block.projections {
+                projection.custom.materialize_adapters()?;
+                for adapter in projection.custom.adapters() {
+                    crate::adapters::validate_lora(adapter)?;
+                    if let Adapter::Lora { a, b, .. } = adapter {
+                        bytes = bytes
+                            .checked_add((a.nbytes() + b.nbytes()) as u64)
+                            .ok_or_else(|| Error::Msg("MOSS adapter residency overflow".into()))?;
+                    }
+                }
+                for lokr in &projection.lokr {
+                    lokr.materialize_and_validate()?;
+                    for array in lokr.arrays() {
+                        bytes = bytes
+                            .checked_add(array.nbytes() as u64)
+                            .ok_or_else(|| Error::Msg("MOSS adapter residency overflow".into()))?;
+                    }
+                }
+            }
+        }
+        self.custom_owned_bytes = bytes;
+        Ok(())
+    }
+    #[cfg(test)]
+    fn raw_lokr_bytes(&self) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.projections)
+            .flat_map(|p| &p.lokr)
+            .flat_map(|l| l.arrays())
+            .map(|a| a.nbytes())
+            .sum()
     }
     pub(crate) fn cast_training_weights(&mut self, dtype: Dtype) -> Result<()> {
         for p in [
@@ -655,7 +771,7 @@ impl Transformer {
             (&mut self.time1, "time_embedding.0"),
             (&mut self.time2, "time_embedding.2"),
         ] {
-            projection.weight = shaped(
+            let weight = shaped(
                 replacements,
                 &format!("{prefix}.weight"),
                 projection.weight.shape(),
@@ -664,11 +780,12 @@ impl Transformer {
                 .bias
                 .as_ref()
                 .ok_or_else(|| Error::Msg("missing time bias".into()))?;
-            projection.bias = Some(shaped(
+            let bias = Some(shaped(
                 replacements,
                 &format!("{prefix}.bias"),
                 bias.shape(),
             )?);
+            projection.replace_weight_bias(weight, bias);
         }
         self.modulation.bias = Some(shaped(
             replacements,
@@ -805,16 +922,7 @@ impl Transformer {
 
 impl AdaptableHost for Transformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        match path {
-            ["layers", index, "proj", name] => {
-                let index = index.parse::<usize>().ok()?;
-                let projection = ["q", "k", "v", "o", "ffn_up_gate", "ffn_down"]
-                    .iter()
-                    .position(|n| n == name)?;
-                Some(&mut self.blocks.get_mut(index)?.projections[projection].custom)
-            }
-            _ => None,
-        }
+        self.projection_mut(path).map(|p| &mut p.custom)
     }
     fn adaptable_paths(&self) -> Vec<String> {
         (0..self.blocks.len())
@@ -1138,6 +1246,7 @@ mod training_projection_tests {
         let _device = crate::cpu_test_device();
         let weight = Array::from_slice(&[1f32, 0., 0., 1.], &[2, 2]);
         let mut p = Projection {
+            lokr: Vec::new(),
             weight: weight.clone(),
             bias: None,
             adapter: Some((
@@ -1245,8 +1354,8 @@ mod training_graph_tests {
                         &cancel,
                     )
                     .unwrap();
-                adapter
-                    .install(&mut model, &params, 3., 2., Dtype::Float32)
+                model
+                    .install_training_adapter(&adapter, &params, 3., 2.)
                     .unwrap();
                 assert_eq!(
                     read(&baseline),
@@ -1398,8 +1507,8 @@ mod training_graph_tests {
                 adapter
                     .save_with_meta(&params, 3., 2., 2, "", &extra, &path)
                     .unwrap();
-                adapter
-                    .install(&mut model, &params, 3., 2., Dtype::Float32)
+                model
+                    .install_training_adapter(&adapter, &params, 3., 2.)
                     .unwrap();
                 let trained = model
                     .forward(
@@ -1655,8 +1764,8 @@ mod training_bf16_cpu_tests {
                 71,
             )
             .unwrap();
-            adapter
-                .install(&mut model, &params, 3., 2., Dtype::Float32)
+            model
+                .install_training_adapter(&adapter, &params, 3., 2.)
                 .unwrap();
             let before = model
                 .forward(
@@ -1706,6 +1815,449 @@ mod training_bf16_cpu_tests {
             assert_eq!(
                 reloaded.resident_bytes(),
                 reloaded.owned_weight_bytes + reloaded.custom_owned_bytes
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::author_fixture_tests::*;
+    use super::*;
+    use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+    use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+    fn tiny() -> Transformer {
+        let f = fixture("ordinary");
+        Transformer::load(&weights(&f["weights"], Dtype::Float32), geometry(&f)).unwrap()
+    }
+    fn file(
+        temp: &tempfile::TempDir,
+        values: std::collections::HashMap<String, Array>,
+        meta: std::collections::BTreeMap<String, String>,
+        kind: AdapterKind,
+        scale: f32,
+    ) -> AdapterSpec {
+        let path = temp.path().join("adapter.safetensors");
+        let meta: std::collections::HashMap<_, _> = meta.into_iter().collect();
+        Array::save_safetensors(
+            values.iter().map(|(k, v)| (k.as_str(), v)),
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        AdapterSpec::new(path, scale, kind)
+    }
+    fn full(shape: &[i32], value: f32) -> Array {
+        Array::from_slice(
+            &vec![value; shape.iter().map(|v| *v as usize).product()],
+            shape,
+        )
+    }
+    fn lokr_values() -> std::collections::HashMap<String, Array> {
+        [
+            ("layers.0.proj.q.lokr_w1".into(), full(&[2, 2], 0.5)),
+            ("layers.0.proj.q.lokr_w2".into(), full(&[8, 8], 0.25)),
+        ]
+        .into_iter()
+        .collect()
+    }
+    fn lokr_meta() -> std::collections::BTreeMap<String, String> {
+        let mut m = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
+        m.insert("networkType".into(), "lokr".into());
+        m.insert("rank".into(), "4".into());
+        m.insert("alpha".into(), "6".into());
+        m
+    }
+    #[test]
+    fn lokr_real_loader_rejects_crossed_axes_unused_factors_and_bad_scaling() {
+        let _device = crate::cpu_test_device();
+        for defect in [
+            "axes",
+            "orphan",
+            "competing",
+            "rank_zero",
+            "rank_garbage",
+            "alpha_garbage",
+            "alpha_missing",
+        ] {
+            let mut values = lokr_values();
+            let mut meta = lokr_meta();
+            match defect {
+                "axes" => {
+                    values.insert("layers.0.proj.q.lokr_w2".into(), full(&[4, 16], 0.25));
+                }
+                "orphan" => {
+                    values.insert("layers.0.proj.q.lokr_w2_a".into(), full(&[8, 1], 0.25));
+                }
+                "competing" => {
+                    values.insert("layers.0.proj.q.lokr_w2_a".into(), full(&[8, 1], 0.25));
+                    values.insert("layers.0.proj.q.lokr_w2_b".into(), full(&[1, 8], 0.25));
+                }
+                "rank_zero" => {
+                    meta.insert("rank".into(), "0".into());
+                }
+                "rank_garbage" => {
+                    meta.insert("rank".into(), "garbage".into());
+                }
+                "alpha_garbage" => {
+                    meta.insert("alpha".into(), "garbage".into());
+                }
+                "alpha_missing" => {
+                    meta.remove("alpha");
+                }
+                _ => unreachable!(),
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let spec = file(&temp, values, meta, AdapterKind::Lokr, 1.);
+            assert!(
+                crate::adapters::apply(&mut tiny(), MossImageVariant::Base, &[spec]).is_err(),
+                "accepted {defect}"
+            );
+        }
+    }
+    #[test]
+    fn installed_adapter_validation_rejects_finite_sources_that_overflow() {
+        let _device = crate::cpu_test_device();
+        for defect in [
+            "kron_product",
+            "decomposed_factor",
+            "lora_alpha_fold",
+            "lora_strength",
+        ] {
+            let mut meta = lokr_meta();
+            let mut values = lokr_values();
+            let mut kind = AdapterKind::Lokr;
+            let mut strength = 1.;
+            match defect {
+                "kron_product" => {
+                    values.insert("layers.0.proj.q.lokr_w1".into(), full(&[2, 2], 1e30));
+                    values.insert("layers.0.proj.q.lokr_w2".into(), full(&[8, 8], 1e30));
+                }
+                "decomposed_factor" => {
+                    values.remove("layers.0.proj.q.lokr_w2");
+                    values.insert("layers.0.proj.q.lokr_w2_a".into(), full(&[8, 1], 1e30));
+                    values.insert("layers.0.proj.q.lokr_w2_b".into(), full(&[1, 8], 1e30));
+                }
+                "lora_alpha_fold" | "lora_strength" => {
+                    meta.insert("networkType".into(), "lora".into());
+                    kind = AdapterKind::Lora;
+                    values = [
+                        ("layers.0.proj.q.lora_A.weight".into(), full(&[2, 16], 1.)),
+                        ("layers.0.proj.q.lora_B.weight".into(), full(&[16, 2], 1e30)),
+                        (
+                            "layers.0.proj.q.alpha".into(),
+                            full(
+                                &[1],
+                                if defect == "lora_alpha_fold" {
+                                    1e30
+                                } else {
+                                    2.
+                                },
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect();
+                    if defect == "lora_strength" {
+                        strength = 1e30;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                values.values().all(|array| array
+                    .is_finite()
+                    .unwrap()
+                    .all(None)
+                    .unwrap()
+                    .item::<bool>()),
+                "fixture must have finite source tensors"
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let spec = file(&temp, values, meta, kind, strength);
+            assert!(
+                crate::adapters::apply(&mut tiny(), MossImageVariant::Base, &[spec]).is_err(),
+                "accepted derived overflow {defect}"
+            );
+        }
+    }
+    #[test]
+    fn all_projection_lokr_keeps_raw_factors_in_dense_and_checkpointed_backward() {
+        let _device = crate::cpu_test_device();
+        use mlx_gen::train::lora::{build_lokr_targets, TrainAdapter};
+        let f = fixture("ordinary");
+        let g = geometry(&f);
+        let mut model = tiny();
+        let paths = contract::target_paths(g.layers, &[]).unwrap();
+        let (targets, params) = build_lokr_targets(&mut model, &paths, 2, 2, 19).unwrap();
+        let adapter = TrainAdapter::Lokr { targets };
+        let x = slice_axis(&array(&f["inputs"]["hidden_states"]), 0, 0, 1).unwrap();
+        let context = contexts(
+            &f["inputs"]["encoder_hidden_states"],
+            &f["inputs"]["encoder_attention_mask"],
+            g.text,
+        );
+        let noise = add(&x, Array::from_f32(0.7)).unwrap();
+        let expected: usize = params.values().map(|a| a.nbytes()).sum();
+        for checkpoint in [false, true] {
+            let cfg = mlx_gen::TrainingConfig {
+                rank: 2,
+                alpha: 3.,
+                network_type: mlx_gen::NetworkType::Lokr,
+                gradient_checkpointing: checkpoint,
+                ..Default::default()
+            };
+            let (_, grads) = crate::training::loss_grads(
+                &mut model,
+                &params,
+                &adapter,
+                &cfg,
+                &x,
+                &context[0],
+                &noise,
+                0.41,
+                None,
+                &CancelFlag::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                model.raw_lokr_bytes(),
+                expected,
+                "retained reconstructed delta collection instead of raw trainable factors"
+            );
+            assert!(
+                model
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.projections)
+                    .all(|p| p.custom.adapters().is_empty()),
+                "generic dense LoKr installation reached production graph"
+            );
+            assert!(
+                grads
+                    .values()
+                    .map(|g| crate::pipeline::logical_f32_readback(g)
+                        .unwrap()
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f32>())
+                    .sum::<f32>()
+                    > 0.
+            );
+        }
+    }
+    #[test]
+    fn routing_owner_tracks_widening_and_dmd_weight_replacement() {
+        let _device = crate::cpu_test_device();
+        let original = full(&[2, 2], 0.25).as_dtype(Dtype::Bfloat16).unwrap();
+        let mut p = Projection {
+            weight: original.clone(),
+            bias: None,
+            adapter: None,
+            custom: AdaptableLinear::dense(original, None),
+            lokr: Vec::new(),
+        };
+        p.widen().unwrap();
+        assert_eq!(
+            p.custom.dense_weight().unwrap().0.dtype(),
+            Dtype::Float32,
+            "routing retained original BF16 allocation"
+        );
+        p.replace_weight_bias(full(&[2, 2], 0.75), None);
+        assert_eq!(
+            crate::pipeline::logical_f32_readback(p.custom.dense_weight().unwrap().0).unwrap(),
+            crate::pipeline::logical_f32_readback(&p.weight).unwrap(),
+            "routing retained replaced time weight"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_publication_tests {
+    use super::author_fixture_tests::*;
+    use super::*;
+    #[test]
+    fn final_optimizer_values_are_validated_before_adapter_file_is_written() {
+        let _device = crate::cpu_test_device();
+        let f = fixture("ordinary");
+        let mut model =
+            Transformer::load(&weights(&f["weights"], Dtype::Float32), geometry(&f)).unwrap();
+        let (targets, mut params) = mlx_gen::train::lora::build_lora_targets(
+            &mut model,
+            &["layers.0.proj.q".into()],
+            2,
+            13,
+        )
+        .unwrap();
+        let key = params
+            .keys()
+            .find(|key| key.ends_with(".lora_b"))
+            .unwrap()
+            .clone();
+        params.insert(key, Array::from_slice(&[1e30f32; 16 * 2], &[16, 2]));
+        let adapter = mlx_gen::train::lora::TrainAdapter::Lora { targets };
+        let config = mlx_gen::TrainingConfig {
+            rank: 2,
+            alpha: 1e30,
+            ..Default::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("must-not-publish.safetensors");
+        assert!(crate::adapters::save_validated(
+            &mut model,
+            &adapter,
+            &params,
+            &config,
+            &[],
+            &path
+        )
+        .is_err());
+        assert!(
+            !path.exists(),
+            "invalid effective adapter was published as a trained artifact"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_structured_math_tests {
+    use super::author_fixture_tests::*;
+    use super::*;
+    use mlx_gen::gen_core::{moss_image::MossImageVariant, moss_image_training as contract};
+    use std::collections::{BTreeMap, HashMap};
+    fn values(rows: usize, cols: usize, phase: f32) -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| ((i as f32 + 1.) * 0.31 + phase).sin() * 0.4)
+            .collect()
+    }
+    fn product(a: &[f32], rows: usize, rank: usize, b: &[f32], cols: usize) -> Vec<f64> {
+        (0..rows)
+            .flat_map(|r| {
+                (0..cols).map(move |c| {
+                    (0..rank)
+                        .map(|k| a[r * rank + k] as f64 * b[k * cols + c] as f64)
+                        .sum()
+                })
+            })
+            .collect()
+    }
+    #[test]
+    fn raw_structured_full_and_decomposed_factors_match_independent_kronecker_math() {
+        let _device = crate::cpu_test_device();
+        for ((a, c), (b, d)) in [((2usize, 3usize), (4usize, 2usize)), ((4, 2), (2, 3))] {
+            for decomposed in [false, true] {
+                let mut group = BTreeMap::new();
+                let mut effective = Vec::new();
+                for (name, rows, cols, phase) in [("lokr_w1", a, c, 0.2), ("lokr_w2", b, d, 0.7)] {
+                    if decomposed {
+                        let rank = 2;
+                        let left = values(rows, rank, phase);
+                        let right = values(rank, cols, phase + 0.4);
+                        effective.push(product(&left, rows, rank, &right, cols));
+                        group.insert(
+                            format!("{name}_a"),
+                            Array::from_slice(&left, &[rows as i32, rank as i32]),
+                        );
+                        group.insert(
+                            format!("{name}_b"),
+                            Array::from_slice(&right, &[rank as i32, cols as i32]),
+                        );
+                    } else {
+                        let full = values(rows, cols, phase);
+                        effective.push(full.iter().map(|v| *v as f64).collect());
+                        group.insert(
+                            name.into(),
+                            Array::from_slice(&full, &[rows as i32, cols as i32]),
+                        );
+                    }
+                }
+                let input = values(6, c * d, 1.3);
+                let x = Array::from_slice(&input, &[2, 3, (c * d) as i32]);
+                let scale = -0.75f32;
+                let lokr = crate::adapters::Lokr::from_group(
+                    &group,
+                    &[(a * b) as i32, (c * d) as i32],
+                    scale,
+                )
+                .unwrap();
+                let output = lokr.residual(&x).unwrap().expect("nonzero explicit scale");
+                assert_eq!(output.shape(), &[2, 3, (a * b) as i32]);
+                let actual = crate::pipeline::logical_f32_readback(&output).unwrap();
+                for row in 0..6 {
+                    for p in 0..a {
+                        for q in 0..b {
+                            let expected: f64 = (0..c)
+                                .flat_map(|r| (0..d).map(move |s| (r, s)))
+                                .map(|(r, s)| {
+                                    input[row * c * d + r * d + s] as f64
+                                        * effective[0][p * c + r]
+                                        * effective[1][q * d + s]
+                                        * scale as f64
+                                })
+                                .sum();
+                            let error = (actual[row * a * b + p * b + q] as f64 - expected).abs();
+                            assert!(error<1e-6+expected.abs()*1e-5,"Kronecker axis/order/scale mismatch: {error}, decomposed={decomposed}");
+                        }
+                    }
+                }
+                let zero = crate::adapters::Lokr::from_group(
+                    &group,
+                    &[(a * b) as i32, (c * d) as i32],
+                    0.,
+                )
+                .unwrap();
+                assert!(zero.residual(&x).unwrap().is_none());
+            }
+        }
+    }
+    #[test]
+    fn real_loader_uses_nondefault_rank_alpha_and_user_strength_on_the_projection() {
+        let _device = crate::cpu_test_device();
+        let fixture = fixture("ordinary");
+        let geometry = geometry(&fixture);
+        let mut metadata = contract::metadata(MossImageVariant::Base, contract::SAMPLER);
+        metadata.insert("networkType".into(), "lokr".into());
+        metadata.insert("rank".into(), "4".into());
+        metadata.insert("alpha".into(), "6".into());
+        let metadata: HashMap<_, _> = metadata.into_iter().collect();
+        let w1 = Array::from_slice(&[0.5f32; 4], &[2, 2]);
+        let w2 = Array::from_slice(&[0.25f32; 64], &[8, 8]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scaled.safetensors");
+        Array::save_safetensors(
+            [
+                ("layers.0.proj.q.lokr_w1", &w1),
+                ("layers.0.proj.q.lokr_w2", &w2),
+            ],
+            Some(&metadata),
+            &path,
+        )
+        .unwrap();
+        let x = Array::from_slice(&(1..=16).map(|v| v as f32).collect::<Vec<_>>(), &[1, 1, 16]);
+        for strength in [1f32, -2.] {
+            let mut model = Transformer::load(
+                &weights(&fixture["weights"], Dtype::Float32),
+                geometry.clone(),
+            )
+            .unwrap();
+            crate::adapters::apply(
+                &mut model,
+                MossImageVariant::Base,
+                &[mlx_gen::runtime::AdapterSpec::new(
+                    path.clone(),
+                    strength,
+                    mlx_gen::runtime::AdapterKind::Lokr,
+                )],
+            )
+            .unwrap();
+            let residual = model.blocks[0].projections[0].lokr[0]
+                .residual(&x)
+                .unwrap()
+                .unwrap();
+            let expected = (1..=16).sum::<i32>() as f32 * 0.5 * 0.25 * (6. / 4.) * strength;
+            assert_eq!(
+                crate::pipeline::logical_f32_readback(&residual).unwrap(),
+                vec![expected; 16]
             );
         }
     }

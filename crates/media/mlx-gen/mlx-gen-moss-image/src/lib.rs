@@ -7,6 +7,7 @@ mod pipeline;
 mod precision;
 mod text_encoder;
 pub mod training;
+mod training_memory;
 mod transformer;
 pub use model::{descriptor_base, descriptor_sft, load_base, load_sft, MossImage};
 

@@ -160,3 +160,144 @@ mod tests {
         assert!((a * 1000.0 - (a * 1000.0).round()).abs() < 0.0001);
     }
 }
+
+/// Required portable LoKr scaling metadata. Unlike permissive third-party parsing, an invalid
+/// rank/alpha cannot silently change the strength of a SceneWorks-native adapter.
+pub fn lokr_scaling(meta: &BTreeMap<String, String>) -> Result<(f32, f32)> {
+    let rank = meta
+        .get("rank")
+        .ok_or_else(|| Error::Unsupported("MOSS LoKr metadata is missing rank".into()))?
+        .parse::<u32>()
+        .map_err(|_| Error::Unsupported("MOSS LoKr rank must be a positive integer".into()))?;
+    let alpha = meta
+        .get("alpha")
+        .ok_or_else(|| Error::Unsupported("MOSS LoKr metadata is missing alpha".into()))?
+        .parse::<f32>()
+        .map_err(|_| Error::Unsupported("MOSS LoKr alpha must be finite".into()))?;
+    if rank == 0 || !alpha.is_finite() {
+        return Err(Error::Unsupported(
+            "MOSS LoKr requires positive rank and finite alpha".into(),
+        ));
+    }
+    Ok((rank as f32, alpha))
+}
+
+/// Logical dimensions of one Kronecker factor; decomposed factors preserve both raw matrices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LokrFactorShape {
+    pub rows: usize,
+    pub cols: usize,
+    pub inner: Option<usize>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LokrLayout {
+    pub first: LokrFactorShape,
+    pub second: LokrFactorShape,
+}
+/// Exactly one complete representation per factor, with explicit row AND column compatibility.
+/// Equal element counts never justify reshaping a crossed Kronecker geometry.
+pub fn lokr_layout(
+    factors: &BTreeMap<String, Vec<usize>>,
+    output: usize,
+    input: usize,
+) -> Result<LokrLayout> {
+    if factors.keys().any(|k| {
+        ![
+            "lokr_w1",
+            "lokr_w1_a",
+            "lokr_w1_b",
+            "lokr_w2",
+            "lokr_w2_a",
+            "lokr_w2_b",
+        ]
+        .contains(&k.as_str())
+    }) {
+        return Err(Error::Unsupported(
+            "MOSS LoKr has an unconsumed factor".into(),
+        ));
+    }
+    let factor = |prefix: &str| -> Result<LokrFactorShape> {
+        let full = factors.get(prefix);
+        let a = factors.get(&format!("{prefix}_a"));
+        let b = factors.get(&format!("{prefix}_b"));
+        let matrix = |shape: &Vec<usize>| shape.len() == 2 && shape.iter().all(|d| *d > 0);
+        match (full,a,b) {
+            (Some(w),None,None) if matrix(w)=>Ok(LokrFactorShape{rows:w[0],cols:w[1],inner:None}),
+            (None,Some(a),Some(b)) if matrix(a)&&matrix(b)&&a[1]==b[0]=>Ok(LokrFactorShape{rows:a[0],cols:b[1],inner:Some(a[1])}),
+            _=>Err(Error::Unsupported(format!("MOSS {prefix} requires exactly full OR a complete shape-compatible a/b pair; orphan/mixed factors are not applied"))),
+        }
+    };
+    let first = factor("lokr_w1")?;
+    let second = factor("lokr_w2")?;
+    if first.rows.checked_mul(second.rows) != Some(output)
+        || first.cols.checked_mul(second.cols) != Some(input)
+    {
+        return Err(Error::Unsupported(format!(
+            "MOSS LoKr reconstructed axes do not match [{output},{input}]"
+        )));
+    }
+    Ok(LokrLayout { first, second })
+}
+
+#[cfg(test)]
+mod review_validation_tests {
+    use super::*;
+    fn valid() -> BTreeMap<String, Vec<usize>> {
+        [
+            ("lokr_w1".into(), vec![2, 2]),
+            ("lokr_w2".into(), vec![1536, 1536]),
+        ]
+        .into_iter()
+        .collect()
+    }
+    #[test]
+    fn lokr_validates_both_axes_not_equal_element_count() {
+        lokr_layout(&valid(), 3072, 3072).unwrap();
+        let mut crossed = valid();
+        crossed.insert("lokr_w2".into(), vec![768, 3072]);
+        assert!(lokr_layout(&crossed, 3072, 3072).is_err());
+    }
+    #[test]
+    fn every_kronecker_factor_has_exactly_one_complete_representation() {
+        for factor in ["lokr_w1", "lokr_w2"] {
+            let mut mixed = valid();
+            let shape = mixed[factor].clone();
+            mixed.insert(format!("{factor}_a"), vec![shape[0], 1]);
+            assert!(
+                lokr_layout(&mixed, 3072, 3072).is_err(),
+                "orphan {factor}_a"
+            );
+            mixed.insert(format!("{factor}_b"), vec![1, shape[1]]);
+            assert!(
+                lokr_layout(&mixed, 3072, 3072).is_err(),
+                "competing full and decomposed {factor}"
+            );
+            mixed.remove(factor);
+            lokr_layout(&mixed, 3072, 3072).unwrap();
+            mixed.remove(&format!("{factor}_a"));
+            assert!(
+                lokr_layout(&mixed, 3072, 3072).is_err(),
+                "orphan {factor}_b"
+            );
+        }
+    }
+    #[test]
+    fn portable_lokr_scaling_never_defaults_bad_metadata() {
+        let mut meta = BTreeMap::from([("rank".into(), "4".into()), ("alpha".into(), "6".into())]);
+        assert_eq!(lokr_scaling(&meta).unwrap(), (4., 6.));
+        for rank in ["0", "-1", "oops", "NaN", "inf", "4.5"] {
+            meta.insert("rank".into(), rank.into());
+            assert!(lokr_scaling(&meta).is_err(), "rank {rank}");
+        }
+        meta.insert("rank".into(), "4".into());
+        for alpha in ["oops", "NaN", "inf", "1e999"] {
+            meta.insert("alpha".into(), alpha.into());
+            assert!(lokr_scaling(&meta).is_err(), "alpha {alpha}");
+        }
+        meta.remove("alpha");
+        assert!(lokr_scaling(&meta).is_err());
+        meta.insert("alpha".into(), "6".into());
+        meta.remove("rank");
+        assert!(lokr_scaling(&meta).is_err());
+    }
+}

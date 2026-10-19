@@ -1,5 +1,8 @@
 //! Native MOSS transformer-only LoRA/LoKr. Frozen Qwen3.5 conditioning and full FLUX2 VAE
 //! encoding are cached before functional autograd; only the explicit adapter-factor map is a leaf.
+use crate::training_memory::{
+    self as admission, EstimateRequest, FootprintFacts, MemoryEstimate, Phase,
+};
 use crate::{
     loader::{read_weights, Sources},
     text_encoder::Encoder,
@@ -29,13 +32,16 @@ use mlx_rs::{
 };
 use std::path::Path;
 
-pub struct MossImageTrainer {
+struct LoadedTrainer {
     descriptor: TrainerDescriptor,
     variant: MossImageVariant,
     sources: Sources,
     encoder: Option<Encoder>,
     vae: Flux2Vae,
     transformer: Transformer,
+    facts: FootprintFacts,
+    memory_budget_override: Option<u64>,
+    decode_bytes: u64,
 }
 fn descriptor(variant: MossImageVariant) -> TrainerDescriptor {
     TrainerDescriptor {
@@ -67,24 +73,129 @@ pub fn load_base(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
 pub fn load_sft(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     load(spec, MossImageVariant::Sft)
 }
-fn load(spec: &LoadSpec, variant: MossImageVariant) -> Result<Box<dyn Trainer>> {
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(
-            "MOSS trainer requires the exact unadapted Base/SFT checkpoint".into(),
-        ));
+/// Request-aware lazy trainer. Header facts and validation never allocate model tensors.
+/// The override is a native integration/test budget, not a nonexistent generic request cap.
+pub struct MossImageTrainer {
+    descriptor: TrainerDescriptor,
+    variant: MossImageVariant,
+    sources: Sources,
+    facts: FootprintFacts,
+    memory_budget_override: Option<u64>,
+    loaded: Option<LoadedTrainer>,
+}
+fn admission_error(error: admission::AdmissionError) -> Error {
+    Error::Unsupported(error.to_string())
+}
+fn estimate_request(facts: &FootprintFacts, req: &TrainingRequest) -> Result<MemoryEstimate> {
+    let shape = EstimateRequest::from_request(req).map_err(admission_error)?;
+    admission::estimate(facts, &shape).map_err(admission_error)
+}
+fn budget(override_bytes: Option<u64>) -> Result<u64> {
+    match override_bytes {
+        Some(bytes) => Ok(admission::resolve_budget(Some(bytes), 0)),
+        None => admission::device_budget_bytes().map_err(admission_error),
     }
-    // Header-only authentication, same source pins/identity validation as the generator.
-    let sources = Sources::prepare(variant, spec)?;
-    Ok(Box::new(mlx_gen::train::lazy::LazyTrainer::new(
-        descriptor(variant),
-        validate_floors,
-        move || load_weights(sources.clone(), variant),
-    )))
+}
+/// The real eager-loading boundary: no encoder/VAE/backbone allocation runs before admission.
+fn admitted_load<T>(
+    estimate: &MemoryEstimate,
+    budget: u64,
+    load: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    estimate.check_all(budget).map_err(admission_error)?;
+    load()
+}
+impl MossImageTrainer {
+    pub fn load(variant: MossImageVariant, spec: &LoadSpec) -> Result<Self> {
+        if !spec.adapters.is_empty() {
+            return Err(Error::Unsupported(
+                "MOSS trainer requires the exact unadapted Base/SFT checkpoint".into(),
+            ));
+        }
+        let sources = Sources::prepare(variant, spec)?;
+        let facts = FootprintFacts::from_sources(&sources).map_err(admission_error)?;
+        Ok(Self {
+            descriptor: descriptor(variant),
+            variant,
+            sources,
+            facts,
+            memory_budget_override: None,
+            loaded: None,
+        })
+    }
+    pub fn set_memory_budget_override(&mut self, bytes: Option<u64>) {
+        self.memory_budget_override = bytes;
+        if let Some(loaded) = &mut self.loaded {
+            loaded.memory_budget_override = bytes;
+        }
+    }
+}
+impl Trainer for MossImageTrainer {
+    fn descriptor(&self) -> &TrainerDescriptor {
+        &self.descriptor
+    }
+    fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        validate_floors(&self.descriptor, req)?;
+        self.sources.ensure_unchanged()?;
+        estimate_request(&self.facts, req)?
+            .check_all(budget(self.memory_budget_override)?)
+            .map_err(admission_error)?;
+        let shape = EstimateRequest::from_request(req)
+            .map_err(admission_error)?
+            .with_image_headers(req)
+            .map_err(admission_error)?;
+        admission::estimate(&self.facts, &shape)
+            .map_err(admission_error)?
+            .check_all(budget(self.memory_budget_override)?)
+            .map_err(admission_error)?;
+        Ok(())
+    }
+    fn train(
+        &mut self,
+        req: &TrainingRequest,
+        progress: &mut dyn FnMut(TrainingProgress),
+    ) -> gen_core::Result<TrainingOutput> {
+        self.validate(req)?;
+        if self.loaded.is_none() {
+            let shape = EstimateRequest::from_request(req)
+                .map_err(admission_error)?
+                .with_image_headers(req)
+                .map_err(admission_error)?;
+            let estimate = admission::estimate(&self.facts, &shape).map_err(admission_error)?;
+            self.loaded = Some(admitted_load(
+                &estimate,
+                budget(self.memory_budget_override)?,
+                || {
+                    load_weights(
+                        self.sources.clone(),
+                        self.variant,
+                        self.facts.clone(),
+                        self.memory_budget_override,
+                        shape.decode_bytes,
+                    )
+                },
+            )?);
+        }
+        self.loaded
+            .as_mut()
+            .expect("admitted model initialized above")
+            .train(req, progress)
+    }
+}
+fn load(spec: &LoadSpec, variant: MossImageVariant) -> Result<Box<dyn Trainer>> {
+    Ok(Box::new(MossImageTrainer::load(variant, spec)?))
 }
 mlx_gen::register_trainer! { pub(crate) const BASE_REGISTRATION = base_descriptor => load_base }
 mlx_gen::register_trainer! { pub(crate) const SFT_REGISTRATION = sft_descriptor => load_sft }
-fn load_weights(sources: Sources, variant: MossImageVariant) -> Result<MossImageTrainer> {
+fn load_weights(
+    sources: Sources,
+    variant: MossImageVariant,
+    facts: FootprintFacts,
+    memory_budget_override: Option<u64>,
+    decode_bytes: u64,
+) -> Result<LoadedTrainer> {
     let cancel = CancelFlag::new();
+    mlx_rs::memory::clear_cache();
     let encoder = Encoder::load(&sources, &cancel)?;
     let weights = read_weights(
         sources
@@ -116,7 +227,10 @@ fn load_weights(sources: Sources, variant: MossImageVariant) -> Result<MossImage
     }
     let transformer = sources.transformer(MossImageAcceleration::Off, &cancel)?;
     sources.ensure_unchanged()?;
-    Ok(MossImageTrainer {
+    Ok(LoadedTrainer {
+        facts,
+        memory_budget_override,
+        decode_bytes,
         descriptor: descriptor(variant),
         variant,
         sources,
@@ -319,7 +433,9 @@ pub(crate) fn loss_grads(
     transformer.training = true;
     transformer.training_checkpoint = cfg.gradient_checkpointing;
     let loss = |p: LoraParams| -> MlxResult<Vec<Array>> {
-        adapter.install(transformer, &p, cfg.alpha, cfg.rank as f32, Dtype::Float32)?;
+        transformer
+            .install_training_adapter(adapter, &p, cfg.alpha, cfg.rank as f32)
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let pred = transformer
             .forward(&x, &[time], std::slice::from_ref(context), &[], cancel)
             .map_err(|e| Exception::custom(e.to_string()))?;
@@ -377,7 +493,7 @@ struct Entry {
     context: Array,
     mask: Option<Array>,
 }
-impl Trainer for MossImageTrainer {
+impl Trainer for LoadedTrainer {
     fn descriptor(&self) -> &TrainerDescriptor {
         &self.descriptor
     }
@@ -393,9 +509,27 @@ impl Trainer for MossImageTrainer {
         self.train_impl(req, on_progress).map_err(Into::into)
     }
 }
-impl MossImageTrainer {
+impl LoadedTrainer {
+    fn admit(&self, req: &TrainingRequest, phase: Phase) -> Result<()> {
+        let mut shape = EstimateRequest::from_request(req).map_err(admission_error)?;
+        shape.decode_bytes = self.decode_bytes;
+        admission::estimate(&self.facts, &shape)
+            .map_err(admission_error)?
+            .check(phase, budget(self.memory_budget_override)?)
+            .map_err(admission_error)
+    }
+    fn admit_image(&self, req: &TrainingRequest, path: &Path) -> Result<()> {
+        let mut shape = EstimateRequest::from_request(req).map_err(admission_error)?;
+        shape.decode_bytes = self
+            .decode_bytes
+            .max(admission::image_decode_bytes(path).map_err(admission_error)?);
+        admission::estimate(&self.facts, &shape)
+            .map_err(admission_error)?
+            .check(Phase::Cache, budget(self.memory_budget_override)?)
+            .map_err(admission_error)
+    }
     fn save(
-        &self,
+        &mut self,
         adapter: &TrainAdapter,
         params: &LoraParams,
         cfg: &TrainingConfig,
@@ -406,15 +540,7 @@ impl MossImageTrainer {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        adapter.save_with_meta(
-            params,
-            cfg.alpha,
-            cfg.rank as f32,
-            cfg.decompose_factor,
-            "",
-            &extra,
-            path,
-        )
+        crate::adapters::save_validated(&mut self.transformer, adapter, params, cfg, &extra, path)
     }
     fn train_impl(
         &mut self,
@@ -442,6 +568,7 @@ impl MossImageTrainer {
             request_fingerprint: &fingerprint,
         };
         self.sources.ensure_unchanged()?;
+        self.admit(req, Phase::Cast)?;
         let dtype = if matches!(
             c.train_dtype.to_ascii_lowercase().as_str(),
             "bf16" | "bfloat16"
@@ -453,11 +580,13 @@ impl MossImageTrainer {
         self.transformer.cast_training_weights(dtype)?;
         progress(TrainingProgress::Preparing);
         progress(TrainingProgress::LoadingModel);
+        self.admit(req, Phase::Cache)?;
         let edges = bucket_edges(c);
         let mut cache = Vec::new();
         let encoder=self.encoder.as_ref().ok_or_else(||Error::Msg("MOSS trainer instance already consumed its conditioning cache; reload for a new dataset".into()))?;
         for (i, item) in req.items.iter().enumerate() {
             crate::pipeline::check(&req.cancel)?;
+            self.admit_image(req, &item.image_path)?;
             progress(TrainingProgress::Caching {
                 current: i as u32 + 1,
                 total: req.items.len() as u32,
@@ -509,6 +638,8 @@ impl MossImageTrainer {
             Some(encoder.encode("", 4096, &req.cancel)?.0)
         };
         self.encoder = None;
+        mlx_rs::memory::clear_cache();
+        self.admit(req, Phase::Backward)?;
         let paths = contract::target_paths(42, &c.lora_target_modules)?;
         let (adapter, mut params) = match c.network_type {
             NetworkType::Lora => {
@@ -571,6 +702,7 @@ impl MossImageTrainer {
         let mut steps = start;
         for step in start + 1..=c.steps {
             crate::pipeline::check(&req.cancel)?;
+            self.admit(req, Phase::Backward)?;
             let mut micro = None;
             let mut total_loss = 0.;
             let mut total_tokens = 0u32;
@@ -649,12 +781,12 @@ impl MossImageTrainer {
                 progress(TrainingProgress::Checkpoint { step });
             }
             if c.sample_every > 0 && step % c.sample_every == 0 && !previews.is_empty() {
-                adapter.install(
-                    &mut self.transformer,
+                self.admit(req, Phase::Preview)?;
+                self.transformer.install_training_adapter(
+                    &adapter,
                     &params,
                     c.alpha,
                     c.rank as f32,
-                    Dtype::Float32,
                 )?;
                 self.previews(
                     c,
@@ -796,5 +928,80 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_admission_tests {
+    use super::*;
+    #[test]
+    fn refused_working_set_never_enters_the_eager_loader() {
+        let (facts, shape) = admission::tests::tiny();
+        let estimate = admission::estimate(&facts, &shape).unwrap();
+        let loads = std::cell::Cell::new(0);
+        let result = admitted_load(&estimate, estimate.peak() - 1, || {
+            loads.set(loads.get() + 1);
+            Ok(())
+        });
+        assert!(
+            matches!(result,Err(Error::Unsupported(message)) if message.contains("structural working-set"))
+        );
+        assert_eq!(
+            loads.get(),
+            0,
+            "eager allocation ran before structural admission"
+        );
+        admitted_load(&estimate, estimate.peak(), || {
+            loads.set(loads.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(loads.get(), 1);
+    }
+    #[test]
+    fn concrete_trainer_override_refuses_before_missing_model_or_dataset_can_load() {
+        let _device = crate::cpu_test_device();
+        let (facts, _) = admission::tests::tiny();
+        let sources = Sources {
+            selection: None,
+            ordinary: Vec::new(),
+            optional: Vec::new(),
+            config: facts.config.clone(),
+        };
+        let mut trainer = MossImageTrainer {
+            descriptor: descriptor(MossImageVariant::Base),
+            variant: MossImageVariant::Base,
+            sources,
+            facts,
+            memory_budget_override: None,
+            loaded: None,
+        };
+        trainer.set_memory_budget_override(Some(0));
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("not-created");
+        let request = TrainingRequest {
+            items: vec![gen_core::TrainingItem::captioned(
+                temp.path().join("not-opened.png"),
+                "caption".into(),
+            )],
+            config: TrainingConfig {
+                resolution: 32,
+                rank: 1,
+                ..Default::default()
+            },
+            output_dir: output.clone(),
+            file_name: "adapter.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: Default::default(),
+        };
+        let result = trainer.train(&request, &mut |_| {
+            panic!("no model/cache/progress before refusal")
+        });
+        assert!(
+            matches!(result,Err(gen_core::Error::Unsupported(message)) if message.contains("structural working-set")),
+            "request reached missing assets instead of admission"
+        );
+        assert!(trainer.loaded.is_none());
+        assert!(!output.exists());
     }
 }
