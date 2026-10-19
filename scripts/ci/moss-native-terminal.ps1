@@ -18,8 +18,8 @@ function Plain-Path([string]$path) {
 }
 function Hash([string]$path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function Creation-Key([DateTime]$created) {
-    # Win32_Process creation timestamps have microsecond precision; normalize handle timestamps
-    # to the same exact unit rather than accepting a PID reuse inside a tolerance window.
+    # Canonicalize CIM timestamps only. A retained handle has its own full-precision key;
+    # comparing timestamps from different providers is not proof of process ownership.
     $ticks=$created.ToUniversalTime().Ticks
     [DateTime]::new(($ticks-($ticks%10)),[DateTimeKind]::Utc).ToString('o')
 }
@@ -113,8 +113,20 @@ function Owned-Entry-Live($entry) {
     try {
         $entry.process.Refresh()
         (-not $entry.process.HasExited) -and $entry.process.Id -eq $entry.identity.pid -and
-            (Creation-Key $entry.process.StartTime) -ceq $entry.identity.created_utc
+            $entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc
     } catch { $false }
+}
+function Capture-Owned($process,$expected=$null) {
+    # The caller already holds the exact process handle. Authenticate the CIM read by
+    # bracketing it with liveness checks on that handle, not a launch-path basename or
+    # an assumed CIM/GetProcessTimes conversion. Never change either identity later.
+    if ($process.HasExited) { return $null }
+    $entry=[pscustomobject]@{identity=[pscustomobject]@{pid=[int]$process.Id};process=$process;handle_created_utc=$process.StartTime.ToUniversalTime().ToString('o')}
+    if (-not (Owned-Entry-Live $entry)) { return $null }
+    try { $identity=Identity $process.Id } catch { if ($process.HasExited) { return $null }; throw }
+    if (-not (Owned-Entry-Live $entry)) { return $null }
+    if ($null -ne $expected -and -not (Same-Identity $expected $identity)) { return $null }
+    [pscustomobject]@{identity=$identity;process=$process;handle_created_utc=$entry.handle_created_utc}
 }
 function Retain-Child($row,$parent) {
     $process=$null
@@ -122,14 +134,16 @@ function Retain-Child($row,$parent) {
         $identity=Snapshot-Identity $row
         $process=[Diagnostics.Process]::GetProcessById($identity.pid)
         $null=$process.Handle # Hold this exact kernel process object through final cleanup.
-        $entry=[pscustomobject]@{identity=$identity;process=$process}
+        $entry=Capture-Owned $process $identity
         # The snapshot's parent identity must still be live after capturing the child handle.
         # An exited/reused parent PID never authenticates a new edge (sc-26325 / F-277).
-        if (-not (Owned-Entry-Live $parent) -or
+        if ($null -eq $entry -or -not (Owned-Entry-Live $parent) -or
             -not (Same-Identity $parent.identity (Identity $parent.identity.pid)) -or
+            -not (Owned-Entry-Live $parent) -or
             -not (Owned-Entry-Live $entry) -or
             -not (Ancestry-Order $process.StartTime $parent.process.StartTime) -or
-            -not (Same-Identity $identity (Identity $identity.pid))) { return $null }
+            -not (Same-Identity $identity (Identity $identity.pid)) -or
+            -not (Owned-Entry-Live $entry)) { return $null }
         $process=$null # Ownership transfers to the retained entry only after every check passes.
         $entry
     } catch { $null } finally { if ($null -ne $process) { $process.Dispose() } }
@@ -139,7 +153,11 @@ function Discover-Owned($rows,[hashtable]$owned,[scriptblock]$retain) {
     foreach ($row in $rows) { $snapshot[[int]$row.ProcessId]=$row }
     foreach ($entry in @($owned.Values)) {
         if ($snapshot.ContainsKey($entry.identity.pid)) {
-            Require (Same-Identity $entry.identity (Snapshot-Identity $snapshot[$entry.identity.pid])) 'Observed owned PID was reused; immutable ownership retained'
+            $observed=Snapshot-Identity $snapshot[$entry.identity.pid]
+            if (-not (Same-Identity $entry.identity $observed)) {
+                $detail=@{expected=$entry.identity;observed=$observed}|ConvertTo-Json -Compress -Depth 4
+                throw "Observed owned PID was reused; immutable ownership retained: $detail"
+            }
         }
     }
     do {
@@ -169,12 +187,18 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
     $out = Join-Path $script:evidence ($name + '.stdout.log')
     $err = Join-Path $script:evidence ($name + '.stderr.log')
     $p = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-    $null=$p.Handle
-    $root=[pscustomobject]@{identity=[pscustomobject]@{pid=[int]$p.Id;name=[IO.Path]::GetFileName($exe);created_utc=Creation-Key $p.StartTime};process=$p}
-    $owned = @{}; $owned[[int]$p.Id]=$root
+    $owned = @{}
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
+        $null=$p.Handle
+        $root=Capture-Owned $p
+        if ($null -ne $root) {
+            $owned[[int]$p.Id]=$root
+            @{launch_path=$exe;identity=$root.identity;handle_created_utc=$root.handle_created_utc}|
+                ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $script:evidence ($name+'.ownership.json')) -Encoding UTF8
+        }
         while (-not $p.HasExited) {
+            Require ($null -ne $root) 'Live root has no authenticated ownership identity'
             $all = @(Get-CimInstance Win32_Process)
             Discover-Owned $all $owned {param($row,$parent) Retain-Child $row $parent}
             $ids=@($owned.Values | Where-Object { Owned-Entry-Live $_ } | ForEach-Object { [int]$_.identity.pid })
@@ -194,7 +218,16 @@ function Owned-Run([string]$exe, [string[]]$arguments, [string]$name, [int]$seco
                     if (Owned-Entry-Live $entry) { throw }
                 }
             }
-        } finally { foreach ($entry in @($owned.Values)) { $entry.process.Dispose() } }
+        } finally {
+            # Also cover identity-capture failure: Start-Process gave us this exact object,
+            # even when no CIM identity could be admitted. Never look it up again by PID.
+            try {
+                if (-not $p.HasExited) { try { $p.Kill() } catch { if (-not $p.HasExited) { throw } } }
+            } finally {
+                foreach ($entry in @($owned.Values)) { if ($entry.process -ne $p) { $entry.process.Dispose() } }
+                $p.Dispose()
+            }
+        }
     }
 }
 function Evidence-Files([string]$root) {
@@ -259,6 +292,41 @@ function Validate-Product([string]$root,$protocol) {
         }
     }
 }
+function Test-Capture-Fixture {
+    # Deliberately disagree across providers while keeping each provider immutable.
+    # This rejects a mutation that compares the held timestamp to the CIM timestamp.
+    $created=[DateTime]::new(2026,1,1,0,0,0,[DateTimeKind]::Utc).AddTicks(7)
+    $script:fixtureCaptureProcess=[pscustomobject]@{Id=100;HasExited=$false;StartTime=$created}
+    $script:fixtureCaptureProcess|Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
+    $script:fixtureCaptureRace='none'
+    function Identity($pidValue) {
+        if ($script:fixtureCaptureRace -eq 'unresolved') { throw 'fixture identity unavailable' }
+        if ($script:fixtureCaptureRace -eq 'exit') { $script:fixtureCaptureProcess.HasExited=$true }
+        if ($script:fixtureCaptureRace -eq 'creation') { $script:fixtureCaptureProcess.StartTime=$script:fixtureCaptureProcess.StartTime.AddTicks(1) }
+        if ($script:fixtureCaptureRace -eq 'pid') { $script:fixtureCaptureProcess.Id=101 }
+        [pscustomobject]@{pid=[int]$pidValue;name='actual-image.exe';created_utc='2026-01-01T00:00:00.0000010Z'}
+    }
+    try {
+        $entry=Capture-Owned $script:fixtureCaptureProcess
+        Require ($null -ne $entry -and (Owned-Entry-Live $entry)) 'Independent immutable CIM/handle identities rejected'
+        Require ($entry.identity.created_utc -cne (Creation-Key $created)) 'Cross-provider precision fixture did not discriminate'
+        foreach ($field in @('name','created_utc','pid')) {
+            $changed=$entry.identity.PSObject.Copy()
+            if ($field -eq 'name') { $changed.name='foreign.exe' }
+            if ($field -eq 'created_utc') { $changed.created_utc=Creation-Key ([DateTime]::Parse($changed.created_utc).AddTicks(10)) }
+            if ($field -eq 'pid') { $changed.pid=101 }
+            Require ($null -eq (Capture-Owned $script:fixtureCaptureProcess $changed)) "Identity capture admitted changed $field"
+        }
+        $script:fixtureCaptureRace='unresolved'; $rejected=$false
+        try { Capture-Owned $script:fixtureCaptureProcess|Out-Null } catch { $rejected=$_.Exception.Message -ceq 'fixture identity unavailable' }
+        Require $rejected 'Unresolved live identity accepted'
+        foreach ($race in @('exit','creation','pid')) {
+            $script:fixtureCaptureProcess.Id=100; $script:fixtureCaptureProcess.HasExited=$false; $script:fixtureCaptureProcess.StartTime=$created
+            $script:fixtureCaptureRace=$race
+            Require ($null -eq (Capture-Owned $script:fixtureCaptureProcess)) "Identity capture admitted $race race"
+        }
+    } finally { Remove-Variable fixtureCaptureProcess,fixtureCaptureRace -Scope Script }
+}
 function Test-Ownership-Fixture {
     # sc-26325 / F-277: no real processes are killed by this discriminating CPU fixture.
     $row={param($id,$parent,$second) [pscustomobject]@{ProcessId=$id;ParentProcessId=$parent;Name='fixture.exe';CreationDate=[DateTime]::new(2026,1,1,0,0,$second,[DateTimeKind]::Utc)}}
@@ -282,6 +350,19 @@ function Test-Ownership-Fixture {
     Discover-Owned $rows $owned $retain
     Require ($owned.Count -eq 3 -and $owned.ContainsKey(200) -and $owned.ContainsKey(201)) 'Genuine child/grandchild rejected'
     Require (-not $owned.ContainsKey(300) -and -not $owned.ContainsKey(301)) 'Stale-parent foreign survivor admitted'
+    foreach ($field in @('name','created_utc','pid')) {
+        $changed=Snapshot-Identity $root
+        if ($field -eq 'name') { $changed.name='foreign.exe' }
+        if ($field -eq 'created_utc') { $changed.created_utc=Creation-Key ($root.CreationDate.AddTicks(10)) }
+        if ($field -eq 'pid') { $changed.pid=101 }
+        Require (-not (Same-Identity (Snapshot-Identity $root) $changed)) "Changed $field accepted"
+    }
+    $renamed=& $row 100 9 10; $renamed.Name='foreign.exe'
+    $rejected=$false
+    try { Discover-Owned @($renamed,$child) $owned $retain } catch {
+        $rejected=$_.Exception.Message -like 'Observed owned PID was reused*' -and $_.Exception.Message -like '*"observed"*'
+    }
+    Require ($rejected -and $owned[100].identity.name -ceq 'fixture.exe') 'Changed name replaced immutable ownership or lacked identity evidence'
     $script:fixtureTerminated=@(); Stop-Owned $owned $live $terminate
     Require ($script:fixtureTerminated.Count -eq 3 -and $script:fixtureTerminated -notcontains 300 -and $script:fixtureTerminated -notcontains 301) 'Foreign survivor terminated or genuine cleanup omitted'
 
@@ -330,6 +411,7 @@ if ($SelfTest) {
             try { Import-MsvcEnvironment $batch } catch { $rejected=$_.Exception.Message -ceq 'MSVC environment import failed: exit=7' }
             Require ($rejected -and $env:MOSS_MSVC_FIXTURE -ceq 'spaces & equals=preserved') 'Failed MSVC batch imported partial environment'
         } finally { [Environment]::SetEnvironmentVariable('MOSS_MSVC_FIXTURE',$previous,'Process') }
+        Test-Capture-Fixture
         Test-Ownership-Fixture
         Cargo-Dependency-Setup {Require ($env:CARGO_NET_OFFLINE -ceq 'false') 'Dependency preparation was not scoped online'}
         Require ($env:CARGO_NET_OFFLINE -ceq 'true') 'Offline mode not restored after dependency setup'
@@ -372,7 +454,7 @@ if ($SelfTest) {
         # F-277: a real harmless powershell child/grandchild chain exercises CIM versus held
         # Process creation times. The release-file protocol, not elapsed speed, proves admission.
         $grand=@'
-$limit=[DateTime]::UtcNow.AddSeconds(20)
+$limit=[DateTime]::UtcNow.AddSeconds(60)
 while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-fixture'))) {
     if ([DateTime]::UtcNow -gt $limit) { exit 91 }
     Start-Sleep -Milliseconds 25
@@ -389,19 +471,97 @@ try { $child.WaitForExit();exit $child.ExitCode } finally {$child.Dispose()}
         [IO.File]::WriteAllText((Join-Path $temp 'parent-fixture.ps1'),$parent)
         [IO.File]::WriteAllText((Join-Path $temp 'root-fixture.ps1'),$rootScript)
         $script:fixtureRelease=Join-Path $temp 'release-fixture';$script:fixtureChainObserved=$false
-        Owned-Run (Join-Path $PSHOME 'powershell.exe') @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'root-fixture.ps1')+'"')) 'real-owned-chain' 30 {
+        # Deliberately launch via an extensionless command alias. The old root used
+        # GetFileName(exe)='powershell', which cannot match CIM's 'powershell.exe'.
+        # Keep the child chain alive until it is observed so a quick exit cannot pass.
+        Owned-Run 'powershell' @('-NoProfile','-NonInteractive','-File',('"'+(Join-Path $temp 'root-fixture.ps1')+'"')) 'real-owned-chain' 60 {
             param($ids,$owned)
             $chain=@($owned.Values|Where-Object {$_.identity.name -ieq 'powershell.exe' -and (Owned-Entry-Live $_)})
             if ($chain.Count -ge 3) {
+                foreach ($entry in $chain) {
+                    Require (Same-Identity $entry.identity (Identity $entry.identity.pid)) 'Real held identity changed'
+                    foreach ($field in @('name','created_utc','pid')) {
+                        $changed=$entry.identity.PSObject.Copy()
+                        if ($field -eq 'name') { $changed.name='foreign.exe' }
+                        if ($field -eq 'created_utc') { $changed.created_utc=Creation-Key ([DateTime]::Parse($changed.created_utc).AddTicks(10)) }
+                        if ($field -eq 'pid') { $changed.pid=-1 }
+                        Require ($null -eq (Capture-Owned $entry.process $changed)) "Real changed $field admitted"
+                    }
+                    $changedHandle=[pscustomobject]@{identity=$entry.identity;process=$entry.process;handle_created_utc=([DateTime]::Parse($entry.handle_created_utc).AddTicks(1).ToUniversalTime().ToString('o'))}
+                    Require (-not (Owned-Entry-Live $changedHandle)) 'Held identity lost 100ns precision'
+                }
                 $script:fixtureChainObserved=$true
                 [IO.File]::WriteAllText($script:fixtureRelease,'release')
             }
         }
         Require $script:fixtureChainObserved 'Real valid child/grandchild ancestry was never admitted'
+        $observed=Get-Content -Raw -LiteralPath (Join-Path $temp 'real-owned-chain.ownership.json')|ConvertFrom-Json
+        Require ($observed.launch_path -ceq 'powershell' -and $observed.identity.name -ieq 'powershell.exe') 'Alias regression did not distinguish launch path from process identity'
+        $legacy=[pscustomobject]@{pid=$observed.identity.pid;name=[IO.Path]::GetFileName($observed.launch_path);created_utc=Creation-Key ([DateTime]::Parse($observed.handle_created_utc))}
+        Require (-not (Same-Identity $legacy $observed.identity)) 'Legacy root identity unexpectedly passed the alias regression'
+        Write-Output ('Owned alias identity: '+($observed|ConvertTo-Json -Compress -Depth 4))
         Remove-Variable fixtureRelease,fixtureChainObserved -Scope Script
-        $rejected=$false
-        try { Owned-Run (Get-Command powershell).Source @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 20') 'fake-timeout' 1 {param($ids)} } catch { $rejected=$_.Exception.Message -like 'Owned child timeout*' }
-        Require $rejected 'Owned-child timeout/cleanup failed'
+        # Exercise the installed Cargo/rustup launcher without Rust compilation,
+        # dependencies, network, or GPU work. Cargo waits for this temporary external
+        # subcommand until the supervisor has authenticated the live process chain.
+        $helper=Join-Path $temp 'cargo-moss-identity-fixture.exe'
+        Add-Type -OutputAssembly $helper -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+public static class MossIdentityFixture {
+    public static int Main(string[] args) {
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while (!File.Exists(args[args.Length - 1])) {
+            if (DateTime.UtcNow > deadline) return 91;
+            Thread.Sleep(25);
+        }
+        return 0;
+    }
+}
+'@
+        $previousPath=$env:PATH
+        $script:fixtureRelease=Join-Path $temp 'release-cargo-fixture'; $script:fixtureCargoObserved=$false
+        try {
+            $env:PATH=$temp+';'+$previousPath
+            Owned-Run (Get-Command cargo).Source @('moss-identity-fixture',('"'+$script:fixtureRelease+'"')) 'real-cargo-chain' 60 {
+                param($ids,$owned)
+                $helpers=@($owned.Values|Where-Object {$_.identity.name -ieq 'cargo-moss-identity-fixture.exe' -and (Owned-Entry-Live $_)})
+                if ($helpers.Count -eq 1 -and $ids.Count -ge 2) {
+                    $script:fixtureCargoObserved=$true
+                    [IO.File]::WriteAllText($script:fixtureRelease,'release')
+                }
+            }
+            Require $script:fixtureCargoObserved 'Actual Cargo child was never authenticated'
+            Write-Output ('Owned Cargo identity: '+(Get-Content -Raw -LiteralPath (Join-Path $temp 'real-cargo-chain.ownership.json')))
+        } finally {
+            $env:PATH=$previousPath
+            Remove-Variable fixtureRelease,fixtureCargoObserved -Scope Script
+        }
+        $foreign=Start-Process -FilePath $helper -ArgumentList ('"'+(Join-Path $temp 'never-release-foreign')+'"') -PassThru -NoNewWindow
+        $script:fixtureTimeoutHandle=$null
+        try {
+            $null=$foreign.Handle
+            $rejected=$false
+            try {
+                Owned-Run $helper @(('"'+(Join-Path $temp 'never-release-owned')+'"')) 'fake-timeout' 1 {
+                    param($ids,$owned)
+                    if ($null -eq $script:fixtureTimeoutHandle) {
+                        $entry=@($owned.Values)[0]
+                        $script:fixtureTimeoutHandle=[Diagnostics.Process]::GetProcessById($entry.identity.pid)
+                        $null=$script:fixtureTimeoutHandle.Handle
+                        Require ($script:fixtureTimeoutHandle.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc) 'Timeout observation captured a different process'
+                    }
+                }
+            } catch { $rejected=$_.Exception.Message -like 'Owned child timeout*' }
+            Require $rejected 'Owned-child timeout/cleanup failed'
+            Require ($null -ne $script:fixtureTimeoutHandle -and $script:fixtureTimeoutHandle.WaitForExit(5000)) 'Timed-out owned process survived cleanup'
+            $foreign.Refresh(); Require (-not $foreign.HasExited) 'Foreign same-name process was terminated'
+        } finally {
+            try { if (-not $foreign.HasExited) { $foreign.Kill(); $null=$foreign.WaitForExit(5000) } } finally { $foreign.Dispose() }
+            if ($null -ne $script:fixtureTimeoutHandle) { $script:fixtureTimeoutHandle.Dispose() }
+            Remove-Variable fixtureTimeoutHandle -Scope Script
+        }
         $lockPath=Join-Path $temp 'lease.lock'
         $held=[IO.File]::Open($lockPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
         try {

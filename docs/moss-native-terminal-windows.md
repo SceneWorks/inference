@@ -50,6 +50,19 @@ creation-time ordering. Retained handles are rechecked before GPU allowlisting;
 cleanup terminates only those exact held process objects, never a reopened PID. A new campaign directory is required; failed or
 old evidence is never overwritten or automatically retried.
 
+Root and child ownership retain two immutable identities: the canonical CIM
+PID/name/creation timestamp and the exact handle creation timestamp. CIM identity
+capture is bracketed by liveness checks on the held handle; child capture also
+requires the original snapshot identity and a still-live authenticated parent.
+Each identity is subsequently compared only with its own provider, without a
+timestamp tolerance. Launch-path names (including extensionless commands and
+proxies) are not process identities. Per-command `.ownership.json` evidence
+records the launch path and both identities; snapshot mismatches retain expected
+and observed CIM identity in the error. CPU self-tests exercise a live
+extensionless-command root and child/grandchild chain, the installed Cargo launcher
+with a temporary CPU subcommand, exact timestamp/name/PID mutations, capture
+races, timeout/failure cleanup, and foreign survivor exclusion.
+
 Snapshots above are historical candidates. The CPU-only Rust `native_inventory`
 example rehashes all 41 shared frozen entries before admission, including four
 published full-FP32 shards. It fails rather than acquiring missing files. The
@@ -115,7 +128,7 @@ The always-upload artifact `moss-native-cuda-<run>-<attempt>` contains source/pi
 compiler/binary/asset identity, stdout/stderr, lease/before-after device identity,
 status/error/exit evidence, PNGs/receipts and a SHA manifest. The same evidence is
 copied to the persistent new campaign. Weights, build targets and credentials are
-never uploaded. Windows CI invokes controller `-SelfTest` with fake CPU children;
+never uploaded. Windows CI invokes controller `-SelfTest` with harmless CPU children;
 ordinary CI never runs the ignored native model test.
 
 
