@@ -31,6 +31,13 @@ files never inflate OFF residency; full-FP32 substitutes the ordinary DiT and ex
 LoRA/time replacement storage. Workspace separately includes one largest-shard owned
 source buffer, so this admission estimate can exceed steady-state residency.
 
+FP32 transformer projections, adapter residuals and dataspace mixing use float-accumulating
+batched GEMV, so M5's process-wide TF32 setting cannot narrow them. FP32 attention keeps
+all keys and runs at most eight query rows per precise vector-kernel call, with cancellation
+between calls. This prioritizes the published FP32 contract over NAX throughput; BF16
+backbone projections and attention retain their normal kernels. No global precision setting
+is changed.
+
 Each sample's text mask is compacted before text/joint attention. Text
 encoding runs one unpadded fresh-state prompt at a time, with materialized block
 boundaries for cooperative cancellation. The admitted default MLX device is retained.

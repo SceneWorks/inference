@@ -3,6 +3,7 @@ pub mod loader;
 pub mod memory_strategy;
 pub mod model;
 mod pipeline;
+mod precision;
 mod text_encoder;
 mod transformer;
 pub use model::{descriptor_base, descriptor_sft, load_base, load_sft, MossImage};
