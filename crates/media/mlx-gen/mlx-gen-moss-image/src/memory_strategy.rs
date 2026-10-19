@@ -12,7 +12,15 @@ pub fn selected_asset_facts(
     mode: moss_image::MossImageAcceleration,
 ) -> Result<MemoryAssetFacts> {
     let sources = Sources::selected(variant, spec, mode).map_err(Error::from)?;
-    selected_facts(&sources, mode)
+    let mut facts = selected_facts(&sources, mode)?;
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(
+            crate::adapters::estimated_bytes(&spec.adapters, &sources.config)
+                .map_err(Error::from)?,
+        )
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    Ok(facts)
 }
 
 pub(crate) fn facts(s: &Sources) -> Result<MemoryAssetFacts> {
@@ -138,7 +146,14 @@ pub(crate) fn contract_with_facts(
 }
 pub(crate) fn contract(v: MossImageVariant, spec: &LoadSpec) -> Result<MemoryProviderContract> {
     let s = Sources::prepare(v, spec).map_err(Error::from)?;
-    Ok(contract_with_facts(v, facts(&s)?))
+    let mut facts = facts(&s)?;
+    facts.overlay_bytes = facts
+        .overlay_bytes
+        .checked_add(
+            crate::adapters::estimated_bytes(&spec.adapters, &s.config).map_err(Error::from)?,
+        )
+        .ok_or_else(|| Error::Unsupported("MOSS adapter residency overflow".into()))?;
+    Ok(contract_with_facts(v, facts))
 }
 pub(crate) fn fixture(v: MossImageVariant, _: &LoadSpec) -> Result<MemoryProviderContract> {
     // The frozen Base/SFT geometry is known without a snapshot; only byte facts are absent.
