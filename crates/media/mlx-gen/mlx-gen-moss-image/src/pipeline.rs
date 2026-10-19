@@ -1,4 +1,5 @@
 //! FP32 host noise and source-faithful ordinary/DMD sampling over the native graph.
+use crate::precision::linear_fp32;
 use crate::transformer::Transformer;
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::moss_image::{
@@ -80,8 +81,7 @@ impl Sampling<'_> {
                 let flat = clean
                     .transpose_axes(&[0, 2, 3, 1])?
                     .reshape(&[-1, shape[1]])?;
-                let mixed = flat
-                    .matmul(q.t())?
+                let mixed = linear_fp32(&flat, q)?
                     .reshape(&[shape[0], shape[2], shape[3], shape[1]])?
                     .transpose_axes(&[0, 3, 1, 2])?;
                 let input = add(noise, mixed)?;

@@ -1,4 +1,5 @@
 //! Frozen MOSS graph. No FLUX DiT/scheduler or ordinary cast-down adapter abstraction is used.
+use crate::precision::{attention_fp32, linear_fp32};
 use mlx_gen::attention::slice_axis;
 use mlx_gen::gen_core::moss_image::{moss_time_features, MossImageConfig};
 use mlx_gen::weights::Weights;
@@ -104,17 +105,20 @@ impl Projection {
     }
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let cast = x.as_dtype(self.weight.dtype())?;
-        let base = if let Some(b) = &self.bias {
+        let base = if self.weight.dtype() == Dtype::Float32 {
+            let projected = linear_fp32(&cast, &self.weight)?;
+            match &self.bias {
+                Some(bias) => add(projected, bias)?,
+                None => projected,
+            }
+        } else if let Some(b) = &self.bias {
             mlx_gen::nn::linear(&cast, &self.weight, b)?
         } else {
             cast.matmul(self.weight.t())?
         };
         if let Some((down, up, scale)) = &self.adapter {
             // The original input's FP32 values feed the residual; only the backbone is narrowed.
-            let residual = x
-                .as_dtype(Dtype::Float32)?
-                .matmul(down.t())?
-                .matmul(up.t())?;
+            let residual = linear_fp32(&linear_fp32(&x.as_dtype(Dtype::Float32)?, down)?, up)?;
             Ok(add(
                 base.as_dtype(Dtype::Float32)?,
                 self::scale(&residual, *scale)?,
@@ -211,7 +215,14 @@ fn rotate(x: &Array, rope: &Array) -> Result<Array> {
     let rotated = concatenate_axis(&[&b, &a], -1)?;
     Ok(add(multiply(x, cos)?, multiply(rotated, sin)?)?)
 }
-fn attention(q: &Array, k: &Array, v: &Array, rope: &Array, g: &Geometry) -> Result<Array> {
+fn attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    rope: &Array,
+    g: &Geometry,
+    cancel: &CancelFlag,
+) -> Result<Array> {
     let shape = [q.shape()[0], q.shape()[1], g.heads, g.dim / g.heads];
     let q = rotate(&q.reshape(&shape)?, rope)?
         .as_dtype(v.dtype())?
@@ -220,14 +231,12 @@ fn attention(q: &Array, k: &Array, v: &Array, rope: &Array, g: &Geometry) -> Res
         .as_dtype(v.dtype())?
         .transpose_axes(&[0, 2, 1, 3])?;
     let v = v.reshape(&shape)?.transpose_axes(&[0, 2, 1, 3])?;
-    let out = mlx_rs::fast::scaled_dot_product_attention(
-        &q,
-        &k,
-        &v,
-        1.0 / (g.dim as f32 / g.heads as f32).sqrt(),
-        None,
-        None,
-    )?;
+    let scale = 1.0 / (g.dim as f32 / g.heads as f32).sqrt();
+    let out = if v.dtype() == Dtype::Float32 {
+        attention_fp32(&q, &k, &v, scale, cancel)?
+    } else {
+        mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None)?
+    };
     Ok(out
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[shape[0], shape[1], g.dim])?)
@@ -257,12 +266,16 @@ impl TextBlock {
             down: Projection::load(w, &format!("{p}.ffn_down"), g.ffn, g.dim, true)?,
         })
     }
-    fn forward(&self, x: &Array, rope: &Array, g: &Geometry) -> Result<Array> {
+    fn forward(&self, x: &Array, rope: &Array, g: &Geometry, cancel: &CancelFlag) -> Result<Array> {
         let qkv = self.qkv.forward(&self.n1.forward(x)?)?;
         let q = qk_norm(&slice_axis(&qkv, 2, 0, g.dim)?, &self.qn, g)?;
         let k = qk_norm(&slice_axis(&qkv, 2, g.dim, g.dim)?, &self.kn, g)?;
         let v = slice_axis(&qkv, 2, 2 * g.dim, g.dim)?;
-        let x = add(x, self.proj.forward(&attention(&q, &k, &v, rope, g)?)?)?;
+        let x = add(
+            x,
+            self.proj
+                .forward(&attention(&q, &k, &v, rope, g, cancel)?)?,
+        )?;
         let y = self.n2.forward(&x)?;
         Ok(add(
             &x,
@@ -306,7 +319,14 @@ impl Block {
             projections,
         })
     }
-    fn forward(&self, x: &Array, rope: &Array, modulation: &Array, g: &Geometry) -> Result<Array> {
+    fn forward(
+        &self,
+        x: &Array,
+        rope: &Array,
+        modulation: &Array,
+        g: &Geometry,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
         let m =
             |i| -> Result<Array> { Ok(slice_axis(modulation, 1, i, 1)?.reshape(&[1, 1, g.dim])?) };
         let y = add(
@@ -320,7 +340,7 @@ impl Block {
         let q = qk_norm(&self.projections[0].forward(&y)?, &self.qn, g)?;
         let k = qk_norm(&self.projections[1].forward(&y)?, &self.kn, g)?;
         let v = self.projections[2].forward(&y)?;
-        let a = self.projections[3].forward(&attention(&q, &k, &v, rope, g)?)?;
+        let a = self.projections[3].forward(&attention(&q, &k, &v, rope, g, cancel)?)?;
         let x = add(x, multiply(a, m(2)?)?)?;
         let y = add(
             multiply(
@@ -541,7 +561,7 @@ impl Transformer {
             let mut text = self.text.forward(context)?;
             for block in &self.text_blocks {
                 check(cancel)?;
-                text = block.forward(&text, &text_rope, g)?;
+                text = block.forward(&text, &text_rope, g, cancel)?;
                 eval([&text])?;
                 check(cancel)?;
             }
@@ -549,7 +569,7 @@ impl Transformer {
             for (i, block) in self.blocks.iter().enumerate() {
                 check(cancel)?;
                 if !skip.contains(&(i as u32)) {
-                    x = block.forward(&x, &rope, &modulation, g)?;
+                    x = block.forward(&x, &rope, &modulation, g, cancel)?;
                     eval([&x])?;
                 }
             }
@@ -835,12 +855,12 @@ mod author_fixture_tests {
             .iter()
             .enumerate()
         {
-            let mixed = clean
+            let flat = clean
                 .transpose_axes(&[0, 2, 3, 1])
                 .unwrap()
                 .reshape(&[-1, g.channels])
-                .unwrap()
-                .matmul(q.t())
+                .unwrap();
+            let mixed = linear_fp32(&flat, &q)
                 .unwrap()
                 .reshape(&[shape[0], shape[2], shape[3], g.channels])
                 .unwrap()
