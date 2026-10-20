@@ -752,16 +752,17 @@ class CandleGenCiTargetCoverageTests(unittest.TestCase):
 
     def test_the_coverage_check_discriminates_mutations(self) -> None:
         """Each mutation is applied ALONE — a batch would let one survivor hide behind another."""
-        step = "cargo test --locked --lib --tests -j 1\n          -p 'candle-gen*'"
+        selector = "select --scope \"$TEST_SCOPE\" -p 'candle-gen*')"
+        command = 'cargo test --locked --lib --tests -j 1 "${packages[@]}"'
         mutations = {
             "--tests dropped": self.workflow.replace(
-                step, "cargo test --locked --lib -j 1\n          -p 'candle-gen*'"
+                command, 'cargo test --locked --lib -j 1 "${packages[@]}"'
             ),
             "glob narrowed to one crate": self.workflow.replace(
-                step, "cargo test --locked --lib --tests -j 1\n          -p candle-gen-minimax-h3"
+                selector, 'select --scope "$TEST_SCOPE" -p candle-gen-minimax-h3)'
             ),
             "glob narrowed away from the epic crate": self.workflow.replace(
-                step, "cargo test --locked --lib --tests -j 1\n          -p 'candle-gen-s*'"
+                selector, "select --scope \"$TEST_SCOPE\" -p 'candle-gen-s*')"
             ),
         }
         for label, mutant in mutations.items():
