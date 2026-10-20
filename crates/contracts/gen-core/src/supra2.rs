@@ -1057,6 +1057,208 @@ pub fn quantize_rgb(decoded_hwc: &[f32]) -> Vec<u8> {
     decoded_hwc.iter().map(|&x| quantize_pixel(x)).collect()
 }
 
+// ------------------------------------------------------------------------------------------------
+// Load-time sources and structural memory facts (shared by the MLX and Candle providers)
+// ------------------------------------------------------------------------------------------------
+
+/// Flan-T5-Base encoder geometry the providers build (`config.json` must declare exactly this).
+pub const T5_LAYERS: usize = 12;
+pub const T5_HEADS: usize = 12;
+pub const T5_D_KV: usize = 64;
+/// `stabilityai/sd-vae-ft-mse` AutoencoderKL geometry (`config.json` must declare exactly this).
+pub const VAE_BLOCK_OUT_CHANNELS: [usize; 4] = [128, 256, 512, 512];
+pub const VAE_LAYERS_PER_BLOCK: usize = 2;
+pub const VAE_NORM_GROUPS: usize = 32;
+/// The VAE's spatial downsampling factor (`2^(len(block_out_channels) - 1)`).
+pub const VAE_SPATIAL_SCALE: usize = 8;
+
+/// The resolved component directories of one load: the converted bundle plus the pinned
+/// `text_encoder` and `vae` snapshot directories from `LoadSpec::components`.
+#[derive(Clone, Debug)]
+pub struct Supra2Sources {
+    pub bundle: Supra2Bundle,
+    pub text_encoder: PathBuf,
+    pub vae: PathBuf,
+}
+
+fn component_dir(spec: &crate::LoadSpec, id: &str, label: &str) -> Result<PathBuf> {
+    match crate::control::require_component(spec, id, PROVIDER_ID, label)? {
+        crate::WeightsSource::Dir(dir) => Ok(dir.clone()),
+        crate::WeightsSource::File(file) => Err(Error::Unsupported(format!(
+            "{PROVIDER_ID}: component `{id}` must be the pinned snapshot directory, got file {}",
+            file.display()
+        ))),
+    }
+}
+
+impl Supra2Sources {
+    /// Resolve and validate every input: the converted bundle (manifest + digests + the
+    /// [`read_pinned_bundle`] pin contract), and the pinned component snapshots (exact files and
+    /// sizes, plus their `config.json` geometry).
+    pub fn resolve(spec: &crate::LoadSpec) -> Result<Self> {
+        Self::resolve_checked(spec, BundleCheck::Digests)
+    }
+
+    /// [`Self::resolve`] with an explicit bundle check depth: footprint / admission queries use
+    /// [`BundleCheck::SizesOnly`] so they never re-hash the 417 MB denoiser; `load` keeps digests.
+    pub fn resolve_checked(spec: &crate::LoadSpec, check: BundleCheck) -> Result<Self> {
+        crate::control::reject_unknown_components(
+            spec,
+            &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
+            PROVIDER_ID,
+        )?;
+        let crate::WeightsSource::Dir(dir) = &spec.weights else {
+            return Err(Error::Unsupported(format!(
+                "{PROVIDER_ID}: weights must be the converted Supra2 bundle directory"
+            )));
+        };
+        let bundle = read_pinned_bundle(dir, check)?;
+        let text_encoder = component_dir(spec, TEXT_ENCODER_COMPONENT, "Flan-T5-Base")?;
+        let vae = component_dir(spec, VAE_COMPONENT, "SD VAE ft-MSE")?;
+        FLAN_T5_BASE.check_sizes(&text_encoder)?;
+        SD_VAE.check_sizes(&vae)?;
+        check_t5_config(&text_encoder, &bundle.manifest.config)?;
+        check_vae_config(&vae)?;
+        Ok(Self {
+            bundle,
+            text_encoder,
+            vae,
+        })
+    }
+
+    /// The Flan-T5 weights file.
+    pub fn text_encoder_weights(&self) -> PathBuf {
+        self.text_encoder.join("model.safetensors")
+    }
+
+    /// The SD VAE weights file.
+    pub fn vae_weights(&self) -> PathBuf {
+        self.vae.join("diffusion_pytorch_model.safetensors")
+    }
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|e| Error::Unsupported(format!("supra2: invalid {}: {e}", path.display())))
+}
+
+/// The Flan-T5 `config.json` must describe the 12-layer, 12-head gated-GELU T5 v1.1 encoder whose
+/// width is the bundle's `ctx_dim`.
+pub fn check_t5_config(dir: &Path, cfg: &Supra2Config) -> Result<()> {
+    let c = read_json(&dir.join("config.json"))?;
+    let expect = [
+        ("d_model", cfg.ctx_dim as u64),
+        ("num_layers", T5_LAYERS as u64),
+        ("num_heads", T5_HEADS as u64),
+        ("d_kv", T5_D_KV as u64),
+        ("relative_attention_num_buckets", 32),
+        ("relative_attention_max_distance", 128),
+    ];
+    for (key, want) in expect {
+        if c[key].as_u64() != Some(want) {
+            return Err(Error::Unsupported(format!(
+                "supra2: text encoder config `{key}` is {}, expected {want} (google/flan-t5-base)",
+                c[key]
+            )));
+        }
+    }
+    if c["feed_forward_proj"].as_str() != Some("gated-gelu") {
+        return Err(Error::Unsupported(
+            "supra2: text encoder must be a gated-GELU T5 v1.1 (google/flan-t5-base)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The VAE `config.json` must describe the SD AutoencoderKL ft-MSE geometry (and, when it states
+/// one, the 0.18215 scaling factor).
+pub fn check_vae_config(dir: &Path) -> Result<()> {
+    let c = read_json(&dir.join("config.json"))?;
+    let blocks: Option<Vec<u64>> = c["block_out_channels"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
+    let want_blocks: Vec<u64> = VAE_BLOCK_OUT_CHANNELS.iter().map(|&v| v as u64).collect();
+    let ok = c["latent_channels"].as_u64()
+        == Some(Supra2Config::published().latent_channels as u64)
+        && c["layers_per_block"].as_u64() == Some(VAE_LAYERS_PER_BLOCK as u64)
+        && c["norm_num_groups"].as_u64() == Some(VAE_NORM_GROUPS as u64)
+        && blocks.as_deref() == Some(want_blocks.as_slice())
+        && c["scaling_factor"]
+            .as_f64()
+            .is_none_or(|s| (s as f32 - VAE_SCALE).abs() < 1e-7);
+    if !ok {
+        return Err(Error::Unsupported(
+            "supra2: VAE config does not match stabilityai/sd-vae-ft-mse".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn header_bytes(path: &Path, keep: impl Fn(&str) -> bool) -> Result<u64> {
+    crate::weightsmeta::safetensors_path_tensor_headers(path)?
+        .iter()
+        .filter(|h| keep(&h.name))
+        .try_fold(0u64, |acc, h| {
+            acc.checked_add(h.data_bytes)
+                .ok_or_else(|| Error::Unsupported("supra2: byte facts overflow".into()))
+        })
+}
+
+/// Resident byte facts from the safetensors headers of exactly the tensors a provider materializes:
+/// the f32 denoiser (+ stored conditioning), the Flan-T5 **encoder** tensors (the decoder half of
+/// the checkpoint is never read) and the full f32 AutoencoderKL file.
+pub fn memory_asset_facts(s: &Supra2Sources) -> Result<crate::MemoryAssetFacts> {
+    let transformer_bytes = header_bytes(&s.bundle.denoiser_path(), |_| true)?;
+    let stored = match s.bundle.conditioning_path() {
+        Some(path) => header_bytes(&path, |_| true)?,
+        None => 0,
+    };
+    let conditioning_bytes = header_bytes(&s.text_encoder_weights(), |n| {
+        n.starts_with("encoder.") || n.starts_with("shared.")
+    })?
+    .saturating_add(stored);
+    let decoder_bytes = header_bytes(&s.vae_weights(), |_| true)?;
+    let base_bytes = transformer_bytes
+        .checked_add(conditioning_bytes)
+        .and_then(|n| n.checked_add(decoder_bytes))
+        .ok_or_else(|| Error::Unsupported("supra2: base bytes overflow".into()))?;
+    Ok(crate::MemoryAssetFacts {
+        base_bytes,
+        transformer_bytes,
+        conditioning_bytes,
+        decoder_bytes,
+        ..Default::default()
+    })
+}
+
+/// Architecture facts of the DiT + SD VAE (f32 activations).
+pub fn memory_architecture_facts(cfg: &Supra2Config) -> crate::MemoryArchitectureFacts {
+    crate::MemoryArchitectureFacts {
+        attention_heads: Some(cfg.num_heads as u32),
+        head_dim: Some(cfg.head_dim() as u32),
+        transformer_blocks: Some(cfg.depth as u32),
+        patch_size: Some(cfg.patch as u32),
+        latent_channels: Some(cfg.latent_channels as u32),
+        vae_spatial_scale: Some(VAE_SPATIAL_SCALE as u32),
+        vae_temporal_scale: None,
+        activation_dtype_width: Some(4),
+    }
+}
+
+/// Text-to-image only: reference images, PiD and phased runs are refused before the shared check.
+pub fn memory_safety(
+    spec: &crate::LoadSpec,
+    contract: &crate::MemoryProviderContract,
+    context: &crate::MemoryRunContext,
+) -> crate::MemorySafetyDecision {
+    if context.geometry.reference_count != 0 || context.use_pid || context.has_phases {
+        return crate::MemorySafetyDecision::Reject {
+            reason: "Supra2-IMG supports text-to-image only".into(),
+        };
+    }
+    crate::default_registered_memory_strategy_safety_check(spec, contract, context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1366,22 @@ mod tests {
                 Supra2Resolved::resolve(&bad),
                 Err(Error::Unsupported(_))
             ));
+        }
+    }
+
+    /// A missing component `config.json` surfaces as the IO error (as it did in the MLX provider
+    /// before the checks moved here), not as a typed refusal.
+    #[test]
+    fn missing_component_config_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for result in [
+            check_t5_config(dir.path(), &Supra2Config::published()),
+            check_vae_config(dir.path()),
+        ] {
+            match result {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+                other => panic!("expected an IO error, got {other:?}"),
+            }
         }
     }
 

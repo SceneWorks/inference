@@ -39,6 +39,7 @@ candle-gen-sd3 = { path = "../candle-gen-sd3" }
 candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 candle-gen-seedvr2 = { path = "../candle-gen-seedvr2" }
 candle-gen-sensenova = { path = "../candle-gen-sensenova" }
+candle-gen-supra2 = { path = "../candle-gen-supra2" }
 candle-gen-svd = { path = "../candle-gen-svd" }
 candle-gen-wan = { path = "../candle-gen-wan" }
 candle-gen-z-image = { path = "../candle-gen-z-image" }
@@ -83,6 +84,7 @@ metal = [
     "candle-gen-sdxl/metal",
     "candle-gen-seedvr2/metal",
     "candle-gen-sensenova/metal",
+    "candle-gen-supra2/metal",
     "candle-gen-svd/metal",
     "candle-gen-wan/metal",
     "candle-gen-z-image/metal",
@@ -121,6 +123,7 @@ cuda = [
     "candle-gen-sdxl/cuda",
     "candle-gen-seedvr2/cuda",
     "candle-gen-sensenova/cuda",
+    "candle-gen-supra2/cuda",
     "candle-gen-svd/cuda",
     "candle-gen-wan/cuda",
     "candle-gen-z-image/cuda",

@@ -2,18 +2,16 @@
 //! upstream's `generate()` — tokenize/truncate/mask, encode, stored-or-fallback unconditional
 //! context, CFG-or-plain Euler flow integration, VAE decode, `save_image` quantization.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::sampling::{self, ContextBatch};
 use mlx_gen::gen_core::supra2::{
-    self as s2, image_seed, initial_noise, quantize_rgb, read_pinned_bundle, BundleCheck,
-    Supra2Bundle, Supra2Config, Supra2Resolved, Supra2Tokenizer, FLAN_T5_BASE, PROVIDER_ID, SD_VAE,
-    TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
+    self as s2, image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
+    Supra2Resolved, Supra2Tokenizer, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen::gen_core::{
-    self, control::reject_unknown_components, control::require_component, LoadShape,
-    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality, PerComponentBytes,
-    SizeFloor, WeightsSource,
+    self, LoadShape, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality,
+    PerComponentBytes, SizeFloor,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -57,116 +55,14 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The resolved component directories of one load.
-#[derive(Clone, Debug)]
-pub struct Supra2Sources {
-    pub bundle: Supra2Bundle,
-    pub text_encoder: PathBuf,
-    pub vae: PathBuf,
-}
-
-fn component_dir(spec: &LoadSpec, id: &str, label: &str) -> Result<PathBuf> {
-    match require_component(spec, id, PROVIDER_ID, label)? {
-        WeightsSource::Dir(dir) => Ok(dir.clone()),
-        WeightsSource::File(file) => Err(Error::Unsupported(format!(
-            "{PROVIDER_ID}: component `{id}` must be the pinned snapshot directory, got file {}",
-            file.display()
-        ))),
-    }
-}
-
-impl Supra2Sources {
-    /// Resolve and validate every input: the converted bundle (manifest + digests + the
-    /// [`read_pinned_bundle`] pin contract), and the pinned component snapshots (exact files and
-    /// sizes, plus their `config.json` geometry).
-    pub fn resolve(spec: &LoadSpec) -> Result<Self> {
-        Self::resolve_checked(spec, BundleCheck::Digests)
-    }
-
-    /// [`Self::resolve`] with an explicit bundle check depth: footprint / admission queries use
-    /// [`BundleCheck::SizesOnly`] so they never re-hash the 417 MB denoiser; `load` keeps digests.
-    pub fn resolve_checked(spec: &LoadSpec, check: BundleCheck) -> Result<Self> {
-        reject_unknown_components(spec, &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT], PROVIDER_ID)?;
-        let WeightsSource::Dir(dir) = &spec.weights else {
-            return Err(Error::Unsupported(format!(
-                "{PROVIDER_ID}: weights must be the converted Supra2 bundle directory"
-            )));
-        };
-        let bundle = read_pinned_bundle(dir, check)?;
-        let text_encoder = component_dir(spec, TEXT_ENCODER_COMPONENT, "Flan-T5-Base")?;
-        let vae = component_dir(spec, VAE_COMPONENT, "SD VAE ft-MSE")?;
-        FLAN_T5_BASE.check_sizes(&text_encoder)?;
-        SD_VAE.check_sizes(&vae)?;
-        check_t5_config(&text_encoder, &bundle.manifest.config)?;
-        check_vae_config(&vae)?;
-        Ok(Self {
-            bundle,
-            text_encoder,
-            vae,
-        })
-    }
-}
-
-fn read_json(path: &Path) -> Result<serde_json::Value> {
-    serde_json::from_slice(&std::fs::read(path)?)
-        .map_err(|e| Error::Unsupported(format!("supra2: invalid {}: {e}", path.display())))
-}
-
-fn check_t5_config(dir: &Path, cfg: &Supra2Config) -> Result<()> {
-    let c = read_json(&dir.join("config.json"))?;
-    let expect = [
-        ("d_model", cfg.ctx_dim as u64),
-        ("num_layers", 12),
-        ("num_heads", 12),
-        ("d_kv", 64),
-        ("relative_attention_num_buckets", 32),
-        ("relative_attention_max_distance", 128),
-    ];
-    for (key, want) in expect {
-        if c[key].as_u64() != Some(want) {
-            return Err(Error::Unsupported(format!(
-                "supra2: text encoder config `{key}` is {}, expected {want} (google/flan-t5-base)",
-                c[key]
-            )));
-        }
-    }
-    if c["feed_forward_proj"].as_str() != Some("gated-gelu") {
-        return Err(Error::Unsupported(
-            "supra2: text encoder must be a gated-GELU T5 v1.1 (google/flan-t5-base)".into(),
-        ));
-    }
-    Ok(())
-}
+/// The resolved component directories of one load (backend-neutral; shared with the Candle port).
+pub use mlx_gen::gen_core::supra2::Supra2Sources;
 
 fn vae_config() -> VaeConfig {
     VaeConfig {
         scaling_factor: s2::VAE_SCALE,
         ..VaeConfig::sdxl_base()
     }
-}
-
-fn check_vae_config(dir: &Path) -> Result<()> {
-    let c = read_json(&dir.join("config.json"))?;
-    let want = vae_config();
-    let blocks: Option<Vec<i32>> = c["block_out_channels"].as_array().map(|a| {
-        a.iter()
-            .filter_map(|v| v.as_i64())
-            .map(|v| v as i32)
-            .collect()
-    });
-    let ok = c["latent_channels"].as_i64() == Some(want.latent_channels_in as i64)
-        && c["layers_per_block"].as_i64() == Some(want.layers_per_block as i64)
-        && c["norm_num_groups"].as_i64() == Some(want.norm_num_groups as i64)
-        && blocks.as_deref() == Some(want.block_out_channels.as_slice())
-        && c["scaling_factor"]
-            .as_f64()
-            .is_none_or(|s| (s as f32 - s2::VAE_SCALE).abs() < 1e-7);
-    if !ok {
-        return Err(Error::Unsupported(
-            "supra2: VAE config does not match stabilityai/sd-vae-ft-mse".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// sd-vae-ft-mse predates diffusers' attention rename: map its legacy mid-block attention keys
@@ -220,8 +116,8 @@ pub fn load_text_encoder(dir: &Path) -> Result<T5TextEncoder> {
         // Affine group size is only read for packed checkpoints; Flan-T5 loads dense f32.
         64,
         T5Geometry {
-            blocks: 12,
-            heads: 12,
+            blocks: s2::T5_LAYERS,
+            heads: s2::T5_HEADS as i32,
         },
     )?;
     w.materialize_accessed()?;

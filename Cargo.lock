@@ -598,6 +598,7 @@ dependencies = [
  "candle-gen-sdxl",
  "candle-gen-seedvr2",
  "candle-gen-sensenova",
+ "candle-gen-supra2",
  "candle-gen-svd",
  "candle-gen-wan",
  "candle-gen-z-image",
@@ -1083,6 +1084,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-sdxl",
+ "candle-transformers",
+ "image",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
