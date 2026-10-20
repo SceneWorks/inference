@@ -1028,6 +1028,56 @@ def manifest_environment_wiring_errors(models: list[dict], workflows: str) -> li
 
 
 class CiWorkflowPolicyTests(unittest.TestCase):
+    def test_native_terminal_initializes_evidence_without_job_runner_context(self):
+        # Job env is evaluated before a runner exists. Step env may use runner context;
+        # parse the context boundary so a different path/name or wrapped expression fails too.
+        def runner_job_env(workflow):
+            return [
+                (job_name, name)
+                for job_name, job in workflow.get("jobs", {}).items()
+                for name, value in job.get("env", {}).items()
+                if any(
+                    re.search(r"\brunner\s*(?:\.|\[)", expression)
+                    for expression in re.findall(r"\$\{\{(.*?)\}\}", str(value), re.S)
+                )
+            ]
+
+        valid = {"jobs": {"native": {
+            "env": {"ID": "${{ github.run_id }}"},
+            "steps": [{"env": {"PATH": "${{ runner.temp }}"}}],
+        }}}
+        self.assertEqual(runner_job_env(valid), [])
+        for invalid in (
+            "${{ runner.temp }}/evidence",
+            "${{ runner['temp'] }}",
+            "${{ format('{0}', runner.os) }}",
+        ):
+            mutated = copy.deepcopy(valid)
+            mutated["jobs"]["native"]["env"]["ANY_NAME"] = invalid
+            self.assertEqual(runner_job_env(mutated), [("native", "ANY_NAME")])
+
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(runner_job_env(native), [])
+        job = native["jobs"]["native"]
+        steps = job["steps"]
+        first = steps[0]
+        self.assertEqual(first["shell"], "powershell")
+        self.assertNotIn("uses", first)
+        self.assertIn("$env:RUNNER_TEMP", first["run"])
+        self.assertIn("$env:GITHUB_ENV", first["run"])
+        self.assertIn("transport-initialization.json", first["run"])
+        self.assertNotIn("$env:GITHUB_WORKSPACE", first["run"])
+        upload = next(
+            step for step in steps
+            if step.get("uses", "").startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn(
+            "${{ env.MOSS_TRANSPORT_ARTIFACT_ROOT }}/*.json", upload["with"]["path"]
+        )
+
     def require_posix_shell(self) -> str:
         shell = posix_shell()
         if shell is None:
@@ -1037,6 +1087,100 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 "parsed a trivial script. Install Git for Windows, or a bash, to run this gate."
             )
         return shell
+
+    def test_native_terminal_uses_trusted_workflow_controller_with_pinned_engine(self):
+        native = yaml.safe_load(
+            WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8")
+        )
+        steps = native["jobs"]["native"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        guard = next(i for i, run in enumerate(runs) if "Pinned inference is not a main ancestor" in run)
+        controller = next(i for i, run in enumerate(runs) if "controller-source.json" in run)
+        selftest = runs.index("& $env:MOSS_NATIVE_CONTROLLER -SelfTest")
+        execution = runs.index("& $env:MOSS_NATIVE_CONTROLLER")
+        self.assertLess(guard, controller)
+        self.assertLess(controller, selftest)
+        self.assertLess(selftest, execution)
+        materialize = runs[controller]
+        for invariant in (
+            "$env:GITHUB_REF -cne 'refs/heads/main'",
+            "git merge-base --is-ancestor $env:GITHUB_SHA origin/main",
+            "$object=$env:GITHUB_SHA+':scripts/ci/moss-native-terminal.ps1'",
+            "$start.Arguments='cat-file blob '+$blob",
+            "[IO.FileMode]::CreateNew",
+            "$process.StandardOutput.BaseStream.CopyToAsync($file)",
+            "git hash-object --no-filters $path",
+            "$actual -cne $blob",
+            "controller_sha256=$sha256",
+            "MOSS_NATIVE_CONTROLLER=$path",
+        ):
+            self.assertIn(invariant, materialize)
+        self.assertNotIn("inputs.", materialize)
+        self.assertNotIn("control_json", materialize)
+        self.assertIn("$env:MOSS_TRANSPORT_ARTIFACT_ROOT", materialize)
+        checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+        self.assertEqual(checkouts[0]["with"]["ref"], "${{ fromJSON(inputs.control_json).inference_revision }}")
+        controller_source = (WORKFLOW.parents[2] / "scripts/ci/moss-native-terminal.ps1").read_text(encoding="utf-8")
+        self.assertIn("$source = (Get-Location).Path", controller_source)
+        self.assertIn("Join-Path $source 'scripts/ci/moss-native-terminal-protocol.json'", controller_source)
+        windows_selftest = [
+            step for step in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["windows-cuda-check"]["steps"]
+            if "moss-native-terminal.ps1 -SelfTest" in step.get("run", "")
+        ]
+        self.assertEqual(len(windows_selftest), 1)
+        self.assertEqual(windows_selftest[0]["shell"], "powershell")
+
+    def assert_moss_exit_drain_guards(self, source: str) -> None:
+        # Source policy complements Windows behavioral fixtures; it never executes PowerShell.
+        owned = source.split("function Owned-Gpu-Identity(", 1)[1].split("function Capture-Owned(", 1)[0]
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction Stop',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$entry.process.ExitTime.ToUniversalTime()',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+        ):
+            self.assertIn(guard, owned)
+        self.assertNotIn('catch', owned)
+        device = source.split("function Check-Device(", 1)[1].split("function Evidence-Files(", 1)[0]
+        self.assertIn('Pid-Subset $pids @($allowed+$baseline+@($owned.Keys))', device)
+        self.assertIn('Owned-Gpu-Identity ([int]$_) $owned', device)
+        self.assertIn('$g[0].owned_pids.Count -eq 0 -and', device)
+        self.assertIn('$script:deviceIdleConfirmed=$false', device)
+        self.assertIn('$script:deviceIdleConfirmed=$true; return $g', device)
+        run = source.split('function Owned-Run(', 1)[1].split('function Check-Device(', 1)[0]
+        self.assertIn('& $drain $owned', run)
+        self.assertLess(run.index('Stop-Owned $owned'), run.index('& $drain $owned'))
+        self.assertLess(run.index('& $drain $owned'), run.index('$p.Dispose()'))
+        self.assertIn('Test-Device-Exit-Fixture $temp', source)
+        self.assertEqual(source.count('} {param($owned) Wait-DeviceIdle $owned | Out-Null}'), 2)
+        self.assertIn('if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)', source)
+
+    def test_moss_exit_drain_guards_and_omission_mutants(self) -> None:
+        source = (WORKFLOW.parents[2] / 'scripts/ci/moss-native-terminal.ps1').read_text(encoding='utf-8')
+        self.assert_moss_exit_drain_guards(source)
+        for guard in (
+            '$owned.ContainsKey($id)',
+            'Same-Identity $entry.identity (Snapshot-Identity $row)',
+            '$entry.process.Id -eq $id -and $entry.identity.pid -eq $id',
+            "$entry.process.StartTime.ToUniversalTime().ToString('o') -ceq $entry.handle_created_utc",
+            'if ($entry.process.HasExited)',
+            '$age -ge 0 -and $age -le 30',
+            'Require ($null -ne $row)',
+            '$g[0].owned_pids.Count -eq 0 -and',
+            '& $drain $owned',
+            'Test-Device-Exit-Fixture $temp',
+            '} {param($owned) Wait-DeviceIdle $owned | Out-Null}',
+            'if ($script:deviceIdleConfirmed -and (Test-Path -LiteralPath $leasePath)',
+        ):
+            with self.subTest(omitted=guard), self.assertRaises(AssertionError):
+                self.assert_moss_exit_drain_guards(source.replace(guard, ''))
+        with self.assertRaises(AssertionError):
+            self.assert_moss_exit_drain_guards(source.replace('-ErrorAction Stop', '-ErrorAction SilentlyContinue', 1))
 
     # The Candle Metal pins of the vendored candle-metal-kernels fix (its VENDORED.md): the crate
     # each libtest filter must select an integration module of. libtest passes on zero matches,
