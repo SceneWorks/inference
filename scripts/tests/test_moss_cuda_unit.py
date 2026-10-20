@@ -300,7 +300,7 @@ class FixedCommandTests(unittest.TestCase):
         self.assertEqual((unit.DEADLINE_SECONDS, unit.RSS_CAP_BYTES), (300.0, 6 * 1024**3))
 
     def test_the_fixed_test_exists_unignored_in_the_package_source(self):
-        source = (unit.REPO_ROOT / "crates/media/candle-gen/candle-gen-moss-image/src/training_tests.rs").read_text(
+        source = (unit.REPO_ROOT / "crates/media/candle-gen/candle-gen-moss-image/src/tests/training_contract_tests.rs").read_text(
             encoding="utf-8"
         )
         head = source.index("fn cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload")
