@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -378,7 +378,7 @@ impl PreparedFilePins {
 /// subset. Two pins agreeing on all of it are, by the seal's own definition, pins of the same
 /// unmutated object, which is what makes reusing a digest between them sound rather than merely
 /// convenient.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SealIdentity {
     loader_path: PathBuf,
     canonical_target_path: PathBuf,
@@ -435,9 +435,91 @@ fn remember_proven_digest(identity: SealIdentity, sha256: [u8; 32]) {
     digests.insert(identity, sha256);
 }
 
+/// Consumer-chosen directory that carries [`PROVEN_DIGESTS`] across process restarts.
+///
+/// The in-process memo dies with the worker, and a consumer restarts its worker routinely. On a
+/// USB model drive (sc-26610) one MOSS-Image job then spent 6.5 minutes re-hashing 25 GB of
+/// weights that the previous process had already proven, before a 10-second load.
+///
+/// A persisted entry is keyed on a digest of the WHOLE [`SealIdentity`], the same predicate the
+/// in-process memo trusts, so it never authorizes anything the in-memory memo would not: any
+/// change to the path, parent chain, entry, resolution, or target (including `ctime`/inode on
+/// Unix) yields a different key and a full re-read. Unset by default; gen-core never picks a
+/// location on its own.
+static PROVEN_DIGEST_STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Version prefix for the persisted key. Bump it if [`SealIdentity`]'s fields change meaning;
+/// older entries then simply miss.
+const PROVEN_DIGEST_STORE_KEY_VERSION: &str = "artifact-seal-identity-v1";
+
+fn proven_digest_store_entry(store: &Path, identity: &SealIdentity) -> PathBuf {
+    // `Debug` renders every identity field, escaping paths, so equal renderings mean equal
+    // identities. A future std rendering change can only turn hits into misses.
+    let key = Sha256::digest(format!("{PROVEN_DIGEST_STORE_KEY_VERSION}\n{identity:?}"));
+    store.join(hex_lower(&key))
+}
+
+fn stored_proven_digest(store: &Path, identity: &SealIdentity) -> Option<[u8; 32]> {
+    let text = std::fs::read_to_string(proven_digest_store_entry(store, identity)).ok()?;
+    parse_hex_digest(text.trim())
+}
+
+fn store_proven_digest(store: &Path, identity: &SealIdentity, sha256: &[u8; 32]) {
+    let entry = proven_digest_store_entry(store, identity);
+    if std::fs::create_dir_all(store).is_err() {
+        return;
+    }
+    // Write-then-rename so a concurrent reader in another worker never sees a torn entry.
+    let staging = entry.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&staging, hex_lower(sha256)).is_err()
+        || std::fs::rename(&staging, &entry).is_err()
+    {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
+/// Drop this process's in-memory digests for `path`, as a worker restart would.
+#[cfg(test)]
+fn forget_proven_digests_for(path: &Path) {
+    proven_digests()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|identity, _| identity.loader_path != path);
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_hex_digest(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
 impl ArtifactSeal {
+    /// Persist proven seal digests under `dir` for the rest of this process (first call wins).
+    ///
+    /// Store failures are never errors: an unreadable or unwritable store only costs the full read
+    /// that pinning performs without one.
+    pub fn persist_proven_digests_in(dir: impl Into<PathBuf>) {
+        let _ = PROVEN_DIGEST_STORE.set(dir.into());
+    }
+
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let loader_path = std::path::absolute(path.as_ref())?;
+        Self::pin_with_store(
+            path.as_ref(),
+            PROVEN_DIGEST_STORE.get().map(PathBuf::as_path),
+        )
+    }
+
+    fn pin_with_store(path: &Path, store: Option<&Path>) -> crate::Result<Self> {
+        let loader_path = std::path::absolute(path)?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
         let path_component_fingerprints = path_component_fingerprints(&loader_path)?;
         let entry_fingerprint = stat_fingerprint(&loader_path, false)?;
@@ -474,12 +556,19 @@ impl ArtifactSeal {
         if let Some(sha256) = proven_digest(&identity) {
             return Ok(Self { sha256, ..pinned });
         }
+        if let Some(sha256) = store.and_then(|store| stored_proven_digest(store, &identity)) {
+            remember_proven_digest(identity, sha256);
+            return Ok(Self { sha256, ..pinned });
+        }
         #[cfg(test)]
         {
             pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
         let sha256 = pinned.read_unchanged(hash_file_sha256)?;
+        if let Some(store) = store {
+            store_proven_digest(store, &identity, &sha256);
+        }
         remember_proven_digest(identity, sha256);
         Ok(Self { sha256, ..pinned })
     }
@@ -613,10 +702,14 @@ impl ArtifactSeal {
     }
 }
 
+/// Read size for full-content hashing. 64 KiB reads held a USB model drive to ~63 MB/s against
+/// ~216 MB/s for 4 MiB reads of the same disk (sc-26610); the sequential hash is I/O-bound there.
+const HASH_READ_BYTES: usize = 8 * 1024 * 1024;
+
 fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = File::open(path)?;
     let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; HASH_READ_BYTES];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -2402,6 +2495,71 @@ mod tests {
             second.content_sha256(),
             "the re-read must report the digest of the bytes that are there now"
         );
+    }
+
+    /// A restarted worker reuses the digest the previous process proved (sc-26610).
+    ///
+    /// Forgetting this process's in-memory entries stands in for the restart; only the store can
+    /// then supply the digest.
+    #[test]
+    fn a_persisted_digest_survives_a_restart_without_a_re_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin after restart");
+        assert_eq!(
+            test_full_hash_work_count(),
+            before,
+            "an unchanged file proven by an earlier process must not be re-read"
+        );
+        assert_eq!(first.content_sha256(), second.content_sha256());
+    }
+
+    /// The persisted key is the whole seal identity, so a rewritten file misses the store.
+    #[test]
+    fn a_persisted_digest_never_authorizes_a_mutated_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+
+        std::fs::write(&file, b"TRANSFORMER WEIGHTS").expect("mutate fixture");
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin the mutated file");
+        assert!(
+            test_full_hash_work_count() > before,
+            "changed bytes must send the pin back through the full read"
+        );
+        assert_ne!(first.content_sha256(), second.content_sha256());
+    }
+
+    /// A garbage store entry is a miss, never a digest.
+    #[test]
+    fn a_corrupt_persisted_entry_is_ignored() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = dir.path().join("seal-digests");
+        let file = dir.path().join("transformer.safetensors");
+        std::fs::write(&file, b"transformer weights").expect("write fixture");
+        let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
+        for entry in std::fs::read_dir(&store).expect("store exists") {
+            std::fs::write(entry.expect("entry").path(), "not a digest").expect("corrupt");
+        }
+
+        forget_proven_digests_for(first.loader_path());
+        let before = test_full_hash_work_count();
+        let second =
+            ArtifactSeal::pin_with_store(&file, Some(&store)).expect("re-pin with corrupt store");
+        assert!(test_full_hash_work_count() > before);
+        assert_eq!(first.content_sha256(), second.content_sha256());
     }
 
     #[test]
