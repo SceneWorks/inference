@@ -2530,7 +2530,8 @@ mod tests {
         std::fs::write(&file, b"transformer weights").expect("write fixture");
         let first = ArtifactSeal::pin_with_store(&file, Some(&store)).expect("pin regular file");
 
-        std::fs::write(&file, b"TRANSFORMER WEIGHTS").expect("mutate fixture");
+        // A different length, so the identity changes even within one coarse filesystem clock tick.
+        std::fs::write(&file, b"transformer weights, rewritten").expect("mutate fixture");
         forget_proven_digests_for(first.loader_path());
         let before = test_full_hash_work_count();
         let second =
