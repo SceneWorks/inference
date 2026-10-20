@@ -387,6 +387,15 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Exact MOSS bundles, including SFT's optional published distillation package.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft", "moss_image_sft_8_steps_dmd"],
+    },
     // --- pulid -------------------------------------------------------------------------------
     // MLX-only: the Candle twin is a plain struct the worker drives and registers nothing. The row
     // reaches through the unregistered `mlx-gen-face` crate to the artifacts that crate loads, which
@@ -961,8 +970,9 @@ mod tests {
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
         // sc-26234: `flux3_klein` registers with its own complete row (76 / 66).
         // sc-26239: `flux3_klein_base` registers with its own complete row (77 / 67).
-        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 67);
+        // sc-26323: both MOSS providers join the union (79 / 69).
+        assert_eq!(registered.len(), 79, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 69);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1029,11 +1039,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            28,
+            30,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239)"
+             sc-25900, flux3_klein in sc-26234, flux3_klein_base in sc-26239; MOSS Base/SFT in sc-26323)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {

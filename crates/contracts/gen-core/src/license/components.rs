@@ -1282,6 +1282,39 @@ pub const Z_IMAGE_TURBO_FUN_CONTROLNET_UNION_2_1: ComponentLicense = ComponentLi
     retrieved: "2026-08-02",
 };
 
+/// Official Base bundle; the frozen LICENSE is Apache-2.0.
+pub const MOSS_IMAGE_BASE: ComponentLicense = ComponentLicense {
+    component: "moss_image_base",
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base/blob/1ceede80badddd6a7812069619edaa5633587192/LICENSE",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-Base by OpenMOSS-Team — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
+/// Official SFT bundle including its shipped text tower, tokenizer and small VAE.
+pub const MOSS_IMAGE_SFT: ComponentLicense = ComponentLicense {
+    component: "moss_image_sft",
+    source_url: "https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/blob/fc5de0d56fc910cbca6f6625a70f5f582b26deb1/LICENSE",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-SFT by OpenMOSS-Team — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
+/// Optional mixed/full-FP32 distilled package; its frozen card declares apache-2.0.
+pub const MOSS_IMAGE_SFT_8_STEPS_DMD: ComponentLicense = ComponentLicense {
+    component: "moss_image_sft_8_steps_dmd",
+    source_url: "https://huggingface.co/lodestones/MOSS-Image-SFT-8-steps-dmd/blob/5ff314b4c1470876b114b810146085db8a181a6e/README.md",
+    gated: false,
+    declared: "Apache-2.0",
+    family: "apache-2-0",
+    attribution: Some("MOSS-Image-SFT-8-steps-dmd by lodestones — licensed under Apache-2.0"),
+    retrieved: "2026-10-18",
+};
+
 /// Every media checkpoint whose licence has been read, ordered by
 /// [`ComponentLicense::component`].
 ///
@@ -1334,6 +1367,9 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     LTX_2_3,
     MINIMAX_H3,
     MOCHI_1_PREVIEW,
+    MOSS_IMAGE_BASE,
+    MOSS_IMAGE_SFT,
+    MOSS_IMAGE_SFT_8_STEPS_DMD,
     NVIDIA_PID_STUDENTS,
     PULID,
     QWEN3_VL_32B_INSTRUCT,
@@ -1390,7 +1426,8 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 80);
+        // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows.
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 83);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1789,6 +1826,8 @@ mod tests {
         // (`mlx-gen-flux3/tests/fixtures/base-hub-identity.json`, its UPSTREAM.md distinguishes
         // metadata evidence from gated-file authorization). A row carrying any other date is
         // a row whose provenance nobody can re-read.
+        // sc-26323 read the frozen MOSS bundles on 2026-10-18; see
+        // docs/licensing/sc-26323-moss-image-licence-evidence.md.
         const EVIDENCE_PACK_DATES: &[&str] = &[
             "2026-08-02",
             "2026-08-12",
@@ -1797,6 +1836,7 @@ mod tests {
             "2026-10-13",
             "2026-10-15",
             "2026-10-16",
+            "2026-10-18",
         ];
         for row in MEDIA_COMPONENT_LICENSES {
             assert!(

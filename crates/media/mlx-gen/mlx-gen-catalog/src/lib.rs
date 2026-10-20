@@ -41,6 +41,7 @@ pub mod providers {
     pub use mlx_gen_mage as mage;
     pub use mlx_gen_minimax_h3 as minimax_h3;
     pub use mlx_gen_mochi as mochi;
+    pub use mlx_gen_moss_image as moss_image;
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
     pub use mlx_gen_qwen_image as qwen_image;
@@ -109,6 +110,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_mage::register_providers(registry);
     let registry = mlx_gen_minimax_h3::register_providers(registry);
     let registry = mlx_gen_mochi::register_providers(registry);
+    let registry = mlx_gen_moss_image::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
     let registry = mlx_gen_qwen_image_2_1::register_providers(registry);
@@ -869,6 +871,9 @@ mod tests {
                 // FLUX 3's packed 16× latent (its own autoencoder with BatchNorm-stat tokens)
                 // has no shared decoder consumer, so nothing is advertised (sc-26234).
                 "flux3" => None,
+                // MOSS's small FLUX.2 VAE consumes the same normalized 128-channel packed grid
+                // before channel-major 2×2 unpacking into the raw 32-channel VAE latents.
+                "moss_image" => Some(&FLUX2_PACKED_LATENT_SPACE),
                 "ltx" => Some(&LTX_VIDEO_LATENT_SPACE),
                 "mage_flow" => Some(&MAGE_LATENT_SPACE),
                 "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
@@ -1056,8 +1061,9 @@ mod tests {
         // bounded rungs `Missing` until sc-26241), with a contract fixture — 63/60 -> 64/61.
         // sc-26239 adds `flux3_klein_base` under the same ladder, with its own contract fixture —
         // 64/61 -> 65/62.
-        assert_eq!(registry.memory_strategy_registrations().len(), 65);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 62);
+        // sc-26323 adds the MOSS Base/SFT providers and their contract fixtures: 67/64.
+        assert_eq!(registry.memory_strategy_registrations().len(), 67);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 64);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1095,7 +1101,7 @@ mod tests {
         // sc-26234's `flux3_klein` and sc-26239's `flux3_klein_base` each witness the dense tier
         // plus sc-26241's MLX affine q4/q8 tiers, eagerly materialized (no deferred FLUX3 load
         // shape), under both offload policies — 3 tiers x 2 policies = 6 apiece.
-        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 6 + 6);
+        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 6 + 6 + 2);
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
         let composed: std::collections::BTreeSet<_> = surfaces
@@ -1926,6 +1932,8 @@ mod tests {
                 "mage_flow_edit_turbo",
                 "minimax_h3",
                 "mochi_1",
+                "moss_image_base",
+                "moss_image_sft",
                 "pulid_flux",
                 "qwen_image",
                 "qwen_image_control",
@@ -2014,8 +2022,9 @@ mod tests {
         // sc-25900 adds `qwen_image_2_1_turbo` (a generator with its own complete row): 75 / 65.
         // sc-26234 adds `flux3_klein` (a generator with its own complete row): 76 / 66.
         // sc-26239 adds `flux3_klein_base` (a generator with its own complete row): 77 / 67.
-        assert_eq!(distinct.len(), 77);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 67);
+        // sc-26323 adds both MOSS providers: 79 distinct ids / 69 complete rows.
+        assert_eq!(distinct.len(), 79);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 69);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

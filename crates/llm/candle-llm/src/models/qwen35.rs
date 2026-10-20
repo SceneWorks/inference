@@ -1560,7 +1560,7 @@ pub struct Qwen35Model {
     embed_tokens: QwenEmbedding,
     layers: Vec<DecoderLayer>,
     norm: Tensor,
-    lm_head: std::sync::Arc<Projection>,
+    lm_head: Option<std::sync::Arc<Projection>>,
     rope: Rope,
     cfg: Qwen35Config,
     eps: f64,
@@ -1925,7 +1925,10 @@ impl Qwen35Mtp {
 
         Ok(Self {
             embed_tokens: target.embed_tokens.clone(),
-            lm_head: target.lm_head.clone(),
+            lm_head: target
+                .lm_head
+                .clone()
+                .ok_or_else(|| Error::Config("MTP requires a target language head".into()))?,
             pre_fc_norm_embedding: norm_w("mtp.pre_fc_norm_embedding.weight")?,
             pre_fc_norm_hidden: norm_w("mtp.pre_fc_norm_hidden.weight")?,
             fc: proj_q("mtp.fc.weight")?,
@@ -2310,8 +2313,11 @@ impl Qwen35Model {
     pub fn weight_census(&self) -> WeightCensus {
         let mut census = WeightCensus::default();
         // A dense tied head *is* the embedding tensor; count the storage once.
-        let head_is_embedding =
-            self.cfg.tie_word_embeddings && matches!(*self.lm_head, Projection::Dense(_));
+        let head_is_embedding = self.cfg.tie_word_embeddings
+            && self
+                .lm_head
+                .as_deref()
+                .is_some_and(|head| matches!(head, Projection::Dense(_)));
         match &self.embed_tokens {
             QwenEmbedding::Dense(t) if !head_is_embedding => census.record_tensor(t),
             QwenEmbedding::Dense(_) => {}
@@ -2319,7 +2325,9 @@ impl Qwen35Model {
                 census.record_unmeasured((p.rows() * p.input_width()) as u64)
             }
         }
-        census.projections.record(&self.lm_head);
+        if let Some(head) = &self.lm_head {
+            census.projections.record(head);
+        }
         census.record_tensor(&self.norm);
         for layer in &self.layers {
             layer.record(&mut census);
@@ -2600,6 +2608,17 @@ impl Qwen35Model {
     /// cache and the static path stay one arithmetic); both keep the cache's host-side state
     /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
+        self.hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+    }
+
+    fn hidden_checked(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        check(input_ids)?;
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let s = h.dim(1)?;
         if s <= MAX_DEVICE_STEP_TOKENS
@@ -2619,6 +2638,7 @@ impl Qwen35Model {
                 .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
             let mut h = h;
             for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+                check(&h)?;
                 h = layer.forward_with(
                     &h,
                     &cos,
@@ -2628,13 +2648,14 @@ impl Qwen35Model {
                     Some(positions),
                     None,
                 )?;
+                check(&h)?;
             }
             return Ok(h);
         }
         let (cos, sin) = self
             .rope
             .cos_sin(s as i32, offset, self.dtype, &self.device)?;
-        self.hidden_from_embeds(&h, &cos, &sin, cache)
+        self.hidden_from_embeds_checked(&h, &cos, &sin, cache, check)
     }
 
     /// The step start a short cached step attends from with the length-aware decode attention
@@ -2663,10 +2684,23 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        self.hidden_from_embeds_checked(embeds, cos, sin, cache, &mut |_| Ok(()))
+    }
+
+    fn hidden_from_embeds_checked(
+        &self,
+        embeds: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35Cache,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        check(embeds)?;
         let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
+            check(&h)?;
             h = layer.forward_with(
                 &h,
                 cos,
@@ -2676,6 +2710,7 @@ impl Qwen35Model {
                 None,
                 decode_start.as_ref(),
             )?;
+            check(&h)?;
         }
         Ok(h)
     }
@@ -2688,7 +2723,14 @@ impl Qwen35Model {
 
     /// Shared `lm_head` projection over already normalized hidden states.
     fn project_normalized(&self, h: &Tensor) -> Result<Tensor> {
-        self.lm_head.forward(h)
+        self.lm_head
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Config(
+                    "Qwen35Model was loaded headless; vocabulary logits are unavailable".into(),
+                )
+            })?
+            .forward(h)
     }
 
     /// Final RMSNorm + `lm_head` over hidden states `[B, n, hidden]` → logits `[B, n, vocab]`.
@@ -2714,6 +2756,40 @@ impl Qwen35Model {
     ) -> Result<Tensor> {
         let h = self.hidden(input_ids, cache, offset)?;
         self.project(&h)
+    }
+
+    /// Final RMS-normalized decoder states `[B, S, hidden]`, without a vocabulary projection.
+    /// Use an individual unpadded prompt with a fresh cache for text-encoder inference.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+    ) -> Result<Tensor> {
+        self.forward_hidden_checked(input_ids, cache, offset, &mut |_| Ok(()))
+    }
+
+    /// Final-normalized headless states with cooperative checks before/after every decoder block
+    /// and final norm. Any error resets KV/recurrent state, allowing clean prompt reentry.
+    /// The callback uses engine errors and may return [`Error::Canceled`].
+    pub fn forward_hidden_checked(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Qwen35Cache,
+        offset: i32,
+        check: &mut dyn FnMut(&Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
+        let result = (|| {
+            let h = self.hidden_checked(input_ids, cache, offset, check)?;
+            check(&h)?;
+            let hidden = self.normalize(&h)?;
+            check(&hidden)?;
+            Ok(hidden)
+        })();
+        if result.is_err() {
+            cache.reset();
+        }
+        result
     }
 
     /// Target verification output for Qwen3.8 MTP: logits and final-normalized target hidden states
@@ -3012,6 +3088,13 @@ impl Qwen35Model {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
+    /// Build only the text decoder and final norm, without reading or allocating an LM head.
+    /// `prefix` is the exact decoder root, including any frozen `language_model` wrapper.
+    /// Parse wrapped configurations with [`Qwen35Config::from_json`].
+    pub fn from_weights_headless(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, None, compute_dtype(w.device()), None, false)
+    }
+
     /// Build from a loaded checkpoint, optionally quantizing the large projections on load. The
     /// compute dtype is the device default ([`compute_dtype`] — bf16 on GPU, f32 on CPU).
     pub fn from_weights_with(
@@ -3031,7 +3114,15 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         format: Option<&ProjectionFormat>,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, format, compute_dtype(w.device()), None)
+        Self::from_weights_dtype_impl(
+            w,
+            prefix,
+            cfg,
+            format,
+            compute_dtype(w.device()),
+            None,
+            true,
+        )
     }
 
     /// Build from a loaded checkpoint with an explicit compute `dtype`.
@@ -3050,7 +3141,7 @@ impl Qwen35Model {
         dtype: DType,
     ) -> Result<Self> {
         let format = quant.map(ProjectionFormat::from);
-        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, None)
+        Self::from_weights_dtype_impl(w, prefix, cfg, format.as_ref(), dtype, None, true)
     }
 
     /// Build Qwen3.5/3.8 with compact Prism matrices while retaining ordinary tensors for norms,
@@ -3062,7 +3153,7 @@ impl Qwen35Model {
         prism: &PrismRegistry,
         dtype: DType,
     ) -> Result<Self> {
-        Self::from_weights_dtype_impl(w, prefix, cfg, None, dtype, Some(prism))
+        Self::from_weights_dtype_impl(w, prefix, cfg, None, dtype, Some(prism), true)
     }
 
     fn from_weights_dtype_impl(
@@ -3072,6 +3163,7 @@ impl Qwen35Model {
         format: Option<&ProjectionFormat>,
         dtype: DType,
         prism: Option<&PrismRegistry>,
+        with_lm_head: bool,
     ) -> Result<Self> {
         let device = w.device().clone();
         let eps = cfg.rms_norm_eps as f64;
@@ -3119,19 +3211,25 @@ impl Qwen35Model {
         } else {
             "lm_head.weight".to_string()
         };
-        let lm_head = if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
-            Projection::load_prism(weight.clone())
-        } else if cfg.tie_word_embeddings {
-            let QwenEmbedding::Dense(weight) = &embed_tokens else {
-                return Err(Error::Config(
-                    "Prism tied embeddings require an explicit lm_head packed tensor".into(),
-                ));
-            };
-            Projection::load_as(weight.clone(), None, format)?
+        let lm_head = if !with_lm_head {
+            None
         } else {
-            Projection::load_as(req(head_key)?, None, format)?
+            Some(std::sync::Arc::new(
+                if let Some(weight) = prism.and_then(|registry| registry.get(&head_key)) {
+                    Projection::load_prism(weight.clone())
+                } else if cfg.tie_word_embeddings {
+                    let QwenEmbedding::Dense(weight) = &embed_tokens else {
+                        return Err(Error::Config(
+                            "Prism tied embeddings require an explicit lm_head packed tensor"
+                                .into(),
+                        ));
+                    };
+                    Projection::load_as(weight.clone(), None, format)?
+                } else {
+                    Projection::load_as(req(head_key)?, None, format)?
+                },
+            ))
         };
-        let lm_head = std::sync::Arc::new(lm_head);
 
         let key_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads) as usize;
         let value_dim = (cfg.linear_value_head_dim * cfg.linear_num_value_heads) as usize;
@@ -3831,6 +3929,88 @@ pub(crate) mod tests {
         // 3 linear : 1 full.
         assert!(cfg.is_linear(0) && cfg.is_linear(1) && cfg.is_linear(2));
         assert!(!cfg.is_linear(3));
+    }
+
+    #[test]
+    fn headless_decoder_preserves_normalized_hidden_and_hybrid_cache() {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        // Frozen text encoders may wrap the decoder under language_model.model or language_model.
+        for prefix in ["language_model.model", "language_model"] {
+            let weights = synthetic_weights_with_prefix(&cfg, prefix);
+            let lm = Qwen35Model::from_weights(&weights, prefix, cfg.clone()).unwrap();
+            let mut tensors = weights.into_map();
+            tensors.remove("lm_head.weight");
+            let weights = Weights::from_map(tensors, Device::Cpu);
+            assert!(Qwen35Model::from_weights(&weights, prefix, cfg.clone()).is_err());
+            let encoder =
+                Qwen35Model::from_weights_headless(&weights, prefix, cfg.clone()).unwrap();
+            assert!(encoder.lm_head.is_none());
+            let mut lm_cache = lm.new_cache();
+            let mut cache = encoder.new_cache();
+            let (logits, expected) = lm
+                .forward_with_hidden(&ids(&[1, 7, 3]), &mut lm_cache, 0)
+                .unwrap();
+            let hidden = encoder
+                .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+                .unwrap();
+            assert_eq!(hidden.dims(), &[1, 3, cfg.hidden_size as usize]);
+            assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size as usize]);
+            assert_eq!(cache.offset(), 3);
+            assert!(max_abs_diff(&hidden, &expected) < 1e-6);
+            let next = encoder.forward_hidden(&ids(&[42]), &mut cache, 3).unwrap();
+            let (_, expected_next) = lm
+                .forward_with_hidden(&ids(&[42]), &mut lm_cache, 3)
+                .unwrap();
+            assert!(max_abs_diff(&next, &expected_next) < 1e-6);
+            assert_eq!(cache.offset(), 4);
+            cache.reset();
+            let repeated = encoder
+                .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+                .unwrap();
+            assert!(max_abs_diff(&repeated, &hidden) < 1e-6);
+            assert!(encoder
+                .forward(&ids(&[1]), &mut encoder.new_cache(), 0)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn headless_checked_callback_cancels_between_layers_and_resets_cache() {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let weights = synthetic_weights_with_prefix(&cfg, "language_model");
+        let model =
+            Qwen35Model::from_weights_headless(&weights, "language_model", cfg.clone()).unwrap();
+        let mut cache = model.new_cache();
+        let expected = model
+            .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        cache.reset();
+        let mut calls = 0;
+        let checked = model
+            .forward_hidden_checked(&ids(&[1, 7, 3]), &mut cache, 0, &mut |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 2 * cfg.num_layers + 4);
+        assert!(max_abs_diff(&checked, &expected) < 1e-6);
+        cache.reset();
+        let mut calls = 0;
+        let result = model.forward_hidden_checked(&ids(&[1, 7, 3]), &mut cache, 0, &mut |_| {
+            calls += 1;
+            if calls == 4 {
+                Err(Error::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(Error::Canceled)));
+        assert_eq!(calls, 4);
+        assert_eq!(cache.offset(), 0);
+        let recovered = model
+            .forward_hidden(&ids(&[1, 7, 3]), &mut cache, 0)
+            .unwrap();
+        assert!(max_abs_diff(&recovered, &expected) < 1e-6);
     }
 
     #[test]
@@ -5278,7 +5458,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(nvfp4.is_quantized());
-        assert_eq!(nvfp4.lm_head.kind(), ProjectionKind::Nvfp4);
+        assert_eq!(
+            nvfp4.lm_head.as_ref().unwrap().kind(),
+            ProjectionKind::Nvfp4
+        );
         let census = nvfp4.weight_census().projections;
         assert_eq!(census.nvfp4.count, 32 - 6, "all but in_proj_a/b");
         assert_eq!(

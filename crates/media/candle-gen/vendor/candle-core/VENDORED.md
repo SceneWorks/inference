@@ -1,5 +1,12 @@
 # Vendored `candle-core` — CUDA-graph parameter cache (sc-24441)
 
+Dependency maintenance (2026-10-17): the standalone `Cargo.toml` now requires
+`zip = "9"` instead of `7.2.0` to address RUSTSEC-2026-0367, RUSTSEC-2026-0368,
+and RUSTSEC-2026-0369. Features remain disabled by default. `src/npy.rs` and
+`src/pickle.rs` propagate zip 9's fallible filename decoding and own the decoded
+names before reading entries. No tensor or kernel source changes accompany this
+migration. Validate the NPY/NPZ and pickle archive tests when refreshing it.
+
 This directory is `candle-core` `0.10.2` from
 
     https://github.com/huggingface/candle @ 1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d

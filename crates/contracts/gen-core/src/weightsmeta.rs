@@ -588,13 +588,24 @@ pub struct SafetensorsFileLayout {
 /// byte range, and proves the payload region is contiguous and exactly covers the file. Reads the
 /// header only; never a tensor payload.
 pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<SafetensorsFileLayout> {
-    const MAX_HEADER_SIZE: u64 = 100_000_000;
-
     let path = path.as_ref();
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
+    safetensors_reader_tensor_locations(&mut file, file_len, path)
+}
+
+/// Parse the same bounded, validated header from an already-open reader. `source` labels errors
+/// only; this function never opens it. The reader is left immediately after the header so callers
+/// can authenticate that exact prefix and remaining payload through one handle (sc-26325/F-280).
+pub fn safetensors_reader_tensor_locations(
+    mut reader: impl Read,
+    file_len: u64,
+    source: impl AsRef<Path>,
+) -> Result<SafetensorsFileLayout> {
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+    let path = source.as_ref();
     let mut prefix = [0_u8; 8];
-    file.read_exact(&mut prefix)?;
+    reader.read_exact(&mut prefix)?;
     let header_len = u64::from_le_bytes(prefix);
     if header_len > MAX_HEADER_SIZE {
         return Err(Error::Msg(format!(
@@ -621,7 +632,7 @@ pub fn safetensors_file_tensor_locations(path: impl AsRef<Path>) -> Result<Safet
         ))
     })?;
     let mut header = vec![0_u8; header_len];
-    file.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
     let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
         .map_err(|error| {
             Error::Msg(format!("safetensors header in {}: {error}", path.display()))

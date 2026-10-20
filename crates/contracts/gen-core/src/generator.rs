@@ -35,6 +35,22 @@ pub trait Generator {
         None
     }
 
+    /// Actual last successful MOSS execution. Providers clear this under their lifecycle lock
+    /// before every attempt and publish only after all outputs and a final cancellation check.
+    /// Callers must serialize generation and receipt retrieval together; concurrent attempts may
+    /// clear/replace the last-completed receipt. None never implies successful MOSS execution.
+    fn moss_image_execution_report(&self) -> Option<crate::moss_image::MossImageExecutionReport> {
+        None
+    }
+
+    /// MOSS-owned materialized weight buffers retained by this provider, excluding workspace,
+    /// allocator slack, source payloads and other providers. This metadata-only getter never
+    /// evaluates tensors. Call within the serialized cache transaction; warm admission may credit
+    /// at most this value bounded by the current committed snapshot. None grants no extra credit.
+    fn moss_image_owned_weight_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Actual per-adapter install outcomes from the most recent successful generation.
     ///
     /// Most providers either reject an adapter atomically or have no partial-install surface, so the
@@ -444,6 +460,8 @@ impl HdrRequest {
 pub struct GenerationRequest {
     // --- Core ---
     pub prompt: String,
+    /// Frozen MOSS controls. None means ordinary inference with acceleration OFF.
+    pub moss_image: Option<crate::moss_image::MossImageOptions>,
     pub negative_prompt: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -1326,6 +1344,7 @@ impl Default for GenerationRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            moss_image: None,
             negative_prompt: None,
             width: 1024,
             height: 1024,
@@ -1617,6 +1636,8 @@ impl GenerationRequest {
             // Non-float fields: explicitly ignored, but named (no `..`) so a newly-added field breaks
             // the build here and the author must classify it.
             prompt: _,
+            // MOSS sub-block floats join the floor through its exhaustive helper below.
+            moss_image,
             negative_prompt: _,
             width: _,
             height: _,
@@ -1699,6 +1720,9 @@ impl GenerationRequest {
             pid_capture_sigma,
             text_style_gain,
         } = self;
+        if let Some(nonfinite) = moss_image.as_ref().and_then(|v| v.first_nonfinite_float()) {
+            return Some(nonfinite);
+        }
         let floats: [(&'static str, Option<f32>); 16] = [
             ("guidance", *guidance),
             ("true_cfg", *true_cfg),
@@ -3704,6 +3728,13 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        if req.moss_image.is_some()
+            && crate::moss_image::MossImageVariant::from_provider_id(id).is_none()
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: MOSS controls require a MOSS-Image provider"
+            )));
+        }
         if req.veda.as_ref().is_some_and(|v| v.enabled) && id != "minimax_h3" {
             return Err(Error::Unsupported(format!(
                 "{id}: Veda attention requires MiniMax-H3"
@@ -6529,6 +6560,7 @@ mod tests {
                 ..Default::default()
             },
         });
+        assert_eq!(generator.moss_image_owned_weight_bytes(), None);
         let mut progress = Vec::new();
         let report = generator
             .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))

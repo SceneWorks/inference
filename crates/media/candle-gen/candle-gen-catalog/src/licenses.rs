@@ -331,6 +331,16 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "mochi_1",
         components: &["mochi_1_preview", "t5_v1_1_xxl"],
     },
+    // Frozen MOSS Base transformer uses the SFT bundled encoder/tokenizer/VAE.
+    // Optional DMD is disclosed from actual execution assets, never asserted for ordinary runs.
+    ProviderComponents {
+        provider_id: "moss_image_base",
+        components: &["moss_image_base", "moss_image_sft"],
+    },
+    ProviderComponents {
+        provider_id: "moss_image_sft",
+        components: &["moss_image_sft"],
+    },
     // --- qwen-image -------------------------------------------------------------------------
     // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
     // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
@@ -611,7 +621,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 57);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 59);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -643,9 +653,9 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            67,
-            "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
-             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239) + 20 trainers (16 of them also \
+            69,
+            "69 distinct Candle provider ids: 62 generators (qwen_image_2_1_turbo joined in \
+             sc-25901, flux3_klein in sc-26235, flux3_klein_base in sc-26239, MOSS Base/SFT in sc-26323) + 20 trainers (16 of them also \
              generator ids — iris_3b joined in sc-25686, flux3_klein_base in sc-26240; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"
@@ -808,6 +818,8 @@ mod tests {
                 "ltx_2_3_distilled",
                 "minimax_h3",
                 "mochi_1",
+                "moss_image_base",
+                "moss_image_sft",
                 "qwen_image_2_1",
                 "qwen_image_2_1_turbo",
                 "sana_1600m",
@@ -894,6 +906,7 @@ mod tests {
             "controlnet_openpose_sdxl_1_0",
             // Caller-selected add-ons, deliberately out of scope for a list with no optionality.
             "anima_official_loras",
+            "moss_image_sft_8_steps_dmd",
             "hyper_sd_flux1_dev_8steps_lora",
             "ip_adapter",
             "kolors_ip_adapter_plus",

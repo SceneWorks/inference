@@ -351,6 +351,44 @@ mod tests {
         }
     }
 
+    fn voice_archive() -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("voice/byteorder", options).unwrap();
+        writer.write_all(b"little").unwrap();
+        writer.start_file("voice/data/0", options).unwrap();
+        for _ in 0..VoicePack::STYLE_WIDTH {
+            writer.write_all(&0.5f32.to_le_bytes()).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn voice_archive_preserves_style_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("voice.pt");
+        std::fs::write(&path, voice_archive()).unwrap();
+        let voice = VoicePack::from_file(&path).unwrap();
+        assert_eq!(voice.rows, 1);
+        assert_eq!(voice.dim, VoicePack::STYLE_WIDTH);
+        assert_eq!(voice.ref_s(1), vec![0.5; VoicePack::STYLE_WIDTH]);
+    }
+
+    #[test]
+    fn voice_archive_rejects_invalid_utf8_names() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("voice.pt");
+        let mut bytes = voice_archive();
+        let header = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        // Mark the central entry as UTF-8, then supply an invalid first name byte.
+        let flags = u16::from_le_bytes(bytes[header + 8..header + 10].try_into().unwrap());
+        bytes[header + 8..header + 10].copy_from_slice(&(flags | 0x800).to_le_bytes());
+        bytes[header + 46] = 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(VoicePack::from_file(&path).is_err());
+    }
+
     #[test]
     fn weight_norm_resolution_matches_the_definition() {
         let dev = Device::Cpu;
