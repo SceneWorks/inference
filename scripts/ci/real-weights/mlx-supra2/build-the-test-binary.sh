@@ -11,6 +11,28 @@ export CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none
   echo "CARGO_PROFILE_RELEASE_STRIP=none"
   echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP=none"
 } >> "$GITHUB_ENV"
+# Prebuilt libmlx (sc-21382): the fork's `prebuilt-<sha12>` Release cell for the mlx-rs rev pinned
+# in Cargo.lock, exporting BOTH PMETAL_MLX_PREBUILT_DIR and PMETAL_METALLIB_PATH here and, through
+# GITHUB_ENV, for the run step (the test binary has no compiled-in metallib). Exit 1 = nothing
+# published for this rev: pmetal-mlx-sys then builds libmlx from source, which needs the Xcode
+# Metal Toolchain component — checked up front so a box without it fails with the fix named
+# instead of deep inside cmake. Any other exit is a corrupt/mislabeled asset and is fatal.
+rc=0
+prebuilt="$(scripts/fetch-prebuilt-mlx.sh --build-type Release --github-env)" || rc=$?
+if (( rc == 0 )); then
+  eval "$prebuilt"
+  export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
+  echo "$prebuilt" | tee "$SUPRA2_OUT/prebuilt-mlx.txt"
+elif (( rc == 1 )); then
+  echo "::warning title=prebuilt MLX unavailable::no prebuilt for the pinned mlx-rs rev; building libmlx from source"
+  if ! xcrun -sdk macosx metal --version > "$SUPRA2_OUT/metal-version.txt" 2>&1; then
+    cat "$SUPRA2_OUT/metal-version.txt"
+    echo "::error::$RUNNER_NAME has no Metal Toolchain and no prebuilt libmlx is published for the pinned mlx-rs rev: install it on the runner (xcodebuild -downloadComponent MetalToolchain) or publish the fork's prebuilt-mlx release for the pinned rev"
+    exit 1
+  fi
+else
+  exit "$rc"
+fi
 cargo test --locked --release -p mlx-gen-supra2 --test integration --no-run
 cargo test --locked --release -p mlx-gen-supra2 --test integration --no-run --message-format=json \
   | python3.12 -c 'import json,sys
