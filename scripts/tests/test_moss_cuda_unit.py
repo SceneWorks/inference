@@ -289,6 +289,22 @@ class Gpu0OccupancyTests(unittest.TestCase):
             with self.subTest(label), self.assertRaises(unit.UnitFailure):
                 self.check(**kwargs)
 
+    def test_nonzero_exit_is_refused_even_with_a_valid_idle_inventory_on_stdout(self):
+        from unittest import mock
+
+        def completed(returncode):
+            def run(argv, **_):
+                out = "0, GPU-aaa\n" if "index,uuid" in argv[1] else ""
+                return unit.subprocess.CompletedProcess(argv, returncode, stdout=out, stderr="boom")
+            return run
+
+        with mock.patch.object(unit, "smi_path", return_value="nvidia-smi"):
+            with mock.patch.object(unit.subprocess, "run", completed(0)):
+                unit.require_gpu0_idle()  # the same stdout with exit 0 is admitted
+            with mock.patch.object(unit.subprocess, "run", completed(9)):
+                with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"):
+                    unit.require_gpu0_idle()
+
     def test_run_checks_occupancy_before_spawning(self):
         from unittest import mock
 
