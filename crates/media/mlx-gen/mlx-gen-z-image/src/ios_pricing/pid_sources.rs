@@ -133,7 +133,7 @@ struct Work {
     host_start: usize,
 }
 #[derive(Clone, Default)]
-struct Program { prefix: Prefix, work: Work, host_live:BTreeMap<String,HostDemand>, raw_IO_frontiers:Vec<Arc<Prefix>> }
+struct Program { prefix: Prefix, work: Work, host_live:BTreeMap<String,HostDemand>, raw_io_frontiers:Vec<Arc<Prefix>> }
 
 fn elements(shape: &[i32]) -> Result<u64> {
     shape.iter().try_fold(1u64,|n,&d| {
@@ -692,9 +692,9 @@ fn materialize_accessed(p:&mut Program,w:&Sources,site:&str,held:&BTreeSet<Slot>
     for key in &w.accessed {
         let t=&w.tensors[key];batch.extend(t.roots.iter().copied());
         bytes=bytes.checked_add(t.elements()?.checked_mul(dtype_width(t.dtype)).ok_or_else(||Error::Msg("PiD raw batch bytes overflow".into()))?).ok_or_else(||Error::Msg("PiD raw batch sum overflow".into()))?;
-        if bytes>=512*1024*1024 {p.work.roots.extend(batch.iter().copied());p.window(IosPhase::Load,site,&resident,0,None,None)?;p.raw_IO_frontiers.push(Arc::new(p.prefix.clone()));resident.extend(batch.iter().copied());batch.clear();bytes=0;}
+        if bytes>=512*1024*1024 {p.work.roots.extend(batch.iter().copied());p.window(IosPhase::Load,site,&resident,0,None,None)?;p.raw_io_frontiers.push(Arc::new(p.prefix.clone()));resident.extend(batch.iter().copied());batch.clear();bytes=0;}
     }
-    if !batch.is_empty() {p.work.roots.extend(batch);p.window(IosPhase::Load,site,&resident,0,None,None)?;p.raw_IO_frontiers.push(Arc::new(p.prefix.clone()));}
+    if !batch.is_empty() {p.work.roots.extend(batch);p.window(IosPhase::Load,site,&resident,0,None,None)?;p.raw_io_frontiers.push(Arc::new(p.prefix.clone()));}
     Ok(())
 }
 
@@ -1489,7 +1489,7 @@ impl Unified<'_> {
 }
 
 fn emit_raw_io_refusals(unified:&mut Unified,adapter:&AdapterSourcePrefix,p:&Program,base:&BaseContext,route:&Route,scale:i32)->Result<()> {
-    for (ordinal,prefix) in p.raw_IO_frontiers.iter().enumerate() {
+    for (ordinal,prefix) in p.raw_io_frontiers.iter().enumerate() {
         let mut conditions=(0..ordinal).map(|prior|Condition::RawMaterializeBatchCompletes {ordinal:prior,completes:true}).collect::<Vec<_>>();
         conditions.push(Condition::RawMaterializeBatchCompletes {ordinal,completes:false});
         unified.pending=Arc::clone(prefix);
@@ -1547,7 +1547,7 @@ fn source_case(unified:&mut Unified,model:&Model,route:&Route,sampling:&Resolved
                 let mut p=loaded.clone();let mut e=engine.clone();p.begin();
                 let base=base_context(model,route,sampling,quanta,forward,adapter,ledger)?;
                 let mut conditions=conditions.clone();
-                conditions.extend((0..loaded.raw_IO_frontiers.len()).map(|ordinal|Condition::RawMaterializeBatchCompletes {ordinal,completes:true}));
+                conditions.extend((0..loaded.raw_io_frontiers.len()).map(|ordinal|Condition::RawMaterializeBatchCompletes {ordinal,completes:true}));
                 conditions.extend([Condition::NativeMinimumTileGuardPasses(true),Condition::InputLatentDtype(input_dtype),Condition::ZModelForward(forward),Condition::CaptureControl {requested:controls.capture_sigma}]);
                 // SAME retained student map. Rebuilding a decoder is not a source-file reopening.
                 let built=(||->Result<(IosPricing,Tensor)> {

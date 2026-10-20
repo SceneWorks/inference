@@ -2,7 +2,7 @@
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
   "UTC": "2026-10-20T20:22:25.564692+00:00",
-  "rust_proof_closure_sha256": "a6359803a866f7702683e809badc0490311824089234834c91b7c5040431de4a",
+  "rust_proof_closure_sha256": "2f18aa9afa0978c3afcaec4f238ae4a4ab85c7a5592beac0cc1f50698697a4cd",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -808,11 +808,11 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
-      "sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43"
+      "sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
-      "sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10"
+      "sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2"
     },
     {
       "path": ".github/workflows/real-weights.yml",
@@ -983,7 +983,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::actual_utf8_input_bytes_roundtrip_without_prompt_or_synthetic_replay_request",
-      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -995,7 +995,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::missing_is_not_empty_or_fixed300_and_old_successful_non_pid_token_is_identical",
-      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1006,8 +1006,8 @@
     },
     {
       "binary_binding": "mlx_gen_z_image",
-      "fqn": "ios_pricing::pid_work_basis::tests::canonical_A_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec",
-      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "fqn": "ios_pricing::pid_work_basis::tests::canonical_a_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec",
+      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1019,7 +1019,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::outer_decode_bound_is_inner_limit_plus_tuple_u64_not_a_prompt_cap",
-      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1031,7 +1031,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_work_basis::tests::malformed_outer_tokens_preserve_prefix_lowerhex_tuple_and_version_checks",
-      "source_sha256": "14b62847041a6cf7e059b10f992dedb43f35ee04ff6ae6e348eea224ee960f43",
+      "source_sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1043,7 +1043,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::same_cache_endpoint_survives_steps_and_count_but_geometry_config_and_domain_do_not_alias",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1055,7 +1055,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::lazy_caption_keeps_full_hidden_parent_and_frozen_old_window_survives_later_graph_detach",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1067,7 +1067,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::initial_noise_and_all_eps_are_distinct_full_resolution_source_factories",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1079,7 +1079,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::row_strip_full_accumulator_and_full_normalizer_remain_coincident_not_tile_sized",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1091,7 +1091,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::composite_consumer_abort_keeps_same_prefix_and_prior_whole_case_only_once",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "scope": "sourceHOSTmetadata/codec/control/visitor/DAGonly; notnative/physicalqualification",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
@@ -1255,7 +1255,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_gathered_affine_preserves_actual_batch_rank_layout_and_single_output_source",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,
@@ -1267,7 +1267,7 @@
     {
       "binary_binding": "mlx_gen_z_image",
       "fqn": "ios_pricing::pid_sources::source_tests::gemma_affine_shape_only_or_wrong_slot_provenance_is_not_a_layout_certificate",
-      "source_sha256": "790b30dde975b9f2df0ff79d453809841a1451bafce3f0e4a33ccdf9409f9d10",
+      "source_sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2",
       "expected_Rust_rows": 1,
       "expected_logical_targets": 1,
       "expected_each_passed": 1,

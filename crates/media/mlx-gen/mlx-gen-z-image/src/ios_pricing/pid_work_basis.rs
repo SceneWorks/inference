@@ -117,7 +117,7 @@ mod tests {
         let (_,work)=decode(&encode(&flow(true),empty).unwrap(),None).unwrap();assert_eq!(work,Some(empty));
     }
     #[test]
-    fn canonical_A_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec() {
+    fn canonical_a_tuple_encoding_is_accepted_by_the_existing_provider_replay_codec() {
         // Independent owner-side wire recipe: no private helper called to build this expectation.
         let flow=flow(true);let bytes=serde_json::to_vec(&(1u8,flow.canonical_token(),513u64)).unwrap();
         let text=bytes.iter().map(|b|format!("{b:02x}")).collect::<String>();
