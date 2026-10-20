@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::pth::{PthArchive, PthDtype, PthTensor, PthValue};
-use crate::{Error, GenerationRequest, Result};
+use crate::{Error, GenerationRequest, GenerationWarning, Result};
 
 /// Registry id of the text-to-image provider.
 pub const PROVIDER_ID: &str = "supra2_img";
@@ -52,6 +52,26 @@ pub const VAE_SCALE: f32 = 0.18215;
 /// Sampler / scheduler names advertised on the descriptor.
 pub const SAMPLER: &str = "euler";
 pub const SCHEDULER: &str = "supra2_uniform_flow";
+/// The prompt context: upstream tokenizes with `truncation=True, max_length=128`, so a longer prompt
+/// conditions on its first 128 Flan-T5 tokens (the last one `</s>`). Advertised on both backends'
+/// descriptors as `Capabilities::max_prompt_tokens`.
+pub const MAX_PROMPT_TOKENS: u32 = Supra2Config::published().ctx_len as u32;
+/// [`GenerationWarning::code`] both backends report when a prompt was truncated to the context.
+pub const PROMPT_TRUNCATED_WARNING: &str = "prompt_truncated";
+
+/// The warning a render reports for a prompt of `prompt_tokens` untruncated tokens against a
+/// `ctx_len`-token context: `Some` exactly when the tokenizer truncated it (upstream's
+/// `WARNING: prompt truncated`). One constructor so the MLX and Candle providers report the same
+/// code and the same `prompt_tokens=… ctx_len=…` fields.
+pub fn prompt_truncated_warning(prompt_tokens: usize, ctx_len: usize) -> Option<GenerationWarning> {
+    (prompt_tokens > ctx_len).then(|| GenerationWarning {
+        code: PROMPT_TRUNCATED_WARNING.to_string(),
+        message: format!(
+            "the prompt is {prompt_tokens} Flan-T5 tokens; Supra2-IMG conditions on the first \
+             {ctx_len} and ignored the rest (prompt_tokens={prompt_tokens} ctx_len={ctx_len})"
+        ),
+    })
+}
 
 /// Supra2 DiT geometry. [`Supra2Config::published`] is the frozen checkpoint; the struct is
 /// dimension-parametric so tiny parity fixtures run through the same code.
@@ -340,6 +360,24 @@ pub const DENOISER_FILE: &str = "denoiser.safetensors";
 pub const CONDITIONING_FILE: &str = "conditioning.safetensors";
 /// Manifest schema tag.
 pub const BUNDLE_SCHEMA: &str = "sceneworks.supra2.bundle/v1";
+
+/// The converted denoiser of [`SUPRA2_SOURCE`]: [`convert_pinned_checkpoint`] is deterministic (the
+/// checkpoint's `model` state dict, F32, canonical tensor order, no metadata), so the pinned
+/// checkpoint converts to exactly these bytes on every platform. Recorded from a conversion of the
+/// pinned `model_final_ema.pt`; `real_checkpoint_converts_byte_exact` re-derives it.
+pub const PINNED_DENOISER: PinnedFile = PinnedFile {
+    path: DENOISER_FILE,
+    bytes: 416_402_008,
+    sha256: "bab91250c25ce2c6b0efc7e23f59be2e088bebae76954dbceab56e3e9a2120b7",
+};
+
+/// The converted stored unconditional conditioning of [`SUPRA2_SOURCE`] (the pinned checkpoint
+/// stores `uncond_text` / `uncond_mask`), recorded and re-derived like [`PINNED_DENOISER`].
+pub const PINNED_CONDITIONING: PinnedFile = PinnedFile {
+    path: CONDITIONING_FILE,
+    bytes: 393_880,
+    sha256: "2cbed5c950cae7694da7e6e85bd5aff705b984396b6cfb96068fa057c4ca1ac3",
+};
 
 /// A file written into the bundle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,12 +746,22 @@ pub fn read_bundle(dir: &Path) -> Result<Supra2Bundle> {
 }
 
 /// [`read_bundle`] plus the pin contract: the bundle must have been converted from exactly
-/// [`SUPRA2_SOURCE`] (repo, revision, file size and SHA-256), carry the published geometry, and
-/// expect exactly the [`FLAN_T5_BASE`] / [`SD_VAE`] component revisions. This is what the registered
-/// `supra2_img` provider loads, so an unpinned or re-geometried bundle is refused (E3).
+/// [`SUPRA2_SOURCE`] (repo, revision, file size and SHA-256), carry the published geometry, expect
+/// exactly the [`FLAN_T5_BASE`] / [`SD_VAE`] component revisions, and hold exactly the deterministic
+/// conversion of that checkpoint — the [`PINNED_DENOISER`] and the stored [`PINNED_CONDITIONING`]
+/// (the pinned checkpoint stores its unconditional embedding, so a manifest without one is not
+/// that checkpoint's bundle and would silently switch CFG to the empty-string fallback). This is
+/// what the registered `supra2_img` provider loads, so an unpinned, re-geometried or edited bundle
+/// is refused (E3).
 pub fn read_pinned_bundle(dir: &Path, check: BundleCheck) -> Result<Supra2Bundle> {
     let bundle = read_bundle_checked(dir, check)?;
-    let m = &bundle.manifest;
+    check_pinned_manifest(dir, &bundle.manifest)?;
+    Ok(bundle)
+}
+
+/// The manifest half of [`read_pinned_bundle`]; the file half (sizes, digests) is
+/// [`read_bundle_checked`], which already holds every file to its manifest entry.
+fn check_pinned_manifest(dir: &Path, m: &BundleManifest) -> Result<()> {
     let pin = SUPRA2_SOURCE.files[0];
     let refuse = |what: String| {
         Err(Error::Unsupported(format!(
@@ -758,7 +806,24 @@ pub fn read_pinned_bundle(dir: &Path, check: BundleCheck) -> Result<Supra2Bundle
                 .collect::<Vec<_>>()
         ));
     }
-    Ok(bundle)
+    let Some(conditioning) = &m.conditioning else {
+        return refuse(
+            "stores no unconditional conditioning, but the pinned checkpoint does".to_string(),
+        );
+    };
+    for (what, file, want) in [
+        ("denoiser", &m.denoiser, PINNED_DENOISER),
+        ("conditioning", conditioning, PINNED_CONDITIONING),
+    ] {
+        if file.file != want.path || file.bytes != want.bytes || file.sha256 != want.sha256 {
+            return refuse(format!(
+                "{what} `{}` ({} bytes, sha256 {}) is not the pinned conversion `{}` ({} bytes, \
+                 sha256 {})",
+                file.file, file.bytes, file.sha256, want.path, want.bytes, want.sha256
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`read_bundle`] with an explicit on-disk check depth.
@@ -1262,6 +1327,94 @@ pub fn memory_safety(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest `convert_pinned_checkpoint` writes for the pinned checkpoint.
+    fn pinned_manifest() -> BundleManifest {
+        let source = SUPRA2_SOURCE.files[0];
+        let file = |pin: PinnedFile| BundleFile {
+            file: pin.path.to_string(),
+            bytes: pin.bytes,
+            sha256: pin.sha256.to_string(),
+        };
+        let component = |id: &str, pin: &ComponentPin| BundleComponent {
+            component: id.to_string(),
+            repo: pin.repo.to_string(),
+            revision: pin.revision.to_string(),
+            license: pin.license.to_string(),
+            download_bytes: pin.download_bytes(),
+        };
+        BundleManifest {
+            schema: BUNDLE_SCHEMA.to_string(),
+            provider_id: PROVIDER_ID.to_string(),
+            source: BundleSource {
+                repo: Some(SUPRA2_SOURCE.repo.to_string()),
+                revision: Some(SUPRA2_SOURCE.revision.to_string()),
+                file: source.path.to_string(),
+                bytes: source.bytes,
+                sha256: source.sha256.to_string(),
+                weights_key: "model".to_string(),
+            },
+            config: Supra2Config::published(),
+            vae_scale: VAE_SCALE,
+            denoiser: file(PINNED_DENOISER),
+            denoiser_tensors: Supra2Config::published().expected_tensors().len(),
+            conditioning: Some(file(PINNED_CONDITIONING)),
+            components: vec![
+                component(TEXT_ENCODER_COMPONENT, &FLAN_T5_BASE),
+                component(VAE_COMPONENT, &SD_VAE),
+            ],
+        }
+    }
+
+    /// The pin contract accepts exactly the pinned conversion and refuses a manifest that drops
+    /// the stored conditioning or names any other denoiser / conditioning bytes (E3).
+    #[test]
+    fn pinned_manifest_requires_the_stored_conditioning_and_the_pinned_conversion() {
+        let dir = Path::new("/supra2-bundle");
+        check_pinned_manifest(dir, &pinned_manifest()).unwrap();
+        let refused = |edit: &dyn Fn(&mut BundleManifest)| {
+            let mut m = pinned_manifest();
+            edit(&mut m);
+            check_pinned_manifest(dir, &m).unwrap_err().to_string()
+        };
+        let err = refused(&|m| m.conditioning = None);
+        assert!(
+            err.contains("stores no unconditional conditioning"),
+            "{err}"
+        );
+        let other = "0".repeat(64);
+        for (what, err) in [
+            ("denoiser", refused(&|m| m.denoiser.sha256 = other.clone())),
+            ("denoiser", refused(&|m| m.denoiser.bytes += 4)),
+            (
+                "conditioning",
+                refused(&|m| m.conditioning.as_mut().unwrap().sha256 = other.clone()),
+            ),
+            (
+                "conditioning",
+                refused(&|m| m.conditioning.as_mut().unwrap().bytes -= 4),
+            ),
+        ] {
+            assert!(
+                err.contains(&format!("{what} `")) && err.contains("is not the pinned conversion"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_warning_carries_the_token_counts_only_past_the_context() {
+        assert_eq!(MAX_PROMPT_TOKENS, 128);
+        assert_eq!(prompt_truncated_warning(128, 128), None);
+        let w = prompt_truncated_warning(129, 128).unwrap();
+        assert_eq!(w.code, PROMPT_TRUNCATED_WARNING);
+        assert_eq!(w.code, "prompt_truncated");
+        assert!(
+            w.message.contains("prompt_tokens=129 ctx_len=128"),
+            "{}",
+            w.message
+        );
+    }
 
     #[test]
     fn published_geometry_matches_the_model_card() {

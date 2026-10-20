@@ -23,5 +23,8 @@ mod sampler;
 #[path = "tiny_dit_parity.rs"]
 mod tiny_dit_parity;
 
+#[path = "tiny_generator.rs"]
+mod tiny_generator;
+
 #[path = "tiny_t5_parity.rs"]
 mod tiny_t5_parity;

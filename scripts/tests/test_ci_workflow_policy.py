@@ -794,8 +794,9 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 38 since sc-25688 added the dispatch-only `mlx-iris-restore-train` job;
         # 39 since sc-25689 added the dispatch-only `mlx-iris-curricula-train` job;
         # 40 since sc-25690 added the dispatch-only `mlx-iris-memory-probe` job;
-        # 41 since sc-26214 added the dispatch-only `mlx-veda` job.
-        MACOS_HUB_LOCK: 41,
+        # 41 since sc-26214 added the dispatch-only `mlx-veda` job;
+        # 42 since sc-24217 added the dispatch-only `mlx-supra2` job.
+        MACOS_HUB_LOCK: 42,
         # 19 since sc-24214 added the dispatch-only `candle-supra2` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
         # 17 since sc-25690 added the dispatch-only `candle-iris-memory-probe` job;
@@ -1266,12 +1267,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # follow-up added `candle-qwen-image-2-1-train`; 40 macOS / 17 Windows after sc-25690 added
         # `mlx-iris-memory-probe` and `candle-iris-memory-probe`; 18 Windows after sc-25901 added
         # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 19 Windows after
-        # sc-24214 added `candle-supra2`.
+        # sc-24214 added `candle-supra2`; 42 macOS after sc-24217 added `mlx-supra2`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
-        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 41)
+        self.assertEqual(workflow.count(MACOS_HUB_LOCK), 42)
         self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 19)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)

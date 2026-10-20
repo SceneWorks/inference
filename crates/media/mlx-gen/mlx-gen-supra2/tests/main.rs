@@ -22,3 +22,6 @@ mod real_weights;
 
 #[path = "tiny_dit_parity.rs"]
 mod tiny_dit_parity;
+
+#[path = "tiny_generator.rs"]
+mod tiny_generator;

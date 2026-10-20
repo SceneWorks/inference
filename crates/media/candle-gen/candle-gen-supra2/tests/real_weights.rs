@@ -22,8 +22,7 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::supra2::{
-    image_seed, initial_noise, BundleManifest, BUNDLE_MANIFEST, DENOISER_FILE, PROVIDER_ID,
-    TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
+    image_seed, initial_noise, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use candle_gen::gen_core::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
@@ -210,29 +209,6 @@ fn components_match_torch_reference() {
     }
 }
 
-/// A bundle view without the stored conditioning, to exercise upstream's empty-string fallback on
-/// the real checkpoint: the denoiser is hard-linked (copied if the filesystem refuses) and the
-/// manifest drops its conditioning entry.
-fn fallback_bundle(bundle: &Path) -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("supra2-fallback-{}-", std::process::id()))
-        .tempdir()
-        .unwrap();
-    let mut manifest: BundleManifest =
-        serde_json::from_slice(&std::fs::read(bundle.join(BUNDLE_MANIFEST)).unwrap()).unwrap();
-    manifest.conditioning = None;
-    let (from, to) = (bundle.join(DENOISER_FILE), dir.path().join(DENOISER_FILE));
-    if std::fs::hard_link(&from, &to).is_err() {
-        std::fs::copy(&from, &to).unwrap();
-    }
-    std::fs::write(
-        dir.path().join(BUNDLE_MANIFEST),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    dir
-}
-
 /// Whole-pipeline trajectories from the shared seed-0 initial noise (2 images): stored-uncond CFG
 /// at 8 and 50 steps, fallback-uncond CFG, and guidance off — latents and decoded pixels vs torch.
 #[test]
@@ -252,8 +228,12 @@ fn trajectories_match_torch_reference() {
     );
 
     let stored = Supra2Image::load_on_device(&spec_for(&bundle), device.clone()).unwrap();
-    let fb_dir = fallback_bundle(&bundle);
-    let fallback = Supra2Image::load_on_device(&spec_for(fb_dir.path()), device.clone()).unwrap();
+    // Upstream's empty-string fallback on the real checkpoint (the pinned bundle always stores an
+    // unconditional embedding, so only the test seam can drop it).
+    let fallback = Supra2Image::load_on_device(&spec_for(&bundle), device.clone())
+        .unwrap()
+        .without_stored_unconditional();
+    assert!(stored.stored_unconditional().is_some());
     assert!(fallback.stored_unconditional().is_none());
     let prompt = "a sea jellyfish floating in the pitch-black ocean depths";
     let latent_tol = tol(&device, (5e-5, 5e-6), (5e-3, 5e-4));

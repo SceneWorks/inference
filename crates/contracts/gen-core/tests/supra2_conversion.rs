@@ -146,8 +146,9 @@ fn rewrite_manifest(dir: &Path, edit: impl FnOnce(&mut BundleManifest)) {
 }
 
 /// The production read refuses each way a self-consistent bundle can be off-pin: an unpinned
-/// source, non-published geometry, and component revisions other than the pins — and accepts a
-/// manifest that satisfies all three (sizes-only check, so the tiny denoiser stands in).
+/// source, non-published geometry, component revisions other than the pins, a missing stored
+/// conditioning, and converted bytes other than the pinned conversion. The accepting half is
+/// `check_pinned_manifest`'s unit test and, on the real checkpoint, `real_checkpoint_converts_byte_exact`.
 #[test]
 fn pinned_read_refuses_unpinned_source_geometry_and_components() {
     let out = scratch("pinned");
@@ -191,13 +192,41 @@ fn pinned_read_refuses_unpinned_source_geometry_and_components() {
         .to_string();
     assert!(err.contains("unpinned components"), "{err}");
 
+    // A manifest that drops the stored conditioning is not the pinned checkpoint's bundle: it
+    // would silently switch CFG to the empty-string fallback.
     let vae_revision = SD_VAE.revision;
-    rewrite_manifest(out.path(), |m| {
-        m.components[1].revision = vae_revision.into()
+    let conditioning = rewrite_manifest_returning(out.path(), |m| {
+        m.components[1].revision = vae_revision.into();
+        m.conditioning.take()
     });
-    read_pinned_bundle(out.path(), BundleCheck::SizesOnly).unwrap();
-    // The bundle files are untouched, so the digest-checking read accepts the manifest too.
-    read_pinned_bundle(out.path(), BundleCheck::Digests).unwrap();
+    let err = read_pinned_bundle(out.path(), BundleCheck::SizesOnly)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("stores no unconditional conditioning"),
+        "{err}"
+    );
+
+    // With every manifest pin satisfied, the tiny denoiser is still not the pinned conversion —
+    // for both check depths (the files are untouched, so this is the pin, not a digest mismatch).
+    rewrite_manifest(out.path(), |m| m.conditioning = conditioning);
+    for check in [BundleCheck::SizesOnly, BundleCheck::Digests] {
+        let err = read_pinned_bundle(out.path(), check)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("denoiser `denoiser.safetensors`")
+                && err.contains("is not the pinned conversion")
+                && err.contains(PINNED_DENOISER.sha256),
+            "{err}"
+        );
+    }
+}
+
+fn rewrite_manifest_returning<T>(dir: &Path, edit: impl FnOnce(&mut BundleManifest) -> T) -> T {
+    let mut out = None;
+    rewrite_manifest(dir, |m| out = Some(edit(m)));
+    out.unwrap()
 }
 
 /// The sizes-only check (footprint/admission) still refuses a truncated file but does not hash.
@@ -286,6 +315,15 @@ fn real_checkpoint_converts_byte_exact() {
     assert_eq!(manifest.source.weights_key, reference["weights_key"]);
     let bundle = read_bundle(out.path()).unwrap();
     assert_denoiser_matches(&bundle, &reference);
+    // The conversion is deterministic: it reproduces the recorded pins, so the provider's reader
+    // accepts it at both check depths.
+    assert_eq!(manifest.denoiser.sha256, PINNED_DENOISER.sha256);
+    assert_eq!(manifest.denoiser.bytes, PINNED_DENOISER.bytes);
+    let conditioning = manifest.conditioning.as_ref().unwrap();
+    assert_eq!(conditioning.sha256, PINNED_CONDITIONING.sha256);
+    assert_eq!(conditioning.bytes, PINNED_CONDITIONING.bytes);
+    read_pinned_bundle(out.path(), BundleCheck::Digests).unwrap();
+    read_pinned_bundle(out.path(), BundleCheck::SizesOnly).unwrap();
     let cond = tensor_digests(&bundle.conditioning_path().unwrap());
     assert_eq!(cond["uncond_text"].1, reference["uncond_text_f32_sha256"]);
     assert_eq!(cond["uncond_mask"].1, reference["uncond_mask_f32_sha256"]);

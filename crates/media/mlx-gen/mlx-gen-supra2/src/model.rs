@@ -10,13 +10,13 @@ use mlx_gen::gen_core::supra2::{
     Supra2Resolved, Supra2Tokenizer, PROVIDER_ID, TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
 use mlx_gen::gen_core::{
-    self, LoadShape, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, Modality,
-    PerComponentBytes, SizeFloor,
+    self, GenerationReport, LoadShape, MemoryAssetFacts, MemoryProviderContract, MemoryRunContext,
+    MemorySafetyDecision, Modality, PerComponentBytes, SizeFloor,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     CancelFlag, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Result,
+    LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::text_encoder::{T5Geometry, T5TextEncoder};
 use mlx_gen_sdxl::config::VaeConfig;
@@ -50,6 +50,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_count: s2::MAX_IMAGES,
             size_floor: SizeFloor::RangeChecked,
             mac_only: true,
+            max_prompt_tokens: Some(s2::MAX_PROMPT_TOKENS),
             ..Default::default()
         },
     }
@@ -163,7 +164,7 @@ fn check(cancel: &CancelFlag) -> Result<()> {
 pub struct Supra2Image {
     descriptor: ModelDescriptor,
     spec: LoadSpec,
-    sources: Supra2Sources,
+    config: Supra2Config,
     tokenizer: Supra2Tokenizer,
     text_encoder: T5TextEncoder,
     dit: SupraDit,
@@ -219,7 +220,7 @@ impl Supra2Image {
         Ok(Self {
             descriptor: descriptor(),
             spec: spec.clone(),
-            sources,
+            config: sources.bundle.manifest.config,
             tokenizer,
             text_encoder,
             dit,
@@ -229,8 +230,43 @@ impl Supra2Image {
         })
     }
 
+    /// **Test seam** — assemble a generator from already-built parts on a non-published
+    /// `config` (the crate's tiny random-weight `tests/`). The registered provider never reaches
+    /// it: [`load`] builds only through [`Supra2Image::load`], which reads a pinned bundle. The
+    /// memory contract carries the geometry and no byte facts.
+    #[doc(hidden)]
+    pub fn from_parts(
+        config: Supra2Config,
+        tokenizer: Supra2Tokenizer,
+        text_encoder: T5TextEncoder,
+        dit: SupraDit,
+        vae: Autoencoder,
+        stored_unconditional: Option<TextConditioning>,
+    ) -> Self {
+        Self {
+            descriptor: descriptor(),
+            spec: LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::new())),
+            config,
+            tokenizer,
+            text_encoder,
+            dit,
+            vae,
+            stored_unconditional,
+            memory: memory_strategy::contract_with_facts(&config, MemoryAssetFacts::default()),
+        }
+    }
+
+    /// **Test seam** — drop the checkpoint-stored unconditional conditioning so CFG takes
+    /// upstream's empty-string fallback on the real checkpoint (`tests/real_weights.rs`). Not
+    /// reachable from the registered provider, whose pinned bundle always stores one.
+    #[doc(hidden)]
+    pub fn without_stored_unconditional(mut self) -> Self {
+        self.stored_unconditional = None;
+        self
+    }
+
     pub fn config(&self) -> &Supra2Config {
-        &self.sources.bundle.manifest.config
+        &self.config
     }
 
     pub fn denoiser(&self) -> &SupraDit {
@@ -409,8 +445,25 @@ impl Generator for Supra2Image {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        self.generate_with_report(request, on_progress)?
+            .output
+            .ok_or_else(|| gen_core::Error::Msg("supra2: the render produced no output".into()))
+    }
+
+    /// The render plus a [`s2::PROMPT_TRUNCATED_WARNING`] when the prompt exceeded the
+    /// [`s2::MAX_PROMPT_TOKENS`]-token context (upstream truncates it and logs a warning).
+    fn generate_with_report(
+        &self,
+        request: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationReport> {
         let out = self.generate_with(request, None, on_progress)?;
-        Ok(GenerationOutput::Images(out.images))
+        let mut report = GenerationReport::from_output(GenerationOutput::Images(out.images));
+        report.warnings.extend(s2::prompt_truncated_warning(
+            out.prompt_tokens,
+            self.config.ctx_len,
+        ));
+        Ok(report)
     }
 
     fn memory_strategy_contract(&self) -> Option<&MemoryProviderContract> {
@@ -443,6 +496,18 @@ pub(crate) const MEMORY: gen_core::MemoryRegistration = gen_core::MemoryRegistra
 #[cfg(test)]
 mod cpu_tests {
     use super::*;
+
+    /// The 256² geometry and the 128-token prompt limit are advertised weights-free.
+    #[test]
+    fn descriptor_advertises_the_native_geometry_and_prompt_limit() {
+        let d = descriptor();
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(
+            (d.capabilities.min_size, d.capabilities.max_size),
+            (256, 256)
+        );
+        assert_eq!(d.capabilities.max_prompt_tokens, Some(128));
+    }
 
     /// sd-vae-ft-mse's legacy mid-block attention keys map onto the AutoencoderKL layout; keys
     /// already in the new layout, and non-attention keys, are left alone. Tensor-free (no eval).
