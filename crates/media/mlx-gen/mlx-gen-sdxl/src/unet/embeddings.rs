@@ -114,6 +114,11 @@ pub struct TimestepEmbedding {
 }
 
 impl TimestepEmbedding {
+    pub(super) fn pricing_facts(&self) -> super::pricing::TimeFacts {
+        super::pricing::TimeFacts { linear1: crate::quantum::LinearWork::of(&self.linear1),
+            linear2: crate::quantum::LinearWork::of(&self.linear2) }
+    }
+
     /// `prefix` is e.g. `time_embedding` or `add_embedding`; leaves are `linear_1`/`linear_2`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         // Packed-detect (sc-8746): both MLP Linears are quantized in [`Self::quantize`], so a
@@ -150,36 +155,22 @@ impl TimestepEmbedding {
         self.linear2.forward(&x)
     }
 
+    #[cfg(test)]
     pub(crate) fn output_dtype_with_effects(&self, x: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
-        let first = effects.linear("linear_1", &self.linear1)?.output_dtype(x);
-        let first = Dtype::from_promoting_types(x, first);
-        Ok(Dtype::from_promoting_types(first,
-            effects.linear("linear_2", &self.linear2)?.output_dtype(first)))
+        self.pricing_facts().output_dtype_with_effects(x, effects)
     }
 
-    pub(crate) fn projection_scratch(&self, batch: i32, input: Dtype, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
-        let first = effects.linear("linear_1", &self.linear1)?;
-        let second = effects.linear("linear_2", &self.linear2)?;
-        let shape = [batch, *first.base.base_shape.last().unwrap_or(&0)];
-        let hidden = first.output_dtype(input);
-        let intermediate = [batch, first.output_width() as i32];
-        let output = second.output_dtype(hidden);
-        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(
-            crate::quantum::dtype_bytes(dtype), &[batch.max(0) as u64, width]);
-        Ok(first.operand_bytes(&shape, input)
-            .saturating_add(plane(hidden, first.output_width()).saturating_mul(3))
-            .saturating_add(second.operand_bytes(&intermediate, hidden))
-            .saturating_add(plane(output, second.output_width()))
-            .saturating_add(crate::quantum::page_slack(4)))
-    }
 
+
+    #[cfg(test)]
     pub(crate) fn out_features_with_effects(&self, effects: &crate::quantum::EffectScope<'_>) -> Result<i32> {
-        Ok(effects.linear("linear_2", &self.linear2)?.output_width() as i32)
+        self.pricing_facts().out_features_with_effects(effects)
     }
 
 }
 
 /// Pure final projection facts for the existing time/add embedding flow.
+#[cfg(test)]
 pub(crate) fn text_time_temb_dtype_with_effects(
     time_embedding: &TimestepEmbedding,
     add_embedding: &TimestepEmbedding,
@@ -201,18 +192,10 @@ pub(crate) fn stem_projection_scratch(
     batch: i32, dtype: Dtype, text: Dtype, memory: &Array,
     effects: &crate::quantum::EffectScope<'_>,
 ) -> Result<u64> {
-    let mut bytes = time.projection_scratch(batch, dtype, &effects.child("time_embedding"))?
-        .saturating_add(add.projection_scratch(batch, Dtype::from_promoting_types(text, dtype),
-            &effects.child("add_embedding"))?);
-    if let Some(encoder) = encoder {
-        let work = effects.linear("encoder_hid_proj", encoder)?;
-        bytes = bytes.saturating_add(work.operand_bytes(memory.shape(), memory.dtype()))
-            .saturating_add(mlx_gen::ios_quantum::tensor_bytes(
-                crate::quantum::dtype_bytes(work.output_dtype(memory.dtype())),
-                &[memory.shape()[0].max(0) as u64, memory.shape()[1].max(0) as u64, work.output_width()]));
+    super::pricing::stem_projection_scratch(&time.pricing_facts(), &add.pricing_facts(),
+        encoder.map(crate::quantum::LinearWork::of).as_ref(), batch, dtype, text,
+        &crate::quantum::activation_facts(memory), effects)
     }
-    Ok(bytes)
-}
 
 /// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by
 /// [`UNet2DConditionModel::forward_core`](crate::unet::UNet2DConditionModel) and

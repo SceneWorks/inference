@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-20T20:22:25.564692+00:00",
-  "rust_proof_closure_sha256": "2f18aa9afa0978c3afcaec4f238ae4a4ab85c7a5592beac0cc1f50698697a4cd",
+  "UTC": "2026-10-20T21:46:03.187920+00:00",
+  "rust_proof_closure_sha256": "c4c0b8c30cc22c6a7bfff1b84aad07134cb54342dc72ac5053094108bf7d0f61",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -17,6 +17,10 @@
     {
       "path": ".cargo/config.toml",
       "sha256": "f784f55120306ca7be3b744d230b3a29af2fe4b3d689b579d2f7962b11d14aac"
+    },
+    {
+      "path": ".github/workflows/real-weights.yml",
+      "sha256": "a5899d293d3c2855eac24ebd814bf136058afaf387aa281207b7fae0d3cdfd44"
     },
     {
       "path": "Cargo.lock",
@@ -359,8 +363,16 @@
       "sha256": "0ed627a0632b0ec0f4ee50d9693436851dd557634c763513b276045551265733"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/block_stream.rs",
+      "sha256": "f0c8346eb3e02619024e0a4c157df3c14ad208f945b1f251b936da9a17e80ba1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/config.rs",
+      "sha256": "0afbd6b268798bd3d1ce78234c72a371c7981a2b777928fe81c98d88e07108b1"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ios_pricing.rs",
-      "sha256": "37b5e5edbd9799fb98e3be533dc8913a2fd725292d45479e7a2d834c414c6afc"
+      "sha256": "26d1fc8c243ca3098beafa64f12121f8759feb4b28308aa734090c309d5882d2"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/ip_adapter.rs",
@@ -392,7 +404,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum.rs",
-      "sha256": "2c8bf165b0c22fba69a93cd99fdad3b931828905ecb42d173b86665ec55b85d5"
+      "sha256": "2929805d9addb21e821db478e678e7cdbfa6dcd77ed7e8d0a374d48edf4e6476"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
@@ -404,7 +416,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_pricing.rs",
-      "sha256": "873a958ea84d5ae6985125e44f363c392ca2b034f8f94ce0ea182b1d4e19fe1f"
+      "sha256": "06ca65223ef5a31f8888edfea1f58ccc5144d06ed6149190e1fc96a68c0d09c7"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests_reachable.rs",
@@ -423,32 +435,48 @@
       "sha256": "4b5716eb537cc2c04ce9cc801aa9bc7c96e45cea5fcc3b02b9c3c00963768c11"
     },
     {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/test_support.rs",
+      "sha256": "c66761e3767c30b7b9176f70ec7f0bf82aafed5ac21019b4baca633031b18c1e"
+    },
+    {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/text_encoder.rs",
-      "sha256": "f343cf89e156bc4f218c20f23c881b085078353b38244f979a824282d2a4e818"
+      "sha256": "c5abdd418fec53db4edb0412a70a12f6dfe45114b8185bb658f4d98192d90365"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/block.rs",
-      "sha256": "9f20de0f2a59e249851ae1b64235bc466245ec4f33ab83feaa2d9b2c35aeb019"
+      "sha256": "6ae85954cd2cec66b69bba3cd6f28aacc84dcdaa2304392d1ec31691532eeb4e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/controlnet.rs",
-      "sha256": "f9b4b04fc1a404ba2dce95565fdeea960957f40b99b5fd8f5c2300e1fb6f7ae5"
+      "sha256": "dcbf1a59cc92955d132d86a9840f3fcdfba5a9f54ab615c41b0cc8d133de8194"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/embeddings.rs",
+      "sha256": "174c1cc1ebe95431603e32fd42e0306b89413527224d156cf04e3062b5830da0"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/mod.rs",
-      "sha256": "cb90b3047788aed2bd2695a3c0a6cfa9e722c2e7a6c146f44ea824af44fe1ed5"
+      "sha256": "725417efd062a8232d51acd6ef80d07e34a8fa1c77ca20b693fc0e963411c9dd"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/pricing.rs",
+      "sha256": "85be1a66715a86364cafaf1429446ef924f2acae2703e2466c5716e352a27986"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
-      "sha256": "5aa25d00e232d9d4c1a89a1950002b75718a02658529de787c406559f8ec16da"
+      "sha256": "444ec04c697fd537d647dbfda5d5d9002e6883f28268e545391169013bfc648b"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/transformer.rs",
-      "sha256": "36891b88fd3a06cd3d8be848ee022152a4a3bcefbf0d04d2a2e0a52ae23baefd"
+      "sha256": "378be745292764c9d1c19b51cec26bd7e767ab9edb5681435e28d3a248727309"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae.rs",
-      "sha256": "e37d0b82e25f9f66426a9e6faacefbeda35a3525bc8205aae9409b22e189c52f"
+      "sha256": "36513585060f1c1499588eb96875e11b8c9110bfc3febe3f42b2f8ba975f0b1c"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae/pricing.rs",
+      "sha256": "f4770fc8135085006a907263e34ff7bdfe8a6d49d370984a3ef2be6582144a25"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vision_encoder.rs",
@@ -505,6 +533,18 @@
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing.rs",
       "sha256": "ffb8fc0dc0920438a95596619482da84ffeca6fec8a40b0e604c0d3095296e24"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
+      "sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
+      "sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
+      "sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing_tests.rs",
@@ -679,6 +719,10 @@
       "sha256": "7d15f5441c19aa215772e7995c9e071f49a4238ed66dfa0c04ee05d79f0de757"
     },
     {
+      "path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs",
+      "sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c"
+    },
+    {
       "path": "crates/media/mlx-gen/src/array.rs",
       "sha256": "269ce72afad672497fce54c99631619759e71a63eae610ac0689d6e7f2845fd8"
     },
@@ -704,7 +748,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum.rs",
-      "sha256": "3670a4fe35b6888b4ec28647e236cc9632ee2ad8abaf3a54a56e7323a0d8bf78"
+      "sha256": "853b7ff598afb0b16ffe821dcd33188b5ea4eeaa27d0e032c2c1db4ddf5df869"
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum_budget.rs",
@@ -712,7 +756,7 @@
     },
     {
       "path": "crates/media/mlx-gen/src/ios_quantum_kernels.rs",
-      "sha256": "5947e74e68ecbf6ae932341d8088ef53903314a1157d0283b37358b0ceed904f"
+      "sha256": "bbbd80d25558d3766d27077aff2450948ed95825a4fdbf01d5e74eb0ff87f5d9"
     },
     {
       "path": "crates/media/mlx-gen/src/lib.rs",
@@ -779,48 +823,16 @@
       "sha256": "0496bc858d2c470e8acab0556cdd4177a5e3c96cfdbad3d1b8d1c93d371fcc7b"
     },
     {
+      "path": "scripts/ci/ios_pricing_compile_only.py",
+      "sha256": "ab6dae583547be63916cb2bb4529c3e5fcc81bd0bb45e0ce51aace3b2470d05c"
+    },
+    {
       "path": "scripts/ios/campaign.py",
       "sha256": "2075aae8864bb2b5c6186a8442a2e858e85f75bbfba37c8dbd8d1d3cabffe38e"
     },
     {
       "path": "scripts/tests/test_ios_campaign.py",
       "sha256": "ab86d7bed9c261fd8424264500f8d8fbd6f064789df3c0e83dffede5f0c8efb1"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/config.rs",
-      "sha256": "0afbd6b268798bd3d1ce78234c72a371c7981a2b777928fe81c98d88e07108b1"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/test_support.rs",
-      "sha256": "c66761e3767c30b7b9176f70ec7f0bf82aafed5ac21019b4baca633031b18c1e"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/embeddings.rs",
-      "sha256": "210f6b33b61e9bd87b8b4940a656b08cca3ca9226c24ae449592e58111de1923"
-    },
-    {
-      "path": "crates/media/mlx-gen/src/adapters/loader/source_facts.rs",
-      "sha256": "d337b0f85678726bb1abb02f73a7349bc4c04231f3c2ab1cfb21b476c39cfc0c"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/adapter_sources.rs",
-      "sha256": "e97a1f0bfd9bf4e8b0f3e3b00220b763a017e589842140455ba5cf5099ae4ba1"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_work_basis.rs",
-      "sha256": "42df03d84570e85bd7d5e92624e8a34b399c6eb3131baccfdac915f14553179e"
-    },
-    {
-      "path": "crates/media/mlx-gen/mlx-gen-z-image/src/ios_pricing/pid_sources.rs",
-      "sha256": "72e74a1426f18b00a52bf6f381ff01b5b33a36ecf305c20dca233e0cd78aa9b2"
-    },
-    {
-      "path": ".github/workflows/real-weights.yml",
-      "sha256": "a5899d293d3c2855eac24ebd814bf136058afaf387aa281207b7fae0d3cdfd44"
-    },
-    {
-      "path": "scripts/ci/ios_pricing_compile_only.py",
-      "sha256": "ab6dae583547be63916cb2bb4529c3e5fcc81bd0bb45e0ce51aace3b2470d05c"
     }
   ],
   "HOSTs": [

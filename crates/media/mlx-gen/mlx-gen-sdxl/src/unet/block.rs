@@ -228,6 +228,7 @@ impl UNetBlock2D {
         Ok((x, output_states))
     }
 
+    #[cfg(test)]
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,
@@ -458,13 +459,8 @@ impl AdaptableHost for UNetBlock2D {
 /// Shared sampler price from actual OHWI metadata. Native wrappers keep their original trace
 /// operands; selected-world pricing substitutes only the installed weight facts.
 fn sampler_scratch(x: &Array, work: &crate::quantum::ConvWork, up: bool) -> u64 {
-    let mut shape = x.shape().to_vec();
-    if up { shape[1] *= 2; shape[2] *= 2; }
-    let act = crate::quantum::element_bytes(x);
-    let call = work.call(&shape, act, if up { 1 } else { 2 }, 1);
-    crate::quantum::single_conv_bytes(&call, u64::from(up), 0, crate::quantum::backend())
-        .saturating_add(work.bias_bytes(x.dtype(), call.out_bytes() / act))
-}
+    super::pricing::sampler_scratch(&crate::quantum::activation_facts(x), work, up)
+    }
 
 fn downsample_scratch(x: &Array, c: &AdaptableConv2d) -> u64 {
     #[cfg(test)]

@@ -22,7 +22,7 @@ use crate::plan::SdxlForwardPlan;
 type ProjectionOperandRecord = (String, Vec<i32>, Dtype, u64);
 #[cfg(test)]
 thread_local! {
-    static PROJECTION_OPERAND_LOG: std::cell::RefCell<Option<Vec<ProjectionOperandRecord>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static PROJECTION_OPERAND_LOG: std::cell::RefCell<Option<Vec<ProjectionOperandRecord>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 pub(crate) fn with_projection_operands_for_test<T>(body: impl FnOnce() -> T) -> (T, Vec<ProjectionOperandRecord>) {
@@ -69,6 +69,15 @@ struct AttentionMHA {
 }
 
 impl AttentionMHA {
+    fn pricing_facts(&self) -> super::pricing::AttentionFacts {
+        use crate::quantum::LinearWork;
+        super::pricing::AttentionFacts { q: LinearWork::of(&self.q), k: LinearWork::of(&self.k),
+            v: LinearWork::of(&self.v), out: LinearWork::of(&self.out),
+            num_heads: self.num_heads, head_dim: self.head_dim,
+            to_k_ip: self.to_k_ip.as_ref().map(LinearWork::of),
+            to_v_ip: self.to_v_ip.as_ref().map(LinearWork::of) }
+    }
+
     fn from_weights(w: &Weights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
         // Packed-detect (sc-8746): q/k/v (bias-free) + to_out.0 (biased) are all quantized in
         // [`Self::quantize`], so `crate::quant::lin` loads their packed triple or the dense weight.
@@ -245,6 +254,18 @@ pub(crate) struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    fn pricing_facts(&self) -> super::pricing::TransformerBlockFacts {
+        use crate::quantum::LinearWork;
+        super::pricing::TransformerBlockFacts {
+            norm1_w: crate::quantum::activation_facts(&self.norm1_w), norm1_b: crate::quantum::activation_facts(&self.norm1_b),
+            norm2_w: crate::quantum::activation_facts(&self.norm2_w), norm2_b: crate::quantum::activation_facts(&self.norm2_b),
+            norm3_w: crate::quantum::activation_facts(&self.norm3_w), norm3_b: crate::quantum::activation_facts(&self.norm3_b),
+            attn1: self.attn1.pricing_facts(), attn2: self.attn2.pricing_facts(),
+            linear1: LinearWork::of(&self.linear1), linear2: LinearWork::of(&self.linear2),
+            linear3: LinearWork::of(&self.linear3),
+        }
+    }
+
     pub(crate) fn from_weights(
         w: &Weights,
         prefix: &str,
@@ -442,49 +463,8 @@ impl TransformerBlock {
         activation: Dtype,
         ff_width: u64,
     ) -> u64 {
-        let heads = self.attn1.num_heads;
-        let act = crate::quantum::dtype_bytes(activation);
-        let dim = self.norm1_w.shape()[0] as u64;
-        // Entered narrower than the projections promote to: the self-attention's q/k/v each cast
-        // the narrow LayerNorm output up (`quantized_matmul`'s `astype(x, result_type)`).
-        let casts = if act > crate::quantum::dtype_bytes(x) {
-            mlx_gen::ios_quantum::tensor_bytes(act, &[3, batch.max(1) as u64, tokens as u64, dim])
-                .saturating_add(crate::quantum::page_slack(3))
-        } else {
-            0
-        };
-        // The two attentions are planned independently by `sdpa_budgeted_bhsd`; the self-attention
-        // (the larger key axis) has the smaller chunk, the cross-attention the larger — each prices
-        // at its own rows, so take the plan of the larger score domain (rows × keys).
-        let self_rows = attention
-            .budget
-            .query_block(batch, heads, tokens, tokens)
-            .clamp(1, tokens.max(1));
-        let cross_rows = attention
-            .budget
-            .query_block(batch, heads, tokens, context_tokens)
-            .clamp(1, tokens.max(1));
-        let rows = if (self_rows as i64) * (tokens as i64)
-            >= (cross_rows as i64) * (context_tokens as i64)
-        {
-            self_rows
-        } else {
-            cross_rows
-        };
-        casts.saturating_add(crate::quantum::transformer_block_bytes(
-            batch,
-            context_batch,
-            tokens,
-            dim,
-            heads,
-            self.attn1.head_dim,
-            context_tokens,
-            ff_width,
-            rows,
-            ip && self.has_ip(),
-            act,
-            crate::quantum::backend(),
-        ))
+        self.pricing_facts().quantum_scratch_from_facts(batch, context_batch, tokens,
+            context_tokens, ip, x, attention, activation, ff_width)
     }
 
     /// The dtype this block's hidden state runs at for `x`-typed input: `x`'s, promoted by the
@@ -520,69 +500,8 @@ impl TransformerBlock {
         x: Dtype, memory: Dtype, ip: Option<(i32, i32, Dtype)>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(Dtype, u64)> {
-        // Native projections read ACTIVATIONS, not the pre-install borrowed weight's axes.
-        // Selected effects may have changed a dense base before its actual load-time pack.
-        let dim = hidden_width;
-        let operand = |_family: &str, _role: &str, linear: &crate::quantum::LinearWork,
-            shape: &[i32], dtype: Dtype| {
-            let bytes = linear.operand_bytes(shape, dtype);
-            #[cfg(test)]
-            PROJECTION_OPERAND_LOG.with(|log| {
-                if let Some(records) = log.borrow_mut().as_mut() {
-                    records.push((format!("{_family}.{_role}"), shape.to_vec(), dtype, bytes));
-                }
-            });
-            bytes
-        };
-        let mut scratch = 0u64;
-        let mut hidden = x;
-        for (name, attention, norm_w, norm_b, cross) in [
-            ("attn1", &self.attn1, &self.norm1_w, &self.norm1_b, false),
-            ("attn2", &self.attn2, &self.norm2_w, &self.norm2_b, true),
-        ] {
-            let scope = effects.child(name);
-            let norm = crate::quantum::promote_all(hidden, &[norm_w, norm_b]);
-            let query = [batch, tokens, dim];
-            let key = [if cross { context_batch } else { batch },
-                if cross { context_tokens } else { tokens },
-                if cross { memory_width } else { hidden_width }];
-            let key_dtype = if cross { memory } else { norm };
-            let q = scope.linear("to_q", &attention.q)?;
-            let k = scope.linear("to_k", &attention.k)?;
-            let v = scope.linear("to_v", &attention.v)?;
-            scratch = scratch.saturating_add(operand(name, "to_q", &q, &query, norm))
-                .saturating_add(operand(name, "to_k", &k, &key, key_dtype))
-                .saturating_add(operand(name, "to_v", &v, &key, key_dtype));
-            let mut attended = Dtype::from_promoting_types(q.output_dtype(norm),
-                Dtype::from_promoting_types(k.output_dtype(key_dtype), v.output_dtype(key_dtype)));
-            if cross {
-                if let Some((ip_tokens, ip_width, ip_dtype)) = ip {
-                    for (name, projection) in [("to_k_ip", &attention.to_k_ip), ("to_v_ip", &attention.to_v_ip)] {
-                        if let Some(projection) = projection {
-                            let work = scope.linear(name, projection)?;
-                            scratch = scratch.saturating_add(operand("attn2", name, &work,
-                                &[context_batch, ip_tokens, ip_width], ip_dtype));
-                            attended = Dtype::from_promoting_types(attended, work.output_dtype(ip_dtype));
-                        }
-                    }
-                }
-            }
-            let out = scope.linear("to_out.0", &attention.out)?;
-            scratch = scratch.saturating_add(operand(name, "to_out.0", &out,
-                &[batch, tokens, attention.num_heads * attention.head_dim], attended));
-            hidden = Dtype::from_promoting_types(hidden, out.output_dtype(attended));
-        }
-        let norm = crate::quantum::promote_all(hidden, &[&self.norm3_w, &self.norm3_b]);
-        let value = effects.linear("ff.linear1", &self.linear1)?;
-        let gate = effects.linear("ff.linear2", &self.linear2)?;
-        let output = effects.linear("ff.linear3", &self.linear3)?;
-        let input = [batch, tokens, dim];
-        scratch = scratch.saturating_add(operand("ff", "linear1", &value, &input, norm))
-            .saturating_add(operand("ff", "linear2", &gate, &input, norm));
-        let product = Dtype::from_promoting_types(value.output_dtype(norm), gate.output_dtype(norm));
-        scratch = scratch.saturating_add(operand("ff", "linear3", &output,
-            &[batch, tokens, value.output_width() as i32], product));
-        Ok((Dtype::from_promoting_types(hidden, output.output_dtype(product)), scratch))
+        self.pricing_facts().projection_work(batch, context_batch, tokens, hidden_width,
+            context_tokens, memory_width, x, memory, ip, effects)
     }
 
     /// The cross-attention key count this block sees for `memory` (+ IP tokens when this block
@@ -672,6 +591,15 @@ pub struct Transformer2D {
 }
 
 impl Transformer2D {
+    fn pricing_facts_without_stream(&self) -> super::pricing::TransformerFacts {
+        use crate::quantum::LinearWork;
+        super::pricing::TransformerFacts { norm_w: crate::quantum::activation_facts(&self.norm_w),
+            norm_b: crate::quantum::activation_facts(&self.norm_b), proj_in: LinearWork::of(&self.proj_in),
+            proj_out: LinearWork::of(&self.proj_out),
+            blocks: self.blocks.iter().map(TransformerBlock::pricing_facts).collect(),
+            block_stream: None }
+    }
+
     /// `prefix` addresses the `attentions.{i}` module. `num_layers` = transformer blocks.
     pub fn from_weights(
         w: &Weights,
@@ -1018,37 +946,13 @@ impl Transformer2D {
         plan: SdxlForwardPlan<'_>,
         effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<(u64, u64, i32, Dtype, Dtype)> {
-        let input = effects.linear("proj_in", &self.proj_in)?;
-        let output = effects.linear("proj_out", &self.proj_out)?;
-        let s = x.shape();
-        let shape = [s[0], s[1] * s[2], s[3]];
-        let norm = crate::quantum::promote_all(x.dtype(), &[&self.norm_w, &self.norm_b]);
-        let inner = input.output_width() as i32;
-        let mut hidden = input.output_dtype(norm);
-        let groups = crate::quantum::group_norm_buffers(crate::quantum::backend(), crate::quantum::element_bytes(x));
-        let plane = |dtype, width| mlx_gen::ios_quantum::tensor_bytes(crate::quantum::dtype_bytes(dtype),
-            &[s[0] as u64, s[1] as u64, s[2] as u64, width]);
-        let proj_in = plane(x.dtype(), s[3] as u64).saturating_mul(groups)
-            .saturating_add(input.operand_bytes(&shape, norm))
-            .saturating_add(plane(hidden, inner as u64))
-            .saturating_add(crate::quantum::page_slack(groups + 1));
-        let entered = hidden;
-        for (index, block) in self.blocks.iter().enumerate() {
-            hidden = block.projection_work(s[0], plan.conditioning_batch(s[0]).max(encoder_x.shape()[0]),
-                s[1] * s[2], inner, encoder_x.shape()[1], encoder_x.shape()[2], hidden, encoder_x.dtype(),
-                ip.map(|(a, _)| (a.shape()[1], a.shape()[2], a.dtype())),
-                &effects.child(&format!("transformer_blocks.{index}")))?.0;
-        }
-        let projected = output.output_dtype(hidden);
-        let summed = Dtype::from_promoting_types(projected, x.dtype());
-        let widened = u64::from(summed != projected);
-        let proj_out = plane(projected, output.output_width())
-            .saturating_add(output.operand_bytes(&[s[0], s[1] * s[2], inner], hidden))
-            .saturating_add(plane(summed, output.output_width()).saturating_mul(widened))
-            .saturating_add(crate::quantum::page_slack(1 + widened));
-        Ok((proj_in, proj_out, inner, entered, summed))
+        self.pricing_facts_without_stream().projection_budgets_with_effects(
+            &crate::quantum::activation_facts(x), &crate::quantum::activation_facts(encoder_x),
+            ip.map(|(tokens, scale)| (crate::quantum::activation_facts(tokens), scale)).as_ref().map(|(tokens, scale)| (tokens, *scale)),
+            plan, effects)
     }
 
+    #[cfg(test)]
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,

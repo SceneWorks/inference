@@ -487,8 +487,18 @@ pub fn tile_bytes(
     f32_accum: bool,
     backend: Backend,
 ) -> u64 {
+    tile_bytes_from_metadata(tile, source, act, weight.shape(), element_bytes(weight), f32_accum, backend)
+}
+
+/// The identical existing raw guard formula over exact operand metadata; no native graph,
+/// new rank/cap/policy, allocation identity or physical-transfer certificate.
+pub fn tile_bytes_from_metadata(
+    tile: &[i32], source: TileSource, act: u64,
+    weight_shape: &[i32], weight_element_bytes: u64,
+    f32_accum: bool, backend: Backend,
+) -> u64 {
     let conv_act = if f32_accum { 4 } else { act };
-    let call = ConvCall::new(tile, conv_act, weight, 1, 1);
+    let call = ConvCall::from_metadata(tile, conv_act, weight_shape, weight_element_bytes, 1, 1);
     let (b, h, w, c) = (u(tile[0]), u(tile[1]), u(tile[2]), u(tile[3]));
     let crop = tensor_bytes(act, &[b, h, w, c]);
     let strip = tensor_bytes(act, &[b, h, u(source.full_width).max(w), c]);
@@ -542,7 +552,15 @@ pub fn downsample_stage_bytes(out: &[i32], act: u64) -> u64 {
 /// halo, `2·core + 1`): the bottom/right zero-padded crop copy, the stride-2 convolution's output
 /// core (its bias add donates) and the kernel transient.
 pub fn downsample_tile_bytes(crop: &[i32], act: u64, weight: &Array, backend: Backend) -> u64 {
-    let call = ConvCall::new(crop, act, weight, 2, 0);
+    downsample_tile_bytes_from_metadata(crop, act, weight.shape(), element_bytes(weight), backend)
+}
+
+/// The identical existing raw guard formula over exact operand metadata; no native graph,
+/// new rank/cap/policy, allocation identity or physical-transfer certificate.
+pub fn downsample_tile_bytes_from_metadata(
+    crop: &[i32], act: u64, weight_shape: &[i32], weight_element_bytes: u64, backend: Backend,
+) -> u64 {
+    let call = ConvCall::from_metadata(crop, act, weight_shape, weight_element_bytes, 2, 0);
     single_conv_bytes(&call, 1, 0, backend)
 }
 
@@ -551,17 +569,31 @@ pub fn downsample_tile_bytes(crop: &[i32], act: u64, weight: &Array, backend: Ba
 /// and stay live across every tile of the stage, on top of the stage's activations. Each tile's own
 /// promoted crop and f32 output are priced by [`tile_bytes`].
 pub fn tiled_stage_f32_accum(out: &[i32], weight: &Array, bias: &Array, act: u64) -> u64 {
-    let (cin, cout) = conv_channels(weight);
+    tiled_stage_f32_accum_from_metadata(out, weight.shape(), elements(weight), elements(bias), act)
+}
+
+/// The identical existing raw guard formula over exact operand metadata; no native graph,
+/// new rank/cap/policy, allocation identity or physical-transfer certificate.
+pub fn tiled_stage_f32_accum_from_metadata(
+    out: &[i32], weight_shape: &[i32], weight_elements: u64, bias_elements: u64, act: u64,
+) -> u64 {
+    let (cin, cout) = (weight_shape[weight_shape.len() - 1], weight_shape[0]);
     tiled_stage_bytes(out, cin, cout, act, false)
-        .saturating_add(elements(weight).saturating_mul(4))
-        .saturating_add(elements(bias).saturating_mul(4))
+        .saturating_add(weight_elements.saturating_mul(4))
+        .saturating_add(bias_elements.saturating_mul(4))
 }
 
 /// The decoded image's pixel conversion (`mlx_gen::image::decoded_to_image`): one f32 image-sized
 /// buffer (every op of the scale/clamp/round chain after the first donates; a half-precision VAE's
 /// lazy f32 output cast is donated into by the first) and its allocator page.
 pub fn decoded_to_image_bytes(decoded: &Array) -> u64 {
-    super::elementwise_bytes(decoded.size() as u64, 1).saturating_add(page_slack(1))
+    decoded_to_image_bytes_from_metadata(decoded.size() as u64)
+}
+
+/// The identical existing raw guard formula over exact operand metadata; no native graph,
+/// new rank/cap/policy, allocation identity or physical-transfer certificate.
+pub fn decoded_to_image_bytes_from_metadata(decoded_elements: u64) -> u64 {
+    super::elementwise_bytes(decoded_elements, 1).saturating_add(page_slack(1))
 }
 
 

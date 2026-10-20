@@ -24,7 +24,9 @@ pub use kernels::{
     bytes, conv_channels, conv_sum, decoded_to_image_bytes, downsample_stage_bytes,
     downsample_tile_bytes, dtype_bytes, element_bytes, elements, group_norm_buffers,
     norm_conv_bytes, norm_promotion_units, page_slack, resnet_bytes, resnet_bytes_from_metadata, sdpa_scores,
-    single_conv_bytes, tile_bytes, tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes,
+    single_conv_bytes, tile_bytes, tile_bytes_from_metadata, tiled_stage_bytes,
+    tiled_stage_f32_accum, tiled_stage_f32_accum_from_metadata, vae_attention_bytes,
+    downsample_tile_bytes_from_metadata, decoded_to_image_bytes_from_metadata,
     Backend, ConvCall, TileSource, GROUP_NORM_BUFFERS, PAGE_BYTES, VAE_ATTENTION_SCORE_ELEMENTS,
 };
 

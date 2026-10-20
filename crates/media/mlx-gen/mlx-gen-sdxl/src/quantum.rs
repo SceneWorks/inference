@@ -36,6 +36,10 @@ pub(crate) use mlx_gen::ios_quantum::{
 };
 #[cfg(test)]
 pub(crate) use mlx_gen::ios_quantum::{resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES};
+// Additive VAE metadata bindings; current native TileSource/callers remain untouched.
+pub(crate) use mlx_gen::ios_quantum::{tile_bytes_from_metadata,
+    downsample_tile_bytes_from_metadata, tiled_stage_f32_accum_from_metadata,
+    decoded_to_image_bytes_from_metadata};
 use mlx_rs::{Array, Dtype};
 
 #[cfg(test)]
@@ -456,6 +460,7 @@ pub(crate) fn conv_bias_bytes(
 
 /// Dense convolution facts in native OHWI order, at their PRECAST element widths. Source quant
 /// bits, total nbytes and a promoted activation width are never substituted for the weight width.
+#[derive(Clone)]
 pub(crate) struct ConvWork {
     pub weight: mlx_gen::adapters::facts::TensorFacts,
     pub bias: Option<mlx_gen::adapters::facts::TensorFacts>,
@@ -567,8 +572,9 @@ pub(crate) fn control_injection_bytes(hidden: &Array, residual: &Array) -> u64 {
         trace_layout("control injection hidden", hidden);
         trace_layout("control injection residual", residual);
     }
-    let output = Dtype::from_promoting_types(hidden.dtype(), residual.dtype());
-    bytes(residual).saturating_add(elements(hidden) * dtype_bytes(output))
+    control_injection_bytes_metadata(
+        &activation_facts(hidden),
+        &activation_facts(residual))
 }
 
 /// Deferred MultiControlNet sums are graph work, not already-held early-forward tensors. Record
@@ -583,21 +589,8 @@ pub(crate) struct ControlMergeWork {
 
 impl ControlMergeWork {
     pub fn record_outputs(&mut self, down: &[Array], mid: &Array) -> mlx_gen::Result<()> {
-        for output in down {
-            self.down = self
-                .down
-                .checked_add(mlx_gen::ios_quantum::allocated_bytes(bytes(output)))
-                .ok_or_else(|| {
-                    mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
-                })?;
-        }
-        self.mid = self
-            .mid
-            .checked_add(mlx_gen::ios_quantum::allocated_bytes(bytes(mid)))
-            .ok_or_else(|| {
-                mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into())
-            })?;
-        Ok(())
+        let down: Vec<_> = down.iter().map(activation_facts).collect();
+        self.record_outputs_metadata(&down, &activation_facts(mid))
     }
 }
 
@@ -944,7 +937,7 @@ pub(crate) fn before_tile(
 /// difference; the update's scaled sample, the f32 noise draw and its compute-dtype cast; and, with
 /// an inpaint blend, the re-noised init, the kept and the repainted halves.
 pub(crate) fn sampler_step_bytes(latents: &Array, inpaint: bool) -> u64 {
-    mlx_gen::ios_quantum::elementwise_bytes(latents.size() as u64, 4 + 3 * u64::from(inpaint))
+    sampler_step_bytes_metadata(latents.size() as u64, inpaint)
 }
 
 /// The IP tokens' CFG pair over the materialized `[1, T, D]` `tokens`
@@ -1045,4 +1038,75 @@ pub(crate) fn cast_load_parts(
     floor = floor.max(done.saturating_add(batch_live));
     done = done.saturating_add(batch_resident);
     Ok((done, floor.max(done)))
+}
+
+
+impl LinearWork {
+    /// A constructor-owned dense metadata base. This does not manufacture a native parameter.
+    pub(crate) fn dense(weight: mlx_gen::adapters::facts::TensorFacts,
+        bias: Option<mlx_gen::adapters::facts::TensorFacts>) -> Self {
+        Self { base: mlx_gen::adapters::LinearFacts {
+            base_shape: weight.shape.clone(), is_quantized: false, has_live_adapters: false,
+            adapter_count: 0, bias_shape: bias.as_ref().map(|b| b.shape.clone()),
+        }, weights: vec![weight], bias, residuals: Vec::new(), group_size: crate::quant::GROUP_SIZE, bits: None }
+    }
+}
+impl ConvWork {
+    pub(crate) fn new(weight: mlx_gen::adapters::facts::TensorFacts,
+        bias: Option<mlx_gen::adapters::facts::TensorFacts>) -> Self { Self { weight, bias } }
+    pub(crate) fn weight(&self) -> &mlx_gen::adapters::facts::TensorFacts { &self.weight }
+    pub(crate) fn bias(&self) -> Option<&mlx_gen::adapters::facts::TensorFacts> { self.bias.as_ref() }
+}
+impl EffectScope<'_> {
+    /// Header-owned constructor defaults replace only the native fallback; selected effect lookup
+    /// and missing-target errors remain the same as the native scope. No dense fallback on a map miss.
+    pub(crate) fn linear_metadata(&self, name: &str, base: &LinearWork) -> Result<LinearWork> {
+        let path = crate::quant::child_path(&self.prefix, name);
+        match self.effects {
+            Some(effects) => effects.0.get(&path).cloned().ok_or_else(||
+                mlx_gen::Error::Msg(format!("sdxl missing final projection effect: {path}"))),
+            None => Ok(base.clone()),
+        }
+    }
+    pub(crate) fn shortcut_metadata(&self, name: &str, base: &LinearWork) -> LinearWork {
+        let path = crate::quant::child_path(&self.prefix, name);
+        self.effects.and_then(|effects| effects.0.get(&path)).cloned().unwrap_or_else(|| base.clone())
+    }
+    pub(crate) fn conv_metadata(&self, name: &str, base: &ConvWork) -> ConvWork {
+        let path = crate::quant::child_path(&self.prefix, name);
+        let weight = self.effects.and_then(|effects| effects.1.get(&path)).cloned()
+            .unwrap_or_else(|| base.weight.clone());
+        ConvWork { weight, bias: base.bias.clone() }
+    }
+}
+
+pub(crate) fn control_injection_bytes_metadata(
+    hidden: &mlx_gen::adapters::facts::TensorFacts,
+    residual: &mlx_gen::adapters::facts::TensorFacts,
+) -> u64 {
+    let output = Dtype::from_promoting_types(hidden.dtype, residual.dtype);
+    residual.bytes().saturating_add(hidden.elements() * dtype_bytes(output))
+}
+impl ControlMergeWork {
+    pub(crate) fn record_outputs_metadata(&mut self,
+        down: &[mlx_gen::adapters::facts::TensorFacts],
+        mid: &mlx_gen::adapters::facts::TensorFacts,
+    ) -> Result<()> {
+        for output in down {
+            self.down = self.down.checked_add(mlx_gen::ios_quantum::allocated_bytes(output.bytes()))
+                .ok_or_else(|| mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into()))?;
+        }
+        self.mid = self.mid.checked_add(mlx_gen::ios_quantum::allocated_bytes(mid.bytes()))
+            .ok_or_else(|| mlx_gen::Error::Unsupported("sdxl control merge accounting overflow".into()))?;
+        Ok(())
+    }
+}
+pub(crate) fn sampler_step_bytes_metadata(elements: u64, inpaint: bool) -> u64 {
+    mlx_gen::ios_quantum::elementwise_bytes(elements, 4 + 3 * u64::from(inpaint))
+}
+
+/// Borrow only shape/dtype for guard activations. Never query lazy strides, evaluate, retain a
+/// native owner, or claim a layout/backing identity merely to calculate a header-equivalent guard.
+pub(crate) fn activation_facts(array: &Array) -> mlx_gen::adapters::facts::TensorFacts {
+    mlx_gen::adapters::facts::TensorFacts { shape: array.shape().to_vec(), dtype: array.dtype(), strides: Vec::new() }
 }

@@ -41,6 +41,19 @@ pub struct ResnetBlock2D {
 }
 
 impl ResnetBlock2D {
+    fn pricing_facts(&self) -> super::pricing::ResnetFacts {
+        let conv = |c: &AdaptableConv2d| crate::quantum::ConvWork {
+            weight: crate::quantum::activation_facts(c.weight()), bias: c.bias().map(crate::quantum::activation_facts),
+        };
+        super::pricing::ResnetFacts {
+            norm1_w: crate::quantum::activation_facts(&self.norm1_w), norm1_b: crate::quantum::activation_facts(&self.norm1_b),
+            norm2_w: crate::quantum::activation_facts(&self.norm2_w), norm2_b: crate::quantum::activation_facts(&self.norm2_b),
+            conv1: conv(&self.conv1), conv2: conv(&self.conv2),
+            time_emb_proj: self.time_emb_proj.as_ref().map(crate::quantum::LinearWork::of),
+            shortcut: self.shortcut.as_ref().map(crate::quantum::LinearWork::of),
+        }
+    }
+
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
         let shortcut = match w.get(&format!("{prefix}.conv_shortcut.weight")) {
@@ -217,29 +230,9 @@ impl ResnetBlock2D {
     }
 
     pub(crate) fn quantum_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
-        #[cfg(test)]
-        {
-            crate::quantum::trace_layout(crate::quantum::UNET_RESNET, x);
-            crate::quantum::trace_layout("resnet conv1", self.conv1.weight());
-            crate::quantum::trace_layout("resnet conv2", self.conv2.weight());
-        }
-        let act_in = crate::quantum::element_bytes(x);
-        let act_out = match (&self.time_emb_proj, temb) {
-            (Some(proj), Some(t)) => {
-                let projected = effects.linear("time_emb_proj", proj)?.output_dtype(t.dtype());
-                crate::quantum::dtype_bytes(Dtype::from_promoting_types(x.dtype(), projected))
-            }
-            _ => act_in,
-        };
-        let conv1 = effects.conv("conv1", &self.conv1);
-        let conv2 = effects.conv("conv2", &self.conv2);
-        Ok(crate::quantum::resnet_bytes_from_metadata(
-            x.shape(), act_in, act_out,
-            &conv1.weight.shape, crate::quantum::dtype_bytes(conv1.weight.dtype),
-            &conv2.weight.shape, crate::quantum::dtype_bytes(conv2.weight.dtype),
-            crate::quantum::backend(),
-        )
-        .saturating_add(self.promotion_scratch_with_effects(x, temb, effects)?))
+        self.pricing_facts().quantum_scratch_with_effects(
+            &crate::quantum::activation_facts(x),
+            temb.map(crate::quantum::activation_facts).as_ref(), effects)
     }
 
     /// Small affine/bias casts and the dense shortcut's addmm operand casts are distinct from
@@ -250,50 +243,11 @@ impl ResnetBlock2D {
             .expect("native projection facts are infallible")
     }
 
+    #[cfg(test)]
     fn promotion_scratch_with_effects(&self, x: &Array, temb: Option<&Array>, effects: &crate::quantum::EffectScope<'_>) -> Result<u64> {
-        use crate::quantum as q;
-        let casts = |input: Dtype, arrays: &[&Array]| {
-            let output = q::promote_all(input, arrays);
-            arrays
-                .iter()
-                .map(|a| {
-                    if a.dtype() != output {
-                        q::elements(a) * q::dtype_bytes(output)
-                    } else {
-                        0
-                    }
-                })
-                .sum::<u64>()
-        };
-        let conv1 = effects.conv("conv1", &self.conv1);
-        let conv2 = effects.conv("conv2", &self.conv2);
-        let n1 = q::promote_all(x.dtype(), &[&self.norm1_w, &self.norm1_b]);
-        let c1 = Dtype::from_promoting_types(n1, conv1.weight.dtype);
-        let mut mid = self
-            .conv1
-            .bias()
-            .map_or(c1, |b| Dtype::from_promoting_types(c1, b.dtype()));
-        let mut extra = casts(x.dtype(), &[&self.norm1_w, &self.norm1_b]);
-        if let Some(b) = self.conv1.bias() {
-            extra += casts(c1, &[b]);
-        }
-        if let (Some(p), Some(t)) = (&self.time_emb_proj, temb) {
-            let projection = effects.linear("time_emb_proj", p)?;
-            extra += projection.operand_bytes(t.shape(), t.dtype());
-            mid = Dtype::from_promoting_types(mid, projection.output_dtype(t.dtype()));
-        }
-        extra += casts(mid, &[&self.norm2_w, &self.norm2_b]);
-        let n2 = q::promote_all(mid, &[&self.norm2_w, &self.norm2_b]);
-        let c2 = Dtype::from_promoting_types(n2, conv2.weight.dtype);
-        if let Some(b) = self.conv2.bias() {
-            extra += casts(c2, &[b]);
-        }
-        if let Some(shortcut) = &self.shortcut {
-            let mut shape = x.shape().to_vec();
-            *shape.last_mut().expect("NHWC input") = conv1.weight.shape[3];
-            extra += effects.shortcut("conv_shortcut", shortcut).operand_bytes(&shape, x.dtype());
-        }
-        Ok(extra)
+        self.pricing_facts().promotion_scratch_with_effects(
+            &crate::quantum::activation_facts(x),
+            temb.map(crate::quantum::activation_facts).as_ref(), effects)
     }
 
     /// The dtype [`Self::forward_core`] returns for an `input`-typed input (the up path's
@@ -306,41 +260,13 @@ impl ResnetBlock2D {
     }
 
     pub(crate) fn output_dtype_with_effects(&self, input: Dtype, temb: Option<Dtype>, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
-        let mut arrays: Vec<&Array> = vec![&self.norm1_w, &self.norm1_b];
-        arrays.extend(self.conv1.bias());
-        arrays.extend([&self.norm2_w, &self.norm2_b]);
-        arrays.extend(self.conv2.bias());
-        let conv1 = effects.conv("conv1", &self.conv1);
-        let conv2 = effects.conv("conv2", &self.conv2);
-        let mut y = Dtype::from_promoting_types(crate::quantum::promote_all(input, &arrays),
-            Dtype::from_promoting_types(conv1.weight.dtype, conv2.weight.dtype));
-        if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
-            y = Dtype::from_promoting_types(y, effects.linear("time_emb_proj", proj)?.output_dtype(t));
-        }
-        let residual = match &self.shortcut {
-            Some(sc) => {
-                Dtype::from_promoting_types(input, effects.shortcut("conv_shortcut", sc).output_dtype(input))
-            }
-            None => input,
-        };
-        Ok(Dtype::from_promoting_types(residual, y))
+        self.pricing_facts().output_dtype_with_effects(input, temb, effects)
     }
 
     pub(crate) fn output_shape_with_effects(
         &self, input: &[i32], skip: Option<&[i32]>, effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Vec<i32>> {
-        let mut input = input.to_vec();
-        if let Some(skip) = skip {
-            if input[..3] != skip[..3] { return Err(mlx_gen::Error::Msg("sdxl resnet skip concat axes disagree".into())); }
-            input[3] = input[3].checked_add(skip[3]).ok_or_else(|| mlx_gen::Error::Msg("sdxl resnet concat width overflow".into()))?;
-        }
-        let first = effects.conv("conv1", &self.conv1).output_shape(&input, 1, 1)?;
-        let output = effects.conv("conv2", &self.conv2).output_shape(&first, 1, 1)?;
-        let residual = match &self.shortcut {
-            Some(shortcut) => effects.shortcut("conv_shortcut", shortcut).output_shape(&input)?,
-            None => input,
-        };
-        crate::adapters::broadcast_shape(&output, &residual)
+        self.pricing_facts().output_shape_with_effects(input, skip, effects)
     }
 
     /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).
@@ -441,6 +367,7 @@ impl ResnetBlock2D {
 
     /// Header-only pricing of [`Self::forward_tiled_vae`] over the shape-only `x`: the stage and
     /// each convolution's widest tile, with the guards' own formulas. Returns the shape-only output.
+    #[cfg(test)]
     pub(crate) fn price_tiled_vae(
         &self,
         x: &Array,

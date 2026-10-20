@@ -4,6 +4,8 @@
 //! `scaling_factor` is **0.13025** (not SD-2.1's 0.18215). Latents are scaled by it on encode and
 //! divided by it on decode.
 
+pub(crate) mod pricing;
+
 use mlx_rs::ops::{add, multiply, pad};
 use mlx_rs::{Array, Dtype};
 
@@ -195,21 +197,12 @@ impl VaeAttention {
 
     /// iOS scratch of this attention over `x` under `plan` (one query chunk's price).
     fn scratch(x: &Array, plan: mlx_gen::attention::AttentionPlan<'_>) -> u64 {
-        let s = x.shape();
-        let tokens = s[1] * s[2];
-        let rows = plan.budget.query_block(s[0], 1, tokens, tokens);
-        crate::quantum::vae_attention_bytes(
-            s[0],
-            tokens,
-            s[3],
-            rows,
-            crate::quantum::element_bytes(x),
-            crate::quantum::backend(),
-        )
+        pricing::attention_scratch(x.shape(), x.dtype(), plan)
     }
 
     /// Header-only pricing of the guarded attention over the shape-only `x` under the device's
     /// (bounded) plan. Returns the shape-only output.
+    #[cfg(test)]
     fn price(
         &self,
         x: &Array,
@@ -365,6 +358,7 @@ impl EncoderDecoderBlock2D {
     }
 
     /// Header-only pricing of [`Self::forward`] (the dense pass) under `labels`.
+    #[cfg(test)]
     fn price_forward(
         &self,
         x: &Array,
@@ -402,6 +396,7 @@ impl EncoderDecoderBlock2D {
     }
 
     /// Header-only pricing of [`Self::forward_tiled_decode`].
+    #[cfg(test)]
     fn price_tiled_decode(
         &self,
         x: &Array,
@@ -441,6 +436,7 @@ pub(crate) fn max_conv_tile(h: i32, w: i32, max_tile_edge: i32) -> (i32, i32) {
 }
 
 /// Header-only pricing of one per-tile check (`quantum::before_tile`) at the widest crop.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn price_tiles(
     label: &'static str,
@@ -471,6 +467,7 @@ fn price_tiles(
 }
 
 /// Header-only pricing of [`upsample_tiled`] over the shape-only `x`.
+#[cfg(test)]
 fn price_upsample_tiled(
     x: &Array,
     weight: &Array,
@@ -512,6 +509,7 @@ fn price_upsample_tiled(
 
 /// Header-only pricing of [`downsample_tiled`] (`mlx_gen::vae_tiling::downsample_tiled_nhwc`)
 /// over the shape-only `x`: its stage and its widest tile.
+#[cfg(test)]
 fn price_downsample_tiled(
     x: &Array,
     weight: &Array,
@@ -543,6 +541,7 @@ fn price_downsample_tiled(
 }
 
 /// Header-only pricing of one guarded VAE resnet ([`resnet_quantum`]) under `label`.
+#[cfg(test)]
 fn price_resnet(
     label: &'static str,
     resnet: &ResnetBlock2D,
@@ -782,6 +781,7 @@ impl Decoder {
     }
 
     /// Header-only pricing of [`Self::head`] over the shape-only `z`.
+    #[cfg(test)]
     fn price_head(
         &self,
         z: &Array,
@@ -813,6 +813,7 @@ impl Decoder {
     }
 
     /// The shape-only output of the `conv_out` head over `x`.
+    #[cfg(test)]
     fn price_conv_out_output(&self, x: &Array) -> Result<Array> {
         let s = x.shape();
         crate::quantum::shaped(
@@ -822,6 +823,7 @@ impl Decoder {
     }
 
     /// Header-only pricing of [`Self::tail`] (the dense decode tail).
+    #[cfg(test)]
     fn price_tail(&self, x: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
         let mut x = x.clone();
         for ub in &self.up_blocks {
@@ -832,6 +834,7 @@ impl Decoder {
     }
 
     /// Header-only pricing of [`Self::tail_tiled`].
+    #[cfg(test)]
     fn price_tail_tiled(
         &self,
         x: &Array,
@@ -1184,6 +1187,7 @@ impl Encoder {
     }
 
     /// Header-only pricing of [`Self::forward_body`] (the dense encode body).
+    #[cfg(test)]
     fn price_body(&self, x: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
         let call = crate::quantum::ConvCall::new(
             x.shape(),
@@ -1208,6 +1212,7 @@ impl Encoder {
     }
 
     /// Header-only pricing of [`Self::forward_body_tiled`] (the bounded encode body).
+    #[cfg(test)]
     fn price_body_tiled(
         &self,
         x: &Array,
@@ -1255,6 +1260,7 @@ impl Encoder {
     }
 
     /// Header-only pricing of the mid block both encode bodies end on.
+    #[cfg(test)]
     fn price_mid(&self, x: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
         let x = price_resnet(crate::quantum::VAE_ENCODE_RESNET, &self.mid_resnet0, x, out)?;
         let x = self
@@ -1533,6 +1539,7 @@ impl Autoencoder {
     }
 
     /// The dtype [`Self::to_compute`] brings an `x`-typed caller tensor to.
+    #[cfg(test)]
     fn compute_dtype(&self, x: Dtype) -> Dtype {
         if self.dtype == Dtype::Float32 {
             x
@@ -1544,20 +1551,14 @@ impl Autoencoder {
     /// Caller-owned decode input plus its distinct compute copy, if any. The latent is held
     /// across every decoder quantum; an identity to_compute is an alias, never a second buffer.
     pub(crate) fn decode_input_retained_bytes(&self, latents: &Array) -> u64 {
-        let caller = crate::quantum::bytes(latents);
-        let compute = self.compute_dtype(latents.dtype());
-        caller
-            + if compute == latents.dtype() {
-                0
-            } else {
-                crate::quantum::elements(latents) * crate::quantum::dtype_bytes(compute)
-            }
+        pricing::input_retained_bytes(self.dtype, &crate::quantum::activation_facts(latents))
     }
 
     /// Header-only pricing of the decode the request runs ([`Self::decode_tiled`] under the
     /// rung-2 `tiling`, else [`Self::decode`]) over the shape-only NHWC `latents`: every quantum it
     /// checks, in order, with the guards' own formulas. Returns the shape-only decoded image (the
     /// pixel conversion's input).
+    #[cfg(test)]
     pub(crate) fn price_decode(
         &self,
         latents: &Array,
@@ -1591,6 +1592,7 @@ impl Autoencoder {
     /// Header-only pricing of the init-image encode the request runs (`encode_tiled` at
     /// `tile_px`, which takes the whole-image encode when the image fits one tile) over the
     /// shape-only NHWC `image`: every quantum it checks, in order, with the guards' own formulas.
+    #[cfg(test)]
     pub(crate) fn price_encode(
         &self,
         image: &Array,

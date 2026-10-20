@@ -189,7 +189,7 @@ struct ClipLayerPrice {
     head_dim: i32,
 }
 
-fn clip_header_tensor(
+pub(crate) fn clip_header_tensor(
     headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], name: &str,
 ) -> Result<mlx_gen::adapters::facts::TensorFacts> {
     let header = headers.iter().find(|h| h.name == name)
@@ -203,7 +203,7 @@ fn clip_header_tensor(
 
 /// Exact shared quant::lin lookup order: ordinary bias first, scales selector, weight + packed
 /// validator, then affine biases. Dense weights gain no new exact-rank/shape/dtype restriction.
-fn clip_header_linear(
+pub(crate) fn clip_header_linear(
     headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader], base: &str, biased: bool,
 ) -> Result<crate::quantum::LinearWork> {
     use mlx_gen::adapters::LinearFacts;

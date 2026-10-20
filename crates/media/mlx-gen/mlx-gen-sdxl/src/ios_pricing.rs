@@ -3,7 +3,8 @@
 //! counted quantum — built from the SAME formulas the `ios_quantum` guards check.
 //!
 //! [`ios_pricing`] constructs CLIP pricing entirely from tensor headers and the load-time cast
-//! policy. The remaining heavy components still use lazy native weight/model graphs
+//! policy. UNet/ControlNet/VAE construction and activation walks are also pure metadata; only
+//! the IP image encoder/Resampler still use lazy native weight/model graphs
 //! and walk the request's execution with each module's own guard formulas
 //! (`price_forward` / `price_encode` / `price_decode` beside every guarded forward), over
 //! shape-only activations. Load floors and resident bytes are the loaders' header-only floors
@@ -38,7 +39,8 @@ use mlx_gen::ios_pricing::{
     IosPricing, IosPricingRequest, IosWindowBound, IosWindowPrice, IosWorkBasis,
 };
 use mlx_gen::{Error, Result};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Dtype;
+use mlx_gen::adapters::facts::TensorFacts as PriceTensor;
 use std::path::{Path, PathBuf};
 
 use crate::config::{ClipTextConfig, UNetConfig, VaeConfig};
@@ -46,8 +48,8 @@ use crate::ip_adapter::{IpImageEncoder, ResamplerConfig};
 use crate::quantum::{self as q, Backend, Quanta};
 use crate::sampling::{ResolvedSampling, SamplingRecipe, SamplingRoute, SamplingWorkFacts};
 use crate::text_encoder::ClipPrice;
-use crate::unet::{ControlNet, UNet2DConditionModel};
-use crate::vae::Autoencoder;
+use crate::unet::pricing::{UNetFacts, ControlFacts, FactView, tensor as price_tensor, tensor_bytes as price_bytes};
+use crate::vae::pricing::AutoencoderFacts;
 use crate::vision_encoder::VisionConfig;
 
 /// Every quantum label this crate checks (`ios_quantum::{run, before, before_load*}`) and the phase
@@ -1183,14 +1185,14 @@ pub(crate) struct LoadPackPoint {
 
 fn collect_pack_effect(
     path: &str,
-    linear: &mlx_gen::adapters::AdaptableLinear,
+    linear: &q::LinearWork,
     bits: i32,
     retained: &mut u64,
     outputs: &mut u64,
     points: &mut Vec<LoadPackPoint>,
     effects: &mut q::LinearEffects,
 ) -> Result<()> {
-    let mut work = q::LinearWork::of(linear);
+    let mut work = linear.clone();
     if work.bits.is_none() {
         let scratch = work.pack(bits)?;
         points.push(LoadPackPoint { before_resident: *retained, scratch });
@@ -1206,14 +1208,14 @@ fn collect_pack_effect(
     Ok(())
 }
 
-/// The text pair is pure metadata; remaining components still have native lazy shape models.
+/// Text/UNet/ControlNet/VAE are metadata; IP still has native lazy shape models.
 /// All footprints are header-only. The heavy pack collector
 /// below is metadata-only and never quantizes/evaluates those graphs to discover pricing.
 pub(crate) struct Priced {
     te: (ClipPrice, ClipPrice),
-    unet: UNet2DConditionModel,
-    vae: Autoencoder,
-    controls: Vec<ControlNet>,
+    unet: UNetFacts,
+    vae: AutoencoderFacts,
+    controls: Vec<ControlFacts>,
     ip: Option<IpImageEncoder>,
     /// Pre-pack read/cast floors and declared owners, including TE1 while TE2 is loaded.
     pub te_bytes: [Footprint; 2],
@@ -1307,10 +1309,8 @@ impl Priced {
             te2.quantize(bits)?;
         }
 
-        let mut unet = UNet2DConditionModel::from_weights(
-            &crate::loader::lazy_weights(&one(&inputs.unet), dtype, false)?,
-            &arch.unet,
-        )?;
+        let unet_headers = headers(&inputs.unet)?;
+        let mut unet = UNetFacts::from_headers(&unet_headers, &arch.unet)?;
         let (resident, floor) = crate::loader::unet_load_parts(
             &one(&inputs.unet),
             dtype,
@@ -1321,10 +1321,7 @@ impl Priced {
         let unet_bytes = Footprint { resident, floor };
 
         let (vae_file, vae_dtype) = &inputs.vae;
-        let vae = Autoencoder::from_weights(
-            &crate::loader::lazy_weights(&one(vae_file), *vae_dtype, true)?,
-            &arch.vae,
-        )?;
+        let vae = AutoencoderFacts::from_headers(&headers(vae_file)?, &arch.vae, *vae_dtype)?;
         let vae_bytes = footprint(&one(vae_file), *vae_dtype, |_| true)?;
 
         // All loads precede the actual ordered heavy pack walk.
@@ -1332,10 +1329,7 @@ impl Priced {
         let mut controls = Vec::new();
         let mut control_bytes = Vec::new();
         for file in &inputs.controls {
-            let control = ControlNet::from_weights(
-                &crate::loader::lazy_weights(&one(file), dtype, false)?,
-                &arch.unet,
-            )?;
+            let control = ControlFacts::from_headers(&headers(file)?, &arch.unet)?;
             // The guard checks the header floor; the constructor's tables stay resident beside it.
             let mut load = footprint(&one(file), dtype, |_| true)?;
             load.resident += control_tables(&arch.unet);
@@ -1355,7 +1349,7 @@ impl Priced {
             let ip_w = crate::loader::lazy_weights(&one(ip_file), dtype, false)?;
             let resampler =
                 crate::ip_adapter::Resampler::from_weights(&ip_w, "image_proj", &arch.resampler)?;
-            unet.install_ip_adapter(crate::ip_adapter::load_ip_kv_pairs(&ip_w)?)?;
+            unet.install_ip_adapter(crate::unet::pricing::ip_pairs_from_headers(&headers(ip_file)?)?)?;
             ip = Some(IpImageEncoder::with_image_size(
                 encoder,
                 resampler,
@@ -1380,7 +1374,7 @@ impl Priced {
                 let mut effects = q::LinearEffects::default();
                 let mut outputs = 0;
                 // This is the ACTUAL ordered module walk, with a pure metadata visitor. The borrowed
-                // native model is left untouched: no quantize_linear, Array creation, eval or read.
+                // constructor facts stay untouched: no quantize_linear, Array creation, eval or read.
                 unet.quantize_using(bits, &mut |path, linear, bits|
                     collect_pack_effect(path, linear, bits, &mut retained, &mut outputs,
                         &mut load_quantize, &mut effects))?;
@@ -1402,11 +1396,7 @@ impl Priced {
         // Ordinary/no-adapter builds already filled this vector, so resize is a no-op there.
         control_effects.resize_with(controls.len(), || None);
         if inputs.streamable {
-            unet.arm_block_streams(
-                &WeightsSource::File(inputs.unet.clone()),
-                dtype,
-                inputs.quant_bits,
-            );
+            unet.arm_block_streams(&unet_headers, dtype, inputs.quant_bits)?;
         }
         Ok(Self {
             te: (te1, te2),
@@ -1435,7 +1425,7 @@ impl Priced {
     /// Consume a complete selected world at the real adapter boundary. Each world is replayed
     /// through selected dispatch, the load ledger, actual target storage and the SAME ordered base
     /// pack walk, then through the whole forward before any envelope is taken. The native pricing
-    /// model is never adapted/packed to discover facts. Legacy shape-only Array construction remains.
+    /// model facts are never adapted/packed to discover values. Remaining IP graphs stay separate.
     pub(crate) fn price_configured(
         &mut self, spec: &LoadSpec, unet_file: &Path, bits: Option<i32>, regime: &Regime,
     ) -> Result<IosPricing> {
@@ -1488,10 +1478,9 @@ impl Priced {
                 let saved_control_resident: Vec<_> = self.control_bytes.iter().map(|(_, r)| *r).collect();
                 let selected = (|| -> Result<IosPricing> {
                     use crate::adapters::{AdapterInstallStorage as S, AdapterWork};
-                    use mlx_gen::adapters::AdaptableHost;
                     let mut effects = q::LinearEffects::default();
                     self.unet.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
-                        if effects.0.insert(path.to_owned(), q::LinearWork::of(linear)).is_some() {
+                        if effects.0.insert(path.to_owned(), linear.clone()).is_some() {
                             return Err(Error::Msg(format!("sdxl duplicate adapter base target: {path}")));
                         }
                         Ok(())
@@ -1510,7 +1499,7 @@ impl Priced {
                                 // Dense shortcut is deliberately absent from the base pack walk.
                                 let native = self.unet.adaptable_mut(&path).ok_or_else(|| Error::Msg(
                                     format!("sdxl missing actual selected projection: {}", install.target)))?;
-                                effects.0.insert(install.target.clone(), q::LinearWork::of(native));
+                                effects.0.insert(install.target.clone(), native.clone());
                             }
                             effects.0.get_mut(&install.target).expect("inserted selected target").install(install)?;
                         }
@@ -1769,7 +1758,7 @@ impl Priced {
                     quanta,
                 );
                 let t = tokens.shape();
-                Some(q::shaped(&[rows, t[1], t[2]], tokens.dtype())?)
+                Some(price_tensor(&[rows, t[1], t[2]], tokens.dtype())?)
             }
             _ => None,
         };
@@ -1784,7 +1773,7 @@ impl Priced {
                 .and_then(|cfg| cfg.spatial.as_ref().map(|s| s.tile_px))
                 .unwrap_or(crate::vae::IOS_ENCODE_TILE_PX);
             self.vae.price_encode(
-                &q::shaped(&[1, h, w, 3], Dtype::Float32)?,
+                &price_tensor(&[1, h, w, 3], Dtype::Float32)?,
                 tile,
                 &mut quanta,
             )?;
@@ -1794,13 +1783,13 @@ impl Priced {
             let mut quanta = Quanta::new();
             for control in &self.controls {
                 cond_embeds.push(control.price_embed_cond(
-                    &q::shaped(&[rows, ch, cw, 3], Dtype::Float32)?,
+                    &price_tensor(&[rows, ch, cw, 3], Dtype::Float32)?,
                     &mut quanta,
                 )?);
             }
             // Conservatively: one branch's control image pair (a branch's images are released once
             // its embedding exists) and every branch's embedding beside each embedding quantum.
-            let embeds: u64 = cond_embeds.iter().map(q::bytes).sum();
+            let embeds: u64 = cond_embeds.iter().map(price_bytes).sum();
             take(
                 IosPhase::Encode,
                 heavy + warm_text + control_images + embeds,
@@ -1864,11 +1853,11 @@ impl Priced {
         let plan = crate::plan::SdxlForwardPlan::UNBOUNDED
             .with_cfg_batching(regime.cfg_batching)
             .with_cfg_row(sequential.then_some(0));
-        let encoder_x = q::shaped(
+        let encoder_x = price_tensor(
             &[rows, regime.context_tokens, self.arch.context_dim],
             conditioning_dtype,
         )?;
-        let text_emb = q::shaped(&[rows, self.te.1.pooled_width()], pooled)?;
+        let text_emb = price_tensor(&[rows, self.te.1.pooled_width()], pooled)?;
         // Step 1 runs the U-Net on the init latent's dtype; every later step on the sampler's
         // output, which the step promotes to the U-Net output's dtype (a packed tier's f32) — so
         // the denoise prices every distinct latent dtype the loop feeds the U-Net.
@@ -1882,7 +1871,7 @@ impl Priced {
             let mut forward = Quanta::new();
             let (eps, coincident_control) = self.price_step(
                 regime,
-                q::shaped(&[batch, lh, lw, 4], step_dtype)?,
+                price_tensor(&[batch, lh, lw, 4], step_dtype)?,
                 &encoder_x,
                 &text_emb,
                 &cond_embeds,
@@ -1899,13 +1888,13 @@ impl Priced {
                     batch as u64,
                 );
                 let fixed = regime.initial_fixed_inputs(elements);
-                let addons = cond_embeds.iter().map(q::bytes).sum::<u64>()
-                    + ip_tokens.as_ref().map_or(0, q::bytes);
+                let addons = cond_embeds.iter().map(price_bytes).sum::<u64>()
+                    + ip_tokens.as_ref().map_or(0, price_bytes);
                 let completed = elements * q::dtype_bytes(next) * u64::from(regime.count - 1);
                 // Both conditioning tensors and model::generate's f32 [rows,6] time_ids remain
                 // owned in the enclosing generation scope (pipeline::text_time_ids).
-                let conditioning = q::bytes(&encoder_x)
-                    + q::bytes(&text_emb)
+                let conditioning = price_bytes(&encoder_x)
+                    + price_bytes(&text_emb)
                     + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
                 let halves = if sequential { 2 } else { 1 };
                 let shed_ip = crate::model::sheds_ip_image_encoder(staged)
@@ -1988,12 +1977,10 @@ impl Priced {
                         + fixed
                         + conditioning
                         + completed
-                        + cond_embeds.iter().map(q::bytes).sum::<u64>()
-                        + ip_tokens.as_ref().map_or(0, q::bytes),
-                    scratch_bytes: q::sampler_step_bytes(
-                        &q::shaped(&[1, lh, lw, 4], step_dtype)?,
-                        regime.route == Route::Mask,
-                    ),
+                        + cond_embeds.iter().map(price_bytes).sum::<u64>()
+                        + ip_tokens.as_ref().map_or(0, price_bytes),
+                    scratch_bytes: q::sampler_step_bytes_metadata(
+                        (lh as u64) * (lw as u64) * 4, regime.route == Route::Mask),
                     basis: Some(IosWorkBasis {
                         forward_rows: 1,
                         token_count: regime.context_tokens as u64,
@@ -2060,16 +2047,16 @@ impl Priced {
                             q::dtype_bytes(eps),
                         )?;
                     let fixed = regime.initial_fixed_inputs(elements);
-                    let conditioning = q::bytes(&encoder_x)
-                        + q::bytes(&text_emb)
+                    let conditioning = price_bytes(&encoder_x)
+                        + price_bytes(&text_emb)
                         + rows as u64 * 6 * q::dtype_bytes(Dtype::Float32);
                     let completed =
                         elements * q::dtype_bytes(Dtype::Float32) * u64::from(regime.count - 1);
                     let shed_ip = crate::model::sheds_ip_image_encoder(staged)
                         && regime.route == Route::IpAdapter;
                     let structural = self.heavy(shed_ip) + warm_text;
-                    let addons = cond_embeds.iter().map(q::bytes).sum::<u64>()
-                        + ip_tokens.as_ref().map_or(0, q::bytes);
+                    let addons = cond_embeds.iter().map(price_bytes).sum::<u64>()
+                        + ip_tokens.as_ref().map_or(0, price_bytes);
                     // This is the real VE/CFG++ factory's bounded POSSIBLE family set, not a
                     // claim that a representative sigma schedule was observed for this request.
                     // Current x, scaled input, history and secondary-callback outer nodes remain
@@ -2170,7 +2157,7 @@ impl Priced {
                 step_dtype = next;
             }
         }
-        let latents = q::shaped(&[1, lh, lw, 4], step_dtype)?;
+        let latents = price_tensor(&[1, lh, lw, 4], step_dtype)?;
         if regime.sampling.route().is_curated() {
             quanta.push((
                 mlx_gen::sampler::SAMPLER_STEP_QUANTUM,
@@ -2180,7 +2167,7 @@ impl Priced {
             // Acceleration and bespoke ancestral both run the actual SDXL denoise_core guard.
             quanta.push((
                 q::SAMPLER_STEP,
-                q::sampler_step_bytes(&latents, regime.route == Route::Mask),
+                q::sampler_step_bytes_metadata(latents.elements(), regime.route == Route::Mask),
             ));
         }
         let shed_ip =
@@ -2190,8 +2177,8 @@ impl Priced {
         // an IP image prompt does not. These are owners, not a fitted phase correction.
         let elements = (lh as u64) * (lw as u64) * 4;
         let held = regime.initial_fixed_inputs(elements)
-            + cond_embeds.iter().map(q::bytes).sum::<u64>()
-            + ip_tokens.as_ref().map_or(0, q::bytes);
+            + cond_embeds.iter().map(price_bytes).sum::<u64>()
+            + ip_tokens.as_ref().map_or(0, price_bytes);
         take(
             IosPhase::Denoise,
             self.heavy(shed_ip) + warm_text + held,
@@ -2203,7 +2190,7 @@ impl Priced {
         let decoded = self
             .vae
             .price_decode(&latents, regime.tiling.as_ref(), &mut quanta)?;
-        quanta.push((q::DECODED_TO_IMAGE, q::decoded_to_image_bytes(&decoded)));
+        quanta.push((q::DECODED_TO_IMAGE, q::decoded_to_image_bytes_from_metadata(decoded.elements())));
         let decode_resident = if staged {
             self.vae_bytes.resident
         } else {
@@ -2211,7 +2198,7 @@ impl Priced {
         };
         // The decode closure retains the caller's sampler latent. to_compute aliases it only
         // at the same dtype (or for an f32 VAE); otherwise its compute copy is live beside it.
-        let caller = q::bytes(&latents);
+        let caller = price_bytes(&latents);
         let cast = self.vae.decode_input_retained_bytes(&latents) - caller;
         for (label, scratch) in quanta {
             // The first guard pays the not-yet-materialized cast as scratch. Later decoder
@@ -2263,27 +2250,27 @@ impl Priced {
     fn price_step(
         &self,
         regime: &Regime,
-        x: Array,
-        encoder_x: &Array,
-        text_emb: &Array,
-        cond_embeds: &[Array],
-        ip_tokens: Option<&Array>,
+        x: PriceTensor,
+        encoder_x: &PriceTensor,
+        text_emb: &PriceTensor,
+        cond_embeds: &[PriceTensor],
+        ip_tokens: Option<&PriceTensor>,
         plan: crate::plan::SdxlForwardPlan<'_>,
         quanta: &mut Quanta,
     ) -> Result<(Dtype, Vec<u64>)> {
         let first_quantum = quanta.len();
-        let x = q::shaped(x.shape(), crate::model::DTYPE)?;
+        let x = price_tensor(x.shape(), crate::model::DTYPE)?;
         let batch = x.shape()[0];
-        let mut control: Option<(Vec<Array>, Array)> = None;
+        let mut control: Option<(Vec<PriceTensor>, PriceTensor)> = None;
         let mut pending_control = q::ControlMergeWork::default();
         let mut owners = Vec::new();
         let (mut raw_down, mut raw_mid, mut selected_rows) = (0u64, 0u64, 0u64);
         if regime.route == Route::Control {
             for (branch_index, (branch, embed)) in self.controls.iter().zip(cond_embeds).enumerate() {
                 let s = embed.shape();
-                let row = q::shaped(&[batch, s[1], s[2], s[3]], embed.dtype())?;
+                let row = price_tensor(&[batch, s[1], s[2], s[3]], embed.dtype())?;
                 let selected = if plan.cfg_row.is_some() && s[0] == 2 {
-                    q::bytes(&row)
+                    price_bytes(&row)
                 } else {
                     0
                 };
@@ -2307,8 +2294,8 @@ impl Priced {
                         raw_down + raw_mid + selected_rows + if index == 0 { 0 } else { selected };
                 }
                 selected_rows += selected;
-                raw_down += down.iter().map(q::bytes).sum::<u64>();
-                raw_mid += q::bytes(&mid);
+                raw_down += down.iter().map(price_bytes).sum::<u64>();
+                raw_mid += price_bytes(&mid);
                 control = Some(match control {
                     None => (down, mid),
                     Some((prev_down, prev_mid)) => {
@@ -2321,15 +2308,15 @@ impl Priced {
                             .iter()
                             .zip(&down)
                             .map(|(a, b)| {
-                                // Let the actual add producer decide broadcast geometry/promotion;
-                                // retain only shape metadata, never evaluate a pricing payload.
-                                let added = mlx_rs::ops::add(a, b)?;
-                                q::shaped(added.shape(), added.dtype())
+                                // Same elementwise broadcast/result-type semantics, over metadata only;
+                                // no native add/zero graph is built to discover its output.
+                                let added = crate::unet::pricing::add(a, b)?;
+                                price_tensor(added.shape(), added.dtype())
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        let added = mlx_rs::ops::add(&prev_mid, &mid)?;
-                        let merged_mid = q::shaped(added.shape(), added.dtype())?;
-                        pending_control.record_outputs(&merged_down, &merged_mid)?;
+                        let added = crate::unet::pricing::add(&prev_mid, &mid)?;
+                        let merged_mid = price_tensor(added.shape(), added.dtype())?;
+                        pending_control.record_outputs_metadata(&merged_down, &merged_mid)?;
                         (merged_down, merged_mid)
                     }
                 });
@@ -2338,12 +2325,12 @@ impl Priced {
         // `pipeline::forward_eps` casts the combined residuals at the iOS U-Net boundary.
         if let Some((down, mid)) = &mut control {
             for residual in down {
-                *residual = q::shaped(residual.shape(), crate::model::DTYPE)?;
+                *residual = price_tensor(residual.shape(), crate::model::DTYPE)?;
             }
-            *mid = q::shaped(mid.shape(), crate::model::DTYPE)?;
+            *mid = price_tensor(mid.shape(), crate::model::DTYPE)?;
         }
         let (cast_down, cast_mid) = control.as_ref().map_or((0, 0), |(down, mid)| {
-            (down.iter().map(q::bytes).sum::<u64>(), q::bytes(mid))
+            (down.iter().map(price_bytes).sum::<u64>(), price_bytes(mid))
         });
         let unet_first = quanta.len();
         let effects = self.unet_effects.as_ref().map_or_else(q::EffectScope::native, q::EffectScope::root);

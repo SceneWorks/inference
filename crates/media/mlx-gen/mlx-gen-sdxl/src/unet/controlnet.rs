@@ -81,6 +81,7 @@ impl Conv2dLayer {
     }
 
     /// The NHWC shape and dtype this layer's convolution returns over `x` (header-only pricing).
+    #[cfg(test)]
     fn price_output(&self, x: &Array) -> Result<Array> {
         let s = x.shape();
         let w = self.weight.shape();
@@ -132,6 +133,7 @@ impl CondEmbedding {
 
     /// Header-only pricing of [`Self::forward`] over the shape-only `control`: each convolution's
     /// guarded quantum, in order. Returns the shape-only embedding.
+    #[cfg(test)]
     fn price_forward(&self, control: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
         let mut e = control.clone();
         for (layer, silu) in std::iter::once((&self.conv_in, true))
@@ -333,6 +335,7 @@ impl ControlNet {
     }
 
     /// Header-only pricing of [`Self::embed_cond`] over the shape-only control image.
+    #[cfg(test)]
     pub(crate) fn price_embed_cond(
         &self,
         control: &Array,
@@ -341,6 +344,7 @@ impl ControlNet {
         self.cond_embedding.price_forward(control, out)
     }
 
+    #[cfg(test)]
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,

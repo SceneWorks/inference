@@ -7,6 +7,7 @@ mod block;
 mod controlnet;
 mod embeddings;
 mod resnet;
+pub(crate) mod pricing;
 // `pub(crate)` for ladder rung 4: `crate::block_stream` names `TransformerBlock` so it can rebuild
 // one with the SAME constructor the resident stack used (SC-16355).
 pub(crate) mod transformer;
@@ -108,23 +109,10 @@ fn stem_work_bytes(
     x: &Array, encoder_x: &Array, conv_in: &crate::quantum::ConvWork,
     encoder_hid_proj: Option<&AdaptableLinear>, extra_out: u64, backend: crate::quantum::Backend,
 ) -> u64 {
-    let call = conv_in.call(x.shape(), crate::quantum::element_bytes(x), 1, 1);
-    let conv = crate::quantum::single_conv_bytes(&call, 0, extra_out, backend);
-    let e = encoder_x.shape();
-    let context = encoder_hid_proj.map_or(0, |proj| {
-        (e[0].max(0) as u64)
-            .saturating_mul(e[1].max(0) as u64)
-            .saturating_mul(crate::quantum::linear_out(proj))
-            .saturating_mul(crate::quantum::element_bytes(encoder_x))
-    });
-    let temb_width = 4 * conv_in.weight.shape[0].max(0) as u64;
-    let temb =
-        mlx_gen::ios_quantum::elementwise_bytes((e[0].max(0) as u64).saturating_mul(temb_width), 8);
-    let upstream = mlx_gen::ios_quantum::elementwise_bytes(x.size() as u64, 3);
-    conv.saturating_add(context)
-        .saturating_add(temb)
-        .saturating_add(upstream)
-}
+    pricing::stem_work_bytes(&crate::quantum::activation_facts(x),
+        &crate::quantum::activation_facts(encoder_x), conv_in,
+        encoder_hid_proj.map(crate::quantum::LinearWork::of).as_ref(), extra_out, backend)
+    }
 
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
@@ -907,6 +895,7 @@ impl UNet2DConditionModel {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn price_forward_with_effects(
         &self,
         x: &Array,

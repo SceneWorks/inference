@@ -3442,3 +3442,528 @@ fn native_free_clip_pair_matches_actual_load_pack_and_forward_cpu() {
     }
     completed.body_completed = true;
 }
+
+// Native-free hierarchy literals are independent of the fixture's native parameter generator.
+fn hierarchy_header(name: &str, shape: &[usize], dtype: mlx_gen::gen_core::weightsmeta::Dtype)
+    -> mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let width = match dtype { Stored::F32 | Stored::U32 => 4, Stored::F16 | Stored::BF16 => 2,
+        _ => panic!("literal fixture uses only these source types") };
+    mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader { name: name.into(), dtype,
+        shape: shape.to_vec(), data_bytes: width * shape.iter().product::<usize>() as u64 }
+}
+
+#[test]
+fn native_free_unet_control_literals_layout_geglu_effects_stream_and_merge_host() {
+    use crate::unet::pricing::{HeaderWeights, ResnetFacts, TransformerBlockFacts, tensor, add};
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    let mut headers = Vec::new();
+    for (name, shape) in [
+        ("r.conv_shortcut.weight", vec![64, 32, 1, 1]), ("r.conv_shortcut.bias", vec![64]),
+        ("r.time_emb_proj.weight", vec![64, 128]), ("r.time_emb_proj.bias", vec![64]),
+        ("r.norm1.weight", vec![32]), ("r.norm1.bias", vec![32]),
+        ("r.conv1.weight", vec![64, 32, 3, 3]), ("r.conv1.bias", vec![64]),
+        ("r.norm2.weight", vec![64]), ("r.norm2.bias", vec![64]),
+        ("r.conv2.weight", vec![64, 64, 3, 3]), ("r.conv2.bias", vec![64]),
+    ] { headers.push(hierarchy_header(name, &shape, Stored::F32)); }
+    let weights = HeaderWeights::new(&headers).unwrap();
+    let mut resnet = ResnetFacts::from_weights(&weights, "r").unwrap();
+    assert_eq!(resnet.adaptable_conv_mut(&["conv1"]).unwrap().weight.shape, [64, 3, 3, 32]);
+    assert_eq!(resnet.adaptable_conv_mut(&["conv2"]).unwrap().weight.shape, [64, 3, 3, 64]);
+    let shortcut = resnet.adaptable_mut(&["conv_shortcut"]).unwrap();
+    assert_eq!(shortcut.weights[0].shape, [64, 32]);
+    assert_eq!(shortcut.weights[0].dtype, Dtype::Float16);
+    let mut order = Vec::new();
+    resnet.quantize_using("r", 4, &mut |name, projection, bits| {
+        order.push(name.to_owned()); projection.pack(bits)?; Ok(())
+    }).unwrap();
+    assert_eq!(order, ["r.time_emb_proj"]);
+    assert!(resnet.adaptable_mut(&["conv_shortcut"]).unwrap().bits.is_none(),
+        "the actual dense shortcut is not in the pack walk");
+    assert_eq!(resnet.output_shape_with_effects(&[1, 4, 5, 32], None,
+        &crate::quantum::EffectScope::native()).unwrap(), [1, 4, 5, 64]);
+    assert_eq!(resnet.output_dtype_with_effects(Dtype::Float16, Some(Dtype::Float16),
+        &crate::quantum::EffectScope::native()).unwrap(), Dtype::Float32);
+    let mut missing = headers.clone();
+    missing.retain(|h| h.name != "r.conv_shortcut.bias" && h.name != "r.norm1.weight");
+    let error = ResnetFacts::from_weights(&HeaderWeights::new(&missing).unwrap(), "r").err().unwrap().to_string();
+    assert!(error.contains("r.conv_shortcut.bias"), "shortcut reshape/bias precede norm lookup: {error}");
+
+    let mut block = Vec::new();
+    for norm in ["norm1", "norm2", "norm3"] {
+        for part in ["weight", "bias"] {
+            block.push(hierarchy_header(&format!("t.{norm}.{part}"), &[64], Stored::F32));
+        }
+    }
+    for attention in ["attn1", "attn2"] {
+        for role in ["to_q", "to_k", "to_v"] {
+            let input = if attention == "attn2" && role != "to_q" { 128 } else { 64 };
+            block.push(hierarchy_header(&format!("t.{attention}.{role}.weight"), &[64, input], Stored::F32));
+        }
+        block.push(hierarchy_header(&format!("t.{attention}.to_out.0.weight"), &[64, 64], Stored::F32));
+        block.push(hierarchy_header(&format!("t.{attention}.to_out.0.bias"), &[64], Stored::F32));
+    }
+    block.push(hierarchy_header("t.ff.net.0.proj.weight", &[384, 64], Stored::F32));
+    block.push(hierarchy_header("t.ff.net.0.proj.bias", &[384], Stored::F32));
+    block.push(hierarchy_header("t.ff.net.2.weight", &[64, 192], Stored::F32));
+    block.push(hierarchy_header("t.ff.net.2.bias", &[64], Stored::F32));
+    let mut model = TransformerBlockFacts::from_weights(&HeaderWeights::new(&block).unwrap(), "t", 64, 1).unwrap();
+    for role in ["linear1", "linear2"] {
+        let projection = model.adaptable_mut(&["ff", role]).unwrap();
+        assert_eq!(projection.weights[0].shape, [192, 64]);
+        assert_eq!(projection.bias.as_ref().unwrap().shape, [192]);
+    }
+    let mut order = Vec::new();
+    model.quantize_using("t", 4, &mut |name, projection, bits| {
+        order.push(name.to_owned()); projection.pack(bits)?; Ok(())
+    }).unwrap();
+    assert_eq!(order.len(), 11);
+    assert_eq!((&order[0], &order[3], &order[4], &order[7]),
+        (&"t.attn1.to_q".to_owned(), &"t.attn1.to_out.0".to_owned(),
+         &"t.attn2.to_q".to_owned(), &"t.attn2.to_out.0".to_owned()));
+    assert_eq!(&order[8..], ["t.ff.linear1", "t.ff.linear2", "t.ff.linear3"]);
+    assert_eq!(model.adaptable_mut(&["ff", "linear1"]).unwrap().weights[0].shape, [192, 8]);
+    assert_eq!(model.adaptable_mut(&["ff", "linear1"]).unwrap().weights[1].dtype, Dtype::Bfloat16);
+    assert_eq!(model.adaptable_mut(&["attn2", "to_k"]).unwrap().weights[1].shape, [64, 2]);
+    let mut invalid = block.clone();
+    invalid.iter_mut().find(|h| h.name == "t.ff.net.0.proj.weight").unwrap().shape[0] = 383;
+    invalid.retain(|h| h.name != "t.norm1.weight");
+    let error = TransformerBlockFacts::from_weights(&HeaderWeights::new(&invalid).unwrap(), "t", 64, 1)
+        .err().unwrap().to_string();
+    assert!(error.contains("odd output dim"), "GEGLU selection precedes norms: {error}");
+
+    let left = tensor(&[1, 4, 5, 1], Dtype::Float16).unwrap();
+    let right = tensor(&[2, 1, 5, 64], Dtype::Bfloat16).unwrap();
+    let sum = add(&left, &right).unwrap();
+    assert_eq!(sum.shape, [2, 4, 5, 64]); assert_eq!(sum.dtype, Dtype::Float32);
+    let hidden = tensor(&[1, 4, 5, 64], Dtype::Float16).unwrap();
+    let residual = tensor(&[1, 4, 5, 64], Dtype::Float32).unwrap();
+    assert_eq!(crate::quantum::control_injection_bytes_metadata(&hidden, &residual), 10240);
+    let mut pending = crate::quantum::ControlMergeWork::default();
+    pending.record_outputs_metadata(&[sum.clone()], &sum).unwrap();
+    assert_eq!(pending.down, mlx_gen::ios_quantum::allocated_bytes(10240));
+    assert_eq!(pending.mid, pending.down);
+    // Independent literal dense read+cast+GEGLU selection budget: 98304 raw +49152 cast
+    // +49152 half-views +two separate page-rounded 192*i32 selections. Not physical allocation.
+    let stream = [hierarchy_header("a.transformer_blocks.0.ff.net.0.proj.weight", &[384, 64], Stored::F32)];
+    assert_eq!(crate::block_stream::streamed_block_bytes_from_headers(&stream, "a", 1,
+        Dtype::Float16, None).unwrap(), [196608 + 2 * crate::quantum::PAGE_BYTES]);
+    assert!(crate::block_stream::streamed_block_bytes_from_headers(&stream, "a", 1,
+        Dtype::Float16, Some(4)).unwrap_err().to_string().contains("not a streamable load"));
+}
+
+#[test]
+fn native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu() {
+    let Some(mut completed) = completed_cpu_child(
+        "pricing::native_free_unet_control_matches_actual_constructor_pack_and_guards_cpu") else { return; };
+    {
+        use crate::unet::pricing::{UNetFacts, ControlFacts, ip_pairs_from_headers};
+        use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+        use crate::quantum::LinearWork;
+        let compare = |name: &str, expected: &LinearWork, actual: &LinearWork| {
+            assert_eq!(expected.base, actual.base, "{name}: native target/base facts");
+            assert_eq!(expected.bits, actual.bits, "{name}: stored/final pack policy");
+            assert_eq!(expected.group_size, actual.group_size);
+            assert_eq!(expected.weights.iter().map(|t| (&t.shape, t.dtype)).collect::<Vec<_>>(),
+                actual.weights.iter().map(|t| (&t.shape, t.dtype)).collect::<Vec<_>>(), "{name}: native operands");
+            assert_eq!(expected.bias.as_ref().map(|t| (&t.shape, t.dtype)),
+                actual.bias.as_ref().map(|t| (&t.shape, t.dtype)));
+        };
+        let mut cases = 0;
+        for bits in [None, Some(4), Some(8)] {
+            let snap = match bits { None => Snapshot::new(2), Some(bits) => Snapshot::packed(bits) };
+            for route in [Route::Text, Route::Control, Route::IpAdapter] {
+                let inputs = snap.inputs(route);
+                let headers = safetensors_path_tensor_headers(&inputs.unet).unwrap();
+                let mut model = UNetFacts::from_headers(&headers, &snap.unet).unwrap();
+                if let Some((_, ip_file)) = &inputs.ip {
+                    model.install_ip_adapter(ip_pairs_from_headers(&safetensors_path_tensor_headers(ip_file).unwrap()).unwrap()).unwrap();
+                }
+                let mut expected = Vec::new();
+                model.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                    if let Some(bits) = bits { linear.pack(bits)?; }
+                    expected.push((path.to_owned(), linear.clone())); Ok(())
+                }).unwrap();
+                let (native, _) = observe(PLENTY, || load(&snap, route));
+                let mut loaded = native.unwrap();
+                let mut actual = Vec::new();
+                loaded.unet.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                    actual.push((path.to_owned(), LinearWork::of(linear))); Ok(())
+                }).unwrap();
+                assert_eq!(expected.len(), actual.len());
+                for ((name, expected), (actual_name, actual)) in expected.iter().zip(&actual) {
+                    assert_eq!(name, actual_name, "UNet actual ordered pack target identity"); compare(name, expected, actual);
+                }
+                if route == Route::IpAdapter {
+                    let ip: Vec<_> = expected.iter().filter(|(name, _)| name.ends_with("to_k_ip")).map(|(name, _)| name).collect();
+                    assert!(!ip.is_empty());
+                    assert!(ip.first().unwrap().starts_with("down_blocks."));
+                    // Installation uses down→up→mid; the actual pack walk independently uses
+                    // down→mid→up. Native role/shape comparison above distinguishes both orders.
+                }
+                if route == Route::Control {
+                    let file = &inputs.controls[0];
+                    let mut control = ControlFacts::from_headers(&safetensors_path_tensor_headers(file).unwrap(), &snap.unet).unwrap();
+                    let mut expected = Vec::new(); let mut actual = Vec::new();
+                    control.quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                        if let Some(bits) = bits { linear.pack(bits)?; }
+                        expected.push((path.to_owned(), linear.clone())); Ok(())
+                    }).unwrap();
+                    loaded.controls[0].quantize_using(bits.unwrap_or(4), &mut |path, linear, _| {
+                        actual.push((path.to_owned(), LinearWork::of(linear))); Ok(())
+                    }).unwrap();
+                    assert_eq!(expected.len(), actual.len());
+                    for ((name, expected), (actual_name, actual)) in expected.iter().zip(&actual) {
+                        assert_eq!(name, actual_name, "ControlNet actual ordered pack"); compare(name, expected, actual);
+                    }
+                }
+                let r = regime(route);
+                let (_, items) = crate::quantum::with_backend(Backend::Cpu, || {
+                    Priced::build(&inputs).unwrap().price(&r).unwrap()
+                });
+                let mut expected = Vec::new();
+                for item in items.iter().filter(|q| q.phase == IosPhase::Denoise && q.label != SAMPLER_STEP) {
+                    expected.push((item.label.to_owned(), item.scratch));
+                    if item.label == UNET_CONV_OUT { break; }
+                }
+                assert_eq!(expected.last().map(|q| q.0.as_str()), Some(UNET_CONV_OUT));
+                let tiling = mlx_gen::tiling::TilingConfig::spatial_only(8, 0);
+                let (result, events) = observe(PLENTY, || run_request(&loaded, route, &tiling));
+                result.unwrap(); assert_well_ordered(&events.iter().filter(|e| match e {
+                    Ev::Checked(label, _) => ios_quantum_phase(label) != Some(IosPhase::Load), _ => true,
+                }).cloned().collect::<Vec<_>>());
+                let mut actual = Vec::new();
+                for event in &events {
+                    if let Ev::Checked(label, scratch) = event {
+                        if ios_quantum_phase(label) == Some(IosPhase::Denoise) && label != SAMPLER_STEP {
+                            actual.push((label.clone(), *scratch));
+                            if label == UNET_CONV_OUT { break; }
+                        }
+                    }
+                }
+                assert_eq!(expected, actual, "{bits:?}/{route:?}: actual pipeline first-forward ordered guards, not maxima");
+                cases += 1;
+                eprintln!("SDXL_NATIVE_FREE_HIERARCHY_ROW {cases} bits={bits:?} route={route:?}");
+            }
+        }
+        assert_eq!(cases, 9);
+        eprintln!("SDXL_NATIVE_FREE_HIERARCHY_MECHANISM 0 nine_synthetic_native_cases_not_physical_evidence");
+    }
+    completed.body_completed = true;
+}
+
+#[test]
+fn native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu() {
+    let Some(mut completed) = completed_cpu_child(
+        "pricing::native_free_multicontrol_deferred_sums_match_actual_pipeline_cpu") else { return; };
+    {
+        // Private explicit-config fixture: two real loaded branches/contexts. This proves this
+        // pipeline/pricing consumer, not catalog admission or a physical allocation theorem.
+        let snap = Snapshot::packed(4);
+        let mut inputs = snap.inputs(Route::Control);
+        inputs.controls.push(inputs.controls[0].clone());
+        let (loaded, _) = observe(PLENTY, || {
+            let mut loaded = load(&snap, Route::Control)?;
+            let mut extra = crate::loader::load_controlnet_with(
+                &mlx_gen::WeightsSource::Dir(snap.root.join("controlnet")), crate::model::DTYPE, &snap.unet)?;
+            extra.quantize(4)?;
+            loaded.controls.push(extra);
+            Ok(loaded)
+        });
+        let loaded = loaded.unwrap();
+        let ((cond, pooled, contexts), _) = {
+            let (result, events) = observe(PLENTY, || {
+                let (cond, pooled) = crate::pipeline::encode_conditioning(&loaded.te1, &loaded.te2, &ids())?;
+                let mut contexts = Vec::new();
+                for (index, branch) in loaded.controls.iter().enumerate() {
+                    let edge = LATENT * CONTROL_SCALE;
+                    let pixels = crate::pipeline::preprocess_control_image(&image(edge, edge, 17 + index as i32),
+                        edge as u32, edge as u32)?;
+                    let pair = mlx_rs::ops::concatenate_axis(&[&pixels, &pixels], 0)?;
+                    contexts.push(crate::pipeline::ControlContext {
+                        controlnet: branch, cond_embed: branch.embed_cond(&pair)?,
+                        scale: if index == 0 { 0.25 } else { 0.75 },
+                    });
+                }
+                Ok((cond, pooled, contexts))
+            });
+            (result.unwrap(), events)
+        };
+        assert_eq!(contexts.len(), 2);
+        let euler = crate::sampler::EulerSampler::new_with_dtype(
+            &crate::config::DiffusionConfig::sdxl_base(), true, crate::model::DTYPE).unwrap();
+        let sampler = crate::sampler::AncestralEuler::new(&euler, 2, 800.0).unwrap();
+        let plan = crate::plan::SdxlForwardPlan::UNBOUNDED.with_cfg_batching(CfgBatching::Sequential);
+        let denoiser = crate::pipeline::Denoiser::with_plan(&loaded.unet, &sampler, plan);
+        let latents = euler.sample_prior(&[1, LATENT, LATENT, 4]).unwrap();
+        let time_ids = crate::pipeline::text_time_ids(2);
+        let cancel = mlx_gen::CancelFlag::default();
+        let (result, events) = observe(PLENTY, || crate::pipeline::denoise_multi_control(
+            &denoiser, latents, &cond, &pooled, &time_ids, 5.0, &cancel, &mut |_| {}, &contexts));
+        let result = result.unwrap();
+        assert_eq!(super::bits(&result).len(), (LATENT * LATENT * 4) as usize);
+        let (_, items) = crate::quantum::with_backend(Backend::Cpu, || {
+            Priced::build(&inputs).unwrap().price(&regime(Route::Control)).unwrap()
+        });
+        let mut expected = Vec::new();
+        for item in items.iter().filter(|q| q.phase == IosPhase::Denoise && q.label != SAMPLER_STEP) {
+            expected.push((item.label.to_owned(), item.scratch));
+            if item.label == UNET_CONV_OUT { break; }
+        }
+        let mut actual = Vec::new();
+        for event in &events {
+            if let Ev::Checked(label, scratch) = event {
+                if ios_quantum_phase(label) == Some(IosPhase::Denoise) && label != SAMPLER_STEP {
+                    actual.push((label.clone(), *scratch));
+                    if label == UNET_CONV_OUT { break; }
+                }
+            }
+        }
+        assert_eq!(expected, actual, "two actual pipeline branches, pending sum DAG and boundary casts");
+        assert_eq!(actual.iter().filter(|p| p.0 == CONTROL_STEM).count(), 2);
+        assert_eq!(actual.iter().filter(|p| p.0 == CONTROL_DOWN_INJECTION).count(), 1);
+        assert_eq!(actual.iter().filter(|p| p.0 == CONTROL_MID_INJECTION).count(), 1);
+        eprintln!("SDXL_NATIVE_FREE_MULTICONTROL_MECHANISM 0 two_real_contexts_quarter_and_three_quarter");
+    }
+    completed.body_completed = true;
+}
+
+
+fn vae_literal_conv(headers: &mut Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>,
+    prefix: &str, input: usize, output: usize, kernel: usize) {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    headers.push(hierarchy_header(&format!("{prefix}.weight"), &[output, input, kernel, kernel], Stored::F32));
+    headers.push(hierarchy_header(&format!("{prefix}.bias"), &[output], Stored::F32));
+}
+fn vae_literal_norm(headers: &mut Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>, prefix: &str) {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    for part in ["weight", "bias"] { headers.push(hierarchy_header(&format!("{prefix}.{part}"), &[32], Stored::F32)); }
+}
+fn vae_literal_resnet(headers: &mut Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>, prefix: &str) {
+    vae_literal_norm(headers, &format!("{prefix}.norm1"));
+    vae_literal_norm(headers, &format!("{prefix}.norm2"));
+    vae_literal_conv(headers, &format!("{prefix}.conv1"), 32, 32, 3);
+    vae_literal_conv(headers, &format!("{prefix}.conv2"), 32, 32, 3);
+}
+fn vae_literal_mid(headers: &mut Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>, prefix: &str) {
+    use mlx_gen::gen_core::weightsmeta::Dtype as Stored;
+    vae_literal_resnet(headers, &format!("{prefix}.resnets.0"));
+    vae_literal_norm(headers, &format!("{prefix}.attentions.0.group_norm"));
+    for role in ["to_q", "to_k", "to_v", "to_out.0"] {
+        headers.push(hierarchy_header(&format!("{prefix}.attentions.0.{role}.weight"), &[32, 32], Stored::F32));
+        headers.push(hierarchy_header(&format!("{prefix}.attentions.0.{role}.bias"), &[32], Stored::F32));
+    }
+    vae_literal_resnet(headers, &format!("{prefix}.resnets.1"));
+}
+fn vae_literal_headers() -> (Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>, crate::config::VaeConfig) {
+    let cfg = crate::config::VaeConfig { in_channels: 3, out_channels: 3, latent_channels_out: 8,
+        latent_channels_in: 4, block_out_channels: vec![32, 32], layers_per_block: 1,
+        norm_num_groups: 32, scaling_factor: 0.13025 };
+    let mut headers = Vec::new();
+    for block in 0..2 { vae_literal_resnet(&mut headers, &format!("encoder.down_blocks.{block}.resnets.0")); }
+    vae_literal_conv(&mut headers, "encoder.down_blocks.0.downsamplers.0.conv", 32, 32, 3);
+    vae_literal_conv(&mut headers, "encoder.conv_in", 3, 32, 3);
+    vae_literal_mid(&mut headers, "encoder.mid_block");
+    vae_literal_norm(&mut headers, "encoder.conv_norm_out");
+    vae_literal_conv(&mut headers, "encoder.conv_out", 32, 8, 3);
+    for block in 0..2 {
+        for resnet in 0..2 { vae_literal_resnet(&mut headers, &format!("decoder.up_blocks.{block}.resnets.{resnet}")); }
+    }
+    vae_literal_conv(&mut headers, "decoder.up_blocks.0.upsamplers.0.conv", 32, 32, 3);
+    vae_literal_conv(&mut headers, "decoder.conv_in", 4, 32, 3);
+    vae_literal_mid(&mut headers, "decoder.mid_block");
+    vae_literal_norm(&mut headers, "decoder.conv_norm_out");
+    vae_literal_conv(&mut headers, "decoder.conv_out", 32, 3, 3);
+    vae_literal_conv(&mut headers, "quant_conv", 8, 8, 1);
+    vae_literal_conv(&mut headers, "post_quant_conv", 4, 4, 1);
+    (headers, cfg)
+}
+
+#[test]
+fn native_free_vae_literal_cast_geometry_halo_and_rgb_host() {
+    use crate::vae::pricing::AutoencoderFacts;
+    use crate::unet::pricing::tensor;
+    let (headers, cfg) = vae_literal_headers();
+    for loaded in [Dtype::Float16, Dtype::Float32] {
+        let model = AutoencoderFacts::from_headers(&headers, &cfg, loaded).unwrap();
+        assert_eq!(model.dtype(), loaded);
+        let latents = tensor(&[2, 4, 5, 4], Dtype::Float32).unwrap();
+        assert_eq!(model.decode_input_retained_bytes(&latents), if loaded == Dtype::Float16 { 960 } else { 640 });
+        let narrow = tensor(&[2, 4, 5, 4], Dtype::Float16).unwrap();
+        assert_eq!(model.decode_input_retained_bytes(&narrow), 320,
+            "f32 VAE leaves its narrow caller untouched; f16 identity does not allocate twice");
+        for tile in [None, Some(5)] {
+            let tiling = tile.map(|edge| mlx_gen::tiling::TilingConfig::spatial_only(edge, 0));
+            let mut quanta = Vec::new();
+            let decoded = crate::quantum::with_backend(Backend::Cpu, || model.price_decode(&latents, tiling.as_ref(), &mut quanta)).unwrap();
+            assert_eq!(decoded.shape, [2, 8, 10, 3]); assert_eq!(decoded.dtype, Dtype::Float32);
+            assert_eq!(crate::quantum::decoded_to_image_bytes_from_metadata(decoded.elements()),
+                1920 + crate::quantum::PAGE_BYTES, "actual B*H*W*C, not pixel-only or single-image count");
+            assert_eq!(quanta[0].0, VAE_DECODE_IN);
+            if tile.is_some() {
+                let attention = quanta.iter().position(|q| q.0 == VAE_ATTENTION).unwrap();
+                let first_tile = quanta.iter().position(|q| q.0 == VAE_TILE).unwrap();
+                assert!(attention < first_tile, "global mid attention must precede the tiled tail");
+                assert!(quanta.iter().any(|q| q.0 == VAE_TILED_STAGE));
+            }
+        }
+        for edge in [64, 5] {
+            let mut quanta = Vec::new();
+            crate::quantum::with_backend(Backend::Cpu, || model.price_encode(
+                &tensor(&[1, 8, 10, 3], Dtype::Float32).unwrap(), edge, &mut quanta)).unwrap();
+            assert_eq!(quanta[0].0, if edge == 64 { VAE_ENCODE_IN } else { VAE_ENCODE_TILED_STAGE });
+            assert_eq!(quanta.last().unwrap().0, VAE_ENCODE_OUT);
+        }
+    }
+    let mut missing = headers.clone();
+    missing.retain(|h| h.name != "encoder.down_blocks.0.resnets.0.conv1.weight" && h.name != "decoder.conv_in.weight");
+    let error = AutoencoderFacts::from_headers(&missing, &cfg, Dtype::Float16).err().unwrap().to_string();
+    assert!(error.contains("encoder.down_blocks.0.resnets.0.conv1.weight"), "encoder/down lookup precedes decoder: {error}");
+    assert_eq!(crate::vae::max_conv_tile(13, 17, 7), (7, 7));
+    // Independent arithmetic of CURRENT5947 source facts. Differences below are logical component
+    // correctness, not raw-upper subtraction, fresh backing, residual fitting or physical evidence.
+    let tile = [1, 7, 7, 32]; let weight = [32, 3, 3, 32];
+    let raw = |width, normalized| crate::quantum::tile_bytes_from_metadata(&tile,
+        crate::quantum::TileSource { full_width: width, normalized }, 2, &weight, 2, false, Backend::Cpu);
+    assert_eq!(raw(17, false) - raw(7, false), 4480, "full source row width, not crop width");
+    assert_eq!(raw(17, true) - raw(17, false), 28224, "global GN/SiLU f32+narrow buffers");
+    assert_eq!(crate::quantum::tiled_stage_f32_accum_from_metadata(&[1, 8, 10, 64],
+        &[64, 3, 3, 32], 18432, 64, 2), 99584, "full element counts times4, not already-byte extents");
+}
+
+
+#[test]
+fn native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu() {
+    let Some(mut completed) = completed_cpu_child(
+        "pricing::native_free_vae_encode_decode_tiles_and_rgb_match_actual_cpu") else { return; };
+    {
+        use crate::vae::{Autoencoder, pricing::AutoencoderFacts};
+        use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+        // This comparator targets assembled prospective Root625b +CURRENT native TileSource
+        // callers. Own stale Root is not imported or treated as an execution authority.
+        let (weights, cfg) = crate::vae::tests::fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("vae.safetensors"); save(&weights, &file); drop(weights);
+        let headers = safetensors_path_tensor_headers(&file).unwrap();
+        let check = |priced: &crate::quantum::Quanta, events: &[Ev], phase: IosPhase, tiled: bool| {
+            let observed: Vec<(String, u64)> = events.iter().filter_map(|e| match e {
+                Ev::Checked(label, scratch) if ios_quantum_phase(label) == Some(phase) => Some((label.clone(), *scratch)),
+                _ => None,
+            }).collect();
+            let expected: Vec<_> = priced.iter().map(|(label, scratch)| (label.to_string(), *scratch)).collect();
+            if !tiled { assert_eq!(expected, observed, "dense/fallback every ordered guard"); }
+            else {
+                // Native executes EVERY tile; metadata projects the exact widest crop of each
+                // convolution. Compare complete label maxima plus ordered whole-stage guards;
+                // never pretend one representative tile is a full native window/physical proof.
+                let maxima = |items: &[(String, u64)]| {
+                    let mut maxima = std::collections::BTreeMap::new();
+                    for (label, scratch) in items { let slot = maxima.entry(label.clone()).or_insert(0u64); *slot = (*slot).max(*scratch); }
+                    maxima
+                };
+                assert_eq!(maxima(&expected), maxima(&observed), "all actual tiled guard classes");
+                let stage_windows = |items: &[(String, u64)]| {
+                    let mut windows = Vec::new();
+                    let mut current: Option<(String, u64, u64)> = None;
+                    for (label, scratch) in items {
+                        if [VAE_TILED_STAGE, VAE_ENCODE_TILED_STAGE].contains(&label.as_str()) {
+                            if let Some(window) = current.take() { windows.push(window); }
+                            current = Some((label.clone(), *scratch, 0));
+                        } else if [VAE_TILE, VAE_ENCODE_TILE].contains(&label.as_str()) {
+                            let window = current.as_mut().expect("tile follows its real whole-image stage");
+                            window.2 = window.2.max(*scratch);
+                        }
+                    }
+                    if let Some(window) = current { windows.push(window); }
+                    windows
+                };
+                assert_eq!(stage_windows(&expected), stage_windows(&observed),
+                    "each source-correlated VAE stage and its tile envelope, not a common maximum");
+                for label in [VAE_TILED_STAGE, VAE_ENCODE_TILED_STAGE] {
+                    assert_eq!(expected.iter().filter(|p| p.0 == label).map(|p| p.1).collect::<Vec<_>>(),
+                        observed.iter().filter(|p| p.0 == label).map(|p| p.1).collect::<Vec<_>>(),
+                        "every whole-image/global-stat/halo stage in execution order");
+                }
+            }
+        };
+        let mut decodes = 0; let mut encodes = 0;
+        for loaded in [Dtype::Float16, Dtype::Float32] {
+            let mut weights = Weights::from_file(&file).unwrap();
+            weights.cast_all(loaded).unwrap(); weights.materialize().unwrap();
+            let native = Autoencoder::from_weights(&weights, &cfg).unwrap(); drop(weights);
+            let metadata = AutoencoderFacts::from_headers(&headers, &cfg, loaded).unwrap();
+            assert_eq!(native.dtype(), metadata.dtype());
+            for input in [Dtype::Float16, Dtype::Float32] {
+                let latents = rnd(&[1, 5, 7, 4], 1901, 0.1).as_dtype(input).unwrap();
+                assert_eq!(metadata.decode_input_retained_bytes(&crate::quantum::activation_facts(&latents)),
+                    native.decode_input_retained_bytes(&latents), "actual input identity versus distinct compute copy");
+                for edge in [None, Some(7)] {
+                    let tiling = edge.map(|edge| mlx_gen::tiling::TilingConfig::spatial_only(edge, 1));
+                    let mut priced = Vec::new();
+                    let expected = crate::quantum::with_backend(Backend::Cpu, || metadata.price_decode(
+                        &crate::quantum::activation_facts(&latents), tiling.as_ref(), &mut priced)).unwrap();
+                    priced.push((DECODED_TO_IMAGE, crate::quantum::decoded_to_image_bytes_from_metadata(expected.elements())));
+                    let (result, events) = observe(PLENTY, || {
+                        let decoded = match &tiling { Some(cfg) => native.decode_tiled(&latents, cfg, None)?, None => native.decode(&latents)? };
+                        // Shape/dtype only, no returned-image pre-eval/readback/pointer or retained
+                        // alternate decoded parent before the ORIGINAL NHWC RGB consumer.
+                        let shape = decoded.shape().to_vec(); let dtype = decoded.dtype();
+                        let image = crate::pipeline::decoded_to_image(&decoded)?;
+                        Ok((image, shape, dtype))
+                    });
+                    let (image, shape, dtype) = result.unwrap();
+                    assert_eq!(expected.shape, shape); assert_eq!(expected.dtype, dtype);
+                    assert_eq!((image.width, image.height, image.pixels.len()), (14, 10, 14 * 10 * 3));
+                    check(&priced, &events, IosPhase::Decode, edge.is_some());
+                    decodes += 1;
+                    eprintln!("SDXL_NATIVE_FREE_VAE_DECODE {decodes} loaded={loaded:?} input={input:?} edge={edge:?}");
+                }
+            }
+            let pixels = rnd(&[1, 13, 17, 3], 1902, 0.1);
+            for edge in [64, 5] {
+                let mut priced = Vec::new();
+                crate::quantum::with_backend(Backend::Cpu, || metadata.price_encode(
+                    &crate::quantum::activation_facts(&pixels), edge, &mut priced)).unwrap();
+                let (result, events) = observe(PLENTY, || native.encode_tiled(&pixels, edge, None));
+                let encoded = result.unwrap();
+                assert_eq!(encoded.shape(), [1, 6, 8, 4]); assert_eq!(encoded.dtype(), Dtype::Float32);
+                assert_eq!(super::bits(&encoded).len(), 6 * 8 * 4);
+                check(&priced, &events, IosPhase::Encode, edge == 5);
+                encodes += 1;
+                eprintln!("SDXL_NATIVE_FREE_VAE_ENCODE {encodes} loaded={loaded:?} edge={edge}");
+            }
+        }
+        assert_eq!((decodes, encodes), (8, 4));
+        // Real served Priced init/decode/RGB consumption through existing actual tiny pipeline.
+        // Other registered modes/all windows/device admission remain separate SAME-story duties.
+        let snapshot = Snapshot::new(2);
+        let r = regime(Route::Reference);
+        let (_, items) = crate::quantum::with_backend(Backend::Cpu, || {
+            Priced::build(&snapshot.inputs(Route::Reference)).unwrap().price(&r).unwrap()
+        });
+        let (result, events) = observe(PLENTY, || {
+            let loaded = load(&snapshot, Route::Reference)?;
+            run_request(&loaded, Route::Reference, r.tiling.as_ref().unwrap())
+        });
+        result.unwrap();
+        let expected_rgb = items.iter().filter(|p| p.label == DECODED_TO_IMAGE).map(|p| p.scratch).max();
+        let actual_rgb = events.iter().filter_map(|e| match e {
+            Ev::Checked(label, scratch) if label == DECODED_TO_IMAGE => Some(*scratch), _ => None,
+        }).max();
+        assert!(actual_rgb.is_some());
+        assert_eq!(expected_rgb, actual_rgb, "served RGB input extent must be actual full element count, not a masked phase maximum");
+        let expected_decode = items.iter().filter(|p| p.phase == IosPhase::Decode)
+            .map(|p| (p.label.to_owned(), p.scratch)).collect::<Vec<_>>();
+        let maxima = |values: &[(String, u64)]| {
+            let mut result = std::collections::BTreeMap::new();
+            for (label, value) in values { let slot = result.entry(label.clone()).or_insert(0u64); *slot = (*slot).max(*value); }
+            result
+        };
+        let actual_decode = events.iter().filter_map(|e| match e {
+            Ev::Checked(label, scratch) if ios_quantum_phase(label) == Some(IosPhase::Decode) => Some((label.clone(), *scratch)), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(maxima(&expected_decode), maxima(&actual_decode), "served VAE/encode-init request decode and RGB consumers");
+        eprintln!("SDXL_NATIVE_FREE_VAE_MECHANISM 0 eight_decode_four_encode_and_served_reference_not_physical_evidence");
+    }
+    completed.body_completed = true;
+}
