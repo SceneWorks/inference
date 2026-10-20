@@ -25,6 +25,7 @@ LANES = (
 # A manual-only profile, not a path-selected lane: it is never part of LANES, so `--all`, path
 # selection and `--only` can never turn it on. Only `--moss-cuda-unit` selects it (and nothing else).
 MANUAL_PROFILE = "moss_cuda_unit"
+INVENTORY_PROFILE = "moss_cuda_inventory"
 
 
 def _under(path: str, prefix: str) -> bool:
@@ -240,18 +241,22 @@ def main() -> int:
         action="store_true",
         help="select only the manual MOSS CUDA unit profile; every path-selected lane is off",
     )
+    source.add_argument(
+        "--moss-cuda-inventory", action="store_true",
+        help="select only read-only Windows MOSS GPU inventory; all ordinary lanes are off",
+    )
     parser.add_argument("--base", help="base Git revision")
     parser.add_argument("--head", default="HEAD", help="head Git revision")
     parser.add_argument("--github-output", help="append key=value outputs to this file")
     args = parser.parse_args()
 
     paths = args.paths
-    if paths is None and not args.all and not args.only and not args.moss_cuda_unit:
+    if paths is None and not args.all and not args.only and not args.moss_cuda_unit and not args.moss_cuda_inventory:
         if not args.base:
             parser.error("provide --paths, --base, --all or --only")
         paths = changed_paths(args.base, args.head)
 
-    if args.moss_cuda_unit:
+    if args.moss_cuda_unit or args.moss_cuda_inventory:
         lanes = {lane: False for lane in LANES}
     elif args.only:
         lanes = only_lanes(args.only)
@@ -263,6 +268,7 @@ def main() -> int:
             for lane, selected in lanes.items():
                 output.write(f"{lane}={'true' if selected else 'false'}\n")
             output.write(f"{MANUAL_PROFILE}={'true' if args.moss_cuda_unit else 'false'}\n")
+            output.write(f"{INVENTORY_PROFILE}={'true' if args.moss_cuda_inventory else 'false'}\n")
     return 0
 
 

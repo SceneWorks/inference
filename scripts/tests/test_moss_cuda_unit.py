@@ -8,6 +8,7 @@ import textwrap
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.ci import moss_cuda_unit as unit
@@ -356,6 +357,124 @@ class SmokeGateTests(unittest.TestCase):
             ("scripts.tests.test_media_campaign_supervisor.WindowsSupervisorTests",
              "scripts.tests.test_moss_cuda_unit.WindowsOwnerTests"),
         )
+
+
+class InventoryTests(unittest.TestCase):
+    GPU = '0, GPU-a, "RTX, test", 0, 24000\n1, GPU-b, other, N/A, 24000\n'
+    APPS = 'GPU-a, 7256, C:\\secret-dir\\foreign.exe, N/A\nGPU-b, 7256, N/A, 128\n'
+
+    def capture(self, gpu=None, apps=None, cim=None, machine="MICHAEL-TRX50"):
+        query = mock.Mock(side_effect=[self.GPU if gpu is None else gpu, self.APPS if apps is None else apps])
+        process = mock.Mock(return_value={} if cim is None else cim)
+        with mock.patch.object(unit.platform, "node", return_value=machine), mock.patch.object(unit.platform, "system", return_value="Windows"):
+            return unit.inventory_document(query, process), query, process
+
+    def test_current_metadata_preserves_identity_unknown_memory_and_pid_scope(self):
+        with mock.patch.dict(os.environ, {"RUNNER_NAME": "cuda-windows-2", "GITHUB_SHA": "a" * 40, "SECRET_CREDENTIAL": "MUST_NOT_PUBLISH"}):
+            doc, query, process = self.capture(cim={7256: {"pid": 7256, "name": "foreign.exe"}})
+        self.assertEqual(doc["runner"], "cuda-windows-2")
+        self.assertEqual(doc["source_sha"], "a" * 40)
+        self.assertNotIn("MUST_NOT_PUBLISH", json.dumps(doc))
+        self.assertEqual(doc["status"], "CAPTURED")
+        self.assertEqual(doc["machine"], "MICHAEL-TRX50")
+        self.assertEqual(doc["gpus"]["rows"][0]["free_memory_mib"], 0)
+        self.assertEqual(doc["gpus"]["rows"][1]["free_memory_mib"], "UNKNOWN")
+        first, second = doc["compute_processes"]["rows"]
+        self.assertEqual((first["pid"], first["gpu_index"], first["process_basename"], first["used_memory_mib"]), (7256, 0, "foreign.exe", "UNKNOWN"))
+        self.assertEqual((second["gpu_index"], second["process_basename"], second["used_memory_mib"]), (1, "UNKNOWN", 128))
+        self.assertNotIn("secret-dir", json.dumps(doc))
+        process.assert_called_once_with([7256])
+        self.assertEqual(query.call_args_list, [mock.call("--query-gpu=index,uuid,name,memory.free,memory.total"), mock.call("--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory")])
+
+    def test_wrong_machine_never_queries_and_unknown_is_not_idle(self):
+        doc, query, process = self.capture(machine="SOME-OTHER-HOST")
+        self.assertEqual(doc["status"], "WRONG_MACHINE")
+        self.assertEqual(doc["compute_processes"]["status"], "UNKNOWN")
+        query.assert_not_called(); process.assert_not_called()
+        doc, _, _ = self.capture(gpu="", apps="bad inventory")
+        self.assertEqual(doc["status"], "PARTIAL")
+        self.assertEqual(doc["gpus"]["status"], "UNKNOWN")
+        self.assertEqual(doc["compute_processes"]["status"], "UNKNOWN")
+
+    def test_denied_nvml_and_cim_are_recorded_not_fabricated_idle(self):
+        with mock.patch.object(unit.platform, "node", return_value="MICHAEL-TRX50"), mock.patch.object(unit.platform, "system", return_value="Windows"):
+            doc = unit.inventory_document(mock.Mock(side_effect=OSError("denied")), mock.Mock())
+            self.assertEqual(doc["status"], "PARTIAL")
+            self.assertEqual(doc["compute_processes"]["status"], "UNKNOWN")
+            doc = unit.inventory_document(mock.Mock(side_effect=[self.GPU, self.APPS]), mock.Mock(side_effect=PermissionError("denied")))
+            self.assertEqual(doc["compute_processes"]["status"], "KNOWN")
+            self.assertEqual(doc["compute_processes"]["rows"][0]["windows_process"], "UNKNOWN")
+            self.assertEqual(doc["windows_metadata"], {"status": "UNKNOWN", "reason": "PermissionError"})
+
+    def test_invalid_nvml_pid_never_reaches_cim(self):
+        for pid in ("0", "1 OR 1=1", "4294967296", "N/A"):
+            doc, _, cim = self.capture(apps=f"GPU-a, {pid}, test, 0\n")
+            self.assertEqual(doc["compute_processes"]["status"], "UNKNOWN", pid)
+            cim.assert_not_called()
+
+    def test_cim_reads_only_nvml_pids_and_returns_only_allowed_metadata(self):
+        raw = [{"ProcessId": 7256, "ParentProcessId": 100, "Name": r"C:\secret-dir\foreign.exe", "CreationDate": "2026-10-20T22:00:00Z", "SessionId": 0, "CommandLine": "SECRET", "Environment": "SECRET"}]
+        with mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=json.dumps(raw))) as run:
+            rows = unit.inventory_processes([7256])
+        command = run.call_args.args[0][-1]
+        self.assertIn("-Filter 'ProcessId = 7256'", command)
+        self.assertIn("-Property ProcessId,ParentProcessId,Name,CreationDate,SessionId", command)
+        self.assertNotIn("CommandLine", command)
+        self.assertNotIn("Environment", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertIn("-NoProfile", run.call_args.args[0])
+        self.assertIn("-NonInteractive", run.call_args.args[0])
+        self.assertEqual(rows, {7256: {"pid": 7256, "parent_pid": 100, "name": "foreign.exe", "creation_time": "2026-10-20T22:00:00Z", "session_id": 0}})
+        self.assertNotIn("SECRET", json.dumps(rows))
+        with mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=9, stdout=json.dumps(raw))):
+            with self.assertRaisesRegex(unit.UnitFailure, "restricted CIM query exited with 9"):
+                unit.inventory_processes([7256])
+        with mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="[]")) as run:
+            self.assertEqual(unit.inventory_processes([]), {})
+            for ids in (["7256"], [0], [4294967296]):
+                with self.assertRaises(unit.UnitFailure): unit.inventory_processes(ids)
+            run.assert_not_called()
+
+    def test_unknown_numbers_missing_cim_and_non_windows_are_not_invented(self):
+        for value in ("N/A", "[N/A]", "nan", "inf", "-1"):
+            self.assertEqual(unit.inventory_memory(value), "UNKNOWN")
+        with mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout='[{"ProcessId":7256}]')):
+            self.assertEqual(unit.inventory_processes([7256]), {7256: {"pid": 7256, "parent_pid": "UNKNOWN", "name": "UNKNOWN", "creation_time": "UNKNOWN", "session_id": "UNKNOWN"}})
+        with mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout='[{"ProcessId":123}]')):
+            with self.assertRaises(unit.UnitFailure): unit.inventory_processes([7256])
+        query = mock.Mock(side_effect=[self.GPU, self.APPS])
+        with mock.patch.object(unit.platform, "node", return_value="MICHAEL-TRX50"), mock.patch.object(unit.platform, "system", return_value="Darwin"):
+            self.assertEqual(unit.inventory_document(query, mock.Mock(return_value={}))["status"], "WRONG_MACHINE")
+            query.assert_not_called()
+        doc, _, cim = self.capture(apps="")
+        self.assertEqual(doc["compute_processes"], {"status": "KNOWN", "rows": []})
+        self.assertEqual(doc["status"], "CAPTURED")
+        cim.assert_called_once_with([])
+
+    def test_inventory_nvml_query_has_utf8_timeout_and_nonzero_refusal(self):
+        with mock.patch.object(unit, "smi_path", return_value=r"C:\trusted\nvidia-smi.exe"), mock.patch.object(unit.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="valid")) as run:
+            self.assertEqual(unit.inventory_query("--query-gpu=index,uuid"), "valid")
+            self.assertEqual(run.call_args.kwargs["timeout"], 10)
+            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+            self.assertIn("--format=csv,noheader,nounits", run.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][0], r"C:\trusted\nvidia-smi.exe")
+            run.return_value = types.SimpleNamespace(returncode=9, stdout="valid idle output")
+            with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"):
+                unit.inventory_query("--query-gpu=index,uuid")
+
+    def test_fixed_inventory_artifact_and_cli_reject_arbitrary_commands(self):
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"RUNNER_TEMP": scratch}), mock.patch.object(unit, "inventory_document", return_value={"status": "CAPTURED", "marker": "actual"}):
+            self.assertEqual(unit.main(["inventory"]), 0)
+            path = Path(scratch) / "moss-cuda-inventory.json"
+            self.assertTrue(path.is_file(), "the diagnostic artifact has a fixed basename")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["marker"], "actual")
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"RUNNER_TEMP": scratch}), mock.patch.object(unit, "inventory_document", return_value={"status": "WRONG_MACHINE", "machine": "other"}):
+            with self.assertRaisesRegex(unit.UnitFailure, "unknown is not idle"):
+                unit.inventory_command()
+            self.assertEqual(json.loads((Path(scratch) / unit.INVENTORY_FILE).read_text(encoding="utf-8"))["status"], "WRONG_MACHINE")
+        with self.assertRaises(SystemExit): unit.main(["inventory", "--pid", "7256"])
+        with self.assertRaises(SystemExit): unit.main(["inventory", "--command", "whoami"])
 
 
 class FixedCommandTests(unittest.TestCase):

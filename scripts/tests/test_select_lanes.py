@@ -228,14 +228,21 @@ class SelectLanesTests(unittest.TestCase):
         self.assertNotIn("moss_cuda_unit", LANES)
         only = self.run_selector("--moss-cuda-unit")
         self.assertEqual({k for k, v in only.items() if v == "true"}, {"moss_cuda_unit"})
-        self.assertEqual(set(only), set(LANES) | {"moss_cuda_unit"})
+        self.assertEqual(set(only), set(LANES) | {"moss_cuda_unit", "moss_cuda_inventory"})
         for args in (("--all",), ("--only", "windows_cuda"), ("--paths", "crates/media/candle-gen/x.rs")):
             with self.subTest(args=args):
                 self.assertEqual(self.run_selector(*args)["moss_cuda_unit"], "false")
 
+    def test_inventory_selects_no_ordinary_or_unit_lane(self) -> None:
+        self.assertNotIn("moss_cuda_inventory", LANES)
+        selected = self.run_selector("--moss-cuda-inventory")
+        self.assertEqual({k for k, v in selected.items() if v == "true"}, {"moss_cuda_inventory"})
+        for args in (("--all",), ("--only", "windows_cuda"), ("--moss-cuda-unit",), ("--paths", "scripts/ci/moss_cuda_unit.py")):
+            self.assertEqual(self.run_selector(*args)["moss_cuda_inventory"], "false")
+
     def test_all_and_windows_cuda_selection_is_unchanged_by_the_profile(self) -> None:
         everything = self.run_selector("--all")
-        self.assertTrue(all(v == "true" for k, v in everything.items() if k != "moss_cuda_unit"))
+        self.assertTrue(all(v == "true" for k, v in everything.items() if k not in {"moss_cuda_unit", "moss_cuda_inventory"}))
         cuda = self.run_selector("--only", "windows_cuda")
         self.assertEqual({k for k, v in cuda.items() if v == "true"}, {"windows_cuda"})
 

@@ -27,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       lanes:
-        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights)"
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes; moss-cuda-unit = only the one-test MOSS CUDA unit job (no weights); moss-cuda-inventory = read-only process metadata on MICHAEL-TRX50"
         type: choice
-        options: [all, windows-cuda, moss-cuda-unit]
+        options: [all, windows-cuda, moss-cuda-unit, moss-cuda-inventory]
         default: all
 
 permissions:
@@ -73,6 +73,7 @@ jobs:
       macos_metal: ${{ steps.select.outputs.macos_metal }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
       moss_cuda_unit: ${{ steps.select.outputs.moss_cuda_unit }}
+      moss_cuda_inventory: ${{ steps.select.outputs.moss_cuda_inventory }}
       docs: ${{ steps.select.outputs.docs }}
       release: ${{ steps.select.outputs.release }}
       # Informational only: ordinary CI has no job that consumes this output because privileged
@@ -116,6 +117,8 @@ jobs:
             python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then
             python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-inventory" ]]; then
+            python3 scripts/ci/select_lanes.py --moss-cuda-inventory --github-output "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
           else
@@ -1193,6 +1196,45 @@ jobs:
         timeout-minutes: 6
         run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit run'
 
+  # Read-only diagnostic, deliberately NOT in the physical GPU lease group: it must be able to
+  # observe a busy device without starting CUDA or signalling its owner. Current metadata only.
+  moss-cuda-inventory:
+    name: MOSS CUDA inventory (Windows, metadata only)
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.lanes == 'moss-cuda-inventory' &&
+      needs.changes.outputs.moss_cuda_inventory == 'true' &&
+      github.repository == 'SceneWorks/inference' &&
+      github.ref_type == 'branch' &&
+      startsWith(github.ref, 'refs/heads/')
+    runs-on: [self-hosted, Windows, X64, cuda, real-weights, cuda-windows-2]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned uv for metadata-only Python
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12 for metadata only
+        shell: cmd
+        run: call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd
+      - name: Record restricted NVML and Windows process metadata
+        shell: cmd
+        run: '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit inventory'
+      - name: Upload restricted metadata (including unknown or wrong-host results)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moss-cuda-inventory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/moss-cuda-inventory.json
+          if-no-files-found: error
+          retention-days: 3
+
   supply-chain:
     name: dependency policy + advisories
     runs-on: ubuntu-latest
@@ -1304,6 +1346,7 @@ jobs:
       - windows-cuda-check
       - windows-cuda
       - moss-cuda-unit
+      - moss-cuda-inventory
       - supply-chain
       - docs
       - release-metadata
@@ -1317,10 +1360,16 @@ jobs:
           # A requested profile that was skipped is not a pass (a skip normally reads green below).
           REQUIRE_MOSS_CUDA_UNIT: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-unit' }}
           MOSS_CUDA_UNIT_RESULT: ${{ needs.moss-cuda-unit.result }}
+          REQUIRE_MOSS_CUDA_INVENTORY: ${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-inventory' }}
+          MOSS_CUDA_INVENTORY_RESULT: ${{ needs.moss-cuda-inventory.result }}
         run: |
           echo "lane results: $RESULTS"
           if [[ "$REQUIRE_MOSS_CUDA_UNIT" == "true" && "$MOSS_CUDA_UNIT_RESULT" != "success" ]]; then
             echo "::error::the requested moss-cuda-unit profile reported '$MOSS_CUDA_UNIT_RESULT', not success"
+            exit 1
+          fi
+          if [[ "$REQUIRE_MOSS_CUDA_INVENTORY" == "true" && "$MOSS_CUDA_INVENTORY_RESULT" != "success" ]]; then
+            echo "::error::the requested moss-cuda-inventory profile reported '$MOSS_CUDA_INVENTORY_RESULT', not success"
             exit 1
           fi
           for result in $RESULTS; do

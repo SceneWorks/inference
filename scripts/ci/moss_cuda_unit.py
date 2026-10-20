@@ -3,14 +3,20 @@
 
 `compile` builds the fixed package's lib test binary and records the one matching executable.
 `run` starts that binary with the fixed libtest filter under a wall-clock and RSS ceiling, then
-requires a positive `running 1 test` / `1 passed` result. Nothing here loads model weights or
-measures VRAM: the caps are safety limits for a unit process, not calibration. A missing CUDA
+requires a positive `running 1 test` / `1 passed` result. No command loads model weights.
+`inventory` reads current NVML/CIM metadata only (including reported memory), never starts CUDA,
+and is neither calibration nor an ownership lease. Unit caps remain safety limits. A missing CUDA
 device fails the test itself; this module never reports a pass it did not observe.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
+import math
+import ntpath
+import platform
 import json
 import os
 import re
@@ -261,6 +267,136 @@ def require_gpu0_idle(query: Callable[..., str] = smi_query) -> None:
             raise UnitFailure(f"GPU 0 already has compute process {row[1]}; not starting")
 
 
+INVENTORY_FILE = "moss-cuda-inventory.json"
+INVENTORY_MACHINE = "MICHAEL-TRX50"
+INVENTORY_TIMEOUT_SECONDS = 10
+UNKNOWN = "UNKNOWN"
+
+
+def inventory_query(*args: str) -> str:
+    """Only the fixed read-only NVML queries below call this; never initializes CUDA."""
+    result = subprocess.run(
+        [smi_path(), *args, "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, encoding="utf-8", timeout=INVENTORY_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise UnitFailure(f"inventory query exited with {result.returncode}")
+    return result.stdout
+
+
+def inventory_memory(value: str) -> float | str:
+    try:
+        number = float(value)
+    except ValueError:
+        return UNKNOWN
+    return number if math.isfinite(number) and number >= 0 else UNKNOWN
+
+
+def inventory_basename(value: str) -> str:
+    return UNKNOWN if value.strip().upper() in {"", "N/A", "[N/A]", "[NOT SUPPORTED]", "[NOT FOUND]"} else ntpath.basename(value.strip()) or UNKNOWN
+
+
+def inventory_processes(pids: list[int]) -> dict[int, dict]:
+    """Restricted optional CIM metadata for NVML-observed PIDs, never a process dump."""
+    if not pids:
+        return {}
+    if any(type(pid) is not int or not 0 < pid <= 0xFFFFFFFF for pid in pids):
+        raise UnitFailure("invalid NVML PID for CIM query")
+    ids = sorted(set(pids))
+    where = " OR ".join(f"ProcessId = {pid}" for pid in ids)
+    fields = "ProcessId,ParentProcessId,Name,CreationDate,SessionId"
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        f"$rows=@(Get-CimInstance -ClassName Win32_Process -Filter '{where}' -Property {fields}); "
+        f"ConvertTo-Json -InputObject @($rows | Select-Object {fields}) -Compress"
+    )
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True, text=True, encoding="utf-8", timeout=INVENTORY_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise UnitFailure(f"restricted CIM query exited with {result.returncode}")
+    rows = json.loads(result.stdout)
+    if not isinstance(rows, list):
+        raise UnitFailure("restricted CIM result is not an array")
+    found = {}
+    for row in rows:
+        if not isinstance(row, dict) or type(row.get("ProcessId")) is not int or row["ProcessId"] not in ids:
+            raise UnitFailure("restricted CIM returned an unexpected PID")
+        # Copy ONLY these fields; never log raw output, extra properties, paths or command lines.
+        integer = lambda value: value if type(value) is int and value >= 0 else UNKNOWN
+        created = row.get("CreationDate")
+        found[row["ProcessId"]] = {
+            "pid": row["ProcessId"], "parent_pid": integer(row.get("ParentProcessId")),
+            "name": inventory_basename(row.get("Name")) if isinstance(row.get("Name"), str) else UNKNOWN,
+            "creation_time": created if isinstance(created, str) and created else UNKNOWN,
+            "session_id": integer(row.get("SessionId")),
+        }
+    return found
+
+
+def inventory_document(query=inventory_query, process_query=inventory_processes) -> dict:
+    """Current metadata only, not a lease, an idle assertion, or historical PID ownership proof."""
+    machine = platform.node()
+    document = {
+        "schema": 1, "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "machine": machine, "runner": os.environ.get("RUNNER_NAME") or UNKNOWN,
+        "expected_machine": INVENTORY_MACHINE, "source_sha": os.environ.get("GITHUB_SHA") or UNKNOWN,
+        "status": "WRONG_MACHINE", "gpus": {"status": UNKNOWN, "rows": []},
+        "compute_processes": {"status": UNKNOWN, "rows": []}, "windows_metadata": {"status": UNKNOWN},
+    }
+    if platform.system() != "Windows" or machine.upper() != INVENTORY_MACHINE:
+        return document
+    try:
+        rows = list(csv.reader(query("--query-gpu=index,uuid,name,memory.free,memory.total").splitlines(), skipinitialspace=True, strict=True))
+        gpus = []
+        for row in rows:
+            if len(row) != 5 or not row[0].strip().isdigit() or not row[1].strip().startswith("GPU-"):
+                raise UnitFailure("malformed GPU inventory")
+            gpus.append({"index": int(row[0]), "uuid": row[1].strip(), "name": row[2].strip() or UNKNOWN,
+                         "free_memory_mib": inventory_memory(row[3]), "total_memory_mib": inventory_memory(row[4])})
+        if not gpus or len({g["index"] for g in gpus}) != len(gpus) or len({g["uuid"] for g in gpus}) != len(gpus):
+            raise UnitFailure("empty or ambiguous GPU inventory")
+        document["gpus"] = {"status": "KNOWN", "rows": gpus}
+    except (OSError, subprocess.SubprocessError, UnitFailure, ValueError, csv.Error) as error:
+        document["gpus"]["reason"] = type(error).__name__
+    try:
+        rows = list(csv.reader(query("--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory").splitlines(), skipinitialspace=True, strict=True))
+        indices = {g["uuid"]: g["index"] for g in document["gpus"]["rows"]}
+        apps = []
+        for row in rows:
+            if len(row) != 4 or not row[0].strip().startswith("GPU-") or not row[1].strip().isdigit() or not 0 < int(row[1]) <= 0xFFFFFFFF:
+                raise UnitFailure("malformed compute inventory")
+            apps.append({"gpu_uuid": row[0].strip(), "gpu_index": indices.get(row[0].strip(), UNKNOWN),
+                         "pid": int(row[1]), "process_basename": inventory_basename(row[2]),
+                         "used_memory_mib": inventory_memory(row[3]), "windows_process": UNKNOWN})
+        document["compute_processes"] = {"status": "KNOWN", "rows": apps}
+        try:
+            metadata = process_query(sorted({a["pid"] for a in apps}))
+            for app in apps:
+                app["windows_process"] = metadata.get(app["pid"], UNKNOWN)
+            document["windows_metadata"] = {"status": "KNOWN" if all(app["windows_process"] != UNKNOWN for app in apps) else UNKNOWN}
+        except (OSError, subprocess.SubprocessError, UnitFailure, ValueError) as error:
+            document["windows_metadata"]["reason"] = type(error).__name__
+    except (OSError, subprocess.SubprocessError, UnitFailure, ValueError, csv.Error) as error:
+        document["compute_processes"]["reason"] = type(error).__name__
+    document["status"] = "CAPTURED" if all(document[key]["status"] == "KNOWN" for key in ("gpus", "compute_processes")) else "PARTIAL"
+    return document
+
+
+def inventory_command(_unused: Path | None = None) -> None:
+    root = os.environ.get("RUNNER_TEMP")
+    if not root:
+        raise UnitFailure("inventory requires the runner temporary directory")
+    document = inventory_document()
+    text = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False)
+    (Path(root) / INVENTORY_FILE).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    if document["status"] != "CAPTURED":
+        raise UnitFailure(f"inventory incomplete: {document['status']}; unknown is not idle")
+
+
 def provenance() -> str:
     """Device and driver name for the log only; never an input to pass/fail."""
     try:
@@ -319,11 +455,11 @@ def run_command(source: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("compile", "run", "smoke"))
+    parser.add_argument("command", choices=("compile", "run", "smoke", "inventory"))
     parser.add_argument("--exe-file", type=Path, default=Path(os.environ.get("RUNNER_TEMP", ".")) / EXE_FILE)
     args = parser.parse_args(argv)
     try:
-        {"compile": compile_command, "run": run_command, "smoke": smoke_command}[args.command](args.exe_file)
+        {"compile": compile_command, "run": run_command, "smoke": smoke_command, "inventory": inventory_command}[args.command](args.exe_file)
     except (UnitFailure, OSError, subprocess.SubprocessError) as error:
         print(f"moss-cuda-unit: FAIL {error}", file=sys.stderr)
         return 1

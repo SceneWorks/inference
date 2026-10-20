@@ -1824,7 +1824,9 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("real_weights: ${{ steps.select.outputs.real_weights }}", workflow)
         self.assertIn("ordinary CI cannot launch privileged real-weight runners", workflow)
-        self.assertEqual(privileged_real_weight_jobs(workflow), [])
+        # The sole privileged-label job here is dispatch-only, fixed read-only inventory; its
+        # full command/source/selection contract is asserted below. No other job is exempt.
+        self.assertEqual(privileged_real_weight_jobs(workflow), ["moss-cuda-inventory"])
 
     def test_privileged_runner_guard_rejects_differently_named_jobs(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -1840,7 +1842,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 mutated = workflow + f"\n  differently-named-{shape}:\n{runs_on}\n"
                 self.assertEqual(
                     privileged_real_weight_jobs(mutated),
-                    [f"differently-named-{shape}"],
+                    ["moss-cuda-inventory", f"differently-named-{shape}"],
                 )
 
     def test_sa3_weight_free_step_keeps_only_the_executable_invariant(self) -> None:
@@ -4105,7 +4107,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "moss-cuda-unit"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "moss-cuda-unit", "moss-cuda-inventory"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4116,6 +4118,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             '  python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"\n'
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then\n'
             '  python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-inventory" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --moss-cuda-inventory --github-output "$GITHUB_OUTPUT"\n'
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
         )
         self.assertTrue(run.startswith(scoped), run)
@@ -4229,6 +4233,46 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for name in ("windows-cuda", "macos-nax"):
             self.assertIn("needs.changes.outputs.", jobs[name]["if"])
             self.assertNotIn("moss_cuda_unit", jobs[name]["if"])
+
+    def test_inventory_is_read_only_host_bound_and_profile_exclusive(self) -> None:
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = workflow["jobs"]
+        job = jobs["moss-cuda-inventory"]
+        self.assertEqual(job["runs-on"], ["self-hosted", "Windows", "X64", "cuda", "real-weights", "cuda-windows-2"])
+        registered = yaml.safe_load(WORKFLOW.with_name("moss-native-terminal-windows.yml").read_text(encoding="utf-8"))
+        self.assertEqual(job["runs-on"], registered["jobs"]["native"]["runs-on"])
+        self.assertEqual(job["timeout-minutes"], 10)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        for guard in ("github.event_name == 'workflow_dispatch'", "inputs.lanes == 'moss-cuda-inventory'", "needs.changes.outputs.moss_cuda_inventory == 'true'", "github.repository == 'SceneWorks/inference'", "github.ref_type == 'branch'", "startsWith(github.ref, 'refs/heads/')"):
+            self.assertIn(guard, job["if"])
+        steps = job["steps"]
+        self.assertEqual(steps[0]["with"], {"ref": "${{ github.sha }}", "persist-credentials": False})
+        commands = "\n".join(step.get("run", "") for step in steps)
+        self.assertEqual(commands.splitlines()[-1], '\"%REVIEWED_PYTHON%\" -m scripts.ci.moss_cuda_unit inventory')
+        for forbidden in ("cargo", "rustc", "vcvars", " smoke", " compile", " run", "--pid", "--command"):
+            self.assertNotIn(forbidden, commands.lower())
+        self.assertFalse(any("rust-toolchain" in step.get("uses", "") for step in steps))
+        upload = steps[-1]
+        self.assertEqual(upload["if"], "always()")
+        self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/moss-cuda-inventory.json")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertNotIn("concurrency", job)  # Read-only observation must not wait for a GPU lease.
+
+        select = next(step["run"] for step in jobs["changes"]["steps"] if step.get("id") == "select")
+        self.assertEqual(select.count("--moss-cuda-inventory"), 1)
+        gate = jobs["gate"]
+        self.assertIn("moss-cuda-inventory", gate["needs"])
+        step = gate["steps"][0]
+        self.assertEqual(step["env"]["REQUIRE_MOSS_CUDA_INVENTORY"], "${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-inventory' }}")
+        self.assertEqual(step["env"]["MOSS_CUDA_INVENTORY_RESULT"], "${{ needs.moss-cuda-inventory.result }}")
+        import os
+        import shutil
+        shell = shutil.which("bash")
+        self.assertIsNotNone(shell)
+        for result, expected in (("success", 0), ("skipped", 1), ("failure", 1)):
+            env = dict(os.environ, RESULTS="success skipped", REQUIRE_MOSS_CUDA_UNIT="false", MOSS_CUDA_UNIT_RESULT="skipped", REQUIRE_MOSS_CUDA_INVENTORY="true", MOSS_CUDA_INVENTORY_RESULT=result)
+            done = subprocess.run([shell, "-c", step["run"]], env=env, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(done.returncode, expected, result)
 
     def test_gate_fails_a_requested_moss_cuda_unit_that_did_not_succeed(self) -> None:
         gate = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]
