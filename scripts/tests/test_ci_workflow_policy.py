@@ -4160,6 +4160,11 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             self.assertIn(fragment, job["if"])
         self.assertEqual(job["runs-on"], ["self-hosted", "windows", "cuda"])
         self.assertEqual(job["timeout-minutes"], 60)
+        self.assertEqual(
+            job["concurrency"],
+            {"group": "inference-real-weights-physical-host", "cancel-in-progress": False},
+        )
+        self.assertEqual(parsed["concurrency"]["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
         env = job["env"]
         self.assertEqual(
             {k: env[k] for k in ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "RUST_TEST_THREADS", "CI", "RUSTC_WRAPPER")},

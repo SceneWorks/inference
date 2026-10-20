@@ -221,16 +221,50 @@ def target_dir() -> Path:
     return Path(os.environ.get("CARGO_TARGET_DIR") or REPO_ROOT / "target")
 
 
+def smi_path() -> str:
+    from scripts import media_campaign_windows as windows
+
+    return windows.trusted_nvidia_smi()
+
+
+def smi_query(*args: str) -> str:
+    result = subprocess.run(
+        [smi_path(), *args, "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise UnitFailure(f"nvidia-smi {args[0]} exited with {result.returncode}")
+    return result.stdout
+
+
+def require_gpu0_idle(query: Callable[..., str] = smi_query) -> None:
+    """Refuse to start while any compute process is on GPU 0, or if occupancy cannot be read.
+
+    A pre-spawn check only: it narrows the window left by the compile step, it is not a lease
+    and does not stop a process that starts later. Foreign processes are never signalled.
+    """
+    try:
+        gpus = [[f.strip() for f in row.split(",")] for row in query("--query-gpu=index,uuid").splitlines() if row.strip()]
+        apps = [[f.strip() for f in row.split(",")] for row in query("--query-compute-apps=gpu_uuid,pid").splitlines() if row.strip()]
+    except (OSError, subprocess.SubprocessError) as error:
+        raise UnitFailure(f"GPU occupancy unreadable: {error}") from error
+    uuids = {row[1] for row in gpus if len(row) == 2 and row[0].isdigit() and row[1].startswith("GPU-")}
+    if len(uuids) != len(gpus) or not gpus or len({row[0] for row in gpus}) != len(gpus):
+        raise UnitFailure("GPU inventory is malformed or ambiguous")
+    gpu0 = [row[1] for row in gpus if row[0] == "0"]
+    if len(gpu0) != 1:
+        raise UnitFailure("GPU 0 is not present exactly once")
+    for row in apps:
+        if len(row) != 2 or row[0] not in uuids or not row[1].isdigit():
+            raise UnitFailure(f"malformed or unknown compute process row: {row}")
+        if row[0] == gpu0[0]:
+            raise UnitFailure(f"GPU 0 already has compute process {row[1]}; not starting")
+
+
 def provenance() -> str:
     """Device and driver name for the log only; never an input to pass/fail."""
     try:
-        from scripts import media_campaign_windows as windows
-
-        smi = windows.trusted_nvidia_smi() if os.name == "nt" else "nvidia-smi"
-        return subprocess.run(
-            [smi, "--query-gpu=name,driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, check=True, timeout=15,
-        ).stdout.strip()
+        return smi_query("--query-gpu=name,driver_version").strip()
     except Exception as error:  # informational; the test itself requires a CUDA device
         return f"unavailable ({error})"
 
@@ -274,6 +308,7 @@ def run_command(source: Path) -> None:
     if not exe.is_file():
         raise UnitFailure(f"recorded test executable {exe} is missing")
     print(f"moss-cuda-unit: device {provenance()}")
+    require_gpu0_idle()
     owner = WindowsOwner()
     with tempfile.TemporaryDirectory() as scratch:
         output = supervise([str(exe), *RUN_ARGS], owner, Path(scratch) / "unit.log")

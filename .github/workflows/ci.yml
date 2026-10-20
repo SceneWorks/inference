@@ -1136,6 +1136,11 @@ jobs:
       startsWith(github.ref, 'refs/heads/')
     runs-on: [self-hosted, windows, cuda]
     timeout-minutes: 60
+    # Job-level, so the workflow's per-sha group is untouched. Serializes only against workflows that
+    # use this group; other repositories and unrelated jobs are not covered.
+    concurrency:
+      group: inference-real-weights-physical-host
+      cancel-in-progress: false
     env:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"

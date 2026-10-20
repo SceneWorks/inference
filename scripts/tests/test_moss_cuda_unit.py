@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -250,6 +251,61 @@ class WindowsOwnerTests(unittest.TestCase):
         with self.assertRaisesRegex(unit.UnitFailure, "byte cap"):
             self.supervise(script, deadline=30.0, rss_cap=64 * 1024**2)
         self.assert_exited("r")
+
+
+class Gpu0OccupancyTests(unittest.TestCase):
+    GPUS = "0, GPU-aaa\n1, GPU-bbb\n"
+
+    def check(self, gpus=GPUS, apps="", fail=None):
+        def query(*args):
+            if fail:
+                raise fail
+            return gpus if "index,uuid" in args[0] else apps
+        unit.require_gpu0_idle(query)
+
+    def test_idle_or_other_gpu_only_is_admitted(self):
+        self.check()
+        self.check(apps="GPU-bbb, 4242\n")
+
+    def test_gpu0_process_is_refused_without_signalling_it(self):
+        with self.assertRaisesRegex(unit.UnitFailure, "compute process 7"):
+            self.check(apps="GPU-bbb, 4242\nGPU-aaa, 7\n")
+
+    def test_unreadable_malformed_or_unknown_occupancy_is_refused(self):
+        cases = {
+            "tool error": dict(fail=unit.UnitFailure("nvidia-smi exited with 9")),
+            "os error": dict(fail=FileNotFoundError("nvidia-smi")),
+            "timeout": dict(fail=unit.subprocess.TimeoutExpired("nvidia-smi", 15)),
+            "no gpus": dict(gpus=""),
+            "gpu0 absent": dict(gpus="1, GPU-bbb\n"),
+            "duplicate index": dict(gpus="0, GPU-aaa\n0, GPU-bbb\n"),
+            "bad uuid": dict(gpus="0, nope\n"),
+            "malformed gpu row": dict(gpus="0\n"),
+            "unknown uuid": dict(apps="GPU-zzz, 5\n"),
+            "N/A pid": dict(apps="GPU-bbb, [N/A]\n"),
+            "short app row": dict(apps="GPU-bbb\n"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label), self.assertRaises(unit.UnitFailure):
+                self.check(**kwargs)
+
+    def test_run_checks_occupancy_before_spawning(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as scratch, \
+             mock.patch.object(unit, "os", types.SimpleNamespace(name="nt")), \
+             mock.patch.object(unit, "provenance", return_value="x"), \
+             mock.patch.object(unit, "require_gpu0_idle", side_effect=unit.UnitFailure("busy")), \
+             mock.patch.object(unit, "WindowsOwner") as owner, \
+             mock.patch.object(unit, "supervise") as supervise:
+            record = Path(scratch) / "exe"
+            exe = Path(scratch) / "t"
+            exe.write_text("x")
+            record.write_text(str(exe))
+            with self.assertRaisesRegex(unit.UnitFailure, "busy"):
+                unit.run_command(record)
+            supervise.assert_not_called()
+            owner.assert_not_called()
 
 
 class SmokeGateTests(unittest.TestCase):
