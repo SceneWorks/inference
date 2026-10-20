@@ -168,26 +168,26 @@ fn save(set: &LoraSet, variant: MossImageVariant, path: &std::path::Path) {
 fn fixture_lineage(path: &std::path::Path) -> Value {
     use sha2::{Digest, Sha256};
     let sources: &[(&str, &[u8])] = &[
-        ("Cargo.lock", include_bytes!("../../../../../Cargo.lock")),
+        ("Cargo.lock", include_bytes!("../../../../../../Cargo.lock")),
         (
             "moss-contract",
-            include_bytes!("../../../../contracts/gen-core/src/moss_image_training.rs"),
+            include_bytes!("../../../../../contracts/gen-core/src/moss_image_training.rs"),
         ),
         (
             "author-fixture",
             include_bytes!(
-                "../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_author/fixture.json"
+                "../../../../../contracts/gen-core/tests/fixtures/moss_image/tiny_author/fixture.json"
             ),
         ),
-        ("transformer", include_bytes!("transformer.rs")),
-        ("adapters", include_bytes!("adapters.rs")),
-        ("training", include_bytes!("training.rs")),
-        ("sampling", include_bytes!("pipeline.rs")),
+        ("transformer", include_bytes!("../transformer.rs")),
+        ("adapters", include_bytes!("../adapters.rs")),
+        ("training", include_bytes!("../training.rs")),
+        ("sampling", include_bytes!("../pipeline.rs")),
         (
             "shared-adapter-writer",
-            include_bytes!("../../candle-gen/src/train/lora.rs"),
+            include_bytes!("../../../candle-gen/src/train/lora.rs"),
         ),
-        ("fixture-producer", include_bytes!("training_tests.rs")),
+        ("fixture-producer", include_bytes!("training_contract_tests.rs")),
     ];
     let mut tree = Sha256::new();
     for (name, source) in sources {

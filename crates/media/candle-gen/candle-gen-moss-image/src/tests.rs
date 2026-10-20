@@ -936,5 +936,4 @@ fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325(
     assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }
 
-#[path = "training_tests.rs"]
 mod training_contract_tests;
