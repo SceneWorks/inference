@@ -465,6 +465,20 @@ class InventoryTests(unittest.TestCase):
             with self.assertRaisesRegex(unit.UnitFailure, "exited with 9"):
                 unit.inventory_query("--query-gpu=index,uuid")
 
+        with mock.patch.object(unit, "smi_path", side_effect=RuntimeError("private tool error")), mock.patch.object(unit.subprocess, "run") as run:
+            try:
+                unit.inventory_query("--query-gpu=index,uuid")
+            except Exception as error:
+                self.assertIsInstance(error, unit.UnitFailure)
+            else:
+                self.fail("missing trusted tool must be a typed refusal")
+            run.assert_not_called()
+            with mock.patch.object(unit.platform, "node", return_value="MICHAEL-TRX50"), mock.patch.object(unit.platform, "system", return_value="Windows"):
+                doc = unit.inventory_document(unit.inventory_query, mock.Mock())
+            self.assertEqual(doc["gpus"]["status"], "UNKNOWN")
+            self.assertEqual(doc["compute_processes"]["status"], "UNKNOWN")
+            self.assertNotIn("private tool error", json.dumps(doc))
+
     def test_fixed_inventory_artifact_and_cli_reject_arbitrary_commands(self):
         with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {"RUNNER_TEMP": scratch}), mock.patch.object(unit, "inventory_document", return_value={"status": "CAPTURED", "marker": "actual"}):
             self.assertEqual(unit.main(["inventory"]), 0)

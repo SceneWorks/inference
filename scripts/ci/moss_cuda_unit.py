@@ -275,8 +275,12 @@ UNKNOWN = "UNKNOWN"
 
 def inventory_query(*args: str) -> str:
     """Only the fixed read-only NVML queries below call this; never initializes CUDA."""
+    try:
+        executable = smi_path()
+    except RuntimeError as error:
+        raise UnitFailure("trusted NVML inventory tool unavailable") from error
     result = subprocess.run(
-        [smi_path(), *args, "--format=csv,noheader,nounits"],
+        [executable, *args, "--format=csv,noheader,nounits"],
         capture_output=True, text=True, encoding="utf-8", timeout=INVENTORY_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
