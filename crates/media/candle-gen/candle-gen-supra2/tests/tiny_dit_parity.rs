@@ -21,9 +21,8 @@ fn tiny_dit_matches_upstream_module() {
         let (max_abs, _, _) = diff_stats(&host(&features), &host(&io["out.t_freq"]));
         assert!(max_abs < 1e-4, "{name}: timestep features max_abs {max_abs}");
 
-        let mask = dit
-            .additive_mask(&host(&io["in.mask"]), 2, cfg.ctx_len)
-            .unwrap();
+        let mask =
+            SupraDit::additive_mask(&host(&io["in.mask"]), 2, cfg.ctx_len, &device).unwrap();
         let v = dit
             .forward(&io["in.z"], &features, &io["in.ctx"], &mask)
             .unwrap();
@@ -53,7 +52,7 @@ fn masked_context_rows_cannot_move_the_velocity() {
             mask01.contains(&0.0),
             "the fixture must carry a padded sample"
         );
-        let mask = dit.additive_mask(&mask01, 2, cfg.ctx_len).unwrap();
+        let mask = SupraDit::additive_mask(&mask01, 2, cfg.ctx_len, &device).unwrap();
         let features = dit.timestep_features(&host(&io["in.t"])).unwrap();
         let base = host(
             &dit.forward(&io["in.z"], &features, &io["in.ctx"], &mask)

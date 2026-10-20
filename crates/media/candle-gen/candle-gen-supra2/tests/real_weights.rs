@@ -175,7 +175,7 @@ fn components_match_torch_reference() {
     .unwrap();
     let mut mask01 = host(&g["t5.mask.short"]);
     mask01.extend(stored.mask.iter());
-    let mask = dit.additive_mask(&mask01, 2, 128).unwrap();
+    let mask = candle_gen_supra2::SupraDit::additive_mask(&mask01, 2, 128, &device).unwrap();
     let z2 = Tensor::cat(&[&z, &z], 0).unwrap();
     let v = host(
         &dit.forward(&z2, &dit.timestep_features(&[t, t]).unwrap(), &ctx, &mask)

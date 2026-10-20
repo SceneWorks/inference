@@ -27,7 +27,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_supra2::{Supra2Image, SupraDit};
 
-use crate::{diff_stats, host};
+use crate::common::{diff_stats, host};
 
 fn on_cpu() -> bool {
     std::env::var("SUPRA2_TEST_DEVICE").as_deref() == Ok("cpu")

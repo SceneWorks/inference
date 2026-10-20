@@ -232,7 +232,12 @@ impl SupraDit {
 
     /// Additive cross-attention mask `[B, 1, 1, M]` from a `0/1` text mask (`1` = attend, as
     /// upstream's boolean `scaled_dot_product_attention` mask).
-    pub fn additive_mask(&self, mask01: &[f32], batch: usize, len: usize) -> Result<Tensor> {
+    pub fn additive_mask(
+        mask01: &[f32],
+        batch: usize,
+        len: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
         if mask01.len() != batch * len {
             return Err(Error::Msg(format!(
                 "supra2: mask has {} values, expected {batch}×{len}",
@@ -243,7 +248,7 @@ impl SupraDit {
             .iter()
             .map(|&m| if m != 0.0 { 0.0 } else { f32::NEG_INFINITY })
             .collect();
-        Ok(Tensor::from_vec(data, (batch, 1, 1, len), &self.device)?)
+        Ok(Tensor::from_vec(data, (batch, 1, 1, len), device)?)
     }
 
     /// Velocity `v(z, t | ctx)`: `z` NCHW `[B, C, S, S]` f32, `t_features` `[B, freq_dim]`,

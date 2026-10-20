@@ -138,6 +138,94 @@ fn prefers_ema_and_omits_absent_conditioning() {
     assert_denoiser_matches(&bundle, &digests(&fixtures().join("tiny_digests.json")));
 }
 
+fn rewrite_manifest(dir: &Path, edit: impl FnOnce(&mut BundleManifest)) {
+    let path = dir.join(BUNDLE_MANIFEST);
+    let mut m: BundleManifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut m);
+    std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+/// The production read refuses each way a self-consistent bundle can be off-pin: an unpinned
+/// source, non-published geometry, and component revisions other than the pins — and accepts a
+/// manifest that satisfies all three (sizes-only check, so the tiny denoiser stands in).
+#[test]
+fn pinned_read_refuses_unpinned_source_geometry_and_components() {
+    let out = scratch("pinned");
+    convert_checkpoint(
+        &fixtures().join("tiny_model_with_uncond.pt"),
+        out.path(),
+        &opts(tiny_config()),
+    )
+    .unwrap();
+    // Self-consistent, so the unpinned reader accepts it…
+    read_bundle(out.path()).unwrap();
+    // …but the provider's reader names the pin it requires.
+    let err = read_pinned_bundle(out.path(), BundleCheck::Digests)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unpinned source"), "{err}");
+    assert!(
+        err.contains("SupraLabs/Supra2-IMG@10dec6e4b4b5d1c44fd1d7d3fe5e50137333da5b"),
+        "{err}"
+    );
+
+    let pin = SUPRA2_SOURCE.files[0];
+    rewrite_manifest(out.path(), |m| {
+        m.source.repo = Some(SUPRA2_SOURCE.repo.into());
+        m.source.revision = Some(SUPRA2_SOURCE.revision.into());
+        m.source.sha256 = pin.sha256.into();
+        m.source.bytes = pin.bytes;
+    });
+    let err = read_pinned_bundle(out.path(), BundleCheck::SizesOnly)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("non-published geometry"), "{err}");
+
+    rewrite_manifest(out.path(), |m| {
+        m.config = Supra2Config::published();
+        m.denoiser_tensors = Supra2Config::published().expected_tensors().len();
+        m.components[1].revision = "0000000000000000000000000000000000000000".into();
+    });
+    let err = read_pinned_bundle(out.path(), BundleCheck::SizesOnly)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unpinned components"), "{err}");
+
+    let vae_revision = SD_VAE.revision;
+    rewrite_manifest(out.path(), |m| {
+        m.components[1].revision = vae_revision.into()
+    });
+    read_pinned_bundle(out.path(), BundleCheck::SizesOnly).unwrap();
+    // The bundle files are untouched, so the digest-checking read accepts the manifest too.
+    read_pinned_bundle(out.path(), BundleCheck::Digests).unwrap();
+}
+
+/// The sizes-only check (footprint/admission) still refuses a truncated file but does not hash.
+#[test]
+fn sizes_only_check_catches_size_changes_without_hashing() {
+    let out = scratch("sizes");
+    convert_checkpoint(
+        &fixtures().join("tiny_model_with_uncond.pt"),
+        out.path(),
+        &opts(tiny_config()),
+    )
+    .unwrap();
+    let path = out.path().join(DENOISER_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    // Same size, edited byte: only the digest check sees it.
+    read_bundle_checked(out.path(), BundleCheck::SizesOnly).unwrap();
+    assert!(read_bundle_checked(out.path(), BundleCheck::Digests).is_err());
+    bytes.pop();
+    std::fs::write(&path, &bytes).unwrap();
+    let err = read_bundle_checked(out.path(), BundleCheck::SizesOnly)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match its manifest"), "{err}");
+}
+
 #[test]
 fn refuses_mismatched_geometry_unpinned_sources_and_tampered_bundles() {
     let src = fixtures().join("tiny_model_with_uncond.pt");
@@ -240,7 +328,5 @@ fn pinned_component_snapshots_verify() {
     FLAN_T5_BASE
         .verify(&env_path("SUPRA2_T5_SNAPSHOT"))
         .unwrap();
-    SD_VAE
-        .verify(&env_path("SUPRA2_VAE_SNAPSHOT"))
-        .unwrap();
+    SD_VAE.verify(&env_path("SUPRA2_VAE_SNAPSHOT")).unwrap();
 }

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::supra2::{
-    self as s2, image_seed, initial_noise, quantize_rgb, Supra2Bundle, Supra2Config,
+    self as s2, image_seed, initial_noise, quantize_rgb, BundleCheck, Supra2Bundle, Supra2Config,
     Supra2Resolved, Supra2Sources, Supra2Tokenizer, Supra2Tokens, PROVIDER_ID,
     TEXT_ENCODER_COMPONENT, VAE_COMPONENT,
 };
@@ -25,6 +25,7 @@ use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 
 use crate::dit::SupraDit;
 use crate::memory_strategy;
+use crate::sampling::{self, ContextBatch};
 
 /// The weights-free descriptor (the MLX twin's, with `backend = "candle"` and `mac_only = false`).
 pub fn descriptor() -> ModelDescriptor {
@@ -155,90 +156,6 @@ pub fn encode_tokens(
     }
     let pad = Tensor::zeros((1, ctx_len - real, ctx_dim), DType::F32, device)?;
     Ok(Tensor::cat(&[&hidden, &pad], 1)?)
-}
-
-/// `n` copies of one conditioning as a `[n, M, C]` context and an additive `[n, 1, 1, M]` mask.
-fn broadcast(dit: &SupraDit, c: &TextConditioning, n: usize) -> Result<(Tensor, Tensor)> {
-    let len = c.mask.len();
-    let ctx = c.context.repeat((n, 1, 1))?;
-    let mask = dit.additive_mask(&c.mask.repeat(n), n, len)?;
-    Ok((ctx, mask))
-}
-
-/// One CFG-or-plain velocity evaluation, exactly upstream's loop body: CFG batches the conditional
-/// and unconditional halves through one forward and mixes `v_u + g · (v_c − v_u)`.
-fn velocity(
-    dit: &SupraDit,
-    z: &Tensor,
-    t: f32,
-    cond: (&Tensor, &Tensor),
-    uncond: Option<(&Tensor, &Tensor)>,
-    guidance: f32,
-) -> Result<Tensor> {
-    let n = z.dim(0)?;
-    match uncond {
-        Some((uctx, umask)) => {
-            let z2 = Tensor::cat(&[z, z], 0)?;
-            let tf = dit.timestep_features(&vec![t; 2 * n])?;
-            let ctx = Tensor::cat(&[cond.0, uctx], 0)?;
-            let mask = Tensor::cat(&[cond.1, umask], 0)?;
-            let both = dit.forward(&z2, &tf, &ctx, &mask)?;
-            let vc = both.narrow(0, 0, n)?;
-            let vu = both.narrow(0, n, n)?;
-            Ok((&vu + ((vc - &vu)? * guidance as f64)?)?)
-        }
-        None => {
-            let tf = dit.timestep_features(&vec![t; n])?;
-            dit.forward(z, &tf, cond.0, cond.1)
-        }
-    }
-}
-
-/// Upstream's Euler flow integration from `z0` (`count × C×S×S` f32, row-major NCHW): `steps`
-/// uniform steps, CFG when `uncond` is given. Emits one `Progress::Step` per step and honours the
-/// cancel flag between steps. Returns the final latents `[count, C, S, S]` on the DiT's device.
-#[allow(clippy::too_many_arguments)]
-pub fn integrate(
-    dit: &SupraDit,
-    cond: &TextConditioning,
-    uncond: Option<&TextConditioning>,
-    z0: &[f32],
-    steps: u32,
-    guidance: f32,
-    cancel: &CancelFlag,
-    progress: &mut dyn FnMut(Progress),
-) -> Result<Tensor> {
-    let cfg = *dit.config();
-    let per_image = cfg.latent_numel();
-    if z0.is_empty() || z0.len() % per_image != 0 {
-        return Err(Error::Msg(format!(
-            "supra2: initial noise has {} values, not a multiple of {per_image}",
-            z0.len()
-        )));
-    }
-    let n = z0.len() / per_image;
-    let (cond_ctx, cond_mask) = broadcast(dit, cond, n)?;
-    let uncond = uncond.map(|u| broadcast(dit, u, n)).transpose()?;
-    let s = cfg.latent_size;
-    let mut z = Tensor::from_vec(z0.to_vec(), (n, cfg.latent_channels, s, s), dit.device())?;
-    let dt = s2::euler_dt(steps) as f64;
-    for (i, t) in s2::euler_timesteps(steps).into_iter().enumerate() {
-        check(cancel)?;
-        let v = velocity(
-            dit,
-            &z,
-            t,
-            (&cond_ctx, &cond_mask),
-            uncond.as_ref().map(|(c, m)| (c, m)),
-            guidance,
-        )?;
-        z = (&z + (v * dt)?)?;
-        progress(Progress::Step {
-            current: i as u32 + 1,
-            total: steps,
-        });
-    }
-    Ok(z)
 }
 
 /// A loaded Supra2-IMG generator (every component resident, f32).
@@ -401,13 +318,22 @@ impl Supra2Image {
                 .flat_map(|i| initial_noise(image_seed(r.seed, i), per_image))
                 .collect(),
         };
-        let z = integrate(
+        let s = cfg.latent_size;
+        let z0 = Tensor::from_vec(z0, (n, cfg.latent_channels, s, s), &self.device)?;
+        let (cond_ctx, cond_mask) = sampling::broadcast(&cond.context, &cond.mask, n)?;
+        let uncond = uncond
+            .map(|u| sampling::broadcast(&u.context, &u.mask, n))
+            .transpose()?;
+        let z = sampling::denoise(
             &self.dit,
-            &cond,
-            uncond.as_ref(),
-            &z0,
+            z0,
             r.steps,
             r.guidance,
+            ContextBatch {
+                context: &cond_ctx,
+                mask: &cond_mask,
+            },
+            uncond.as_ref().map(|(context, mask)| ContextBatch { context, mask }),
             &request.cancel,
             progress,
         )?;
@@ -524,7 +450,11 @@ impl Generator for Supra2Image {
 }
 
 fn footprint(spec: &LoadSpec) -> gen_core::Result<PerComponentBytes> {
-    let f = s2::memory_asset_facts(&Supra2Sources::resolve(spec)?)?;
+    // Footprint queries never re-hash the 417 MB denoiser; the load that follows does.
+    let f = s2::memory_asset_facts(&Supra2Sources::resolve_checked(
+        spec,
+        BundleCheck::SizesOnly,
+    )?)?;
     Ok(PerComponentBytes {
         text_encoder: f.conditioning_bytes,
         dit: f.transformer_bytes,

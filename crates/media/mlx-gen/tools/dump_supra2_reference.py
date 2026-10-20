@@ -116,8 +116,45 @@ def dump_tiny(upstream_dir, gen_core_dir, mlx_dir):
     temb = model.t_embed._sinusoidal(t)
     out = {f"w.{k}": v_.contiguous() for k, v_ in sd.items()}
     out.update({"in.z": z, "in.t": t, "in.ctx": ctx, "in.mask": mask, "out.v": v, "out.t_freq": temb})
+
+    # 3-step trajectories through the verbatim upstream loop: CFG on (stored uncond) and off.
+    torch.manual_seed(5)
+    z0 = torch.randn(B, TINY["latent_ch"], S, S)
+    uc = uncond_text.float()[None].expand(B, -1, -1)
+    um = uncond_mask.float()[None].expand(B, -1)
+    out.update({
+        "traj.z0": z0,
+        "traj.uncond_ctx": uncond_text.float(),
+        "traj.uncond_mask": uncond_mask.float(),
+        "traj.cfg3": sample(model, z0, 3, 3.0, ctx, mask, uc, um),
+        "traj.cfg1": sample(model, z0, 3, 1.0, ctx, mask, None, None),
+    })
     save_file({k: x.contiguous().float() for k, x in out.items()}, os.path.join(mlx_dir, "tiny_dit_parity.safetensors"))
     print("tiny fixtures written; v absmax", float(v.abs().max()))
+    dump_tiny_t5(mlx_dir)
+
+
+def dump_tiny_t5(mlx_dir):
+    """A 2-block, 4-head random-weight T5 v1.1 (gated-GELU) encoder — the non-XXL geometry path
+    Flan-T5-Base takes — with a padded attention mask."""
+    from transformers import T5Config, T5EncoderModel
+
+    torch.manual_seed(6)
+    cfg = T5Config(vocab_size=64, d_model=32, d_kv=8, num_heads=4, num_layers=2, d_ff=48,
+                   feed_forward_proj="gated-gelu", relative_attention_num_buckets=32,
+                   relative_attention_max_distance=128, dropout_rate=0.0)
+    t5 = T5EncoderModel(cfg).eval()
+    for p in t5.parameters():
+        p.copy_(torch.randn_like(p) * 0.2)
+    ids = torch.tensor([[5, 17, 3, 42, 9, 1, 0, 0, 0, 0]])
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0, 0, 0]])
+    hidden = t5(input_ids=ids, attention_mask=mask).last_hidden_state
+    # `encoder.embed_tokens` is tied to `shared` (the key the Flan-T5 checkpoint and the Rust
+    # loader use); keep one copy.
+    out = {f"w.{k}": v.clone().contiguous() for k, v in t5.state_dict().items() if k != "encoder.embed_tokens.weight"}
+    out.update({"in.ids": ids.float(), "in.mask": mask.float(), "out.hidden": hidden})
+    save_file({k: x.contiguous().float() for k, x in out.items()}, os.path.join(mlx_dir, "tiny_t5_parity.safetensors"))
+    print("tiny T5 written; hidden absmax", float(hidden.abs().max()))
 
 
 # ----------------------------------------------------------------------------------------------

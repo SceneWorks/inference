@@ -6,7 +6,8 @@
 //! [`gen_core::supra2::memory_asset_facts`]: candle_gen::gen_core::supra2::memory_asset_facts
 
 use candle_gen::gen_core::supra2::{
-    memory_architecture_facts, memory_asset_facts, Supra2Config, Supra2Sources, PROVIDER_ID,
+    memory_architecture_facts, memory_asset_facts, BundleCheck, Supra2Config, Supra2Sources,
+    PROVIDER_ID,
 };
 use candle_gen::gen_core::*;
 
@@ -37,8 +38,12 @@ pub(crate) fn contract_for(s: &Supra2Sources) -> Result<MemoryProviderContract> 
     ))
 }
 
+/// Admission queries read sizes only; the load re-verifies every digest.
 pub(crate) fn contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
-    contract_for(&Supra2Sources::resolve(spec)?)
+    contract_for(&Supra2Sources::resolve_checked(
+        spec,
+        BundleCheck::SizesOnly,
+    )?)
 }
 
 /// Weights-free surface: the frozen geometry is known without a snapshot; byte facts are absent.

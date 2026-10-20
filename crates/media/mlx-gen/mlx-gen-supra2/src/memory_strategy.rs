@@ -36,7 +36,10 @@ pub(crate) fn contract_for(s: &Supra2Sources) -> Result<MemoryProviderContract> 
 }
 
 pub(crate) fn contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
-    contract_for(&Supra2Sources::resolve(spec).map_err(Error::from)?)
+    contract_for(
+        &Supra2Sources::resolve_checked(spec, mlx_gen::gen_core::supra2::BundleCheck::SizesOnly)
+            .map_err(Error::from)?,
+    )
 }
 
 /// Weights-free surface: the frozen geometry is known without a snapshot; byte facts are absent.

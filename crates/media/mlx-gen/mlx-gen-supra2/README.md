@@ -32,8 +32,10 @@ LoadSpec::new(WeightsSource::Dir(bundle_dir))
     .with_component("vae", WeightsSource::Dir(sd_vae_ft_mse_snapshot))
 ```
 
-Load re-verifies the bundle manifest digests, the pinned component file sizes and their
-`config.json` geometry. Requests: prompt, `seed` (default 0; image *i* uses `seed + i` through the
+Load re-verifies the bundle manifest digests and refuses any bundle not converted from the pinned
+checkpoint with the published geometry and component pins (`read_pinned_bundle`), then checks the
+pinned component file sizes and their `config.json` geometry. Footprint/admission queries read the
+same manifest with a sizes-only check (no re-hash). Requests: prompt, `seed` (default 0; image *i* uses `seed + i` through the
 backend-neutral `initial_noise`), `guidance` (default 3.0; CFG only when `> 1`), `steps` (default
 50, uniform Euler flow), `count` (1–64 individual images). Negative prompts, prompt batches,
 conditioning and other sizes are refused. Prompts longer than 128 tokens are truncated exactly as

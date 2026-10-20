@@ -690,9 +690,79 @@ pub fn convert_checkpoint(
     Ok(manifest)
 }
 
+/// How much of a bundle's on-disk state [`read_bundle_checked`] re-verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleCheck {
+    /// File sizes **and** SHA-256 of every converted file — the load path.
+    Digests,
+    /// File sizes only — for footprint / admission queries, which must not re-hash ~417 MB each
+    /// time. The load that follows still runs [`BundleCheck::Digests`].
+    SizesOnly,
+}
+
 /// Read and validate a converted bundle: schema, provider id, geometry, and the size and SHA-256 of
-/// every converted file (so a truncated or edited bundle never loads).
+/// every converted file (so a truncated or edited bundle never loads). Accepts any self-consistent
+/// geometry and source — the production provider uses [`read_pinned_bundle`].
 pub fn read_bundle(dir: &Path) -> Result<Supra2Bundle> {
+    read_bundle_checked(dir, BundleCheck::Digests)
+}
+
+/// [`read_bundle`] plus the pin contract: the bundle must have been converted from exactly
+/// [`SUPRA2_SOURCE`] (repo, revision, file size and SHA-256), carry the published geometry, and
+/// expect exactly the [`FLAN_T5_BASE`] / [`SD_VAE`] component revisions. This is what the registered
+/// `supra2_img` provider loads, so an unpinned or re-geometried bundle is refused (E3).
+pub fn read_pinned_bundle(dir: &Path, check: BundleCheck) -> Result<Supra2Bundle> {
+    let bundle = read_bundle_checked(dir, check)?;
+    let m = &bundle.manifest;
+    let pin = SUPRA2_SOURCE.files[0];
+    let refuse = |what: String| {
+        Err(Error::Unsupported(format!(
+            "supra2: bundle {} {what}; the provider loads only bundles converted from {}@{}/{} \
+             (sha256 {}) by convert_pinned_checkpoint",
+            dir.display(),
+            SUPRA2_SOURCE.repo,
+            SUPRA2_SOURCE.revision,
+            pin.path,
+            pin.sha256
+        )))
+    };
+    if m.source.repo.as_deref() != Some(SUPRA2_SOURCE.repo)
+        || m.source.revision.as_deref() != Some(SUPRA2_SOURCE.revision)
+        || m.source.sha256 != pin.sha256
+        || m.source.bytes != pin.bytes
+    {
+        return refuse(format!(
+            "was converted from an unpinned source ({:?}@{:?}, sha256 {})",
+            m.source.repo, m.source.revision, m.source.sha256
+        ));
+    }
+    if m.config != Supra2Config::published() {
+        return refuse(format!("declares non-published geometry {:?}", m.config));
+    }
+    let expected = [
+        (TEXT_ENCODER_COMPONENT, &FLAN_T5_BASE),
+        (VAE_COMPONENT, &SD_VAE),
+    ];
+    let pinned = m.components.len() == expected.len()
+        && expected.iter().all(|(id, pin)| {
+            m.components
+                .iter()
+                .any(|c| c.component == *id && c.repo == pin.repo && c.revision == pin.revision)
+        });
+    if !pinned {
+        return refuse(format!(
+            "expects unpinned components {:?}",
+            m.components
+                .iter()
+                .map(|c| format!("{}={}@{}", c.component, c.repo, c.revision))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(bundle)
+}
+
+/// [`read_bundle`] with an explicit on-disk check depth.
+pub fn read_bundle_checked(dir: &Path, check: BundleCheck) -> Result<Supra2Bundle> {
     let path = dir.join(BUNDLE_MANIFEST);
     let bytes = std::fs::read(&path).map_err(|e| {
         Error::Unsupported(format!(
@@ -726,7 +796,14 @@ pub fn read_bundle(dir: &Path) -> Result<Supra2Bundle> {
                 file.file
             )));
         }
-        let actual = bundle_file(dir, &file.file)?;
+        let actual = match check {
+            BundleCheck::Digests => bundle_file(dir, &file.file)?,
+            BundleCheck::SizesOnly => BundleFile {
+                file: file.file.clone(),
+                bytes: std::fs::metadata(dir.join(&file.file))?.len(),
+                sha256: file.sha256.clone(),
+            },
+        };
         if actual != *file {
             return Err(Error::Unsupported(format!(
                 "supra2: bundle file {} does not match its manifest (bytes {} vs {}, sha256 {} vs {})",
@@ -1015,9 +1092,16 @@ fn component_dir(spec: &crate::LoadSpec, id: &str, label: &str) -> Result<PathBu
 }
 
 impl Supra2Sources {
-    /// Resolve and validate every input: the converted bundle (manifest + digests), and the pinned
-    /// component snapshots (exact files and sizes, plus their `config.json` geometry).
+    /// Resolve and validate every input: the converted bundle (manifest + digests + the
+    /// [`read_pinned_bundle`] pin contract), and the pinned component snapshots (exact files and
+    /// sizes, plus their `config.json` geometry).
     pub fn resolve(spec: &crate::LoadSpec) -> Result<Self> {
+        Self::resolve_checked(spec, BundleCheck::Digests)
+    }
+
+    /// [`Self::resolve`] with an explicit bundle check depth: footprint / admission queries use
+    /// [`BundleCheck::SizesOnly`] so they never re-hash the 417 MB denoiser; `load` keeps digests.
+    pub fn resolve_checked(spec: &crate::LoadSpec, check: BundleCheck) -> Result<Self> {
         crate::control::reject_unknown_components(
             spec,
             &[TEXT_ENCODER_COMPONENT, VAE_COMPONENT],
@@ -1028,7 +1112,7 @@ impl Supra2Sources {
                 "{PROVIDER_ID}: weights must be the converted Supra2 bundle directory"
             )));
         };
-        let bundle = read_bundle(dir)?;
+        let bundle = read_pinned_bundle(dir, check)?;
         let text_encoder = component_dir(spec, TEXT_ENCODER_COMPONENT, "Flan-T5-Base")?;
         let vae = component_dir(spec, VAE_COMPONENT, "SD VAE ft-MSE")?;
         FLAN_T5_BASE.check_sizes(&text_encoder)?;

@@ -725,6 +725,23 @@ fn read_entry(zip: &mut zip::ZipArchive<std::fs::File>, name: &str, who: &str) -
     Ok(out)
 }
 
+/// The top-level `(name, tensor)` entries of a `torch.save(state_dict)` object graph. Errors unless
+/// the top object is a dict; skips non-tensor values (e.g. a nested `_metadata`-style dict).
+pub fn state_dict_entries(root: &PthValue) -> Result<Vec<(String, PthTensorSpec)>> {
+    let PthValue::Dict(items) = root else {
+        return Err(Error::Msg(
+            "pickle: top object is not a dict (expected a torch.save state dict)".into(),
+        ));
+    };
+    Ok(items
+        .iter()
+        .filter_map(|(name, value)| match value {
+            PthValue::Tensor(spec) => Some((name.clone(), spec.clone())),
+            _ => None,
+        })
+        .collect())
+}
+
 /// An opened `torch.save` archive: the parsed object graph plus lazy access to storage blobs.
 pub struct PthArchive {
     path: PathBuf,
@@ -814,7 +831,7 @@ impl PthArchive {
     pub fn visit_tensors(
         &mut self,
         keep: impl Fn(&str) -> bool,
-        mut visit: impl FnMut(String, PthTensor) -> Result<()>,
+        visit: impl FnMut(String, PthTensor) -> Result<()>,
     ) -> Result<()> {
         let specs: Vec<(String, PthTensorSpec)> = self
             .root
@@ -823,6 +840,30 @@ impl PthArchive {
             .filter(|(name, _)| keep(name))
             .map(|(name, spec)| (name, spec.clone()))
             .collect();
+        self.visit_specs(specs, visit)
+    }
+
+    /// The flat `torch.save(state_dict)` view: the top object must be a dict, and only its
+    /// **top-level** tensor values are visited under their own keys (non-tensor and nested values
+    /// are skipped) — exactly the pre-sc-24213 `mlx_gen::pth` contract the Wan and E-LatentLPIPS
+    /// converters were written against.
+    pub fn visit_state_dict(
+        &mut self,
+        keep: impl Fn(&str) -> bool,
+        visit: impl FnMut(String, PthTensor) -> Result<()>,
+    ) -> Result<()> {
+        let specs = state_dict_entries(&self.root)?
+            .into_iter()
+            .filter(|(name, _)| keep(name))
+            .collect();
+        self.visit_specs(specs, visit)
+    }
+
+    fn visit_specs(
+        &mut self,
+        specs: Vec<(String, PthTensorSpec)>,
+        mut visit: impl FnMut(String, PthTensor) -> Result<()>,
+    ) -> Result<()> {
         let mut remaining: HashMap<String, usize> = HashMap::new();
         for (_, spec) in &specs {
             *remaining.entry(spec.storage_key.clone()).or_insert(0) += 1;
@@ -975,6 +1016,79 @@ mod tests {
         let flat = root.flatten_tensors();
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0].0, "model.w");
+    }
+
+    /// The flat state-dict view (mlx-gen's `load_pth_f32*` adapter) keeps the pre-sc-24213
+    /// contract: a non-dict top object is refused, and only top-level tensors are visited — a
+    /// nested dict's tensors never appear under dotted names.
+    #[test]
+    fn state_dict_view_refuses_non_dict_roots_and_skips_nested_tensors() {
+        // Root = a bare tensor.
+        let mut p: Vec<u8> = vec![0x80, 2];
+        push_tensor(&mut p);
+        p.push(b'.');
+        let root = to_value(parse_pickle(&p).unwrap()).unwrap();
+        let err = state_dict_entries(&root).unwrap_err().to_string();
+        assert!(err.contains("top object is not a dict"), "{err}");
+        // Root = a list.
+        let list = to_value(parse_pickle(&[0x80, 2, b']', b'.']).unwrap()).unwrap();
+        assert!(state_dict_entries(&list).is_err());
+
+        // {"a": T, "nested": {"w": T}, "n": 3} → only "a".
+        let mut p: Vec<u8> = vec![0x80, 2, b'}', b'('];
+        push_str(&mut p, "a");
+        push_tensor(&mut p);
+        push_str(&mut p, "nested");
+        p.extend_from_slice(b"}(");
+        push_str(&mut p, "w");
+        push_tensor(&mut p);
+        p.push(b'u');
+        push_str(&mut p, "n");
+        p.extend_from_slice(&[b'K', 3]);
+        p.extend_from_slice(b"u.");
+        let root = to_value(parse_pickle(&p).unwrap()).unwrap();
+        let names: Vec<String> = state_dict_entries(&root)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["a".to_string()]);
+        // The general nested view still sees both.
+        assert_eq!(root.flatten_tensors().len(), 2);
+    }
+
+    /// On a real nested archive (the Supra2 tiny checkpoint: `{"model": {…}, "config": {…}}`) the
+    /// flat state-dict view mlx-gen's `load_pth_f32*` uses visits no tensors — as before sc-24213,
+    /// nested values are skipped, never surfaced under dotted names — while the nested view sees all.
+    #[test]
+    fn archive_state_dict_view_never_surfaces_nested_tensors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/supra2/tiny_model_with_uncond.pt");
+        let mut flat = Vec::new();
+        PthArchive::open(&path)
+            .unwrap()
+            .visit_state_dict(
+                |_| true,
+                |name, _| {
+                    flat.push(name);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(flat.is_empty(), "{flat:?}");
+        let mut nested = Vec::new();
+        PthArchive::open(&path)
+            .unwrap()
+            .visit_tensors(
+                |_| true,
+                |name, _| {
+                    nested.push(name);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(nested.contains(&"model.pos_embed".to_string()));
+        assert!(nested.contains(&"config.uncond_text".to_string()));
     }
 
     #[test]

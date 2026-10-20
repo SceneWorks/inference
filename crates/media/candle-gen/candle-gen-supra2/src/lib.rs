@@ -28,11 +28,10 @@
 pub mod dit;
 pub mod memory_strategy;
 pub mod model;
+pub mod sampling;
 
 pub use dit::SupraDit;
-pub use model::{
-    descriptor, encode_tokens, integrate, load, Supra2Image, Supra2Output, TextConditioning,
-};
+pub use model::{descriptor, encode_tokens, load, Supra2Image, Supra2Output, TextConditioning};
 
 /// Compose the Supra2 generator and its memory surfaces into an explicit registry.
 pub fn register_providers(

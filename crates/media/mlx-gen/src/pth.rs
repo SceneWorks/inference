@@ -30,7 +30,7 @@ pub fn load_pth_f32_filtered(
 ) -> Result<HashMap<String, Array>> {
     let mut archive = PthArchive::open(path)?;
     let mut out = HashMap::new();
-    archive.visit_tensors(keep, |name, tensor| {
+    archive.visit_state_dict(keep, |name, tensor| {
         let floats = tensor.to_f32()?;
         // Dims are validated non-negative and ≤ i32::MAX by the reader, so this cannot truncate.
         let shape: Vec<i32> = tensor.shape.iter().map(|&d| d as i32).collect();
