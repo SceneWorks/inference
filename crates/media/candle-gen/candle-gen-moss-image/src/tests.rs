@@ -84,7 +84,8 @@ fn numerical_oracle_rejects_nan_truncation_and_shape_mismatch_sc26325() {
 #[test]
 fn descriptors_keep_acceleration_explicit() {
     for descriptor in [descriptor_base(), descriptor_sft()] {
-        assert!(!descriptor.capabilities.supports_lora);
+        assert!(descriptor.capabilities.supports_lora);
+        assert!(descriptor.capabilities.supports_lokr);
         assert!(descriptor.capabilities.supports_prompt_batch);
     }
     let request = GenerationRequest {
@@ -299,7 +300,7 @@ fn mask_and_cancellation_refuse_before_blocks() {
 }
 
 pub(crate) fn synthetic_sources() -> Sources {
-    Sources{selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
+    Sources{variant:MossImageVariant::Sft,adapter_pins:vec![],selection:Some(MossImageAcceleration::Off),ordinary:vec![],mixed:None,full:None,headers:BTreeMap::new(),config:MossImageConfig::default(),
         text_config:candle_llm::models::qwen35::Qwen35Config::from_json(&serde_json::json!({"hidden_size":4096,"num_hidden_layers":2,"intermediate_size":24,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":32,"linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":8,"linear_value_head_dim":8})).unwrap(),
         tokenizer:{let path=std::env::current_exe().unwrap();loader::Asset{pin:PinnedWeightsFile::pin(path).unwrap(),role:MossImageAssetRole::Tokenizer,repo:SFT_REPO,revision:SFT_REVISION,relative:"tokenizer/tokenizer.json".into()}},
         spec:LoadSpec::new(WeightsSource::Dir("synthetic-unloaded-only".into()))}
@@ -934,3 +935,6 @@ fn selected_pin_authentication_ignores_unconsumed_optional_pin_mutation_sc26325(
     .unwrap();
     assert_eq!(selected.authenticated_bytes().unwrap(), source);
 }
+
+#[path = "training_tests.rs"]
+mod training_contract_tests;

@@ -1,9 +1,12 @@
 //! Native MOSS-Image Base/SFT, including both explicit published DMD precision policies.
 //! Caller-provisioned exact assets only. No acquisition or Python production execution.
+mod adapters;
 mod loader;
 pub mod memory_strategy;
 mod pipeline;
 mod text_encoder;
+pub mod training;
+mod training_memory;
 mod transformer;
 
 /// The exact canvas grid of the frozen packed-latent model.
@@ -144,6 +147,7 @@ impl MossImageGenerator {
         if cancel.is_cancelled() {
             return Err(gen_core::Error::Canceled);
         }
+        self.sources.ensure_unchanged()?;
         if self.sources.selection == Some(mode) {
             Ok(std::borrow::Cow::Borrowed(&self.sources))
         } else {
@@ -536,6 +540,8 @@ fn descriptor(v: MossImageVariant) -> ModelDescriptor {
             &[]
         },
         capabilities: Capabilities {
+            supports_lora: true,
+            supports_lokr: true,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_prompt_batch: true,
@@ -602,6 +608,8 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     registry
         .register_generator(BASE_REGISTRATION)
         .register_generator(SFT_REGISTRATION)
+        .register_trainer(training::BASE_REGISTRATION)
+        .register_trainer(training::SFT_REGISTRATION)
         .register_memory_strategy(MemoryRegistration {
             provider_id: "moss_image_base",
             contract: contract_base,

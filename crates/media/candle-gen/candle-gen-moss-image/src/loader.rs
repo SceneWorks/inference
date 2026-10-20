@@ -106,6 +106,8 @@ impl Asset {
 }
 #[derive(Clone)]
 pub(crate) struct Sources {
+    pub variant: MossImageVariant,
+    pub adapter_pins: Vec<PinnedWeightsFile>,
     pub selection: Option<MossImageAcceleration>,
     pub ordinary: Vec<Asset>,
     pub mixed: Option<Vec<Asset>>,
@@ -242,7 +244,6 @@ impl Sources {
         }
         if spec.precision != gen_core::Precision::Bf16
             || spec.quantize.is_some()
-            || !spec.adapters.is_empty()
             || spec.control.is_some()
             || !spec.extra_controls.is_empty()
             || spec.ip_adapter.is_some()
@@ -467,7 +468,14 @@ impl Sources {
             .find(|a| a.relative == "tokenizer/tokenizer.json")
             .expect("static path")
             .clone();
+        let adapter_pins = spec
+            .adapters
+            .iter()
+            .map(|a| spec.file_pin_for(&a.path))
+            .collect::<gen_core::Result<Vec<_>>>()?;
         Ok(Self {
+            variant,
+            adapter_pins,
             selection,
             ordinary,
             mixed,
@@ -479,7 +487,44 @@ impl Sources {
             headers,
         })
     }
+    pub fn ensure_unchanged(&self) -> gen_core::Result<()> {
+        // Optional DMD closures are authenticated only when selected by assets(mode).
+        for a in &self.ordinary {
+            a.pin.verify_unchanged()?;
+        }
+        for pin in &self.adapter_pins {
+            pin.verify_unchanged()?;
+        }
+        Ok(())
+    }
+    pub fn training_vae(&self, device: &Device) -> Result<Flux2Vae> {
+        let weights = load_weights(
+            &self.ordinary,
+            MossImageAssetRole::Vae,
+            device,
+            DType::F32,
+            &[
+                "encoder.",
+                "decoder.",
+                "quant_conv.",
+                "post_quant_conv.",
+                "bn.running_mean",
+                "bn.running_var",
+            ],
+        )?;
+        let map = weights
+            .keys()
+            .map(|k| Ok((k.clone(), weights.require(k)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        Ok(Flux2Vae::new_with_encoder_and_decoder_config(
+            VarBuilder::from_tensors(map, DType::F32, device),
+            &Flux2VaeDecoderConfig {
+                block_out_channels: MOSS_VAE_DECODER_CHANNELS,
+            },
+        )?)
+    }
     pub fn assets(&self, mode: MossImageAcceleration) -> gen_core::Result<Vec<Asset>> {
+        self.ensure_unchanged()?;
         let mut a = self.ordinary.clone();
         match mode {
             MossImageAcceleration::Off=>(),

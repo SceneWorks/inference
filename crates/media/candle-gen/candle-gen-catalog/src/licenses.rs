@@ -631,11 +631,8 @@ mod tests {
         assert_eq!(
             registered.len(),
             67,
-            "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
-             sc-25901) + 19 trainers (15 of them also \
-             generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
-             transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
-             1 transform (iris_3b_restore, sc-25683)"
+            "provider identity is a union across kinds; the MOSS Base/SFT trainers reuse \
+             their existing generator identities and license rows rather than adding providers"
         );
 
         let mapped: BTreeSet<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();

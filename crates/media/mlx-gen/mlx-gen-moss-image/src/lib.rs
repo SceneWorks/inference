@@ -52,3 +52,6 @@ impl Drop for CpuTestDevice {
         mlx_rs::Device::set_default(&self.0);
     }
 }
+
+#[cfg(test)]
+mod portable_exchange_tests;

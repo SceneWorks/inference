@@ -92,6 +92,7 @@ fn descriptor(variant: MossImageVariant) -> ModelDescriptor {
         modality: Modality::Image,
         capabilities: Capabilities {
             supports_lora: true,
+            supports_lokr: true,
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_prompt_batch: true,
@@ -748,6 +749,7 @@ mod cpu_tests {
             assert!(descriptor.capabilities.supports_negative_prompt);
             assert!(descriptor.capabilities.conditioning.is_empty());
             assert!(descriptor.capabilities.supports_lora);
+            assert!(descriptor.capabilities.supports_lokr);
             assert!(descriptor
                 .capabilities
                 .validate_request(
