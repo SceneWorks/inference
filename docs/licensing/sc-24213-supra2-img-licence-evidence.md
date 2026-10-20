@@ -18,6 +18,31 @@ encoder/tokenizer and the SD VAE. The converted bundle is produced locally at
 install time from the pinned checkpoint and is not redistributed. Metadata is
 disclosure and does not gate execution.
 
-The committed test fixtures are synthetic: tiny random-weight checkpoints written
-by the upstream `SupraDiT` class, upstream token ids for four prompts, and SHA-256
-digests of the real checkpoint's tensors. No upstream weights are committed.
+Most committed test fixtures are synthetic: `tiny_model_with_uncond.pt`,
+`tiny_ema_without_uncond.pt`, `tiny_digests.json`,
+`mlx-gen-supra2/tests/fixtures/tiny_dit_parity.safetensors`, and
+`mlx-gen-supra2/tests/fixtures/tiny_t5_parity.safetensors` contain deterministic
+random-weight models, inputs, and torch outputs. The two tiny `.pt` files are
+written by the frozen upstream `SupraDiT` class, but contain no upstream parameter
+or output. `gen-core/tests/fixtures/supra2/supra2_reference_digests.json` contains
+only SHA-256 digests of real Supra2 checkpoint tensors. `tokenizer_cases.json`
+contains four prompt strings and their ids/masks emitted by the pinned Flan-T5-Base
+tokenizer; it contains neither tokenizer files nor tensors.
+
+One committed fixture is deliberately different:
+`crates/media/candle-gen/candle-gen-supra2/tests/fixtures/supra2_real_golden.safetensors`.
+It contains the `t5.uncond_text` `[128, 768]` F32 and `t5.uncond_mask` `[128]` F32
+tensors copied verbatim from the Supra2-IMG `model_final_ema.pt` checkpoint. It
+also contains torch CPU F32 reference inputs and outputs: Flan-T5 contexts/masks
+for the four tokenizer cases (`t5.ctx.*` / `t5.mask.*`), a Supra2 DiT forward
+(`dit.*`), VAE decode inputs/outputs (`vae.*`), and four full sampling trajectories
+with decoded pixels (`traj.*`). The `t5.ctx.*`, `dit.*`, `vae.*`, and `traj.*`
+values are derived from real Supra2-IMG, Flan-T5-Base, and SD-VAE weights; the
+trajectory pixel tensors are stored as U8.
+
+Accordingly, redistribution of this golden is disclosed with attribution to
+SupraLabs/Supra2-IMG (Apache-2.0), google/flan-t5-base (Apache-2.0), and
+stabilityai/sd-vae-ft-mse (MIT), at the revisions and evidence links in the table
+above. The direct checkpoint tensors are Supra2-IMG material; the real-weight
+reference outputs retain the applicable attribution and notice obligations of the
+components used to produce them. No other upstream weight tensor is committed.
