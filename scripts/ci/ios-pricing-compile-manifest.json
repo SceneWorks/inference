@@ -816,11 +816,11 @@
     },
     {
       "path": ".github/workflows/real-weights.yml",
-      "sha256": "e381d088c79ae9b7dd1bbdf9d0c3166b2aa4a8d2a59741b1c0ea3377d9002a4d"
+      "sha256": "a5899d293d3c2855eac24ebd814bf136058afaf387aa281207b7fae0d3cdfd44"
     },
     {
       "path": "scripts/ci/ios_pricing_compile_only.py",
-      "sha256": "bca0c8bb957dca3b538b7b9057c89c59ebf840a8a5cd6e786525e9c05c9d5f8a"
+      "sha256": "ab6dae583547be63916cb2bb4529c3e5fcc81bd0bb45e0ce51aace3b2470d05c"
     }
   ],
   "HOSTs": [

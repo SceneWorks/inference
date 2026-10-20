@@ -150,7 +150,7 @@ on:
         default: full
         options: [probe, diagnostic, q4-numeric, direction-protocol, current-diagnostic, current-trajectory, edit, imports, full]
       ios_pricing_compile_binding:
-        description: 'Owner-bound JSON: exact source_sha, manifest_sha256, host second-mac, phase compile-only or compile-host'
+        description: 'Owner-bound JSON: exact source_sha, manifest_sha256, host second-mac, phase compile-only, compile-host or prerequisite-probe'
         type: string
         required: false
         default: '{"source_sha":"","manifest_sha256":"","host":"second-mac"}'
@@ -410,6 +410,7 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
           [[ "$COMPILE_HOST" == second-mac ]]
+          [[ "$COMPILE_PHASE" == compile-only || "$COMPILE_PHASE" == compile-host || "$COMPILE_PHASE" == prerequisite-probe ]]
           [[ "$RUNNER_NAME" == nax-macos-2 ]]
           command -v python3.12 >/dev/null || { echo "::error::Preinstalled Python3.12 required; no provisioning"; exit 1; }
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -417,7 +418,7 @@ jobs:
           ref: ${{ fromJSON(inputs.ios_pricing_compile_binding).source_sha }}
           persist-credentials: false
           clean: false
-      - name: Compile exact three units offline and enumerate; pure HOST only if explicitly admitted
+      - name: Run isolated prerequisite probe or explicitly admitted compiler phase
         shell: bash
         run: python3.12 -I scripts/ci/ios_pricing_compile_only.py --manifest scripts/ci/ios-pricing-compile-manifest.json --seconds 1800 --phase "$COMPILE_PHASE"
       - name: Upload compile receipt, logs and source provenance

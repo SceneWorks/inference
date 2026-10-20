@@ -73,11 +73,123 @@ def validate_host(step, text, rust):
         # The pinned parent creates a fresh absolute DONE, waits status.success, then reads b"ok".
         # Do not infer completion from an ignored/default test or an invented marker.
 
+def prerequisite_probe(manifest, report, deadline):
+    """Read only named prerequisites; never select an alternate SDK or launch Cargo."""
+    result = {"checks": {}, "SDKs": [], "discovery": [], "no_compile_or_test": True,
+              "automatic_SDK_substitution": False}
+    checks = result["checks"]
+    def check(name, observe, accepts):
+        try:
+            value = observe()
+            checks[name] = {"value": value, "ok": bool(accepts(value))}
+        except Exception as error:
+            checks[name] = {"ok": False, "error": repr(error)}
+        return checks[name]
+    home = Path.home()
+    check("Python", lambda: {"executable": sys.executable, "version": list(sys.version_info[:3])},
+          lambda v: v["version"][:2] == [3, 12])
+    check("platform", lambda: [platform.system(), platform.machine()],
+          lambda v: v[0] == "Darwin" and v[1] in ("arm64", "aarch64"))
+    for name, path in (("cargo", home / ".cargo/bin/cargo"),
+                       ("rustc", home / ".rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustc")):
+        check(name, lambda p=path: {"path": str(p), "present": p.is_file()}, lambda v: v["present"])
+    check("disk", lambda: {"free_bytes": shutil.disk_usage(report).free, "required_bytes": 40 * 1024**3},
+          lambda v: v["free_bytes"] >= v["required_bytes"])
+    check("RUST_MIN_STACK_absent", lambda: "RUST_MIN_STACK" not in os.environ, bool)
+    default_sdk = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk"
+    selected = os.environ.get("SDKROOT", default_sdk)
+    result["selected_SDKROOT"] = {"environment_value": os.environ.get("SDKROOT"), "effective": selected}
+    check("selected_SDK26.5", lambda: {"path": selected, "directory": Path(selected).is_dir(),
+                                     "name": Path(selected).name},
+          lambda v: v["directory"] and v["name"] == "MacOSX26.5.sdk")
+    seen = set()
+    def sdk_headers(path, origin, required=False):
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        row = {"path": key, "origin": origin, "headers": []}
+        for item in manifest["SDK_headers"]:
+            entry = {"relative_path": item["relative_path"], "expected_sha256": item["sha256"]}
+            try:
+                entry["sha256"] = sha(path / item["relative_path"])
+                entry["matches"] = entry["sha256"] == item["sha256"]
+            except Exception as error:
+                entry.update(matches=False, error=repr(error))
+            row["headers"].append(entry)
+        result["SDKs"].append(row)
+        if required:
+            checks["selected_SDK_headers"] = {"ok": all(x["matches"] for x in row["headers"])}
+    sdk_headers(Path(selected), "selected", required=True)
+    def xcrun_sdk():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("STOPNEXT finite admission expired before xcrun")
+        command = ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"]
+        child = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return {"argv": command, "exit": child.returncode, "stdout": child.stdout[:4096],
+                "stderr": child.stderr[:4096], "output_truncated": len(child.stdout) > 4096 or len(child.stderr) > 4096}
+    xcrun = check("xcrun", xcrun_sdk, lambda v: v["exit"] == 0 and not v["output_truncated"]
+                  and Path(v["stdout"].strip()).is_absolute())
+    if xcrun["ok"]:
+        sdk_headers(Path(xcrun["value"]["stdout"].strip()), "xcrun-observation-only")
+    # Nonrecursive, bounded discovery: no caches, models, or unrelated application contents.
+    def bounded_names(path, accepts, limit):
+        names = []
+        with os.scandir(path) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 256:
+                    return names, True
+                if accepts(entry.name) and entry.is_dir():
+                    names.append(entry.name)
+                    if len(names) >= limit:
+                        return names, True
+        return sorted(names), False
+    apps = check("Xcode_candidates", lambda: bounded_names(Path("/Applications"),
+                 lambda name: name.startswith("Xcode") and name.endswith(".app"), 16),
+                 lambda v: bool(v[0]) and not v[1])
+    if "value" in apps:
+        for name in apps["value"][0]:
+            base = Path("/Applications") / name / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs"
+            try:
+                names, truncated = bounded_names(base, lambda n: n.startswith("MacOSX") and n.endswith(".sdk"), 32)
+                result["discovery"].append({"directory": str(base), "SDK_names": names, "truncated": truncated})
+                for sdk_name in names:
+                    sdk_headers(base / sdk_name, "installed-observation-only")
+            except Exception as error:
+                result["discovery"].append({"directory": str(base), "error": repr(error)})
+    native_text = os.environ.get("PMETAL_MLX_PREBUILT_DIR")
+    metallib_text = os.environ.get("PMETAL_METALLIB_PATH")
+    result["native_environment"] = {"PMETAL_MLX_PREBUILT_DIR": native_text,
+                                    "PMETAL_METALLIB_PATH": metallib_text}
+    native = Path(native_text) if native_text else None
+    metallib = Path(metallib_text) if metallib_text else None
+    check("native_paths", lambda: bool(native and metallib and native.is_absolute() and metallib.is_absolute()
+                                      and metallib == native / "mlx.metallib"), bool)
+    for item in manifest["native_files"]:
+        def native_hash(entry=item):
+            if native is None or not native.is_absolute():
+                raise ValueError("missing absolute PMETAL_MLX_PREBUILT_DIR")
+            return {"path": str(native / entry["name"]), "sha256": sha(native / entry["name"]),
+                    "expected_sha256": entry["sha256"]}
+        check("native_file:" + item["name"], native_hash, lambda v: v["sha256"] == v["expected_sha256"])
+    def fingerprint():
+        if native is None or not native.is_absolute():
+            raise ValueError("missing absolute PMETAL_MLX_PREBUILT_DIR")
+        text = (native / "pmetal-mlx-prebuilt.txt").read_text()
+        expected = "fingerprint=096020673cabac7c1cfda2faee80393c5902a41e6d2f004e7e70f27debe4357c"
+        return {"expected": expected, "present": expected in text}
+    check("native_fingerprint", fingerprint, lambda v: v["present"])
+    result["all_named_prerequisites_ok"] = all(row["ok"] for row in checks.values())
+    result["discovery_complete"] = apps["ok"] and all("error" not in row and not row["truncated"]
+                                                      for row in result["discovery"])
+    result["compile_readiness_claim"] = False  # Presence/hash observations are not an execution qualification.
+    return result
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--seconds", type=int, required=True)
-    parser.add_argument("--phase", choices=("compile-only", "compile-host"), default="compile-only")
+    parser.add_argument("--phase", choices=("compile-only", "compile-host", "prerequisite-probe"), default="compile-only")
     args = parser.parse_args()
     assert 0 < args.seconds <= 1800, "finite owner admission required"
     repo = Path(__file__).resolve().parents[2]
@@ -113,7 +225,7 @@ def main():
         assert len({x["fqn"] for x in manifest["HOSTs"]}) == len(manifest["HOSTs"])
         assert sum(x["expected_Rust_rows"] for x in manifest["HOSTs"]) == manifest["expected_HOST_Rust_rows"]
         (report / "source-manifest.json").write_bytes(manifest_path.read_bytes())
-        def inputs():
+        def inputs(source_only=False):
             assert sha(manifest_path) == manifest_sha
             assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == source_sha
             assert not subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"], text=True).strip(), "dirty/untracked remote checkout"
@@ -121,8 +233,23 @@ def main():
                 relative = Path(item["path"])
                 assert not relative.is_absolute() and ".." not in relative.parts
                 assert sha(repo / relative) == item["sha256"], str(relative)
-            assert shutil.disk_usage(report).free >= 40 * 1024**3, "disk below40GiB"
-            assert "RUST_MIN_STACK" not in os.environ, "no stack workaround"
+            if not source_only:
+                assert shutil.disk_usage(report).free >= 40 * 1024**3, "disk below40GiB"
+                assert "RUST_MIN_STACK" not in os.environ, "no stack workaround"
+        if args.phase == "prerequisite-probe":
+            inputs(source_only=True)
+            assert time.monotonic() < deadline, "STOPNEXT finite admission expired before probe"
+            probe = prerequisite_probe(manifest, report, deadline)
+            probe_path = report / "prerequisite-probe.json"
+            probe_path.write_text(json.dumps(probe, indent=2) + "\n")
+            receipt["prerequisite_probe"] = {"path": str(probe_path), "sha256": sha(probe_path),
+                                             "all_named_prerequisites_ok": probe["all_named_prerequisites_ok"],
+                                             "discovery_complete": probe["discovery_complete"]}
+            inputs(source_only=True)
+            receipt["probe_observations_complete"] = True
+            receipt["state"] = "PROBE_RECORDED_NOT_COMPILE_QUALIFIED"
+            save()
+            return 0 if probe["all_named_prerequisites_ok"] and probe["discovery_complete"] else 1
         inputs()
         home = Path.home()
         cargo = home / ".cargo/bin/cargo"
