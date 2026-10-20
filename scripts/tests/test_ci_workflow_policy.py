@@ -4105,7 +4105,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         parsed = yaml.safe_load(workflow)
         lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
         self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
-        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda", "moss-cuda-unit"])
         select = next(
             step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
         )
@@ -4114,6 +4114,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         scoped = (
             'if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then\n'
             '  python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "moss-cuda-unit" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --moss-cuda-unit --github-output "$GITHUB_OUTPUT"\n'
             'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
         )
         self.assertTrue(run.startswith(scoped), run)
@@ -4142,6 +4144,101 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     parsed["jobs"][name].get("if", ""),
                     f"{name} could be scheduled by a dispatch that did not select the macOS lane",
                 )
+
+    def test_moss_cuda_unit_is_a_bounded_manual_exact_test_profile(self) -> None:
+        parsed = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        job = parsed["jobs"]["moss-cuda-unit"]
+        # Dispatch-only, profile-exclusive, own repository: never PRs, tags, `all` or `windows-cuda`.
+        for fragment in (
+            "github.event_name == 'workflow_dispatch'",
+            "inputs.lanes == 'moss-cuda-unit'",
+            "needs.changes.outputs.moss_cuda_unit == 'true'",
+            "github.repository == 'SceneWorks/inference'",
+            "github.ref_type == 'branch'",
+            "startsWith(github.ref, 'refs/heads/')",
+        ):
+            self.assertIn(fragment, job["if"])
+        self.assertEqual(job["runs-on"], ["self-hosted", "windows", "cuda"])
+        self.assertEqual(job["timeout-minutes"], 60)
+        env = job["env"]
+        self.assertEqual(
+            {k: env[k] for k in ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "RUST_TEST_THREADS", "CI", "RUSTC_WRAPPER")},
+            {"CARGO_BUILD_JOBS": "2", "CMAKE_BUILD_PARALLEL_LEVEL": "2", "RUST_TEST_THREADS": "1",
+             "CI": "true", "RUSTC_WRAPPER": ""},
+        )
+        windows_cuda = parsed["jobs"]["windows-cuda"]["env"]
+        for key in ("CUDA_COMPUTE_CAP", "CUDA_PATH", "VCVARS"):
+            self.assertEqual(env[key], windows_cuda[key], f"{key} must stay the reviewed Windows CUDA value")
+
+        steps = {step.get("name", step.get("uses")): step for step in job["steps"]}
+        checkout = job["steps"][0]
+        self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "persist-credentials": False})
+        self.assertEqual(steps["Install pinned uv for the MOSS unit supervisor"]["uses"], WINDOWS_SETUP_ACTION)
+        self.assertEqual(steps["Install pinned uv for the MOSS unit supervisor"]["with"],
+                         {"version": "0.12.3", "enable-cache": False})
+        self.assertEqual(
+            steps["Install reviewed CPython 3.12 for the MOSS unit supervisor"]["run"],
+            r"call scripts\ci\real-weights\candle-llm\install-reviewed-cpython-3-12.cmd",
+        )
+        compile_step = steps["Compile the MOSS lib test binary (no GPU execution)"]
+        execute = steps["Execute the one MOSS CUDA production-graph test"]
+        self.assertTrue(compile_step["run"].strip().endswith('-m scripts.ci.moss_cuda_unit compile'))
+        self.assertEqual(execute["run"], '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit run')
+        self.assertEqual(execute["timeout-minutes"], 6)
+        smoke = steps["Verify Windows Job Object ownership (no GPU)"]
+        self.assertEqual(smoke["run"], '"%REVIEWED_PYTHON%" -m scripts.ci.moss_cuda_unit smoke')
+        self.assertFalse(smoke.get("continue-on-error", False))
+        names = [step.get("name", step.get("uses")) for step in job["steps"]]
+        order = [names.index(n) for n in (
+            "Install reviewed CPython 3.12 for the MOSS unit supervisor", smoke["name"],
+            compile_step["name"], execute["name"])]
+        self.assertEqual(order, sorted(order))
+        text = json.dumps(job)
+        # No weights, provisioning, downloads, secrets, writes, or broader/ignored test selection.
+        for forbidden in ("secrets.", "--ignored", "HF_", "huggingface", "ensure_model_snapshot",
+                          "--workspace", "-p \"candle-gen*\"", "continue-on-error", "retry", "attempt"):
+            self.assertNotIn(forbidden, text)
+        self.assertNotIn("permissions", job)
+        self.assertEqual(parsed["permissions"], {"contents": "read"})
+
+        # The package, filter and bounds are fixed constants of the supervisor, never inputs.
+        from scripts.ci import moss_cuda_unit as supervisor
+
+        self.assertEqual(supervisor.PACKAGE, "candle-gen-moss-image")
+        self.assertEqual(
+            supervisor.TEST_NAME,
+            "tests::training_contract_tests::cuda_production_graph_four_cases_checkpoint_gradients_updates_and_strict_reload",
+        )
+        self.assertNotIn("inputs.", compile_step["run"] + execute["run"])
+
+    def test_moss_cuda_unit_is_selected_only_by_its_own_profile(self) -> None:
+        run = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["changes"]["steps"]
+        select = next(step for step in run if step.get("id") == "select")["run"]
+        self.assertEqual(select.count("--moss-cuda-unit"), 1)
+        self.assertEqual(select.count('"$DISPATCH_LANES" == "moss-cuda-unit"'), 1)
+        for command in ("--all", "--only windows_cuda", "--base"):
+            line = next(line for line in select.splitlines() if command in line)
+            self.assertNotIn("--moss-cuda-unit", line)
+        # Every other job is already gated on a lane output the profile leaves false.
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        for name in ("windows-cuda", "macos-nax"):
+            self.assertIn("needs.changes.outputs.", jobs[name]["if"])
+            self.assertNotIn("moss_cuda_unit", jobs[name]["if"])
+
+    def test_gate_fails_a_requested_moss_cuda_unit_that_did_not_succeed(self) -> None:
+        gate = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["gate"]
+        self.assertIn("moss-cuda-unit", gate["needs"])
+        step = gate["steps"][0]
+        self.assertEqual(
+            step["env"]["REQUIRE_MOSS_CUDA_UNIT"],
+            "${{ github.event_name == 'workflow_dispatch' && inputs.lanes == 'moss-cuda-unit' }}",
+        )
+        self.assertEqual(step["env"]["MOSS_CUDA_UNIT_RESULT"], "${{ needs.moss-cuda-unit.result }}")
+        guard = step["run"].index('"$MOSS_CUDA_UNIT_RESULT" != "success"')
+        self.assertLess(guard, step["run"].index("for result in $RESULTS"))
+        self.assertIn("exit 1", step["run"][guard:step["run"].index("for result")])
+        # The existing tolerance for path skips is untouched.
+        self.assertIn("success|skipped)", step["run"])
 
     def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
