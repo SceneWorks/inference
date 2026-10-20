@@ -72,6 +72,7 @@ Grouped by provider family. `✓` = shipped on that platform; `—` = not shippe
 | | `flux2_dev_control` | ✓ | — |
 | **ideogram** | `ideogram_4` | ✓ | ✓ |
 | | `ideogram_4_turbo` | ✓ | ✓ |
+| **flux3** (FLUX 3 Image Klein, distilled flow map) | `flux3_klein` | ✓ | ✓ |
 | **iris** (Iris-3B, pixel space) | `iris_3b` | ✓ | ✓ |
 | **kolors** | `kolors` | ✓ | ✓ |
 | **krea** | `krea_2_turbo` | ✓ | ✓ |

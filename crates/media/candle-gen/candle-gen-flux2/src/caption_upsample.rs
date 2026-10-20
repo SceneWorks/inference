@@ -261,6 +261,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_default_decode_budget_remains_the_reference_512() {
+        // The native FLUX.2 provider resolves absent enhancement tuning through this constant;
+        // FLUX 3's separately opted-in 3584-token source budget must not change it.
+        assert_eq!(DEFAULT_MAX_NEW_TOKENS, 512);
+    }
+
+    #[test]
     fn image_placeholder_expands_to_projector_grid() {
         let ids = expand_image_tokens(&[1, IMAGE_TOKEN_ID, 2], (2, 3));
         assert_eq!(ids, vec![1, 10, 10, 10, 12, 10, 10, 10, 13, 2]);

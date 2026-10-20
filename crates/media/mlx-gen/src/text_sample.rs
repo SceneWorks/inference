@@ -81,6 +81,8 @@ impl SampleParams {
             top_p: self.top_p,
             top_k: usize::try_from(self.top_k).unwrap_or(0),
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
             repetition_penalty: self
                 .repetition_penalty
                 .filter(|&penalty| penalty > 0.0)

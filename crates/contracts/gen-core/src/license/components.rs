@@ -382,6 +382,59 @@ pub const FLUX2_KLEIN_9B_KV: ComponentLicense = ComponentLicense {
     retrieved: "2026-08-02",
 };
 
+/// `black-forest-labs/flux-3-image-klein` — the distilled FLUX 3 Image Klein package: the 5.6B
+/// flow-map DiT (`model.safetensors`) and the autoencoder (`ae.safetensors`), both under the FLUX
+/// Kommunity License v1.0 (`LICENSE.md` of the package, read 2026-10-15 at revision
+/// `8454017f9ebaada30c998fccd9f67a80c7580f68` under an authenticated session; the card declares
+/// `license: other`, `license_name: flux-kommunity-license`). The bundled `text_encoder/` is a
+/// byte-identical copy of `Qwen/Qwen3-VL-4B-Instruct` and resolves through
+/// [`QWEN3_VL_4B_INSTRUCT`], not this row.
+pub const FLUX3_IMAGE_KLEIN: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein",
+    gated: true,
+    declared: "flux-kommunity-license",
+    family: "flux-kommunity-v1-0",
+    attribution: Some(
+        "This FLUX Model is licensed by Black Forest Labs Inc. under the FLUX Kommunity License. \
+         Copyright Black Forest Labs Inc.",
+    ),
+    retrieved: "2026-10-15",
+};
+
+/// Base CFG checkpoint. Pinned Hub metadata at revision
+/// `1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4` declares `license_name: flux-kommunity-license`.
+/// Its LICENSE.md git blob id `044cf48568c278150d132a7479ea237a79766ea7` equals distilled's;
+/// this is API metadata evidence, not a claim of authenticated base-file download.
+pub const FLUX3_IMAGE_KLEIN_BASE: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein_base",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein-base",
+    retrieved: "2026-10-16",
+    ..FLUX3_IMAGE_KLEIN
+};
+
+/// `black-forest-labs/flux-3-image-klein-pup` — the FLUX 3 Image Klein **prompt upsampler**
+/// (sc-26238): a 9B Qwen3.5 vision-language model, a full fine-tune of `Qwen/Qwen3.5-9B`, in a
+/// separate, ungated repository. The card front matter at the pinned revision
+/// `8b069751eb5dcab23829d9c5eccb470eb8b8a4ed` declares `license: apache-2.0` (verbatim) and the
+/// card's own licence section says "released under the Apache License 2.0 … derived from
+/// Qwen3.5-9B … released under the Apache License 2.0". The Hub API reported `gated: false` on
+/// 2026-10-15. Rowed separately from [`FLUX3_IMAGE_KLEIN`]: the image model's weights are under
+/// the FLUX Kommunity License, the upsampler's are not, and the upsampler is an optional
+/// co-requisite the provider loads only when the `prompt_upsampler` component names it.
+pub const FLUX3_IMAGE_KLEIN_PUP: ComponentLicense = ComponentLicense {
+    component: "flux3_image_klein_pup",
+    source_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein-pup",
+    gated: false,
+    declared: "apache-2.0",
+    family: "apache-2-0",
+    attribution: Some(
+        "FLUX 3 Image Klein Prompt Upsampler \u{a9} Black Forest Labs — licensed under \
+         Apache-2.0; derived from Qwen3.5-9B \u{a9} Alibaba Cloud (Apache-2.0)",
+    ),
+    retrieved: "2026-10-15",
+};
+
 /// Gemma-2-2B-IT — the PiD caption encoder and the SANA text encoder.
 ///
 /// Three redistributions are named in this codebase (`SceneWorks/gemma-2-2b-it`,
@@ -1295,6 +1348,9 @@ pub const MEDIA_COMPONENT_LICENSES: &[ComponentLicense] = &[
     FLUX2_DEV,
     FLUX2_KLEIN_9B,
     FLUX2_KLEIN_9B_KV,
+    FLUX3_IMAGE_KLEIN,
+    FLUX3_IMAGE_KLEIN_BASE,
+    FLUX3_IMAGE_KLEIN_PUP,
     GEMMA_2_2B_IT,
     GEMMA_3_12B_IT,
     GPT_OSS_20B,
@@ -1370,7 +1426,8 @@ mod tests {
     /// consumer while still looking landed in source.
     #[test]
     fn every_row_is_in_the_slice_and_resolves_by_key() {
-        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 80);
+        // The sync preserves the 77 shared rows plus all three FLUX3 and all three MOSS rows.
+        assert_eq!(MEDIA_COMPONENT_LICENSES.len(), 83);
         for row in MEDIA_COMPONENT_LICENSES {
             assert_eq!(
                 resolve_component(MEDIA_COMPONENT_LICENSES, row.component),
@@ -1484,6 +1541,8 @@ mod tests {
                 "flux2_dev",
                 "flux2_klein_9b",
                 "flux2_klein_9b_kv",
+                "flux3_image_klein",
+                "flux3_image_klein_base",
                 "gemma_2_2b_it",
                 "gemma_3_12b_it",
                 "ideogram_4_fp8",
@@ -1760,8 +1819,13 @@ mod tests {
         // Iris-3B and Qwen3-VL-4B-Instruct cards on 2026-10-10
         // (`docs/licensing/sc-25679-iris-licence-evidence.md`); sc-25900 read the
         // Qwen-Image-2.1-Turbo card and LICENSE on 2026-10-13
-        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`). A row carrying
-        // any other date is a row whose provenance nobody can re-read.
+        // (`docs/licensing/sc-25900-qwen-image-2-1-turbo-licence-evidence.md`); sc-26234 read the
+        // FLUX 3 Image Klein card and LICENSE.md on 2026-10-15
+        // (`docs/licensing/sc-26234-flux-kommunity-licence-evidence.md`); sc-26239 compared
+        // pinned base Hub metadata and LICENSE git blob identity on 2026-10-16
+        // (`mlx-gen-flux3/tests/fixtures/base-hub-identity.json`, its UPSTREAM.md distinguishes
+        // metadata evidence from gated-file authorization). A row carrying any other date is
+        // a row whose provenance nobody can re-read.
         // sc-26323 read the frozen MOSS bundles on 2026-10-18; see
         // docs/licensing/sc-26323-moss-image-licence-evidence.md.
         const EVIDENCE_PACK_DATES: &[&str] = &[
@@ -1770,6 +1834,8 @@ mod tests {
             "2026-09-22",
             "2026-10-10",
             "2026-10-13",
+            "2026-10-15",
+            "2026-10-16",
             "2026-10-18",
         ];
         for row in MEDIA_COMPONENT_LICENSES {

@@ -523,6 +523,20 @@ pub struct GenerationRequest {
 
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
+    /// FLUX 3 reference-output intent before API defaults are inserted (sc-26236).
+    /// `None` preserves legacy explicit `width`/`height`; `Some` preserves whether neither,
+    /// one, or both dimensions were supplied. Auto size is the first prepared reference canvas;
+    /// a padded single-reference output is cropped only when neither dimension was supplied.
+    /// Consumers must resolve this intent and reference token count BEFORE memory admission.
+    /// This is not img2img strength and is unsupported on other model families.
+    pub flux3_reference_output: Option<crate::flux3::references::ReferenceOutputSize>,
+    /// Lossless FLUX 3 placement/edit controls (sc-26237). Caption-only spatial guidance,
+    /// not masks or img2img strength. Resolve against authorized reference geometry before
+    /// admission/PUP/seed/text encoding; retain the original document in saved settings.
+    pub flux3_layout: Option<crate::flux3::layouts::Layout>,
+    /// Caller-resolved attachment identities and decoded geometry in conditioning order.
+    /// Required for stable-ID or original-pixel layout coordinates; never inferred from a label.
+    pub flux3_layout_bindings: Vec<crate::flux3::layouts::ReferenceBinding>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
     pub strength: Option<f32>,
     /// Wan-VACE control strength — the diffusers `conditioning_scale` / per-vace-layer
@@ -1351,6 +1365,9 @@ impl Default for GenerationRequest {
             prompt_batch: Vec::new(),
             caption_overflow: None,
             conditioning: Vec::new(),
+            flux3_reference_output: None,
+            flux3_layout: None,
+            flux3_layout_bindings: Vec::new(),
             strength: None,
             control_scale: None,
             text_style_gain: None,
@@ -1635,6 +1652,11 @@ impl GenerationRequest {
             // bounds join the float floor below.
             prompt_batch: _,
             caption_overflow: _,
+            // Optional integer output dimensions, not floating controls.
+            flux3_reference_output: _,
+            // Layout construction validates f64 coordinates, before conversion to native rows.
+            flux3_layout: _,
+            flux3_layout_bindings: _,
             cfg_interval,
             conditioning,
             frames: _,
@@ -2889,7 +2911,10 @@ impl ComponentPrecisionFloor {
     pub const fn applies_to(self, selected: Quant) -> bool {
         matches!(
             (self.selected_tier, selected),
-            (Quant::Q4, Quant::Q4) | (Quant::Q8, Quant::Q8) | (Quant::Nvfp4, Quant::Nvfp4)
+            (Quant::Q4, Quant::Q4)
+                | (Quant::Q8, Quant::Q8)
+                | (Quant::Nvfp4, Quant::Nvfp4)
+                | (Quant::Fp8Rowwise, Quant::Fp8Rowwise)
         )
     }
 }
@@ -3383,8 +3408,13 @@ pub struct Capabilities {
     /// conversation+seed; the `gen-core-testkit` `check_multi_turn` check enforces it. A model may
     /// advertise either path independently.
     pub supports_conversation_session: bool,
-    /// On-the-fly quantization levels this engine offers (empty slice = none). Read by the worker's
-    /// capability advertisement (sc-3723) instead of a hardcoded per-row flag. `Default` is `&[]`.
+    /// Exact native quantization formats this engine can load (empty slice = none),
+    /// whether from a pre-converted/publisher artifact or an explicitly supported
+    /// on-the-fly conversion. This is NOT a list of interchangeable bit widths:
+    /// FP8R does not inherit Q8 support. A loader must reject incompatible artifacts
+    /// and must not claim on-the-fly conversion where only a packaged tier exists.
+    /// Read by the worker's capability advertisement instead of a hardcoded per-row flag.
+    /// `Default` is `&[]`.
     pub supported_quants: &'static [Quant],
     /// Component-local numeric floors applied above the selected model tier. Empty means that a q4
     /// load is uniformly q4 across every packable component. This is a binding provider contract:
@@ -3493,8 +3523,18 @@ const MAX_STEPS: u32 = 100_000;
 const MAX_FRAMES: u32 = 1_000_000;
 const MAX_FPS: u32 = 100_000;
 const MAX_DURATION_SECS: f32 = 1_000_000.0;
-/// Shared hard ceiling for autoregressive prompt enhancement. Providers may choose a lower cap.
+/// Legacy prompt-enhancement token ceiling. Unrelated providers must not inherit FLUX 3's cap.
 pub const MAX_ENHANCE_TOKENS: u32 = 2_048;
+
+/// Resolve the provider's token ceiling, distinct from the effective-caption character bound.
+/// Only the two canonical FLUX 3 ids opt into the frozen PUP source's 3584-token budget.
+/// Unknown ids and every legacy enhancer retain their existing 2048-token limit.
+pub fn max_enhance_tokens_for_model(model_id: &str) -> u32 {
+    match model_id {
+        "flux3_klein" | "flux3_klein_base" => crate::flux3::pup::MAX_TOKENS,
+        _ => MAX_ENHANCE_TOKENS,
+    }
+}
 /// Shared temperature range for prompt enhancement sampling.
 pub const MAX_ENHANCE_TEMPERATURE: f32 = 2.0;
 
@@ -3657,6 +3697,26 @@ impl Capabilities {
         req: &GenerationRequest,
         check_size: bool,
     ) -> Result<()> {
+        if (req.flux3_layout.is_some() || !req.flux3_layout_bindings.is_empty())
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_layout is supported only by FLUX 3; remove the layout controls"
+            )));
+        }
+        if req.flux3_reference_output.is_some()
+            && !matches!(
+                id,
+                crate::flux3::DISTILLED_MODEL_ID | crate::flux3::BASE_MODEL_ID
+            )
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: flux3_reference_output is supported only by FLUX 3 reference editing; remove it"
+            )));
+        }
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
         // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
@@ -4139,9 +4199,10 @@ impl Capabilities {
                     "{id}: enhance_max_tokens requires enhance_prompt=true"
                 )));
             }
-            if tokens == 0 || tokens > MAX_ENHANCE_TOKENS {
+            let max_tokens = max_enhance_tokens_for_model(id);
+            if tokens == 0 || tokens > max_tokens {
                 return Err(Error::Msg(format!(
-                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={MAX_ENHANCE_TOKENS}"
+                    "{id}: enhance_max_tokens {tokens} outside supported range 1..={max_tokens}"
                 )));
             }
         }
@@ -5043,6 +5104,50 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    #[test]
+    fn enhancement_token_limits_are_canonical_model_scoped_without_changing_defaults() {
+        let supported = Capabilities {
+            supports_prompt_enhancement: true,
+            ..caps()
+        };
+        for (id, limit) in [
+            ("flux2_dev", 2_048),
+            ("ltx_2_3", 2_048),
+            ("unknown", 2_048),
+            ("flux3_klein_alias", 2_048),
+            ("flux3_klein", 3_584),
+            ("flux3_klein_base", 3_584),
+        ] {
+            assert_eq!(max_enhance_tokens_for_model(id), limit, "{id}");
+            for tokens in [0, 2_048, 2_049, 3_584, 3_585] {
+                let request = GenerationRequest {
+                    enhance_prompt: true,
+                    enhance_max_tokens: Some(tokens),
+                    ..base_req()
+                };
+                assert_eq!(
+                    supported.validate_request(id, &request).is_ok(),
+                    tokens > 0 && tokens <= limit,
+                    "{id}: {tokens} tokens"
+                );
+            }
+            for enabled in [false, true] {
+                let request = GenerationRequest {
+                    enhance_prompt: enabled,
+                    ..base_req()
+                };
+                assert!(supported.validate_request(id, &request).is_ok(), "{id}");
+                assert!(request.enhance_max_tokens.is_none());
+            }
+            let disabled_tuning = GenerationRequest {
+                enhance_max_tokens: Some(limit),
+                ..base_req()
+            };
+            assert!(supported.validate_request(id, &disabled_tuning).is_err());
+        }
+        assert_eq!(MAX_ENHANCE_TOKENS, 2_048);
     }
 
     fn base_req() -> GenerationRequest {

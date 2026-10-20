@@ -84,6 +84,8 @@ pub fn bytes_per_param(quant: Quant) -> f64 {
         // 4.5/8 B/param. NVFP4 is served by `Nvfp4Linear` (its own packed container), not this crate's
         // GGUF fold, so this feeds only the `minMemoryGb` footprint estimate for an NVFP4 tier.
         Quant::Nvfp4 => 4.5 / 8.0,
+        // FP8 rowwise: one E4M3 byte per weight plus a negligible FP32 scale per output row.
+        Quant::Fp8Rowwise => 1.0,
     }
 }
 

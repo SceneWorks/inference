@@ -134,7 +134,7 @@ pub fn requested_tier(id: &str, quantize: Option<Quant>) -> gen_core::Result<Opt
         None => Ok(None),
         Some(Quant::Q8) => Ok(Some(Tier::Q8)),
         Some(Quant::Q4) => Ok(Some(Tier::Q4)),
-        Some(q @ Quant::Nvfp4) => Err(gen_core::Error::Unsupported(format!(
+        Some(q @ (Quant::Nvfp4 | Quant::Fp8Rowwise)) => Err(gen_core::Error::Unsupported(format!(
             "{id}: quantize={q:?} is not a YuE tier; the stage-1/stage-2 LMs ship bf16, q8 and q4 \
              (request Q8 or Q4, or leave quantize unset for the staged tier)"
         ))),

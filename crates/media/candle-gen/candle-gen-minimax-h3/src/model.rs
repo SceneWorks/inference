@@ -304,6 +304,11 @@ fn requested_tier(spec: &LoadSpec) -> candle_gen::gen_core::Result<Option<crate:
              because it also reports 4 bits it would otherwise reconcile silently against a `q4` \
              marker and render int4-affine under an NVFP4 request. Request `Q4` or `Q8`."
         ))),
+        Some(q @ Quant::Fp8Rowwise) => Err(candle_gen::gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: spec.quantize={q:?} is not a published MiniMax-H3 tier. This family ships \
+             MLX affine `q4` and `q8` only; FP8 rowwise is a distinct W8A8 format, never an alias \
+             of `q8`. Request `Q4` or `Q8`."
+        ))),
     }
 }
 

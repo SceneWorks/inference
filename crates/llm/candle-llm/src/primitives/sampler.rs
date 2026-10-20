@@ -116,6 +116,10 @@ pub struct SamplingParams {
     pub repetition_context: usize,
     /// Additive penalty subtracted once from every token present anywhere in the history.
     pub presence_penalty: f32,
+    /// Penalize only generated tokens (vLLM semantics), not prompt ids.
+    pub presence_penalty_generated_only: bool,
+    /// Request-local prompt boundary, reset by the decode engine after prefill.
+    pub presence_penalty_prompt_len: usize,
 }
 
 impl Default for SamplingParams {
@@ -127,11 +131,19 @@ impl Default for SamplingParams {
             repetition_penalty: 1.0,
             repetition_context: 0,
             presence_penalty: 0.0,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
         }
     }
 }
 
 impl SamplingParams {
+    /// Reset the generated-only presence boundary for an independently admitted batch lane.
+    pub fn for_prompt(mut self, prompt_len: usize) -> Self {
+        self.presence_penalty_prompt_len = prompt_len;
+        self
+    }
+
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
     /// constraint mask — eligible for the on-device argmax fast path (and, in the speculative
     /// engine, for device-resident drafts).
@@ -146,6 +158,7 @@ impl SamplingParams {
             top_p: self.top_p,
             top_k: self.top_k,
             presence_penalty: self.presence_penalty,
+            presence_penalty_generated_only: self.presence_penalty_generated_only,
             repetition_penalty: self.repetition_penalty,
             repetition_context: self.repetition_context,
         }
@@ -642,7 +655,12 @@ fn penalize_host(
     // ignored, and a repeated id is adjusted exactly once.
     if params.presence_penalty != 0.0 {
         let mut seen = HashSet::with_capacity(history.len());
-        for &tok in history {
+        let start = if params.presence_penalty_generated_only {
+            params.presence_penalty_prompt_len.min(history.len())
+        } else {
+            0
+        };
+        for &tok in &history[start..] {
             if seen.insert(tok) {
                 if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
                     *slot -= params.presence_penalty;
@@ -1300,6 +1318,8 @@ mod tests {
             repetition_penalty: 1.3,
             repetition_context: 4,
             presence_penalty: 0.2,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
         };
         let row = logits(&[1.0, 2.0, 3.0, 0.5, -1.0, 4.0]);
         let history = [1, 5, 5];
@@ -1478,6 +1498,8 @@ mod tests {
     fn presence_penalty_is_additive_once_per_seen_token() {
         let params = SamplingParams {
             presence_penalty: 0.75,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
             ..Default::default()
         };
         let l = logits(&[2.0, 1.5, 0.5]);
@@ -1491,11 +1513,56 @@ mod tests {
     }
 
     #[test]
+    fn generated_only_presence_excludes_prompt_but_not_emitted_repeats() {
+        let mut params = SamplingParams {
+            presence_penalty: 1.5,
+            presence_penalty_generated_only: true,
+            presence_penalty_prompt_len: 3,
+            ..Default::default()
+        };
+        let shape = |history: &[i32], params: &SamplingParams| {
+            let mut row = vec![4.0, 3.0, 2.0];
+            penalize_host(&mut row, history, params, None);
+            row
+        };
+        assert_eq!(shape(&[0, 0, 1], &params), vec![4.0, 3.0, 2.0]);
+        assert_eq!(shape(&[0, 0, 1, 0, 0, 2], &params), vec![2.5, 3.0, 0.5]);
+        params.repetition_penalty = 2.0;
+        params.repetition_context = 8;
+        assert_eq!(
+            shape(&[0, 0, 1], &params),
+            vec![2.0, 1.5, 2.0],
+            "repetition still includes prompt"
+        );
+        params.repetition_penalty = 1.0;
+        params.presence_penalty_generated_only = false;
+        assert_eq!(
+            shape(&[0, 0, 1], &params),
+            vec![2.5, 1.5, 2.0],
+            "legacy policy ignores boundary"
+        );
+        params.presence_penalty_generated_only = true;
+        let lane = params.for_prompt(1);
+        assert_eq!(
+            shape(&[0, 1], &lane),
+            vec![4.0, 1.5, 2.0],
+            "each batch lane resets its own boundary"
+        );
+        assert_eq!(
+            params.presence_penalty_prompt_len, 3,
+            "lane construction does not mutate shared knobs"
+        );
+        assert!(!SamplingParams::default().presence_penalty_generated_only);
+    }
+
+    #[test]
     fn presence_and_repetition_use_backend_parity_order() {
         let params = SamplingParams {
             repetition_penalty: 2.0,
             repetition_context: 8,
             presence_penalty: 0.5,
+            presence_penalty_generated_only: false,
+            presence_penalty_prompt_len: 0,
             ..Default::default()
         };
         let l = logits(&[4.0, -2.0]);

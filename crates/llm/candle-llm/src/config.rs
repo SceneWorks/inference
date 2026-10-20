@@ -777,6 +777,14 @@ impl ModelConfig {
         } else {
             top
         };
+        // Normalize only Qwen3-VL's modern spelling through shared tensor-neutral policy.
+        // Gemma 4's per-layer map and every unrelated architecture retain their own parser.
+        let normalized_rope = if architecture.is_qwen3_vl() {
+            Some(core_llm::rope_config::normalize_qwen3_vl_rope(v).map_err(Error::Config)?)
+        } else {
+            None
+        };
+        let v = normalized_rope.as_ref().unwrap_or(v);
         let int =
             |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req_int = |key: &str| -> Result<i32> {
@@ -1476,6 +1484,41 @@ mod tests {
             .unwrap();
         assert_eq!(nested.bits(), 8);
         assert_eq!(nested.group_size(), 32);
+    }
+
+    #[test]
+    fn qwen3vl_modern_rope_parameters_match_the_flux3_tiny_snapshot() {
+        let text = json!({
+            "model_type":"qwen3_vl_text", "hidden_size":32, "intermediate_size":48,
+            "num_hidden_layers":36, "num_attention_heads":4, "num_key_value_heads":2,
+            "head_dim":16, "vocab_size":28, "rms_norm_eps":1e-6, "rope_theta":123456,
+            "rope_parameters":{"rope_type":"default","rope_theta":5000000,
+                "mrope_section":[4,2,2],"mrope_interleaved":true}
+        });
+        for value in [&text, &json!({"model_type":"qwen3_vl","text_config":text})] {
+            let cfg = ModelConfig::from_json(value).unwrap();
+            assert_eq!(
+                cfg.rope_theta, 5_000_000.0,
+                "selected modern theta wins root legacy theta"
+            );
+            assert_eq!(cfg.mrope_section, Some([4, 2, 2]));
+            assert_eq!(cfg.rotary_dim(), 16);
+            assert!(cfg.rope_scaling.is_none());
+            assert!(cfg.yarn.is_none());
+        }
+        let mut malformed = text.clone();
+        malformed["rope_parameters"]["rope_theta"] = json!("not numeric");
+        assert!(ModelConfig::from_json(&malformed)
+            .unwrap_err()
+            .to_string()
+            .contains("rope_theta"));
+        let mut unrelated = text;
+        unrelated["model_type"] = json!("llama");
+        unrelated["rope_parameters"] = json!("not a uniform Qwen3-VL config");
+        assert_eq!(
+            ModelConfig::from_json(&unrelated).unwrap().rope_theta,
+            123456.0
+        );
     }
 
     #[test]

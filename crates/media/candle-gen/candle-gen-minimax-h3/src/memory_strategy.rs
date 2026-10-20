@@ -1643,6 +1643,7 @@ mod tests {
 
     fn context(strategy: MemoryStrategy) -> MemoryRunContext {
         MemoryRunContext {
+            reference_resources: None,
             // Inert for the Resident probe this fixture serves (the authority gate fires only for
             // optimized strategies); Calibrated matches every other provider's weights-free
             // safety-check context.
