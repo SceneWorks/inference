@@ -541,6 +541,12 @@ pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
     },
+    // --- supra2 ------------------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
+    },
     // --- svd ---------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and ViT-H image encoder, all in one ungated snapshot.
     ProviderComponents {
@@ -945,8 +951,9 @@ mod tests {
         // sc-25683: the `iris_3b_restore` transform registers with its own complete row (73 / 63).
         // sc-25687: the `iris_3b_depth` trainer registers with its own complete row (74 / 64).
         // sc-25900: `qwen_image_2_1_turbo` registers with its own complete row (75 / 65).
-        assert_eq!(registered.len(), 77, "registered ids: {registered:?}");
-        assert_eq!(mapped.len(), 67);
+        // sc-24213: `supra2_img` registers with its own complete row (78 / 68).
+        assert_eq!(registered.len(), 78, "registered ids: {registered:?}");
+        assert_eq!(mapped.len(), 68);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
         assert_eq!(pinned.len(), 10);
 
@@ -1013,11 +1020,11 @@ mod tests {
         );
         assert_eq!(
             mapped.difference(&incomplete).count(),
-            28,
+            29,
             "the complete ids are the mapped ids minus the pinned-incomplete ones \
              (qwen_image_2_1 joined the complete set in sc-24108, iris_3b in sc-25679, \
              iris_3b_restore in sc-25683, iris_3b_depth in sc-25687, qwen_image_2_1_turbo in \
-             sc-25900; MOSS Base/SFT in sc-26323)"
+             sc-25900; MOSS Base/SFT in sc-26323; supra2_img in sc-24213)"
         );
 
         for (id, missing) in INCOMPLETE_MAPPED_IDS {
@@ -1205,7 +1212,7 @@ mod tests {
 
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["kind"], "model-weight-licenses");
-        assert_eq!(value["providers"].as_array().unwrap().len(), 67);
+        assert_eq!(value["providers"].as_array().unwrap().len(), 68);
         assert!(!json.contains("commercial_use"));
 
         let sdxl = value["providers"]

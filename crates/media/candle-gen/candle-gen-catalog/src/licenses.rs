@@ -867,6 +867,11 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
+            // Supra2-IMG registers on MLX first (sc-24213); epic sc-24212's Candle/CUDA slice maps
+            // these when it registers the Candle provider.
+            "supra2_img",
+            "flan_t5_base",
+            "sd_vae_ft_mse",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

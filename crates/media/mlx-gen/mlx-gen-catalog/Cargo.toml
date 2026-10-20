@@ -43,6 +43,7 @@ mlx-gen-sd3 = { path = "../mlx-gen-sd3" }
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 mlx-gen-seedvr2 = { path = "../mlx-gen-seedvr2" }
 mlx-gen-sensenova = { path = "../mlx-gen-sensenova" }
+mlx-gen-supra2 = { path = "../mlx-gen-supra2" }
 mlx-gen-svd = { path = "../mlx-gen-svd" }
 mlx-gen-wan = { path = "../mlx-gen-wan" }
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }

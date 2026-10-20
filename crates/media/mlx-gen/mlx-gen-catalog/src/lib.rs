@@ -53,6 +53,7 @@ pub mod providers {
     pub use mlx_gen_sdxl as sdxl;
     pub use mlx_gen_seedvr2 as seedvr2;
     pub use mlx_gen_sensenova as sensenova;
+    pub use mlx_gen_supra2 as supra2;
     pub use mlx_gen_svd as svd;
     pub use mlx_gen_wan as wan;
     pub use mlx_gen_z_image as z_image;
@@ -118,6 +119,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_sdxl::register_providers(registry);
     let registry = mlx_gen_seedvr2::register_providers(registry);
     let registry = mlx_gen_sensenova::register_providers(registry);
+    let registry = mlx_gen_supra2::register_providers(registry);
     let registry = mlx_gen_svd::register_providers(registry);
     let registry = mlx_gen_wan::register_providers(registry);
     mlx_gen_z_image::register_providers(registry)
@@ -874,7 +876,9 @@ mod tests {
                 "mochi" => Some(&MOCHI_VIDEO_LATENT_SPACE),
                 "sana" => Some(&SANA_LATENT_SPACE),
                 "seedvr2" => Some(&SEEDVR2_VIDEO_LATENT_SPACE),
-                "svd" => Some(&SVD_LATENT_SPACE),
+                // Supra2-IMG decodes with stabilityai/sd-vae-ft-mse: SD's 4-channel f8 latent at
+                // scale 0.18215, the same space SVD's VAE consumes (sc-24213).
+                "svd" | "supra2" => Some(&SVD_LATENT_SPACE),
                 // SenseNova's flow head emits RGB patches directly; there is no latent decoder seam.
                 "sensenova-u1" => None,
                 // Iris-3B generates RGB pixels directly (patch DiT + PiT pixel head, no VAE).
@@ -1049,8 +1053,10 @@ mod tests {
         // resident-only witness cannot express — 59/56 -> 62/59.
         // sc-25900 adds `qwen_image_2_1_turbo`, the distilled checkpoint served by the same crate
         // under the same contract as `qwen_image_2_1` — 62/59 -> 63/60.
-        assert_eq!(registry.memory_strategy_registrations().len(), 65);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 62);
+        // sc-24213 adds `supra2_img` (resident-only dense f32, with a contract fixture) — 65/62 ->
+        // 66/63.
+        assert_eq!(registry.memory_strategy_registrations().len(), 66);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 63);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -1084,7 +1090,10 @@ mod tests {
         //
         // sc-25900's `qwen_image_2_1_turbo` publishes the same full surface as `qwen_image_2_1`,
         // so it joins the 12-apiece group — 52 -> 53.
-        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 2);
+        //
+        // sc-24213's `supra2_img` publishes exactly one surface: the dense tier, resident, eager
+        // (its loader refuses quantization, sequential offload and deferred materialization) — +1.
+        assert_eq!(surfaces.len(), 53 * 12 + 6 + 3 + 2 * 3 + 3 * 2 + 2 + 1);
         // The MLX catalog's only composed memory routes are Iris depth (a provider-specific API)
         // and Iris restoration (a transform): real routes with no gen-core generator registration.
         let composed: std::collections::BTreeSet<_> = surfaces
@@ -1932,6 +1941,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_ti2v_5b",
                 "wan2_2_t2v_14b",
@@ -2000,8 +2010,9 @@ mod tests {
         // 74 / 64.
         // sc-25900 adds `qwen_image_2_1_turbo` (a generator with its own complete row): 75 / 65.
         // sc-26323 adds both MOSS providers: 77 distinct ids / 67 complete rows.
-        assert_eq!(distinct.len(), 77);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 67);
+        // sc-24213 adds `supra2_img` (its own complete row): 78 / 68.
+        assert_eq!(distinct.len(), 78);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 68);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

@@ -2377,7 +2377,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
- "zip",
 ]
 
 [[package]]
@@ -2473,6 +2472,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-seedvr2",
  "mlx-gen-sensenova",
+ "mlx-gen-supra2",
  "mlx-gen-svd",
  "mlx-gen-wan",
  "mlx-gen-z-image",
@@ -2914,6 +2914,19 @@ dependencies = [
  "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "mlx-gen-supra2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "mlx-gen-flux",
+ "mlx-gen-sdxl",
+ "pmetal-mlx-rs",
+ "serde_json",
  "tempfile",
 ]
 
@@ -3702,6 +3715,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "windows-sys",
+ "zip",
 ]
 
 [[package]]
