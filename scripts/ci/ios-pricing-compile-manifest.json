@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-20T22:11:56.224573+00:00",
-  "rust_proof_closure_sha256": "5a0ecba27b1269b34a794b67ca3c8abe0ef5bbba852ea5e0c3851189bd7f5a63",
+  "UTC": "2026-10-20T22:38:01.977717+00:00",
+  "rust_proof_closure_sha256": "f06e30a2a5333cb0fed68548457761d12ea0198452f7b8b40fb371768811084b",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -448,7 +448,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/controlnet.rs",
-      "sha256": "dcbf1a59cc92955d132d86a9840f3fcdfba5a9f54ab615c41b0cc8d133de8194"
+      "sha256": "722476d039206e28b076f61a245645c060a0b1b683d138601a017d8695480347"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/embeddings.rs",
@@ -472,7 +472,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae.rs",
-      "sha256": "36513585060f1c1499588eb96875e11b8c9110bfc3febe3f42b2f8ba975f0b1c"
+      "sha256": "9fedf235c70d4a86e56b780bdae8f44e0acd796cf2e9d9bcf87edf52571d8efe"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/vae/pricing.rs",

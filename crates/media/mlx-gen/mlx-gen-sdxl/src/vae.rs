@@ -507,38 +507,6 @@ fn price_upsample_tiled(
     crate::quantum::shaped(&[up[0], up[1], up[2], cout], dtype)
 }
 
-/// Header-only pricing of [`downsample_tiled`] (`mlx_gen::vae_tiling::downsample_tiled_nhwc`)
-/// over the shape-only `x`: its stage and its widest tile.
-#[cfg(test)]
-fn price_downsample_tiled(
-    x: &Array,
-    weight: &Array,
-    bias: &Array,
-    tile: i32,
-    out: &mut crate::quantum::Quanta,
-) -> Result<Array> {
-    let s = x.shape();
-    let (oh, ow) = ((s[1] - 2) / 2 + 1, (s[2] - 2) / 2 + 1);
-    let core = tile.max(1);
-    let act = crate::quantum::element_bytes(x);
-    out.push((
-        crate::quantum::VAE_ENCODE_TILED_STAGE,
-        crate::quantum::downsample_stage_bytes(&[s[0], oh, ow, weight.shape()[0]], act),
-    ));
-    out.push((
-        crate::quantum::VAE_ENCODE_TILE,
-        crate::quantum::downsample_tile_bytes(
-            &[s[0], 2 * core.min(oh) + 1, 2 * core.min(ow) + 1, s[3]],
-            act,
-            weight,
-            crate::quantum::backend(),
-        ),
-    ));
-    crate::quantum::shaped(
-        &[s[0], oh, ow, weight.shape()[0]],
-        crate::quantum::promote_all(x.dtype(), &[weight, bias]),
-    )
-}
 
 /// Header-only pricing of one guarded VAE resnet ([`resnet_quantum`]) under `label`.
 #[cfg(test)]
@@ -1186,93 +1154,8 @@ impl Encoder {
         )
     }
 
-    /// Header-only pricing of [`Self::forward_body`] (the dense encode body).
-    #[cfg(test)]
-    fn price_body(&self, x: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
-        let call = crate::quantum::ConvCall::new(
-            x.shape(),
-            crate::quantum::element_bytes(x),
-            &self.conv_in_w,
-            1,
-            1,
-        );
-        out.push((
-            crate::quantum::VAE_ENCODE_IN,
-            crate::quantum::single_conv_bytes(&call, 1, 1, crate::quantum::backend()),
-        ));
-        let s = x.shape();
-        let mut x = crate::quantum::shaped(
-            &[s[0], s[1], s[2], self.conv_in_w.shape()[0]],
-            crate::quantum::promote_all(x.dtype(), &[&self.conv_in_w, &self.conv_in_b]),
-        )?;
-        for db in &self.down_blocks {
-            x = db.price_forward(&x, crate::quantum::VAE_ENCODE_LABELS, out)?;
-        }
-        self.price_mid(&x, out)
-    }
 
-    /// Header-only pricing of [`Self::forward_body_tiled`] (the bounded encode body).
-    #[cfg(test)]
-    fn price_body_tiled(
-        &self,
-        x: &Array,
-        tile: i32,
-        out: &mut crate::quantum::Quanta,
-    ) -> Result<Array> {
-        let s = x.shape();
-        let (cin, cout) = crate::quantum::conv_channels(&self.conv_in_w);
-        out.push((
-            crate::quantum::VAE_ENCODE_TILED_STAGE,
-            crate::quantum::tiled_stage_bytes(
-                &[s[0], s[1], s[2], cout],
-                cin,
-                cout,
-                crate::quantum::element_bytes(x),
-                false,
-            ),
-        ));
-        price_tiles(
-            crate::quantum::VAE_ENCODE_TILE,
-            x,
-            cin,
-            &self.conv_in_w,
-            tile.max(3),
-            false,
-            false,
-            out,
-        );
-        let mut x = crate::quantum::shaped(
-            &[s[0], s[1], s[2], cout],
-            crate::quantum::promote_all(x.dtype(), &[&self.conv_in_w, &self.conv_in_b]),
-        )?;
-        let mut scale = 1;
-        for db in &self.down_blocks {
-            let edge = ((tile + scale - 1) / scale).max(3);
-            for r in &db.resnets {
-                x = r.price_tiled_vae(&x, edge, crate::quantum::VAE_ENCODE_LABELS, out)?;
-            }
-            if let Some((cw, cb)) = &db.downsample {
-                scale *= 2;
-                x = price_downsample_tiled(&x, cw, cb, ((tile + scale - 1) / scale).max(1), out)?;
-            }
-        }
-        self.price_mid(&x, out)
-    }
 
-    /// Header-only pricing of the mid block both encode bodies end on.
-    #[cfg(test)]
-    fn price_mid(&self, x: &Array, out: &mut crate::quantum::Quanta) -> Result<Array> {
-        let x = price_resnet(crate::quantum::VAE_ENCODE_RESNET, &self.mid_resnet0, x, out)?;
-        let x = self
-            .mid_attn
-            .price(&x, crate::quantum::VAE_ENCODE_ATTENTION, out)?;
-        price_resnet(
-            crate::quantum::VAE_ENCODE_RESNET,
-            &self.mid_resnet1,
-            &x,
-            out,
-        )
-    }
 
     /// The output GroupNorm + SiLU + `conv_out` over the body's output.
     fn forward_out(&self, x: &Array) -> Result<Array> {
@@ -1589,29 +1472,6 @@ impl Autoencoder {
         crate::quantum::shaped(decoded.shape(), Dtype::Float32)
     }
 
-    /// Header-only pricing of the init-image encode the request runs (`encode_tiled` at
-    /// `tile_px`, which takes the whole-image encode when the image fits one tile) over the
-    /// shape-only NHWC `image`: every quantum it checks, in order, with the guards' own formulas.
-    #[cfg(test)]
-    pub(crate) fn price_encode(
-        &self,
-        image: &Array,
-        tile_px: i32,
-        out: &mut crate::quantum::Quanta,
-    ) -> Result<()> {
-        let s = image.shape();
-        let x = crate::quantum::shaped(s, self.compute_dtype(image.dtype()))?;
-        let body = if s[1] <= tile_px && s[2] <= tile_px {
-            self.encoder.price_body(&x, out)?
-        } else {
-            self.encoder.price_body_tiled(&x, tile_px, out)?
-        };
-        out.push((
-            crate::quantum::VAE_ENCODE_OUT,
-            self.encoder.out_scratch(&body),
-        ));
-        Ok(())
-    }
 
     /// The encoder body (through the mid block) and the encode-out quantum's price over it
     /// (sc-26270 proof tests).
