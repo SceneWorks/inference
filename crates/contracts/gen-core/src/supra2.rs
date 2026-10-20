@@ -1138,9 +1138,7 @@ impl Supra2Sources {
 }
 
 fn read_json(path: &Path) -> Result<serde_json::Value> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::Unsupported(format!("supra2: read {}: {e}", path.display())))?;
-    serde_json::from_slice(&bytes)
+    serde_json::from_slice(&std::fs::read(path)?)
         .map_err(|e| Error::Unsupported(format!("supra2: invalid {}: {e}", path.display())))
 }
 
@@ -1368,6 +1366,22 @@ mod tests {
                 Supra2Resolved::resolve(&bad),
                 Err(Error::Unsupported(_))
             ));
+        }
+    }
+
+    /// A missing component `config.json` surfaces as the IO error (as it did in the MLX provider
+    /// before the checks moved here), not as a typed refusal.
+    #[test]
+    fn missing_component_config_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for result in [
+            check_t5_config(dir.path(), &Supra2Config::published()),
+            check_vae_config(dir.path()),
+        ] {
+            match result {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+                other => panic!("expected an IO error, got {other:?}"),
+            }
         }
     }
 

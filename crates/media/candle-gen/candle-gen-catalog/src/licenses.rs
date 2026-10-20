@@ -638,8 +638,8 @@ mod tests {
         assert_eq!(
             registered.len(),
             68,
-            "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
-             sc-25901) + 19 trainers (15 of them also \
+            "68 distinct Candle provider ids: 61 generators (qwen_image_2_1_turbo joined in \
+             sc-25901; supra2_img in sc-24214) + 19 trainers (15 of them also \
              generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
              transform's id; iris_3b_depth, sc-25687, is its own) + 1 captioner + 2 embedders + \
              1 transform (iris_3b_restore, sc-25683)"

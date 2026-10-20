@@ -1456,7 +1456,7 @@ mod preview_advertising {
         },
         ProviderCrate {
             dir: "candle-gen-supra2",
-            // Upstream's plain Euler/CFG loop (`model::integrate`) is bespoke; it emits no preview
+            // Upstream's plain Euler/CFG loop (`sampling::denoise`) is bespoke; it emits no preview
             // (`NoGo::Supra2`).
             register: candle_gen_supra2::register_providers,
             denoise: Denoise::Bespoke,

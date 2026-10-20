@@ -117,7 +117,7 @@ pub fn load_text_encoder(dir: &Path) -> Result<T5TextEncoder> {
         64,
         T5Geometry {
             blocks: s2::T5_LAYERS,
-            heads: s2::T5_HEADS,
+            heads: s2::T5_HEADS as i32,
         },
     )?;
     w.materialize_accessed()?;
