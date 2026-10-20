@@ -28,14 +28,14 @@ use mlx_gen::ios_quantum::{
 // diffusers VAE on iOS (sc-26433): it lives in `mlx_gen::ios_quantum` and is re-exported here so
 // this crate's call sites and proofs keep their paths.
 pub(crate) use mlx_gen::ios_quantum::{
-    bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes, downsample_tile_bytes,
+    bytes, conv_channels, decoded_to_image_bytes, downsample_stage_bytes,
     dtype_bytes, element_bytes, elements, group_norm_buffers, norm_conv_bytes,
     norm_promotion_units, page_slack, resnet_bytes_from_metadata, single_conv_bytes, tile_bytes,
     tiled_stage_bytes, tiled_stage_f32_accum, vae_attention_bytes, Backend, ConvCall, TileSource,
     VAE_ATTENTION_SCORE_ELEMENTS,
 };
 #[cfg(test)]
-pub(crate) use mlx_gen::ios_quantum::{resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES};
+pub(crate) use mlx_gen::ios_quantum::{downsample_tile_bytes, resnet_bytes, GROUP_NORM_BUFFERS, PAGE_BYTES};
 // Additive VAE metadata bindings; current native TileSource/callers remain untouched.
 pub(crate) use mlx_gen::ios_quantum::{tile_bytes_from_metadata,
     downsample_tile_bytes_from_metadata, tiled_stage_f32_accum_from_metadata,

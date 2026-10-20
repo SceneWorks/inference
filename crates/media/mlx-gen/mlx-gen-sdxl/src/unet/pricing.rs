@@ -1599,6 +1599,18 @@ pub(crate) fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut q::Con
     }
 }
 
+impl AttentionFacts {
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
+        match path {
+            ["to_q"] => Some(&mut self.q),
+            ["to_k"] => Some(&mut self.k),
+            ["to_v"] => Some(&mut self.v),
+            ["to_out", "0"] => Some(&mut self.out),
+            _ => None,
+        }
+    }
+}
+
 impl TransformerBlockFacts {
 pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut q::LinearWork> {
         match path {
@@ -1817,5 +1829,45 @@ impl ResnetFacts {
             &[s[0], s[1], s[2], cout],
             self.output_dtype(x.dtype(), None),
         )
+    }
+}
+
+#[cfg(test)]
+mod attention_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_adapter_targets_match_native_paths_and_mutate_only_selected_linear() {
+        let linear = |input| q::LinearWork::dense(tensor(&[64, input], Dtype::Float16).unwrap(), None);
+        let base = AttentionFacts {
+            q: linear(64), k: linear(128), v: linear(192), out: linear(256),
+            num_heads: 1, head_dim: 64,
+            to_k_ip: Some(linear(320)), to_v_ip: Some(linear(384)),
+        };
+        // Independent native leaf-to-field inventory. Pointer equality is ONLY Rust metadata
+        // object identity, never an Array/NativeData backing or physical-allocation certificate.
+        let targets: &[(&[&str], usize)] = &[
+            (&["to_q"], 0), (&["to_k"], 1), (&["to_v"], 2), (&["to_out", "0"], 3),
+        ];
+        for &(path, selected) in targets {
+            let mut trial = base.clone();
+            let expected = match selected {
+                0 => &mut trial.q, 1 => &mut trial.k, 2 => &mut trial.v, 3 => &mut trial.out,
+                _ => unreachable!(),
+            } as *mut q::LinearWork;
+            let actual = trial.adaptable_mut(path).expect("native metadata adapter target") as *mut q::LinearWork;
+            assert_eq!(actual, expected, "literal native target must return its actual mutable field: {path:?}");
+            trial.adaptable_mut(path).unwrap().pack(8).unwrap();
+            let states = [trial.q.bits, trial.k.bits, trial.v.bits, trial.out.bits,
+                trial.to_k_ip.as_ref().unwrap().bits, trial.to_v_ip.as_ref().unwrap().bits];
+            for (index, state) in states.into_iter().enumerate() {
+                assert_eq!(state, if index == selected { Some(8) } else { None },
+                    "selected-world pack must mutate one actual field, not a clone/alias/default: {path:?}/{index}");
+            }
+        }
+        for path in [vec![], vec!["to_out"], vec!["to_out", "1"], vec!["to_q", "extra"],
+                     vec!["to_k_ip"], vec!["to_v_ip"], vec!["unknown"]] {
+            assert!(base.clone().adaptable_mut(&path).is_none(), "not a native adaptable leaf: {path:?}");
+        }
     }
 }
