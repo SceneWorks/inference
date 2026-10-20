@@ -547,7 +547,7 @@ impl Flux3Klein {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationParams> {
         let staged = stage_residency_for(&self.spec, req);
-        let outcome=self.upsampler.with_request(
+        let outcome=self.upsampler.with_prompt_upsampling(
             req.enhance_prompt,staged,&req.cancel,
             || {
                 let dir=self.upsampler_dir.as_ref().ok_or_else(||gen_core::Error::Unsupported(
@@ -556,9 +556,10 @@ impl Flux3Klein {
                 let loaded=if staged {crate::pup::Flux3PromptUpsampler::load_bounded(dir)}else{crate::pup::Flux3PromptUpsampler::load(dir)};
                 loaded.map_err(gen_core::Error::from)
             },
-            |upsampler|crate::pup::effective_prompt(upsampler,req,&references::upsampler_input(req)?,on_progress).map_err(gen_core::Error::from),
+            |upsampler, progress|crate::pup::effective_prompt(upsampler,req,&references::upsampler_input(req)?,progress).map_err(gen_core::Error::from),
             crate::pup::Flux3PromptUpsampler::synchronize_before_release,
             ||{mlx_gen::residency::drain_allocator_cache();},
+            on_progress,
         )?;
         Ok(GenerationParams::resolve_caption(
             req,

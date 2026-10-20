@@ -439,3 +439,138 @@ fn cancellation_in_conditioning_callback_stops_before_denoise_without_terminal_p
     assert!(matches!(result, Err(Error::Canceled)));
     assert_eq!(events, [crate::Progress::ConditioningComplete]);
 }
+
+#[test]
+fn prompt_upsampling_completion_follows_materialization_fence_and_owned_release() {
+    for staged in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let slot = PhaseResourceSlot::default();
+        let (owner, weak) = resource(&events);
+        let cancel = CancelFlag::new();
+        let output = slot
+            .with_prompt_upsampling(
+                true,
+                staged,
+                &cancel,
+                || {
+                    events.lock().unwrap().push("load");
+                    Ok(owner)
+                },
+                |_, progress| {
+                    progress(crate::Progress::Upsampling {
+                        tokens: 1,
+                        max_tokens: 2,
+                    });
+                    events.lock().unwrap().push("host-caption");
+                    Ok("materialized caption")
+                },
+                |_| {
+                    events.lock().unwrap().push("owned-fence");
+                    Ok(())
+                },
+                || events.lock().unwrap().push("allocator-drained"),
+                &mut |event| match event {
+                    crate::Progress::Upsampling { .. } => events.lock().unwrap().push("token"),
+                    crate::Progress::PromptUpsamplingComplete => {
+                        assert_eq!(weak.upgrade().is_none(), staged);
+                        events.lock().unwrap().push("pup-complete");
+                    }
+                    other => panic!("unexpected progress: {other:?}"),
+                },
+            )
+            .unwrap();
+        assert_eq!(output, "materialized caption");
+        events.lock().unwrap().push("text-and-reference-encode");
+        let expected = if staged {
+            vec![
+                "load",
+                "token",
+                "host-caption",
+                "owned-fence",
+                "drop-owner",
+                "allocator-drained",
+                "pup-complete",
+                "text-and-reference-encode",
+            ]
+        } else {
+            vec![
+                "load",
+                "token",
+                "host-caption",
+                "owned-fence",
+                "pup-complete",
+                "text-and-reference-encode",
+            ]
+        };
+        let recorded = events.lock().unwrap().clone();
+        assert_eq!(recorded, expected);
+        assert_eq!(slot.is_loaded().unwrap(), !staged);
+    }
+}
+
+#[test]
+fn prompt_upsampling_failure_cancel_and_bypass_never_claim_completion() {
+    for staged in [false, true] {
+        for failure in [
+            "fence",
+            "token-cancel",
+            "fence-cancel",
+            "run-error",
+            "bypass",
+            "pre-cancel",
+            "boundary-cancel",
+        ] {
+            let slot = PhaseResourceSlot::default();
+            let cancel = CancelFlag::new();
+            if failure == "pre-cancel" {
+                cancel.cancel();
+            }
+            let mut events = Vec::new();
+            let result = slot.with_prompt_upsampling(
+                failure != "bypass",
+                staged,
+                &cancel,
+                || Ok(()),
+                |owner, progress| {
+                    assert_eq!(owner.is_none(), failure == "bypass");
+                    if failure == "token-cancel" {
+                        progress(crate::Progress::Upsampling {
+                            tokens: 1,
+                            max_tokens: 2,
+                        });
+                    }
+                    if failure == "run-error" {
+                        return Err(Error::Unsupported("run failed".into()));
+                    }
+                    Ok("caption")
+                },
+                |_| {
+                    if failure == "fence" {
+                        return Err(Error::Unsupported("fence failed".into()));
+                    }
+                    if failure == "fence-cancel" {
+                        cancel.cancel();
+                    }
+                    Ok(())
+                },
+                || {},
+                &mut |event| {
+                    events.push(event);
+                    if failure == "token-cancel" || failure == "boundary-cancel" {
+                        cancel.cancel();
+                    }
+                },
+            );
+            if failure == "bypass" {
+                assert_eq!(result.unwrap(), "caption");
+                assert!(events.is_empty());
+            } else if failure == "boundary-cancel" {
+                assert!(matches!(result, Err(Error::Canceled)));
+                assert_eq!(events, [crate::Progress::PromptUpsamplingComplete]);
+            } else {
+                assert!(result.is_err(), "{failure}, staged={staged}");
+                assert!(!events.contains(&crate::Progress::PromptUpsamplingComplete));
+            }
+        }
+    }
+}
