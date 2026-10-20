@@ -359,7 +359,28 @@ fn registry_renders_published_defaults() {
         GenerationOutput::Images(images) => images,
         _ => panic!("expected images"),
     };
-    assert_eq!(again[0].pixels, images[0].pixels);
+    // The same seed reproduces image 0. On the CPU this is bit-exact. On CUDA a batch of one and a
+    // batch of two run differently tiled GEMMs (reduction order only; measured 4 of 196,608
+    // channels off by 1 on the first CUDA run), so the declared CUDA pixel bound applies:
+    // mean |d| <= 0.1 / 255 and max |d| <= 1.
+    // The registry loads on the build's default device.
+    if candle_gen::default_device().unwrap().is_cpu() {
+        assert_eq!(again[0].pixels, images[0].pixels);
+    } else {
+        let d: Vec<u32> = again[0]
+            .pixels
+            .iter()
+            .zip(&images[0].pixels)
+            .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
+            .collect();
+        let max = d.iter().copied().max().unwrap_or(0);
+        let mean = d.iter().map(|&v| v as f64).sum::<f64>() / d.len() as f64;
+        eprintln!("PIXELS seed repeat (batch 1 vs 2): mean |d| {mean:.6} / 255, max |d| {max}");
+        assert!(
+            mean <= 0.1 && max <= 1,
+            "seed repeat drifted: mean {mean}, max {max}"
+        );
+    }
 
     // Cancellation surfaces as the typed error.
     // (A fresh flag: a cloned request shares its original's.)
