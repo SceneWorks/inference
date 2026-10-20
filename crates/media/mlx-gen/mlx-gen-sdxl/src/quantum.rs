@@ -420,12 +420,6 @@ impl<'a> EffectScope<'a> {
             .unwrap_or_else(|| mlx_gen::adapters::facts::TensorFacts::of(native.weight()));
         ConvWork { weight, bias: native.bias().map(mlx_gen::adapters::facts::TensorFacts::of) }
     }
-    /// Dense shortcuts deliberately do not participate in the actual quantization walk.
-    pub(crate) fn shortcut(&self, name: &str, native: &AdaptableLinear) -> LinearWork {
-        let path = crate::quant::child_path(&self.prefix, name);
-        self.effects.and_then(|effects| effects.0.get(&path)).cloned()
-            .unwrap_or_else(|| LinearWork::of(native))
-    }
     pub(crate) fn linear(&self, name: &str, native: &AdaptableLinear) -> Result<LinearWork> {
         let path = crate::quant::child_path(&self.prefix, name);
         match self.effects {

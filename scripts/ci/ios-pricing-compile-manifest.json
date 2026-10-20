@@ -1,8 +1,8 @@
 {
   "state": "CANONICAL_OWNER_SOURCE_BOUND",
   "binding_scope": "Actualsourcebytesverifiedprecommit; containingcommitSboundexternallybydispatchinput==GITHUB_SHA==checkoutHEAD. ThisfiledoesNOTclaimacommitexistsorembeditselfhash/S.",
-  "UTC": "2026-10-20T21:59:27.314682+00:00",
-  "rust_proof_closure_sha256": "adf23a3f1757b47949b038a5ca212949f0e69949ef0a7ce3a96356f783a2684d",
+  "UTC": "2026-10-20T22:11:56.224573+00:00",
+  "rust_proof_closure_sha256": "5a0ecba27b1269b34a794b67ca3c8abe0ef5bbba852ea5e0c3851189bd7f5a63",
   "compiler_packages": [
     "mlx-gen",
     "mlx-gen-z-image",
@@ -404,7 +404,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum.rs",
-      "sha256": "e68d9a89e94b2df5f04951fe83c1d5a75d5408b08ab0d0b271219f428a4a7dbd"
+      "sha256": "68df92339dd37f3d30540ab2c52ea0b9fa0bc7eff408b9cf8b0dd54fd64d2db3"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/quantum_tests.rs",
@@ -464,7 +464,7 @@
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/resnet.rs",
-      "sha256": "444ec04c697fd537d647dbfda5d5d9002e6883f28268e545391169013bfc648b"
+      "sha256": "6c9d6d5139a424d1c87f476700d5b6a7a7492daaf80c7c2b3e9a17f34688e252"
     },
     {
       "path": "crates/media/mlx-gen/mlx-gen-sdxl/src/unet/transformer.rs",

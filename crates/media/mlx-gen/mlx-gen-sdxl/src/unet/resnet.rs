@@ -254,15 +254,18 @@ impl ResnetBlock2D {
     /// concatenation already applied) and a `temb`-typed time embedding: MLX promotes through
     /// every weight, bias and norm affine the forward touches and the projected embedding
     /// ([`crate::quantum::linear_output_dtype`]). Header-only pricing threads it.
+    #[cfg(test)]
     pub(crate) fn output_dtype(&self, input: Dtype, temb: Option<Dtype>) -> Dtype {
         self.output_dtype_with_effects(input, temb, &crate::quantum::EffectScope::native())
             .expect("native projection facts are infallible")
     }
 
+    #[cfg(test)]
     pub(crate) fn output_dtype_with_effects(&self, input: Dtype, temb: Option<Dtype>, effects: &crate::quantum::EffectScope<'_>) -> Result<Dtype> {
         self.pricing_facts().output_dtype_with_effects(input, temb, effects)
     }
 
+    #[cfg(test)]
     pub(crate) fn output_shape_with_effects(
         &self, input: &[i32], skip: Option<&[i32]>, effects: &crate::quantum::EffectScope<'_>,
     ) -> Result<Vec<i32>> {
@@ -270,6 +273,7 @@ impl ResnetBlock2D {
     }
 
     /// The `[cin, cout]` of `conv1` and `cout` of `conv2` (header-only pricing).
+    #[cfg(test)]
     pub(crate) fn conv_weights(&self) -> (&Array, &Array) {
         (self.conv1.weight(), self.conv2.weight())
     }
