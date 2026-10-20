@@ -19,10 +19,12 @@ fn tiny_dit_matches_upstream_module() {
         let t = host(&io["in.t"]);
         let features = dit.timestep_features(&t).unwrap();
         let (max_abs, _, _) = diff_stats(&host(&features), &host(&io["out.t_freq"]));
-        assert!(max_abs < 1e-4, "{name}: timestep features max_abs {max_abs}");
+        assert!(
+            max_abs < 1e-4,
+            "{name}: timestep features max_abs {max_abs}"
+        );
 
-        let mask =
-            SupraDit::additive_mask(&host(&io["in.mask"]), 2, cfg.ctx_len, &device).unwrap();
+        let mask = SupraDit::additive_mask(&host(&io["in.mask"]), 2, cfg.ctx_len, &device).unwrap();
         let v = dit
             .forward(&io["in.z"], &features, &io["in.ctx"], &mask)
             .unwrap();
@@ -73,7 +75,10 @@ fn masked_context_rows_cannot_move_the_velocity() {
             })
             .collect();
         let garbage = Tensor::from_vec(garbage, (2, cfg.ctx_len, cfg.ctx_dim), &device).unwrap();
-        let moved = host(&dit.forward(&io["in.z"], &features, &garbage, &mask).unwrap());
+        let moved = host(
+            &dit.forward(&io["in.z"], &features, &garbage, &mask)
+                .unwrap(),
+        );
         let (max_abs, _, ref_max) = diff_stats(&moved, &base);
         eprintln!("{name}: masked-row perturbation moved the velocity by {max_abs:.3e}");
         if device.is_cpu() {

@@ -75,8 +75,8 @@ fn spec_for(bundle: &Path) -> LoadSpec {
 }
 
 fn golden() -> HashMap<String, Tensor> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/supra2_real_golden.safetensors");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/supra2_real_golden.safetensors");
     candle_gen::candle_core::safetensors::load(path, &Device::Cpu).unwrap()
 }
 
@@ -127,8 +127,8 @@ fn save(images: &[Image], stem: &str) {
 fn components_match_torch_reference() {
     let device = device();
     eprintln!("device: {device:?}");
-    let model = Supra2Image::load_on_device(&spec_for(&env_path("SUPRA2_BUNDLE")), device.clone())
-        .unwrap();
+    let model =
+        Supra2Image::load_on_device(&spec_for(&env_path("SUPRA2_BUNDLE")), device.clone()).unwrap();
     let g = golden();
     let t5_tol = tol(&device, (2e-5, 2e-6), (1e-3, 1e-4));
     let dit_tol = tol(&device, (2e-5, 2e-6), (1e-3, 1e-4));
@@ -167,7 +167,11 @@ fn components_match_torch_reference() {
     let t = host(&g["dit.t"])[0];
     let ctx = Tensor::cat(
         &[
-            &g["t5.ctx.short"].unsqueeze(0).unwrap().to_device(&device).unwrap(),
+            &g["t5.ctx.short"]
+                .unsqueeze(0)
+                .unwrap()
+                .to_device(&device)
+                .unwrap(),
             &stored.context,
         ],
         0,
@@ -183,12 +187,21 @@ fn components_match_torch_reference() {
     );
     let half = v.len() / 2;
     report("dit.v_cond", &v[..half], &host(&g["dit.v_cond"]), dit_tol);
-    report("dit.v_uncond", &v[half..], &host(&g["dit.v_uncond"]), dit_tol);
+    report(
+        "dit.v_uncond",
+        &v[half..],
+        &host(&g["dit.v_uncond"]),
+        dit_tol,
+    );
 
     // `latent` is a denoised (unscaled) Supra2 latent; `decode_latent` owns the `/ 0.18215`.
     for (stage, latent, decoded) in [
         ("vae.decode", "vae.latent", "vae.decoded"),
-        ("vae.decode_random", "vae.random_latent", "vae.random_decoded"),
+        (
+            "vae.decode_random",
+            "vae.random_latent",
+            "vae.random_decoded",
+        ),
     ] {
         let got = model
             .decode_latent(&g[latent].to_device(&device).unwrap())

@@ -2,7 +2,7 @@
 //! VAE, then run upstream's `generate()` — tokenize/truncate/mask, encode, stored-or-fallback
 //! unconditional context, CFG-or-plain Euler flow integration, VAE decode, `save_image`
 //! quantization. The request/load surface is the MLX twin's (`mlx-gen-supra2`), field for field:
-//! both read [`gen_core::supra2`](candle_gen::gen_core::supra2).
+//! both read [`candle_gen::gen_core::supra2`].
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -78,10 +78,11 @@ pub fn load_vae(sources: &Supra2Sources, device: &Device) -> Result<SdxlVaeDecod
 /// `shared.*` + `encoder.*` and never touches the decoder half of the checkpoint.
 pub fn load_text_encoder(sources: &Supra2Sources, device: &Device) -> Result<T5EncoderModel> {
     let cfg_path = sources.text_encoder.join("config.json");
-    let cfg: T5Config = serde_json::from_slice(&std::fs::read(&cfg_path).map_err(|e| {
-        Error::Unsupported(format!("supra2: read {}: {e}", cfg_path.display()))
-    })?)
-    .map_err(|e| Error::Unsupported(format!("supra2: invalid {}: {e}", cfg_path.display())))?;
+    let cfg: T5Config =
+        serde_json::from_slice(&std::fs::read(&cfg_path).map_err(|e| {
+            Error::Unsupported(format!("supra2: read {}: {e}", cfg_path.display()))
+        })?)
+        .map_err(|e| Error::Unsupported(format!("supra2: invalid {}: {e}", cfg_path.display())))?;
     let vb = candle_gen::mmap_var_builder(&[sources.text_encoder_weights()], DType::F32, device)?;
     Ok(T5EncoderModel::load(vb, &cfg)?)
 }
@@ -333,7 +334,9 @@ impl Supra2Image {
                 context: &cond_ctx,
                 mask: &cond_mask,
             },
-            uncond.as_ref().map(|(context, mask)| ContextBatch { context, mask }),
+            uncond
+                .as_ref()
+                .map(|(context, mask)| ContextBatch { context, mask }),
             &request.cancel,
             progress,
         )?;

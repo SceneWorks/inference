@@ -85,8 +85,18 @@ fn tiny_denoise_loop_matches_upstream_trajectories() {
             None => cpu = Some((on, off)),
             // Cross-device: the accelerator integrates the same z0 to the CPU's latents.
             Some((cpu_on, cpu_off)) => {
-                report(&format!("tiny_traj.cfg3.{name}_vs_cpu"), &on, cpu_on, (1e-4, 1e-5));
-                report(&format!("tiny_traj.cfg1.{name}_vs_cpu"), &off, cpu_off, (1e-4, 1e-5));
+                report(
+                    &format!("tiny_traj.cfg3.{name}_vs_cpu"),
+                    &on,
+                    cpu_on,
+                    (1e-4, 1e-5),
+                );
+                report(
+                    &format!("tiny_traj.cfg1.{name}_vs_cpu"),
+                    &off,
+                    cpu_off,
+                    (1e-4, 1e-5),
+                );
             }
         }
     }
@@ -175,10 +185,11 @@ fn cancellation_stops_before_the_next_step_and_zero_steps_is_refused() {
                 }
             }
         },
-    )
-    .err()
-    .expect("a cancelled run must fail");
-    assert!(matches!(err, candle_gen::CandleError::Canceled), "{err}");
+    );
+    assert!(
+        matches!(err, Err(candle_gen::CandleError::Canceled)),
+        "a cancelled run must fail with the typed cancellation"
+    );
     assert_eq!(seen, 2);
     assert!(sampling::denoise(
         &dit,

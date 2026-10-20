@@ -3643,8 +3643,8 @@ mod preview_advertising {
         MemoryRouteCrate {
             dir: "candle-gen-supra2",
             register_providers: candle_gen_supra2::register_providers,
-            register_surfaces: Some(candle_gen_supra2::register_memory_contract_surfaces),
-            resident_only_on_cpu: false,
+            register_surfaces: None,
+            resident_only_on_cpu: true,
         },
         MemoryRouteCrate {
             dir: "candle-gen-svd",
@@ -5969,6 +5969,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_ti2v_5b",
                 "wan2_2_t2v_14b",
@@ -6020,7 +6021,8 @@ mod tests {
         // `iris_3b` trainer reuses the generator's row and adds no id; the sc-25687 `iris_3b_depth`
         // trainer is a new id with its own complete row: 64 / 54; the sc-25688 `iris_3b_restore`
         // trainer reuses the transform's id and row and adds no id; sc-25901 adds
-        // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55).
+        // `qwen_image_2_1_turbo`, a generator with its own complete row: 65 / 55; sc-24214 adds
+        // `supra2_img`, a generator with its own complete row: 68 / 58 with the MOSS pair).
         //
         // Registration is never conditioned on the mapping: 53 < 63 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
@@ -6034,8 +6036,8 @@ mod tests {
             .chain(&text_embedders)
             .chain(&transforms)
             .collect();
-        assert_eq!(distinct.len(), 67);
-        assert_eq!(super::provider_components().len(), 57);
+        assert_eq!(distinct.len(), 68);
+        assert_eq!(super::provider_components().len(), 58);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is

@@ -33,25 +33,22 @@ pub mod sampling;
 pub use dit::SupraDit;
 pub use model::{descriptor, encode_tokens, load, Supra2Image, Supra2Output, TextConditioning};
 
-/// Compose the Supra2 generator and its memory surfaces into an explicit registry.
+/// Compose the Supra2 generator, its memory strategy and its resident-only contract witness into
+/// an explicit registry. The loader is resident-only (no quantization, staging or deferred
+/// materialization), so — like the other resident-only Candle routes — it publishes a typed
+/// [`ResidentOnlyMemoryContractRegistration`](candle_gen::gen_core::ResidentOnlyMemoryContractRegistration)
+/// rather than optimized contract surfaces.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    register_memory_contract_surfaces(registry.register_generator(model::REGISTRATION))
-}
-
-/// The memory-strategy registration and its weights-free contract fixture (one resident, dense,
-/// eager surface), split out the way the sibling Candle providers do.
-pub fn register_memory_contract_surfaces(
-    registry: candle_gen::gen_core::ProviderRegistryBuilder,
-) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    use candle_gen::gen_core::MemoryContractFixtureRegistration;
+    use candle_gen::gen_core::ResidentOnlyMemoryContractRegistration;
     registry
+        .register_generator(model::REGISTRATION)
         .register_memory_strategy(model::MEMORY)
-        .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+        .register_resident_only_memory_contract(ResidentOnlyMemoryContractRegistration {
             provider_id: candle_gen::gen_core::supra2::PROVIDER_ID,
-            contract: memory_strategy::fixture,
-            surface_specs: memory_strategy::surface_specs,
+            contract: memory_strategy::witness,
+            surface_specs: memory_strategy::witness_specs,
         })
 }
 
@@ -72,6 +69,12 @@ mod tests {
         assert_eq!(ids, ["supra2_img"]);
         assert!(registry.descriptor_conformance_errors().is_empty());
         assert_eq!(registry.memory_strategy_registrations().len(), 1);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 1);
+        assert_eq!(
+            registry
+                .resident_only_memory_contract_registrations()
+                .map(|r| r.provider_id)
+                .collect::<Vec<_>>(),
+            ["supra2_img"]
+        );
     }
 }

@@ -318,13 +318,6 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "moss_image_sft",
         components: &["moss_image_sft"],
     },
-    // --- supra2 (sc-24214) --------------------------------------------------------------------
-    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE — the
-    // MLX twin's row, unchanged.
-    ProviderComponents {
-        provider_id: "supra2_img",
-        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
-    },
     // --- qwen-image -------------------------------------------------------------------------
     // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
     // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
@@ -434,6 +427,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
     ProviderComponents {
         provider_id: "sensenova_u1_8b_fast",
         components: &["sensenova_u1_8b_mot", "sensenova_u1_8b_mot_loras"],
+    },
+    // --- supra2 (sc-24214) --------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE — the
+    // MLX twin's row, unchanged.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
     },
     // --- svd --------------------------------------------------------------------------------
     // UNet, temporal-decoder VAE and the ViT-H image encoder all ship in one ungated snapshot.
@@ -637,7 +637,7 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            67,
+            68,
             "67 distinct Candle provider ids: 60 generators (qwen_image_2_1_turbo joined in \
              sc-25901) + 19 trainers (15 of them also \
              generator ids — iris_3b joined in sc-25686; iris_3b_restore, sc-25688, is the \
