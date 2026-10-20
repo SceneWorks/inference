@@ -1,44 +1,16 @@
 //! Structural resident memory contract: byte facts from the safetensors headers of exactly the
 //! tensors the provider materializes. No calibration is claimed (the terminal campaign measures).
 
-use mlx_gen::gen_core::supra2::{Supra2Config, PROVIDER_ID};
-use mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers;
+use mlx_gen::gen_core::supra2::{
+    memory_architecture_facts, memory_asset_facts, Supra2Config, PROVIDER_ID,
+};
 use mlx_gen::gen_core::*;
 
 use crate::model::Supra2Sources;
 
-fn sum(path: &std::path::Path, keep: impl Fn(&str) -> bool) -> Result<u64> {
-    safetensors_path_tensor_headers(path)?
-        .iter()
-        .filter(|h| keep(&h.name))
-        .try_fold(0u64, |acc, h| {
-            acc.checked_add(h.data_bytes)
-                .ok_or_else(|| Error::Unsupported("supra2: byte facts overflow".into()))
-        })
-}
-
-/// Resident bytes: the f32 denoiser (+ stored conditioning), the Flan-T5 **encoder** tensors (the
-/// decoder half of the checkpoint is never read), and the full f32 AutoencoderKL.
+/// Resident bytes (shared with the Candle port): see [`memory_asset_facts`].
 pub(crate) fn facts(s: &Supra2Sources) -> Result<MemoryAssetFacts> {
-    let mut f = MemoryAssetFacts {
-        transformer_bytes: sum(&s.bundle.denoiser_path(), |_| true)?,
-        ..Default::default()
-    };
-    let conditioning = match s.bundle.conditioning_path() {
-        Some(path) => sum(&path, |_| true)?,
-        None => 0,
-    };
-    f.conditioning_bytes = sum(&s.text_encoder.join("model.safetensors"), |n| {
-        n.starts_with("encoder.") || n.starts_with("shared.")
-    })?
-    .saturating_add(conditioning);
-    f.decoder_bytes = sum(&s.vae.join("diffusion_pytorch_model.safetensors"), |_| true)?;
-    f.base_bytes = f
-        .transformer_bytes
-        .checked_add(f.conditioning_bytes)
-        .and_then(|n| n.checked_add(f.decoder_bytes))
-        .ok_or_else(|| Error::Unsupported("supra2: base bytes overflow".into()))?;
-    Ok(f)
+    memory_asset_facts(s)
 }
 
 pub(crate) fn contract_with_facts(
@@ -55,16 +27,7 @@ pub(crate) fn contract_with_facts(
         },
     );
     c.asset_facts = f;
-    c.architecture_facts = MemoryArchitectureFacts {
-        attention_heads: Some(cfg.num_heads as u32),
-        head_dim: Some(cfg.head_dim() as u32),
-        transformer_blocks: Some(cfg.depth as u32),
-        patch_size: Some(cfg.patch as u32),
-        latent_channels: Some(cfg.latent_channels as u32),
-        vae_spatial_scale: Some(8),
-        vae_temporal_scale: None,
-        activation_dtype_width: Some(4),
-    };
+    c.architecture_facts = memory_architecture_facts(cfg);
     c
 }
 
@@ -89,12 +52,7 @@ pub(crate) fn safety(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    if context.geometry.reference_count != 0 || context.use_pid || context.has_phases {
-        return MemorySafetyDecision::Reject {
-            reason: "Supra2-IMG supports text-to-image only".into(),
-        };
-    }
-    default_registered_memory_strategy_safety_check(spec, contract, context)
+    mlx_gen::gen_core::supra2::memory_safety(spec, contract, context)
 }
 
 pub(crate) fn surface_specs() -> Vec<MemoryContractSurfaceSpec> {

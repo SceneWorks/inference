@@ -796,6 +796,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 40 since sc-25690 added the dispatch-only `mlx-iris-memory-probe` job;
         # 41 since sc-26214 added the dispatch-only `mlx-veda` job.
         MACOS_HUB_LOCK: 41,
+        # 19 since sc-24214 added the dispatch-only `candle-supra2` job;
         # 18 since sc-25901 added the dispatch-only `candle-qwen-image-2-1-turbo` job;
         # 17 since sc-25690 added the dispatch-only `candle-iris-memory-probe` job;
         # 16 since the sc-25678 follow-up added the dispatch-only `candle-qwen-image-2-1-train` job;
@@ -804,7 +805,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 18,
+        WINDOWS_HUB_LOCK: 19,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -1264,13 +1265,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # `mlx-iris-curricula-train` and `candle-iris-curricula`; 16 Windows after the sc-25678
         # follow-up added `candle-qwen-image-2-1-train`; 40 macOS / 17 Windows after sc-25690 added
         # `mlx-iris-memory-probe` and `candle-iris-memory-probe`; 18 Windows after sc-25901 added
-        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`.
+        # `candle-qwen-image-2-1-turbo`; 41 macOS after sc-26214 added `mlx-veda`; 19 Windows after
+        # sc-24214 added `candle-supra2`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 41)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 18)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 19)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(

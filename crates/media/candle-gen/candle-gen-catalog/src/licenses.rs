@@ -318,6 +318,13 @@ pub const PROVIDER_COMPONENTS: &[ProviderComponents] = &[
         provider_id: "moss_image_sft",
         components: &["moss_image_sft"],
     },
+    // --- supra2 (sc-24214) --------------------------------------------------------------------
+    // The locally converted denoiser bundle plus the pinned Flan-T5-Base encoder and SD VAE — the
+    // MLX twin's row, unchanged.
+    ProviderComponents {
+        provider_id: "supra2_img",
+        components: &["supra2_img", "flan_t5_base", "sd_vae_ft_mse"],
+    },
     // --- qwen-image -------------------------------------------------------------------------
     // Candle registers the base id only; control and edit are bespoke and unregistered. The VAE
     // rides the repository row, the Qwen2.5-VL tower is a pinned hole, and the fast tokenizer is
@@ -598,7 +605,7 @@ mod tests {
     /// failing.
     #[test]
     fn mapping_is_sorted_and_every_key_resolves() {
-        assert_eq!(PROVIDER_COMPONENTS.len(), 57);
+        assert_eq!(PROVIDER_COMPONENTS.len(), 58);
         let ids: Vec<&str> = PROVIDER_COMPONENTS.iter().map(|p| p.provider_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -804,6 +811,7 @@ mod tests {
                 "seedvr2_7b",
                 "sensenova_u1_8b",
                 "sensenova_u1_8b_fast",
+                "supra2_img",
                 "svd_xt",
                 "wan2_2_i2v_14b",
                 "wan2_2_t2v_14b",
@@ -867,11 +875,6 @@ mod tests {
             "krea_realtime_video",
             "wan2_1_t2v_14b_diffusers",
             "wan2_1_vace_1_3b_diffusers",
-            // Supra2-IMG registers on MLX first (sc-24213); epic sc-24212's Candle/CUDA slice maps
-            // these when it registers the Candle provider.
-            "supra2_img",
-            "flan_t5_base",
-            "sd_vae_ft_mse",
             // The bespoke Candle PuLID path and the overlay crates (sc-16668), which register
             // no provider id on this backend. Candle has no `sam2` crate at all, so both SAM 2.1
             // rows are unreached here as well.

@@ -18,6 +18,11 @@ Usage:
       -> <out_dir>/{t5,dit,vae,trajectory}_reference.safetensors (large; not committed) plus
          supra2_reference_digests.json and tokenizer_cases.json (small; committed copies live in
          gen-core/tests/fixtures/supra2/)
+  python -I dump_supra2_reference.py pack  <out_dir> <golden_file>
+      -> candle-gen-supra2/tests/fixtures/supra2_real_golden.safetensors (sc-24214): the `real`
+         outputs repacked verbatim (no recomputation) into one committed file, `<stage>.<name>`
+         keys, decoded pixels as uint8 (their exact values), so CUDA runners without a torch
+         environment compare against the same torch reference.
 """
 import hashlib
 import importlib.util
@@ -290,11 +295,29 @@ def dump_real(upstream_dir, t5_dir, vae_dir, out_dir):
     )
 
 
+def pack_golden(out_dir, golden_file):
+    from safetensors.numpy import load_file, save_file as save_np
+
+    packed = {}
+    for stage, name in [("t5", "t5_reference"), ("dit", "dit_reference"), ("vae", "vae_reference"),
+                        ("traj", "trajectory_reference")]:
+        for key, value in load_file(os.path.join(out_dir, f"{name}.safetensors")).items():
+            if key.endswith(".pixels"):
+                as_u8 = value.astype(np.uint8)
+                assert np.array_equal(as_u8.astype(np.float32), value), key
+                value = as_u8
+            packed[f"{stage}.{key}"] = np.ascontiguousarray(value)
+    save_np(packed, golden_file)
+    print("packed", len(packed), "tensors into", golden_file, os.path.getsize(golden_file), "bytes")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "tiny":
         dump_tiny(*sys.argv[2:5])
     elif mode == "real":
         dump_real(*sys.argv[2:6])
+    elif mode == "pack":
+        pack_golden(*sys.argv[2:4])
     else:
         raise SystemExit(f"unknown mode {mode}")
