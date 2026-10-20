@@ -69,6 +69,7 @@ pub mod registry;
 pub mod report;
 pub mod request;
 pub mod resource;
+pub mod rope_config;
 pub mod schedule;
 pub mod speculative;
 pub mod starvector;

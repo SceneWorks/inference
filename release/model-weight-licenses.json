@@ -131,6 +131,52 @@
       ]
     },
     {
+      "id": "flux-kommunity-v1-0",
+      "spdx_id": "LicenseRef-FLUX-Kommunity-v1.0",
+      "name": "FLUX Kommunity License v1.0",
+      "text_url": "https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md",
+      "terms": [
+        {
+          "term": "non_commercial_weights"
+        },
+        {
+          "term": "revenue_ceiling",
+          "amount_usd": 5000000,
+          "boundary": "inclusive"
+        },
+        {
+          "term": "registration_required",
+          "contact": "https://bfl.ai/licensing"
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "flux-kommunity-v1-0"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "downstream_restrictions",
+          "family": "flux-kommunity-v1-0"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "implement and maintain content filtering measures (\"Content Filters\") for your use of the FLUX Model or Derivatives to prevent the creation, display, transmission, generation, or dissemination of unlawful, unsafe or infringing content"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "ensure Output includes disclosures (or other indications) that the Output was generated or modified using artificial intelligence technologies to the extent required under applicable law"
+        },
+        {
+          "term": "acceptable_use_policy",
+          "url": null
+        }
+      ]
+    },
+    {
       "id": "flux-non-commercial-v2-1",
       "spdx_id": "LicenseRef-FLUX-Non-Commercial-v2.1",
       "name": "FLUX Non-Commercial License v2.1",

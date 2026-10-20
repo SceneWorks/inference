@@ -383,6 +383,8 @@ impl<'a> ReasonerSampler<'a> {
                 top_p: params.top_p,
                 top_k: usize::try_from(params.top_k).unwrap_or(0),
                 presence_penalty: 0.0,
+                presence_penalty_generated_only: false,
+                presence_penalty_prompt_len: 0,
                 repetition_penalty: params.repetition_penalty.unwrap_or(1.0),
                 repetition_context: params.repetition_context,
             },

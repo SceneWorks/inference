@@ -237,6 +237,8 @@ fn joycaption_model_matches_golden_tokens() {
         top_p: 1.0,
         top_k: 0,
         presence_penalty: 0.0,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };
@@ -300,6 +302,8 @@ fn joycaption_resize_path_matches_golden() {
         top_p: 1.0,
         top_k: 0,
         presence_penalty: 0.0,
+        presence_penalty_generated_only: false,
+        presence_penalty_prompt_len: 0,
         repetition_penalty: 1.0,
         repetition_context: 0,
     };

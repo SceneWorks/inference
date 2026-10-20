@@ -1864,6 +1864,286 @@ mod cuda_impl {
         }
     }
 
+    /// FLUX3 publisher-format projections (sc-26241). The frozen BFL recipes, not the generic
+    /// per-tensor FP8 / dynamic NVFP4 ones above; see `flux3_quant.cu` for the exact math and
+    /// `crate::flux3_quant` for the bit-level CPU mirrors.
+    impl CublasLt {
+        fn flux3_kernels(&self) -> Result<Arc<crate::nvrtc::CompiledKernel>> {
+            crate::flux3_quant::FLUX3_QUANT_SRC
+                .compiled(&self.device)
+                .map_err(|e| candle_core::Error::Msg(format!("flux3 quant kernels: {e}")))
+        }
+
+        /// The activation as a contiguous offset-0 f32 CUDA slice (the kernels index from 0).
+        fn flux3_f32_input(x: &Tensor) -> Result<Tensor> {
+            let xf = x.to_dtype(DType::F32)?.contiguous()?;
+            Ok(if xf.layout().start_offset() != 0 {
+                xf.force_contiguous()?
+            } else {
+                xf
+            })
+        }
+
+        /// Stage a checkpoint's raw E4M3 weight bytes `[rows, cols]` (row-major) as a resident
+        /// [`DevFp8`]. No conversion: the bytes are the publisher's codes.
+        pub fn stage_fp8_bytes(&self, bytes: &[u8], rows: usize, cols: usize) -> Result<DevFp8> {
+            if rows.checked_mul(cols) != Some(bytes.len()) {
+                candle_core::bail!(
+                    "stage_fp8_bytes: {} bytes for [{rows}, {cols}]",
+                    bytes.len()
+                );
+            }
+            let codes: Vec<float8::F8E4M3> = bytes
+                .iter()
+                .map(|b| float8::F8E4M3::from_bits(*b))
+                .collect();
+            let buf = self.stream.clone_htod(&codes).map_err(drv_err)?;
+            Ok(DevFp8 { buf, rows, cols })
+        }
+
+        /// Upload a small host f32 vector (FP8R per-output weight scales).
+        pub fn stage_f32(&self, values: &[f32]) -> Result<cudarc::driver::CudaSlice<f32>> {
+            self.stream.clone_htod(values).map_err(drv_err)
+        }
+
+        /// **FLUX3 FP8R W8A8 rowwise linear**: `bf16(Σ_k e4m3(x/sa)·w · sa[m] · sw[n])`.
+        /// `x` is `[M, K]` (bf16/f32, CUDA); `w` the resident `[N, K]` E4M3 weight; `w_scales` its
+        /// `[N]` f32 per-output scales. The activation row scale is `max(|row|)/448` (≥ 1e-12), the
+        /// GEMM accumulates in f32 with unit operand scales, and the epilogue applies both scale
+        /// vectors before the one BF16 rounding — `torch._scaled_mm` rowwise semantics.
+        pub fn flux3_fp8_rowwise_linear(
+            &self,
+            x: &Tensor,
+            w: &DevFp8,
+            w_scales: &cudarc::driver::CudaSlice<f32>,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (m, k) = x.dims2()?;
+            let n = w.rows;
+            if w.cols != k || w_scales.len() != n {
+                candle_core::bail!(
+                    "flux3 fp8r: x [.., {k}] vs weight [{n}, {}] with {} scales",
+                    w.cols,
+                    w_scales.len()
+                );
+            }
+            check_alignment(k, n)?;
+            let kernels = self.flux3_kernels()?;
+            let quantize = kernels
+                .function("flux3_fp8_rowwise_quantize_f32")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let epilogue = kernels
+                .function("flux3_fp8_rowwise_epilogue")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let xf = Self::flux3_f32_input(x)?;
+            let (x_storage, _) = xf.storage_and_layout();
+            let x_slice = match &*x_storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("flux3 fp8r: expected F32 CUDA storage"),
+                },
+                _ => candle_core::bail!("flux3 fp8r: activation is not on CUDA"),
+            };
+            // The kernel writes E4M3 bytes directly into the FP8 operand buffer: no backend
+            // f32 -> F8E4M3 cast kernel is involved (candle builds those only for sm_89+ arches).
+            let mut q = unsafe { self.stream.alloc::<float8::F8E4M3>(m * k) }.map_err(drv_err)?;
+            let mut sa = unsafe { self.stream.alloc::<f32>(m) }.map_err(drv_err)?;
+            let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+            unsafe {
+                self.stream
+                    .launch_builder(&quantize)
+                    .arg(x_slice)
+                    .arg(&mut q)
+                    .arg(&mut sa)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .launch(LaunchConfig {
+                        grid_dim: (m as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            drop(x_storage);
+            let xq = DevFp8 {
+                buf: q,
+                rows: m,
+                cols: k,
+            };
+            let mut acc = unsafe { self.stream.alloc::<f32>(m * n) }.map_err(drv_err)?;
+            let one_a = self.upload_scalar(1.0)?;
+            let one_b = self.upload_scalar(1.0)?;
+            {
+                let (a_ptr, _ga) = w.buf.device_ptr(&self.stream);
+                let (b_ptr, _gb) = xq.buf.device_ptr(&self.stream);
+                let (sa_ptr, _gsa) = one_a.device_ptr(&self.stream);
+                let (sb_ptr, _gsb) = one_b.device_ptr(&self.stream);
+                let (d_ptr, _gd) = acc.device_ptr_mut(&self.stream);
+                unsafe {
+                    self.run(
+                        sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        sys::cudaDataType_t::CUDA_R_32F,
+                        sys::cudaDataType_t::CUDA_R_32F,
+                        m,
+                        k,
+                        n,
+                        a_ptr,
+                        b_ptr,
+                        d_ptr,
+                        Some((sa_ptr, sb_ptr)),
+                        Alpha::F32(1.0),
+                    )?;
+                }
+            }
+            let mut out = unsafe { self.stream.alloc::<half::bf16>(m * n) }.map_err(drv_err)?;
+            let total = (m * n) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&epilogue)
+                    .arg(&acc)
+                    .arg(&sa)
+                    .arg(w_scales)
+                    .arg(&mut out)
+                    .arg(&mi)
+                    .arg(&ni)
+                    .launch(LaunchConfig {
+                        grid_dim: (total.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            Ok(Tensor::from_storage(
+                Storage::Cuda(CudaStorage {
+                    slice: CudaStorageSlice::BF16(out),
+                    device: self.device.clone(),
+                }),
+                (m, n),
+                BackpropOp::none(),
+                false,
+            ))
+        }
+
+        /// Stage a publisher NVFP4 weight: packed E2M1 `[rows, cols/2]` (even column in the low
+        /// nibble) + its row-major E4M3 block scales `[rows, cols/16]`, swizzled here into the
+        /// compute atom layout, with the static `weight_scale_2` as the per-tensor scale.
+        pub fn flux3_stage_nvfp4_weight(
+            &self,
+            packed: &[u8],
+            block_scales: &[u8],
+            rows: usize,
+            cols: usize,
+            weight_scale_2: f32,
+        ) -> Result<DevNvfp4> {
+            check_nvfp4_alignment(cols, rows)?;
+            if packed.len() != rows * cols / 2 || block_scales.len() != rows * cols / 16 {
+                candle_core::bail!(
+                    "flux3 nvfp4: weight byte inventory does not match [{rows}, {cols}]"
+                );
+            }
+            if !weight_scale_2.is_finite() || weight_scale_2 < 0.0 {
+                candle_core::bail!("flux3 nvfp4: invalid weight_scale_2 {weight_scale_2}");
+            }
+            let swizzled = crate::flux3_quant::swizzle_scales(block_scales, rows, cols / 16);
+            Ok(DevNvfp4 {
+                packed: self.stream.clone_htod(packed).map_err(drv_err)?,
+                scales: self.stream.clone_htod(&swizzled).map_err(drv_err)?,
+                rows,
+                cols_padded: cols,
+                global_scale: weight_scale_2,
+            })
+        }
+
+        /// **FLUX3 NVFP4 W4A4 linear with a STATIC activation scale.** The activation is packed with
+        /// the clamped reciprocal `max(input_scale, 1e-8)`; the GEMM alpha is the RAW
+        /// `input_scale · weight_scale_2` (a zero calibrated scale yields an all-zero product, as
+        /// the source does). `x` is `[M, K]`; M is zero-padded to the FP4 row alignment and narrowed.
+        pub fn flux3_nvfp4_static_linear(
+            &self,
+            x: &Tensor,
+            w: &DevNvfp4,
+            input_scale: f32,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{LaunchConfig, PushKernelArg};
+            if !input_scale.is_finite() || input_scale < 0.0 {
+                candle_core::bail!("flux3 nvfp4: invalid input_scale {input_scale}");
+            }
+            let (m, k) = x.dims2()?;
+            if k != w.cols_padded {
+                candle_core::bail!("flux3 nvfp4: x [.., {k}] vs weight K {}", w.cols_padded);
+            }
+            let m_pad = round_up_usize(m.max(1), super::super::nvfp4_linear::NVFP4_M_ALIGN);
+            let x_pad = if m_pad != m {
+                x.pad_with_zeros(0, 0, m_pad - m)?
+            } else {
+                x.clone()
+            };
+            let kernels = self.flux3_kernels()?;
+            let pack = kernels
+                .function("flux3_nvfp4_static_pack_f32")
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let xf = Self::flux3_f32_input(&x_pad)?;
+            let (x_storage, _) = xf.storage_and_layout();
+            let x_slice = match &*x_storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("flux3 nvfp4: expected F32 CUDA storage"),
+                },
+                _ => candle_core::bail!("flux3 nvfp4: activation is not on CUDA"),
+            };
+            let n_blocks = k / 16;
+            let sf_rows = round_up_usize(m_pad, SF_ATOM_ROWS);
+            let sf_cols = round_up_usize(n_blocks, SF_ATOM_COLS);
+            let mut packed = self
+                .stream
+                .alloc_zeros::<u8>(m_pad * (k / 2))
+                .map_err(drv_err)?;
+            let mut scales = self
+                .stream
+                .alloc_zeros::<u8>(sf_rows * sf_cols)
+                .map_err(drv_err)?;
+            let (mi, ki, nbi, cpi, sci) = (
+                m_pad as i32,
+                k as i32,
+                n_blocks as i32,
+                k as i32,
+                sf_cols as i32,
+            );
+            let qscale = input_scale.max(1e-8);
+            let total = (m_pad * n_blocks) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&pack)
+                    .arg(x_slice)
+                    .arg(&mut packed)
+                    .arg(&mut scales)
+                    .arg(&mi)
+                    .arg(&ki)
+                    .arg(&nbi)
+                    .arg(&cpi)
+                    .arg(&sci)
+                    .arg(&qscale)
+                    .launch(LaunchConfig {
+                        grid_dim: (total.div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(drv_err)?;
+            }
+            drop(x_storage);
+            let xq = DevNvfp4 {
+                packed,
+                scales,
+                rows: m_pad,
+                cols_padded: k,
+                global_scale: input_scale,
+            };
+            let y = self.matmul_nvfp4_staged(w, &xq)?;
+            Ok(if m_pad != m { y.narrow(0, 0, m)? } else { y })
+        }
+    }
+
     /// alpha carrier so int32 vs f32 compute get correctly-typed scalars.
     enum Alpha {
         F32(f32),

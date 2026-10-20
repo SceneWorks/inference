@@ -554,6 +554,78 @@ pub const CIRCLESTONE_LABS_NON_COMMERCIAL: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// FLUX Kommunity License v1.0 — the FLUX 3 Image Klein weights.
+///
+/// Text read at `LICENSE.md` of `black-forest-labs/flux-3-image-klein` @
+/// `8454017f9ebaada30c998fccd9f67a80c7580f68` on 2026-10-15 under an authenticated session (the
+/// file is served ungated at the same path).
+pub const FLUX_KOMMUNITY_V1_0: LicenseFamily = LicenseFamily {
+    id: "flux-kommunity-v1-0",
+    spdx_id: "LicenseRef-FLUX-Kommunity-v1.0",
+    name: "FLUX Kommunity License v1.0",
+    text_url: "https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md",
+    terms: &[
+        // §2(b) "You may only access, use, Distribute, or create Derivatives of the FLUX Model or
+        // Derivatives for Non-Commercial Purposes, except as set forth in Section 2.a."
+        LicenseTerm::NonCommercialWeights,
+        // §2(a)(ii): "solely if you are a Qualifying User, use Outputs, including Outputs from
+        // Derivatives, for commercial purposes, and you may access and use the FLUX Model and
+        // Derivatives in a production environment solely for the purpose of generating such
+        // Outputs". §1(e) "'Qualifying User' means you, if at any time you together with your
+        // affiliates' gross annualized revenue is less than US$5,000,000." — "less than", so the
+        // amount itself is already past the threshold: Inclusive. The exception is for OUTPUTS
+        // only; it is not a licence to train, fine-tune, distil or redistribute commercially
+        // (§1(c)(c), §4(a)), so NonCommercialWeights stands and NonCommercialOutputs is absent.
+        LicenseTerm::RevenueCeiling {
+            amount_usd: 5_000_000,
+            boundary: CeilingBoundary::Inclusive,
+        },
+        // §2(b) "If you want to use a FLUX Model or a Derivative for any purpose that is not
+        // expressly authorized under this License, such as for a commercial activity, you must
+        // request a license from Company … Please see https://bfl.ai/licensing".
+        LicenseTerm::RegistrationRequired {
+            contact: Some("https://bfl.ai/licensing"),
+        },
+        // §3(a) "you must make available a copy of this License to third-party recipients of the
+        // FLUX Model and/or Derivatives you Distribute, and specify that any rights to use the
+        // FLUX Model and/or Derivatives shall be directly granted by Company to said third-party
+        // recipients pursuant to this License".
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "flux-kommunity-v1-0",
+        },
+        // §3(b) "you must prominently display the following notice alongside the Distribution of
+        // the FLUX Model or Derivative (such as via a \"Notice\" text file distributed as part of
+        // such FLUX Model or Derivative) (the \"Attribution Notice\")".
+        LicenseTerm::NoticeFileRequired,
+        // Same §3(b) clause, which names itself the "Attribution Notice".
+        LicenseTerm::AttributionRequired,
+        // §3(c) "any terms and conditions you impose on any third-party recipients relating to
+        // Derivatives made by or for you shall neither limit such third-party recipients' use of
+        // the FLUX Model … nor conflict with any of its terms and conditions".
+        LicenseTerm::DownstreamRestrictions {
+            family: "flux-kommunity-v1-0",
+        },
+        // §2(e)(i)(A), the Qualifying-User condition, first of two duties.
+        LicenseTerm::DeployerObligation {
+            text:
+                "implement and maintain content filtering measures (\"Content Filters\") for your \
+                   use of the FLUX Model or Derivatives to prevent the creation, display, \
+                   transmission, generation, or dissemination of unlawful, unsafe or infringing \
+                   content",
+        },
+        // §2(e)(ii), second duty.
+        LicenseTerm::DeployerObligation {
+            text: "ensure Output includes disclosures (or other indications) that the Output was \
+                   generated or modified using artificial intelligence technologies to the extent \
+                   required under applicable law",
+        },
+        // The licence enumerates prohibited uses inline in §4 (commercial/production beyond §2(a),
+        // military, surveillance, biometric processing, Robotics Uses outside §2(a), …) and names
+        // no separate policy document; the only address in the text is the licensing page above.
+        LicenseTerm::AcceptableUsePolicy { url: None },
+    ],
+};
+
 /// Gemma Terms of Use.
 ///
 /// Text read at <https://ai.google.dev/gemma/terms> on 2026-08-02.
@@ -1068,6 +1140,7 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     CIRCLESTONE_LABS_NON_COMMERCIAL,
     CREATIVEML_OPENRAIL_PP_M,
     FLUX_1_DEV_NON_COMMERCIAL,
+    FLUX_KOMMUNITY_V1_0,
     FLUX_NON_COMMERCIAL_V2_1,
     GEMMA_TERMS,
     IDEOGRAM_4_NON_COMMERCIAL,
@@ -1105,6 +1178,7 @@ mod tests {
             CIRCLESTONE_LABS_NON_COMMERCIAL,
             CREATIVEML_OPENRAIL_PP_M,
             FLUX_1_DEV_NON_COMMERCIAL,
+            FLUX_KOMMUNITY_V1_0,
             FLUX_NON_COMMERCIAL_V2_1,
             GEMMA_TERMS,
             IDEOGRAM_4_NON_COMMERCIAL,
@@ -1121,7 +1195,7 @@ mod tests {
             STABILITY_AI_COMMUNITY,
             TONGYI_QIANWEN,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 22);
+        assert_eq!(LICENSE_FAMILIES.len(), 23);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -1201,6 +1275,7 @@ mod tests {
                 "cc-by-nc-4-0",
                 "circlestone-labs-non-commercial",
                 "flux-1-dev-non-commercial",
+                "flux-kommunity-v1-0",
                 "flux-non-commercial-v2-1",
                 "ideogram-4-non-commercial",
                 "insightface-research-only",
@@ -1255,6 +1330,7 @@ mod tests {
         assert_eq!(
             with_ceiling,
             vec![
+                "flux-kommunity-v1-0",
                 "krea-2-community",
                 "ltx-2-community",
                 "minimax-h3-community",
@@ -1281,6 +1357,7 @@ mod tests {
             ids("downstream_restrictions"),
             vec![
                 "creativeml-openrail-pp-m",
+                "flux-kommunity-v1-0",
                 "gemma-terms",
                 "ideogram-4-non-commercial",
                 "ltx-2-community",
@@ -1297,6 +1374,7 @@ mod tests {
                 "apple-mlr",
                 "circlestone-labs-non-commercial",
                 "flux-1-dev-non-commercial",
+                "flux-kommunity-v1-0",
                 "flux-non-commercial-v2-1",
                 "gemma-terms",
                 "ideogram-4-non-commercial",
@@ -1316,6 +1394,7 @@ mod tests {
         // Five texts impose both, and CreativeML Open RAIL++-M imposes only the heavier one — so
         // neither list is a subset of the other and neither variant can stand in for the other.
         for id in [
+            "flux-kommunity-v1-0",
             "gemma-terms",
             "ideogram-4-non-commercial",
             "ltx-2-community",
@@ -1375,6 +1454,7 @@ mod tests {
             vec![
                 "creativeml-openrail-pp-m",
                 "flux-1-dev-non-commercial",
+                "flux-kommunity-v1-0",
                 "ltx-2-community",
                 "minimax-h3-community",
             ]
@@ -1547,6 +1627,22 @@ mod tests {
                     "non_commercial_weights",
                     "downstream_license_copy:flux-1-dev-non-commercial",
                     "deployer_obligation:implement and maintain content filtering measure",
+                    "acceptable_use_policy:<none>",
+                ],
+            ),
+            (
+                // docs/licensing/sc-26234-flux-kommunity-licence-evidence.md
+                "flux-kommunity-v1-0",
+                vec![
+                    "non_commercial_weights",
+                    "revenue_ceiling:5000000:inclusive",
+                    "registration_required:https://bfl.ai/licensing",
+                    "downstream_license_copy:flux-kommunity-v1-0",
+                    "notice_file_required",
+                    "attribution_required",
+                    "downstream_restrictions:flux-kommunity-v1-0",
+                    "deployer_obligation:implement and maintain content filtering measure",
+                    "deployer_obligation:ensure Output includes disclosures (or other ind",
                     "acceptable_use_policy:<none>",
                 ],
             ),

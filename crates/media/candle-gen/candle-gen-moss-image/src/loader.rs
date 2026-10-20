@@ -1127,8 +1127,16 @@ mod constructor_tests {
                 .err()
                 .unwrap()
                 .to_string();
-        assert!(error.contains("text_encoder/config.json"), "{error}");
-        assert!(!error.contains("ordinary-unpinned/transformer"), "{error}");
+        // Missing paths use native separators; assert the same boundary on every host.
+        let normalized_error = error.replace('\\', "/");
+        assert!(
+            normalized_error.contains("text_encoder/config.json"),
+            "{error}"
+        );
+        assert!(
+            !normalized_error.contains("ordinary-unpinned/transformer"),
+            "{error}"
+        );
         std::fs::write(config, b"corrupt selected published config").unwrap();
         assert!(transformer_config(full, &spec, &ordinary).is_err());
     }

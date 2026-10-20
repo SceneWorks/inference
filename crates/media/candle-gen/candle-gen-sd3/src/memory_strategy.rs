@@ -931,6 +931,11 @@ pub fn weights_free_contract(
                 "SD3.5 has no NVFP4 tier".into(),
             ))
         }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "SD3.5 has no FP8 rowwise tier".into(),
+            ))
+        }
     };
     let mut normalized = spec.clone();
     normalized.quantize = None;
@@ -960,6 +965,11 @@ pub fn weights_free_surface_contract(
         gen_core::MemoryContractSurfaceTier::Nvfp4 => {
             return Err(gen_core::Error::Unsupported(
                 "SD3.5 has no NVFP4 tier".into(),
+            ))
+        }
+        gen_core::MemoryContractSurfaceTier::Fp8Rowwise => {
+            return Err(gen_core::Error::Unsupported(
+                "SD3.5 has no FP8 rowwise tier".into(),
             ))
         }
     };
@@ -1652,6 +1662,7 @@ pub fn registered_valid_fixture(
     .into_iter()
     .map(|request_route| {
         let context = MemoryRunContext {
+            reference_resources: None,
             selection: contract.representative_selection(
                 strategy,
                 MemoryNumericTier {
@@ -1705,6 +1716,11 @@ fn weights_free_behavior_spec(route: Sd35Route, spec: &LoadSpec) -> gen_core::Re
         Some(Quant::Nvfp4) => {
             return Err(gen_core::Error::Unsupported(
                 "SD3.5 has no NVFP4 tier".into(),
+            ))
+        }
+        Some(Quant::Fp8Rowwise) => {
+            return Err(gen_core::Error::Unsupported(
+                "SD3.5 has no FP8 rowwise tier".into(),
             ))
         }
     };
@@ -2124,6 +2140,7 @@ mod tests {
             contract_from_receipt(&spec(receipt.route, &receipt.root, Vec::new()), receipt);
         let refs = u32::from(mode == MemoryMode::ImageToImage);
         MemoryRunContext {
+            reference_resources: None,
             selection: MemorySelection {
                 strategy: MemoryStrategy::StagedResidency,
                 parameters: MemoryStrategyParameters::default(),

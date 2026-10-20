@@ -1060,6 +1060,7 @@ mod tests {
             Some(Quant::Q8) => "pose-control-q8",
             Some(Quant::Q4) => "pose-control-q4",
             Some(Quant::Nvfp4) => "pose-control-nvfp4",
+            Some(Quant::Fp8Rowwise) => "pose-control-fp8r",
             None => "pose-control-bf16",
         };
         let observed_calibration = memory_contract
