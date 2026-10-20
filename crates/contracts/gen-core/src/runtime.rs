@@ -482,7 +482,7 @@ fn store_proven_digest(entry: &Path, sha256: &[u8; 32]) {
     // Write-then-rename so a concurrent reader in another worker never sees a torn entry.
     let staging = entry.with_extension(format!("tmp-{}", std::process::id()));
     if std::fs::write(&staging, hex_lower(sha256)).is_err()
-        || std::fs::rename(&staging, &entry).is_err()
+        || std::fs::rename(&staging, entry).is_err()
     {
         let _ = std::fs::remove_file(&staging);
     }
