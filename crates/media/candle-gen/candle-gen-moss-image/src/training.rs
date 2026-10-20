@@ -339,21 +339,29 @@ fn caption(text: &str, trigger: Option<&str>) -> String {
         _ => text.into(),
     }
 }
-fn save(
+pub(super) fn save(
     model: &Transformer,
     set: &LoraSet,
     variant: MossImageVariant,
-    c: &TrainingConfig,
+    req: &TrainingRequest,
     path: &Path,
 ) -> Result<()> {
+    let c = &req.config;
     for (_, var) in set.named_vars() {
         crate::adapters::finite(var.as_tensor(), "saved factor")?;
     }
     // Validate derived products, not only their finite source factors, after the final update too.
     model.validate_residuals()?;
-    let meta: HashMap<_, _> = contract::metadata(variant, sampler_name(c))
+    let mut meta: HashMap<_, _> = contract::metadata(variant, sampler_name(c))
         .into_iter()
         .collect();
+    if !req.trigger_words.is_empty() {
+        meta.insert(
+            "triggerWords".into(),
+            serde_json::to_string(&req.trigger_words)
+                .map_err(|e| CandleError::Msg(e.to_string()))?,
+        );
+    }
     match set.kind {
         lora::AdapterKind::Lora => lora::save_lora_peft(set, "", &meta, path),
         lora::AdapterKind::Lokr => lora::save_lokr(set, &meta, path),
@@ -627,7 +635,7 @@ impl MossImageTrainer {
                     &transformer,
                     &set,
                     self.variant,
-                    c,
+                    req,
                     &req.output_dir
                         .join(checkpoint::checkpoint_filename(stem, step)),
                 )?;
@@ -709,7 +717,7 @@ impl MossImageTrainer {
         progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir).map_err(|e| CandleError::Msg(e.to_string()))?;
         let path = req.output_dir.join(&req.file_name);
-        save(&transformer, &set, self.variant, c, &path)?;
+        save(&transformer, &set, self.variant, req, &path)?;
         Ok(TrainingOutput {
             adapter_path: path,
             steps: c.steps,

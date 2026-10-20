@@ -437,3 +437,231 @@ pub(crate) fn import_candle_exchange(root: &Path) {
         }
     }
 }
+
+#[test]
+fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
+    let _device = crate::cpu_test_device();
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        let temp = tempfile::tempdir().unwrap();
+        let f = fixture();
+        let (weights, geometry) = base(&f, Dtype::Float32);
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for case in [
+                "lora",
+                "lora-scaled",
+                "lokr",
+                "lokr-reversed",
+                "lokr-decomposed",
+            ] {
+                let lokr = case.starts_with("lokr");
+                let scaled = case == "lora-scaled";
+                let alpha = if scaled { 32f32 } else { 0.25 };
+                let mut metadata = mlx_gen::gen_core::moss_image_training::metadata(
+                    variant,
+                    mlx_gen::gen_core::moss_image_training::SAMPLER,
+                );
+                metadata.extend([
+                    (
+                        "networkType".into(),
+                        if lokr { "lokr" } else { "lora" }.into(),
+                    ),
+                    ("rank".into(), "1".into()),
+                    ("alpha".into(), alpha.to_string()),
+                    ("decomposeFactor".into(), "-1".into()),
+                ]);
+                let sparse = |shape: [i32; 2]| {
+                    let mut v = vec![0f32; (shape[0] * shape[1]) as usize];
+                    v[0] = if scaled { 1e18 } else { 2e19 };
+                    if scaled && shape[0] == 1 {
+                        v.fill(1e18);
+                    }
+                    Array::from_slice(&v, &shape)
+                };
+                let factors = if case == "lokr-reversed" {
+                    vec![
+                        ("layers.0.proj.q.lokr_w1", sparse([1, 4])),
+                        ("layers.0.proj.q.lokr_w2", sparse([16, 4])),
+                    ]
+                } else if case == "lokr-decomposed" {
+                    vec![
+                        (
+                            "layers.0.proj.q.lokr_w1_a",
+                            Array::from_slice(&[0f32; 4], &[4, 1]),
+                        ),
+                        (
+                            "layers.0.proj.q.lokr_w1_b",
+                            Array::from_slice(&[f32::MAX, f32::MAX, 0., 0.], &[1, 4]),
+                        ),
+                        (
+                            "layers.0.proj.q.lokr_w2",
+                            Array::from_slice(
+                                &[
+                                    1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0.,
+                                    1.,
+                                ],
+                                &[4, 4],
+                            ),
+                        ),
+                    ]
+                } else if lokr {
+                    vec![
+                        ("layers.0.proj.q.lokr_w1", sparse([4, 4])),
+                        ("layers.0.proj.q.lokr_w2", sparse([4, 4])),
+                    ]
+                } else {
+                    vec![
+                        ("layers.0.proj.q.lora_A.weight", sparse([1, 16])),
+                        ("layers.0.proj.q.lora_B.weight", sparse([16, 1])),
+                        ("layers.0.proj.q.alpha", Array::from_slice(&[alpha], &[1])),
+                    ]
+                };
+                let raw = if scaled {
+                    f64::from(1e18f32).powi(2) * 16.
+                } else {
+                    f64::from(2e19f32).powi(2)
+                };
+                assert!(if scaled {
+                    raw < f64::from(f32::MAX) && raw * f64::from(alpha) > f64::from(f32::MAX)
+                } else {
+                    raw > f64::from(f32::MAX) && raw * f64::from(alpha) < f64::from(f32::MAX)
+                });
+                let path = temp.path().join("overflow.safetensors");
+                let metadata: std::collections::HashMap<_, _> = metadata.into_iter().collect();
+                Array::save_safetensors(
+                    factors.iter().map(|(k, v)| (*k, v)),
+                    Some(&metadata),
+                    &path,
+                )
+                .unwrap();
+                let kind = if lokr {
+                    mlx_gen::runtime::AdapterKind::Lokr
+                } else {
+                    mlx_gen::runtime::AdapterKind::Lora
+                };
+                let mut host = Transformer::load(&weights, geometry.clone()).unwrap();
+                let spec = mlx_gen::runtime::AdapterSpec::new(path.clone(), 1., kind);
+                let result = crate::adapters::apply(&mut host, variant, &[spec]);
+                assert!(matches!(result, Err(mlx_gen::Error::Unsupported(ref message))
+                    if message.contains("contraction") && message.contains("reduce factor magnitude")),
+                    "unsafe raw contraction must be actionably refused before application success ({variant:?}/{case}): {result:?}");
+                if !lokr {
+                    let installed = mlx_gen::adapters::Adapter::Lora {
+                        a: factors[0].1.t(),
+                        b: factors[1].1.t(),
+                        scale: alpha,
+                    };
+                    let validation = crate::adapters::validate_lora(&installed);
+                    assert!(
+                        matches!(validation, Err(mlx_gen::Error::Unsupported(ref message))
+                        if message.contains("contraction")),
+                        "producer must reject unsafe unfused training factors too"
+                    );
+                    let mut producer = Transformer::load(&weights, geometry.clone()).unwrap();
+                    let paths = vec!["layers.0.proj.q".to_owned()];
+                    let (targets, mut params) =
+                        mlx_gen::train::lora::build_lora_targets(&mut producer, &paths, 1, 17)
+                            .unwrap();
+                    params.insert(
+                        format!("{}.lora_a", targets[0].path).into(),
+                        factors[0].1.clone(),
+                    );
+                    params.insert(
+                        format!("{}.lora_b", targets[0].path).into(),
+                        factors[1].1.clone(),
+                    );
+                    let adapter = mlx_gen::train::lora::TrainAdapter::Lora { targets };
+                    let cfg = mlx_gen::TrainingConfig {
+                        rank: 1,
+                        alpha,
+                        train_dtype: "f32".into(),
+                        ..Default::default()
+                    };
+                    let output = temp.path().join("must-not-export.safetensors");
+                    let export = crate::adapters::save_validated(
+                        &mut producer,
+                        &adapter,
+                        &params,
+                        &cfg,
+                        &[],
+                        &output,
+                    );
+                    assert!(matches!(export, Err(mlx_gen::Error::Unsupported(ref message))
+                        if message.contains("contraction")) && !output.exists(),
+                        "actual producer export must reject unsafe RAW factors before alpha folding or writing");
+                }
+                let mut zero_host = Transformer::load(&weights, geometry.clone()).unwrap();
+                let zero = mlx_gen::runtime::AdapterSpec::new(path.clone(), 0., kind);
+                assert!(crate::adapters::apply(&mut zero_host, variant, &[zero]).is_ok(),
+                    "finite disabled factors must not execute or be rejected for a skipped contraction");
+            }
+        }
+    });
+}
+
+#[test]
+fn periodic_and_final_exports_preserve_request_trigger_words() {
+    let _device = crate::cpu_test_device();
+    mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+        use mlx_gen::train::lora::{build_lokr_targets, build_lora_targets, TrainAdapter};
+        let temp = tempfile::tempdir().unwrap();
+        let f = fixture();
+        let (weights, geometry) = base(&f, Dtype::Float32);
+        for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+            for network in [NetworkType::Lora, NetworkType::Lokr] {
+                let mut model = Transformer::load(&weights, geometry.clone()).unwrap();
+                let paths = vec!["layers.0.proj.q".to_owned()];
+                let (adapter, params) = match network {
+                    NetworkType::Lora => {
+                        let (targets, params) =
+                            build_lora_targets(&mut model, &paths, 3, 17).unwrap();
+                        (TrainAdapter::Lora { targets }, params)
+                    }
+                    NetworkType::Lokr => {
+                        let (targets, params) =
+                            build_lokr_targets(&mut model, &paths, 3, 2, 17).unwrap();
+                        (TrainAdapter::Lokr { targets }, params)
+                    }
+                };
+                let mut req = mlx_gen::TrainingRequest {
+                    items: vec![],
+                    output_dir: temp.path().into(),
+                    file_name: "final.safetensors".into(),
+                    trigger_words: vec!["ohwx".into(), "quoted\"word".into()],
+                    cancel: CancelFlag::new(),
+                    config: mlx_gen::TrainingConfig {
+                        rank: 3,
+                        alpha: 0.7,
+                        decompose_factor: 2,
+                        network_type: network,
+                        trigger_word: Some("caption_only_not_export_words".into()),
+                        train_dtype: "f32".into(),
+                        ..Default::default()
+                    },
+                };
+                for words in [req.trigger_words.clone(), vec![]] {
+                    req.trigger_words = words.clone();
+                    for file in [
+                        mlx_gen::train::checkpoint::checkpoint_filename("adapter", 1),
+                        req.file_name.clone(),
+                    ] {
+                        let path = temp.path().join(file);
+                        crate::training::save(&mut model, &adapter, &params, variant, &req, &path)
+                            .unwrap();
+                        let metadata =
+                            mlx_gen::gen_core::weightsmeta::safetensors_file_metadata(&path)
+                                .unwrap();
+                        if words.is_empty() {
+                            assert!(
+                                !metadata.contains_key("triggerWords"),
+                                "empty legacy words must stay absent"
+                            );
+                        } else {
+                            assert_eq!(serde_json::from_str::<Vec<String>>(&metadata["triggerWords"]).unwrap(), words,
+                                "saved adapter must carry request words, not config caption injection");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}

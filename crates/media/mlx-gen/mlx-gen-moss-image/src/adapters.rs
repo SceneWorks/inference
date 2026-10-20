@@ -9,6 +9,37 @@ use mlx_gen::{
 use mlx_rs::{ops::multiply, transforms::eval, Array, Dtype};
 use std::collections::BTreeMap;
 
+// Same raw-factor admission as Candle, independent of PEFT's alpha folding on reload.
+// Check every unscaled FP32 contraction (including decomposed legs) before success/export.
+fn contraction_bound(weight: &Array, input: f64) -> Result<f64> {
+    let columns = weight.shape()[1] as usize;
+    let norm = crate::pipeline::logical_f32_readback(weight)?
+        .chunks_exact(columns)
+        .map(|row| row.iter().map(|v| f64::from(v.abs())).sum::<f64>())
+        .fold(0., f64::max);
+    let bound = norm * input;
+    if !bound.is_finite() || bound > f32::MAX as f64 {
+        return Err(Error::Unsupported(
+            "MOSS unscaled factor contraction overflows FP32; reduce factor magnitude".into(),
+        ));
+    }
+    Ok(bound)
+}
+fn validate_lora_factors(a: &Array, b: &Array, scale: f32) -> Result<()> {
+    finite(a, "LoRA A")?;
+    finite(b, "LoRA B")?;
+    if scale == 0. {
+        return Ok(()); // Disabled adapters skip contractions, but source finiteness still applies.
+    }
+    let raw = contraction_bound(b, contraction_bound(a, 1.)?)?;
+    if raw * f64::from(scale.abs()) > f32::MAX as f64 {
+        return Err(Error::Unsupported(
+            "MOSS scaled LoRA contraction overflows FP32; reduce factor magnitude or strength"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 #[derive(Clone)]
 enum Factor {
     Full(Array),
@@ -62,6 +93,12 @@ impl Factor {
         match self {
             Self::Full(w) => linear_fp32(x, w),
             Self::LowRank { a, b } => linear_fp32(&linear_fp32(x, b)?, a),
+        }
+    }
+    fn forward_bound(&self, input: f64) -> Result<f64> {
+        match self {
+            Self::Full(w) => contraction_bound(w, input),
+            Self::LowRank { a, b } => contraction_bound(a, contraction_bound(b, input)?),
         }
     }
     fn effective_max(&self) -> Result<f64> {
@@ -157,6 +194,21 @@ impl Lokr {
             eval([array])?;
             finite(array, "LoKr factor")?;
         }
+        let (a, c) = self.first.shape();
+        let (b, d) = self.second.shape();
+        let raw_bound = if self.scale == 0. {
+            0.
+        } else if i64::from(c) * i64::from(b) <= i64::from(d) * i64::from(a) {
+            self.first.forward_bound(self.second.forward_bound(1.)?)?
+        } else {
+            self.second.forward_bound(self.first.forward_bound(1.)?)?
+        };
+        if raw_bound * f64::from(self.scale.abs()) > f32::MAX as f64 {
+            return Err(Error::Unsupported(
+                "MOSS scaled LoKr contraction overflows FP32; reduce factor magnitude or strength"
+                    .into(),
+            ));
+        }
         // Kronecker coefficient maxima factor exactly. Validate derived (possibly decomposed)
         // factors and their effective product, not just finite source tensors.
         let first = self.first.effective_max()?;
@@ -178,8 +230,9 @@ fn finite(array: &Array, label: &str) -> Result<()> {
 pub(crate) fn validate_lora(adapter: &Adapter) -> Result<()> {
     match adapter {
         Adapter::Lora { a, b, scale } => {
-            finite(a, "installed LoRA A")?;
-            finite(b, "folded LoRA B")?;
+            // Shared Adapter stores [in,rank] / [rank,out], unlike raw PEFT [rank,in] /
+            // [out,rank]. Validate the actual contraction axes, not the storage row axes.
+            validate_lora_factors(&a.t(), &b.t(), *scale)?;
             finite(&multiply(b, Array::from_f32(*scale))?, "scaled LoRA B")
         }
         _ => Err(Error::Unsupported(
@@ -309,6 +362,15 @@ pub(crate) fn apply(
         }
         let applied = match spec.kind {
             AdapterKind::Lora => {
+                // Validate RAW portable factors too: alpha folding must not make this backend
+                // accept a file that overflows Candle's otherwise identical raw execution.
+                for path in groups.keys() {
+                    validate_lora_factors(
+                        weights.require(&format!("{path}.lora_A.weight"))?,
+                        weights.require(&format!("{path}.lora_B.weight"))?,
+                        if scale == 0. { 0. } else { 1. },
+                    )?;
+                }
                 let report =
                     mlx_gen::adapters::loader::apply_lora_peft(host, &weights, scale, None)?;
                 if report.applied != groups.len() || !report.unmatched_paths.is_empty() {
@@ -402,6 +464,21 @@ pub(crate) fn save_validated(
     extra: &[(&str, &str)],
     path: &std::path::Path,
 ) -> Result<()> {
+    // Validate raw portable PEFT tensors before the shared installer folds alpha into B.
+    // Reload and producer must agree even when folding would hide raw FP32 overflow.
+    if let mlx_gen::train::lora::TrainAdapter::Lora { targets } = adapter {
+        for target in targets {
+            let a_key = format!("{}.lora_a", target.path);
+            let b_key = format!("{}.lora_b", target.path);
+            let a = params
+                .get(a_key.as_str())
+                .ok_or_else(|| Error::MissingTensor(a_key.clone()))?;
+            let b = params
+                .get(b_key.as_str())
+                .ok_or_else(|| Error::MissingTensor(b_key.clone()))?;
+            validate_lora_factors(a, b, cfg.alpha / cfg.rank as f32)?;
+        }
+    }
     host.install_training_adapter(adapter, params, cfg.alpha, cfg.rank as f32)?;
     host.materialize_custom()?;
     adapter.save_with_meta(

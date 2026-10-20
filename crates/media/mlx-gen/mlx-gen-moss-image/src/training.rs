@@ -363,6 +363,29 @@ fn encode_image(vae: &Flux2Vae, image: &mlx_gen::media::Image, edge: u32) -> Res
         .transpose_axes(&[0, 2, 3, 1])?;
     vae.bn_normalize_nchw(&pack_mean(&vae.encode_mean(&pixels)?)?)
 }
+/// Common periodic/final portable export; request words are independent of caption injection.
+pub(super) fn save(
+    model: &mut Transformer,
+    adapter: &TrainAdapter,
+    params: &LoraParams,
+    variant: MossImageVariant,
+    req: &TrainingRequest,
+    path: &Path,
+) -> Result<()> {
+    let cfg = &req.config;
+    let mut metadata = contract::metadata(variant, sampler_name(cfg));
+    if !req.trigger_words.is_empty() {
+        metadata.insert(
+            "triggerWords".into(),
+            serde_json::Value::from(req.trigger_words.clone()).to_string(),
+        );
+    }
+    let extra: Vec<_> = metadata
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    crate::adapters::save_validated(model, adapter, params, cfg, &extra, path)
+}
 fn caption(item: &str, trigger: Option<&str>) -> String {
     match trigger.filter(|s| !s.trim().is_empty()) {
         Some(t) if !item.contains(t) => format!("{t}, {item}"),
@@ -527,20 +550,6 @@ impl LoadedTrainer {
             .map_err(admission_error)?
             .check(Phase::Cache, budget(self.memory_budget_override)?)
             .map_err(admission_error)
-    }
-    fn save(
-        &mut self,
-        adapter: &TrainAdapter,
-        params: &LoraParams,
-        cfg: &TrainingConfig,
-        path: &Path,
-    ) -> Result<()> {
-        let metadata = contract::metadata(self.variant, sampler_name(cfg));
-        let extra: Vec<_> = metadata
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        crate::adapters::save_validated(&mut self.transformer, adapter, params, cfg, &extra, path)
     }
     fn train_impl(
         &mut self,
@@ -759,10 +768,12 @@ impl LoadedTrainer {
             });
             if c.save_every > 0 && step % c.save_every == 0 && step != c.steps {
                 std::fs::create_dir_all(&req.output_dir)?;
-                self.save(
+                save(
+                    &mut self.transformer,
                     &adapter,
                     &params,
-                    c,
+                    self.variant,
+                    req,
                     &req.output_dir
                         .join(checkpoint::checkpoint_filename(stem, step)),
                 )?;
@@ -805,7 +816,14 @@ impl LoadedTrainer {
         progress(TrainingProgress::Saving);
         std::fs::create_dir_all(&req.output_dir)?;
         let path = req.output_dir.join(&req.file_name);
-        self.save(&adapter, &params, c, &path)?;
+        save(
+            &mut self.transformer,
+            &adapter,
+            &params,
+            self.variant,
+            req,
+            &path,
+        )?;
         Ok(TrainingOutput {
             adapter_path: path,
             steps,

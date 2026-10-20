@@ -7,6 +7,7 @@ use candle_gen::train::{
     lora::{self, LoraSet},
     optim::TrainOptimizer,
 };
+use candle_gen::CandleError;
 use std::collections::BTreeMap;
 
 fn data(device: &Device, dtype: DType) -> (Transformer, Weights, Tensor, Tensor) {
@@ -990,5 +991,152 @@ fn strict_adapter_rejects_orphans_crossed_axes_nonfinite_and_derived_overflow() 
             "malformed file {defect}"
         );
         close(&before, &generation(&host, &x, &context), 0.);
+    }
+}
+
+/// A scaled finite coefficient does not make the pre-scale FP32 GEMMs finite.
+#[test]
+fn strict_application_rejects_unscaled_intermediate_overflow_before_success() {
+    let temp = tempfile::tempdir().unwrap();
+    for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+        for case in [
+            "lora",
+            "lora-scaled",
+            "lokr",
+            "lokr-reversed",
+            "lokr-decomposed",
+        ] {
+            let lokr = case.starts_with("lokr");
+            let scaled = case == "lora-scaled";
+            let alpha = if scaled { 32f32 } else { 0.25 };
+            let mut metadata = contract::metadata(variant, contract::SAMPLER);
+            metadata.extend([
+                (
+                    "networkType".into(),
+                    if lokr { "lokr" } else { "lora" }.into(),
+                ),
+                ("rank".into(), "1".into()),
+                ("alpha".into(), alpha.to_string()),
+                ("decomposeFactor".into(), "-1".into()),
+            ]);
+            let sparse = |shape: (usize, usize)| {
+                let mut v = vec![0f32; shape.0 * shape.1];
+                v[0] = if scaled { 1e18 } else { 2e19 };
+                if scaled && shape.0 == 1 {
+                    v.fill(1e18);
+                }
+                Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+            };
+            let factors = if case == "lokr-reversed" {
+                BTreeMap::from([
+                    ("layers.0.proj.q.lokr_w1".into(), sparse((1, 4))),
+                    ("layers.0.proj.q.lokr_w2".into(), sparse((16, 4))),
+                ])
+            } else if case == "lokr-decomposed" {
+                // Effective first factor is zero, but its raw inner leg overflows for a
+                // bounded input BEFORE multiplication by the zero outer leg.
+                BTreeMap::from([
+                    (
+                        "layers.0.proj.q.lokr_w1_a".into(),
+                        Tensor::zeros((4, 1), DType::F32, &Device::Cpu).unwrap(),
+                    ),
+                    (
+                        "layers.0.proj.q.lokr_w1_b".into(),
+                        Tensor::from_vec(vec![f32::MAX, f32::MAX, 0., 0.], (1, 4), &Device::Cpu)
+                            .unwrap(),
+                    ),
+                    (
+                        "layers.0.proj.q.lokr_w2".into(),
+                        Tensor::eye(4, DType::F32, &Device::Cpu).unwrap(),
+                    ),
+                ])
+            } else if lokr {
+                BTreeMap::from([
+                    ("layers.0.proj.q.lokr_w1".into(), sparse((4, 4))),
+                    ("layers.0.proj.q.lokr_w2".into(), sparse((4, 4))),
+                ])
+            } else {
+                BTreeMap::from([
+                    ("layers.0.proj.q.lora_A.weight".into(), sparse((1, 16))),
+                    ("layers.0.proj.q.lora_B.weight".into(), sparse((16, 1))),
+                    (
+                        "layers.0.proj.q.alpha".into(),
+                        Tensor::from_vec(vec![alpha], (1,), &Device::Cpu).unwrap(),
+                    ),
+                ])
+            };
+            // Independent f64 witness: all raw coefficients and the scaled product are finite,
+            // but the second raw contraction exceeds FP32 before alpha/rank is multiplied.
+            let raw = if scaled {
+                f64::from(1e18f32).powi(2) * 16.
+            } else {
+                f64::from(2e19f32).powi(2)
+            };
+            assert!(if scaled {
+                raw < f64::from(f32::MAX) && raw * f64::from(alpha) > f64::from(f32::MAX)
+            } else {
+                raw > f64::from(f32::MAX) && raw * f64::from(alpha) < f64::from(f32::MAX)
+            });
+            let path = temp.path().join("overflow.safetensors");
+            write_adapter_file(&path, &factors, &metadata);
+            let (mut host, _, _, _) = data(&Device::Cpu, DType::F32);
+            let spec = adapter_spec(path.clone(), lokr, 1.);
+            let pin = PinnedWeightsFile::pin(&path).unwrap();
+            let result = crate::adapters::apply(&mut host, variant, &[spec], &[pin]);
+            assert!(matches!(result, Err(CandleError::Unsupported(ref message))
+                if message.contains("contraction") && message.contains("reduce factor magnitude")),
+                "unsafe raw contraction must be actionably refused before application success: {result:?}");
+            let zero = adapter_spec(path.clone(), lokr, 0.);
+            let pin = PinnedWeightsFile::pin(&path).unwrap();
+            assert!(
+                crate::adapters::apply(&mut host, variant, &[zero], &[pin]).is_ok(),
+                "finite disabled factors must not execute or be rejected for a skipped contraction"
+            );
+        }
+    }
+}
+
+#[test]
+fn periodic_and_final_exports_preserve_request_trigger_words() {
+    let temp = tempfile::tempdir().unwrap();
+    for variant in [MossImageVariant::Base, MossImageVariant::Sft] {
+        for network in [NetworkType::Lora, NetworkType::Lokr] {
+            let (mut model, _, _, _) = data(&Device::Cpu, DType::F32);
+            let mut cfg = config(network, DType::F32);
+            cfg.trigger_word = Some("caption_only_not_export_words".into());
+            let set = model.training_adapter(&cfg).unwrap();
+            nonzero(&set);
+            let mut req = candle_gen::gen_core::TrainingRequest {
+                items: vec![],
+                config: cfg,
+                output_dir: temp.path().into(),
+                file_name: "final.safetensors".into(),
+                trigger_words: vec!["ohwx".into(), "quoted\"word".into()],
+                cancel: CancelFlag::new(),
+            };
+            for words in [req.trigger_words.clone(), vec![]] {
+                req.trigger_words = words.clone();
+                for file in [
+                    candle_gen::train::checkpoint::checkpoint_filename("adapter", 1),
+                    req.file_name.clone(),
+                ] {
+                    let path = temp.path().join(file);
+                    training::save(&model, &set, variant, &req, &path).unwrap();
+                    let metadata = gen_core::weightsmeta::safetensors_file_metadata(&path).unwrap();
+                    if words.is_empty() {
+                        assert!(
+                            !metadata.contains_key("triggerWords"),
+                            "empty legacy words must stay absent"
+                        );
+                    } else {
+                        assert_eq!(
+                            serde_json::from_str::<Vec<String>>(&metadata["triggerWords"]).unwrap(),
+                            words,
+                            "saved adapter must carry request words, not config caption injection"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

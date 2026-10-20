@@ -16,6 +16,23 @@ pub(crate) fn finite(t: &Tensor, label: &str) -> Result<()> {
     }
     Ok(())
 }
+// Bound each actual FP32 contraction for inputs with magnitude <= 1. A finite scaled
+// coefficient is insufficient: the implementation applies scale only AFTER the raw factors.
+// Absolute row sums also cover cancellation and each decomposed leg, without a dense delta.
+fn contraction_bound(weight: &Tensor, input: f64) -> Result<f64> {
+    let (_, columns) = weight.dims2()?;
+    let norm = tensor_f32(weight)?
+        .chunks_exact(columns)
+        .map(|row| row.iter().map(|v| f64::from(v.abs())).sum::<f64>())
+        .fold(0., f64::max);
+    let bound = norm * input;
+    if !bound.is_finite() || bound > f32::MAX as f64 {
+        return Err(invalid(
+            "unscaled factor contraction overflows FP32; reduce factor magnitude",
+        ));
+    }
+    Ok(bound)
+}
 #[derive(Clone)]
 pub(crate) enum Factor {
     Full(Tensor),
@@ -58,6 +75,12 @@ impl Factor {
             Self::Full(w) => Ok(Linear::new(w.clone(), None).forward(&x.contiguous()?)?),
             Self::LowRank { a, b } => Ok(Linear::new(a.clone(), None)
                 .forward(&Linear::new(b.clone(), None).forward(&x.contiguous()?)?)?),
+        }
+    }
+    fn forward_bound(&self, input: f64) -> Result<f64> {
+        match self {
+            Self::Full(w) => contraction_bound(w, input),
+            Self::LowRank { a, b } => contraction_bound(a, contraction_bound(b, input)?),
         }
     }
     fn tensors(&self) -> Vec<&Tensor> {
@@ -179,6 +202,27 @@ impl Residual {
     pub(crate) fn validate(&self) -> Result<()> {
         for tensor in self.tensors() {
             finite(tensor, "source factor")?;
+        }
+        let raw_bound = if self.scale() == 0. {
+            0. // Forward skips a disabled residual before any contraction.
+        } else {
+            match self {
+                Self::Lora { down, up, .. } => contraction_bound(up, contraction_bound(down, 1.)?)?,
+                Self::Lokr { first, second, .. } => {
+                    let (a, c) = first.shape();
+                    let (b, d) = second.shape();
+                    if c * b <= d * a {
+                        first.forward_bound(second.forward_bound(1.)?)?
+                    } else {
+                        second.forward_bound(first.forward_bound(1.)?)?
+                    }
+                }
+            }
+        };
+        if raw_bound * self.scale().abs() > f32::MAX as f64 {
+            return Err(invalid(
+                "scaled factor contraction overflows FP32; reduce factor magnitude or strength",
+            ));
         }
         let envelope = match self {
             Self::Lora { down, up, scale } => {
